@@ -124,6 +124,26 @@ describe("LetMeKnow", () => {
     expect(await response.json()).toEqual({ error: "internal server error" });
   });
 
+  it("returns the create rate-limit contract", async () => {
+    const limit = vi.fn().mockResolvedValue({ success: false });
+    const response = await worker.fetch(request("/questions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "203.0.113.10"
+      },
+      body: JSON.stringify(questionBody())
+    }), {
+      QUESTIONS: env.QUESTIONS,
+      CREATE_RATE_LIMIT: { limit }
+    });
+
+    expect(limit).toHaveBeenCalledWith({ key: "203.0.113.10" });
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("60");
+    expect(await response.json()).toEqual({ error: "too many questions; try again later" });
+  });
+
   it("creates a tiny answer path and a private status path using the request origin", async () => {
     const before = Date.now();
     const { response, data } = await create();
