@@ -4,7 +4,6 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "db:local": "wrangler d1 migrations apply letmeknow --local",
     "deploy": "wrangler deploy",
     "check": "tsc --noEmit",
     "smoke": "bash scripts/smoke-test.sh",

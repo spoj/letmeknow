@@ -5,9 +5,6 @@
   "account_id": "7a70f73ca6868c580737f00a3ddbf79b",
   "compatibility_date": "2025-03-01",
   "workers_dev": true,
-  "triggers": {
-    "crons": ["0 3 * * *"]
-  },
   "ratelimits": [
     {
       "name": "CREATE_RATE_LIMIT",
@@ -18,12 +15,18 @@
       }
     }
   ],
-  "d1_databases": [
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "QUESTIONS",
+        "class_name": "Question"
+      }
+    ]
+  },
+  "migrations": [
     {
-      "binding": "DB",
-      "database_name": "letmeknow",
-      "database_id": "9158e031-4018-49cf-8837-1174527ea87e",
-      "migrations_dir": "migrations"
+      "tag": "v1",
+      "new_sqlite_classes": ["Question"]
     }
   ]
 }

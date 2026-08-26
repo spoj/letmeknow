@@ -1,5 +1,5 @@
 interface Env {
-  DB: D1Database;
+  QUESTIONS: DurableObjectNamespace;
   CREATE_RATE_LIMIT: RateLimitBinding;
 }
 
@@ -33,6 +33,15 @@ type QuestionRow = {
   answered_at: number | null;
 };
 
+type QuestionInit = {
+  answerHash: string;
+  statusHash: string;
+  title: string;
+  fields: Field[];
+  createdAt: number;
+  expiresAt: number;
+};
+
 const MAX_BODY_BYTES = 16_384;
 const MAX_TITLE_LENGTH = 120;
 const MAX_LABEL_LENGTH = 300;
@@ -41,6 +50,8 @@ const MAX_FIELDS = 8;
 const MAX_OPTIONS = 8;
 const MAX_OPTION_LENGTH = 100;
 const QUESTION_TTL_MS = 24 * 60 * 60 * 1_000;
+const MAX_WAIT_SECONDS = 30;
+const RETRY_AFTER_SECONDS = 3;
 const encoder = new TextEncoder();
 
 function baseHeaders(contentType: string): Headers {
@@ -114,11 +125,11 @@ async function hash(value: string): Promise<string> {
 async function readJson(request: Request): Promise<Record<string, unknown>> {
   const contentLength = Number(request.headers.get("Content-Length") ?? 0);
   if (contentLength > MAX_BODY_BYTES) throw new Error("request too large");
-  const text = await request.text();
-  if (encoder.encode(text).byteLength > MAX_BODY_BYTES) throw new Error("request too large");
+  const bodyText = await request.text();
+  if (encoder.encode(bodyText).byteLength > MAX_BODY_BYTES) throw new Error("request too large");
   let body: unknown;
   try {
-    body = JSON.parse(text);
+    body = JSON.parse(bodyText);
   } catch {
     throw new Error("invalid JSON");
   }
@@ -130,18 +141,14 @@ function fieldsFromRow(row: QuestionRow): Field[] {
   return JSON.parse(row.fields) as Field[];
 }
 
-async function findBy(field: "answer_hash" | "status_hash", value: string, env: Env): Promise<QuestionRow | null> {
-  return env.DB.prepare(`SELECT answer_hash, status_hash, title, fields, answers, created_at, expires_at, answered_at FROM questions WHERE ${field} = ?`)
-    .bind(await hash(value)).first<QuestionRow>();
-}
-
-function pathToken(pathname: string, prefix: string): string | null {
+function questionPath(pathname: string, prefix: "/q/" | "/s/"): { id: string; token: string } | null {
   if (!pathname.startsWith(prefix)) return null;
-  const value = pathname.slice(prefix.length);
-  return value && !value.includes("/") ? value : null;
+  const parts = pathname.slice(prefix.length).split("/");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  return { id: parts[0], token: parts[1] };
 }
 
-function questionForm(row: QuestionRow, answerToken: string, error = ""): string {
+function questionForm(row: QuestionRow, questionId: string, answerToken: string, error = ""): string {
   const fields = fieldsFromRow(row);
   const controls = fields.map((field) => {
     const name = `field_${field.id}`;
@@ -150,7 +157,7 @@ function questionForm(row: QuestionRow, answerToken: string, error = ""): string
     }
     return `<div class="field"><label for="${escapeHtml(name)}">${escapeHtml(field.label)}</label><textarea id="${escapeHtml(name)}" name="${escapeHtml(name)}" maxlength="${MAX_ANSWER_LENGTH}" required></textarea></div>`;
   }).join("");
-  return `<section class="card"><h1>${escapeHtml(row.title)}</h1>${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}<form method="post" action="/q/${escapeHtml(answerToken)}">${controls}<button type="submit">Submit answer</button></form><p class="muted">This link expires in 24 hours. No account is required.</p></section>`;
+  return `<section class="card"><h1>${escapeHtml(row.title)}</h1>${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}<form method="post" action="/q/${escapeHtml(questionId)}/${escapeHtml(answerToken)}">${controls}<button type="submit">Submit answer</button></form><p class="muted">This link expires in 24 hours. No account is required.</p></section>`;
 }
 
 function messagePage(title: string, message: string, status = 200): Response {
@@ -188,6 +195,205 @@ function validateFields(value: unknown): Field[] | string {
   return fields;
 }
 
+function parseWaitSeconds(url: URL): number {
+  const value = url.searchParams.get("wait");
+  if (value === null || !/^\d+$/.test(value)) return 0;
+  return Math.min(Number(value), MAX_WAIT_SECONDS);
+}
+
+export class Question {
+  private readonly waiters = new Set<() => void>();
+
+  constructor(private readonly state: DurableObjectState, _env: Env) {
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS question (
+          answer_hash TEXT PRIMARY KEY,
+          status_hash TEXT NOT NULL UNIQUE,
+          title TEXT NOT NULL,
+          fields TEXT NOT NULL,
+          answers TEXT,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          answered_at INTEGER
+        )
+      `);
+      this.state.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS lifecycle (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          expires_at INTEGER NOT NULL
+        )
+      `);
+    });
+  }
+
+  private getQuestion(): QuestionRow | null {
+    const rows = [...this.state.storage.sql.exec(`SELECT answer_hash, status_hash, title, fields, answers, created_at, expires_at, answered_at FROM question LIMIT 1`)] as QuestionRow[];
+    return rows[0] ?? null;
+  }
+
+  private getExpiry(): number | null {
+    const rows = [...this.state.storage.sql.exec(`SELECT expires_at FROM lifecycle WHERE id = 1`)] as Array<{ expires_at: number }>;
+    return rows[0]?.expires_at ?? null;
+  }
+
+  private findBy(field: "answer_hash" | "status_hash", value: string): Promise<QuestionRow | null> {
+    return hash(value).then((valueHash) => {
+      const rows = [...this.state.storage.sql.exec(`SELECT answer_hash, status_hash, title, fields, answers, created_at, expires_at, answered_at FROM question WHERE ${field} = ?`, valueHash)] as QuestionRow[];
+      return rows[0] ?? null;
+    });
+  }
+
+  private expired(): boolean {
+    const expiry = this.getExpiry();
+    return expiry !== null && expiry <= Date.now();
+  }
+
+  private pendingResponse(): Response {
+    return json({ status: "pending" }, 202, { "Retry-After": String(RETRY_AFTER_SECONDS) });
+  }
+
+  private statusResponse(row: QuestionRow | null): Response {
+    if (!row) return json({ status: "expired" }, 410);
+    if (row.expires_at <= Date.now()) return json({ status: "expired" }, 410);
+    if (row.answers === null) return this.pendingResponse();
+    return json({ status: "answered", answers: JSON.parse(row.answers), answered_at: new Date(row.answered_at!).toISOString() });
+  }
+
+  private addWaiter(timeoutMs: number): { promise: Promise<void>; resolve: () => void } {
+    let finish!: () => void;
+    let timer!: ReturnType<typeof setTimeout>;
+    let settled = false;
+    const promise = new Promise<void>((resolve) => {
+      finish = () => {
+        if (settled) return;
+        settled = true;
+        this.waiters.delete(finish);
+        clearTimeout(timer);
+        resolve();
+      };
+      this.waiters.add(finish);
+      timer = setTimeout(finish, timeoutMs);
+    });
+    return { promise, resolve: finish };
+  }
+
+  private wakeWaiters(): void {
+    for (const resolve of [...this.waiters]) resolve();
+  }
+
+  private async initialize(request: Request): Promise<Response> {
+    if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+    const body = await request.json() as QuestionInit;
+    if (this.getQuestion()) return json({ error: "already initialized" }, 409);
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(
+        "INSERT INTO question (answer_hash, status_hash, title, fields, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+        body.answerHash,
+        body.statusHash,
+        body.title,
+        JSON.stringify(body.fields),
+        body.createdAt,
+        body.expiresAt
+      );
+      this.state.storage.sql.exec("INSERT INTO lifecycle (id, expires_at) VALUES (1, ?)", body.expiresAt);
+    });
+    await this.state.storage.setAlarm(body.expiresAt);
+    return new Response(null, { status: 204 });
+  }
+
+  private async showQuestion(answerToken: string): Promise<Response> {
+    const row = await this.findBy("answer_hash", answerToken);
+    if (!row) return messagePage(this.expired() ? "Expired" : "Not found", this.expired() ? "This question link has expired." : "This question link is invalid.", this.expired() ? 410 : 404);
+    if (row.expires_at <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
+    if (row.answers !== null) return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
+    return html(row.title, questionForm(row, this.state.id.toString(), answerToken));
+  }
+
+  private async answerQuestion(request: Request, answerToken: string): Promise<Response> {
+    const row = await this.findBy("answer_hash", answerToken);
+    if (!row) return messagePage(this.expired() ? "Expired" : "Not found", this.expired() ? "This question link has expired." : "This question link is invalid.", this.expired() ? 410 : 404);
+    if (row.expires_at <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
+    if (!request.headers.get("Content-Type")?.startsWith("application/x-www-form-urlencoded")) return messagePage("Invalid answer", "Submit the form from the question page.", 400);
+    if (Number(request.headers.get("Content-Length") ?? 0) > MAX_BODY_BYTES) return messagePage("Invalid answer", "That answer is too large.", 400);
+
+    const body = await request.text();
+    if (encoder.encode(body).byteLength > MAX_BODY_BYTES) return messagePage("Invalid answer", "That answer is too large.", 400);
+    const form = new URLSearchParams(body);
+    const answers: Record<string, string> = {};
+    for (const field of fieldsFromRow(row)) {
+      const value = form.get(`field_${field.id}`);
+      if (value === null) return html(row.title, questionForm(row, this.state.id.toString(), answerToken, "Please answer every field."), 400);
+      const answer = value.trim();
+      if (!answer || answer.length > MAX_ANSWER_LENGTH || (field.type === "choice" && !field.options.includes(answer))) {
+        return html(row.title, questionForm(row, this.state.id.toString(), answerToken, "Please provide a valid answer for every field."), 400);
+      }
+      answers[field.id] = answer;
+    }
+
+    const answeredAt = Date.now();
+    const result = this.state.storage.sql.exec(
+      "UPDATE question SET answers = ?, answered_at = ? WHERE answer_hash = ? AND answers IS NULL AND expires_at > ?",
+      JSON.stringify(answers),
+      answeredAt,
+      row.answer_hash,
+      answeredAt
+    );
+    if (result.rowsWritten !== 1) {
+      const latest = await this.findBy("answer_hash", answerToken);
+      if (latest?.answers !== null) return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
+      return messagePage("Expired", "This question link has expired.", 410);
+    }
+    this.wakeWaiters();
+    return messagePage("Answer received", "Thanks — the agent can now continue.");
+  }
+
+  private async showStatus(request: Request, statusToken: string): Promise<Response> {
+    const row = await this.findBy("status_hash", statusToken);
+    if (!row) return this.expired() ? json({ status: "expired" }, 410) : json({ error: "not found" }, 404);
+    if (row.expires_at <= Date.now()) return json({ status: "expired" }, 410);
+    if (row.answers !== null) return this.statusResponse(row);
+
+    const waitSeconds = parseWaitSeconds(new URL(request.url));
+    if (waitSeconds === 0) return this.pendingResponse();
+
+    const waiter = this.addWaiter(waitSeconds * 1_000);
+    const latest = this.getQuestion();
+    if (!latest || latest.answers !== null || latest.expires_at <= Date.now()) waiter.resolve();
+    await waiter.promise;
+    return this.statusResponse(this.getQuestion());
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/initialize") return this.initialize(request);
+
+    const question = questionPath(url.pathname, "/q/");
+    if (question) {
+      if (request.method === "GET") return this.showQuestion(question.token);
+      if (request.method === "POST") return this.answerQuestion(request, question.token);
+      return messagePage("Method not allowed", "Use GET or POST for this question link.", 405);
+    }
+
+    const status = questionPath(url.pathname, "/s/");
+    if (status && request.method === "GET") return this.showStatus(request, status.token);
+    if (status) return json({ error: "method not allowed" }, 405);
+    return json({ error: "not found" }, 404);
+  }
+
+  async alarm(): Promise<void> {
+    const expiresAt = this.getExpiry();
+    if (expiresAt === null) return;
+    const now = Date.now();
+    if (expiresAt > now) {
+      await this.state.storage.setAlarm(expiresAt);
+      return;
+    }
+    this.state.storage.sql.exec("DELETE FROM question WHERE expires_at <= ?", now);
+    this.wakeWaiters();
+  }
+}
+
 async function createQuestion(request: Request, env: Env): Promise<Response> {
   const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
   const allowed = await env.CREATE_RATE_LIMIT.limit({ key: ip });
@@ -208,64 +414,28 @@ async function createQuestion(request: Request, env: Env): Promise<Response> {
   const statusToken = token();
   const createdAt = Date.now();
   const expiresAt = createdAt + QUESTION_TTL_MS;
-  await env.DB.prepare("INSERT INTO questions (answer_hash, status_hash, title, fields, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)")
-    .bind(await hash(answerToken), await hash(statusToken), title, JSON.stringify(fields), createdAt, expiresAt)
-    .run();
+  const objectId = env.QUESTIONS.newUniqueId();
+  const questionId = objectId.toString();
+  const initialized = await env.QUESTIONS.get(objectId).fetch(new Request("https://question.internal/initialize", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      answerHash: await hash(answerToken),
+      statusHash: await hash(statusToken),
+      title,
+      fields,
+      createdAt,
+      expiresAt
+    } satisfies QuestionInit)
+  }));
+  if (!initialized.ok) return json({ error: "could not create question" }, 500);
 
   const origin = new URL(request.url).origin;
   return json({
-    question_url: `${origin}/q/${answerToken}`,
-    status_url: `${origin}/s/${statusToken}`,
+    question_url: `${origin}/q/${questionId}/${answerToken}`,
+    status_url: `${origin}/s/${questionId}/${statusToken}`,
     expires_at: new Date(expiresAt).toISOString()
   }, 201);
-}
-
-async function showQuestion(env: Env, answerToken: string): Promise<Response> {
-  const row = await findBy("answer_hash", answerToken, env);
-  if (!row) return messagePage("Not found", "This question link is invalid.", 404);
-  if (row.expires_at <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
-  if (row.answers !== null) return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
-  return html(row.title, questionForm(row, answerToken));
-}
-
-async function answerQuestion(request: Request, env: Env, answerToken: string): Promise<Response> {
-  const row = await findBy("answer_hash", answerToken, env);
-  if (!row) return messagePage("Not found", "This question link is invalid.", 404);
-  if (row.expires_at <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
-  if (row.answers !== null) return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
-  if (!request.headers.get("Content-Type")?.startsWith("application/x-www-form-urlencoded")) return messagePage("Invalid answer", "Submit the form from the question page.", 400);
-  if (Number(request.headers.get("Content-Length") ?? 0) > MAX_BODY_BYTES) return messagePage("Invalid answer", "That answer is too large.", 400);
-
-  const form = await request.formData();
-  const answers: Record<string, string> = {};
-  for (const field of fieldsFromRow(row)) {
-    const value = form.get(`field_${field.id}`);
-    if (typeof value !== "string") return html(row.title, questionForm(row, answerToken, "Please answer every field."), 400);
-    const answer = value.trim();
-    if (!answer || answer.length > MAX_ANSWER_LENGTH || (field.type === "choice" && !field.options.includes(answer))) {
-      return html(row.title, questionForm(row, answerToken, "Please provide a valid answer for every field."), 400);
-    }
-    answers[field.id] = answer;
-  }
-
-  const answeredAt = Date.now();
-  const result = await env.DB.prepare("UPDATE questions SET answers = ?, answered_at = ? WHERE answer_hash = ? AND answers IS NULL AND expires_at > ?")
-    .bind(JSON.stringify(answers), answeredAt, row.answer_hash, answeredAt)
-    .run();
-  if (result.meta.changes !== 1) {
-    const latest = await findBy("answer_hash", answerToken, env);
-    if (latest?.answers !== null) return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
-    return messagePage("Expired", "This question link has expired.", 410);
-  }
-  return messagePage("Answer received", "Thanks — the agent can now continue.");
-}
-
-async function showStatus(env: Env, statusToken: string): Promise<Response> {
-  const row = await findBy("status_hash", statusToken, env);
-  if (!row) return json({ error: "not found" }, 404);
-  if (row.expires_at <= Date.now()) return json({ status: "expired" }, 410);
-  if (row.answers === null) return json({ status: "pending" }, 202, { "Retry-After": "3" });
-  return json({ status: "answered", answers: JSON.parse(row.answers), answered_at: new Date(row.answered_at!).toISOString() });
 }
 
 function home(): Response {
@@ -286,11 +456,14 @@ The response contains two independent capability URLs:
 
 ## Poll the answer
 
-GET /s/<status-token>
+GET /s/<question-id>/<status-token>?wait=25
 
-202 {"status":"pending"} and Retry-After: 3 means poll again.
-200 {"status":"answered","answers":{...}} means the human submitted.
-410 {"status":"expired"} means the question is gone.
+A pending request waits up to 25 seconds for an answer. It returns:
+- 200 {"status":"answered","answers":{...}} when the human submits.
+- 202 {"status":"pending"} with Retry-After when the bounded wait expires.
+- 410 {"status":"expired"} when the question is gone.
+
+Without wait, 202 means poll again after the Retry-After delay.
 
 ## Answer rules
 
@@ -307,23 +480,32 @@ export default {
       if (url.pathname === "/" && request.method === "GET") return home();
       if (url.pathname === "/questions" && request.method === "POST") return createQuestion(request, env);
 
-      const answerToken = pathToken(url.pathname, "/q/");
-      if (answerToken) {
-        if (request.method === "GET") return showQuestion(env, answerToken);
-        if (request.method === "POST") return answerQuestion(request, env, answerToken);
+      const question = questionPath(url.pathname, "/q/");
+      if (question) {
+        let id: DurableObjectId;
+        try {
+          id = env.QUESTIONS.idFromString(question.id);
+        } catch {
+          return messagePage("Not found", "This question link is invalid.", 404);
+        }
+        if (request.method === "GET" || request.method === "POST") return env.QUESTIONS.get(id).fetch(request);
         return messagePage("Method not allowed", "Use GET or POST for this question link.", 405);
       }
 
-      const statusToken = pathToken(url.pathname, "/s/");
-      if (statusToken && request.method === "GET") return showStatus(env, statusToken);
-      if (statusToken) return json({ error: "method not allowed" }, 405);
+      const status = questionPath(url.pathname, "/s/");
+      if (status) {
+        if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
+        let id: DurableObjectId;
+        try {
+          id = env.QUESTIONS.idFromString(status.id);
+        } catch {
+          return json({ error: "not found" }, 404);
+        }
+        return env.QUESTIONS.get(id).fetch(request);
+      }
       return json({ error: "not found" }, 404);
     } catch {
       return json({ error: "internal server error" }, 500);
     }
-  },
-
-  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
-    await env.DB.prepare("DELETE FROM questions WHERE expires_at <= ?").bind(Date.now()).run();
   }
 };
