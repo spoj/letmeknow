@@ -262,6 +262,7 @@ describe("LetMeKnow", () => {
     expect(beforeAnswerBody).toContain("Review &lt;release&gt; &amp; &quot;approval&quot;");
     expect(beforeAnswerBody).toContain("Continue &lt;now&gt; &amp; verify");
     expect(beforeAnswerBody).toContain(`<form method="post" action="${questionPath}">`);
+    expect(beforeAnswerBody).toMatch(/link expires in \d{2}:\d{2}/);
 
     const answerResponse = await answer(data.question_url!);
     expect(answerResponse.status).toBe(200);
@@ -330,11 +331,12 @@ describe("LetMeKnow", () => {
     expect(redirect.status).toBe(307);
     expect(redirect.headers.get("Location")).toBe("https://public.example/");
     expect(redirect.headers.get("Strict-Transport-Security")).toBe("max-age=31536000");
+    await redirect.text();
 
     const page = await SELF.fetch(new Request("https://public.example/q/not-an-id/token"));
     expect(page.status).toBe(404);
     expect(page.headers.get("Strict-Transport-Security")).toBe("max-age=31536000");
-    expect(page.headers.get("Content-Security-Policy")).toBe("default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; object-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+    expect(page.headers.get("Content-Security-Policy")).toBe("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
     await page.text();
   });
 
