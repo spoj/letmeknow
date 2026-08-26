@@ -1,4 +1,4 @@
-import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import worker from "../src/index";
 import { describe, expect, it, vi } from "vitest";
@@ -78,22 +78,6 @@ function streamed(text: string): ReadableStream<Uint8Array> {
   });
 }
 
-function objectStub(statusUrl: string): DurableObjectStub {
-  const answerToken = new URL(statusUrl).pathname.split("/")[2].split(".")[0];
-  return env.QUESTIONS.get(env.QUESTIONS.idFromName(answerToken));
-}
-
-async function waitForWaiters(statusUrl: string, count: number): Promise<void> {
-  const stub = objectStub(statusUrl);
-  await vi.waitFor(async () => {
-    const actual = await runInDurableObject(stub, (instance) => {
-      const waiters = Reflect.get(instance as object, "waiters");
-      return waiters instanceof Set ? waiters.size : -1;
-    });
-    expect(actual).toBe(count);
-  }, { interval: 1, timeout: 1_000 });
-}
-
 describe("LetMeKnow", () => {
   it("serves the root as genuine plain text", async () => {
     const response = await SELF.fetch(`${origin}/`);
@@ -103,7 +87,7 @@ describe("LetMeKnow", () => {
     const body = await response.text();
     expect(body).toContain("# LetMeKnow");
     expect(body).toContain(`curl -sS -X POST ${origin}/questions`);
-    expect(body).toContain(`status_url="${origin}/s/<answer-code>.<status-token>"`);
+    expect(body).toContain(`status_url="${origin}/s/<status-token>"`);
     expect(body).toContain(`curl -sS -w '\\n%{http_code}'`);
     expect(body).toContain("202) sleep 3 ;;");
     expect(body).toContain("200|410|404) break");
@@ -116,7 +100,7 @@ describe("LetMeKnow", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(questionBody())
     }), {
-      QUESTIONS: env.QUESTIONS,
+      DB: env.DB,
       CREATE_RATE_LIMIT: { limit: vi.fn().mockRejectedValue(new Error("rate limit unavailable")) }
     });
 
@@ -134,7 +118,7 @@ describe("LetMeKnow", () => {
       },
       body: JSON.stringify(questionBody())
     }), {
-      QUESTIONS: env.QUESTIONS,
+      DB: env.DB,
       CREATE_RATE_LIMIT: { limit }
     });
 
@@ -150,9 +134,9 @@ describe("LetMeKnow", () => {
 
     expect(response.status).toBe(201);
     expect(data.question_url).toMatch(new RegExp(`^${origin}/q/[A-Za-z0-9_-]{11}$`));
-    expect(data.status_url).toMatch(new RegExp(`^${origin}/s/[A-Za-z0-9_-]{11}\\.[A-Za-z0-9_-]{43}$`));
+    expect(data.status_url).toMatch(new RegExp(`^${origin}/s/[A-Za-z0-9_-]{43}$`));
     expect(new URL(data.question_url!).pathname.length).toBe(14);
-    expect(new URL(data.status_url!).pathname.length).toBe(58);
+    expect(new URL(data.status_url!).pathname.length).toBe(46);
     expect(data.question_url).not.toBe(data.status_url);
 
     const statusUsingAnswerCapability = await status(data.question_url!.replace("/q/", "/s/"), "0");
@@ -173,10 +157,10 @@ describe("LetMeKnow", () => {
       `/q/${"a".repeat(12)}`,
       `/q/${"a".repeat(10)}!`,
       `/q/${"a".repeat(11)}.extra`,
-      `/s/${"a".repeat(10)}.${"b".repeat(43)}`,
-      `/s/${"a".repeat(11)}.${"b".repeat(42)}`,
-      `/s/${"a".repeat(10)}!.${"b".repeat(43)}`,
-      `/s/${"a".repeat(11)}.${"b".repeat(43)}.extra`
+      `/s/${"b".repeat(42)}`,
+      `/s/${"b".repeat(44)}`,
+      `/s/${"b".repeat(42)}!`,
+      `/s/${"b".repeat(43)}.extra`
     ];
 
     for (const path of malformed) {
@@ -213,10 +197,10 @@ describe("LetMeKnow", () => {
     expect(await response.json()).toEqual({ status: "pending" });
   });
 
-  it("keeps an omitted wait open until the question is answered", async () => {
+  it("returns an answer during a bounded D1 poll", async () => {
     const { data } = await create();
-    const waiting = status(data.status_url!);
-    await waitForWaiters(data.status_url!, 1);
+    const waiting = status(data.status_url!, "3");
+    await new Promise((resolve) => setTimeout(resolve, 20));
 
     const answerResponse = await answer(data.question_url!);
     expect(answerResponse.status).toBe(200);
@@ -253,16 +237,29 @@ describe("LetMeKnow", () => {
     const response = await status(data.status_url!, "1");
 
     expect(Date.now() - started).toBeGreaterThanOrEqual(800);
+    expect(Date.now() - started).toBeLessThan(2_000);
     expect(response.status).toBe(202);
     expect(response.headers.get("Retry-After")).toBe("3");
     expect(await response.json()).toEqual({ status: "pending" });
   });
 
-  it("wakes every concurrent long poll when an answer arrives", async () => {
+  it("cancels an active D1 poll when the request aborts", async () => {
     const { data } = await create();
-    const first = status(data.status_url!, "25");
-    const second = status(data.status_url!, "25");
-    await waitForWaiters(data.status_url!, 2);
+    const controller = new AbortController();
+    const started = Date.now();
+    const waiting = worker.fetch(new Request(data.status_url!, { signal: controller.signal }), env);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    controller.abort();
+
+    await expect(waiting).rejects.toBeDefined();
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  it("returns an answer to concurrent D1 polls", async () => {
+    const { data } = await create();
+    const first = status(data.status_url!, "3");
+    const second = status(data.status_url!, "3");
+    await new Promise((resolve) => setTimeout(resolve, 20));
 
     const answerResponse = await answer(data.question_url!, { approve: "No", notes: "Wait for the next release" });
     expect(answerResponse.status).toBe(200);
@@ -366,10 +363,10 @@ describe("LetMeKnow", () => {
     await stillPending.text();
   });
 
-  it("expires question and status links before alarm cleanup and wakes registered polls", async () => {
+  it("expires question and status links before scheduled cleanup", async () => {
     const { data } = await create();
     const waiting = status(data.status_url!, "25");
-    await waitForWaiters(data.status_url!, 1);
+    await new Promise((resolve) => setTimeout(resolve, 20));
     const expiresAt = new Date(data.expires_at!).getTime();
     vi.setSystemTime(expiresAt + 1);
 
@@ -386,7 +383,7 @@ describe("LetMeKnow", () => {
       expect(beforeStatus.status).toBe(410);
       expect(await beforeStatus.json()).toEqual({ status: "expired" });
 
-      expect(await runDurableObjectAlarm(objectStub(data.status_url!))).toBe(true);
+      await worker.scheduled!({} as ScheduledController, env);
 
       const woken = await waiting;
       expect(woken.status).toBe(404);

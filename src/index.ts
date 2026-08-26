@@ -1,5 +1,5 @@
 interface Env {
-  QUESTIONS: DurableObjectNamespace;
+  DB: D1Database;
   CREATE_RATE_LIMIT: RateLimitBinding;
 }
 
@@ -23,24 +23,14 @@ type TextField = {
 type Field = ChoiceField | TextField;
 
 type QuestionRecord = {
-  answerHash: string;
-  statusHash: string;
+  answer_code: string;
+  status_hash: string;
   title: string;
   fields: Field[];
   answers: Record<string, string> | null;
-  expiresAt: number;
-  answeredAt: number | null;
+  expires_at: number;
+  answered_at: number | null;
 };
-
-type QuestionInit = {
-  answerHash: string;
-  statusHash: string;
-  title: string;
-  fields: Field[];
-  expiresAt: number;
-};
-
-const QUESTION_KEY = "question";
 const MAX_BODY_BYTES = 16_384;
 const MAX_TITLE_LENGTH = 120;
 const MAX_LABEL_LENGTH = 300;
@@ -50,7 +40,6 @@ const MAX_OPTIONS = 8;
 const MAX_OPTION_LENGTH = 100;
 const QUESTION_TTL_MS = 10 * 60 * 1_000;
 const MAX_WAIT_SECONDS = 25;
-const MAX_WAITERS = 32;
 const RETRY_AFTER_SECONDS = 3;
 const ANSWER_TOKEN_BYTES = 8;
 const ANSWER_TOKEN_LENGTH = 11;
@@ -191,21 +180,16 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
   return body as Record<string, unknown>;
 }
 
-function questionPath(pathname: string, prefix: "/q/" | "/s/"): { routeToken: string; token: string } | null {
+function questionPath(pathname: string, prefix: "/q/" | "/s/"): { token: string } | null {
   if (!pathname.startsWith(prefix)) return null;
   const value = pathname.slice(prefix.length);
-  if (prefix === "/q/") {
-    if (value.length !== ANSWER_TOKEN_LENGTH || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
-    return { routeToken: value, token: value };
-  }
-  const parts = value.split(".");
-  if (parts.length !== 2 || parts[0].length !== ANSWER_TOKEN_LENGTH || parts[1].length !== STATUS_TOKEN_LENGTH) return null;
-  if (![...parts[0], ...parts[1]].every((character) => /[A-Za-z0-9_-]/.test(character))) return null;
-  return { routeToken: parts[0], token: parts[1] };
+  const length = prefix === "/q/" ? ANSWER_TOKEN_LENGTH : STATUS_TOKEN_LENGTH;
+  if (value.length !== length || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  return { token: value };
 }
 
 function questionForm(row: QuestionRecord, routeToken: string, submitted: URLSearchParams | undefined, error = ""): string {
-  const remainingMinutes = Math.max(0, Math.ceil((row.expiresAt - Date.now()) / 60_000));
+  const remainingMinutes = Math.max(0, Math.ceil((row.expires_at - Date.now()) / 60_000));
   const remaining = `${String(Math.floor(remainingMinutes / 60)).padStart(2, "0")}:${String(remainingMinutes % 60).padStart(2, "0")}`;
   const controls = row.fields.map((field) => {
     const name = `field_${field.id}`;
@@ -273,176 +257,138 @@ function httpsRedirect(url: URL): Response {
   return new Response("Redirecting to HTTPS.\n", { status: 307, headers });
 }
 
-export class Question {
-  private readonly waiters = new Set<() => void>();
+type StoredQuestion = {
+  answer_code: string;
+  status_hash: string;
+  title: string;
+  fields_json: string;
+  answers_json: string | null;
+  expires_at: number;
+  answered_at: number | null;
+};
 
-  constructor(private readonly state: DurableObjectState, _env: Env) {}
+function questionFromRow(row: StoredQuestion): QuestionRecord {
+  return {
+    answer_code: row.answer_code,
+    status_hash: row.status_hash,
+    title: row.title,
+    fields: JSON.parse(row.fields_json) as Field[],
+    answers: row.answers_json === null ? null : JSON.parse(row.answers_json) as Record<string, string>,
+    expires_at: row.expires_at,
+    answered_at: row.answered_at
+  };
+}
 
-  private getQuestion(): Promise<QuestionRecord | undefined> {
-    return this.state.storage.get<QuestionRecord>(QUESTION_KEY);
-  }
+async function findQuestion(db: D1Database | D1DatabaseSession, field: "answer_code" | "status_hash", value: string): Promise<QuestionRecord | undefined> {
+  const column = field === "answer_code" ? "answer_code" : "status_hash";
+  const lookup = field === "status_hash" ? await hash(value) : value;
+  const row = await db.prepare(`SELECT answer_code, status_hash, title, fields_json, answers_json, expires_at, answered_at FROM questions WHERE ${column} = ?1`).bind(lookup).first<StoredQuestion>();
+  return row ? questionFromRow(row) : undefined;
+}
 
-  private async findBy(field: "answerHash" | "statusHash", value: string): Promise<QuestionRecord | undefined> {
-    const valueHash = await hash(value);
-    const question = await this.getQuestion();
-    return question?.[field] === valueHash ? question : undefined;
-  }
+function pendingResponse(): Response {
+  return json({ status: "pending" }, 202, { "Retry-After": String(RETRY_AFTER_SECONDS) });
+}
 
-  private pendingResponse(): Response {
-    return json({ status: "pending" }, 202, { "Retry-After": String(RETRY_AFTER_SECONDS) });
-  }
+function statusResponse(row: QuestionRecord | undefined): Response {
+  if (!row) return json({ error: "not found" }, 404);
+  if (row.expires_at <= Date.now()) return json({ status: "expired" }, 410);
+  if (row.answers === null) return pendingResponse();
+  return json({ status: "answered", answers: row.answers, answered_at: new Date(row.answered_at!).toISOString() });
+}
 
-  private statusResponse(row: QuestionRecord | undefined): Response {
-    if (!row) return json({ error: "not found" }, 404);
-    if (row.expiresAt <= Date.now()) return json({ status: "expired" }, 410);
-    if (row.answers === null) return this.pendingResponse();
-    return json({ status: "answered", answers: row.answers, answered_at: new Date(row.answeredAt!).toISOString() });
-  }
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+}
 
-  private addWaiter(timeoutMs: number): { promise: Promise<void>; resolve: () => void } | null {
-    if (this.waiters.size >= MAX_WAITERS) return null;
-    let finish!: () => void;
-    let timer!: ReturnType<typeof setTimeout>;
-    let settled = false;
-    const promise = new Promise<void>((resolve) => {
-      finish = () => {
-        if (settled) return;
-        settled = true;
-        this.waiters.delete(finish);
-        clearTimeout(timer);
-        resolve();
-      };
-      this.waiters.add(finish);
-      timer = setTimeout(finish, timeoutMs);
-    });
-    return { promise, resolve: finish };
-  }
+function sleep(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
-  private wakeWaiters(): void {
-    for (const resolve of [...this.waiters]) resolve();
-  }
-
-  private async initialize(request: Request): Promise<Response> {
-    if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
-    const body = await request.json() as QuestionInit;
-    const question: QuestionRecord = {
-      answerHash: body.answerHash,
-      statusHash: body.statusHash,
-      title: body.title,
-      fields: body.fields,
-      answers: null,
-      expiresAt: body.expiresAt,
-      answeredAt: null
-    };
-    const initialized = await this.state.storage.transaction(async (transaction) => {
-      if (await transaction.get<QuestionRecord>(QUESTION_KEY)) return false;
-      await transaction.put(QUESTION_KEY, question);
-      await transaction.setAlarm(body.expiresAt);
-      return true;
-    });
-    if (!initialized) return json({ error: "already initialized" }, 409);
-    return new Response(null, { status: 204, headers: baseHeaders("text/plain; charset=utf-8") });
-  }
-
-  private async showQuestion(routeToken: string, answerToken: string): Promise<Response> {
-    const row = await this.findBy("answerHash", answerToken);
-    if (!row) return messagePage("Not found", "This question link is invalid.", 404);
-    if (row.expiresAt <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
-    if (row.answers !== null) return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
-    return html(row.title, questionForm(row, routeToken, undefined));
-  }
-
-  private async answerQuestion(request: Request, routeToken: string, answerToken: string): Promise<Response> {
-    const row = await this.findBy("answerHash", answerToken);
-    if (!row) return messagePage("Not found", "This question link is invalid.", 404);
-    if (row.expiresAt <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
-    if (!request.headers.get("Content-Type")?.startsWith("application/x-www-form-urlencoded")) return messagePage("Invalid answer", "Submit the form from the question page.", 400);
-
-    let body: string;
-    try {
-      body = await readBody(request);
-    } catch (error) {
-      const message = error instanceof Error && error.message === "request too large" ? "That answer is too large." : "Could not read that answer.";
-      return messagePage("Invalid answer", message, 400);
-    }
-    const form = new URLSearchParams(body);
-    const answers: Record<string, string> = {};
-    for (const field of row.fields) {
-      const value = form.get(`field_${field.id}`);
-      if (value === null) return html(row.title, questionForm(row, routeToken, form, "Please answer every field."), 400);
-      const answer = value.trim();
-      if (!answer || answer.length > MAX_ANSWER_LENGTH || (field.type === "choice" && !field.options.includes(answer))) {
-        return html(row.title, questionForm(row, routeToken, form, "Please provide a valid answer for every field."), 400);
-      }
-      answers[field.id] = answer;
+    function done(): void {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
     }
 
-    const result = await this.state.storage.transaction(async (transaction) => {
-      const current = await transaction.get<QuestionRecord>(QUESTION_KEY);
-      if (!current) return "missing" as const;
-      const answeredAt = Date.now();
-      if (current.expiresAt <= answeredAt) return "expired" as const;
-      if (current.answers !== null) return "answered" as const;
-      await transaction.put(QUESTION_KEY, { ...current, answers, answeredAt });
-      return "accepted" as const;
-    });
-    if (result === "answered") return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
-    if (result === "expired") return messagePage("Expired", "This question link has expired.", 410);
-    if (result === "missing") return messagePage("Not found", "This question link is invalid.", 404);
-    this.wakeWaiters();
-    return messagePage("Answer received", "Thanks — the agent can now continue.");
-  }
-
-  private async showStatus(request: Request, statusToken: string): Promise<Response> {
-    const waitSeconds = parseWaitSeconds(new URL(request.url));
-    if (waitSeconds === null) return json({ error: "wait must be an integer from 0 through 25" }, 400);
-
-    const row = await this.findBy("statusHash", statusToken);
-    if (!row) return json({ error: "not found" }, 404);
-    if (row.expiresAt <= Date.now()) return json({ status: "expired" }, 410);
-    if (row.answers !== null) return this.statusResponse(row);
-    if (waitSeconds === 0) return this.pendingResponse();
-
-    const waiter = this.addWaiter(waitSeconds * 1_000);
-    if (!waiter) return json({ error: "too many concurrent waiters" }, 429, { "Retry-After": String(RETRY_AFTER_SECONDS) });
-    const latest = await this.getQuestion();
-    if (!latest || latest.answers !== null || latest.expiresAt <= Date.now()) waiter.resolve();
-    await waiter.promise;
-    return this.statusResponse(await this.getQuestion());
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    if (url.pathname === "/initialize") return this.initialize(request);
-
-    const question = questionPath(url.pathname, "/q/");
-    if (question) {
-      if (request.method === "GET") return this.showQuestion(question.routeToken, question.token);
-      if (request.method === "POST") return this.answerQuestion(request, question.routeToken, question.token);
-      return messagePage("Method not allowed", "Use GET or POST for this question link.", 405);
+    function onAbort(): void {
+      if (timer !== undefined) clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
     }
 
-    const status = questionPath(url.pathname, "/s/");
-    if (status && request.method === "GET") return this.showStatus(request, status.token);
-    if (status) return json({ error: "method not allowed" }, 405);
-    return json({ error: "not found" }, 404);
-  }
-
-  async alarm(): Promise<void> {
-    const now = Date.now();
-    const result = await this.state.storage.transaction(async (transaction) => {
-      const row = await transaction.get<QuestionRecord>(QUESTION_KEY);
-      if (!row) return "missing" as const;
-      if (row.expiresAt > now) return "future" as const;
-      await transaction.delete(QUESTION_KEY);
-      return "deleted" as const;
-    });
-    if (result === "future") {
-      const row = await this.getQuestion();
-      if (row) await this.state.storage.setAlarm(row.expiresAt);
+    if (signal.aborted) {
+      onAbort();
       return;
     }
-    this.wakeWaiters();
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    timer = setTimeout(done, milliseconds);
+  });
+}
+
+async function showQuestion(db: D1DatabaseSession, answerToken: string): Promise<Response> {
+  const row = await findQuestion(db, "answer_code", answerToken);
+  if (!row) return messagePage("Not found", "This question link is invalid.", 404);
+  if (row.expires_at <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
+  if (row.answers !== null) return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
+  return html(row.title, questionForm(row, answerToken, undefined));
+}
+
+async function answerQuestion(db: D1DatabaseSession, request: Request, answerToken: string): Promise<Response> {
+  const row = await findQuestion(db, "answer_code", answerToken);
+  if (!row) return messagePage("Not found", "This question link is invalid.", 404);
+  if (row.expires_at <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
+  if (!request.headers.get("Content-Type")?.startsWith("application/x-www-form-urlencoded")) return messagePage("Invalid answer", "Submit the form from the question page.", 400);
+
+  let body: string;
+  try {
+    body = await readBody(request);
+  } catch (error) {
+    const message = error instanceof Error && error.message === "request too large" ? "That answer is too large." : "Could not read that answer.";
+    return messagePage("Invalid answer", message, 400);
+  }
+  const form = new URLSearchParams(body);
+  const answers: Record<string, string> = {};
+  for (const field of row.fields) {
+    const value = form.get(`field_${field.id}`);
+    if (value === null) return html(row.title, questionForm(row, answerToken, form, "Please answer every field."), 400);
+    const answer = value.trim();
+    if (!answer || answer.length > MAX_ANSWER_LENGTH || (field.type === "choice" && !field.options.includes(answer))) {
+      return html(row.title, questionForm(row, answerToken, form, "Please provide a valid answer for every field."), 400);
+    }
+    answers[field.id] = answer;
+  }
+
+  const answeredAt = Date.now();
+  const result = await db.prepare("UPDATE questions SET answers_json = ?1, answered_at = ?2 WHERE answer_code = ?3 AND answers_json IS NULL AND expires_at > ?4").bind(JSON.stringify(answers), answeredAt, answerToken, answeredAt).run();
+  if (result.meta.changes === 0) {
+    const current = await findQuestion(db, "answer_code", answerToken);
+    if (!current) return messagePage("Not found", "This question link is invalid.", 404);
+    if (current.expires_at <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
+    return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
+  }
+  return messagePage("Answer received", "Thanks — the agent can now continue.");
+}
+
+async function showStatus(db: D1Database, request: Request, statusToken: string): Promise<Response> {
+  const waitSeconds = parseWaitSeconds(new URL(request.url));
+  if (waitSeconds === null) return json({ error: "wait must be an integer from 0 through 25" }, 400);
+
+  const deadline = Date.now() + waitSeconds * 1_000;
+  while (true) {
+    throwIfAborted(request.signal);
+    const row = await findQuestion(db.withSession("first-primary"), "status_hash", statusToken);
+    throwIfAborted(request.signal);
+    if (!row) return json({ error: "not found" }, 404);
+    if (row.expires_at <= Date.now()) return json({ status: "expired" }, 410);
+    if (row.answers !== null) return statusResponse(row);
+    if (waitSeconds === 0) return pendingResponse();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return pendingResponse();
+    await sleep(Math.min(RETRY_AFTER_SECONDS * 1_000, remaining), request.signal);
   }
 }
 
@@ -465,24 +411,14 @@ async function createQuestion(request: Request, env: Env): Promise<Response> {
   const answerToken = token(ANSWER_TOKEN_BYTES);
   const statusToken = token(STATUS_TOKEN_BYTES);
   const expiresAt = Date.now() + QUESTION_TTL_MS;
-  const objectId = env.QUESTIONS.idFromName(answerToken);
-  const initialized = await env.QUESTIONS.get(objectId).fetch(new Request("https://question.internal/initialize", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      answerHash: await hash(answerToken),
-      statusHash: await hash(statusToken),
-      title,
-      fields,
-      expiresAt
-    } satisfies QuestionInit)
-  }));
-  if (!initialized.ok) return json({ error: "could not create question" }, 500);
+  await env.DB.withSession("first-primary").prepare("INSERT INTO questions (answer_code, status_hash, title, fields_json, answers_json, expires_at, answered_at) VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL)")
+    .bind(answerToken, await hash(statusToken), title, JSON.stringify(fields), expiresAt)
+    .run();
 
   const origin = new URL(request.url).origin;
   return json({
     question_url: `${origin}/q/${answerToken}`,
-    status_url: `${origin}/s/${answerToken}.${statusToken}`,
+    status_url: `${origin}/s/${statusToken}`,
     expires_at: new Date(expiresAt).toISOString()
   }, 201);
 }
@@ -507,7 +443,7 @@ The response contains a public answer URL and a private status URL:
 
 Use a bounded long poll and repeat the same curl request after each pending response:
 
-status_url="${origin}/s/<answer-code>.<status-token>"
+status_url="${origin}/s/<status-token>"
 while response="$(curl -sS -w '\\n%{http_code}' "\${status_url}?wait=25")"; do
   status="\${response##*$'\\n'}"
   body="\${response%$'\\n'*}"
@@ -542,20 +478,24 @@ export default {
 
       const question = questionPath(url.pathname, "/q/");
       if (question) {
-        const id = env.QUESTIONS.idFromName(question.routeToken);
-        if (request.method === "GET" || request.method === "POST") return await env.QUESTIONS.get(id).fetch(request);
+        if (request.method === "GET") return await showQuestion(env.DB.withSession("first-primary"), question.token);
+        if (request.method === "POST") return await answerQuestion(env.DB.withSession("first-primary"), request, question.token);
         return messagePage("Method not allowed", "Use GET or POST for this question link.", 405);
       }
 
       const status = questionPath(url.pathname, "/s/");
       if (status) {
         if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
-        const id = env.QUESTIONS.idFromName(status.routeToken);
-        return await env.QUESTIONS.get(id).fetch(request);
+        return await showStatus(env.DB, request, status.token);
       }
       return json({ error: "not found" }, 404);
-    } catch {
+    } catch (error) {
+      if (request.signal.aborted) throw error;
       return json({ error: "internal server error" }, 500);
     }
+  },
+
+  async scheduled(_controller: ScheduledController, env: Pick<Env, "DB">): Promise<void> {
+    await env.DB.withSession("first-primary").prepare("DELETE FROM questions WHERE expires_at <= ?1").bind(Date.now()).run();
   }
 };
