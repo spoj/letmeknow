@@ -514,7 +514,7 @@ while response="$(curl -sS -w '\\n%{http_code}' "\${status_url}?wait=25")"; do
   printf '%s\\n' "$body"
   case "$status" in
     200|410|404) break ;;
-    202) ;;
+    202) sleep ${RETRY_AFTER_SECONDS} ;;
     *) printf 'unexpected HTTP status: %s\\n' "$status" >&2; exit 1 ;;
   esac
 done

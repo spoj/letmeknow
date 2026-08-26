@@ -105,7 +105,7 @@ describe("LetMeKnow", () => {
     expect(body).toContain(`curl -sS -X POST ${origin}/questions`);
     expect(body).toContain(`status_url="${origin}/s/<answer-code>.<status-token>"`);
     expect(body).toContain(`curl -sS -w '\\n%{http_code}'`);
-    expect(body).toContain("202) ;");
+    expect(body).toContain("202) sleep 3 ;;");
     expect(body).toContain("200|410|404) break");
     expect(body).not.toContain(`GET ${origin}/s/`);
   });
