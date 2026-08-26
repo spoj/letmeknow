@@ -78,8 +78,8 @@ function streamed(text: string): ReadableStream<Uint8Array> {
 }
 
 function objectStub(statusUrl: string): DurableObjectStub {
-  const id = new URL(statusUrl).pathname.split("/")[2];
-  return env.QUESTIONS.get(env.QUESTIONS.idFromString(id));
+  const answerToken = new URL(statusUrl).pathname.split("/")[2].split(".")[0];
+  return env.QUESTIONS.get(env.QUESTIONS.idFromName(answerToken));
 }
 
 async function waitForWaiters(statusUrl: string, count: number): Promise<void> {
@@ -101,17 +101,54 @@ describe("LetMeKnow", () => {
     expect(response.headers.get("Content-Type")).toMatch(/^text\/plain; charset=utf-8$/);
     const body = await response.text();
     expect(body).toContain("# LetMeKnow");
-    expect(body).toContain(`${origin}/questions`);
+    expect(body).toContain(`curl -sS -X POST ${origin}/questions`);
+    expect(body).toContain(`status_url="${origin}/s/<answer-code>.<status-token>"`);
+    expect(body).toContain(`curl -sS -w '\\n%{http_code}'`);
+    expect(body).toContain("202) ;");
+    expect(body).toContain("200|410|404) break");
+    expect(body).not.toContain(`GET ${origin}/s/`);
   });
 
-  it("creates separate q and s capability paths using the request origin", async () => {
+  it("creates a tiny answer path and a private status path using the request origin", async () => {
+    const before = Date.now();
     const { response, data } = await create();
 
     expect(response.status).toBe(201);
-    expect(data.question_url).toMatch(new RegExp(`^${origin}/q/[^/]+/[^/]+$`));
-    expect(data.status_url).toMatch(new RegExp(`^${origin}/s/[^/]+/[^/]+$`));
+    expect(data.question_url).toMatch(new RegExp(`^${origin}/q/[A-Za-z0-9_-]{11}$`));
+    expect(data.status_url).toMatch(new RegExp(`^${origin}/s/[A-Za-z0-9_-]{11}\\.[A-Za-z0-9_-]{43}$`));
+    expect(new URL(data.question_url!).pathname.length).toBe(14);
+    expect(new URL(data.status_url!).pathname.length).toBe(58);
     expect(data.question_url).not.toBe(data.status_url);
-    expect(data.expires_at).toEqual(expect.any(String));
+
+    const statusUsingAnswerCapability = await status(data.question_url!.replace("/q/", "/s/"), "0");
+    expect(statusUsingAnswerCapability.status).toBe(404);
+    await statusUsingAnswerCapability.text();
+    const questionUsingStatusCapability = await SELF.fetch(new Request(data.status_url!.replace("/s/", "/q/")));
+    expect(questionUsingStatusCapability.status).toBe(404);
+    await questionUsingStatusCapability.text();
+
+    const expiresAt = new Date(data.expires_at!).getTime();
+    expect(expiresAt - before).toBeGreaterThan(9 * 60 * 1_000);
+    expect(expiresAt - before).toBeLessThanOrEqual(10 * 60 * 1_000 + 1_000);
+  });
+
+  it("rejects malformed compact q and s routes before dispatch", async () => {
+    const malformed = [
+      `/q/${"a".repeat(10)}`,
+      `/q/${"a".repeat(12)}`,
+      `/q/${"a".repeat(10)}!`,
+      `/q/${"a".repeat(11)}.extra`,
+      `/s/${"a".repeat(10)}.${"b".repeat(43)}`,
+      `/s/${"a".repeat(11)}.${"b".repeat(42)}`,
+      `/s/${"a".repeat(10)}!.${"b".repeat(43)}`,
+      `/s/${"a".repeat(11)}.${"b".repeat(43)}.extra`
+    ];
+
+    for (const path of malformed) {
+      const response = await SELF.fetch(request(path));
+      expect(response.status).toBe(404);
+      await response.text();
+    }
   });
 
   it("rejects malformed creation and invalid field definitions", async () => {
@@ -273,6 +310,29 @@ describe("LetMeKnow", () => {
     await afterAnswer.text();
   });
 
+  it("chooses each of five themes independently for human HTML responses", async () => {
+    const { data } = await create();
+    const random = vi.spyOn(Math, "random");
+    const themes = [
+      [0, "windows-95"],
+      [0.2, "terminal"],
+      [0.4, "blueprint"],
+      [0.6, "paper"],
+      [0.8, "candy"]
+    ] as const;
+
+    try {
+      for (const [value, theme] of themes) {
+        random.mockReturnValueOnce(value);
+        const response = await SELF.fetch(new Request(data.question_url!));
+        expect(response.status).toBe(200);
+        expect(await response.text()).toContain(`<body data-theme="${theme}">`);
+      }
+    } finally {
+      random.mockRestore();
+    }
+  });
+
   it("rejects invalid choices and missing required text", async () => {
     const { data } = await create();
     const invalidChoice = await answer(data.question_url!, { approve: "Maybe", notes: "Text" });
@@ -333,7 +393,7 @@ describe("LetMeKnow", () => {
     expect(redirect.headers.get("Strict-Transport-Security")).toBe("max-age=31536000");
     await redirect.text();
 
-    const page = await SELF.fetch(new Request("https://public.example/q/not-an-id/token"));
+    const page = await SELF.fetch(new Request(`https://public.example/q/${"a".repeat(11)}`));
     expect(page.status).toBe(404);
     expect(page.headers.get("Strict-Transport-Security")).toBe("max-age=31536000");
     expect(page.headers.get("Content-Security-Policy")).toBe("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
