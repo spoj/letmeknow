@@ -22,15 +22,15 @@ type TextField = {
 
 type Field = ChoiceField | TextField;
 
-type QuestionRow = {
-  answer_hash: string;
-  status_hash: string;
+type QuestionRecord = {
+  answerHash: string;
+  statusHash: string;
   title: string;
-  fields: string;
-  answers: string | null;
-  created_at: number;
-  expires_at: number;
-  answered_at: number | null;
+  fields: Field[];
+  answers: Record<string, string> | null;
+  createdAt: number;
+  expiresAt: number;
+  answeredAt: number | null;
 };
 
 type QuestionInit = {
@@ -42,6 +42,7 @@ type QuestionInit = {
   expiresAt: number;
 };
 
+const QUESTION_KEY = "question";
 const MAX_BODY_BYTES = 16_384;
 const MAX_TITLE_LENGTH = 120;
 const MAX_LABEL_LENGTH = 300;
@@ -50,7 +51,8 @@ const MAX_FIELDS = 8;
 const MAX_OPTIONS = 8;
 const MAX_OPTION_LENGTH = 100;
 const QUESTION_TTL_MS = 24 * 60 * 60 * 1_000;
-const MAX_WAIT_SECONDS = 30;
+const MAX_WAIT_SECONDS = 25;
+const MAX_WAITERS = 32;
 const RETRY_AFTER_SECONDS = 3;
 const encoder = new TextEncoder();
 
@@ -59,6 +61,7 @@ function baseHeaders(contentType: string): Headers {
     "Content-Type": contentType,
     "Cache-Control": "no-store",
     "Referrer-Policy": "no-referrer",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
     "X-Content-Type-Options": "nosniff",
     "X-Robots-Tag": "noindex, nofollow"
   });
@@ -78,7 +81,7 @@ function html(title: string, body: string, status = 200): Response {
   const responseHeaders = baseHeaders("text/html; charset=utf-8");
   responseHeaders.set(
     "Content-Security-Policy",
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    "default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; object-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
   );
   return new Response(`<!doctype html>
 <html lang="en">
@@ -88,15 +91,33 @@ function html(title: string, body: string, status = 200): Response {
   <meta name="referrer" content="no-referrer">
   <title>${escapeHtml(title)} · LetMeKnow</title>
   <style>
-    :root{color-scheme:dark;--bg:#0b120f;--panel:#111a15;--line:#294333;--text:#f5fff7;--muted:#a2b7a7;--accent:#78f2a1;--danger:#ffb0b0}
-    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(700px 400px at 80% 0,#17442b 0,transparent 65%),var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,sans-serif}
-    main{width:min(640px,calc(100% - 32px));margin:0 auto;padding:40px 0 64px}.brand{color:var(--accent);font-size:13px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;margin-bottom:42px}
-    .card{border:1px solid var(--line);background:#111a2fdd;border-radius:20px;padding:clamp(22px,5vw,42px);box-shadow:0 24px 80px #0004}h1{font-size:clamp(25px,5vw,38px);line-height:1.1;letter-spacing:-.04em;margin:0 0 14px}p{color:var(--muted);margin:0 0 28px;white-space:pre-wrap}
-    fieldset{border:0;padding:0;margin:0 0 28px}legend{font-weight:650;margin-bottom:14px}.choice{display:flex;align-items:center;gap:12px;border:1px solid var(--line);border-radius:12px;padding:13px 15px;margin:9px 0;cursor:pointer}.choice:has(input:checked){border-color:var(--accent);background:#65e6dc12}.choice input{accent-color:var(--accent);width:17px;height:17px}
-    .field{margin:0 0 24px}.field label{display:block;font-weight:650;margin-bottom:10px}textarea{display:block;width:100%;min-height:130px;resize:vertical;border:1px solid var(--line);border-radius:12px;background:#0a120d;color:var(--text);padding:14px;font:inherit;outline:none}textarea:focus{border-color:var(--accent)}button{border:0;border-radius:11px;background:var(--accent);color:#08121d;padding:12px 19px;font:700 15px system-ui;cursor:pointer}button:hover{filter:brightness(1.08)}.error{color:var(--danger);margin:-8px 0 20px}.muted{font-size:13px;color:var(--muted);margin-top:22px;margin-bottom:0}.home h1{font-size:32px}.home code{display:block;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:14px;background:#080e1c;color:var(--accent);font-size:13px;margin-top:14px}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;background:#008080;color:#000;font:13px/1.35 "MS Sans Serif","Microsoft Sans Serif","Segoe UI",Tahoma,sans-serif}
+    main{width:min(560px,calc(100% - 24px));margin:24px auto;padding-bottom:24px}
+    .card{background:#c0c0c0;border:2px solid;border-color:#fff #404040 #404040 #fff;border-radius:0;box-shadow:2px 2px 0 #000;padding:0}
+    .titlebar{display:flex;align-items:center;justify-content:space-between;gap:12px;background:#000080;color:#fff;font-weight:700;padding:3px 5px;min-height:22px}
+    .window-controls{font-weight:400;letter-spacing:1px;white-space:nowrap}
+    .window-body{padding:14px 16px 16px}
+    h1{font-size:18px;line-height:1.2;margin:0 0 12px;font-weight:700}
+    p{margin:0 0 16px;white-space:pre-wrap}
+    fieldset{border:1px groove #fff;margin:0 0 12px;padding:8px 10px 7px}
+    legend{padding:0 4px;font-weight:700}
+    .choice{display:flex;align-items:center;gap:7px;margin:4px 0;cursor:pointer}
+    .choice input{margin:0}
+    .field{margin:0 0 12px}
+    .field label{display:block;font-weight:700;margin-bottom:4px}
+    textarea{display:block;width:100%;min-height:84px;resize:vertical;border:2px inset #fff;border-radius:0;background:#fff;color:#000;padding:4px;font:13px/1.3 "MS Sans Serif","Microsoft Sans Serif","Segoe UI",Tahoma,sans-serif}
+    textarea:focus{outline:1px dotted #000;outline-offset:-3px}
+    button{border:2px outset #fff;border-radius:0;background:#c0c0c0;color:#000;min-width:88px;padding:4px 14px;font:700 13px "MS Sans Serif","Microsoft Sans Serif","Segoe UI",Tahoma,sans-serif;cursor:pointer}
+    button:focus{outline:1px dotted #000;outline-offset:-4px}
+    button:active{border-style:inset;padding-top:5px;padding-bottom:3px}
+    .dialog-actions{text-align:right;margin-top:14px}
+    .error{color:#800000;margin:-2px 0 14px;font-weight:700}
+    .muted{font-size:12px;color:#404040;margin:16px 0 0}
+    @media (max-width:420px){main{width:calc(100% - 12px);margin:12px auto}.window-body{padding:12px}}
   </style>
 </head>
-<body><main><div class="brand">LetMeKnow</div>${body}</main></body></html>`, { status, headers: responseHeaders });
+<body><main>${body}</main></body></html>`, { status, headers: responseHeaders });
 }
 
 function escapeHtml(value: string): string {
@@ -122,11 +143,42 @@ async function hash(value: string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+async function readBody(request: Request): Promise<string> {
+  const contentLength = request.headers.get("Content-Length");
+  if (contentLength !== null && Number.isFinite(Number(contentLength)) && Number(contentLength) > MAX_BODY_BYTES) {
+    try {
+      await request.body?.cancel();
+    } catch {
+      // The body is already unusable; the size error is the useful response.
+    }
+    throw new Error("request too large");
+  }
+
+  const reader = request.body?.getReader();
+  if (!reader) return "";
+
+  const decoder = new TextDecoder();
+  let body = "";
+  let bytesRead = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytesRead += value.byteLength;
+    if (bytesRead > MAX_BODY_BYTES) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Keep returning the size error if cancellation races stream teardown.
+      }
+      throw new Error("request too large");
+    }
+    body += decoder.decode(value, { stream: true });
+  }
+  return body + decoder.decode();
+}
+
 async function readJson(request: Request): Promise<Record<string, unknown>> {
-  const contentLength = Number(request.headers.get("Content-Length") ?? 0);
-  if (contentLength > MAX_BODY_BYTES) throw new Error("request too large");
-  const bodyText = await request.text();
-  if (encoder.encode(bodyText).byteLength > MAX_BODY_BYTES) throw new Error("request too large");
+  const bodyText = await readBody(request);
   let body: unknown;
   try {
     body = JSON.parse(bodyText);
@@ -137,10 +189,6 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
   return body as Record<string, unknown>;
 }
 
-function fieldsFromRow(row: QuestionRow): Field[] {
-  return JSON.parse(row.fields) as Field[];
-}
-
 function questionPath(pathname: string, prefix: "/q/" | "/s/"): { id: string; token: string } | null {
   if (!pathname.startsWith(prefix)) return null;
   const parts = pathname.slice(prefix.length).split("/");
@@ -148,20 +196,19 @@ function questionPath(pathname: string, prefix: "/q/" | "/s/"): { id: string; to
   return { id: parts[0], token: parts[1] };
 }
 
-function questionForm(row: QuestionRow, questionId: string, answerToken: string, error = ""): string {
-  const fields = fieldsFromRow(row);
-  const controls = fields.map((field) => {
+function questionForm(row: QuestionRecord, questionId: string, answerToken: string, error = ""): string {
+  const controls = row.fields.map((field) => {
     const name = `field_${field.id}`;
     if (field.type === "choice") {
       return `<fieldset><legend>${escapeHtml(field.label)}</legend>${field.options.map((option) => `<label class="choice"><input type="radio" name="${escapeHtml(name)}" value="${escapeHtml(option)}" required><span>${escapeHtml(option)}</span></label>`).join("")}</fieldset>`;
     }
     return `<div class="field"><label for="${escapeHtml(name)}">${escapeHtml(field.label)}</label><textarea id="${escapeHtml(name)}" name="${escapeHtml(name)}" maxlength="${MAX_ANSWER_LENGTH}" required></textarea></div>`;
   }).join("");
-  return `<section class="card"><h1>${escapeHtml(row.title)}</h1>${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}<form method="post" action="/q/${escapeHtml(questionId)}/${escapeHtml(answerToken)}">${controls}<button type="submit">Submit answer</button></form><p class="muted">This link expires in 24 hours. No account is required.</p></section>`;
+  return `<section class="card" role="dialog" aria-labelledby="question-title"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">_ □ ×</span></div><div class="window-body"><h1 id="question-title">${escapeHtml(row.title)}</h1>${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ""}<form method="post" action="/q/${escapeHtml(questionId)}/${escapeHtml(answerToken)}">${controls}<div class="dialog-actions"><button type="submit">Submit answer</button></div></form><p class="muted">This link expires in 24 hours. No account is required.</p></div></section>`;
 }
 
 function messagePage(title: string, message: string, status = 200): Response {
-  return html(title, `<section class="card"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></section>`, status);
+  return html(title, `<section class="card" role="dialog" aria-labelledby="message-title"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">_ □ ×</span></div><div class="window-body"><h1 id="message-title">${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></div></section>`, status);
 }
 
 function validateFields(value: unknown): Field[] | string {
@@ -195,72 +242,54 @@ function validateFields(value: unknown): Field[] | string {
   return fields;
 }
 
-function parseWaitSeconds(url: URL): number {
+function parseWaitSeconds(url: URL): number | null {
   const value = url.searchParams.get("wait");
-  if (value === null || !/^\d+$/.test(value)) return 0;
-  return Math.min(Number(value), MAX_WAIT_SECONDS);
+  if (value === null) return MAX_WAIT_SECONDS;
+  if (!/^\d+$/.test(value)) return null;
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) && seconds <= MAX_WAIT_SECONDS ? seconds : null;
+}
+
+function isLocalHost(url: URL): boolean {
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname.endsWith(".localhost");
+}
+
+function httpsRedirect(url: URL): Response {
+  url.protocol = "https:";
+  const headers = baseHeaders("text/plain; charset=utf-8");
+  headers.set("Location", url.toString());
+  return new Response("Redirecting to HTTPS.\n", { status: 307, headers });
 }
 
 export class Question {
   private readonly waiters = new Set<() => void>();
 
-  constructor(private readonly state: DurableObjectState, _env: Env) {
-    this.state.storage.transactionSync(() => {
-      this.state.storage.sql.exec(`
-        CREATE TABLE IF NOT EXISTS question (
-          answer_hash TEXT PRIMARY KEY,
-          status_hash TEXT NOT NULL UNIQUE,
-          title TEXT NOT NULL,
-          fields TEXT NOT NULL,
-          answers TEXT,
-          created_at INTEGER NOT NULL,
-          expires_at INTEGER NOT NULL,
-          answered_at INTEGER
-        )
-      `);
-      this.state.storage.sql.exec(`
-        CREATE TABLE IF NOT EXISTS lifecycle (
-          id INTEGER PRIMARY KEY CHECK (id = 1),
-          expires_at INTEGER NOT NULL
-        )
-      `);
-    });
+  constructor(private readonly state: DurableObjectState, _env: Env) {}
+
+  private getQuestion(): Promise<QuestionRecord | undefined> {
+    return this.state.storage.get<QuestionRecord>(QUESTION_KEY);
   }
 
-  private getQuestion(): QuestionRow | null {
-    const rows = [...this.state.storage.sql.exec(`SELECT answer_hash, status_hash, title, fields, answers, created_at, expires_at, answered_at FROM question LIMIT 1`)] as QuestionRow[];
-    return rows[0] ?? null;
-  }
-
-  private getExpiry(): number | null {
-    const rows = [...this.state.storage.sql.exec(`SELECT expires_at FROM lifecycle WHERE id = 1`)] as Array<{ expires_at: number }>;
-    return rows[0]?.expires_at ?? null;
-  }
-
-  private findBy(field: "answer_hash" | "status_hash", value: string): Promise<QuestionRow | null> {
-    return hash(value).then((valueHash) => {
-      const rows = [...this.state.storage.sql.exec(`SELECT answer_hash, status_hash, title, fields, answers, created_at, expires_at, answered_at FROM question WHERE ${field} = ?`, valueHash)] as QuestionRow[];
-      return rows[0] ?? null;
-    });
-  }
-
-  private expired(): boolean {
-    const expiry = this.getExpiry();
-    return expiry !== null && expiry <= Date.now();
+  private async findBy(field: "answerHash" | "statusHash", value: string): Promise<QuestionRecord | undefined> {
+    const valueHash = await hash(value);
+    const question = await this.getQuestion();
+    return question?.[field] === valueHash ? question : undefined;
   }
 
   private pendingResponse(): Response {
     return json({ status: "pending" }, 202, { "Retry-After": String(RETRY_AFTER_SECONDS) });
   }
 
-  private statusResponse(row: QuestionRow | null): Response {
-    if (!row) return json({ status: "expired" }, 410);
-    if (row.expires_at <= Date.now()) return json({ status: "expired" }, 410);
+  private statusResponse(row: QuestionRecord | undefined): Response {
+    if (!row) return json({ error: "not found" }, 404);
+    if (row.expiresAt <= Date.now()) return json({ status: "expired" }, 410);
     if (row.answers === null) return this.pendingResponse();
-    return json({ status: "answered", answers: JSON.parse(row.answers), answered_at: new Date(row.answered_at!).toISOString() });
+    return json({ status: "answered", answers: row.answers, answered_at: new Date(row.answeredAt!).toISOString() });
   }
 
-  private addWaiter(timeoutMs: number): { promise: Promise<void>; resolve: () => void } {
+  private addWaiter(timeoutMs: number): { promise: Promise<void>; resolve: () => void } | null {
+    if (this.waiters.size >= MAX_WAITERS) return null;
     let finish!: () => void;
     let timer!: ReturnType<typeof setTimeout>;
     let settled = false;
@@ -285,43 +314,50 @@ export class Question {
   private async initialize(request: Request): Promise<Response> {
     if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
     const body = await request.json() as QuestionInit;
-    if (this.getQuestion()) return json({ error: "already initialized" }, 409);
-    this.state.storage.transactionSync(() => {
-      this.state.storage.sql.exec(
-        "INSERT INTO question (answer_hash, status_hash, title, fields, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-        body.answerHash,
-        body.statusHash,
-        body.title,
-        JSON.stringify(body.fields),
-        body.createdAt,
-        body.expiresAt
-      );
-      this.state.storage.sql.exec("INSERT INTO lifecycle (id, expires_at) VALUES (1, ?)", body.expiresAt);
+    const question: QuestionRecord = {
+      answerHash: body.answerHash,
+      statusHash: body.statusHash,
+      title: body.title,
+      fields: body.fields,
+      answers: null,
+      createdAt: body.createdAt,
+      expiresAt: body.expiresAt,
+      answeredAt: null
+    };
+    const initialized = await this.state.storage.transaction(async (transaction) => {
+      if (await transaction.get<QuestionRecord>(QUESTION_KEY)) return false;
+      await transaction.put(QUESTION_KEY, question);
+      return true;
     });
+    if (!initialized) return json({ error: "already initialized" }, 409);
     await this.state.storage.setAlarm(body.expiresAt);
-    return new Response(null, { status: 204 });
+    return new Response(null, { status: 204, headers: baseHeaders("text/plain; charset=utf-8") });
   }
 
   private async showQuestion(answerToken: string): Promise<Response> {
-    const row = await this.findBy("answer_hash", answerToken);
-    if (!row) return messagePage(this.expired() ? "Expired" : "Not found", this.expired() ? "This question link has expired." : "This question link is invalid.", this.expired() ? 410 : 404);
-    if (row.expires_at <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
+    const row = await this.findBy("answerHash", answerToken);
+    if (!row) return messagePage("Not found", "This question link is invalid.", 404);
+    if (row.expiresAt <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
     if (row.answers !== null) return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
     return html(row.title, questionForm(row, this.state.id.toString(), answerToken));
   }
 
   private async answerQuestion(request: Request, answerToken: string): Promise<Response> {
-    const row = await this.findBy("answer_hash", answerToken);
-    if (!row) return messagePage(this.expired() ? "Expired" : "Not found", this.expired() ? "This question link has expired." : "This question link is invalid.", this.expired() ? 410 : 404);
-    if (row.expires_at <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
+    const row = await this.findBy("answerHash", answerToken);
+    if (!row) return messagePage("Not found", "This question link is invalid.", 404);
+    if (row.expiresAt <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
     if (!request.headers.get("Content-Type")?.startsWith("application/x-www-form-urlencoded")) return messagePage("Invalid answer", "Submit the form from the question page.", 400);
-    if (Number(request.headers.get("Content-Length") ?? 0) > MAX_BODY_BYTES) return messagePage("Invalid answer", "That answer is too large.", 400);
 
-    const body = await request.text();
-    if (encoder.encode(body).byteLength > MAX_BODY_BYTES) return messagePage("Invalid answer", "That answer is too large.", 400);
+    let body: string;
+    try {
+      body = await readBody(request);
+    } catch (error) {
+      const message = error instanceof Error && error.message === "request too large" ? "That answer is too large." : "Could not read that answer.";
+      return messagePage("Invalid answer", message, 400);
+    }
     const form = new URLSearchParams(body);
     const answers: Record<string, string> = {};
-    for (const field of fieldsFromRow(row)) {
+    for (const field of row.fields) {
       const value = form.get(`field_${field.id}`);
       if (value === null) return html(row.title, questionForm(row, this.state.id.toString(), answerToken, "Please answer every field."), 400);
       const answer = value.trim();
@@ -331,37 +367,38 @@ export class Question {
       answers[field.id] = answer;
     }
 
-    const answeredAt = Date.now();
-    const result = this.state.storage.sql.exec(
-      "UPDATE question SET answers = ?, answered_at = ? WHERE answer_hash = ? AND answers IS NULL AND expires_at > ?",
-      JSON.stringify(answers),
-      answeredAt,
-      row.answer_hash,
-      answeredAt
-    );
-    if (result.rowsWritten !== 1) {
-      const latest = await this.findBy("answer_hash", answerToken);
-      if (latest?.answers !== null) return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
-      return messagePage("Expired", "This question link has expired.", 410);
-    }
+    const result = await this.state.storage.transaction(async (transaction) => {
+      const current = await transaction.get<QuestionRecord>(QUESTION_KEY);
+      if (!current) return "missing" as const;
+      const answeredAt = Date.now();
+      if (current.expiresAt <= answeredAt) return "expired" as const;
+      if (current.answers !== null) return "answered" as const;
+      await transaction.put(QUESTION_KEY, { ...current, answers, answeredAt });
+      return "accepted" as const;
+    });
+    if (result === "answered") return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
+    if (result === "expired") return messagePage("Expired", "This question link has expired.", 410);
+    if (result === "missing") return messagePage("Not found", "This question link is invalid.", 404);
     this.wakeWaiters();
     return messagePage("Answer received", "Thanks — the agent can now continue.");
   }
 
   private async showStatus(request: Request, statusToken: string): Promise<Response> {
-    const row = await this.findBy("status_hash", statusToken);
-    if (!row) return this.expired() ? json({ status: "expired" }, 410) : json({ error: "not found" }, 404);
-    if (row.expires_at <= Date.now()) return json({ status: "expired" }, 410);
-    if (row.answers !== null) return this.statusResponse(row);
-
     const waitSeconds = parseWaitSeconds(new URL(request.url));
+    if (waitSeconds === null) return json({ error: "wait must be an integer from 0 through 25" }, 400);
+
+    const row = await this.findBy("statusHash", statusToken);
+    if (!row) return json({ error: "not found" }, 404);
+    if (row.expiresAt <= Date.now()) return json({ status: "expired" }, 410);
+    if (row.answers !== null) return this.statusResponse(row);
     if (waitSeconds === 0) return this.pendingResponse();
 
     const waiter = this.addWaiter(waitSeconds * 1_000);
-    const latest = this.getQuestion();
-    if (!latest || latest.answers !== null || latest.expires_at <= Date.now()) waiter.resolve();
+    if (!waiter) return json({ error: "too many concurrent waiters" }, 429, { "Retry-After": String(RETRY_AFTER_SECONDS) });
+    const latest = await this.getQuestion();
+    if (!latest || latest.answers !== null || latest.expiresAt <= Date.now()) waiter.resolve();
     await waiter.promise;
-    return this.statusResponse(this.getQuestion());
+    return this.statusResponse(await this.getQuestion());
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -382,14 +419,19 @@ export class Question {
   }
 
   async alarm(): Promise<void> {
-    const expiresAt = this.getExpiry();
-    if (expiresAt === null) return;
     const now = Date.now();
-    if (expiresAt > now) {
-      await this.state.storage.setAlarm(expiresAt);
+    const result = await this.state.storage.transaction(async (transaction) => {
+      const row = await transaction.get<QuestionRecord>(QUESTION_KEY);
+      if (!row) return "missing" as const;
+      if (row.expiresAt > now) return "future" as const;
+      await transaction.delete(QUESTION_KEY);
+      return "deleted" as const;
+    });
+    if (result === "future") {
+      const row = await this.getQuestion();
+      if (row) await this.state.storage.setAlarm(row.expiresAt);
       return;
     }
-    this.state.storage.sql.exec("DELETE FROM question WHERE expires_at <= ?", now);
     this.wakeWaiters();
   }
 }
@@ -438,14 +480,14 @@ async function createQuestion(request: Request, env: Env): Promise<Response> {
   }, 201);
 }
 
-function home(): Response {
+function home(origin: string): Response {
   return text(`# LetMeKnow
 
 Ask a human, then poll for structured answer.
 
 ## Create a questionnaire
 
-curl -sS -X POST https://letmeknow.dev/questions \\
+curl -sS -X POST ${origin}/questions \\
   -H 'Content-Type: application/json' \\
   -d '{"title":"Release approval","fields":[{"id":"approve","label":"Deploy this release?","type":"choice","options":["Yes","No"]},{"id":"notes","label":"Anything else?","type":"text"}]}'
 
@@ -456,12 +498,13 @@ The response contains two independent capability URLs:
 
 ## Poll the answer
 
-GET /s/<question-id>/<status-token>?wait=25
+GET ${origin}/s/<question-id>/<status-token>?wait=25
 
 A pending request waits up to 25 seconds for an answer. It returns:
 - 200 {"status":"answered","answers":{...}} when the human submits.
 - 202 {"status":"pending"} with Retry-After when the bounded wait expires.
-- 410 {"status":"expired"} when the question is gone.
+- 410 {"status":"expired"} when the question has logically expired.
+- 404 after expiry cleanup when the capability has been removed.
 
 Without wait, 202 means poll again after the Retry-After delay.
 
@@ -476,8 +519,9 @@ Without wait, 202 means poll again after the Retry-After delay.
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    if (url.protocol === "http:" && !isLocalHost(url)) return httpsRedirect(url);
     try {
-      if (url.pathname === "/" && request.method === "GET") return home();
+      if (url.pathname === "/" && request.method === "GET") return home(url.origin);
       if (url.pathname === "/questions" && request.method === "POST") return createQuestion(request, env);
 
       const question = questionPath(url.pathname, "/q/");
