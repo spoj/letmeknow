@@ -197,6 +197,8 @@ function questionPath(pathname: string, prefix: "/q/" | "/s/"): { id: string; to
 }
 
 function questionForm(row: QuestionRecord, questionId: string, answerToken: string, error = ""): string {
+  const remainingMinutes = Math.max(0, Math.ceil((row.expiresAt - Date.now()) / 60_000));
+  const remaining = `${String(Math.floor(remainingMinutes / 60)).padStart(2, "0")}:${String(remainingMinutes % 60).padStart(2, "0")}`;
   const controls = row.fields.map((field) => {
     const name = `field_${field.id}`;
     if (field.type === "choice") {
@@ -204,7 +206,7 @@ function questionForm(row: QuestionRecord, questionId: string, answerToken: stri
     }
     return `<div class="field"><label for="${escapeHtml(name)}">${escapeHtml(field.label)}</label><textarea id="${escapeHtml(name)}" name="${escapeHtml(name)}" maxlength="${MAX_ANSWER_LENGTH}" required></textarea></div>`;
   }).join("");
-  return `<section class="card" role="dialog" aria-labelledby="question-title"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">_ □ ×</span></div><div class="window-body"><h1 id="question-title">${escapeHtml(row.title)}</h1>${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ""}<form method="post" action="/q/${escapeHtml(questionId)}/${escapeHtml(answerToken)}">${controls}<div class="dialog-actions"><button type="submit">Submit answer</button></div></form><p class="muted">This link expires in 24 hours. No account is required.</p></div></section>`;
+  return `<section class="card" role="dialog" aria-labelledby="question-title"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">_ □ ×</span></div><div class="window-body"><h1 id="question-title">${escapeHtml(row.title)}</h1>${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ""}<form method="post" action="/q/${escapeHtml(questionId)}/${escapeHtml(answerToken)}">${controls}<div class="dialog-actions"><button type="submit">Submit answer</button></div></form><p class="muted">link expires in ${remaining}</p></div></section>`;
 }
 
 function messagePage(title: string, message: string, status = 200): Response {
