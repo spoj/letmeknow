@@ -28,7 +28,6 @@ type QuestionRecord = {
   title: string;
   fields: Field[];
   answers: Record<string, string> | null;
-  createdAt: number;
   expiresAt: number;
   answeredAt: number | null;
 };
@@ -38,7 +37,6 @@ type QuestionInit = {
   statusHash: string;
   title: string;
   fields: Field[];
-  createdAt: number;
   expiresAt: number;
 };
 
@@ -61,7 +59,7 @@ function baseHeaders(contentType: string): Headers {
     "Content-Type": contentType,
     "Cache-Control": "no-store",
     "Referrer-Policy": "no-referrer",
-    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "Strict-Transport-Security": "max-age=31536000",
     "X-Content-Type-Options": "nosniff",
     "X-Robots-Tag": "noindex, nofollow"
   });
@@ -81,7 +79,7 @@ function html(title: string, body: string, status = 200): Response {
   const responseHeaders = baseHeaders("text/html; charset=utf-8");
   responseHeaders.set(
     "Content-Security-Policy",
-    "default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; object-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
   );
   return new Response(`<!doctype html>
 <html lang="en">
@@ -206,11 +204,11 @@ function questionForm(row: QuestionRecord, questionId: string, answerToken: stri
     }
     return `<div class="field"><label for="${escapeHtml(name)}">${escapeHtml(field.label)}</label><textarea id="${escapeHtml(name)}" name="${escapeHtml(name)}" maxlength="${MAX_ANSWER_LENGTH}" required></textarea></div>`;
   }).join("");
-  return `<section class="card" role="dialog" aria-labelledby="question-title"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">_ □ ×</span></div><div class="window-body"><h1 id="question-title">${escapeHtml(row.title)}</h1>${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ""}<form method="post" action="/q/${escapeHtml(questionId)}/${escapeHtml(answerToken)}">${controls}<div class="dialog-actions"><button type="submit">Submit answer</button></div></form><p class="muted">link expires in ${remaining}</p></div></section>`;
+  return `<section class="card"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">_ □ ×</span></div><div class="window-body"><h1>${escapeHtml(row.title)}</h1>${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ""}<form method="post" action="/q/${escapeHtml(questionId)}/${escapeHtml(answerToken)}">${controls}<div class="dialog-actions"><button type="submit">Submit answer</button></div></form><p class="muted">link expires in ${remaining}</p></div></section>`;
 }
 
 function messagePage(title: string, message: string, status = 200): Response {
-  return html(title, `<section class="card" role="dialog" aria-labelledby="message-title"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">_ □ ×</span></div><div class="window-body"><h1 id="message-title">${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></div></section>`, status);
+  return html(title, `<section class="card"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">_ □ ×</span></div><div class="window-body"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></div></section>`, status);
 }
 
 function validateFields(value: unknown): Field[] | string {
@@ -322,17 +320,16 @@ export class Question {
       title: body.title,
       fields: body.fields,
       answers: null,
-      createdAt: body.createdAt,
       expiresAt: body.expiresAt,
       answeredAt: null
     };
     const initialized = await this.state.storage.transaction(async (transaction) => {
       if (await transaction.get<QuestionRecord>(QUESTION_KEY)) return false;
       await transaction.put(QUESTION_KEY, question);
+      await transaction.setAlarm(body.expiresAt);
       return true;
     });
     if (!initialized) return json({ error: "already initialized" }, 409);
-    await this.state.storage.setAlarm(body.expiresAt);
     return new Response(null, { status: 204, headers: baseHeaders("text/plain; charset=utf-8") });
   }
 
@@ -456,8 +453,7 @@ async function createQuestion(request: Request, env: Env): Promise<Response> {
 
   const answerToken = token();
   const statusToken = token();
-  const createdAt = Date.now();
-  const expiresAt = createdAt + QUESTION_TTL_MS;
+  const expiresAt = Date.now() + QUESTION_TTL_MS;
   const objectId = env.QUESTIONS.newUniqueId();
   const questionId = objectId.toString();
   const initialized = await env.QUESTIONS.get(objectId).fetch(new Request("https://question.internal/initialize", {
@@ -468,7 +464,6 @@ async function createQuestion(request: Request, env: Env): Promise<Response> {
       statusHash: await hash(statusToken),
       title,
       fields,
-      createdAt,
       expiresAt
     } satisfies QuestionInit)
   }));
