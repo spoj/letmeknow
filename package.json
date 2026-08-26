@@ -1,0 +1,18 @@
+{
+  "name": "letmeknow",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "db:local": "wrangler d1 migrations apply letmeknow --local",
+    "deploy": "wrangler deploy",
+    "check": "tsc --noEmit",
+    "smoke": "bash scripts/smoke-test.sh",
+    "test": "npm run check && npm run smoke"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260825.1",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.126.0"
+  }
+}

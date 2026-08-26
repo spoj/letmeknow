@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "letmeknow",
+  "main": "src/index.ts",
+  "account_id": "7a70f73ca6868c580737f00a3ddbf79b",
+  "compatibility_date": "2025-03-01",
+  "workers_dev": true,
+  "triggers": {
+    "crons": ["0 3 * * *"]
+  },
+  "ratelimits": [
+    {
+      "name": "CREATE_RATE_LIMIT",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 3,
+        "period": 60
+      }
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "letmeknow",
+      "database_id": "9158e031-4018-49cf-8837-1174527ea87e",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
