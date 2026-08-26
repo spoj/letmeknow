@@ -204,15 +204,16 @@ function questionPath(pathname: string, prefix: "/q/" | "/s/"): { routeToken: st
   return { routeToken: parts[0], token: parts[1] };
 }
 
-function questionForm(row: QuestionRecord, routeToken: string, error = ""): string {
+function questionForm(row: QuestionRecord, routeToken: string, submitted: URLSearchParams | undefined, error = ""): string {
   const remainingMinutes = Math.max(0, Math.ceil((row.expiresAt - Date.now()) / 60_000));
   const remaining = `${String(Math.floor(remainingMinutes / 60)).padStart(2, "0")}:${String(remainingMinutes % 60).padStart(2, "0")}`;
   const controls = row.fields.map((field) => {
     const name = `field_${field.id}`;
+    const value = submitted?.get(name) ?? "";
     if (field.type === "choice") {
-      return `<fieldset><legend>${escapeHtml(field.label)}</legend>${field.options.map((option) => `<label class="choice"><input type="radio" name="${escapeHtml(name)}" value="${escapeHtml(option)}" required><span>${escapeHtml(option)}</span></label>`).join("")}</fieldset>`;
+      return `<fieldset><legend>${escapeHtml(field.label)}</legend>${field.options.map((option) => `<label class="choice"><input type="radio" name="${escapeHtml(name)}" value="${escapeHtml(option)}"${value === option ? " checked" : ""} required><span>${escapeHtml(option)}</span></label>`).join("")}</fieldset>`;
     }
-    return `<div class="field"><label for="${escapeHtml(name)}">${escapeHtml(field.label)}</label><textarea id="${escapeHtml(name)}" name="${escapeHtml(name)}" maxlength="${MAX_ANSWER_LENGTH}" required></textarea></div>`;
+    return `<div class="field"><label for="${escapeHtml(name)}">${escapeHtml(field.label)}</label><textarea id="${escapeHtml(name)}" name="${escapeHtml(name)}" maxlength="${MAX_ANSWER_LENGTH}" required>${escapeHtml(value)}</textarea></div>`;
   }).join("");
   return `<section class="card"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">▼ ▲</span></div><div class="window-body"><h1>${escapeHtml(row.title)}</h1>${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ""}<form method="post" action="/q/${escapeHtml(routeToken)}">${controls}<div class="dialog-actions"><button type="submit">Submit answer</button></div></form><p class="muted">link expires in ${remaining}</p></div></section>`;
 }
@@ -348,7 +349,7 @@ export class Question {
     if (!row) return messagePage("Not found", "This question link is invalid.", 404);
     if (row.expiresAt <= Date.now()) return messagePage("Expired", "This question link has expired.", 410);
     if (row.answers !== null) return messagePage("Already answered", "Thanks. This question has already received an answer.", 409);
-    return html(row.title, questionForm(row, routeToken));
+    return html(row.title, questionForm(row, routeToken, undefined));
   }
 
   private async answerQuestion(request: Request, routeToken: string, answerToken: string): Promise<Response> {
@@ -368,10 +369,10 @@ export class Question {
     const answers: Record<string, string> = {};
     for (const field of row.fields) {
       const value = form.get(`field_${field.id}`);
-      if (value === null) return html(row.title, questionForm(row, routeToken, "Please answer every field."), 400);
+      if (value === null) return html(row.title, questionForm(row, routeToken, form, "Please answer every field."), 400);
       const answer = value.trim();
       if (!answer || answer.length > MAX_ANSWER_LENGTH || (field.type === "choice" && !field.options.includes(answer))) {
-        return html(row.title, questionForm(row, routeToken, "Please provide a valid answer for every field."), 400);
+        return html(row.title, questionForm(row, routeToken, form, "Please provide a valid answer for every field."), 400);
       }
       answers[field.id] = answer;
     }

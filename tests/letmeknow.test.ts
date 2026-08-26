@@ -311,15 +311,20 @@ describe("LetMeKnow", () => {
     await afterAnswer.text();
   });
 
-  it("rejects invalid choices and missing required text", async () => {
+  it("rejects invalid choices while preserving and escaping submitted fields", async () => {
     const { data } = await create();
-    const invalidChoice = await answer(data.question_url!, { approve: "Maybe", notes: "Text" });
+    const notes = `Keep <this> & \"safe\"`;
+    const invalidChoice = await answer(data.question_url!, { approve: "Maybe", notes });
     expect(invalidChoice.status).toBe(400);
-    await invalidChoice.text();
+    const invalidChoiceBody = await invalidChoice.text();
+    expect(invalidChoiceBody).toContain("Please provide a valid answer for every field.");
+    expect(invalidChoiceBody).toContain(">Keep &lt;this&gt; &amp; &quot;safe&quot;</textarea>");
+    expect(invalidChoiceBody).not.toContain(notes);
 
     const missingText = await answer(data.question_url!, { approve: "Yes" });
     expect(missingText.status).toBe(400);
-    await missingText.text();
+    const missingTextBody = await missingText.text();
+    expect(missingTextBody).toContain('value="Yes" checked required');
 
     const stillPending = await status(data.status_url!, "0");
     expect(stillPending.status).toBe(202);
