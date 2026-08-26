@@ -56,7 +56,6 @@ const ANSWER_TOKEN_BYTES = 8;
 const ANSWER_TOKEN_LENGTH = 11;
 const STATUS_TOKEN_BYTES = 32;
 const STATUS_TOKEN_LENGTH = 43;
-const THEMES = ["windows-95", "terminal", "blueprint", "paper", "candy"] as const;
 const encoder = new TextEncoder();
 
 function baseHeaders(contentType: string): Headers {
@@ -86,7 +85,6 @@ function html(title: string, body: string, status = 200): Response {
     "Content-Security-Policy",
     "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
   );
-  const theme = THEMES[Math.floor(Math.random() * THEMES.length)];
   return new Response(`<!doctype html>
 <html lang="en">
 <head>
@@ -96,37 +94,32 @@ function html(title: string, body: string, status = 200): Response {
   <title>${escapeHtml(title)} · LetMeKnow</title>
   <style>
     *{box-sizing:border-box}
-    body[data-theme="windows-95"]{--page-background:#008080;--page-image:none;--text:#000;--font:"MS Sans Serif","Microsoft Sans Serif","Segoe UI",Tahoma,sans-serif;--surface:#c0c0c0;--card-border:2px solid;--card-border-color:#fff #404040 #404040 #fff;--card-radius:0;--card-shadow:2px 2px 0 #000;--title-background:#000080;--title-color:#fff;--field-border:1px groove #fff;--input-background:#fff;--input-text:#000;--input-border:2px inset #fff;--input-radius:0;--button-background:#c0c0c0;--button-text:#000;--button-border:2px outset #fff;--button-radius:0;--accent:#000080;--muted:#404040;--error:#800000;--focus:#000}
-    body[data-theme="terminal"]{--page-background:#06100a;--page-image:repeating-linear-gradient(0deg,transparent 0 3px,rgba(80,255,120,.035) 3px 4px);--text:#9cff9c;--font:"SFMono-Regular",Consolas,"Liberation Mono",monospace;--surface:#0b1a10;--card-border:1px solid;--card-border-color:#36d66b;--card-radius:2px;--card-shadow:0 0 24px rgba(54,214,107,.22);--title-background:#36d66b;--title-color:#031006;--field-border:1px solid #277f42;--input-background:#020704;--input-text:#9cff9c;--input-border:1px solid #36d66b;--input-radius:0;--button-background:#36d66b;--button-text:#031006;--button-border:1px solid #9cff9c;--button-radius:0;--accent:#36d66b;--muted:#6cab78;--error:#ff7b72;--focus:#fff}
-    body[data-theme="blueprint"]{--page-background:#0b3d69;--page-image:linear-gradient(rgba(125,211,252,.12) 1px,transparent 1px),linear-gradient(90deg,rgba(125,211,252,.12) 1px,transparent 1px);--page-size:24px 24px;--text:#e0f2fe;--font:"Avenir Next","Segoe UI",sans-serif;--surface:#104e7a;--card-border:2px solid;--card-border-color:#7dd3fc;--card-radius:4px;--card-shadow:8px 8px 0 rgba(3,31,55,.55);--title-background:#082f49;--title-color:#bae6fd;--field-border:1px dashed #7dd3fc;--input-background:#e0f2fe;--input-text:#082f49;--input-border:2px solid #7dd3fc;--input-radius:2px;--button-background:#bae6fd;--button-text:#082f49;--button-border:2px solid #e0f2fe;--button-radius:2px;--accent:#7dd3fc;--muted:#bae6fd;--error:#fecaca;--focus:#fff}
-    body[data-theme="paper"]{--page-background:#eadfca;--page-image:radial-gradient(rgba(91,67,47,.12) .7px,transparent .7px);--page-size:8px 8px;--text:#3f3025;--font:Georgia,"Times New Roman",serif;--surface:#fffaf0;--card-border:1px solid;--card-border-color:#8c735d;--card-radius:1px;--card-shadow:0 12px 28px rgba(76,54,36,.2);--title-background:#7d2f2f;--title-color:#fffaf0;--field-border:1px solid #b89b7d;--input-background:#fffdf8;--input-text:#3f3025;--input-border:1px solid #8c735d;--input-radius:1px;--button-background:#7d2f2f;--button-text:#fffaf0;--button-border:1px solid #5d2020;--button-radius:1px;--accent:#7d2f2f;--muted:#786553;--error:#9f1d1d;--focus:#7d2f2f}
-    body[data-theme="candy"]{--page-background:#f8d8ed;--page-image:linear-gradient(135deg,rgba(255,255,255,.55) 25%,transparent 25% 50%,rgba(255,255,255,.55) 50% 75%,transparent 75%);--page-size:32px 32px;--text:#4c245c;--font:"Trebuchet MS","Segoe UI",sans-serif;--surface:#fff7fc;--card-border:3px solid;--card-border-color:#9b5de5;--card-radius:18px;--card-shadow:0 12px 0 #f15bb5;--title-background:linear-gradient(90deg,#9b5de5,#f15bb5);--title-color:#fff;--field-border:2px solid #f15bb5;--input-background:#fff;--input-text:#4c245c;--input-border:2px solid #9b5de5;--input-radius:10px;--button-background:#fee440;--button-text:#4c245c;--button-border:2px solid #9b5de5;--button-radius:999px;--accent:#9b5de5;--muted:#7a4b89;--error:#b5175b;--focus:#00bbf9}
-    body{margin:0;min-height:100vh;background-color:var(--page-background);background-image:var(--page-image);background-size:var(--page-size,auto);color:var(--text);font:13px/1.35 var(--font)}
+    body{margin:0;min-height:100vh;background:#008080;color:#000;font:13px/1.35 "MS Sans Serif","Microsoft Sans Serif",Tahoma,sans-serif}
     main{width:min(560px,calc(100% - 24px));margin:24px auto;padding-bottom:24px}
-    .card{background:var(--surface);border:var(--card-border);border-color:var(--card-border-color);border-radius:var(--card-radius);box-shadow:var(--card-shadow);padding:0;overflow:hidden}
-    .titlebar{display:flex;align-items:center;justify-content:space-between;gap:12px;background:var(--title-background);color:var(--title-color);font-weight:700;padding:5px 8px;min-height:22px}
+    .card{background:#c0c0c0;border:2px solid;border-color:#fff #000 #000 #fff;box-shadow:1px 1px 0 #808080;padding:0}
+    .titlebar{display:flex;align-items:center;justify-content:space-between;gap:12px;background:#000080;color:#fff;font-weight:700;padding:2px 3px;min-height:20px}
     .window-controls{font-weight:400;letter-spacing:1px;white-space:nowrap}
     .window-body{padding:14px 16px 16px}
     h1{font-size:18px;line-height:1.2;margin:0 0 12px;font-weight:700}
     p{margin:0 0 16px;white-space:pre-wrap}
-    fieldset{border:var(--field-border);margin:0 0 12px;padding:8px 10px 7px}
+    fieldset{border:2px groove #fff;margin:0 0 12px;padding:8px 10px 7px}
     legend{padding:0 4px;font-weight:700}
     .choice{display:flex;align-items:center;gap:7px;margin:4px 0;cursor:pointer}
-    .choice input{margin:0;accent-color:var(--accent)}
+    .choice input{margin:0}
     .field{margin:0 0 12px}
     .field label{display:block;font-weight:700;margin-bottom:4px}
-    textarea{display:block;width:100%;min-height:84px;resize:vertical;border:var(--input-border);border-radius:var(--input-radius);background:var(--input-background);color:var(--input-text);padding:6px;font:13px/1.3 var(--font)}
-    textarea:focus{outline:2px dotted var(--focus);outline-offset:-4px}
-    button{border:var(--button-border);border-radius:var(--button-radius);background:var(--button-background);color:var(--button-text);min-width:88px;padding:5px 14px;font:700 13px var(--font);cursor:pointer}
-    button:focus{outline:2px dotted var(--focus);outline-offset:-4px}
-    button:active{border-style:inset;transform:translateY(1px)}
+    textarea{display:block;width:100%;min-height:84px;resize:vertical;border:2px inset #fff;border-radius:0;background:#fff;color:#000;padding:4px;font:13px/1.3 "MS Sans Serif","Microsoft Sans Serif",Tahoma,sans-serif}
+    textarea:focus{outline:1px dotted #000;outline-offset:-3px}
+    button{border:2px outset #fff;border-radius:0;background:#c0c0c0;color:#000;min-width:88px;padding:4px 14px;font:700 13px "MS Sans Serif","Microsoft Sans Serif",Tahoma,sans-serif;cursor:pointer}
+    button:focus{outline:1px dotted #000;outline-offset:-4px}
+    button:active{border-style:inset;padding-top:5px;padding-bottom:3px}
     .dialog-actions{text-align:right;margin-top:14px}
-    .error{color:var(--error);margin:-2px 0 14px;font-weight:700}
-    .muted{font-size:12px;color:var(--muted);margin:16px 0 0}
+    .error{color:#800000;margin:-2px 0 14px;font-weight:700}
+    .muted{font-size:12px;color:#404040;margin:16px 0 0}
     @media (max-width:420px){main{width:calc(100% - 12px);margin:12px auto}.window-body{padding:12px}}
   </style>
 </head>
-<body data-theme="${theme}"><main>${body}</main></body></html>`, { status, headers: responseHeaders });
+<body class="windows-31"><main>${body}</main></body></html>`, { status, headers: responseHeaders });
 }
 
 function escapeHtml(value: string): string {
@@ -221,11 +214,11 @@ function questionForm(row: QuestionRecord, routeToken: string, error = ""): stri
     }
     return `<div class="field"><label for="${escapeHtml(name)}">${escapeHtml(field.label)}</label><textarea id="${escapeHtml(name)}" name="${escapeHtml(name)}" maxlength="${MAX_ANSWER_LENGTH}" required></textarea></div>`;
   }).join("");
-  return `<section class="card"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">_ □ ×</span></div><div class="window-body"><h1>${escapeHtml(row.title)}</h1>${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ""}<form method="post" action="/q/${escapeHtml(routeToken)}">${controls}<div class="dialog-actions"><button type="submit">Submit answer</button></div></form><p class="muted">link expires in ${remaining}</p></div></section>`;
+  return `<section class="card"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">▼ ▲</span></div><div class="window-body"><h1>${escapeHtml(row.title)}</h1>${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ""}<form method="post" action="/q/${escapeHtml(routeToken)}">${controls}<div class="dialog-actions"><button type="submit">Submit answer</button></div></form><p class="muted">link expires in ${remaining}</p></div></section>`;
 }
 
 function messagePage(title: string, message: string, status = 200): Response {
-  return html(title, `<section class="card"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">_ □ ×</span></div><div class="window-body"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></div></section>`, status);
+  return html(title, `<section class="card"><div class="titlebar"><span>LetMeKnow</span><span class="window-controls" aria-hidden="true">▼ ▲</span></div><div class="window-body"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></div></section>`, status);
 }
 
 function validateFields(value: unknown): Field[] | string {

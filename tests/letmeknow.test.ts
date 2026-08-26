@@ -296,6 +296,7 @@ describe("LetMeKnow", () => {
     const beforeAnswerBody = await beforeAnswer.text();
 
     expect(beforeAnswer.status).toBe(200);
+    expect(beforeAnswerBody).toContain('<body class="windows-31">');
     expect(beforeAnswerBody).toContain("Review &lt;release&gt; &amp; &quot;approval&quot;");
     expect(beforeAnswerBody).toContain("Continue &lt;now&gt; &amp; verify");
     expect(beforeAnswerBody).toContain(`<form method="post" action="${questionPath}">`);
@@ -308,29 +309,6 @@ describe("LetMeKnow", () => {
     const afterAnswer = await SELF.fetch(new Request(data.question_url!));
     expect(afterAnswer.status).toBe(409);
     await afterAnswer.text();
-  });
-
-  it("chooses each of five themes independently for human HTML responses", async () => {
-    const { data } = await create();
-    const random = vi.spyOn(Math, "random");
-    const themes = [
-      [0, "windows-95"],
-      [0.2, "terminal"],
-      [0.4, "blueprint"],
-      [0.6, "paper"],
-      [0.8, "candy"]
-    ] as const;
-
-    try {
-      for (const [value, theme] of themes) {
-        random.mockReturnValueOnce(value);
-        const response = await SELF.fetch(new Request(data.question_url!));
-        expect(response.status).toBe(200);
-        expect(await response.text()).toContain(`<body data-theme="${theme}">`);
-      }
-    } finally {
-      random.mockRestore();
-    }
   });
 
   it("rejects invalid choices and missing required text", async () => {
