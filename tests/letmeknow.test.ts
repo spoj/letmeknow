@@ -1,0 +1,286 @@
+import { SELF, runDurableObjectAlarm } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { describe, expect, it, vi } from "vitest";
+
+type QuestionResponse = {
+  question_url: string;
+  status_url: string;
+  expires_at: string;
+};
+
+type Answer = {
+  approve: string;
+  notes: string;
+};
+
+const origin = "https://client.example";
+let ipNumber = 0;
+
+function fields() {
+  return [
+    { id: "approve", label: "Continue?", type: "choice", options: ["Yes", "No"] },
+    { id: "notes", label: "Notes", type: "text" }
+  ];
+}
+
+function questionBody() {
+  return { title: "Release approval", fields: fields() };
+}
+
+function nextIp(): string {
+  ipNumber += 1;
+  return `198.51.100.${ipNumber}`;
+}
+
+function request(path: string, init: RequestInit = {}): Request {
+  const headers = new Headers(init.headers);
+  if (!headers.has("CF-Connecting-IP")) headers.set("CF-Connecting-IP", nextIp());
+  return new Request(`${origin}${path}`, { ...init, headers });
+}
+
+async function create(body: unknown = questionBody()): Promise<{ response: Response; data: Partial<QuestionResponse> }> {
+  const response = await SELF.fetch(request("/questions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }));
+  const data = await response.json() as Partial<QuestionResponse>;
+  return { response, data };
+}
+
+async function answer(questionUrl: string, values: Partial<Answer> = { approve: "Yes", notes: "Looks good" }): Promise<Response> {
+  const body = new URLSearchParams();
+  if (values.approve !== undefined) body.set("field_approve", values.approve);
+  if (values.notes !== undefined) body.set("field_notes", values.notes);
+  return SELF.fetch(new Request(questionUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body
+  }));
+}
+
+async function status(statusUrl: string, wait?: string, signal?: AbortSignal): Promise<Response> {
+  const url = new URL(statusUrl);
+  if (wait !== undefined) url.searchParams.set("wait", wait);
+  return SELF.fetch(new Request(url, { signal }));
+}
+
+function streamed(text: string): ReadableStream<Uint8Array> {
+  const bytes = new TextEncoder().encode(text);
+  return new ReadableStream({
+    start(controller) {
+      for (let offset = 0; offset < bytes.length; offset += 257) {
+        controller.enqueue(bytes.slice(offset, offset + 257));
+      }
+      controller.close();
+    }
+  });
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function objectStub(statusUrl: string): DurableObjectStub {
+  const id = new URL(statusUrl).pathname.split("/")[2];
+  return env.QUESTIONS.get(env.QUESTIONS.idFromString(id));
+}
+
+describe("LetMeKnow", () => {
+  it("serves the root as genuine plain text", async () => {
+    const response = await SELF.fetch(`${origin}/`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toMatch(/^text\/plain; charset=utf-8$/);
+    const body = await response.text();
+    expect(body).toContain("# LetMeKnow");
+    expect(body).toContain(`${origin}/questions`);
+  });
+
+  it("creates separate q and s capability paths using the request origin", async () => {
+    const { response, data } = await create();
+
+    expect(response.status).toBe(201);
+    expect(data.question_url).toMatch(new RegExp(`^${origin}/q/[^/]+/[^/]+$`));
+    expect(data.status_url).toMatch(new RegExp(`^${origin}/s/[^/]+/[^/]+$`));
+    expect(data.question_url).not.toBe(data.status_url);
+    expect(data.expires_at).toEqual(expect.any(String));
+  });
+
+  it("rejects malformed creation and invalid field definitions", async () => {
+    const invalidBodies: unknown[] = [
+      "not an object",
+      {},
+      { title: "", fields: fields() },
+      { title: "Question", fields: [] },
+      { title: "Question", fields: [{ id: "Bad id", label: "Question", type: "text" }] },
+      { title: "Question", fields: [{ id: "same", label: "One", type: "text" }, { id: "same", label: "Two", type: "text" }] },
+      { title: "Question", fields: [{ id: "pick", label: "Pick", type: "choice", options: ["Only one"] }] },
+      { title: "Question", fields: [{ id: "other", label: "Other", type: "unsupported" }] }
+    ];
+
+    for (const body of invalidBodies) {
+      const { response } = await create(body);
+      expect(response.status).toBe(400);
+    }
+  });
+
+  it("returns pending immediately for wait=0", async () => {
+    const { data } = await create();
+    const response = await status(data.status_url!, "0");
+
+    expect(response.status).toBe(202);
+    expect(response.headers.get("Retry-After")).toBe("3");
+    expect(await response.json()).toEqual({ status: "pending" });
+  });
+
+  it("keeps an omitted wait open until the question is answered", async () => {
+    const { data } = await create();
+    const waiting = status(data.status_url!);
+    await delay(25);
+
+    const answerResponse = await answer(data.question_url!);
+    expect(answerResponse.status).toBe(200);
+    await answerResponse.text();
+
+    const response = await waiting;
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      status: "answered",
+      answers: { approve: "Yes", notes: "Looks good" }
+    });
+  });
+
+  it.each(["not-a-number", "-1", "1.5", "26"])("rejects wait=%s", async (wait) => {
+    const { data } = await create();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1_000);
+    let response: Response | undefined;
+    try {
+      response = await status(data.status_url!, wait, controller.signal);
+    } catch {
+      response = undefined;
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    expect(response?.status).toBe(400);
+    if (response) await response.text();
+  });
+
+  it("returns a bounded timeout with Retry-After", async () => {
+    const { data } = await create();
+    const started = Date.now();
+    const response = await status(data.status_url!, "1");
+
+    expect(Date.now() - started).toBeGreaterThanOrEqual(800);
+    expect(response.status).toBe(202);
+    expect(response.headers.get("Retry-After")).toBe("3");
+    expect(await response.json()).toEqual({ status: "pending" });
+  });
+
+  it("wakes every concurrent long poll when an answer arrives", async () => {
+    const { data } = await create();
+    const first = status(data.status_url!, "25");
+    const second = status(data.status_url!, "25");
+    await delay(25);
+
+    const answerResponse = await answer(data.question_url!, { approve: "No", notes: "Wait for the next release" });
+    expect(answerResponse.status).toBe(200);
+    await answerResponse.text();
+
+    const responses = await Promise.all([first, second]);
+    for (const response of responses) {
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        status: "answered",
+        answers: { approve: "No", notes: "Wait for the next release" }
+      });
+    }
+  });
+
+  it("keeps the first answer across repeated status reads and rejects duplicates", async () => {
+    const { data } = await create();
+    const firstAnswer = await answer(data.question_url!);
+    expect(firstAnswer.status).toBe(200);
+    await firstAnswer.text();
+
+    const duplicate = await answer(data.question_url!, { approve: "No", notes: "Second answer" });
+    expect(duplicate.status).toBe(409);
+    await duplicate.text();
+
+    for (let index = 0; index < 2; index += 1) {
+      const response = await status(data.status_url!);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        status: "answered",
+        answers: { approve: "Yes", notes: "Looks good" }
+      });
+    }
+  });
+
+  it("rejects invalid choices and missing required text", async () => {
+    const { data } = await create();
+    const invalidChoice = await answer(data.question_url!, { approve: "Maybe", notes: "Text" });
+    expect(invalidChoice.status).toBe(400);
+    await invalidChoice.text();
+
+    const missingText = await answer(data.question_url!, { approve: "Yes" });
+    expect(missingText.status).toBe(400);
+    await missingText.text();
+
+    const stillPending = await status(data.status_url!, "0");
+    expect(stillPending.status).toBe(202);
+    await stillPending.text();
+  });
+
+  it("reports expiry before alarm cleanup and not found after cleanup", async () => {
+    const { data } = await create();
+    const expiresAt = new Date(data.expires_at!).getTime();
+    vi.setSystemTime(expiresAt + 1);
+
+    try {
+      const beforeCleanup = await status(data.status_url!);
+      expect(beforeCleanup.status).toBe(410);
+      expect(await beforeCleanup.json()).toEqual({ status: "expired" });
+
+      expect(await runDurableObjectAlarm(objectStub(data.status_url!))).toBe(true);
+
+      const afterCleanup = await status(data.status_url!);
+      expect(afterCleanup.status).toBe(404);
+      await afterCleanup.text();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects oversized streamed JSON without Content-Length", async () => {
+    const body = JSON.stringify({ title: "x".repeat(17_000), fields: fields() });
+    const requestBody = streamed(body);
+    const requestWithStream = request("/questions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: requestBody
+    });
+
+    expect(requestWithStream.headers.has("Content-Length")).toBe(false);
+    const response = await SELF.fetch(requestWithStream);
+    expect(response.status).toBe(400);
+    await response.text();
+  });
+
+  it("rejects oversized streamed form data without Content-Length", async () => {
+    const { data } = await create();
+    const requestBody = streamed(`field_approve=Yes&field_notes=${"x".repeat(17_000)}`);
+    const requestWithStream = new Request(data.question_url!, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: requestBody
+    });
+
+    expect(requestWithStream.headers.has("Content-Length")).toBe(false);
+    const response = await SELF.fetch(requestWithStream);
+    expect(response.status).toBe(400);
+    await response.text();
+  });
+});
