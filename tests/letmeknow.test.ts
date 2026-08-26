@@ -1,5 +1,6 @@
 import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
+import worker from "../src/index";
 import { describe, expect, it, vi } from "vitest";
 
 type QuestionResponse = {
@@ -107,6 +108,20 @@ describe("LetMeKnow", () => {
     expect(body).toContain("202) ;");
     expect(body).toContain("200|410|404) break");
     expect(body).not.toContain(`GET ${origin}/s/`);
+  });
+
+  it("converts rejected async dependencies into an internal server error", async () => {
+    const response = await worker.fetch(request("/questions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(questionBody())
+    }), {
+      QUESTIONS: env.QUESTIONS,
+      CREATE_RATE_LIMIT: { limit: vi.fn().mockRejectedValue(new Error("rate limit unavailable")) }
+    });
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "internal server error" });
   });
 
   it("creates a tiny answer path and a private status path using the request origin", async () => {

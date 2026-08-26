@@ -538,12 +538,12 @@ export default {
     if (url.protocol === "http:" && !isLocalHost(url)) return httpsRedirect(url);
     try {
       if (url.pathname === "/" && request.method === "GET") return home(url.origin);
-      if (url.pathname === "/questions" && request.method === "POST") return createQuestion(request, env);
+      if (url.pathname === "/questions" && request.method === "POST") return await createQuestion(request, env);
 
       const question = questionPath(url.pathname, "/q/");
       if (question) {
         const id = env.QUESTIONS.idFromName(question.routeToken);
-        if (request.method === "GET" || request.method === "POST") return env.QUESTIONS.get(id).fetch(request);
+        if (request.method === "GET" || request.method === "POST") return await env.QUESTIONS.get(id).fetch(request);
         return messagePage("Method not allowed", "Use GET or POST for this question link.", 405);
       }
 
@@ -551,7 +551,7 @@ export default {
       if (status) {
         if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
         const id = env.QUESTIONS.idFromName(status.routeToken);
-        return env.QUESTIONS.get(id).fetch(request);
+        return await env.QUESTIONS.get(id).fetch(request);
       }
       return json({ error: "not found" }, 404);
     } catch {
