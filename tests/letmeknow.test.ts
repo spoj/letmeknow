@@ -1,4 +1,4 @@
-import { SELF, runDurableObjectAlarm } from "cloudflare:test";
+import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 
@@ -77,13 +77,20 @@ function streamed(text: string): ReadableStream<Uint8Array> {
   });
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
 function objectStub(statusUrl: string): DurableObjectStub {
   const id = new URL(statusUrl).pathname.split("/")[2];
   return env.QUESTIONS.get(env.QUESTIONS.idFromString(id));
+}
+
+async function waitForWaiters(statusUrl: string, count: number): Promise<void> {
+  const stub = objectStub(statusUrl);
+  await vi.waitFor(async () => {
+    const actual = await runInDurableObject(stub, (instance) => {
+      const waiters = Reflect.get(instance as object, "waiters");
+      return waiters instanceof Set ? waiters.size : -1;
+    });
+    expect(actual).toBe(count);
+  }, { interval: 1, timeout: 1_000 });
 }
 
 describe("LetMeKnow", () => {
@@ -137,7 +144,7 @@ describe("LetMeKnow", () => {
   it("keeps an omitted wait open until the question is answered", async () => {
     const { data } = await create();
     const waiting = status(data.status_url!);
-    await delay(25);
+    await waitForWaiters(data.status_url!, 1);
 
     const answerResponse = await answer(data.question_url!);
     expect(answerResponse.status).toBe(200);
@@ -183,7 +190,7 @@ describe("LetMeKnow", () => {
     const { data } = await create();
     const first = status(data.status_url!, "25");
     const second = status(data.status_url!, "25");
-    await delay(25);
+    await waitForWaiters(data.status_url!, 2);
 
     const answerResponse = await answer(data.question_url!, { approve: "No", notes: "Wait for the next release" });
     expect(answerResponse.status).toBe(200);
@@ -219,6 +226,52 @@ describe("LetMeKnow", () => {
     }
   });
 
+  it("accepts exactly one of two simultaneous answers and preserves its winner", async () => {
+    const { data } = await create();
+    const first = answer(data.question_url!, { approve: "Yes", notes: "First simultaneous answer" });
+    const second = answer(data.question_url!, { approve: "No", notes: "Second simultaneous answer" });
+    const [firstResponse, secondResponse] = await Promise.all([first, second]);
+
+    expect([firstResponse.status, secondResponse.status].sort()).toEqual([200, 409]);
+    await firstResponse.text();
+    await secondResponse.text();
+
+    const response = await status(data.status_url!);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      status: "answered",
+      answers: firstResponse.status === 200
+        ? { approve: "Yes", notes: "First simultaneous answer" }
+        : { approve: "No", notes: "Second simultaneous answer" }
+    });
+  });
+
+  it("renders an escaped question form and rejects GET after answering", async () => {
+    const { data } = await create({
+      title: 'Review <release> & "approval"',
+      fields: [
+        { id: "approve", label: "Continue <now> & verify", type: "choice", options: ["Yes", "No"] },
+        { id: "notes", label: "Notes", type: "text" }
+      ]
+    });
+    const questionPath = new URL(data.question_url!).pathname;
+    const beforeAnswer = await SELF.fetch(new Request(data.question_url!));
+    const beforeAnswerBody = await beforeAnswer.text();
+
+    expect(beforeAnswer.status).toBe(200);
+    expect(beforeAnswerBody).toContain("Review &lt;release&gt; &amp; &quot;approval&quot;");
+    expect(beforeAnswerBody).toContain("Continue &lt;now&gt; &amp; verify");
+    expect(beforeAnswerBody).toContain(`<form method="post" action="${questionPath}">`);
+
+    const answerResponse = await answer(data.question_url!);
+    expect(answerResponse.status).toBe(200);
+    await answerResponse.text();
+
+    const afterAnswer = await SELF.fetch(new Request(data.question_url!));
+    expect(afterAnswer.status).toBe(409);
+    await afterAnswer.text();
+  });
+
   it("rejects invalid choices and missing required text", async () => {
     const { data } = await create();
     const invalidChoice = await answer(data.question_url!, { approve: "Maybe", notes: "Text" });
@@ -234,28 +287,59 @@ describe("LetMeKnow", () => {
     await stillPending.text();
   });
 
-  it("reports expiry before alarm cleanup and not found after cleanup", async () => {
+  it("expires question and status links before alarm cleanup and wakes registered polls", async () => {
     const { data } = await create();
+    const waiting = status(data.status_url!, "25");
+    await waitForWaiters(data.status_url!, 1);
     const expiresAt = new Date(data.expires_at!).getTime();
     vi.setSystemTime(expiresAt + 1);
 
     try {
-      const beforeCleanup = await status(data.status_url!);
-      expect(beforeCleanup.status).toBe(410);
-      expect(await beforeCleanup.json()).toEqual({ status: "expired" });
+      const beforeQuestion = await SELF.fetch(new Request(data.question_url!));
+      expect(beforeQuestion.status).toBe(410);
+      expect(await beforeQuestion.text()).toContain("This question link has expired.");
+
+      const beforeAnswer = await answer(data.question_url!);
+      expect(beforeAnswer.status).toBe(410);
+      expect(await beforeAnswer.text()).toContain("This question link has expired.");
+
+      const beforeStatus = await status(data.status_url!);
+      expect(beforeStatus.status).toBe(410);
+      expect(await beforeStatus.json()).toEqual({ status: "expired" });
 
       expect(await runDurableObjectAlarm(objectStub(data.status_url!))).toBe(true);
 
-      const afterCleanup = await status(data.status_url!);
-      expect(afterCleanup.status).toBe(404);
-      await afterCleanup.text();
+      const woken = await waiting;
+      expect(woken.status).toBe(404);
+      await woken.text();
+
+      const afterQuestion = await SELF.fetch(new Request(data.question_url!));
+      expect(afterQuestion.status).toBe(404);
+      await afterQuestion.text();
+
+      const afterStatus = await status(data.status_url!);
+      expect(afterStatus.status).toBe(404);
+      await afterStatus.text();
     } finally {
       vi.useRealTimers();
     }
   });
 
+  it("redirects public HTTP and sends focused security headers", async () => {
+    const redirect = await SELF.fetch(new Request("http://public.example/", { redirect: "manual" }));
+    expect(redirect.status).toBe(307);
+    expect(redirect.headers.get("Location")).toBe("https://public.example/");
+    expect(redirect.headers.get("Strict-Transport-Security")).toBe("max-age=31536000");
+
+    const page = await SELF.fetch(new Request("https://public.example/q/not-an-id/token"));
+    expect(page.status).toBe(404);
+    expect(page.headers.get("Strict-Transport-Security")).toBe("max-age=31536000");
+    expect(page.headers.get("Content-Security-Policy")).toBe("default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; object-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+    await page.text();
+  });
+
   it("rejects oversized streamed JSON without Content-Length", async () => {
-    const body = JSON.stringify({ title: "x".repeat(17_000), fields: fields() });
+    const body = JSON.stringify({ ...questionBody(), ignored: "x".repeat(17_000) });
     const requestBody = streamed(body);
     const requestWithStream = request("/questions", {
       method: "POST",
@@ -266,12 +350,17 @@ describe("LetMeKnow", () => {
     expect(requestWithStream.headers.has("Content-Length")).toBe(false);
     const response = await SELF.fetch(requestWithStream);
     expect(response.status).toBe(400);
-    await response.text();
+    expect(await response.json()).toEqual({ error: "request too large" });
   });
 
   it("rejects oversized streamed form data without Content-Length", async () => {
     const { data } = await create();
-    const requestBody = streamed(`field_approve=Yes&field_notes=${"x".repeat(17_000)}`);
+    const form = new URLSearchParams({
+      field_approve: "Yes",
+      field_notes: "Looks good",
+      ignored: "x".repeat(17_000)
+    });
+    const requestBody = streamed(form.toString());
     const requestWithStream = new Request(data.question_url!, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -281,6 +370,6 @@ describe("LetMeKnow", () => {
     expect(requestWithStream.headers.has("Content-Length")).toBe(false);
     const response = await SELF.fetch(requestWithStream);
     expect(response.status).toBe(400);
-    await response.text();
+    expect(await response.text()).toContain("That answer is too large.");
   });
 });
