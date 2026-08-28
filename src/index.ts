@@ -123,7 +123,7 @@ function bytesToBase64(value: Uint8Array): string {
 }
 
 function proxyResponse(packet: Packet): Response {
-  if (!Number.isInteger(packet.status) || (packet.status as number) < 200 || (packet.status as number) > 599) {
+  if (!Number.isInteger(packet.status) || (packet.status as number) < 100 || (packet.status as number) > 599) {
     throw new Error("invalid proxy response status");
   }
   if (typeof packet.body !== "string") throw new Error("proxy response body is required");

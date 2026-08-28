@@ -11,7 +11,7 @@ if (process.argv[2] === "--skill") {
 } else if (process.env.LETMEKNOW_URL && process.argv.length === 2) {
   await import("./remote.js");
 } else if (process.argv.slice(2).includes("--help") || process.argv.slice(2).includes("-h")) {
-  process.stdout.write("Usage: npx letmeknow-cli [directory] [--port port]\n\nServe a folder through the hosted LetMeKnow relay. The CLI does not listen on a network port. Form submissions are JSON lines on stdout.\n");
+  process.stdout.write("Usage: npx letmeknow-cli [directory]\n\nServe a folder through the hosted LetMeKnow relay. The CLI does not listen on a network port. Form submissions are JSON lines on stdout.\n");
 } else {
   try {
     await import("./relay.js");
