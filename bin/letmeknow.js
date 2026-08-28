@@ -176,7 +176,7 @@ class RelayRequest extends Readable {
     this.method = packet.method;
     this.url = packet.path;
     this.originalUrl = packet.path;
-    this.headers = packet.headers || {};
+    this.headers = { ...(packet.headers || {}), host: "localhost" };
     this.httpVersion = "1.1";
     this.httpVersionMajor = 1;
     this.httpVersionMinor = 1;

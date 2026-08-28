@@ -31,7 +31,7 @@ const CHALLENGE_TIMEOUT_MS = 2 * 1_000;
 const MAX_BODY_BYTES = 1024 * 1024;
 const PROXY_TIMEOUT_MS = 30 * 1_000;
 const encoder = new TextEncoder();
-const hopHeaders = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"]);
+const hopHeaders = new Set(["connection", "host", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "x-forwarded-host"]);
 
 function error(message: string, status: number): Response {
   return Response.json({ error: message }, { status, headers: { "Cache-Control": "no-store" } });
