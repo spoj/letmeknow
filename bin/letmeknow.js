@@ -5,7 +5,7 @@ import readline from "node:readline";
 
 if (process.argv[2] === "--skill") {
   if (process.argv.length !== 3) {
-    process.stderr.write("Usage: npx letmeknow --skill\\n");
+    process.stderr.write("Usage: npx letmeknow-cli --skill\n");
     process.exit(1);
   }
   writeSync(1, readFileSync(new URL("../SKILL.md", import.meta.url)));

@@ -1,5 +1,5 @@
 {
-  "name": "letmeknow",
+  "name": "letmeknow-cli",
   "version": "0.1.0",
   "description": "A temporary interactive web surface for agents.",
   "files": ["bin", "SKILL.md"],

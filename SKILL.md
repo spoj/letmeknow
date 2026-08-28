@@ -12,13 +12,13 @@ Use LetMeKnow when a human needs a temporary web page or interactive UI from an 
 Node.js 22 or newer is required.
 
 ```bash
-npx letmeknow
+npx letmeknow-cli
 ```
 
 This connects to `https://letmeknow.dev` by default. To use another trusted deployment:
 
 ```bash
-LETMEKNOW_URL=http://localhost:8787 npx letmeknow
+LETMEKNOW_URL=http://localhost:8787 npx letmeknow-cli
 ```
 
 Run the CLI as a long-lived child process. Write one compact JSON object per line to stdin, keep stdin open while the session is active, and read one JSON event per line from stdout. Read diagnostics from stderr separately. Do not mix stderr into the NDJSON stream.
@@ -92,7 +92,7 @@ Treat the session URL as a bearer secret: anyone who has it can access the surfa
 The minimal package interface should be:
 
 ```bash
-npx letmeknow --skill
+npx letmeknow-cli --skill
 ```
 
 It should print this exact `SKILL.md` byte-for-byte to stdout and exit successfully without opening a network connection.
