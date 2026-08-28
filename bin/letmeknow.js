@@ -37,7 +37,7 @@ const client = String.raw`
 const sessionMatch=location.pathname.match(/^\/s\/[a-f0-9]{20}(?:\/|$)/);
 const sessionBase=sessionMatch?(sessionMatch[0].endsWith("/")?sessionMatch[0]:sessionMatch[0]+"/"):"/";
 const credentialKey="letmeknow-credential:"+location.origin+sessionBase;
-const snapshotKey=credentialKey+":snapshot";
+const snapshotKey=()=>credentialKey+":state:"+pageIdentity();
 let credential;
 try{credential=sessionStorage.getItem(credentialKey)}catch{}
 let socket;
@@ -57,14 +57,25 @@ const status=message=>{const element=document.querySelector("[data-letmeknow-sta
 const stripSessionPath=path=>{if(sessionBase==="/")return path;if(path===sessionBase.slice(0,-1))return "/";return path.startsWith(sessionBase)?"/"+path.slice(sessionBase.length):path};
 const routePath=()=>{let path=stripSessionPath(location.pathname);return path.endsWith("/")?path+"index.html":path};
 const pagePath=path=>{path=path.split("?",1)[0];return stripSessionPath(path)||"/"};
-const restore=()=>{let raw;try{raw=sessionStorage.getItem(snapshotKey)}catch{return}if(!raw)return;try{sessionStorage.removeItem(snapshotKey)}catch{}let saved;try{saved=JSON.parse(raw)}catch{return}if(saved.version!==1||saved.page!==pageIdentity())return;const all=controls();const savedControls=new Map((Array.isArray(saved.controls)?saved.controls:[]).map(state=>[state.key,state]));let active;for(const [index,control] of all.entries()){const state=savedControls.get(controlKey(control,index,all));if(!state)continue;if(control instanceof HTMLSelectElement&&Array.isArray(state.selected))for(const [optionIndex,option] of [...control.options].entries())option.selected=state.selected.includes(optionIndex);else if(control.type==="checkbox"||control.type==="radio"){control.checked=state.checked;control.indeterminate=state.indeterminate}else{control.value=state.value;if(typeof state.start==="number"&&typeof control.setSelectionRange==="function")control.setSelectionRange(state.start,state.end,state.direction||"none")}if(controlKey(control,index,all)===saved.active)active=control}const savedDetails=new Map((Array.isArray(saved.details)?saved.details:[]).map(state=>[state.key,state]));for(const [index,element] of details().entries()){const state=savedDetails.get(detailKey(element,index));if(state)element.open=state.open}active?.focus({preventScroll:true});scrollTo(saved.x||0,saved.y||0)};
-const reload=()=>{if(reloadTimer)return;reloadTimer=setTimeout(()=>{try{sessionStorage.setItem(snapshotKey,JSON.stringify(snapshot()))}catch{}location.reload()},75)};
+const save=()=>{try{sessionStorage.setItem(snapshotKey(),JSON.stringify(snapshot()))}catch{}};
+const restore=()=>{let raw;try{raw=sessionStorage.getItem(snapshotKey())}catch{return}if(!raw)return;let saved;try{saved=JSON.parse(raw)}catch{return}if(saved.version!==1||saved.page!==pageIdentity())return;const all=controls();const savedControls=new Map((Array.isArray(saved.controls)?saved.controls:[]).map(state=>[state.key,state]));let active;for(const [index,control] of all.entries()){const state=savedControls.get(controlKey(control,index,all));if(!state)continue;if(control instanceof HTMLSelectElement&&Array.isArray(state.selected))for(const [optionIndex,option] of [...control.options].entries())option.selected=state.selected.includes(optionIndex);else if(control.type==="checkbox"||control.type==="radio"){control.checked=state.checked;control.indeterminate=state.indeterminate}else{control.value=state.value;if(typeof state.start==="number"&&typeof control.setSelectionRange==="function")control.setSelectionRange(state.start,state.end,state.direction||"none")}if(controlKey(control,index,all)===saved.active)active=control}const savedDetails=new Map((Array.isArray(saved.details)?saved.details:[]).map(state=>[state.key,state]));for(const [index,element] of details().entries()){const state=savedDetails.get(detailKey(element,index));if(state)element.open=state.open}active?.focus({preventScroll:true});scrollTo(saved.x||0,saved.y||0)};
+const reload=()=>{if(reloadTimer)return;reloadTimer=setTimeout(()=>{save();location.reload()},75)};
 const linkedStylesheet=path=>{for(const link of document.querySelectorAll('link[rel~="stylesheet"]')){let url;try{url=new URL(link.href,location.href)}catch{continue}if(url.origin!==location.origin)continue;if(sessionBase!=="/"&&!url.pathname.startsWith(sessionBase))continue;if(pagePath(url.pathname)===path)return link}return null};
 const refreshStylesheet=link=>{const url=new URL(link.href,location.href);url.searchParams.set("_letmeknow",crypto.randomUUID());link.href=url.href};
 const flushUpdates=()=>{updateTimer=undefined;const paths=[...pendingUpdates];pendingUpdates.clear();let shouldReload=false;const styles=[];for(const path of paths){if(/\.html?$/i.test(path)){if(path===routePath())shouldReload=true}else if(/\.css$/i.test(path)){const link=linkedStylesheet(path);if(link)styles.push([path,link]);else shouldReload=true}else shouldReload=true}if(shouldReload){reload();return}for(const [,link] of styles)refreshStylesheet(link)};
 const pendingUpdates=new Set();
 const update=path=>{if(typeof path!=="string")return;path=pagePath(path);pendingUpdates.add(path);if(!updateTimer)updateTimer=setTimeout(flushUpdates,75)};
+let saveTimer;
+const scheduleSave=()=>{if(!saveTimer)saveTimer=setTimeout(()=>{saveTimer=undefined;save()},100)};
+addEventListener("input",scheduleSave,true);
+addEventListener("change",scheduleSave,true);
+addEventListener("toggle",scheduleSave,true);
+addEventListener("focusin",scheduleSave,true);
+addEventListener("selectionchange",scheduleSave,true);
+addEventListener("scroll",scheduleSave,{passive:true});
+addEventListener("pagehide",save);
 addEventListener("load",()=>requestAnimationFrame(restore),{once:true});
+document.addEventListener("reset",()=>setTimeout(save));
 const connect=()=>{
   clearTimeout(retryTimer);retryTimer=undefined;
   const url=new URL(sessionBase+"_letmeknow/client",location.href);url.protocol=url.protocol==="https:"?"wss:":"ws:";
@@ -77,7 +88,7 @@ const connect=()=>{
     if(message.type==="challenge"){if(current.readyState===WebSocket.OPEN)try{current.send(JSON.stringify({type:"alive",nonce:message.nonce}))}catch{}return}
     if(message.type==="busy"){status("This session is open elsewhere");retryTimer=setTimeout(connect,message.retry_after*1000);return}
     if(message.type==="file_update"){update(message.path);return}
-    if(message.type==="closed"){terminal=true;try{sessionStorage.removeItem(credentialKey);sessionStorage.removeItem(snapshotKey)}catch{}status(message.message)}
+    if(message.type==="closed"){terminal=true;try{sessionStorage.removeItem(credentialKey)}catch{}status(message.message)}
   };
   current.onclose=()=>{if(socket!==current||terminal)return;if(!retryTimer){status("Reconnecting…");retryTimer=setTimeout(connect,1000)}};
   current.onerror=()=>{};

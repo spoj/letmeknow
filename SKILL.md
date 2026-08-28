@@ -33,9 +33,11 @@ Create an ordinary static page in the folder, usually `index.html`, plus any CSS
 
 The relay serves exact files and directory `index.html` files. It supports GET and HEAD, redirects directory paths to a trailing slash, and does not provide an application-shell fallback. HTML responses include the live-preview client inline.
 
+The preview continuously saves each page's form values, checked controls, selections, focus, text selection, scroll position, and open `<details>` elements in the tab's session storage. It restores them after file-triggered and user-triggered reloads.
+
 The preview is live:
 
-- A change to the current HTML route reloads the page and restores form values, checked controls, selections, focus, text selection, scroll position, and open `<details>` elements.
+- A change to the current HTML route reloads the page with its saved state.
 - CSS changes cache-bust matching linked stylesheets without navigating.
 - Changes to a different HTML route do not disturb the current page.
 - Changes to other assets reload the page. Arbitrary JavaScript heap state cannot be preserved.

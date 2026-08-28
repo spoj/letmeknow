@@ -30,7 +30,7 @@ The CLI does not receive file commands. The agent reads and writes the directory
 
 The preview serves exact files and `index.html` for directory paths. It supports GET and HEAD, redirects directory paths to a trailing slash, and has no application-shell fallback. HTML responses include the live-preview client inline. Use relative asset URLs so previews also work on path-based session URLs.
 
-When a watched file changes, the browser receives an update. Changes to the current HTML route or to another asset reload the page and preserve form values, checked controls, selections, focus, text selection, scroll position, and open `<details>` elements. CSS changes cache-bust matching stylesheets without navigating. Changes to a different HTML route do not disturb the current page. Arbitrary JavaScript heap state cannot be preserved.
+The client continuously saves form values, checked controls, selections, focus, text selection, scroll position, and open `<details>` elements for each page in the tab's session storage. It restores them after file-triggered and user-triggered reloads. CSS changes cache-bust matching stylesheets without navigating, while changes to the current HTML route or another asset reload the page. Changes to a different HTML route do not disturb the current page. Arbitrary JavaScript heap state cannot be preserved.
 
 An optional element can display submission status:
 
