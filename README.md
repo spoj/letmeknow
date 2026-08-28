@@ -1,175 +1,80 @@
 # LetMeKnow
 
-LetMeKnow gives one agent and one human browser a temporary HTML and CSS workspace. The agent renders a page, receives normalized form and button actions, and responds with HTML fragments. A private browser WebSocket carries renders and actions; assets use ordinary HTTP.
+LetMeKnow is a small Vite-based preview server for an agent-managed folder. The agent edits files, Vite watches them, and the open browser updates in place. HTML changes replace the document body without a page reload, while Vite handles CSS and JavaScript HMR normally.
 
-It is not a localhost proxy or a programmable frontend. Agents provide presentation and semantic actions, not JavaScript or HTTP handlers.
+## Start
 
-## CLI
-
-Node 22 or newer is required.
+Node.js 22.12 or newer is required.
 
 ```bash
-npx letmeknow-cli
+npx letmeknow-cli ./workspace
 ```
 
-The deployed service is used by default. Set `LETMEKNOW_URL` for local development:
+The CLI prints JSON lines to stdout. The first line contains the local preview URL:
+
+```json
+{"type":"ready","url":"http://127.0.0.1:5173/"}
+```
+
+Open that URL in one browser. The directory defaults to the current working directory. Use `--host` and `--port` when needed:
 
 ```bash
-LETMEKNOW_URL=http://localhost:8787 npx letmeknow-cli
+npx letmeknow-cli ./workspace --host 0.0.0.0 --port 4173
 ```
 
-stdin contains one compact JSON command per line. stdout contains one JSON event per line. Diagnostics go to stderr.
+Diagnostics go to stderr. `--skill` prints the agent instructions without starting a server.
 
-```bash
-npx letmeknow-cli --skill
-```
+## File workflow
 
-prints the agent instructions without connecting.
+The CLI does not receive file commands. The agent reads and writes the directory directly. Keep a normal Vite entry point such as `index.html`; JavaScript, CSS, images, and other Vite-supported files work as usual.
 
-## Example
+When an HTML file changes, the browser keeps its current form values, focus, selection, and scroll position while the new body is installed. Changes to a different HTML route do not disturb the current page. CSS and JavaScript updates use Vite's HMR connection.
 
-Open a session:
-
-```json
-{"type":"open","id":"open-1"}
-```
-
-The CLI emits its temporary URL:
-
-```json
-{"type":"session","id":"open-1","url":"https://0123456789abcdef0123.letmeknow.dev/","expires_after_disconnect":600}
-```
-
-The URL serves a trusted shell immediately. Send HTML and optional CSS with `render`:
-
-```json
-{"type":"render","id":"render-1","body":"<h1>Search invoices</h1><form id=\"search\" action=\"search\" method=\"post\" data-lmk-target=\"results\"><label>Customer<input name=\"customer\" required></label><button>Search</button></form><section id=\"results\"><p>Enter a customer.</p></section>","css":"#results { margin-top: 2rem; }"}
-```
-
-A connected browser receives the render immediately. The acknowledgement contains its revision:
-
-```json
-{"type":"ack","id":"render-1","render_id":"b87438c2-4f1c-44bd-9875-6cc64370b8aa"}
-```
-
-Submitting the form produces one normalized action:
-
-```json
-{"type":"action","id":"2ee81a6b-1035-40a7-a90d-c1e02f426baa","render_id":"b87438c2-4f1c-44bd-9875-6cc64370b8aa","action_id":"search","form_id":"search","target_id":"results","trigger":{"id":null,"name":null,"value":null},"values":{"customer":"Acme Ltd"}}
-```
-
-Respond to that ID with HTML for the target's contents:
-
-```json
-{"type":"response","id":"response-1","request_id":"2ee81a6b-1035-40a7-a90d-c1e02f426baa","body":"<table><tr><th>Invoice</th><th>Amount</th></tr><tr><td>INV-42</td><td>$800</td></tr></table>"}
-```
-
-The browser inserts the fragment into `#results`. Without `data-lmk-target`, the response replaces the whole workspace.
-
-## HTML actions
-
-### Forms
-
-Interactive forms use standard HTML:
+An optional element can display submission status:
 
 ```html
-<form id="decision" action="decide" method="post">
-  <label>Comment<textarea name="comment"></textarea></label>
-  <button name="decision" value="approve" formaction="approve">Approve</button>
-  <button name="decision" value="reject" formaction="reject">Reject</button>
+<p data-letmeknow-status aria-live="polite"></p>
+```
+
+## Form submissions
+
+Forms are submitted locally without navigation. GET and POST forms are sent back to the CLI, which prints each submission as one JSON line on stdout. The agent can read that line and edit the folder in response.
+
+```html
+<form id="decision" action="/decide" method="post">
+  <label>Comment <textarea name="comment"></textarea></label>
+  <button name="decision" value="approve">Approve</button>
+  <button name="decision" value="reject">Reject</button>
 </form>
 ```
 
-Forms require `method="post"`, a stable `id`, a relative action identifier, and meaningful control names. A submit button's `formaction` overrides the form's `action`. Native validation runs locally. `FormData(form, submitter)` is captured before controls are disabled, so selected controls and the clicked button are included. Repeated names become string arrays. File inputs are rejected.
-
-### Standalone actions
-
-A button can invoke an action without a form:
-
-```html
-<button type="button" data-lmk-action="refresh-status" data-lmk-target="status">Refresh</button>
-```
-
-Its event has `form_id: null`, empty `values`, and its optional `id`, `name`, and `value` in `trigger`.
-
-### Targeted updates
-
-`data-lmk-target` accepts one bare element ID. All updates use `innerHTML`. There are no alternate swap modes or selector targets. The default target is `lmk-view`, the whole workspace.
-
-Typing, focusing, expanding `<details>`, validation, scrolling, and other local browser behavior produce no agent events.
-
-## CSS
-
-`render` accepts page CSS in its `css` field. A `response` may include `css` to replace it; omitting `css` preserves it.
-
-Modern CSS is supported, including grid, flexbox, media queries, variables, transitions, and print styles. External stylesheets, `@import`, scripts, inline handlers, and inline `style` attributes are blocked. Local assets work in HTML and CSS. The built-in style is deliberately document-like and avoids decorative cards, gradients, shadows, and rounded controls.
-
-## One browser client
-
-At most one browser is active for a session. The first browser receives a private credential stored in that tab's `sessionStorage`.
-
-- Reloads and reconnects reuse the credential.
-- A competing browser triggers at most one liveness probe every five seconds.
-- If the active browser answers, the claimant sees “This session is open elsewhere.”
-- After a disconnect, the previous credential has a five-second exclusive reconnect period.
-- After five seconds, either the old browser or a new claimant may connect; first connection wins.
-- Laptop sleep does not invalidate the credential.
-
-The server sends a connecting browser one canonical snapshot of the current HTML, CSS, render ID, and pending actions. It does not replay user actions. The browser restores same-tab drafts from `sessionStorage`; drafts do not transfer to another browser.
-
-The server keeps committed page state and assets for the producer session. A full `render` replaces the page and clears old pending actions. A targeted response updates the canonical page. Browser disconnect alone does not delete state.
-
-## Assets
-
-`put` stores or replaces passive resources only under `/assets/`:
+Submitting `Approve` prints an event like:
 
 ```json
-{"type":"put","id":"logo","path":"/assets/logo.png","content_type":"image/png","encoding":"base64","body":"iVBORw0KGgo..."}
+{"type":"submit","id":"…","method":"POST","action":"/decide","form_id":"decision","trigger":{"id":null,"name":"decision","value":"approve"},"values":{"comment":"Looks good","decision":"approve"}}
 ```
 
-Reference them relatively:
+Repeated field names become arrays. Native browser validation still runs before a submission is sent. File inputs and cross-origin form actions are not supported. Forms can use a submitter's standard `formaction`, `formmethod`, and `name`/`value` attributes.
 
-```html
-<img src="assets/logo.png" alt="Company logo">
+The event ID identifies that submission. It is not a request/response handle: update the files and let the normal Vite watcher refresh the page.
+
+## Hosted mode
+
+The deployed Cloudflare service and its older NDJSON WebSocket protocol remain available explicitly for existing clients:
+
+```bash
+LETMEKNOW_URL=https://letmeknow.dev npx letmeknow-cli
 ```
 
-Assets answer only `GET` and `HEAD`. Each body is limited to 1 MiB. A session accepts 100 assets and 10 MiB decoded asset data. There is no `delete`; assets disappear with the session.
-
-## Protocol
-
-Commands:
-
-- `open`: create the session; it must be first.
-- `render`: replace the committed HTML and CSS and push it to the browser.
-- `put`: store an asset under `/assets/`.
-- `response`: resolve one pending action with HTML and optional CSS.
-- `close`: destroy the session immediately.
-
-Events:
-
-- `session`: public URL and producer disconnect grace.
-- `action`: normalized form or standalone-button action.
-- `ack`: command completion.
-- `error`: invalid command or protocol state.
-- `closing`: explicit session destruction.
-
-Actions remain pending until `response`, a superseding full `render`, or session close. One form or overlapping target can be pending at a time; independent regions may proceed concurrently. Match responses by action ID.
-
-HTML, CSS, asset, and action bodies are each limited to 1 MiB. Up to 32 actions may be pending.
-
-## Security and lifecycle
-
-HTML fragments are sanitized. Scripts, style elements, inline handlers, HTMX attributes, frames, active metadata, external form actions, and invalid LetMeKnow attributes are removed. CSP blocks arbitrary browser connections and external resources.
-
-The URL is a bearer secret. Share it only with the intended human. Browser and producer reconnect credentials remain private and never appear in protocol output.
-
-If the producer disconnects, the current page remains visible, drafts are preserved, and actions are disabled. The CLI can reconnect for ten minutes. Browser traffic does not extend that grace. `close` or producer-grace expiry deletes page state, credentials, pending actions, and assets.
+Normal local use does not connect to the hosted service or create a remote session.
 
 ## Development
 
 ```bash
 npm install
-npm run dev
 npm test
+npm run dev
 npm run deploy
 ```
+
+`npm run dev` and `npm run deploy` continue to operate the Cloudflare worker used by hosted mode.

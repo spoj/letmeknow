@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import { spawn } from "node:child_process";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { once } from "node:events";
 import { afterEach, describe, it } from "node:test";
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
 const cli = new URL("../bin/letmeknow.js", import.meta.url);
 const servers = [];
@@ -196,6 +198,149 @@ async function runDelayedAcceptScenario() {
   await new Promise((resolve) => httpServer.close(resolve));
   return { code, packets };
 }
+
+async function runLocalScenario() {
+  const folder = mkdtempSync(join(tmpdir(), "letmeknow-"));
+  writeFileSync(join(folder, "index.html"), `<!doctype html><html><body><form id="contact" action="/save" method="post"><input name="name"><button name="kind" value="send">Send</button></form></body></html>`);
+  const child = spawn(process.execPath, [cli.pathname, folder, "--port", "0"], {
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let output = "";
+  let error = "";
+  const lines = [];
+  let pending = "";
+  child.stdout.on("data", chunk => {
+    output += chunk;
+    pending += chunk.toString();
+    const complete = pending.split("\n");
+    pending = complete.pop();
+    lines.push(...complete.filter(Boolean).map(line => JSON.parse(line)));
+  });
+  child.stderr.on("data", chunk => { error += chunk; });
+  try {
+    let ready;
+    for (let attempt = 0; !ready && attempt < 50; attempt++) {
+      ready = lines.find(line => line.type === "ready");
+      if (!ready) await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert(ready, `server did not start: ${error}`);
+    const page = await fetch(ready.url);
+    const html = await page.text();
+    const response = await fetch(new URL("/save", ready.url), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-LetMeKnow-Submission": "1",
+        "X-LetMeKnow-ID": "local-test",
+        "X-LetMeKnow-Form-ID": "contact",
+        "X-LetMeKnow-Action": "%2Fsave",
+        "X-LetMeKnow-Trigger-Name": "kind",
+        "X-LetMeKnow-Trigger-Value": "send"
+      },
+      body: "name=Ada&kind=send"
+    });
+    for (let attempt = 0; !lines.some(line => line.type === "submit") && attempt < 50; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    return { code: await new Promise(resolve => {
+      child.once("exit", code => resolve(code));
+      child.kill("SIGTERM");
+    }), output, error, html, response, event: lines.find(line => line.type === "submit") };
+  } finally {
+    if (!child.killed) child.kill("SIGTERM");
+    rmSync(folder, { recursive: true, force: true });
+  }
+}
+
+async function runLocalHotUpdateScenario() {
+  const folder = mkdtempSync(join(tmpdir(), "letmeknow-"));
+  writeFileSync(join(folder, "index.html"), "<!doctype html><html><body><h1>Before</h1></body></html>");
+  const child = spawn(process.execPath, [cli.pathname, folder, "--port", "0"], {
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let output = "";
+  let pending = "";
+  let error = "";
+  const lines = [];
+  child.stdout.on("data", chunk => {
+    output += chunk;
+    pending += chunk.toString();
+    const complete = pending.split("\n");
+    pending = complete.pop();
+    lines.push(...complete.filter(Boolean).map(line => JSON.parse(line)));
+  });
+  child.stderr.on("data", chunk => { error += chunk; });
+  let socket;
+  try {
+    let ready;
+    for (let attempt = 0; !ready && attempt < 50; attempt++) {
+      ready = lines.find(line => line.type === "ready");
+      if (!ready) await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert(ready, `server did not start: ${error}`);
+    const hmrUrl = new URL(ready.url);
+    hmrUrl.protocol = hmrUrl.protocol === "https:" ? "wss:" : "ws:";
+    socket = new WebSocket(hmrUrl, "vite-hmr");
+    const connected = new Promise((resolve, reject) => {
+      socket.once("error", reject);
+      socket.on("message", data => {
+        const message = JSON.parse(data.toString());
+        if (message.type === "connected") resolve();
+      });
+    });
+    await connected;
+    const update = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("HMR update timed out")), 2_000);
+      socket.on("message", data => {
+        const message = JSON.parse(data.toString());
+        if (message.type === "custom" || message.type === "full-reload") {
+          clearTimeout(timer);
+          resolve(message);
+        }
+      });
+    });
+    writeFileSync(join(folder, "index.html"), "<!doctype html><html><body><h1>After</h1></body></html>");
+    const message = await update;
+    socket.close();
+    const code = await new Promise(resolve => {
+      child.once("exit", resolve);
+      child.kill("SIGTERM");
+    });
+    return { code, message, output };
+  } finally {
+    socket?.close();
+    if (!child.killed) child.kill("SIGTERM");
+    rmSync(folder, { recursive: true, force: true });
+  }
+}
+
+describe("LetMeKnow local Vite server", () => {
+  it("updates HTML through HMR without a full reload", async () => {
+    const result = await runLocalHotUpdateScenario();
+    assert.equal(result.code, 0);
+    assert.deepEqual(result.message, {
+      type: "custom",
+      event: "letmeknow:html-update",
+      data: { path: "/index.html" }
+    });
+  }, { timeout: 10_000 });
+
+  it("serves a folder and prints form submissions as JSONL", async () => {
+    const result = await runLocalScenario();
+    assert.equal(result.code, 0);
+    assert.equal(result.response.status, 204);
+    assert.match(result.html, /data-letmeknow-client/);
+    assert.deepEqual(result.event, {
+      type: "submit",
+      id: "local-test",
+      method: "POST",
+      action: "/save",
+      form_id: "contact",
+      trigger: { id: null, name: "kind", value: "send" },
+      values: { name: "Ada", kind: "send" }
+    });
+  }, { timeout: 10_000 });
+});
 
 describe("LetMeKnow CLI reconnect", () => {
   it("prints the packaged skill file without connecting", async () => {

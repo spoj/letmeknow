@@ -1,166 +1,98 @@
 ---
 name: letmeknow
-description: Show one human a temporary HTML and CSS workspace and handle normalized form or button actions through the LetMeKnow NDJSON CLI.
+description: Serve an agent-managed folder with a live Vite preview and receive browser form submissions as JSON lines.
 ---
 
 # LetMeKnow
 
-Use LetMeKnow when one human needs a temporary rich document, dashboard, report, preview, form, approval, quiz, table, or status view. The agent supplies semantic HTML and CSS. The browser sends only declared actions; typing and local UI state do not create events.
-
-LetMeKnow is not a localhost proxy, persistent application, or arbitrary JavaScript environment.
+Use LetMeKnow when one human needs to inspect or interact with a temporary page, report, dashboard, approval form, quiz, table, or status view. The agent owns the files in a folder; the CLI serves that folder and reports browser submissions.
 
 ## Start
 
-Node.js 22 or newer is required.
+Run the CLI as a long-lived child process with the folder you will edit:
 
 ```bash
-npx letmeknow-cli
+npx letmeknow-cli ./workspace
 ```
 
-Run it as a long-lived child process. Write one compact JSON object per line to stdin, keep stdin open, and read one JSON event per line from stdout. Read stderr separately.
+Node.js 22.12 or newer is required. Read stdout and stderr separately. Stdout is JSONL; the first event is:
 
 ```json
-{"type":"open","id":"open-1"}
+{"type":"ready","url":"http://127.0.0.1:5173/"}
 ```
 
-Wait for the session URL:
+Open the URL for the human. The directory defaults to the current working directory. `--host` and `--port` are available when the browser is on another interface:
 
-```json
-{"type":"session","id":"open-1","url":"https://0123456789abcdef0123.letmeknow.dev/","expires_after_disconnect":600}
+```bash
+npx letmeknow-cli ./workspace --host 0.0.0.0 --port 4173
 ```
 
-The URL immediately serves a shell with a waiting message. One browser may use it at a time.
+Do not send file commands to stdin. Read and write the folder directly. Keep stdin open if the process runner expects a long-lived child.
 
-## Render HTML and CSS
+## Build the page
 
-```json
-{"type":"render","id":"render-1","body":"<h1>Search invoices</h1><form id=\"search\" action=\"search\" method=\"post\" data-lmk-target=\"results\"><label>Customer<input name=\"customer\" required></label><button>Search</button></form><section id=\"results\"><p>Enter a customer.</p></section>","css":"#results { margin-top: 2rem; }"}
-```
+Create an ordinary Vite page in the folder, usually `index.html`, plus any CSS, JavaScript, images, or other assets it needs. Use semantic HTML and accessible labels, headings, sections, tables, and controls.
 
-A connected browser receives the render immediately. Wait for its acknowledgement and retain the `render_id`:
+The page is live:
 
-```json
-{"type":"ack","id":"render-1","render_id":"b87438c2-4f1c-44bd-9875-6cc64370b8aa"}
-```
+- HTML changes update the current document body without a full page reload.
+- Existing form values, focus, text selection, and scroll position are restored after an HTML update.
+- CSS and JavaScript changes use Vite HMR.
+- Changes to another HTML route do not replace the current route.
 
-Use semantic HTML: headings, sections, paragraphs, lists, tables, `dl`, forms, labels, controls, buttons, `details`, progress, and images. Do not include `<html>`, `<head>`, `<body>`, `<main id="lmk-view">`, scripts, style elements, inline handlers, inline `style`, iframes, or HTMX attributes.
-
-The optional `css` field supports modern CSS, including grid, flexbox, media queries, variables, transitions, and print styles. External stylesheets, `@import`, and remote resources do not work. Use relative session assets.
-
-Unless the human asks for a visual treatment, keep the page document-like: plain backgrounds, restrained typography, square corners, and simple borders. Avoid gradients, shadows, pill badges, rounded card grids, and decorative dashboard styling by default.
-
-A full `render` intentionally replaces the current page, resets drafts, and cancels actions from the previous render. Use `response` rather than `render` after a user action.
-
-## Forms
-
-Interactive forms use standard HTML:
+An optional status element gives the human feedback after a form submission:
 
 ```html
-<form id="decision" action="decide" method="post">
-  <label>Reason<textarea name="reason" required></textarea></label>
-  <button name="decision" value="approve" formaction="approve">Approve</button>
-  <button name="decision" value="reject" formaction="reject">Reject</button>
+<p data-letmeknow-status aria-live="polite"></p>
+```
+
+## Receive form submissions
+
+GET and POST forms are intercepted before navigation and sent to the local CLI. Read stdout for a `submit` event:
+
+```html
+<form id="search" action="/search" method="post">
+  <label>Query <input name="query" required></label>
+  <button name="scope" value="all">Search all</button>
 </form>
+```
+
+The event is:
+
+```json
+{"type":"submit","id":"…","method":"POST","action":"/search","form_id":"search","trigger":{"id":null,"name":"scope","value":"all"},"values":{"query":"quarterly report","scope":"all"}}
 ```
 
 Rules:
 
-- Use `method="post"`.
-- Give each form a stable, unique `id`.
+- Give interactive forms a stable, meaningful `id`.
 - Give controls meaningful `name` values.
-- Use an action identifier containing letters, digits, `.`, `_`, `:`, or `-`.
-- A submit button's standard `formaction` may override the form action.
-- Native `required`, input types, ranges, and patterns validate locally.
+- Use normal relative or same-origin actions.
+- Use `formaction` and `formmethod` on submitters when different buttons have different intents.
+- Native `required`, input types, ranges, and patterns validate in the browser before the event is sent.
+- Repeated names become string arrays.
+- File inputs and cross-origin actions are not supported.
 
-The runtime captures `FormData(form, submitter)` before disabling controls. Selected radios, checked boxes, ordinary controls, and the clicked submit button are included. Repeated names become string arrays. File inputs are rejected.
+The event ID identifies the submission. There is no response packet. Validate the values, edit the files, and let the live preview show the result. Do not try to write JSON commands to stdin.
 
-## Standalone actions
+## Example response workflow
 
-```html
-<button type="button" data-lmk-action="refresh-status" data-lmk-target="status">
-  Refresh
-</button>
+1. Render the initial state in `index.html`.
+2. Wait for a `submit` event on stdout.
+3. Validate its `values` and `action`.
+4. Rewrite the relevant HTML or data file in the workspace.
+5. The browser updates in place through Vite.
+
+Escape untrusted values before placing them in HTML. Treat the browser input as untrusted even though the server is local.
+
+## Stop
+
+Send `SIGINT` or `SIGTERM` to stop the preview server. The CLI does not persist submissions or create a remote session.
+
+Use this only when an existing client explicitly needs the hosted protocol:
+
+```bash
+LETMEKNOW_URL=https://letmeknow.dev npx letmeknow-cli
 ```
 
-Use standalone actions for refresh, retry, cancel, generate, inspect, load-more, and export. Their events have `form_id: null`, empty `values`, and the button's optional `id`, `name`, and `value` in `trigger`.
-
-## Whole and partial updates
-
-Responses replace the whole workspace by default. To update a region, put `data-lmk-target="element-id"` on the form or action button:
-
-```html
-<form id="search" action="search" method="post" data-lmk-target="results">
-  <input name="query">
-  <button>Search</button>
-</form>
-<section id="results"></section>
-```
-
-The target is one bare element ID without `#`. Every update uses `innerHTML`. A submit button may override its form's target.
-
-## Handle actions
-
-```json
-{"type":"action","id":"2ee81a6b-1035-40a7-a90d-c1e02f426baa","render_id":"b87438c2-4f1c-44bd-9875-6cc64370b8aa","action_id":"search","form_id":"search","target_id":"results","trigger":{"id":null,"name":null,"value":null},"values":{"query":"quarterly report"}}
-```
-
-Use:
-
-- `id` to respond to this exact action.
-- `render_id` to identify the page revision that produced it.
-- `action_id` for user intent.
-- `form_id` and `target_id` for context.
-- `trigger` for the clicked button.
-- `values` for the submitted form snapshot.
-
-Validate actions and values. Treat values as untrusted and HTML-escape reflected text.
-
-Respond with HTML for the target contents:
-
-```json
-{"type":"response","id":"response-1","request_id":"2ee81a6b-1035-40a7-a90d-c1e02f426baa","body":"<table><tr><th>Invoice</th><th>Amount</th></tr><tr><td>INV-42</td><td>$800</td></tr></table>"}
-```
-
-A response may include `css` to replace the page CSS. Omitting it preserves the existing CSS:
-
-```json
-{"type":"response","id":"response-2","request_id":"event-2","body":"<h1 class=\"success\">Approved</h1>","css":".success { color: green; }"}
-```
-
-Wait for the acknowledgement and its new `render_id`. An action remains pending until `response`, a superseding full `render`, or session close. Independent regions may be pending concurrently, so always match by action ID.
-
-## One-browser behavior
-
-The first browser claims the session with a private credential. Reload and laptop wake reconnect automatically. A second browser cannot connect while the first is active.
-
-Liveness is checked only when another browser tries to claim, at most once every five seconds. After a browser disconnect, its credential has five seconds of exclusive reconnect priority. After that, the first old or new browser to connect wins.
-
-A reconnect receives one canonical snapshot of committed HTML, CSS, render ID, and pending actions. It does not replay old user actions. Same-tab drafts are restored from `sessionStorage`; drafts do not transfer during takeover.
-
-## Assets
-
-```json
-{"type":"put","id":"logo","path":"/assets/logo.png","content_type":"image/png","encoding":"base64","body":"iVBORw0KGgo..."}
-```
-
-Store resources only under `/assets/` and reference them relatively:
-
-```html
-<img src="assets/logo.png" alt="Company logo">
-```
-
-`encoding` is `utf8` by default or `base64` for binary data. Assets answer only `GET` and `HEAD`. There is no `delete`; another `put` replaces an asset.
-
-## Close and lifecycle
-
-```json
-{"type":"close","id":"close-1"}
-```
-
-Wait for `ack` and `closing`. Closing stdin only disconnects the producer.
-
-If the producer disconnects, the page remains visible, drafts remain, and actions are disabled. The CLI has ten minutes to reconnect. Browser traffic does not extend that period. Explicit close or expiry deletes HTML, CSS, credentials, actions, and assets.
-
-Limits: 1 MiB per HTML, CSS, asset, or action body; 100 assets; 10 MiB decoded asset storage; and 32 pending actions.
-
-Treat the URL as a bearer secret. Never expose either private reconnect credential.
+`--skill` prints these instructions without starting a server.

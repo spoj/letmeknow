@@ -801,7 +801,7 @@ export class Session extends DurableObject<Env> {
 }
 
 function home(): Response {
-  return new Response(`# LetMeKnow\n\nRun the NDJSON CLI:\n\n  npx letmeknow-cli\n\nThe default service URL is https://letmeknow.dev. Set LETMEKNOW_URL for local development. Write {"type":"open"} to stdin. Read protocol events from stdout.\n`, {
+  return new Response(`# LetMeKnow\n\nRun a local Vite preview for an agent-managed folder:\n\n  npx letmeknow-cli ./workspace\n\nThe CLI prints the preview URL and form submissions as JSON lines. The hosted WebSocket protocol is available explicitly with LETMEKNOW_URL=https://letmeknow.dev.\n`, {
     headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }
   });
 }
