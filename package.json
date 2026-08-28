@@ -1,6 +1,6 @@
 {
   "name": "letmeknow-cli",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "A live static preview with agent-readable form submissions.",
   "files": [
     "bin",
