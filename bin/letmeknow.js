@@ -14,7 +14,6 @@ const clientPath = "/__letmeknow_client.js";
 const clientId = "\0letmeknow-client";
 const client = String.raw`
 const key="letmeknow-client:"+location.host+location.pathname;
-const draftKey="letmeknow-draft:"+location.host+location.pathname;
 let credential=sessionStorage.getItem(key);
 let socket;
 let retryTimer;
@@ -69,7 +68,7 @@ const connect=()=>{
     if(message.type==="challenge"){socket.send(JSON.stringify({type:"alive",nonce:message.nonce}));return}
     if(message.type==="busy"){status("This session is open elsewhere");retryTimer=setTimeout(connect,message.retry_after*1000);return}
     if(message.type==="file_update"){update(message.path);return}
-    if(message.type==="closed"){terminal=true;sessionStorage.removeItem(key);sessionStorage.removeItem(draftKey);status(message.message)}
+    if(message.type==="closed"){terminal=true;sessionStorage.removeItem(key);status(message.message)}
   };
   socket.onclose=()=>{if(!terminal&&!retryTimer){status("Reconnecting…");retryTimer=setTimeout(connect,1000)}};
   socket.onerror=()=>{};
@@ -208,7 +207,7 @@ class RelayResponse extends Writable {
 
   appendHeader(name, value) {
     const current = this.getHeader(name);
-    return this.setHeader(name, current ? [current, value] : value);
+    return this.setHeader(name, current === undefined ? value : [current, value]);
   }
 
   getHeader(name) {
@@ -420,7 +419,6 @@ async function start(args) {
       } else if (packet.type === "session") {
         if (!validSessionUrl(packet.url)) return void stop(1);
         sessionUrl = packet.url;
-        retryDelay = 100;
         if (!ready) {
           ready = true;
           process.stdout.write(`${JSON.stringify({ type: "ready", url: sessionUrl })}\n`);

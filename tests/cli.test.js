@@ -104,6 +104,7 @@ describe("LetMeKnow CLI", () => {
     const result = await runRelayScenario();
     assert.equal(result.code, 0);
     assert.equal(result.pageResponse.status, 200);
+    assert.match(result.pageResponse.headers.vary, /(?:^|,\s*)sec-fetch-dest(?:,|$)/i);
     assert.match(result.pageResponse.body, /data-letmeknow-client/);
     assert.equal(result.formResponse.status, 204);
     assert.deepEqual(result.event, {

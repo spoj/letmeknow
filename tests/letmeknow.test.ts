@@ -83,9 +83,14 @@ describe("LetMeKnow outbound relay", () => {
     const client = await connectClient(url);
     expect(await client.next()).toEqual({ type: "connected", producer_connected: true });
 
-    const page = SELF.fetch(url);
+    const page = SELF.fetch(new Request(url, { headers: { "Sec-Fetch-Dest": "document" } }));
     const request = await producer.next();
-    expect(request).toMatchObject({ type: "http_request", method: "GET", path: "/" });
+    expect(request).toMatchObject({
+      type: "http_request",
+      method: "GET",
+      path: "/",
+      headers: { "sec-fetch-dest": "document" }
+    });
     expect(request.headers.host).toBeUndefined();
     producer.send({
       type: "http_response",
