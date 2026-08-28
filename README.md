@@ -64,14 +64,6 @@ The preview URL is a bearer capability. The relay receives the served files and 
 
 The CLI's Vite configuration is disabled and its filesystem access is limited to the selected folder. The CLI itself still requires an outbound network connection to the relay. It does not accept inbound browser connections.
 
-## Hosted compatibility
-
-Existing clients using the older command protocol can still connect explicitly without a folder:
-
-```bash
-LETMEKNOW_URL=https://letmeknow.dev npx letmeknow-cli
-```
-
 ## Development
 
 ```bash

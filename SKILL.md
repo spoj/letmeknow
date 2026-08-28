@@ -92,9 +92,3 @@ The CLI disables Vite config discovery and limits filesystem access to the selec
 ## Stop
 
 Send `SIGINT` or `SIGTERM` to stop the CLI. The relay session expires after producer disconnect. `--skill` prints these instructions without starting a session.
-
-Existing clients using the older hosted command protocol can still connect explicitly without a folder:
-
-```bash
-LETMEKNOW_URL=https://letmeknow.dev npx letmeknow-cli
-```
