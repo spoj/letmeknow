@@ -1,6 +1,6 @@
 # LetMeKnow
 
-LetMeKnow is a small Vite-based preview server for an agent-managed folder. The agent edits files, Vite watches them, and the open browser updates in place. HTML changes replace the document body without a page reload, while Vite handles CSS and JavaScript HMR normally.
+LetMeKnow gives an agent-managed folder a public, live Vite preview. The CLI runs Vite in middleware mode and makes only an outbound WebSocket connection to the relay; it does not listen on a network port.
 
 ## Start
 
@@ -10,25 +10,25 @@ Node.js 22.12 or newer is required.
 npx letmeknow-cli ./workspace
 ```
 
-The CLI prints JSON lines to stdout. The first line contains the local preview URL:
+The CLI prints JSON lines to stdout. The first line contains the public preview URL:
 
 ```json
-{"type":"ready","url":"http://127.0.0.1:5173/"}
+{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/"}
 ```
 
-Open that URL in one browser. The directory defaults to the current working directory. Use `--host` and `--port` when needed:
+Open that URL in one browser. The directory defaults to the current working directory. Set `LETMEKNOW_URL` to use another compatible relay:
 
 ```bash
-npx letmeknow-cli ./workspace --host 0.0.0.0 --port 4173
+LETMEKNOW_URL=https://letmeknow.dev npx letmeknow-cli ./workspace
 ```
 
-Diagnostics go to stderr. `--skill` prints the agent instructions without starting a server.
+There are no `--host` or `--port` options because the CLI intentionally has no listening network socket. Diagnostics go to stderr. `--skill` prints the agent instructions without starting a session.
 
 ## File workflow
 
-The CLI does not receive file commands. The agent reads and writes the directory directly. Keep a normal Vite entry point such as `index.html`; JavaScript, CSS, images, and other Vite-supported files work as usual.
+The CLI does not receive file commands. The agent reads and writes the directory directly. Keep a normal Vite entry point such as `index.html`; JavaScript, CSS, images, and other Vite-supported files can be requested through the relay.
 
-When an HTML file changes, the browser keeps its current form values, focus, selection, and scroll position while the new body is installed. Changes to a different HTML route do not disturb the current page. CSS and JavaScript updates use Vite's HMR connection.
+When a watched file changes, the browser receives an update. HTML changes replace the current document body without a page reload and preserve form values, focus, selection, and scroll position. CSS links are refreshed without navigating. Changes to a different HTML route do not disturb the current page.
 
 An optional element can display submission status:
 
@@ -38,7 +38,7 @@ An optional element can display submission status:
 
 ## Form submissions
 
-Forms are submitted locally without navigation. GET and POST forms are sent back to the CLI, which prints each submission as one JSON line on stdout. The agent can read that line and edit the folder in response.
+Forms are submitted without navigation. GET and POST forms are sent through the relay to the CLI, which prints each submission as one JSON line on stdout. The agent can read that line and edit the folder in response.
 
 ```html
 <form id="decision" action="/decide" method="post">
@@ -56,17 +56,21 @@ Submitting `Approve` prints an event like:
 
 Repeated field names become arrays. Native browser validation still runs before a submission is sent. File inputs and cross-origin form actions are not supported. Forms can use a submitter's standard `formaction`, `formmethod`, and `name`/`value` attributes.
 
-The event ID identifies that submission. It is not a request/response handle: update the files and let the normal Vite watcher refresh the page.
+The event ID identifies the submission. It is not a request/response handle: update the files and let the live preview show the result.
 
-## Hosted mode
+## Security
 
-The deployed Cloudflare service and its older NDJSON WebSocket protocol remain available explicitly for existing clients:
+The preview URL is a bearer capability. The relay receives the served files and submitted values. Do not put secrets in the preview folder or submit credentials unless that is intentional. The folder is trusted executable code from the browser's perspective.
+
+The CLI's Vite configuration is disabled and its filesystem access is limited to the selected folder. The CLI itself still requires an outbound network connection to the relay. It does not accept inbound browser connections.
+
+## Hosted compatibility
+
+Existing clients using the older command protocol can still connect explicitly without a folder:
 
 ```bash
 LETMEKNOW_URL=https://letmeknow.dev npx letmeknow-cli
 ```
-
-Normal local use does not connect to the hosted service or create a remote session.
 
 ## Development
 
@@ -77,4 +81,4 @@ npm run dev
 npm run deploy
 ```
 
-`npm run dev` and `npm run deploy` continue to operate the Cloudflare worker used by hosted mode.
+`npm run dev` and `npm run deploy` operate the Cloudflare relay.

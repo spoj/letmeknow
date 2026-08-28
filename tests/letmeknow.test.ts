@@ -54,9 +54,9 @@ async function connectProducer(base = origin, auth?: { code: string; credential:
   return peer(response.webSocket!);
 }
 
-async function open(base = origin): Promise<{ producer: Peer; url: string }> {
+async function open(base = origin, mode: "legacy" | "proxy" = "legacy"): Promise<{ producer: Peer; url: string }> {
   const producer = await connectProducer(base);
-  producer.send({ type: "open", id: "open" });
+  producer.send({ type: "open", id: "open", ...(mode === "proxy" ? { mode } : {}) });
   const session = await producer.next();
   expect(session).toMatchObject({ type: "session", id: "open", expires_after_disconnect: 600 });
   return { producer, url: session.url };
@@ -116,6 +116,57 @@ describe("LetMeKnow one-to-one HTML surface", () => {
     expect(html).toContain("_letmeknow/client");
     expect(html).toContain("sessionStorage");
     expect(html).not.toContain("_letmeknow/view");
+  });
+
+  it("relays browser requests and file updates to an outbound proxy producer", async () => {
+    const { producer, url } = await open(origin, "proxy");
+    const client = await connectClient(url);
+    await client.next();
+    const page = SELF.fetch(url);
+    const request = await producer.next();
+    expect(request).toMatchObject({ type: "http_request", method: "GET", path: "/" });
+    producer.send({
+      type: "http_response",
+      request_id: request.request_id,
+      status: 200,
+      headers: { "content-type": "text/html" },
+      body: btoa("<h1>From CLI</h1>")
+    });
+    const response = await page;
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("<h1>From CLI</h1>");
+
+    producer.send({ type: "file_update", path: "/index.html" });
+    expect(await client.next()).toEqual({ type: "file_update", path: "/index.html" });
+  });
+
+  it("relays form submissions through the producer middleware", async () => {
+    const { producer, url } = await open(origin, "proxy");
+    const page = SELF.fetch(new Request(new URL("save", url), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-LetMeKnow-Submission": "1",
+        "X-LetMeKnow-ID": "submission",
+        "X-LetMeKnow-Form-ID": "decision",
+        "X-LetMeKnow-Action": "%2Fsave"
+      },
+      body: "answer=yes"
+    }));
+    const request = await producer.next();
+    expect(request).toMatchObject({
+      type: "http_request",
+      method: "POST",
+      path: "/save",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        "x-letmeknow-submission": "1",
+        "x-letmeknow-id": "submission"
+      }
+    });
+    expect(atob(request.body)).toBe("answer=yes");
+    producer.send({ type: "http_response", request_id: request.request_id, status: 204, headers: {}, body: "" });
+    expect((await page).status).toBe(204);
   });
 
   it("pushes a render to the single client and restores it on reconnect", async () => {

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { once } from "node:events";
 import { afterEach, describe, it } from "node:test";
-import { WebSocket, WebSocketServer } from "ws";
+import { WebSocketServer } from "ws";
 
 const cli = new URL("../bin/letmeknow.js", import.meta.url);
 const servers = [];
@@ -199,137 +199,88 @@ async function runDelayedAcceptScenario() {
   return { code, packets };
 }
 
-async function runLocalScenario() {
+async function runRelayScenario() {
   const folder = mkdtempSync(join(tmpdir(), "letmeknow-"));
   writeFileSync(join(folder, "index.html"), `<!doctype html><html><body><form id="contact" action="/save" method="post"><input name="name"><button name="kind" value="send">Send</button></form></body></html>`);
-  const child = spawn(process.execPath, [cli.pathname, folder, "--port", "0"], {
+  writeFileSync(join(folder, "vite.config.js"), "throw new Error('project config must not execute')");
+  const relay = new WebSocketServer({
+    port: 0,
+    handleProtocols(protocols) { return [...protocols][0]; }
+  });
+  await once(relay, "listening");
+  const port = relay.address().port;
+  const child = spawn(process.execPath, [cli.pathname, folder], {
+    env: { ...process.env, LETMEKNOW_URL: `http://127.0.0.1:${port}` },
     stdio: ["ignore", "pipe", "pipe"]
   });
   let output = "";
   let error = "";
+  let pendingOutput = "";
   const lines = [];
-  let pending = "";
-  child.stdout.on("data", chunk => {
-    output += chunk;
-    pending += chunk.toString();
-    const complete = pending.split("\n");
-    pending = complete.pop();
-    lines.push(...complete.filter(Boolean).map(line => JSON.parse(line)));
-  });
-  child.stderr.on("data", chunk => { error += chunk; });
-  try {
-    let ready;
-    for (let attempt = 0; !ready && attempt < 50; attempt++) {
-      ready = lines.find(line => line.type === "ready");
-      if (!ready) await new Promise(resolve => setTimeout(resolve, 20));
-    }
-    assert(ready, `server did not start: ${error}`);
-    const page = await fetch(ready.url);
-    const html = await page.text();
-    const response = await fetch(new URL("/save", ready.url), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-LetMeKnow-Submission": "1",
-        "X-LetMeKnow-ID": "local-test",
-        "X-LetMeKnow-Form-ID": "contact",
-        "X-LetMeKnow-Action": "%2Fsave",
-        "X-LetMeKnow-Trigger-Name": "kind",
-        "X-LetMeKnow-Trigger-Value": "send"
-      },
-      body: "name=Ada&kind=send"
-    });
-    for (let attempt = 0; !lines.some(line => line.type === "submit") && attempt < 50; attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 20));
-    }
-    return { code: await new Promise(resolve => {
-      child.once("exit", code => resolve(code));
-      child.kill("SIGTERM");
-    }), output, error, html, response, event: lines.find(line => line.type === "submit") };
-  } finally {
-    if (!child.killed) child.kill("SIGTERM");
-    rmSync(folder, { recursive: true, force: true });
-  }
-}
-
-async function runLocalHotUpdateScenario() {
-  const folder = mkdtempSync(join(tmpdir(), "letmeknow-"));
-  writeFileSync(join(folder, "index.html"), "<!doctype html><html><body><h1>Before</h1></body></html>");
-  const child = spawn(process.execPath, [cli.pathname, folder, "--port", "0"], {
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-  let output = "";
-  let pending = "";
-  let error = "";
-  const lines = [];
-  child.stdout.on("data", chunk => {
-    output += chunk;
-    pending += chunk.toString();
-    const complete = pending.split("\n");
-    pending = complete.pop();
-    lines.push(...complete.filter(Boolean).map(line => JSON.parse(line)));
-  });
-  child.stderr.on("data", chunk => { error += chunk; });
-  let socket;
-  try {
-    let ready;
-    for (let attempt = 0; !ready && attempt < 50; attempt++) {
-      ready = lines.find(line => line.type === "ready");
-      if (!ready) await new Promise(resolve => setTimeout(resolve, 20));
-    }
-    assert(ready, `server did not start: ${error}`);
-    const hmrUrl = new URL(ready.url);
-    hmrUrl.protocol = hmrUrl.protocol === "https:" ? "wss:" : "ws:";
-    socket = new WebSocket(hmrUrl, "vite-hmr");
-    const connected = new Promise((resolve, reject) => {
-      socket.once("error", reject);
+  let pageResponse;
+  let formResponse;
+  const responses = new Promise((resolve, reject) => {
+    relay.on("connection", socket => {
+      socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
+      socket.send(JSON.stringify({ type: "session", url: "http://127.0.0.1/s/0123456789abcdef0123/", expires_after_disconnect: 600 }));
       socket.on("message", data => {
-        const message = JSON.parse(data.toString());
-        if (message.type === "connected") resolve();
-      });
-    });
-    await connected;
-    const update = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("HMR update timed out")), 2_000);
-      socket.on("message", data => {
-        const message = JSON.parse(data.toString());
-        if (message.type === "custom" || message.type === "full-reload") {
-          clearTimeout(timer);
-          resolve(message);
+        const packet = JSON.parse(data.toString());
+        if (packet.type === "open") {
+          socket.send(JSON.stringify({ type: "http_request", request_id: "page", method: "GET", path: "/", headers: { accept: "text/html" }, body: "" }));
+        } else if (packet.type === "http_response" && packet.request_id === "page") {
+          pageResponse = { ...packet, body: Buffer.from(packet.body, "base64").toString() };
+          socket.send(JSON.stringify({
+            type: "http_request",
+            request_id: "form",
+            method: "POST",
+            path: "/save",
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              "x-letmeknow-submission": "1",
+              "x-letmeknow-id": "local-test",
+              "x-letmeknow-form-id": "contact",
+              "x-letmeknow-action": "%2Fsave",
+              "x-letmeknow-trigger-name": "kind",
+              "x-letmeknow-trigger-value": "send"
+            },
+            body: Buffer.from("name=Ada&kind=send").toString("base64")
+          }));
+        } else if (packet.type === "http_response" && packet.request_id === "form") {
+          formResponse = packet;
+          resolve();
         }
       });
     });
-    writeFileSync(join(folder, "index.html"), "<!doctype html><html><body><h1>After</h1></body></html>");
-    const message = await update;
-    socket.close();
+  });
+  child.stdout.on("data", chunk => {
+    output += chunk;
+    pendingOutput += chunk.toString();
+    const complete = pendingOutput.split("\n");
+    pendingOutput = complete.pop();
+    lines.push(...complete.filter(Boolean).map(line => JSON.parse(line)));
+  });
+  child.stderr.on("data", chunk => { error += chunk; });
+  try {
+    await Promise.race([responses, new Promise((_, reject) => setTimeout(() => reject(new Error(`relay timed out: ${error}`)), 5_000))]);
     const code = await new Promise(resolve => {
       child.once("exit", resolve);
       child.kill("SIGTERM");
     });
-    return { code, message, output };
+    return { code, output, pageResponse, formResponse, event: lines.find(line => line.type === "submit") };
   } finally {
-    socket?.close();
     if (!child.killed) child.kill("SIGTERM");
+    await new Promise(resolve => relay.close(resolve));
     rmSync(folder, { recursive: true, force: true });
   }
 }
 
-describe("LetMeKnow local Vite server", () => {
-  it("updates HTML through HMR without a full reload", async () => {
-    const result = await runLocalHotUpdateScenario();
+describe("LetMeKnow outbound relay", () => {
+  it("serves the folder through middleware without a local listener and prints submissions", async () => {
+    const result = await runRelayScenario();
     assert.equal(result.code, 0);
-    assert.deepEqual(result.message, {
-      type: "custom",
-      event: "letmeknow:html-update",
-      data: { path: "/index.html" }
-    });
-  }, { timeout: 10_000 });
-
-  it("serves a folder and prints form submissions as JSONL", async () => {
-    const result = await runLocalScenario();
-    assert.equal(result.code, 0);
-    assert.equal(result.response.status, 204);
-    assert.match(result.html, /data-letmeknow-client/);
+    assert.equal(result.pageResponse.status, 200);
+    assert.match(result.pageResponse.body, /data-letmeknow-client/);
+    assert.equal(result.formResponse.status, 204);
     assert.deepEqual(result.event, {
       type: "submit",
       id: "local-test",

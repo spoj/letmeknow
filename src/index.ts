@@ -20,6 +20,7 @@ type StoredAsset = {
 type ProducerAttachment = {
   role: "producer";
   url: string;
+  mode: "legacy" | "proxy";
   opened: boolean;
   closing: boolean;
 };
@@ -39,6 +40,10 @@ type Probe = {
   timer?: ReturnType<typeof setTimeout>;
   settle(active: boolean): void;
 };
+type PendingProxy = {
+  resolve(response: Response): void;
+  timer: ReturnType<typeof setTimeout>;
+};
 
 const CODE_LENGTH = 20;
 const PRODUCER_GRACE_MS = 10 * 60 * 1_000;
@@ -49,6 +54,7 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_ASSETS = 100;
 const MAX_ASSET_BYTES = 10 * 1024 * 1024;
 const MAX_PENDING_ACTIONS = 32;
+const PROXY_TIMEOUT_MS = 30 * 1_000;
 const encoder = new TextEncoder();
 
 function error(message: string, status: number): Response {
@@ -108,6 +114,29 @@ function packetCss(packet: Packet, required: boolean): string | undefined {
 function base64ToBytes(value: string): Uint8Array {
   const binary = atob(value);
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function bytesToBase64(value: Uint8Array): string {
+  let binary = "";
+  for (const byte of value) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function proxyResponse(packet: Packet): Response {
+  if (!Number.isInteger(packet.status) || (packet.status as number) < 200 || (packet.status as number) > 599) {
+    throw new Error("invalid proxy response status");
+  }
+  if (typeof packet.body !== "string") throw new Error("proxy response body is required");
+  const body = base64ToBytes(packet.body);
+  if (body.byteLength > MAX_BODY_BYTES) throw new Error("proxy response body is too large");
+  if (!packet.headers || typeof packet.headers !== "object" || Array.isArray(packet.headers)) throw new Error("proxy response headers are required");
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(packet.headers)) {
+    if (typeof value !== "string") throw new Error("proxy response headers must be strings");
+    headers.set(name, value);
+  }
+  const empty = packet.status === 204 || packet.status === 205 || packet.status === 304;
+  return new Response(empty ? null : body, { status: packet.status as number, headers });
 }
 
 function assetData(packet: Packet): StoredAsset {
@@ -396,6 +425,7 @@ async function replaceTarget(html: string, targetId: string, fragment: string): 
 export class Session extends DurableObject<Env> {
   private probe?: Probe;
   private stateMutation: Promise<void> = Promise.resolve();
+  private readonly pendingProxy = new Map<string, PendingProxy>();
 
   async fetch(request: Request): Promise<Response> {
     const action = request.headers.get("x-letmeknow-action");
@@ -443,9 +473,11 @@ export class Session extends DurableObject<Env> {
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
+    const mode = reconnect ? await this.ctx.storage.get<ProducerAttachment["mode"]>("mode") ?? "legacy" : "legacy";
     const attachment: ProducerAttachment = {
       role: "producer",
       url: request.headers.get("x-letmeknow-url")!,
+      mode,
       opened: reconnect && opened,
       closing: false
     };
@@ -559,17 +591,66 @@ export class Session extends DurableObject<Env> {
 
   private async browserRequest(request: Request): Promise<Response> {
     if (!(await this.ctx.storage.get<boolean>("opened"))) return error("session not found", 404);
+    const producer = this.producer();
+    const mode = producer ? (producer.deserializeAttachment() as ProducerAttachment).mode : "legacy";
+    if (mode === "proxy") return this.proxyRequest(request);
     const path = request.headers.get("x-letmeknow-path")!;
-    if (path === "/" && (request.method === "GET" || request.method === "HEAD")) {
+    const pathname = path.split("?", 1)[0];
+    if (pathname === "/" && (request.method === "GET" || request.method === "HEAD")) {
       const response = shell();
       return request.method === "HEAD" ? new Response(null, { status: response.status, headers: response.headers }) : response;
     }
-    if (path.startsWith("/assets/") && (request.method === "GET" || request.method === "HEAD")) {
-      const asset = await this.ctx.storage.get<StoredAsset>(`asset:${path}`);
+    if (pathname.startsWith("/assets/") && (request.method === "GET" || request.method === "HEAD")) {
+      const asset = await this.ctx.storage.get<StoredAsset>(`asset:${pathname}`);
       return asset ? assetResponse(asset, request.method === "HEAD") : error("asset not found", 404);
     }
     await request.body?.cancel();
     return error("not found", 404);
+  }
+
+  private async proxyRequest(request: Request): Promise<Response> {
+    const producer = this.producer();
+    if (!producer) return error("producer disconnected", 503);
+    const body = new Uint8Array(await request.arrayBuffer());
+    if (body.byteLength > MAX_BODY_BYTES) return error("request body is too large", 413);
+    const headers: Record<string, string> = {};
+    for (const [name, value] of request.headers) {
+      if (name !== "connection" && name !== "content-length" && name !== "host" && name !== "upgrade") headers[name] = value;
+    }
+    const id = crypto.randomUUID();
+    const response = new Promise<Response>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingProxy.delete(id);
+        resolve(error("producer request timed out", 504));
+      }, PROXY_TIMEOUT_MS);
+      this.pendingProxy.set(id, { resolve, timer });
+    });
+    try {
+      producer.send(JSON.stringify({
+        type: "http_request",
+        request_id: id,
+        method: request.method,
+        path: request.headers.get("x-letmeknow-path")!,
+        headers,
+        body: bytesToBase64(body)
+      }));
+    } catch {
+      const pending = this.pendingProxy.get(id);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pendingProxy.delete(id);
+        pending.resolve(error("producer disconnected", 503));
+      }
+    }
+    return response;
+  }
+
+  private failProxyRequests(): void {
+    for (const [id, pending] of this.pendingProxy) {
+      clearTimeout(pending.timer);
+      pending.resolve(error("producer disconnected", 503));
+      this.pendingProxy.delete(id);
+    }
   }
 
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -610,10 +691,13 @@ export class Session extends DurableObject<Env> {
     if (attachment.closing) throw new Error("session is closing");
 
     if (packet.type === "open") {
+      const mode = packet.mode ?? "legacy";
+      if (mode !== "legacy" && mode !== "proxy") throw new Error("invalid producer mode");
       await this.ctx.storage.transaction(async (txn) => {
         if (await txn.get<boolean>("expired") || !(await txn.get<string>("credential"))) throw new Error("session expired");
-        await txn.put("opened", true);
+        await txn.put({ opened: true, mode });
       });
+      attachment.mode = mode;
       attachment.opened = true;
       socket.serializeAttachment(attachment);
       await this.ctx.storage.deleteAlarm();
@@ -627,6 +711,25 @@ export class Session extends DurableObject<Env> {
     }
     if (!attachment.opened) throw new Error("open must be the first command");
 
+    if (packet.type === "http_response") {
+      if (typeof packet.request_id !== "string") throw new Error("request_id is required");
+      const pending = this.pendingProxy.get(packet.request_id);
+      if (!pending) throw new Error("proxy request is not pending");
+      clearTimeout(pending.timer);
+      this.pendingProxy.delete(packet.request_id);
+      try {
+        pending.resolve(proxyResponse(packet));
+      } catch {
+        pending.resolve(error("invalid proxy response", 502));
+      }
+      return;
+    }
+    if (packet.type === "file_update") {
+      if (attachment.mode !== "proxy") throw new Error("file updates require proxy mode");
+      if (typeof packet.path !== "string" || !packet.path.startsWith("/")) throw new Error("file update path is required");
+      this.sendClient({ type: "file_update", path: packet.path });
+      return;
+    }
     if (packet.type === "render") {
       const view: RenderedView = { id: crypto.randomUUID(), html: await packetHtml(packet), css: packetCss(packet, true)! };
       await this.ctx.storage.put({ view, pendingActions: {} });
@@ -772,6 +875,7 @@ export class Session extends DurableObject<Env> {
     if (this.probe?.socket === socket) this.probe.settle(false);
     await this.mutate(async () => {
       if (attachment.role === "producer") {
+        this.failProxyRequests();
         this.sendClient({ type: "producer", connected: false });
         if (attachment.opened && await this.ctx.storage.get<boolean>("opened")) {
           await this.ctx.storage.setAlarm(Date.now() + PRODUCER_GRACE_MS);
@@ -792,6 +896,7 @@ export class Session extends DurableObject<Env> {
     await this.mutate(async () => {
       const producer = this.producer();
       if (producer && (producer.deserializeAttachment() as ProducerAttachment).opened) return;
+      this.failProxyRequests();
       this.sendClient({ type: "closed", message: "Session expired" });
       this.client()?.close(1000, "session expired");
       producer?.close(1000, "session expired");
@@ -819,12 +924,9 @@ export default {
       const headers = new Headers(request.headers);
       if (target.path === "/_letmeknow/client") {
         headers.set("x-letmeknow-action", "client");
-      } else if (target.path === "/" || target.path.startsWith("/assets/")) {
-        headers.set("x-letmeknow-action", "browser");
-        headers.set("x-letmeknow-path", target.path);
       } else {
-        await request.body?.cancel();
-        return error("not found", 404);
+        headers.set("x-letmeknow-action", "browser");
+        headers.set("x-letmeknow-path", target.path + url.search);
       }
       return env.SESSIONS.getByName(target.code).fetch(new Request(request, { headers }));
     }
