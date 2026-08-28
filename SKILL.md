@@ -47,6 +47,8 @@ Use semantic HTML: headings, sections, paragraphs, lists, tables, `dl`, forms, l
 
 The optional `css` field supports modern CSS, including grid, flexbox, media queries, variables, transitions, and print styles. External stylesheets, `@import`, and remote resources do not work. Use relative session assets.
 
+Unless the human asks for a visual treatment, keep the page document-like: plain backgrounds, restrained typography, square corners, and simple borders. Avoid gradients, shadows, pill badges, rounded card grids, and decorative dashboard styling by default.
+
 A full `render` intentionally replaces the current page, resets drafts, and cancels actions from the previous render. Use `response` rather than `render` after a user action.
 
 ## Forms

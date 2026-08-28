@@ -102,7 +102,7 @@ Typing, focusing, expanding `<details>`, validation, scrolling, and other local 
 
 `render` accepts page CSS in its `css` field. A `response` may include `css` to replace it; omitting `css` preserves it.
 
-Modern CSS is supported, including grid, flexbox, media queries, variables, transitions, and print styles. External stylesheets, `@import`, scripts, inline handlers, and inline `style` attributes are blocked. Local assets work in HTML and CSS.
+Modern CSS is supported, including grid, flexbox, media queries, variables, transitions, and print styles. External stylesheets, `@import`, scripts, inline handlers, and inline `style` attributes are blocked. Local assets work in HTML and CSS. The built-in style is deliberately document-like and avoids decorative cards, gradients, shadows, and rounded controls.
 
 ## One browser client
 
