@@ -31,7 +31,7 @@ const CHALLENGE_TIMEOUT_MS = 2 * 1_000;
 const MAX_BODY_BYTES = 1024 * 1024;
 const PROXY_TIMEOUT_MS = 30 * 1_000;
 const encoder = new TextEncoder();
-const hopHeaders = new Set(["connection", "host", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "x-forwarded-host"]);
+const hopHeaders = new Set(["connection", "host", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "x-forwarded-host", "x-letmeknow-path", "x-letmeknow-route"]);
 
 function error(message: string, status: number): Response {
   return Response.json({ error: message }, { status, headers: { "Cache-Control": "no-store" } });
@@ -86,7 +86,7 @@ function publicTarget(url: URL): { code: string; path: string } | null {
   const host = hostname.match(new RegExp(`^([a-f0-9]{${CODE_LENGTH}})\\.letmeknow\\.dev$`));
   if (host) return { code: host[1], path: url.pathname };
   const path = url.pathname.match(new RegExp(`^/s/([a-f0-9]{${CODE_LENGTH}})(/.*)?$`));
-  if (!path || isProductionHost(url.hostname)) return null;
+  if (!path || (isProductionHost(url.hostname) && normalizedHostname(url.hostname) !== "letmeknow.dev")) return null;
   return { code: path[1], path: path[2] || "/" };
 }
 
@@ -102,10 +102,10 @@ export class Session extends DurableObject<Env> {
   private readonly pendingProxy = new Map<string, PendingProxy>();
 
   async fetch(request: Request): Promise<Response> {
-    const action = request.headers.get("x-letmeknow-action");
-    if (action === "producer") return this.mutate(() => this.acceptProducer(request));
-    if (action === "client") return this.mutate(() => this.acceptClient(request));
-    if (action === "browser") return this.browserRequest(request);
+    const route = request.headers.get("x-letmeknow-route");
+    if (route === "producer") return this.mutate(() => this.acceptProducer(request));
+    if (route === "client") return this.mutate(() => this.acceptClient(request));
+    if (route === "browser") return this.browserRequest(request);
     return error("not found", 404);
   }
 
@@ -448,9 +448,9 @@ export default {
     if (target) {
       const headers = new Headers(request.headers);
       if (target.path === "/_letmeknow/client") {
-        headers.set("x-letmeknow-action", "client");
+        headers.set("x-letmeknow-route", "client");
       } else {
-        headers.set("x-letmeknow-action", "browser");
+        headers.set("x-letmeknow-route", "browser");
         headers.set("x-letmeknow-path", target.path + url.search);
       }
       return env.SESSIONS.getByName(target.code).fetch(new Request(request, { headers }));
@@ -474,7 +474,7 @@ export default {
       const code = requestedCode || token();
       const producerCredential = credential || token(CODE_LENGTH * 2);
       const headers = new Headers(request.headers);
-      headers.set("x-letmeknow-action", "producer");
+      headers.set("x-letmeknow-route", "producer");
       headers.set("x-letmeknow-url", sessionUrl(url, code));
       headers.set("x-letmeknow-credential", producerCredential);
       if (reconnect) headers.set("x-letmeknow-reconnect", "true");
