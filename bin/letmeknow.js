@@ -206,6 +206,11 @@ class RelayResponse extends Writable {
     return this;
   }
 
+  appendHeader(name, value) {
+    const current = this.getHeader(name);
+    return this.setHeader(name, current ? [current, value] : value);
+  }
+
   getHeader(name) {
     return this.headers.get(name.toLowerCase());
   }
@@ -260,8 +265,10 @@ async function handleRequest(server, packet, send) {
     response.once("finish", resolveRequest);
     response.once("error", rejectRequest);
     try {
-      server.middlewares(request, response, () => {
-        if (!response.writableEnded) {
+      server.middlewares(request, response, cause => {
+        if (cause) {
+          rejectRequest(cause);
+        } else if (!response.writableEnded) {
           response.statusCode = 404;
           response.end("Not found");
         }

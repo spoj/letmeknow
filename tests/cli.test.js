@@ -36,7 +36,7 @@ async function runRelayScenario() {
       socket.on("message", data => {
         const packet = JSON.parse(data.toString());
         if (packet.type === "open") {
-          socket.send(JSON.stringify({ type: "http_request", request_id: "page", method: "GET", path: "/", headers: { accept: "text/html" }, body: "" }));
+          socket.send(JSON.stringify({ type: "http_request", request_id: "page", method: "GET", path: "/", headers: { accept: "text/html", "sec-fetch-dest": "document" }, body: "" }));
         } else if (packet.type === "http_response" && packet.request_id === "page") {
           pageResponse = { ...packet, body: Buffer.from(packet.body, "base64").toString() };
           socket.send(JSON.stringify({
