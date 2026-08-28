@@ -28,7 +28,7 @@ Start a session:
 stdout returns the URL to share with the human:
 
 ```json
-{"type":"session","id":"1","url":"https://0123456789abcdef0123.app.letmeknow.dev/","expires_after_disconnect":600}
+{"type":"session","id":"1","url":"https://0123456789abcdef0123.letmeknow.dev/","expires_after_disconnect":600}
 ```
 
 There is no initial bundle. Initial resources and later updates are the same `put` command:
@@ -90,7 +90,7 @@ Answer with the request event's `id` as `request_id`:
 
 Dynamic responses are not stored. Send a separate `put` to serve a path without involving the producer next time.
 
-Production sessions use isolated `*.app.letmeknow.dev` origins, so root-relative links, forms, and asset URLs work normally. Local sessions use `/s/<code>/`; use relative URLs there. Stored paths ignore the URL query when matching. Dynamic events contain pathname and query separately. Methods, forms, cookies, HTMX headers, SPA API requests, status, response headers, and text or binary bodies pass through generically. Browser request bodies use UTF-8 only for recognized textual media types; absent, unrecognized, or invalid UTF-8 bodies use base64. Request, response, and stored-resource bodies are bounded to 1 MiB and are non-streaming; a dynamic browser request times out after 30 seconds. Stored and dynamic responses default to `Cache-Control: no-store`; an explicit producer header overrides that default. A session accepts at most 100 stored resources (10 MiB decoded total) and 32 simultaneous dynamic requests.
+Production sessions use isolated `*.letmeknow.dev` origins, so root-relative links, forms, and asset URLs work normally. Local sessions use `/s/<code>/`; use relative URLs there. Stored paths ignore the URL query when matching. Dynamic events contain pathname and query separately. Methods, forms, cookies, HTMX headers, SPA API requests, status, response headers, and text or binary bodies pass through generically. Browser request bodies use UTF-8 only for recognized textual media types; absent, unrecognized, or invalid UTF-8 bodies use base64. Request, response, and stored-resource bodies are bounded to 1 MiB and are non-streaming; a dynamic browser request times out after 30 seconds. Stored and dynamic responses default to `Cache-Control: no-store`; an explicit producer header overrides that default. A session accepts at most 100 stored resources (10 MiB decoded total) and 32 simultaneous dynamic requests.
 
 ## Lifecycle
 
@@ -112,4 +112,4 @@ Deploy with:
 npm run deploy
 ```
 
-Production subdomain URLs require a proxied `*.app.letmeknow.dev` DNS record and a Worker route for `*.app.letmeknow.dev/*` in Cloudflare. The apex `letmeknow.dev` remains the control endpoint.
+Production subdomain URLs require a proxied `*.letmeknow.dev` DNS record and a Worker route for `*.letmeknow.dev/*` in Cloudflare. The apex `letmeknow.dev` remains the control endpoint.

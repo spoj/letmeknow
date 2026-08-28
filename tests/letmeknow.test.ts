@@ -110,7 +110,7 @@ describe("LetMeKnow agent web surface", () => {
     expect(local.url).toMatch(/^https:\/\/client\.example\/s\/[a-f0-9]{20}\/$/);
 
     const production = await open("https://letmeknow.dev");
-    expect(production.url).toMatch(/^https:\/\/[a-f0-9]{20}\.app\.letmeknow\.dev\/$/);
+    expect(production.url).toMatch(/^https:\/\/[a-f0-9]{20}\.letmeknow\.dev\/$/);
     production.producer.send({ type: "put", path: "/", body: "stored root" });
     await production.producer.next();
     expect(await (await SELF.fetch(production.url)).text()).toBe("stored root");
@@ -155,13 +155,13 @@ describe("LetMeKnow agent web surface", () => {
     expect(apex.status).toBe(308);
     expect(apex.headers.get("Location")).toBe("https://letmeknow.dev/form?step=2");
 
-    const publicHost = await SELF.fetch(new Request("http://0123456789abcdef0123.app.letmeknow.dev/v1/connect?step=2", {
+    const publicHost = await SELF.fetch(new Request("http://0123456789abcdef0123.letmeknow.dev/v1/connect?step=2", {
       method: "POST",
       body: "answer=yes",
       redirect: "manual"
     }));
     expect(publicHost.status).toBe(308);
-    expect(publicHost.headers.get("Location")).toBe("https://0123456789abcdef0123.app.letmeknow.dev/v1/connect?step=2");
+    expect(publicHost.headers.get("Location")).toBe("https://0123456789abcdef0123.letmeknow.dev/v1/connect?step=2");
 
     const local = await SELF.fetch(new Request("http://localhost/v1/connect", {
       method: "POST",

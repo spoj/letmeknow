@@ -31,7 +31,7 @@ function endpoint() {
   url.hash = "";
   if (credential && sessionUrl) {
     const publicUrl = new URL(sessionUrl);
-    const hostCode = publicUrl.hostname.match(/^([a-f0-9]{20})\.app\.letmeknow\.dev$/);
+    const hostCode = publicUrl.hostname.match(/^([a-f0-9]{20})\.letmeknow\.dev$/);
     const pathCode = publicUrl.pathname.match(/^\/s\/([a-f0-9]{20})(?:\/|$)/);
     const code = hostCode?.[1] || pathCode?.[1];
     if (code) {

@@ -32,11 +32,11 @@ async function runScenario(closeDuringReconnect) {
     connections++;
     if (connections === 1) {
       socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
-      socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.app.letmeknow.dev/", expires_after_disconnect: 600 }));
+      socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.letmeknow.dev/", expires_after_disconnect: 600 }));
     } else {
       reconnectQuery = request.url;
       reconnectProtocol = request.headers["sec-websocket-protocol"];
-      socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.app.letmeknow.dev/", expires_after_disconnect: 600 }));
+      socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.letmeknow.dev/", expires_after_disconnect: 600 }));
     }
     socket.on("message", (data) => {
       const packet = JSON.parse(data.toString());
@@ -85,7 +85,7 @@ async function runSentCloseScenario() {
   server.on("connection", (socket) => {
     connections++;
     socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
-    socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.app.letmeknow.dev/", expires_after_disconnect: 600 }));
+    socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.letmeknow.dev/", expires_after_disconnect: 600 }));
     socket.on("message", (data) => {
       if (JSON.parse(data.toString()).type === "open") child.stdin.write('{"type":"close","id":"sent-close"}\n');
       else socket.close(1000, "lost closing");
@@ -111,7 +111,7 @@ async function runTerminalCloseScenario() {
   const packets = [];
   server.on("connection", (socket) => {
     socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
-    socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.app.letmeknow.dev/", expires_after_disconnect: 600 }));
+    socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.letmeknow.dev/", expires_after_disconnect: 600 }));
     socket.on("message", (data) => {
       const packet = JSON.parse(data.toString());
       packets.push(packet);

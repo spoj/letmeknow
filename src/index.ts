@@ -180,11 +180,11 @@ function toResponse(resource: StoredResource, head = false): Response {
 }
 
 function isProductionHost(hostname: string): boolean {
-  return hostname === "letmeknow.dev" || /^[^.]+\.app\.letmeknow\.dev$/.test(hostname);
+  return hostname === "letmeknow.dev" || new RegExp(`^[a-f0-9]{${CODE_LENGTH}}\\.letmeknow\\.dev$`).test(hostname);
 }
 
 function publicTarget(url: URL): { code: string; path: string } | null {
-  const host = url.hostname.match(new RegExp(`^([a-f0-9]{${CODE_LENGTH}})\\.app\\.letmeknow\\.dev$`));
+  const host = url.hostname.match(new RegExp(`^([a-f0-9]{${CODE_LENGTH}})\\.letmeknow\\.dev$`));
   if (host) return { code: host[1], path: url.pathname };
   const path = url.pathname.match(new RegExp(`^/s/([a-f0-9]{${CODE_LENGTH}})(/.*)?$`));
   if (!path || url.hostname === "letmeknow.dev") return null;
@@ -193,7 +193,7 @@ function publicTarget(url: URL): { code: string; path: string } | null {
 
 function sessionUrl(url: URL, code: string): string {
   return url.hostname === "letmeknow.dev"
-    ? `https://${code}.app.letmeknow.dev/`
+    ? `https://${code}.letmeknow.dev/`
     : `${url.origin}/s/${code}/`;
 }
 

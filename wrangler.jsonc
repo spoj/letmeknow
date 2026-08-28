@@ -7,7 +7,7 @@
   "workers_dev": true,
   "routes": [
     "letmeknow.dev/*",
-    "*.app.letmeknow.dev/*"
+    "*.letmeknow.dev/*"
   ],
   "ratelimits": [
     {
