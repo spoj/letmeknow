@@ -103,8 +103,8 @@ describe("LetMeKnow outbound relay", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("<h1>From CLI</h1>");
 
-    producer.send({ type: "file_update", path: "/index.html" });
-    expect(await client.next()).toEqual({ type: "file_update", path: "/index.html" });
+    producer.send({ type: "file_update", path: "/space%20file.css" });
+    expect(await client.next()).toEqual({ type: "file_update", path: "/space%20file.css" });
   });
 
   it("relays form submissions and preserves the session path", async () => {

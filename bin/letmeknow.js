@@ -10,6 +10,7 @@ const CONNECTION_TIMEOUT = 10_000;
 const MAX_RETRY_DELAY = 5_000;
 const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const mimeTypes = {
+  ".avif": "image/avif",
   ".css": "text/css; charset=utf-8",
   ".csv": "text/csv; charset=utf-8",
   ".gif": "image/gif",
@@ -19,12 +20,14 @@ const mimeTypes = {
   ".jpg": "image/jpeg",
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
   ".mjs": "text/javascript; charset=utf-8",
   ".pdf": "application/pdf",
   ".png": "image/png",
   ".svg": "image/svg+xml",
   ".txt": "text/plain; charset=utf-8",
   ".wasm": "application/wasm",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
   ".webp": "image/webp",
   ".woff": "font/woff",
   ".woff2": "font/woff2",
@@ -42,22 +45,23 @@ let retryTimer;
 let updateTimer;
 let reloadTimer;
 let terminal=false;
-const controls=()=>[...document.querySelectorAll("input,select,textarea")];
+const controls=()=>[...document.querySelectorAll("button,input,select,textarea")];
 const details=()=>[...document.querySelectorAll("details")];
 const uniqueId=(element,all)=>element.id&&all.filter(candidate=>candidate.id===element.id).length===1?element.id:null;
 const formIdentity=form=>form?.id||form?.getAttribute("name")||form?.getAttribute("action")||"document";
 const controlKey=(control,index,all=controls())=>{const id=uniqueId(control,all);if(id)return"id:"+id;const form=control.form;const identity=formIdentity(form)+":"+(control.type||control.localName)+":"+(control.name||"");const occurrence=all.slice(0,index).filter(candidate=>!uniqueId(candidate,all)&&formIdentity(candidate.form)+":"+(candidate.type||candidate.localName)+":"+(candidate.name||"")===identity).length;return"control:"+identity+":"+occurrence};
 const detailKey=(element,index,all=details())=>{const id=uniqueId(element,all);return id?"id:"+id:"detail:"+index};
-const snapshot=()=>{const all=controls();return{version:1,page:routePath(),controls:all.map((control,index)=>({key:controlKey(control,index,all),value:control.value,checked:control.checked,indeterminate:control.indeterminate,selected:control instanceof HTMLSelectElement?[...control.options].map((option,optionIndex)=>option.selected?optionIndex:null).filter(optionIndex=>optionIndex!==null):undefined,start:typeof control.selectionStart==="number"?control.selectionStart:undefined,end:typeof control.selectionEnd==="number"?control.selectionEnd:undefined,direction:control.selectionDirection||undefined})),active:document.activeElement instanceof Element?controlKey(document.activeElement,all.indexOf(document.activeElement),all):undefined,details:details().map((element,index)=>({key:detailKey(element,index),open:element.open})),x:scrollX,y:scrollY}};
+const pageIdentity=()=>location.pathname+location.search+location.hash;
+const snapshot=()=>{const all=controls();return{version:1,page:pageIdentity(),controls:all.map((control,index)=>({key:controlKey(control,index,all),value:control.value,checked:control.checked,indeterminate:control.indeterminate,selected:control instanceof HTMLSelectElement?[...control.options].map((option,optionIndex)=>option.selected?optionIndex:null).filter(optionIndex=>optionIndex!==null):undefined,start:typeof control.selectionStart==="number"?control.selectionStart:undefined,end:typeof control.selectionEnd==="number"?control.selectionEnd:undefined,direction:control.selectionDirection||undefined})),active:document.activeElement instanceof Element?controlKey(document.activeElement,all.indexOf(document.activeElement),all):undefined,details:details().map((element,index)=>({key:detailKey(element,index),open:element.open})),x:scrollX,y:scrollY}};
 const status=message=>{const element=document.querySelector("[data-letmeknow-status]");if(element)element.textContent=message};
 const stripSessionPath=path=>{if(sessionBase==="/")return path;if(path===sessionBase.slice(0,-1))return "/";return path.startsWith(sessionBase)?"/"+path.slice(sessionBase.length):path};
 const routePath=()=>{let path=stripSessionPath(location.pathname);return path.endsWith("/")?path+"index.html":path};
 const pagePath=path=>{path=path.split("?",1)[0];return stripSessionPath(path)||"/"};
-const restore=()=>{let raw;try{raw=sessionStorage.getItem(snapshotKey)}catch{return}if(!raw)return;try{sessionStorage.removeItem(snapshotKey)}catch{}let saved;try{saved=JSON.parse(raw)}catch{return}if(saved.version!==1||saved.page!==routePath())return;const all=controls();const savedControls=new Map((Array.isArray(saved.controls)?saved.controls:[]).map(state=>[state.key,state]));let active;for(const [index,control] of all.entries()){const state=savedControls.get(controlKey(control,index,all));if(!state)continue;if(control instanceof HTMLSelectElement&&Array.isArray(state.selected))for(const [optionIndex,option] of [...control.options].entries())option.selected=state.selected.includes(optionIndex);else if(control.type==="checkbox"||control.type==="radio"){control.checked=state.checked;control.indeterminate=state.indeterminate}else{control.value=state.value;if(typeof state.start==="number"&&typeof control.setSelectionRange==="function")control.setSelectionRange(state.start,state.end,state.direction||"none")}if(controlKey(control,index,all)===saved.active)active=control}const savedDetails=new Map((Array.isArray(saved.details)?saved.details:[]).map(state=>[state.key,state]));for(const [index,element] of details().entries()){const state=savedDetails.get(detailKey(element,index));if(state)element.open=state.open}active?.focus({preventScroll:true});scrollTo(saved.x||0,saved.y||0)};
+const restore=()=>{let raw;try{raw=sessionStorage.getItem(snapshotKey)}catch{return}if(!raw)return;try{sessionStorage.removeItem(snapshotKey)}catch{}let saved;try{saved=JSON.parse(raw)}catch{return}if(saved.version!==1||saved.page!==pageIdentity())return;const all=controls();const savedControls=new Map((Array.isArray(saved.controls)?saved.controls:[]).map(state=>[state.key,state]));let active;for(const [index,control] of all.entries()){const state=savedControls.get(controlKey(control,index,all));if(!state)continue;if(control instanceof HTMLSelectElement&&Array.isArray(state.selected))for(const [optionIndex,option] of [...control.options].entries())option.selected=state.selected.includes(optionIndex);else if(control.type==="checkbox"||control.type==="radio"){control.checked=state.checked;control.indeterminate=state.indeterminate}else{control.value=state.value;if(typeof state.start==="number"&&typeof control.setSelectionRange==="function")control.setSelectionRange(state.start,state.end,state.direction||"none")}if(controlKey(control,index,all)===saved.active)active=control}const savedDetails=new Map((Array.isArray(saved.details)?saved.details:[]).map(state=>[state.key,state]));for(const [index,element] of details().entries()){const state=savedDetails.get(detailKey(element,index));if(state)element.open=state.open}active?.focus({preventScroll:true});scrollTo(saved.x||0,saved.y||0)};
 const reload=()=>{if(reloadTimer)return;reloadTimer=setTimeout(()=>{try{sessionStorage.setItem(snapshotKey,JSON.stringify(snapshot()))}catch{}location.reload()},75)};
 const linkedStylesheet=path=>{for(const link of document.querySelectorAll("link[rel=stylesheet]")){let url;try{url=new URL(link.href,location.href)}catch{continue}if(url.origin!==location.origin)continue;if(sessionBase!=="/"&&!url.pathname.startsWith(sessionBase))continue;if(pagePath(url.pathname)===path)return link}return null};
-const refreshStylesheet=(path,link)=>{const url=new URL(link.href,location.href);url.searchParams.set("_letmeknow",crypto.randomUUID());link.href=url.href};
-const flushUpdates=()=>{updateTimer=undefined;const paths=[...pendingUpdates];pendingUpdates.clear();let shouldReload=false;const styles=[];for(const path of paths){if(/\.html?$/i.test(path)){if(path===routePath())shouldReload=true}else if(/\.css$/i.test(path)){const link=linkedStylesheet(path);if(link)styles.push([path,link]);else shouldReload=true}else shouldReload=true}if(shouldReload){reload();return}for(const [path,link] of styles)refreshStylesheet(path,link)};
+const refreshStylesheet=link=>{const url=new URL(link.href,location.href);url.searchParams.set("_letmeknow",crypto.randomUUID());link.href=url.href};
+const flushUpdates=()=>{updateTimer=undefined;const paths=[...pendingUpdates];pendingUpdates.clear();let shouldReload=false;const styles=[];for(const path of paths){if(/\.html?$/i.test(path)){if(path===routePath())shouldReload=true}else if(/\.css$/i.test(path)){const link=linkedStylesheet(path);if(link)styles.push([path,link]);else shouldReload=true}else shouldReload=true}if(shouldReload){reload();return}for(const [,link] of styles)refreshStylesheet(link)};
 const pendingUpdates=new Set();
 const update=path=>{if(typeof path!=="string")return;path=pagePath(path);pendingUpdates.add(path);if(!updateTimer)updateTimer=setTimeout(flushUpdates,75)};
 addEventListener("load",()=>requestAnimationFrame(restore),{once:true});
@@ -105,11 +109,14 @@ document.addEventListener("submit",async event=>{
 connect();
 `;
 
+function header(packet, name) {
+  const entry = Object.entries(packet.headers || {}).find(([key]) => key.toLowerCase() === name);
+  return typeof entry?.[1] === "string" && entry[1] !== "" ? entry[1] : null;
+}
+
 function encodedHeader(packet, name) {
-  const headers = packet.headers || {};
-  const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === name);
-  const value = entry?.[1];
-  if (typeof value !== "string" || value === "") return null;
+  const value = header(packet, name);
+  if (value === null) return null;
   try { return decodeURIComponent(value); } catch { return null; }
 }
 
@@ -159,11 +166,11 @@ async function safeRealpath(root, candidate) {
 function requestUrl(packet) {
   if (typeof packet.path !== "string" || !packet.path.startsWith("/")) throw new Error("invalid request path");
   const url = new URL(packet.path, "http://letmeknow.local");
-  if (url.origin !== "http://letmeknow.local" || url.pathname.includes("\\")) throw new Error("invalid request path");
+  if (url.origin !== "http://letmeknow.local") throw new Error("invalid request path");
   let pathname;
   try { pathname = decodeURIComponent(url.pathname); } catch { throw new Error("invalid request path"); }
-  if (pathname.includes("\0")) throw new Error("invalid request path");
-  return { pathname, search: url.search };
+  if (pathname.includes("\0") || pathname.includes("\\")) throw new Error("invalid request path");
+  return { pathname, encodedPathname: url.pathname, search: url.search };
 }
 
 function htmlWithClient(body) {
@@ -193,7 +200,10 @@ async function staticResponse(root, packet) {
     return errorResponse(packet, 500, "preview request failed");
   }
   if (info.isDirectory()) {
-    if (!request.pathname.endsWith("/")) return response(packet, 301, Buffer.from(`Redirecting to ${request.pathname}/${request.search}`), { Location: request.pathname + "/" + request.search, "Content-Type": "text/plain; charset=utf-8" });
+    if (!request.pathname.endsWith("/")) {
+      const location = request.encodedPathname + "/" + request.search;
+      return response(packet, 301, Buffer.from(`Redirecting to ${location}`), { Location: location, "Content-Type": "text/plain; charset=utf-8" });
+    }
     const index = resolve(target, "index.html");
     try { target = await realpath(index); } catch (cause) {
       if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");
@@ -223,7 +233,7 @@ async function submission(packet) {
   } else if (method === "POST") {
     const body = Buffer.from(typeof packet.body === "string" ? packet.body : "", "base64");
     if (body.byteLength > MAX_BODY_BYTES) throw new Error("submission is too large");
-    const contentType = encodedHeader(packet, "content-type")?.split(";", 1)[0].trim();
+    const contentType = header(packet, "content-type")?.split(";", 1)[0].trim().toLowerCase();
     if (contentType !== "application/x-www-form-urlencoded") throw new Error("unsupported submission encoding");
     for (const [name, value] of new URLSearchParams(body.toString("utf8"))) addValue(values, name, value);
   } else throw new Error("unsupported submission method");
@@ -241,7 +251,7 @@ async function submission(packet) {
 }
 
 async function handleRequest(root, packet) {
-  if (encodedHeader(packet, "x-letmeknow-submission") === "1") {
+  if (header(packet, "x-letmeknow-submission") === "1") {
     try { return await submission(packet); } catch (cause) { return errorResponse(packet, cause?.message === "submission is too large" ? 413 : 400, cause instanceof Error ? cause.message : "invalid submission"); }
   }
   return staticResponse(root, packet);
@@ -292,7 +302,7 @@ async function start(args) {
     if (!filename) { send({ type: "file_update", path: "/" }); return; }
     const file = resolve(root, String(filename));
     const path = relative(root, file).split(sep).join("/");
-    if (!path || path.startsWith("../") || path === "..") return;
+    if (!path || path.startsWith("../") || path === ".." || deniedPath("/" + path)) return;
     send({ type: "file_update", path: "/" + path.split("/").map(encodeURIComponent).join("/") });
   });
   let socket;
