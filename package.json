@@ -2,11 +2,17 @@
   "name": "letmeknow",
   "private": true,
   "type": "module",
+  "bin": {
+    "letmeknow": "bin/letmeknow.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
-    "test": "npm run check && vitest run"
+    "test": "npm run check && vitest run && node --test tests/cli.test.js"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.1.0",
@@ -14,6 +20,7 @@
     "@types/node": "^22.15.17",
     "typescript": "^5.9.2",
     "vitest": "^4.1.11",
-    "wrangler": "^4.126.0"
+    "wrangler": "^4.126.0",
+    "ws": "^8.21.3"
   }
 }
