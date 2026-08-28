@@ -1,452 +1,632 @@
-import { SELF } from "cloudflare:test";
+import { SELF, runDurableObjectAlarm } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import worker from "../src/index";
-import { describe, expect, it, vi } from "vitest";
+import { Session } from "../src/index";
+import { afterEach, describe, expect, it } from "vitest";
 
-type QuestionResponse = {
-  question_url: string;
-  status_url: string;
-  expires_at: string;
-};
-
-type Answer = {
-  approve: string;
-  notes: string;
+type Event = Record<string, unknown>;
+type Producer = {
+  socket: WebSocket;
+  credential?: string;
+  next(): Promise<Event>;
+  send(packet: Record<string, unknown>): void;
 };
 
 const origin = "https://client.example";
-let ipNumber = 0;
+const sockets: WebSocket[] = [];
+let ipCounter = 0;
 
-function fields() {
-  return [
-    { id: "approve", label: "Continue?", type: "choice", options: ["Yes", "No"] },
-    { id: "notes", label: "Notes", type: "text" }
-  ];
-}
+async function connect(base = origin, auth?: { code: string; credential: string }): Promise<Producer> {
+  const endpoint = new URL(`${base}/v1/connect`);
+  const headers: Record<string, string> = {
+    Upgrade: "websocket",
+    "CF-Connecting-IP": `192.0.2.${++ipCounter}`
+  };
+  if (auth) headers["Sec-WebSocket-Protocol"] = auth.credential;
+  if (auth) endpoint.searchParams.set("code", auth.code);
+  const response = await SELF.fetch(new Request(endpoint, { headers }));
+  expect(response.status).toBe(101);
+  expect(response.headers.get("Sec-WebSocket-Protocol")).toBe(auth?.credential || null);
+  const socket = response.webSocket!;
+  socket.accept();
+  sockets.push(socket);
 
-function questionBody() {
-  return { title: "Release approval", fields: fields() };
-}
-
-function nextIp(): string {
-  ipNumber += 1;
-  return `198.51.100.${ipNumber}`;
-}
-
-function request(path: string, init: RequestInit = {}): Request {
-  const headers = new Headers(init.headers);
-  if (!headers.has("CF-Connecting-IP")) headers.set("CF-Connecting-IP", nextIp());
-  return new Request(`${origin}${path}`, { ...init, headers });
-}
-
-async function create(body: unknown = questionBody()): Promise<{ response: Response; data: Partial<QuestionResponse> }> {
-  const response = await SELF.fetch(request("/questions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  }));
-  const data = await response.json() as Partial<QuestionResponse>;
-  return { response, data };
-}
-
-async function answer(questionUrl: string, values: Partial<Answer> = { approve: "Yes", notes: "Looks good" }): Promise<Response> {
-  const body = new URLSearchParams();
-  if (values.approve !== undefined) body.set("field_approve", values.approve);
-  if (values.notes !== undefined) body.set("field_notes", values.notes);
-  return SELF.fetch(new Request(questionUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body
-  }));
-}
-
-async function status(statusUrl: string, wait?: string, signal?: AbortSignal): Promise<Response> {
-  const url = new URL(statusUrl);
-  if (wait !== undefined) url.searchParams.set("wait", wait);
-  return SELF.fetch(new Request(url, { signal }));
-}
-
-function streamed(text: string): ReadableStream<Uint8Array> {
-  const bytes = new TextEncoder().encode(text);
-  return new ReadableStream({
-    start(controller) {
-      for (let offset = 0; offset < bytes.length; offset += 257) {
-        controller.enqueue(bytes.slice(offset, offset + 257));
-      }
-      controller.close();
+  const queued: Event[] = [];
+  const waiting: Array<(event: Event) => void> = [];
+  let credential: string | undefined;
+  socket.addEventListener("message", (message) => {
+    const event = JSON.parse(message.data as string) as Event;
+    if (event.type === "credential") {
+      credential = event.credential as string;
+      return;
     }
+    const resolve = waiting.shift();
+    if (resolve) resolve(event);
+    else queued.push(event);
   });
+  return {
+    socket,
+    get credential() { return credential; },
+    next: () => {
+      const event = queued.shift();
+      return event ? Promise.resolve(event) : new Promise((resolve) => waiting.push(resolve));
+    },
+    send: (packet) => socket.send(JSON.stringify(packet))
+  };
 }
 
-describe("LetMeKnow", () => {
-  it("serves the root as genuine plain text", async () => {
-    const response = await SELF.fetch(`${origin}/`);
-
-    expect(response.status).toBe(200);
-    expect(response.headers.get("Content-Type")).toMatch(/^text\/plain; charset=utf-8$/);
-    const body = await response.text();
-    expect(body).toContain("# LetMeKnow");
-    expect(body).toContain(`curl -sS -X POST ${origin}/questions`);
-    expect(body).toContain(`status_url="${origin}/s/<status-token>"`);
-    expect(body).toContain(`curl -sS -w '\\n%{http_code}'`);
-    expect(body).toContain("202) sleep 3 ;;");
-    expect(body).toContain("200|410|404) break");
-    expect(body).not.toContain(`GET ${origin}/s/`);
+async function open(base = origin): Promise<{ producer: Producer; url: string }> {
+  const producer = await connect(base);
+  producer.send({ type: "open", id: "open-1" });
+  const event = await producer.next();
+  expect(event).toMatchObject({
+    type: "session",
+    id: "open-1",
+    expires_after_disconnect: 600
   });
+  return { producer, url: event.url as string };
+}
 
-  it("converts rejected async dependencies into an internal server error", async () => {
-    const response = await worker.fetch(request("/questions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(questionBody())
-    }), {
-      DB: env.DB,
-      CREATE_RATE_LIMIT: { limit: vi.fn().mockRejectedValue(new Error("rate limit unavailable")) }
+async function reconnect(url: string, producer: Producer): Promise<Producer> {
+  const publicUrl = new URL(url);
+  const code = publicUrl.hostname.match(/^([a-f0-9]{20})\.app\.letmeknow\.dev$/)?.[1]
+    || publicUrl.pathname.match(/^\/s\/([a-f0-9]{20})\//)?.[1];
+  expect(code).toBeDefined();
+  expect(producer.credential).toBeDefined();
+  const replacement = await connect(origin, { code: code!, credential: producer.credential! });
+  expect(await replacement.next()).toMatchObject({ type: "session", url });
+  return replacement;
+}
+
+function path(url: string, pathname: string): string {
+  return new URL(pathname.replace(/^\//, ""), url).toString();
+}
+
+afterEach(() => {
+  for (const socket of sockets.splice(0)) socket.close(1000, "test complete");
+});
+
+describe("LetMeKnow agent web surface", () => {
+  it("documents the NDJSON transport and requires a WebSocket upgrade", async () => {
+    const home = await SELF.fetch(`${origin}/`);
+    expect(home.status).toBe(200);
+    expect(home.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
+    expect(await home.text()).toContain('{"type":"open"}');
+    const apex = await SELF.fetch("https://letmeknow.dev/");
+    expect(apex.status).toBe(200);
+    expect(await apex.text()).toContain("LETMEKNOW_URL=https://letmeknow.dev");
+
+    const connectResponse = await SELF.fetch(`${origin}/v1/connect`);
+    expect(connectResponse.status).toBe(426);
+    expect(await connectResponse.json()).toEqual({ error: "websocket upgrade required" });
+
+    const queryCredential = await SELF.fetch(`${origin}/v1/connect?credential=private`, {
+      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": "letmeknow" }
     });
-
-    expect(response.status).toBe(500);
-    expect(await response.json()).toEqual({ error: "internal server error" });
+    expect(queryCredential.status).toBe(401);
   });
 
-  it("returns the create rate-limit contract", async () => {
-    const limit = vi.fn().mockResolvedValue({ success: false });
-    const response = await worker.fetch(request("/questions", {
+  it("uses an isolated production host and the path form in local environments", async () => {
+    const local = await open();
+    expect(local.url).toMatch(/^https:\/\/client\.example\/s\/[a-f0-9]{20}\/$/);
+
+    const production = await open("https://letmeknow.dev");
+    expect(production.url).toMatch(/^https:\/\/[a-f0-9]{20}\.app\.letmeknow\.dev\/$/);
+    production.producer.send({ type: "put", path: "/", body: "stored root" });
+    await production.producer.next();
+    expect(await (await SELF.fetch(production.url)).text()).toBe("stored root");
+
+    const code = new URL(production.url).hostname.split(".")[0];
+    const apexPath = await SELF.fetch(`https://letmeknow.dev/s/${code}/`);
+    expect(apexPath.status).toBe(404);
+
+    production.producer.send({ type: "delete", path: "/" });
+    await production.producer.next();
+    const dynamic = SELF.fetch(production.url);
+    const request = await production.producer.next();
+    expect(request).toMatchObject({ type: "request", method: "GET", path: "/" });
+    production.producer.send({ type: "response", request_id: request.id, body: "dynamic root" });
+    await production.producer.next();
+    expect(await (await dynamic).text()).toBe("dynamic root");
+
+    production.producer.send({ type: "put", path: "/app.js", body: "root relative works" });
+    await production.producer.next();
+    expect(await (await SELF.fetch(new URL("/app.js", production.url))).text()).toBe("root relative works");
+
+    production.producer.send({ type: "put", path: "/v1/connect", body: "stored connect path" });
+    await production.producer.next();
+    expect(await (await SELF.fetch(new URL("/v1/connect", production.url))).text()).toBe("stored connect path");
+
+    production.producer.send({ type: "delete", path: "/v1/connect" });
+    await production.producer.next();
+    const dynamicConnect = SELF.fetch(new URL("/v1/connect", production.url));
+    const connectRequest = await production.producer.next();
+    expect(connectRequest).toMatchObject({ type: "request", method: "GET", path: "/v1/connect" });
+    production.producer.send({ type: "response", request_id: connectRequest.id, body: "dynamic connect path" });
+    await production.producer.next();
+    expect(await (await dynamicConnect).text()).toBe("dynamic connect path");
+  });
+
+  it("redirects production HTTP requests to HTTPS without redirecting local hosts", async () => {
+    const apex = await SELF.fetch(new Request("http://letmeknow.dev/form?step=2", {
+      method: "POST",
+      body: "answer=yes",
+      redirect: "manual"
+    }));
+    expect(apex.status).toBe(308);
+    expect(apex.headers.get("Location")).toBe("https://letmeknow.dev/form?step=2");
+
+    const publicHost = await SELF.fetch(new Request("http://0123456789abcdef0123.app.letmeknow.dev/v1/connect?step=2", {
+      method: "POST",
+      body: "answer=yes",
+      redirect: "manual"
+    }));
+    expect(publicHost.status).toBe(308);
+    expect(publicHost.headers.get("Location")).toBe("https://0123456789abcdef0123.app.letmeknow.dev/v1/connect?step=2");
+
+    const local = await SELF.fetch(new Request("http://localhost/v1/connect", {
+      method: "POST",
+      body: "answer=yes",
+      redirect: "manual"
+    }));
+    expect(local.status).toBe(426);
+  });
+
+  it("stores, replaces, and deletes exact paths with ordinary commands", async () => {
+    const { producer, url } = await open();
+
+    producer.send({
+      type: "put",
+      id: "put-1",
+      path: "/index.html",
+      content_type: "text/html; charset=utf-8",
+      headers: {
+        "content-type": "text/plain",
+        "set-cookie": ["first=1; Path=/", "second=2; Path=/"],
+        "x-repeat": ["one", "two"]
+      },
+      body: "<h1>First</h1>"
+    });
+    expect(await producer.next()).toEqual({ type: "ack", id: "put-1" });
+
+    const first = await SELF.fetch(path(url, "/index.html?view=full"));
+    expect(first.status).toBe(200);
+    expect(first.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
+    expect(first.headers.getSetCookie()).toEqual(["first=1; Path=/", "second=2; Path=/"]);
+    expect(first.headers.get("X-Repeat")).toBe("one, two");
+    expect(first.headers.get("Cache-Control")).toBe("no-store");
+    expect(await first.text()).toBe("<h1>First</h1>");
+
+    producer.send({ type: "put", id: "put-2", path: "/index.html", status: 201, body: "Second" });
+    expect(await producer.next()).toEqual({ type: "ack", id: "put-2" });
+    const replaced = await SELF.fetch(path(url, "/index.html"));
+    expect(replaced.status).toBe(201);
+    expect(await replaced.text()).toBe("Second");
+
+    producer.send({ type: "delete", id: "delete-1", path: "/index.html" });
+    expect(await producer.next()).toEqual({ type: "ack", id: "delete-1" });
+
+    const waiting = SELF.fetch(path(url, "/index.html"));
+    expect(await producer.next()).toMatchObject({ type: "request", method: "GET", path: "/index.html" });
+    producer.send({ type: "response", request_id: "missing", body: "no" });
+    expect(await producer.next()).toMatchObject({ type: "error", message: "request is not pending" });
+    producer.socket.close(1000, "done");
+    expect((await waiting).status).toBe(503);
+  });
+
+  it("supports base64 resources", async () => {
+    const { producer, url } = await open();
+    producer.send({
+      type: "put",
+      id: "image",
+      path: "/pixel.bin",
+      content_type: "application/octet-stream",
+      encoding: "base64",
+      body: "AAEC/w=="
+    });
+    expect(await producer.next()).toEqual({ type: "ack", id: "image" });
+
+    const response = await SELF.fetch(path(url, "/pixel.bin"));
+    expect([...new Uint8Array(await response.arrayBuffer())]).toEqual([0, 1, 2, 255]);
+  });
+
+  it("forwards forms and returns arbitrary dynamic responses without storing them", async () => {
+    const { producer, url } = await open();
+    const browserResponse = SELF.fetch(path(url, "/answer?step=2"), {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        "CF-Connecting-IP": "203.0.113.10"
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: "visitor=abc",
+        "HX-Request": "true"
       },
-      body: JSON.stringify(questionBody())
-    }), {
-      DB: env.DB,
-      CREATE_RATE_LIMIT: { limit }
+      body: "answer=yes"
     });
 
-    expect(limit).toHaveBeenCalledWith({ key: "203.0.113.10" });
-    expect(response.status).toBe(429);
-    expect(response.headers.get("Retry-After")).toBe("60");
-    expect(await response.json()).toEqual({ error: "too many questions; try again later" });
-  });
+    const request = await producer.next();
+    expect(request).toMatchObject({
+      type: "request",
+      method: "POST",
+      path: "/answer",
+      query: "step=2",
+      encoding: "utf8",
+      body: "answer=yes"
+    });
+    expect(request.headers).toMatchObject({
+      "content-type": "application/x-www-form-urlencoded",
+      cookie: "visitor=abc",
+      "hx-request": "true"
+    });
 
-  it("creates a tiny answer path and a private status path using the request origin", async () => {
-    const before = Date.now();
-    const { response, data } = await create();
+    producer.send({
+      type: "response",
+      id: "response-1",
+      request_id: request.id,
+      status: 202,
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "hx-trigger": "answered",
+        "set-cookie": ["done=yes; Path=/; Secure", "theme=dark; Path=/; Secure"]
+      },
+      body: "<strong>Accepted</strong>"
+    });
+    expect(await producer.next()).toEqual({ type: "ack", id: "response-1" });
 
-    expect(response.status).toBe(201);
-    expect(data.question_url).toMatch(new RegExp(`^${origin}/q/[A-Za-z0-9_-]{11}$`));
-    expect(data.status_url).toMatch(new RegExp(`^${origin}/s/[A-Za-z0-9_-]{43}$`));
-    expect(new URL(data.question_url!).pathname.length).toBe(14);
-    expect(new URL(data.status_url!).pathname.length).toBe(46);
-    expect(data.question_url).not.toBe(data.status_url);
-
-    const statusUsingAnswerCapability = await status(data.question_url!.replace("/q/", "/s/"), "0");
-    expect(statusUsingAnswerCapability.status).toBe(404);
-    await statusUsingAnswerCapability.text();
-    const questionUsingStatusCapability = await SELF.fetch(new Request(data.status_url!.replace("/s/", "/q/")));
-    expect(questionUsingStatusCapability.status).toBe(404);
-    await questionUsingStatusCapability.text();
-
-    const expiresAt = new Date(data.expires_at!).getTime();
-    expect(expiresAt - before).toBeGreaterThan(9 * 60 * 1_000);
-    expect(expiresAt - before).toBeLessThanOrEqual(10 * 60 * 1_000 + 1_000);
-  });
-
-  it("rejects malformed compact q and s routes before dispatch", async () => {
-    const malformed = [
-      `/q/${"a".repeat(10)}`,
-      `/q/${"a".repeat(12)}`,
-      `/q/${"a".repeat(10)}!`,
-      `/q/${"a".repeat(11)}.extra`,
-      `/s/${"b".repeat(42)}`,
-      `/s/${"b".repeat(44)}`,
-      `/s/${"b".repeat(42)}!`,
-      `/s/${"b".repeat(43)}.extra`
-    ];
-
-    for (const path of malformed) {
-      const response = await SELF.fetch(request(path));
-      expect(response.status).toBe(404);
-      await response.text();
-    }
-  });
-
-  it("rejects malformed creation and invalid field definitions", async () => {
-    const invalidBodies: unknown[] = [
-      "not an object",
-      {},
-      { title: "", fields: fields() },
-      { title: "Question", fields: [] },
-      { title: "Question", fields: [{ id: "Bad id", label: "Question", type: "text" }] },
-      { title: "Question", fields: [{ id: "same", label: "One", type: "text" }, { id: "same", label: "Two", type: "text" }] },
-      { title: "Question", fields: [{ id: "pick", label: "Pick", type: "choice", options: ["Only one"] }] },
-      { title: "Question", fields: [{ id: "other", label: "Other", type: "unsupported" }] }
-    ];
-
-    for (const body of invalidBodies) {
-      const { response } = await create(body);
-      expect(response.status).toBe(400);
-    }
-  });
-
-  it("returns pending immediately for wait=0", async () => {
-    const { data } = await create();
-    const response = await status(data.status_url!, "0");
-
+    const response = await browserResponse;
     expect(response.status).toBe(202);
-    expect(response.headers.get("Retry-After")).toBe("3");
-    expect(await response.json()).toEqual({ status: "pending" });
+    expect(response.headers.get("HX-Trigger")).toBe("answered");
+    expect(response.headers.getSetCookie()).toEqual(["done=yes; Path=/; Secure", "theme=dark; Path=/; Secure"]);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(await response.text()).toBe("<strong>Accepted</strong>");
+
+    const secondBrowserResponse = SELF.fetch(path(url, "/answer?step=3"));
+    const secondRequest = await producer.next();
+    expect(secondRequest).toMatchObject({ type: "request", path: "/answer", query: "step=3" });
+    producer.send({ type: "response", request_id: secondRequest.id, status: 204 });
+    expect(await producer.next()).toEqual({ type: "ack" });
+    expect((await secondBrowserResponse).status).toBe(204);
   });
 
-  it("returns an answer during a bounded D1 poll", async () => {
-    const { data } = await create();
-    const waiting = status(data.status_url!, "3");
+  it("encodes valid browser bodies without a content type as base64", async () => {
+    const { producer, url } = await open();
+    const browserResponse = SELF.fetch(path(url, "/upload"), {
+      method: "POST",
+      body: new Uint8Array([0x68, 0xc3, 0xa9])
+    });
+    const request = await producer.next();
+    expect(request).toMatchObject({ encoding: "base64", body: "aMOp" });
+    producer.send({ type: "response", request_id: request.id, body: "ok" });
+    await producer.next();
+    expect(await (await browserResponse).text()).toBe("ok");
+  });
+
+  it("preserves invalid UTF-8 browser bodies without a content type", async () => {
+    const { producer, url } = await open();
+    const browserResponse = SELF.fetch(path(url, "/upload"), {
+      method: "POST",
+      body: new Uint8Array([0xc3, 0x28])
+    });
+    const request = await producer.next();
+    expect(request).toMatchObject({ encoding: "base64", body: "wyg=" });
+    producer.send({ type: "response", request_id: request.id, body: "ok" });
+    await producer.next();
+    expect(await (await browserResponse).text()).toBe("ok");
+  });
+
+  it("falls back to base64 for invalid UTF-8 with a textual content type", async () => {
+    const { producer, url } = await open();
+    const browserResponse = SELF.fetch(path(url, "/upload"), {
+      method: "POST",
+      headers: { "Content-Type": "TEXT/PLAIN; charset=UTF-8" },
+      body: new Uint8Array([0xc3, 0x28])
+    });
+    const request = await producer.next();
+    expect(request).toMatchObject({ encoding: "base64", body: "wyg=" });
+    producer.send({ type: "response", request_id: request.id, body: "ok" });
+    await producer.next();
+    expect(await (await browserResponse).text()).toBe("ok");
+  });
+
+  it("preserves a UTF-8 BOM for textual media types", async () => {
+    const { producer, url } = await open();
+    const browserResponse = SELF.fetch(path(url, "/bom"), {
+      method: "POST",
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+      body: new Uint8Array([0xef, 0xbb, 0xbf, 0x68, 0x69])
+    });
+    const request = await producer.next();
+    expect(request).toMatchObject({ encoding: "utf8", body: "\ufeffhi" });
+    producer.send({ type: "response", request_id: request.id, body: "ok" });
+    await producer.next();
+    expect(await (await browserResponse).text()).toBe("ok");
+  });
+
+  it("recognizes textual media types case-insensitively", async () => {
+    const { producer, url } = await open();
+    const browserResponse = SELF.fetch(path(url, "/json"), {
+      method: "POST",
+      headers: { "Content-Type": "Application/JSON; charset=UTF-8" },
+      body: "{\"ok\":true}"
+    });
+    const request = await producer.next();
+    expect(request).toMatchObject({ encoding: "utf8", body: "{\"ok\":true}" });
+    producer.send({ type: "response", request_id: request.id, body: "ok" });
+    await producer.next();
+    expect(await (await browserResponse).text()).toBe("ok");
+  });
+
+  it("forwards binary browser bodies as base64", async () => {
+    const { producer, url } = await open();
+    const browserResponse = SELF.fetch(path(url, "/upload"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: new Uint8Array([0, 255, 7])
+    });
+    const request = await producer.next();
+    expect(request).toMatchObject({ encoding: "base64", body: "AP8H" });
+    producer.send({ type: "response", request_id: request.id, body: "ok" });
+    await producer.next();
+    expect(await (await browserResponse).text()).toBe("ok");
+  });
+
+  it("preserves empty command IDs in session and acknowledgements", async () => {
+    const producer = await connect();
+    producer.send({ type: "open", id: "" });
+    expect(await producer.next()).toMatchObject({ type: "session", id: "" });
+    producer.send({ type: "put", id: "", path: "/empty-id", body: "ok" });
+    expect(await producer.next()).toEqual({ type: "ack", id: "" });
+  });
+
+  it("reports protocol errors and requires open first", async () => {
+    const producer = await connect();
+    producer.send({ type: "put", id: "early", path: "/", body: "no" });
+    expect(await producer.next()).toEqual({ type: "error", id: "early", message: "open must be the first command" });
+
+    producer.socket.send("not json");
+    expect(await producer.next()).toEqual({ type: "error", message: "invalid JSON" });
+  });
+
+  it("destroys a session on explicit close", async () => {
+    const { producer, url } = await open();
+    producer.send({ type: "put", path: "/", body: "alive" });
+    expect(await producer.next()).toEqual({ type: "ack" });
+    expect(await (await SELF.fetch(url)).text()).toBe("alive");
+
+    producer.send({ type: "close", id: "close-1" });
+    producer.send({ type: "put", path: "/late", body: "must not be stored" });
+    expect(await producer.next()).toEqual({ type: "ack", id: "close-1" });
+    expect(await producer.next()).toEqual({ type: "closing" });
+
+    const response = await SELF.fetch(url);
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: "session not found" });
+  });
+
+  it("allows an authenticated reconnect without another open command", async () => {
+    const { producer, url } = await open();
+    expect(producer.credential).toMatch(/^[a-f0-9]{40}$/);
+    expect(producer.credential).not.toBe(new URL(url).hostname.split(".")[0]);
+    producer.send({ type: "put", path: "/before", body: "before" });
+    await producer.next();
+    producer.socket.close(1000, "temporary disconnect");
     await new Promise((resolve) => setTimeout(resolve, 20));
 
-    const answerResponse = await answer(data.question_url!);
-    expect(answerResponse.status).toBe(200);
-    await answerResponse.text();
-
-    const response = await waiting;
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
-      status: "answered",
-      answers: { approve: "Yes", notes: "Looks good" }
-    });
+    const replacement = await reconnect(url, producer);
+    replacement.send({ type: "put", path: "/after", body: "after" });
+    expect(await replacement.next()).toEqual({ type: "ack" });
+    expect(await (await SELF.fetch(path(url, "/before"))).text()).toBe("before");
+    expect(await (await SELF.fetch(path(url, "/after"))).text()).toBe("after");
   });
 
-  it.each(["not-a-number", "-1", "1.5", "26"])("rejects wait=%s", async (wait) => {
-    const { data } = await create();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 1_000);
-    let response: Response | undefined;
-    try {
-      response = await status(data.status_url!, wait, controller.signal);
-    } catch {
-      response = undefined;
-    } finally {
-      clearTimeout(timeout);
-    }
+  it("handles a client close before reconnecting and expiring", async () => {
+    const { producer, url } = await open();
+    producer.socket.close(1000, "client disconnect");
+    await new Promise((resolve) => setTimeout(resolve, 20));
 
-    expect(response?.status).toBe(400);
-    if (response) await response.text();
-  });
-
-  it("returns a bounded timeout with Retry-After", async () => {
-    const { data } = await create();
-    const started = Date.now();
-    const response = await status(data.status_url!, "1");
-
-    expect(Date.now() - started).toBeGreaterThanOrEqual(800);
-    expect(Date.now() - started).toBeLessThan(2_000);
-    expect(response.status).toBe(202);
-    expect(response.headers.get("Retry-After")).toBe("3");
-    expect(await response.json()).toEqual({ status: "pending" });
-  });
-
-  it("cancels an active D1 poll when the request aborts", async () => {
-    const { data } = await create();
-    const controller = new AbortController();
-    const started = Date.now();
-    const waiting = worker.fetch(new Request(data.status_url!, { signal: controller.signal }), env);
+    const replacement = await reconnect(url, producer);
+    replacement.socket.close(1000, "client disconnect");
     await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const publicUrl = new URL(url);
+    const code = publicUrl.hostname.match(/^([a-f0-9]{20})\.app\.letmeknow\.dev$/)?.[1]
+      || publicUrl.pathname.split("/")[2];
+    expect(await runDurableObjectAlarm(env.SESSIONS.getByName(code))).toBe(true);
+    expect((await SELF.fetch(url)).status).toBe(404);
+  });
+
+  it("closes unopened producers and rejects a late open after the deadline alarm", async () => {
+    const code = "b".repeat(20);
+    const credential = "unopened-test-credential";
+    const stub = env.SESSIONS.getByName(code);
+    const response = await stub.fetch(new Request(`${origin}/v1/connect`, {
+      headers: {
+        Upgrade: "websocket",
+        "x-letmeknow-action": "connect",
+        "x-letmeknow-url": `${origin}/s/${code}/`,
+        "x-letmeknow-credential": credential
+      }
+    }));
+    expect(response.status).toBe(101);
+    const socket = response.webSocket!;
+    socket.accept();
+    sockets.push(socket);
+    await runDurableObjectAlarm(stub);
+    expect(socket.readyState).toBe(WebSocket.CLOSING);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const late = await SELF.fetch(`${origin}/v1/connect?code=${code}`, {
+      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": credential }
+    });
+    expect(late.status).toBe(401);
+  });
+
+  it("serves stored resources during disconnect grace and expires by alarm", async () => {
+    const { producer, url } = await open();
+    producer.send({ type: "put", path: "/", body: "still here" });
+    await producer.next();
+    producer.socket.close(1000, "disconnect");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const stored = await SELF.fetch(url);
+    expect(stored.status).toBe(200);
+    expect(await stored.text()).toBe("still here");
+
+    const dynamic = await SELF.fetch(path(url, "/dynamic"));
+    expect(dynamic.status).toBe(503);
+    expect(await dynamic.json()).toEqual({ error: "producer disconnected" });
+
+    const code = new URL(url).pathname.split("/")[2];
+    const stub = env.SESSIONS.getByName(code);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const expired = await SELF.fetch(url);
+    expect(expired.status).toBe(404);
+    expect(await expired.json()).toEqual({ error: "session not found" });
+  });
+
+  it("preserves explicit cache policy and enforces stored resource limits", async () => {
+    const { producer, url } = await open();
+    producer.send({ type: "put", path: "/public", headers: { "cache-control": "public, max-age=60" }, body: "public" });
+    expect(await producer.next()).toEqual({ type: "ack" });
+    const publicResponse = await SELF.fetch(path(url, "/public"));
+    expect(publicResponse.headers.get("Cache-Control")).toBe("public, max-age=60");
+
+    for (let index = 0; index < 98; index++) {
+      producer.send({ type: "put", path: `/resource-${index}`, body: String(index) });
+      expect(await producer.next()).toEqual({ type: "ack" });
+    }
+    producer.send({ type: "put", path: "/resource-99", body: "99" });
+    expect(await producer.next()).toEqual({ type: "ack" });
+    producer.send({ type: "put", id: "too-many", path: "/resource-100", body: "overflow" });
+    expect(await producer.next()).toEqual({ type: "error", id: "too-many", message: "too many stored resources" });
+    producer.send({ type: "delete", path: "/resource-0" });
+    expect(await producer.next()).toEqual({ type: "ack" });
+    producer.send({ type: "put", path: "/resource-100", body: "now fits" });
+    expect(await producer.next()).toEqual({ type: "ack" });
+  });
+
+  it("accounts for decoded bytes when replacing stored resources", async () => {
+    const { producer } = await open();
+    const body = "x".repeat(1024 * 1024);
+    for (let index = 0; index < 10; index++) {
+      producer.send({ type: "put", path: `/large-${index}`, body });
+      expect(await producer.next()).toEqual({ type: "ack" });
+    }
+    producer.send({ type: "put", id: "too-large", path: "/large-new", body });
+    expect(await producer.next()).toEqual({ type: "error", id: "too-large", message: "stored resources are too large" });
+    producer.send({ type: "put", path: "/large-0", body: "" });
+    expect(await producer.next()).toEqual({ type: "ack" });
+    producer.send({ type: "put", path: "/large-new", body });
+    expect(await producer.next()).toEqual({ type: "ack" });
+  });
+
+  it("times out stalled request bodies and releases their dynamic slots", async () => {
+    const session = Object.create(Session.prototype) as {
+      activeRequests: number;
+      ctx: {
+        storage: { get(key: string): Promise<unknown> };
+        getWebSockets(): Array<{ deserializeAttachment(): { opened: boolean } }>;
+      };
+      browserRequest(request: Request, timeoutMs: number): Promise<Response>;
+    };
+    session.activeRequests = 0;
+    session.ctx = {
+      storage: {
+        get: async (key: string) => key === "opened" ? true : undefined
+      },
+      getWebSockets: () => [{ deserializeAttachment: () => ({ opened: true }) }]
+    };
+    let cancelled = false;
+    const stalledBody = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+      }
+    });
+    const request = new Request("https://client.example/stalled", {
+      method: "POST",
+      body: stalledBody,
+      duplex: "half"
+    } as RequestInit & { duplex: "half" });
+    request.headers.set("x-letmeknow-path", "/stalled");
+
+    const response = await session.browserRequest(request, 1);
+
+    expect(response.status).toBe(408);
+    expect(await response.json()).toEqual({ error: "request body timed out" });
+    expect(cancelled).toBe(true);
+    expect(session.activeRequests).toBe(0);
+  });
+
+  it("rejects an already-aborted body before forwarding and releases its slot once", async () => {
+    const session = Object.create(Session.prototype) as {
+      activeRequests: number;
+      ctx: {
+        storage: { get(key: string): Promise<unknown> };
+        getWebSockets(): Array<{ deserializeAttachment(): { opened: boolean }; send(): void }>;
+      };
+      browserRequest(request: Request, timeoutMs: number): Promise<Response>;
+    };
+    session.activeRequests = 0;
+    let sent = 0;
+    session.ctx = {
+      storage: {
+        get: async (key: string) => key === "opened" ? true : undefined
+      },
+      getWebSockets: () => [{
+        deserializeAttachment: () => ({ opened: true }),
+        send: () => { sent++; }
+      }]
+    };
+    let cancellations = 0;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancellations++;
+      }
+    });
+    const controller = new AbortController();
     controller.abort();
-
-    await expect(waiting).rejects.toBeDefined();
-    expect(Date.now() - started).toBeLessThan(1_000);
-  });
-
-  it("returns an answer to concurrent D1 polls", async () => {
-    const { data } = await create();
-    const first = status(data.status_url!, "3");
-    const second = status(data.status_url!, "3");
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
-    const answerResponse = await answer(data.question_url!, { approve: "No", notes: "Wait for the next release" });
-    expect(answerResponse.status).toBe(200);
-    await answerResponse.text();
-
-    const responses = await Promise.all([first, second]);
-    for (const response of responses) {
-      expect(response.status).toBe(200);
-      expect(await response.json()).toMatchObject({
-        status: "answered",
-        answers: { approve: "No", notes: "Wait for the next release" }
-      });
-    }
-  });
-
-  it("keeps the first answer across repeated status reads and rejects duplicates", async () => {
-    const { data } = await create();
-    const firstAnswer = await answer(data.question_url!);
-    expect(firstAnswer.status).toBe(200);
-    await firstAnswer.text();
-
-    const duplicate = await answer(data.question_url!, { approve: "No", notes: "Second answer" });
-    expect(duplicate.status).toBe(409);
-    await duplicate.text();
-
-    for (let index = 0; index < 2; index += 1) {
-      const response = await status(data.status_url!);
-      expect(response.status).toBe(200);
-      expect(await response.json()).toMatchObject({
-        status: "answered",
-        answers: { approve: "Yes", notes: "Looks good" }
-      });
-    }
-  });
-
-  it("accepts exactly one of two simultaneous answers and preserves its winner", async () => {
-    const { data } = await create();
-    const first = answer(data.question_url!, { approve: "Yes", notes: "First simultaneous answer" });
-    const second = answer(data.question_url!, { approve: "No", notes: "Second simultaneous answer" });
-    const [firstResponse, secondResponse] = await Promise.all([first, second]);
-
-    expect([firstResponse.status, secondResponse.status].sort()).toEqual([200, 409]);
-    await firstResponse.text();
-    await secondResponse.text();
-
-    const response = await status(data.status_url!);
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
-      status: "answered",
-      answers: firstResponse.status === 200
-        ? { approve: "Yes", notes: "First simultaneous answer" }
-        : { approve: "No", notes: "Second simultaneous answer" }
-    });
-  });
-
-  it("renders an escaped question form and rejects GET after answering", async () => {
-    const { data } = await create({
-      title: 'Review <release> & "approval"',
-      fields: [
-        { id: "approve", label: "Continue <now> & verify", type: "choice", options: ["Yes", "No"] },
-        { id: "notes", label: "Notes", type: "text" }
-      ]
-    });
-    const questionPath = new URL(data.question_url!).pathname;
-    const beforeAnswer = await SELF.fetch(new Request(data.question_url!));
-    const beforeAnswerBody = await beforeAnswer.text();
-
-    expect(beforeAnswer.status).toBe(200);
-    expect(beforeAnswerBody).toContain('<body class="windows-31">');
-    expect(beforeAnswerBody).toContain("Review &lt;release&gt; &amp; &quot;approval&quot;");
-    expect(beforeAnswerBody).toContain("Continue &lt;now&gt; &amp; verify");
-    expect(beforeAnswerBody).toContain(`<form method="post" action="${questionPath}">`);
-    expect(beforeAnswerBody).toMatch(/link expires in \d{2}:\d{2}/);
-
-    const answerResponse = await answer(data.question_url!);
-    expect(answerResponse.status).toBe(200);
-    await answerResponse.text();
-
-    const afterAnswer = await SELF.fetch(new Request(data.question_url!));
-    expect(afterAnswer.status).toBe(409);
-    await afterAnswer.text();
-  });
-
-  it("rejects invalid choices while preserving and escaping submitted fields", async () => {
-    const { data } = await create();
-    const notes = `Keep <this> & \"safe\"`;
-    const invalidChoice = await answer(data.question_url!, { approve: "Maybe", notes });
-    expect(invalidChoice.status).toBe(400);
-    const invalidChoiceBody = await invalidChoice.text();
-    expect(invalidChoiceBody).toContain("Please provide a valid answer for every field.");
-    expect(invalidChoiceBody).toContain(">Keep &lt;this&gt; &amp; &quot;safe&quot;</textarea>");
-    expect(invalidChoiceBody).not.toContain(notes);
-
-    const missingText = await answer(data.question_url!, { approve: "Yes" });
-    expect(missingText.status).toBe(400);
-    const missingTextBody = await missingText.text();
-    expect(missingTextBody).toContain('value="Yes" checked required');
-
-    const stillPending = await status(data.status_url!, "0");
-    expect(stillPending.status).toBe(202);
-    await stillPending.text();
-  });
-
-  it("expires question and status links before scheduled cleanup", async () => {
-    const { data } = await create();
-    const waiting = status(data.status_url!, "25");
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    const expiresAt = new Date(data.expires_at!).getTime();
-    vi.setSystemTime(expiresAt + 1);
-
-    try {
-      const beforeQuestion = await SELF.fetch(new Request(data.question_url!));
-      expect(beforeQuestion.status).toBe(410);
-      expect(await beforeQuestion.text()).toContain("This question link has expired.");
-
-      const beforeAnswer = await answer(data.question_url!);
-      expect(beforeAnswer.status).toBe(410);
-      expect(await beforeAnswer.text()).toContain("This question link has expired.");
-
-      const beforeStatus = await status(data.status_url!);
-      expect(beforeStatus.status).toBe(410);
-      expect(await beforeStatus.json()).toEqual({ status: "expired" });
-
-      await worker.scheduled!({} as ScheduledController, env);
-
-      const woken = await waiting;
-      expect(woken.status).toBe(404);
-      await woken.text();
-
-      const afterQuestion = await SELF.fetch(new Request(data.question_url!));
-      expect(afterQuestion.status).toBe(404);
-      await afterQuestion.text();
-
-      const afterStatus = await status(data.status_url!);
-      expect(afterStatus.status).toBe(404);
-      await afterStatus.text();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("redirects public HTTP and sends focused security headers", async () => {
-    const redirect = await SELF.fetch(new Request("http://public.example/", { redirect: "manual" }));
-    expect(redirect.status).toBe(307);
-    expect(redirect.headers.get("Location")).toBe("https://public.example/");
-    expect(redirect.headers.get("Strict-Transport-Security")).toBe("max-age=31536000");
-    await redirect.text();
-
-    const page = await SELF.fetch(new Request(`https://public.example/q/${"a".repeat(11)}`));
-    expect(page.status).toBe(404);
-    expect(page.headers.get("Strict-Transport-Security")).toBe("max-age=31536000");
-    expect(page.headers.get("Content-Security-Policy")).toBe("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
-    await page.text();
-  });
-
-  it("rejects oversized streamed JSON without Content-Length", async () => {
-    const body = JSON.stringify({ ...questionBody(), ignored: "x".repeat(17_000) });
-    const requestBody = streamed(body);
-    const requestWithStream = request("/questions", {
+    const request = new Request("https://client.example/already-aborted", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: requestBody
-    });
+      body,
+      signal: controller.signal,
+      duplex: "half"
+    } as RequestInit & { duplex: "half" });
+    request.headers.set("x-letmeknow-path", "/already-aborted");
 
-    expect(requestWithStream.headers.has("Content-Length")).toBe(false);
-    const response = await SELF.fetch(requestWithStream);
+    const response = await session.browserRequest(request, 30_000);
+
     expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: "request too large" });
+    expect(await response.json()).toEqual({ error: "request body cancelled" });
+    expect(sent).toBe(0);
+    expect(cancellations).toBe(1);
+    expect(session.activeRequests).toBe(0);
   });
 
-  it("rejects oversized streamed form data without Content-Length", async () => {
-    const { data } = await create();
-    const form = new URLSearchParams({
-      field_approve: "Yes",
-      field_notes: "Looks good",
-      ignored: "x".repeat(17_000)
-    });
-    const requestBody = streamed(form.toString());
-    const requestWithStream = new Request(data.question_url!, {
+  it("limits dynamic request bodies and concurrent requests", async () => {
+    const { producer, url } = await open();
+    const tooLarge = await SELF.fetch(path(url, "/too-large"), {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: requestBody
+      headers: { "Content-Length": String(1024 * 1024 + 1) },
+      body: "small"
     });
+    expect(tooLarge.status).toBe(413);
 
-    expect(requestWithStream.headers.has("Content-Length")).toBe(false);
-    const response = await SELF.fetch(requestWithStream);
-    expect(response.status).toBe(400);
-    expect(await response.text()).toContain("That answer is too large.");
+    const browserRequests: Promise<Response>[] = [];
+    const requests: Event[] = [];
+    for (let index = 0; index < 32; index++) {
+      browserRequests.push(SELF.fetch(path(url, `/pending-${index}`)));
+      requests.push(await producer.next());
+    }
+    expect(await SELF.fetch(path(url, "/pending-32"))).toMatchObject({ status: 503 });
+    for (const request of requests) {
+      producer.send({ type: "response", request_id: request.id, body: "ok" });
+      expect(await producer.next()).toEqual({ type: "ack" });
+    }
+    const responses = await Promise.all(browserRequests);
+    expect(responses.every((response) => response.status === 200)).toBe(true);
+
+    const afterRelease = SELF.fetch(path(url, "/after-release"));
+    const request = await producer.next();
+    producer.send({ type: "response", request_id: request.id, body: "released" });
+    await producer.next();
+    expect(await (await afterRelease).text()).toBe("released");
   });
 });
