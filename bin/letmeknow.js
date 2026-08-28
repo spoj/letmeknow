@@ -1,77 +1,82 @@
 #!/usr/bin/env node
 
-import { createServer } from "vite";
-import { existsSync, readFileSync, statSync, writeSync } from "node:fs";
-import { relative, resolve, sep } from "node:path";
-import { Readable, Writable } from "node:stream";
+import { existsSync, readFileSync, statSync, watch, writeSync } from "node:fs";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { dirname, extname, relative, resolve, sep } from "node:path";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const GRACE_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
 const MAX_RETRY_DELAY = 5_000;
 const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-const clientPath = "/__letmeknow_client.js";
-const clientId = "\0letmeknow-client";
+const mimeTypes = {
+  ".css": "text/css; charset=utf-8",
+  ".csv": "text/csv; charset=utf-8",
+  ".gif": "image/gif",
+  ".html": "text/html; charset=utf-8",
+  ".ico": "image/x-icon",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".pdf": "application/pdf",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+  ".txt": "text/plain; charset=utf-8",
+  ".wasm": "application/wasm",
+  ".webp": "image/webp",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".xml": "application/xml; charset=utf-8"
+};
 const client = String.raw`
-const key="letmeknow-client:"+location.host+location.pathname;
-let credential=sessionStorage.getItem(key);
+const sessionMatch=location.pathname.match(/^\/s\/[a-f0-9]{20}(?:\/|$)/);
+const sessionBase=sessionMatch?(sessionMatch[0].endsWith("/")?sessionMatch[0]:sessionMatch[0]+"/"):"/";
+const credentialKey="letmeknow-credential:"+location.origin+sessionBase;
+const snapshotKey=credentialKey+":snapshot";
+let credential;
+try{credential=sessionStorage.getItem(credentialKey)}catch{}
 let socket;
 let retryTimer;
+let updateTimer;
+let reloadTimer;
 let terminal=false;
-const stateKey=(control,index)=>control.id?"#"+control.id:(control.form?.id??"")+":"+control.name+":"+control.type+":"+index;
-const controls=root=>[...root.querySelectorAll("input,select,textarea")];
-const snapshot=()=>{
-  const state=new Map();
-  let activeKey;
-  for(const [index,control] of controls(document).entries()){
-    const key=stateKey(control,index);
-    state.set(key,{value:control.value,checked:control.checked,selected:control instanceof HTMLSelectElement?[...control.options].filter(option=>option.selected).map(option=>option.value):undefined,start:typeof control.selectionStart==="number"?control.selectionStart:undefined,end:typeof control.selectionEnd==="number"?control.selectionEnd:undefined});
-    if(control===document.activeElement)activeKey=key;
-  }
-  return {state,activeKey,x:scrollX,y:scrollY};
-};
-const restore=saved=>{
-  let active;
-  for(const [index,control] of controls(document).entries()){
-    const state=saved.state.get(stateKey(control,index));
-    if(!state)continue;
-    if(control instanceof HTMLSelectElement&&state.selected)for(const option of control.options)option.selected=state.selected.includes(option.value);
-    else if(control.type==="checkbox"||control.type==="radio")control.checked=state.checked;
-    else{control.value=state.value;if(typeof state.start==="number"&&typeof control.setSelectionRange==="function")control.setSelectionRange(state.start,state.end)}
-    if(stateKey(control,index)===saved.activeKey)active=control;
-  }
-  active?.focus();
-  scrollTo(saved.x,saved.y);
-};
+const controls=()=>[...document.querySelectorAll("input,select,textarea")];
+const details=()=>[...document.querySelectorAll("details")];
+const uniqueId=(element,all)=>element.id&&all.filter(candidate=>candidate.id===element.id).length===1?element.id:null;
+const formIdentity=form=>form?.id||form?.getAttribute("name")||form?.getAttribute("action")||"document";
+const controlKey=(control,index,all=controls())=>{const id=uniqueId(control,all);if(id)return"id:"+id;const form=control.form;const identity=formIdentity(form)+":"+(control.type||control.localName)+":"+(control.name||"");const occurrence=all.slice(0,index).filter(candidate=>!uniqueId(candidate,all)&&formIdentity(candidate.form)+":"+(candidate.type||candidate.localName)+":"+(candidate.name||"")===identity).length;return"control:"+identity+":"+occurrence};
+const detailKey=(element,index,all=details())=>{const id=uniqueId(element,all);return id?"id:"+id:"detail:"+index};
+const snapshot=()=>{const all=controls();return{version:1,page:routePath(),controls:all.map((control,index)=>({key:controlKey(control,index,all),value:control.value,checked:control.checked,indeterminate:control.indeterminate,selected:control instanceof HTMLSelectElement?[...control.options].map((option,optionIndex)=>option.selected?optionIndex:null).filter(optionIndex=>optionIndex!==null):undefined,start:typeof control.selectionStart==="number"?control.selectionStart:undefined,end:typeof control.selectionEnd==="number"?control.selectionEnd:undefined,direction:control.selectionDirection||undefined})),active:document.activeElement instanceof Element?controlKey(document.activeElement,all.indexOf(document.activeElement),all):undefined,details:details().map((element,index)=>({key:detailKey(element,index),open:element.open})),x:scrollX,y:scrollY}};
 const status=message=>{const element=document.querySelector("[data-letmeknow-status]");if(element)element.textContent=message};
-const sessionPrefix=location.pathname.match(/^\/s\/[a-f0-9]{20}\//)?.[0];
-const currentPath=()=>{const path=sessionPrefix?location.pathname.slice(sessionPrefix.length-1)||"/":location.pathname;return path.endsWith("/")?path+"index.html":path};
-const refresh=async()=>{
-  const saved=snapshot();
-  const response=await fetch(location.href,{cache:"no-store",headers:{Accept:"text/html"}});
-  if(!response.ok)throw new Error("page refresh failed");
-  const next=new DOMParser().parseFromString(await response.text(),"text/html");
-  document.title=next.title;
-  document.body.replaceChildren(...[...next.body.childNodes].filter(node=>!(node instanceof HTMLScriptElement&&node.hasAttribute("data-letmeknow-client"))));
-  const links=[...document.head.querySelectorAll("link[rel=stylesheet]")];
-  for(const link of links){const url=new URL(link.href);url.searchParams.set("_letmeknow",crypto.randomUUID());link.href=url}
-  restore(saved);
-};
-const update=path=>{if(path===currentPath()||path?.endsWith(".css"))refresh().catch(()=>status("The page could not be refreshed"))};
+const stripSessionPath=path=>{if(sessionBase==="/")return path;if(path===sessionBase.slice(0,-1))return "/";return path.startsWith(sessionBase)?"/"+path.slice(sessionBase.length):path};
+const routePath=()=>{let path=stripSessionPath(location.pathname);return path.endsWith("/")?path+"index.html":path};
+const pagePath=path=>{path=path.split("?",1)[0];return stripSessionPath(path)||"/"};
+const restore=()=>{let raw;try{raw=sessionStorage.getItem(snapshotKey)}catch{return}if(!raw)return;try{sessionStorage.removeItem(snapshotKey)}catch{}let saved;try{saved=JSON.parse(raw)}catch{return}if(saved.version!==1||saved.page!==routePath())return;const all=controls();const savedControls=new Map((Array.isArray(saved.controls)?saved.controls:[]).map(state=>[state.key,state]));let active;for(const [index,control] of all.entries()){const state=savedControls.get(controlKey(control,index,all));if(!state)continue;if(control instanceof HTMLSelectElement&&Array.isArray(state.selected))for(const [optionIndex,option] of [...control.options].entries())option.selected=state.selected.includes(optionIndex);else if(control.type==="checkbox"||control.type==="radio"){control.checked=state.checked;control.indeterminate=state.indeterminate}else{control.value=state.value;if(typeof state.start==="number"&&typeof control.setSelectionRange==="function")control.setSelectionRange(state.start,state.end,state.direction||"none")}if(controlKey(control,index,all)===saved.active)active=control}const savedDetails=new Map((Array.isArray(saved.details)?saved.details:[]).map(state=>[state.key,state]));for(const [index,element] of details().entries()){const state=savedDetails.get(detailKey(element,index));if(state)element.open=state.open}active?.focus({preventScroll:true});scrollTo(saved.x||0,saved.y||0)};
+const reload=()=>{if(reloadTimer)return;reloadTimer=setTimeout(()=>{try{sessionStorage.setItem(snapshotKey,JSON.stringify(snapshot()))}catch{}location.reload()},75)};
+const linkedStylesheet=path=>{for(const link of document.querySelectorAll("link[rel=stylesheet]")){let url;try{url=new URL(link.href,location.href)}catch{continue}if(url.origin!==location.origin)continue;if(sessionBase!=="/"&&!url.pathname.startsWith(sessionBase))continue;if(pagePath(url.pathname)===path)return link}return null};
+const refreshStylesheet=(path,link)=>{const url=new URL(link.href,location.href);url.searchParams.set("_letmeknow",crypto.randomUUID());link.href=url.href};
+const flushUpdates=()=>{updateTimer=undefined;const paths=[...pendingUpdates];pendingUpdates.clear();let shouldReload=false;const styles=[];for(const path of paths){if(/\.html?$/i.test(path)){if(path===routePath())shouldReload=true}else if(/\.css$/i.test(path)){const link=linkedStylesheet(path);if(link)styles.push([path,link]);else shouldReload=true}else shouldReload=true}if(shouldReload){reload();return}for(const [path,link] of styles)refreshStylesheet(path,link)};
+const pendingUpdates=new Set();
+const update=path=>{if(typeof path!=="string")return;path=pagePath(path);pendingUpdates.add(path);if(!updateTimer)updateTimer=setTimeout(flushUpdates,75)};
+addEventListener("load",()=>requestAnimationFrame(restore),{once:true});
 const connect=()=>{
   clearTimeout(retryTimer);retryTimer=undefined;
-  const url=new URL("_letmeknow/client",location.href);url.protocol=url.protocol==="https:"?"wss:":"ws:";
-  socket=credential?new WebSocket(url,credential):new WebSocket(url);
-  socket.onmessage=event=>{
-    const message=JSON.parse(event.data);
-    if(message.type==="credential"){credential=message.credential;sessionStorage.setItem(key,credential);return}
-    if(message.type==="challenge"){socket.send(JSON.stringify({type:"alive",nonce:message.nonce}));return}
+  const url=new URL(sessionBase+"_letmeknow/client",location.href);url.protocol=url.protocol==="https:"?"wss:":"ws:";
+  const current=credential?new WebSocket(url,credential):new WebSocket(url);
+  socket=current;
+  current.onmessage=event=>{
+    if(socket!==current||typeof event.data!=="string")return;
+    let message;try{message=JSON.parse(event.data)}catch{return}
+    if(message.type==="credential"){credential=message.credential;try{sessionStorage.setItem(credentialKey,credential)}catch{}return}
+    if(message.type==="challenge"){if(current.readyState===WebSocket.OPEN)try{current.send(JSON.stringify({type:"alive",nonce:message.nonce}))}catch{}return}
     if(message.type==="busy"){status("This session is open elsewhere");retryTimer=setTimeout(connect,message.retry_after*1000);return}
     if(message.type==="file_update"){update(message.path);return}
-    if(message.type==="closed"){terminal=true;sessionStorage.removeItem(key);status(message.message)}
+    if(message.type==="closed"){terminal=true;try{sessionStorage.removeItem(credentialKey);sessionStorage.removeItem(snapshotKey)}catch{}status(message.message)}
   };
-  socket.onclose=()=>{if(!terminal&&!retryTimer){status("Reconnecting…");retryTimer=setTimeout(connect,1000)}};
-  socket.onerror=()=>{};
+  current.onclose=()=>{if(socket!==current||terminal)return;if(!retryTimer){status("Reconnecting…");retryTimer=setTimeout(connect,1000)}};
+  current.onerror=()=>{};
 };
 document.addEventListener("submit",async event=>{
   const form=event.target;
@@ -82,12 +87,16 @@ document.addEventListener("submit",async event=>{
   if(method!=="get"&&method!=="post"){status("Only GET and POST forms are supported");return}
   if(!form.checkValidity()){form.reportValidity();return}
   let target;
-  try{target=new URL(submitter?.getAttribute("formaction")??form.getAttribute("action")??location.href,location.href)}catch{status("Invalid form action");return}
+  try{const action=submitter?.getAttribute("formaction")??form.getAttribute("action")??location.href;const base=sessionBase!=="/"&&location.pathname===sessionBase.slice(0,-1)?new URL(sessionBase,location.href):location.href;target=new URL(action,base)}catch{status("Invalid form action");return}
   if(target.origin!==location.origin){status("Form actions must stay on this site");return}
-  if(sessionPrefix&&!target.pathname.startsWith(sessionPrefix))target.pathname=(sessionPrefix+target.pathname.replace(/^\//,""));
+  if(sessionBase!=="/"){
+    const sessionPath=sessionBase.slice(0,-1);
+    if(target.pathname===sessionPath)target.pathname=sessionBase;
+    else if(!target.pathname.startsWith(sessionBase))target.pathname=sessionBase+target.pathname.replace(/^\//,"");
+  }
   const values=new URLSearchParams();
   for(const [name,value] of new FormData(form,submitter)){if(typeof value!=="string"){status("File inputs are not supported");return}values.append(name,value)}
-  const actionPath=sessionPrefix?target.pathname.slice(sessionPrefix.length-1)||"/":target.pathname;
+  const actionPath=sessionBase!=="/"?target.pathname.slice(sessionBase.length-1)||"/":target.pathname;
   const metadata={id:crypto.randomUUID(),form_id:form.id||null,action:actionPath+target.search,trigger:{id:submitter?.id||null,name:submitter?.getAttribute("name"),value:submitter?.getAttribute("value")}};
   const headers={"X-LetMeKnow-Submission":"1","X-LetMeKnow-ID":encodeURIComponent(metadata.id),"X-LetMeKnow-Form-ID":encodeURIComponent(metadata.form_id??""),"X-LetMeKnow-Action":encodeURIComponent(metadata.action),"X-LetMeKnow-Trigger-ID":encodeURIComponent(metadata.trigger.id??""),"X-LetMeKnow-Trigger-Name":encodeURIComponent(metadata.trigger.name??""),"X-LetMeKnow-Trigger-Value":encodeURIComponent(metadata.trigger.value??"")};
   if(method==="get")for(const [name,value] of values)target.searchParams.append(name,value);
@@ -96,187 +105,146 @@ document.addEventListener("submit",async event=>{
 connect();
 `;
 
-function encodedHeader(request, name) {
-  const value = request.headers[name];
+function encodedHeader(packet, name) {
+  const headers = packet.headers || {};
+  const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === name);
+  const value = entry?.[1];
   if (typeof value !== "string" || value === "") return null;
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return null;
-  }
+  try { return decodeURIComponent(value); } catch { return null; }
 }
 
 function addValue(values, name, value) {
-  if (Object.prototype.hasOwnProperty.call(values, name)) {
-    values[name] = Array.isArray(values[name]) ? [...values[name], value] : [values[name], value];
-  } else {
-    values[name] = value;
+  if (Object.prototype.hasOwnProperty.call(values, name)) values[name] = Array.isArray(values[name]) ? [...values[name], value] : [values[name], value];
+  else values[name] = value;
+}
+
+function response(packet, status, body = Buffer.alloc(0), headers = {}) {
+  if (body.byteLength > MAX_BODY_BYTES) return response(packet, 413, Buffer.from("response body is too large"), { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+  const outputHeaders = { "Cache-Control": "no-store", ...headers };
+  if (!Object.keys(outputHeaders).some(name => name.toLowerCase() === "content-length")) outputHeaders["Content-Length"] = String(body.byteLength);
+  const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
+  return { type: "http_response", request_id: packet.request_id, status, headers: outputHeaders, body: method === "HEAD" ? "" : body.toString("base64") };
+}
+
+function errorResponse(packet, status, message) {
+  return response(packet, status, Buffer.from(message), { "Content-Type": "text/plain; charset=utf-8" });
+}
+
+function deniedPath(pathname) {
+  return pathname.split("/").some(part => part === ".env" || part.startsWith(".env.") || part === ".git" || /\.(?:key|pem|p12|sqlite|db)$/i.test(part));
+}
+
+function inside(root, target) {
+  const path = relative(root, target);
+  return path === "" || (path !== ".." && !path.startsWith(".." + sep));
+}
+
+async function safeRealpath(root, candidate) {
+  try {
+    const target = await realpath(candidate);
+    return inside(root, target) ? target : null;
+  } catch (cause) {
+    if (cause?.code === "EACCES" || cause?.code === "EPERM") return null;
+    if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") {
+      try {
+        const parent = await realpath(dirname(candidate));
+        if (!inside(root, parent)) return null;
+      } catch {}
+      return undefined;
+    }
+    throw cause;
   }
 }
 
-function readBody(request) {
-  return new Promise((resolveBody, reject) => {
-    const chunks = [];
-    let size = 0;
-    let tooLarge = false;
-    request.on("data", chunk => {
-      if (tooLarge) return;
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      size += buffer.byteLength;
-      if (size > MAX_BODY_BYTES) {
-        tooLarge = true;
-        request.resume();
-        reject(new Error("submission is too large"));
-        return;
-      }
-      chunks.push(buffer);
-    });
-    request.on("end", () => resolveBody(Buffer.concat(chunks)));
-    request.on("error", reject);
-  });
+function requestUrl(packet) {
+  if (typeof packet.path !== "string" || !packet.path.startsWith("/")) throw new Error("invalid request path");
+  const url = new URL(packet.path, "http://letmeknow.local");
+  if (url.origin !== "http://letmeknow.local" || url.pathname.includes("\\")) throw new Error("invalid request path");
+  let pathname;
+  try { pathname = decodeURIComponent(url.pathname); } catch { throw new Error("invalid request path"); }
+  if (pathname.includes("\0")) throw new Error("invalid request path");
+  return { pathname, search: url.search };
 }
 
-async function submission(request, response) {
-  const url = new URL(request.url || "/", "http://localhost");
-  const method = (request.method || "GET").toUpperCase();
+function htmlWithClient(body) {
+  const text = body.toString("utf8");
+  const script = `<script type="module" data-letmeknow-client>${client}</script>`;
+  const closingBody = text.search(/<\/body\s*>/i);
+  return Buffer.from(closingBody < 0 ? text + script : text.slice(0, closingBody) + script + text.slice(closingBody), "utf8");
+}
+
+async function staticResponse(root, packet) {
+  const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
+  if (method !== "GET" && method !== "HEAD") return errorResponse(packet, 405, "method not allowed");
+  let request;
+  try { request = requestUrl(packet); } catch { return errorResponse(packet, 400, "bad request"); }
+  if (deniedPath(request.pathname)) return errorResponse(packet, 403, "forbidden");
+  const candidate = resolve(root, "." + request.pathname);
+  if (!inside(root, candidate)) return errorResponse(packet, 403, "forbidden");
+  let target;
+  try { target = await safeRealpath(root, candidate); } catch { return errorResponse(packet, 500, "preview request failed"); }
+  if (target === null) return errorResponse(packet, 403, "forbidden");
+  if (target === undefined) return errorResponse(packet, 404, "not found");
+  if (deniedPath("/" + relative(root, target).split(sep).join("/"))) return errorResponse(packet, 403, "forbidden");
+  let info;
+  try { info = await stat(target); } catch (cause) {
+    if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");
+    if (cause?.code === "EACCES" || cause?.code === "EPERM") return errorResponse(packet, 403, "forbidden");
+    return errorResponse(packet, 500, "preview request failed");
+  }
+  if (info.isDirectory()) {
+    if (!request.pathname.endsWith("/")) return response(packet, 301, Buffer.from(`Redirecting to ${request.pathname}/${request.search}`), { Location: request.pathname + "/" + request.search, "Content-Type": "text/plain; charset=utf-8" });
+    const index = resolve(target, "index.html");
+    try { target = await realpath(index); } catch (cause) {
+      if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");
+      return errorResponse(packet, 500, "preview request failed");
+    }
+    if (!inside(root, target)) return errorResponse(packet, 403, "forbidden");
+    if (deniedPath("/" + relative(root, target).split(sep).join("/"))) return errorResponse(packet, 403, "forbidden");
+  } else if (request.pathname.endsWith("/")) return errorResponse(packet, 404, "not found");
+  let body;
+  try { body = await readFile(target); } catch (cause) {
+    if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");
+    if (cause?.code === "EACCES" || cause?.code === "EPERM") return errorResponse(packet, 403, "forbidden");
+    return errorResponse(packet, 500, "preview request failed");
+  }
+  if (body.byteLength > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
+  if (extname(target).toLowerCase() === ".html") body = htmlWithClient(body);
+  if (body.byteLength > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
+  return response(packet, 200, body, { "Content-Type": mimeTypes[extname(target).toLowerCase()] || "application/octet-stream" });
+}
+
+async function submission(packet) {
+  const url = requestUrl(packet);
+  const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
   const values = Object.create(null);
   if (method === "GET") {
-    for (const [name, value] of url.searchParams) addValue(values, name, value);
+    for (const [name, value] of new URLSearchParams(url.search)) addValue(values, name, value);
   } else if (method === "POST") {
-    const body = await readBody(request);
-    const contentType = request.headers["content-type"]?.split(";", 1)[0].trim();
+    const body = Buffer.from(typeof packet.body === "string" ? packet.body : "", "base64");
+    if (body.byteLength > MAX_BODY_BYTES) throw new Error("submission is too large");
+    const contentType = encodedHeader(packet, "content-type")?.split(";", 1)[0].trim();
     if (contentType !== "application/x-www-form-urlencoded") throw new Error("unsupported submission encoding");
     for (const [name, value] of new URLSearchParams(body.toString("utf8"))) addValue(values, name, value);
-  } else {
-    throw new Error("unsupported submission method");
-  }
+  } else throw new Error("unsupported submission method");
   const event = {
     type: "submit",
-    id: encodedHeader(request, "x-letmeknow-id"),
+    id: encodedHeader(packet, "x-letmeknow-id"),
     method,
-    action: encodedHeader(request, "x-letmeknow-action") || url.pathname,
-    form_id: encodedHeader(request, "x-letmeknow-form-id"),
-    trigger: {
-      id: encodedHeader(request, "x-letmeknow-trigger-id"),
-      name: encodedHeader(request, "x-letmeknow-trigger-name"),
-      value: encodedHeader(request, "x-letmeknow-trigger-value")
-    },
+    action: encodedHeader(packet, "x-letmeknow-action") || url.pathname,
+    form_id: encodedHeader(packet, "x-letmeknow-form-id"),
+    trigger: { id: encodedHeader(packet, "x-letmeknow-trigger-id"), name: encodedHeader(packet, "x-letmeknow-trigger-name"), value: encodedHeader(packet, "x-letmeknow-trigger-value") },
     values
   };
   process.stdout.write(`${JSON.stringify(event)}\n`);
-  response.statusCode = 204;
-  response.setHeader("Cache-Control", "no-store");
-  response.end();
+  return response(packet, 204);
 }
 
-class RelayRequest extends Readable {
-  constructor(packet) {
-    super();
-    this.method = packet.method;
-    this.url = packet.path;
-    this.originalUrl = packet.path;
-    this.headers = { ...(packet.headers || {}), host: "localhost" };
-    this.httpVersion = "1.1";
-    this.httpVersionMajor = 1;
-    this.httpVersionMinor = 1;
-    this.socket = { encrypted: false, remoteAddress: "127.0.0.1" };
-    this.body = Buffer.from(packet.body || "", "base64");
-    this.sent = false;
+async function handleRequest(root, packet) {
+  if (encodedHeader(packet, "x-letmeknow-submission") === "1") {
+    try { return await submission(packet); } catch (cause) { return errorResponse(packet, cause?.message === "submission is too large" ? 413 : 400, cause instanceof Error ? cause.message : "invalid submission"); }
   }
-
-  _read() {
-    if (this.sent) return;
-    this.sent = true;
-    this.push(this.body);
-    this.push(null);
-  }
-}
-
-class RelayResponse extends Writable {
-  constructor() {
-    super();
-    this.statusCode = 200;
-    this.headers = new Map();
-    this.chunks = [];
-  }
-
-  setHeader(name, value) {
-    this.headers.set(name.toLowerCase(), Array.isArray(value) ? value.join(", ") : String(value));
-    return this;
-  }
-
-  appendHeader(name, value) {
-    const current = this.getHeader(name);
-    return this.setHeader(name, current === undefined ? value : [current, value]);
-  }
-
-  getHeader(name) {
-    return this.headers.get(name.toLowerCase());
-  }
-
-  getHeaders() {
-    return Object.fromEntries(this.headers);
-  }
-
-  hasHeader(name) {
-    return this.headers.has(name.toLowerCase());
-  }
-
-  removeHeader(name) {
-    this.headers.delete(name.toLowerCase());
-  }
-
-  writeHead(status, headers) {
-    this.statusCode = status;
-    if (headers) for (const [name, value] of Object.entries(headers)) this.setHeader(name, value);
-    return this;
-  }
-
-  flushHeaders() {}
-
-  _write(chunk, _encoding, callback) {
-    this.chunks.push(Buffer.from(chunk));
-    callback();
-  }
-
-  body() {
-    return Buffer.concat(this.chunks);
-  }
-}
-
-function middlewareResponse(response) {
-  const body = response.body();
-  if (body.byteLength > MAX_BODY_BYTES) throw new Error("response body is too large");
-  return {
-    type: "http_response",
-    request_id: response.requestId,
-    status: response.statusCode,
-    headers: response.getHeaders(),
-    body: body.toString("base64")
-  };
-}
-
-async function handleRequest(server, packet, send) {
-  const request = new RelayRequest(packet);
-  const response = new RelayResponse();
-  response.requestId = packet.request_id;
-  await new Promise((resolveRequest, rejectRequest) => {
-    response.once("finish", resolveRequest);
-    response.once("error", rejectRequest);
-    try {
-      server.middlewares(request, response, cause => {
-        if (cause) {
-          rejectRequest(cause);
-        } else if (!response.writableEnded) {
-          response.statusCode = 404;
-          response.end("Not found");
-        }
-      });
-    } catch (cause) {
-      rejectRequest(cause);
-    }
-  });
-  send(middlewareResponse(response));
+  return staticResponse(root, packet);
 }
 
 function options(args) {
@@ -288,7 +256,7 @@ function options(args) {
   }
   root = root || process.cwd();
   if (!existsSync(root) || !statSync(root).isDirectory()) throw new Error(`directory does not exist: ${root}`);
-  return { root };
+  return realpath(root).then(root => ({ root }));
 }
 
 function endpoint(control, credential, sessionUrl) {
@@ -310,55 +278,23 @@ function endpoint(control, credential, sessionUrl) {
 function validSessionUrl(value) {
   if (typeof value !== "string") return false;
   let url;
-  try {
-    url = new URL(value);
-  } catch {
-    return false;
-  }
+  try { url = new URL(value); } catch { return false; }
   if (url.protocol !== "http:" && url.protocol !== "https:") return false;
   if (/^[a-f0-9]{20}\.letmeknow\.dev$/.test(url.hostname)) return true;
   return /^\/s\/[a-f0-9]{20}(?:\/|$)/.test(url.pathname);
 }
 
 async function start(args) {
-  const { root } = options(args);
+  const { root } = await options(args);
   const control = process.env.LETMEKNOW_URL || "https://letmeknow.dev";
   let send = () => false;
-  const vite = await createServer({
-    root,
-    configFile: false,
-    appType: "spa",
-    css: { postcss: false },
-    logLevel: "silent",
-    server: { middlewareMode: true, hmr: false, ws: false, fs: { strict: true, allow: [root], deny: ["**/.env", "**/.env.*", "**/.git/**", "**/*.key", "**/*.pem", "**/*.p12", "**/*.sqlite", "**/*.db"] } },
-    plugins: [{
-      name: "letmeknow-relay",
-      resolveId(id) { return id === clientPath ? clientId : undefined; },
-      load(id) { return id === clientId ? client : undefined; },
-      configureServer(server) {
-        server.middlewares.use((request, response, next) => {
-          if (request.headers["x-letmeknow-submission"] !== "1") {
-            next();
-            return;
-          }
-          submission(request, response).catch(cause => {
-            response.statusCode = cause instanceof Error && cause.message === "submission is too large" ? 413 : 400;
-            response.setHeader("Content-Type", "text/plain; charset=utf-8");
-            response.end(cause instanceof Error ? cause.message : "invalid submission");
-          });
-        });
-        const update = file => send({ type: "file_update", path: "/" + relative(root, file).split(sep).join("/") });
-        server.watcher.on("change", update);
-        server.watcher.on("add", update);
-        server.watcher.on("unlink", update);
-      },
-      transformIndexHtml(html) {
-        const script = `<script type="module" src="${clientPath}" data-letmeknow-client></script>`;
-        return html.includes("</body>") ? html.replace("</body>", `${script}</body>`) : `${html}${script}`;
-      }
-    }]
+  const watcher = watch(root, { recursive: true, encoding: "utf8" }, (_event, filename) => {
+    if (!filename) { send({ type: "file_update", path: "/" }); return; }
+    const file = resolve(root, String(filename));
+    const path = relative(root, file).split(sep).join("/");
+    if (!path || path.startsWith("../") || path === "..") return;
+    send({ type: "file_update", path: "/" + path.split("/").map(encodeURIComponent).join("/") });
   });
-
   let socket;
   let credential;
   let sessionUrl;
@@ -374,7 +310,7 @@ async function start(args) {
     clearTimeout(retryTimer);
     clearTimeout(connectionTimer);
     try { socket?.close(); } catch {}
-    await vite.close();
+    watcher.close();
     process.exit(code);
   };
   process.once("SIGINT", () => void stop(0));
@@ -382,10 +318,7 @@ async function start(args) {
 
   const retry = () => {
     if (stopped || Date.now() >= retryUntil) return void stop(1);
-    retryTimer = setTimeout(() => {
-      retryTimer = undefined;
-      connect();
-    }, retryDelay);
+    retryTimer = setTimeout(() => { retryTimer = undefined; connect(); }, retryDelay);
     retryDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);
   };
 
@@ -419,12 +352,9 @@ async function start(args) {
       } else if (packet.type === "session") {
         if (!validSessionUrl(packet.url)) return void stop(1);
         sessionUrl = packet.url;
-        if (!ready) {
-          ready = true;
-          process.stdout.write(`${JSON.stringify({ type: "ready", url: sessionUrl })}\n`);
-        }
+        if (!ready) { ready = true; process.stdout.write(`${JSON.stringify({ type: "ready", url: sessionUrl })}\n`); }
       } else if (packet.type === "http_request") {
-        void handleRequest(vite, packet, response => send(response)).catch(() => send({ type: "http_response", request_id: packet.request_id, status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" }, body: Buffer.from("preview request failed").toString("base64") }));
+        void handleRequest(root, packet).then(result => send(result)).catch(() => send(errorResponse(packet, 500, "preview request failed")));
       } else if (packet.type === "closed") {
         void stop(0);
       } else if (packet.type === "error") {
@@ -448,18 +378,10 @@ async function start(args) {
 }
 
 if (process.argv[2] === "--skill") {
-  if (process.argv.length !== 3) {
-    process.stderr.write("Usage: npx letmeknow-cli --skill\n");
-    process.exit(1);
-  }
+  if (process.argv.length !== 3) { process.stderr.write("Usage: npx letmeknow-cli --skill\n"); process.exit(1); }
   writeSync(1, readFileSync(new URL("../SKILL.md", import.meta.url)));
 } else if (process.argv.slice(2).includes("--help") || process.argv.slice(2).includes("-h")) {
   process.stdout.write("Usage: npx letmeknow-cli [directory]\n\nServe a folder through the hosted LetMeKnow relay. The CLI does not listen on a network port. Form submissions are JSON lines on stdout.\n");
 } else {
-  try {
-    await start(process.argv.slice(2));
-  } catch (cause) {
-    process.stderr.write(`letmeknow: ${cause instanceof Error ? cause.message : "server failed"}\n`);
-    process.exitCode = 1;
-  }
+  try { await start(process.argv.slice(2)); } catch (cause) { process.stderr.write(`letmeknow: ${cause instanceof Error ? cause.message : "server failed"}\n`); process.exitCode = 1; }
 }

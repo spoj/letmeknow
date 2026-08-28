@@ -5,7 +5,7 @@ description: Give a human a live public preview of an agent-managed folder and r
 
 # LetMeKnow
 
-Use LetMeKnow when one human needs to inspect or interact with a temporary page, report, dashboard, approval form, quiz, table, or status view. The agent owns the files in a folder. The CLI runs Vite in middleware mode, connects to the public relay over an outbound WebSocket, and reports browser submissions on stdout.
+Use LetMeKnow when one human needs to inspect or interact with a temporary page, report, dashboard, approval form, quiz, table, or status view. The agent owns the files in a folder. The CLI serves that folder directly, connects to the public relay over an outbound WebSocket, and reports browser submissions on stdout.
 
 The CLI does **not** listen on a local network port.
 
@@ -23,20 +23,22 @@ Node.js 22.12 or newer is required. Read stdout and stderr separately. Stdout is
 {"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/"}
 ```
 
-Open the public URL for the human. The directory defaults to the current working directory. Set `LETMEKNOW_URL` to use another compatible relay. There are no host or port options: the CLI intentionally has no listening socket.
+Open that URL for the human. The directory defaults to the current working directory. Set `LETMEKNOW_URL` to use another compatible relay. There are no host or port options: the CLI intentionally has no listening socket.
 
 Do not send file commands to stdin. Read and write the folder directly. Keep the process running while the human uses the page.
 
 ## Build the page
 
-Create an ordinary Vite page in the folder, usually `index.html`, plus any CSS, JavaScript, images, or other assets it needs. Use semantic HTML and accessible labels, headings, sections, tables, and controls.
+Create an ordinary static page in the folder, usually `index.html`, plus any CSS, JavaScript, images, or other assets it needs. Use semantic HTML and accessible labels, headings, sections, tables, and controls.
 
-The relay is live:
+The relay serves exact files and directory `index.html` files. It supports GET and HEAD, redirects directory paths to a trailing slash, and does not provide an application-shell fallback. HTML responses include the live-preview client inline.
 
-- HTML changes update the current document body without a full page reload.
-- Existing form values, focus, text selection, and scroll position are restored after an HTML update.
-- CSS links are refreshed without navigating.
-- Changes to another HTML route do not replace the current route.
+The preview is live:
+
+- A change to the current HTML route reloads the page and restores form values, checked controls, selections, focus, text selection, scroll position, and open `<details>` elements.
+- CSS changes cache-bust matching linked stylesheets without navigating.
+- Changes to a different HTML route do not disturb the current page.
+- Changes to other assets reload the page. Arbitrary JavaScript heap state cannot be preserved.
 
 An optional status element gives the human feedback after a form submission:
 
@@ -79,7 +81,7 @@ The event ID identifies the submission. There is no response packet. Validate it
 2. Wait for a `submit` event on stdout.
 3. Validate its `values` and `action`.
 4. Rewrite the relevant HTML or data file in the workspace.
-5. The browser updates in place through the relay.
+5. The agent updates the live preview.
 
 Escape untrusted values before placing them in HTML. Treat browser input as untrusted even though the folder is local to the agent.
 
@@ -87,7 +89,7 @@ Escape untrusted values before placing them in HTML. Treat browser input as untr
 
 The public URL is a bearer capability. The relay receives the served files and submitted values. Do not put secrets in the preview folder or submit credentials unless that is intentional. The folder is trusted executable code from the browser's perspective.
 
-The CLI disables Vite config discovery and limits filesystem access to the selected folder. It makes outbound relay connections only; it does not accept inbound browser connections.
+The selected folder is resolved with real paths, and requests cannot escape it through symlinks. `.env` files, `.git`, private-key files, and database files are denied. The CLI makes outbound relay connections only; it does not accept inbound browser connections.
 
 ## Stop
 

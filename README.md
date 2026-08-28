@@ -1,6 +1,6 @@
 # LetMeKnow
 
-LetMeKnow gives an agent-managed folder a public, live Vite preview. The CLI runs Vite in middleware mode and makes only an outbound WebSocket connection to the relay; it does not listen on a network port.
+LetMeKnow gives an agent-managed folder a public, live static preview and receives browser form submissions. The CLI serves files directly and makes only an outbound WebSocket connection to the relay; it does not listen on a network port.
 
 ## Start
 
@@ -26,9 +26,11 @@ There are no `--host` or `--port` options because the CLI intentionally has no l
 
 ## File workflow
 
-The CLI does not receive file commands. The agent reads and writes the directory directly. Keep a normal Vite entry point such as `index.html`; JavaScript, CSS, images, and other Vite-supported files can be requested through the relay.
+The CLI does not receive file commands. The agent reads and writes the directory directly. Keep an `index.html` at the root, plus ordinary JavaScript, CSS, images, and other static assets.
 
-When a watched file changes, the browser receives an update. HTML changes replace the current document body without a page reload and preserve form values, focus, selection, and scroll position. CSS links are refreshed without navigating. Changes to a different HTML route do not disturb the current page.
+The preview serves exact files and `index.html` for directory paths. It supports GET and HEAD, redirects directory paths to a trailing slash, and has no application-shell fallback. HTML responses include the live-preview client inline.
+
+When a watched file changes, the browser receives an update. Changes to the current HTML route or to another asset reload the page and preserve form values, checked controls, selections, focus, text selection, scroll position, and open `<details>` elements. CSS changes cache-bust matching stylesheets without navigating. Changes to a different HTML route do not disturb the current page. Arbitrary JavaScript heap state cannot be preserved.
 
 An optional element can display submission status:
 
@@ -62,7 +64,7 @@ The event ID identifies the submission. It is not a request/response handle: upd
 
 The preview URL is a bearer capability. The relay receives the served files and submitted values. Do not put secrets in the preview folder or submit credentials unless that is intentional. The folder is trusted executable code from the browser's perspective.
 
-The CLI's Vite configuration is disabled and its filesystem access is limited to the selected folder. The CLI itself still requires an outbound network connection to the relay. It does not accept inbound browser connections.
+The selected folder is resolved with real paths. Requests that would leave that folder through a symlink are denied. `.env` files, `.git`, private-key files, database files, and their descendants are denied. The CLI itself still requires an outbound network connection to the relay. It does not accept inbound browser connections.
 
 ## Development
 

@@ -370,7 +370,7 @@ export class Session extends DurableObject<Env> {
       return;
     }
     if (packet.type === "file_update") {
-      if (typeof packet.path !== "string" || !/^\/[A-Za-z0-9._/-]+$/.test(packet.path)) throw new Error("invalid file update path");
+      if (typeof packet.path !== "string" || !/^\/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-Fa-f]{2})*$/.test(packet.path)) throw new Error("invalid file update path");
       this.sendClient({ type: "file_update", path: packet.path });
       return;
     }

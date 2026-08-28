@@ -41,8 +41,6 @@ describe("LetMeKnow integration", () => {
     const persist = mkdtempSync(join(tmpdir(), "letmeknow-wrangler-"));
     const port = await freePort();
     writeFileSync(join(folder, "index.html"), `<!doctype html><html><body><form id="contact" action="/save" method="post"><input name="name"><button name="kind" value="send">Send</button></form></body></html>`);
-    writeFileSync(join(folder, "vite.config.js"), "throw new Error('config discovery must stay disabled')");
-
     const relay = spawn(process.execPath, [wrangler, "dev", "--local", "--local-protocol", "https", "--port", String(port), "--persist-to", persist], {
       cwd: root,
       env: { ...process.env, NO_PROXY: "*", no_proxy: "*" },
