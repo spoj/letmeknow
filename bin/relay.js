@@ -321,7 +321,7 @@ async function start(args) {
     appType: "spa",
     css: { postcss: false },
     logLevel: "silent",
-    server: { middlewareMode: true, hmr: false, fs: { strict: true, allow: [root], deny: ["**/.env", "**/.env.*", "**/.git/**", "**/*.key", "**/*.pem", "**/*.p12", "**/*.sqlite", "**/*.db"] } },
+    server: { middlewareMode: true, hmr: false, ws: false, fs: { strict: true, allow: [root], deny: ["**/.env", "**/.env.*", "**/.git/**", "**/*.key", "**/*.pem", "**/*.p12", "**/*.sqlite", "**/*.db"] } },
     plugins: [{
       name: "letmeknow-relay",
       resolveId(id) { return id === clientPath ? clientId : undefined; },
