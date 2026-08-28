@@ -1,13 +1,15 @@
 ---
 name: letmeknow
-description: Create a temporary browser surface for a human, serve static resources, and handle interactive HTTP requests through the LetMeKnow NDJSON CLI.
+description: Show one human a temporary HTML and CSS workspace and handle normalized form or button actions through the LetMeKnow NDJSON CLI.
 ---
 
 # LetMeKnow
 
-Use LetMeKnow when a human needs a temporary web page or interactive UI from an agent. It is not a localhost proxy and does not read files or directories.
+Use LetMeKnow when one human needs a temporary rich document, dashboard, report, preview, form, approval, quiz, table, or status view. The agent supplies semantic HTML and CSS. The browser sends only declared actions; typing and local UI state do not create events.
 
-## Start the CLI
+LetMeKnow is not a localhost proxy, persistent application, or arbitrary JavaScript environment.
+
+## Start
 
 Node.js 22 or newer is required.
 
@@ -15,84 +17,148 @@ Node.js 22 or newer is required.
 npx letmeknow-cli
 ```
 
-This connects to `https://letmeknow.dev` by default. To use another trusted deployment:
-
-```bash
-LETMEKNOW_URL=http://localhost:8787 npx letmeknow-cli
-```
-
-Run the CLI as a long-lived child process. Write one compact JSON object per line to stdin, keep stdin open while the session is active, and read one JSON event per line from stdout. Read diagnostics from stderr separately. Do not mix stderr into the NDJSON stream.
-
-## Open and publish static content
-
-`open` must be the first command. String `id` values are optional; use them to correlate results.
+Run it as a long-lived child process. Write one compact JSON object per line to stdin, keep stdin open, and read one JSON event per line from stdout. Read stderr separately.
 
 ```json
 {"type":"open","id":"open-1"}
 ```
 
-Wait for the `session` event and retain its URL:
+Wait for the session URL:
 
 ```json
 {"type":"session","id":"open-1","url":"https://0123456789abcdef0123.letmeknow.dev/","expires_after_disconnect":600}
 ```
 
-Store or replace exact pathnames with `put`. The following page submits to an unstored path so the agent can handle it dynamically:
+The URL immediately serves a shell with a waiting message. One browser may use it at a time.
+
+## Render HTML and CSS
 
 ```json
-{"type":"put","id":"put-1","path":"/","content_type":"text/html; charset=utf-8","body":"<!doctype html><form method=\"post\" action=\"answer\"><label>Answer <input name=\"answer\"></label><button>Send</button></form>"}
+{"type":"render","id":"render-1","body":"<h1>Search invoices</h1><form id=\"search\" action=\"search\" method=\"post\" data-lmk-target=\"results\"><label>Customer<input name=\"customer\" required></label><button>Search</button></form><section id=\"results\"><p>Enter a customer.</p></section>","css":"#results { margin-top: 2rem; }"}
 ```
 
-Use relative links, form actions, and asset URLs so pages also work on local deployments, whose session URL includes a path prefix. Wait for `{"type":"ack","id":"put-1"}` before relying on the update. `status` defaults to `200`, `encoding` to `utf8`, and `body` to an empty string. `headers` accepts string values or string arrays; `content_type` overrides `Content-Type`. For binary content, set `encoding` to `base64`. Paths must start with `/` and must not contain a query. Query strings do not affect stored-path matching.
-
-Remove static content with:
+A connected browser receives the render immediately. Wait for its acknowledgement and retain the `render_id`:
 
 ```json
-{"type":"delete","id":"delete-1","path":"/old.html"}
+{"type":"ack","id":"render-1","render_id":"b87438c2-4f1c-44bd-9875-6cc64370b8aa"}
 ```
 
-## Handle dynamic requests
+Use semantic HTML: headings, sections, paragraphs, lists, tables, `dl`, forms, labels, controls, buttons, `details`, progress, and images. Do not include `<html>`, `<head>`, `<body>`, `<main id="lmk-view">`, scripts, style elements, inline handlers, inline `style`, iframes, or HTMX attributes.
 
-A browser request whose path is not stored produces a `request` event:
+The optional `css` field supports modern CSS, including grid, flexbox, media queries, variables, transitions, and print styles. External stylesheets, `@import`, and remote resources do not work. Use relative session assets.
+
+A full `render` intentionally replaces the current page, resets drafts, and cancels actions from the previous render. Use `response` rather than `render` after a user action.
+
+## Forms
+
+Interactive forms use standard HTML:
+
+```html
+<form id="decision" action="decide" method="post">
+  <label>Reason<textarea name="reason" required></textarea></label>
+  <button name="decision" value="approve" formaction="approve">Approve</button>
+  <button name="decision" value="reject" formaction="reject">Reject</button>
+</form>
+```
+
+Rules:
+
+- Use `method="post"`.
+- Give each form a stable, unique `id`.
+- Give controls meaningful `name` values.
+- Use an action identifier containing letters, digits, `.`, `_`, `:`, or `-`.
+- A submit button's standard `formaction` may override the form action.
+- Native `required`, input types, ranges, and patterns validate locally.
+
+The runtime captures `FormData(form, submitter)` before disabling controls. Selected radios, checked boxes, ordinary controls, and the clicked submit button are included. Repeated names become string arrays. File inputs are rejected.
+
+## Standalone actions
+
+```html
+<button type="button" data-lmk-action="refresh-status" data-lmk-target="status">
+  Refresh
+</button>
+```
+
+Use standalone actions for refresh, retry, cancel, generate, inspect, load-more, and export. Their events have `form_id: null`, empty `values`, and the button's optional `id`, `name`, and `value` in `trigger`.
+
+## Whole and partial updates
+
+Responses replace the whole workspace by default. To update a region, put `data-lmk-target="element-id"` on the form or action button:
+
+```html
+<form id="search" action="search" method="post" data-lmk-target="results">
+  <input name="query">
+  <button>Search</button>
+</form>
+<section id="results"></section>
+```
+
+The target is one bare element ID without `#`. Every update uses `innerHTML`. A submit button may override its form's target.
+
+## Handle actions
 
 ```json
-{"type":"request","id":"cf-request-id","method":"POST","path":"/answer","query":"step=2","headers":{"content-type":"application/x-www-form-urlencoded"},"encoding":"utf8","body":"answer=yes"}
+{"type":"action","id":"2ee81a6b-1035-40a7-a90d-c1e02f426baa","render_id":"b87438c2-4f1c-44bd-9875-6cc64370b8aa","action_id":"search","form_id":"search","target_id":"results","trigger":{"id":null,"name":null,"value":null},"values":{"query":"quarterly report"}}
 ```
 
-Reply using the event's `id` as `request_id`:
+Use:
+
+- `id` to respond to this exact action.
+- `render_id` to identify the page revision that produced it.
+- `action_id` for user intent.
+- `form_id` and `target_id` for context.
+- `trigger` for the clicked button.
+- `values` for the submitted form snapshot.
+
+Validate actions and values. Treat values as untrusted and HTML-escape reflected text.
+
+Respond with HTML for the target contents:
 
 ```json
-{"type":"response","id":"response-1","request_id":"cf-request-id","status":200,"content_type":"text/html; charset=utf-8","body":"<strong>Accepted</strong>"}
+{"type":"response","id":"response-1","request_id":"2ee81a6b-1035-40a7-a90d-c1e02f426baa","body":"<table><tr><th>Invoice</th><th>Amount</th></tr><tr><td>INV-42</td><td>$800</td></tr></table>"}
 ```
 
-Wait for the correlated `ack`. Dynamic responses are not stored; use `put` if later requests should receive the same response without involving the agent. Treat request bodies and headers as untrusted input, and escape or validate values before placing them in HTML, headers, or commands.
+A response may include `css` to replace the page CSS. Omitting it preserves the existing CSS:
 
-The stdout event types are `session`, `request`, `ack`, `error`, and `closing`. Handle `error` rather than assuming a command succeeded.
+```json
+{"type":"response","id":"response-2","request_id":"event-2","body":"<h1 class=\"success\">Approved</h1>","css":".success { color: green; }"}
+```
+
+Wait for the acknowledgement and its new `render_id`. An action remains pending until `response`, a superseding full `render`, or session close. Independent regions may be pending concurrently, so always match by action ID.
+
+## One-browser behavior
+
+The first browser claims the session with a private credential. Reload and laptop wake reconnect automatically. A second browser cannot connect while the first is active.
+
+Liveness is checked only when another browser tries to claim, at most once every five seconds. After a browser disconnect, its credential has five seconds of exclusive reconnect priority. After that, the first old or new browser to connect wins.
+
+A reconnect receives one canonical snapshot of committed HTML, CSS, render ID, and pending actions. It does not replay old user actions. Same-tab drafts are restored from `sessionStorage`; drafts do not transfer during takeover.
+
+## Assets
+
+```json
+{"type":"put","id":"logo","path":"/assets/logo.png","content_type":"image/png","encoding":"base64","body":"iVBORw0KGgo..."}
+```
+
+Store resources only under `/assets/` and reference them relatively:
+
+```html
+<img src="assets/logo.png" alt="Company logo">
+```
+
+`encoding` is `utf8` by default or `base64` for binary data. Assets answer only `GET` and `HEAD`. There is no `delete`; another `put` replaces an asset.
 
 ## Close and lifecycle
-
-Destroy the session and all content immediately when finished:
 
 ```json
 {"type":"close","id":"close-1"}
 ```
 
-Wait for `ack` and `closing`, then let the process exit. Closing stdin or terminating the CLI only disconnects the producer; it does not replace an explicit `close`.
+Wait for `ack` and `closing`. Closing stdin only disconnects the producer.
 
-The CLI owns the session and automatically reconnects after an unexpected disconnect. Each connection attempt has a 10-second deadline. Reconnection is possible only during the 10-minute disconnect grace period; stored resources remain available then, but unstored paths return `503`, and browser traffic does not extend the grace period. An initial producer connection must send `open` within 30 seconds. Dynamic request bodies have a 30-second read deadline, and a `response` may take at most 5 minutes.
+If the producer disconnects, the page remains visible, drafts remain, and actions are disabled. The CLI has ten minutes to reconnect. Browser traffic does not extend that period. Explicit close or expiry deletes HTML, CSS, credentials, actions, and assets.
 
-Limits per session: 1 MiB per stored, request, or response body; 100 stored resources; 10 MiB decoded stored content in total; and 32 simultaneous dynamic requests. Bodies are non-streaming. Default responses include `Cache-Control: no-store` unless explicitly overridden.
+Limits: 1 MiB per HTML, CSS, asset, or action body; 100 assets; 10 MiB decoded asset storage; and 32 pending actions.
 
-## Security
-
-Treat the session URL as a bearer secret: anyone who has it can access the surface and submit requests. Share it only with the intended human, and do not put it in source control, public logs, issue trackers, or unrelated output. The CLI also receives a separate private reconnect credential over the WebSocket, keeps it off protocol stdout, and uses it automatically. Never expose, persist, or ask the human for that credential. Use only a trusted `LETMEKNOW_URL`, because the deployment receives all page content and browser traffic.
-
-## Recommended skill output
-
-The minimal package interface should be:
-
-```bash
-npx letmeknow-cli --skill
-```
-
-It should print this exact `SKILL.md` byte-for-byte to stdout and exit successfully without opening a network connection.
+Treat the URL as a bearer secret. Never expose either private reconnect credential.

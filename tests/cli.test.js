@@ -191,7 +191,7 @@ async function runDelayedAcceptScenario() {
       if (packets.length === 2) socket.close(1000, "commands received");
     });
   });
-  child.stdin.end('{"type":"open"}\n{"type":"put","path":"/","body":"seed"}\n');
+  child.stdin.end('{"type":"open"}\n{"type":"render","body":"<h1>Ready</h1>"}\n');
   const [code] = await once(child, "exit");
   await new Promise((resolve) => httpServer.close(resolve));
   return { code, packets };
@@ -241,7 +241,7 @@ describe("LetMeKnow CLI reconnect", () => {
     assert.equal(result.code, 0);
     assert.deepEqual(result.packets, [
       { type: "open" },
-      { type: "put", path: "/", body: "seed" }
+      { type: "render", body: "<h1>Ready</h1>" }
     ]);
   }, { timeout: 10_000 });
 

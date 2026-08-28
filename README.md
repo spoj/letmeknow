@@ -1,6 +1,8 @@
 # LetMeKnow
 
-LetMeKnow gives an agent a temporary interactive web surface for a human. It is not a localhost proxy and does not read directories. A Node CLI carries newline-delimited JSON between stdin/stdout and a Cloudflare Durable Object over one persistent WebSocket.
+LetMeKnow gives one agent and one human browser a temporary HTML and CSS workspace. The agent renders a page, receives normalized form and button actions, and responds with HTML fragments. A private browser WebSocket carries renders and actions; assets use ordinary HTTP.
+
+It is not a localhost proxy or a programmable frontend. Agents provide presentation and semantic actions, not JavaScript or HTTP handlers.
 
 ## CLI
 
@@ -18,88 +20,150 @@ LETMEKNOW_URL=http://localhost:8787 npx letmeknow-cli
 
 stdin contains one compact JSON command per line. stdout contains one JSON event per line. Diagnostics go to stderr.
 
-Print the agent-facing skill file without opening a network connection:
-
 ```bash
-npx letmeknow-cli --skill > SKILL.md
+npx letmeknow-cli --skill
 ```
 
-Start a session:
+prints the agent instructions without connecting.
+
+## Example
+
+Open a session:
 
 ```json
-{"type":"open","id":"1"}
+{"type":"open","id":"open-1"}
 ```
 
-stdout returns the URL to share with the human:
+The CLI emits its temporary URL:
 
 ```json
-{"type":"session","id":"1","url":"https://0123456789abcdef0123.letmeknow.dev/","expires_after_disconnect":600}
+{"type":"session","id":"open-1","url":"https://0123456789abcdef0123.letmeknow.dev/","expires_after_disconnect":600}
 ```
 
-There is no initial bundle. Initial resources and later updates are the same `put` command:
+The URL serves a trusted shell immediately. Send HTML and optional CSS with `render`:
 
 ```json
-{"type":"put","id":"2","path":"/","content_type":"text/html; charset=utf-8","body":"<h1>Hello</h1>"}
-{"type":"put","id":"3","path":"/app.js","content_type":"text/javascript","body":"document.body.append(' ready')"}
+{"type":"render","id":"render-1","body":"<h1>Search invoices</h1><form id=\"search\" action=\"search\" method=\"post\" data-lmk-target=\"results\"><label>Customer<input name=\"customer\" required></label><button>Search</button></form><section id=\"results\"><p>Enter a customer.</p></section>","css":"#results { margin-top: 2rem; }"}
 ```
+
+A connected browser receives the render immediately. The acknowledgement contains its revision:
+
+```json
+{"type":"ack","id":"render-1","render_id":"b87438c2-4f1c-44bd-9875-6cc64370b8aa"}
+```
+
+Submitting the form produces one normalized action:
+
+```json
+{"type":"action","id":"2ee81a6b-1035-40a7-a90d-c1e02f426baa","render_id":"b87438c2-4f1c-44bd-9875-6cc64370b8aa","action_id":"search","form_id":"search","target_id":"results","trigger":{"id":null,"name":null,"value":null},"values":{"customer":"Acme Ltd"}}
+```
+
+Respond to that ID with HTML for the target's contents:
+
+```json
+{"type":"response","id":"response-1","request_id":"2ee81a6b-1035-40a7-a90d-c1e02f426baa","body":"<table><tr><th>Invoice</th><th>Amount</th></tr><tr><td>INV-42</td><td>$800</td></tr></table>"}
+```
+
+The browser inserts the fragment into `#results`. Without `data-lmk-target`, the response replaces the whole workspace.
+
+## HTML actions
+
+### Forms
+
+Interactive forms use standard HTML:
+
+```html
+<form id="decision" action="decide" method="post">
+  <label>Comment<textarea name="comment"></textarea></label>
+  <button name="decision" value="approve" formaction="approve">Approve</button>
+  <button name="decision" value="reject" formaction="reject">Reject</button>
+</form>
+```
+
+Forms require `method="post"`, a stable `id`, a relative action identifier, and meaningful control names. A submit button's `formaction` overrides the form's `action`. Native validation runs locally. `FormData(form, submitter)` is captured before controls are disabled, so selected controls and the clicked button are included. Repeated names become string arrays. File inputs are rejected.
+
+### Standalone actions
+
+A button can invoke an action without a form:
+
+```html
+<button type="button" data-lmk-action="refresh-status" data-lmk-target="status">Refresh</button>
+```
+
+Its event has `form_id: null`, empty `values`, and its optional `id`, `name`, and `value` in `trigger`.
+
+### Targeted updates
+
+`data-lmk-target` accepts one bare element ID. All updates use `innerHTML`. There are no alternate swap modes or selector targets. The default target is `lmk-view`, the whole workspace.
+
+Typing, focusing, expanding `<details>`, validation, scrolling, and other local browser behavior produce no agent events.
+
+## CSS
+
+`render` accepts page CSS in its `css` field. A `response` may include `css` to replace it; omitting `css` preserves it.
+
+Modern CSS is supported, including grid, flexbox, media queries, variables, transitions, and print styles. External stylesheets, `@import`, scripts, inline handlers, and inline `style` attributes are blocked. Local assets work in HTML and CSS.
+
+## One browser client
+
+At most one browser is active for a session. The first browser receives a private credential stored in that tab's `sessionStorage`.
+
+- Reloads and reconnects reuse the credential.
+- A competing browser triggers at most one liveness probe every five seconds.
+- If the active browser answers, the claimant sees “This session is open elsewhere.”
+- After a disconnect, the previous credential has a five-second exclusive reconnect period.
+- After five seconds, either the old browser or a new claimant may connect; first connection wins.
+- Laptop sleep does not invalidate the credential.
+
+The server sends a connecting browser one canonical snapshot of the current HTML, CSS, render ID, and pending actions. It does not replay user actions. The browser restores same-tab drafts from `sessionStorage`; drafts do not transfer to another browser.
+
+The server keeps committed page state and assets for the producer session. A full `render` replaces the page and clears old pending actions. A targeted response updates the canonical page. Browser disconnect alone does not delete state.
+
+## Assets
+
+`put` stores or replaces passive resources only under `/assets/`:
+
+```json
+{"type":"put","id":"logo","path":"/assets/logo.png","content_type":"image/png","encoding":"base64","body":"iVBORw0KGgo..."}
+```
+
+Reference them relatively:
+
+```html
+<img src="assets/logo.png" alt="Company logo">
+```
+
+Assets answer only `GET` and `HEAD`. Each body is limited to 1 MiB. A session accepts 100 assets and 10 MiB decoded asset data. There is no `delete`; assets disappear with the session.
 
 ## Protocol
 
-### Commands: stdin to LetMeKnow
+Commands:
 
-- `open` creates the session and emits `session`.
-- `put` stores or replaces an exact pathname.
-- `delete` removes a stored pathname.
-- `response` answers one pending browser request.
-- `close` immediately destroys the session.
+- `open`: create the session; it must be first.
+- `render`: replace the committed HTML and CSS and push it to the browser.
+- `put`: store an asset under `/assets/`.
+- `response`: resolve one pending action with HTML and optional CSS.
+- `close`: destroy the session immediately.
 
-All commands accept an optional string `id`. Successful `put`, `delete`, `response`, and `close` commands emit a correlated `ack`.
+Events:
 
-A resource supports `status`, `headers`, `content_type`, `encoding`, and `body`. `status` defaults to `200`, `encoding` to `utf8`, and `body` to an empty string. Header values may be strings or string arrays; arrays preserve repeated headers such as `Set-Cookie`. `content_type` overrides any `Content-Type` header. Binary bodies use base64:
+- `session`: public URL and producer disconnect grace.
+- `action`: normalized form or standalone-button action.
+- `ack`: command completion.
+- `error`: invalid command or protocol state.
+- `closing`: explicit session destruction.
 
-```json
-{"type":"put","path":"/logo.png","content_type":"image/png","encoding":"base64","body":"iVBORw0KGgo..."}
-```
+Actions remain pending until `response`, a superseding full `render`, or session close. One form or overlapping target can be pending at a time; independent regions may proceed concurrently. Match responses by action ID.
 
-Delete a resource:
+HTML, CSS, asset, and action bodies are each limited to 1 MiB. Up to 32 actions may be pending.
 
-```json
-{"type":"delete","id":"4","path":"/old.html"}
-```
+## Security and lifecycle
 
-Destroy everything immediately:
+HTML fragments are sanitized. Scripts, style elements, inline handlers, HTMX attributes, frames, active metadata, external form actions, and invalid LetMeKnow attributes are removed. CSP blocks arbitrary browser connections and external resources.
 
-```json
-{"type":"close","id":"5"}
-```
+The URL is a bearer secret. Share it only with the intended human. Browser and producer reconnect credentials remain private and never appear in protocol output.
 
-### Events: LetMeKnow to stdout
-
-- `session` contains the public URL and disconnect grace period.
-- `request` describes a browser request that did not match a stored resource.
-- `ack` confirms a command.
-- `error` reports a command or protocol error.
-- `closing` reports explicit destruction.
-
-Unknown paths are sent to the producer:
-
-```json
-{"type":"request","id":"cf-request-id","method":"POST","path":"/answer","query":"step=2","headers":{"content-type":"application/x-www-form-urlencoded","hx-request":"true"},"encoding":"utf8","body":"answer=yes"}
-```
-
-Answer with the request event's `id` as `request_id`:
-
-```json
-{"type":"response","id":"6","request_id":"cf-request-id","status":200,"headers":{"content-type":"text/html; charset=utf-8","hx-trigger":"answered"},"body":"<strong>Accepted</strong>"}
-```
-
-Dynamic responses are not stored. Send a separate `put` to serve a path without involving the producer next time.
-
-Production sessions use isolated `*.letmeknow.dev` origins, so root-relative links, forms, and asset URLs work normally. Local sessions use `/s/<code>/`; use relative URLs there. Stored paths ignore the URL query when matching. Dynamic events contain pathname and query separately. Methods, forms, cookies, HTMX headers, SPA API requests, status, response headers, and text or binary bodies pass through generically. Browser request bodies use UTF-8 only for recognized textual media types; absent, unrecognized, or invalid UTF-8 bodies use base64. Request, response, and stored-resource bodies are bounded to 1 MiB and are non-streaming; a stalled dynamic browser request body times out after 30 seconds, and a producer response may take up to 5 minutes. Stored and dynamic responses default to `Cache-Control: no-store`; an explicit producer header overrides that default. A session accepts at most 100 stored resources (10 MiB decoded total) and 32 simultaneous dynamic requests.
-
-## Lifecycle
-
-The active CLI connection owns the session. The CLI receives an unguessable private reconnect credential in a private WebSocket message, keeps it off protocol stdout, and sends it as the WebSocket subprotocol on reconnect. The reconnect URL contains only the public session code. If the connection drops unexpectedly, it reconnects with that credential during the ten-minute grace period without requiring another `open` command; each connection attempt has a ten-second deadline, and a failed initial attempt exits nonzero while reconnect attempts continue within the grace period. Stored resources remain available for ten minutes, while unknown paths return `503`. Browser traffic does not extend the grace period. After the alarm fires all resources are deleted. A producer connection that never sends `open` is cleaned up after a short deadline. `close` deletes everything immediately.
+If the producer disconnects, the current page remains visible, drafts are preserved, and actions are disabled. The CLI can reconnect for ten minutes. Browser traffic does not extend that grace. `close` or producer-grace expiry deletes page state, credentials, pending actions, and assets.
 
 ## Development
 
@@ -107,14 +171,5 @@ The active CLI connection owns the session. The CLI receives an unguessable priv
 npm install
 npm run dev
 npm test
-```
-
-The Worker uses one Durable Object per session. The object owns the producer WebSocket, stored resources, pending browser requests, and disconnect alarm. No D1 or R2 binding is required.
-
-Deploy with:
-
-```bash
 npm run deploy
 ```
-
-Production subdomain URLs require a proxied `*.letmeknow.dev` DNS record and a Worker route for `*.letmeknow.dev/*` in Cloudflare. The apex `letmeknow.dev` remains the control endpoint.
