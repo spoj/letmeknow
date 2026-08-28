@@ -31,7 +31,8 @@ type Attachment = {
 const CODE_LENGTH = 20;
 const GRACE_MS = 10 * 60 * 1_000;
 const OPEN_DEADLINE_MS = 30 * 1_000;
-const REQUEST_TIMEOUT_MS = 30 * 1_000;
+const REQUEST_BODY_TIMEOUT_MS = 30 * 1_000;
+const RESPONSE_TIMEOUT_MS = 5 * 60 * 1_000;
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_RESOURCES = 100;
 const MAX_STORED_BYTES = 10 * 1024 * 1024;
@@ -76,7 +77,7 @@ function bodyBytes(packet: Packet): Uint8Array {
   return bytes;
 }
 
-async function requestBody(request: Request, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Uint8Array> {
+async function requestBody(request: Request, timeoutMs = REQUEST_BODY_TIMEOUT_MS): Promise<Uint8Array> {
   const contentLength = request.headers.get("content-length");
   if (contentLength !== null && Number.isFinite(Number(contentLength)) && Number(contentLength) > MAX_BODY_BYTES) {
     throw new Error("request body is too large");
@@ -282,7 +283,7 @@ export class Session extends DurableObject<Env> {
     });
   }
 
-  private async browserRequest(request: Request, requestBodyTimeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
+  private async browserRequest(request: Request, requestBodyTimeoutMs = REQUEST_BODY_TIMEOUT_MS): Promise<Response> {
     const opened = await this.ctx.storage.get<boolean>("opened");
     if (!opened) return error("session not found", 404);
 
@@ -319,7 +320,7 @@ export class Session extends DurableObject<Env> {
         this.pending.delete(id);
         this.activeRequests--;
         resolve(error("producer response timed out", 504));
-      }, REQUEST_TIMEOUT_MS);
+      }, RESPONSE_TIMEOUT_MS);
       this.pending.set(id, { resolve, timer, head: request.method === "HEAD" });
     });
     try {

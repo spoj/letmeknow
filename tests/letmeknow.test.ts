@@ -1,7 +1,7 @@
 import { SELF, runDurableObjectAlarm } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { Session } from "../src/index";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 type Event = Record<string, unknown>;
 type Producer = {
@@ -516,6 +516,53 @@ describe("LetMeKnow agent web surface", () => {
     expect(await producer.next()).toEqual({ type: "ack" });
     producer.send({ type: "put", path: "/large-new", body });
     expect(await producer.next()).toEqual({ type: "ack" });
+  });
+
+  it("waits five minutes for producer responses before timing out", async () => {
+    vi.useFakeTimers();
+    try {
+      const session = Object.create(Session.prototype) as {
+        activeRequests: number;
+        pending: Map<string, unknown>;
+        ctx: {
+          storage: { get(key: string): Promise<unknown> };
+          getWebSockets(): Array<{ deserializeAttachment(): { opened: boolean }; send(message: string): void }>;
+        };
+        browserRequest(request: Request, timeoutMs?: number): Promise<Response>;
+      };
+      let sent: Event | undefined;
+      session.activeRequests = 0;
+      session.pending = new Map();
+      session.ctx = {
+        storage: {
+          get: async (key: string) => key === "opened" ? true : undefined
+        },
+        getWebSockets: () => [{
+          deserializeAttachment: () => ({ opened: true }),
+          send: (message) => { sent = JSON.parse(message) as Event; }
+        }]
+      };
+
+      const request = new Request("https://client.example/wait");
+      request.headers.set("x-letmeknow-path", "/wait");
+      const waiting = session.browserRequest(request);
+      for (let index = 0; index < 5 && !sent; index += 1) await Promise.resolve();
+      expect(sent).toMatchObject({ type: "request", path: "/wait" });
+
+      let settled = false;
+      waiting.then(() => { settled = true; });
+      vi.advanceTimersByTime(5 * 60 * 1_000 - 1);
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      vi.advanceTimersByTime(1);
+      const response = await waiting;
+      expect(response.status).toBe(504);
+      expect(await response.json()).toEqual({ error: "producer response timed out" });
+      expect(session.activeRequests).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("times out stalled request bodies and releases their dynamic slots", async () => {
