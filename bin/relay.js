@@ -83,7 +83,7 @@ document.addEventListener("submit",async event=>{
   let target;
   try{target=new URL(submitter?.getAttribute("formaction")??form.getAttribute("action")??location.href,location.href)}catch{status("Invalid form action");return}
   if(target.origin!==location.origin){status("Form actions must stay on this site");return}
-  if(sessionPrefix&&!target.pathname.startsWith(sessionPrefix))target.pathname=sessionPrefix+target.pathname;
+  if(sessionPrefix&&!target.pathname.startsWith(sessionPrefix))target.pathname=(sessionPrefix+target.pathname.replace(/^\//,""));
   const values=new URLSearchParams();
   for(const [name,value] of new FormData(form,submitter)){if(typeof value!=="string"){status("File inputs are not supported");return}values.append(name,value)}
   const metadata={id:crypto.randomUUID(),form_id:form.id||null,action:target.pathname+target.search,trigger:{id:submitter?.id||null,name:submitter?.getAttribute("name"),value:submitter?.getAttribute("value")}};
