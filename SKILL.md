@@ -29,7 +29,7 @@ Do not send file commands to stdin. Read and write the folder directly. Keep the
 
 ## Build the page
 
-Create an ordinary static page in the folder, usually `index.html`, plus any CSS, JavaScript, images, or other assets it needs. Use semantic HTML and accessible labels, headings, sections, tables, and controls.
+Create an ordinary static page in the folder, usually `index.html`, plus any CSS, JavaScript, images, or other assets it needs. Use relative asset URLs so path-based preview URLs work. Use semantic HTML and accessible labels, headings, sections, tables, and controls.
 
 The relay serves exact files and directory `index.html` files. It supports GET and HEAD, redirects directory paths to a trailing slash, and does not provide an application-shell fallback. HTML responses include the live-preview client inline.
 
