@@ -1,6 +1,16 @@
 #!/usr/bin/env node
 
+import { readFileSync, writeSync } from "node:fs";
 import readline from "node:readline";
+
+if (process.argv[2] === "--skill") {
+  if (process.argv.length !== 3) {
+    process.stderr.write("Usage: npx letmeknow --skill\\n");
+    process.exit(1);
+  }
+  writeSync(1, readFileSync(new URL("../SKILL.md", import.meta.url)));
+  process.exit(0);
+}
 
 const control = new URL(process.env.LETMEKNOW_URL || "https://letmeknow.dev");
 const graceSeconds = 10 * 60;

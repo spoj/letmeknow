@@ -7,17 +7,22 @@ LetMeKnow gives an agent a temporary interactive web surface for a human. It is 
 Node 22 or newer is required.
 
 ```bash
-npm install
-./bin/letmeknow.js
+npx letmeknow
 ```
 
 The deployed service is used by default. Set `LETMEKNOW_URL` for local development:
 
 ```bash
-LETMEKNOW_URL=http://localhost:8787 ./bin/letmeknow.js
+LETMEKNOW_URL=http://localhost:8787 npx letmeknow
 ```
 
 stdin contains one compact JSON command per line. stdout contains one JSON event per line. Diagnostics go to stderr.
+
+Print the agent-facing skill file without opening a network connection:
+
+```bash
+npx letmeknow --skill > SKILL.md
+```
 
 Start a session:
 

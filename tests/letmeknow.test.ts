@@ -94,7 +94,7 @@ describe("LetMeKnow agent web surface", () => {
     expect(await home.text()).toContain('{"type":"open"}');
     const apex = await SELF.fetch("https://letmeknow.dev/");
     expect(apex.status).toBe(200);
-    expect(await apex.text()).toContain("LETMEKNOW_URL=https://letmeknow.dev");
+    expect(await apex.text()).toContain("default service URL is https://letmeknow.dev");
 
     const connectResponse = await SELF.fetch(`${origin}/v1/connect`);
     expect(connectResponse.status).toBe(426);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -197,6 +198,20 @@ async function runDelayedAcceptScenario() {
 }
 
 describe("LetMeKnow CLI reconnect", () => {
+  it("prints the packaged skill file without connecting", async () => {
+    const child = spawn(process.execPath, [cli.pathname, "--skill"], {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let output = "";
+    let error = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.stderr.on("data", (chunk) => { error += chunk; });
+    const [code] = await once(child, "exit");
+    assert.equal(code, 0);
+    assert.equal(error, "");
+    assert.equal(output, readFileSync(new URL("../SKILL.md", import.meta.url), "utf8"));
+  }, { timeout: 10_000 });
+
   it("reconnects after an unexpected clean close", async () => {
     const result = await runScenario(false);
     assert.equal(result.code, 0);

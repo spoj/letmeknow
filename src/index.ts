@@ -507,7 +507,7 @@ export class Session extends DurableObject<Env> {
 }
 
 function home(origin: string): Response {
-  return new Response(`# LetMeKnow\n\nRun the NDJSON CLI transport from the repository:\n\n  npm install\n  LETMEKNOW_URL=${origin} ./bin/letmeknow.js\n\nSee https://github.com/spoj/letmeknow for setup. Write {"type":"open"} to stdin. Read protocol events from stdout.\n`, {
+  return new Response(`# LetMeKnow\n\nRun the NDJSON CLI:\n\n  npx letmeknow\n\nThe default service URL is https://letmeknow.dev. Set LETMEKNOW_URL for local development. Write {"type":"open"} to stdin. Read protocol events from stdout.\n`, {
     headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }
   });
 }
