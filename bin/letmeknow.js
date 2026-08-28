@@ -6,6 +6,7 @@ const control = new URL(process.env.LETMEKNOW_URL || "https://letmeknow.dev");
 const graceSeconds = 10 * 60;
 const connectionAttemptTimeout = 10_000;
 const maxRetryDelay = 5_000;
+const subprotocolTokenPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 let socket;
 let input;
 let credential;
@@ -53,6 +54,23 @@ function finish(code) {
   clearConnectionTimer();
   input?.close();
   process.exitCode = code;
+}
+
+function validCredential(value) {
+  return typeof value === "string" && subprotocolTokenPattern.test(value);
+}
+
+function validSessionUrl(value) {
+  if (typeof value !== "string") return false;
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  if (/^[a-f0-9]{20}\.letmeknow\.dev$/.test(url.hostname)) return true;
+  return /^\/s\/[a-f0-9]{20}(?:\/|$)/.test(url.pathname);
 }
 
 function isCloseCommand(line) {
@@ -139,12 +157,26 @@ function handleMessage(event) {
     return;
   }
   if (packet.type === "credential") {
-    if (typeof packet.credential === "string") credential = packet.credential;
+    if (!validCredential(packet.credential)) {
+      protocolFailure("invalid credential");
+      return;
+    }
+    credential = packet.credential;
     return;
   }
   if (packet.type === "session") {
-    if (typeof packet.url === "string") sessionUrl = packet.url;
-    if (typeof packet.expires_after_disconnect === "number") retryDelay = 100;
+    if (!validSessionUrl(packet.url)) {
+      protocolFailure("invalid session URL");
+      return;
+    }
+    if (typeof packet.expires_after_disconnect !== "number"
+      || !Number.isFinite(packet.expires_after_disconnect)
+      || packet.expires_after_disconnect <= 0) {
+      protocolFailure("invalid session expiration");
+      return;
+    }
+    sessionUrl = packet.url;
+    retryDelay = 100;
   }
   if (packet.type === "closing") explicitSessionClosed = true;
   process.stdout.write(`${text}\n`);

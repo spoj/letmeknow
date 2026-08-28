@@ -180,20 +180,26 @@ function toResponse(resource: StoredResource, head = false): Response {
   return new Response(bodyless ? null : bytes, { status: resource.status, headers });
 }
 
+function normalizedHostname(hostname: string): string {
+  return hostname.endsWith(".") ? hostname.slice(0, -1) : hostname;
+}
+
 function isProductionHost(hostname: string): boolean {
-  return hostname === "letmeknow.dev" || new RegExp(`^[a-f0-9]{${CODE_LENGTH}}\\.letmeknow\\.dev$`).test(hostname);
+  hostname = normalizedHostname(hostname);
+  return hostname === "letmeknow.dev" || hostname.endsWith(".letmeknow.dev");
 }
 
 function publicTarget(url: URL): { code: string; path: string } | null {
-  const host = url.hostname.match(new RegExp(`^([a-f0-9]{${CODE_LENGTH}})\\.letmeknow\\.dev$`));
+  const hostname = normalizedHostname(url.hostname);
+  const host = hostname.match(new RegExp(`^([a-f0-9]{${CODE_LENGTH}})\\.letmeknow\\.dev$`));
   if (host) return { code: host[1], path: url.pathname };
   const path = url.pathname.match(new RegExp(`^/s/([a-f0-9]{${CODE_LENGTH}})(/.*)?$`));
-  if (!path || url.hostname === "letmeknow.dev") return null;
+  if (!path || isProductionHost(url.hostname)) return null;
   return { code: path[1], path: path[2] || "/" };
 }
 
 function sessionUrl(url: URL, code: string): string {
-  return url.hostname === "letmeknow.dev"
+  return normalizedHostname(url.hostname) === "letmeknow.dev"
     ? `https://${code}.letmeknow.dev/`
     : `${url.origin}/s/${code}/`;
 }
@@ -464,12 +470,13 @@ export class Session extends DurableObject<Env> {
   }
 
   async webSocketClose(socket: WebSocket, code: number, reason: string): Promise<void> {
-    socket.close(code, reason);
     const attachment = socket.deserializeAttachment() as Attachment;
     this.failPending("producer disconnected");
     if (attachment.opened && await this.ctx.storage.get<boolean>("opened")) {
       await this.ctx.storage.setAlarm(Date.now() + GRACE_MS);
     }
+    if (code === 1005 || code === 1006 || code === 1015) socket.close();
+    else socket.close(code, reason);
   }
 
   async webSocketError(socket: WebSocket, _error: unknown): Promise<void> {
@@ -523,6 +530,7 @@ export default {
     }
 
     if (url.pathname === "/v1/connect") {
+      if (isProductionHost(url.hostname) && normalizedHostname(url.hostname) !== "letmeknow.dev") return error("not found", 404);
       if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return error("websocket upgrade required", 426);
       const requestedCode = url.searchParams.get("code");
       if (requestedCode !== null && !new RegExp(`^[a-f0-9]{${CODE_LENGTH}}$`).test(requestedCode)) return error("invalid session code", 400);

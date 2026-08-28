@@ -68,11 +68,12 @@ async function open(base = origin): Promise<{ producer: Producer; url: string }>
 
 async function reconnect(url: string, producer: Producer): Promise<Producer> {
   const publicUrl = new URL(url);
-  const code = publicUrl.hostname.match(/^([a-f0-9]{20})\.app\.letmeknow\.dev$/)?.[1]
+  const code = publicUrl.hostname.match(/^([a-f0-9]{20})\.letmeknow\.dev$/)?.[1]
     || publicUrl.pathname.match(/^\/s\/([a-f0-9]{20})\//)?.[1];
   expect(code).toBeDefined();
   expect(producer.credential).toBeDefined();
-  const replacement = await connect(origin, { code: code!, credential: producer.credential! });
+  const base = publicUrl.hostname.match(/^[a-f0-9]{20}\.letmeknow\.dev$/) ? "https://letmeknow.dev" : origin;
+  const replacement = await connect(base, { code: code!, credential: producer.credential! });
   expect(await replacement.next()).toMatchObject({ type: "session", url });
   return replacement;
 }
@@ -99,6 +100,9 @@ describe("LetMeKnow agent web surface", () => {
     expect(connectResponse.status).toBe(426);
     expect(await connectResponse.json()).toEqual({ error: "websocket upgrade required" });
 
+    const dottedApexConnect = await SELF.fetch("https://letmeknow.dev./v1/connect");
+    expect(dottedApexConnect.status).toBe(426);
+
     const queryCredential = await SELF.fetch(`${origin}/v1/connect?credential=private`, {
       headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": "letmeknow" }
     });
@@ -114,10 +118,19 @@ describe("LetMeKnow agent web surface", () => {
     production.producer.send({ type: "put", path: "/", body: "stored root" });
     await production.producer.next();
     expect(await (await SELF.fetch(production.url)).text()).toBe("stored root");
+    const dottedSessionUrl = new URL(production.url);
+    dottedSessionUrl.hostname += ".";
+    expect(await (await SELF.fetch(dottedSessionUrl)).text()).toBe("stored root");
 
     const code = new URL(production.url).hostname.split(".")[0];
     const apexPath = await SELF.fetch(`https://letmeknow.dev/s/${code}/`);
     expect(apexPath.status).toBe(404);
+    const productionPath = await SELF.fetch(`https://preview.letmeknow.dev/s/${code}/`);
+    expect(productionPath.status).toBe(404);
+    const dottedProductionPath = await SELF.fetch(`https://preview.letmeknow.dev./s/${code}/`);
+    expect(dottedProductionPath.status).toBe(404);
+    const productionConnect = await SELF.fetch("https://preview.letmeknow.dev/v1/connect");
+    expect(productionConnect.status).toBe(404);
 
     production.producer.send({ type: "delete", path: "/" });
     await production.producer.next();
@@ -162,6 +175,18 @@ describe("LetMeKnow agent web surface", () => {
     }));
     expect(publicHost.status).toBe(308);
     expect(publicHost.headers.get("Location")).toBe("https://0123456789abcdef0123.letmeknow.dev/v1/connect?step=2");
+
+    const arbitraryProductionHost = await SELF.fetch(new Request("http://preview.letmeknow.dev/v1/connect", {
+      redirect: "manual"
+    }));
+    expect(arbitraryProductionHost.status).toBe(308);
+    expect(arbitraryProductionHost.headers.get("Location")).toBe("https://preview.letmeknow.dev/v1/connect");
+
+    const dottedProductionHost = await SELF.fetch(new Request("http://preview.letmeknow.dev./anything", {
+      redirect: "manual"
+    }));
+    expect(dottedProductionHost.status).toBe(308);
+    expect(dottedProductionHost.headers.get("Location")).toBe("https://preview.letmeknow.dev./anything");
 
     const local = await SELF.fetch(new Request("http://localhost/v1/connect", {
       method: "POST",
@@ -416,6 +441,51 @@ describe("LetMeKnow agent web surface", () => {
     expect(await (await SELF.fetch(path(url, "/after"))).text()).toBe("after");
   });
 
+  it("reconnects on an exact production session host", async () => {
+    const { producer, url } = await open("https://letmeknow.dev");
+    producer.socket.close(1000, "temporary disconnect");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const replacement = await reconnect(url, producer);
+    expect(new URL(url).hostname).toMatch(/^[a-f0-9]{20}\.letmeknow\.dev$/);
+    replacement.socket.close(1000, "test complete");
+  });
+
+  it("cleans up and schedules grace after a reserved close code", async () => {
+    const session = Object.create(Session.prototype) as {
+      activeRequests: number;
+      pending: Map<string, { resolve(response: Response): void; timer: ReturnType<typeof setTimeout>; head: boolean }>;
+      ctx: { storage: { get(key: string): Promise<unknown>; setAlarm(when: number): Promise<void> } };
+      webSocketClose(socket: WebSocket, code: number, reason: string): Promise<void>;
+    };
+    let resolved = false;
+    let alarmAt: number | undefined;
+    let closeArguments: unknown[] | undefined;
+    session.activeRequests = 1;
+    session.pending = new Map([[
+      "request",
+      { resolve: () => { resolved = true; }, timer: setTimeout(() => {}, 60_000), head: false }
+    ]]);
+    session.ctx = {
+      storage: {
+        get: async (key) => key === "opened",
+        setAlarm: async (when) => { alarmAt = when; }
+      }
+    };
+    const socket = {
+      deserializeAttachment: () => ({ opened: true }),
+      close: (...args: unknown[]) => { closeArguments = args; }
+    } as unknown as WebSocket;
+
+    await session.webSocketClose(socket, 1006, "abnormal closure");
+
+    expect(resolved).toBe(true);
+    expect(session.pending.size).toBe(0);
+    expect(session.activeRequests).toBe(0);
+    expect(alarmAt).toBeTypeOf("number");
+    expect(closeArguments).toEqual([]);
+  });
+
   it("handles a client close before reconnecting and expiring", async () => {
     const { producer, url } = await open();
     producer.socket.close(1000, "client disconnect");
@@ -426,7 +496,7 @@ describe("LetMeKnow agent web surface", () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     const publicUrl = new URL(url);
-    const code = publicUrl.hostname.match(/^([a-f0-9]{20})\.app\.letmeknow\.dev$/)?.[1]
+    const code = publicUrl.hostname.match(/^([a-f0-9]{20})\.letmeknow\.dev$/)?.[1]
       || publicUrl.pathname.split("/")[2];
     expect(await runDurableObjectAlarm(env.SESSIONS.getByName(code))).toBe(true);
     expect((await SELF.fetch(url)).status).toBe(404);

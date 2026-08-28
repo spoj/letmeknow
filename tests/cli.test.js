@@ -260,6 +260,35 @@ describe("LetMeKnow CLI reconnect", () => {
     assert.match(result.error, /server protocol error: packet must be a JSON object/);
   }, { timeout: 10_000 });
 
+  it("rejects malformed credential control events", async () => {
+    const result = await runServerProtocolFailure(JSON.stringify({ type: "credential", credential: "" }));
+    assert.equal(result.code, 1);
+    assert.equal(result.output, "");
+    assert.match(result.error, /server protocol error: invalid credential/);
+  }, { timeout: 10_000 });
+
+  it("rejects malformed session URLs", async () => {
+    const result = await runServerProtocolFailure(JSON.stringify({
+      type: "session",
+      url: "not-a-session-url",
+      expires_after_disconnect: 600
+    }));
+    assert.equal(result.code, 1);
+    assert.equal(result.output, "");
+    assert.match(result.error, /server protocol error: invalid session URL/);
+  }, { timeout: 10_000 });
+
+  it("rejects malformed session expiration data", async () => {
+    const result = await runServerProtocolFailure(JSON.stringify({
+      type: "session",
+      url: "https://0123456789abcdef0123.letmeknow.dev/",
+      expires_after_disconnect: 0
+    }));
+    assert.equal(result.code, 1);
+    assert.equal(result.output, "");
+    assert.match(result.error, /server protocol error: invalid session expiration/);
+  }, { timeout: 10_000 });
+
   it("times out a hanging WebSocket handshake", async () => {
     const result = await runHangingHandshakeScenario();
     assert.equal(result.code, 1);
