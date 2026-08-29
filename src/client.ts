@@ -1,32 +1,57 @@
 const client = String.raw`(() => {
   const socketPath = "/_letmeknow/client";
   const stateKey = () => "letmeknow-state:" + location.href;
-  let socket;
-  let connected = false;
-  let reconnecting = false;
+  let hadSocketConnection = false;
   let reconnectTimer;
   let terminal = false;
-  const statusPage = document.documentElement.hasAttribute("data-letmeknow-status-page");
+  let reloading = false;
+  let producerKnown = false;
+  let producerConnected = false;
+  const submitting = new WeakSet();
 
   function statusTarget(form) {
-    return form.querySelector("[data-letmeknow-status]") || document.querySelector("[data-letmeknow-status]");
+    const local = form.querySelector("[data-letmeknow-status]");
+    if (local) return local;
+    for (const candidate of document.querySelectorAll("[data-letmeknow-status]")) {
+      if (!candidate.closest("form")) return candidate;
+    }
+    let generated = form.querySelector("output[data-letmeknow-generated-status]");
+    if (!generated) {
+      generated = document.createElement("output");
+      generated.setAttribute("role", "status");
+      generated.setAttribute("data-letmeknow-status", "");
+      generated.setAttribute("data-letmeknow-generated-status", "");
+      form.append(generated);
+    }
+    return generated;
   }
 
   function setStatus(form, message) {
-    let target = statusTarget(form);
+    statusTarget(form).textContent = message;
+  }
+
+  function setSystemStatus(message) {
+    let target = document.querySelector("[data-letmeknow-system-status]");
     if (!target) {
       target = document.createElement("output");
       target.setAttribute("role", "status");
-      target.setAttribute("data-letmeknow-status", "");
-      form.append(target);
+      target.setAttribute("data-letmeknow-system-status", "");
+      target.setAttribute("data-letmeknow-generated-status", "");
+      document.body.append(target);
     }
     target.textContent = message;
+  }
+
+  function clearSystemStatus() {
+    const target = document.querySelector("[data-letmeknow-system-status][data-letmeknow-generated-status]");
+    if (target) target.remove();
   }
 
   function saveState() {
     const values = {};
     const seen = new Set();
     for (const control of document.querySelectorAll("input[id], textarea[id], select[id]")) {
+      if (control instanceof HTMLInputElement && control.type === "file") continue;
       if (seen.has(control.id) || document.querySelectorAll("#" + CSS.escape(control.id)).length !== 1) continue;
       seen.add(control.id);
       if (control instanceof HTMLInputElement && (control.type === "checkbox" || control.type === "radio")) {
@@ -38,7 +63,7 @@ const client = String.raw`(() => {
       }
     }
     try {
-      sessionStorage.setItem(stateKey(), JSON.stringify({ values, scrollX: scrollX, scrollY: scrollY }));
+      sessionStorage.setItem(stateKey(), JSON.stringify({ values, scrollX, scrollY }));
     } catch {}
   }
 
@@ -53,97 +78,103 @@ const client = String.raw`(() => {
     if (!saved) return;
     for (const [id, state] of Object.entries(saved.values || {})) {
       const control = document.getElementById(id);
-      if (!control || document.querySelectorAll("#" + CSS.escape(id)).length !== 1) continue;
+      if (!control || (control instanceof HTMLInputElement && control.type === "file") || document.querySelectorAll("#" + CSS.escape(id)).length !== 1) continue;
       if (control instanceof HTMLInputElement && (control.type === "checkbox" || control.type === "radio")) control.checked = Boolean(state.checked);
       else if (control instanceof HTMLSelectElement && control.multiple) {
         const selected = new Set(state.selected || []);
         for (const option of control.options) option.selected = selected.has(option.value);
       } else if (typeof state.value === "string") control.value = state.value;
     }
-    if (Number.isFinite(saved.scrollX) && Number.isFinite(saved.scrollY)) scrollTo(saved.scrollX, saved.scrollY);
+    if (Number.isFinite(saved.scrollX) && Number.isFinite(saved.scrollY)) {
+      requestAnimationFrame(() => scrollTo(saved.scrollX, saved.scrollY));
+    }
   }
 
   function reload() {
+    if (terminal || reloading) return;
+    reloading = true;
     saveState();
     location.reload();
+  }
+
+  function updateProducer(connected) {
+    if (connected) {
+      document.documentElement.removeAttribute("data-letmeknow-disconnected");
+      clearSystemStatus();
+    } else {
+      document.documentElement.setAttribute("data-letmeknow-disconnected", "");
+      setSystemStatus("Connection lost. Reconnecting…");
+    }
+    if (producerKnown && !producerConnected && connected) reload();
+    producerKnown = true;
+    producerConnected = connected;
   }
 
   function connect() {
     if (terminal) return;
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    socket = new WebSocket(protocol + "//" + location.host + socketPath);
+    const socket = new WebSocket(protocol + "//" + location.host + socketPath);
     socket.addEventListener("open", () => {
-      if (connected || reconnecting) {
-        reconnecting = false;
-        connected = true;
-        reload();
-        return;
-      }
-      connected = true;
+      const reconnect = hadSocketConnection;
+      hadSocketConnection = true;
+      if (reconnect) reload();
+      clearSystemStatus();
     });
     socket.addEventListener("message", (event) => {
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
       if (message.type === "revision") reload();
-      else if (message.type === "producer") {
-        if (message.connected) {
-          document.documentElement.removeAttribute("data-letmeknow-disconnected");
-          if (statusPage) reload();
-        }
-        else {
-          document.documentElement.setAttribute("data-letmeknow-disconnected", "");
-          setStatus(document.body, "Connection lost. Reconnecting…");
-        }
-      } else if (message.type === "connected") {
-        if (message.producer_connected) {
-          document.documentElement.removeAttribute("data-letmeknow-disconnected");
-          if (statusPage) reload();
-        }
-        else {
-          document.documentElement.setAttribute("data-letmeknow-disconnected", "");
-          setStatus(document.body, "Connection lost. Reconnecting…");
-        }
-      } else if (message.type === "closed") {
+      else if (message.type === "producer") updateProducer(Boolean(message.connected));
+      else if (message.type === "connected") updateProducer(Boolean(message.producer_connected));
+      else if (message.type === "closed") {
         terminal = true;
         if (reconnectTimer) clearTimeout(reconnectTimer);
-        setStatus(document.body, message.message || "Session closed");
+        setSystemStatus(message.message || "Session closed");
       }
     });
     socket.addEventListener("close", () => {
-      if (terminal) return;
-      if (connected) reconnecting = true;
-      connected = false;
+      if (terminal || reloading) return;
       document.documentElement.setAttribute("data-letmeknow-disconnected", "");
-      setStatus(document.body, "Connection lost. Reconnecting…");
+      setSystemStatus("Connection lost. Reconnecting…");
       reconnectTimer = setTimeout(connect, 1000);
     });
     socket.addEventListener("error", () => {});
   }
 
-  async function submit(form, submitter) {
-    if (!form.checkValidity()) {
+  function submissionDetails(form, submitter) {
+    const method = (submitter?.formMethod || form.method || "get").toUpperCase();
+    const action = new URL(submitter?.formAction || form.action || location.href, location.href);
+    return { method, action, noValidate: Boolean(form.noValidate || submitter?.formNoValidate) };
+  }
+
+  async function submit(form, submitter, details) {
+    if (submitting.has(form)) return;
+    if (!details.noValidate && !form.checkValidity()) {
       form.reportValidity();
       return;
     }
-    const method = (form.method || "get").toUpperCase();
-    if (method !== "GET" && method !== "POST") return;
-    const action = new URL(form.action || location.href, location.href);
-    const data = new FormData(form);
-    const values = {};
-    for (const [name, value] of data.entries()) {
-      if (typeof value !== "string") continue;
-      if (name in values) values[name] = Array.isArray(values[name]) ? values[name].concat(value) : [values[name], value];
-      else values[name] = value;
+    if (details.method !== "GET" && details.method !== "POST") return;
+    if (details.action.origin !== location.origin) {
+      setStatus(form, "Only same-origin forms can be sent.");
+      return;
     }
-    if (method === "GET") {
-      for (const [name, value] of data.entries()) if (typeof value === "string") action.searchParams.append(name, value);
+    const data = new FormData(form, submitter);
+    for (const [, value] of data.entries()) {
+      if (typeof value !== "string") {
+        setStatus(form, "File uploads are not supported yet.");
+        return;
+      }
+    }
+    if (details.method === "GET") {
+      details.action.search = "";
+      for (const [name, value] of data.entries()) details.action.searchParams.append(name, value);
     }
     const id = crypto.randomUUID();
     const headers = {
       "X-LetMeKnow-Submission": "1",
       "X-LetMeKnow-ID": id,
       "X-LetMeKnow-Form-ID": encodeURIComponent(form.id || ""),
-      "X-LetMeKnow-Action": encodeURIComponent(action.pathname + action.search)
+      "X-LetMeKnow-Action": encodeURIComponent(details.action.pathname + details.action.search)
     };
     if (submitter) {
       headers["X-LetMeKnow-Trigger-ID"] = encodeURIComponent(submitter.id || "");
@@ -151,33 +182,37 @@ const client = String.raw`(() => {
       headers["X-LetMeKnow-Trigger-Value"] = encodeURIComponent(submitter.value || "");
     }
     let body;
-    if (method === "POST") {
+    if (details.method === "POST") {
       body = new URLSearchParams();
-      for (const [name, value] of data.entries()) if (typeof value === "string") body.append(name, value);
+      for (const [name, value] of data.entries()) body.append(name, value);
     }
     const previousBusy = form.getAttribute("aria-busy");
-    const previousDisabled = submitter?.disabled;
+    const previousDisabled = submitter ? submitter.disabled : undefined;
+    submitting.add(form);
     form.setAttribute("aria-busy", "true");
     if (submitter) submitter.disabled = true;
     setStatus(form, "Sending…");
     try {
-      const response = await fetch(action, { method, headers, body });
+      const response = await fetch(details.action, { method: details.method, headers, body });
       if (response.status !== 202) throw new Error("submission failed");
       setStatus(form, "Sent. Waiting for an update…");
     } catch {
       setStatus(form, "Couldn’t send. Try again.");
     } finally {
+      submitting.delete(form);
       if (previousBusy === null) form.removeAttribute("aria-busy");
       else form.setAttribute("aria-busy", previousBusy);
-      if (submitter && previousDisabled !== undefined) submitter.disabled = previousDisabled;
+      if (submitter) submitter.disabled = previousDisabled;
     }
   }
 
   document.addEventListener("submit", (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
+    const details = submissionDetails(form, event.submitter);
+    if (details.method === "DIALOG") return;
     event.preventDefault();
-    submit(form, event.submitter);
+    submit(form, event.submitter, details);
   });
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", restoreState, { once: true });
   else restoreState();
