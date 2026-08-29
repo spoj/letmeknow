@@ -77,6 +77,7 @@ const page = `<!doctype html>
   <label><input id="stable-check" type="checkbox" name="checked"> Checked</label>
   <label>Choice <select id="stable-select" name="choice"><option value="one">One</option><option value="two">Two</option></select></label>
   <label>Unstable <input name="unstable"></label>
+  <input type="file" name="empty-file">
   <button id="submit" formaction="/submit" name="decision" value="approve">Approve</button>
   <output id="status" data-letmeknow-status role="status"></output>
 </form>
@@ -187,6 +188,7 @@ describe("browser runtime", () => {
       assert.equal(post.headers["x-letmeknow-trigger-value"], "approve");
       assert.match(post.body, /message=remember\+this/);
       assert.match(post.body, /decision=approve/);
+      assert.doesNotMatch(post.body, /empty-file/);
 
       const revisionBaseline = rootRequests;
       const revisionSocket = sockets.at(-1);

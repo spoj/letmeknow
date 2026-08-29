@@ -208,7 +208,9 @@ describe("LetMeKnow outbound relay", () => {
     const disconnected = await SELF.fetch(new Request(url));
     expect(disconnected.status).toBe(503);
     expect(disconnected.headers.get("content-type")).toContain("text/html");
-    expect(await disconnected.text()).toContain("/_letmeknow/client.js");
+    const body = await disconnected.text();
+    expect(body).toContain('data-letmeknow-status-page="disconnected"');
+    expect(body).toContain("/_letmeknow/client.js");
   });
 
   it("relays requests and preserves late-response and size boundaries", async () => {

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync, statSync, writeSync } from "node:fs";
-import { mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { constants, existsSync, readFileSync, statSync, writeSync } from "node:fs";
+import { mkdtemp, open, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
@@ -130,15 +130,24 @@ async function staticResponse(root, packet) {
       return errorResponse(packet, 500, "preview request failed");
     }
   } else if (request.pathname.endsWith("/")) return errorResponse(packet, 404, "not found");
-  if (info.size > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
-  let body;
-  try { body = await readFile(target); } catch (cause) {
+  let file;
+  try { file = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW); } catch (cause) {
     if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");
-    if (cause?.code === "EACCES" || cause?.code === "EPERM") return errorResponse(packet, 403, "forbidden");
+    if (cause?.code === "EACCES" || cause?.code === "EPERM" || cause?.code === "ELOOP") return errorResponse(packet, 403, "forbidden");
     return errorResponse(packet, 500, "preview request failed");
   }
-  if (body.byteLength > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
-  return response(packet, 200, body, { "Content-Type": getMimeType(target) });
+  try {
+    info = await file.stat();
+    if (!info.isFile()) return errorResponse(packet, 404, "not found");
+    if (info.size > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
+    const body = await file.readFile();
+    if (body.byteLength > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
+    return response(packet, 200, body, { "Content-Type": getMimeType(target) });
+  } catch {
+    return errorResponse(packet, 500, "preview request failed");
+  } finally {
+    await file.close();
+  }
 }
 
 async function multipartSubmission(body, contentType, getAttachmentInbox) {

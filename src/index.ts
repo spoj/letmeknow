@@ -87,7 +87,8 @@ function runtimeTag(): string {
 }
 
 function runtimePage(title: string, message: string, status: number): Response {
-  const body = `<!doctype html><html data-letmeknow-status-page><head><meta charset="utf-8"><title>${title}</title></head><body><h1>${title}</h1><p>${message}</p></body></html>`;
+  const kind = status === 503 ? "disconnected" : "missing";
+  const body = `<!doctype html><html data-letmeknow-status-page="${kind}"><head><meta charset="utf-8"><title>${title}</title></head><body><h1>${title}</h1><p>${message}</p></body></html>`;
   return new Response(body, {
     status,
     headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }

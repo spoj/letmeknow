@@ -7,6 +7,7 @@ const client = String.raw`(() => {
   let reloading = false;
   let producerKnown = false;
   let producerConnected = false;
+  const disconnectedPage = document.documentElement.getAttribute("data-letmeknow-status-page") === "disconnected";
   const submitting = new WeakSet();
 
   function statusTarget(form) {
@@ -112,7 +113,7 @@ const client = String.raw`(() => {
       document.documentElement.setAttribute("data-letmeknow-disconnected", "");
       setSystemStatus("Connection lost. Reconnecting…");
     }
-    if (producerKnown && !producerConnected && connected) reload();
+    if (connected && (disconnectedPage || (producerKnown && !producerConnected))) reload();
     producerKnown = true;
     producerConnected = connected;
   }
@@ -199,7 +200,7 @@ const client = String.raw`(() => {
       if (hasSelectedFile || enctype === "multipart/form-data") body = data;
       else {
         body = new URLSearchParams();
-        for (const [name, value] of data.entries()) body.append(name, value);
+        for (const [name, value] of data.entries()) if (typeof value === "string") body.append(name, value);
       }
     }
     const previousBusy = form.getAttribute("aria-busy");
