@@ -214,7 +214,13 @@ async function staticResponse(root, packet) {
     }
     if (!inside(root, target)) return errorResponse(packet, 403, "forbidden");
     if (deniedPath("/" + relative(root, target).split(sep).join("/"))) return errorResponse(packet, 403, "forbidden");
+    try { info = await stat(target); } catch (cause) {
+      if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");
+      if (cause?.code === "EACCES" || cause?.code === "EPERM") return errorResponse(packet, 403, "forbidden");
+      return errorResponse(packet, 500, "preview request failed");
+    }
   } else if (request.pathname.endsWith("/")) return errorResponse(packet, 404, "not found");
+  if (info.size > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
   let body;
   try { body = await readFile(target); } catch (cause) {
     if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");

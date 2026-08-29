@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -8,6 +8,8 @@ import { describe, it } from "node:test";
 import { WebSocketServer } from "ws";
 
 const cli = new URL("../bin/letmeknow.js", import.meta.url);
+
+const MAX_BODY_BYTES = 1024 * 1024;
 
 async function runRelayScenario() {
   const folder = mkdtempSync(join(tmpdir(), "letmeknow-"));
@@ -20,6 +22,11 @@ async function runRelayScenario() {
   writeFileSync(join(folder, "assets", "app.js"), "console.log('ok')\n");
   writeFileSync(join(folder, "space file.css"), "body {}\n");
   writeFileSync(join(folder, "credentials.PEM"), "secret");
+  writeFileSync(join(folder, "large.bin"), "");
+  truncateSync(join(folder, "large.bin"), MAX_BODY_BYTES + 1);
+  mkdirSync(join(folder, "large-index"));
+  writeFileSync(join(folder, "large-index", "index.html"), "");
+  truncateSync(join(folder, "large-index", "index.html"), MAX_BODY_BYTES + 1);
   writeFileSync(join(outside, "secret.txt"), "outside");
   symlinkSync(join(outside, "secret.txt"), join(folder, "escape.txt"));
   const relay = new WebSocketServer({ port: 0, handleProtocols(protocols) { return [...protocols][0]; } });
@@ -47,6 +54,8 @@ async function runRelayScenario() {
     { request_id: "missing", method: "GET", path: "/missing", headers: {} },
     { request_id: "escape", method: "GET", path: "/escape.txt", headers: {} },
     { request_id: "private", method: "GET", path: "/credentials.PEM", headers: {} },
+    { request_id: "large", method: "GET", path: "/large.bin", headers: {} },
+    { request_id: "largeIndex", method: "GET", path: "/large-index/", headers: {} },
     { request_id: "form", method: "POST", path: "/save", headers: {
       "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
       "x-letmeknow-submission": "1",
@@ -142,6 +151,8 @@ describe("LetMeKnow CLI", () => {
     assert.equal(result.response("missing").status, 404);
     assert.equal(result.response("escape").status, 403);
     assert.equal(result.response("private").status, 403);
+    assert.equal(result.response("large").status, 413);
+    assert.equal(result.response("largeIndex").status, 413);
     assert.deepEqual(result.event, {
       type: "submit",
       id: "local-test",
