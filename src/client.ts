@@ -166,11 +166,12 @@ const client = String.raw`(() => {
       return;
     }
     const data = new FormData(form, submitter);
-    for (const [, value] of data.entries()) {
-      if (typeof value !== "string") {
-        setStatus(form, "File uploads are not supported yet.");
-        return;
-      }
+    const files = Array.from(data.values()).filter((value) => typeof File !== "undefined" && value instanceof File);
+    const hasFile = files.length > 0;
+    const hasSelectedFile = files.some((file) => file.name);
+    if (details.method === "GET" && hasSelectedFile) {
+      setStatus(form, "File uploads are not supported for GET forms.");
+      return;
     }
     if (details.method === "GET") {
       details.action.search = "";
@@ -189,18 +190,31 @@ const client = String.raw`(() => {
       headers["X-LetMeKnow-Trigger-Value"] = encodeURIComponent(submitter.value || "");
     }
     let body;
+    let uploading = false;
     if (details.method === "POST") {
-      body = new URLSearchParams();
-      for (const [name, value] of data.entries()) body.append(name, value);
+      const submitterEnctype = submitter?.hasAttribute("formenctype")
+        ? submitter.formEnctype || submitter.getAttribute("formenctype")
+        : undefined;
+      const enctype = (submitterEnctype || form.enctype || "application/x-www-form-urlencoded").toLowerCase();
+      uploading = hasSelectedFile;
+      if (hasFile || enctype === "multipart/form-data") body = data;
+      else {
+        body = new URLSearchParams();
+        for (const [name, value] of data.entries()) body.append(name, value);
+      }
     }
     const previousBusy = form.getAttribute("aria-busy");
     const previousDisabled = submitter ? submitter.disabled : undefined;
     submitting.add(form);
     form.setAttribute("aria-busy", "true");
     if (submitter) submitter.disabled = true;
-    setStatus(form, "Sending…");
     try {
+      setStatus(form, uploading ? "Uploading…" : "Sending…");
       const response = await fetch(details.action, { method: details.method, headers, body });
+      if (response.status === 413) {
+        setStatus(form, "Attachment is too large.");
+        return;
+      }
       if (response.status !== 202) throw new Error("submission failed");
       setStatus(form, "Sent. Waiting for an update…");
     } catch {
