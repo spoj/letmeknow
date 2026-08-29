@@ -2,6 +2,13 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "letmeknow",
   "main": "src/index.ts",
+  "rules": [
+    {
+      "type": "Text",
+      "globs": ["**/*.client.js"],
+      "fallthrough": true
+    }
+  ],
   "account_id": "7a70f73ca6868c580737f00a3ddbf79b",
   "compatibility_date": "2025-03-01",
   "workers_dev": true,

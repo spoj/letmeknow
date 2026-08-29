@@ -9,7 +9,7 @@ import { describe, it } from "node:test";
 
 const firefox = "/usr/bin/firefox";
 const geckodriver = "/usr/bin/geckodriver";
-const clientFile = new URL("../src/client.ts", import.meta.url);
+const clientFile = new URL("../src/runtime.client.js", import.meta.url);
 
 function requireExecutable(path, name) {
   try {
@@ -20,11 +20,7 @@ function requireExecutable(path, name) {
 }
 
 function runtimeSource() {
-  const source = readFileSync(clientFile, "utf8");
-  const start = source.indexOf("String.raw`") + "String.raw`".length;
-  const end = source.lastIndexOf("`;\n\nexport default client;");
-  if (start < "String.raw`".length || end < start) throw new Error("could not extract browser runtime from src/client.ts");
-  return source.slice(start, end);
+  return readFileSync(clientFile, "utf8");
 }
 
 function request(port, method, path, body) {

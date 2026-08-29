@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import clientSource from "./client";
+import clientSource from "./runtime.client.js";
 
 interface Env {
   SESSIONS: DurableObjectNamespace<Session>;

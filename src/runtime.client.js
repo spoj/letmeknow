@@ -1,4 +1,4 @@
-const client = String.raw`(() => {
+(() => {
   const socketPath = "/_letmeknow/client";
   const stateKey = () => "letmeknow-state:" + location.href;
   let hadSocketConnection = false;
@@ -238,6 +238,4 @@ const client = String.raw`(() => {
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", restoreState, { once: true });
   else restoreState();
   connect();
-})();`;
-
-export default client;
+})();

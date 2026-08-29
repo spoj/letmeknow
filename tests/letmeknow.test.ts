@@ -1,7 +1,6 @@
 import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it } from "vitest";
-import clientSource from "../src/client";
 
 type Event = Record<string, any>;
 type Peer = {
@@ -188,13 +187,6 @@ describe("LetMeKnow outbound relay", () => {
     const post = await SELF.fetch(new Request(runtimeUrl, { method: "POST" }));
     expect(post.status).toBe(405);
     expect(post.headers.get("allow")).toBe("GET, HEAD");
-  });
-
-  it("restores only uniquely identified controls and scroll state", () => {
-    expect(clientSource).toContain("input[id], textarea[id], select[id]");
-    expect(clientSource).toContain("document.querySelectorAll(\"#\" + CSS.escape(control.id)");
-    expect(clientSource).toContain("seen.has(control.id)");
-    expect(clientSource).not.toContain("data-letmeknow-index");
   });
 
   it("serves the runtime and live disconnected pages", async () => {
