@@ -31,7 +31,13 @@ const client = String.raw`(() => {
   }
 
   function setSystemStatus(message) {
-    let target = document.querySelector("[data-letmeknow-system-status]");
+    let target;
+    for (const candidate of document.querySelectorAll("[data-letmeknow-system-status]")) {
+      if (!candidate.closest("form")) {
+        target = candidate;
+        break;
+      }
+    }
     if (!target) {
       target = document.createElement("output");
       target.setAttribute("role", "status");
@@ -43,8 +49,9 @@ const client = String.raw`(() => {
   }
 
   function clearSystemStatus() {
-    const target = document.querySelector("[data-letmeknow-system-status][data-letmeknow-generated-status]");
-    if (target) target.remove();
+    for (const target of document.querySelectorAll("[data-letmeknow-system-status][data-letmeknow-generated-status]")) {
+      if (!target.closest("form")) target.remove();
+    }
   }
 
   function saveState() {
