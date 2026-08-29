@@ -19,6 +19,7 @@ async function runRelayScenario() {
   writeFileSync(join(folder, "assets", "app.css"), "body { color: red }\n");
   writeFileSync(join(folder, "assets", "app.js"), "console.log('ok')\n");
   writeFileSync(join(folder, "space file.css"), "body {}\n");
+  writeFileSync(join(folder, "credentials.PEM"), "secret");
   writeFileSync(join(outside, "secret.txt"), "outside");
   symlinkSync(join(outside, "secret.txt"), join(folder, "escape.txt"));
   const relay = new WebSocketServer({ port: 0, handleProtocols(protocols) { return [...protocols][0]; } });
@@ -42,6 +43,7 @@ async function runRelayScenario() {
     { request_id: "encoded", method: "GET", path: "/space%20file.css?x=1", headers: {} },
     { request_id: "missing", method: "GET", path: "/missing", headers: {} },
     { request_id: "escape", method: "GET", path: "/escape.txt", headers: {} },
+    { request_id: "private", method: "GET", path: "/credentials.PEM", headers: {} },
     { request_id: "form", method: "POST", path: "/save", headers: {
       "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
       "x-letmeknow-submission": "1",
@@ -126,6 +128,7 @@ describe("LetMeKnow CLI", () => {
     assert.equal(result.response("encoded").status, 200);
     assert.equal(result.response("missing").status, 404);
     assert.equal(result.response("escape").status, 403);
+    assert.equal(result.response("private").status, 403);
     assert.deepEqual(result.event, {
       type: "submit",
       id: "local-test",

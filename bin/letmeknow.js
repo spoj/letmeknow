@@ -1,38 +1,28 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync, statSync, watch, writeSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeSync } from "node:fs";
 import { readFile, realpath, stat } from "node:fs/promises";
 import { dirname, extname, relative, resolve, sep } from "node:path";
+import { parseArgs } from "node:util";
+import chokidar from "chokidar";
+import ignore from "ignore";
+import { lookup } from "mrmime";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const GRACE_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
 const MAX_RETRY_DELAY = 5_000;
 const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-const mimeTypes = {
-  ".avif": "image/avif",
-  ".css": "text/css; charset=utf-8",
-  ".csv": "text/csv; charset=utf-8",
-  ".gif": "image/gif",
-  ".html": "text/html; charset=utf-8",
-  ".ico": "image/x-icon",
-  ".jpeg": "image/jpeg",
-  ".jpg": "image/jpeg",
-  ".js": "text/javascript; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".map": "application/json; charset=utf-8",
-  ".mjs": "text/javascript; charset=utf-8",
-  ".pdf": "application/pdf",
-  ".png": "image/png",
-  ".svg": "image/svg+xml",
-  ".txt": "text/plain; charset=utf-8",
-  ".wasm": "application/wasm",
-  ".webmanifest": "application/manifest+json; charset=utf-8",
-  ".webp": "image/webp",
-  ".woff": "font/woff",
-  ".woff2": "font/woff2",
-  ".xml": "application/xml; charset=utf-8"
-};
+const ig = ignore().add([".env", ".env.*", ".git", "*.key", "*.pem", "*.p12", "*.sqlite", "*.db"]);
+const privateFilePattern = /\.(?:key|pem|p12|sqlite|db)$/i;
+
+function getMimeType(filename) {
+  const type = lookup(filename);
+  if (!type) return "application/octet-stream";
+  return type.startsWith("text/") || type === "application/json" || type === "application/xml" || type === "application/manifest+json"
+    ? `${type}; charset=utf-8`
+    : type;
+}
 const client = String.raw`
 const sessionMatch=location.pathname.match(/^\/s\/[a-f0-9]{20}(?:\/|$)/);
 const sessionBase=sessionMatch?(sessionMatch[0].endsWith("/")?sessionMatch[0]:sessionMatch[0]+"/"):"/";
@@ -52,13 +42,13 @@ const formIdentity=form=>form?.id||form?.getAttribute("name")||form?.getAttribut
 const controlKey=(control,index,all=controls())=>{const id=uniqueId(control,all);if(id)return"id:"+id;const form=control.form;const identity=formIdentity(form)+":"+(control.type||control.localName)+":"+(control.name||"");const occurrence=all.slice(0,index).filter(candidate=>!uniqueId(candidate,all)&&formIdentity(candidate.form)+":"+(candidate.type||candidate.localName)+":"+(candidate.name||"")===identity).length;return"control:"+identity+":"+occurrence};
 const detailKey=(element,index,all=details())=>{const id=uniqueId(element,all);return id?"id:"+id:"detail:"+index};
 const pageIdentity=()=>location.pathname+location.search+location.hash;
-const snapshot=()=>{const all=controls();return{version:1,page:pageIdentity(),controls:all.map((control,index)=>({key:controlKey(control,index,all),value:control.value,checked:control.checked,indeterminate:control.indeterminate,selected:control instanceof HTMLSelectElement?[...control.options].map((option,optionIndex)=>option.selected?optionIndex:null).filter(optionIndex=>optionIndex!==null):undefined,start:typeof control.selectionStart==="number"?control.selectionStart:undefined,end:typeof control.selectionEnd==="number"?control.selectionEnd:undefined,direction:control.selectionDirection||undefined})),active:document.activeElement instanceof Element?controlKey(document.activeElement,all.indexOf(document.activeElement),all):undefined,details:details().map((element,index)=>({key:detailKey(element,index),open:element.open})),x:scrollX,y:scrollY}};
+const snapshot=()=>{const all=controls();return{version:1,page:pageIdentity(),controls:all.map((control,index)=>({key:controlKey(control,index,all),value:control.value,checked:control.checked,indeterminate:control.indeterminate,selected:control instanceof HTMLSelectElement?[...control.options].map((option,optionIndex,options)=>option.selected?[option.value,options.slice(0,optionIndex).filter(candidate=>candidate.value===option.value).length]:null).filter(Boolean):undefined,start:typeof control.selectionStart==="number"?control.selectionStart:undefined,end:typeof control.selectionEnd==="number"?control.selectionEnd:undefined,direction:control.selectionDirection||undefined})),active:document.activeElement instanceof Element?controlKey(document.activeElement,all.indexOf(document.activeElement),all):undefined,details:details().map((element,index)=>({key:detailKey(element,index),open:element.open})),x:scrollX,y:scrollY}};
 const status=message=>{const element=document.querySelector("[data-letmeknow-status]");if(element)element.textContent=message};
 const stripSessionPath=path=>{if(sessionBase==="/")return path;if(path===sessionBase.slice(0,-1))return "/";return path.startsWith(sessionBase)?"/"+path.slice(sessionBase.length):path};
 const routePath=()=>{let path=stripSessionPath(location.pathname);return path.endsWith("/")?path+"index.html":path};
 const pagePath=path=>{path=path.split("?",1)[0];return stripSessionPath(path)||"/"};
 const save=()=>{try{sessionStorage.setItem(snapshotKey(),JSON.stringify(snapshot()))}catch{}};
-const restore=()=>{let raw;try{raw=sessionStorage.getItem(snapshotKey())}catch{return}if(!raw)return;let saved;try{saved=JSON.parse(raw)}catch{return}if(saved.version!==1||saved.page!==pageIdentity())return;const all=controls();const savedControls=new Map((Array.isArray(saved.controls)?saved.controls:[]).map(state=>[state.key,state]));let active;for(const [index,control] of all.entries()){const state=savedControls.get(controlKey(control,index,all));if(!state)continue;if(control instanceof HTMLSelectElement&&Array.isArray(state.selected))for(const [optionIndex,option] of [...control.options].entries())option.selected=state.selected.includes(optionIndex);else if(control.type==="checkbox"||control.type==="radio"){control.checked=state.checked;control.indeterminate=state.indeterminate}else{control.value=state.value;if(typeof state.start==="number"&&typeof control.setSelectionRange==="function")control.setSelectionRange(state.start,state.end,state.direction||"none")}if(controlKey(control,index,all)===saved.active)active=control}const savedDetails=new Map((Array.isArray(saved.details)?saved.details:[]).map(state=>[state.key,state]));for(const [index,element] of details().entries()){const state=savedDetails.get(detailKey(element,index));if(state)element.open=state.open}active?.focus({preventScroll:true});scrollTo(saved.x||0,saved.y||0)};
+const restore=()=>{let raw;try{raw=sessionStorage.getItem(snapshotKey())}catch{return}if(!raw)return;let saved;try{saved=JSON.parse(raw)}catch{return}if(saved.version!==1||saved.page!==pageIdentity())return;const all=controls();const savedControls=new Map((Array.isArray(saved.controls)?saved.controls:[]).map(state=>[state.key,state]));let active;for(const [index,control] of all.entries()){const state=savedControls.get(controlKey(control,index,all));if(!state)continue;if(control instanceof HTMLSelectElement&&Array.isArray(state.selected)){const selectedIndexes=new Set(state.selected.filter(Number.isInteger));const selectedValues=new Set(state.selected.filter(Array.isArray).map(entry=>entry.join("\u0000")));for(const [optionIndex,option] of [...control.options].entries()){const occurrence=[...control.options].slice(0,optionIndex).filter(candidate=>candidate.value===option.value).length;option.selected=selectedIndexes.has(optionIndex)||selectedValues.has([option.value,occurrence].join("\u0000"))}}else if(control.type==="checkbox"||control.type==="radio"){control.checked=state.checked;control.indeterminate=state.indeterminate}else{control.value=state.value;if(typeof state.start==="number"&&typeof control.setSelectionRange==="function")control.setSelectionRange(state.start,state.end,state.direction||"none")}if(controlKey(control,index,all)===saved.active)active=control}const savedDetails=new Map((Array.isArray(saved.details)?saved.details:[]).map(state=>[state.key,state]));for(const [index,element] of details().entries()){const state=savedDetails.get(detailKey(element,index));if(state)element.open=state.open}active?.focus({preventScroll:true});scrollTo(saved.x||0,saved.y||0)};
 const reload=()=>{if(reloadTimer)return;reloadTimer=setTimeout(()=>{save();location.reload()},75)};
 const linkedStylesheet=path=>{for(const link of document.querySelectorAll('link[rel~="stylesheet"]')){let url;try{url=new URL(link.href,location.href)}catch{continue}if(url.origin!==location.origin)continue;if(sessionBase!=="/"&&!url.pathname.startsWith(sessionBase))continue;if(pagePath(url.pathname)===path)return link}return null};
 const refreshStylesheet=link=>{const url=new URL(link.href,location.href);url.searchParams.set("_letmeknow",crypto.randomUUID());link.href=url.href};
@@ -149,7 +139,8 @@ function errorResponse(packet, status, message) {
 }
 
 function deniedPath(pathname) {
-  return pathname.split("/").some(part => part === ".env" || part.startsWith(".env.") || part === ".git" || /\.(?:key|pem|p12|sqlite|db)$/i.test(part));
+  const normalized = pathname.replace(/^\/+/, "");
+  return normalized !== "" && (ig.ignores(normalized) || pathname.split("/").filter(Boolean).some(part => ig.ignores(part) || privateFilePattern.test(part)));
 }
 
 function inside(root, target) {
@@ -232,7 +223,7 @@ async function staticResponse(root, packet) {
   if (body.byteLength > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
   if (extname(target).toLowerCase() === ".html") body = htmlWithClient(body);
   if (body.byteLength > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
-  return response(packet, 200, body, { "Content-Type": mimeTypes[extname(target).toLowerCase()] || "application/octet-stream" });
+  return response(packet, 200, body, { "Content-Type": getMimeType(target) });
 }
 
 async function submission(packet) {
@@ -268,14 +259,8 @@ async function handleRequest(root, packet) {
   return staticResponse(root, packet);
 }
 
-function options(args) {
-  let root;
-  for (const argument of args) {
-    if (argument.startsWith("-")) throw new Error(`unknown option: ${argument}`);
-    if (root !== undefined) throw new Error("only one directory may be provided");
-    root = resolve(argument);
-  }
-  root = root || process.cwd();
+function options(directory) {
+  const root = resolve(directory || process.cwd());
   if (!existsSync(root) || !statSync(root).isDirectory()) throw new Error(`directory does not exist: ${root}`);
   return realpath(root).then(root => ({ root }));
 }
@@ -305,11 +290,12 @@ function validSessionUrl(value) {
   return /^\/s\/[a-f0-9]{20}(?:\/|$)/.test(url.pathname);
 }
 
-async function start(args) {
-  const { root } = await options(args);
+async function start(directory) {
+  const { root } = await options(directory);
   const control = process.env.LETMEKNOW_URL || "https://letmeknow.dev";
   let send = () => false;
-  const watcher = watch(root, { recursive: true, encoding: "utf8" }, (_event, filename) => {
+  const watcher = chokidar.watch(root, { ignoreInitial: true });
+  watcher.on("all", (_event, filename) => {
     if (!filename) { send({ type: "file_update", path: "/" }); return; }
     const file = resolve(root, String(filename));
     const path = relative(root, file).split(sep).join("/");
@@ -331,7 +317,7 @@ async function start(args) {
     clearTimeout(retryTimer);
     clearTimeout(connectionTimer);
     try { socket?.close(); } catch {}
-    watcher.close();
+    await watcher.close();
     process.exit(code);
   };
   process.once("SIGINT", () => void stop(0));
@@ -398,11 +384,29 @@ async function start(args) {
   await new Promise(() => {});
 }
 
-if (process.argv[2] === "--skill") {
-  if (process.argv.length !== 3) { process.stderr.write("Usage: npx letmeknow-cli --skill\n"); process.exit(1); }
+let parsed;
+try {
+  parsed = parseArgs({
+    args: process.argv.slice(2),
+    options: {
+      skill: { type: "boolean" },
+      help: { type: "boolean", short: "h" }
+    },
+    allowPositionals: true
+  });
+} catch (cause) {
+  process.stderr.write(`letmeknow: ${cause instanceof Error ? cause.message : "invalid arguments"}\n`);
+  process.exit(1);
+}
+
+if (parsed.values.skill) {
+  if (parsed.positionals.length > 0) { process.stderr.write("Usage: npx letmeknow-cli --skill\n"); process.exit(1); }
   writeSync(1, readFileSync(new URL("../SKILL.md", import.meta.url)));
-} else if (process.argv.slice(2).includes("--help") || process.argv.slice(2).includes("-h")) {
+} else if (parsed.values.help) {
   process.stdout.write("Usage: npx letmeknow-cli [directory]\n\nServe a folder through the hosted LetMeKnow relay. The CLI does not listen on a network port. Form submissions are JSON lines on stdout.\n");
+} else if (parsed.positionals.length > 1) {
+  process.stderr.write("letmeknow: only one directory may be provided\n");
+  process.exit(1);
 } else {
-  try { await start(process.argv.slice(2)); } catch (cause) { process.stderr.write(`letmeknow: ${cause instanceof Error ? cause.message : "server failed"}\n`); process.exitCode = 1; }
+  try { await start(parsed.positionals[0]); } catch (cause) { process.stderr.write(`letmeknow: ${cause instanceof Error ? cause.message : "server failed"}\n`); process.exitCode = 1; }
 }
