@@ -238,7 +238,9 @@ describe("LetMeKnow outbound relay", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(await runDurableObjectAlarm(env.SESSIONS.getByName(code))).toBe(true);
     expect(await client.next()).toEqual({ type: "closed", message: "Session expired" });
-    expect((await SELF.fetch(url)).status).toBe(404);
+    const expired = await SELF.fetch(url);
+    expect(expired.status).toBe(404);
+    expect(await expired.text()).not.toContain("/_letmeknow/client.js");
   });
 
   it("ignores stale producer closes after replacement reconnects", async () => {

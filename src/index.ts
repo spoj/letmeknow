@@ -190,9 +190,9 @@ export class Session extends DurableObject<Env> {
   private async browserRequest(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") return error("websockets are not supported", 426);
     const document = isDocumentRequest(request);
+    if (!(await this.ctx.storage.get<boolean>("opened"))) return document ? runtimePage("Session not found", "This preview is no longer available.", 404) : error("session not found", 404);
     let response: Response;
-    if (!(await this.ctx.storage.get<boolean>("opened"))) response = document ? runtimePage("Session not found", "This preview is not available yet.", 404) : error("session not found", 404);
-    else if (!this.producer()) response = document ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503);
+    if (!this.producer()) response = document ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503);
     else {
       response = await this.proxyRequest(request);
       if (document && response.status === 404) response = runtimePage("Page not found", "This page does not exist yet. Waiting for an update…", 404);
@@ -285,7 +285,7 @@ export class Session extends DurableObject<Env> {
     if (packet.type === "open") {
       if (attachment.opened) throw new Error("open must be the first command");
       await this.ctx.storage.transaction(async (txn) => {
-        if (await txn.get<boolean>("expired") || !(await txn.get<string>("credential"))) throw new Error("session expired");
+        if (!(await txn.get<string>("credential"))) throw new Error("session expired");
         await txn.put("opened", true);
       });
       attachment.opened = true;

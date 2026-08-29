@@ -16,7 +16,7 @@ The CLI prints JSON lines to stdout. The first line contains the public URL:
 {"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/"}
 ```
 
-Open the URL in one or more browsers. The URL is a bearer capability: anyone who has it can view the preview and submit its forms. Sessions are hosted at `letmeknow.dev` and are temporary. `--skill` prints instructions for an agent without starting a session. Diagnostics go to stderr.
+Open the URL in one or more browsers. The URL is a bearer capability: anyone who has it can view the preview and submit its forms. Sessions are hosted at `letmeknow.dev` and are temporary. A graceful CLI stop closes the session; an unexpected disconnect can reconnect for up to ten minutes. `--skill` prints instructions for an agent without starting a session. Diagnostics go to stderr.
 
 The preview directory is public. Keep secrets and unrelated project files elsewhere. Use a dedicated directory containing only the files intended for the human.
 

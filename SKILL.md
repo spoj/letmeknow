@@ -70,4 +70,4 @@ The preview folder is public and is trusted code from the browser's perspective.
 
 ## Stop
 
-Send `SIGINT` or `SIGTERM` to stop the CLI. The temporary hosted session ends when the producer disconnects. Diagnostics go to stderr; stdout remains JSONL.
+Send `SIGINT` or `SIGTERM` to close the session. After an unexpected disconnect, the CLI can reconnect to the session for up to ten minutes. Diagnostics go to stderr; stdout remains JSONL.
