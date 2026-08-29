@@ -12,6 +12,8 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const GRACE_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
 const MAX_RETRY_DELAY = 5_000;
+const REVISION_QUIET_MS = 200;
+const CONTROL_URL = "https://letmeknow.dev";
 const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const ig = ignore().add([".env", ".env.*", ".git", ".ssh", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "*.key", "*.pem", "*.p12", "*.ppk", "*.p8", "*.sqlite", "*.sqlite3", "*.db", "*.db3", "*-wal", "*-shm", "*-journal"]);
 const privateFilePattern = /\.(?:key|pem|p12|ppk|p8|sqlite|sqlite3|db|db3)$|-(?:wal|shm|journal)$/i;
@@ -23,93 +25,6 @@ function getMimeType(filename) {
     ? `${type}; charset=utf-8`
     : type;
 }
-const client = String.raw`
-const clientScript=document.querySelector("script[data-letmeknow-client]");
-const sessionBase=clientScript?new URL(clientScript.src,location.href).pathname.slice(0,-"_letmeknow/client.js".length):"/";
-const credentialKey="letmeknow-credential:"+location.origin+sessionBase;
-const snapshotKey=()=>credentialKey+":state:"+pageIdentity();
-let credential;
-try{credential=sessionStorage.getItem(credentialKey)}catch{}
-let socket;
-let retryTimer;
-let updateTimer;
-let reloadTimer;
-let terminal=false;
-const controls=()=>[...document.querySelectorAll("button,input,select,textarea")];
-const details=()=>[...document.querySelectorAll("details")];
-const uniqueId=(element,all)=>element.id&&all.filter(candidate=>candidate.id===element.id).length===1?element.id:null;
-const formIdentity=form=>form?.id||form?.getAttribute("name")||form?.getAttribute("action")||"document";
-const controlKey=(control,index,all=controls())=>{const id=uniqueId(control,all);if(id)return"id:"+id;const form=control.form;const identity=formIdentity(form)+":"+(control.type||control.localName)+":"+(control.name||"");const occurrence=all.slice(0,index).filter(candidate=>!uniqueId(candidate,all)&&formIdentity(candidate.form)+":"+(candidate.type||candidate.localName)+":"+(candidate.name||"")===identity).length;return"control:"+identity+":"+occurrence};
-const detailKey=(element,index,all=details())=>{const id=uniqueId(element,all);return id?"id:"+id:"detail:"+index};
-const pageIdentity=()=>location.pathname+location.search+location.hash;
-const snapshot=()=>{const all=controls();return{version:1,page:pageIdentity(),controls:all.map((control,index)=>({key:controlKey(control,index,all),value:control.value,checked:control.checked,indeterminate:control.indeterminate,selected:control instanceof HTMLSelectElement?[...control.options].map((option,optionIndex,options)=>option.selected?[option.value,options.slice(0,optionIndex).filter(candidate=>candidate.value===option.value).length]:null).filter(Boolean):undefined,start:typeof control.selectionStart==="number"?control.selectionStart:undefined,end:typeof control.selectionEnd==="number"?control.selectionEnd:undefined,direction:control.selectionDirection||undefined})),active:document.activeElement instanceof Element?controlKey(document.activeElement,all.indexOf(document.activeElement),all):undefined,details:details().map((element,index)=>({key:detailKey(element,index),open:element.open})),x:scrollX,y:scrollY}};
-const status=message=>{const element=document.querySelector("[data-letmeknow-status]");if(element)element.textContent=message};
-const stripSessionPath=path=>{if(sessionBase==="/")return path;if(path===sessionBase.slice(0,-1))return "/";return path.startsWith(sessionBase)?"/"+path.slice(sessionBase.length):path};
-const decodePath=path=>path.split("/").map(part=>{try{return decodeURIComponent(part)}catch{return part}}).join("/");
-const routePath=()=>{let path=decodePath(stripSessionPath(location.pathname));return path.endsWith("/")?path+"index.html":path};
-const pagePath=path=>{path=path.split("?",1)[0];return decodePath(stripSessionPath(path))||"/"};
-const save=()=>{try{sessionStorage.setItem(snapshotKey(),JSON.stringify(snapshot()))}catch{}};
-const restore=()=>{let raw;try{raw=sessionStorage.getItem(snapshotKey())}catch{return}if(!raw)return;let saved;try{saved=JSON.parse(raw)}catch{return}if(saved.version!==1||saved.page!==pageIdentity())return;const all=controls();const savedControls=new Map((Array.isArray(saved.controls)?saved.controls:[]).map(state=>[state.key,state]));let active;for(const [index,control] of all.entries()){const state=savedControls.get(controlKey(control,index,all));if(!state)continue;if(control instanceof HTMLSelectElement&&Array.isArray(state.selected)){const selectedIndexes=new Set(state.selected.filter(Number.isInteger));const selectedValues=new Set(state.selected.filter(Array.isArray).map(entry=>entry.join("\u0000")));for(const [optionIndex,option] of [...control.options].entries()){const occurrence=[...control.options].slice(0,optionIndex).filter(candidate=>candidate.value===option.value).length;option.selected=selectedIndexes.has(optionIndex)||selectedValues.has([option.value,occurrence].join("\u0000"))}}else if(control.type==="checkbox"||control.type==="radio"){control.checked=state.checked;control.indeterminate=state.indeterminate}else if(control.type!=="file"){control.value=state.value;if(typeof state.start==="number"&&typeof control.setSelectionRange==="function")control.setSelectionRange(state.start,state.end,state.direction||"none")}if(controlKey(control,index,all)===saved.active)active=control}const savedDetails=new Map((Array.isArray(saved.details)?saved.details:[]).map(state=>[state.key,state]));for(const [index,element] of details().entries()){const state=savedDetails.get(detailKey(element,index));if(state)element.open=state.open}active?.focus({preventScroll:true});scrollTo(saved.x||0,saved.y||0)};
-const reload=()=>{if(reloadTimer)return;reloadTimer=setTimeout(()=>{save();location.reload()},75)};
-const linkedStylesheet=path=>{for(const link of document.querySelectorAll('link[rel~="stylesheet"]')){let url;try{url=new URL(link.href,location.href)}catch{continue}if(url.origin!==location.origin)continue;if(sessionBase!=="/"&&!url.pathname.startsWith(sessionBase))continue;if(pagePath(url.pathname)===path)return link}return null};
-const refreshStylesheet=link=>{const url=new URL(link.href,location.href);url.searchParams.set("_letmeknow",crypto.randomUUID());link.href=url.href};
-const flushUpdates=()=>{updateTimer=undefined;const paths=[...pendingUpdates];pendingUpdates.clear();let shouldReload=false;const styles=[];for(const path of paths){if(/\.html?$/i.test(path)){if(path===routePath())shouldReload=true}else if(/\.css$/i.test(path)){const link=linkedStylesheet(path);if(link)styles.push([path,link]);else shouldReload=true}else shouldReload=true}if(shouldReload){reload();return}for(const [,link] of styles)refreshStylesheet(link)};
-const pendingUpdates=new Set();
-const update=path=>{if(typeof path!=="string")return;path=pagePath(path);pendingUpdates.add(path);if(!updateTimer)updateTimer=setTimeout(flushUpdates,75)};
-let saveTimer;
-const scheduleSave=()=>{if(!saveTimer)saveTimer=setTimeout(()=>{saveTimer=undefined;save()},100)};
-addEventListener("input",scheduleSave,true);
-addEventListener("change",scheduleSave,true);
-addEventListener("toggle",scheduleSave,true);
-addEventListener("focusin",scheduleSave,true);
-addEventListener("selectionchange",scheduleSave,true);
-addEventListener("scroll",scheduleSave,{passive:true});
-addEventListener("pagehide",save);
-addEventListener("load",()=>requestAnimationFrame(restore),{once:true});
-document.addEventListener("reset",()=>setTimeout(save));
-const connect=()=>{
-  clearTimeout(retryTimer);retryTimer=undefined;
-  const url=new URL(sessionBase+"_letmeknow/client",location.href);url.protocol=url.protocol==="https:"?"wss:":"ws:";
-  const current=credential?new WebSocket(url,credential):new WebSocket(url);
-  socket=current;
-  current.onmessage=event=>{
-    if(socket!==current||typeof event.data!=="string")return;
-    let message;try{message=JSON.parse(event.data)}catch{return}
-    if(message.type==="credential"){credential=message.credential;try{sessionStorage.setItem(credentialKey,credential)}catch{}return}
-    if(message.type==="challenge"){if(current.readyState===WebSocket.OPEN)try{current.send(JSON.stringify({type:"alive",nonce:message.nonce}))}catch{}return}
-    if(message.type==="busy"){status("This session is open elsewhere");retryTimer=setTimeout(connect,message.retry_after*1000);return}
-    if(message.type==="file_update"){update(message.path);return}
-    if(message.type==="closed"){terminal=true;try{sessionStorage.removeItem(credentialKey)}catch{}status(message.message)}
-  };
-  current.onclose=()=>{if(socket!==current||terminal)return;if(!retryTimer){status("Reconnecting…");retryTimer=setTimeout(connect,1000)}};
-  current.onerror=()=>{};
-};
-document.addEventListener("submit",async event=>{
-  const form=event.target;
-  if(!(form instanceof HTMLFormElement))return;
-  const submitter=event.submitter;
-  const method=(submitter?.formMethod||form.method).toLowerCase();
-  if(method==="dialog")return;
-  event.preventDefault();
-  if(!form.noValidate&&!submitter?.formNoValidate&&!form.checkValidity()){form.reportValidity();return}
-  let target;
-  try{const action=submitter?.getAttribute("formaction")??form.getAttribute("action")??location.href;const base=sessionBase!=="/"&&location.pathname===sessionBase.slice(0,-1)&&!document.querySelector("base")?new URL(sessionBase,location.href):document.baseURI;target=new URL(action,base)}catch{status("Invalid form action");return}
-  if(target.origin!==location.origin){status("Form actions must stay on this site");return}
-  if(sessionBase!=="/"){
-    const sessionPath=sessionBase.slice(0,-1);
-    if(target.pathname===sessionPath)target.pathname=sessionBase;
-    else if(!target.pathname.startsWith(sessionBase))target.pathname=sessionBase+target.pathname.replace(/^\//,"");
-  }
-  const values=new URLSearchParams();
-  for(const [name,value] of new FormData(form,submitter)){if(typeof value!=="string"){status("File inputs are not supported");return}values.append(name,value)}
-  const actionPath=sessionBase!=="/"?target.pathname.slice(sessionBase.length-1)||"/":target.pathname;
-  if(method==="get"){target.search="";for(const [name,value] of values)target.searchParams.append(name,value)}
-  const metadata={id:crypto.randomUUID(),form_id:form.id||null,action:actionPath+target.search,trigger:{id:submitter?.id||null,name:submitter?.getAttribute("name"),value:submitter?.getAttribute("value")}};
-  const headers={"X-LetMeKnow-Submission":"1","X-LetMeKnow-ID":encodeURIComponent(metadata.id),"X-LetMeKnow-Form-ID":encodeURIComponent(metadata.form_id??""),"X-LetMeKnow-Action":encodeURIComponent(metadata.action),"X-LetMeKnow-Trigger-ID":encodeURIComponent(metadata.trigger.id??""),"X-LetMeKnow-Trigger-Name":encodeURIComponent(metadata.trigger.name??""),"X-LetMeKnow-Trigger-Value":encodeURIComponent(metadata.trigger.value??"")};
-  try{const response=await fetch(target,{method:method.toUpperCase(),headers,...(method==="post"?{body:values}:{})});if(!response.ok)throw new Error();status("Submitted")}catch{status("The submission failed")}
-});
-connect();
-`;
 
 function header(packet, name) {
   const entry = Object.entries(packet.headers || {}).find(([key]) => key.toLowerCase() === name);
@@ -176,19 +91,11 @@ function requestUrl(packet) {
   return { pathname, encodedPathname: url.pathname, search: url.search };
 }
 
-function htmlWithClient(body, sessionBase) {
-  const text = body.toString("utf8");
-  const base = typeof sessionBase === "string" && /^\/s\/[a-f0-9]{20}\/$/.test(sessionBase) ? sessionBase : "/";
-  const script = `<script type="module" src="${base}_letmeknow/client.js" data-letmeknow-client></script>`;
-  return Buffer.from(text + script, "utf8");
-}
-
 async function staticResponse(root, packet) {
   const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
   if (method !== "GET" && method !== "HEAD") return errorResponse(packet, 405, "method not allowed");
   let request;
   try { request = requestUrl(packet); } catch { return errorResponse(packet, 400, "bad request"); }
-  if (request.pathname === "/_letmeknow/client.js") return response(packet, 200, Buffer.from(client), { "Content-Type": "text/javascript; charset=utf-8" });
   if (deniedPath(request.pathname)) return errorResponse(packet, 403, "forbidden");
   const candidate = resolve(root, "." + request.pathname);
   if (!inside(root, candidate)) return errorResponse(packet, 403, "forbidden");
@@ -229,8 +136,6 @@ async function staticResponse(root, packet) {
     return errorResponse(packet, 500, "preview request failed");
   }
   if (body.byteLength > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
-  if (/^\.html?$/i.test(extname(target))) body = htmlWithClient(body, header(packet, "x-letmeknow-session-base"));
-  if (body.byteLength > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
   return response(packet, 200, body, { "Content-Type": getMimeType(target) });
 }
 
@@ -257,7 +162,7 @@ async function submission(packet) {
     values
   };
   process.stdout.write(`${JSON.stringify(event)}\n`);
-  return response(packet, 204);
+  return response(packet, 202);
 }
 
 async function handleRequest(root, packet) {
@@ -268,23 +173,20 @@ async function handleRequest(root, packet) {
 }
 
 function options(directory) {
-  const root = resolve(directory || process.cwd());
+  const root = resolve(directory);
   if (!existsSync(root) || !statSync(root).isDirectory()) throw new Error(`directory does not exist: ${root}`);
   return realpath(root).then(root => ({ root }));
 }
 
-function endpoint(control, credential, sessionUrl) {
-  const url = new URL(control);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.pathname = "/v1/connect";
-  url.search = "";
-  url.hash = "";
+function endpoint(credential, sessionUrl) {
+  const url = new URL(CONTROL_URL);
+  url.protocol = "wss:";
+  url.pathname = "/v2/connect";
   if (credential && sessionUrl) {
     const publicUrl = new URL(sessionUrl);
-    const hostCode = publicUrl.hostname.match(/^([a-f0-9]{20})\.letmeknow\.dev$/);
-    const pathCode = publicUrl.pathname.match(/^\/s\/([a-f0-9]{20})(?:\/|$)/);
-    const code = hostCode?.[1] || pathCode?.[1];
-    if (code) url.searchParams.set("code", code);
+    const code = publicUrl.hostname.match(/^([a-f0-9]{20})\.letmeknow\.dev$/)?.[1];
+    if (!code) throw new Error("invalid session URL");
+    url.searchParams.set("code", code);
   }
   return url;
 }
@@ -293,22 +195,32 @@ function validSessionUrl(value) {
   if (typeof value !== "string") return false;
   let url;
   try { url = new URL(value); } catch { return false; }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
-  if (/^[a-f0-9]{20}\.letmeknow\.dev$/.test(url.hostname)) return true;
-  return /^\/s\/[a-f0-9]{20}(?:\/|$)/.test(url.pathname);
+  return url.protocol === "https:" && /^[a-f0-9]{20}\.letmeknow\.dev$/.test(url.hostname) && url.pathname === "/" && !url.search && !url.hash;
 }
 
 async function start(directory) {
   const { root } = await options(directory);
-  const control = process.env.LETMEKNOW_URL || "https://letmeknow.dev";
   let send = () => false;
-  const watcher = chokidar.watch(root, { ignoreInitial: true });
-  watcher.on("all", (_event, filename) => {
-    if (!filename) { send({ type: "file_update", path: "/" }); return; }
-    const file = resolve(root, String(filename));
+  let revisionTimer;
+  const watchedPath = filename => {
+    const file = resolve(String(filename));
     const path = relative(root, file).split(sep).join("/");
-    if (!path || path.startsWith("../") || path === ".." || deniedPath("/" + path)) return;
-    send({ type: "file_update", path: "/" + path.split("/").map(encodeURIComponent).join("/") });
+    return path && path !== ".." && !path.startsWith("../") && !deniedPath("/" + path);
+  };
+  const watcher = chokidar.watch(root, {
+    ignoreInitial: true,
+    ignored: filename => {
+      const path = relative(root, resolve(String(filename))).split(sep).join("/");
+      return path !== "" && (path === ".." || path.startsWith("../") || deniedPath("/" + path));
+    }
+  });
+  const scheduleRevision = () => {
+    clearTimeout(revisionTimer);
+    revisionTimer = setTimeout(() => { revisionTimer = undefined; send({ type: "revision" }); }, REVISION_QUIET_MS);
+  };
+  watcher.on("all", (_event, filename) => {
+    if (filename && !watchedPath(filename)) return;
+    scheduleRevision();
   });
   let socket;
   let credential;
@@ -324,6 +236,7 @@ async function start(directory) {
     stopped = true;
     clearTimeout(retryTimer);
     clearTimeout(connectionTimer);
+    clearTimeout(revisionTimer);
     try { socket?.close(); } catch {}
     await watcher.close();
     process.exit(code);
@@ -340,7 +253,7 @@ async function start(directory) {
   const connect = () => {
     if (stopped) return;
     const reconnecting = Boolean(credential && sessionUrl);
-    const current = socket = reconnecting ? new WebSocket(endpoint(control, credential, sessionUrl), credential) : new WebSocket(endpoint(control));
+    const current = socket = reconnecting ? new WebSocket(endpoint(credential, sessionUrl), credential) : new WebSocket(endpoint());
     connectionTimer = setTimeout(() => {
       if (socket !== current || current.readyState === WebSocket.OPEN || stopped) return;
       try { current.close(); } catch {}
@@ -411,9 +324,9 @@ if (parsed.values.skill) {
   if (parsed.positionals.length > 0) { process.stderr.write("Usage: npx letmeknow-cli --skill\n"); process.exit(1); }
   writeSync(1, readFileSync(new URL("../SKILL.md", import.meta.url)));
 } else if (parsed.values.help) {
-  process.stdout.write("Usage: npx letmeknow-cli [directory]\n\nServe a folder through the hosted LetMeKnow relay. The CLI does not listen on a network port. Form submissions are JSON lines on stdout.\n");
-} else if (parsed.positionals.length > 1) {
-  process.stderr.write("letmeknow: only one directory may be provided\n");
+  process.stdout.write("Usage: npx letmeknow-cli <directory>\n\nServe a folder through the hosted LetMeKnow relay. The CLI does not listen on a network port. Form submissions are JSON lines on stdout.\n");
+} else if (parsed.positionals.length !== 1) {
+  process.stderr.write("letmeknow: exactly one directory must be provided\n");
   process.exit(1);
 } else {
   try { await start(parsed.positionals[0]); } catch (cause) { process.stderr.write(`letmeknow: ${cause instanceof Error ? cause.message : "server failed"}\n`); process.exitCode = 1; }
