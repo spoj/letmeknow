@@ -444,6 +444,12 @@ export default {
       return new Response(null, { status: 308, headers: { Location: url.toString() } });
     }
 
+    const slashlessSession = url.pathname.match(new RegExp(`^/s/[a-f0-9]{${CODE_LENGTH}}$`));
+    if (slashlessSession && (!isProductionHost(url.hostname) || normalizedHostname(url.hostname) === "letmeknow.dev")) {
+      url.pathname += "/";
+      return new Response(null, { status: 308, headers: { Location: url.toString() } });
+    }
+
     const target = publicTarget(url);
     if (target) {
       const headers = new Headers(request.headers);

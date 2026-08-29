@@ -78,6 +78,29 @@ describe("LetMeKnow outbound relay", () => {
     expect((await open("https://letmeknow.dev")).url).toMatch(/^https:\/\/[a-f0-9]{20}\.letmeknow\.dev\/$/);
   });
 
+  it("redirects slashless path session roots to a relative-asset-safe URL", async () => {
+    const { producer, url } = await open();
+    const canonical = new URL(url);
+    const slashless = new URL(canonical);
+    slashless.pathname = slashless.pathname.slice(0, -1);
+    slashless.search = "?view=source";
+
+    const redirect = await SELF.fetch(new Request(slashless, { redirect: "manual" }));
+    expect(redirect.status).toBe(308);
+    const location = redirect.headers.get("location")!;
+    const expected = new URL(slashless);
+    expected.pathname += "/";
+    expect(location).toBe(expected.toString());
+
+    const asset = new URL("assets/app.css", location);
+    expect(asset.pathname).toBe(`${canonical.pathname}assets/app.css`);
+    const assetResponse = SELF.fetch(new Request(asset));
+    const request = await producer.next();
+    expect(request).toMatchObject({ type: "http_request", method: "GET", path: "/assets/app.css" });
+    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
+    expect((await assetResponse).status).toBe(200);
+  });
+
   it("relays browser requests and file updates through one producer", async () => {
     const { producer, url } = await open();
     const client = await connectClient(url);
