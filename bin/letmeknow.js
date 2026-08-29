@@ -203,7 +203,7 @@ async function staticResponse(root, packet) {
     return errorResponse(packet, 500, "preview request failed");
   }
   if (info.isDirectory()) {
-    if (!request.pathname.endsWith("/")) {
+    if (!request.encodedPathname.endsWith("/")) {
       const location = request.encodedPathname + "/" + request.search;
       return response(packet, 301, Buffer.from(`Redirecting to ${location}`), { Location: location, "Content-Type": "text/plain; charset=utf-8" });
     }

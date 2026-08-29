@@ -40,6 +40,8 @@ async function runRelayScenario() {
     { request_id: "asset", method: "GET", path: "/assets/app.js?cache=1", headers: {} },
     { request_id: "head", method: "HEAD", path: "/assets/app.js?cache=1", headers: {} },
     { request_id: "redirect", method: "GET", path: "/nested", headers: {} },
+    { request_id: "encodedUpper", method: "GET", path: "/nested%2F?view=upper", headers: {} },
+    { request_id: "encodedLower", method: "GET", path: "/nested%2f?view=lower", headers: {} },
     { request_id: "directory", method: "GET", path: "/nested/", headers: {} },
     { request_id: "encoded", method: "GET", path: "/space%20file.css?x=1", headers: {} },
     { request_id: "missing", method: "GET", path: "/missing", headers: {} },
@@ -131,6 +133,10 @@ describe("LetMeKnow CLI", () => {
     assert.equal(result.response("head").headers["Content-Length"], String(Buffer.byteLength("console.log('ok')\n")));
     assert.equal(result.response("redirect").status, 301);
     assert.equal(result.response("redirect").headers.Location, "/nested/");
+    assert.equal(result.response("encodedUpper").status, 301);
+    assert.equal(result.response("encodedUpper").headers.Location, "/nested%2F/?view=upper");
+    assert.equal(result.response("encodedLower").status, 301);
+    assert.equal(result.response("encodedLower").headers.Location, "/nested%2f/?view=lower");
     assert.match(result.response("directory").body, /^nested<script type="module" src="\/_letmeknow\/client\.js" data-letmeknow-client>/);
     assert.equal(result.response("encoded").status, 200);
     assert.equal(result.response("missing").status, 404);
