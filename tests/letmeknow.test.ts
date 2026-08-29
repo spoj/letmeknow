@@ -1,4 +1,4 @@
-import { SELF, runDurableObjectAlarm } from "cloudflare:test";
+import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -78,6 +78,29 @@ describe("LetMeKnow outbound relay", () => {
     expect((await open("https://letmeknow.dev")).url).toMatch(/^https:\/\/[a-f0-9]{20}\.letmeknow\.dev\/$/);
   });
 
+  it("redirects slashless path session roots to a relative-asset-safe URL", async () => {
+    const { producer, url } = await open();
+    const canonical = new URL(url);
+    const slashless = new URL(canonical);
+    slashless.pathname = slashless.pathname.slice(0, -1);
+    slashless.search = "?view=source";
+
+    const redirect = await SELF.fetch(new Request(slashless, { redirect: "manual" }));
+    expect(redirect.status).toBe(308);
+    const location = redirect.headers.get("location")!;
+    const expected = new URL(slashless);
+    expected.pathname += "/";
+    expect(location).toBe(expected.toString());
+
+    const asset = new URL("assets/app.css", location);
+    expect(asset.pathname).toBe(`${canonical.pathname}assets/app.css`);
+    const assetResponse = SELF.fetch(new Request(asset));
+    const request = await producer.next();
+    expect(request).toMatchObject({ type: "http_request", method: "GET", path: "/assets/app.css" });
+    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
+    expect((await assetResponse).status).toBe(200);
+  });
+
   it("relays browser requests and file updates through one producer", async () => {
     const { producer, url } = await open();
     const client = await connectClient(url);
@@ -105,6 +128,46 @@ describe("LetMeKnow outbound relay", () => {
 
     producer.send({ type: "file_update", path: "/space%20file.css" });
     expect(await client.next()).toEqual({ type: "file_update", path: "/space%20file.css" });
+  });
+
+  it("ignores late responses for timed-out browser requests", async () => {
+    const { producer, url } = await open();
+    const page = SELF.fetch(new Request(url));
+    const request = await producer.next();
+    const code = new URL(url).pathname.split("/")[2];
+    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => {
+      const session = instance as unknown as {
+        pendingProxy: Map<string, { resolve(response: Response): void; timer: ReturnType<typeof setTimeout> }>
+      };
+      const pending = session.pendingProxy.get(request.request_id);
+      clearTimeout(pending!.timer);
+      session.pendingProxy.delete(request.request_id);
+      pending!.resolve(new Response(null, { status: 504 }));
+    });
+    expect((await page).status).toBe(504);
+
+    const lateEvents: Event[] = [];
+    const lateListener = (message: MessageEvent) => lateEvents.push(JSON.parse(message.data as string));
+    producer.socket.addEventListener("message", lateListener);
+    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    producer.socket.removeEventListener("message", lateListener);
+    expect(lateEvents).toEqual([]);
+
+    const nextPage = SELF.fetch(new Request(url));
+    const nextRequest = await producer.next();
+    producer.send({ type: "http_response", request_id: nextRequest.request_id, status: 200, headers: {}, body: "" });
+    expect((await nextPage).status).toBe(200);
+  });
+
+  it("rejects oversized requests from Content-Length before proxying", async () => {
+    const { producer, url } = await open();
+    const response = await SELF.fetch(new Request(url, {
+      method: "POST",
+      headers: { "Content-Length": String(1024 * 1024 + 1) }
+    }));
+    expect(response.status).toBe(413);
+    expect(await Promise.race([producer.next(), new Promise((resolve) => setTimeout(() => resolve(undefined), 50))])).toBeUndefined();
   });
 
   it("relays form submissions and preserves the session path", async () => {
@@ -153,6 +216,35 @@ describe("LetMeKnow outbound relay", () => {
     const replacement = await connectClient(url);
     expect(await replacement.next()).toEqual({ type: "busy", retry_after: 5 });
     producer.socket.close(1000, "done");
+  });
+
+  it("ignores a stale producer close after replacement reconnects", async () => {
+    const { producer, url } = await open();
+    const client = await connectClient(url);
+    expect(await client.next()).toEqual({ type: "connected", producer_connected: true });
+    producer.socket.close(1000, "restart");
+    expect(await client.next()).toEqual({ type: "producer", connected: false });
+
+    const code = new URL(url).pathname.split("/")[2];
+    const replacement = await SELF.fetch(new Request(`${origin}/v1/connect?code=${code}`, {
+      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": producer.credential! }
+    }));
+    expect(replacement.status).toBe(101);
+    const replacementProducer = peer(replacement.webSocket!);
+    expect(await replacementProducer.next()).toMatchObject({ type: "session", url });
+    expect(await client.next()).toEqual({ type: "producer", connected: true });
+
+    const page = SELF.fetch(new Request(url));
+    const request = await replacementProducer.next();
+    const staleSocket = {
+      deserializeAttachment: () => ({ role: "producer", url, opened: true, closing: false }),
+      close: () => {}
+    } as unknown as WebSocket;
+    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.webSocketClose(staleSocket, 1000, "stale"));
+    expect(await runDurableObjectAlarm(env.SESSIONS.getByName(code))).toBe(false);
+    replacementProducer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
+    expect((await page).status).toBe(200);
+    expect(await Promise.race([client.next(), new Promise((resolve) => setTimeout(() => resolve(undefined), 50))])).toBeUndefined();
   });
 
   it("reconnects the producer and expires disconnected sessions", async () => {

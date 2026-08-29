@@ -13,8 +13,8 @@ const GRACE_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
 const MAX_RETRY_DELAY = 5_000;
 const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-const ig = ignore().add([".env", ".env.*", ".git", "*.key", "*.pem", "*.p12", "*.sqlite", "*.db"]);
-const privateFilePattern = /\.(?:key|pem|p12|sqlite|db)$/i;
+const ig = ignore().add([".env", ".env.*", ".git", ".ssh", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "*.key", "*.pem", "*.p12", "*.ppk", "*.p8", "*.sqlite", "*.db"]);
+const privateFilePattern = /\.(?:key|pem|p12|ppk|p8|sqlite|db)$/i;
 
 function getMimeType(filename) {
   const type = lookup(filename);
@@ -90,7 +90,7 @@ document.addEventListener("submit",async event=>{
   const submitter=event.submitter;
   const method=(submitter?.getAttribute("formmethod")??form.getAttribute("method")??"get").toLowerCase()||"get";
   if(method!=="get"&&method!=="post"){status("Only GET and POST forms are supported");return}
-  if(!submitter?.hasAttribute("formnovalidate")&&!form.checkValidity()){form.reportValidity();return}
+  if(!form.noValidate&&!submitter?.formNoValidate&&!form.checkValidity()){form.reportValidity();return}
   let target;
   try{const action=submitter?.getAttribute("formaction")??form.getAttribute("action")??location.href;const base=sessionBase!=="/"&&location.pathname===sessionBase.slice(0,-1)&&!document.querySelector("base")?new URL(sessionBase,location.href):document.baseURI;target=new URL(action,base)}catch{status("Invalid form action");return}
   if(target.origin!==location.origin){status("Form actions must stay on this site");return}
@@ -203,8 +203,8 @@ async function staticResponse(root, packet) {
     return errorResponse(packet, 500, "preview request failed");
   }
   if (info.isDirectory()) {
-    if (!request.pathname.endsWith("/")) {
-      const location = request.encodedPathname + "/" + request.search;
+    if (!request.encodedPathname.endsWith("/")) {
+      const location = request.encodedPathname.slice(request.encodedPathname.lastIndexOf("/") + 1) + "/" + request.search;
       return response(packet, 301, Buffer.from(`Redirecting to ${location}`), { Location: location, "Content-Type": "text/plain; charset=utf-8" });
     }
     const index = resolve(target, "index.html");
@@ -214,7 +214,13 @@ async function staticResponse(root, packet) {
     }
     if (!inside(root, target)) return errorResponse(packet, 403, "forbidden");
     if (deniedPath("/" + relative(root, target).split(sep).join("/"))) return errorResponse(packet, 403, "forbidden");
+    try { info = await stat(target); } catch (cause) {
+      if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");
+      if (cause?.code === "EACCES" || cause?.code === "EPERM") return errorResponse(packet, 403, "forbidden");
+      return errorResponse(packet, 500, "preview request failed");
+    }
   } else if (request.pathname.endsWith("/")) return errorResponse(packet, 404, "not found");
+  if (info.size > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
   let body;
   try { body = await readFile(target); } catch (cause) {
     if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");
@@ -337,7 +343,7 @@ async function start(directory) {
     connectionTimer = setTimeout(() => {
       if (socket !== current || current.readyState === WebSocket.OPEN || stopped) return;
       try { current.close(); } catch {}
-      if (reconnecting) retry(); else void stop(1);
+      if (!reconnecting) void stop(1);
     }, CONNECTION_TIMEOUT);
     current.addEventListener("open", () => {
       if (socket !== current || stopped) return;

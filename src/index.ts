@@ -258,8 +258,31 @@ export class Session extends DurableObject<Env> {
   private async proxyRequest(request: Request): Promise<Response> {
     const producer = this.producer();
     if (!producer) return error("producer disconnected", 503);
-    const body = new Uint8Array(await request.arrayBuffer());
-    if (body.byteLength > MAX_BODY_BYTES) return error("request body is too large", 413);
+    const contentLength = request.headers.get("content-length");
+    if (contentLength !== null && /^\d+$/.test(contentLength) && BigInt(contentLength) > BigInt(MAX_BODY_BYTES)) {
+      return error("request body is too large", 413);
+    }
+    const reader = request.body?.getReader();
+    const chunks: Uint8Array[] = [];
+    let bodyLength = 0;
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (bodyLength + value.byteLength > MAX_BODY_BYTES) {
+          await reader.cancel();
+          return error("request body is too large", 413);
+        }
+        chunks.push(value);
+        bodyLength += value.byteLength;
+      }
+    }
+    const body = new Uint8Array(bodyLength);
+    let bodyOffset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, bodyOffset);
+      bodyOffset += chunk.byteLength;
+    }
     const headers: Record<string, string> = {};
     for (const [name, value] of request.headers) {
       if (!hopHeaders.has(name)) headers[name] = value;
@@ -359,7 +382,7 @@ export class Session extends DurableObject<Env> {
     if (packet.type === "http_response") {
       if (typeof packet.request_id !== "string") throw new Error("request_id is required");
       const pending = this.pendingProxy.get(packet.request_id);
-      if (!pending) throw new Error("proxy request is not pending");
+      if (!pending) return;
       clearTimeout(pending.timer);
       this.pendingProxy.delete(packet.request_id);
       try {
@@ -400,6 +423,8 @@ export class Session extends DurableObject<Env> {
     if (this.probe?.socket === socket) this.probe.settle(false);
     await this.mutate(async () => {
       if (attachment.role === "producer") {
+        const active = this.producer();
+        if (active && active !== socket) return;
         this.failProxyRequests();
         this.sendClient({ type: "producer", connected: false });
         if (attachment.opened && await this.ctx.storage.get<boolean>("opened")) {
@@ -441,6 +466,12 @@ export default {
     const url = new URL(request.url);
     if (url.protocol === "http:" && isProductionHost(url.hostname)) {
       url.protocol = "https:";
+      return new Response(null, { status: 308, headers: { Location: url.toString() } });
+    }
+
+    const slashlessSession = url.pathname.match(new RegExp(`^/s/[a-f0-9]{${CODE_LENGTH}}$`));
+    if (slashlessSession && (!isProductionHost(url.hostname) || normalizedHostname(url.hostname) === "letmeknow.dev")) {
+      url.pathname += "/";
       return new Response(null, { status: 308, headers: { Location: url.toString() } });
     }
 
