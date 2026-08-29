@@ -167,7 +167,6 @@ const client = String.raw`(() => {
     }
     const data = new FormData(form, submitter);
     const files = Array.from(data.values()).filter((value) => typeof File !== "undefined" && value instanceof File);
-    const hasFile = files.length > 0;
     const hasSelectedFile = files.some((file) => file.name);
     if (details.method === "GET" && hasSelectedFile) {
       setStatus(form, "File uploads are not supported for GET forms.");
@@ -175,7 +174,7 @@ const client = String.raw`(() => {
     }
     if (details.method === "GET") {
       details.action.search = "";
-      for (const [name, value] of data.entries()) details.action.searchParams.append(name, value);
+      for (const [name, value] of data.entries()) if (typeof value === "string") details.action.searchParams.append(name, value);
     }
     const id = crypto.randomUUID();
     const headers = {
@@ -197,7 +196,7 @@ const client = String.raw`(() => {
         : undefined;
       const enctype = (submitterEnctype || form.enctype || "application/x-www-form-urlencoded").toLowerCase();
       uploading = hasSelectedFile;
-      if (hasFile || enctype === "multipart/form-data") body = data;
+      if (hasSelectedFile || enctype === "multipart/form-data") body = data;
       else {
         body = new URLSearchParams();
         for (const [name, value] of data.entries()) body.append(name, value);
