@@ -160,6 +160,16 @@ describe("LetMeKnow outbound relay", () => {
     expect((await nextPage).status).toBe(200);
   });
 
+  it("rejects oversized requests from Content-Length before proxying", async () => {
+    const { producer, url } = await open();
+    const response = await SELF.fetch(new Request(url, {
+      method: "POST",
+      headers: { "Content-Length": String(1024 * 1024 + 1) }
+    }));
+    expect(response.status).toBe(413);
+    expect(await Promise.race([producer.next(), new Promise((resolve) => setTimeout(() => resolve(undefined), 50))])).toBeUndefined();
+  });
+
   it("relays form submissions and preserves the session path", async () => {
     const { producer, url } = await open();
     const page = SELF.fetch(new Request(new URL("save", url), {

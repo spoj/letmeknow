@@ -258,8 +258,31 @@ export class Session extends DurableObject<Env> {
   private async proxyRequest(request: Request): Promise<Response> {
     const producer = this.producer();
     if (!producer) return error("producer disconnected", 503);
-    const body = new Uint8Array(await request.arrayBuffer());
-    if (body.byteLength > MAX_BODY_BYTES) return error("request body is too large", 413);
+    const contentLength = request.headers.get("content-length");
+    if (contentLength !== null && /^\d+$/.test(contentLength) && BigInt(contentLength) > BigInt(MAX_BODY_BYTES)) {
+      return error("request body is too large", 413);
+    }
+    const reader = request.body?.getReader();
+    const chunks: Uint8Array[] = [];
+    let bodyLength = 0;
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (bodyLength + value.byteLength > MAX_BODY_BYTES) {
+          await reader.cancel();
+          return error("request body is too large", 413);
+        }
+        chunks.push(value);
+        bodyLength += value.byteLength;
+      }
+    }
+    const body = new Uint8Array(bodyLength);
+    let bodyOffset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, bodyOffset);
+      bodyOffset += chunk.byteLength;
+    }
     const headers: Record<string, string> = {};
     for (const [name, value] of request.headers) {
       if (!hopHeaders.has(name)) headers[name] = value;
