@@ -130,6 +130,36 @@ describe("LetMeKnow outbound relay", () => {
     expect(await client.next()).toEqual({ type: "file_update", path: "/space%20file.css" });
   });
 
+  it("ignores late responses for timed-out browser requests", async () => {
+    const { producer, url } = await open();
+    const page = SELF.fetch(new Request(url));
+    const request = await producer.next();
+    const code = new URL(url).pathname.split("/")[2];
+    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => {
+      const session = instance as unknown as {
+        pendingProxy: Map<string, { resolve(response: Response): void; timer: ReturnType<typeof setTimeout> }>
+      };
+      const pending = session.pendingProxy.get(request.request_id);
+      clearTimeout(pending!.timer);
+      session.pendingProxy.delete(request.request_id);
+      pending!.resolve(new Response(null, { status: 504 }));
+    });
+    expect((await page).status).toBe(504);
+
+    const lateEvents: Event[] = [];
+    const lateListener = (message: MessageEvent) => lateEvents.push(JSON.parse(message.data as string));
+    producer.socket.addEventListener("message", lateListener);
+    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    producer.socket.removeEventListener("message", lateListener);
+    expect(lateEvents).toEqual([]);
+
+    const nextPage = SELF.fetch(new Request(url));
+    const nextRequest = await producer.next();
+    producer.send({ type: "http_response", request_id: nextRequest.request_id, status: 200, headers: {}, body: "" });
+    expect((await nextPage).status).toBe(200);
+  });
+
   it("relays form submissions and preserves the session path", async () => {
     const { producer, url } = await open();
     const page = SELF.fetch(new Request(new URL("save", url), {

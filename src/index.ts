@@ -359,7 +359,7 @@ export class Session extends DurableObject<Env> {
     if (packet.type === "http_response") {
       if (typeof packet.request_id !== "string") throw new Error("request_id is required");
       const pending = this.pendingProxy.get(packet.request_id);
-      if (!pending) throw new Error("proxy request is not pending");
+      if (!pending) return;
       clearTimeout(pending.timer);
       this.pendingProxy.delete(packet.request_id);
       try {
