@@ -203,14 +203,14 @@ async function start(directory) {
   let send = () => false;
   let revisionTimer;
   const watchedPath = filename => {
-    const file = resolve(String(filename));
+    const file = resolve(root, String(filename));
     const path = relative(root, file).split(sep).join("/");
     return path && path !== ".." && !path.startsWith("../") && !deniedPath("/" + path);
   };
   const watcher = chokidar.watch(root, {
     ignoreInitial: true,
     ignored: filename => {
-      const path = relative(root, resolve(String(filename))).split(sep).join("/");
+      const path = relative(root, resolve(root, String(filename))).split(sep).join("/");
       return path !== "" && (path === ".." || path.startsWith("../") || deniedPath("/" + path));
     }
   });
@@ -237,6 +237,7 @@ async function start(directory) {
     clearTimeout(retryTimer);
     clearTimeout(connectionTimer);
     clearTimeout(revisionTimer);
+    send({ type: "close" });
     try { socket?.close(); } catch {}
     await watcher.close();
     process.exit(code);
