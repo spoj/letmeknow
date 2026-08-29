@@ -1,56 +1,39 @@
 ---
 name: letmeknow
-description: Give a human a live public preview of an agent-managed folder and receive browser form submissions as JSON lines.
+description: Give a human a temporary live preview of an agent-managed folder and receive browser form submissions as JSON lines.
 ---
 
 # LetMeKnow
 
-Use LetMeKnow when one human needs to inspect or interact with a temporary page, report, dashboard, approval form, quiz, table, or status view. The agent owns the files in a folder. The CLI serves that folder directly, connects to the public relay over an outbound WebSocket, and reports browser submissions on stdout.
-
-The CLI does **not** listen on a local network port.
+Use LetMeKnow when a human needs to inspect or interact with a temporary page, report, dashboard, approval form, quiz, table, or status view. You own the files in a dedicated preview folder. The CLI serves that folder through the hosted LetMeKnow relay and reports browser submissions on stdout. It does not listen on a local network port.
 
 ## Start
 
-Run the CLI as a long-lived child process with the folder you will edit:
+Pass only the files intended for public viewing in an explicit directory:
 
 ```bash
-npx letmeknow-cli ./workspace
+npx letmeknow-cli ./preview
 ```
 
-Node.js 22.12 or newer is required. Read stdout and stderr separately. Stdout is JSONL; the first event is:
+Node.js 22.12 or newer is required. Keep the process running while the human uses the page. Read stdout and stderr separately. Stdout is JSONL; the first event is:
 
 ```json
 {"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/"}
 ```
 
-Open that URL for the human. The directory defaults to the current working directory. Set `LETMEKNOW_URL` to use another compatible relay. There are no host or port options: the CLI intentionally has no listening socket.
+Give the human the URL. It is a bearer capability, so anyone with it can view the preview and submit forms. Multiple browsers may view the session. `--skill` prints these instructions without starting a session.
 
-Do not send file commands to stdin. Read and write the folder directly. Keep the process running while the human uses the page.
+## Build the preview
 
-## Build the page
+Create an ordinary static site in the folder, usually `index.html`, with its CSS, JavaScript, images, and other assets. Use semantic HTML, accessible labels, and relative asset URLs. Use normal links for navigation.
 
-Create an ordinary static page in the folder, usually `index.html`, plus any CSS, JavaScript, images, or other assets it needs. Use relative asset URLs so path-based preview URLs work. Use semantic HTML and accessible labels, headings, sections, tables, and controls.
+The relay injects the browser runtime into HTML. All files in the folder form one live workspace. Changes made in a short burst become one revision, and connected browsers perform a full-page reload. The runtime preserves scroll position and values, checked state, and selected state for controls with stable, unique `id` attributes.
 
-The relay serves exact files and directory `index.html` files. It supports GET and HEAD, redirects directory paths to a trailing slash, and does not provide an application-shell fallback. HTML responses load the live-preview client script.
-
-The preview continuously saves each page's form values, checked controls, selections, focus, text selection, scroll position, and open `<details>` elements in the tab's session storage. It restores them after file-triggered and user-triggered reloads.
-
-The preview is live:
-
-- A change to the current HTML route reloads the page with its saved state.
-- CSS changes cache-bust matching linked stylesheets without navigating.
-- Changes to a different HTML route do not disturb the current page.
-- Changes to other assets reload the page. Arbitrary JavaScript heap state cannot be preserved.
-
-An optional status element gives the human feedback after a form submission:
-
-```html
-<p data-letmeknow-status aria-live="polite"></p>
-```
+A missing page displays a live 404 page that can recover when you create the page. Connection status pages reconnect and recover when the producer is available again.
 
 ## Receive form submissions
 
-GET and POST forms are intercepted before navigation and sent through the relay to the CLI. Read stdout for a `submit` event:
+Use native GET and POST forms with relative or same-origin actions:
 
 ```html
 <form id="search" action="/search" method="post">
@@ -59,40 +42,30 @@ GET and POST forms are intercepted before navigation and sent through the relay 
 </form>
 ```
 
-The event is:
+The runtime provides automatic transport feedback: **Sending…**, **Sent. Waiting for an update…**, or **Couldn’t send. Try again.** Add `[data-letmeknow-status]` for a custom status location. The transport accepts submissions asynchronously with `202 Accepted`.
+
+Read stdout for a `submit` event:
 
 ```json
 {"type":"submit","id":"…","method":"POST","action":"/search","form_id":"search","trigger":{"id":null,"name":"scope","value":"all"},"values":{"query":"quarterly report","scope":"all"}}
 ```
 
-Rules:
+Give forms stable IDs and controls meaningful `name` values. Native browser validation runs before delivery. Repeated names become arrays. File inputs are not supported in this release. The event ID identifies the submission, not a response channel: validate the values, update the files, and let the next workspace revision show the result. Do not write commands to stdin.
 
-- Give interactive forms a stable, meaningful `id`.
-- Give controls meaningful `name` values.
-- Use normal relative or same-origin actions.
-- Use `formaction` and `formmethod` on submitters when different buttons have different intents.
-- Native `required`, input types, ranges, and patterns validate in the browser before the event is sent.
-- Repeated names become string arrays.
-- File inputs and cross-origin actions are not supported.
+## Example workflow
 
-The event ID identifies the submission. There is no response packet. Validate its values, edit the files, and let the live preview show the result. Do not write JSON commands to stdin.
-
-## Example response workflow
-
-1. Render the initial state in `index.html`.
+1. Build the initial page in `index.html`.
 2. Wait for a `submit` event on stdout.
-3. Validate its `values` and `action`.
-4. Rewrite the relevant HTML or data file in the workspace.
-5. The agent updates the live preview.
+3. Validate its values and action.
+4. Rewrite the relevant HTML or data file in the preview folder.
+5. Let the workspace revision reload the human's page.
 
-Escape untrusted values before placing them in HTML. Treat browser input as untrusted even though the folder is local to the agent.
+Escape untrusted values before placing them in HTML.
 
 ## Security
 
-The public URL is a bearer capability. The relay receives the served files and submitted values. Do not put secrets in the preview folder or submit credentials unless that is intentional. The folder is trusted executable code from the browser's perspective.
-
-The selected folder is resolved with real paths, and requests cannot escape it through symlinks. `.env` files, `.git`, private-key files, and database files are denied. The CLI makes outbound relay connections only; it does not accept inbound browser connections.
+The preview folder is public and is trusted code from the browser's perspective. Keep secrets and unrelated project files elsewhere. The CLI restricts requests to the selected directory and excludes `.env`, `.git`, private-key, and database files. It makes outbound relay connections only and accepts no inbound browser connections.
 
 ## Stop
 
-Send `SIGINT` or `SIGTERM` to stop the CLI. The relay session expires after producer disconnect. `--skill` prints these instructions without starting a session.
+Send `SIGINT` or `SIGTERM` to stop the CLI. The temporary hosted session ends when the producer disconnects. Diagnostics go to stderr; stdout remains JSONL.
