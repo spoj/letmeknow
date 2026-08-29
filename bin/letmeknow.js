@@ -13,8 +13,8 @@ const GRACE_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
 const MAX_RETRY_DELAY = 5_000;
 const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-const ig = ignore().add([".env", ".env.*", ".git", "*.key", "*.pem", "*.p12", "*.sqlite", "*.db"]);
-const privateFilePattern = /\.(?:key|pem|p12|sqlite|db)$/i;
+const ig = ignore().add([".env", ".env.*", ".git", ".ssh", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "*.key", "*.pem", "*.p12", "*.ppk", "*.p8", "*.sqlite", "*.db"]);
+const privateFilePattern = /\.(?:key|pem|p12|ppk|p8|sqlite|db)$/i;
 
 function getMimeType(filename) {
   const type = lookup(filename);

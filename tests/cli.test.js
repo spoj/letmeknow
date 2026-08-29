@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { once } from "node:events";
 import { describe, it } from "node:test";
@@ -110,7 +110,72 @@ async function runRelayScenario() {
   }
 }
 
+async function runStaticRequests(paths) {
+  const folder = mkdtempSync(join(tmpdir(), "letmeknow-sensitive-"));
+  const publicPaths = ["public.txt", "id_rsa.pub"];
+  for (const path of [...paths, ...publicPaths]) {
+    const file = join(folder, path);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, paths.includes(path) ? "private" : "public");
+  }
+  const relay = new WebSocketServer({ port: 0, handleProtocols(protocols) { return [...protocols][0]; } });
+  await once(relay, "listening");
+  const responses = new Map();
+  const requestPaths = [...paths, ".ssh/", ...publicPaths];
+  const requests = requestPaths.map(path => ({ request_id: path, method: "GET", path: "/" + path, headers: {} }));
+  const done = new Promise((resolve, reject) => {
+    relay.on("error", reject);
+    relay.on("connection", socket => {
+      socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
+      socket.send(JSON.stringify({ type: "session", url: "http://127.0.0.1/s/0123456789abcdef0123/", expires_after_disconnect: 600 }));
+      let opened = false;
+      let index = 0;
+      const next = () => {
+        if (index === requests.length) return resolve(responses);
+        socket.send(JSON.stringify({ type: "http_request", body: "", ...requests[index++] }));
+      };
+      socket.on("message", data => {
+        const packet = JSON.parse(data.toString());
+        if (packet.type === "open" && !opened) { opened = true; next(); }
+        else if (packet.type === "http_response") { responses.set(packet.request_id, packet); next(); }
+      });
+    });
+  });
+  const child = spawn(process.execPath, [cli.pathname, folder], {
+    env: { ...process.env, LETMEKNOW_URL: `http://127.0.0.1:${relay.address().port}` },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let timer;
+  try {
+    return await Promise.race([done, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("sensitive-file request timed out")), 10_000); })]);
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null) {
+      child.kill("SIGTERM");
+      await once(child, "exit");
+    }
+    await new Promise(resolve => relay.close(resolve));
+    rmSync(folder, { recursive: true, force: true });
+  }
+}
+
 describe("LetMeKnow CLI", () => {
+  it("denies SSH private-key paths but serves public files", async () => {
+    const protectedPaths = [
+      ".ssh/id_ed25519", ".ssh/id_rsa", ".ssh/id_ecdsa", ".ssh/id_dsa",
+      "id_ed25519", "id_rsa", "id_ecdsa", "id_dsa",
+      "server.key", "server.pem", "bundle.p12", "putty.ppk", "private.p8"
+    ];
+    const responses = await runStaticRequests(protectedPaths);
+    for (const path of protectedPaths) assert.equal(responses.get(path).status, 403, path);
+    assert.equal(responses.get(".ssh/").status, 403);
+    for (const path of ["public.txt", "id_rsa.pub"]) {
+      const result = responses.get(path);
+      assert.equal(result.status, 200, path);
+      assert.equal(Buffer.from(result.body, "base64").toString(), "public");
+    }
+  });
+
   it("prints the skill file without connecting", async () => {
     const child = spawn(process.execPath, [cli.pathname, "--skill"], { stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
