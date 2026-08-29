@@ -14,7 +14,7 @@ type Packet = Record<string, unknown>;
 type ProducerAttachment = { role: "producer"; url: string; opened: boolean; closing: boolean };
 type ClientAttachment = { role: "client" };
 type Attachment = ProducerAttachment | ClientAttachment;
-type PendingProxy = { resolve(response: Response): void; timer: ReturnType<typeof setTimeout> };
+type PendingProxy = { resolve(response: Response): void; timer: ReturnType<typeof setTimeout>; document: boolean };
 
 const CODE_LENGTH = 20;
 const PRODUCER_GRACE_MS = 10 * 60 * 1_000;
@@ -78,7 +78,7 @@ function publicTarget(url: URL): { code: string; path: string } | null {
   return match ? { code: match[1], path: url.pathname } : null;
 }
 
-function sessionUrl(url: URL, code: string): string {
+function sessionUrl(code: string): string {
   return `https://${code}.letmeknow.dev/`;
 }
 
@@ -99,7 +99,7 @@ function isDocumentRequest(request: Request): boolean {
   const destination = request.headers.get("sec-fetch-dest");
   if (destination !== null) return destination === "document";
   const accept = request.headers.get("accept");
-  return accept === null || accept.includes("text/html");
+  return accept === null || accept.toLowerCase().includes("text/html");
 }
 
 function injectRuntime(response: Response, request: Request): Response {
@@ -109,9 +109,9 @@ function injectRuntime(response: Response, request: Request): Response {
   const headers = new Headers(response.headers);
   headers.delete("content-length");
   const rewriter = new HTMLRewriter();
-  let hasBody = false;
-  rewriter.on("body", { element(element) { hasBody = true; element.append(runtimeTag(), { html: true }); } });
-  rewriter.onDocument({ end(document) { if (!hasBody) document.append(runtimeTag(), { html: true }); } });
+  let hasRuntime = false;
+  rewriter.on("[data-letmeknow-runtime]", { element() { hasRuntime = true; } });
+  rewriter.onDocument({ end(document) { if (!hasRuntime) document.append(runtimeTag(), { html: true }); } });
   return rewriter.transform(new Response(response.body, { status: response.status, statusText: response.statusText, headers }));
 }
 
@@ -192,12 +192,15 @@ export class Session extends DurableObject<Env> {
     if (!(await this.ctx.storage.get<boolean>("opened"))) return isDocumentRequest(request) ? runtimePage("Session not found", "This preview is not available yet.", 404) : error("session not found", 404);
     if (!this.producer()) return isDocumentRequest(request) ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503);
     const response = await this.proxyRequest(request);
-    return request.headers.get("x-letmeknow-submission") === "1" ? response : injectRuntime(response, request);
+    if (request.method === "HEAD") return new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers });
+    if (request.headers.get("x-letmeknow-submission") === "1") return response;
+    if (isDocumentRequest(request) && response.status === 404) return runtimePage("Page not found", "This page does not exist yet. Waiting for an update…", 404);
+    return injectRuntime(response, request);
   }
 
   private async proxyRequest(request: Request): Promise<Response> {
     const producer = this.producer();
-    if (!producer) return runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503);
+    if (!producer) return isDocumentRequest(request) ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503);
     const contentLength = request.headers.get("content-length");
     if (contentLength !== null && /^\d+$/.test(contentLength) && BigInt(contentLength) > BigInt(MAX_BODY_BYTES)) return error("request body is too large", 413);
     const reader = request.body?.getReader();
@@ -223,13 +226,17 @@ export class Session extends DurableObject<Env> {
     const id = crypto.randomUUID();
     const response = new Promise<Response>((resolve) => {
       const timer = setTimeout(() => { this.pendingProxy.delete(id); resolve(error("producer request timed out", 504)); }, PROXY_TIMEOUT_MS);
-      this.pendingProxy.set(id, { resolve, timer });
+      this.pendingProxy.set(id, { resolve, timer, document: isDocumentRequest(request) });
     });
     try {
       producer.send(JSON.stringify({ type: "http_request", request_id: id, method: request.method, path: request.headers.get("x-letmeknow-path")!, headers, body: bytesToBase64(body) }));
     } catch {
       const pending = this.pendingProxy.get(id);
-      if (pending) { clearTimeout(pending.timer); this.pendingProxy.delete(id); pending.resolve(error("producer disconnected", 503)); }
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pendingProxy.delete(id);
+        pending.resolve(pending.document ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503));
+      }
     }
     return response;
   }
@@ -237,7 +244,7 @@ export class Session extends DurableObject<Env> {
   private failProxyRequests(): void {
     for (const [id, pending] of this.pendingProxy) {
       clearTimeout(pending.timer);
-      pending.resolve(error("producer disconnected", 503));
+      pending.resolve(pending.document ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503));
       this.pendingProxy.delete(id);
     }
   }
@@ -361,8 +368,11 @@ export default {
     if (target) {
       const headers = new Headers(request.headers);
       if (target.path === clientSocketPath) headers.set("x-letmeknow-route", "client");
-      else if (target.path === runtimePath && request.method === "GET") return new Response(clientSource, { headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" } });
-      else {
+      else if (target.path === runtimePath) {
+        if (request.method === "GET") return new Response(clientSource, { headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" } });
+        if (request.method === "HEAD") return new Response(null, { headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" } });
+        return new Response(null, { status: 405, headers: { Allow: "GET, HEAD", "Cache-Control": "no-store" } });
+      } else {
         headers.set("x-letmeknow-route", "browser");
         headers.set("x-letmeknow-path", target.path + url.search);
       }
@@ -386,7 +396,7 @@ export default {
       const producerCredential = reconnect ? protocol! : token(CODE_LENGTH * 2);
       const headers = new Headers(request.headers);
       headers.set("x-letmeknow-route", "producer");
-      headers.set("x-letmeknow-url", sessionUrl(url, code));
+      headers.set("x-letmeknow-url", sessionUrl(code));
       headers.set("x-letmeknow-credential", producerCredential);
       if (reconnect) headers.set("x-letmeknow-reconnect", "true");
       return env.SESSIONS.getByName(code).fetch(new Request(request, { headers }));

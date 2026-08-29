@@ -73,6 +73,7 @@ describe("LetMeKnow outbound relay", () => {
     expect(url).toMatch(/^https:\/\/[a-f0-9]{20}\.letmeknow\.dev\/$/);
     expect((await SELF.fetch(new Request(`${origin}/s/01234567890123456789/`))).status).toBe(404);
     expect((await SELF.fetch(new Request("https://preview.example/v2/connect", { headers: { Upgrade: "websocket" } }))).status).toBe(404);
+    expect((await SELF.fetch(new Request(`${origin}/v1/connect`, { headers: { Upgrade: "websocket" } }))).status).toBe(404);
   });
 
   it("allows multiple clients and broadcasts revisions and producer lifecycle", async () => {
@@ -106,6 +107,91 @@ describe("LetMeKnow outbound relay", () => {
     const submissionRequest = await producer.next();
     producer.send({ type: "http_response", request_id: submissionRequest.request_id, status: 202, headers: { "content-type": "text/html" }, body: btoa("accepted") });
     expect(await (await submission).text()).toBe("accepted");
+  });
+
+  it("turns producer document 404s into live pages but leaves missing assets alone", async () => {
+    const { producer, url } = await open();
+    const missingPage = SELF.fetch(new Request(new URL("missing", url), { headers: { Accept: "text/html" } }));
+    const pageRequest = await producer.next();
+    producer.send({ type: "http_response", request_id: pageRequest.request_id, status: 404, headers: { "content-type": "text/plain" }, body: btoa("missing") });
+    const pageResponse = await missingPage;
+    const pageBody = await pageResponse.text();
+    expect(pageResponse.status).toBe(404);
+    expect(pageResponse.headers.get("content-type")).toContain("text/html");
+    expect(pageBody).toContain("This page does not exist yet");
+    expect(pageBody).toContain("/_letmeknow/client.js");
+
+    const missingAsset = SELF.fetch(new Request(new URL("missing.css", url), { headers: { Accept: "text/css", "Sec-Fetch-Dest": "style" } }));
+    const assetRequest = await producer.next();
+    producer.send({ type: "http_response", request_id: assetRequest.request_id, status: 404, headers: { "content-type": "text/plain" }, body: btoa("missing asset") });
+    const assetResponse = await missingAsset;
+    expect(assetResponse.status).toBe(404);
+    expect(await assetResponse.text()).toBe("missing asset");
+    expect(assetResponse.headers.get("content-type")).toBe("text/plain");
+  });
+
+  it("injects HTML once, removes stale lengths, and handles documents without a body", async () => {
+    const { producer, url } = await open();
+    const page = SELF.fetch(new Request(url));
+    const pageRequest = await producer.next();
+    producer.send({ type: "http_response", request_id: pageRequest.request_id, status: 200, headers: { "content-type": "text/html", "content-length": "4" }, body: btoa("<html><head></head><body>ok</body></html>") });
+    const pageResponse = await page;
+    const pageBody = await pageResponse.text();
+    expect(pageResponse.headers.get("content-length")).toBeNull();
+    expect(pageBody.match(/data-letmeknow-runtime/g)).toHaveLength(1);
+
+    const alreadyInjected = SELF.fetch(new Request(new URL("already", url)));
+    const alreadyRequest = await producer.next();
+    producer.send({ type: "http_response", request_id: alreadyRequest.request_id, status: 200, headers: { "content-type": "text/html" }, body: btoa(`<html>${'<script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime></script>'}</html>`) });
+    expect((await (await alreadyInjected).text()).match(/data-letmeknow-runtime/g)).toHaveLength(1);
+
+    const noBody = SELF.fetch(new Request(new URL("empty", url)));
+    const noBodyRequest = await producer.next();
+    producer.send({ type: "http_response", request_id: noBodyRequest.request_id, status: 200, headers: { "content-type": "text/html" }, body: "" });
+    expect(await (await noBody).text()).toContain("/_letmeknow/client.js");
+  });
+
+  it("does not inject or return a body for HEAD HTML requests", async () => {
+    const { producer, url } = await open();
+    const head = SELF.fetch(new Request(url, { method: "HEAD" }));
+    const request = await producer.next();
+    expect(request.method).toBe("HEAD");
+    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: { "content-type": "text/html", "content-length": "4" }, body: btoa("body") });
+    const response = await head;
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("");
+    expect(response.headers.get("content-length")).toBe("4");
+  });
+
+  it("keeps disconnected asset responses non-HTML", async () => {
+    const { producer, url } = await open();
+    const pendingPage = SELF.fetch(new Request(url));
+    await producer.next();
+    producer.socket.close(1000, "gone");
+    const pendingResponse = await pendingPage;
+    expect(pendingResponse.status).toBe(503);
+    expect(pendingResponse.headers.get("content-type")).toContain("text/html");
+
+    const response = await SELF.fetch(new Request(new URL("style.css", url), { headers: { Accept: "text/css", "Sec-Fetch-Dest": "style" } }));
+    expect(response.status).toBe(503);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    expect(await response.text()).not.toContain("<html");
+  });
+
+  it("serves the runtime with deliberate method handling", async () => {
+    const { url } = await open();
+    const runtimeUrl = new URL("_letmeknow/client.js", url);
+    const runtime = await SELF.fetch(new Request(runtimeUrl));
+    expect(runtime.status).toBe(200);
+    expect(await runtime.text()).toContain("Sent. Waiting for an update");
+
+    const head = await SELF.fetch(new Request(runtimeUrl, { method: "HEAD" }));
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+
+    const post = await SELF.fetch(new Request(runtimeUrl, { method: "POST" }));
+    expect(post.status).toBe(405);
+    expect(post.headers.get("allow")).toBe("GET, HEAD");
   });
 
   it("restores only uniquely identified controls and scroll state", () => {
