@@ -93,7 +93,7 @@ describe("LetMeKnow integration", () => {
       assert.match(pageText, new RegExp(`src="/s/${code}/_letmeknow/client\\.js"`));
       const clientScript = await fetch(new URL("_letmeknow/client.js", browserUrl));
       assert.equal(clientScript.status, 200);
-      assert.match(await clientScript.text(), /const sessionMatch/);
+      assert.match(await clientScript.text(), /const clientScript=/);
 
       const nestedRequest = new URL("nested?view=source", browserUrl);
       const nestedRedirect = await fetch(nestedRequest, { redirect: "manual" });

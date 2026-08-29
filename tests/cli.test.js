@@ -17,6 +17,7 @@ async function runRelayScenario() {
   mkdirSync(join(folder, "nested"));
   mkdirSync(join(folder, "assets"));
   writeFileSync(join(folder, "index.html"), `<!doctype html><html><head><script>const marker = "</body>";</script><link rel="stylesheet" href="/assets/app.css"></head><body><form id="contact" action="/save" method="post"><input name="name"><button name="kind" value="send">Send</button></form></body></html>`);
+  writeFileSync(join(folder, "page.htm"), "legacy html");
   writeFileSync(join(folder, "nested", "index.html"), "nested");
   writeFileSync(join(folder, "assets", "app.css"), "body { color: red }\n");
   writeFileSync(join(folder, "assets", "app.js"), "console.log('ok')\n");
@@ -43,6 +44,7 @@ async function runRelayScenario() {
   let update;
   const requests = [
     { request_id: "page", method: "GET", path: "/", headers: { accept: "text/html" } },
+    { request_id: "legacyPage", method: "GET", path: "/page.htm", headers: {} },
     { request_id: "client", method: "GET", path: "/_letmeknow/client.js", headers: {} },
     { request_id: "asset", method: "GET", path: "/assets/app.js?cache=1", headers: {} },
     { request_id: "head", method: "HEAD", path: "/assets/app.js?cache=1", headers: {} },
@@ -164,7 +166,8 @@ describe("LetMeKnow CLI", () => {
     const protectedPaths = [
       ".ssh/id_ed25519", ".ssh/id_rsa", ".ssh/id_ecdsa", ".ssh/id_dsa",
       "id_ed25519", "id_rsa", "id_ecdsa", "id_dsa",
-      "server.key", "server.pem", "bundle.p12", "putty.ppk", "private.p8"
+      "server.key", "server.pem", "bundle.p12", "putty.ppk", "private.p8",
+      "app.sqlite3", "cache.db3", "app.sqlite-wal", "app.sqlite-shm", "app.sqlite-journal"
     ];
     const responses = await runStaticRequests(protectedPaths);
     for (const path of protectedPaths) assert.equal(responses.get(path).status, 403, path);
@@ -196,9 +199,14 @@ describe("LetMeKnow CLI", () => {
     assert.match(result.response("page").body, /src="\/_letmeknow\/client\.js"/);
     assert.ok(result.response("page").body.lastIndexOf("data-letmeknow-client") > result.response("page").body.lastIndexOf("</html>"));
     assert.equal(result.response("page").headers["Content-Type"], "text/html; charset=utf-8");
+    assert.match(result.response("legacyPage").body, /^legacy html<script type="module"/);
+    assert.equal(result.response("legacyPage").headers["Content-Type"], "text/html; charset=utf-8");
     assert.equal(result.response("client").status, 200);
     assert.equal(result.response("client").headers["Content-Type"], "text/javascript; charset=utf-8");
-    assert.match(result.response("client").body, /const sessionMatch/);
+    assert.match(result.response("client").body, /const clientScript=/);
+    assert.match(result.response("client").body, /const decodePath=/);
+    assert.match(result.response("client").body, /control\.type!=="file"/);
+    assert.match(result.response("client").body, /if\(method==="dialog"\)return/);
     assert.match(result.response("client").body, /if\(!form\.noValidate&&!submitter\?\.formNoValidate&&!form\.checkValidity\(\)\)/);
     assert.equal(result.response("asset").status, 200);
     assert.equal(result.response("asset").headers["Content-Type"], "text/javascript; charset=utf-8");

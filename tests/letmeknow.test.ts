@@ -88,9 +88,13 @@ describe("LetMeKnow outbound relay", () => {
     const redirect = await SELF.fetch(new Request(slashless, { redirect: "manual" }));
     expect(redirect.status).toBe(308);
     const location = redirect.headers.get("location")!;
-    const expected = new URL(slashless);
-    expected.pathname += "/";
-    expect(location).toBe(expected.toString());
+    expect(location).toBe(canonical.toString() + slashless.search);
+
+    const encodedSlash = new URL(slashless);
+    encodedSlash.pathname += "%2F";
+    const encodedRedirect = await SELF.fetch(new Request(encodedSlash, { redirect: "manual" }));
+    expect(encodedRedirect.status).toBe(308);
+    expect(encodedRedirect.headers.get("location")).toBe(location);
 
     const asset = new URL("assets/app.css", location);
     expect(asset.pathname).toBe(`${canonical.pathname}assets/app.css`);
@@ -99,6 +103,21 @@ describe("LetMeKnow outbound relay", () => {
     expect(request).toMatchObject({ type: "http_request", method: "GET", path: "/assets/app.css" });
     producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
     expect((await assetResponse).status).toBe(200);
+  });
+
+  it("uses the root session base for host-session paths that resemble path sessions", async () => {
+    const { producer, url } = await open("https://letmeknow.dev");
+    const code = new URL(url).hostname.split(".")[0];
+    const page = new URL(`/s/${code}/index.html`, url);
+    const response = SELF.fetch(new Request(page, { headers: { "X-LetMeKnow-Session-Base": "https://evil.example/" } }));
+    const request = await producer.next();
+    expect(request).toMatchObject({
+      type: "http_request",
+      path: `/s/${code}/index.html`,
+      headers: { "x-letmeknow-session-base": "/" }
+    });
+    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
+    expect((await response).status).toBe(200);
   });
 
   it("relays browser requests and file updates through one producer", async () => {

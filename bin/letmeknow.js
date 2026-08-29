@@ -13,8 +13,8 @@ const GRACE_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
 const MAX_RETRY_DELAY = 5_000;
 const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-const ig = ignore().add([".env", ".env.*", ".git", ".ssh", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "*.key", "*.pem", "*.p12", "*.ppk", "*.p8", "*.sqlite", "*.db"]);
-const privateFilePattern = /\.(?:key|pem|p12|ppk|p8|sqlite|db)$/i;
+const ig = ignore().add([".env", ".env.*", ".git", ".ssh", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "*.key", "*.pem", "*.p12", "*.ppk", "*.p8", "*.sqlite", "*.sqlite3", "*.db", "*.db3", "*-wal", "*-shm", "*-journal"]);
+const privateFilePattern = /\.(?:key|pem|p12|ppk|p8|sqlite|sqlite3|db|db3)$|-(?:wal|shm|journal)$/i;
 
 function getMimeType(filename) {
   const type = lookup(filename);
@@ -24,8 +24,8 @@ function getMimeType(filename) {
     : type;
 }
 const client = String.raw`
-const sessionMatch=location.pathname.match(/^\/s\/[a-f0-9]{20}(?:\/|$)/);
-const sessionBase=sessionMatch?(sessionMatch[0].endsWith("/")?sessionMatch[0]:sessionMatch[0]+"/"):"/";
+const clientScript=document.querySelector("script[data-letmeknow-client]");
+const sessionBase=clientScript?new URL(clientScript.src,location.href).pathname.slice(0,-"_letmeknow/client.js".length):"/";
 const credentialKey="letmeknow-credential:"+location.origin+sessionBase;
 const snapshotKey=()=>credentialKey+":state:"+pageIdentity();
 let credential;
@@ -45,10 +45,11 @@ const pageIdentity=()=>location.pathname+location.search+location.hash;
 const snapshot=()=>{const all=controls();return{version:1,page:pageIdentity(),controls:all.map((control,index)=>({key:controlKey(control,index,all),value:control.value,checked:control.checked,indeterminate:control.indeterminate,selected:control instanceof HTMLSelectElement?[...control.options].map((option,optionIndex,options)=>option.selected?[option.value,options.slice(0,optionIndex).filter(candidate=>candidate.value===option.value).length]:null).filter(Boolean):undefined,start:typeof control.selectionStart==="number"?control.selectionStart:undefined,end:typeof control.selectionEnd==="number"?control.selectionEnd:undefined,direction:control.selectionDirection||undefined})),active:document.activeElement instanceof Element?controlKey(document.activeElement,all.indexOf(document.activeElement),all):undefined,details:details().map((element,index)=>({key:detailKey(element,index),open:element.open})),x:scrollX,y:scrollY}};
 const status=message=>{const element=document.querySelector("[data-letmeknow-status]");if(element)element.textContent=message};
 const stripSessionPath=path=>{if(sessionBase==="/")return path;if(path===sessionBase.slice(0,-1))return "/";return path.startsWith(sessionBase)?"/"+path.slice(sessionBase.length):path};
-const routePath=()=>{let path=stripSessionPath(location.pathname);return path.endsWith("/")?path+"index.html":path};
-const pagePath=path=>{path=path.split("?",1)[0];return stripSessionPath(path)||"/"};
+const decodePath=path=>path.split("/").map(part=>{try{return decodeURIComponent(part)}catch{return part}}).join("/");
+const routePath=()=>{let path=decodePath(stripSessionPath(location.pathname));return path.endsWith("/")?path+"index.html":path};
+const pagePath=path=>{path=path.split("?",1)[0];return decodePath(stripSessionPath(path))||"/"};
 const save=()=>{try{sessionStorage.setItem(snapshotKey(),JSON.stringify(snapshot()))}catch{}};
-const restore=()=>{let raw;try{raw=sessionStorage.getItem(snapshotKey())}catch{return}if(!raw)return;let saved;try{saved=JSON.parse(raw)}catch{return}if(saved.version!==1||saved.page!==pageIdentity())return;const all=controls();const savedControls=new Map((Array.isArray(saved.controls)?saved.controls:[]).map(state=>[state.key,state]));let active;for(const [index,control] of all.entries()){const state=savedControls.get(controlKey(control,index,all));if(!state)continue;if(control instanceof HTMLSelectElement&&Array.isArray(state.selected)){const selectedIndexes=new Set(state.selected.filter(Number.isInteger));const selectedValues=new Set(state.selected.filter(Array.isArray).map(entry=>entry.join("\u0000")));for(const [optionIndex,option] of [...control.options].entries()){const occurrence=[...control.options].slice(0,optionIndex).filter(candidate=>candidate.value===option.value).length;option.selected=selectedIndexes.has(optionIndex)||selectedValues.has([option.value,occurrence].join("\u0000"))}}else if(control.type==="checkbox"||control.type==="radio"){control.checked=state.checked;control.indeterminate=state.indeterminate}else{control.value=state.value;if(typeof state.start==="number"&&typeof control.setSelectionRange==="function")control.setSelectionRange(state.start,state.end,state.direction||"none")}if(controlKey(control,index,all)===saved.active)active=control}const savedDetails=new Map((Array.isArray(saved.details)?saved.details:[]).map(state=>[state.key,state]));for(const [index,element] of details().entries()){const state=savedDetails.get(detailKey(element,index));if(state)element.open=state.open}active?.focus({preventScroll:true});scrollTo(saved.x||0,saved.y||0)};
+const restore=()=>{let raw;try{raw=sessionStorage.getItem(snapshotKey())}catch{return}if(!raw)return;let saved;try{saved=JSON.parse(raw)}catch{return}if(saved.version!==1||saved.page!==pageIdentity())return;const all=controls();const savedControls=new Map((Array.isArray(saved.controls)?saved.controls:[]).map(state=>[state.key,state]));let active;for(const [index,control] of all.entries()){const state=savedControls.get(controlKey(control,index,all));if(!state)continue;if(control instanceof HTMLSelectElement&&Array.isArray(state.selected)){const selectedIndexes=new Set(state.selected.filter(Number.isInteger));const selectedValues=new Set(state.selected.filter(Array.isArray).map(entry=>entry.join("\u0000")));for(const [optionIndex,option] of [...control.options].entries()){const occurrence=[...control.options].slice(0,optionIndex).filter(candidate=>candidate.value===option.value).length;option.selected=selectedIndexes.has(optionIndex)||selectedValues.has([option.value,occurrence].join("\u0000"))}}else if(control.type==="checkbox"||control.type==="radio"){control.checked=state.checked;control.indeterminate=state.indeterminate}else if(control.type!=="file"){control.value=state.value;if(typeof state.start==="number"&&typeof control.setSelectionRange==="function")control.setSelectionRange(state.start,state.end,state.direction||"none")}if(controlKey(control,index,all)===saved.active)active=control}const savedDetails=new Map((Array.isArray(saved.details)?saved.details:[]).map(state=>[state.key,state]));for(const [index,element] of details().entries()){const state=savedDetails.get(detailKey(element,index));if(state)element.open=state.open}active?.focus({preventScroll:true});scrollTo(saved.x||0,saved.y||0)};
 const reload=()=>{if(reloadTimer)return;reloadTimer=setTimeout(()=>{save();location.reload()},75)};
 const linkedStylesheet=path=>{for(const link of document.querySelectorAll('link[rel~="stylesheet"]')){let url;try{url=new URL(link.href,location.href)}catch{continue}if(url.origin!==location.origin)continue;if(sessionBase!=="/"&&!url.pathname.startsWith(sessionBase))continue;if(pagePath(url.pathname)===path)return link}return null};
 const refreshStylesheet=link=>{const url=new URL(link.href,location.href);url.searchParams.set("_letmeknow",crypto.randomUUID());link.href=url.href};
@@ -86,10 +87,10 @@ const connect=()=>{
 document.addEventListener("submit",async event=>{
   const form=event.target;
   if(!(form instanceof HTMLFormElement))return;
-  event.preventDefault();
   const submitter=event.submitter;
-  const method=(submitter?.getAttribute("formmethod")??form.getAttribute("method")??"get").toLowerCase()||"get";
-  if(method!=="get"&&method!=="post"){status("Only GET and POST forms are supported");return}
+  const method=(submitter?.formMethod||form.method).toLowerCase();
+  if(method==="dialog")return;
+  event.preventDefault();
   if(!form.noValidate&&!submitter?.formNoValidate&&!form.checkValidity()){form.reportValidity();return}
   let target;
   try{const action=submitter?.getAttribute("formaction")??form.getAttribute("action")??location.href;const base=sessionBase!=="/"&&location.pathname===sessionBase.slice(0,-1)&&!document.querySelector("base")?new URL(sessionBase,location.href):document.baseURI;target=new URL(action,base)}catch{status("Invalid form action");return}
@@ -102,9 +103,9 @@ document.addEventListener("submit",async event=>{
   const values=new URLSearchParams();
   for(const [name,value] of new FormData(form,submitter)){if(typeof value!=="string"){status("File inputs are not supported");return}values.append(name,value)}
   const actionPath=sessionBase!=="/"?target.pathname.slice(sessionBase.length-1)||"/":target.pathname;
+  if(method==="get"){target.search="";for(const [name,value] of values)target.searchParams.append(name,value)}
   const metadata={id:crypto.randomUUID(),form_id:form.id||null,action:actionPath+target.search,trigger:{id:submitter?.id||null,name:submitter?.getAttribute("name"),value:submitter?.getAttribute("value")}};
   const headers={"X-LetMeKnow-Submission":"1","X-LetMeKnow-ID":encodeURIComponent(metadata.id),"X-LetMeKnow-Form-ID":encodeURIComponent(metadata.form_id??""),"X-LetMeKnow-Action":encodeURIComponent(metadata.action),"X-LetMeKnow-Trigger-ID":encodeURIComponent(metadata.trigger.id??""),"X-LetMeKnow-Trigger-Name":encodeURIComponent(metadata.trigger.name??""),"X-LetMeKnow-Trigger-Value":encodeURIComponent(metadata.trigger.value??"")};
-  if(method==="get")for(const [name,value] of values)target.searchParams.append(name,value);
   try{const response=await fetch(target,{method:method.toUpperCase(),headers,...(method==="post"?{body:values}:{})});if(!response.ok)throw new Error();status("Submitted")}catch{status("The submission failed")}
 });
 connect();
@@ -228,7 +229,7 @@ async function staticResponse(root, packet) {
     return errorResponse(packet, 500, "preview request failed");
   }
   if (body.byteLength > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
-  if (extname(target).toLowerCase() === ".html") body = htmlWithClient(body, header(packet, "x-letmeknow-session-base"));
+  if (/^\.html?$/i.test(extname(target))) body = htmlWithClient(body, header(packet, "x-letmeknow-session-base"));
   if (body.byteLength > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
   return response(packet, 200, body, { "Content-Type": getMimeType(target) });
 }

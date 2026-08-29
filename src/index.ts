@@ -469,9 +469,9 @@ export default {
       return new Response(null, { status: 308, headers: { Location: url.toString() } });
     }
 
-    const slashlessSession = url.pathname.match(new RegExp(`^/s/[a-f0-9]{${CODE_LENGTH}}$`));
-    if (slashlessSession && (!isProductionHost(url.hostname) || normalizedHostname(url.hostname) === "letmeknow.dev")) {
-      url.pathname += "/";
+    const pathSessionRoot = url.pathname.match(new RegExp(`^/s/([a-f0-9]{${CODE_LENGTH}})(?:%2[fF])?$`));
+    if (pathSessionRoot && (!isProductionHost(url.hostname) || normalizedHostname(url.hostname) === "letmeknow.dev")) {
+      url.pathname = `/s/${pathSessionRoot[1]}/`;
       return new Response(null, { status: 308, headers: { Location: url.toString() } });
     }
 
@@ -483,8 +483,9 @@ export default {
       } else {
         headers.set("x-letmeknow-route", "browser");
         headers.set("x-letmeknow-path", target.path + url.search);
-        const sessionBase = url.pathname.match(/^\/s\/[a-f0-9]{20}(?:\/|$)/)?.[0];
-        if (sessionBase) headers.set("x-letmeknow-session-base", sessionBase.endsWith("/") ? sessionBase : `${sessionBase}/`);
+        const hostSession = new RegExp(`^[a-f0-9]{${CODE_LENGTH}}\\.letmeknow\\.dev$`).test(normalizedHostname(url.hostname));
+        const sessionBase = hostSession ? "/" : url.pathname.match(/^\/s\/[a-f0-9]{20}\//)?.[0] ?? "/";
+        headers.set("x-letmeknow-session-base", sessionBase);
       }
       return env.SESSIONS.getByName(target.code).fetch(new Request(request, { headers }));
     }
