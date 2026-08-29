@@ -87,7 +87,7 @@ function runtimeTag(): string {
 }
 
 function runtimePage(title: string, message: string, status: number): Response {
-  const body = `<!doctype html><html data-letmeknow-status-page><head><meta charset="utf-8"><title>${title}</title></head><body><h1>${title}</h1><p>${message}</p>${runtimeTag()}</body></html>`;
+  const body = `<!doctype html><html data-letmeknow-status-page><head><meta charset="utf-8"><title>${title}</title></head><body><h1>${title}</h1><p>${message}</p></body></html>`;
   return new Response(body, {
     status,
     headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }
@@ -109,9 +109,9 @@ function injectRuntime(response: Response, request: Request): Response {
   const headers = new Headers(response.headers);
   headers.delete("content-length");
   const rewriter = new HTMLRewriter();
-  let hasRuntime = false;
-  rewriter.on("[data-letmeknow-runtime]", { element() { hasRuntime = true; } });
-  rewriter.onDocument({ end(document) { if (!hasRuntime) document.append(runtimeTag(), { html: true }); } });
+  let hasBody = false;
+  rewriter.on("body", { element(element) { hasBody = true; element.append(runtimeTag(), { html: true }); } });
+  rewriter.onDocument({ end(document) { if (!hasBody) document.append(runtimeTag(), { html: true }); } });
   return rewriter.transform(new Response(response.body, { status: response.status, statusText: response.statusText, headers }));
 }
 
@@ -189,12 +189,16 @@ export class Session extends DurableObject<Env> {
 
   private async browserRequest(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") return error("websockets are not supported", 426);
-    if (!(await this.ctx.storage.get<boolean>("opened"))) return isDocumentRequest(request) ? runtimePage("Session not found", "This preview is not available yet.", 404) : error("session not found", 404);
-    if (!this.producer()) return isDocumentRequest(request) ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503);
-    const response = await this.proxyRequest(request);
+    const document = isDocumentRequest(request);
+    let response: Response;
+    if (!(await this.ctx.storage.get<boolean>("opened"))) response = document ? runtimePage("Session not found", "This preview is not available yet.", 404) : error("session not found", 404);
+    else if (!this.producer()) response = document ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503);
+    else {
+      response = await this.proxyRequest(request);
+      if (document && response.status === 404) response = runtimePage("Page not found", "This page does not exist yet. Waiting for an update…", 404);
+    }
     if (request.method === "HEAD") return new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers });
     if (request.headers.get("x-letmeknow-submission") === "1") return response;
-    if (isDocumentRequest(request) && response.status === 404) return runtimePage("Page not found", "This page does not exist yet. Waiting for an update…", 404);
     return injectRuntime(response, request);
   }
 

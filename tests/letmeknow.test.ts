@@ -139,11 +139,7 @@ describe("LetMeKnow outbound relay", () => {
     const pageBody = await pageResponse.text();
     expect(pageResponse.headers.get("content-length")).toBeNull();
     expect(pageBody.match(/data-letmeknow-runtime/g)).toHaveLength(1);
-
-    const alreadyInjected = SELF.fetch(new Request(new URL("already", url)));
-    const alreadyRequest = await producer.next();
-    producer.send({ type: "http_response", request_id: alreadyRequest.request_id, status: 200, headers: { "content-type": "text/html" }, body: btoa(`<html>${'<script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime></script>'}</html>`) });
-    expect((await (await alreadyInjected).text()).match(/data-letmeknow-runtime/g)).toHaveLength(1);
+    expect(pageBody.indexOf("data-letmeknow-runtime")).toBeLessThan(pageBody.indexOf("</body>"));
 
     const noBody = SELF.fetch(new Request(new URL("empty", url)));
     const noBodyRequest = await producer.next();
