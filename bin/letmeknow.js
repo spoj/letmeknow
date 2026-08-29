@@ -337,7 +337,7 @@ async function start(directory) {
     connectionTimer = setTimeout(() => {
       if (socket !== current || current.readyState === WebSocket.OPEN || stopped) return;
       try { current.close(); } catch {}
-      if (reconnecting) retry(); else void stop(1);
+      if (!reconnecting) void stop(1);
     }, CONNECTION_TIMEOUT);
     current.addEventListener("open", () => {
       if (socket !== current || stopped) return;
