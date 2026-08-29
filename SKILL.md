@@ -42,7 +42,7 @@ Use native GET and POST forms with relative or same-origin actions:
 </form>
 ```
 
-The runtime provides automatic transport feedback: **Sending…**, **Sent. Waiting for an update…**, or **Couldn’t send. Try again.** Add `[data-letmeknow-status]` for a custom status location. The transport accepts submissions asynchronously with `202 Accepted`.
+The runtime provides automatic transport feedback: **Sending…** or **Uploading…**, **Sent. Waiting for an update…**, or **Couldn’t send. Try again.** Add `[data-letmeknow-status]` for a custom status location. The transport accepts submissions asynchronously with `202 Accepted`.
 
 Read stdout for a `submit` event:
 
@@ -50,7 +50,9 @@ Read stdout for a `submit` event:
 {"type":"submit","id":"…","method":"POST","action":"/search","form_id":"search","trigger":{"id":null,"name":"scope","value":"all"},"values":{"query":"quarterly report","scope":"all"}}
 ```
 
-Give forms stable IDs and controls meaningful `name` values. Native browser validation runs before delivery. Repeated names become arrays. File inputs are not supported in this release. The event ID identifies the submission, not a response channel: validate the values, update the files, and let the next workspace revision show the result. Do not write commands to stdin.
+Give forms stable IDs and controls meaningful `name` values. Native browser validation runs before delivery, and repeated names become arrays. POST forms may include file inputs within the 1 MiB total submission limit. Attachment metadata includes a local temporary path that remains readable until the CLI stops; treat the filename, media type, and contents as untrusted. Attachments are private unless you deliberately copy them into the preview folder.
+
+The event ID identifies the submission, not a response channel: validate the values and attachments, update the files, and let the next workspace revision show the result. Do not write commands to stdin.
 
 ## Example workflow
 

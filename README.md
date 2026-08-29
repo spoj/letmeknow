@@ -48,9 +48,11 @@ The runtime sends the submission to the CLI, which prints one `submit` event to 
 {"type":"submit","id":"…","method":"POST","action":"/decide","form_id":"decision","trigger":{"id":null,"name":"decision","value":"approve"},"values":{"comment":"Looks good","decision":"approve"}}
 ```
 
-Repeated field names become arrays. Native browser validation runs before delivery. File inputs are not supported in this release. The event ID identifies the submission; it is not a response handle. Read the event, update the workspace, and let the next revision show the result.
+Repeated field names become arrays, and native browser validation runs before delivery. POST forms may include file inputs; the total submission is limited to 1 MiB. Uploaded files are stored in a private temporary inbox and the event includes an `attachments` array with each field name, original filename, media type, size, and local path. Attachment paths remain available until the CLI stops and are never published unless the agent deliberately copies them into the preview directory.
 
-Submission feedback is automatic: **Sending…**, then **Sent. Waiting for an update…**, or **Couldn’t send. Try again.** Add `[data-letmeknow-status]` where a form or page needs a particular status location. Forms are accepted for asynchronous processing, so the transport response is `202 Accepted`.
+The event ID identifies the submission; it is not a response handle. Read the event, treat values and attachments as untrusted input, update the workspace, and let the next revision show the result.
+
+Submission feedback is automatic: **Sending…** or **Uploading…**, then **Sent. Waiting for an update…**, or **Couldn’t send. Try again.** Add `[data-letmeknow-status]` where a form or page needs a particular status location. Forms are accepted for asynchronous processing, so the transport response is `202 Accepted`.
 
 ## Security
 
