@@ -66,7 +66,7 @@ Escape untrusted values before placing them in HTML.
 
 ## Security
 
-The preview folder is public and is trusted code from the browser's perspective. Keep secrets and unrelated project files elsewhere. The CLI restricts requests to the selected directory and excludes `.env`, `.git`, private-key, and database files. It makes outbound relay connections only and accepts no inbound browser connections.
+The preview folder is public and is trusted code from the browser's perspective. Keep secrets and unrelated project files elsewhere. The CLI restricts requests to the selected directory and excludes `.env`, `.git`, private-key, and database files. Treat every process with write access to the preview folder as a trusted publisher. The CLI makes outbound relay connections only and accepts no inbound browser connections.
 
 ## Stop
 

@@ -58,7 +58,7 @@ Submission feedback is automatic: **Sending…** or **Uploading…**, then **Sen
 
 The preview URL grants access to the session. The relay receives served files and submitted values. The preview folder is trusted code from the browser's perspective, so do not include secrets or credentials unless that is intentional. The CLI makes outbound relay connections only and accepts no inbound browser connections.
 
-The CLI keeps requests inside the selected directory, including when files contain symlinks. Sensitive names such as `.env`, `.git`, private keys, and database files are excluded.
+The CLI resolves requested paths and denies symlinks whose targets leave the selected directory. Sensitive names such as `.env`, `.git`, private keys, and database files are excluded. Processes with write access to the preview directory are trusted publishers and can make data public through it.
 
 ## Development
 
