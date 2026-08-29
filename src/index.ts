@@ -452,6 +452,8 @@ export default {
       } else {
         headers.set("x-letmeknow-route", "browser");
         headers.set("x-letmeknow-path", target.path + url.search);
+        const sessionBase = url.pathname.match(/^\/s\/[a-f0-9]{20}(?:\/|$)/)?.[0];
+        if (sessionBase) headers.set("x-letmeknow-session-base", sessionBase.endsWith("/") ? sessionBase : `${sessionBase}/`);
       }
       return env.SESSIONS.getByName(target.code).fetch(new Request(request, { headers }));
     }

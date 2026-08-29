@@ -14,7 +14,7 @@ async function runRelayScenario() {
   const outside = mkdtempSync(join(tmpdir(), "letmeknow-outside-"));
   mkdirSync(join(folder, "nested"));
   mkdirSync(join(folder, "assets"));
-  writeFileSync(join(folder, "index.html"), `<!doctype html><html><head><link rel="stylesheet" href="/assets/app.css"></head><body><form id="contact" action="/save" method="post"><input name="name"><button name="kind" value="send">Send</button></form></body></html>`);
+  writeFileSync(join(folder, "index.html"), `<!doctype html><html><head><script>const marker = "</body>";</script><link rel="stylesheet" href="/assets/app.css"></head><body><form id="contact" action="/save" method="post"><input name="name"><button name="kind" value="send">Send</button></form></body></html>`);
   writeFileSync(join(folder, "nested", "index.html"), "nested");
   writeFileSync(join(folder, "assets", "app.css"), "body { color: red }\n");
   writeFileSync(join(folder, "assets", "app.js"), "console.log('ok')\n");
@@ -36,6 +36,7 @@ async function runRelayScenario() {
   let update;
   const requests = [
     { request_id: "page", method: "GET", path: "/", headers: { accept: "text/html" } },
+    { request_id: "client", method: "GET", path: "/_letmeknow/client.js", headers: {} },
     { request_id: "asset", method: "GET", path: "/assets/app.js?cache=1", headers: {} },
     { request_id: "head", method: "HEAD", path: "/assets/app.js?cache=1", headers: {} },
     { request_id: "redirect", method: "GET", path: "/nested", headers: {} },
@@ -116,7 +117,12 @@ describe("LetMeKnow CLI", () => {
     assert.equal(result.code, 0);
     assert.equal(result.response("page").status, 200);
     assert.match(result.response("page").body, /data-letmeknow-client/);
+    assert.match(result.response("page").body, /src="\/_letmeknow\/client\.js"/);
+    assert.ok(result.response("page").body.lastIndexOf("data-letmeknow-client") > result.response("page").body.lastIndexOf("</html>"));
     assert.equal(result.response("page").headers["Content-Type"], "text/html; charset=utf-8");
+    assert.equal(result.response("client").status, 200);
+    assert.equal(result.response("client").headers["Content-Type"], "text/javascript; charset=utf-8");
+    assert.match(result.response("client").body, /const sessionMatch/);
     assert.equal(result.response("asset").status, 200);
     assert.equal(result.response("asset").headers["Content-Type"], "text/javascript; charset=utf-8");
     assert.equal(result.response("head").status, 200);
@@ -124,7 +130,7 @@ describe("LetMeKnow CLI", () => {
     assert.equal(result.response("head").headers["Content-Length"], String(Buffer.byteLength("console.log('ok')\n")));
     assert.equal(result.response("redirect").status, 301);
     assert.equal(result.response("redirect").headers.Location, "/nested/");
-    assert.match(result.response("directory").body, /^nested<script type="module" data-letmeknow-client>/);
+    assert.match(result.response("directory").body, /^nested<script type="module" src="\/_letmeknow\/client\.js" data-letmeknow-client>/);
     assert.equal(result.response("encoded").status, 200);
     assert.equal(result.response("missing").status, 404);
     assert.equal(result.response("escape").status, 403);

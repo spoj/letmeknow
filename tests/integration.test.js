@@ -86,7 +86,12 @@ describe("LetMeKnow integration", () => {
       browserUrl.pathname = `/s/${code}/`;
       const page = await fetch(browserUrl);
       assert.equal(page.status, 200);
-      assert.match(await page.text(), /data-letmeknow-client/);
+      const pageText = await page.text();
+      assert.match(pageText, /data-letmeknow-client/);
+      assert.match(pageText, new RegExp(`src="/s/${code}/_letmeknow/client\\.js"`));
+      const clientScript = await fetch(new URL("_letmeknow/client.js", browserUrl));
+      assert.equal(clientScript.status, 200);
+      assert.match(await clientScript.text(), /const sessionMatch/);
 
       const form = await fetch(new URL("save", browserUrl), {
         method: "POST",
