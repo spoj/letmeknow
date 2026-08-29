@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import clientSource from "./client";
 
 interface Env {
   SESSIONS: DurableObjectNamespace<Session>;
@@ -11,27 +12,19 @@ interface RateLimitBinding {
 
 type Packet = Record<string, unknown>;
 type ProducerAttachment = { role: "producer"; url: string; opened: boolean; closing: boolean };
-type ClientAttachment = { role: "client"; probedAt: number };
-type CandidateAttachment = { role: "candidate" };
-type Attachment = ProducerAttachment | ClientAttachment | CandidateAttachment;
+type ClientAttachment = { role: "client" };
+type Attachment = ProducerAttachment | ClientAttachment;
 type PendingProxy = { resolve(response: Response): void; timer: ReturnType<typeof setTimeout> };
-type Probe = {
-  socket: WebSocket;
-  nonce: string;
-  promise: Promise<boolean>;
-  timer?: ReturnType<typeof setTimeout>;
-  settle(active: boolean): void;
-};
 
 const CODE_LENGTH = 20;
 const PRODUCER_GRACE_MS = 10 * 60 * 1_000;
-const CLIENT_GRACE_MS = 5 * 1_000;
 const OPEN_DEADLINE_MS = 30 * 1_000;
-const CHALLENGE_TIMEOUT_MS = 2 * 1_000;
 const MAX_BODY_BYTES = 1024 * 1024;
 const PROXY_TIMEOUT_MS = 30 * 1_000;
 const encoder = new TextEncoder();
 const hopHeaders = new Set(["connection", "host", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "x-forwarded-host", "x-letmeknow-path", "x-letmeknow-route"]);
+const runtimePath = "/_letmeknow/client.js";
+const clientSocketPath = "/_letmeknow/client";
 
 function error(message: string, status: number): Response {
   return Response.json({ error: message }, { status, headers: { "Cache-Control": "no-store" } });
@@ -55,9 +48,7 @@ function bytesToBase64(value: Uint8Array): string {
 }
 
 function proxyResponse(packet: Packet): Response {
-  if (!Number.isInteger(packet.status) || (packet.status as number) < 200 || (packet.status as number) > 599) {
-    throw new Error("invalid proxy response status");
-  }
+  if (!Number.isInteger(packet.status) || (packet.status as number) < 200 || (packet.status as number) > 599) throw new Error("invalid proxy response status");
   if (typeof packet.body !== "string") throw new Error("proxy response body is required");
   const body = base64ToBytes(packet.body);
   if (body.byteLength > MAX_BODY_BYTES) throw new Error("proxy response body is too large");
@@ -83,21 +74,48 @@ function isProductionHost(hostname: string): boolean {
 
 function publicTarget(url: URL): { code: string; path: string } | null {
   const hostname = normalizedHostname(url.hostname);
-  const host = hostname.match(new RegExp(`^([a-f0-9]{${CODE_LENGTH}})\\.letmeknow\\.dev$`));
-  if (host) return { code: host[1], path: url.pathname };
-  const path = url.pathname.match(new RegExp(`^/s/([a-f0-9]{${CODE_LENGTH}})(/.*)?$`));
-  if (!path || (isProductionHost(url.hostname) && normalizedHostname(url.hostname) !== "letmeknow.dev")) return null;
-  return { code: path[1], path: path[2] || "/" };
+  const match = hostname.match(new RegExp(`^([a-f0-9]{${CODE_LENGTH}})\\.letmeknow\\.dev$`));
+  return match ? { code: match[1], path: url.pathname } : null;
 }
 
 function sessionUrl(url: URL, code: string): string {
-  return normalizedHostname(url.hostname) === "letmeknow.dev"
-    ? `https://${code}.letmeknow.dev/`
-    : `${url.origin}/s/${code}/`;
+  return `https://${code}.letmeknow.dev/`;
+}
+
+function runtimeTag(): string {
+  return `<script type="module" src="${runtimePath}" data-letmeknow-runtime></script>`;
+}
+
+function runtimePage(title: string, message: string, status: number): Response {
+  const body = `<!doctype html><html data-letmeknow-status-page><head><meta charset="utf-8"><title>${title}</title></head><body><h1>${title}</h1><p>${message}</p>${runtimeTag()}</body></html>`;
+  return new Response(body, {
+    status,
+    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }
+  });
+}
+
+function isDocumentRequest(request: Request): boolean {
+  if (request.method !== "GET") return false;
+  const destination = request.headers.get("sec-fetch-dest");
+  if (destination !== null) return destination === "document";
+  const accept = request.headers.get("accept");
+  return accept === null || accept.includes("text/html");
+}
+
+function injectRuntime(response: Response, request: Request): Response {
+  if (!isDocumentRequest(request) || response.status === 204 || response.status === 205 || response.status === 304) return response;
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.toLowerCase().startsWith("text/html")) return response;
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  const rewriter = new HTMLRewriter();
+  let hasBody = false;
+  rewriter.on("body", { element(element) { hasBody = true; element.append(runtimeTag(), { html: true }); } });
+  rewriter.onDocument({ end(document) { if (!hasBody) document.append(runtimeTag(), { html: true }); } });
+  return rewriter.transform(new Response(response.body, { status: response.status, statusText: response.statusText, headers }));
 }
 
 export class Session extends DurableObject<Env> {
-  private probe?: Probe;
   private stateMutation: Promise<void> = Promise.resolve();
   private readonly pendingProxy = new Map<string, PendingProxy>();
 
@@ -114,19 +132,15 @@ export class Session extends DurableObject<Env> {
     let release!: () => void;
     this.stateMutation = new Promise((resolve) => { release = resolve; });
     await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
+    try { return await operation(); } finally { release(); }
   }
 
   private producer(): WebSocket | undefined {
     return this.ctx.getWebSockets().find((socket) => (socket.deserializeAttachment() as Attachment).role === "producer");
   }
 
-  private client(): WebSocket | undefined {
-    return this.ctx.getWebSockets().find((socket) => (socket.deserializeAttachment() as Attachment).role === "client");
+  private clients(): WebSocket[] {
+    return this.ctx.getWebSockets().filter((socket) => (socket.deserializeAttachment() as Attachment).role === "client");
   }
 
   private async acceptProducer(request: Request): Promise<Response> {
@@ -147,12 +161,7 @@ export class Session extends DurableObject<Env> {
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    const attachment: ProducerAttachment = {
-      role: "producer",
-      url: request.headers.get("x-letmeknow-url")!,
-      opened: reconnect && opened,
-      closing: false
-    };
+    const attachment: ProducerAttachment = { role: "producer", url: request.headers.get("x-letmeknow-url")!, opened: reconnect && opened, closing: false };
     server.serializeAttachment(attachment);
     this.ctx.acceptWebSocket(server);
     if (reconnect && opened) await this.ctx.storage.deleteAlarm();
@@ -160,108 +169,37 @@ export class Session extends DurableObject<Env> {
     if (!reconnect) server.send(JSON.stringify({ type: "credential", credential }));
     if (reconnect && opened) {
       server.send(JSON.stringify({ type: "session", url: attachment.url, expires_after_disconnect: PRODUCER_GRACE_MS / 1000 }));
-      this.sendClient({ type: "producer", connected: true });
+      this.sendClients({ type: "producer", connected: true });
     }
-    return new Response(null, {
-      status: 101,
-      webSocket: client,
-      ...(protocol ? { headers: { "Sec-WebSocket-Protocol": protocol } } : {})
-    });
-  }
-
-  private async challenge(socket: WebSocket): Promise<boolean> {
-    const attachment = socket.deserializeAttachment() as ClientAttachment;
-    if (Date.now() - attachment.probedAt < CLIENT_GRACE_MS) return true;
-    if (this.probe?.socket === socket) return this.probe.promise;
-    attachment.probedAt = Date.now();
-    socket.serializeAttachment(attachment);
-    const nonce = token(32);
-    let resolvePromise!: (active: boolean) => void;
-    const promise = new Promise<boolean>((resolve) => { resolvePromise = resolve; });
-    const probe: Probe = {
-      socket,
-      nonce,
-      promise,
-      settle: (active): void => {
-        if (this.probe !== probe) return;
-        if (probe.timer) clearTimeout(probe.timer);
-        this.probe = undefined;
-        resolvePromise(active);
-      }
-    };
-    probe.timer = setTimeout(() => probe.settle(false), CHALLENGE_TIMEOUT_MS);
-    this.probe = probe;
-    try {
-      socket.send(JSON.stringify({ type: "challenge", nonce }));
-    } catch {
-      probe.settle(false);
-    }
-    return promise;
-  }
-
-  private busyClient(protocol: string | null, retryAfter: number): Response {
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    server.serializeAttachment({ role: "candidate" } satisfies CandidateAttachment);
-    this.ctx.acceptWebSocket(server);
-    server.send(JSON.stringify({ type: "busy", retry_after: retryAfter }));
-    server.close(4009, "session already open");
-    return new Response(null, {
-      status: 101,
-      webSocket: client,
-      ...(protocol ? { headers: { "Sec-WebSocket-Protocol": protocol } } : {})
-    });
+    return new Response(null, { status: 101, webSocket: client, ...(protocol ? { headers: { "Sec-WebSocket-Protocol": protocol } } : {}) });
   }
 
   private async acceptClient(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return error("websocket upgrade required", 426);
-    if (!(await this.ctx.storage.get<boolean>("opened"))) return error("session not found", 404);
-    const protocol = request.headers.get("sec-websocket-protocol");
-    if (protocol && (protocol.includes(",") || !/^[a-f0-9]{40}$/.test(protocol))) return error("invalid client credential", 401);
-
-    const active = this.client();
-    if (active && await this.challenge(active)) return this.busyClient(protocol, CLIENT_GRACE_MS / 1000);
-    if (active) {
-      active.close(4000, "connection lost");
-      await this.ctx.storage.put("clientDisconnectedAt", Date.now());
-    }
-
-    const storedCredential = await this.ctx.storage.get<string>("clientCredential");
-    const disconnectedAt = await this.ctx.storage.get<number>("clientDisconnectedAt") ?? 0;
-    const reconnect = storedCredential !== undefined && protocol === storedCredential;
-    if (!reconnect && storedCredential !== undefined && Date.now() - disconnectedAt < CLIENT_GRACE_MS) {
-      return this.busyClient(protocol, Math.ceil((CLIENT_GRACE_MS - (Date.now() - disconnectedAt)) / 1000));
-    }
-
-    const credential = reconnect ? storedCredential : token(40);
-    await this.ctx.storage.put("clientCredential", credential);
-    await this.ctx.storage.delete("clientDisconnectedAt");
+    const opened = await this.ctx.storage.get<boolean>("opened");
+    if (!opened) return error("session not found", 404);
+    if (request.headers.get("Sec-WebSocket-Protocol")) return error("client credentials are not supported", 400);
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    server.serializeAttachment({ role: "client", probedAt: Date.now() } satisfies ClientAttachment);
+    server.serializeAttachment({ role: "client" } satisfies ClientAttachment);
     this.ctx.acceptWebSocket(server);
-    if (!reconnect) server.send(JSON.stringify({ type: "credential", credential }));
     server.send(JSON.stringify({ type: "connected", producer_connected: Boolean(this.producer()) }));
-    return new Response(null, {
-      status: 101,
-      webSocket: client,
-      ...(protocol ? { headers: { "Sec-WebSocket-Protocol": protocol } } : {})
-    });
+    return new Response(null, { status: 101, webSocket: client });
   }
 
   private async browserRequest(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") return error("websockets are not supported", 426);
-    if (!(await this.ctx.storage.get<boolean>("opened"))) return error("session not found", 404);
-    return this.proxyRequest(request);
+    if (!(await this.ctx.storage.get<boolean>("opened"))) return isDocumentRequest(request) ? runtimePage("Session not found", "This preview is not available yet.", 404) : error("session not found", 404);
+    if (!this.producer()) return isDocumentRequest(request) ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503);
+    const response = await this.proxyRequest(request);
+    return request.headers.get("x-letmeknow-submission") === "1" ? response : injectRuntime(response, request);
   }
 
   private async proxyRequest(request: Request): Promise<Response> {
     const producer = this.producer();
-    if (!producer) return error("producer disconnected", 503);
+    if (!producer) return runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503);
     const contentLength = request.headers.get("content-length");
-    if (contentLength !== null && /^\d+$/.test(contentLength) && BigInt(contentLength) > BigInt(MAX_BODY_BYTES)) {
-      return error("request body is too large", 413);
-    }
+    if (contentLength !== null && /^\d+$/.test(contentLength) && BigInt(contentLength) > BigInt(MAX_BODY_BYTES)) return error("request body is too large", 413);
     const reader = request.body?.getReader();
     const chunks: Uint8Array[] = [];
     let bodyLength = 0;
@@ -279,38 +217,19 @@ export class Session extends DurableObject<Env> {
     }
     const body = new Uint8Array(bodyLength);
     let bodyOffset = 0;
-    for (const chunk of chunks) {
-      body.set(chunk, bodyOffset);
-      bodyOffset += chunk.byteLength;
-    }
+    for (const chunk of chunks) { body.set(chunk, bodyOffset); bodyOffset += chunk.byteLength; }
     const headers: Record<string, string> = {};
-    for (const [name, value] of request.headers) {
-      if (!hopHeaders.has(name)) headers[name] = value;
-    }
+    for (const [name, value] of request.headers) if (!hopHeaders.has(name)) headers[name] = value;
     const id = crypto.randomUUID();
     const response = new Promise<Response>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pendingProxy.delete(id);
-        resolve(error("producer request timed out", 504));
-      }, PROXY_TIMEOUT_MS);
+      const timer = setTimeout(() => { this.pendingProxy.delete(id); resolve(error("producer request timed out", 504)); }, PROXY_TIMEOUT_MS);
       this.pendingProxy.set(id, { resolve, timer });
     });
     try {
-      producer.send(JSON.stringify({
-        type: "http_request",
-        request_id: id,
-        method: request.method,
-        path: request.headers.get("x-letmeknow-path")!,
-        headers,
-        body: bytesToBase64(body)
-      }));
+      producer.send(JSON.stringify({ type: "http_request", request_id: id, method: request.method, path: request.headers.get("x-letmeknow-path")!, headers, body: bytesToBase64(body) }));
     } catch {
       const pending = this.pendingProxy.get(id);
-      if (pending) {
-        clearTimeout(pending.timer);
-        this.pendingProxy.delete(id);
-        pending.resolve(error("producer disconnected", 503));
-      }
+      if (pending) { clearTimeout(pending.timer); this.pendingProxy.delete(id); pending.resolve(error("producer disconnected", 503)); }
     }
     return response;
   }
@@ -326,7 +245,6 @@ export class Session extends DurableObject<Env> {
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const attachment = socket.deserializeAttachment() as Attachment;
     if (attachment.role === "producer") return this.producerMessage(socket, attachment, message);
-    if (attachment.role === "client") return this.clientMessage(socket, message);
   }
 
   private async producerMessage(socket: WebSocket, attachment: ProducerAttachment, message: string | ArrayBuffer): Promise<void> {
@@ -336,9 +254,7 @@ export class Session extends DurableObject<Env> {
       await this.mutate(() => this.producerCommand(socket, attachment, packet!));
     } catch (cause) {
       const text = cause instanceof Error ? cause.message : "invalid packet";
-      try {
-        socket.send(JSON.stringify({ type: "error", ...(typeof packet?.id === "string" ? { id: packet.id } : {}), message: text }));
-      } catch {}
+      try { socket.send(JSON.stringify({ type: "error", ...(typeof packet?.id === "string" ? { id: packet.id } : {}), message: text })); } catch {}
     }
   }
 
@@ -346,11 +262,7 @@ export class Session extends DurableObject<Env> {
     if (typeof message !== "string") throw new Error("packets must be text");
     if (encoder.encode(message).byteLength > maxBytes) throw new Error("packet is too large");
     let value: unknown;
-    try {
-      value = JSON.parse(message);
-    } catch {
-      throw new Error("invalid JSON");
-    }
+    try { value = JSON.parse(message); } catch { throw new Error("invalid JSON"); }
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("packet must be a JSON object");
     return value as Packet;
   }
@@ -359,7 +271,6 @@ export class Session extends DurableObject<Env> {
     if (typeof packet.type !== "string") throw new Error("type is required");
     if (packet.id !== undefined && typeof packet.id !== "string") throw new Error("id must be a string");
     if (attachment.closing) throw new Error("session is closing");
-
     if (packet.type === "open") {
       if (attachment.opened) throw new Error("open must be the first command");
       await this.ctx.storage.transaction(async (txn) => {
@@ -369,69 +280,49 @@ export class Session extends DurableObject<Env> {
       attachment.opened = true;
       socket.serializeAttachment(attachment);
       await this.ctx.storage.deleteAlarm();
-      socket.send(JSON.stringify({
-        type: "session",
-        ...(packet.id !== undefined ? { id: packet.id } : {}),
-        url: attachment.url,
-        expires_after_disconnect: PRODUCER_GRACE_MS / 1000
-      }));
+      socket.send(JSON.stringify({ type: "session", ...(packet.id !== undefined ? { id: packet.id } : {}), url: attachment.url, expires_after_disconnect: PRODUCER_GRACE_MS / 1000 }));
       return;
     }
     if (!attachment.opened) throw new Error("open must be the first command");
-
     if (packet.type === "http_response") {
       if (typeof packet.request_id !== "string") throw new Error("request_id is required");
       const pending = this.pendingProxy.get(packet.request_id);
       if (!pending) return;
       clearTimeout(pending.timer);
       this.pendingProxy.delete(packet.request_id);
-      try {
-        pending.resolve(proxyResponse(packet));
-      } catch {
-        pending.resolve(error("invalid proxy response", 502));
-      }
+      try { pending.resolve(proxyResponse(packet)); } catch { pending.resolve(error("invalid proxy response", 502)); }
       return;
     }
-    if (packet.type === "file_update") {
-      if (typeof packet.path !== "string" || !/^\/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-Fa-f]{2})*$/.test(packet.path)) throw new Error("invalid file update path");
-      this.sendClient({ type: "file_update", path: packet.path });
+    if (packet.type === "revision") {
+      this.sendClients({ type: "revision" });
+      return;
+    }
+    if (packet.type === "close") {
+      attachment.closing = true;
+      socket.serializeAttachment(attachment);
+      this.sendClients({ type: "closed", message: "Session closed" });
+      for (const client of this.clients()) client.close(1000, "session closed");
+      await this.ctx.storage.deleteAll();
+      socket.close(1000, "session closed");
       return;
     }
     throw new Error("unknown command type");
   }
 
-  private async clientMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    try {
-      const packet = this.parseMessage(message, 4096);
-      if (packet.type !== "alive" || typeof packet.nonce !== "string") throw new Error("unknown client event");
-      if (this.probe?.socket === socket && this.probe.nonce === packet.nonce) this.probe.settle(true);
-    } catch (cause) {
-      try {
-        socket.send(JSON.stringify({ type: "error", message: cause instanceof Error ? cause.message : "invalid client event" }));
-      } catch {}
-    }
-  }
-
-  private sendClient(packet: Packet): void {
-    try {
-      this.client()?.send(JSON.stringify(packet));
-    } catch {}
+  private sendClients(packet: Packet): void {
+    const message = JSON.stringify(packet);
+    for (const client of this.clients()) try { client.send(message); } catch {}
   }
 
   async webSocketClose(socket: WebSocket, code: number, reason: string): Promise<void> {
     const attachment = socket.deserializeAttachment() as Attachment;
-    if (this.probe?.socket === socket) this.probe.settle(false);
     await this.mutate(async () => {
       if (attachment.role === "producer") {
         const active = this.producer();
         if (active && active !== socket) return;
         this.failProxyRequests();
-        this.sendClient({ type: "producer", connected: false });
-        if (attachment.opened && await this.ctx.storage.get<boolean>("opened")) {
-          await this.ctx.storage.setAlarm(Date.now() + PRODUCER_GRACE_MS);
-        }
-      } else if (attachment.role === "client" && await this.ctx.storage.get<boolean>("opened")) {
-        await this.ctx.storage.put("clientDisconnectedAt", Date.now());
+        this.sendClients({ type: "producer", connected: false });
+        if (attachment.opened && await this.ctx.storage.get<boolean>("opened")) await this.ctx.storage.setAlarm(Date.now() + PRODUCER_GRACE_MS);
       }
     });
     if (code === 1005 || code === 1006 || code === 1015) socket.close();
@@ -447,8 +338,8 @@ export class Session extends DurableObject<Env> {
       const producer = this.producer();
       if (producer && (producer.deserializeAttachment() as ProducerAttachment).opened) return;
       this.failProxyRequests();
-      this.sendClient({ type: "closed", message: "Session expired" });
-      this.client()?.close(1000, "session expired");
+      this.sendClients({ type: "closed", message: "Session expired" });
+      for (const client of this.clients()) client.close(1000, "session expired");
       producer?.close(1000, "session expired");
       await this.ctx.storage.deleteAll();
     });
@@ -456,9 +347,7 @@ export class Session extends DurableObject<Env> {
 }
 
 function home(): Response {
-  return new Response(`# LetMeKnow\n\nRun a live preview for an agent-managed folder:\n\n  npx letmeknow-cli ./workspace\n\nThe CLI connects to this service outbound and prints the preview URL and form submissions as JSON lines.\n`, {
-    headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" }
-  });
+  return new Response(`# LetMeKnow\n\nRun a live preview for an agent-managed folder:\n\n  npx letmeknow-cli ./workspace\n\nThe CLI connects to this service outbound and prints the preview URL and form submissions as JSON lines.\n`, { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
 export default {
@@ -468,30 +357,19 @@ export default {
       url.protocol = "https:";
       return new Response(null, { status: 308, headers: { Location: url.toString() } });
     }
-
-    const pathSessionRoot = url.pathname.match(new RegExp(`^/s/([a-f0-9]{${CODE_LENGTH}})(?:%2[fF])?$`));
-    if (pathSessionRoot && (!isProductionHost(url.hostname) || normalizedHostname(url.hostname) === "letmeknow.dev")) {
-      url.pathname = `/s/${pathSessionRoot[1]}/`;
-      return new Response(null, { status: 308, headers: { Location: url.toString() } });
-    }
-
     const target = publicTarget(url);
     if (target) {
       const headers = new Headers(request.headers);
-      if (target.path === "/_letmeknow/client") {
-        headers.set("x-letmeknow-route", "client");
-      } else {
+      if (target.path === clientSocketPath) headers.set("x-letmeknow-route", "client");
+      else if (target.path === runtimePath && request.method === "GET") return new Response(clientSource, { headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" } });
+      else {
         headers.set("x-letmeknow-route", "browser");
         headers.set("x-letmeknow-path", target.path + url.search);
-        const hostSession = new RegExp(`^[a-f0-9]{${CODE_LENGTH}}\\.letmeknow\\.dev$`).test(normalizedHostname(url.hostname));
-        const sessionBase = hostSession ? "/" : url.pathname.match(/^\/s\/[a-f0-9]{20}\//)?.[0] ?? "/";
-        headers.set("x-letmeknow-session-base", sessionBase);
       }
       return env.SESSIONS.getByName(target.code).fetch(new Request(request, { headers }));
     }
-
-    if (url.pathname === "/v1/connect") {
-      if (isProductionHost(url.hostname) && normalizedHostname(url.hostname) !== "letmeknow.dev") return error("not found", 404);
+    if (url.pathname === "/v2/connect") {
+      if (normalizedHostname(url.hostname) !== "letmeknow.dev") return error("not found", 404);
       if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return error("websocket upgrade required", 426);
       const requestedCode = url.searchParams.get("code");
       if (requestedCode !== null && !new RegExp(`^[a-f0-9]{${CODE_LENGTH}}$`).test(requestedCode)) return error("invalid session code", 400);
@@ -500,13 +378,12 @@ export default {
       const protocol = request.headers.get("sec-websocket-protocol");
       if (protocol && (protocol.includes(",") || protocol.trim() !== protocol)) return error("invalid producer credentials", 401);
       if (reconnect ? !protocol : protocol !== null) return error("invalid producer credentials", 401);
-      const credential = reconnect ? protocol : token(CODE_LENGTH * 2);
       if (!reconnect) {
         const ip = request.headers.get("cf-connecting-ip") || "unknown";
         if (!(await env.CREATE_RATE_LIMIT.limit({ key: ip })).success) return error("too many sessions", 429);
       }
       const code = requestedCode || token();
-      const producerCredential = credential || token(CODE_LENGTH * 2);
+      const producerCredential = reconnect ? protocol! : token(CODE_LENGTH * 2);
       const headers = new Headers(request.headers);
       headers.set("x-letmeknow-route", "producer");
       headers.set("x-letmeknow-url", sessionUrl(url, code));
@@ -514,7 +391,6 @@ export default {
       if (reconnect) headers.set("x-letmeknow-reconnect", "true");
       return env.SESSIONS.getByName(code).fetch(new Request(request, { headers }));
     }
-
     if (url.pathname === "/" && request.method === "GET") return home();
     return error("not found", 404);
   }

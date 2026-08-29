@@ -1,6 +1,7 @@
 import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it } from "vitest";
+import clientSource from "../src/client";
 
 type Event = Record<string, any>;
 type Peer = {
@@ -10,11 +11,11 @@ type Peer = {
   send(packet: Event): void;
 };
 
-const origin = "https://client.example";
+const origin = "https://letmeknow.dev";
 const sockets: WebSocket[] = [];
 let ipCounter = 0;
 
-function peer(socket: WebSocket, answerChallenges = false): Peer {
+function peer(socket: WebSocket): Peer {
   socket.accept();
   sockets.push(socket);
   const queued: Event[] = [];
@@ -24,10 +25,6 @@ function peer(socket: WebSocket, answerChallenges = false): Peer {
     const event = JSON.parse(message.data as string) as Event;
     if (event.type === "credential") {
       credential = event.credential;
-      return;
-    }
-    if (answerChallenges && event.type === "challenge") {
-      socket.send(JSON.stringify({ type: "alive", nonce: event.nonce }));
       return;
     }
     const resolve = waiting.shift();
@@ -42,30 +39,28 @@ function peer(socket: WebSocket, answerChallenges = false): Peer {
   };
 }
 
-async function connectProducer(base = origin): Promise<Peer> {
-  const endpoint = new URL(`${base}/v1/connect`);
-  const response = await SELF.fetch(new Request(endpoint, {
-    headers: { Upgrade: "websocket", "CF-Connecting-IP": `192.0.2.${++ipCounter}` }
-  }));
+async function connectProducer(code?: string, credential?: string): Promise<Peer> {
+  const endpoint = new URL(`${origin}/v2/connect`);
+  if (code) endpoint.searchParams.set("code", code);
+  const headers: Record<string, string> = { Upgrade: "websocket", "CF-Connecting-IP": `192.0.2.${++ipCounter}` };
+  if (credential) headers["Sec-WebSocket-Protocol"] = credential;
+  const response = await SELF.fetch(new Request(endpoint, { headers }));
   expect(response.status).toBe(101);
   return peer(response.webSocket!);
 }
 
-async function open(base = origin): Promise<{ producer: Peer; url: string }> {
-  const producer = await connectProducer(base);
+async function open(): Promise<{ producer: Peer; url: string }> {
+  const producer = await connectProducer();
   producer.send({ type: "open", id: "open" });
   const session = await producer.next();
   expect(session).toMatchObject({ type: "session", id: "open", expires_after_disconnect: 600 });
   return { producer, url: session.url };
 }
 
-async function connectClient(url: string, credential?: string): Promise<Peer> {
-  const endpoint = new URL("_letmeknow/client", url);
-  const headers: Record<string, string> = { Upgrade: "websocket" };
-  if (credential) headers["Sec-WebSocket-Protocol"] = credential;
-  const response = await SELF.fetch(new Request(endpoint, { headers }));
+async function connectClient(url: string): Promise<Peer> {
+  const response = await SELF.fetch(new Request(new URL("_letmeknow/client", url), { headers: { Upgrade: "websocket" } }));
   expect(response.status).toBe(101);
-  return peer(response.webSocket!, true);
+  return peer(response.webSocket!);
 }
 
 afterEach(() => {
@@ -73,221 +68,113 @@ afterEach(() => {
 });
 
 describe("LetMeKnow outbound relay", () => {
-  it("creates production subdomains and local path sessions", async () => {
-    expect((await open()).url).toMatch(/^https:\/\/client\.example\/s\/[a-f0-9]{20}\/$/);
-    expect((await open("https://letmeknow.dev")).url).toMatch(/^https:\/\/[a-f0-9]{20}\.letmeknow\.dev\/$/);
+  it("creates hosted subdomain sessions and rejects old or custom session routes", async () => {
+    const { url } = await open();
+    expect(url).toMatch(/^https:\/\/[a-f0-9]{20}\.letmeknow\.dev\/$/);
+    expect((await SELF.fetch(new Request(`${origin}/s/01234567890123456789/`))).status).toBe(404);
+    expect((await SELF.fetch(new Request("https://preview.example/v2/connect", { headers: { Upgrade: "websocket" } }))).status).toBe(404);
   });
 
-  it("redirects slashless path session roots to a relative-asset-safe URL", async () => {
+  it("allows multiple clients and broadcasts revisions and producer lifecycle", async () => {
     const { producer, url } = await open();
-    const canonical = new URL(url);
-    const slashless = new URL(canonical);
-    slashless.pathname = slashless.pathname.slice(0, -1);
-    slashless.search = "?view=source";
-
-    const redirect = await SELF.fetch(new Request(slashless, { redirect: "manual" }));
-    expect(redirect.status).toBe(308);
-    const location = redirect.headers.get("location")!;
-    expect(location).toBe(canonical.toString() + slashless.search);
-
-    const encodedSlash = new URL(slashless);
-    encodedSlash.pathname += "%2F";
-    const encodedRedirect = await SELF.fetch(new Request(encodedSlash, { redirect: "manual" }));
-    expect(encodedRedirect.status).toBe(308);
-    expect(encodedRedirect.headers.get("location")).toBe(location);
-
-    const asset = new URL("assets/app.css", location);
-    expect(asset.pathname).toBe(`${canonical.pathname}assets/app.css`);
-    const assetResponse = SELF.fetch(new Request(asset));
-    const request = await producer.next();
-    expect(request).toMatchObject({ type: "http_request", method: "GET", path: "/assets/app.css" });
-    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
-    expect((await assetResponse).status).toBe(200);
-  });
-
-  it("uses the root session base for host-session paths that resemble path sessions", async () => {
-    const { producer, url } = await open("https://letmeknow.dev");
-    const code = new URL(url).hostname.split(".")[0];
-    const page = new URL(`/s/${code}/index.html`, url);
-    const response = SELF.fetch(new Request(page, { headers: { "X-LetMeKnow-Session-Base": "https://evil.example/" } }));
-    const request = await producer.next();
-    expect(request).toMatchObject({
-      type: "http_request",
-      path: `/s/${code}/index.html`,
-      headers: { "x-letmeknow-session-base": "/" }
-    });
-    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
-    expect((await response).status).toBe(200);
-  });
-
-  it("relays browser requests and file updates through one producer", async () => {
-    const { producer, url } = await open();
-    const client = await connectClient(url);
-    expect(await client.next()).toEqual({ type: "connected", producer_connected: true });
-
-    const page = SELF.fetch(new Request(url, { headers: { "Sec-Fetch-Dest": "document" } }));
-    const request = await producer.next();
-    expect(request).toMatchObject({
-      type: "http_request",
-      method: "GET",
-      path: "/",
-      headers: { "sec-fetch-dest": "document" }
-    });
-    expect(request.headers.host).toBeUndefined();
-    producer.send({
-      type: "http_response",
-      request_id: request.request_id,
-      status: 200,
-      headers: { "content-type": "text/html" },
-      body: btoa("<h1>From CLI</h1>")
-    });
-    const response = await page;
-    expect(response.status).toBe(200);
-    expect(await response.text()).toBe("<h1>From CLI</h1>");
-
-    producer.send({ type: "file_update", path: "/space%20file.css" });
-    expect(await client.next()).toEqual({ type: "file_update", path: "/space%20file.css" });
-  });
-
-  it("ignores late responses for timed-out browser requests", async () => {
-    const { producer, url } = await open();
-    const page = SELF.fetch(new Request(url));
-    const request = await producer.next();
-    const code = new URL(url).pathname.split("/")[2];
-    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => {
-      const session = instance as unknown as {
-        pendingProxy: Map<string, { resolve(response: Response): void; timer: ReturnType<typeof setTimeout> }>
-      };
-      const pending = session.pendingProxy.get(request.request_id);
-      clearTimeout(pending!.timer);
-      session.pendingProxy.delete(request.request_id);
-      pending!.resolve(new Response(null, { status: 504 }));
-    });
-    expect((await page).status).toBe(504);
-
-    const lateEvents: Event[] = [];
-    const lateListener = (message: MessageEvent) => lateEvents.push(JSON.parse(message.data as string));
-    producer.socket.addEventListener("message", lateListener);
-    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    producer.socket.removeEventListener("message", lateListener);
-    expect(lateEvents).toEqual([]);
-
-    const nextPage = SELF.fetch(new Request(url));
-    const nextRequest = await producer.next();
-    producer.send({ type: "http_response", request_id: nextRequest.request_id, status: 200, headers: {}, body: "" });
-    expect((await nextPage).status).toBe(200);
-  });
-
-  it("rejects oversized requests from Content-Length before proxying", async () => {
-    const { producer, url } = await open();
-    const response = await SELF.fetch(new Request(url, {
-      method: "POST",
-      headers: { "Content-Length": String(1024 * 1024 + 1) }
-    }));
-    expect(response.status).toBe(413);
-    expect(await Promise.race([producer.next(), new Promise((resolve) => setTimeout(() => resolve(undefined), 50))])).toBeUndefined();
-  });
-
-  it("relays form submissions and preserves the session path", async () => {
-    const { producer, url } = await open();
-    const page = SELF.fetch(new Request(new URL("save", url), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-LetMeKnow-Submission": "1",
-        "X-LetMeKnow-ID": "submission",
-        "X-LetMeKnow-Form-ID": "decision",
-        "X-LetMeKnow-Action": "%2Fsave"
-      },
-      body: "answer=yes"
-    }));
-    const request = await producer.next();
-    expect(request).toMatchObject({
-      type: "http_request",
-      method: "POST",
-      path: "/save",
-      headers: {
-        "content-type": "application/x-www-form-urlencoded",
-        "x-letmeknow-submission": "1",
-        "x-letmeknow-id": "submission"
-      }
-    });
-    expect(atob(request.body)).toBe("answer=yes");
-    producer.send({ type: "http_response", request_id: request.request_id, status: 204, headers: {}, body: "" });
-    expect((await page).status).toBe(204);
-  });
-
-  it("allows only one producer and one browser consumer", async () => {
-    const { producer, url } = await open();
-    const code = new URL(url).pathname.split("/")[2];
-    const second = await SELF.fetch(new Request(`${origin}/v1/connect?code=${code}`, {
-      headers: {
-        Upgrade: "websocket",
-        "CF-Connecting-IP": `192.0.2.${++ipCounter}`,
-        "Sec-WebSocket-Protocol": producer.credential!
-      }
-    }));
-    expect(second.status).toBe(409);
-
     const first = await connectClient(url);
-    await first.next();
-    const replacement = await connectClient(url);
-    expect(await replacement.next()).toEqual({ type: "busy", retry_after: 5 });
-    producer.socket.close(1000, "done");
+    const second = await connectClient(url);
+    expect(await first.next()).toEqual({ type: "connected", producer_connected: true });
+    expect(await second.next()).toEqual({ type: "connected", producer_connected: true });
+    producer.send({ type: "revision" });
+    expect(await first.next()).toEqual({ type: "revision" });
+    expect(await second.next()).toEqual({ type: "revision" });
+    producer.socket.close(1000, "restart");
+    expect(await first.next()).toEqual({ type: "producer", connected: false });
+    expect(await second.next()).toEqual({ type: "producer", connected: false });
   });
 
-  it("ignores a stale producer close after replacement reconnects", async () => {
+  it("injects the relay runtime into HTML but not other responses or submissions", async () => {
+    const { producer, url } = await open();
+    const htmlRequest = SELF.fetch(new Request(url));
+    const html = await producer.next();
+    producer.send({ type: "http_response", request_id: html.request_id, status: 200, headers: { "content-type": "text/html" }, body: btoa("<html><body><h1>Preview</h1></body></html>") });
+    const htmlResponse = await htmlRequest;
+    expect(await htmlResponse.text()).toContain('<script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime></script>');
+
+    const cssRequest = SELF.fetch(new Request(new URL("style.css", url)));
+    const css = await producer.next();
+    producer.send({ type: "http_response", request_id: css.request_id, status: 200, headers: { "content-type": "text/css" }, body: btoa("body{}")} );
+    expect(await (await cssRequest).text()).toBe("body{}");
+
+    const submission = SELF.fetch(new Request(new URL("save", url), { method: "POST", headers: { "X-LetMeKnow-Submission": "1" }, body: "ok" }));
+    const submissionRequest = await producer.next();
+    producer.send({ type: "http_response", request_id: submissionRequest.request_id, status: 202, headers: { "content-type": "text/html" }, body: btoa("accepted") });
+    expect(await (await submission).text()).toBe("accepted");
+  });
+
+  it("restores only uniquely identified controls and scroll state", () => {
+    expect(clientSource).toContain("input[id], textarea[id], select[id]");
+    expect(clientSource).toContain("document.querySelectorAll(\"#\" + CSS.escape(control.id)");
+    expect(clientSource).toContain("seen.has(control.id)");
+    expect(clientSource).not.toContain("data-letmeknow-index");
+  });
+
+  it("serves the runtime and live disconnected pages", async () => {
+    const { producer, url } = await open();
+    const runtime = await SELF.fetch(new Request(new URL("_letmeknow/client.js", url)));
+    expect(runtime.status).toBe(200);
+    expect(runtime.headers.get("cache-control")).toBe("no-store");
+    expect(runtime.headers.get("content-type")).toContain("text/javascript");
+    expect(await runtime.text()).toContain("Sent. Waiting for an update");
+    producer.socket.close(1000, "gone");
+    const disconnected = await SELF.fetch(new Request(url));
+    expect(disconnected.status).toBe(503);
+    expect(disconnected.headers.get("content-type")).toContain("text/html");
+    expect(await disconnected.text()).toContain("/_letmeknow/client.js");
+  });
+
+  it("relays requests and preserves late-response and size boundaries", async () => {
+    const { producer, url } = await open();
+    const page = SELF.fetch(new Request(url));
+    const request = await producer.next();
+    expect(request).toMatchObject({ type: "http_request", method: "GET", path: "/" });
+    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
+    expect((await page).status).toBe(200);
+
+    const oversized = await SELF.fetch(new Request(url, { method: "POST", headers: { "Content-Length": String(1024 * 1024 + 1) } }));
+    expect(oversized.status).toBe(413);
+  });
+
+  it("reconnects the producer securely and expires disconnected sessions", async () => {
     const { producer, url } = await open();
     const client = await connectClient(url);
     expect(await client.next()).toEqual({ type: "connected", producer_connected: true });
+    const code = new URL(url).hostname.split(".")[0];
     producer.socket.close(1000, "restart");
     expect(await client.next()).toEqual({ type: "producer", connected: false });
-
-    const code = new URL(url).pathname.split("/")[2];
-    const replacement = await SELF.fetch(new Request(`${origin}/v1/connect?code=${code}`, {
-      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": producer.credential! }
-    }));
-    expect(replacement.status).toBe(101);
-    const replacementProducer = peer(replacement.webSocket!);
-    expect(await replacementProducer.next()).toMatchObject({ type: "session", url });
+    const replacement = await connectProducer(code, producer.credential);
+    expect(await replacement.next()).toMatchObject({ type: "session", url });
     expect(await client.next()).toEqual({ type: "producer", connected: true });
-
-    const page = SELF.fetch(new Request(url));
-    const request = await replacementProducer.next();
-    const staleSocket = {
-      deserializeAttachment: () => ({ role: "producer", url, opened: true, closing: false }),
-      close: () => {}
-    } as unknown as WebSocket;
-    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.webSocketClose(staleSocket, 1000, "stale"));
-    expect(await runDurableObjectAlarm(env.SESSIONS.getByName(code))).toBe(false);
-    replacementProducer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
-    expect((await page).status).toBe(200);
-    expect(await Promise.race([client.next(), new Promise((resolve) => setTimeout(() => resolve(undefined), 50))])).toBeUndefined();
-  });
-
-  it("reconnects the producer and expires disconnected sessions", async () => {
-    const { producer, url } = await open();
-    const client = await connectClient(url);
-    await client.next();
-    producer.socket.close(1000, "restart");
-    expect(await client.next()).toEqual({ type: "producer", connected: false });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
-    const code = new URL(url).pathname.split("/")[2];
-    const replacement = await SELF.fetch(new Request(`${origin}/v1/connect?code=${code}`, {
-      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": producer.credential! }
-    }));
-    expect(replacement.status).toBe(101);
-    const replacementProducer = peer(replacement.webSocket!);
-    expect(await replacementProducer.next()).toMatchObject({ type: "session", url });
-    expect(await client.next()).toEqual({ type: "producer", connected: true });
-
-    replacementProducer.socket.close(1000, "gone");
+    replacement.socket.close(1000, "gone");
     expect(await client.next()).toEqual({ type: "producer", connected: false });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(await runDurableObjectAlarm(env.SESSIONS.getByName(code))).toBe(true);
     expect(await client.next()).toEqual({ type: "closed", message: "Session expired" });
     expect((await SELF.fetch(url)).status).toBe(404);
+  });
+
+  it("ignores stale producer closes after replacement reconnects", async () => {
+    const { producer, url } = await open();
+    const client = await connectClient(url);
+    await client.next();
+    producer.socket.close(1000, "restart");
+    await client.next();
+    const code = new URL(url).hostname.split(".")[0];
+    const replacement = await connectProducer(code, producer.credential);
+    await replacement.next();
+    await client.next();
+    const page = SELF.fetch(new Request(url));
+    const request = await replacement.next();
+    const staleSocket = { deserializeAttachment: () => ({ role: "producer", url, opened: true, closing: false }), close: () => {} } as unknown as WebSocket;
+    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.webSocketClose(staleSocket, 1000, "stale"));
+    replacement.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
+    expect((await page).status).toBe(200);
+    expect(await Promise.race([client.next(), new Promise((resolve) => setTimeout(() => resolve(undefined), 50))])).toBeUndefined();
   });
 });
