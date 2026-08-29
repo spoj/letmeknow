@@ -90,7 +90,7 @@ document.addEventListener("submit",async event=>{
   const submitter=event.submitter;
   const method=(submitter?.getAttribute("formmethod")??form.getAttribute("method")??"get").toLowerCase()||"get";
   if(method!=="get"&&method!=="post"){status("Only GET and POST forms are supported");return}
-  if(!submitter?.hasAttribute("formnovalidate")&&!form.checkValidity()){form.reportValidity();return}
+  if(!form.noValidate&&!submitter?.formNoValidate&&!form.checkValidity()){form.reportValidity();return}
   let target;
   try{const action=submitter?.getAttribute("formaction")??form.getAttribute("action")??location.href;const base=sessionBase!=="/"&&location.pathname===sessionBase.slice(0,-1)&&!document.querySelector("base")?new URL(sessionBase,location.href):document.baseURI;target=new URL(action,base)}catch{status("Invalid form action");return}
   if(target.origin!==location.origin){status("Form actions must stay on this site");return}

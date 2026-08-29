@@ -123,6 +123,7 @@ describe("LetMeKnow CLI", () => {
     assert.equal(result.response("client").status, 200);
     assert.equal(result.response("client").headers["Content-Type"], "text/javascript; charset=utf-8");
     assert.match(result.response("client").body, /const sessionMatch/);
+    assert.match(result.response("client").body, /if\(!form\.noValidate&&!submitter\?\.formNoValidate&&!form\.checkValidity\(\)\)/);
     assert.equal(result.response("asset").status, 200);
     assert.equal(result.response("asset").headers["Content-Type"], "text/javascript; charset=utf-8");
     assert.equal(result.response("head").status, 200);
