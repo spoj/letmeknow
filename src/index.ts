@@ -400,6 +400,8 @@ export class Session extends DurableObject<Env> {
     if (this.probe?.socket === socket) this.probe.settle(false);
     await this.mutate(async () => {
       if (attachment.role === "producer") {
+        const active = this.producer();
+        if (active && active !== socket) return;
         this.failProxyRequests();
         this.sendClient({ type: "producer", connected: false });
         if (attachment.opened && await this.ctx.storage.get<boolean>("opened")) {

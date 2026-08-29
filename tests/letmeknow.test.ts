@@ -1,4 +1,4 @@
-import { SELF, runDurableObjectAlarm } from "cloudflare:test";
+import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -176,6 +176,35 @@ describe("LetMeKnow outbound relay", () => {
     const replacement = await connectClient(url);
     expect(await replacement.next()).toEqual({ type: "busy", retry_after: 5 });
     producer.socket.close(1000, "done");
+  });
+
+  it("ignores a stale producer close after replacement reconnects", async () => {
+    const { producer, url } = await open();
+    const client = await connectClient(url);
+    expect(await client.next()).toEqual({ type: "connected", producer_connected: true });
+    producer.socket.close(1000, "restart");
+    expect(await client.next()).toEqual({ type: "producer", connected: false });
+
+    const code = new URL(url).pathname.split("/")[2];
+    const replacement = await SELF.fetch(new Request(`${origin}/v1/connect?code=${code}`, {
+      headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": producer.credential! }
+    }));
+    expect(replacement.status).toBe(101);
+    const replacementProducer = peer(replacement.webSocket!);
+    expect(await replacementProducer.next()).toMatchObject({ type: "session", url });
+    expect(await client.next()).toEqual({ type: "producer", connected: true });
+
+    const page = SELF.fetch(new Request(url));
+    const request = await replacementProducer.next();
+    const staleSocket = {
+      deserializeAttachment: () => ({ role: "producer", url, opened: true, closing: false }),
+      close: () => {}
+    } as unknown as WebSocket;
+    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.webSocketClose(staleSocket, 1000, "stale"));
+    expect(await runDurableObjectAlarm(env.SESSIONS.getByName(code))).toBe(false);
+    replacementProducer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
+    expect((await page).status).toBe(200);
+    expect(await Promise.race([client.next(), new Promise((resolve) => setTimeout(() => resolve(undefined), 50))])).toBeUndefined();
   });
 
   it("reconnects the producer and expires disconnected sessions", async () => {
