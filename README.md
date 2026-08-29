@@ -65,8 +65,9 @@ The CLI keeps requests inside the selected directory, including when files conta
 ```bash
 npm install
 npm test
+npm run test:browser
 npm run dev
 npm run deploy
 ```
 
-`npm run dev` and `npm run deploy` operate the Cloudflare relay. The stdout contract is JSONL (`ready` and `submit` events); diagnostics belong on stderr.
+`npm run test:browser` requires Firefox and geckodriver. `npm run dev` and `npm run deploy` operate the Cloudflare relay. The stdout contract is JSONL (`ready` and `submit` events); diagnostics belong on stderr.
