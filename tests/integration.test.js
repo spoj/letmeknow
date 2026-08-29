@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import net from "node:net";
@@ -40,7 +40,9 @@ describe("LetMeKnow integration", () => {
     const folder = mkdtempSync(join(tmpdir(), "letmeknow-integration-"));
     const persist = mkdtempSync(join(tmpdir(), "letmeknow-wrangler-"));
     const port = await freePort();
+    mkdirSync(join(folder, "nested"));
     writeFileSync(join(folder, "index.html"), `<!doctype html><html><body><form id="contact" action="/save" method="post"><input name="name"><button name="kind" value="send">Send</button></form></body></html>`);
+    writeFileSync(join(folder, "nested", "index.html"), "nested");
     const relay = spawn(process.execPath, [wrangler, "dev", "--local", "--local-protocol", "https", "--port", String(port), "--persist-to", persist], {
       cwd: root,
       env: { ...process.env, NO_PROXY: "*", no_proxy: "*" },
@@ -92,6 +94,14 @@ describe("LetMeKnow integration", () => {
       const clientScript = await fetch(new URL("_letmeknow/client.js", browserUrl));
       assert.equal(clientScript.status, 200);
       assert.match(await clientScript.text(), /const sessionMatch/);
+
+      const nestedRequest = new URL("nested?view=source", browserUrl);
+      const nestedRedirect = await fetch(nestedRequest, { redirect: "manual" });
+      assert.equal(nestedRedirect.status, 301);
+      assert.equal(nestedRedirect.headers.get("location"), "nested/?view=source");
+      const nestedPage = await fetch(new URL(nestedRedirect.headers.get("location"), nestedRequest));
+      assert.equal(nestedPage.status, 200);
+      assert.match(await nestedPage.text(), /^nested<script type="module"/);
 
       const form = await fetch(new URL("save", browserUrl), {
         method: "POST",

@@ -204,7 +204,7 @@ async function staticResponse(root, packet) {
   }
   if (info.isDirectory()) {
     if (!request.encodedPathname.endsWith("/")) {
-      const location = request.encodedPathname + "/" + request.search;
+      const location = request.encodedPathname.slice(request.encodedPathname.lastIndexOf("/") + 1) + "/" + request.search;
       return response(packet, 301, Buffer.from(`Redirecting to ${location}`), { Location: location, "Content-Type": "text/plain; charset=utf-8" });
     }
     const index = resolve(target, "index.html");

@@ -132,11 +132,11 @@ describe("LetMeKnow CLI", () => {
     assert.equal(result.response("head").body, "");
     assert.equal(result.response("head").headers["Content-Length"], String(Buffer.byteLength("console.log('ok')\n")));
     assert.equal(result.response("redirect").status, 301);
-    assert.equal(result.response("redirect").headers.Location, "/nested/");
+    assert.equal(result.response("redirect").headers.Location, "nested/");
     assert.equal(result.response("encodedUpper").status, 301);
-    assert.equal(result.response("encodedUpper").headers.Location, "/nested%2F/?view=upper");
+    assert.equal(result.response("encodedUpper").headers.Location, "nested%2F/?view=upper");
     assert.equal(result.response("encodedLower").status, 301);
-    assert.equal(result.response("encodedLower").headers.Location, "/nested%2f/?view=lower");
+    assert.equal(result.response("encodedLower").headers.Location, "nested%2f/?view=lower");
     assert.match(result.response("directory").body, /^nested<script type="module" src="\/_letmeknow\/client\.js" data-letmeknow-client>/);
     assert.equal(result.response("encoded").status, 200);
     assert.equal(result.response("missing").status, 404);
