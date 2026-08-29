@@ -226,4 +226,3 @@ describe("browser runtime", () => {
     }
   }, { timeout: 45_000 });
 });
-
