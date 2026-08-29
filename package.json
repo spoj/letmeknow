@@ -17,7 +17,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
-    "test": "npm run check && vitest run && node --test tests/cli.test.js"
+    "test": "npm run check && vitest run && node --test tests/cli.test.js",
+    "test:browser": "node --test tests/browser.test.js"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.1.0",
