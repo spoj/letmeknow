@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { once } from "node:events";
@@ -11,6 +11,17 @@ import { WebSocketServer } from "ws";
 const cli = new URL("../bin/letmeknow.js", import.meta.url);
 
 const MAX_BODY_BYTES = 1024 * 1024;
+
+function multipartBody(boundary, parts) {
+  const chunks = [];
+  for (const part of parts) {
+    chunks.push(Buffer.from(`--${boundary}\r\n${part.headers}\r\n\r\n`));
+    chunks.push(Buffer.isBuffer(part.body) ? part.body : Buffer.from(part.body));
+    chunks.push(Buffer.from("\r\n"));
+  }
+  chunks.push(Buffer.from(`--${boundary}--\r\n`));
+  return Buffer.concat(chunks);
+}
 
 function localWebSocketEnvironment(port) {
   const folder = mkdtempSync(join(tmpdir(), "letmeknow-hook-"));
@@ -79,7 +90,17 @@ async function runRelayScenario() {
       "x-letmeknow-action": "%2Fsave",
       "x-letmeknow-trigger-name": "kind",
       "x-letmeknow-trigger-value": "send"
-    }, body: Buffer.from("name=Ada&kind=send").toString("base64") }
+    }, body: Buffer.from("name=Ada&kind=send").toString("base64") },
+    { request_id: "multipart", method: "POST", path: "/review", headers: {
+      "content-type": "multipart/form-data; boundary=----letmeknow-test",
+      "x-letmeknow-submission": "1",
+      "x-letmeknow-id": "multipart-test"
+    }, body: multipartBody("----letmeknow-test", [
+      { headers: 'Content-Disposition: form-data; name="comment"', body: "Review these files" },
+      { headers: 'Content-Disposition: form-data; name="empty"; filename=""\r\nContent-Type: application/octet-stream', body: "" },
+      { headers: 'Content-Disposition: form-data; name="upload"; filename="../../secret.txt"\r\nContent-Type: text/plain', body: Buffer.from([0, 1, 2, 255]) },
+      { headers: 'Content-Disposition: form-data; name="upload"; filename="report.bin"\r\nContent-Type: application/octet-stream', body: Buffer.from("report bytes") }
+    ]).toString("base64") }
   ];
   const done = new Promise((resolve, reject) => {
     relay.on("connection", (socket, request) => {
@@ -117,9 +138,12 @@ async function runRelayScenario() {
   child.stderr.on("data", chunk => { error += chunk; });
   try {
     await Promise.race([done, new Promise((_, reject) => setTimeout(() => reject(new Error(`relay timed out: ${error}`)), 10_000))]);
+    const events = lines.filter(line => line.type === "submit");
+    const attachmentPaths = events.flatMap(line => line.attachments || []).map(attachment => attachment.path);
+    const attachmentBytes = attachmentPaths.map(path => readFileSync(path));
     const code = await new Promise(resolve => { child.once("exit", resolve); child.kill("SIGTERM"); });
     const decoded = request_id => ({ ...responses.get(request_id), body: Buffer.from(responses.get(request_id).body, "base64").toString() });
-    return { code, response: decoded, responses, updates, connectionUrl, event: lines.find(line => line.type === "submit") };
+    return { code, response: decoded, responses, updates, connectionUrl, events, event: events[0], attachmentPaths, attachmentBytes };
   } finally {
     if (!child.killed) child.kill("SIGTERM");
     await new Promise(resolve => relay.close(resolve));
@@ -258,6 +282,20 @@ describe("LetMeKnow CLI", () => {
       values: { name: "Ada", kind: "send" }
     });
     assert.equal(result.responses.get("form").status, 202);
+    const multipartEvent = result.events.find(line => line.id === "multipart-test");
+    assert.deepEqual(multipartEvent.values, { comment: "Review these files" });
+    assert.equal(multipartEvent.attachments.length, 2);
+    assert.deepEqual(multipartEvent.attachments.map(({ field, name, type, size }) => ({ field, name, type, size })), [
+      { field: "upload", name: "../../secret.txt", type: "text/plain", size: 4 },
+      { field: "upload", name: "report.bin", type: "application/octet-stream", size: 12 }
+    ]);
+    assert.deepEqual(result.attachmentBytes[0], Buffer.from([0, 1, 2, 255]));
+    assert.deepEqual(result.attachmentBytes[1], Buffer.from("report bytes"));
+    assert.equal(dirname(multipartEvent.attachments[0].path), dirname(multipartEvent.attachments[1].path));
+    assert.notEqual(basename(multipartEvent.attachments[0].path), "../../secret.txt");
+    assert.equal(existsSync(multipartEvent.attachments[0].path), false);
+    assert.equal(existsSync(multipartEvent.attachments[1].path), false);
+    assert.equal(result.responses.get("multipart").status, 202);
     assert.equal(result.updates.length, 1);
     assert.deepEqual(result.updates[0], { type: "revision" });
   }, { timeout: 15_000 });

@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
 import { existsSync, readFileSync, statSync, writeSync } from "node:fs";
-import { readFile, realpath, stat } from "node:fs/promises";
-import { dirname, extname, relative, resolve, sep } from "node:path";
+import { mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import chokidar from "chokidar";
 import ignore from "ignore";
@@ -139,18 +141,47 @@ async function staticResponse(root, packet) {
   return response(packet, 200, body, { "Content-Type": getMimeType(target) });
 }
 
-async function submission(packet) {
+async function multipartSubmission(body, contentType, getAttachmentInbox) {
+  const formData = await new Request("http://letmeknow.local", {
+    method: "POST",
+    headers: { "Content-Type": contentType },
+    body
+  }).formData();
+  const values = Object.create(null);
+  const attachments = [];
+  for (const [name, value] of formData) {
+    if (typeof value === "string") {
+      addValue(values, name, value);
+      continue;
+    }
+    if (value.name === "") continue;
+    const bytes = Buffer.from(await value.arrayBuffer());
+    const path = join(await getAttachmentInbox(), randomUUID());
+    await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
+    attachments.push({ field: name, name: value.name, type: value.type, size: bytes.byteLength, path });
+  }
+  return { values, attachments };
+}
+
+async function submission(packet, getAttachmentInbox) {
   const url = requestUrl(packet);
   const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
   const values = Object.create(null);
+  let attachments;
   if (method === "GET") {
     for (const [name, value] of new URLSearchParams(url.search)) addValue(values, name, value);
   } else if (method === "POST") {
     const body = Buffer.from(typeof packet.body === "string" ? packet.body : "", "base64");
     if (body.byteLength > MAX_BODY_BYTES) throw new Error("submission is too large");
-    const contentType = header(packet, "content-type")?.split(";", 1)[0].trim().toLowerCase();
-    if (contentType !== "application/x-www-form-urlencoded") throw new Error("unsupported submission encoding");
-    for (const [name, value] of new URLSearchParams(body.toString("utf8"))) addValue(values, name, value);
+    const contentTypeHeader = header(packet, "content-type");
+    const contentType = contentTypeHeader?.split(";", 1)[0].trim().toLowerCase();
+    if (contentType === "application/x-www-form-urlencoded") {
+      for (const [name, value] of new URLSearchParams(body.toString("utf8"))) addValue(values, name, value);
+    } else if (contentType === "multipart/form-data" && contentTypeHeader) {
+      const parsed = await multipartSubmission(body, contentTypeHeader, getAttachmentInbox);
+      Object.assign(values, parsed.values);
+      attachments = parsed.attachments;
+    } else throw new Error("unsupported submission encoding");
   } else throw new Error("unsupported submission method");
   const event = {
     type: "submit",
@@ -161,13 +192,14 @@ async function submission(packet) {
     trigger: { id: encodedHeader(packet, "x-letmeknow-trigger-id"), name: encodedHeader(packet, "x-letmeknow-trigger-name"), value: encodedHeader(packet, "x-letmeknow-trigger-value") },
     values
   };
+  if (attachments?.length) event.attachments = attachments;
   process.stdout.write(`${JSON.stringify(event)}\n`);
   return response(packet, 202);
 }
 
-async function handleRequest(root, packet) {
+async function handleRequest(root, packet, getAttachmentInbox) {
   if (header(packet, "x-letmeknow-submission") === "1") {
-    try { return await submission(packet); } catch (cause) { return errorResponse(packet, cause?.message === "submission is too large" ? 413 : 400, cause instanceof Error ? cause.message : "invalid submission"); }
+    try { return await submission(packet, getAttachmentInbox); } catch (cause) { return errorResponse(packet, cause?.message === "submission is too large" ? 413 : 400, cause instanceof Error ? cause.message : "invalid submission"); }
   }
   return staticResponse(root, packet);
 }
@@ -200,6 +232,11 @@ function validSessionUrl(value) {
 
 async function start(directory) {
   const { root } = await options(directory);
+  let attachmentInboxPromise;
+  const getAttachmentInbox = () => {
+    attachmentInboxPromise ??= mkdtemp(join(tmpdir(), "letmeknow-attachments-"));
+    return attachmentInboxPromise;
+  };
   let send = () => false;
   let revisionTimer;
   const watchedPath = filename => {
@@ -240,6 +277,9 @@ async function start(directory) {
     send({ type: "close" });
     try { socket?.close(); } catch {}
     await watcher.close();
+    if (attachmentInboxPromise) {
+      try { await rm(await attachmentInboxPromise, { recursive: true, force: true }); } catch {}
+    }
     process.exit(code);
   };
   process.once("SIGINT", () => void stop(0));
@@ -283,7 +323,7 @@ async function start(directory) {
         sessionUrl = packet.url;
         if (!ready) { ready = true; process.stdout.write(`${JSON.stringify({ type: "ready", url: sessionUrl })}\n`); }
       } else if (packet.type === "http_request") {
-        void handleRequest(root, packet).then(result => send(result)).catch(() => send(errorResponse(packet, 500, "preview request failed")));
+        void handleRequest(root, packet, getAttachmentInbox).then(result => send(result)).catch(() => send(errorResponse(packet, 500, "preview request failed")));
       } else if (packet.type === "closed") {
         void stop(0);
       } else if (packet.type === "error") {
