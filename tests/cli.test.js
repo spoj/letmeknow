@@ -218,6 +218,7 @@ describe("LetMeKnow CLI", () => {
 
   it("denies SSH private-key paths but serves public files", async () => {
     const protectedPaths = [
+      ".env", ".env.local", ".git/config",
       ".ssh/id_ed25519", ".ssh/id_rsa", ".ssh/id_ecdsa", ".ssh/id_dsa",
       "id_ed25519", "id_rsa", "id_ecdsa", "id_dsa",
       "server.key", "server.pem", "bundle.p12", "putty.ppk", "private.p8",

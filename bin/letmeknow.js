@@ -7,7 +7,6 @@ import { tmpdir } from "node:os";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import chokidar from "chokidar";
-import ignore from "ignore";
 import { lookup } from "mrmime";
 
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -17,8 +16,8 @@ const MAX_RETRY_DELAY = 5_000;
 const REVISION_QUIET_MS = 200;
 const CONTROL_URL = "https://letmeknow.dev";
 const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-const ig = ignore().add([".env", ".env.*", ".git", ".ssh", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "*.key", "*.pem", "*.p12", "*.ppk", "*.p8", "*.sqlite", "*.sqlite3", "*.db", "*.db3", "*-wal", "*-shm", "*-journal"]);
-const privateFilePattern = /\.(?:key|pem|p12|ppk|p8|sqlite|sqlite3|db|db3)$|-(?:wal|shm|journal)$/i;
+const privateNames = new Set([".env", ".git", ".ssh", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]);
+const privateFilePattern = /^\.env\.|\.(?:key|pem|p12|ppk|p8|sqlite|sqlite3|db|db3)$|-(?:wal|shm|journal)$/i;
 
 function getMimeType(filename) {
   const type = lookup(filename);
@@ -57,8 +56,7 @@ function errorResponse(packet, status, message) {
 }
 
 function deniedPath(pathname) {
-  const normalized = pathname.replace(/^\/+/, "");
-  return normalized !== "" && (ig.ignores(normalized) || pathname.split("/").filter(Boolean).some(part => ig.ignores(part) || privateFilePattern.test(part)));
+  return pathname.split("/").filter(Boolean).some(part => privateNames.has(part) || privateFilePattern.test(part));
 }
 
 function inside(root, target) {
