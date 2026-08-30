@@ -65,7 +65,7 @@ async function stopProcess(child) {
 }
 
 const page = `<!doctype html>
-<html><head><meta charset="utf-8"><title>LetMeKnow browser smoke test</title>
+<html data-letmeknow-workspace="workspace-test"><head><meta charset="utf-8"><title>LetMeKnow browser smoke test</title>
 <style>body { min-height: 5000px; } form { margin-top: 20px; }</style></head><body>
 <h1>Preview</h1>
 <form id="review" action="/submit" method="post">
@@ -88,6 +88,8 @@ describe("browser runtime", () => {
     const source = runtimeSource();
     let rootRequests = 0;
     let post;
+    const posts = [];
+    let failNextPost = false;
     const httpServer = http.createServer((req, res) => {
       if (req.method === "GET" && req.url === "/_letmeknow/client.js") {
         res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" });
@@ -105,6 +107,13 @@ describe("browser runtime", () => {
         req.on("data", chunk => chunks.push(chunk));
         req.on("end", () => {
           post = { headers: req.headers, body: Buffer.concat(chunks).toString() };
+          posts.push(post);
+          if (failNextPost) {
+            failNextPost = false;
+            res.writeHead(503);
+            res.end();
+            return;
+          }
           setTimeout(() => { res.writeHead(202); res.end(); }, 150);
         });
         return;
@@ -180,6 +189,8 @@ describe("browser runtime", () => {
       await waitFor(async () => (await execute("return document.querySelector('#status').textContent")) === "Sending…", "sending status was not shown");
       await waitFor(async () => (await execute("return document.querySelector('#status').textContent")) === "Sent. Waiting for an update…", "accepted status was not shown");
       assert.ok(post, "form request was not received");
+      assert.equal(post.headers["x-letmeknow-id"].length, 36);
+      assert.equal(post.headers["x-letmeknow-based-on"], "workspace-test");
       assert.equal(post.headers["x-letmeknow-trigger-name"], "decision");
       assert.equal(post.headers["x-letmeknow-trigger-value"], "approve");
       assert.match(post.body, /message=remember\+this/);
@@ -203,6 +214,32 @@ describe("browser runtime", () => {
       }, "revision did not restore stable state");
       await sleep(300);
       assert.equal(rootRequests, revisionBaseline + 1, "revision must not reload more than once");
+
+      const duplicateBaseline = posts.length;
+      await execute("document.querySelector('#stable-text').value = 'one request'; const button = document.querySelector('#submit'); button.click(); button.click();");
+      await waitFor(() => posts.length === duplicateBaseline + 1, "duplicate clicks created multiple requests");
+      await waitFor(async () => (await execute("return document.querySelector('#status').textContent")) === "Sent. Waiting for an update…", "duplicate-click submission was not accepted");
+      assert.equal(posts.at(-1).headers["x-letmeknow-id"].length, 36);
+
+      failNextPost = true;
+      const failedPostCount = posts.length;
+      await execute("document.querySelector('#stable-text').value = 'retry this'; document.querySelector('#submit').click();");
+      await waitFor(() => posts.length === failedPostCount + 1, "failed form request was not received");
+      const failedId = posts.at(-1).headers["x-letmeknow-id"];
+      const failedBody = posts.at(-1).body;
+      await waitFor(async () => (await execute("return document.querySelector('#status').textContent")) === "Couldn’t send. Try again.", "failed submission status was not shown");
+      const reloadBaseline = rootRequests;
+      const reloadSocket = sockets.at(-1);
+      reloadSocket.send(JSON.stringify({ type: "revision" }));
+      await waitFor(() => rootRequests === reloadBaseline + 1, "reload for pending submission did not happen");
+      await waitFor(() => posts.length === failedPostCount + 2, "pending submission was not retried after reload");
+      assert.equal(posts.at(-1).headers["x-letmeknow-id"], failedId, "reload retry must reuse submission ID");
+      assert.equal(posts.at(-1).body, failedBody, "reload retry must reuse serialized submission");
+      await waitFor(async () => (await execute("return document.querySelector('#status').textContent")) === "Sent. Waiting for an update…", "retried submission was not accepted");
+      const acceptedPostCount = posts.length;
+      sockets.at(-1).send(JSON.stringify({ type: "revision" }));
+      await sleep(300);
+      assert.equal(posts.length, acceptedPostCount, "accepted submission must be removed from outbox");
 
       const reconnectBaseline = rootRequests;
       const reconnectSocket = sockets.at(-1);

@@ -9,6 +9,103 @@
   let producerConnected = false;
   const disconnectedPage = document.documentElement.getAttribute("data-letmeknow-status-page") === "disconnected";
   const submitting = new WeakSet();
+  const outboxInFlight = new Set();
+  const submissionForms = new Map();
+  const OUTBOX_RETRY_MS = 1000;
+  let outboxDatabasePromise;
+  let outboxFlushPromise;
+  let outboxRetryTimer;
+
+  function outboxDatabase() {
+    outboxDatabasePromise ??= new Promise((resolve, reject) => {
+      const request = indexedDB.open("letmeknow-outbox:" + location.origin, 1);
+      request.onupgradeneeded = () => request.result.createObjectStore("submissions", { keyPath: "id" });
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error("could not open submission outbox"));
+    });
+    return outboxDatabasePromise;
+  }
+
+  function outboxTransaction(mode, operation) {
+    return outboxDatabase().then((database) => new Promise((resolve, reject) => {
+      const transaction = database.transaction("submissions", mode);
+      const store = transaction.objectStore("submissions");
+      let result;
+      transaction.oncomplete = () => resolve(result);
+      transaction.onerror = () => reject(transaction.error || new Error("submission outbox failed"));
+      transaction.onabort = () => reject(transaction.error || new Error("submission outbox aborted"));
+      result = operation(store);
+    }));
+  }
+
+  function outboxPut(record) {
+    return outboxTransaction("readwrite", (store) => store.put(record));
+  }
+
+  function outboxDelete(id) {
+    return outboxTransaction("readwrite", (store) => store.delete(id));
+  }
+
+  function outboxList() {
+    return outboxTransaction("readonly", (store) => {
+      const request = store.getAll();
+      return new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error("could not read submission outbox"));
+      });
+    });
+  }
+
+  function scheduleOutboxFlush(delay = OUTBOX_RETRY_MS) {
+    if (outboxRetryTimer) return;
+    outboxRetryTimer = setTimeout(() => {
+      outboxRetryTimer = undefined;
+      void flushOutbox();
+    }, delay);
+  }
+
+  function setSubmissionStatus(id, message, formId) {
+    const form = submissionForms.get(id) || (formId ? document.getElementById(formId) : undefined);
+    if (form && (!form.dataset.letmeknowSubmission || form.dataset.letmeknowSubmission === id)) setStatus(form, message);
+  }
+
+  async function deliverSubmission(record) {
+    if (outboxInFlight.has(record.id)) return;
+    outboxInFlight.add(record.id);
+    try {
+      const response = await fetch(record.url, {
+        method: record.method,
+        headers: record.headers,
+        body: record.body === null ? undefined : record.body.slice(0)
+      });
+      if (response.status === 202) {
+        await outboxDelete(record.id);
+        setSubmissionStatus(record.id, "Sent. Waiting for an update…", record.form_id);
+        const form = submissionForms.get(record.id);
+        if (form?.dataset.letmeknowSubmission === record.id) delete form.dataset.letmeknowSubmission;
+        submissionForms.delete(record.id);
+        return;
+      }
+      setSubmissionStatus(record.id, response.status === 413 ? "Attachment is too large." : "Couldn’t send. Try again.", record.form_id);
+      if (response.status >= 500) scheduleOutboxFlush();
+    } catch {
+      setSubmissionStatus(record.id, "Couldn’t send. Try again.", record.form_id);
+      scheduleOutboxFlush();
+    } finally {
+      outboxInFlight.delete(record.id);
+    }
+  }
+
+  function flushOutbox() {
+    if (!producerConnected) return Promise.resolve();
+    if (outboxFlushPromise) return outboxFlushPromise;
+    outboxFlushPromise = outboxList().then(async (records) => {
+      for (const record of records) await deliverSubmission(record);
+    }).catch(() => {}).finally(() => {
+      outboxFlushPromise = undefined;
+    });
+    return outboxFlushPromise;
+  }
 
   function statusTarget(form) {
     const local = form.querySelector("[data-letmeknow-status]");
@@ -116,6 +213,7 @@
     if (connected && (disconnectedPage || (producerKnown && !producerConnected))) reload();
     producerKnown = true;
     producerConnected = connected;
+    if (connected) void flushOutbox();
   }
 
   function connect() {
@@ -127,6 +225,7 @@
       hadSocketConnection = true;
       if (reconnect) reload();
       clearSystemStatus();
+      void flushOutbox();
     });
     socket.addEventListener("message", (event) => {
       let message;
@@ -173,52 +272,59 @@
       setStatus(form, "File uploads are not supported for GET forms.");
       return;
     }
-    if (details.method === "GET") {
-      details.action.search = "";
-      for (const [name, value] of data.entries()) if (typeof value === "string") details.action.searchParams.append(name, value);
-    }
     const id = crypto.randomUUID();
-    const headers = {
-      "X-LetMeKnow-Submission": "1",
-      "X-LetMeKnow-ID": id,
-      "X-LetMeKnow-Form-ID": encodeURIComponent(form.id || ""),
-      "X-LetMeKnow-Action": encodeURIComponent(details.action.pathname + details.action.search)
-    };
-    if (submitter) {
-      headers["X-LetMeKnow-Trigger-ID"] = encodeURIComponent(submitter.id || "");
-      headers["X-LetMeKnow-Trigger-Name"] = encodeURIComponent(submitter.name || "");
-      headers["X-LetMeKnow-Trigger-Value"] = encodeURIComponent(submitter.value || "");
-    }
-    let body;
-    let uploading = false;
-    if (details.method === "POST") {
-      const submitterEnctype = submitter?.hasAttribute("formenctype")
-        ? submitter.formEnctype || submitter.getAttribute("formenctype")
-        : undefined;
-      const enctype = (submitterEnctype || form.enctype || "application/x-www-form-urlencoded").toLowerCase();
-      uploading = hasSelectedFile;
-      if (hasSelectedFile || enctype === "multipart/form-data") body = data;
-      else {
-        body = new URLSearchParams();
-        for (const [name, value] of data.entries()) if (typeof value === "string") body.append(name, value);
-      }
-    }
     const previousBusy = form.getAttribute("aria-busy");
     const previousDisabled = submitter ? submitter.disabled : undefined;
     submitting.add(form);
+    submissionForms.set(id, form);
+    form.dataset.letmeknowSubmission = id;
     form.setAttribute("aria-busy", "true");
     if (submitter) submitter.disabled = true;
     try {
-      setStatus(form, uploading ? "Uploading…" : "Sending…");
-      const response = await fetch(details.action, { method: details.method, headers, body });
-      if (response.status === 413) {
-        setStatus(form, "Attachment is too large.");
-        return;
+      if (details.method === "GET") {
+        details.action.search = "";
+        for (const [name, value] of data.entries()) if (typeof value === "string") details.action.searchParams.append(name, value);
       }
-      if (response.status !== 202) throw new Error("submission failed");
-      setStatus(form, "Sent. Waiting for an update…");
+      const headers = {
+        "X-LetMeKnow-Submission": "1",
+        "X-LetMeKnow-ID": id,
+        "X-LetMeKnow-Form-ID": encodeURIComponent(form.id || ""),
+        "X-LetMeKnow-Action": encodeURIComponent(details.action.pathname + details.action.search)
+      };
+      if (submitter) {
+        headers["X-LetMeKnow-Trigger-ID"] = encodeURIComponent(submitter.id || "");
+        headers["X-LetMeKnow-Trigger-Name"] = encodeURIComponent(submitter.name || "");
+        headers["X-LetMeKnow-Trigger-Value"] = encodeURIComponent(submitter.value || "");
+      }
+      let body = null;
+      let uploading = false;
+      if (details.method === "POST") {
+        const submitterEnctype = submitter?.hasAttribute("formenctype")
+          ? submitter.formEnctype || submitter.getAttribute("formenctype")
+          : undefined;
+        const enctype = (submitterEnctype || form.enctype || "application/x-www-form-urlencoded").toLowerCase();
+        uploading = hasSelectedFile;
+        const source = hasSelectedFile || enctype === "multipart/form-data"
+          ? data
+          : (() => {
+            const values = new URLSearchParams();
+            for (const [name, value] of data.entries()) if (typeof value === "string") values.append(name, value);
+            return values;
+          })();
+        const request = new Request(details.action, { method: details.method, body: source });
+        body = await request.arrayBuffer();
+        headers["Content-Type"] = request.headers.get("content-type") || "application/octet-stream";
+      }
+      const basedOn = document.documentElement.getAttribute("data-letmeknow-workspace");
+      if (basedOn) headers["X-LetMeKnow-Based-On"] = encodeURIComponent(basedOn);
+      const record = { id, url: details.action.toString(), method: details.method, headers, body, form_id: form.id || null, ...(basedOn ? { based_on: basedOn } : {}) };
+      setStatus(form, uploading ? "Uploading…" : "Sending…");
+      await outboxPut(record);
+      await flushOutbox();
     } catch {
       setStatus(form, "Couldn’t send. Try again.");
+      delete form.dataset.letmeknowSubmission;
+      submissionForms.delete(id);
     } finally {
       submitting.delete(form);
       if (previousBusy === null) form.removeAttribute("aria-busy");
