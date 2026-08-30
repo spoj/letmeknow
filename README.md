@@ -1,64 +1,98 @@
 # LetMeKnow
 
-LetMeKnow gives an agent a temporary public preview of a dedicated folder and receives structured input from a human. The CLI serves the folder over an outbound connection to the LetMeKnow relay; it does not listen on a network port.
+LetMeKnow gives an agent a temporary public browser surface and structured human feedback. The agent edits an ordinary folder, explicitly publishes coherent revisions, and pulls form submissions as JSON. The CLI connects outbound to the hosted relay and does not listen on a network port.
 
 ## Start a session
 
-Node.js 22.12 or newer is required. Pass the preview directory explicitly:
+Node.js 22.12 or newer is required. Create a dedicated directory containing only public files, then keep the server running:
 
 ```bash
-npx letmeknow-cli ./preview
+npx letmeknow-cli serve ./preview
 ```
 
-The CLI prints JSON lines to stdout. The first line contains the public URL:
+The server prints one JSON line containing the public bearer URL and initial workspace revision:
 
 ```json
-{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/"}
+{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","workspace":"…","workspace_sequence":1}
 ```
 
-Open the URL in one or more browsers. The URL is a bearer capability: anyone who has it can view the preview and submit its forms. Sessions are hosted at `letmeknow.dev` and are temporary. A graceful CLI stop closes the session; an unexpected disconnect can reconnect for up to ten minutes. `--skill` prints instructions for an agent without starting a session. Diagnostics go to stderr.
+Anyone with the URL can view the published workspace and submit its forms. A graceful stop closes the session; an unexpected relay disconnect can reconnect for up to ten minutes. Diagnostics go to stderr.
 
-The preview directory is public. Keep secrets and unrelated project files elsewhere. Use a dedicated directory containing only the files intended for the human.
+## Publish revisions
 
-## Live workspace
+`serve` snapshots the initial folder. Later filesystem changes remain private until explicitly published:
 
-Create an ordinary static site in the directory, usually with `index.html`, plus its CSS, JavaScript, images, and other assets. The relay injects the small browser runtime into HTML pages. The CLI serves the workspace files unchanged.
+```bash
+npx letmeknow-cli pull ./preview --wait 30
+npx letmeknow-cli push ./preview --based-on <batch-token>
+```
 
-Every file in the preview directory is part of the live artifact. A burst of changes is coalesced into one workspace revision. Each connected browser then performs a full-page reload.
+`pull` returns pending browser interactions, the current workspace, and an opaque batch token:
 
-The runtime preserves scroll position and the values of controls with stable, unique `id` attributes, including checked and selected state. Other browser state is not part of the preview contract. Use relative asset URLs and normal links between pages.
+```json
+{
+  "ok": true,
+  "type": "batch",
+  "token": "…",
+  "workspace": "…",
+  "workspace_sequence": 1,
+  "frontier": 1,
+  "events": [
+    {
+      "type": "submit",
+      "id": "…",
+      "form_id": "decision",
+      "values": {"decision":"approve"},
+      "based_on": "…",
+      "context": {"based_on":"…","current":"…","relationship":"current"}
+    }
+  ]
+}
+```
 
-If a requested page does not exist, the live 404 page remains connected and recovers when the page is created. Connection status pages likewise reconnect and recover when the producer becomes available again.
+A repeated pull returns uncommitted events again. `push` atomically snapshots the folder, commits the batch, and reloads connected browsers once. Events arriving while the agent works remain for the next pull. A push can also publish independent work from an empty batch.
+
+If a batch requires no workspace change, commit it without publishing:
+
+```bash
+npx letmeknow-cli ack ./preview --based-on <batch-token>
+```
+
+`push` and `ack` are idempotent for a token. They fail if another command has moved the workspace or event cursor first.
+
+The commands communicate with `serve` through a private local Unix socket. `--skill` prints agent instructions without starting a session.
+
+## Workspace behavior
+
+A published workspace is an immutable temporary snapshot of the selected folder. It may contain HTML, CSS, JavaScript, images, data, and linked pages. The relay injects a small runtime into HTML and serves all files from the same workspace revision.
+
+A successful push sends one revision notification. Browsers reload and preserve scroll position plus the values, checked state, and selected state of controls with stable unique IDs. Missing pages and connection-status pages remain live and recover on a later publication or reconnect.
 
 ## Forms
 
-Use native HTML GET and POST forms with same-origin or relative actions:
+Use native same-origin GET or POST forms:
 
 ```html
 <form id="decision" action="/decide" method="post">
-  <label>Comment <textarea name="comment"></textarea></label>
+  <label>Comment <textarea id="comment" name="comment"></textarea></label>
   <button name="decision" value="approve">Approve</button>
   <button name="decision" value="reject">Reject</button>
 </form>
 ```
 
-The runtime sends the submission to the CLI, which prints one `submit` event to stdout:
+Before delivery, the runtime gives each logical submission an opaque UUID and persists the serialized request in IndexedDB. Network retries and page reloads reuse that UUID. The CLI deduplicates accepted events, so a transport retry does not become another interaction. Distinct intentional submissions receive distinct IDs.
 
-```json
-{"type":"submit","id":"…","method":"POST","action":"/decide","form_id":"decision","trigger":{"id":null,"name":"decision","value":"approve"},"values":{"comment":"Looks good","decision":"approve"}}
-```
+The runtime displays **Sending…** or **Uploading…**, followed by **Sent. Waiting for an update…** or an error. Add `[data-letmeknow-status]` to choose the status location. Native validation runs before submission. Repeated field names become arrays.
 
-Repeated field names become arrays, and native browser validation runs before delivery. POST forms may include file inputs; the total submission is limited to 1 MiB. Uploaded files are stored in a private temporary inbox and the event includes an `attachments` array with each field name, original filename, media type, size, and local path. Attachment paths remain available until the CLI stops and are never published unless the agent deliberately copies them into the preview directory.
+POST forms may include files within the 1 MiB total request limit. `pull` events contain attachment metadata and private temporary paths. Attachments remain available until `serve` stops and are not public unless deliberately copied into the workspace and pushed.
 
-The event ID identifies the submission; it is not a response handle. Read the event, treat values and attachments as untrusted input, update the workspace, and let the next revision show the result.
-
-Submission feedback is automatic: **Sending…** or **Uploading…**, then **Sent. Waiting for an update…**, or **Couldn’t send. Try again.** Add `[data-letmeknow-status]` where a form or page needs a particular status location. Forms are accepted for asynchronous processing, so the transport response is `202 Accepted`.
+Every submission records the exact workspace revision shown to the user. Its derived `context.relationship` is `current`, `stale`, or `unknown`, allowing the agent to decide whether to apply, rebase, or reject old feedback.
 
 ## Security
 
-The preview URL grants access to the session. The relay receives served files and submitted values. The preview folder is trusted code from the browser's perspective, so do not include secrets or credentials unless that is intentional. The CLI makes outbound relay connections only and accepts no inbound browser connections.
+The URL is a bearer capability. The relay receives published files and submitted values. Keep secrets and unrelated files outside the preview directory.
 
-The CLI resolves requested paths and denies symlinks whose targets leave the selected directory. Sensitive names such as `.env`, `.git`, private keys, and database files are excluded. Processes with write access to the preview directory are trusted publishers and can make data public through it.
+The CLI excludes `.env`, `.git`, SSH keys, private-key files, and database files, and prevents symlink escapes. Processes that can write the workspace and invoke `push` are trusted publishers. Browser values, filenames, media types, and attachment contents remain untrusted input.
 
 ## Development
 
@@ -70,4 +104,4 @@ npm run dev
 npm run deploy
 ```
 
-`npm run test:browser` requires Firefox and geckodriver. `npm run dev` and `npm run deploy` operate the Cloudflare relay. The stdout contract is JSONL (`ready` and `submit` events); diagnostics belong on stderr.
+The browser test requires Firefox and geckodriver. `npm run dev` and `npm run deploy` operate the Cloudflare relay.

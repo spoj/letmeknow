@@ -365,7 +365,7 @@ export class Session extends DurableObject<Env> {
 }
 
 function home(): Response {
-  return new Response(`# LetMeKnow\n\nRun a live preview for an agent-managed folder:\n\n  npx letmeknow-cli ./workspace\n\nThe CLI connects to this service outbound and prints the preview URL and form submissions as JSON lines.\n`, { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
+  return new Response(`# LetMeKnow\n\nPublish a temporary browser workspace:\n\n  npx letmeknow-cli serve ./workspace\n\nThe CLI connects outbound. Use its pull, push, and ack commands to exchange feedback and coherent workspace revisions.\n`, { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
 export default {

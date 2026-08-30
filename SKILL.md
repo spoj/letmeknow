@@ -1,73 +1,89 @@
 ---
 name: letmeknow
-description: Give a human a temporary live preview of an agent-managed folder and receive browser form submissions as JSON lines.
+description: Publish a temporary browser workspace, pull structured human feedback, and push coherent agent revisions.
 ---
 
 # LetMeKnow
 
-Use LetMeKnow when a human needs to inspect or interact with a temporary page, report, dashboard, approval form, quiz, table, or status view. You own the files in a dedicated preview folder. The CLI serves that folder through the hosted LetMeKnow relay and reports browser submissions on stdout. It does not listen on a local network port.
+Use LetMeKnow when a human should inspect or interact with an agent-managed page, report, dashboard, approval, quiz, table, or prototype.
 
 ## Start
 
-Pass only the files intended for public viewing in an explicit directory:
+Create a dedicated directory containing only public files and keep the server running:
 
 ```bash
-npx letmeknow-cli ./preview
+npx letmeknow-cli serve ./preview
 ```
 
-Node.js 22.12 or newer is required. Keep the process running while the human uses the page. Read stdout and stderr separately. Stdout is JSONL; the first event is:
+Node.js 22.12 or newer is required. The first stdout JSON line contains the bearer URL and initial workspace revision:
 
 ```json
-{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/"}
+{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","workspace":"…","workspace_sequence":1}
 ```
 
-Give the human the URL. It is a bearer capability, so anyone with it can view the preview and submit forms. Multiple browsers may view the session. `--skill` prints these instructions without starting a session.
+Give the URL to the human. Anyone with it can view the workspace and submit forms. The CLI connects outbound and opens no network port. Diagnostics go to stderr.
 
-## Build the preview
+## Agent loop
 
-Create an ordinary static site in the folder, usually `index.html`, with its CSS, JavaScript, images, and other assets. Use semantic HTML, accessible labels, and relative asset URLs. Use normal links for navigation.
+Filesystem writes are private drafts. Explicitly pull feedback and publish coherent revisions:
 
-The relay injects the browser runtime into HTML. All files in the folder form one live workspace. Changes made in a short burst become one revision, and connected browsers perform a full-page reload. The runtime preserves scroll position and values, checked state, and selected state for controls with stable, unique `id` attributes.
+```bash
+npx letmeknow-cli pull ./preview --wait 30
+# validate feedback and edit files
+npx letmeknow-cli push ./preview --based-on <batch-token>
+```
 
-A missing page displays a live 404 page that can recover when you create the page. Connection status pages reconnect and recover when the producer is available again.
+`pull` returns pending events, their derived causal context, the current workspace, and an opaque token. Pulling does not consume events; they are returned again after a crash. A successful `push` atomically snapshots the folder, commits that batch, and reloads connected browsers once. Feedback that arrives while you work remains for the next pull.
 
-## Receive form submissions
+When a batch needs no visible workspace change:
 
-Use native GET and POST forms with relative or same-origin actions:
+```bash
+npx letmeknow-cli ack ./preview --based-on <batch-token>
+```
+
+Both commands are idempotent for a token. Do not edit while `push` is snapshotting. Do not write commands to the long-running server's stdin.
+
+A push may publish independent work from an empty batch. Use the token returned by an empty `pull`.
+
+## Build the workspace
+
+Use ordinary HTML, CSS, JavaScript, images, and relative links. Give forms stable IDs and controls meaningful names. Give editable controls stable unique IDs so values and scroll position survive published revisions.
+
+Use native same-origin GET or POST forms:
 
 ```html
-<form id="search" action="/search" method="post">
-  <label>Query <input name="query" required></label>
-  <button name="scope" value="all">Search all</button>
+<form id="review" action="/review" method="post">
+  <label>Comment <textarea id="comment" name="comment"></textarea></label>
+  <button name="decision" value="approve">Approve</button>
+  <button name="decision" value="reject">Reject</button>
 </form>
 ```
 
-The runtime provides automatic transport feedback: **Sending…** or **Uploading…**, **Sent. Waiting for an update…**, or **Couldn’t send. Try again.** Add `[data-letmeknow-status]` for a custom status location. The transport accepts submissions asynchronously with `202 Accepted`.
+The browser persists each serialized submission before delivery and retries it with the same opaque UUID after network failures or reloads. The CLI deduplicates retries. Distinct intentional submissions remain distinct. Native validation and repeated field names work normally.
 
-Read stdout for a `submit` event:
+A pulled event includes the workspace the human saw:
 
 ```json
-{"type":"submit","id":"…","method":"POST","action":"/search","form_id":"search","trigger":{"id":null,"name":"scope","value":"all"},"values":{"query":"quarterly report","scope":"all"}}
+{
+  "type": "submit",
+  "id": "…",
+  "form_id": "review",
+  "values": {"comment":"Looks good","decision":"approve"},
+  "based_on": "…",
+  "context": {
+    "based_on": "…",
+    "current": "…",
+    "relationship": "current"
+  }
+}
 ```
 
-Give forms stable IDs and controls meaningful `name` values. Native browser validation runs before delivery, and repeated names become arrays. POST forms may include file inputs within the 1 MiB total submission limit. Attachment metadata includes a local temporary path that remains readable until the CLI stops; treat the filename, media type, and contents as untrusted. Attachments are private unless you deliberately copy them into the preview folder.
+Treat `stale` feedback deliberately: apply its intent to current state when safe, or show that the artifact changed and ask the human to review again. Never reconstruct the workspace from stale form values.
 
-The event ID identifies the submission, not a response channel: validate the values and attachments, update the files, and let the next workspace revision show the result. Do not write commands to stdin.
+POST forms may upload files within the 1 MiB request limit. Attachment events contain private temporary paths valid until `serve` stops. Validate names, media types, sizes, contents, actions, and IDs. Copy only deliberate outputs into the public workspace.
 
-## Example workflow
-
-1. Build the initial page in `index.html`.
-2. Wait for a `submit` event on stdout.
-3. Validate its values and action.
-4. Rewrite the relevant HTML or data file in the preview folder.
-5. Let the workspace revision reload the human's page.
-
-Escape untrusted values before placing them in HTML.
-
-## Security
-
-The preview folder is public and is trusted code from the browser's perspective. Keep secrets and unrelated project files elsewhere. The CLI restricts requests to the selected directory and excludes `.env`, `.git`, private-key, and database files. Treat every process with write access to the preview folder as a trusted publisher. The CLI makes outbound relay connections only and accepts no inbound browser connections.
+Escape untrusted text before placing it in HTML.
 
 ## Stop
 
-Send `SIGINT` or `SIGTERM` to close the session. After an unexpected disconnect, the CLI can reconnect to the session for up to ten minutes. Diagnostics go to stderr; stdout remains JSONL.
+Send `SIGINT` or `SIGTERM` to `serve`. A graceful stop closes the public session and removes temporary snapshots, attachments, and the local control socket. `--skill` prints these instructions.
