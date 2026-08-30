@@ -55,6 +55,7 @@ async function runRelayScenario() {
   writeFileSync(join(folder, "nested", "index.html"), "nested");
   writeFileSync(join(folder, "assets", "app.css"), "body { color: red }\n");
   writeFileSync(join(folder, "assets", "app.js"), "console.log('ok')\n");
+  symlinkSync(join(folder, "assets"), join(folder, "assets-alias"));
   writeFileSync(join(folder, "space file.css"), "body {}\n");
   writeFileSync(join(folder, "credentials.PEM"), "secret");
   symlinkSync(join(folder, "credentials.PEM"), join(folder, "private-alias.txt"));
@@ -86,6 +87,7 @@ async function runRelayScenario() {
     { request_id: "page", method: "GET", path: "/", headers: { accept: "text/html" } },
     { request_id: "legacyPage", method: "GET", path: "/page.htm", headers: {} },
     { request_id: "asset", method: "GET", path: "/assets/app.js?cache=1", headers: {} },
+    { request_id: "assetAlias", method: "GET", path: "/assets-alias/app.js", headers: {} },
     { request_id: "head", method: "HEAD", path: "/assets/app.js?cache=1", headers: {} },
     { request_id: "redirect", method: "GET", path: "/nested", headers: {} },
     { request_id: "encodedUpper", method: "GET", path: "/nested%2F?view=upper", headers: {} },
@@ -319,6 +321,7 @@ describe("LetMeKnow CLI", () => {
     assert.equal(result.response("legacyPage").headers["Content-Type"], "text/html; charset=utf-8");
     assert.equal(result.response("asset").status, 200);
     assert.equal(result.response("asset").headers["Content-Type"], "text/javascript; charset=utf-8");
+    assert.equal(result.response("assetAlias").body, "console.log('ok')\n");
     assert.equal(result.response("head").status, 200);
     assert.equal(result.response("head").body, "");
     assert.equal(result.response("head").headers["Content-Length"], String(Buffer.byteLength("console.log('ok')\n")));

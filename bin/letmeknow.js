@@ -248,6 +248,7 @@ async function copyDirectory(source, target, root, visited = new Set()) {
     if (info.isDirectory()) await copyDirectory(targetReal, targetPath, root, visited);
     else if (info.isFile()) await copyFile(targetReal, targetPath);
   }
+  visited.delete(sourceReal);
 }
 
 async function snapshotDirectory(root) {
