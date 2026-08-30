@@ -65,7 +65,7 @@ async function stopProcess(child) {
 }
 
 const page = `<!doctype html>
-<html data-letmeknow-workspace="workspace-test"><head><meta charset="utf-8"><title>LetMeKnow browser smoke test</title>
+<html><head><meta charset="utf-8"><title>LetMeKnow browser smoke test</title>
 <style>body { min-height: 5000px; } form { margin-top: 20px; }</style></head><body>
 <h1>Preview</h1>
 <form id="review" action="/submit" method="post">
@@ -77,7 +77,7 @@ const page = `<!doctype html>
   <button id="submit" formaction="/submit" name="decision" value="approve">Approve</button>
   <output id="status" data-letmeknow-status role="status"></output>
 </form>
-<script type="module" src="/_letmeknow/client.js"></script>
+<script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime data-letmeknow-workspace="11111111-1111-4111-8111-111111111111"></script>
 </body></html>`;
 
 describe("browser runtime", () => {
@@ -190,7 +190,7 @@ describe("browser runtime", () => {
       await waitFor(async () => (await execute("return document.querySelector('#status').textContent")) === "Sent. Waiting for an update…", "accepted status was not shown");
       assert.ok(post, "form request was not received");
       assert.equal(post.headers["x-letmeknow-id"].length, 36);
-      assert.equal(post.headers["x-letmeknow-based-on"], "workspace-test");
+      assert.equal(post.headers["x-letmeknow-based-on"], "11111111-1111-4111-8111-111111111111");
       assert.equal(post.headers["x-letmeknow-trigger-name"], "decision");
       assert.equal(post.headers["x-letmeknow-trigger-value"], "approve");
       assert.match(post.body, /message=remember\+this/);

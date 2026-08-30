@@ -8,6 +8,7 @@
   let producerKnown = false;
   let producerConnected = false;
   const disconnectedPage = document.documentElement.getAttribute("data-letmeknow-status-page") === "disconnected";
+  const workspace = document.querySelector("script[data-letmeknow-runtime]")?.getAttribute("data-letmeknow-workspace");
   const submitting = new WeakSet();
   const outboxInFlight = new Set();
   const submissionForms = new Map();
@@ -315,9 +316,8 @@
         body = await request.arrayBuffer();
         headers["Content-Type"] = request.headers.get("content-type") || "application/octet-stream";
       }
-      const basedOn = document.documentElement.getAttribute("data-letmeknow-workspace");
-      if (basedOn) headers["X-LetMeKnow-Based-On"] = encodeURIComponent(basedOn);
-      const record = { id, url: details.action.toString(), method: details.method, headers, body, form_id: form.id || null, ...(basedOn ? { based_on: basedOn } : {}) };
+      if (workspace) headers["X-LetMeKnow-Based-On"] = encodeURIComponent(workspace);
+      const record = { id, url: details.action.toString(), method: details.method, headers, body, form_id: form.id || null, ...(workspace ? { based_on: workspace } : {}) };
       setStatus(form, uploading ? "Uploading…" : "Sending…");
       await outboxPut(record);
       await flushOutbox();
