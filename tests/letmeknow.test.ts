@@ -11,6 +11,7 @@ type Peer = {
 };
 
 const origin = "https://letmeknow.dev";
+const workspace = "11111111-1111-4111-8111-111111111111";
 const sockets: WebSocket[] = [];
 let ipCounter = 0;
 
@@ -93,19 +94,34 @@ describe("LetMeKnow outbound relay", () => {
     const { producer, url } = await open();
     const htmlRequest = SELF.fetch(new Request(url));
     const html = await producer.next();
-    producer.send({ type: "http_response", request_id: html.request_id, status: 200, headers: { "content-type": "text/html" }, body: btoa("<html><body><h1>Preview</h1></body></html>") });
+    producer.send({ type: "http_response", request_id: html.request_id, status: 200, headers: { "content-type": "text/html", "x-letmeknow-workspace": workspace }, body: btoa("<html><body><h1>Preview</h1></body></html>") });
     const htmlResponse = await htmlRequest;
-    expect(await htmlResponse.text()).toContain('<script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime></script>');
+    expect(await htmlResponse.text()).toContain(`<script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime data-letmeknow-workspace="${workspace}"></script>`);
+    expect(htmlResponse.headers.get("x-letmeknow-workspace")).toBeNull();
 
     const cssRequest = SELF.fetch(new Request(new URL("style.css", url)));
     const css = await producer.next();
-    producer.send({ type: "http_response", request_id: css.request_id, status: 200, headers: { "content-type": "text/css" }, body: btoa("body{}")} );
-    expect(await (await cssRequest).text()).toBe("body{}");
+    producer.send({ type: "http_response", request_id: css.request_id, status: 200, headers: { "content-type": "text/css", "x-letmeknow-workspace": workspace }, body: btoa("body{}")} );
+    const cssResponse = await cssRequest;
+    expect(await cssResponse.text()).toBe("body{}");
+    expect(cssResponse.headers.get("x-letmeknow-workspace")).toBeNull();
 
     const submission = SELF.fetch(new Request(new URL("save", url), { method: "POST", headers: { "X-LetMeKnow-Submission": "1" }, body: "ok" }));
     const submissionRequest = await producer.next();
-    producer.send({ type: "http_response", request_id: submissionRequest.request_id, status: 202, headers: { "content-type": "text/html" }, body: btoa("accepted") });
-    expect(await (await submission).text()).toBe("accepted");
+    producer.send({ type: "http_response", request_id: submissionRequest.request_id, status: 202, headers: { "content-type": "text/html", "x-letmeknow-workspace": workspace }, body: btoa("accepted") });
+    const submissionResponse = await submission;
+    expect(await submissionResponse.text()).toBe("accepted");
+    expect(submissionResponse.headers.get("x-letmeknow-workspace")).toBeNull();
+  });
+
+  it("rejects invalid workspace headers on HTML documents", async () => {
+    const { producer, url } = await open();
+    const page = SELF.fetch(new Request(url));
+    const request = await producer.next();
+    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: { "content-type": "text/html", "x-letmeknow-workspace": "not-a-uuid" }, body: btoa("<html><body>bad</body></html>") });
+    const response = await page;
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({ error: "invalid workspace header" });
   });
 
   it("turns producer document 404s into live pages but leaves missing assets alone", async () => {
@@ -151,11 +167,12 @@ describe("LetMeKnow outbound relay", () => {
     const head = SELF.fetch(new Request(url, { method: "HEAD" }));
     const request = await producer.next();
     expect(request.method).toBe("HEAD");
-    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: { "content-type": "text/html", "content-length": "4" }, body: btoa("body") });
+    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: { "content-type": "text/html", "content-length": "4", "x-letmeknow-workspace": workspace }, body: btoa("body") });
     const response = await head;
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("");
     expect(response.headers.get("content-length")).toBe("4");
+    expect(response.headers.get("x-letmeknow-workspace")).toBeNull();
   });
 
   it("keeps disconnected asset responses non-HTML", async () => {
@@ -203,6 +220,7 @@ describe("LetMeKnow outbound relay", () => {
     const body = await disconnected.text();
     expect(body).toContain('data-letmeknow-status-page="disconnected"');
     expect(body).toContain("/_letmeknow/client.js");
+    expect(body).not.toContain("data-letmeknow-workspace");
   });
 
   it("relays requests and preserves late-response and size boundaries", async () => {

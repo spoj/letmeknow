@@ -25,6 +25,8 @@ const encoder = new TextEncoder();
 const hopHeaders = new Set(["connection", "host", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "x-forwarded-host", "x-letmeknow-path", "x-letmeknow-route"]);
 const runtimePath = "/_letmeknow/client.js";
 const clientSocketPath = "/_letmeknow/client";
+const workspaceHeader = "x-letmeknow-workspace";
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function error(message: string, status: number): Response {
   return Response.json({ error: message }, { status, headers: { "Cache-Control": "no-store" } });
@@ -82,8 +84,9 @@ function sessionUrl(code: string): string {
   return `https://${code}.letmeknow.dev/`;
 }
 
-function runtimeTag(): string {
-  return `<script type="module" src="${runtimePath}" data-letmeknow-runtime></script>`;
+function runtimeTag(workspace: string | null): string {
+  const attribute = workspace === null ? "" : ` data-letmeknow-workspace="${workspace}"`;
+  return `<script type="module" src="${runtimePath}" data-letmeknow-runtime${attribute}></script>`;
 }
 
 function runtimePage(title: string, message: string, status: number): Response {
@@ -104,15 +107,18 @@ function isDocumentRequest(request: Request): boolean {
 }
 
 function injectRuntime(response: Response, request: Request): Response {
-  if (!isDocumentRequest(request) || response.status === 204 || response.status === 205 || response.status === 304) return response;
   const contentType = response.headers.get("content-type") || "";
-  if (!contentType.toLowerCase().startsWith("text/html")) return response;
+  const document = isDocumentRequest(request) && response.status !== 204 && response.status !== 205 && response.status !== 304 && contentType.toLowerCase().startsWith("text/html");
+  const workspace = response.headers.get(workspaceHeader);
+  if (document && workspace !== null && !uuidPattern.test(workspace)) throw new Error("invalid workspace header");
   const headers = new Headers(response.headers);
+  headers.delete(workspaceHeader);
+  if (!document) return workspace === null ? response : new Response(response.body, { status: response.status, statusText: response.statusText, headers });
   headers.delete("content-length");
   const rewriter = new HTMLRewriter();
   let hasBody = false;
-  rewriter.on("body", { element(element) { hasBody = true; element.append(runtimeTag(), { html: true }); } });
-  rewriter.onDocument({ end(document) { if (!hasBody) document.append(runtimeTag(), { html: true }); } });
+  rewriter.on("body", { element(element) { hasBody = true; element.append(runtimeTag(workspace), { html: true }); } });
+  rewriter.onDocument({ end(document) { if (!hasBody) document.append(runtimeTag(workspace), { html: true }); } });
   return rewriter.transform(new Response(response.body, { status: response.status, statusText: response.statusText, headers }));
 }
 
@@ -198,9 +204,9 @@ export class Session extends DurableObject<Env> {
       response = await this.proxyRequest(request);
       if (document && response.status === 404) response = runtimePage("Page not found", "This page does not exist yet. Waiting for an update…", 404);
     }
+    try { response = injectRuntime(response, request); } catch { return error("invalid workspace header", 502); }
     if (request.method === "HEAD") return new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers });
-    if (request.headers.get("x-letmeknow-submission") === "1") return response;
-    return injectRuntime(response, request);
+    return response;
   }
 
   private async proxyRequest(request: Request): Promise<Response> {
