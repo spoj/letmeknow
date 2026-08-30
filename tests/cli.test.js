@@ -106,6 +106,16 @@ async function runRelayScenario() {
       "x-letmeknow-trigger-value": "send",
       "x-letmeknow-based-on": "workspace-test"
     }, body: Buffer.from("name=Ada&kind=send").toString("base64") },
+    { request_id: "formRetry", method: "POST", path: "/save", headers: {
+      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "x-letmeknow-submission": "1",
+      "x-letmeknow-id": "local-test",
+      "x-letmeknow-form-id": "contact",
+      "x-letmeknow-action": "%2Fsave",
+      "x-letmeknow-trigger-name": "kind",
+      "x-letmeknow-trigger-value": "send",
+      "x-letmeknow-based-on": "workspace-test"
+    }, body: Buffer.from("name=Ada&kind=send").toString("base64") },
     { request_id: "multipart", method: "POST", path: "/review", headers: {
       "content-type": "multipart/form-data; boundary=----letmeknow-test",
       "x-letmeknow-submission": "1",
@@ -144,7 +154,12 @@ async function runRelayScenario() {
             const retried = await cliCommand(["push", folder, "--based-on", pulledBatch.token]);
             assert.deepEqual(retried, pushed);
             const empty = await cliCommand(["pull", folder]);
-            assert.equal(empty.token, null);
+            assert.ok(empty.token);
+            assert.deepEqual(empty.events, []);
+            writeFileSync(join(folder, "assets", "app.js"), "console.log('independent change')\n");
+            const independent = await cliCommand(["push", folder, "--based-on", empty.token]);
+            assert.equal(independent.type, "published");
+            assert.deepEqual(independent.events, []);
             setTimeout(() => { clearTimeout(timer); resolve(); }, 150);
           })().catch(reject);
         }
@@ -158,6 +173,7 @@ async function runRelayScenario() {
             void (async () => {
               const batch = await cliCommand(["pull", folder]);
               assert.equal(batch.events.length, 1);
+              assert.deepEqual(await cliCommand(["pull", folder]), batch);
               const acknowledged = await cliCommand(["ack", folder, "--based-on", batch.token]);
               assert.equal(acknowledged.type, "acknowledged");
               acknowledgedEvents = batch.events;
@@ -325,9 +341,15 @@ describe("LetMeKnow CLI", () => {
       form_id: "contact",
       trigger: { id: null, name: "kind", value: "send" },
       values: { name: "Ada", kind: "send" },
-      based_on: "workspace-test"
+      based_on: "workspace-test",
+      context: {
+        based_on: "workspace-test",
+        current: result.ready.workspace,
+        relationship: "unknown"
+      }
     });
     assert.equal(result.responses.get("form").status, 202);
+    assert.equal(result.responses.get("formRetry").status, 202);
     const multipartEvent = result.events.find(line => line.id === "multipart-test");
     assert.deepEqual(multipartEvent.values, { comment: "Review these files" });
     assert.equal(multipartEvent.attachments.length, 2);
@@ -342,7 +364,7 @@ describe("LetMeKnow CLI", () => {
     assert.equal(existsSync(multipartEvent.attachments[0].path), false);
     assert.equal(existsSync(multipartEvent.attachments[1].path), false);
     assert.equal(result.responses.get("multipart").status, 202);
-    assert.equal(result.updates.length, 1);
-    assert.deepEqual(result.updates[0], { type: "revision" });
+    assert.equal(result.updates.length, 2);
+    assert.deepEqual(result.updates, [{ type: "revision" }, { type: "revision" }]);
   }, { timeout: 15_000 });
 });

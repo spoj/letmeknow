@@ -312,10 +312,12 @@ async function start(directory) {
   let publishedRoot = await snapshotDirectory(root);
   let workspaceId = randomUUID();
   let workspaceSequence = 1;
+  const workspaceIds = new Set([workspaceId]);
   const eventLog = [];
   let committedCursor = 0;
   const seenEvents = new Set();
   const tokens = new Map();
+  const pendingTokens = new Map();
   const pullWaiters = new Set();
   const mutate = mutateQueue();
   let controlServer;
@@ -332,12 +334,24 @@ async function start(directory) {
   let initialPublished = false;
 
   const batch = () => {
-    if (eventLog.length === committedCursor) return { ok: true, type: "batch", token: null, workspace: workspaceId, workspace_sequence: workspaceSequence, frontier: committedCursor, events: [] };
-    const token = randomUUID();
     const start = committedCursor;
     const end = eventLog.length;
-    tokens.set(token, { start, end, parent: workspaceId, status: "pending" });
-    return { ok: true, type: "batch", token, workspace: workspaceId, workspace_sequence: workspaceSequence, frontier: end, events: eventLog.slice(start, end) };
+    const key = `${workspaceId}:${start}:${end}`;
+    const existing = pendingTokens.get(key);
+    if (existing) return existing;
+    const token = randomUUID();
+    const events = eventLog.slice(start, end).map(event => ({
+      ...event,
+      context: {
+        based_on: event.based_on ?? null,
+        current: workspaceId,
+        relationship: event.based_on === workspaceId ? "current" : workspaceIds.has(event.based_on) ? "stale" : "unknown"
+      }
+    }));
+    tokens.set(token, { start, end, parent: workspaceId, status: "pending", key });
+    const result = { ok: true, type: "batch", token, workspace: workspaceId, workspace_sequence: workspaceSequence, frontier: end, events };
+    pendingTokens.set(key, result);
+    return result;
   };
 
   const notifyPullWaiters = () => {
@@ -361,17 +375,24 @@ async function start(directory) {
     const record = tokens.get(token);
     if (!record) return { ok: false, error: "unknown batch token" };
     if (record.status !== "pending") return record.result;
-    if (record.end <= committedCursor) {
+    if (record.start < committedCursor && record.end <= committedCursor) {
+      pendingTokens.delete(record.key);
       record.status = "committed";
       record.result = { ok: true, type: "already_committed", token, workspace: workspaceId, workspace_sequence: workspaceSequence, frontier: committedCursor };
       return record.result;
     }
-    if (record.parent !== workspaceId || record.start !== committedCursor) return { ok: false, error: "batch is based on an old workspace or cursor", current_workspace: workspaceId, frontier: committedCursor };
+    if (record.parent !== workspaceId || record.start !== committedCursor) {
+      pendingTokens.delete(record.key);
+      record.status = "failed";
+      record.result = { ok: false, error: "batch is based on an old workspace or cursor", current_workspace: workspaceId, frontier: committedCursor };
+      return record.result;
+    }
     if (publish) {
       const nextRoot = await snapshotDirectory(root);
       const previousRoot = publishedRoot;
       publishedRoot = nextRoot;
       workspaceId = randomUUID();
+      workspaceIds.add(workspaceId);
       workspaceSequence += 1;
       record.result = { ok: true, type: "published", token, workspace: workspaceId, workspace_sequence: workspaceSequence, parent: record.parent, frontier: record.end, events: eventLog.slice(record.start, record.end).map(event => event.id) };
       void rm(previousRoot, { recursive: true, force: true }).catch(() => {});
@@ -379,6 +400,7 @@ async function start(directory) {
       record.result = { ok: true, type: "acknowledged", token, workspace: workspaceId, workspace_sequence: workspaceSequence, frontier: record.end, events: eventLog.slice(record.start, record.end).map(event => event.id) };
     }
     committedCursor = record.end;
+    pendingTokens.delete(record.key);
     record.status = "committed";
     if (publish) send({ type: "revision" });
     return record.result;

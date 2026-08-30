@@ -87,6 +87,7 @@
         submissionForms.delete(record.id);
         return;
       }
+      if (response.status >= 400 && response.status < 500) await outboxDelete(record.id);
       setSubmissionStatus(record.id, response.status === 413 ? "Attachment is too large." : "Couldn’t send. Try again.", record.form_id);
       if (response.status >= 500) scheduleOutboxFlush();
     } catch {
