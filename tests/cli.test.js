@@ -57,6 +57,7 @@ async function runRelayScenario() {
   writeFileSync(join(folder, "assets", "app.js"), "console.log('ok')\n");
   writeFileSync(join(folder, "space file.css"), "body {}\n");
   writeFileSync(join(folder, "credentials.PEM"), "secret");
+  symlinkSync(join(folder, "credentials.PEM"), join(folder, "private-alias.txt"));
   writeFileSync(join(folder, "large.bin"), "");
   truncateSync(join(folder, "large.bin"), MAX_BODY_BYTES + 1);
   mkdirSync(join(folder, "large-index"));
@@ -94,6 +95,7 @@ async function runRelayScenario() {
     { request_id: "missing", method: "GET", path: "/missing", headers: {} },
     { request_id: "escape", method: "GET", path: "/escape.txt", headers: {} },
     { request_id: "private", method: "GET", path: "/credentials.PEM", headers: {} },
+    { request_id: "privateAlias", method: "GET", path: "/private-alias.txt", headers: {} },
     { request_id: "large", method: "GET", path: "/large.bin", headers: {} },
     { request_id: "largeIndex", method: "GET", path: "/large-index/", headers: {} },
     { request_id: "form", method: "POST", path: "/save", headers: {
@@ -331,6 +333,7 @@ describe("LetMeKnow CLI", () => {
     assert.equal(result.response("missing").status, 404);
     assert.equal(result.response("escape").status, 403);
     assert.equal(result.response("private").status, 403);
+    assert.equal(result.response("privateAlias").status, 404);
     assert.equal(result.response("large").status, 413);
     assert.equal(result.response("largeIndex").status, 413);
     assert.deepEqual(result.event, {

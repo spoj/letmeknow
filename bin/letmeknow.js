@@ -243,6 +243,7 @@ async function copyDirectory(source, target, root, visited = new Set()) {
       continue;
     }
     if (targetReal === undefined) continue;
+    if (deniedPath("/" + relative(root, targetReal).split(sep).join("/"))) continue;
     const info = await stat(targetReal);
     if (info.isDirectory()) await copyDirectory(targetReal, targetPath, root, visited);
     else if (info.isFile()) await copyFile(targetReal, targetPath);
