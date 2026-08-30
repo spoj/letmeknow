@@ -34,6 +34,17 @@ function localWebSocketEnvironment(port) {
   };
 }
 
+async function cliCommand(args) {
+  const child = spawn(process.execPath, [cli.pathname, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  let error = "";
+  child.stdout.on("data", chunk => { output += chunk; });
+  child.stderr.on("data", chunk => { error += chunk; });
+  const [code] = await once(child, "exit");
+  assert.equal(code, 0, `${args.join(" ")}: ${error}`);
+  return JSON.parse(output);
+}
+
 async function runRelayScenario() {
   const folder = mkdtempSync(join(tmpdir(), "letmeknow-"));
   const outside = mkdtempSync(join(tmpdir(), "letmeknow-outside-"));
@@ -57,7 +68,7 @@ async function runRelayScenario() {
   await once(relay, "listening");
   const port = relay.address().port;
   const local = localWebSocketEnvironment(port);
-  const child = spawn(process.execPath, [cli.pathname, folder], {
+  const child = spawn(process.execPath, [cli.pathname, "serve", folder], {
     env: local.env,
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -67,6 +78,9 @@ async function runRelayScenario() {
   const responses = new Map();
   const updates = [];
   let connectionUrl;
+  let pulledBatch;
+  let waitingBatch;
+  let acknowledgedEvents = [];
   const requests = [
     { request_id: "page", method: "GET", path: "/", headers: { accept: "text/html" } },
     { request_id: "legacyPage", method: "GET", path: "/page.htm", headers: {} },
@@ -89,7 +103,8 @@ async function runRelayScenario() {
       "x-letmeknow-form-id": "contact",
       "x-letmeknow-action": "%2Fsave",
       "x-letmeknow-trigger-name": "kind",
-      "x-letmeknow-trigger-value": "send"
+      "x-letmeknow-trigger-value": "send",
+      "x-letmeknow-based-on": "workspace-test"
     }, body: Buffer.from("name=Ada&kind=send").toString("base64") },
     { request_id: "multipart", method: "POST", path: "/review", headers: {
       "content-type": "multipart/form-data; boundary=----letmeknow-test",
@@ -116,15 +131,41 @@ async function runRelayScenario() {
             const packet = JSON.parse(data.toString());
             if (packet.type === "revision") updates.push(packet);
           });
-          writeFileSync(join(folder, "space file.css"), "body { color: blue }\n");
-          writeFileSync(join(folder, "assets", "app.js"), "console.log('changed')\n");
-          setTimeout(() => { clearTimeout(timer); resolve(); }, 500);
+          void (async () => {
+            pulledBatch = await waitingBatch;
+            assert.equal(pulledBatch.events.length, 1);
+            assert.ok(pulledBatch.token);
+            writeFileSync(join(folder, "space file.css"), "body { color: blue }\n");
+            writeFileSync(join(folder, "assets", "app.js"), "console.log('changed')\n");
+            await new Promise(resolve => setTimeout(resolve, 350));
+            assert.equal(updates.length, 0, "file changes must not publish automatically");
+            const pushed = await cliCommand(["push", folder, "--based-on", pulledBatch.token]);
+            assert.equal(pushed.type, "published");
+            const retried = await cliCommand(["push", folder, "--based-on", pulledBatch.token]);
+            assert.deepEqual(retried, pushed);
+            const empty = await cliCommand(["pull", folder]);
+            assert.equal(empty.token, null);
+            setTimeout(() => { clearTimeout(timer); resolve(); }, 150);
+          })().catch(reject);
         }
       };
       socket.on("message", data => {
         const packet = JSON.parse(data.toString());
         if (packet.type === "open") next();
-        else if (packet.type === "http_response") { responses.set(packet.request_id, packet); next(); }
+        else if (packet.type === "http_response") {
+          responses.set(packet.request_id, packet);
+          if (packet.request_id === "form") {
+            void (async () => {
+              const batch = await cliCommand(["pull", folder]);
+              assert.equal(batch.events.length, 1);
+              const acknowledged = await cliCommand(["ack", folder, "--based-on", batch.token]);
+              assert.equal(acknowledged.type, "acknowledged");
+              acknowledgedEvents = batch.events;
+              waitingBatch = cliCommand(["pull", folder, "--wait", "2"]);
+              next();
+            })().catch(reject);
+          } else next();
+        }
       });
     });
     relay.on("error", reject);
@@ -138,12 +179,13 @@ async function runRelayScenario() {
   child.stderr.on("data", chunk => { error += chunk; });
   try {
     await Promise.race([done, new Promise((_, reject) => setTimeout(() => reject(new Error(`relay timed out: ${error}`)), 10_000))]);
-    const events = lines.filter(line => line.type === "submit");
+    assert.deepEqual(lines.filter(line => line.type === "submit"), []);
+    const events = [...acknowledgedEvents, ...pulledBatch.events];
     const attachmentPaths = events.flatMap(line => line.attachments || []).map(attachment => attachment.path);
     const attachmentBytes = attachmentPaths.map(path => readFileSync(path));
     const code = await new Promise(resolve => { child.once("exit", resolve); child.kill("SIGTERM"); });
     const decoded = request_id => ({ ...responses.get(request_id), body: Buffer.from(responses.get(request_id).body, "base64").toString() });
-    return { code, response: decoded, responses, updates, connectionUrl, events, event: events[0], attachmentPaths, attachmentBytes };
+    return { code, response: decoded, responses, updates, connectionUrl, events, event: events[0], attachmentPaths, attachmentBytes, ready: lines.find(line => line.type === "ready") };
   } finally {
     if (!child.killed) child.kill("SIGTERM");
     await new Promise(resolve => relay.close(resolve));
@@ -185,7 +227,7 @@ async function runStaticRequests(paths) {
     });
   });
   const local = localWebSocketEnvironment(relay.address().port);
-  const child = spawn(process.execPath, [cli.pathname, folder], {
+  const child = spawn(process.execPath, [cli.pathname, "serve", folder], {
     env: local.env,
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -205,14 +247,14 @@ async function runStaticRequests(paths) {
 }
 
 describe("LetMeKnow CLI", () => {
-  it("requires exactly one preview directory", async () => {
-    for (const args of [[], ["one", "two"]]) {
+  it("requires the serve command and directory", async () => {
+    for (const args of [[], ["serve", "one", "two"]]) {
       const child = spawn(process.execPath, [cli.pathname, ...args], { stdio: ["ignore", "pipe", "pipe"] });
       let error = "";
       child.stderr.on("data", chunk => { error += chunk; });
       const [code] = await once(child, "exit");
       assert.equal(code, 1);
-      assert.match(error, /exactly one directory must be provided/);
+      assert.match(error, /Usage:/);
     }
   });
 
@@ -250,9 +292,11 @@ describe("LetMeKnow CLI", () => {
     const result = await runRelayScenario();
     assert.equal(result.code, 0);
     assert.equal(result.connectionUrl, "/v2/connect");
+    assert.equal(result.ready.workspace_sequence, 1);
     assert.equal(result.response("page").status, 200);
     assert.equal(result.response("page").body, `<!doctype html><html><head><script>const marker = "</body>";</script><link rel="stylesheet" href="/assets/app.css"></head><body><form id="contact" action="/save" method="post"><input name="name"><button name="kind" value="send">Send</button></form></body></html>`);
     assert.equal(result.response("page").headers["Content-Type"], "text/html; charset=utf-8");
+    assert.match(result.response("page").headers["X-LetMeKnow-Workspace"], /^[0-9a-f-]{36}$/);
     assert.equal(result.response("legacyPage").body, "legacy html");
     assert.equal(result.response("legacyPage").headers["Content-Type"], "text/html; charset=utf-8");
     assert.equal(result.response("asset").status, 200);
@@ -280,7 +324,8 @@ describe("LetMeKnow CLI", () => {
       action: "/save",
       form_id: "contact",
       trigger: { id: null, name: "kind", value: "send" },
-      values: { name: "Ada", kind: "send" }
+      values: { name: "Ada", kind: "send" },
+      based_on: "workspace-test"
     });
     assert.equal(result.responses.get("form").status, 202);
     const multipartEvent = result.events.find(line => line.id === "multipart-test");

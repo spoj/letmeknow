@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 
 import { constants, existsSync, readFileSync, statSync, writeSync } from "node:fs";
-import { mkdtemp, open, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
-import { tmpdir } from "node:os";
+import { chmod, copyFile, lstat, mkdtemp, mkdir, open, readdir, readlink, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import net from "node:net";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
+import { tmpdir } from "node:os";
 import { parseArgs } from "node:util";
-import chokidar from "chokidar";
 import { lookup } from "mrmime";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const GRACE_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
+const CONTROL_TIMEOUT = 35_000;
 const MAX_RETRY_DELAY = 5_000;
-const REVISION_QUIET_MS = 200;
+const CONTROL_PREFIX = "letmeknow-control-";
+const SNAPSHOT_PREFIX = "letmeknow-snapshot-";
 const CONTROL_URL = "https://letmeknow.dev";
 const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const privateNames = new Set([".env", ".git", ".ssh", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]);
@@ -91,7 +93,8 @@ function requestUrl(packet) {
   return { pathname, encodedPathname: url.pathname, search: url.search };
 }
 
-async function staticResponse(root, packet) {
+async function staticResponse(root, packet, workspaceId) {
+  const published = (status, body = Buffer.alloc(0), headers = {}) => response(packet, status, body, { ...headers, "X-LetMeKnow-Workspace": workspaceId });
   const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
   if (method !== "GET" && method !== "HEAD") return errorResponse(packet, 405, "method not allowed");
   let request;
@@ -113,7 +116,7 @@ async function staticResponse(root, packet) {
   if (info.isDirectory()) {
     if (!request.encodedPathname.endsWith("/")) {
       const location = request.encodedPathname.slice(request.encodedPathname.lastIndexOf("/") + 1) + "/" + request.search;
-      return response(packet, 301, Buffer.from(`Redirecting to ${location}`), { Location: location, "Content-Type": "text/plain; charset=utf-8" });
+      return published(301, Buffer.from(`Redirecting to ${location}`), { Location: location, "Content-Type": "text/plain; charset=utf-8" });
     }
     const index = resolve(target, "index.html");
     try { target = await realpath(index); } catch (cause) {
@@ -140,7 +143,7 @@ async function staticResponse(root, packet) {
     if (info.size > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
     const body = await file.readFile();
     if (body.byteLength > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
-    return response(packet, 200, body, { "Content-Type": getMimeType(target) });
+    return published(200, body, { "Content-Type": getMimeType(target) });
   } catch {
     return errorResponse(packet, 500, "preview request failed");
   } finally {
@@ -170,7 +173,7 @@ async function multipartSubmission(body, contentType, getAttachmentInbox) {
   return { values, attachments };
 }
 
-async function submission(packet, getAttachmentInbox) {
+async function submission(packet, getAttachmentInbox, recordInteraction) {
   const url = requestUrl(packet);
   const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
   const values = Object.create(null);
@@ -192,23 +195,25 @@ async function submission(packet, getAttachmentInbox) {
   } else throw new Error("unsupported submission method");
   const event = {
     type: "submit",
-    id: encodedHeader(packet, "x-letmeknow-id"),
+    id: encodedHeader(packet, "x-letmeknow-id") || randomUUID(),
     method,
     action: encodedHeader(packet, "x-letmeknow-action") || url.pathname,
     form_id: encodedHeader(packet, "x-letmeknow-form-id"),
     trigger: { id: encodedHeader(packet, "x-letmeknow-trigger-id"), name: encodedHeader(packet, "x-letmeknow-trigger-name"), value: encodedHeader(packet, "x-letmeknow-trigger-value") },
     values
   };
+  const basedOn = encodedHeader(packet, "x-letmeknow-based-on");
+  if (basedOn !== null) event.based_on = basedOn;
   if (attachments?.length) event.attachments = attachments;
-  process.stdout.write(`${JSON.stringify(event)}\n`);
+  await recordInteraction(event);
   return response(packet, 202);
 }
 
-async function handleRequest(root, packet, getAttachmentInbox) {
+async function handleRequest(root, workspaceId, packet, getAttachmentInbox, recordInteraction) {
   if (header(packet, "x-letmeknow-submission") === "1") {
-    try { return await submission(packet, getAttachmentInbox); } catch (cause) { return errorResponse(packet, cause?.message === "submission is too large" ? 413 : 400, cause instanceof Error ? cause.message : "invalid submission"); }
+    try { return await submission(packet, getAttachmentInbox, recordInteraction); } catch (cause) { return errorResponse(packet, cause?.message === "submission is too large" ? 413 : 400, cause instanceof Error ? cause.message : "invalid submission"); }
   }
-  return staticResponse(root, packet);
+  return staticResponse(root, packet, workspaceId);
 }
 
 function options(directory) {
@@ -217,24 +222,83 @@ function options(directory) {
   return realpath(root).then(root => ({ root }));
 }
 
-function endpoint(credential, sessionUrl) {
-  const url = new URL(CONTROL_URL);
-  url.protocol = "wss:";
-  url.pathname = "/v2/connect";
-  if (credential && sessionUrl) {
-    const publicUrl = new URL(sessionUrl);
-    const code = publicUrl.hostname.match(/^([a-f0-9]{20})\.letmeknow\.dev$/)?.[1];
-    if (!code) throw new Error("invalid session URL");
-    url.searchParams.set("code", code);
-  }
-  return url;
+function controlPath(root) {
+  const key = createHash("sha256").update(root).digest("hex").slice(0, 32);
+  return join(tmpdir(), `${CONTROL_PREFIX}${key}.sock`);
 }
 
-function validSessionUrl(value) {
-  if (typeof value !== "string") return false;
-  let url;
-  try { url = new URL(value); } catch { return false; }
-  return url.protocol === "https:" && /^[a-f0-9]{20}\.letmeknow\.dev$/.test(url.hostname) && url.pathname === "/" && !url.search && !url.hash;
+async function copyDirectory(source, target, root, visited = new Set()) {
+  const sourceReal = await realpath(source);
+  if (visited.has(sourceReal)) return;
+  visited.add(sourceReal);
+  await mkdir(target, { recursive: true });
+  for (const entry of await readdir(sourceReal, { withFileTypes: true })) {
+    const candidate = join(sourceReal, entry.name);
+    const pathname = "/" + relative(root, candidate).split(sep).join("/");
+    if (deniedPath(pathname)) continue;
+    const targetPath = join(target, entry.name);
+    const targetReal = await safeRealpath(root, candidate);
+    if (targetReal === null) {
+      if ((await lstat(candidate)).isSymbolicLink()) await symlink(await readlink(candidate), targetPath);
+      continue;
+    }
+    if (targetReal === undefined) continue;
+    const info = await stat(targetReal);
+    if (info.isDirectory()) await copyDirectory(targetReal, targetPath, root, visited);
+    else if (info.isFile()) await copyFile(targetReal, targetPath);
+  }
+}
+
+async function snapshotDirectory(root) {
+  const snapshot = await mkdtemp(join(tmpdir(), SNAPSHOT_PREFIX));
+  try {
+    await copyDirectory(root, snapshot, root);
+    return snapshot;
+  } catch (cause) {
+    await rm(snapshot, { recursive: true, force: true });
+    throw cause;
+  }
+}
+
+function mutateQueue() {
+  let chain = Promise.resolve();
+  return operation => {
+    const previous = chain;
+    let release;
+    chain = new Promise(resolve => { release = resolve; });
+    return previous.then(operation).finally(release);
+  };
+}
+
+function connectControl(root, packet) {
+  const timeout = Math.max(CONTROL_TIMEOUT, ((packet.wait_seconds || 0) + 5) * 1_000);
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(controlPath(root));
+    let output = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("control request timed out"));
+    }, timeout);
+    const finish = (cause, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (cause) reject(cause);
+      else resolve(value);
+    };
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.write(JSON.stringify(packet) + "\n"));
+    socket.on("data", chunk => {
+      output += chunk;
+      const newline = output.indexOf("\n");
+      if (newline < 0) return;
+      try { finish(null, JSON.parse(output.slice(0, newline))); } catch (cause) { finish(cause); }
+      socket.destroy();
+    });
+    socket.on("error", cause => finish(new Error(`serve is not running: ${cause.message}`)));
+    socket.on("close", () => { if (!settled) finish(new Error("serve closed the control connection")); });
+  });
 }
 
 async function start(directory) {
@@ -244,28 +308,18 @@ async function start(directory) {
     attachmentInboxPromise ??= mkdtemp(join(tmpdir(), "letmeknow-attachments-"));
     return attachmentInboxPromise;
   };
+  const socketPath = controlPath(root);
+  let publishedRoot = await snapshotDirectory(root);
+  let workspaceId = randomUUID();
+  let workspaceSequence = 1;
+  const eventLog = [];
+  let committedCursor = 0;
+  const seenEvents = new Set();
+  const tokens = new Map();
+  const pullWaiters = new Set();
+  const mutate = mutateQueue();
+  let controlServer;
   let send = () => false;
-  let revisionTimer;
-  const watchedPath = filename => {
-    const file = resolve(root, String(filename));
-    const path = relative(root, file).split(sep).join("/");
-    return path && path !== ".." && !path.startsWith("../") && !deniedPath("/" + path);
-  };
-  const watcher = chokidar.watch(root, {
-    ignoreInitial: true,
-    ignored: filename => {
-      const path = relative(root, resolve(root, String(filename))).split(sep).join("/");
-      return path !== "" && (path === ".." || path.startsWith("../") || deniedPath("/" + path));
-    }
-  });
-  const scheduleRevision = () => {
-    clearTimeout(revisionTimer);
-    revisionTimer = setTimeout(() => { revisionTimer = undefined; send({ type: "revision" }); }, REVISION_QUIET_MS);
-  };
-  watcher.on("all", (_event, filename) => {
-    if (filename && !watchedPath(filename)) return;
-    scheduleRevision();
-  });
   let socket;
   let credential;
   let sessionUrl;
@@ -275,15 +329,121 @@ async function start(directory) {
   let retryUntil = 0;
   let stopped = false;
   let ready = false;
+  let initialPublished = false;
+
+  const batch = () => {
+    if (eventLog.length === committedCursor) return { ok: true, type: "batch", token: null, workspace: workspaceId, workspace_sequence: workspaceSequence, frontier: committedCursor, events: [] };
+    const token = randomUUID();
+    const start = committedCursor;
+    const end = eventLog.length;
+    tokens.set(token, { start, end, parent: workspaceId, status: "pending" });
+    return { ok: true, type: "batch", token, workspace: workspaceId, workspace_sequence: workspaceSequence, frontier: end, events: eventLog.slice(start, end) };
+  };
+
+  const notifyPullWaiters = () => {
+    for (const waiter of [...pullWaiters]) {
+      if (eventLog.length === committedCursor) continue;
+      pullWaiters.delete(waiter);
+      clearTimeout(waiter.timer);
+      waiter.resolve(batch());
+    }
+  };
+
+  const pull = waitSeconds => {
+    if (eventLog.length > committedCursor || waitSeconds <= 0) return Promise.resolve(batch());
+    return new Promise(resolve => {
+      const waiter = { resolve, timer: setTimeout(() => { pullWaiters.delete(waiter); resolve(batch()); }, waitSeconds * 1_000) };
+      pullWaiters.add(waiter);
+    });
+  };
+
+  const commit = async (token, publish) => {
+    const record = tokens.get(token);
+    if (!record) return { ok: false, error: "unknown batch token" };
+    if (record.status !== "pending") return record.result;
+    if (record.end <= committedCursor) {
+      record.status = "committed";
+      record.result = { ok: true, type: "already_committed", token, workspace: workspaceId, workspace_sequence: workspaceSequence, frontier: committedCursor };
+      return record.result;
+    }
+    if (record.parent !== workspaceId || record.start !== committedCursor) return { ok: false, error: "batch is based on an old workspace or cursor", current_workspace: workspaceId, frontier: committedCursor };
+    if (publish) {
+      const nextRoot = await snapshotDirectory(root);
+      const previousRoot = publishedRoot;
+      publishedRoot = nextRoot;
+      workspaceId = randomUUID();
+      workspaceSequence += 1;
+      record.result = { ok: true, type: "published", token, workspace: workspaceId, workspace_sequence: workspaceSequence, parent: record.parent, frontier: record.end, events: eventLog.slice(record.start, record.end).map(event => event.id) };
+      void rm(previousRoot, { recursive: true, force: true }).catch(() => {});
+    } else {
+      record.result = { ok: true, type: "acknowledged", token, workspace: workspaceId, workspace_sequence: workspaceSequence, frontier: record.end, events: eventLog.slice(record.start, record.end).map(event => event.id) };
+    }
+    committedCursor = record.end;
+    record.status = "committed";
+    if (publish) send({ type: "revision" });
+    return record.result;
+  };
+
+  const dispatchControl = async request => {
+    if (!request || typeof request !== "object") return { ok: false, error: "invalid control request" };
+    if (request.type === "pull") return pull(Number.isFinite(request.wait_seconds) ? Math.max(0, request.wait_seconds) : 0);
+    if (request.type === "push") return commit(typeof request.token === "string" ? request.token : "", true);
+    if (request.type === "ack") return commit(typeof request.token === "string" ? request.token : "", false);
+    return { ok: false, error: "unknown control request" };
+  };
+
+  const controlConnections = new Set();
+  controlServer = net.createServer(connection => {
+    controlConnections.add(connection);
+    connection.setEncoding("utf8");
+    let input = "";
+    let handled = false;
+    connection.on("data", async chunk => {
+      input += chunk;
+      if (input.length > MAX_BODY_BYTES || handled) return;
+      const newline = input.indexOf("\n");
+      if (newline < 0) return;
+      handled = true;
+      let result;
+      try {
+        const request = JSON.parse(input.slice(0, newline));
+        result = request.type === "pull" ? await dispatchControl(request) : await mutate(() => dispatchControl(request));
+      } catch (cause) { result = { ok: false, error: cause instanceof Error ? cause.message : "control request failed" }; }
+      connection.end(JSON.stringify(result) + "\n");
+    });
+    connection.on("close", () => controlConnections.delete(connection));
+    connection.on("error", () => controlConnections.delete(connection));
+  });
+  await new Promise((resolveListen, reject) => {
+    controlServer.once("error", reject);
+    controlServer.listen(socketPath, async () => {
+      try { await chmod(socketPath, 0o600); } catch (cause) { controlServer.close(() => reject(cause)); return; }
+      controlServer.off("error", reject);
+      resolveListen();
+    });
+  }).catch(async cause => {
+    await rm(publishedRoot, { recursive: true, force: true });
+    throw new Error(`cannot start local control channel: ${cause.message}`);
+  });
+
+  const recordInteraction = event => mutate(async () => {
+    if (seenEvents.has(event.id)) return;
+    seenEvents.add(event.id);
+    eventLog.push(event);
+    notifyPullWaiters();
+  });
+
   const stop = async code => {
     if (stopped) return;
     stopped = true;
     clearTimeout(retryTimer);
     clearTimeout(connectionTimer);
-    clearTimeout(revisionTimer);
     send({ type: "close" });
     try { socket?.close(); } catch {}
-    await watcher.close();
+    for (const connection of controlConnections) connection.destroy();
+    await new Promise(resolveClose => controlServer.close(() => resolveClose()));
+    await unlink(socketPath).catch(() => {});
+    await rm(publishedRoot, { recursive: true, force: true });
     if (attachmentInboxPromise) {
       try { await rm(await attachmentInboxPromise, { recursive: true, force: true }); } catch {}
     }
@@ -328,9 +488,15 @@ async function start(directory) {
       } else if (packet.type === "session") {
         if (!validSessionUrl(packet.url)) return void stop(1);
         sessionUrl = packet.url;
-        if (!ready) { ready = true; process.stdout.write(`${JSON.stringify({ type: "ready", url: sessionUrl })}\n`); }
+        if (!initialPublished) {
+          initialPublished = true;
+          send({ type: "revision" });
+        }
+        if (!ready) { ready = true; process.stdout.write(`${JSON.stringify({ type: "ready", url: sessionUrl, workspace: workspaceId, workspace_sequence: workspaceSequence })}\n`); }
       } else if (packet.type === "http_request") {
-        void handleRequest(root, packet, getAttachmentInbox).then(result => send(result)).catch(() => send(errorResponse(packet, 500, "preview request failed")));
+        const requestRoot = publishedRoot;
+        const requestWorkspace = workspaceId;
+        void handleRequest(requestRoot, requestWorkspace, packet, getAttachmentInbox, recordInteraction).then(result => send(result)).catch(() => send(errorResponse(packet, 500, "preview request failed")));
       } else if (packet.type === "closed") {
         void stop(0);
       } else if (packet.type === "error") {
@@ -353,29 +519,79 @@ async function start(directory) {
   await new Promise(() => {});
 }
 
-let parsed;
-try {
-  parsed = parseArgs({
-    args: process.argv.slice(2),
-    options: {
-      skill: { type: "boolean" },
-      help: { type: "boolean", short: "h" }
-    },
-    allowPositionals: true
-  });
-} catch (cause) {
-  process.stderr.write(`letmeknow: ${cause instanceof Error ? cause.message : "invalid arguments"}\n`);
-  process.exit(1);
+function endpoint(credential, sessionUrl) {
+  const url = new URL(CONTROL_URL);
+  url.protocol = "wss:";
+  url.pathname = "/v2/connect";
+  if (credential && sessionUrl) {
+    const publicUrl = new URL(sessionUrl);
+    const code = publicUrl.hostname.match(/^([a-f0-9]{20})\.letmeknow\.dev$/)?.[1];
+    if (!code) throw new Error("invalid session URL");
+    url.searchParams.set("code", code);
+  }
+  return url;
 }
 
-if (parsed.values.skill) {
-  if (parsed.positionals.length > 0) { process.stderr.write("Usage: npx letmeknow-cli --skill\n"); process.exit(1); }
-  writeSync(1, readFileSync(new URL("../SKILL.md", import.meta.url)));
-} else if (parsed.values.help) {
-  process.stdout.write("Usage: npx letmeknow-cli <directory>\n\nServe a folder through the hosted LetMeKnow relay. The CLI does not listen on a network port. Form submissions are JSON lines on stdout.\n");
-} else if (parsed.positionals.length !== 1) {
-  process.stderr.write("letmeknow: exactly one directory must be provided\n");
-  process.exit(1);
-} else {
-  try { await start(parsed.positionals[0]); } catch (cause) { process.stderr.write(`letmeknow: ${cause instanceof Error ? cause.message : "server failed"}\n`); process.exitCode = 1; }
+function validSessionUrl(value) {
+  if (typeof value !== "string") return false;
+  let url;
+  try { url = new URL(value); } catch { return false; }
+  return url.protocol === "https:" && /^[a-f0-9]{20}\.letmeknow\.dev$/.test(url.hostname) && url.pathname === "/" && !url.search && !url.hash;
+}
+
+function usage() {
+  return "Usage:\n  npx letmeknow-cli serve <directory>\n  npx letmeknow-cli pull <directory> [--wait <seconds>]\n  npx letmeknow-cli push <directory> --based-on <token>\n  npx letmeknow-cli ack <directory> --based-on <token>\n";
+}
+
+function commandArgs() {
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args: process.argv.slice(2),
+      options: {
+        skill: { type: "boolean" },
+        help: { type: "boolean", short: "h" },
+        wait: { type: "string" },
+        "based-on": { type: "string" }
+      },
+      allowPositionals: true,
+      strict: true
+    });
+  } catch (cause) {
+    throw new Error(cause instanceof Error ? cause.message : "invalid arguments");
+  }
+  if (parsed.values.skill || parsed.values.help) {
+    if (parsed.positionals.length || parsed.values.wait !== undefined || parsed.values["based-on"] !== undefined) throw new Error(usage());
+    return { command: parsed.values.skill ? "skill" : "help" };
+  }
+  const [command, directory, ...extra] = parsed.positionals;
+  if (!command || !directory || extra.length) throw new Error(usage());
+  if (command === "serve" && (parsed.values.wait !== undefined || parsed.values["based-on"] !== undefined)) throw new Error(usage());
+  if (command === "pull" && parsed.values["based-on"] !== undefined) throw new Error(usage());
+  if ((command === "push" || command === "ack") && parsed.values.wait !== undefined) throw new Error(usage());
+  if (!["serve", "pull", "push", "ack"].includes(command)) throw new Error(usage());
+  let wait = 0;
+  if (parsed.values.wait !== undefined) {
+    wait = Number(parsed.values.wait);
+    if (!Number.isFinite(wait) || wait < 0) throw new Error("--wait must be a non-negative number");
+  }
+  if ((command === "push" || command === "ack") && typeof parsed.values["based-on"] !== "string") throw new Error("--based-on is required");
+  return { command, directory, wait, token: parsed.values["based-on"] };
+}
+
+let command;
+try {
+  command = commandArgs();
+  if (command.command === "skill") writeSync(1, readFileSync(new URL("../SKILL.md", import.meta.url)));
+  else if (command.command === "help") process.stdout.write(usage());
+  else if (command.command === "serve") await start(command.directory);
+  else {
+    const { root } = await options(command.directory);
+    const result = await connectControl(root, command.command === "pull" ? { type: "pull", wait_seconds: command.wait } : { type: command.command, token: command.token });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (!result.ok) process.exitCode = 1;
+  }
+} catch (cause) {
+  process.stderr.write(`letmeknow: ${cause instanceof Error ? cause.message : "command failed"}\n`);
+  process.exitCode = 1;
 }
