@@ -1,21 +1,21 @@
 #!/usr/bin/env node
 
-import { constants, createReadStream, existsSync, readFileSync, statSync, writeSync } from "node:fs";
+import { constants, existsSync, readFileSync, statSync, writeSync } from "node:fs";
 import { chmod, open, readFile, realpath, stat, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import net from "node:net";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { parseArgs } from "node:util";
-import { parse, parseFragment, serialize } from "parse5";
+import { parse, serialize } from "parse5";
 import { lookup } from "mrmime";
 
 const MAX_BODY_BYTES = 1024 * 1024;
-const UPDATE_BATCH_MAX_BYTES = 16 * MAX_BODY_BYTES;
+const MAX_SCRIPT_BYTES = MAX_BODY_BYTES;
 const MAX_BATCH_TOKENS = 100_000;
 const MAX_UNIQUE_SUBMISSIONS = 100_000;
 const MAX_RETAINED_SUBMISSION_BYTES = 256 * 1024 * 1024;
-const CONTROL_MAX_BYTES = UPDATE_BATCH_MAX_BYTES * 2;
+const CONTROL_MAX_BYTES = MAX_SCRIPT_BYTES * 2;
 const RECONNECT_RETRY_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
 const CONTROL_TIMEOUT = 35_000;
@@ -25,7 +25,6 @@ const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const privateNames = new Set([".env", ".git", ".ssh", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]);
 const privateFilePattern = /^\.env\.|\.(?:key|pem|p12|ppk|p8|sqlite|sqlite3|db|db3)$|-(?:wal|shm|journal)$/i;
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const forbiddenUpdateTargets = new Set(["html", "head", "body", "script"]);
 
 function getMimeType(filename) {
   const type = lookup(filename);
@@ -159,117 +158,65 @@ async function readInitialPage(root) {
   return (await readFile(target)).toString("utf8");
 }
 
-function nodeId(node) {
-  return node.attrs?.find(attribute => attribute.name === "id")?.value;
-}
-
-function elementsWithId(node, id, matches = []) {
-  if (node.nodeName !== "#text" && node.nodeName !== "#comment" && nodeId(node) === id) matches.push(node);
-  for (const child of node.childNodes || []) elementsWithId(child, id, matches);
-  return matches;
-}
-
-function containsScript(node) {
-  if (node.nodeName === "script") return true;
-  if (node.content && containsScript(node.content)) return true;
-  return (node.childNodes || []).some(containsScript);
-}
-
-function updateFragment(target, html, context) {
-  const fragment = parseFragment(context, html);
-  const meaningful = (fragment.childNodes || []).filter(node => node.nodeName !== "#text" || node.value.trim() !== "");
-  if (meaningful.length !== 1 || meaningful[0].nodeName === "#comment" || meaningful[0].nodeName?.startsWith("#")) throw new Error(`update for ${target} must contain exactly one root element`);
-  const root = meaningful[0];
-  if (containsScript(root)) throw new Error(`update for ${target} cannot contain script elements`);
-  if (nodeId(root) !== target) throw new Error(`update root ID must be ${target}`);
-  return root;
-}
-
-function replaceElement(document, target, html) {
-  if (forbiddenUpdateTargets.has(target.nodeName)) throw new Error(`cannot update ${target.nodeName} element`);
-  const parent = target.parentNode;
-  const index = parent?.childNodes.indexOf(target);
-  if (!parent || index === undefined || index < 0) throw new Error("update target has no parent");
-  const replacement = updateFragment(nodeId(target), html, parent);
-  parent.childNodes[index] = replacement;
-  replacement.parentNode = parent;
-  target.parentNode = null;
-}
-
-function validateUpdates(updates) {
-  if (!Array.isArray(updates)) throw new Error("updates must be an array");
-  let bytes = 0;
-  for (const update of updates) {
-    if (!update || typeof update !== "object" || Array.isArray(update)) throw new Error("each update must be an object");
-    if (typeof update.target !== "string" || update.target.trim() === "") throw new Error("update target must be a non-empty ID");
-    if (typeof update.html !== "string") throw new Error("update html must be text");
-    bytes += Buffer.byteLength(update.html, "utf8");
-    if (bytes > UPDATE_BATCH_MAX_BYTES) throw new Error("updates are too large");
+function bodyElement(node) {
+  if (node.nodeName === "body") return node;
+  for (const child of node.childNodes || []) {
+    const body = bodyElement(child);
+    if (body) return body;
   }
-  return updates;
 }
 
-function applyUpdates(page, updates) {
-  validateUpdates(updates);
+function replayablePage(page, history) {
   const document = parse(page);
-  for (const update of updates) {
-    const matches = elementsWithId(document, update.target);
-    if (matches.length !== 1) throw new Error(`update target ${update.target} must match exactly one element`);
-    replaceElement(document, matches[0], update.html);
-  }
+  const body = bodyElement(document);
+  const value = JSON.stringify(history).replaceAll("<", "\\u003c");
+  const script = {
+    nodeName: "script",
+    tagName: "script",
+    attrs: [
+      { name: "type", value: "application/json" },
+      { name: "data-letmeknow-history", value: "" }
+    ],
+    namespaceURI: body.namespaceURI,
+    childNodes: [{ nodeName: "#text", value }]
+  };
+  script.childNodes[0].parentNode = script;
+  script.parentNode = body;
+  body.childNodes.push(script);
   const result = serialize(document);
-  if (Buffer.byteLength(result, "utf8") > MAX_BODY_BYTES) throw new Error("updated page is too large");
+  if (Buffer.byteLength(result, "utf8") > MAX_BODY_BYTES) throw new Error("replayable page is too large");
   return result;
 }
 
-async function readInput(filename) {
-  const chunks = [];
-  let length = 0;
-  const input = filename === "-" ? process.stdin : createReadStream(filename);
-  for await (const chunk of input) {
-    const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    length += value.byteLength;
-    if (length > UPDATE_BATCH_MAX_BYTES) throw new Error("updates are too large");
-    chunks.push(value);
-  }
-  return Buffer.concat(chunks).toString("utf8");
+function scriptHash(script) {
+  return createHash("sha256").update(JSON.stringify(script === undefined ? null : script)).digest("hex");
 }
 
-async function readUpdatesInput(filename) {
-  const manifest = await readInput(filename);
-  let value;
-  try { value = JSON.parse(manifest); } catch { throw new Error("invalid updates JSON"); }
-  if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.updates)) throw new Error("updates must be an object with an updates array");
-  const base = filename === "-" ? process.cwd() : dirname(resolve(filename));
-  const updates = [];
-  let bytes = 0;
-  for (const item of value.updates) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("each update must be an object");
-    if (typeof item.target !== "string" || item.target.trim() === "") throw new Error("update target must be a non-empty ID");
-    const hasHtml = Object.prototype.hasOwnProperty.call(item, "html");
-    const hasFile = Object.prototype.hasOwnProperty.call(item, "file");
-    if (hasHtml === hasFile) throw new Error(`update for ${item.target} must have exactly one of html or file`);
-    let html;
-    if (hasHtml) {
-      if (typeof item.html !== "string") throw new Error(`update html for ${item.target} must be text`);
-      html = item.html;
-    } else {
-      if (typeof item.file !== "string" || item.file === "") throw new Error(`update file for ${item.target} must be a path`);
-      const file = resolve(base, item.file);
-      const info = await stat(file);
-      if (!info.isFile()) throw new Error(`update file for ${item.target} must be a regular file`);
-      if (info.size > UPDATE_BATCH_MAX_BYTES - bytes) throw new Error("updates are too large");
-      html = (await readFile(file)).toString("utf8");
+function validateScript(script) {
+  if (script !== undefined && typeof script !== "string") throw new Error("script must be text");
+  if (script !== undefined && Buffer.byteLength(script, "utf8") > MAX_SCRIPT_BYTES) throw new Error("script is too large");
+  return script;
+}
+
+async function readScriptInput(filename) {
+  if (filename === "-") {
+    const chunks = [];
+    let length = 0;
+    for await (const chunk of process.stdin) {
+      const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      length += value.byteLength;
+      if (length > MAX_SCRIPT_BYTES) throw new Error("script is too large");
+      chunks.push(value);
     }
-    bytes += Buffer.byteLength(html, "utf8");
-    if (bytes > UPDATE_BATCH_MAX_BYTES) throw new Error("updates are too large");
-    updates.push({ target: item.target, html });
+    return Buffer.concat(chunks).toString("utf8");
   }
-  return updates;
-}
-
-function updatesHash(updates) {
-  return createHash("sha256").update(JSON.stringify(updates)).digest("hex");
+  const file = resolve(filename);
+  const info = await stat(file);
+  if (!info.isFile()) throw new Error("script file must be a regular file");
+  if (info.size > MAX_SCRIPT_BYTES) throw new Error("script is too large");
+  const source = await readFile(file);
+  if (source.byteLength > MAX_SCRIPT_BYTES) throw new Error("script is too large");
+  return source.toString("utf8");
 }
 
 async function submission(packet, recordInteraction) {
@@ -360,7 +307,9 @@ function pageHash(page) {
 
 async function start(directory) {
   const { root } = await options(directory);
-  let page = await readInitialPage(root);
+  const basePage = await readInitialPage(root);
+  let history = [];
+  let page = replayablePage(basePage, history);
   let pageEvent = 0;
   let eventNumber = 0;
   const currentPageHash = () => pageHash(page);
@@ -397,7 +346,7 @@ async function start(directory) {
         throw new Error("session batch token limit exceeded");
       }
       token = randomUUID();
-      tokens.set(token, { start, end, page_event: pageEvent, status: "pending", key, updates_hash: null });
+      tokens.set(token, { start, end, page_event: pageEvent, status: "pending", key, script_hash: null });
       pendingTokens.set(key, { token });
     }
     return { ok: true, type: "batch", token, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash(), events: browserEvents.slice() };
@@ -420,42 +369,43 @@ async function start(directory) {
     });
   };
 
-  const commit = async (token, requestedUpdates) => {
+  const commit = async (token, requestedScript) => {
     const record = tokens.get(token);
     if (!record) return { ok: false, error: "unknown batch token" };
-    const updates = validateUpdates(requestedUpdates);
-    const requestedUpdatesHash = updatesHash(updates);
+    validateScript(requestedScript);
+    const requestedScriptHash = scriptHash(requestedScript);
     if (record.status !== "pending") {
-      if (record.updates_hash === requestedUpdatesHash) return record.result;
-      return { ok: false, error: "batch was already committed with a different updates payload" };
+      if (record.script_hash === requestedScriptHash) return record.result;
+      return { ok: false, error: "batch was already committed with a different script" };
     }
     if (record.page_event !== pageEvent || record.start !== committedBrowserCursor) {
-      record.updates_hash = requestedUpdatesHash;
+      record.script_hash = requestedScriptHash;
       pendingTokens.delete(record.key);
       record.status = "failed";
       record.result = { ok: false, error: "batch is based on an old page or browser cursor", frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash() };
       return record.result;
     }
-    let nextPage = page;
-    try { if (updates.length) nextPage = applyUpdates(page, updates); } catch (cause) {
-      throw new Error(cause instanceof Error ? cause.message : "invalid page updates");
-    }
     const committedCount = record.end - record.start;
     const committedEvents = browserEvents.slice(0, committedCount).map(event => event.id);
     retainedSubmissionBytes -= browserEventBytes.slice(0, committedCount).reduce((total, bytes) => total + bytes, 0);
-    const updateEvents = [];
-    for (const update of updates) {
-      eventNumber += 1;
-      updateEvents.push({ type: "update_ui", event_number: eventNumber, target: update.target, html: update.html });
+    let runEvent;
+    let nextPage = page;
+    if (requestedScript !== undefined) {
+      runEvent = { type: "run_ui", event_number: eventNumber + 1, script: requestedScript };
+      nextPage = replayablePage(basePage, [...history, runEvent]);
+    }
+    if (runEvent) {
+      eventNumber = runEvent.event_number;
+      pageEvent = runEvent.event_number;
+      history.push(runEvent);
     }
     page = nextPage;
-    pageEvent = updateEvents.at(-1)?.event_number ?? pageEvent;
     browserEvents.splice(0, committedCount);
     browserEventBytes.splice(0, committedCount);
     committedBrowserCursor = record.end;
     pendingTokens.delete(record.key);
     record.status = "committed";
-    record.updates_hash = requestedUpdatesHash;
+    record.script_hash = requestedScriptHash;
     record.result = {
       ok: true,
       type: "committed",
@@ -464,19 +414,18 @@ async function start(directory) {
       page_event: pageEvent,
       page_hash: currentPageHash(),
       events: committedEvents,
-      updates: updateEvents.map(({ event_number, target }) => ({ event_number, target }))
+      ...(runEvent ? { run_ui: { event_number: runEvent.event_number } } : {})
     };
-    for (const update of updateEvents) send(update);
+    if (runEvent) send(runEvent);
     return record.result;
   };
 
   const dispatchControl = async request => {
     if (!request || typeof request !== "object") return { ok: false, error: "invalid control request" };
     if (request.type === "pull") return pull(Number.isFinite(request.wait_seconds) ? Math.max(0, request.wait_seconds) : 0);
-    if (request.type === "show") return { ok: true, type: "page", page_event: pageEvent, page_hash: currentPageHash(), html: page };
     if (request.type === "push") {
       if (typeof request.token !== "string") return { ok: false, error: "batch token is required" };
-      return commit(request.token, request.updates === undefined ? [] : request.updates);
+      return commit(request.token, request.script);
     }
     return { ok: false, error: "unknown control request" };
   };
@@ -627,7 +576,7 @@ function validSessionUrl(value) {
 }
 
 function usage() {
-  return "Usage:\n  npx letmeknow-cli serve <directory>\n  npx letmeknow-cli show <directory>\n  npx letmeknow-cli pull <directory> [--wait <seconds>]\n  npx letmeknow-cli push <directory> --batch <token> [--updates <file|->]\n";
+  return "Usage:\n  npx letmeknow-cli serve <directory>\n  npx letmeknow-cli pull <directory> [--wait <seconds>]\n  npx letmeknow-cli push <directory> --batch <token> [--script <file|->]\n";
 }
 
 function commandArgs() {
@@ -640,7 +589,7 @@ function commandArgs() {
         help: { type: "boolean", short: "h" },
         wait: { type: "string" },
         batch: { type: "string" },
-        updates: { type: "string" }
+        script: { type: "string" }
       },
       allowPositionals: true,
       strict: true
@@ -649,14 +598,14 @@ function commandArgs() {
     throw new Error(cause instanceof Error ? cause.message : "invalid arguments");
   }
   if (parsed.values.skill || parsed.values.help) {
-    if (parsed.positionals.length || parsed.values.wait !== undefined || parsed.values.batch !== undefined || parsed.values.updates !== undefined) throw new Error(usage());
+    if (parsed.positionals.length || parsed.values.wait !== undefined || parsed.values.batch !== undefined || parsed.values.script !== undefined) throw new Error(usage());
     return { command: parsed.values.skill ? "skill" : "help" };
   }
   const [command, directory, ...extra] = parsed.positionals;
   if (!command || !directory || extra.length) throw new Error(usage());
-  if (!["serve", "show", "pull", "push"].includes(command)) throw new Error(usage());
-  if ((command === "serve" || command === "show") && (parsed.values.wait !== undefined || parsed.values.batch !== undefined || parsed.values.updates !== undefined)) throw new Error(usage());
-  if (command === "pull" && (parsed.values.batch !== undefined || parsed.values.updates !== undefined)) throw new Error(usage());
+  if (!["serve", "pull", "push"].includes(command)) throw new Error(usage());
+  if (command === "serve" && (parsed.values.wait !== undefined || parsed.values.batch !== undefined || parsed.values.script !== undefined)) throw new Error(usage());
+  if (command === "pull" && (parsed.values.batch !== undefined || parsed.values.script !== undefined)) throw new Error(usage());
   if (command === "push" && parsed.values.wait !== undefined) throw new Error(usage());
   let wait = 0;
   if (parsed.values.wait !== undefined) {
@@ -664,7 +613,7 @@ function commandArgs() {
     if (!Number.isFinite(wait) || wait < 0) throw new Error("--wait must be a non-negative number");
   }
   if (command === "push" && typeof parsed.values.batch !== "string") throw new Error("--batch is required");
-  return { command, directory, wait, token: parsed.values.batch, updates: parsed.values.updates };
+  return { command, directory, wait, token: parsed.values.batch, script: parsed.values.script };
 }
 
 
@@ -678,13 +627,12 @@ try {
     const { root } = await options(command.directory);
     let packet;
     if (command.command === "pull") packet = { type: "pull", wait_seconds: command.wait };
-    else if (command.command === "show") packet = { type: "show" };
     else {
-      packet = { type: "push", token: command.token, updates: command.updates === undefined ? [] : await readUpdatesInput(command.updates) };
+      packet = { type: "push", token: command.token };
+      if (command.script !== undefined) packet.script = await readScriptInput(command.script);
     }
     const result = await connectControl(root, packet);
-    if (command.command === "show" && result.ok) process.stdout.write(result.html);
-    else process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
     if (!result.ok) process.exitCode = 1;
   }
 } catch (cause) {
