@@ -54,6 +54,10 @@
     return outboxTransaction("readwrite", (store) => store.delete(id));
   }
 
+  function outboxClear() {
+    return outboxTransaction("readwrite", (store) => store.clear());
+  }
+
   function outboxList() {
     return outboxTransaction("readonly", (store) => {
       const request = store.getAll();
@@ -65,7 +69,7 @@
   }
 
   function scheduleOutboxFlush(delay = OUTBOX_RETRY_MS) {
-    if (outboxRetryTimer) return;
+    if (terminal || outboxRetryTimer) return;
     outboxRetryTimer = setTimeout(() => {
       outboxRetryTimer = undefined;
       void flushOutbox();
@@ -104,7 +108,7 @@
   }
 
   function flushOutbox() {
-    if (!producerConnected) return Promise.resolve();
+    if (terminal || !producerConnected) return Promise.resolve();
     if (outboxFlushPromise) {
       outboxFlushAgain = true;
       return outboxFlushPromise;
@@ -113,9 +117,11 @@
       for (const record of records) await deliverSubmission(record);
     }).catch(() => {}).finally(() => {
       outboxFlushPromise = undefined;
-      if (outboxFlushAgain) {
+      if (outboxFlushAgain && !terminal) {
         outboxFlushAgain = false;
         void flushOutbox();
+      } else {
+        outboxFlushAgain = false;
       }
     });
     return outboxFlushPromise;
@@ -169,7 +175,9 @@
   function scheduleReload() {
     if (terminal || reloadScheduled) return;
     reloadScheduled = true;
-    setTimeout(() => location.reload(), 0);
+    setTimeout(() => {
+      if (!terminal) location.reload();
+    }, 0);
   }
 
   function targetIsUnique(id) {
@@ -215,11 +223,12 @@
   }
 
   function receiveUpdate(update) {
-    if (!dynamicPage || !Number.isSafeInteger(update.event_number) || update.event_number <= pageEvent) return;
+    if (terminal || !dynamicPage || !Number.isSafeInteger(update.event_number) || update.event_number <= pageEvent) return;
     if (!applyUpdate(update)) scheduleReload();
   }
 
   function updateProducer(connected) {
+    if (terminal) return;
     const recovered = connected && producerKnown && !producerConnected;
     producerKnown = true;
     producerConnected = connected;
@@ -240,6 +249,7 @@
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(protocol + "//" + location.host + socketPath);
     socket.addEventListener("open", () => {
+      if (terminal) return;
       const reconnect = hadSocketConnection;
       hadSocketConnection = true;
       clearSystemStatus();
@@ -254,7 +264,13 @@
       else if (message.type === "connected") updateProducer(Boolean(message.producer_connected));
       else if (message.type === "closed") {
         terminal = true;
+        producerConnected = false;
         if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (outboxRetryTimer) clearTimeout(outboxRetryTimer);
+        outboxRetryTimer = undefined;
+        outboxFlushAgain = false;
+        submissionForms.clear();
+        void outboxClear().catch(() => {});
         setSystemStatus(message.message || "Session closed");
       }
     });
@@ -278,6 +294,10 @@
   }
 
   async function submit(form, submitter) {
+    if (terminal) {
+      setStatus(form, "Session closed.");
+      return;
+    }
     if (!form.noValidate && !submitter?.formNoValidate && !form.checkValidity()) {
       form.reportValidity();
       return;
@@ -309,6 +329,11 @@
     setStatus(form, "Sending…");
     try {
       await outboxPut({ id, form_id: formId, body: JSON.stringify(payload) });
+      if (terminal) {
+        submissionForms.delete(id);
+        await outboxDelete(id);
+        return;
+      }
       void flushOutbox();
     } catch {
       submissionForms.delete(id);
