@@ -80,7 +80,7 @@ The initial `index.html` is the base for the session. New or reloaded browsers l
 
 A failed script reports an error but does not stop later scripts. A later script may repair the page. Reloading replays the committed sequence, including the failed script, so later corrective scripts should remain safe to run after it.
 
-There is no `show` command. Use the public URL to inspect global state. The CLI serves the base document and the script event log; it does not attempt to materialize the live browser DOM.
+Use the public URL to inspect global state. The CLI serves the base document and the script event log; it does not attempt to materialize the live browser DOM.
 
 ## Event stream and atomic pushes
 
