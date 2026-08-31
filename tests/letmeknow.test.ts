@@ -1,5 +1,6 @@
-import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { SELF, runDurableObjectAlarm } from "cloudflare:test";
 import { env } from "cloudflare:workers";
+import { createHash, randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 type Event = Record<string, any>;
@@ -9,9 +10,11 @@ type Peer = {
   next(): Promise<Event>;
   send(packet: Event): void;
 };
+type WorkspaceFile = { data: Uint8Array; content_type: string };
 
 const origin = "https://letmeknow.dev";
 const SESSION_LIFETIME_MS = 24 * 60 * 60 * 1_000;
+const MAX_BODY_BYTES = 1024 * 1024;
 const sockets: WebSocket[] = [];
 let ipCounter = 0;
 
@@ -21,7 +24,7 @@ function peer(socket: WebSocket): Peer {
   const queued: Event[] = [];
   const waiting: Array<(event: Event) => void> = [];
   let credential: string | undefined;
-  socket.addEventListener("message", (message) => {
+  socket.addEventListener("message", message => {
     const event = JSON.parse(message.data as string) as Event;
     if (event.type === "credential") {
       credential = event.credential;
@@ -34,8 +37,8 @@ function peer(socket: WebSocket): Peer {
   return {
     socket,
     get credential() { return credential; },
-    next: () => queued.length ? Promise.resolve(queued.shift()!) : new Promise((resolve) => waiting.push(resolve)),
-    send: (packet) => socket.send(JSON.stringify(packet))
+    next: () => queued.length ? Promise.resolve(queued.shift()!) : new Promise(resolve => waiting.push(resolve)),
+    send: packet => socket.send(JSON.stringify(packet))
   };
 }
 
@@ -49,12 +52,46 @@ async function connectProducer(code?: string, credential?: string): Promise<Peer
   return peer(response.webSocket!);
 }
 
-async function open(): Promise<{ producer: Peer; url: string }> {
+function digest(data: Uint8Array): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+async function nextType(producer: Peer, type: string): Promise<Event> {
+  while (true) {
+    const event = await producer.next();
+    if (event.type === type) return event;
+  }
+}
+
+async function uploadWorkspace(producer: Peer, url: string, index: Uint8Array, files: Record<string, WorkspaceFile>): Promise<{ index_hash: string; index_size: number; manifest: Event }> {
+  const index_hash = digest(index);
+  const hashes = Object.entries(files).map(([path, file]) => ({ hash: digest(file.data), size: file.data.byteLength }));
+  producer.send({ type: "workspace_manifest", id: randomUUID(), index: { hash: index_hash, size: index.byteLength }, hashes });
+  const manifestResponse = await nextType(producer, "workspace_manifest");
+  const blobs = new Map<string, Uint8Array>([[index_hash, index], ...Object.entries(files).map(([, file]) => [digest(file.data), file.data] as const)]);
+  for (const item of manifestResponse.missing) {
+    const response = await SELF.fetch(new Request(new URL(`_letmeknow/workspace/${item.hash}`, url), {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${producer.credential}` },
+      body: blobs.get(item.hash)
+    }));
+    if (response.status !== 204) console.log("UPLOAD", response.status, await response.text());
+    expect(response.status).toBe(204);
+  }
+  const manifest = { files: Object.fromEntries(Object.entries(files).map(([path, file]) => [path, { hash: digest(file.data), size: file.data.byteLength, content_type: file.content_type }])) };
+  return { index_hash, index_size: index.byteLength, manifest };
+}
+
+async function open(options: { index?: string; files?: Record<string, WorkspaceFile> } = {}): Promise<{ producer: Peer; url: string; workspace: Event }> {
   const producer = await connectProducer();
-  producer.send({ type: "open", id: "open" });
-  const session = await producer.next();
-  expect(session).toEqual({ type: "session", id: "open", url: session.url });
-  return { producer, url: session.url };
+  const provisioned = await nextType(producer, "provisioned");
+  const index = new TextEncoder().encode(options.index || "<!doctype html><html><body><main id=app>initial</main></body></html>");
+  const files = options.files || { "app.js": { data: new TextEncoder().encode("initial"), content_type: "text/javascript" } };
+  const workspace = await uploadWorkspace(producer, provisioned.url, index, files);
+  producer.send({ type: "open", id: "open", ...workspace });
+  const session = await nextType(producer, "session");
+  expect(session).toMatchObject({ type: "session", id: "open", url: provisioned.url, frontier: 0, page_event: 0, workspace_version: 0 });
+  return { producer, url: session.url, workspace };
 }
 
 async function connectClient(url: string): Promise<Peer> {
@@ -63,260 +100,153 @@ async function connectClient(url: string): Promise<Peer> {
   return peer(response.webSocket!);
 }
 
+async function commit(producer: Peer, workspace: Event, through: number, script?: string): Promise<Event> {
+  const id = randomUUID();
+  producer.send({ type: "commit", id, request_id: id, through, ...workspace, ...(script === undefined ? {} : { script }) });
+  return nextType(producer, "committed");
+}
+
 afterEach(() => {
   vi.useRealTimers();
   for (const socket of sockets.splice(0)) socket.close(1000, "test complete");
 });
 
-describe("LetMeKnow outbound relay", () => {
-  it("creates hosted subdomain sessions and rejects old or custom session routes", async () => {
-    const { url } = await open();
-    expect(url).toMatch(/^https:\/\/[a-f0-9]{20}\.letmeknow\.dev\/$/);
-    expect((await SELF.fetch(new Request(`${origin}/s/01234567890123456789/`))).status).toBe(404);
-    expect((await SELF.fetch(new Request("https://preview.example/v2/connect", { headers: { Upgrade: "websocket" } }))).status).toBe(404);
-    expect((await SELF.fetch(new Request(`${origin}/v1/connect`, { headers: { Upgrade: "websocket" } }))).status).toBe(404);
+describe("LetMeKnow service", () => {
+  it("creates a hosted session and serves its committed workspace", async () => {
+    const { producer, url } = await open({ files: { "app.js": { data: new TextEncoder().encode("initial"), content_type: "text/javascript" } } });
+    const page = await SELF.fetch(new Request(url));
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain("data-letmeknow-runtime");
+    const asset = await SELF.fetch(new Request(new URL("app.js", url)));
+    expect(asset.status).toBe(200);
+    expect(await asset.text()).toBe("initial");
+    producer.socket.close(1000, "done");
   });
 
-  it("allows reconnect before service expiry", async () => {
+  it("serves the pinned index and switches assets only on commit", async () => {
+    const { producer, url, workspace } = await open({ index: "<!doctype html><html><body>original</body></html>", files: { "app.js": { data: new TextEncoder().encode("one"), content_type: "text/javascript" } } });
+    expect(await (await SELF.fetch(new Request(new URL("app.js", url)))).text()).toBe("one");
+    const nextData = new TextEncoder().encode("two");
+    const next = await uploadWorkspace(producer, url, new TextEncoder().encode("<!doctype html><html><body>original</body></html>"), { "app.js": { data: nextData, content_type: "text/javascript" } });
+    expect((await SELF.fetch(new Request(new URL("app.js", url)))).status).toBe(200);
+    expect(await (await SELF.fetch(new Request(new URL("app.js", url)))).text()).toBe("one");
+    await commit(producer, next, 0);
+    expect(await (await SELF.fetch(new Request(new URL("app.js", url)))).text()).toBe("two");
+    const changedIndex = await uploadWorkspace(producer, url, new TextEncoder().encode("<!doctype html><html><body>changed</body></html>"), { "app.js": { data: nextData, content_type: "text/javascript" } });
+    producer.send({ type: "commit", id: randomUUID(), request_id: randomUUID(), through: 0, ...changedIndex });
+    expect(await nextType(producer, "error")).toMatchObject({ message: "index.html cannot change during a session" });
+    expect((await SELF.fetch(new Request(url))).status).toBe(200);
+  });
+
+  it("accepts submissions while the producer is disconnected and redelivers them in order", async () => {
+    const { producer, url } = await open();
+    const code = new URL(url).hostname.split(".")[0];
+    const first = randomUUID();
+    const second = randomUUID();
+    producer.socket.close(1000, "restart");
+    const submit = (id: string, value: string) => SELF.fetch(new Request(new URL("_letmeknow/submit", url), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, page_event: 0, form_id: "review", action: "/review", trigger: null, values: { value } }) }));
+    expect((await submit(first, "one")).status).toBe(202);
+    expect((await submit(second, "two")).status).toBe(202);
+    const replacement = await connectProducer(code, producer.credential);
+    expect(await nextType(replacement, "session")).toMatchObject({ url });
+    const eventOne = await nextType(replacement, "submit");
+    replacement.send({ type: "event_ack", event_number: eventOne.event_number });
+    const eventTwo = await nextType(replacement, "submit");
+    replacement.send({ type: "event_ack", event_number: eventTwo.event_number });
+    expect([eventOne.id, eventTwo.id]).toEqual([first, second]);
+  });
+
+  it("deduplicates identical submissions and rejects conflicting UUID reuse", async () => {
+    const { producer, url } = await open();
+    const id = randomUUID();
+    const payload = { id, page_event: 0, form_id: null, action: "/save", trigger: null, values: { value: "one" } };
+    const request = () => SELF.fetch(new Request(new URL("_letmeknow/submit", url), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }));
+    expect((await request()).status).toBe(202);
+    expect((await request()).status).toBe(202);
+    const event = await nextType(producer, "submit");
+    producer.send({ type: "event_ack", event_number: event.event_number });
+    expect((await SELF.fetch(new Request(new URL("_letmeknow/submit", url), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...payload, values: { value: "two" } }) }))).status).toBe(409);
+  });
+
+  it("sequences UI scripts with submissions and replays committed scripts", async () => {
+    const { producer, url, workspace } = await open();
+    const client = await connectClient(url);
+    expect(await client.next()).toMatchObject({ type: "connected", producer_connected: true });
+    const id = randomUUID();
+    const response = await SELF.fetch(new Request(new URL("_letmeknow/submit", url), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, page_event: 0, form_id: null, action: "/save", trigger: null, values: {} }) }));
+    expect(response.status).toBe(202);
+    const submission = await nextType(producer, "submit");
+    producer.send({ type: "event_ack", event_number: submission.event_number });
+    const resultPromise = commit(producer, workspace, submission.event_number, "document.body.dataset.updated = 'yes';");
+    const update = await nextType(client, "run_ui");
+    const result = await resultPromise;
+    expect(result).toMatchObject({ ok: true, frontier: submission.event_number + 1, page_event: submission.event_number + 1, events: [id] });
+    expect(update).toMatchObject({ event_number: result.page_event, script: "document.body.dataset.updated = 'yes';" });
+    const page = await SELF.fetch(new Request(url));
+    const pageText = await page.text();
+    expect(pageText).toContain("data-letmeknow-history");
+    expect(pageText).toContain("updated");
+  });
+
+  it("keeps browser pages available while the producer reconnects", async () => {
     const { producer, url } = await open();
     const client = await connectClient(url);
-    expect(await client.next()).toEqual({ type: "connected", producer_connected: true });
+    expect(await client.next()).toMatchObject({ type: "connected", producer_connected: true });
     const code = new URL(url).hostname.split(".")[0];
-
     producer.socket.close(1000, "restart");
     expect(await client.next()).toEqual({ type: "producer", connected: false });
+    expect((await SELF.fetch(new Request(url))).status).toBe(200);
     const replacement = await connectProducer(code, producer.credential);
-    expect(await replacement.next()).toMatchObject({ type: "session", url });
+    expect(await nextType(replacement, "session")).toMatchObject({ url });
     expect(await client.next()).toEqual({ type: "producer", connected: true });
   });
 
-  it("expires an opened session after the service lifetime", async () => {
+  it("rejects invalid workspace paths and serves HEAD without a body", async () => {
+    const { producer, url, workspace } = await open();
+    const badHash = "0".repeat(64);
+    producer.send({ type: "workspace_manifest", id: randomUUID(), index: { hash: badHash, size: 1 }, hashes: [{ hash: badHash, size: 1 }] });
+    expect(await nextType(producer, "workspace_manifest")).toMatchObject({ missing: [{ hash: badHash, size: 1 }, { hash: badHash, size: 1 }] });
+    producer.send({ type: "commit", id: randomUUID(), request_id: randomUUID(), through: 0, index_hash: workspace.index_hash, index_size: workspace.index_size, manifest: { files: { "../escape.js": { hash: badHash, size: 1, content_type: "text/javascript" } } } });
+    expect(await nextType(producer, "error")).toMatchObject({ message: "invalid workspace path" });
+    const head = await SELF.fetch(new Request(new URL("app.js", url), { method: "HEAD" }));
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+    expect((await SELF.fetch(new Request(`${url}%2e%2e%2fapp.js`))).status).toBe(403);
+  });
+
+  it("streams a large pinned index without buffering the page", async () => {
+    const index = `<!doctype html><html><body><main>${"x".repeat(2 * MAX_BODY_BYTES)}</main></body></html>`;
+    const { producer, url } = await open({ index });
+    const response = await SELF.fetch(new Request(url));
+    const page = await response.text();
+    expect(response.status).toBe(200);
+    expect(page.startsWith("<!doctype html>")).toBe(true);
+    expect(page).toContain("x".repeat(1024));
+    expect(page).toContain('data-letmeknow-history');
+    expect(page).toContain('/_letmeknow/client.js');
+    expect(page.length).toBeGreaterThan(index.length);
+    producer.socket.close(1000, "done");
+  });
+
+  it("rejects commits that would exceed the replay history bound", async () => {
+    const { producer, workspace } = await open();
+    const firstScript = "x".repeat(MAX_BODY_BYTES - 300);
+    const first = await commit(producer, workspace, 0, firstScript);
+    expect(first.ok).toBe(true);
+    producer.send({ type: "event_ack", event_number: first.run_ui.event_number });
+    const id = randomUUID();
+    producer.send({ type: "commit", id, request_id: id, through: 0, ...workspace, script: "small" });
+    expect(await nextType(producer, "error")).toMatchObject({ message: "page history is too large" });
+  });
+
+  it("expires the session and removes its public workspace", async () => {
     const now = Date.now();
     vi.useFakeTimers({ now });
     const { producer, url } = await open();
     const code = new URL(url).hostname.split(".")[0];
-    const client = await connectClient(url);
-    await client.next();
-
     vi.setSystemTime(now + SESSION_LIFETIME_MS + 1);
     expect(await runDurableObjectAlarm(env.SESSIONS.getByName(code))).toBe(true);
-    expect(await SELF.fetch(url)).toMatchObject({ status: 404 });
-    expect(client.socket.readyState).not.toBe(WebSocket.OPEN);
+    expect((await SELF.fetch(new Request(url))).status).toBe(404);
     expect(producer.socket.readyState).not.toBe(WebSocket.OPEN);
-  });
-
-  it("allows multiple clients and broadcasts opaque UI scripts and producer lifecycle", async () => {
-    const { producer, url } = await open();
-    const first = await connectClient(url);
-    const second = await connectClient(url);
-    expect(await first.next()).toEqual({ type: "connected", producer_connected: true });
-    expect(await second.next()).toEqual({ type: "connected", producer_connected: true });
-    const update = { type: "run_ui", event_number: 1, considered_through: 0, script: "document.querySelector('#items').append('item')" };
-    producer.send(update);
-    expect(await first.next()).toEqual(update);
-    expect(await second.next()).toEqual(update);
-    producer.socket.close(1000, "restart");
-    expect(await first.next()).toEqual({ type: "producer", connected: false });
-    expect(await second.next()).toEqual({ type: "producer", connected: false });
-  });
-
-  it("rejects invalid UI scripts", async () => {
-    const { producer } = await open();
-    producer.send({ type: "run_ui", event_number: -1, script: "document.body" });
-    expect(await producer.next()).toEqual({ type: "error", message: "event_number must be a nonnegative safe integer" });
-    producer.send({ type: "run_ui", event_number: 0, script: "document.body" });
-    expect(await producer.next()).toEqual({ type: "error", message: "considered_through must be a nonnegative safe integer" });
-    producer.send({ type: "run_ui", event_number: 0, considered_through: 0 });
-    expect(await producer.next()).toEqual({ type: "error", message: "script is required" });
-    producer.send({ type: "run_ui", event_number: 0, considered_through: 0, script: 42 });
-    expect(await producer.next()).toEqual({ type: "error", message: "script is required" });
-    producer.send({ type: "run_ui", event_number: 0, considered_through: 0, script: "x".repeat(1024 * 1024 + 1) });
-    expect(await producer.next()).toEqual({ type: "error", message: "script is too large" });
-  });
-
-  it("injects the relay runtime into HTML but not other responses or submissions", async () => {
-    const { producer, url } = await open();
-    const htmlRequest = SELF.fetch(new Request(url));
-    const html = await producer.next();
-    producer.send({ type: "http_response", request_id: html.request_id, status: 200, headers: { "content-type": "text/html" }, body: btoa("<html><body><h1>Preview</h1></body></html>") });
-    const htmlResponse = await htmlRequest;
-    const htmlBody = await htmlResponse.text();
-    expect(htmlBody).toContain(`<script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime></script>`);
-
-    const cssRequest = SELF.fetch(new Request(new URL("style.css", url)));
-    const css = await producer.next();
-    producer.send({ type: "http_response", request_id: css.request_id, status: 200, headers: { "content-type": "text/css" }, body: btoa("body{}")} );
-    const cssResponse = await cssRequest;
-    expect(await cssResponse.text()).toBe("body{}");
-
-    const submission = SELF.fetch(new Request(new URL("save", url), { method: "POST", headers: { "X-LetMeKnow-Submission": "1" }, body: "ok" }));
-    const submissionRequest = await producer.next();
-    producer.send({ type: "http_response", request_id: submissionRequest.request_id, status: 202, headers: { "content-type": "text/html" }, body: btoa("accepted") });
-    const submissionResponse = await submission;
-    expect(await submissionResponse.text()).toBe("accepted");
-  });
-
-  it("turns producer document 404s into live pages but leaves missing assets alone", async () => {
-    const { producer, url } = await open();
-    const missingPage = SELF.fetch(new Request(new URL("missing", url), { headers: { Accept: "text/html" } }));
-    const pageRequest = await producer.next();
-    producer.send({ type: "http_response", request_id: pageRequest.request_id, status: 404, headers: { "content-type": "text/plain" }, body: btoa("missing") });
-    const pageResponse = await missingPage;
-    const pageBody = await pageResponse.text();
-    expect(pageResponse.status).toBe(404);
-    expect(pageResponse.headers.get("content-type")).toContain("text/html");
-    expect(pageBody).toContain("This page does not exist yet");
-    expect(pageBody).toContain("/_letmeknow/client.js");
-
-    const missingAsset = SELF.fetch(new Request(new URL("missing.css", url), { headers: { Accept: "text/css", "Sec-Fetch-Dest": "style" } }));
-    const assetRequest = await producer.next();
-    producer.send({ type: "http_response", request_id: assetRequest.request_id, status: 404, headers: { "content-type": "text/plain" }, body: btoa("missing asset") });
-    const assetResponse = await missingAsset;
-    expect(assetResponse.status).toBe(404);
-    expect(await assetResponse.text()).toBe("missing asset");
-    expect(assetResponse.headers.get("content-type")).toBe("text/plain");
-  });
-
-  it("injects HTML once, removes stale lengths, and handles documents without a body", async () => {
-    const { producer, url } = await open();
-    const page = SELF.fetch(new Request(url));
-    const pageRequest = await producer.next();
-    producer.send({ type: "http_response", request_id: pageRequest.request_id, status: 200, headers: { "content-type": "text/html", "content-length": "4" }, body: btoa("<html><head></head><body>ok</body></html>") });
-    const pageResponse = await page;
-    const pageBody = await pageResponse.text();
-    expect(pageResponse.headers.get("content-length")).toBeNull();
-    expect(pageBody.match(/data-letmeknow-runtime/g)).toHaveLength(1);
-    expect(pageBody.indexOf("data-letmeknow-runtime")).toBeLessThan(pageBody.indexOf("</body>"));
-
-    const noBody = SELF.fetch(new Request(new URL("empty", url)));
-    const noBodyRequest = await producer.next();
-    producer.send({ type: "http_response", request_id: noBodyRequest.request_id, status: 200, headers: { "content-type": "text/html" }, body: "" });
-    expect(await (await noBody).text()).toContain("/_letmeknow/client.js");
-  });
-
-  it("does not inject or return a body for HEAD HTML requests", async () => {
-    const { producer, url } = await open();
-    const head = SELF.fetch(new Request(url, { method: "HEAD" }));
-    const request = await producer.next();
-    expect(request.method).toBe("HEAD");
-    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: { "content-type": "text/html", "content-length": "4" }, body: btoa("body") });
-    const response = await head;
-    expect(response.status).toBe(200);
-    expect(await response.text()).toBe("");
-    expect(response.headers.get("content-length")).toBe("4");
-  });
-
-  it("keeps disconnected asset responses non-HTML", async () => {
-    const { producer, url } = await open();
-    const pendingPage = SELF.fetch(new Request(url));
-    await producer.next();
-    producer.socket.close(1000, "gone");
-    const pendingResponse = await pendingPage;
-    expect(pendingResponse.status).toBe(503);
-    expect(pendingResponse.headers.get("content-type")).toContain("text/html");
-
-    const response = await SELF.fetch(new Request(new URL("style.css", url), { headers: { Accept: "text/css", "Sec-Fetch-Dest": "style" } }));
-    expect(response.status).toBe(503);
-    expect(response.headers.get("content-type")).toContain("application/json");
-    expect(await response.text()).not.toContain("<html");
-  });
-
-  it("serves the runtime with deliberate method handling", async () => {
-    const { url } = await open();
-    const runtimeUrl = new URL("_letmeknow/client.js", url);
-    const runtime = await SELF.fetch(new Request(runtimeUrl));
-    expect(runtime.status).toBe(200);
-    expect(await runtime.text()).toContain("Sent. Waiting for an update");
-
-    const head = await SELF.fetch(new Request(runtimeUrl, { method: "HEAD" }));
-    expect(head.status).toBe(200);
-    expect(await head.text()).toBe("");
-
-    const post = await SELF.fetch(new Request(runtimeUrl, { method: "POST" }));
-    expect(post.status).toBe(405);
-    expect(post.headers.get("allow")).toBe("GET, HEAD");
-  });
-
-  it("serves the runtime and live disconnected pages", async () => {
-    const { producer, url } = await open();
-    const runtime = await SELF.fetch(new Request(new URL("_letmeknow/client.js", url)));
-    expect(runtime.status).toBe(200);
-    expect(runtime.headers.get("cache-control")).toBe("no-store");
-    expect(runtime.headers.get("content-type")).toContain("text/javascript");
-    expect(await runtime.text()).toContain("Sent. Waiting for an update");
-    producer.socket.close(1000, "gone");
-    const disconnected = await SELF.fetch(new Request(url));
-    expect(disconnected.status).toBe(503);
-    expect(disconnected.headers.get("content-type")).toContain("text/html");
-    const body = await disconnected.text();
-    expect(body).toContain('data-letmeknow-status-page="disconnected"');
-    expect(body).toContain("/_letmeknow/client.js");
-  });
-
-  it("caps concurrent proxied requests per session", async () => {
-    const { producer, url } = await open();
-    const requests = Array.from({ length: 256 }, (_, index) => SELF.fetch(new Request(new URL(`asset-${index}`, url), { method: "POST", body: `payload-${index}` })));
-    const forwarded = await Promise.all(Array.from({ length: 256 }, () => producer.next()));
-    expect(forwarded).toHaveLength(256);
-
-    const excess = await SELF.fetch(new Request(new URL("overflow", url)));
-    expect(excess.status).toBe(503);
-    expect(await excess.json()).toEqual({ error: "too many pending proxy requests" });
-
-    for (const request of forwarded) producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
-    expect((await Promise.all(requests)).every((response) => response.status === 200)).toBe(true);
-  });
-
-  it("relays requests and preserves late-response and size boundaries", async () => {
-    const { producer, url } = await open();
-    const page = SELF.fetch(new Request(url));
-    const request = await producer.next();
-    expect(request).toMatchObject({ type: "http_request", method: "GET", path: "/" });
-    producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
-    expect((await page).status).toBe(200);
-
-    const oversized = await SELF.fetch(new Request(url, { method: "POST", headers: { "Content-Length": String(1024 * 1024 + 1) } }));
-    expect(oversized.status).toBe(413);
-  });
-
-  it("reconnects the producer securely and expires disconnected sessions", async () => {
-    const { producer, url } = await open();
-    const client = await connectClient(url);
-    expect(await client.next()).toEqual({ type: "connected", producer_connected: true });
-    const code = new URL(url).hostname.split(".")[0];
-    producer.socket.close(1000, "restart");
-    expect(await client.next()).toEqual({ type: "producer", connected: false });
-    const replacement = await connectProducer(code, producer.credential);
-    expect(await replacement.next()).toMatchObject({ type: "session", url });
-    expect(await client.next()).toEqual({ type: "producer", connected: true });
-    replacement.socket.close(1000, "gone");
-    expect(await client.next()).toEqual({ type: "producer", connected: false });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(await runDurableObjectAlarm(env.SESSIONS.getByName(code))).toBe(true);
-    expect(client.socket.readyState).not.toBe(WebSocket.OPEN);
-    const expired = await SELF.fetch(url);
-    expect(expired.status).toBe(404);
-    expect(await expired.text()).not.toContain("/_letmeknow/client.js");
-  });
-
-  it("ignores stale producer closes after replacement reconnects", async () => {
-    const { producer, url } = await open();
-    const client = await connectClient(url);
-    await client.next();
-    producer.socket.close(1000, "restart");
-    await client.next();
-    const code = new URL(url).hostname.split(".")[0];
-    const replacement = await connectProducer(code, producer.credential);
-    await replacement.next();
-    await client.next();
-    const page = SELF.fetch(new Request(url));
-    const request = await replacement.next();
-    const staleSocket = { deserializeAttachment: () => ({ role: "producer", id: "stale-producer", url, opened: true, closing: false }), close: () => {}, send: () => {} } as unknown as WebSocket;
-    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.webSocketMessage(staleSocket, JSON.stringify({ type: "run_ui", event_number: 99, considered_through: 0, script: "document.body.append('stale')" })));
-    expect(await Promise.race([client.next(), new Promise((resolve) => setTimeout(() => resolve(undefined), 50))])).toBeUndefined();
-    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.webSocketClose(staleSocket, 1000, "stale"));
-    replacement.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
-    expect((await page).status).toBe(200);
-    expect(await Promise.race([client.next(), new Promise((resolve) => setTimeout(() => resolve(undefined), 50))])).toBeUndefined();
   });
 });

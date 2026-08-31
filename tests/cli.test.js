@@ -1,47 +1,42 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import net from "node:net";
-import { join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { once } from "node:events";
 import { describe, it } from "node:test";
 import { WebSocketServer } from "ws";
 
 const cli = fileURLToPath(new URL("../bin/letmeknow.js", import.meta.url));
-const MAX_BODY_BYTES = 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 10_000;
 const STARTUP_TIMEOUT_MS = 10_000;
 
-function localWebSocketEnvironment(port) {
+function localEnvironment(webSocketPort, httpPort) {
   const folder = mkdtempSync(join(tmpdir(), "letmeknow-hook-"));
   const hook = join(folder, "redirect.mjs");
-  const ws = pathToFileURL(join(join(dirname(cli), "../node_modules/ws/index.js"))).href;
-  writeFileSync(hook, `import WebSocket from ${JSON.stringify(ws)}; const OriginalWebSocket = WebSocket; globalThis.WebSocket = class extends OriginalWebSocket { constructor(url, protocols) { const local = new URL(url); local.protocol = "ws:"; local.hostname = "127.0.0.1"; local.port = process.env.LETMEKNOW_TEST_PORT; super(local, protocols); } };\n`);
+  const ws = pathToFileURL(join(dirname(cli), "../node_modules/ws/index.js")).href;
+  writeFileSync(hook, `import WebSocket from ${JSON.stringify(ws)}; const OriginalWebSocket = WebSocket; globalThis.WebSocket = class extends OriginalWebSocket { constructor(url, protocols) { const local = new URL(url); local.protocol = "ws:"; local.hostname = "127.0.0.1"; local.port = process.env.LETMEKNOW_TEST_WS_PORT; super(local, protocols); } }; const originalFetch = globalThis.fetch; globalThis.fetch = (input, init) => { const value = typeof input === "string" || input instanceof URL ? input : input.url; const url = new URL(value); if (!url.hostname.endsWith('.letmeknow.dev')) return originalFetch(input, init); url.protocol = 'http:'; url.hostname = '127.0.0.1'; url.port = process.env.LETMEKNOW_TEST_HTTP_PORT; return originalFetch(url, init); };\n`);
   return {
-    env: { ...process.env, LETMEKNOW_TEST_PORT: String(port), NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --import=${pathToFileURL(hook).href}`.trim() },
+    env: { ...process.env, LETMEKNOW_TEST_WS_PORT: String(webSocketPort), LETMEKNOW_TEST_HTTP_PORT: String(httpPort), NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --import=${pathToFileURL(hook).href}`.trim() },
     close: () => rmSync(folder, { recursive: true, force: true })
   };
 }
 
-function dirname(path) {
-  return path.slice(0, path.lastIndexOf("/"));
-}
-
-async function stopChild(child) {
-  if (!child || child.exitCode !== null) return;
+function stopChild(child) {
+  if (!child || child.exitCode !== null) return Promise.resolve();
   child.kill("SIGTERM");
-  await Promise.race([once(child, "exit"), new Promise(resolve => setTimeout(resolve, 2_000))]);
-  if (child.exitCode === null) {
+  return Promise.race([once(child, "exit"), new Promise(resolve => setTimeout(resolve, 2_000))]).then(() => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
     child.kill("SIGKILL");
-    await once(child, "exit");
-  }
+    return once(child, "exit");
+  });
 }
 
-async function runCommand(args, input) {
-  const child = spawn(process.execPath, [cli, ...args], { stdio: ["pipe", "pipe", "pipe"] });
+async function runCommand(args, input, env) {
+  const child = spawn(process.execPath, [cli, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
   let stdout = "";
   let stderr = "";
   let timedOut = false;
@@ -59,25 +54,106 @@ async function runCommand(args, input) {
   return { code: timedOut ? 124 : code, stdout, stderr };
 }
 
-async function command(args, input) {
-  const result = await runCommand(args, input);
+async function command(args, input, env) {
+  const result = await runCommand(args, input, env);
   assert.equal(result.code, 0, `${args.join(" ")}: ${result.stderr}\n${result.stdout}`);
   return JSON.parse(result.stdout);
 }
 
-async function startSession({ index = "<!doctype html><html><body><main id=\"letmeknow-root\">initial</main></body></html>" } = {}) {
+function serviceEvent(id, eventNumber, value = "one") {
+  return { type: "submit", id, event_number: eventNumber, page_event: 0, form_id: "review", action: "/review", trigger: null, values: { value } };
+}
+
+async function startSession({ index = "<!doctype html><html><body><main id=app>initial</main></body></html>", files = { "assets/app.js": "initial" } } = {}) {
   const folder = mkdtempSync(join(tmpdir(), "letmeknow-"));
   writeFileSync(join(folder, "index.html"), index);
-  mkdirSync(join(folder, "assets"));
-  writeFileSync(join(folder, "assets", "app.js"), "initial");
+  for (const [pathname, value] of Object.entries(files)) {
+    const filename = join(folder, pathname);
+    const parent = filename.slice(0, filename.lastIndexOf("/"));
+    if (parent !== folder) await import("node:fs/promises").then(fs => fs.mkdir(parent, { recursive: true }));
+    writeFileSync(filename, value);
+  }
+
+  const state = { uploaded: new Map(), events: new Map(), nextEvent: 0, committedThrough: 0, workspaceVersion: 0, pageEvent: 0, acknowledgements: [], ackWaiters: new Map(), producer: undefined };
+  const httpServer = createServer((request, response) => {
+    const match = request.url?.match(/^\/_letmeknow\/workspace\/([0-9a-f]{64})$/);
+    if (request.method !== "PUT" || !match) {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
+    const chunks = [];
+    request.on("data", chunk => chunks.push(chunk));
+    request.on("end", () => {
+      const data = Buffer.concat(chunks);
+      const hash = createHash("sha256").update(data).digest("hex");
+      if (hash !== match[1]) {
+        response.writeHead(400);
+        response.end();
+        return;
+      }
+      state.uploaded.set(match[1], { size: data.byteLength, data });
+      response.writeHead(204);
+      response.end();
+    });
+  });
+  httpServer.listen(0);
+  await once(httpServer, "listening");
   const relay = new WebSocketServer({ port: 0, handleProtocols(protocols) { return [...protocols][0]; } });
   await once(relay, "listening");
-  const local = localWebSocketEnvironment(relay.address().port);
+  const local = localEnvironment(relay.address().port, httpServer.address().port);
+  const code = "0123456789abcdef0123";
+  const url = `https://${code}.letmeknow.dev/`;
+  let opened;
+  let resolveConnection;
+  const connected = new Promise(resolve => { resolveConnection = resolve; });
+  relay.on("connection", socket => {
+    state.producer = socket;
+    resolveConnection(socket);
+    socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
+    socket.send(JSON.stringify({ type: "provisioned", url }));
+    socket.on("message", async data => {
+      const packet = JSON.parse(data.toString());
+      if (packet.type === "workspace_manifest") {
+        const items = [packet.index, ...(packet.hashes || [])].filter(Boolean);
+        const missing = items.filter(item => state.uploaded.get(item.hash)?.size !== item.size);
+        socket.send(JSON.stringify({ type: "workspace_manifest", id: packet.id, missing }));
+      } else if (packet.type === "open") {
+        opened = true;
+        socket.send(JSON.stringify({ type: "session", id: packet.id, url, frontier: state.nextEvent, page_event: state.pageEvent, page_hash: "page-hash", workspace_version: state.workspaceVersion }));
+      } else if (packet.type === "event_ack") {
+        state.acknowledgements.push(packet.event_number);
+        const waiters = state.ackWaiters.get(packet.event_number) || [];
+        state.ackWaiters.delete(packet.event_number);
+        for (const resolve of waiters) resolve();
+      } else if (packet.type === "commit") {
+        const ids = [];
+        for (const event of state.events.values()) {
+          if (event.type === "submit" && event.event_number <= packet.through && !event.committed) {
+            event.committed = true;
+            ids.push(event.id);
+          }
+        }
+        state.committedThrough = packet.through;
+        state.workspaceVersion += 1;
+        let runUI;
+        if (packet.script !== undefined) {
+          const eventNumber = ++state.nextEvent;
+          state.pageEvent = eventNumber;
+          runUI = { type: "run_ui", event_number: eventNumber, considered_through: packet.through, frontier: eventNumber, page_event: eventNumber, page_hash: `page-${eventNumber}`, script: packet.script };
+          state.events.set(eventNumber, runUI);
+          socket.send(JSON.stringify(runUI));
+        }
+        socket.send(JSON.stringify({ ok: true, type: "committed", id: packet.id, through: packet.through, considered_through: packet.through, frontier: state.nextEvent, page_event: state.pageEvent, page_hash: runUI?.page_hash || "page-hash", workspace_version: state.workspaceVersion, events: ids, ...(runUI ? { run_ui: { event_number: runUI.event_number, considered_through: runUI.considered_through } } : {}) }));
+      }
+    });
+  });
+
   const child = spawn(process.execPath, [cli, "serve", folder], { env: local.env, stdio: ["ignore", "pipe", "pipe"] });
   let stderr = "";
   child.stderr.on("data", chunk => { stderr += chunk; });
   const stream = [];
-  const streamWaiters = [];
+  const waiters = [];
   let streamInput = "";
   let streamError;
   child.stdout.on("data", chunk => {
@@ -89,16 +165,13 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
       try { value = JSON.parse(line); }
       catch { streamError = new Error(`invalid serve stream JSON: ${line}`); }
       if (streamError) {
-        for (const waiter of streamWaiters.splice(0)) {
-          clearTimeout(waiter.timer);
-          waiter.reject(streamError);
-        }
+        for (const waiter of waiters.splice(0)) { clearTimeout(waiter.timer); waiter.reject(streamError); }
         return;
       }
       stream.push(value);
-      for (let index = streamWaiters.length - 1; index >= 0; index -= 1) {
-        if (!streamWaiters[index].predicate(value)) continue;
-        const waiter = streamWaiters.splice(index, 1)[0];
+      for (let index = waiters.length - 1; index >= 0; index -= 1) {
+        if (!waiters[index].predicate(value)) continue;
+        const waiter = waiters.splice(index, 1)[0];
         clearTimeout(waiter.timer);
         waiter.resolve(value);
       }
@@ -110,84 +183,58 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
     if (value) return Promise.resolve(value);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        const index = streamWaiters.findIndex(waiter => waiter.timer === timer);
-        if (index >= 0) streamWaiters.splice(index, 1);
+        const index = waiters.findIndex(waiter => waiter.timer === timer);
+        if (index >= 0) waiters.splice(index, 1);
         reject(new Error(`serve stream timed out${stderr ? `: ${stderr.trim()}` : ""}`));
       }, timeout);
-      streamWaiters.push({ predicate, resolve, reject, timer });
+      waiters.push({ predicate, resolve, reject, timer });
     });
   };
-  const ready = waitStream(value => value.type === "ready");
-  let producer;
-  const scripts = [];
-  const waiters = new Map();
-  const connected = new Promise((resolve, reject) => {
-    relay.once("error", reject);
-    child.once("close", (code, signal) => reject(new Error(`serve exited before connecting${code === null ? ` (${signal})` : ` (code ${code})`}${stderr ? `: ${stderr.trim()}` : ""}`)));
-    relay.once("connection", socket => {
-      producer = socket;
-      socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
-      socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.letmeknow.dev/" }));
-      socket.on("message", data => {
-        const packet = JSON.parse(data.toString());
-        if (packet.type === "open") resolve();
-        if (packet.type === "run_ui") scripts.push(packet);
-        if (packet.type !== "http_response") return;
-        const waiter = waiters.get(packet.request_id);
-        if (waiter) {
-          waiters.delete(packet.request_id);
-          waiter(packet);
-        }
-      });
+  const ack = eventNumber => {
+    if (state.acknowledgements.includes(eventNumber)) return Promise.resolve();
+    return new Promise(resolve => {
+      const waitersForEvent = state.ackWaiters.get(eventNumber) || [];
+      waitersForEvent.push(resolve);
+      state.ackWaiters.set(eventNumber, waitersForEvent);
     });
-  });
+  };
+  const sendEvent = async event => {
+    state.events.set(event.event_number, event);
+    state.nextEvent = Math.max(state.nextEvent, event.event_number);
+    state.producer.send(JSON.stringify(event));
+    await ack(event.event_number);
+  };
   const cleanup = async () => {
     await stopChild(child);
+    for (const socket of relay.clients) socket.terminate();
     await new Promise(resolve => relay.close(resolve));
+    httpServer.closeAllConnections?.();
+    await new Promise(resolve => httpServer.close(resolve));
     local.close();
     rmSync(folder, { recursive: true, force: true });
     if (streamError) throw streamError;
   };
+  let connectedTimer;
   try {
-    await Promise.all([connected, ready]);
+    const connectionTimeout = new Promise((_, reject) => { connectedTimer = setTimeout(() => reject(new Error(`serve did not connect${stderr ? `: ${stderr.trim()}` : ""}`)), STARTUP_TIMEOUT_MS); });
+    await Promise.race([connected, connectionTimeout]);
+    clearTimeout(connectedTimer);
+    await waitStream(value => value.type === "ready");
   } catch (cause) {
+    clearTimeout(connectedTimer);
     await cleanup();
     throw cause;
   }
-  let requestNumber = 0;
-  const request = (method, path, headers = {}, body = Buffer.alloc(0)) => {
-    const request_id = `request-${++requestNumber}`;
-    return new Promise(resolve => {
-      waiters.set(request_id, resolve);
-      producer.send(JSON.stringify({ type: "http_request", request_id, method, path, headers, body: body.toString("base64") }));
-    });
-  };
-  return { folder, child, request, scripts, stream, waitStream, ready: await ready, stderr: () => stderr, stop: cleanup };
+  return { folder, child, state, stream, waitStream, sendEvent, ack, ready: stream.find(value => value.type === "ready"), stderr: () => stderr, stop: cleanup, url, opened };
 }
 
-function decodeBody(packet) {
-  return Buffer.from(packet.body, "base64").toString("utf8");
-}
-
-function historyFrom(page) {
-  const matches = [...page.matchAll(/<script type="application\/json" data-letmeknow-history(?:="")?>([\s\S]*?)<\/script>/g)];
-  assert.ok(matches.length, "replay history script is missing");
-  return JSON.parse(matches.at(-1)[1]);
-}
-
-function jsonSubmission(id, pageEvent = 0, values = { amount: "1" }) {
-  return Buffer.from(JSON.stringify({
-    id,
-    page_event: pageEvent,
-    form_id: "counter",
-    action: "/increment",
-    trigger: { id: "increment", name: "amount", value: "1" },
-    values
-  }));
+function controlPath(folder) {
+  const root = realpathSync(folder);
+  return join(tmpdir(), `letmeknow-control-${createHash("sha256").update(root).digest("hex").slice(0, 32)}.sock`);
 }
 
 describe("LetMeKnow CLI", () => {
-  it("uses the serve and through command surface", async () => {
+  it("keeps the command surface", async () => {
     const result = await runCommand(["ack", "/tmp"]);
     assert.equal(result.code, 1);
     assert.match(result.stderr, /Usage:/);
@@ -202,79 +249,95 @@ describe("LetMeKnow CLI", () => {
   it("restarts after an unclean termination", async () => {
     const folder = mkdtempSync(join(tmpdir(), "letmeknow-restart-"));
     writeFileSync(join(folder, "index.html"), "<!doctype html><html><body>initial</body></html>");
-    const root = realpathSync(folder);
-    const controlSocket = join(tmpdir(), `letmeknow-control-${createHash("sha256").update(root).digest("hex").slice(0, 32)}.sock`);
+    const socket = controlPath(folder);
     let first;
-    let restarted;
+    let second;
+    let duplicate;
     try {
-      rmSync(controlSocket, { force: true });
-      first = spawn(process.execPath, [cli, "serve", folder], { stdio: ["ignore", "ignore", "pipe"] });
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("serve did not create its control socket")), STARTUP_TIMEOUT_MS);
-        const check = () => {
-          if (existsSync(controlSocket)) {
-            clearTimeout(timer);
-            resolve();
-          } else if (first.exitCode !== null) reject(new Error("serve exited before creating its control socket"));
-          else setTimeout(check, 25);
-        };
-        check();
-      });
+      rmSync(socket, { force: true });
+      first = spawn(process.execPath, [cli, "serve", folder], { stdio: ["ignore", "ignore", "ignore"] });
+      for (let index = 0; index < STARTUP_TIMEOUT_MS / 25 && !existsSync(socket); index += 1) await new Promise(resolve => setTimeout(resolve, 25));
+      assert.equal(existsSync(socket), true);
+      duplicate = spawn(process.execPath, [cli, "serve", folder], { stdio: ["ignore", "ignore", "ignore"] });
+      const [duplicateCode] = await once(duplicate, "exit");
+      assert.equal(duplicateCode, 1);
+      assert.equal(existsSync(socket), true);
       first.kill("SIGKILL");
       await once(first, "exit");
-
-      restarted = spawn(process.execPath, [cli, "serve", folder], { stdio: ["ignore", "ignore", "pipe"] });
-      await new Promise((resolve, reject) => {
-        const deadline = Date.now() + STARTUP_TIMEOUT_MS;
-        const check = () => {
-          if (restarted.exitCode !== null || restarted.signalCode !== null) return reject(new Error("restarted serve exited"));
-          const probe = net.createConnection(controlSocket);
-          probe.once("connect", () => {
-            probe.destroy();
-            resolve();
-          });
-          probe.once("error", () => {
-            probe.destroy();
-            if (Date.now() >= deadline) reject(new Error("serve did not reclaim its control socket"));
-            else setTimeout(check, 25);
-          });
-        };
-        check();
-      });
-      assert.equal(restarted.exitCode, null);
+      second = spawn(process.execPath, [cli, "serve", folder], { stdio: ["ignore", "ignore", "ignore"] });
+      for (let index = 0; index < STARTUP_TIMEOUT_MS / 25 && second.exitCode === null && !existsSync(socket); index += 1) await new Promise(resolve => setTimeout(resolve, 25));
+      assert.equal(second.exitCode, null);
+      assert.equal(existsSync(socket), true);
     } finally {
-      for (const child of [first, restarted]) {
+      for (const child of [first, second, duplicate]) {
         if (!child || child.exitCode !== null || child.signalCode !== null) continue;
-        await new Promise(resolve => {
-          child.once("exit", resolve);
-          child.kill("SIGKILL");
-        });
+        child.kill("SIGKILL");
+        await once(child, "exit");
       }
-      rmSync(controlSocket, { force: true });
+      rmSync(socket, { force: true });
       rmSync(folder, { recursive: true, force: true });
     }
   });
 
-  it("applies stdout backpressure to accepted submissions", async () => {
+  it("uploads the workspace and reports a compact ready notification", async () => {
     const session = await startSession();
     try {
-      session.child.stdout.pause();
-      const requests = Array.from({ length: 4096 }, () => session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(randomUUID(), 0, { value: "" })));
-      let settled = false;
-      const complete = Promise.all(requests).then(results => {
-        settled = true;
-        return results;
-      });
-      await new Promise(resolve => setTimeout(resolve, 1_000));
-      assert.equal(settled, false);
-      session.child.stdout.resume();
-      const results = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("submissions did not drain after stdout resumed")), STARTUP_TIMEOUT_MS);
-        complete.then(value => { clearTimeout(timer); resolve(value); }, cause => { clearTimeout(timer); reject(cause); });
-      });
-      assert.deepEqual(results.map(result => result.status), Array(requests.length).fill(202));
+      assert.equal(session.ready.type, "ready");
+      assert.match(session.ready.url, /^https:\/\/[0-9a-f]{20}\.letmeknow\.dev\/$/);
+      assert.match(session.ready.session_path, /^\/tmp\/letmeknow-[0-9a-f-]+$/);
+      assert.ok(JSON.stringify(session.ready).length < 400);
+      assert.ok(session.state.uploaded.size >= 2);
+      assert.ok(session.stream.every(value => value.type === "ready"));
     } finally {
-      session.child.stdout.resume();
+      await session.stop();
+    }
+  });
+
+  it("persists complete events, handles redelivery, and cleans acknowledged files", async () => {
+    const session = await startSession();
+    try {
+      const id = randomUUID();
+      const event = serviceEvent(id, 1, "x".repeat(10_000));
+      await session.sendEvent(event);
+      const notification = await session.waitStream(value => value.type === "submit" && value.id === id);
+      const artifact = JSON.parse(readFileSync(notification.event_path));
+      assert.equal(artifact.values.value.length, 10_000);
+      assert.deepEqual(Object.keys(notification).sort(), ["event_number", "event_path", "id", "type"]);
+      await session.sendEvent(event);
+      assert.equal(session.stream.filter(value => value.type === "submit" && value.id === id).length, 1);
+      const result = await command(["commit", session.folder, "--through", "1"]);
+      assert.deepEqual(result.events, [id]);
+      assert.equal(existsSync(notification.event_path), false);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("publishes canonical UI events after earlier submissions", async () => {
+    const session = await startSession();
+    try {
+      const id = randomUUID();
+      await session.sendEvent(serviceEvent(id, 1));
+      const script = "document.body.dataset.updated = 'yes';";
+      const result = await command(["commit", session.folder, "--through", "1", "--script", "-"], script);
+      const update = await session.waitStream(value => value.type === "run_ui" && value.event_number === 2);
+      assert.deepEqual(result.events, [id]);
+      assert.deepEqual(result.run_ui, { event_number: 2, considered_through: 1 });
+      assert.deepEqual(session.stream.filter(value => value.type === "submit" || value.type === "run_ui").map(value => value.event_number), [1, 2]);
+      assert.equal(update.page_hash, "page-2");
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("stops on canonical event-number reuse", async () => {
+    const session = await startSession();
+    try {
+      await session.sendEvent(serviceEvent(randomUUID(), 1));
+      session.state.producer.send(JSON.stringify(serviceEvent(randomUUID(), 1, "different")));
+      const [code] = await once(session.child, "exit");
+      assert.equal(code, 1);
+    } finally {
       await session.stop();
     }
   });
@@ -283,321 +346,13 @@ describe("LetMeKnow CLI", () => {
     const session = await startSession();
     try {
       session.child.stdout.destroy();
-      void session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(randomUUID()));
-      const [code, signal] = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("serve did not stop after stdout closed")), STARTUP_TIMEOUT_MS);
-        session.child.once("exit", (...args) => { clearTimeout(timer); resolve(args); });
-      });
+      session.state.producer.send(JSON.stringify(serviceEvent(randomUUID(), 1)));
+      const [code, signal] = await once(session.child, "exit");
       assert.equal(code, 1);
       assert.equal(signal, null);
       assert.doesNotMatch(session.stderr(), /Unhandled|write EPIPE|EPIPE/);
     } finally {
       await session.stop();
-    }
-  });
-
-  it("serves the initial replayable page, stream metadata, and live assets", async () => {
-    const session = await startSession({ index: "<!doctype html><html><body><script type=\"application/json\" data-letmeknow-history>[\"agent content\"]</script><main id=\"letmeknow-root\">old</main></body></html>" });
-    try {
-      assert.deepEqual(session.ready, { type: "ready", url: "https://0123456789abcdef0123.letmeknow.dev/", session_path: session.ready.session_path, frontier: 0, page_event: 0, page_hash: session.ready.page_hash });
-      assert.match(session.ready.session_path, /^\/tmp\/letmeknow-[0-9a-f-]+$/);
-      assert.ok(existsSync(join(session.ready.session_path, "events")));
-      assert.ok(JSON.stringify(session.ready).length < 400);
-      const page = await session.request("GET", "/", { accept: "text/html" });
-      const index = await session.request("GET", "/index.html", { accept: "text/html" });
-      const asset = await session.request("GET", "/assets/app.js");
-      assert.equal(page.status, 200);
-      assert.deepEqual(historyFrom(decodeBody(page)), []);
-      assert.match(decodeBody(page), /data-letmeknow-history="">\["agent content"\]<\/script>/);
-      assert.equal(decodeBody(index), decodeBody(page));
-      assert.equal(decodeBody(asset), "initial");
-
-      writeFileSync(join(session.folder, "index.html"), "changed draft");
-      writeFileSync(join(session.folder, "assets", "app.js"), "changed asset");
-      const unchangedPage = await session.request("GET", "/", { accept: "text/html" });
-      const changedAsset = await session.request("GET", "/assets/app.js");
-      assert.equal(decodeBody(unchangedPage), decodeBody(page));
-      assert.equal(decodeBody(changedAsset), "changed asset");
-    } finally {
-      await session.stop();
-    }
-  });
-
-  it("streams ordered submissions and acknowledges only the declared prefix", async () => {
-    const session = await startSession();
-    try {
-      const firstId = randomUUID();
-      const secondId = randomUUID();
-      const firstResponse = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(firstId));
-      const first = await session.waitStream(event => event.type === "submit" && event.id === firstId);
-      const secondResponse = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(secondId));
-      const second = await session.waitStream(event => event.type === "submit" && event.id === secondId);
-      assert.equal(firstResponse.status, 202);
-      assert.equal(secondResponse.status, 202);
-      assert.deepEqual([first.event_number, second.event_number], [1, 2]);
-      assert.deepEqual(Object.keys(first).sort(), ["event_number", "event_path", "id", "type"]);
-      assert.ok(first.event_path.startsWith(join(session.ready.session_path, "events")));
-      assert.deepEqual(JSON.parse(readFileSync(first.event_path)), { type: "submit", id: firstId, event_number: 1, page_event: 0, form_id: "counter", action: "/increment", trigger: { id: "increment", name: "amount", value: "1" }, values: { amount: "1" } });
-      assert.deepEqual(session.stream.filter(event => event.type === "submit").map(event => event.id), [firstId, secondId]);
-
-      const script = "document.body.dataset.first = 'ok';";
-      const committed = await command(["commit", session.folder, "--through", "1", "--script", "-"], script);
-      assert.deepEqual(committed, {
-        ok: true,
-        type: "committed",
-        through: 1,
-        considered_through: 1,
-        frontier: 3,
-        page_event: 3,
-        page_hash: committed.page_hash,
-        events: [firstId],
-        run_ui: { event_number: 3, considered_through: 1 }
-      });
-      const runMetadata = await session.waitStream(event => event.type === "run_ui" && event.event_number === 3);
-      assert.deepEqual(runMetadata, { type: "run_ui", event_number: 3, considered_through: 1, frontier: 3, page_event: 3, page_hash: committed.page_hash });
-      assert.equal(existsSync(first.event_path), false);
-      assert.equal(existsSync(second.event_path), true);
-      assert.equal(session.stream.filter(event => event.type === "run_ui").length, 1);
-      assert.deepEqual(session.scripts, [{ type: "run_ui", event_number: 3, considered_through: 1, script }]);
-
-      const lateId = randomUUID();
-      await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(lateId, 3));
-      const late = await session.waitStream(event => event.type === "submit" && event.id === lateId);
-      assert.equal(late.event_number, 4);
-
-      const acknowledged = await command(["commit", session.folder, "--through", "2"]);
-      assert.deepEqual(acknowledged.events, [secondId]);
-      assert.equal(acknowledged.frontier, 4);
-      assert.equal(acknowledged.page_event, 3);
-      const later = await command(["commit", session.folder, "--through", "4", "--script", "-"], "document.body.dataset.second = 'ok';");
-      assert.deepEqual(later.events, [lateId]);
-      assert.deepEqual(later.run_ui, { event_number: 5, considered_through: 4 });
-      await session.waitStream(event => event.type === "run_ui" && event.event_number === 5);
-      assert.equal(existsSync(late.event_path), false);
-      assert.equal(session.stream.filter(event => event.type === "run_ui").length, 2);
-      assert.deepEqual(session.scripts.map(({ event_number, considered_through }) => ({ event_number, considered_through })), [
-        { event_number: 3, considered_through: 1 },
-        { event_number: 5, considered_through: 4 }
-      ]);
-    } finally {
-      await session.stop();
-    }
-  });
-
-  it("persists complete large submissions behind compact notifications", async () => {
-    const session = await startSession();
-    try {
-      const id = randomUUID();
-      const value = "x".repeat(10_000);
-      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(id, 0, { comment: value }))).status, 202);
-      const notification = await session.waitStream(event => event.type === "submit" && event.id === id);
-      assert.ok(JSON.stringify(notification).length < 400);
-      assert.deepEqual(Object.keys(notification).sort(), ["event_number", "event_path", "id", "type"]);
-      const event = JSON.parse(readFileSync(notification.event_path));
-      assert.equal(event.id, id);
-      assert.equal(event.values.comment, value);
-      assert.equal(event.event_number, notification.event_number);
-    } finally {
-      await session.stop();
-    }
-  });
-
-  it("retries persistence failures without consuming an event", async () => {
-    const session = await startSession();
-    const eventsDirectory = join(session.ready.session_path, "events");
-    try {
-      rmSync(eventsDirectory, { recursive: true, force: true });
-      writeFileSync(eventsDirectory, "blocked");
-      const id = randomUUID();
-      const payload = jsonSubmission(id);
-      const failed = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, payload);
-      assert.equal(failed.status, 503);
-      assert.equal(session.stream.filter(event => event.type === "submit").length, 0);
-
-      rmSync(eventsDirectory, { force: true });
-      mkdirSync(eventsDirectory);
-      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, payload)).status, 202);
-      const notification = await session.waitStream(event => event.type === "submit" && event.id === id);
-      assert.equal(notification.event_number, 1);
-      assert.equal(JSON.parse(readFileSync(notification.event_path)).id, id);
-
-      const savedPath = `${notification.event_path}.saved`;
-      renameSync(notification.event_path, savedPath);
-      mkdirSync(notification.event_path);
-      const commitFailure = await runCommand(["commit", session.folder, "--through", "1"]);
-      assert.equal(commitFailure.code, 1);
-      assert.equal(JSON.parse(commitFailure.stdout).ok, false);
-      rmSync(notification.event_path, { recursive: true });
-      renameSync(savedPath, notification.event_path);
-      assert.deepEqual((await command(["commit", session.folder, "--through", "1"])).events, [id]);
-      assert.equal(existsSync(notification.event_path), false);
-    } finally {
-      await session.stop();
-    }
-  });
-
-  it("allows repeated cursors and rejects stale or future commits", async () => {
-    const session = await startSession();
-    try {
-      const id = randomUUID();
-      await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(id));
-      await session.waitStream(event => event.type === "submit" && event.id === id);
-      const acknowledged = await command(["commit", session.folder, "--through", "1"]);
-      assert.deepEqual(acknowledged.events, [id]);
-      assert.equal(acknowledged.page_event, 0);
-      const repeatedAcknowledgement = await command(["commit", session.folder, "--through", "1"]);
-      assert.equal(repeatedAcknowledgement.ok, true);
-      assert.deepEqual(repeatedAcknowledgement.events, []);
-
-      const firstScript = "document.body.dataset.retry = 'first';";
-      const first = await command(["commit", session.folder, "--through", "1", "--script", "-"], firstScript);
-      const second = await command(["commit", session.folder, "--through", "1", "--script", "-"], firstScript);
-      assert.equal(first.run_ui.event_number, 2);
-      assert.equal(second.run_ui.event_number, 3);
-      assert.notDeepEqual(second, first);
-      const different = await command(["commit", session.folder, "--through", "1", "--script", "-"], "document.body.dataset.retry = 'different';");
-      assert.equal(different.run_ui.event_number, 4);
-      await session.waitStream(event => event.type === "run_ui" && event.event_number === 4);
-      assert.deepEqual(session.stream.filter(event => event.type === "run_ui").map(event => event.event_number), [2, 3, 4]);
-
-      const stale = await runCommand(["commit", session.folder, "--through", "0"]);
-      assert.equal(stale.code, 1);
-      assert.match(stale.stdout, /before the acknowledged submission frontier/);
-      const beyond = await runCommand(["commit", session.folder, "--through", "5"]);
-      assert.equal(beyond.code, 1);
-      assert.match(beyond.stdout, /beyond the current event frontier/);
-
-      const noScriptRetry = await command(["commit", session.folder, "--through", "1"]);
-      assert.equal(noScriptRetry.ok, true);
-      assert.equal(noScriptRetry.run_ui, undefined);
-      assert.deepEqual(noScriptRetry.events, []);
-    } finally {
-      await session.stop();
-    }
-  });
-
-  it("keeps script text containing a closing tag inside escaped history JSON", async () => {
-    const session = await startSession();
-    try {
-      const script = "const html = '</ScRiPt><img src=x>';";
-      await command(["commit", session.folder, "--through", "0", "--script", "-"], script);
-      const page = decodeBody(await session.request("GET", "/"));
-      assert.match(page, /\\u003c\/ScRiPt>/);
-      assert.equal(historyFrom(page)[0].script, script);
-      assert.equal(historyFrom(page)[0].considered_through, 0);
-    } finally {
-      await session.stop();
-    }
-  });
-
-  it("leaves a failed oversized script commit retryable", async () => {
-    const filler = "a".repeat(MAX_BODY_BYTES - 4_000);
-    const session = await startSession({ index: `<!doctype html><html><body>${filler}</body></html>` });
-    try {
-      const id = randomUUID();
-      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(id))).status, 202);
-      await session.waitStream(event => event.type === "submit" && event.id === id);
-      const oversized = await runCommand(["commit", session.folder, "--through", "1", "--script", "-"], "x".repeat(5_000));
-      assert.equal(oversized.code, 1);
-      assert.match(oversized.stdout, /page with replay history is too large/);
-      assert.equal(session.scripts.length, 0);
-
-      const script = "document.body.dataset.retry = 'ok';";
-      const committed = await command(["commit", session.folder, "--through", "1", "--script", "-"], script);
-      assert.deepEqual(committed.events, [id]);
-      assert.deepEqual(committed.run_ui, { event_number: 2, considered_through: 1 });
-      assert.equal(committed.page_event, 2);
-      assert.deepEqual(session.scripts, [{ type: "run_ui", event_number: 2, considered_through: 1, script }]);
-      assert.deepEqual(historyFrom(decodeBody(await session.request("GET", "/"))), session.scripts);
-    } finally {
-      await session.stop();
-    }
-  });
-
-  it("serves static paths securely", async () => {
-    const session = await startSession();
-    const outside = mkdtempSync(join(tmpdir(), "letmeknow-outside-"));
-    try {
-      writeFileSync(join(session.folder, "public.txt"), "public");
-      writeFileSync(join(outside, "secret.txt"), "secret");
-      symlinkSync(join(outside, "secret.txt"), join(session.folder, "escape.txt"));
-      const publicFile = await session.request("GET", "/public.txt");
-      const escape = await session.request("GET", "/escape.txt");
-      const privateFile = await session.request("GET", "/.env");
-      assert.equal(publicFile.status, 200);
-      assert.equal(decodeBody(publicFile), "public");
-      assert.equal(escape.status, 403);
-      assert.equal(privateFile.status, 403);
-    } finally {
-      rmSync(outside, { recursive: true, force: true });
-      await session.stop();
-    }
-  });
-
-  it("accepts independent submissions and numbers them globally", async () => {
-    const session = await startSession();
-    try {
-      const invalid = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission("not-a-uuid"));
-      assert.equal(invalid.status, 400);
-      const ids = Array.from({ length: 3 }, () => randomUUID());
-      const submissions = await Promise.all(ids.map(id => session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(id))));
-      assert.deepEqual(submissions.map(result => result.status), Array(3).fill(202));
-      const duplicate = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(ids[0]));
-      assert.equal(duplicate.status, 202);
-      assert.equal(session.stream.filter(event => event.type === "submit" && event.id === ids[0]).length, 1);
-      const events = await Promise.all(ids.map(id => session.waitStream(event => event.type === "submit" && event.id === id)));
-      assert.deepEqual(events.map(event => event.event_number).sort((a, b) => a - b), [1, 2, 3]);
-      assert.deepEqual(new Set(events.map(event => event.id)), new Set(ids));
-    } finally {
-      await session.stop();
-    }
-  });
-
-  it("rejects malformed submissions without creating events", async () => {
-    const session = await startSession();
-    try {
-      for (const body of [Buffer.from("not json"), Buffer.from(JSON.stringify({ id: randomUUID() }))]) {
-        assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, body)).status, 400);
-      }
-      assert.equal(session.stream.filter(event => event.type === "submit").length, 0);
-      const committed = await command(["commit", session.folder, "--through", "0"]);
-      assert.deepEqual(committed.events, []);
-      assert.equal(committed.frontier, 0);
-    } finally {
-      const sessionPath = session.ready.session_path;
-      await session.stop();
-      assert.equal(existsSync(sessionPath), false);
-    }
-  });
-
-  it("rejects oversized initial pages and scripts", async () => {
-    const folder = mkdtempSync(join(tmpdir(), "letmeknow-large-"));
-    writeFileSync(join(folder, "index.html"), Buffer.alloc(MAX_BODY_BYTES + 1, 97));
-    const result = await runCommand(["serve", folder]);
-    assert.equal(result.code, 1);
-    assert.match(result.stderr, /index.html is too large/);
-    rmSync(folder, { recursive: true, force: true });
-
-    const replayableFolder = mkdtempSync(join(tmpdir(), "letmeknow-replayable-large-"));
-    const replayableIndex = `<!doctype html><html><body>${"a".repeat(MAX_BODY_BYTES - 50)}</body></html>`;
-    assert.ok(Buffer.byteLength(replayableIndex) <= MAX_BODY_BYTES);
-    writeFileSync(join(replayableFolder, "index.html"), replayableIndex);
-    const replayable = await runCommand(["serve", replayableFolder]);
-    assert.equal(replayable.code, 1);
-    assert.match(replayable.stderr, /page with replay history is too large/);
-    rmSync(replayableFolder, { recursive: true, force: true });
-
-    const scriptFolder = mkdtempSync(join(tmpdir(), "letmeknow-large-script-"));
-    writeFileSync(join(scriptFolder, "index.html"), "<!doctype html><html><body></body></html>");
-    const script = join(scriptFolder, "large.js");
-    writeFileSync(script, "x");
-    truncateSync(script, MAX_BODY_BYTES + 1);
-    try {
-      const oversized = await runCommand(["commit", scriptFolder, "--through", "0", "--script", script]);
-      assert.equal(oversized.code, 1);
-      assert.match(oversized.stderr, /script is too large/);
-    } finally {
-      rmSync(scriptFolder, { recursive: true, force: true });
     }
   });
 });

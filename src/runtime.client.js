@@ -121,7 +121,7 @@
   }
 
   function flushOutbox() {
-    if (terminal || !producerConnected) return Promise.resolve();
+    if (terminal) return Promise.resolve();
     if (outboxFlushPromise) {
       outboxFlushAgain = true;
       return outboxFlushPromise;

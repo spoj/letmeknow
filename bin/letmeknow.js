@@ -1,20 +1,19 @@
 #!/usr/bin/env node
 
-import { constants, existsSync, readFileSync, statSync, writeSync } from "node:fs";
-import { chmod, mkdir, open, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { createReadStream, existsSync, readFileSync, readdirSync, writeSync } from "node:fs";
+import { chmod, mkdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import net from "node:net";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { parseArgs } from "node:util";
-import { parse, serialize } from "parse5";
 import { lookup } from "mrmime";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_SCRIPT_BYTES = MAX_BODY_BYTES;
-const MAX_PACKET_BYTES = 6 * MAX_SCRIPT_BYTES + 4096;
 const MAX_UNIQUE_SUBMISSIONS = 100_000;
 const MAX_RETAINED_SUBMISSION_BYTES = 256 * 1024 * 1024;
+const MAX_PACKET_BYTES = 6 * MAX_BODY_BYTES + 4096;
 const CONTROL_MAX_BYTES = MAX_PACKET_BYTES;
 const RECONNECT_RETRY_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
@@ -26,6 +25,7 @@ const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const privateNames = new Set([".env", ".git", ".ssh", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]);
 const privateFilePattern = /^\.env\.|\.(?:key|pem|p12|ppk|p8|sqlite|sqlite3|db|db3)$|-(?:wal|shm|journal)$/i;
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const hashPattern = /^[0-9a-f]{64}$/;
 
 function getMimeType(filename) {
   const type = lookup(filename);
@@ -35,228 +35,55 @@ function getMimeType(filename) {
     : type;
 }
 
-function header(packet, name) {
-  const entry = Object.entries(packet.headers || {}).find(([key]) => key.toLowerCase() === name);
-  return typeof entry?.[1] === "string" && entry[1] !== "" ? entry[1] : null;
-}
-
-function response(packet, status, body = Buffer.alloc(0), headers = {}) {
-  if (body.byteLength > MAX_BODY_BYTES) return response(packet, 413, Buffer.from("response body is too large"), { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
-  const outputHeaders = { "Cache-Control": "no-store", ...headers };
-  if (!Object.keys(outputHeaders).some(name => name.toLowerCase() === "content-length")) outputHeaders["Content-Length"] = String(body.byteLength);
-  const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
-  return { type: "http_response", request_id: packet.request_id, status, headers: outputHeaders, body: method === "HEAD" ? "" : body.toString("base64") };
-}
-
-function errorResponse(packet, status, message) {
-  return response(packet, status, Buffer.from(message), { "Content-Type": "text/plain; charset=utf-8" });
-}
-
-function persistenceError(cause) {
-  return Object.assign(new Error("could not persist submission"), { status: 503, cause });
-}
-
 function deniedPath(pathname) {
   return pathname.split("/").filter(Boolean).some(part => privateNames.has(part) || privateFilePattern.test(part));
 }
 
-function inside(root, target) {
-  const path = relative(root, target);
-  return path === "" || (path !== ".." && !path.startsWith(".." + sep));
+function safeWorkspacePath(pathname) {
+  return pathname && !pathname.startsWith("/") && !pathname.includes("\\") && !pathname.includes("\0") && !deniedPath(pathname) && pathname.split("/").every(part => part !== "" && part !== "." && part !== "..");
 }
 
-async function safeRealpath(root, candidate) {
-  try {
-    const target = await realpath(candidate);
-    return inside(root, target) ? target : null;
-  } catch (cause) {
-    if (cause?.code === "EACCES" || cause?.code === "EPERM") return null;
-    if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") {
-      try {
-        const parent = await realpath(dirname(candidate));
-        if (!inside(root, parent)) return null;
-      } catch {}
-      return undefined;
+async function hashFile(filename) {
+  const digest = createHash("sha256");
+  let size = 0;
+  for await (const chunk of createReadStream(filename)) {
+    size += chunk.byteLength;
+    digest.update(chunk);
+  }
+  return { hash: digest.digest("hex"), size };
+}
+
+async function scanWorkspace(root) {
+  const files = {};
+  const paths = new Map();
+  let index;
+  const visit = async (directory, prefix) => {
+    const entries = readdirSync(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const pathname = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (!safeWorkspacePath(pathname)) {
+        if (entry.isDirectory() && deniedPath(pathname)) continue;
+        if (entry.name === "." || entry.name === "..") continue;
+        throw new Error(`invalid workspace path: ${pathname}`);
+      }
+      const filename = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await visit(filename, pathname);
+        continue;
+      }
+      if (!entry.isFile()) throw new Error(`workspace file is not regular: ${pathname}`);
+      const infoBefore = await stat(filename);
+      const file = { ...(await hashFile(filename)), content_type: getMimeType(pathname) };
+      const infoAfter = await stat(filename);
+      if (infoAfter.size !== infoBefore.size || file.size !== infoAfter.size) throw new Error(`workspace file changed while being read: ${pathname}`);
+      paths.set(file.hash, { filename, size: file.size });
+      if (pathname === "index.html") index = { ...file, filename };
+      else files[pathname] = { hash: file.hash, size: file.size, content_type: file.content_type };
     }
-    throw cause;
-  }
-}
-
-function requestUrl(packet) {
-  if (typeof packet.path !== "string" || !packet.path.startsWith("/")) throw new Error("invalid request path");
-  const url = new URL(packet.path, "http://letmeknow.local");
-  if (url.origin !== "http://letmeknow.local") throw new Error("invalid request path");
-  let pathname;
-  try { pathname = decodeURIComponent(url.pathname); } catch { throw new Error("invalid request path"); }
-  if (pathname.includes("\0") || pathname.includes("\\")) throw new Error("invalid request path");
-  return { pathname, encodedPathname: url.pathname, search: url.search };
-}
-
-async function staticResponse(root, packet, page) {
-  const published = (status, body = Buffer.alloc(0), headers = {}) => response(packet, status, body, headers);
-  const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
-  if (method !== "GET" && method !== "HEAD") return errorResponse(packet, 405, "method not allowed");
-  let request;
-  try { request = requestUrl(packet); } catch { return errorResponse(packet, 400, "bad request"); }
-  if (request.pathname === "/" || request.pathname === "/index.html") {
-    return published(200, Buffer.from(page), { "Content-Type": "text/html; charset=utf-8" });
-  }
-  if (deniedPath(request.pathname)) return errorResponse(packet, 403, "forbidden");
-  const candidate = resolve(root, "." + request.pathname);
-  if (!inside(root, candidate)) return errorResponse(packet, 403, "forbidden");
-  let target;
-  try { target = await safeRealpath(root, candidate); } catch { return errorResponse(packet, 500, "preview request failed"); }
-  if (target === null) return errorResponse(packet, 403, "forbidden");
-  if (target === undefined) return errorResponse(packet, 404, "not found");
-  if (deniedPath("/" + relative(root, target).split(sep).join("/"))) return errorResponse(packet, 403, "forbidden");
-  let info;
-  try { info = await stat(target); } catch (cause) {
-    if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");
-    if (cause?.code === "EACCES" || cause?.code === "EPERM") return errorResponse(packet, 403, "forbidden");
-    return errorResponse(packet, 500, "preview request failed");
-  }
-  if (info.isDirectory()) {
-    if (!request.encodedPathname.endsWith("/")) {
-      const location = request.encodedPathname.slice(request.encodedPathname.lastIndexOf("/") + 1) + "/" + request.search;
-      return published(301, Buffer.from(`Redirecting to ${location}`), { Location: location, "Content-Type": "text/plain; charset=utf-8" });
-    }
-    const index = resolve(target, "index.html");
-    try { target = await realpath(index); } catch (cause) {
-      if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");
-      return errorResponse(packet, 500, "preview request failed");
-    }
-    if (!inside(root, target)) return errorResponse(packet, 403, "forbidden");
-    if (deniedPath("/" + relative(root, target).split(sep).join("/"))) return errorResponse(packet, 403, "forbidden");
-    try { info = await stat(target); } catch (cause) {
-      if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");
-      if (cause?.code === "EACCES" || cause?.code === "EPERM") return errorResponse(packet, 403, "forbidden");
-      return errorResponse(packet, 500, "preview request failed");
-    }
-  } else if (request.pathname.endsWith("/")) return errorResponse(packet, 404, "not found");
-  let file;
-  try { file = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW); } catch (cause) {
-    if (cause?.code === "ENOENT" || cause?.code === "ENOTDIR") return errorResponse(packet, 404, "not found");
-    if (cause?.code === "EACCES" || cause?.code === "EPERM" || cause?.code === "ELOOP") return errorResponse(packet, 403, "forbidden");
-    return errorResponse(packet, 500, "preview request failed");
-  }
-  try {
-    info = await file.stat();
-    if (!info.isFile()) return errorResponse(packet, 404, "not found");
-    if (info.size > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
-    const body = await file.readFile();
-    if (body.byteLength > MAX_BODY_BYTES) return errorResponse(packet, 413, "response body is too large");
-    return published(200, body, { "Content-Type": getMimeType(target) });
-  } catch {
-    return errorResponse(packet, 500, "preview request failed");
-  } finally {
-    await file.close();
-  }
-}
-
-async function readInitialPage(root) {
-  const candidate = join(root, "index.html");
-  const target = await safeRealpath(root, candidate);
-  if (target === null || target === undefined || deniedPath("/" + relative(root, target).split(sep).join("/"))) throw new Error("index.html is required");
-  const info = await stat(target);
-  if (!info.isFile()) throw new Error("index.html must be a file");
-  if (info.size > MAX_BODY_BYTES) throw new Error("index.html is too large");
-  return (await readFile(target)).toString("utf8");
-}
-
-function bodyElement(node) {
-  if (node.nodeName === "body") return node;
-  for (const child of node.childNodes || []) {
-    const body = bodyElement(child);
-    if (body) return body;
-  }
-}
-
-function replayablePage(page, history) {
-  const document = parse(page);
-  const body = bodyElement(document);
-  const value = JSON.stringify(history).replace(/<\/script/gi, match => "\\u003c" + match.slice(1));
-  const script = {
-    nodeName: "script",
-    tagName: "script",
-    attrs: [
-      { name: "type", value: "application/json" },
-      { name: "data-letmeknow-history", value: "" }
-    ],
-    namespaceURI: body.namespaceURI,
-    childNodes: [{ nodeName: "#text", value }]
   };
-  script.childNodes[0].parentNode = script;
-  script.parentNode = body;
-  body.childNodes.push(script);
-  const result = serialize(document);
-  if (Buffer.byteLength(result, "utf8") > MAX_BODY_BYTES) throw new Error("page with replay history is too large");
-  return result;
-}
-
-function validateScript(script) {
-  if (script !== undefined && typeof script !== "string") throw new Error("script must be text");
-  if (script !== undefined && Buffer.byteLength(script, "utf8") > MAX_SCRIPT_BYTES) throw new Error("script is too large");
-  return script;
-}
-
-async function readScriptInput(filename) {
-  if (filename === "-") {
-    const chunks = [];
-    let length = 0;
-    for await (const chunk of process.stdin) {
-      const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      length += value.byteLength;
-      if (length > MAX_SCRIPT_BYTES) throw new Error("script is too large");
-      chunks.push(value);
-    }
-    return Buffer.concat(chunks).toString("utf8");
-  }
-  const file = resolve(filename);
-  const info = await stat(file);
-  if (!info.isFile()) throw new Error("script file must be a regular file");
-  if (info.size > MAX_SCRIPT_BYTES) throw new Error("script is too large");
-  const source = await readFile(file);
-  if (source.byteLength > MAX_SCRIPT_BYTES) throw new Error("script is too large");
-  return source.toString("utf8");
-}
-
-async function submission(packet, recordInteraction) {
-  const request = requestUrl(packet);
-  const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
-  if (method !== "POST" || request.pathname !== "/_letmeknow/submit") throw new Error("invalid submission endpoint");
-  const contentType = header(packet, "content-type")?.split(";", 1)[0].trim().toLowerCase();
-  if (contentType !== "application/json") throw new Error("JSON submission is required");
-  const body = Buffer.from(typeof packet.body === "string" ? packet.body : "", "base64");
-  if (body.byteLength > MAX_BODY_BYTES) throw new Error("submission is too large");
-  let value;
-  try { value = JSON.parse(body.toString("utf8")); } catch { throw new Error("invalid submission JSON"); }
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("submission must be an object");
-  if (typeof value.id !== "string" || !uuidPattern.test(value.id)) throw new Error("submission id must be a UUID");
-  if (!Number.isSafeInteger(value.page_event) || value.page_event < 0) throw new Error("page_event must be a non-negative integer");
-  if (value.form_id !== null && typeof value.form_id !== "string") throw new Error("form_id must be text or null");
-  if (typeof value.action !== "string") throw new Error("action is required");
-  if (value.trigger !== null && (typeof value.trigger !== "object" || Array.isArray(value.trigger))) throw new Error("trigger must be an object or null");
-  if (!value.values || typeof value.values !== "object" || Array.isArray(value.values)) throw new Error("values are required");
-  await recordInteraction({ type: "submit", id: value.id, page_event: value.page_event, form_id: value.form_id, action: value.action, trigger: value.trigger, values: value.values }, body.byteLength);
-  return response(packet, 202);
-}
-
-async function handleRequest(root, page, packet, recordInteraction) {
-  let request;
-  try { request = requestUrl(packet); } catch { return errorResponse(packet, 400, "bad request"); }
-  if (request.pathname === "/_letmeknow/submit") {
-    try { return await submission(packet, recordInteraction); } catch (cause) {
-      const status = cause?.status || (cause?.message === "submission is too large" ? 413 : 400);
-      return errorResponse(packet, status, cause instanceof Error ? cause.message : "invalid submission");
-    }
-  }
-  return staticResponse(root, packet, page);
-}
-
-function options(directory) {
-  const root = resolve(directory);
-  if (!existsSync(root) || !statSync(root).isDirectory()) throw new Error(`directory does not exist: ${root}`);
-  return realpath(root).then(root => ({ root }));
+  await visit(root, "");
+  if (!index) throw new Error("index.html is required");
+  return { index, files, paths };
 }
 
 function controlPath(root) {
@@ -294,7 +121,6 @@ function mutateQueue() {
 }
 
 function connectControl(root, packet) {
-  const timeout = CONTROL_TIMEOUT;
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(controlPath(root));
     let output = "";
@@ -302,7 +128,7 @@ function connectControl(root, packet) {
     const timer = setTimeout(() => {
       socket.destroy();
       reject(new Error("control request timed out"));
-    }, timeout);
+    }, CONTROL_TIMEOUT);
     const finish = (cause, value) => {
       if (settled) return;
       settled = true;
@@ -324,60 +150,56 @@ function connectControl(root, packet) {
   });
 }
 
-function pageHash(page) {
-  return createHash("sha256").update(page).digest("hex");
-}
-
 async function start(directory) {
-  const { root } = await options(directory);
-  const basePage = await readInitialPage(root);
-  let history = [];
-  let page = replayablePage(basePage, history);
-  let pageEvent = 0;
-  let eventNumber = 0;
-  const currentPageHash = () => pageHash(page);
+  const root = await realpath(resolve(directory));
   const sessionDirectory = join(tmpdir(), `letmeknow-${randomUUID()}`);
   const eventsDirectory = join(sessionDirectory, "events");
-  try { await mkdir(eventsDirectory, { recursive: true, mode: 0o700 }); }
-  catch (cause) { await rm(sessionDirectory, { recursive: true, force: true }).catch(() => {}); throw cause; }
-  const browserEvents = [];
-  let retainedSubmissionBytes = 0;
-  let acknowledgedThrough = 0;
-  const seenEvents = new Set();
-  const mutate = mutateQueue();
+  await mkdir(eventsDirectory, { recursive: true, mode: 0o700 });
+  const socketPath = controlPath(root);
+  await removeStaleControlSocket(socketPath);
+
   let controlServer;
-  let send = () => false;
   let socket;
   let credential;
+  let resolveCredential;
+  const credentialReady = new Promise(resolve => { resolveCredential = resolve; });
   let sessionUrl;
+  let resolveProvision;
+  const provisionReady = new Promise(resolve => { resolveProvision = resolve; });
+  let ready = false;
+  let stopped = false;
   let retryTimer;
   let connectionTimer;
   let retryDelay = 100;
   let retryUntil = 0;
-  let stopped = false;
-  let ready = false;
-  let stopSession = () => {};
-  let stop = async () => {};
   let streamFailure;
   let streamWrite = Promise.resolve();
   const streamBeforeReady = [];
+  const mutate = mutateQueue();
+  const pending = new Map();
+  const receivedEvents = new Map();
+  const eventFiles = new Map();
+  let receivedThrough = 0;
+  let retainedSubmissionBytes = 0;
+  let submissionCount = 0;
+  let publication = Promise.resolve();
+  let stop = async () => {};
 
   const writeStream = value => {
     if (!ready) {
       streamBeforeReady.push(value);
       return Promise.resolve();
     }
-    const pending = streamWrite.then(() => {
+    const pendingWrite = streamWrite.then(() => {
       if (streamFailure) throw streamFailure;
-      return new Promise((resolve, reject) => {
-        try {
-          process.stdout.write(`${JSON.stringify(value)}\n`, cause => cause ? reject(cause) : resolve());
-        } catch (cause) { reject(cause); }
+      return new Promise((resolveWrite, rejectWrite) => {
+        try { process.stdout.write(`${JSON.stringify(value)}\n`, cause => cause ? rejectWrite(cause) : resolveWrite()); }
+        catch (cause) { rejectWrite(cause); }
       });
     });
-    streamWrite = pending.then(undefined, cause => { streamFailure ??= cause; throw cause; });
+    streamWrite = pendingWrite.then(undefined, cause => { streamFailure ??= cause; throw cause; });
     streamWrite.catch(() => {});
-    return pending;
+    return pendingWrite;
   };
 
   process.stdout.once("error", cause => {
@@ -385,61 +207,136 @@ async function start(directory) {
     void stop(1);
   });
 
-  const commit = async (through, requestedScript) => {
-    validateScript(requestedScript);
-    if (!Number.isSafeInteger(through) || through < 0) return { ok: false, error: "through must be a non-negative safe integer" };
-    if (through > eventNumber) return { ok: false, error: "through is beyond the current event frontier" };
-    if (through < acknowledgedThrough) return { ok: false, error: "through is before the acknowledged submission frontier" };
+  const sendPacket = packet => {
+    if (!socket || socket.readyState !== WebSocket.OPEN || stopped) return false;
+    try { socket.send(JSON.stringify(packet)); return true; } catch { return false; }
+  };
 
-    let committedCount = 0;
-    while (committedCount < browserEvents.length && browserEvents[committedCount].event_number <= through) committedCount += 1;
-    const committedRecords = browserEvents.slice(0, committedCount);
-    const committedEvents = committedRecords.map(event => event.id);
-    let runEvent;
-    let nextPage = page;
-    if (requestedScript !== undefined) {
-      runEvent = { type: "run_ui", event_number: eventNumber + 1, considered_through: through, script: requestedScript };
-      nextPage = replayablePage(basePage, [...history, runEvent]);
-    }
+  const request = (packet, expected) => {
+    const id = packet.id || packet.request_id || randomUUID();
+    packet = { ...packet, id };
+    return new Promise((resolveRequest, rejectRequest) => {
+      pending.set(id, { expected, resolve: resolveRequest, reject: rejectRequest });
+      if (!sendPacket(packet)) {
+        pending.delete(id);
+        rejectRequest(new Error("producer is not connected"));
+      }
+    });
+  };
 
-    await Promise.all(committedRecords.map(event => unlink(event.event_path).catch(cause => {
-      if (cause?.code !== "ENOENT") throw cause;
-    })));
-    if (runEvent) await writeStream({ type: "run_ui", event_number: runEvent.event_number, considered_through: through, frontier: runEvent.event_number, page_event: runEvent.event_number, page_hash: pageHash(nextPage) });
-    retainedSubmissionBytes -= committedRecords.reduce((total, event) => total + event.bytes, 0);
-    browserEvents.splice(0, committedCount);
-    if (runEvent) {
-      eventNumber = runEvent.event_number;
-      pageEvent = runEvent.event_number;
-      history.push(runEvent);
+  const rejectPending = cause => {
+    for (const { reject } of pending.values()) reject(cause);
+    pending.clear();
+  };
+
+  const eventIdentity = event => createHash("sha256").update(JSON.stringify(event)).digest("hex");
+
+  const publish = event => {
+    const next = publication.then(async () => {
+      if (event.type === "submit") {
+        await writeStream({ type: "submit", event_number: event.event_number, id: event.id, event_path: event.event_path });
+      } else {
+        await writeStream({ type: "run_ui", event_number: event.event_number, considered_through: event.considered_through, frontier: event.frontier, page_event: event.page_event, page_hash: event.page_hash });
+      }
+    });
+    publication = next;
+    next.catch(() => { void stop(1); });
+    return next;
+  };
+
+  const persistEvent = async event => {
+    if (!Number.isSafeInteger(event.event_number) || event.event_number < 1) throw new Error("event sequence is invalid");
+    const identity = eventIdentity(event);
+    const known = receivedEvents.get(event.event_number);
+    if (known !== undefined) {
+      if (known !== identity) throw new Error("event number was reused");
+      sendPacket({ type: "event_ack", event_number: event.event_number });
+      return;
     }
-    page = nextPage;
-    acknowledgedThrough = through;
-    const result = {
-      ok: true,
-      type: "committed",
+    if (event.event_number !== receivedThrough + 1) throw new Error("event sequence is invalid");
+    let eventPath;
+    let bytes = 0;
+    if (event.type === "submit") {
+      const serialized = JSON.stringify(event);
+      bytes = Buffer.byteLength(serialized);
+      if (submissionCount >= MAX_UNIQUE_SUBMISSIONS || retainedSubmissionBytes + bytes > MAX_RETAINED_SUBMISSION_BYTES) throw new Error("local event storage limit exceeded");
+      eventPath = join(eventsDirectory, `${String(event.event_number).padStart(12, "0")}.json`);
+      const temporaryPath = `${eventPath}.tmp-${randomUUID()}`;
+      try {
+        await writeFile(temporaryPath, serialized, { mode: 0o600 });
+        await rename(temporaryPath, eventPath);
+      } catch (cause) {
+        await unlink(temporaryPath).catch(() => {});
+        throw cause;
+      }
+      event = { ...event, event_path: eventPath };
+      retainedSubmissionBytes += bytes;
+      submissionCount += 1;
+    } else if (event.type !== "run_ui") {
+      throw new Error("invalid event type");
+    }
+    const published = publish(event);
+    receivedEvents.set(event.event_number, identity);
+    receivedThrough = event.event_number;
+    if (event.type === "submit") eventFiles.set(event.id, { event_number: event.event_number, event_path: eventPath, bytes, published });
+    sendPacket({ type: "event_ack", event_number: event.event_number });
+  };
+
+  const cleanupEvents = async ids => {
+    if (!Array.isArray(ids)) return;
+    for (const id of ids) {
+      const record = eventFiles.get(id);
+      if (!record) continue;
+      try {
+        await record.published;
+        await unlink(record.event_path).catch(cause => { if (cause?.code !== "ENOENT") throw cause; });
+        eventFiles.delete(id);
+        retainedSubmissionBytes -= record.bytes;
+        submissionCount -= 1;
+      } catch (cause) {
+        process.stderr.write(`letmeknow: could not remove event file ${record.event_path}: ${cause instanceof Error ? cause.message : "cleanup failed"}\n`);
+      }
+    }
+  };
+
+  const scanAndUpload = async snapshot => {
+    const hashes = Object.values(snapshot.files).map(file => ({ hash: file.hash, size: file.size }));
+    const result = await request({ type: "workspace_manifest", hashes, index: { hash: snapshot.index.hash, size: snapshot.index.size } }, "workspace_manifest");
+    for (const item of result.missing) {
+      const file = snapshot.paths.get(item.hash);
+      if (!file || file.size !== item.size) throw new Error("workspace snapshot is inconsistent");
+      const uploadUrl = new URL(`_letmeknow/workspace/${item.hash}`, sessionUrl);
+      const response = await fetch(uploadUrl, { method: "PUT", headers: { Authorization: `Bearer ${credential}`, "Content-Length": String(file.size) }, body: createReadStream(file.filename), duplex: "half" });
+      if (!response.ok) throw new Error(`workspace upload failed: ${response.status}`);
+    }
+  };
+
+  const commitWorkspace = async (through, script) => {
+    if (!ready || !socket || socket.readyState !== WebSocket.OPEN) throw new Error("serve is not connected");
+    const snapshot = await scanWorkspace(root);
+    await scanAndUpload(snapshot);
+    const packet = {
+      type: "commit",
+      request_id: randomUUID(),
       through,
-      considered_through: through,
-      frontier: eventNumber,
-      page_event: pageEvent,
-      page_hash: currentPageHash(),
-      events: committedEvents,
-      ...(runEvent ? { run_ui: { event_number: runEvent.event_number, considered_through: through } } : {})
+      index_hash: snapshot.index.hash,
+      index_size: snapshot.index.size,
+      manifest: { files: snapshot.files },
+      ...(script === undefined ? {} : { script })
     };
-    if (runEvent) send(runEvent);
+    const result = await request(packet, "committed");
+    await cleanupEvents(result.events);
     return result;
   };
 
-  const dispatchControl = async request => {
-    if (!request || typeof request !== "object") return { ok: false, error: "invalid control request" };
-    if (request.type !== "commit") return { ok: false, error: "unknown control request" };
-    if (!ready) return { ok: false, error: "serve is not ready" };
-    return commit(request.through, request.script);
+  const dispatchControl = requestPacket => {
+    if (!requestPacket || typeof requestPacket !== "object" || requestPacket.type !== "commit") return { ok: false, error: "unknown control request" };
+    if (!Number.isSafeInteger(requestPacket.through) || requestPacket.through < 0) return { ok: false, error: "through must be a non-negative safe integer" };
+    if (requestPacket.script !== undefined && (typeof requestPacket.script !== "string" || Buffer.byteLength(requestPacket.script, "utf8") > MAX_SCRIPT_BYTES)) return { ok: false, error: "script is too large" };
+    return commitWorkspace(requestPacket.through, requestPacket.script);
   };
 
-  const controlConnections = new Set();
   controlServer = net.createServer(connection => {
-    controlConnections.add(connection);
     connection.setEncoding("utf8");
     let input = "";
     let handled = false;
@@ -455,73 +352,91 @@ async function start(directory) {
       if (newline < 0) return;
       handled = true;
       let result;
-      try {
-        const request = JSON.parse(input.slice(0, newline));
-        result = await mutate(() => dispatchControl(request));
-      } catch (cause) { result = { ok: false, error: cause instanceof Error ? cause.message : "control request failed" }; }
-      connection.end(JSON.stringify(result) + "\n");
+      try { result = await mutate(() => dispatchControl(JSON.parse(input.slice(0, newline)))); }
+      catch (cause) { result = { ok: false, error: cause instanceof Error ? cause.message : "control request failed" }; }
+      connection.end(JSON.stringify(await result) + "\n");
     });
-    connection.on("close", () => controlConnections.delete(connection));
-    connection.on("error", () => controlConnections.delete(connection));
   });
-  const controlSocket = controlPath(root);
-  await removeStaleControlSocket(controlSocket);
-  await new Promise((resolveListen, reject) => {
-    controlServer.once("error", reject);
-    controlServer.listen(controlSocket, async () => {
-      try { await chmod(controlSocket, 0o600); } catch (cause) { controlServer.close(() => reject(cause)); return; }
-      controlServer.off("error", reject);
+
+  let controlListening = false;
+  await new Promise((resolveListen, rejectListen) => {
+    controlServer.once("error", rejectListen);
+    controlServer.listen(socketPath, async () => {
+      controlListening = true;
+      try { await chmod(socketPath, 0o600); } catch (cause) { controlServer.close(() => rejectListen(cause)); return; }
+      controlServer.off("error", rejectListen);
       resolveListen();
     });
   }).catch(async cause => {
-    await unlink(controlSocket).catch(() => {});
+    if (controlListening) await unlink(socketPath).catch(() => {});
     await rm(sessionDirectory, { recursive: true, force: true }).catch(() => {});
     throw new Error(`cannot start local control channel: ${cause.message}`);
   });
 
-  const recordInteraction = (event, bytes) => mutate(async () => {
-    if (seenEvents.has(event.id)) return;
-    if (seenEvents.size >= MAX_UNIQUE_SUBMISSIONS || retainedSubmissionBytes + bytes > MAX_RETAINED_SUBMISSION_BYTES) {
-      stopSession();
-      throw new Error("session submission limit exceeded");
+  const initialize = async () => {
+    await credentialReady;
+    await provisionReady;
+    const snapshot = await scanWorkspace(root);
+    await scanAndUpload(snapshot);
+    const session = await request({ type: "open", index_hash: snapshot.index.hash, index_size: snapshot.index.size, manifest: { files: snapshot.files } }, "session");
+    if (!session.url) throw new Error("session URL is missing");
+  };
+
+  const handlePacket = packet => {
+    if (typeof packet.id === "string" && pending.has(packet.id)) {
+      const waiter = pending.get(packet.id);
+      if (packet.type === "error") {
+        pending.delete(packet.id);
+        waiter.reject(new Error(packet.message || "producer request failed"));
+        return;
+      }
+      if (packet.type === waiter.expected) {
+        pending.delete(packet.id);
+        waiter.resolve(packet);
+      }
     }
-    const numbered = { ...event, event_number: eventNumber + 1 };
-    const eventPath = join(eventsDirectory, `${String(numbered.event_number).padStart(12, "0")}.json`);
-    const temporaryPath = `${eventPath}.tmp-${randomUUID()}`;
-    try {
-      await writeFile(temporaryPath, JSON.stringify(numbered), { mode: 0o600 });
-      await rename(temporaryPath, eventPath);
-    } catch (cause) {
-      await unlink(temporaryPath).catch(() => {});
-      throw persistenceError(cause);
+    if (packet.type === "credential") {
+      if (typeof packet.credential !== "string" || !credentialPattern.test(packet.credential)) return void stop(1);
+      credential = packet.credential;
+      resolveCredential(packet.credential);
+    } else if (packet.type === "provisioned") {
+      if (!validSessionUrl(packet.url)) return void stop(1);
+      sessionUrl = packet.url;
+      resolveProvision(packet.url);
+    } else if (packet.type === "session") {
+      if (!validSessionUrl(packet.url)) return void stop(1);
+      sessionUrl = packet.url;
+      if (!ready) {
+        ready = true;
+        void writeStream({ type: "ready", url: sessionUrl, session_path: sessionDirectory, frontier: packet.frontier, page_event: packet.page_event, page_hash: packet.page_hash });
+        for (const value of streamBeforeReady) void writeStream(value);
+        streamBeforeReady.length = 0;
+      }
+    } else if (packet.type === "submit" || packet.type === "run_ui") {
+      receiptChain = receiptChain.then(() => persistEvent(packet)).catch(cause => { void stop(1); throw cause; });
+    } else if (packet.type === "closed") {
+      void stop(0);
+    } else if (packet.type === "error" && typeof packet.message === "string") {
+      void stop(1);
     }
-    try {
-      await writeStream({ type: "submit", event_number: numbered.event_number, id: numbered.id, event_path: eventPath });
-    } catch (cause) {
-      await unlink(eventPath).catch(() => {});
-      throw cause;
-    }
-    seenEvents.add(event.id);
-    retainedSubmissionBytes += bytes;
-    eventNumber = numbered.event_number;
-    browserEvents.push({ event_number: numbered.event_number, id: numbered.id, event_path: eventPath, bytes });
-  });
+  };
+
+  let receiptChain = Promise.resolve();
 
   stop = async code => {
     if (stopped) return;
     stopped = true;
     clearTimeout(retryTimer);
     clearTimeout(connectionTimer);
-    send({ type: "close" });
+    rejectPending(new Error("serve stopped"));
     try { socket?.close(); } catch {}
-    for (const connection of controlConnections) connection.destroy();
     await new Promise(resolveClose => controlServer.close(() => resolveClose()));
-    await unlink(controlSocket).catch(() => {});
-    await Promise.race([streamWrite.catch(() => {}), new Promise(resolve => setTimeout(resolve, STREAM_SHUTDOWN_TIMEOUT))]);
+    await unlink(socketPath).catch(() => {});
+    await Promise.race([streamWrite.catch(() => {}), new Promise(resolveTimeout => setTimeout(resolveTimeout, STREAM_SHUTDOWN_TIMEOUT))]);
     await rm(sessionDirectory, { recursive: true, force: true }).catch(() => {});
     process.exit(code);
   };
-  stopSession = () => { void stop(1); };
+
   process.once("SIGINT", () => void stop(0));
   process.once("SIGTERM", () => void stop(0));
 
@@ -545,43 +460,20 @@ async function start(directory) {
       clearTimeout(connectionTimer);
       retryDelay = 100;
       if (reconnecting) retryUntil = 0;
-      send = packet => {
-        if (current.readyState !== WebSocket.OPEN) return false;
-        try { current.send(JSON.stringify(packet)); return true; } catch { return false; }
-      };
-      if (!reconnecting) send({ type: "open" });
+      if (!reconnecting) void initialize().catch(cause => { process.stderr.write(`letmeknow: ${cause.message}\n`); void stop(1); });
     });
     current.addEventListener("message", event => {
       if (typeof event.data !== "string") return;
       let packet;
       try { packet = JSON.parse(event.data); } catch { return; }
-      if (packet.type === "credential") {
-        if (typeof packet.credential !== "string" || !credentialPattern.test(packet.credential)) return void stop(1);
-        credential = packet.credential;
-      } else if (packet.type === "session") {
-        if (!validSessionUrl(packet.url)) return void stop(1);
-        sessionUrl = packet.url;
-        if (!ready) {
-          ready = true;
-          writeStream({ type: "ready", url: sessionUrl, session_path: sessionDirectory, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash() });
-          for (const value of streamBeforeReady) writeStream(value);
-          streamBeforeReady.length = 0;
-        }
-      } else if (packet.type === "http_request") {
-        const requestPage = page;
-        void handleRequest(root, requestPage, packet, recordInteraction).then(result => send(result)).catch(() => send(errorResponse(packet, 500, "preview request failed")));
-      } else if (packet.type === "closed") {
-        void stop(0);
-      } else if (packet.type === "error") {
-        void stop(1);
-      }
+      handlePacket(packet);
     });
     current.addEventListener("error", () => {});
     current.addEventListener("close", () => {
       if (socket !== current || stopped) return;
       clearTimeout(connectionTimer);
-      send = () => false;
       socket = undefined;
+      rejectPending(new Error("producer connection closed"));
       if (!credential || !sessionUrl) return void stop(1);
       if (!retryUntil) retryUntil = Date.now() + RECONNECT_RETRY_SECONDS * 1_000;
       retry();
@@ -612,27 +504,20 @@ function validSessionUrl(value) {
   return url.protocol === "https:" && /^[a-f0-9]{20}\.letmeknow\.dev$/.test(url.hostname) && url.pathname === "/" && !url.search && !url.hash;
 }
 
+function readScriptInput(filename) {
+  if (filename === "-") return readFileSync(0, "utf8");
+  return readFileSync(resolve(filename), "utf8");
+}
+
 function usage() {
-  return "Usage:\n  npx letmeknow-cli serve <directory>\n  npx letmeknow-cli commit <directory> --through <event-number> [--script <file|->]\n";
+  return "Usage:\n  npx letmeknow serve <directory>\n  npx letmeknow commit <directory> --through <event-number> [--script <file|->]\n";
 }
 
 function commandArgs() {
   let parsed;
   try {
-    parsed = parseArgs({
-      args: process.argv.slice(2),
-      options: {
-        skill: { type: "boolean" },
-        help: { type: "boolean", short: "h" },
-        through: { type: "string" },
-        script: { type: "string" }
-      },
-      allowPositionals: true,
-      strict: true
-    });
-  } catch (cause) {
-    throw new Error(cause instanceof Error ? cause.message : "invalid arguments");
-  }
+    parsed = parseArgs({ args: process.argv.slice(2), options: { skill: { type: "boolean" }, help: { type: "boolean", short: "h" }, through: { type: "string" }, script: { type: "string" } }, allowPositionals: true, strict: true });
+  } catch (cause) { throw new Error(cause instanceof Error ? cause.message : "invalid arguments"); }
   if (parsed.values.skill || parsed.values.help) {
     if (parsed.positionals.length || parsed.values.through !== undefined || parsed.values.script !== undefined) throw new Error(usage());
     return { command: parsed.values.skill ? "skill" : "help" };
@@ -651,7 +536,6 @@ function commandArgs() {
   return { command, directory, through, script: parsed.values.script };
 }
 
-
 let command;
 try {
   command = commandArgs();
@@ -659,10 +543,7 @@ try {
   else if (command.command === "help") process.stdout.write(usage());
   else if (command.command === "serve") await start(command.directory);
   else {
-    const { root } = await options(command.directory);
-    const packet = { type: "commit", through: command.through };
-    if (command.script !== undefined) packet.script = await readScriptInput(command.script);
-    const result = await connectControl(root, packet);
+    const result = await connectControl(resolve(command.directory), { type: "commit", through: command.through, ...(command.script === undefined ? {} : { script: readScriptInput(command.script) }) });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     if (!result.ok) process.exitCode = 1;
   }

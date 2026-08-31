@@ -274,10 +274,15 @@ describe("browser runtime", () => {
       await waitFor(() => posts.length === baselinePosts + 1, "submission was not delivered");
       assert.equal(JSON.parse(posts.at(-1).body).page_event, 8);
 
-      await execute("document.querySelector('#message').value = 'in-flight'; document.querySelector('#submit').click();");
-      await waitFor(() => delayedPostResponse !== undefined, "in-flight submission was not received");
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: false }));
       await waitFor(async () => await execute("return document.documentElement.hasAttribute('data-letmeknow-disconnected')"), "disconnect was not reflected");
+      await execute("document.querySelector('#message').value = 'offline'; document.querySelector('#submit').click();");
+      await waitFor(() => posts.length === baselinePosts + 2, "disconnected submission was not delivered to the service");
+      assert.equal(JSON.parse(posts.at(-1).body).values.message, "offline");
+      await waitFor(async () => await execute("return document.querySelector('#status')?.textContent") === "Sent. Waiting for an update…", "disconnected submission was not acknowledged");
+
+      await execute("document.querySelector('#message').value = 'in-flight'; document.querySelector('#submit').click();");
+      await waitFor(() => delayedPostResponse !== undefined, "in-flight submission was not received");
       sockets.at(-1).send(JSON.stringify({ type: "closed", message: "Session closed" }));
       await waitFor(async () => await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent") === "Session closed", "terminal status was not shown");
       delayedPostResponse.writeHead(202);
@@ -287,25 +292,22 @@ describe("browser runtime", () => {
       assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session closed");
       assert.equal(await execute("return document.querySelector('#status')?.textContent"), "Sending…");
 
-      await execute("document.querySelector('#message').value = 'offline'; document.querySelector('#submit').click();");
-      await sleep(100);
-      assert.equal(posts.length, baselinePosts + 2);
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: true }));
       sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 9, considered_through: 8, script: "document.querySelector('#heading').textContent = 'Unexpected';" }));
       await sleep(100);
-      assert.equal(posts.length, baselinePosts + 2);
+      assert.equal(posts.length, baselinePosts + 3);
       assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session closed");
       assert.equal(await execute("return document.querySelector('#heading').textContent"), "Corrected");
       await execute("document.querySelector('#submit').click();");
       await sleep(100);
-      assert.equal(posts.length, baselinePosts + 2);
+      assert.equal(posts.length, baselinePosts + 3);
 
       const beforeTerminalReload = rootRequests;
       await command("POST", "/url", { url: `http://127.0.0.1:${port}/` });
       await waitFor(() => rootRequests > beforeTerminalReload, "fresh runtime did not load after terminal close");
       await waitFor(async () => await execute("return document.querySelector('#heading')?.textContent") === "Corrected", "fresh runtime did not replay history");
       await sleep(200);
-      assert.equal(posts.length, baselinePosts + 2, "terminal outbox submission was delivered after reload");
+      assert.equal(posts.length, baselinePosts + 3, "terminal outbox submission was delivered after reload");
 
       await command("POST", "/url", { url: `http://127.0.0.1:${port}/?idb-failure` });
       await waitFor(() => sockets.length > 2, "IndexedDB retry runtime did not connect");
@@ -313,7 +315,7 @@ describe("browser runtime", () => {
       await sleep(200);
       assert.equal(await execute("return document.querySelector('[data-letmeknow-status]')?.textContent"), "Couldn’t send. Try again.");
       await execute("window.restoreIndexedDB(); document.querySelector('#idb-submit').click();");
-      await waitFor(() => posts.length === baselinePosts + 3, "submission did not retry after IndexedDB recovered");
+      await waitFor(() => posts.length === baselinePosts + 4, "submission did not retry after IndexedDB recovered");
 
       const beforeStatic = sockets.length;
       await command("POST", "/url", { url: `http://127.0.0.1:${port}/static.html` });

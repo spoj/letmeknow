@@ -26,6 +26,12 @@
       }
     }
   ],
+  "r2_buckets": [
+    {
+      "binding": "UPLOADS",
+      "bucket_name": "letmeknow-uploads"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
