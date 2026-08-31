@@ -60,51 +60,52 @@ async function stopProcess(child) {
   if (child.exitCode === null) child.kill("SIGKILL");
 }
 
-function documentPage(pageEvent, title, body, dynamic = true) {
-  const pageAttribute = dynamic ? ` data-letmeknow-page-event="${pageEvent}"` : "";
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}<script id="agent-script">window.agentScriptRuns = (window.agentScriptRuns || 0) + 1;</script><script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime${pageAttribute}></script></body></html>`;
+function documentPage(history, title, body, dynamic = true) {
+  const historyScript = dynamic ? `<script type="application/json" data-letmeknow-history>${JSON.stringify(history).replaceAll("<", "\\u003c")}</script>` : "";
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}${historyScript}<script id="agent-script">window.agentScriptRuns = (window.agentScriptRuns || 0) + 1;</script><script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime></script></body></html>`;
 }
 
-const initialPage = documentPage(0, "Initial", `
+const body = `
   <main id="letmeknow-root">
     <h1 id="heading">Initial</h1>
-    <output id="counter">0</output>
+    <output id="count">0</output>
+    <ul id="items"><li id="item-one">One</li><li id="item-two">Two</li></ul>
     <form id="review" action="/review" method="post">
       <label>Message <textarea id="message" name="message"></textarea></label>
-      <label>Other <input id="other" name="other"></label>
-      <label><input id="tag-one" type="checkbox" name="tag" value="one"> One</label>
-      <label><input id="tag-two" type="checkbox" name="tag" value="two"> Two</label>
+      <label><input id="tag" type="checkbox" name="tag" value="one"> One</label>
       <button id="submit" name="decision" value="approve">Approve</button>
       <output id="status" data-letmeknow-status role="status"></output>
     </form>
     <details id="more"><summary>More</summary><p>Details</p></details>
-    <section id="local-panel" data-letmeknow-local hidden>Local</section>
+    <section id="local-panel" hidden>Local</section>
   </main>
-`);
+`;
 
-const recoveredPage = documentPage(52, "Recovered", `
-  <main id="letmeknow-root">
-    <h1 id="heading">Recovered</h1>
-    <output id="counter">recovered</output>
-    <form id="review" action="/review" method="post">
-      <label>Message <textarea id="message" name="message"></textarea></label>
-      <button id="submit" name="decision" value="approve">Approve</button>
-      <output id="status" data-letmeknow-status role="status"></output>
-    </form>
-    <table><tbody><tr id="row"><td>old row</td></tr></tbody></table>
-    <select><option id="choice">old choice</option></select>
-  </main>
-`);
+const history = [
+  { event_number: 1, script: "window.historyRuns = (window.historyRuns || 0) + 1; document.querySelector('#heading').textContent = 'History';" }
+];
+const liveHistory = [
+  ...history,
+  { event_number: 2, script: "document.querySelector('#items').insertAdjacentHTML('beforeend', '<li id=\"item-three\">Three</li>');" },
+  { event_number: 3, script: "document.querySelector('#items').prepend(document.querySelector('#item-two'));" },
+  { event_number: 4, script: "document.querySelector('#count').textContent = '42'; document.querySelector('#item-two').setAttribute('data-state', 'changed'); document.querySelector('#local-panel').hidden = false;" },
+  { event_number: 5, script: "document.querySelector('#item-three').remove();" },
+  { event_number: 6, script: "throw new Error('intentional update failure');" },
+  { event_number: 7, script: "document.querySelector('#heading').textContent = 'Corrected';" }
+];
+
+const initialPage = documentPage(history, "Initial", body);
+const replayedPage = documentPage(liveHistory, "Initial", body);
+
 
 describe("browser runtime", () => {
-  it("replaces targeted elements, keeps local state, and recovers invalid updates", async () => {
+  it("executes and replays arbitrary UI scripts while preserving browser state", async () => {
     requireExecutable(firefox, "Firefox");
     requireExecutable(geckodriver, "geckodriver");
 
     const runtimeSource = readFileSync(runtimeFile, "utf8");
     let currentPage = initialPage;
     let rootRequests = 0;
-    let scriptHits = 0;
     const posts = [];
     const sockets = [];
     const wsServer = new WebSocketServer({ noServer: true });
@@ -114,15 +115,9 @@ describe("browser runtime", () => {
         res.end(runtimeSource);
         return;
       }
-      if (req.method === "GET" && req.url === "/script-hit") {
-        scriptHits += 1;
-        res.writeHead(204);
-        res.end();
-        return;
-      }
       if (req.method === "GET" && req.url === "/static.html") {
         res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-        res.end(documentPage(null, "Static", "<h1 id=\"static-heading\">Static</h1>", false));
+        res.end(documentPage([], "Static", "<h1 id=\"static-heading\">Static</h1>", false));
         return;
       }
       if (req.method === "GET" && req.url === "/") {
@@ -189,110 +184,86 @@ describe("browser runtime", () => {
       sessionId = created.value?.sessionId || created.sessionId;
       if (!sessionId) throw new Error(`geckodriver did not return a session: ${JSON.stringify(created)}`);
 
-      const command = (method, path, body) => request(driverPort, method, `/session/${sessionId}${path}`, body);
+      const command = (method, path, requestBody) => request(driverPort, method, `/session/${sessionId}${path}`, requestBody);
       const execute = script => command("POST", "/execute/sync", { script, args: [] }).then(result => result.value);
       await command("POST", "/url", { url: `http://127.0.0.1:${port}/` });
       await waitFor(async () => (await execute("return document.readyState")) === "complete", "initial page did not load");
       await waitFor(() => sockets.length === 1, "browser did not connect to runtime");
-      await waitFor(async () => await execute("return document.querySelector('#counter')?.textContent") === "0", "runtime did not load");
-      assert.equal(rootRequests, 1, "initial connection must not reload the page");
+      await waitFor(async () => await execute("return document.querySelector('#heading')?.textContent") === "History", "history did not execute");
+      assert.equal(rootRequests, 1);
+      assert.equal(await execute("return window.historyRuns"), 1);
       assert.equal(await execute("return window.agentScriptRuns"), 1);
 
-      await execute("document.querySelector('#message').value = 'focused draft'; document.querySelector('#other').value = 'dirty draft'; document.querySelector('#other').dispatchEvent(new Event('input', { bubbles: true })); document.querySelector('#tag-one').checked = true; document.querySelector('#more').open = true; document.querySelector('#local-panel').hidden = false; document.querySelector('#message').focus();");
-      for (let eventNumber = 1; eventNumber <= 40; eventNumber += 1) {
-        sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: eventNumber, target: "counter", html: `<output id="counter">${eventNumber}</output>` }));
-      }
-      await waitFor(async () => await execute("return document.querySelector('#counter')?.textContent") === "40", "sequential replacements were not all applied");
-      const preserved = await execute(`return {
+      await execute("window.originalItemOne = document.querySelector('#item-one'); document.querySelector('#message').value = 'focused draft'; document.querySelector('#tag').checked = true; document.querySelector('#more').open = true; document.querySelector('#message').focus();");
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 2, script: "document.querySelector('#items').insertAdjacentHTML('beforeend', '<li id=\"item-three\">Three</li>');" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 3, script: "document.querySelector('#items').prepend(document.querySelector('#item-two'));" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 4, script: "document.querySelector('#count').textContent = '42'; document.querySelector('#item-two').setAttribute('data-state', 'changed'); document.querySelector('#local-panel').hidden = false;" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 5, script: "document.querySelector('#item-three').remove();" }));
+      await waitFor(async () => await execute("return document.querySelector('#count')?.textContent") === "42", "UI scripts did not execute");
+      assert.deepEqual(await execute(`return {
+        items: Array.from(document.querySelectorAll('#items > li')).map(item => item.id),
         message: document.querySelector('#message').value,
-        other: document.querySelector('#other').value,
         focused: document.activeElement.id,
-        checked: document.querySelector('#tag-one').checked,
+        checked: document.querySelector('#tag').checked,
         details: document.querySelector('#more').open,
-        localHidden: document.querySelector('#local-panel').hidden,
-        pageEvent: document.querySelector('script[data-letmeknow-runtime]').dataset.letmeknowPageEvent,
-        agentScripts: window.agentScriptRuns
-      }`);
-      assert.deepEqual(preserved, { message: "focused draft", other: "dirty draft", focused: "message", checked: true, details: true, localHidden: false, pageEvent: "40", agentScripts: 1 });
-
-      const baselinePosts = posts.length;
-      await execute("document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click();");
-      await waitFor(() => posts.length === baselinePosts + 10, "rapid submissions were not all delivered");
-      const payloads = posts.slice(baselinePosts).map(post => JSON.parse(post.body));
-      assert.equal(new Set(payloads.map(payload => payload.id)).size, 10);
-      assert.ok(payloads.every(payload => payload.page_event === 40));
-
-      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 41, target: "letmeknow-root", html: "<main id=\"letmeknow-root\"><h1 id=\"heading\">Broad</h1><output id=\"counter\">broad</output><form id=\"review\"><input id=\"message\" name=\"message\"><button id=\"submit\">Go</button></form><details id=\"more\"><summary>More</summary></details><section id=\"local-panel\" data-letmeknow-local hidden></section></main>" }));
-      await waitFor(async () => await execute("return document.querySelector('#heading')?.textContent") === "Broad", "root replacement was not applied");
-      const broadState = await execute(`return {
-        message: document.querySelector('#message').value,
-        details: document.querySelector('#more').open,
+        movedNodePreserved: document.querySelector('#item-one') === window.originalItemOne,
+        attribute: document.querySelector('#item-two').dataset.state,
         localHidden: document.querySelector('#local-panel').hidden,
         pageEvent: document.querySelector('script[data-letmeknow-runtime]').dataset.letmeknowPageEvent
-      }`);
-      assert.deepEqual(broadState, { message: "", details: false, localHidden: true, pageEvent: "41" });
+      }`), { items: ["item-two", "item-one"], message: "focused draft", focused: "message", checked: true, details: true, movedNodePreserved: true, attribute: "changed", localHidden: false, pageEvent: "5" });
 
-      const invalidUpdate = "<output id=\"counter\">bad</output><script>fetch('/script-hit')</script>";
-      const beforeRecovery = rootRequests;
-      const beforeRecoverySockets = sockets.length;
-      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 42, target: "counter", html: invalidUpdate }));
-      currentPage = recoveredPage;
-      await waitFor(() => rootRequests > beforeRecovery, "invalid replacement did not trigger recovery");
-      await waitFor(async () => await execute("return document.title") === "Recovered", "recovery did not load the canonical page");
-      await sleep(100);
-      assert.equal(scriptHits, 0, "scripts in rejected replacements must not execute");
+      const beforeErrorRequests = rootRequests;
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 6, script: "throw new Error('intentional update failure');" }));
+      await waitFor(async () => (await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"))?.includes("failed"), "failed UI script was not reported");
+      assert.equal(rootRequests, beforeErrorRequests);
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 7, script: "document.querySelector('#heading').textContent = 'Corrected';" }));
+      await waitFor(async () => await execute("return document.querySelector('#heading')?.textContent") === "Corrected", "correction script did not execute");
+      currentPage = replayedPage;
 
-      await waitFor(() => sockets.length > beforeRecoverySockets, "recovered page runtime did not connect");
-      const beforeContextRecovery = rootRequests;
-      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 53, target: "row", html: `<tr id="row"><td>new row</td></tr>` }));
-      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 54, target: "choice", html: `<option id="choice">new choice</option>` }));
-      await waitFor(async () => await execute("return document.querySelector('#row')?.textContent === 'new row' && document.querySelector('#choice')?.textContent === 'new choice'"), "contextual replacements were not applied");
-      assert.equal(rootRequests, beforeContextRecovery, "contextual replacements must not trigger recovery");
-      assert.deepEqual(await execute(`return {
-        rowParent: document.querySelector('#row').parentElement.localName,
-        choiceParent: document.querySelector('#choice').parentElement.localName
-      }`), { rowParent: "tbody", choiceParent: "select" });
+      const beforeReplayRequests = rootRequests;
+      await command("POST", "/url", { url: `http://127.0.0.1:${port}/` });
+      await waitFor(() => rootRequests > beforeReplayRequests, "replay page did not load");
+      await waitFor(() => sockets.length > 1, "replay runtime did not connect");
+      await waitFor(async () => await execute("return document.querySelector('#heading')?.textContent") === "Corrected", "history replay did not reach correction");
+      assert.equal(await execute("return window.historyRuns"), 1);
+      assert.equal(await execute("return document.querySelector('#items').textContent.trim()"), "TwoOne");
+      assert.equal(await execute("return document.querySelector('script[data-letmeknow-runtime]').dataset.letmeknowPageEvent"), "7");
 
-      const beforeCommentRecovery = rootRequests;
-      const beforeCommentRecoverySockets = sockets.length;
-      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 55, target: "counter", html: "<!-- comment --><output id=\"counter\">bad</output>" }));
-      await waitFor(() => rootRequests > beforeCommentRecovery, "comment-wrapped replacement did not trigger recovery");
-      await waitFor(() => sockets.length > beforeCommentRecoverySockets, "comment recovery runtime did not connect");
-      await waitFor(async () => await execute("return document.title") === "Recovered", "comment recovery did not load the canonical page");
+      const baselinePosts = posts.length;
+      await execute("document.querySelector('#submit').click();");
+      await waitFor(() => posts.length === baselinePosts + 1, "submission was not delivered");
+      assert.equal(JSON.parse(posts.at(-1).body).page_event, 7);
 
-      const terminalBaselinePosts = posts.length;
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: false }));
-      await waitFor(async () => await execute("return document.documentElement.hasAttribute('data-letmeknow-disconnected')"), "producer disconnect was not reflected");
-      await execute("document.querySelector('#submit').click();");
+      await waitFor(async () => await execute("return document.documentElement.hasAttribute('data-letmeknow-disconnected')"), "disconnect was not reflected");
+      await execute("document.querySelector('#message').value = 'offline'; document.querySelector('#submit').click();");
       await sleep(100);
-      assert.equal(posts.length, terminalBaselinePosts);
-      await execute("document.querySelector('#submit').click();");
+      assert.equal(posts.length, baselinePosts + 1);
       sockets.at(-1).send(JSON.stringify({ type: "closed", message: "Session closed" }));
       await waitFor(async () => await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent") === "Session closed", "terminal status was not shown");
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: true }));
-      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 54, target: "heading", html: "<h1 id=\"heading\">Unexpected</h1>" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 8, script: "document.querySelector('#heading').textContent = 'Unexpected';" }));
       await sleep(100);
-      assert.equal(posts.length, terminalBaselinePosts);
+      assert.equal(posts.length, baselinePosts + 1);
       assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session closed");
-      assert.equal(await execute("return document.querySelector('#heading').textContent"), "Recovered");
+      assert.equal(await execute("return document.querySelector('#heading').textContent"), "Corrected");
       await execute("document.querySelector('#submit').click();");
       await sleep(100);
-      assert.equal(posts.length, terminalBaselinePosts);
-      assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session closed");
+      assert.equal(posts.length, baselinePosts + 1);
 
-      const beforeTerminalReloadSockets = sockets.length;
+      const beforeTerminalReload = rootRequests;
       await command("POST", "/url", { url: `http://127.0.0.1:${port}/` });
-      await waitFor(() => sockets.length > beforeTerminalReloadSockets, "fresh runtime did not connect after terminal reload");
-      await waitFor(async () => await execute("return document.title") === "Recovered", "fresh runtime did not load the canonical page");
+      await waitFor(() => rootRequests > beforeTerminalReload, "fresh runtime did not load after terminal close");
+      await waitFor(async () => await execute("return document.querySelector('#heading')?.textContent") === "Corrected", "fresh runtime did not replay history");
       await sleep(200);
-      assert.equal(posts.length, terminalBaselinePosts, "terminal submissions must not be delivered after reload");
+      assert.equal(posts.length, baselinePosts + 1, "terminal outbox submission was delivered after reload");
 
       const beforeStatic = sockets.length;
       await command("POST", "/url", { url: `http://127.0.0.1:${port}/static.html` });
-      await waitFor(() => sockets.length > beforeStatic, "static page runtime did not connect");
-      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 43, target: "static-heading", html: "<h1 id=\"static-heading\">Changed</h1>" }));
+      await waitFor(() => sockets.length > beforeStatic, "static runtime did not connect");
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 99, script: "document.querySelector('#static-heading').textContent = 'Changed';" }));
       await sleep(100);
-      assert.equal(await execute("return document.title"), "Static", "static pages must ignore dynamic updates");
+      assert.equal(await execute("return document.title"), "Static");
       assert.equal(await execute("return document.querySelector('#static-heading').textContent"), "Static");
     } catch (error) {
       throw new Error(`${error.message}${driverError ? `\ngeckodriver: ${driverError}` : ""}`, { cause: error });

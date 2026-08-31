@@ -7,9 +7,10 @@
   let terminal = false;
   let producerKnown = false;
   let producerConnected = false;
-  const initialPageEvent = readPageEvent(document);
-  const dynamicPage = initialPageEvent !== null;
-  let pageEvent = initialPageEvent ?? 0;
+  const history = readHistory(document);
+  const dynamicPage = history !== null;
+  let pageEvent = 0;
+  const processedEvents = new Set();
   const submissionForms = new Map();
   const OUTBOX_RETRY_MS = 1000;
   let outboxDatabasePromise;
@@ -17,11 +18,17 @@
   let outboxFlushAgain = false;
   let outboxRetryTimer;
 
-  function readPageEvent(documentLike) {
-    const value = documentLike.querySelector("script[data-letmeknow-runtime]")?.getAttribute("data-letmeknow-page-event");
-    if (value === null || value === undefined || value === "") return null;
-    const number = Number(value);
-    return Number.isSafeInteger(number) && number >= 0 ? number : null;
+  function readHistory(documentLike) {
+    const element = documentLike.querySelector("script[data-letmeknow-history]");
+    if (!element) return null;
+    try {
+      const value = JSON.parse(element.textContent || "");
+      if (!Array.isArray(value)) throw new Error("history must be an array");
+      return value;
+    } catch (error) {
+      reportScriptFailure(error);
+      return [];
+    }
   }
 
   function outboxDatabase() {
@@ -180,52 +187,40 @@
     }, 0);
   }
 
-  function targetIsUnique(id) {
-    let count = 0;
-    for (const element of document.querySelectorAll("[id]")) if (element.id === id) count += 1;
-    return count === 1;
+  function reportScriptFailure(error) {
+    console.error("LetMeKnow UI script failed", error);
+    setSystemStatus("A page update failed. Waiting for a correction…");
   }
 
-  function protectedTarget(target) {
-    if (target === document.documentElement || target === document.head || target === document.body) return true;
-    if (target.localName === "script" || target.closest("head")) return true;
-    const runtime = document.querySelector("script[data-letmeknow-runtime]");
-    return runtime !== null && target.contains(runtime);
+  function setPageEvent(eventNumber) {
+    pageEvent = eventNumber;
+    document.querySelector("script[data-letmeknow-runtime]")?.setAttribute("data-letmeknow-page-event", String(eventNumber));
   }
 
-  function containsScript(node) {
-    if (node.nodeType === Node.ELEMENT_NODE && node.localName === "script") return true;
-    if (node.nodeType === Node.ELEMENT_NODE && node.localName === "template" && containsScript(node.content)) return true;
-    return Array.from(node.childNodes).some(containsScript);
+  function runScript(event) {
+    processedEvents.add(event.event_number);
+    try {
+      Function(event.script).call(window);
+      setPageEvent(event.event_number);
+      clearSystemStatus();
+    } catch (error) {
+      reportScriptFailure(error);
+    }
   }
 
-  function replacementFor(target, html) {
-    const range = document.createRange();
-    range.selectNode(target);
-    const fragment = range.createContextualFragment(html);
-    const nodes = Array.from(fragment.childNodes);
-    const roots = nodes.filter(node => node.nodeType === Node.ELEMENT_NODE);
-    if (roots.length !== 1 || nodes.some(node => node !== roots[0] && (node.nodeType !== Node.TEXT_NODE || node.textContent.trim() !== ""))) return null;
-    const replacement = roots[0];
-    if (replacement.id !== target.id || containsScript(fragment)) return null;
-    return replacement;
-  }
-
-  function applyUpdate(update) {
-    if (typeof update.target !== "string" || update.target === "" || typeof update.html !== "string") return false;
-    const target = document.getElementById(update.target);
-    if (!target || !targetIsUnique(update.target) || protectedTarget(target)) return false;
-    const replacement = replacementFor(target, update.html);
-    if (!replacement) return false;
-    target.replaceWith(replacement);
-    pageEvent = update.event_number;
-    document.querySelector("script[data-letmeknow-runtime]")?.setAttribute("data-letmeknow-page-event", String(pageEvent));
-    return true;
+  function runHistory() {
+    for (const event of history) {
+      if (!event || typeof event !== "object" || !Number.isSafeInteger(event.event_number) || event.event_number < 0 || typeof event.script !== "string") {
+        reportScriptFailure(new Error("invalid page history event"));
+        continue;
+      }
+      runScript(event);
+    }
   }
 
   function receiveUpdate(update) {
-    if (terminal || !dynamicPage || !Number.isSafeInteger(update.event_number) || update.event_number <= pageEvent) return;
-    if (!applyUpdate(update)) scheduleReload();
+    if (terminal || !dynamicPage || !Number.isSafeInteger(update.event_number) || update.event_number <= pageEvent || processedEvents.has(update.event_number) || typeof update.script !== "string") return;
+    runScript({ event_number: update.event_number, script: update.script });
   }
 
   function updateProducer(connected) {
@@ -260,7 +255,7 @@
     socket.addEventListener("message", (event) => {
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
-      if (message.type === "update_ui") receiveUpdate(message);
+      if (message.type === "run_ui") receiveUpdate(message);
       else if (message.type === "producer") updateProducer(Boolean(message.connected));
       else if (message.type === "connected") updateProducer(Boolean(message.producer_connected));
       else if (message.type === "closed") {
@@ -341,6 +336,8 @@
       setStatus(form, "Couldn’t send. Try again.");
     }
   }
+
+  if (dynamicPage) runHistory();
 
   document.addEventListener("submit", (event) => {
     const form = event.target;
