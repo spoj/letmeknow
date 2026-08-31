@@ -70,13 +70,13 @@ Use ordinary same-origin forms with meaningful field names. The runtime captures
 
 The service validates and deduplicates submissions, assigns their global event numbers, and queues them for the CLI. Files are uploaded privately to the service before the JSON submission is accepted. Each attachment descriptor contains its form field, original name, media type, size, and SHA-256 hash; file values do not appear in `values`.
 
-The CLI downloads attachments before acknowledging delivery, verifies their size and hash, and writes them under `session_path/attachments`. The complete event at `event_path` adds a safe local `path` to each attachment. Original filenames are metadata only and never determine local paths. A successful commit removes the acknowledged event and attachment files; stopping `serve` removes the whole private session directory.
+The CLI downloads attachments before acknowledging delivery, verifies their size and hash, and writes them under `session_path/attachments`. The complete event at `event_path` adds a safe local `path` to each attachment. Original filenames are metadata only and never determine local paths. A successful commit removes the acknowledged event and attachment files. The service releases stored attachment blobs after committed submissions no longer reference them; shared blobs remain while another pending submission uses them. Unsubmitted attachment reservations expire after 30 minutes. Stopping `serve` removes the whole private session directory.
 
 Form values, attachment names, media types, and contents are untrusted input. Validate them and escape text before putting it into HTML or scripts. Keep secrets outside the workspace.
 
 ## Workspace limits
 
-LetMeKnow is not a general file host. A session has one aggregate 100 MiB blob-storage limit for its committed and staged workspace plus browser attachments. The service reserves this quota before accepting bytes. There is no separate application file-count or per-file size limit; a single file may consume the remaining session quota. Metadata, submission bodies, replay history, and protocol messages still have bounded sizes.
+LetMeKnow is not a general file host. A session has one aggregate 100 MiB blob-storage limit for its committed and staged workspace plus browser attachments. The service reserves this quota before accepting bytes. A session can reserve at most 1,024 distinct browser attachment objects at once. There is no separate application file-size limit; a single file may consume the remaining session quota. Metadata, submission bodies, replay history, and protocol messages still have bounded sizes.
 
 ## Development
 

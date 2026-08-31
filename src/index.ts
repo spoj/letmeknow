@@ -402,9 +402,7 @@ export class Session extends DurableObject<Env> {
       const object = await this.env.UPLOADS.head(await this.objectKey(hash));
       if (object?.size === record.size) {
         if (!record.stored || record.expires_at !== undefined) {
-          records[hash] = record.stored && record.expires_at === undefined
-            ? record
-            : { ...record, stored: true, expires_at: record.expires_at ?? Date.now() + ATTACHMENT_RESERVATION_LEASE_MS };
+          records[hash] = { ...record, stored: true, expires_at: record.expires_at ?? Date.now() + ATTACHMENT_RESERVATION_LEASE_MS };
           await this.ctx.storage.put("blob_records", records);
         }
         await this.scheduleAlarm();
@@ -421,7 +419,7 @@ export class Session extends DurableObject<Env> {
     const records = await this.blobRecords();
     const record = records[hash];
     if (!record || (record.kind !== "browser" && record.kind !== "shared") || record.size !== size) throw new Error("attachment reservation changed");
-    records[hash] = { ...record, stored: true, ...(record.expires_at === undefined ? {} : { expires_at: record.expires_at }) };
+    records[hash] = { ...record, stored: true };
     await this.ctx.storage.put("blob_records", records);
     await this.scheduleAlarm();
   }

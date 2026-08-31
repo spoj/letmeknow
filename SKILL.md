@@ -119,13 +119,13 @@ Use ordinary same-origin forms with stable IDs and meaningful field names:
 
 The runtime captures native form submissions by default and converts them into JSON `submit` events. It stores the structured event and selected files in a durable browser outbox before delivery, retries after connection failures, and reuses the same UUID and content hashes on retry. The browser sends it to the service even when the producer is disconnected; the disconnected indicator describes the producer, not service acceptance. An application handler can claim a submission by calling `event.preventDefault()` before the runtime handler runs. `form.submit()` and direct `fetch()` bypass the structured outbox.
 
-Files are uploaded privately before the submission is accepted. Attachment descriptors contain `field`, `name`, `content_type`, `size`, and `hash`; file values are excluded from `values`. Before acknowledging the event, the CLI downloads and verifies each file and adds a safe local `path` in the complete event at `event_path`. The original filename never determines the local path. Successful commit cleanup removes acknowledged local event and attachment files.
+Files are uploaded privately before the submission is accepted. Attachment descriptors contain `field`, `name`, `content_type`, `size`, and `hash`; file values are excluded from `values`. Before acknowledging the event, the CLI downloads and verifies each file and adds a safe local `path` in the complete event at `event_path`. The original filename never determines the local path. Successful commit cleanup removes acknowledged local event and attachment files. The service releases stored attachment blobs after committed submissions no longer reference them; shared blobs remain while another pending submission uses them. Unsubmitted attachment reservations expire after 30 minutes.
 
 Form values, attachment metadata, and attachment contents are untrusted input. Validate them and escape text before putting it into HTML or scripts.
 
 ## Workspace and storage limits
 
-LetMeKnow is not a general file host. Each session has one aggregate 100 MiB blob-storage limit covering the committed and staged workspace plus browser attachments. The service reserves this quota before accepting bytes. There is no separate application per-file, workspace-size, or file-count quota; a single file or workspace may consume the remaining session quota. Protocol metadata, submissions, and replay history still have bounded sizes.
+LetMeKnow is not a general file host. Each session has one aggregate 100 MiB blob-storage limit covering the committed and staged workspace plus browser attachments. The service reserves this quota before accepting bytes. A session can reserve at most 1,024 distinct browser attachment objects at once. There is no separate application per-file or workspace-size quota; a single file or workspace may consume the remaining session quota. Protocol metadata, submissions, and replay history still have bounded sizes.
 
 ## Reconnect and expiry
 
