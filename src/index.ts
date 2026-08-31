@@ -447,7 +447,7 @@ export class Session extends DurableObject<Env> {
     const now = Date.now();
     const expired = Object.entries(records).filter(([hash, record]) => {
       if ((this.activeBrowserUploads.get(hash) ?? 0) > 0 || (record.kind !== "browser" && record.kind !== "shared") || referenced.has(hash)) return false;
-      return record.expires_at === undefined ? !record.stored : record.expires_at <= now;
+      return record.expires_at === undefined || record.expires_at <= now;
     });
     if (!expired.length) return;
     const next = { ...records };
@@ -477,7 +477,8 @@ export class Session extends DurableObject<Env> {
       if (typeof value === "number" && Number.isSafeInteger(value)) times.push(value);
     }
     const records = await this.blobRecords();
-    for (const record of Object.values(records)) {
+    for (const [hash, record] of Object.entries(records)) {
+      if ((this.activeBrowserUploads.get(hash) ?? 0) > 0) continue;
       if (typeof record.expires_at === "number" && Number.isSafeInteger(record.expires_at)) times.push(record.expires_at);
     }
     if (times.length) await this.ctx.storage.setAlarm(Math.min(...times));
@@ -568,39 +569,10 @@ export class Session extends DurableObject<Env> {
     });
   }
 
-  private async releaseUnreferencedBrowserObjects(): Promise<void> {
-    await this.reclaimExpiredBrowserObjects();
-    const records = await this.blobRecords();
-    const referenced = await this.referencedBrowserObjects();
-    const next = { ...records };
-    let reserved = await this.ctx.storage.get<number>("reserved_blob_bytes") ?? 0;
-    const remove: string[] = [];
-    let changed = false;
-    for (const [hash, record] of Object.entries(records)) {
-      if ((record.kind !== "browser" && record.kind !== "shared") || !record.stored || record.expires_at !== undefined || referenced.has(hash)) continue;
-      if (record.kind === "shared") {
-        next[hash] = { ...record, kind: "workspace" };
-        delete next[hash].expires_at;
-        changed = true;
-        continue;
-      }
-      remove.push(hash);
-      reserved -= record.size;
-      delete next[hash];
-    }
-    if (!remove.length && !changed) return;
-    if (remove.length) await this.env.UPLOADS.delete(await Promise.all(remove.map(hash => this.objectKey(hash))));
-    await this.ctx.storage.transaction(async transaction => {
-      await transaction.put("blob_records", next);
-      await transaction.put("reserved_blob_bytes", Math.max(0, reserved));
-    });
-    await this.scheduleAlarm();
-  }
-
   private async deleteUnreferencedObjects(manifest: Manifest): Promise<void> {
     const keep = new Set<string>([await this.ctx.storage.get<string>("base_index_hash") || "", ...Object.values(manifest.files).map(entry => entry.hash)]);
     await this.cleanupObjects(keep);
-    await this.releaseUnreferencedBrowserObjects();
+    await this.reclaimExpiredBrowserObjects();
     await this.ctx.storage.delete("staging_hashes");
   }
 
@@ -753,6 +725,7 @@ export class Session extends DurableObject<Env> {
       await this.mutate(() => this.markWorkspaceObjectStored(hash, record.size));
       return new Response(null, { status: 204 });
     } catch {
+      if (!(await this.ctx.storage.get<string>("session_code"))) await this.env.UPLOADS.delete(key).catch(() => {});
       return error("could not store workspace object", 503);
     }
   }
@@ -853,6 +826,7 @@ export class Session extends DurableObject<Env> {
         return new Response(null, { status: 204 });
       } catch (cause) {
         await pumpPromise.catch(() => {});
+        if (!(await this.ctx.storage.get<string>("session_code"))) await this.env.UPLOADS.delete(key).catch(() => {});
         const checksumError = cause instanceof Error && cause.message.includes("checksum you specified did not match");
         const malformed = sizeError || checksumError;
         return error(malformed ? (sizeError ? "attachment size is invalid" : "attachment content is invalid") : "could not store attachment", malformed ? 400 : 503);
