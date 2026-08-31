@@ -63,7 +63,7 @@ async function stopProcess(child) {
 function documentPage(history, title, body, dynamic = true) {
   const existingHistory = dynamic ? `<script type="application/json" data-letmeknow-history>[]</script>` : "";
   const historyScript = dynamic ? `<script type="application/json" data-letmeknow-history>${JSON.stringify(history).replace(/<\/script/gi, match => "\\u003c" + match.slice(1))}</script>` : "";
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}${existingHistory}${historyScript}<script id="agent-script">window.agentScriptRuns = (window.agentScriptRuns || 0) + 1;</script><script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime></script></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}${existingHistory}${historyScript}<script id="agent-script">window.agentScriptRuns = (window.agentScriptRuns || 0) + 1; document.addEventListener('submit', event => { if (event.target.id === 'app-owned') event.preventDefault(); });</script><script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime></script></body></html>`;
 }
 
 const body = `
@@ -77,6 +77,7 @@ const body = `
       <button id="submit" name="decision" value="approve">Approve</button>
       <output id="status" data-letmeknow-status role="status"></output>
     </form>
+    <form id="app-owned" action="/app-owned" method="post"><button id="app-submit">App-owned</button></form>
     <details id="more"><summary>More</summary><p>Details</p></details>
     <section id="local-panel" hidden>Local</section>
   </main>
@@ -195,6 +196,13 @@ describe("browser runtime", () => {
       assert.equal(rootRequests, 1);
       assert.equal(await execute("return window.historyRuns"), 1);
       assert.equal(await execute("return window.agentScriptRuns"), 1);
+      const appPosts = posts.length;
+      const appRequests = rootRequests;
+      await execute("document.querySelector('#app-submit').click();");
+      await sleep(100);
+      assert.equal(posts.length, appPosts, "app-owned forms must not enter the structured outbox");
+      assert.equal(rootRequests, appRequests, "app-owned forms must not navigate");
+      assert.equal(await execute("return location.pathname"), "/");
 
       await execute("window.originalItemOne = document.querySelector('#item-one'); document.querySelector('#message').value = 'focused draft'; document.querySelector('#tag').checked = true; document.querySelector('#more').open = true; document.querySelector('#message').focus();");
       sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 2, script: "document.querySelector('#items').insertAdjacentHTML('beforeend', '<li id=\"item-three\">Three</li>');" }));

@@ -49,7 +49,7 @@ document.querySelector("#items").insertAdjacentHTML(
 
 Existing DOM nodes remain available, so scripts can preserve focus, dirty form controls, open disclosures, and other browser state. New or reloaded browsers start from `index.html` and replay committed scripts in order. The public URL is the way to inspect the resulting global state.
 
-Scripts should generally be synchronous and replayable. Randomness, current time, network requests, and external side effects can produce different results or happen again whenever a browser reloads. A failed script reports an error but does not stop later scripts; a later script can correct the state.
+Scripts should generally be synchronous and replayable. Randomness, current time, network requests, and external side effects can produce different results or happen again whenever a browser reloads. Scripts execute through `Function`, so the page CSP must permit eval-like execution. A failed script reports an error but does not stop later scripts; a later script can correct the state.
 
 ## Forms and security
 

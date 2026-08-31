@@ -76,7 +76,9 @@ list.insertAdjacentHTML(
 
 This exposes the underlying browser capability: scripts can insert, remove, move, replace, and modify any DOM content, as well as use browser APIs. Unaffected DOM nodes retain their browser-owned state.
 
-The initial `index.html` is the base for the session. New or reloaded browsers load that base and replay committed `run_ui` scripts in order. Keep committed scripts generally synchronous and replayable. A script that uses randomness, current time, network requests, or external side effects can produce different results or run its side effects again when a browser reloads.
+Scripts run in a fresh `Function` scope with `this` set to `window`. Put helpers and persistent state on `globalThis` or in the DOM; declarations do not persist between snippets. Execution is synchronous at the runtime boundary: promises and other asynchronous work are not awaited and may interleave with later scripts. Pages need a CSP that permits eval-like `Function` execution.
+
+Scripts are trusted page code and can interfere with the page or runtime, so avoid monkey-patching runtime infrastructure. The initial `index.html` is the base for the session. New or reloaded browsers load that base and replay committed `run_ui` scripts in order. A script that uses randomness, current time, network requests, or external side effects can produce different results or run its side effects again when a browser reloads.
 
 A failed script reports an error but does not stop later scripts. A later script may repair the page. Reloading replays the committed sequence, including the failed script, so later corrective scripts should remain safe to run after it.
 
@@ -134,7 +136,7 @@ Use ordinary same-origin forms with stable IDs and meaningful field names:
 </form>
 ```
 
-The runtime converts native form submission into a JSON `submit` event. It assigns an opaque UUID, stores each event in a durable browser outbox before delivery, retries after connection failures, and reuses the UUID on retry. The CLI deduplicates repeated delivery of the same event. Distinct intentional submissions remain distinct, including rapid repeated clicks. File uploads are not supported.
+The runtime captures native form submissions by default and converts them into JSON `submit` events. An application handler can claim a submission by calling `event.preventDefault()` before the runtime handler runs. It assigns an opaque UUID, stores each event in a durable browser outbox before delivery, retries after connection failures, and reuses the UUID on retry. The CLI deduplicates repeated delivery of the same event. Distinct intentional submissions remain distinct, including rapid repeated clicks. `form.submit()` and direct `fetch()` bypass the structured outbox. File uploads are not supported.
 
 Form values are untrusted input. Validate them and escape them before putting them into HTML or scripts.
 
@@ -148,7 +150,7 @@ When the producer intentionally closes the session, the browser receives a termi
 
 ## Security
 
-Scripts are trusted agent-authored code and execute in every connected browser. Do not put secrets in scripts or in the served directory. Anyone with the public URL can view the page and submit forms.
+Scripts are trusted agent-authored code and execute in every connected browser. They can modify the page and browser environment, so avoid monkey-patching runtime infrastructure. Runtime-generated `data-letmeknow-*` attributes are reserved. Do not put secrets in scripts or in the served directory. Anyone with the public URL can view the page and submit forms.
 
 ## Stop
 

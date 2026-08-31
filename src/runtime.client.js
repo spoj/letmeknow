@@ -10,7 +10,6 @@
   const history = readHistory(document);
   const dynamicPage = history !== null;
   let pageEvent = 0;
-  const processedEvents = new Set();
   const submissionForms = new Map();
   const OUTBOX_RETRY_MS = 1000;
   let outboxDatabasePromise;
@@ -198,7 +197,6 @@
   }
 
   function runScript(event) {
-    processedEvents.add(event.event_number);
     setPageEvent(event.event_number);
     try {
       Function(event.script).call(window);
@@ -219,7 +217,7 @@
   }
 
   function receiveUpdate(update) {
-    if (terminal || !dynamicPage || !Number.isSafeInteger(update.event_number) || update.event_number <= pageEvent || processedEvents.has(update.event_number) || typeof update.script !== "string") return;
+    if (terminal || !dynamicPage || !Number.isSafeInteger(update.event_number) || update.event_number <= pageEvent || typeof update.script !== "string") return;
     runScript({ event_number: update.event_number, script: update.script });
   }
 
@@ -338,6 +336,7 @@
   }
 
   document.addEventListener("submit", (event) => {
+    if (event.defaultPrevented) return;
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
     if (form.method.toLowerCase() === "dialog") return;
