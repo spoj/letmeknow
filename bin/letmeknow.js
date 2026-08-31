@@ -16,7 +16,7 @@ const MAX_BATCH_TOKENS = 100_000;
 const MAX_UNIQUE_SUBMISSIONS = 100_000;
 const MAX_RETAINED_SUBMISSION_BYTES = 256 * 1024 * 1024;
 const CONTROL_MAX_BYTES = UPDATE_BATCH_MAX_BYTES * 2;
-const GRACE_SECONDS = 10 * 60;
+const RECONNECT_RETRY_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
 const CONTROL_TIMEOUT = 35_000;
 const CONTROL_PREFIX = "letmeknow-control-";
@@ -597,7 +597,7 @@ async function start(directory) {
       send = () => false;
       socket = undefined;
       if (!credential || !sessionUrl) return void stop(1);
-      if (!retryUntil) retryUntil = Date.now() + GRACE_SECONDS * 1_000;
+      if (!retryUntil) retryUntil = Date.now() + RECONNECT_RETRY_SECONDS * 1_000;
       retry();
     });
   };

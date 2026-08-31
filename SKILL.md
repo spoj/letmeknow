@@ -36,9 +36,9 @@ The runtime is injected into the page separately. Keep agent-authored scripts an
 
 ## Session lifetime and reconnect
 
-A producer must successfully send `open` shortly after connecting. The session expires exactly 24 hours after that successful `open`, including while the producer remains connected. This deadline is absolute and is not reset by reconnects.
+A producer must successfully send `open` shortly after connecting. Sessions are temporary and may be expired by the service at any time.
 
-If an opened producer disconnects, its session remains reconnectable for 10 minutes. A reconnect uses the existing session credential and does not extend the 24-hour deadline. When the deadline or disconnect grace period expires, the session and its browser connections end.
+If an opened producer disconnects, reconnect is best-effort and may be available only for a limited period. A reconnect uses the existing session credential, but clients must handle disconnects without assuming that reconnect will succeed. When the service expires a session, the session and its browser connections end.
 
 ## Agent loop
 

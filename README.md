@@ -45,7 +45,7 @@ Each replacement must contain one element with the target's ID and cannot contai
 
 ## Session and security basics
 
-Sessions are temporary and held in memory by the CLI and relay. A session expires exactly 24 hours after the producer successfully opens it, even if the producer remains connected. If the producer disconnects before then, it has a 10-minute grace period to reconnect; reconnecting never extends the absolute 24-hour lifetime.
+Sessions are temporary and held in memory by the CLI and relay. The service may expire a session at any time. If the producer disconnects, reconnect is best-effort and may be available only for a limited period; clients should handle disconnects without assuming that reconnect will succeed.
 
 The public URL is a bearer capability: anyone who has it can view the page and submit forms. Treat browser values as untrusted input and escape them before placing them in HTML. Keep secrets and unrelated files outside the served directory.
 
