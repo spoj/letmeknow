@@ -1,6 +1,6 @@
 {
   "name": "letmeknow-cli",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "A live agent-authored page with structured browser feedback.",
   "files": [
     "bin",
