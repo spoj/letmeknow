@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { createReadStream, existsSync, readFileSync, readdirSync, writeSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, readFileSync, readdirSync, writeSync } from "node:fs";
 import { chmod, mkdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import net from "node:net";
@@ -154,6 +154,7 @@ async function start(directory) {
   const root = await realpath(resolve(directory));
   const sessionDirectory = join(tmpdir(), `letmeknow-${randomUUID()}`);
   const eventsDirectory = join(sessionDirectory, "events");
+  const attachmentsDirectory = join(sessionDirectory, "attachments");
   await mkdir(eventsDirectory, { recursive: true, mode: 0o700 });
   const socketPath = controlPath(root);
   await removeStaleControlSocket(socketPath);
@@ -231,6 +232,62 @@ async function start(directory) {
 
   const eventIdentity = event => createHash("sha256").update(JSON.stringify(event)).digest("hex");
 
+  const materializeAttachments = async event => {
+    if (!Array.isArray(event.attachments) || event.attachments.length === 0) return { event, attachmentBytes: 0, directory: undefined };
+    let attachmentBytes = 0;
+    for (const attachment of event.attachments) {
+      if (!attachment || typeof attachment !== "object" || typeof attachment.field !== "string" || typeof attachment.name !== "string" || typeof attachment.content_type !== "string" || !hashPattern.test(attachment.hash) || !Number.isSafeInteger(attachment.size) || attachment.size < 0) throw new Error("invalid attachment metadata");
+      attachmentBytes += attachment.size;
+    }
+    if (retainedSubmissionBytes + Buffer.byteLength(JSON.stringify(event)) + attachmentBytes > MAX_RETAINED_SUBMISSION_BYTES) throw new Error("local event storage limit exceeded");
+    const directory = join(attachmentsDirectory, String(event.event_number).padStart(12, "0"));
+    const persisted = [];
+    try {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      for (const [index, attachment] of event.attachments.entries()) {
+        const path = join(directory, String(index));
+        const temporaryPath = `${path}.tmp-${randomUUID()}`;
+        const response = await fetch(new URL(`_letmeknow/attachments/${attachment.hash}`, sessionUrl), { headers: { Authorization: `Bearer ${credential}` } });
+        if (response.status !== 200 || !response.body) throw new Error("attachment download failed");
+        const digest = createHash("sha256");
+        let size = 0;
+        const output = createWriteStream(temporaryPath, { mode: 0o600, flags: "wx" });
+        try {
+          for await (const chunk of response.body) {
+            size += chunk.byteLength;
+            if (size > attachment.size) throw new Error("attachment size is invalid");
+            digest.update(chunk);
+            await new Promise((resolve, reject) => {
+              const onError = cause => reject(cause);
+              output.once("error", onError);
+              output.write(chunk, cause => {
+                output.off("error", onError);
+                if (cause) reject(cause); else resolve();
+              });
+            });
+          }
+          await new Promise((resolve, reject) => { output.end(cause => cause ? reject(cause) : resolve()); });
+        } catch (cause) {
+          output.destroy();
+          await unlink(temporaryPath).catch(() => {});
+          throw cause;
+        }
+        if (size !== attachment.size || digest.digest("hex") !== attachment.hash) {
+          await unlink(temporaryPath).catch(() => {});
+          throw new Error("attachment content is invalid");
+        }
+        await rename(temporaryPath, path);
+        persisted.push({ ...attachment, path });
+      }
+      const persistedEvent = { ...event, attachments: persisted };
+      if (retainedSubmissionBytes + Buffer.byteLength(JSON.stringify(persistedEvent)) + attachmentBytes > MAX_RETAINED_SUBMISSION_BYTES) throw new Error("local event storage limit exceeded");
+      return { event: persistedEvent, attachmentBytes, directory };
+    } catch (cause) {
+      await rm(directory, { recursive: true, force: true });
+      throw cause;
+    }
+  };
+
   const publish = event => {
     const next = publication.then(async () => {
       if (event.type === "submit") {
@@ -255,21 +312,26 @@ async function start(directory) {
     }
     if (event.event_number !== receivedThrough + 1) throw new Error("event sequence is invalid");
     let eventPath;
+    let attachmentDirectory;
     let bytes = 0;
     if (event.type === "submit") {
-      const serialized = JSON.stringify(event);
-      bytes = Buffer.byteLength(serialized);
-      if (submissionCount >= MAX_UNIQUE_SUBMISSIONS || retainedSubmissionBytes + bytes > MAX_RETAINED_SUBMISSION_BYTES) throw new Error("local event storage limit exceeded");
+      if (submissionCount >= MAX_UNIQUE_SUBMISSIONS) throw new Error("local event storage limit exceeded");
+      const materialized = await materializeAttachments(event);
+      event = materialized.event;
+      attachmentDirectory = materialized.directory;
       eventPath = join(eventsDirectory, `${String(event.event_number).padStart(12, "0")}.json`);
+      event = { ...event, event_path: eventPath };
+      const serialized = JSON.stringify(event);
+      bytes = Buffer.byteLength(serialized) + materialized.attachmentBytes;
       const temporaryPath = `${eventPath}.tmp-${randomUUID()}`;
       try {
         await writeFile(temporaryPath, serialized, { mode: 0o600 });
         await rename(temporaryPath, eventPath);
       } catch (cause) {
         await unlink(temporaryPath).catch(() => {});
+        if (attachmentDirectory) await rm(attachmentDirectory, { recursive: true, force: true });
         throw cause;
       }
-      event = { ...event, event_path: eventPath };
       retainedSubmissionBytes += bytes;
       submissionCount += 1;
     } else if (event.type !== "run_ui") {
@@ -278,7 +340,7 @@ async function start(directory) {
     const published = publish(event);
     receivedEvents.set(event.event_number, identity);
     receivedThrough = event.event_number;
-    if (event.type === "submit") eventFiles.set(event.id, { event_number: event.event_number, event_path: eventPath, bytes, published });
+    if (event.type === "submit") eventFiles.set(event.id, { event_number: event.event_number, event_path: eventPath, attachment_directory: attachmentDirectory, bytes, published });
     sendPacket({ type: "event_ack", event_number: event.event_number });
   };
 
@@ -290,6 +352,7 @@ async function start(directory) {
       try {
         await record.published;
         await unlink(record.event_path).catch(cause => { if (cause?.code !== "ENOENT") throw cause; });
+        if (record.attachment_directory) await rm(record.attachment_directory, { recursive: true, force: true });
         eventFiles.delete(id);
         retainedSubmissionBytes -= record.bytes;
         submissionCount -= 1;

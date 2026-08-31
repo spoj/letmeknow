@@ -60,8 +60,8 @@ async function command(args, input, env) {
   return JSON.parse(result.stdout);
 }
 
-function serviceEvent(id, eventNumber, value = "one") {
-  return { type: "submit", id, event_number: eventNumber, page_event: 0, form_id: "review", action: "/review", trigger: null, values: { value } };
+function serviceEvent(id, eventNumber, value = "one", attachments) {
+  return { type: "submit", id, event_number: eventNumber, page_event: 0, form_id: "review", action: "/review", trigger: null, values: { value }, ...(attachments ? { attachments } : {}) };
 }
 
 async function startSession({ index = "<!doctype html><html><body><main id=app>initial</main></body></html>", files = { "assets/app.js": "initial" } } = {}) {
@@ -74,8 +74,24 @@ async function startSession({ index = "<!doctype html><html><body><main id=app>i
     writeFileSync(filename, value);
   }
 
-  const state = { uploaded: new Map(), events: new Map(), nextEvent: 0, committedThrough: 0, workspaceVersion: 0, pageEvent: 0, acknowledgements: [], ackWaiters: new Map(), producer: undefined };
+  const state = { uploaded: new Map(), attachments: new Map(), attachmentRequests: [], attachmentStatus: 200, events: new Map(), nextEvent: 0, committedThrough: 0, workspaceVersion: 0, pageEvent: 0, acknowledgements: [], ackWaiters: new Map(), producer: undefined };
   const httpServer = createServer((request, response) => {
+    const attachmentMatch = request.url?.match(/^\/_letmeknow\/attachments\/([0-9a-f]{64})$/);
+    if (request.method === "GET" && attachmentMatch) {
+      state.attachmentRequests.push({ hash: attachmentMatch[1], authorization: request.headers.authorization });
+      const data = state.attachments.get(attachmentMatch[1]);
+      if (request.headers.authorization !== "Bearer private-test-credential") {
+        response.writeHead(401);
+        response.end();
+      } else if (!data) {
+        response.writeHead(404);
+        response.end();
+      } else {
+        response.writeHead(state.attachmentStatus);
+        response.end(data);
+      }
+      return;
+    }
     const match = request.url?.match(/^\/_letmeknow\/workspace\/([0-9a-f]{64})$/);
     if (request.method !== "PUT" || !match) {
       response.writeHead(404);
@@ -308,6 +324,52 @@ describe("LetMeKnow CLI", () => {
       const result = await command(["commit", session.folder, "--through", "1"]);
       assert.deepEqual(result.events, [id]);
       assert.equal(existsSync(notification.event_path), false);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("materializes attachments before acknowledgement and keeps original names out of paths", async () => {
+    const session = await startSession();
+    try {
+      const data = Buffer.from([0, 1, 2, 255]);
+      const hash = createHash("sha256").update(data).digest("hex");
+      session.state.attachments.set(hash, data);
+      const event = serviceEvent(randomUUID(), 1, "one", [{ field: "upload", name: "../../secret.txt", content_type: "application/octet-stream", size: data.byteLength, hash }]);
+      await session.sendEvent(event);
+      const notification = await session.waitStream(value => value.type === "submit" && value.id === event.id);
+      const persisted = JSON.parse(readFileSync(notification.event_path));
+      const attachment = persisted.attachments[0];
+      assert.equal(readFileSync(attachment.path).compare(data), 0);
+      assert.match(attachment.path, /\/attachments\/000000000001\/0$/);
+      assert.equal(attachment.name, "../../secret.txt");
+      assert.equal(session.state.attachmentRequests[0].authorization, "Bearer private-test-credential");
+      assert.deepEqual(session.state.acknowledgements, [1]);
+      await session.sendEvent(event);
+      assert.equal(session.state.attachmentRequests.length, 1);
+      assert.equal(session.stream.filter(value => value.type === "submit" && value.id === event.id).length, 1);
+      await command(["commit", session.folder, "--through", "1"]);
+      assert.equal(existsSync(notification.event_path), false);
+      assert.equal(existsSync(dirname(attachment.path)), false);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("does not acknowledge an attachment that fails to download or verify", async () => {
+    const session = await startSession();
+    try {
+      const expected = Buffer.from("expected");
+      const actual = Buffer.from("tampered");
+      const hash = createHash("sha256").update(expected).digest("hex");
+      session.state.attachments.set(hash, actual);
+      const event = serviceEvent(randomUUID(), 1, "one", [{ field: "upload", name: "file.bin", content_type: "application/octet-stream", size: expected.byteLength, hash }]);
+      session.state.producer.send(JSON.stringify(event));
+      const [code] = await once(session.child, "exit");
+      assert.equal(code, 1);
+      assert.deepEqual(session.state.acknowledgements, []);
+      assert.equal(session.stream.some(value => value.type === "submit"), false);
+      assert.equal(existsSync(join(session.ready.session_path, "attachments", "000000000001")), false);
     } finally {
       await session.stop();
     }
