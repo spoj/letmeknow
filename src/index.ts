@@ -463,6 +463,8 @@ export class Session extends DurableObject<Env> {
       }
     }
     if (remove.length) {
+      const retryAt = Date.now() + ATTACHMENT_RECLAIM_RETRY_MS;
+      await this.ctx.storage.put("cleanup_retry_at", retryAt);
       try {
         await this.env.UPLOADS.delete(await Promise.all(remove.map(([hash]) => this.objectKey(hash))));
         for (const [hash, record] of remove) {
@@ -470,27 +472,38 @@ export class Session extends DurableObject<Env> {
           reserved -= record.size;
         }
       } catch {
-        const retryAt = Date.now() + ATTACHMENT_RECLAIM_RETRY_MS;
         for (const [hash, record] of remove) next[hash] = { ...record, expires_at: retryAt };
       }
     }
-    await this.ctx.storage.transaction(async transaction => {
-      await transaction.put("blob_records", next);
-      await transaction.put("reserved_blob_bytes", Math.max(0, reserved));
-    });
-    await this.scheduleAlarm();
+    try {
+      await this.ctx.storage.transaction(async transaction => {
+        await transaction.put("blob_records", next);
+        await transaction.put("reserved_blob_bytes", Math.max(0, reserved));
+      });
+    } catch (cause) {
+      await this.scheduleAlarm().catch(() => {});
+      throw cause;
+    }
+    await this.scheduleAlarm().catch(() => {});
   }
 
   private async scheduleAlarm(): Promise<void> {
+    const now = Date.now();
     const times: number[] = [];
     for (const key of ["open_deadline_at", "expires_at", "producer_grace_at"]) {
       const value = await this.ctx.storage.get<number>(key);
       if (typeof value === "number" && Number.isSafeInteger(value)) times.push(value);
     }
+    const cleanupRetryAt = await this.ctx.storage.get<number>("cleanup_retry_at");
+    const scheduledCleanupRetryAt = typeof cleanupRetryAt === "number" && Number.isSafeInteger(cleanupRetryAt)
+      ? Math.max(cleanupRetryAt, now + ATTACHMENT_RECLAIM_RETRY_MS)
+      : undefined;
+    if (scheduledCleanupRetryAt !== undefined) times.push(scheduledCleanupRetryAt);
     const records = await this.blobRecords();
     for (const [hash, record] of Object.entries(records)) {
       if ((this.activeBrowserUploads.get(hash) ?? 0) > 0) continue;
-      if (typeof record.expires_at === "number" && Number.isSafeInteger(record.expires_at)) times.push(record.expires_at);
+      if (typeof record.expires_at !== "number" || !Number.isSafeInteger(record.expires_at)) continue;
+      times.push(record.expires_at <= now && scheduledCleanupRetryAt !== undefined ? scheduledCleanupRetryAt : record.expires_at);
     }
     if (times.length) await this.ctx.storage.setAlarm(Math.min(...times));
   }
@@ -557,11 +570,14 @@ export class Session extends DurableObject<Env> {
     const referenced = await this.referencedBrowserObjects();
     let reserved = await this.ctx.storage.get<number>("reserved_blob_bytes") ?? 0;
     const remove: string[] = [];
+    let changed = false;
     for (const [hash, record] of Object.entries(records)) {
       if (keep.has(hash) || record.kind === "browser") continue;
       if (record.kind === "shared") {
-        if (referenced.has(hash) || record.expires_at !== undefined) records[hash] = { ...record, kind: "browser" };
-        else {
+        if (referenced.has(hash) || record.expires_at !== undefined) {
+          records[hash] = { ...record, kind: "browser" };
+          changed = true;
+        } else {
           remove.push(hash);
           reserved -= record.size;
           delete records[hash];
@@ -573,18 +589,28 @@ export class Session extends DurableObject<Env> {
       reserved -= record.size;
       delete records[hash];
     }
-    if (remove.length) await this.env.UPLOADS.delete(await Promise.all(remove.map(hash => this.objectKey(hash))));
-    await this.ctx.storage.transaction(async transaction => {
-      await transaction.put("blob_records", records);
-      await transaction.put("reserved_blob_bytes", Math.max(0, reserved));
-    });
+    if (!remove.length && !changed) return;
+    await this.ctx.storage.put("cleanup_retry_at", Date.now() + ATTACHMENT_RECLAIM_RETRY_MS);
+    try {
+      if (remove.length) await this.env.UPLOADS.delete(await Promise.all(remove.map(hash => this.objectKey(hash))));
+      await this.ctx.storage.transaction(async transaction => {
+        await transaction.put("blob_records", records);
+        await transaction.put("reserved_blob_bytes", Math.max(0, reserved));
+      });
+    } catch (cause) {
+      await this.scheduleAlarm().catch(() => {});
+      throw cause;
+    }
   }
 
-  private async deleteUnreferencedObjects(manifest: Manifest): Promise<void> {
-    const keep = new Set<string>([await this.ctx.storage.get<string>("base_index_hash") || "", ...Object.values(manifest.files).map(entry => entry.hash)]);
+  private async deleteUnreferencedObjects(manifest: Manifest, clearStaging = true): Promise<void> {
+    const staging = await this.stagingHashes();
+    const keep = new Set<string>([await this.ctx.storage.get<string>("base_index_hash") || "", ...Object.values(manifest.files).map(entry => entry.hash), ...staging]);
     await this.reclaimExpiredBrowserObjects();
     await this.cleanupObjects(keep);
-    await this.ctx.storage.delete("staging_hashes");
+    if (clearStaging) await this.ctx.storage.delete("staging_hashes");
+    await this.ctx.storage.delete("cleanup_retry_at");
+    await this.scheduleAlarm().catch(() => {});
   }
 
   private async deleteSessionObjects(): Promise<void> {
@@ -1217,13 +1243,19 @@ export class Session extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     await this.mutate(async () => {
-      await this.reclaimExpiredBrowserObjects();
       const opened = await this.ctx.storage.get<boolean>("opened") ?? false;
       if (!opened) {
         await this.expireSession();
         return;
       }
       const now = Date.now();
+      const cleanupRetryAt = await this.ctx.storage.get<number>("cleanup_retry_at");
+      const current = await this.ctx.storage.get<Manifest>("current_manifest");
+      if (current && typeof cleanupRetryAt === "number" && Number.isSafeInteger(cleanupRetryAt) && cleanupRetryAt <= now) {
+        await this.deleteUnreferencedObjects(current, false).catch(() => {});
+      } else {
+        await this.reclaimExpiredBrowserObjects().catch(() => {});
+      }
       const producer = this.producer();
       const expiresAt = await this.ctx.storage.get<number>("expires_at");
       let graceAt = await this.ctx.storage.get<number>("producer_grace_at");
@@ -1235,7 +1267,7 @@ export class Session extends DurableObject<Env> {
         await this.expireSession();
         return;
       }
-      await this.scheduleAlarm();
+      await this.scheduleAlarm().catch(() => {});
     });
   }
 }
