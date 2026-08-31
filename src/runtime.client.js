@@ -95,8 +95,28 @@
     if (form instanceof HTMLFormElement) setStatus(form, message);
   }
 
+  async function uploadAttachments(record) {
+    if (!record.attachments?.length) return;
+    setSubmissionStatus(record.id, "Uploading…", record.form_id);
+    const response = await fetch("/_letmeknow/attachments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hashes: record.attachments.map(({ hash, size }) => ({ hash, size })) })
+    });
+    if (!response.ok) throw Object.assign(new Error("attachment upload failed"), { status: response.status });
+    const result = await response.json();
+    const files = new Map(record.files.map(file => [file.hash, file.file]));
+    for (const item of result.missing || []) {
+      const file = files.get(item.hash);
+      if (!file || file.size !== item.size) throw new Error("attachment upload failed");
+      const upload = await fetch(`/_letmeknow/attachments/${item.hash}`, { method: "PUT", body: file });
+      if (!upload.ok) throw Object.assign(new Error("attachment upload failed"), { status: upload.status });
+    }
+  }
+
   async function deliverSubmission(record) {
     try {
+      await uploadAttachments(record);
       const response = await fetch(submissionPath, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -111,11 +131,11 @@
       }
       if (response.status >= 400 && response.status < 500) await outboxDelete(record.id);
       if (terminal) return;
-      setSubmissionStatus(record.id, response.status === 413 ? "Submission is too large." : "Couldn’t send. Try again.", record.form_id);
+      setSubmissionStatus(record.id, response.status === 413 && record.attachments?.length ? "Attachment is too large." : response.status === 413 ? "Submission is too large." : "Couldn’t send. Try again.", record.form_id);
       if (response.status >= 500) scheduleOutboxFlush();
-    } catch {
+    } catch (cause) {
       if (terminal) return;
-      setSubmissionStatus(record.id, "Couldn’t send. Try again.", record.form_id);
+      setSubmissionStatus(record.id, cause?.status === 413 ? "Attachment is too large." : "Couldn’t send. Try again.", record.form_id);
       scheduleOutboxFlush();
     }
   }
@@ -309,11 +329,10 @@
       return;
     }
     const data = new FormData(form, submitter);
-    const selectedFile = Array.from(data.values()).some((value) => typeof File !== "undefined" && value instanceof File && value.name);
-    if (selectedFile) {
-      setStatus(form, "File uploads are not supported.");
-      return;
-    }
+    const files = Array.from(data.entries()).flatMap(([field, value]) => {
+      if (typeof File === "undefined" || !(value instanceof File) || !value.name) return [];
+      return [{ field, file: value }];
+    });
     const id = crypto.randomUUID();
     const formId = form.id || null;
     const trigger = submitter ? { id: submitter.id || null, name: submitter.name || null, value: submitter.value || null } : null;
@@ -325,10 +344,19 @@
       trigger,
       values: submissionValues(data)
     };
-    submissionForms.set(id, form);
-    setStatus(form, "Sending…");
     try {
-      await outboxPut({ id, form_id: formId, body: JSON.stringify(payload) });
+      const attachments = [];
+      const fileRecords = [];
+      for (const { field, file } of files) {
+        const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", await file.arrayBuffer())), byte => byte.toString(16).padStart(2, "0")).join("");
+        const descriptor = { field, name: file.name, content_type: file.type, size: file.size, hash };
+        attachments.push(descriptor);
+        fileRecords.push({ hash, file });
+      }
+      if (attachments.length) payload.attachments = attachments;
+      submissionForms.set(id, form);
+      setStatus(form, attachments.length ? "Uploading…" : "Sending…");
+      await outboxPut({ id, form_id: formId, body: JSON.stringify(payload), attachments, files: fileRecords });
       if (terminal) {
         submissionForms.delete(id);
         await outboxDelete(id);

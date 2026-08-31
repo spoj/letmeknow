@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { accessSync, constants, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
@@ -78,6 +79,7 @@ const body = `
       <output id="status" data-letmeknow-status role="status"></output>
     </form>
     <form id="app-owned" action="/app-owned" method="post"><button id="app-submit">App-owned</button></form>
+    <form id="upload-review" action="/review" method="post" enctype="multipart/form-data"><input id="upload" type="file" name="evidence"><button id="upload-submit">Upload</button><output id="upload-status" data-letmeknow-status></output></form>
     <details id="more"><summary>More</summary><p>Details</p></details>
     <section id="local-panel" hidden>Local</section>
   </main>
@@ -123,6 +125,8 @@ describe("browser runtime", () => {
     let rootRequests = 0;
     let delayedPostResponse;
     const posts = [];
+    const attachmentReservations = [];
+    const attachmentUploads = new Map();
     const sockets = [];
     const wsServer = new WebSocketServer({ noServer: true });
     const httpServer = http.createServer((req, res) => {
@@ -145,6 +149,29 @@ describe("browser runtime", () => {
         rootRequests += 1;
         res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
         res.end(currentPage);
+        return;
+      }
+      if (req.method === "POST" && req.url === "/_letmeknow/attachments") {
+        const chunks = [];
+        req.on("data", chunk => chunks.push(chunk));
+        req.on("end", () => {
+          const value = JSON.parse(Buffer.concat(chunks).toString());
+          attachmentReservations.push(value);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ missing: value.hashes.filter(item => !attachmentUploads.has(item.hash)) }));
+        });
+        return;
+      }
+      if (req.method === "PUT" && req.url.startsWith("/_letmeknow/attachments/")) {
+        const hash = req.url.slice("/_letmeknow/attachments/".length);
+        const chunks = [];
+        req.on("data", chunk => chunks.push(chunk));
+        req.on("end", () => {
+          const bytes = Buffer.concat(chunks);
+          attachmentUploads.set(hash, bytes);
+          res.writeHead(204);
+          res.end();
+        });
         return;
       }
       if (req.method === "POST" && req.url === "/_letmeknow/submit") {
@@ -226,6 +253,19 @@ describe("browser runtime", () => {
       assert.equal(posts.length, appPosts, "app-owned forms must not enter the structured outbox");
       assert.equal(rootRequests, appRequests, "app-owned forms must not navigate");
       assert.equal(await execute("return location.pathname"), "/");
+
+      const uploadBody = "browser attachment bytes";
+      await execute(`const input = document.querySelector('#upload'); const transfer = new DataTransfer(); transfer.items.add(new File([${JSON.stringify(uploadBody)}], '../evidence.txt', { type: 'text/plain' })); input.files = transfer.files; document.querySelector('#upload-submit').click();`);
+      await waitFor(() => posts.length === appPosts + 1, "file submission was not delivered");
+      const uploadedSubmission = JSON.parse(posts.at(-1).body);
+      assert.equal(uploadedSubmission.values.evidence, undefined);
+      assert.equal(uploadedSubmission.attachments.length, 1);
+      const attachment = uploadedSubmission.attachments[0];
+      assert.deepEqual({ field: attachment.field, name: attachment.name, content_type: attachment.content_type, size: attachment.size }, { field: "evidence", name: "../evidence.txt", content_type: "text/plain", size: Buffer.byteLength(uploadBody) });
+      assert.equal(attachment.hash, createHash("sha256").update(uploadBody).digest("hex"));
+      assert.deepEqual(attachmentReservations, [{ hashes: [{ hash: attachment.hash, size: attachment.size }] }]);
+      assert.deepEqual(attachmentUploads.get(attachment.hash), Buffer.from(uploadBody));
+      await waitFor(async () => await execute("return document.querySelector('#upload-status')?.textContent") === "Sent. Waiting for an update…", "file submission was not acknowledged");
 
       await execute("window.originalItemOne = document.querySelector('#item-one'); document.querySelector('#message').value = 'focused draft'; document.querySelector('#tag').checked = true; document.querySelector('#more').open = true; document.querySelector('#message').focus();");
       sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 2, considered_through: 1, script: "document.querySelector('#items').insertAdjacentHTML('beforeend', '<li id=\"item-three\">Three</li>');" }));
