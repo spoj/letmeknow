@@ -81,7 +81,7 @@ describe("LetMeKnow outbound relay", () => {
     const second = await connectClient(url);
     expect(await first.next()).toEqual({ type: "connected", producer_connected: true });
     expect(await second.next()).toEqual({ type: "connected", producer_connected: true });
-    const update = { type: "update_ui", event_number: 1, html: "<output>1</output>" };
+    const update = { type: "update_ui", event_number: 1, target: "counter", html: "<output id=\"counter\">1</output>" };
     producer.send(update);
     expect(await first.next()).toEqual(update);
     expect(await second.next()).toEqual(update);
@@ -92,9 +92,13 @@ describe("LetMeKnow outbound relay", () => {
 
   it("rejects invalid UI updates", async () => {
     const { producer } = await open();
-    producer.send({ type: "update_ui", event_number: -1, html: "<p>bad</p>" });
+    producer.send({ type: "update_ui", event_number: -1, target: "counter", html: "<p>bad</p>" });
     expect(await producer.next()).toEqual({ type: "error", message: "event_number must be a nonnegative safe integer" });
-    producer.send({ type: "update_ui", event_number: 0, html: 42 });
+    producer.send({ type: "update_ui", event_number: 0, html: "<p>bad</p>" });
+    expect(await producer.next()).toEqual({ type: "error", message: "target is required" });
+    producer.send({ type: "update_ui", event_number: 0, target: "", html: "<p>bad</p>" });
+    expect(await producer.next()).toEqual({ type: "error", message: "target is required" });
+    producer.send({ type: "update_ui", event_number: 0, target: "counter", html: 42 });
     expect(await producer.next()).toEqual({ type: "error", message: "html is required" });
   });
 
@@ -204,10 +208,6 @@ describe("LetMeKnow outbound relay", () => {
     const runtime = await SELF.fetch(new Request(runtimeUrl));
     expect(runtime.status).toBe(200);
     expect(await runtime.text()).toContain("Sent. Waiting for an update");
-
-    const idiomorph = await SELF.fetch(new Request(new URL("_letmeknow/idiomorph.js", url)));
-    expect(idiomorph.status).toBe(200);
-    expect(await idiomorph.text()).toContain("export { Idiomorph }");
 
     const head = await SELF.fetch(new Request(runtimeUrl, { method: "HEAD" }));
     expect(head.status).toBe(200);
