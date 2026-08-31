@@ -12,10 +12,11 @@ import { lookup } from "mrmime";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_SCRIPT_BYTES = MAX_BODY_BYTES;
+const MAX_PACKET_BYTES = 6 * MAX_SCRIPT_BYTES + 4096;
 const MAX_BATCH_TOKENS = 100_000;
 const MAX_UNIQUE_SUBMISSIONS = 100_000;
 const MAX_RETAINED_SUBMISSION_BYTES = 256 * 1024 * 1024;
-const CONTROL_MAX_BYTES = MAX_SCRIPT_BYTES * 2;
+const CONTROL_MAX_BYTES = MAX_PACKET_BYTES;
 const RECONNECT_RETRY_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
 const CONTROL_TIMEOUT = 35_000;
@@ -87,14 +88,14 @@ function requestUrl(packet) {
   return { pathname, encodedPathname: url.pathname, search: url.search };
 }
 
-async function staticResponse(root, packet, page, pageEvent) {
+async function staticResponse(root, packet, page) {
   const published = (status, body = Buffer.alloc(0), headers = {}) => response(packet, status, body, headers);
   const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
   if (method !== "GET" && method !== "HEAD") return errorResponse(packet, 405, "method not allowed");
   let request;
   try { request = requestUrl(packet); } catch { return errorResponse(packet, 400, "bad request"); }
   if (request.pathname === "/" || request.pathname === "/index.html") {
-    return published(200, Buffer.from(page), { "Content-Type": "text/html; charset=utf-8", "X-LetMeKnow-Page-Event": String(pageEvent) });
+    return published(200, Buffer.from(page), { "Content-Type": "text/html; charset=utf-8" });
   }
   if (deniedPath(request.pathname)) return errorResponse(packet, 403, "forbidden");
   const candidate = resolve(root, "." + request.pathname);
@@ -169,7 +170,7 @@ function bodyElement(node) {
 function replayablePage(page, history) {
   const document = parse(page);
   const body = bodyElement(document);
-  const value = JSON.stringify(history).replaceAll("<", "\\u003c");
+  const value = JSON.stringify(history).replace(/<\/script/gi, match => "\\u003c" + match.slice(1));
   const script = {
     nodeName: "script",
     tagName: "script",
@@ -184,7 +185,7 @@ function replayablePage(page, history) {
   script.parentNode = body;
   body.childNodes.push(script);
   const result = serialize(document);
-  if (Buffer.byteLength(result, "utf8") > MAX_BODY_BYTES) throw new Error("replayable page is too large");
+  if (Buffer.byteLength(result, "utf8") > MAX_BODY_BYTES) throw new Error("page with replay history is too large");
   return result;
 }
 
@@ -240,13 +241,13 @@ async function submission(packet, recordInteraction) {
   return response(packet, 202);
 }
 
-async function handleRequest(root, page, pageEvent, packet, recordInteraction) {
+async function handleRequest(root, page, packet, recordInteraction) {
   let request;
   try { request = requestUrl(packet); } catch { return errorResponse(packet, 400, "bad request"); }
   if (request.pathname === "/_letmeknow/submit") {
     try { return await submission(packet, recordInteraction); } catch (cause) { return errorResponse(packet, cause?.message === "submission is too large" ? 413 : 400, cause instanceof Error ? cause.message : "invalid submission"); }
   }
-  return staticResponse(root, packet, page, pageEvent);
+  return staticResponse(root, packet, page);
 }
 
 function options(directory) {
@@ -438,7 +439,12 @@ async function start(directory) {
     let handled = false;
     connection.on("data", async chunk => {
       input += chunk;
-      if (Buffer.byteLength(input, "utf8") > CONTROL_MAX_BYTES || handled) return;
+      if (handled) return;
+      if (Buffer.byteLength(input, "utf8") > CONTROL_MAX_BYTES) {
+        handled = true;
+        connection.end(JSON.stringify({ ok: false, error: "control request is too large" }) + "\n");
+        return;
+      }
       const newline = input.indexOf("\n");
       if (newline < 0) return;
       handled = true;
@@ -531,8 +537,7 @@ async function start(directory) {
         if (!ready) { ready = true; process.stdout.write(`${JSON.stringify({ type: "ready", url: sessionUrl, page_event: pageEvent, page_hash: currentPageHash() })}\n`); }
       } else if (packet.type === "http_request") {
         const requestPage = page;
-        const requestPageEvent = pageEvent;
-        void handleRequest(root, requestPage, requestPageEvent, packet, recordInteraction).then(result => send(result)).catch(() => send(errorResponse(packet, 500, "preview request failed")));
+        void handleRequest(root, requestPage, packet, recordInteraction).then(result => send(result)).catch(() => send(errorResponse(packet, 500, "preview request failed")));
       } else if (packet.type === "closed") {
         void stop(0);
       } else if (packet.type === "error") {

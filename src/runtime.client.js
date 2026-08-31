@@ -19,7 +19,8 @@
   let outboxRetryTimer;
 
   function readHistory(documentLike) {
-    const element = documentLike.querySelector("script[data-letmeknow-history]");
+    const elements = documentLike.querySelectorAll("script[data-letmeknow-history]");
+    const element = elements[elements.length - 1];
     if (!element) return null;
     try {
       const value = JSON.parse(element.textContent || "");
@@ -194,7 +195,6 @@
 
   function setPageEvent(eventNumber) {
     pageEvent = eventNumber;
-    document.querySelector("script[data-letmeknow-runtime]")?.setAttribute("data-letmeknow-page-event", String(eventNumber));
   }
 
   function runScript(event) {

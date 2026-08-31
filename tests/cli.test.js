@@ -155,9 +155,9 @@ function decodeBody(packet) {
 }
 
 function historyFrom(page) {
-  const match = page.match(/<script type="application\/json" data-letmeknow-history(?:="")?>([\s\S]*?)<\/script>/);
-  assert.ok(match, "replay history script is missing");
-  return JSON.parse(match[1]);
+  const matches = [...page.matchAll(/<script type="application\/json" data-letmeknow-history(?:="")?>([\s\S]*?)<\/script>/g)];
+  assert.ok(matches.length, "replay history script is missing");
+  return JSON.parse(matches.at(-1)[1]);
 }
 
 function jsonSubmission(id, pageEvent = 0, values = { amount: "1" }) {
@@ -179,15 +179,15 @@ describe("LetMeKnow CLI", () => {
   });
 
   it("serves the initial replayable page and live assets", async () => {
-    const session = await startSession({ index: "<!doctype html><html><body><main id=\"letmeknow-root\">old</main></body></html>" });
+    const session = await startSession({ index: "<!doctype html><html><body><script type=\"application/json\" data-letmeknow-history>[\"agent content\"]</script><main id=\"letmeknow-root\">old</main></body></html>" });
     try {
       const page = await session.request("GET", "/", { accept: "text/html" });
       const index = await session.request("GET", "/index.html", { accept: "text/html" });
       const asset = await session.request("GET", "/assets/app.js");
       assert.equal(page.status, 200);
       assert.deepEqual(historyFrom(decodeBody(page)), []);
+      assert.match(decodeBody(page), /data-letmeknow-history="">\["agent content"\]<\/script>/);
       assert.equal(decodeBody(index), decodeBody(page));
-      assert.equal(page.headers["X-LetMeKnow-Page-Event"], "0");
       assert.equal(decodeBody(asset), "initial");
 
       writeFileSync(join(session.folder, "index.html"), "changed draft");
@@ -225,7 +225,6 @@ describe("LetMeKnow CLI", () => {
       const pageBody = decodeBody(page);
       assert.deepEqual(historyFrom(pageBody), session.scripts);
       assert.equal(secondPush.page_hash, createHash("sha256").update(pageBody).digest("hex"));
-      assert.equal(page.headers["X-LetMeKnow-Page-Event"], "2");
     } finally {
       await session.stop();
     }
@@ -235,10 +234,10 @@ describe("LetMeKnow CLI", () => {
     const session = await startSession();
     try {
       const batch = await command(["pull", session.folder]);
-      const script = "const html = '</script><img src=x>';";
+      const script = "const html = '</ScRiPt><img src=x>';";
       await command(["push", session.folder, "--batch", batch.token, "--script", "-"], script);
       const page = decodeBody(await session.request("GET", "/"));
-      assert.match(page, /\\u003c\/script>/);
+      assert.match(page, /\\u003c\/ScRiPt>/);
       assert.equal(historyFrom(page)[0].script, script);
     } finally {
       await session.stop();
@@ -321,6 +320,20 @@ describe("LetMeKnow CLI", () => {
     }
   });
 
+  it("accepts escaped scripts through the control envelope", async () => {
+    const session = await startSession();
+    try {
+      const script = join(session.folder, "escaped.js");
+      writeFileSync(script, Buffer.alloc(MAX_BODY_BYTES));
+      const batch = await command(["pull", session.folder]);
+      const result = await runCommand(["push", session.folder, "--batch", batch.token, "--script", script]);
+      assert.equal(result.code, 1);
+      assert.match(result.stdout, /page with replay history is too large/);
+    } finally {
+      await session.stop();
+    }
+  });
+
   it("rejects oversized initial pages and scripts", async () => {
     const folder = mkdtempSync(join(tmpdir(), "letmeknow-large-"));
     writeFileSync(join(folder, "index.html"), Buffer.alloc(MAX_BODY_BYTES + 1, 97));
@@ -328,6 +341,15 @@ describe("LetMeKnow CLI", () => {
     assert.equal(result.code, 1);
     assert.match(result.stderr, /index.html is too large/);
     rmSync(folder, { recursive: true, force: true });
+
+    const replayableFolder = mkdtempSync(join(tmpdir(), "letmeknow-replayable-large-"));
+    const replayableIndex = `<!doctype html><html><body>${"a".repeat(MAX_BODY_BYTES - 50)}</body></html>`;
+    assert.ok(Buffer.byteLength(replayableIndex) <= MAX_BODY_BYTES);
+    writeFileSync(join(replayableFolder, "index.html"), replayableIndex);
+    const replayable = await runCommand(["serve", replayableFolder]);
+    assert.equal(replayable.code, 1);
+    assert.match(replayable.stderr, /page with replay history is too large/);
+    rmSync(replayableFolder, { recursive: true, force: true });
 
     const scriptFolder = mkdtempSync(join(tmpdir(), "letmeknow-large-script-"));
     writeFileSync(join(scriptFolder, "index.html"), "<!doctype html><html><body></body></html>");

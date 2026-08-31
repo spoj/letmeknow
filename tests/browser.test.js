@@ -61,8 +61,9 @@ async function stopProcess(child) {
 }
 
 function documentPage(history, title, body, dynamic = true) {
-  const historyScript = dynamic ? `<script type="application/json" data-letmeknow-history>${JSON.stringify(history).replaceAll("<", "\\u003c")}</script>` : "";
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}${historyScript}<script id="agent-script">window.agentScriptRuns = (window.agentScriptRuns || 0) + 1;</script><script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime></script></body></html>`;
+  const existingHistory = dynamic ? `<script type="application/json" data-letmeknow-history>[]</script>` : "";
+  const historyScript = dynamic ? `<script type="application/json" data-letmeknow-history>${JSON.stringify(history).replace(/<\/script/gi, match => "\\u003c" + match.slice(1))}</script>` : "";
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}${existingHistory}${historyScript}<script id="agent-script">window.agentScriptRuns = (window.agentScriptRuns || 0) + 1;</script><script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime></script></body></html>`;
 }
 
 const body = `
@@ -209,9 +210,8 @@ describe("browser runtime", () => {
         details: document.querySelector('#more').open,
         movedNodePreserved: document.querySelector('#item-one') === window.originalItemOne,
         attribute: document.querySelector('#item-two').dataset.state,
-        localHidden: document.querySelector('#local-panel').hidden,
-        pageEvent: document.querySelector('script[data-letmeknow-runtime]').dataset.letmeknowPageEvent
-      }`), { items: ["item-two", "item-one"], message: "focused draft", focused: "message", checked: true, details: true, movedNodePreserved: true, attribute: "changed", localHidden: false, pageEvent: "5" });
+        localHidden: document.querySelector('#local-panel').hidden
+      }`), { items: ["item-two", "item-one"], message: "focused draft", focused: "message", checked: true, details: true, movedNodePreserved: true, attribute: "changed", localHidden: false });
 
       const beforeErrorRequests = rootRequests;
       sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 6, script: "document.querySelector('#message').value = 'partial'; throw new Error('intentional update failure');" }));
@@ -232,7 +232,6 @@ describe("browser runtime", () => {
       await waitFor(async () => await execute("return document.querySelector('#heading')?.textContent") === "Corrected", "history replay did not reach correction");
       assert.equal(await execute("return window.historyRuns"), 1);
       assert.equal(await execute("return document.querySelector('#items').textContent.trim()"), "TwoOne");
-      assert.equal(await execute("return document.querySelector('script[data-letmeknow-runtime]').dataset.letmeknowPageEvent"), "8");
       await waitFor(() => posts.length > 1, "replayed requestSubmit was not intercepted");
       const replayedSubmission = JSON.parse(posts.at(-1).body);
       assert.equal(replayedSubmission.page_event, 8);
