@@ -243,6 +243,13 @@ describe("browser runtime", () => {
       assert.equal(scriptHits, 0, "scripts in rejected replacements must not execute");
 
       await waitFor(() => sockets.length > beforeRecoverySockets, "recovered page runtime did not connect");
+      const beforeCommentRecovery = rootRequests;
+      const beforeCommentRecoverySockets = sockets.length;
+      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 53, target: "counter", html: "<!-- comment --><output id=\"counter\">bad</output>" }));
+      await waitFor(() => rootRequests > beforeCommentRecovery, "comment-wrapped replacement did not trigger recovery");
+      await waitFor(() => sockets.length > beforeCommentRecoverySockets, "comment recovery runtime did not connect");
+      await waitFor(async () => await execute("return document.title") === "Recovered", "comment recovery did not load the canonical page");
+
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: false }));
       await waitFor(async () => await execute("return document.documentElement.hasAttribute('data-letmeknow-disconnected')"), "producer disconnect was not reflected");
       await execute("document.querySelector('#submit').click();");
@@ -252,7 +259,7 @@ describe("browser runtime", () => {
       await waitFor(async () => await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent") === "Session expired", "terminal status was not shown");
       await waitFor(async () => await outboxCount() === 0, "terminal session did not clear the outbox");
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: true }));
-      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 53, target: "heading", html: "<h1 id=\"heading\">Unexpected</h1>" }));
+      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 54, target: "heading", html: "<h1 id=\"heading\">Unexpected</h1>" }));
       await sleep(100);
       assert.equal(await outboxCount(), 0);
       assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session expired");

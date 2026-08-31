@@ -203,8 +203,9 @@
     const range = document.createRange();
     range.selectNode(target);
     const fragment = range.createContextualFragment(html);
-    const roots = Array.from(fragment.childNodes).filter(node => node.nodeType === Node.ELEMENT_NODE);
-    if (roots.length !== 1 || Array.from(fragment.childNodes).some(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim() !== "")) return null;
+    const nodes = Array.from(fragment.childNodes);
+    const roots = nodes.filter(node => node.nodeType === Node.ELEMENT_NODE);
+    if (roots.length !== 1 || nodes.some(node => node !== roots[0] && (node.nodeType !== Node.TEXT_NODE || node.textContent.trim() !== ""))) return null;
     const replacement = roots[0];
     if (replacement.id !== target.id || containsScript(fragment)) return null;
     return replacement;
