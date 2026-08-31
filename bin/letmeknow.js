@@ -381,6 +381,8 @@ async function start(directory) {
   let connectionTimer;
   let retryDelay = 100;
   let retryUntil = 0;
+  let sessionExpiresAt;
+  let expiryTimer;
   let stopped = false;
   let ready = false;
 
@@ -528,6 +530,7 @@ async function start(directory) {
     stopped = true;
     clearTimeout(retryTimer);
     clearTimeout(connectionTimer);
+    clearTimeout(expiryTimer);
     send({ type: "close" });
     try { socket?.close(); } catch {}
     for (const connection of controlConnections) connection.destroy();
@@ -538,6 +541,20 @@ async function start(directory) {
   stopSession = () => { void stop(1); };
   process.once("SIGINT", () => void stop(0));
   process.once("SIGTERM", () => void stop(0));
+
+  const setSessionExpiry = expiresAt => {
+    if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) return false;
+    if (sessionExpiresAt !== undefined && sessionExpiresAt !== expiresAt) return false;
+    sessionExpiresAt = expiresAt;
+    clearTimeout(expiryTimer);
+    const expire = () => {
+      expiryTimer = undefined;
+      if (Date.now() >= expiresAt) void stop(0);
+      else expiryTimer = setTimeout(expire, expiresAt - Date.now());
+    };
+    expiryTimer = setTimeout(expire, expiresAt - Date.now());
+    return true;
+  };
 
   const retry = () => {
     if (stopped || Date.now() >= retryUntil) return void stop(1);
@@ -573,7 +590,7 @@ async function start(directory) {
         if (typeof packet.credential !== "string" || !credentialPattern.test(packet.credential)) return void stop(1);
         credential = packet.credential;
       } else if (packet.type === "session") {
-        if (!validSessionUrl(packet.url)) return void stop(1);
+        if (!validSessionUrl(packet.url) || !setSessionExpiry(packet.expires_at)) return void stop(1);
         sessionUrl = packet.url;
         if (!ready) { ready = true; process.stdout.write(`${JSON.stringify({ type: "ready", url: sessionUrl, page_event: pageEvent, page_hash: currentPageHash() })}\n`); }
       } else if (packet.type === "http_request") {
@@ -593,7 +610,7 @@ async function start(directory) {
       send = () => false;
       socket = undefined;
       if (!credential || !sessionUrl) return void stop(1);
-      if (!retryUntil) retryUntil = Date.now() + GRACE_SECONDS * 1_000;
+      if (!retryUntil) retryUntil = Math.min(Date.now() + GRACE_SECONDS * 1_000, sessionExpiresAt ?? Infinity);
       retry();
     });
   };

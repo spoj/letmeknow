@@ -131,6 +131,7 @@ function injectRuntime(response: Response, request: Request): Response {
 export class Session extends DurableObject<Env> {
   private stateMutation: Promise<void> = Promise.resolve();
   private readonly pendingProxy = new Map<string, PendingProxy>();
+  private activeProxyRequests = 0;
 
   async fetch(request: Request): Promise<Response> {
     const route = request.headers.get("x-letmeknow-route");
@@ -164,8 +165,10 @@ export class Session extends DurableObject<Env> {
   private async expireSession(): Promise<void> {
     this.failProxyRequests();
     this.sendClients({ type: "closed", message: "Session expired" });
+    const producer = this.producer();
+    try { producer?.send(JSON.stringify({ type: "closed", message: "Session expired" })); } catch {}
     for (const client of this.clients()) client.close(1000, "session expired");
-    this.producer()?.close(1000, "session expired");
+    producer?.close(1000, "session expired");
     await this.ctx.storage.deleteAll();
   }
 
@@ -194,13 +197,13 @@ export class Session extends DurableObject<Env> {
     const attachment: ProducerAttachment = { role: "producer", id: crypto.randomUUID(), url: request.headers.get("x-letmeknow-url")!, opened: reconnect && opened, closing: false };
     server.serializeAttachment(attachment);
     this.ctx.acceptWebSocket(server);
-    if (reconnect && opened) {
-      const expiresAt = await this.ctx.storage.get<number>("expires_at");
-      await this.ctx.storage.setAlarm(expiresAt!);
-    } else await this.ctx.storage.setAlarm(Date.now() + OPEN_DEADLINE_MS);
+    const expiresAt = reconnect && opened ? await this.ctx.storage.get<number>("expires_at") : undefined;
+    if (expiresAt !== undefined) await this.ctx.storage.setAlarm(expiresAt);
+    else await this.ctx.storage.setAlarm(Date.now() + OPEN_DEADLINE_MS);
     if (!reconnect) server.send(JSON.stringify({ type: "credential", credential }));
     if (reconnect && opened) {
-      server.send(JSON.stringify({ type: "session", url: attachment.url, expires_after_disconnect: PRODUCER_GRACE_MS / 1000 }));
+      if (expiresAt === undefined) throw new Error("session expired");
+      server.send(JSON.stringify({ type: "session", url: attachment.url, expires_at: expiresAt, expires_after_disconnect: PRODUCER_GRACE_MS / 1000 }));
       this.sendClients({ type: "producer", connected: true });
     }
     return new Response(null, { status: 101, webSocket: client, ...(protocol ? { headers: { "Sec-WebSocket-Protocol": protocol } } : {}) });
@@ -245,45 +248,50 @@ export class Session extends DurableObject<Env> {
   private async proxyRequest(request: Request): Promise<Response> {
     const producer = this.producer();
     if (!producer) return isDocumentRequest(request) ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503);
-    if (this.pendingProxy.size >= MAX_PENDING_PROXY) return error("too many pending proxy requests", 503);
-    const contentLength = request.headers.get("content-length");
-    if (contentLength !== null && /^\d+$/.test(contentLength) && BigInt(contentLength) > BigInt(MAX_BODY_BYTES)) return error("request body is too large", 413);
-    const reader = request.body?.getReader();
-    const chunks: Uint8Array[] = [];
-    let bodyLength = 0;
-    if (reader) {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (bodyLength + value.byteLength > MAX_BODY_BYTES) {
-          await reader.cancel();
-          return error("request body is too large", 413);
-        }
-        chunks.push(value);
-        bodyLength += value.byteLength;
-      }
-    }
-    const body = new Uint8Array(bodyLength);
-    let bodyOffset = 0;
-    for (const chunk of chunks) { body.set(chunk, bodyOffset); bodyOffset += chunk.byteLength; }
-    const headers: Record<string, string> = {};
-    for (const [name, value] of request.headers) if (!hopHeaders.has(name)) headers[name] = value;
-    const id = crypto.randomUUID();
-    const response = new Promise<Response>((resolve) => {
-      const timer = setTimeout(() => { this.pendingProxy.delete(id); resolve(error("producer request timed out", 504)); }, PROXY_TIMEOUT_MS);
-      this.pendingProxy.set(id, { resolve, timer, document: isDocumentRequest(request) });
-    });
+    if (this.activeProxyRequests >= MAX_PENDING_PROXY) return error("too many pending proxy requests", 503);
+    this.activeProxyRequests += 1;
     try {
-      producer.send(JSON.stringify({ type: "http_request", request_id: id, method: request.method, path: request.headers.get("x-letmeknow-path")!, headers, body: bytesToBase64(body) }));
-    } catch {
-      const pending = this.pendingProxy.get(id);
-      if (pending) {
-        clearTimeout(pending.timer);
-        this.pendingProxy.delete(id);
-        pending.resolve(pending.document ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503));
+      const contentLength = request.headers.get("content-length");
+      if (contentLength !== null && /^\d+$/.test(contentLength) && BigInt(contentLength) > BigInt(MAX_BODY_BYTES)) return error("request body is too large", 413);
+      const reader = request.body?.getReader();
+      const chunks: Uint8Array[] = [];
+      let bodyLength = 0;
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (bodyLength + value.byteLength > MAX_BODY_BYTES) {
+            await reader.cancel();
+            return error("request body is too large", 413);
+          }
+          chunks.push(value);
+          bodyLength += value.byteLength;
+        }
       }
+      const body = new Uint8Array(bodyLength);
+      let bodyOffset = 0;
+      for (const chunk of chunks) { body.set(chunk, bodyOffset); bodyOffset += chunk.byteLength; }
+      const headers: Record<string, string> = {};
+      for (const [name, value] of request.headers) if (!hopHeaders.has(name)) headers[name] = value;
+      const id = crypto.randomUUID();
+      const response = new Promise<Response>((resolve) => {
+        const timer = setTimeout(() => { this.pendingProxy.delete(id); resolve(error("producer request timed out", 504)); }, PROXY_TIMEOUT_MS);
+        this.pendingProxy.set(id, { resolve, timer, document: isDocumentRequest(request) });
+      });
+      try {
+        producer.send(JSON.stringify({ type: "http_request", request_id: id, method: request.method, path: request.headers.get("x-letmeknow-path")!, headers, body: bytesToBase64(body) }));
+      } catch {
+        const pending = this.pendingProxy.get(id);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingProxy.delete(id);
+          pending.resolve(pending.document ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503));
+        }
+      }
+      return await response;
+    } finally {
+      this.activeProxyRequests -= 1;
     }
-    return response;
   }
 
   private failProxyRequests(): void {
@@ -340,7 +348,7 @@ export class Session extends DurableObject<Env> {
       attachment.opened = true;
       socket.serializeAttachment(attachment);
       await this.ctx.storage.setAlarm(expiresAt);
-      socket.send(JSON.stringify({ type: "session", ...(packet.id !== undefined ? { id: packet.id } : {}), url: attachment.url, expires_after_disconnect: PRODUCER_GRACE_MS / 1000 }));
+      socket.send(JSON.stringify({ type: "session", ...(packet.id !== undefined ? { id: packet.id } : {}), url: attachment.url, expires_at: expiresAt, expires_after_disconnect: PRODUCER_GRACE_MS / 1000 }));
       return;
     }
     if (!attachment.opened) throw new Error("open must be the first command");

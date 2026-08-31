@@ -59,12 +59,13 @@ async function connectProducer(code?: string, credential?: string): Promise<Peer
   return peer(response.webSocket!);
 }
 
-async function open(): Promise<{ producer: Peer; url: string }> {
+async function open(): Promise<{ producer: Peer; url: string; expiresAt: number }> {
   const producer = await connectProducer();
   producer.send({ type: "open", id: "open" });
   const session = await producer.next();
   expect(session).toMatchObject({ type: "session", id: "open", expires_after_disconnect: 600 });
-  return { producer, url: session.url };
+  expect(session.expires_at).toBeGreaterThan(Date.now());
+  return { producer, url: session.url, expiresAt: session.expires_at as number };
 }
 
 async function connectClient(url: string): Promise<Peer> {
@@ -87,11 +88,11 @@ describe("LetMeKnow outbound relay", () => {
   });
 
   it("sets an absolute expiration and never extends it on reconnect", async () => {
-    const { producer, url } = await open();
+    const { producer, url, expiresAt } = await open();
     const code = new URL(url).hostname.split(".")[0];
-    const expiresAt = await sessionValue<number>(code, "expires_at");
-    expect(expiresAt).toBeDefined();
-    expect(expiresAt! - Date.now()).toBeGreaterThan(SESSION_LIFETIME_MS - 1_000);
+    const storedExpiresAt = await sessionValue<number>(code, "expires_at");
+    expect(storedExpiresAt).toBe(expiresAt);
+    expect(expiresAt - Date.now()).toBeGreaterThan(SESSION_LIFETIME_MS - 1_000);
     expect(await sessionAlarm(code)).toBe(expiresAt);
 
     const client = await connectClient(url);
@@ -102,7 +103,7 @@ describe("LetMeKnow outbound relay", () => {
     expect(disconnectAlarm).toBeLessThan(expiresAt!);
 
     const replacement = await connectProducer(code, producer.credential);
-    expect(await replacement.next()).toMatchObject({ type: "session", url });
+    expect(await replacement.next()).toMatchObject({ type: "session", url, expires_at: expiresAt });
     expect(await sessionAlarm(code)).toBe(expiresAt);
   });
 
@@ -118,6 +119,7 @@ describe("LetMeKnow outbound relay", () => {
 
     await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.alarm());
     expect(await client.next()).toEqual({ type: "closed", message: "Session expired" });
+    expect(await producer.next()).toEqual({ type: "closed", message: "Session expired" });
     expect((await SELF.fetch(url)).status).toBe(404);
     expect(producer.socket.readyState).not.toBe(WebSocket.OPEN);
   });
@@ -284,7 +286,7 @@ describe("LetMeKnow outbound relay", () => {
 
   it("caps concurrent proxied requests per session", async () => {
     const { producer, url } = await open();
-    const requests = Array.from({ length: 256 }, (_, index) => SELF.fetch(new Request(new URL(`asset-${index}`, url))));
+    const requests = Array.from({ length: 256 }, (_, index) => SELF.fetch(new Request(new URL(`asset-${index}`, url), { method: "POST", body: `payload-${index}` })));
     const forwarded = await Promise.all(Array.from({ length: 256 }, () => producer.next()));
     expect(forwarded).toHaveLength(256);
 
