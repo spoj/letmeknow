@@ -311,7 +311,7 @@ describe("LetMeKnow CLI", () => {
     }
   });
 
-  it("keeps workspace uploads pinned to files opened during the scan", async () => {
+  it("fails safely when a workspace file is replaced before upload", async () => {
     let manifests = 0;
     let resolveManifest;
     const manifestSeen = new Promise(resolve => { resolveManifest = resolve; });
@@ -331,15 +331,18 @@ describe("LetMeKnow CLI", () => {
     try {
       writeFileSync(filename, expected);
       writeFileSync(outside, "outside workspace");
-      const resultPromise = command(["commit", session.folder, "--through", "0"]);
+      const resultPromise = runCommand(["commit", session.folder, "--through", "0"]);
       await manifestSeen;
       renameSync(filename, moved);
       symlinkSync(outside, filename);
       releaseManifest();
       const result = await resultPromise;
-      assert.equal(result.ok, true);
+      assert.equal(result.code, 1);
+      const response = JSON.parse(result.stdout);
+      assert.equal(response.ok, false);
+      assert.match(response.error, /workspace file escapes root/);
       const hash = createHash("sha256").update(expected).digest("hex");
-      assert.deepEqual(session.state.uploaded.get(hash).data, expected);
+      assert.equal(session.state.uploaded.has(hash), false);
     } finally {
       await session.stop();
       rmSync(outside, { force: true });

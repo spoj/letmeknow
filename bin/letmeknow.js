@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { constants, createReadStream, createWriteStream, existsSync, readFileSync, readdirSync, writeSync } from "node:fs";
-import { chmod, mkdir, open, realpath, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import net from "node:net";
 import { join, relative, resolve, sep } from "node:path";
@@ -49,11 +49,14 @@ function inside(root, target) {
 }
 
 async function workspaceDirectory(filename, root) {
+  const target = await realpath(filename);
+  if (!inside(root, target)) throw new Error("workspace path escapes root");
   const handle = await open(filename, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   try {
-    if (!(await handle.stat()).isDirectory()) throw new Error("workspace directory is not a directory");
-    const target = await realpath(`/proc/self/fd/${handle.fd}`);
-    if (!inside(root, target)) throw new Error("workspace path escapes root");
+    const info = await handle.stat();
+    const pathInfo = await stat(filename);
+    const currentTarget = await realpath(filename);
+    if (!info.isDirectory() || info.dev !== pathInfo.dev || info.ino !== pathInfo.ino || !inside(root, currentTarget)) throw new Error("workspace path escapes root");
     return handle;
   } catch (cause) {
     await handle.close().catch(() => {});
@@ -62,20 +65,15 @@ async function workspaceDirectory(filename, root) {
 }
 
 async function workspaceFile(filename, root, pathname) {
+  const target = await realpath(filename);
+  if (!inside(root, target)) throw new Error(`workspace file escapes root: ${pathname}`);
   const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    const infoBefore = await handle.stat();
-    const target = await realpath(`/proc/self/fd/${handle.fd}`);
-    if (!inside(root, target) || !infoBefore.isFile()) throw new Error(`workspace file is not regular: ${pathname}`);
-    const digest = createHash("sha256");
-    let size = 0;
-    for await (const chunk of createReadStream(null, { fd: handle.fd, autoClose: false, start: 0 })) {
-      size += chunk.byteLength;
-      digest.update(chunk);
-    }
-    const infoAfter = await handle.stat();
-    if (infoAfter.dev !== infoBefore.dev || infoAfter.ino !== infoBefore.ino || infoAfter.size !== infoBefore.size || size !== infoAfter.size) throw new Error(`workspace file changed while being read: ${pathname}`);
-    return { handle, hash: digest.digest("hex"), size };
+    const info = await handle.stat();
+    const pathInfo = await stat(filename);
+    const currentTarget = await realpath(filename);
+    if (!info.isFile() || info.dev !== pathInfo.dev || info.ino !== pathInfo.ino || !inside(root, currentTarget)) throw new Error(`workspace file is not regular: ${pathname}`);
+    return { handle, info };
   } catch (cause) {
     await handle.close().catch(() => {});
     throw cause;
@@ -86,11 +84,9 @@ async function scanWorkspace(root) {
   const files = {};
   const paths = new Map();
   let index;
-  const handles = [];
   const rootHandle = await workspaceDirectory(root, root);
   const visit = async (directory, prefix) => {
-    const directoryPath = `/proc/self/fd/${directory.fd}`;
-    const entries = readdirSync(directoryPath, { withFileTypes: true });
+    const entries = readdirSync(directory, { withFileTypes: true });
     for (const entry of entries) {
       const pathname = prefix ? `${prefix}/${entry.name}` : entry.name;
       if (!safeWorkspacePath(pathname)) {
@@ -98,35 +94,39 @@ async function scanWorkspace(root) {
         if (entry.name === "." || entry.name === "..") continue;
         throw new Error(`invalid workspace path: ${pathname}`);
       }
-      const filename = join(directoryPath, entry.name);
+      const filename = join(directory, entry.name);
       if (entry.isDirectory()) {
         const child = await workspaceDirectory(filename, root);
-        handles.push(child);
-        try { await visit(child, pathname); }
+        try { await visit(filename, pathname); }
         finally { await child.close(); }
         continue;
       }
       if (!entry.isFile()) throw new Error(`workspace file is not regular: ${pathname}`);
       const file = await workspaceFile(filename, root, pathname);
-      if (paths.has(file.hash)) await file.handle.close();
-      else {
-        paths.set(file.hash, { handle: file.handle, size: file.size });
-        handles.push(file.handle);
+      try {
+        const digest = createHash("sha256");
+        let size = 0;
+        for await (const chunk of createReadStream(null, { fd: file.handle.fd, autoClose: false, start: 0 })) {
+          size += chunk.byteLength;
+          digest.update(chunk);
+        }
+        const infoAfter = await file.handle.stat();
+        if (infoAfter.dev !== file.info.dev || infoAfter.ino !== file.info.ino || infoAfter.size !== file.info.size || size !== infoAfter.size) throw new Error(`workspace file changed while being read: ${pathname}`);
+        const metadata = { hash: digest.digest("hex"), size, content_type: getMimeType(pathname) };
+        paths.set(metadata.hash, { filename, size });
+        if (pathname === "index.html") index = metadata;
+        else files[pathname] = metadata;
+      } finally {
+        await file.handle.close();
       }
-      const metadata = { hash: file.hash, size: file.size, content_type: getMimeType(pathname) };
-      if (pathname === "index.html") index = metadata;
-      else files[pathname] = metadata;
     }
   };
   try {
-    handles.push(rootHandle);
-    await visit(rootHandle, "");
-    await rootHandle.close();
+    await visit(root, "");
     if (!index) throw new Error("index.html is required");
     return { index, files, paths };
-  } catch (cause) {
-    await Promise.all(handles.map(handle => handle.close().catch(() => {})));
-    throw cause;
+  } finally {
+    await rootHandle.close().catch(() => {});
   }
 }
 
@@ -407,18 +407,19 @@ async function start(directory) {
   };
 
   const scanAndUpload = async snapshot => {
-    try {
-      const hashes = Object.values(snapshot.files).map(file => ({ hash: file.hash, size: file.size }));
-      const result = await request({ type: "workspace_manifest", hashes, index: { hash: snapshot.index.hash, size: snapshot.index.size } }, "workspace_manifest");
-      for (const item of result.missing) {
-        const file = snapshot.paths.get(item.hash);
-        if (!file || file.size !== item.size) throw new Error("workspace snapshot is inconsistent");
+    const hashes = Object.values(snapshot.files).map(file => ({ hash: file.hash, size: file.size }));
+    const result = await request({ type: "workspace_manifest", hashes, index: { hash: snapshot.index.hash, size: snapshot.index.size } }, "workspace_manifest");
+    for (const item of result.missing) {
+      const file = snapshot.paths.get(item.hash);
+      if (!file || file.size !== item.size) throw new Error("workspace snapshot is inconsistent");
+      const opened = await workspaceFile(file.filename, root, item.hash);
+      try {
         const uploadUrl = new URL(`_letmeknow/workspace/${item.hash}`, sessionUrl);
-        const response = await fetch(uploadUrl, { method: "PUT", headers: { Authorization: `Bearer ${credential}`, "Content-Length": String(file.size) }, body: createReadStream(null, { fd: file.handle.fd, autoClose: false, start: 0 }), duplex: "half" });
+        const response = await fetch(uploadUrl, { method: "PUT", headers: { Authorization: `Bearer ${credential}`, "Content-Length": String(file.size) }, body: createReadStream(null, { fd: opened.handle.fd, autoClose: false, start: 0 }), duplex: "half" });
         if (!response.ok) throw new Error(`workspace upload failed: ${response.status}`);
+      } finally {
+        await opened.handle.close().catch(() => {});
       }
-    } finally {
-      await Promise.all([...snapshot.paths.values()].map(file => file.handle.close().catch(() => {})));
     }
   };
 
