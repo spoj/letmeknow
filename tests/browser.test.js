@@ -90,8 +90,9 @@ const liveHistory = [
   { event_number: 3, script: "document.querySelector('#items').prepend(document.querySelector('#item-two'));" },
   { event_number: 4, script: "document.querySelector('#count').textContent = '42'; document.querySelector('#item-two').setAttribute('data-state', 'changed'); document.querySelector('#local-panel').hidden = false;" },
   { event_number: 5, script: "document.querySelector('#item-three').remove();" },
-  { event_number: 6, script: "throw new Error('intentional update failure');" },
-  { event_number: 7, script: "document.querySelector('#heading').textContent = 'Corrected';" }
+  { event_number: 6, script: "document.querySelector('#message').value = 'partial'; throw new Error('intentional update failure');" },
+  { event_number: 7, script: "document.querySelector('#heading').textContent = 'Corrected';" },
+  { event_number: 8, script: "if (location.search === '?replay-submit') { document.querySelector('#message').value = 'replayed'; document.querySelector('#review').requestSubmit(); }" }
 ];
 
 const initialPage = documentPage(history, "Initial", body);
@@ -120,7 +121,7 @@ describe("browser runtime", () => {
         res.end(documentPage([], "Static", "<h1 id=\"static-heading\">Static</h1>", false));
         return;
       }
-      if (req.method === "GET" && req.url === "/") {
+      if (req.method === "GET" && (req.url === "/" || req.url === "/?replay-submit")) {
         rootRequests += 1;
         res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
         res.end(currentPage);
@@ -213,26 +214,35 @@ describe("browser runtime", () => {
       }`), { items: ["item-two", "item-one"], message: "focused draft", focused: "message", checked: true, details: true, movedNodePreserved: true, attribute: "changed", localHidden: false, pageEvent: "5" });
 
       const beforeErrorRequests = rootRequests;
-      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 6, script: "throw new Error('intentional update failure');" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 6, script: "document.querySelector('#message').value = 'partial'; throw new Error('intentional update failure');" }));
       await waitFor(async () => (await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"))?.includes("failed"), "failed UI script was not reported");
       assert.equal(rootRequests, beforeErrorRequests);
+      const failedBaselinePosts = posts.length;
+      await execute("document.querySelector('#submit').click();");
+      await waitFor(() => posts.length === failedBaselinePosts + 1, "submission after failed UI script was not delivered");
+      assert.equal(JSON.parse(posts.at(-1).body).page_event, 6);
       sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 7, script: "document.querySelector('#heading').textContent = 'Corrected';" }));
       await waitFor(async () => await execute("return document.querySelector('#heading')?.textContent") === "Corrected", "correction script did not execute");
       currentPage = replayedPage;
 
       const beforeReplayRequests = rootRequests;
-      await command("POST", "/url", { url: `http://127.0.0.1:${port}/` });
+      await command("POST", "/url", { url: `http://127.0.0.1:${port}/?replay-submit` });
       await waitFor(() => rootRequests > beforeReplayRequests, "replay page did not load");
       await waitFor(() => sockets.length > 1, "replay runtime did not connect");
       await waitFor(async () => await execute("return document.querySelector('#heading')?.textContent") === "Corrected", "history replay did not reach correction");
       assert.equal(await execute("return window.historyRuns"), 1);
       assert.equal(await execute("return document.querySelector('#items').textContent.trim()"), "TwoOne");
-      assert.equal(await execute("return document.querySelector('script[data-letmeknow-runtime]').dataset.letmeknowPageEvent"), "7");
+      assert.equal(await execute("return document.querySelector('script[data-letmeknow-runtime]').dataset.letmeknowPageEvent"), "8");
+      await waitFor(() => posts.length > 1, "replayed requestSubmit was not intercepted");
+      const replayedSubmission = JSON.parse(posts.at(-1).body);
+      assert.equal(replayedSubmission.page_event, 8);
+      assert.equal(replayedSubmission.values.message, "replayed");
+      assert.equal(rootRequests, beforeReplayRequests + 1, "replayed requestSubmit must not navigate");
 
       const baselinePosts = posts.length;
       await execute("document.querySelector('#submit').click();");
       await waitFor(() => posts.length === baselinePosts + 1, "submission was not delivered");
-      assert.equal(JSON.parse(posts.at(-1).body).page_event, 7);
+      assert.equal(JSON.parse(posts.at(-1).body).page_event, 8);
 
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: false }));
       await waitFor(async () => await execute("return document.documentElement.hasAttribute('data-letmeknow-disconnected')"), "disconnect was not reflected");
@@ -242,7 +252,7 @@ describe("browser runtime", () => {
       sockets.at(-1).send(JSON.stringify({ type: "closed", message: "Session closed" }));
       await waitFor(async () => await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent") === "Session closed", "terminal status was not shown");
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: true }));
-      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 8, script: "document.querySelector('#heading').textContent = 'Unexpected';" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 9, script: "document.querySelector('#heading').textContent = 'Unexpected';" }));
       await sleep(100);
       assert.equal(posts.length, baselinePosts + 1);
       assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session closed");

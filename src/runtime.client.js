@@ -199,9 +199,9 @@
 
   function runScript(event) {
     processedEvents.add(event.event_number);
+    setPageEvent(event.event_number);
     try {
       Function(event.script).call(window);
-      setPageEvent(event.event_number);
       clearSystemStatus();
     } catch (error) {
       reportScriptFailure(error);
@@ -337,8 +337,6 @@
     }
   }
 
-  if (dynamicPage) runHistory();
-
   document.addEventListener("submit", (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
@@ -346,5 +344,6 @@
     event.preventDefault();
     void submit(form, event.submitter);
   });
+  if (dynamicPage) runHistory();
   connect();
 })();
