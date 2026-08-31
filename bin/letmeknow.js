@@ -178,7 +178,7 @@ async function start(directory) {
   const streamBeforeReady = [];
   const mutate = mutateQueue();
   const pending = new Map();
-  const receivedEvents = new Map();
+  let lastEventIdentity;
   const eventFiles = new Map();
   let receivedThrough = 0;
   let retainedSubmissionBytes = 0;
@@ -304,9 +304,8 @@ async function start(directory) {
   const persistEvent = async event => {
     if (!Number.isSafeInteger(event.event_number) || event.event_number < 1) throw new Error("event sequence is invalid");
     const identity = eventIdentity(event);
-    const known = receivedEvents.get(event.event_number);
-    if (known !== undefined) {
-      if (known !== identity) throw new Error("event number was reused");
+    if (event.event_number <= receivedThrough) {
+      if (event.event_number !== receivedThrough || lastEventIdentity !== identity) throw new Error("event number was reused");
       sendPacket({ type: "event_ack", event_number: event.event_number });
       return;
     }
@@ -338,7 +337,7 @@ async function start(directory) {
       throw new Error("invalid event type");
     }
     const published = publish(event);
-    receivedEvents.set(event.event_number, identity);
+    lastEventIdentity = identity;
     receivedThrough = event.event_number;
     if (event.type === "submit") eventFiles.set(event.id, { event_number: event.event_number, event_path: eventPath, attachment_directory: attachmentDirectory, bytes, published });
     sendPacket({ type: "event_ack", event_number: event.event_number });
@@ -606,7 +605,7 @@ try {
   else if (command.command === "help") process.stdout.write(usage());
   else if (command.command === "serve") await start(command.directory);
   else {
-    const result = await connectControl(resolve(command.directory), { type: "commit", through: command.through, ...(command.script === undefined ? {} : { script: readScriptInput(command.script) }) });
+    const result = await connectControl(await realpath(resolve(command.directory)), { type: "commit", through: command.through, ...(command.script === undefined ? {} : { script: readScriptInput(command.script) }) });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     if (!result.ok) process.exitCode = 1;
   }
