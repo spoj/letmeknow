@@ -12,6 +12,8 @@ import { lookup } from "mrmime";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const UPDATE_BATCH_MAX_BYTES = 16 * MAX_BODY_BYTES;
+const MAX_UNIQUE_SUBMISSIONS = 100_000;
+const MAX_RETAINED_SUBMISSION_BYTES = 256 * 1024 * 1024;
 const CONTROL_MAX_BYTES = UPDATE_BATCH_MAX_BYTES * 2;
 const GRACE_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
@@ -286,7 +288,7 @@ async function submission(packet, recordInteraction) {
   if (typeof value.action !== "string") throw new Error("action is required");
   if (value.trigger !== null && (typeof value.trigger !== "object" || Array.isArray(value.trigger))) throw new Error("trigger must be an object or null");
   if (!value.values || typeof value.values !== "object" || Array.isArray(value.values)) throw new Error("values are required");
-  await recordInteraction({ type: "submit", id: value.id, page_event: value.page_event, form_id: value.form_id, action: value.action, trigger: value.trigger, values: value.values });
+  await recordInteraction({ type: "submit", id: value.id, page_event: value.page_event, form_id: value.form_id, action: value.action, trigger: value.trigger, values: value.values }, body.byteLength);
   return response(packet, 202);
 }
 
@@ -362,6 +364,8 @@ async function start(directory) {
   let eventNumber = 0;
   const currentPageHash = () => pageHash(page);
   const browserEvents = [];
+  const browserEventBytes = [];
+  let retainedSubmissionBytes = 0;
   let committedBrowserCursor = 0;
   const seenEvents = new Set();
   const tokens = new Map();
@@ -433,6 +437,7 @@ async function start(directory) {
     }
     const committedCount = record.end - record.start;
     const committedEvents = browserEvents.slice(0, committedCount).map(event => event.id);
+    retainedSubmissionBytes -= browserEventBytes.slice(0, committedCount).reduce((total, bytes) => total + bytes, 0);
     const updateEvents = [];
     for (const update of updates) {
       eventNumber += 1;
@@ -441,6 +446,7 @@ async function start(directory) {
     page = nextPage;
     pageEvent = updateEvents.at(-1)?.event_number ?? pageEvent;
     browserEvents.splice(0, committedCount);
+    browserEventBytes.splice(0, committedCount);
     committedBrowserCursor = record.end;
     pendingTokens.delete(record.key);
     record.status = "committed";
@@ -501,12 +507,19 @@ async function start(directory) {
     });
   }).catch(cause => { throw new Error(`cannot start local control channel: ${cause.message}`); });
 
-  const recordInteraction = event => mutate(async () => {
+  let stopSession = () => {};
+  const recordInteraction = (event, bytes) => mutate(async () => {
     if (seenEvents.has(event.id)) return;
+    if (seenEvents.size >= MAX_UNIQUE_SUBMISSIONS || retainedSubmissionBytes + bytes > MAX_RETAINED_SUBMISSION_BYTES) {
+      stopSession();
+      throw new Error("session submission limit exceeded");
+    }
     seenEvents.add(event.id);
+    retainedSubmissionBytes += bytes;
     eventNumber += 1;
     const numbered = { ...event, event_number: eventNumber };
     browserEvents.push(numbered);
+    browserEventBytes.push(bytes);
     notifyPullWaiters();
   });
 
@@ -522,6 +535,7 @@ async function start(directory) {
     await unlink(controlPath(root)).catch(() => {});
     process.exit(code);
   };
+  stopSession = () => { void stop(1); };
   process.once("SIGINT", () => void stop(0));
   process.once("SIGTERM", () => void stop(0));
 
