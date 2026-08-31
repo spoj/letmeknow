@@ -37,7 +37,7 @@ type RunUIEvent = {
 };
 type CanonicalEvent = SubmitEvent | RunUIEvent;
 type StoredEvent = { event: CanonicalEvent; received: boolean; sent: boolean; bytes: number };
-type BlobRecord = { size: number; stored: boolean; kind: "workspace" | "browser" };
+type BlobRecord = { size: number; stored: boolean; kind: "workspace" | "browser"; expires_at?: number };
 type SubmissionRecord = { event_number: number; hash: string };
 type ProducerAttachment = { role: "producer"; id: string; url: string; opened: boolean; closing: boolean };
 type ClientAttachment = { role: "client" };
@@ -57,6 +57,8 @@ const MAX_HISTORY_BYTES = MAX_BODY_BYTES;
 const MAX_PACKET_BYTES = 6 * MAX_BODY_BYTES + 4096;
 const MAX_MANIFEST_BYTES = 512 * 1024;
 const MAX_ATTACHMENTS = 32;
+const MAX_BROWSER_BLOB_RECORDS = 1024;
+const ATTACHMENT_RESERVATION_LEASE_MS = 5 * 60 * 1_000;
 const MAX_ATTACHMENT_FIELD_BYTES = 256;
 const MAX_ATTACHMENT_NAME_BYTES = 512;
 const MAX_ATTACHMENT_CONTENT_TYPE_BYTES = 200;
@@ -387,10 +389,92 @@ export class Session extends DurableObject<Env> {
     }
   }
 
-  private async reserveBrowserObjects(items: Array<{ hash: string; size: number }>): Promise<void> {
+  private async prepareBrowserUpload(hash: string): Promise<{ size: number; stored: boolean }> {
+    return this.mutate(async () => {
+      if (!(await this.ctx.storage.get<boolean>("opened"))) throw new Error("session not found");
+      if (await this.sessionExpired()) { await this.expireSession(); throw new Error("session expired"); }
+      await this.reclaimExpiredBrowserObjects();
+      const records = await this.blobRecords();
+      const record = records[hash];
+      if (!record || record.kind !== "browser") throw new Error("attachment was not reserved");
+      const object = await this.env.UPLOADS.head(await this.objectKey(hash));
+      if (object?.size === record.size) {
+        if (!record.stored || record.expires_at !== undefined) {
+          records[hash] = record.stored && record.expires_at === undefined
+            ? record
+            : { ...record, stored: true, expires_at: record.expires_at ?? Date.now() + ATTACHMENT_RESERVATION_LEASE_MS };
+          await this.ctx.storage.put("blob_records", records);
+        }
+        await this.scheduleAlarm();
+        return { size: record.size, stored: true };
+      }
+      records[hash] = { ...record, stored: false, expires_at: Date.now() + ATTACHMENT_RESERVATION_LEASE_MS };
+      await this.ctx.storage.put("blob_records", records);
+      await this.scheduleAlarm();
+      return { size: record.size, stored: false };
+    });
+  }
+
+  private async markBrowserObjectStored(hash: string, size: number): Promise<void> {
+    const records = await this.blobRecords();
+    const record = records[hash];
+    if (!record || record.kind !== "browser" || record.size !== size) throw new Error("attachment reservation changed");
+    records[hash] = { ...record, stored: true, ...(record.expires_at === undefined ? {} : { expires_at: record.expires_at }) };
+    await this.ctx.storage.put("blob_records", records);
+    await this.scheduleAlarm();
+  }
+
+  private async referencedBrowserObjects(): Promise<Set<string>> {
+    const referenced = new Set<string>();
+    const events = await this.ctx.storage.list<StoredEvent>({ prefix: "event:" });
+    for (const stored of events.values()) {
+      if (stored.event.type !== "submit") continue;
+      for (const attachment of stored.event.attachments || []) referenced.add(attachment.hash);
+    }
+    return referenced;
+  }
+
+  private async reclaimExpiredBrowserObjects(): Promise<void> {
+    const records = await this.blobRecords();
+    const referenced = await this.referencedBrowserObjects();
+    const now = Date.now();
+    const expired = Object.entries(records).filter(([hash, record]) => {
+      if (record.kind !== "browser" || referenced.has(hash)) return false;
+      return record.expires_at === undefined ? !record.stored : record.expires_at <= now;
+    });
+    if (!expired.length) return;
+    const next = { ...records };
+    let reserved = await this.ctx.storage.get<number>("reserved_blob_bytes") ?? 0;
+    for (const [hash, record] of expired) {
+      delete next[hash];
+      reserved -= record.size;
+    }
+    await this.env.UPLOADS.delete(await Promise.all(expired.map(([hash]) => this.objectKey(hash))));
+    await this.ctx.storage.transaction(async transaction => {
+      await transaction.put("blob_records", next);
+      await transaction.put("reserved_blob_bytes", Math.max(0, reserved));
+    });
+  }
+
+  private async scheduleAlarm(): Promise<void> {
+    const times: number[] = [];
+    for (const key of ["open_deadline_at", "expires_at", "producer_grace_at"]) {
+      const value = await this.ctx.storage.get<number>(key);
+      if (typeof value === "number" && Number.isSafeInteger(value)) times.push(value);
+    }
+    const records = await this.blobRecords();
+    for (const record of Object.values(records)) {
+      if (typeof record.expires_at === "number" && Number.isSafeInteger(record.expires_at)) times.push(record.expires_at);
+    }
+    if (times.length) await this.ctx.storage.setAlarm(Math.min(...times));
+  }
+
+  private async reserveBrowserObjects(items: Array<{ hash: string; size: number }>): Promise<Array<{ hash: string; size: number }>> {
+    await this.reclaimExpiredBrowserObjects();
     const records = await this.blobRecords();
     const next = { ...records };
     let reserved = await this.ctx.storage.get<number>("reserved_blob_bytes") ?? 0;
+    let browserRecords = Object.values(next).filter(record => record.kind === "browser").length;
     const requested = new Map<string, number>();
     for (const item of items) {
       const prior = requested.get(item.hash);
@@ -404,22 +488,38 @@ export class Session extends DurableObject<Env> {
         if (existing.size !== size) throw new Error("attachment hash has the wrong size");
         continue;
       }
+      if (browserRecords >= MAX_BROWSER_BLOB_RECORDS) throw new Error("attachment object limit exceeded");
       if (reserved + size > MAX_SESSION_BLOB_BYTES) throw new Error("session blob quota exceeded");
-      next[hash] = { size, stored: false, kind: "browser" };
+      next[hash] = { size, stored: false, kind: "browser", expires_at: Date.now() + ATTACHMENT_RESERVATION_LEASE_MS };
       reserved += size;
+      browserRecords += 1;
+    }
+    const missing: Array<{ hash: string; size: number }> = [];
+    for (const [hash, size] of requested) {
+      const record = next[hash]!;
+      const object = await this.env.UPLOADS.head(await this.objectKey(hash));
+      if (object?.size === size) {
+        if (!record.stored || record.expires_at !== undefined) next[hash] = { ...record, stored: true, expires_at: Date.now() + ATTACHMENT_RESERVATION_LEASE_MS };
+      } else {
+        next[hash] = { ...record, stored: false, expires_at: Date.now() + ATTACHMENT_RESERVATION_LEASE_MS };
+        missing.push({ hash, size });
+      }
     }
     await this.ctx.storage.transaction(async transaction => {
       await transaction.put("blob_records", next);
       await transaction.put("reserved_blob_bytes", reserved);
     });
+    await this.scheduleAlarm();
+    return missing;
   }
 
-  private async validateBrowserAttachments(attachments: AttachmentDescriptor[]): Promise<void> {
+  private async validateBrowserAttachments(attachments: AttachmentDescriptor[]): Promise<Record<string, BlobRecord>> {
     const records = await this.blobRecords();
     for (const attachment of attachments) {
       const record = records[attachment.hash];
       if (!record || record.kind !== "browser" || !record.stored || record.size !== attachment.size) throw new Error("attachment is missing or has the wrong size");
     }
+    return records;
   }
 
   private async cleanupObjects(keep: Set<string>): Promise<void> {
@@ -439,9 +539,32 @@ export class Session extends DurableObject<Env> {
     });
   }
 
-  private async deleteUnreferencedWorkspaceObjects(manifest: Manifest): Promise<void> {
+  private async releaseUnreferencedBrowserObjects(): Promise<void> {
+    await this.reclaimExpiredBrowserObjects();
+    const records = await this.blobRecords();
+    const referenced = await this.referencedBrowserObjects();
+    const next = { ...records };
+    let reserved = await this.ctx.storage.get<number>("reserved_blob_bytes") ?? 0;
+    const remove: string[] = [];
+    for (const [hash, record] of Object.entries(records)) {
+      if (record.kind !== "browser" || !record.stored || record.expires_at !== undefined || referenced.has(hash)) continue;
+      remove.push(hash);
+      reserved -= record.size;
+      delete next[hash];
+    }
+    if (!remove.length) return;
+    await this.env.UPLOADS.delete(await Promise.all(remove.map(hash => this.objectKey(hash))));
+    await this.ctx.storage.transaction(async transaction => {
+      await transaction.put("blob_records", next);
+      await transaction.put("reserved_blob_bytes", Math.max(0, reserved));
+    });
+    await this.scheduleAlarm();
+  }
+
+  private async deleteUnreferencedObjects(manifest: Manifest): Promise<void> {
     const keep = new Set<string>([await this.ctx.storage.get<string>("base_index_hash") || "", ...Object.values(manifest.files).map(entry => entry.hash)]);
     await this.cleanupObjects(keep);
+    await this.releaseUnreferencedBrowserObjects();
     await this.ctx.storage.delete("staging_hashes");
   }
 
@@ -456,6 +579,7 @@ export class Session extends DurableObject<Env> {
   }
 
   private async expireSession(): Promise<void> {
+    if (!(await this.ctx.storage.get<string>("session_code"))) return;
     for (const client of this.clients()) client.close(1000, "session expired");
     this.producer()?.close(1000, "session expired");
     await this.deleteSessionObjects();
@@ -507,6 +631,7 @@ export class Session extends DurableObject<Env> {
       if (!code) throw new Error("session code is required");
       await this.ctx.storage.put("session_code", code);
       await this.ctx.storage.put("session_url", request.headers.get("x-letmeknow-url"));
+      await this.ctx.storage.put("open_deadline_at", Date.now() + OPEN_DEADLINE_MS);
       await this.ctx.storage.put("staging_hashes", []);
       await this.ctx.storage.put("blob_records", {});
       await this.ctx.storage.put("reserved_blob_bytes", 0);
@@ -520,13 +645,18 @@ export class Session extends DurableObject<Env> {
     server.serializeAttachment(attachment);
     this.ctx.acceptWebSocket(server);
     const expiresAt = reconnect && opened ? await this.ctx.storage.get<number>("expires_at") : undefined;
-    await this.ctx.storage.setAlarm(expiresAt ?? Date.now() + OPEN_DEADLINE_MS);
     if (!reconnect) {
+      await this.scheduleAlarm();
       server.send(JSON.stringify({ type: "credential", credential }));
       server.send(JSON.stringify({ type: "provisioned", url }));
+    } else {
+      await this.scheduleAlarm();
     }
     if (reconnect && opened) {
       if (expiresAt === undefined) throw new Error("session expired");
+      await this.ctx.storage.delete("producer_grace_at");
+      await this.resetDelivery();
+      await this.scheduleAlarm();
       server.send(JSON.stringify({ type: "session", url, frontier: await this.eventFrontier(), page_event: await this.ctx.storage.get<number>("page_event") ?? 0, page_hash: await this.ctx.storage.get<string>("page_hash") }));
       this.sendClients({ type: "producer", connected: true });
       await this.sendNext();
@@ -614,21 +744,19 @@ export class Session extends DurableObject<Env> {
           if (typeof item.hash !== "string" || !hashPattern.test(item.hash) || !Number.isSafeInteger(item.size) || (item.size as number) < 0) throw new Error("invalid attachment hash");
           items.push({ hash: item.hash, size: item.size as number });
         }
-        await this.mutate(async () => {
+        const missing = await this.mutate(async () => {
           if (!(await this.ctx.storage.get<boolean>("opened"))) throw new Error("session not found");
           if (await this.sessionExpired()) { await this.expireSession(); throw new Error("session expired"); }
-          await this.reserveBrowserObjects(items);
+          return this.reserveBrowserObjects(items);
         });
+        return Response.json({ missing }, { headers: { "Cache-Control": "no-store" } });
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : "could not reserve attachments";
-        return error(message, message === "session not found" || message === "session expired" ? 404 : message === "session blob quota exceeded" ? 413 : 400);
+        const status = message === "session not found" || message === "session expired" ? 404
+          : message === "session blob quota exceeded" || message === "attachment object limit exceeded" ? 413
+          : message.startsWith("attachment hash") ? 400 : 503;
+        return error(message, status);
       }
-      const missing: Array<{ hash: string; size: number }> = [];
-      for (const item of new Map(items.map(item => [item.hash, item])).values()) {
-        const object = await this.env.UPLOADS.head(await this.objectKey(item.hash));
-        if (!object || object.size !== item.size) missing.push(item);
-      }
-      return Response.json({ missing }, { headers: { "Cache-Control": "no-store" } });
     }
     const match = path.match(/^\/\_letmeknow\/attachments\/([0-9a-f]{64})$/);
     if (!match) return error("not found", 404);
@@ -644,47 +772,54 @@ export class Session extends DurableObject<Env> {
       return new Response(object.body, { status: 200, headers: { "Content-Type": "application/octet-stream", "Content-Length": String(object.size), "Cache-Control": "no-store" } });
     }
     if (request.method !== "PUT") return error("method not allowed", 405);
-    if (!(await this.ctx.storage.get<boolean>("opened"))) return error("session not found", 404);
-    if (await this.sessionExpired()) { await this.mutate(() => this.expireSession()); return error("session expired", 404); }
     const hash = match[1];
-    const record = (await this.blobRecords())[hash];
-    if (!record || record.kind !== "browser") return error("attachment was not reserved", 409);
+    let record: { size: number; stored: boolean };
+    try {
+      record = await this.prepareBrowserUpload(hash);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : "could not prepare attachment";
+      const status = message === "session not found" || message === "session expired" ? 404 : message === "attachment was not reserved" ? 409 : 503;
+      return error(message, status);
+    }
+    if (record.stored) return new Response(null, { status: 204 });
     const key = await this.objectKey(hash);
-    const existing = await this.env.UPLOADS.head(key);
-    if (record.stored && existing?.size === record.size) return new Response(null, { status: 204 });
-    if (existing) await this.env.UPLOADS.delete(key);
     const reader = request.body?.getReader();
     const fixed = new FixedLengthStream(record.size);
     const writer = fixed.writable.getWriter();
     let count = 0;
+    let sizeError = false;
     const pump = async () => {
       try {
         while (reader) {
           const part = await reader.read();
           if (part.done) break;
           count += part.value.byteLength;
-          if (count > record.size) throw new Error("attachment size is invalid");
+          if (count > record.size) {
+            sizeError = true;
+            throw new Error("attachment size is invalid");
+          }
           await writer.write(part.value);
         }
-        if (count !== record.size) throw new Error("attachment size is invalid");
+        if (count !== record.size) {
+          sizeError = true;
+          throw new Error("attachment size is invalid");
+        }
         await writer.close();
       } catch (cause) {
         await writer.abort(cause);
         throw cause;
       }
     };
+    const pumpPromise = pump();
     try {
-      await Promise.all([this.env.UPLOADS.put(key, fixed.readable, { sha256: hash }), pump()]);
-      await this.mutate(async () => {
-        const current = (await this.blobRecords())[hash];
-        if (!current || current.kind !== "browser" || current.size !== record.size) throw new Error("attachment reservation changed");
-        current.stored = true;
-        await this.ctx.storage.put("blob_records", { ...(await this.blobRecords()), [hash]: current });
-      });
+      await Promise.all([this.env.UPLOADS.put(key, fixed.readable, { sha256: hash }), pumpPromise]);
+      await this.mutate(() => this.markBrowserObjectStored(hash, record.size));
       return new Response(null, { status: 204 });
-    } catch {
-      await this.env.UPLOADS.delete(key);
-      return error("could not store attachment", 400);
+    } catch (cause) {
+      await pumpPromise.catch(() => {});
+      const checksumError = cause instanceof Error && cause.message.includes("checksum you specified did not match");
+      const malformed = sizeError || checksumError;
+      return error(malformed ? (sizeError ? "attachment size is invalid" : "attachment content is invalid") : "could not store attachment", malformed ? 400 : 503);
     }
   }
 
@@ -733,18 +868,32 @@ export class Session extends DurableObject<Env> {
     return this.mutate(async () => {
       if (!(await this.ctx.storage.get<boolean>("opened"))) return error("session not found", 404);
       if (await this.sessionExpired()) { await this.expireSession(); return error("session expired", 404); }
-      try { if (attachments) await this.validateBrowserAttachments(attachments); }
-      catch (cause) { return error(cause instanceof Error ? cause.message : "invalid attachments", 400); }
+      await this.reclaimExpiredBrowserObjects();
       const duplicate = await this.ctx.storage.get<SubmissionRecord>(`submission:${id}`);
       if (duplicate) return duplicate.hash === hash ? new Response(null, { status: 202 }) : error("submission id was already used", 409);
+      let attachmentRecords: Record<string, BlobRecord> | undefined;
+      try {
+        if (attachments?.length) attachmentRecords = await this.validateBrowserAttachments(attachments);
+      } catch (cause) { return error(cause instanceof Error ? cause.message : "invalid attachments", 400); }
       const stats = await this.queuedStats();
       if (stats.count >= MAX_QUEUED_EVENTS || stats.bytes + body.byteLength > MAX_QUEUED_BYTES) return error("submission queue is full", 503);
       const submissionCount = await this.ctx.storage.get<number>("submission_count") ?? 0;
       if (submissionCount >= MAX_SESSION_SUBMISSIONS) return error("session submission limit reached", 409);
+      if (attachmentRecords && attachments) {
+        attachmentRecords = { ...attachmentRecords };
+        for (const attachment of attachments) {
+          const record = attachmentRecords[attachment.hash];
+          if (record) {
+            attachmentRecords[attachment.hash] = { ...record };
+            delete attachmentRecords[attachment.hash].expires_at;
+          }
+        }
+      }
       const number = await this.eventFrontier() + 1;
       const event: SubmitEvent = { type: "submit", id, event_number: number, page_event: input.page_event as number, form_id: input.form_id as string | null, action: input.action as string, trigger: input.trigger as Record<string, unknown> | null, values: input.values as Record<string, unknown>, ...(attachments ? { attachments } : {}) };
       const stored: StoredEvent = { event, received: false, sent: false, bytes: body.byteLength };
       await this.ctx.storage.transaction(async transaction => {
+        if (attachmentRecords) await transaction.put("blob_records", attachmentRecords);
         await transaction.put(`submission:${id}`, { event_number: number, hash });
         await transaction.put(`event:${number}`, stored);
         await transaction.put("next_event_number", number + 1);
@@ -864,6 +1013,8 @@ export class Session extends DurableObject<Env> {
       const expiresAt = Date.now() + SESSION_LIFETIME_MS;
       const pageHash = await initialPageHash(indexHash);
       await this.ctx.storage.transaction(async transaction => {
+        await transaction.delete("open_deadline_at");
+        await transaction.delete("producer_grace_at");
         await transaction.put("opened", true);
         await transaction.put("expires_at", expiresAt);
         await transaction.put("base_index_hash", indexHash);
@@ -880,10 +1031,10 @@ export class Session extends DurableObject<Env> {
         await transaction.put("submission_count", 0);
         await transaction.put("staging_hashes", []);
       });
-      await this.deleteUnreferencedWorkspaceObjects(manifest).catch(() => {});
+      await this.deleteUnreferencedObjects(manifest).catch(() => {});
       attachment.opened = true;
       socket.serializeAttachment(attachment);
-      await this.ctx.storage.setAlarm(expiresAt);
+      await this.scheduleAlarm();
       socket.send(JSON.stringify({ type: "session", ...(typeof packet.id === "string" ? { id: packet.id } : {}), url: attachment.url, frontier: 0, page_event: 0, page_hash: pageHash, workspace_version: 0 }));
       return;
     }
@@ -913,7 +1064,7 @@ export class Session extends DurableObject<Env> {
       try { await this.commit(socket, attachment, packet); }
       catch (cause) {
         const current = await this.ctx.storage.get<Manifest>("current_manifest");
-        if (current) await this.deleteUnreferencedWorkspaceObjects(current).catch(() => {});
+        if (current) await this.deleteUnreferencedObjects(current).catch(() => {});
         throw cause;
       }
       return;
@@ -987,7 +1138,7 @@ export class Session extends DurableObject<Env> {
         await transaction.put("queued_event_bytes", stats.bytes + stored.bytes);
         await transaction.put(`commit:${commitId}`, { ok: true, type: "committed", through, considered_through: through, frontier: nextEventNumber, page_event: nextEventNumber, page_hash: nextPageHash, events: committedIds, workspace_version: nextVersion, run_ui: { event_number: nextEventNumber, considered_through: through } });
       });
-      await this.deleteUnreferencedWorkspaceObjects(manifest).catch(() => {});
+      await this.deleteUnreferencedObjects(manifest).catch(() => {});
     } else {
       await this.ctx.storage.transaction(async transaction => {
         for (let number = committedThrough + 1; number <= through; number += 1) {
@@ -999,7 +1150,7 @@ export class Session extends DurableObject<Env> {
         await transaction.put("committed_through", through);
         await transaction.put(`commit:${commitId}`, { ok: true, type: "committed", through, considered_through: through, frontier, page_event: currentPageEvent, page_hash: nextPageHash, events: committedIds, workspace_version: nextVersion });
       });
-      await this.deleteUnreferencedWorkspaceObjects(manifest).catch(() => {});
+      await this.deleteUnreferencedObjects(manifest).catch(() => {});
     }
     if (runEvent) {
       this.sendClients(runEvent);
@@ -1024,8 +1175,8 @@ export class Session extends DurableObject<Env> {
       await this.resetDelivery();
       this.sendClients({ type: "producer", connected: false });
       if (attachment.opened && await this.ctx.storage.get<boolean>("opened")) {
-        const expiresAt = await this.ctx.storage.get<number>("expires_at");
-        await this.ctx.storage.setAlarm(typeof expiresAt === "number" ? Math.min(expiresAt, Date.now() + PRODUCER_GRACE_MS) : Date.now() + PRODUCER_GRACE_MS);
+        await this.ctx.storage.put("producer_grace_at", Date.now() + PRODUCER_GRACE_MS);
+        await this.scheduleAlarm();
       }
     });
     if (code === 1005 || code === 1006 || code === 1015) socket.close(); else socket.close(code, reason);
@@ -1037,13 +1188,25 @@ export class Session extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     await this.mutate(async () => {
-      const producer = this.producer();
-      const expiresAt = await this.ctx.storage.get<number>("expires_at");
-      if (producer && (producer.deserializeAttachment() as ProducerAttachment).opened && typeof expiresAt === "number" && Number.isSafeInteger(expiresAt) && expiresAt > Date.now()) {
-        await this.ctx.storage.setAlarm(expiresAt);
+      await this.reclaimExpiredBrowserObjects();
+      const opened = await this.ctx.storage.get<boolean>("opened") ?? false;
+      if (!opened) {
+        await this.expireSession();
         return;
       }
-      await this.expireSession();
+      const now = Date.now();
+      const producer = this.producer();
+      const expiresAt = await this.ctx.storage.get<number>("expires_at");
+      let graceAt = await this.ctx.storage.get<number>("producer_grace_at");
+      if (!producer && graceAt === undefined) {
+        graceAt = now + PRODUCER_GRACE_MS;
+        await this.ctx.storage.put("producer_grace_at", graceAt);
+      }
+      if (expiresAt === undefined || !Number.isSafeInteger(expiresAt) || expiresAt <= now || (!producer && graceAt !== undefined && graceAt <= now)) {
+        await this.expireSession();
+        return;
+      }
+      await this.scheduleAlarm();
     });
   }
 }
