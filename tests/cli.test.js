@@ -265,6 +265,30 @@ describe("LetMeKnow CLI", () => {
     }
   });
 
+  it("leaves a failed oversized script commit retryable", async () => {
+    const filler = "a".repeat(MAX_BODY_BYTES - 4_000);
+    const session = await startSession({ index: `<!doctype html><html><body>${filler}</body></html>` });
+    try {
+      const id = randomUUID();
+      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(id))).status, 202);
+      const batch = await command(["pull", session.folder]);
+      const oversized = await runCommand(["push", session.folder, "--batch", batch.token, "--script", "-"], "x".repeat(5_000));
+      assert.equal(oversized.code, 1);
+      assert.match(oversized.stdout, /page with replay history is too large/);
+      assert.deepEqual(session.scripts, []);
+
+      const script = "document.body.dataset.retry = 'ok';";
+      const committed = await command(["push", session.folder, "--batch", batch.token, "--script", "-"], script);
+      assert.deepEqual(committed.events, [id]);
+      assert.deepEqual(committed.run_ui, { event_number: 2 });
+      assert.equal(committed.page_event, 2);
+      assert.deepEqual(session.scripts, [{ type: "run_ui", event_number: 2, script }]);
+      assert.deepEqual(historyFrom(decodeBody(await session.request("GET", "/"))), session.scripts);
+    } finally {
+      await session.stop();
+    }
+  });
+
   it("serves static paths securely", async () => {
     const session = await startSession();
     const outside = mkdtempSync(join(tmpdir(), "letmeknow-outside-"));

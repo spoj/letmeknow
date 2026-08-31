@@ -388,13 +388,13 @@ async function start(directory) {
     }
     const committedCount = record.end - record.start;
     const committedEvents = browserEvents.slice(0, committedCount).map(event => event.id);
-    retainedSubmissionBytes -= browserEventBytes.slice(0, committedCount).reduce((total, bytes) => total + bytes, 0);
     let runEvent;
     let nextPage = page;
     if (requestedScript !== undefined) {
       runEvent = { type: "run_ui", event_number: eventNumber + 1, script: requestedScript };
       nextPage = replayablePage(basePage, [...history, runEvent]);
     }
+    retainedSubmissionBytes -= browserEventBytes.slice(0, committedCount).reduce((total, bytes) => total + bytes, 0);
     if (runEvent) {
       eventNumber = runEvent.event_number;
       pageEvent = runEvent.event_number;
