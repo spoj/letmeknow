@@ -33,6 +33,12 @@ npx letmeknow-cli push ./preview --batch "$token" --page index.html
 
 `pull` returns an opaque batch token, current-page metadata, and the browser events not yet committed by the agent. Pulling does not consume events. Events that arrive while the agent works remain for a later pull.
 
+```json
+{"token":"…","frontier":7,"page_event":5,"page_hash":"…","events":[{"type":"submit","id":"…","event_number":7,"page_event":5,"form_id":"decision","action":"/decide","trigger":{"name":"decision","value":"approve"},"values":{"comment":"Looks good","decision":"approve"}}]}
+```
+
+An event's `page_event` identifies the page the browser displayed when it submitted. Compare it with the batch's current `page_event` when deciding whether the input still applies.
+
 A push with a page:
 
 ```bash
@@ -105,7 +111,7 @@ Give elements stable unique IDs. They help the morphing runtime retain unchanged
 <output id="count">0</output>
 ```
 
-Keep the LetMeKnow runtime outside the agent-controlled content where possible. Agent-authored JavaScript should be loaded as a static asset and use delegated event listeners. Scripts in an incoming page update are not executed as live-update commands.
+Agent-authored JavaScript should be loaded by the initial page as a static asset and use delegated event listeners. Existing scripts remain active across morphs, but scripts added or changed by a pushed page are not executed in connected browsers; keep script references fixed for the session.
 
 The CLI owns rendered page content. The browser preserves focus, scrolling, dirty controls with stable IDs, and the open state of `<details id="…">`. Mark an element with a stable ID and `data-letmeknow-local` when its `hidden` state is browser-owned. Avoid having browser JavaScript and pushed HTML otherwise mutate the same state; a later morph may replace browser-created changes.
 

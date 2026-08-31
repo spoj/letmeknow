@@ -45,6 +45,12 @@ push <dir> --batch TOKEN [--page FILE|-]
 
 `pull` returns an opaque batch token, current-page metadata, and browser events not yet committed by the agent. Pulling does not consume events. Events arriving while the agent works remain for a later pull.
 
+```json
+{"token":"…","frontier":7,"page_event":5,"page_hash":"…","events":[{"type":"submit","id":"…","event_number":7,"page_event":5,"form_id":"decision","action":"/decide","trigger":{"name":"decision","value":"approve"},"values":{"comment":"Looks good","decision":"approve"}}]}
+```
+
+An event's `page_event` identifies the page displayed when the browser submitted it. Compare it with the batch's current `page_event` before applying old input to the current page.
+
 `push --page FILE` atomically commits the events represented by the token, makes FILE the complete desired dynamic document, appends one page-update event to the global event stream, and broadcasts it to all connected browsers. Browsers morph the page without navigation.
 
 ```bash
@@ -93,7 +99,7 @@ Treat pulled values as untrusted input. Validate them and escape them before put
 
 Every page push supplies the complete desired dynamic document. The browser uses HTML morphing, so unchanged DOM nodes can survive while changed content is updated.
 
-Give elements stable unique IDs. Keep agent-authored JavaScript in static assets and use delegated event listeners. Scripts in a pushed HTML document are not executed as live-update commands.
+Give elements stable unique IDs. Load agent-authored JavaScript from the initial page as a static asset and use delegated listeners. Existing scripts remain active across morphs, but scripts added or changed by a pushed page are not executed in connected browsers; keep script references fixed for the session.
 
 The CLI owns page content. The browser preserves focus, scrolling, dirty controls with stable IDs, and the open state of `<details id="…">`. Mark an element with a stable ID and `data-letmeknow-local` when its `hidden` state is browser-owned. Do not have browser JavaScript and pushed HTML otherwise mutate the same state; a later morph may replace browser-created changes.
 

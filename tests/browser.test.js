@@ -143,6 +143,11 @@ describe("browser runtime", () => {
         res.end(idiomorphSource);
         return;
       }
+      if (req.method === "GET" && req.url === "/static.html") {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+        res.end('<!doctype html><html><head><title>Static</title></head><body><h1 id="static-heading">Static</h1><script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime></script></body></html>');
+        return;
+      }
       if (req.method === "GET" && req.url === "/") {
         rootRequests += 1;
         const send = () => {
@@ -288,6 +293,13 @@ describe("browser runtime", () => {
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: true }));
       await waitFor(() => rootRequests > beforeProducerResync, "producer reconnection did not resynchronize");
       await waitFor(async () => (await execute("return document.title")) === "Final", "producer resynchronization did not apply current page");
+
+      const socketsBeforeStaticPage = sockets.length;
+      await command("POST", "/url", { url: `http://127.0.0.1:${port}/static.html` });
+      await waitFor(() => sockets.length > socketsBeforeStaticPage, "static page runtime did not connect");
+      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 100, html: finalPage }));
+      await sleep(100);
+      assert.equal(await execute("return document.title"), "Static", "static HTML must not consume dynamic page updates");
     } catch (error) {
       throw new Error(`${error.message}${driverError ? `\ngeckodriver: ${driverError}` : ""}`, { cause: error });
     } finally {
