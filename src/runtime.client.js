@@ -134,9 +134,10 @@
       setSubmissionStatus(record.id, response.status === 413 && record.attachments?.length ? "Attachment is too large." : response.status === 413 ? "Submission is too large." : "Couldn’t send. Try again.", record.form_id);
       if (response.status >= 500) scheduleOutboxFlush();
     } catch (cause) {
+      if (cause?.status >= 400 && cause.status < 500) await outboxDelete(record.id).catch(() => {});
       if (terminal) return;
       setSubmissionStatus(record.id, cause?.status === 413 ? "Attachment is too large." : "Couldn’t send. Try again.", record.form_id);
-      scheduleOutboxFlush();
+      if (!cause?.status || cause.status >= 500) scheduleOutboxFlush();
     }
   }
 
