@@ -1,25 +1,35 @@
+import { Idiomorph } from "/_letmeknow/idiomorph.js";
+
 (() => {
   const socketPath = "/_letmeknow/client";
-  const stateKey = () => "letmeknow-state:" + location.href;
+  const submissionPath = "/_letmeknow/submit";
   let hadSocketConnection = false;
   let reconnectTimer;
   let terminal = false;
-  let reloading = false;
   let producerKnown = false;
   let producerConnected = false;
-  const disconnectedPage = document.documentElement.getAttribute("data-letmeknow-status-page") === "disconnected";
-  const workspace = document.querySelector("script[data-letmeknow-runtime]")?.getAttribute("data-letmeknow-workspace");
-  const submitting = new WeakSet();
-  const outboxInFlight = new Set();
+  let pageEvent = readPageEvent(document) ?? 0;
+  let resyncPromise;
+  let resyncing = false;
+  const bufferedUpdates = [];
   const submissionForms = new Map();
   const OUTBOX_RETRY_MS = 1000;
   let outboxDatabasePromise;
   let outboxFlushPromise;
+  let outboxFlushAgain = false;
   let outboxRetryTimer;
+  let resyncRetryTimer;
+
+  function readPageEvent(documentLike) {
+    const value = documentLike.querySelector("script[data-letmeknow-runtime]")?.getAttribute("data-letmeknow-page-event");
+    if (value === null || value === undefined || value === "") return null;
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= 0 ? number : null;
+  }
 
   function outboxDatabase() {
     outboxDatabasePromise ??= new Promise((resolve, reject) => {
-      const request = indexedDB.open("letmeknow-outbox:" + location.origin, 1);
+      const request = indexedDB.open("letmeknow-outbox-v2:" + location.origin, 1);
       request.onupgradeneeded = () => request.result.createObjectStore("submissions", { keyPath: "id" });
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error || new Error("could not open submission outbox"));
@@ -65,46 +75,51 @@
     }, delay);
   }
 
+  function formForSubmission(id, formId) {
+    return (formId && document.getElementById(formId)) || submissionForms.get(id);
+  }
+
   function setSubmissionStatus(id, message, formId) {
-    const form = submissionForms.get(id) || (formId ? document.getElementById(formId) : undefined);
-    if (form && (!form.dataset.letmeknowSubmission || form.dataset.letmeknowSubmission === id)) setStatus(form, message);
+    const form = formForSubmission(id, formId);
+    if (form instanceof HTMLFormElement) setStatus(form, message);
   }
 
   async function deliverSubmission(record) {
-    if (outboxInFlight.has(record.id)) return;
-    outboxInFlight.add(record.id);
     try {
-      const response = await fetch(record.url, {
-        method: record.method,
-        headers: record.headers,
-        body: record.body === null ? undefined : record.body.slice(0)
+      const response = await fetch(submissionPath, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: record.body
       });
       if (response.status === 202) {
         await outboxDelete(record.id);
         setSubmissionStatus(record.id, "Sent. Waiting for an update…", record.form_id);
-        const form = submissionForms.get(record.id);
-        if (form?.dataset.letmeknowSubmission === record.id) delete form.dataset.letmeknowSubmission;
         submissionForms.delete(record.id);
         return;
       }
       if (response.status >= 400 && response.status < 500) await outboxDelete(record.id);
-      setSubmissionStatus(record.id, response.status === 413 ? "Attachment is too large." : "Couldn’t send. Try again.", record.form_id);
+      setSubmissionStatus(record.id, response.status === 413 ? "Submission is too large." : "Couldn’t send. Try again.", record.form_id);
       if (response.status >= 500) scheduleOutboxFlush();
     } catch {
       setSubmissionStatus(record.id, "Couldn’t send. Try again.", record.form_id);
       scheduleOutboxFlush();
-    } finally {
-      outboxInFlight.delete(record.id);
     }
   }
 
   function flushOutbox() {
     if (!producerConnected) return Promise.resolve();
-    if (outboxFlushPromise) return outboxFlushPromise;
+    if (outboxFlushPromise) {
+      outboxFlushAgain = true;
+      return outboxFlushPromise;
+    }
     outboxFlushPromise = outboxList().then(async (records) => {
       for (const record of records) await deliverSubmission(record);
     }).catch(() => {}).finally(() => {
       outboxFlushPromise = undefined;
+      if (outboxFlushAgain) {
+        outboxFlushAgain = false;
+        void flushOutbox();
+      }
     });
     return outboxFlushPromise;
   }
@@ -154,85 +169,133 @@
     }
   }
 
-  function saveState() {
-    const values = {};
-    const seen = new Set();
-    for (const control of document.querySelectorAll("input[id], textarea[id], select[id]")) {
-      if (control instanceof HTMLInputElement && control.type === "file") continue;
-      if (seen.has(control.id) || document.querySelectorAll("#" + CSS.escape(control.id)).length !== 1) continue;
-      seen.add(control.id);
-      if (control instanceof HTMLInputElement && (control.type === "checkbox" || control.type === "radio")) {
-        values[control.id] = { checked: control.checked };
-      } else if (control instanceof HTMLSelectElement && control.multiple) {
-        values[control.id] = { selected: Array.from(control.selectedOptions, (option) => option.value) };
-      } else {
-        values[control.id] = { value: control.value };
+  function nodeName(node) {
+    return node?.nodeType === 1 ? node.localName : "";
+  }
+
+  function runtimeScript(node) {
+    return nodeName(node) === "script" && node.hasAttribute("data-letmeknow-runtime");
+  }
+
+  const morphOptions = {
+    ignoreActiveValue: true,
+    head: {
+      style: "merge",
+      shouldPreserve: runtimeScript
+    },
+    callbacks: {
+      beforeNodeAdded(node) {
+        return nodeName(node) !== "script";
+      },
+      beforeNodeMorphed(oldNode, newNode) {
+        return nodeName(oldNode) !== "script" && nodeName(newNode) !== "script";
+      },
+      beforeNodeRemoved(node) {
+        return !runtimeScript(node);
       }
     }
-    try {
-      sessionStorage.setItem(stateKey(), JSON.stringify({ values, scrollX, scrollY }));
-    } catch {}
+  };
+
+  function morphDocument(html) {
+    const parsed = new DOMParser().parseFromString(html, "text/html");
+    parsed.doctype?.remove();
+    for (const script of parsed.querySelectorAll("script")) script.remove();
+    Idiomorph.morph(document.documentElement, parsed.documentElement, morphOptions);
   }
 
-  function restoreState() {
-    let saved;
+  function setPageEvent(value) {
+    pageEvent = value;
+    document.querySelector("script[data-letmeknow-runtime]")?.setAttribute("data-letmeknow-page-event", String(value));
+  }
+
+  function applyUpdate(update) {
+    if (!Number.isSafeInteger(update.event_number) || update.event_number <= pageEvent || typeof update.html !== "string") return;
     try {
-      saved = JSON.parse(sessionStorage.getItem(stateKey()) || "null");
-      sessionStorage.removeItem(stateKey());
+      morphDocument(update.html);
+      setPageEvent(update.event_number);
     } catch {
-      return;
-    }
-    if (!saved) return;
-    for (const [id, state] of Object.entries(saved.values || {})) {
-      const control = document.getElementById(id);
-      if (!control || (control instanceof HTMLInputElement && control.type === "file") || document.querySelectorAll("#" + CSS.escape(id)).length !== 1) continue;
-      if (control instanceof HTMLInputElement && (control.type === "checkbox" || control.type === "radio")) control.checked = Boolean(state.checked);
-      else if (control instanceof HTMLSelectElement && control.multiple) {
-        const selected = new Set(state.selected || []);
-        for (const option of control.options) option.selected = selected.has(option.value);
-      } else if (typeof state.value === "string") control.value = state.value;
-    }
-    if (Number.isFinite(saved.scrollX) && Number.isFinite(saved.scrollY)) {
-      requestAnimationFrame(() => scrollTo(saved.scrollX, saved.scrollY));
+      setSystemStatus("Couldn’t apply the update. Reconnecting…");
     }
   }
 
-  function reload() {
-    if (terminal || reloading) return;
-    reloading = true;
-    saveState();
-    location.reload();
+  function receiveUpdate(update) {
+    if (!Number.isSafeInteger(update.event_number) || update.event_number <= pageEvent || typeof update.html !== "string") return;
+    if (resyncing) bufferedUpdates.push(update);
+    else applyUpdate(update);
+  }
+
+  async function resync() {
+    const response = await fetch(location.href, { cache: "no-store", headers: { Accept: "text/html" } });
+    if (!response.ok) throw new Error("current page is unavailable");
+    const html = await response.text();
+    const parsed = new DOMParser().parseFromString(html, "text/html");
+    const fetchedEvent = readPageEvent(parsed);
+    if (fetchedEvent === null || fetchedEvent >= pageEvent) {
+      morphDocument(html);
+      if (fetchedEvent !== null) setPageEvent(fetchedEvent);
+    }
+    bufferedUpdates.sort((left, right) => left.event_number - right.event_number);
+    const updates = bufferedUpdates.splice(0);
+    for (const update of updates) applyUpdate(update);
+  }
+
+  function scheduleResync() {
+    if (resyncRetryTimer || !producerConnected) return;
+    resyncRetryTimer = setTimeout(() => {
+      resyncRetryTimer = undefined;
+      if (producerConnected) void requestResync();
+    }, OUTBOX_RETRY_MS);
+  }
+
+  function requestResync() {
+    if (resyncPromise) return resyncPromise;
+    resyncing = true;
+    setSystemStatus("Synchronizing…");
+    resyncPromise = resync().catch(() => {
+      setSystemStatus("Couldn’t synchronize. Retrying…");
+      scheduleResync();
+    }).finally(() => {
+      resyncing = false;
+      resyncPromise = undefined;
+    });
+    return resyncPromise;
   }
 
   function updateProducer(connected) {
+    const recovered = connected && producerKnown && !producerConnected;
+    producerKnown = true;
+    producerConnected = connected;
     if (connected) {
       document.documentElement.removeAttribute("data-letmeknow-disconnected");
       clearSystemStatus();
+      if (recovered || document.documentElement.getAttribute("data-letmeknow-status-page") === "disconnected") void requestResync();
+      void flushOutbox();
     } else {
+      if (resyncRetryTimer) {
+        clearTimeout(resyncRetryTimer);
+        resyncRetryTimer = undefined;
+      }
       document.documentElement.setAttribute("data-letmeknow-disconnected", "");
       setSystemStatus("Connection lost. Reconnecting…");
     }
-    if (connected && (disconnectedPage || (producerKnown && !producerConnected))) reload();
-    producerKnown = true;
-    producerConnected = connected;
-    if (connected) void flushOutbox();
   }
 
   function connect() {
     if (terminal) return;
+    reconnectTimer = undefined;
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(protocol + "//" + location.host + socketPath);
     socket.addEventListener("open", () => {
       const reconnect = hadSocketConnection;
       hadSocketConnection = true;
-      if (reconnect) reload();
       clearSystemStatus();
+      if (reconnect) void requestResync();
       void flushOutbox();
     });
     socket.addEventListener("message", (event) => {
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
-      if (message.type === "revision") reload();
+      if (message.type === "update_ui") receiveUpdate(message);
       else if (message.type === "producer") updateProducer(Boolean(message.connected));
       else if (message.type === "connected") updateProducer(Boolean(message.producer_connected));
       else if (message.type === "closed") {
@@ -242,7 +305,7 @@
       }
     });
     socket.addEventListener("close", () => {
-      if (terminal || reloading) return;
+      if (terminal) return;
       document.documentElement.setAttribute("data-letmeknow-disconnected", "");
       setSystemStatus("Connection lost. Reconnecting…");
       reconnectTimer = setTimeout(connect, 1000);
@@ -250,99 +313,61 @@
     socket.addEventListener("error", () => {});
   }
 
-  function submissionDetails(form, submitter) {
-    const method = (submitter?.formMethod || form.method || "get").toUpperCase();
-    const action = new URL(submitter?.formAction || form.action || location.href, location.href);
-    return { method, action, noValidate: Boolean(form.noValidate || submitter?.formNoValidate) };
+  function submissionValues(data) {
+    const values = Object.create(null);
+    for (const [name, value] of data.entries()) {
+      if (typeof value !== "string") continue;
+      if (!Object.prototype.hasOwnProperty.call(values, name)) values[name] = value;
+      else values[name] = Array.isArray(values[name]) ? [...values[name], value] : [values[name], value];
+    }
+    return values;
   }
 
-  async function submit(form, submitter, details) {
-    if (submitting.has(form)) return;
-    if (!details.noValidate && !form.checkValidity()) {
+  async function submit(form, submitter) {
+    if (!form.noValidate && !form.checkValidity()) {
       form.reportValidity();
       return;
     }
-    if (details.method !== "GET" && details.method !== "POST") return;
-    if (details.action.origin !== location.origin) {
+    const actionValue = submitter?.hasAttribute("formaction") ? submitter.formAction : form.action;
+    const action = new URL(actionValue || location.href, location.href);
+    if (action.origin !== location.origin) {
       setStatus(form, "Only same-origin forms can be sent.");
       return;
     }
     const data = new FormData(form, submitter);
-    const files = Array.from(data.values()).filter((value) => typeof File !== "undefined" && value instanceof File);
-    const hasSelectedFile = files.some((file) => file.name);
-    if (details.method === "GET" && hasSelectedFile) {
-      setStatus(form, "File uploads are not supported for GET forms.");
+    const selectedFile = Array.from(data.values()).some((value) => typeof File !== "undefined" && value instanceof File && value.name);
+    if (selectedFile) {
+      setStatus(form, "File uploads are not supported.");
       return;
     }
     const id = crypto.randomUUID();
-    const previousBusy = form.getAttribute("aria-busy");
-    const previousDisabled = submitter ? submitter.disabled : undefined;
-    submitting.add(form);
+    const formId = form.id || null;
+    const trigger = submitter ? { id: submitter.id || null, name: submitter.name || null, value: submitter.value || null } : null;
+    const payload = {
+      id,
+      page_event: pageEvent,
+      form_id: formId,
+      action: action.pathname + action.search,
+      trigger,
+      values: submissionValues(data)
+    };
     submissionForms.set(id, form);
-    form.dataset.letmeknowSubmission = id;
-    form.setAttribute("aria-busy", "true");
-    if (submitter) submitter.disabled = true;
+    setStatus(form, "Sending…");
     try {
-      if (details.method === "GET") {
-        details.action.search = "";
-        for (const [name, value] of data.entries()) if (typeof value === "string") details.action.searchParams.append(name, value);
-      }
-      const headers = {
-        "X-LetMeKnow-Submission": "1",
-        "X-LetMeKnow-ID": id,
-        "X-LetMeKnow-Form-ID": encodeURIComponent(form.id || ""),
-        "X-LetMeKnow-Action": encodeURIComponent(details.action.pathname + details.action.search)
-      };
-      if (submitter) {
-        headers["X-LetMeKnow-Trigger-ID"] = encodeURIComponent(submitter.id || "");
-        headers["X-LetMeKnow-Trigger-Name"] = encodeURIComponent(submitter.name || "");
-        headers["X-LetMeKnow-Trigger-Value"] = encodeURIComponent(submitter.value || "");
-      }
-      let body = null;
-      let uploading = false;
-      if (details.method === "POST") {
-        const submitterEnctype = submitter?.hasAttribute("formenctype")
-          ? submitter.formEnctype || submitter.getAttribute("formenctype")
-          : undefined;
-        const enctype = (submitterEnctype || form.enctype || "application/x-www-form-urlencoded").toLowerCase();
-        uploading = hasSelectedFile;
-        const source = hasSelectedFile || enctype === "multipart/form-data"
-          ? data
-          : (() => {
-            const values = new URLSearchParams();
-            for (const [name, value] of data.entries()) if (typeof value === "string") values.append(name, value);
-            return values;
-          })();
-        const request = new Request(details.action, { method: details.method, body: source });
-        body = await request.arrayBuffer();
-        headers["Content-Type"] = request.headers.get("content-type") || "application/octet-stream";
-      }
-      if (workspace) headers["X-LetMeKnow-Based-On"] = encodeURIComponent(workspace);
-      const record = { id, url: details.action.toString(), method: details.method, headers, body, form_id: form.id || null, ...(workspace ? { based_on: workspace } : {}) };
-      setStatus(form, uploading ? "Uploading…" : "Sending…");
-      await outboxPut(record);
-      await flushOutbox();
+      await outboxPut({ id, form_id: formId, body: JSON.stringify(payload) });
+      void flushOutbox();
     } catch {
-      setStatus(form, "Couldn’t send. Try again.");
-      delete form.dataset.letmeknowSubmission;
       submissionForms.delete(id);
-    } finally {
-      submitting.delete(form);
-      if (previousBusy === null) form.removeAttribute("aria-busy");
-      else form.setAttribute("aria-busy", previousBusy);
-      if (submitter) submitter.disabled = previousDisabled;
+      setStatus(form, "Couldn’t send. Try again.");
     }
   }
 
   document.addEventListener("submit", (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
-    const details = submissionDetails(form, event.submitter);
-    if (details.method === "DIALOG") return;
+    if (form.method.toLowerCase() === "dialog") return;
     event.preventDefault();
-    submit(form, event.submitter, details);
+    void submit(form, event.submitter);
   });
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", restoreState, { once: true });
-  else restoreState();
   connect();
 })();

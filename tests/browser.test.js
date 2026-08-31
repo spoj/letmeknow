@@ -9,7 +9,8 @@ import { describe, it } from "node:test";
 
 const firefox = "/usr/bin/firefox";
 const geckodriver = "/usr/bin/geckodriver";
-const clientFile = new URL("../src/runtime.client.js", import.meta.url);
+const runtimeFile = new URL("../src/runtime.client.js", import.meta.url);
+const idiomorphFile = new URL("../src/idiomorph.client.js", import.meta.url);
 
 function requireExecutable(path, name) {
   try {
@@ -17,10 +18,6 @@ function requireExecutable(path, name) {
   } catch {
     throw new Error(`${name} is required for the browser smoke test: ${path}`);
   }
-}
-
-function runtimeSource() {
-  return readFileSync(clientFile, "utf8");
 }
 
 function request(port, method, path, body) {
@@ -64,68 +61,107 @@ async function stopProcess(child) {
   if (child.exitCode === null) child.kill("SIGKILL");
 }
 
-const page = `<!doctype html>
-<html><head><meta charset="utf-8"><title>LetMeKnow browser smoke test</title>
-<style>body { min-height: 5000px; } form { margin-top: 20px; }</style></head><body>
-<h1>Preview</h1>
-<form id="review" action="/submit" method="post">
-  <label>Message <textarea id="stable-text" name="message"></textarea></label>
-  <label><input id="stable-check" type="checkbox" name="checked"> Checked</label>
-  <label>Choice <select id="stable-select" name="choice"><option value="one">One</option><option value="two">Two</option></select></label>
-  <label>Unstable <input name="unstable"></label>
-  <input type="file" name="empty-file">
-  <button id="submit" formaction="/submit" name="decision" value="approve">Approve</button>
-  <output id="status" data-letmeknow-status role="status"></output>
-</form>
-<script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime data-letmeknow-workspace="11111111-1111-4111-8111-111111111111"></script>
-</body></html>`;
+function documentPage(pageEvent, title, body) {
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}<script type="module" src="/_letmeknow/client.js" data-letmeknow-runtime data-letmeknow-page-event="${pageEvent}"></script></body></html>`;
+}
+
+const initialPage = documentPage(10, "Initial", `
+  <main id="letmeknow-root">
+    <h1 id="heading">Initial</h1>
+    <output id="counter">0</output>
+    <form id="review" action="/review" method="post">
+      <label>Message <textarea id="message" name="message"></textarea></label>
+      <label><input id="tag-one" type="checkbox" name="tag" value="one"> One</label>
+      <label><input id="tag-two" type="checkbox" name="tag" value="two"> Two</label>
+      <button id="submit" name="decision" value="approve">Approve</button>
+      <input id="file" type="file" name="attachment">
+      <output id="status" data-letmeknow-status role="status"></output>
+    </form>
+  </main>
+  <script id="agent-script">window.agentScriptRuns = (window.agentScriptRuns || 0) + 1;</script>
+`);
+
+const updatedPage = documentPage(20, "Updated", `
+  <main id="letmeknow-root">
+    <h1 id="heading">Updated</h1>
+    <output id="counter">1</output>
+    <form id="review" action="/review" method="post">
+      <label>Message <textarea id="message" name="message"></textarea></label>
+      <label><input id="tag-one" type="checkbox" name="tag" value="one"> One</label>
+      <label><input id="tag-two" type="checkbox" name="tag" value="two"> Two</label>
+      <button id="submit" name="decision" value="approve">Approve</button>
+      <input id="file" type="file" name="attachment">
+      <output id="status" data-letmeknow-status role="status"></output>
+    </form>
+  </main>
+  <script id="agent-script">window.agentScriptRuns = (window.agentScriptRuns || 0) + 100;</script>
+  <script>window.liveScriptRuns = (window.liveScriptRuns || 0) + 1;</script>
+`);
+
+const finalPage = documentPage(22, "Final", `
+  <main id="letmeknow-root">
+    <h1 id="heading">Final</h1>
+    <output id="counter">2</output>
+    <form id="review" action="/review" method="post">
+      <label>Message <textarea id="message" name="message"></textarea></label>
+      <label><input id="tag-one" type="checkbox" name="tag" value="one"> One</label>
+      <label><input id="tag-two" type="checkbox" name="tag" value="two"> Two</label>
+      <button id="submit" name="decision" value="approve">Approve</button>
+      <input id="file" type="file" name="attachment">
+      <output id="status" data-letmeknow-status role="status"></output>
+    </form>
+  </main>
+`);
 
 describe("browser runtime", () => {
-  it("connects, submits, restores revisions, and recovers once after reconnect", async () => {
+  it("morphs pages, preserves the runtime, submits JSON events, and resynchronizes", async () => {
     requireExecutable(firefox, "Firefox");
     requireExecutable(geckodriver, "geckodriver");
 
-    const source = runtimeSource();
+    const runtimeSource = readFileSync(runtimeFile, "utf8");
+    const idiomorphSource = readFileSync(idiomorphFile, "utf8");
+    let currentPage = initialPage;
     let rootRequests = 0;
-    let post;
+    let delayNextPage = false;
     const posts = [];
-    let failNextPost = false;
+    const sockets = [];
+    const wsServer = new WebSocketServer({ noServer: true });
     const httpServer = http.createServer((req, res) => {
       if (req.method === "GET" && req.url === "/_letmeknow/client.js") {
         res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" });
-        res.end(source);
+        res.end(runtimeSource);
+        return;
+      }
+      if (req.method === "GET" && req.url === "/_letmeknow/idiomorph.js") {
+        res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" });
+        res.end(idiomorphSource);
         return;
       }
       if (req.method === "GET" && req.url === "/") {
         rootRequests += 1;
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-        res.end(page);
+        const send = () => {
+          res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+          res.end(currentPage);
+        };
+        if (delayNextPage) {
+          delayNextPage = false;
+          setTimeout(send, 250);
+        } else send();
         return;
       }
-      if (req.method === "POST" && req.url === "/submit") {
+      if (req.method === "POST" && req.url === "/_letmeknow/submit") {
         const chunks = [];
         req.on("data", chunk => chunks.push(chunk));
         req.on("end", () => {
-          post = { headers: req.headers, body: Buffer.concat(chunks).toString() };
-          posts.push(post);
-          if (failNextPost) {
-            failNextPost = false;
-            res.writeHead(503);
-            res.end();
-            return;
-          }
-          setTimeout(() => { res.writeHead(202); res.end(); }, 150);
+          posts.push({ headers: req.headers, body: Buffer.concat(chunks).toString() });
+          res.writeHead(202);
+          res.end();
         });
         return;
       }
       res.writeHead(404);
       res.end("not found");
     });
-    await once(httpServer.listen(0, "127.0.0.1"), "listening");
-    const port = httpServer.address().port;
-
-    const sockets = [];
-    const wsServer = new WebSocketServer({ noServer: true });
     httpServer.on("upgrade", (req, socket, head) => {
       if (req.url !== "/_letmeknow/client") {
         socket.destroy();
@@ -138,6 +174,8 @@ describe("browser runtime", () => {
         client.send(JSON.stringify({ type: "connected", producer_connected: true }));
       });
     });
+    await once(httpServer.listen(0, "127.0.0.1"), "listening");
+    const port = httpServer.address().port;
 
     let driver;
     let sessionId;
@@ -174,80 +212,72 @@ describe("browser runtime", () => {
       await command("POST", "/url", { url: `http://127.0.0.1:${port}/` });
       await waitFor(async () => (await execute("return document.readyState")) === "complete", "initial page did not load");
       await waitFor(() => sockets.length === 1, "browser did not connect to runtime");
-      await sleep(300);
-      assert.equal(rootRequests, 1, "initial connection must not reload the page");
+      await sleep(250);
+      assert.equal(rootRequests, 1, "initial connection must not fetch the page again");
 
-      await execute(`
-        document.querySelector("#stable-text").value = "remember this";
-        document.querySelector("#stable-check").checked = true;
-        document.querySelector("#stable-select").value = "two";
-        document.querySelector("input:not([id])").value = "do not restore";
-        window.scrollTo(0, 1200);
-      `);
-      await waitFor(async () => (await execute("return window.scrollY")) >= 900, "browser did not scroll");
-      await execute("document.querySelector('#submit').click()");
-      await waitFor(async () => (await execute("return document.querySelector('#status').textContent")) === "Sending…", "sending status was not shown");
-      await waitFor(async () => (await execute("return document.querySelector('#status').textContent")) === "Sent. Waiting for an update…", "accepted status was not shown");
-      assert.ok(post, "form request was not received");
-      assert.equal(post.headers["x-letmeknow-id"].length, 36);
-      assert.equal(post.headers["x-letmeknow-based-on"], "11111111-1111-4111-8111-111111111111");
-      assert.equal(post.headers["x-letmeknow-trigger-name"], "decision");
-      assert.equal(post.headers["x-letmeknow-trigger-value"], "approve");
-      assert.match(post.body, /message=remember\+this/);
-      assert.match(post.body, /decision=approve/);
-      assert.doesNotMatch(post.body, /empty-file/);
+      const initialState = await execute(`return {
+        title: document.title,
+        heading: document.querySelector('#heading').textContent,
+        pageEvent: document.querySelector('script[data-letmeknow-runtime]').dataset.letmeknowPageEvent,
+        agentScriptRuns: window.agentScriptRuns,
+        runtimeScripts: document.querySelectorAll('script[data-letmeknow-runtime]').length
+      }`);
+      assert.deepEqual(initialState, { title: "Initial", heading: "Initial", pageEvent: "10", agentScriptRuns: 1, runtimeScripts: 1 });
 
-      const revisionBaseline = rootRequests;
-      const revisionSocket = sockets.at(-1);
-      assert.equal(revisionSocket.readyState, 1, "revision socket is not open");
-      revisionSocket.send(JSON.stringify({ type: "revision" }));
-      await waitFor(() => rootRequests === revisionBaseline + 1, "revision did not cause one reload");
-      await waitFor(async () => {
-        const state = await execute(`return {
-          text: document.querySelector("#stable-text").value,
-          checked: document.querySelector("#stable-check").checked,
-          choice: document.querySelector("#stable-select").value,
-          unstable: document.querySelector("input:not([id])").value,
-          scroll: window.scrollY
-        }`);
-        return state.text === "remember this" && state.checked && state.choice === "two" && state.unstable === "" && state.scroll >= 900 ? state : false;
-      }, "revision did not restore stable state");
-      await sleep(300);
-      assert.equal(rootRequests, revisionBaseline + 1, "revision must not reload more than once");
+      await execute("document.querySelector('#message').value = 'draft'; document.querySelector('#tag-one').checked = true; document.querySelector('#tag-two').checked = true; document.querySelector('#message').focus();");
+      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 20, html: updatedPage }));
+      await waitFor(async () => (await execute("return document.title")) === "Updated", "full-page update was not applied");
+      const updatedState = await execute(`return {
+        heading: document.querySelector('#heading').textContent,
+        counter: document.querySelector('#counter').textContent,
+        draft: document.querySelector('#message').value,
+        one: document.querySelector('#tag-one').checked,
+        two: document.querySelector('#tag-two').checked,
+        agentScriptRuns: window.agentScriptRuns,
+        liveScriptRuns: window.liveScriptRuns || 0,
+        listeners: document.querySelectorAll('script[data-letmeknow-runtime]').length,
+        pageEvent: document.querySelector('script[data-letmeknow-runtime]').dataset.letmeknowPageEvent
+      }`);
+      assert.deepEqual(updatedState, { heading: "Updated", counter: "1", draft: "draft", one: false, two: false, agentScriptRuns: 1, liveScriptRuns: 0, listeners: 1, pageEvent: "20" });
 
-      const duplicateBaseline = posts.length;
-      await execute("document.querySelector('#stable-text').value = 'one request'; const button = document.querySelector('#submit'); button.click(); button.click();");
-      await waitFor(() => posts.length === duplicateBaseline + 1, "duplicate clicks created multiple requests");
-      await waitFor(async () => (await execute("return document.querySelector('#status').textContent")) === "Sent. Waiting for an update…", "duplicate-click submission was not accepted");
-      assert.equal(posts.at(-1).headers["x-letmeknow-id"].length, 36);
+      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 19, html: documentPage(19, "Old", "<main id=\"letmeknow-root\"><h1 id=\"heading\">Old</h1></main>") }));
+      await sleep(100);
+      assert.equal(await execute("return document.title"), "Updated", "older update must be ignored");
 
-      failNextPost = true;
-      const failedPostCount = posts.length;
-      await execute("document.querySelector('#stable-text').value = 'retry this'; document.querySelector('#submit').click();");
-      await waitFor(() => posts.length === failedPostCount + 1, "failed form request was not received");
-      const failedId = posts.at(-1).headers["x-letmeknow-id"];
-      const failedBody = posts.at(-1).body;
-      await waitFor(async () => (await execute("return document.querySelector('#status').textContent")) === "Couldn’t send. Try again.", "failed submission status was not shown");
-      const reloadBaseline = rootRequests;
-      const reloadSocket = sockets.at(-1);
-      reloadSocket.send(JSON.stringify({ type: "revision" }));
-      await waitFor(() => rootRequests === reloadBaseline + 1, "reload for pending submission did not happen");
-      await waitFor(() => posts.length === failedPostCount + 2, "pending submission was not retried after reload");
-      assert.equal(posts.at(-1).headers["x-letmeknow-id"], failedId, "reload retry must reuse submission ID");
-      assert.equal(posts.at(-1).body, failedBody, "reload retry must reuse serialized submission");
-      await waitFor(async () => (await execute("return document.querySelector('#status').textContent")) === "Sent. Waiting for an update…", "retried submission was not accepted");
-      const acceptedPostCount = posts.length;
-      sockets.at(-1).send(JSON.stringify({ type: "revision" }));
-      await sleep(300);
-      assert.equal(posts.length, acceptedPostCount, "accepted submission must be removed from outbox");
+      const baselinePosts = posts.length;
+      await execute("document.querySelector('#tag-one').checked = true; document.querySelector('#tag-two').checked = true; document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click(); document.querySelector('#submit').click();");
+      await waitFor(() => posts.length === baselinePosts + 10, "rapid submissions were not all delivered");
+      const payloads = posts.slice(baselinePosts).map(post => JSON.parse(post.body));
+      assert.equal(new Set(payloads.map(payload => payload.id)).size, 10, "rapid submissions need distinct IDs");
+      assert.ok(payloads.every(payload => payload.page_event === 20));
+      assert.ok(payloads.every(payload => payload.form_id === "review"));
+      assert.ok(payloads.every(payload => payload.action === "/review"));
+      assert.ok(payloads.every(payload => payload.trigger.name === "decision" && payload.trigger.value === "approve"));
+      assert.ok(payloads.every(payload => payload.values.tag?.join(",") === "one,two"));
+      assert.ok(posts.slice(baselinePosts).every(post => post.headers["content-type"].startsWith("application/json")));
 
+      currentPage = updatedPage;
+      delayNextPage = true;
       const reconnectBaseline = rootRequests;
       const reconnectSocket = sockets.at(-1);
-      assert.equal(reconnectSocket.readyState, 1, "reconnect socket is not open");
-      reconnectSocket.close(1000, "browser smoke test reconnect");
-      await waitFor(() => rootRequests === reconnectBaseline + 1, "reconnect did not cause one recovery reload", 8_000);
-      await sleep(300);
-      assert.equal(rootRequests, reconnectBaseline + 1, "reconnect must cause at most one recovery reload");
+      reconnectSocket.close(1000, "test reconnect");
+      await waitFor(() => sockets.length === 2, "browser did not reconnect", 8_000);
+      const resyncSocket = sockets.at(-1);
+      await waitFor(() => rootRequests === reconnectBaseline + 1, "reconnect resync did not request the current page");
+      resyncSocket.send(JSON.stringify({ type: "update_ui", event_number: 21, html: documentPage(21, "Buffered", "<main id=\"letmeknow-root\"><h1 id=\"heading\">Buffered</h1><output id=\"counter\">1.5</output></main>") }));
+      await waitFor(async () => (await execute("return document.title")) === "Buffered", "buffered update was not applied after resync");
+      assert.equal(await execute("return window.agentScriptRuns"), 1, "live scripts must not execute");
+      assert.equal(await execute("return document.querySelector('#counter').textContent"), "1.5");
+      assert.equal(await execute("return document.querySelectorAll('script[data-letmeknow-runtime]').length"), 1, "runtime must survive morphing");
+      assert.ok(rootRequests >= 2, "reconnect must fetch the current page");
+
+      currentPage = finalPage;
+      const beforeProducerResync = rootRequests;
+      sockets.at(-1).send(JSON.stringify({ type: "producer", connected: false }));
+      await sleep(50);
+      sockets.at(-1).send(JSON.stringify({ type: "producer", connected: true }));
+      await waitFor(() => rootRequests > beforeProducerResync, "producer reconnection did not resynchronize");
+      await waitFor(async () => (await execute("return document.title")) === "Final", "producer resynchronization did not apply current page");
     } catch (error) {
       throw new Error(`${error.message}${driverError ? `\ngeckodriver: ${driverError}` : ""}`, { cause: error });
     } finally {
