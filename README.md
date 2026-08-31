@@ -13,16 +13,16 @@ npx letmeknow-cli serve ./preview
 `serve` prints newline-delimited JSON. The first line contains the public URL and the authoritative event frontier:
 
 ```json
-{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","frontier":0,"page_event":0,"page_hash":"…"}
+{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","session_path":"/tmp/letmeknow-…","frontier":0,"page_event":0,"page_hash":"…"}
 ```
 
-Keep the serve process running and read its stdout stream. Accepted browser submissions then appear as they are numbered; no polling command is needed:
+Keep the serve process running and read its stdout stream. Accepted browser submissions appear as compact notifications; read the complete event from `event_path`, then use its event number when committing:
 
 ```json
-{"type":"submit","id":"…","event_number":1,"page_event":0,"form_id":"review","action":"/review","trigger":{"name":"decision","value":"approve"},"values":{"decision":"approve"}}
+{"type":"submit","event_number":1,"id":"…","event_path":"/tmp/letmeknow-…/events/000000000001.json"}
 ```
 
-The URL is the public page. Anyone who has it can view and submit it.
+The `ready` notification also includes the private `session_path` containing the event files. The notification stream is intentionally compact; it does not contain submission values. The URL is the public page. Anyone who has it can view and submit it.
 
 ## Commands
 
@@ -62,7 +62,7 @@ Scripts should generally be synchronous and replayable. Randomness, current time
 
 ## Forms and security
 
-Use ordinary same-origin forms with meaningful field names. The runtime captures native form submissions by default, stores them in a durable browser outbox before delivery, retries after connection failures, and reuses the same UUID on retry. An application handler can claim a submission with `event.preventDefault()`. `form.submit()` and direct `fetch()` bypass the structured outbox. Treat submitted values as untrusted input and escape them before using them in HTML. File uploads are not supported.
+Use ordinary same-origin forms with meaningful field names. The runtime captures native form submissions by default, stores them in a durable browser outbox before delivery, retries after connection failures, and reuses the same UUID on retry. An application handler can claim a submission with `event.preventDefault()`. `form.submit()` and direct `fetch()` bypass the structured outbox. Treat submitted values as untrusted input and escape them before using them in HTML. Each accepted submission is atomically stored as a private JSON event file under the `session_path`; stdout contains only its compact notification. Event files are removed when the submission is acknowledged or the `serve` process stops. File uploads are not supported.
 
 The public URL is a bearer capability: anyone who has it can view the page and submit forms. Keep secrets and unrelated files outside the served directory.
 

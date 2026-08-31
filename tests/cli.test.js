@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import net from "node:net";
@@ -299,7 +299,10 @@ describe("LetMeKnow CLI", () => {
   it("serves the initial replayable page, stream metadata, and live assets", async () => {
     const session = await startSession({ index: "<!doctype html><html><body><script type=\"application/json\" data-letmeknow-history>[\"agent content\"]</script><main id=\"letmeknow-root\">old</main></body></html>" });
     try {
-      assert.deepEqual(session.ready, { type: "ready", url: "https://0123456789abcdef0123.letmeknow.dev/", frontier: 0, page_event: 0, page_hash: session.ready.page_hash });
+      assert.deepEqual(session.ready, { type: "ready", url: "https://0123456789abcdef0123.letmeknow.dev/", session_path: session.ready.session_path, frontier: 0, page_event: 0, page_hash: session.ready.page_hash });
+      assert.match(session.ready.session_path, /^\/tmp\/letmeknow-[0-9a-f-]+$/);
+      assert.ok(existsSync(join(session.ready.session_path, "events")));
+      assert.ok(JSON.stringify(session.ready).length < 400);
       const page = await session.request("GET", "/", { accept: "text/html" });
       const index = await session.request("GET", "/index.html", { accept: "text/html" });
       const asset = await session.request("GET", "/assets/app.js");
@@ -332,6 +335,9 @@ describe("LetMeKnow CLI", () => {
       assert.equal(firstResponse.status, 202);
       assert.equal(secondResponse.status, 202);
       assert.deepEqual([first.event_number, second.event_number], [1, 2]);
+      assert.deepEqual(Object.keys(first).sort(), ["event_number", "event_path", "id", "type"]);
+      assert.ok(first.event_path.startsWith(join(session.ready.session_path, "events")));
+      assert.deepEqual(JSON.parse(readFileSync(first.event_path)), { type: "submit", id: firstId, event_number: 1, page_event: 0, form_id: "counter", action: "/increment", trigger: { id: "increment", name: "amount", value: "1" }, values: { amount: "1" } });
       assert.deepEqual(session.stream.filter(event => event.type === "submit").map(event => event.id), [firstId, secondId]);
 
       const script = "document.body.dataset.first = 'ok';";
@@ -349,6 +355,8 @@ describe("LetMeKnow CLI", () => {
       });
       const runMetadata = await session.waitStream(event => event.type === "run_ui" && event.event_number === 3);
       assert.deepEqual(runMetadata, { type: "run_ui", event_number: 3, considered_through: 1, frontier: 3, page_event: 3, page_hash: committed.page_hash });
+      assert.equal(existsSync(first.event_path), false);
+      assert.equal(existsSync(second.event_path), true);
       assert.equal(session.stream.filter(event => event.type === "run_ui").length, 1);
       assert.deepEqual(session.scripts, [{ type: "run_ui", event_number: 3, considered_through: 1, script }]);
 
@@ -365,11 +373,64 @@ describe("LetMeKnow CLI", () => {
       assert.deepEqual(later.events, [lateId]);
       assert.deepEqual(later.run_ui, { event_number: 5, considered_through: 4 });
       await session.waitStream(event => event.type === "run_ui" && event.event_number === 5);
+      assert.equal(existsSync(late.event_path), false);
       assert.equal(session.stream.filter(event => event.type === "run_ui").length, 2);
       assert.deepEqual(session.scripts.map(({ event_number, considered_through }) => ({ event_number, considered_through })), [
         { event_number: 3, considered_through: 1 },
         { event_number: 5, considered_through: 4 }
       ]);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("persists complete large submissions behind compact notifications", async () => {
+    const session = await startSession();
+    try {
+      const id = randomUUID();
+      const value = "x".repeat(10_000);
+      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(id, 0, { comment: value }))).status, 202);
+      const notification = await session.waitStream(event => event.type === "submit" && event.id === id);
+      assert.ok(JSON.stringify(notification).length < 400);
+      assert.deepEqual(Object.keys(notification).sort(), ["event_number", "event_path", "id", "type"]);
+      const event = JSON.parse(readFileSync(notification.event_path));
+      assert.equal(event.id, id);
+      assert.equal(event.values.comment, value);
+      assert.equal(event.event_number, notification.event_number);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("retries persistence failures without consuming an event", async () => {
+    const session = await startSession();
+    const eventsDirectory = join(session.ready.session_path, "events");
+    try {
+      rmSync(eventsDirectory, { recursive: true, force: true });
+      writeFileSync(eventsDirectory, "blocked");
+      const id = randomUUID();
+      const payload = jsonSubmission(id);
+      const failed = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, payload);
+      assert.equal(failed.status, 503);
+      assert.equal(session.stream.filter(event => event.type === "submit").length, 0);
+
+      rmSync(eventsDirectory, { force: true });
+      mkdirSync(eventsDirectory);
+      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, payload)).status, 202);
+      const notification = await session.waitStream(event => event.type === "submit" && event.id === id);
+      assert.equal(notification.event_number, 1);
+      assert.equal(JSON.parse(readFileSync(notification.event_path)).id, id);
+
+      const savedPath = `${notification.event_path}.saved`;
+      renameSync(notification.event_path, savedPath);
+      mkdirSync(notification.event_path);
+      const commitFailure = await runCommand(["commit", session.folder, "--through", "1"]);
+      assert.equal(commitFailure.code, 1);
+      assert.equal(JSON.parse(commitFailure.stdout).ok, false);
+      rmSync(notification.event_path, { recursive: true });
+      renameSync(savedPath, notification.event_path);
+      assert.deepEqual((await command(["commit", session.folder, "--through", "1"])).events, [id]);
+      assert.equal(existsSync(notification.event_path), false);
     } finally {
       await session.stop();
     }
@@ -483,6 +544,7 @@ describe("LetMeKnow CLI", () => {
       assert.deepEqual(submissions.map(result => result.status), Array(3).fill(202));
       const duplicate = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(ids[0]));
       assert.equal(duplicate.status, 202);
+      assert.equal(session.stream.filter(event => event.type === "submit" && event.id === ids[0]).length, 1);
       const events = await Promise.all(ids.map(id => session.waitStream(event => event.type === "submit" && event.id === id)));
       assert.deepEqual(events.map(event => event.event_number).sort((a, b) => a - b), [1, 2, 3]);
       assert.deepEqual(new Set(events.map(event => event.id)), new Set(ids));
@@ -502,7 +564,9 @@ describe("LetMeKnow CLI", () => {
       assert.deepEqual(committed.events, []);
       assert.equal(committed.frontier, 0);
     } finally {
+      const sessionPath = session.ready.session_path;
       await session.stop();
+      assert.equal(existsSync(sessionPath), false);
     }
   });
 

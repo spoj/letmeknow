@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { constants, existsSync, readFileSync, statSync, writeSync } from "node:fs";
-import { chmod, open, readFile, realpath, stat, unlink } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import net from "node:net";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -50,6 +50,10 @@ function response(packet, status, body = Buffer.alloc(0), headers = {}) {
 
 function errorResponse(packet, status, message) {
   return response(packet, status, Buffer.from(message), { "Content-Type": "text/plain; charset=utf-8" });
+}
+
+function persistenceError(cause) {
+  return Object.assign(new Error("could not persist submission"), { status: 503, cause });
 }
 
 function deniedPath(pathname) {
@@ -241,7 +245,10 @@ async function handleRequest(root, page, packet, recordInteraction) {
   let request;
   try { request = requestUrl(packet); } catch { return errorResponse(packet, 400, "bad request"); }
   if (request.pathname === "/_letmeknow/submit") {
-    try { return await submission(packet, recordInteraction); } catch (cause) { return errorResponse(packet, cause?.message === "submission is too large" ? 413 : 400, cause instanceof Error ? cause.message : "invalid submission"); }
+    try { return await submission(packet, recordInteraction); } catch (cause) {
+      const status = cause?.status || (cause?.message === "submission is too large" ? 413 : 400);
+      return errorResponse(packet, status, cause instanceof Error ? cause.message : "invalid submission");
+    }
   }
   return staticResponse(root, packet, page);
 }
@@ -329,8 +336,11 @@ async function start(directory) {
   let pageEvent = 0;
   let eventNumber = 0;
   const currentPageHash = () => pageHash(page);
+  const sessionDirectory = join(tmpdir(), `letmeknow-${randomUUID()}`);
+  const eventsDirectory = join(sessionDirectory, "events");
+  try { await mkdir(eventsDirectory, { recursive: true, mode: 0o700 }); }
+  catch (cause) { await rm(sessionDirectory, { recursive: true, force: true }).catch(() => {}); throw cause; }
   const browserEvents = [];
-  const browserEventBytes = [];
   let retainedSubmissionBytes = 0;
   let acknowledgedThrough = 0;
   const seenEvents = new Set();
@@ -383,18 +393,21 @@ async function start(directory) {
 
     let committedCount = 0;
     while (committedCount < browserEvents.length && browserEvents[committedCount].event_number <= through) committedCount += 1;
-    const committedEvents = browserEvents.slice(0, committedCount).map(event => event.id);
+    const committedRecords = browserEvents.slice(0, committedCount);
+    const committedEvents = committedRecords.map(event => event.id);
     let runEvent;
     let nextPage = page;
     if (requestedScript !== undefined) {
       runEvent = { type: "run_ui", event_number: eventNumber + 1, considered_through: through, script: requestedScript };
       nextPage = replayablePage(basePage, [...history, runEvent]);
-      await writeStream({ type: "run_ui", event_number: runEvent.event_number, considered_through: through, frontier: runEvent.event_number, page_event: runEvent.event_number, page_hash: pageHash(nextPage) });
     }
 
-    retainedSubmissionBytes -= browserEventBytes.slice(0, committedCount).reduce((total, bytes) => total + bytes, 0);
+    await Promise.all(committedRecords.map(event => unlink(event.event_path).catch(cause => {
+      if (cause?.code !== "ENOENT") throw cause;
+    })));
+    if (runEvent) await writeStream({ type: "run_ui", event_number: runEvent.event_number, considered_through: through, frontier: runEvent.event_number, page_event: runEvent.event_number, page_hash: pageHash(nextPage) });
+    retainedSubmissionBytes -= committedRecords.reduce((total, event) => total + event.bytes, 0);
     browserEvents.splice(0, committedCount);
-    browserEventBytes.splice(0, committedCount);
     if (runEvent) {
       eventNumber = runEvent.event_number;
       pageEvent = runEvent.event_number;
@@ -460,7 +473,11 @@ async function start(directory) {
       controlServer.off("error", reject);
       resolveListen();
     });
-  }).catch(cause => { throw new Error(`cannot start local control channel: ${cause.message}`); });
+  }).catch(async cause => {
+    await unlink(controlSocket).catch(() => {});
+    await rm(sessionDirectory, { recursive: true, force: true }).catch(() => {});
+    throw new Error(`cannot start local control channel: ${cause.message}`);
+  });
 
   const recordInteraction = (event, bytes) => mutate(async () => {
     if (seenEvents.has(event.id)) return;
@@ -469,12 +486,25 @@ async function start(directory) {
       throw new Error("session submission limit exceeded");
     }
     const numbered = { ...event, event_number: eventNumber + 1 };
-    await writeStream(numbered);
+    const eventPath = join(eventsDirectory, `${String(numbered.event_number).padStart(12, "0")}.json`);
+    const temporaryPath = `${eventPath}.tmp-${randomUUID()}`;
+    try {
+      await writeFile(temporaryPath, JSON.stringify(numbered), { mode: 0o600 });
+      await rename(temporaryPath, eventPath);
+    } catch (cause) {
+      await unlink(temporaryPath).catch(() => {});
+      throw persistenceError(cause);
+    }
+    try {
+      await writeStream({ type: "submit", event_number: numbered.event_number, id: numbered.id, event_path: eventPath });
+    } catch (cause) {
+      await unlink(eventPath).catch(() => {});
+      throw cause;
+    }
     seenEvents.add(event.id);
     retainedSubmissionBytes += bytes;
     eventNumber = numbered.event_number;
-    browserEvents.push(numbered);
-    browserEventBytes.push(bytes);
+    browserEvents.push({ event_number: numbered.event_number, id: numbered.id, event_path: eventPath, bytes });
   });
 
   stop = async code => {
@@ -488,6 +518,7 @@ async function start(directory) {
     await new Promise(resolveClose => controlServer.close(() => resolveClose()));
     await unlink(controlSocket).catch(() => {});
     await Promise.race([streamWrite.catch(() => {}), new Promise(resolve => setTimeout(resolve, STREAM_SHUTDOWN_TIMEOUT))]);
+    await rm(sessionDirectory, { recursive: true, force: true }).catch(() => {});
     process.exit(code);
   };
   stopSession = () => { void stop(1); };
@@ -532,7 +563,7 @@ async function start(directory) {
         sessionUrl = packet.url;
         if (!ready) {
           ready = true;
-          writeStream({ type: "ready", url: sessionUrl, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash() });
+          writeStream({ type: "ready", url: sessionUrl, session_path: sessionDirectory, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash() });
           for (const value of streamBeforeReady) writeStream(value);
           streamBeforeReady.length = 0;
         }

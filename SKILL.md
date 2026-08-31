@@ -15,13 +15,13 @@ Create a directory containing the public files and an initial `index.html`:
 npx letmeknow-cli serve ./preview
 ```
 
-Run `serve` in a monitored background process and consume its stdout as a newline-delimited JSON event stream. Its first line is ready metadata:
+Run `serve` in a monitored background process and consume its stdout as a newline-delimited JSON notification stream. Its first line is ready metadata:
 
 ```json
-{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","frontier":0,"page_event":0,"page_hash":"…"}
+{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","session_path":"/tmp/letmeknow-…","frontier":0,"page_event":0,"page_hash":"…"}
 ```
 
-`frontier` is the latest authoritative global event number. `page_event` is the latest committed UI-script event, and `page_hash` identifies the replayable page at that point. Give the public URL to the human. It is the way to inspect the resulting global state.
+`frontier` is the latest authoritative global event number. `page_event` is the latest committed UI-script event, and `page_hash` identifies the replayable page at that point. `session_path` is a private local directory containing complete event files under `events/`. Give the public URL to the human. It is the way to inspect the resulting global state.
 
 The base page should contain the application shell and any agent-authored static scripts:
 
@@ -44,13 +44,13 @@ The base page should contain the application shell and any agent-authored static
 
 ## Agent loop
 
-Read each accepted submission from the monitored `serve` stdout. It already has its authoritative global event number:
+Read each compact submission notification from the monitored `serve` stdout, then read its `event_path` to get the complete event. It already has its authoritative global event number:
 
 ```json
-{"type":"submit","id":"…","event_number":7,"page_event":5,"form_id":"decision","action":"/decide","trigger":{"name":"decision","value":"approve"},"values":{"comment":"Looks good","decision":"approve"}}
+{"type":"submit","event_number":7,"id":"…","event_path":"/tmp/letmeknow-…/events/000000000007.json"}
 ```
 
-After considering events through event 7, acknowledge that inclusive prefix and optionally run an update:
+After reading and considering the complete event through event 7, acknowledge that inclusive prefix and optionally run an update:
 
 ```bash
 npx letmeknow-cli commit ./preview --through 7 --script update.js
@@ -98,7 +98,7 @@ submit       browser, event 4
 run_ui       CLI,     event 5, considered_through 4
 ```
 
-The CLI assigns event numbers in acceptance order. They do not claim to be the physical order in which people clicked or browsers executed code. Every accepted submission is printed once on the `serve` stream. UI scripts are sent to connected browsers and replayed by later browsers; the stream prints concise metadata for each committed UI script:
+The CLI assigns event numbers in acceptance order. They do not claim to be the physical order in which people clicked or browsers executed code. Every accepted submission is written atomically to a private JSON file and printed once as a compact `serve` notification. UI scripts are sent to connected browsers and replayed by later browsers; the stream prints concise metadata for each committed UI script:
 
 ```json
 {"type":"run_ui","event_number":3,"considered_through":2,"frontier":3,"page_event":3,"page_hash":"…"}
@@ -122,7 +122,7 @@ Use ordinary same-origin forms with stable IDs and meaningful field names:
 </form>
 ```
 
-The runtime captures native form submissions by default and converts them into JSON `submit` events. An application handler can claim a submission by calling `event.preventDefault()` before the runtime handler runs. It assigns an opaque UUID, stores each event in a durable browser outbox before delivery, retries after connection failures, and reuses the UUID on retry. The CLI deduplicates repeated delivery of the same event. Distinct intentional submissions remain distinct, including rapid repeated clicks. `form.submit()` and direct `fetch()` bypass the structured outbox. File uploads are not supported.
+The runtime captures native form submissions by default and converts them into JSON `submit` events. An application handler can claim a submission by calling `event.preventDefault()` before the runtime handler runs. It assigns an opaque UUID, stores each event in a durable browser outbox before delivery, retries after connection failures, and reuses the UUID on retry. The CLI deduplicates repeated delivery of the same event. Distinct intentional submissions remain distinct, including rapid repeated clicks. `form.submit()` and direct `fetch()` bypass the structured outbox. The CLI atomically writes the complete accepted event to the private `session_path/events` directory and emits only a compact notification containing its path. The event file is removed when the event is acknowledged or `serve` stops. File uploads are not supported.
 
 Form values are untrusted input. Validate them and escape them before putting them into HTML or scripts.
 
