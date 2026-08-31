@@ -350,7 +350,7 @@
       const fileRecords = [];
       for (const { field, file } of files) {
         const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", await file.arrayBuffer())), byte => byte.toString(16).padStart(2, "0")).join("");
-        const descriptor = { field, name: file.name, content_type: file.type, size: file.size, hash };
+        const descriptor = { field, name: file.name, content_type: file.type || "application/octet-stream", size: file.size, hash };
         attachments.push(descriptor);
         fileRecords.push({ hash, file });
       }

@@ -36,7 +36,7 @@ type RunUIEvent = {
   script: string;
 };
 type CanonicalEvent = SubmitEvent | RunUIEvent;
-type StoredEvent = { event: CanonicalEvent; received: boolean; sent: boolean; committed: boolean; bytes: number };
+type StoredEvent = { event: CanonicalEvent; received: boolean; sent: boolean; bytes: number };
 type BlobRecord = { size: number; stored: boolean; kind: "workspace" | "browser" };
 type SubmissionRecord = { event_number: number; hash: string };
 type ProducerAttachment = { role: "producer"; id: string; url: string; opened: boolean; closing: boolean };
@@ -52,6 +52,7 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_SESSION_BLOB_BYTES = 100 * 1024 * 1024;
 const MAX_QUEUED_EVENTS = 256;
 const MAX_QUEUED_BYTES = 32 * 1024 * 1024;
+const MAX_SESSION_SUBMISSIONS = 100_000;
 const MAX_HISTORY_BYTES = MAX_BODY_BYTES;
 const MAX_PACKET_BYTES = 6 * MAX_BODY_BYTES + 4096;
 const MAX_MANIFEST_BYTES = 512 * 1024;
@@ -350,11 +351,12 @@ export class Session extends DurableObject<Env> {
       if (prior !== undefined && prior !== item.size) throw new Error("workspace object has the wrong size");
       requested.set(item.hash, item.size);
     }
+    const remove: string[] = [];
     for (const hash of previous) {
       if (current.has(hash) || requested.has(hash)) continue;
       const record = next[hash];
       if (!record || record.kind !== "workspace") continue;
-      await this.env.UPLOADS.delete(await this.objectKey(hash));
+      remove.push(hash);
       reserved -= record.size;
       delete next[hash];
     }
@@ -368,6 +370,7 @@ export class Session extends DurableObject<Env> {
       next[hash] = { size, stored: false, kind: "workspace" };
       reserved += size;
     }
+    if (remove.length) await this.env.UPLOADS.delete(await Promise.all(remove.map(hash => this.objectKey(hash))));
     await this.ctx.storage.transaction(async transaction => {
       await transaction.put("blob_records", next);
       await transaction.put("reserved_blob_bytes", Math.max(0, reserved));
@@ -456,7 +459,8 @@ export class Session extends DurableObject<Env> {
   private async expireSession(): Promise<void> {
     for (const client of this.clients()) client.close(1000, "session expired");
     this.producer()?.close(1000, "session expired");
-    try { await this.deleteSessionObjects(); } finally { await this.ctx.storage.deleteAll(); }
+    await this.deleteSessionObjects();
+    await this.ctx.storage.deleteAll();
   }
 
   private async sendNext(): Promise<void> {
@@ -618,7 +622,7 @@ export class Session extends DurableObject<Env> {
         });
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : "could not reserve attachments";
-        return error(message, message === "session not found" || message === "session expired" ? 404 : 400);
+        return error(message, message === "session not found" || message === "session expired" ? 404 : message === "session blob quota exceeded" ? 413 : 400);
       }
       const missing: Array<{ hash: string; size: number }> = [];
       for (const item of new Map(items.map(item => [item.hash, item])).values()) {
@@ -688,8 +692,22 @@ export class Session extends DurableObject<Env> {
   private async readBody(request: Request): Promise<Uint8Array> {
     const contentLength = request.headers.get("content-length");
     if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > MAX_BODY_BYTES) throw new Error("submission is too large");
-    const body = new Uint8Array(await request.arrayBuffer());
-    if (body.byteLength > MAX_BODY_BYTES) throw new Error("submission is too large");
+    const chunks: Uint8Array[] = [];
+    const reader = request.body?.getReader();
+    let size = 0;
+    while (reader) {
+      const part = await reader.read();
+      if (part.done) break;
+      size += part.value.byteLength;
+      if (size > MAX_BODY_BYTES) {
+        await reader.cancel();
+        throw new Error("submission is too large");
+      }
+      chunks.push(part.value);
+    }
+    const body = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
     return body;
   }
 
@@ -722,13 +740,16 @@ export class Session extends DurableObject<Env> {
       if (duplicate) return duplicate.hash === hash ? new Response(null, { status: 202 }) : error("submission id was already used", 409);
       const stats = await this.queuedStats();
       if (stats.count >= MAX_QUEUED_EVENTS || stats.bytes + body.byteLength > MAX_QUEUED_BYTES) return error("submission queue is full", 503);
+      const submissionCount = await this.ctx.storage.get<number>("submission_count") ?? 0;
+      if (submissionCount >= MAX_SESSION_SUBMISSIONS) return error("session submission limit reached", 409);
       const number = await this.eventFrontier() + 1;
       const event: SubmitEvent = { type: "submit", id, event_number: number, page_event: input.page_event as number, form_id: input.form_id as string | null, action: input.action as string, trigger: input.trigger as Record<string, unknown> | null, values: input.values as Record<string, unknown>, ...(attachments ? { attachments } : {}) };
-      const stored: StoredEvent = { event, received: false, sent: false, committed: false, bytes: body.byteLength };
+      const stored: StoredEvent = { event, received: false, sent: false, bytes: body.byteLength };
       await this.ctx.storage.transaction(async transaction => {
         await transaction.put(`submission:${id}`, { event_number: number, hash });
         await transaction.put(`event:${number}`, stored);
         await transaction.put("next_event_number", number + 1);
+        await transaction.put("submission_count", submissionCount + 1);
         await transaction.put("queued_event_count", stats.count + 1);
         await transaction.put("queued_event_bytes", stats.bytes + body.byteLength);
       });
@@ -857,6 +878,7 @@ export class Session extends DurableObject<Env> {
         await transaction.put("history_bytes", 2);
         await transaction.put("queued_event_count", 0);
         await transaction.put("queued_event_bytes", 0);
+        await transaction.put("submission_count", 0);
         await transaction.put("staging_hashes", []);
       });
       await this.deleteUnreferencedWorkspaceObjects(manifest).catch(() => {});
@@ -943,16 +965,16 @@ export class Session extends DurableObject<Env> {
     }
     const currentPageEvent = await this.ctx.storage.get<number>("page_event") ?? 0;
     const committedIds: string[] = [];
-    for (let number = 1; number <= through; number += 1) {
+    for (let number = committedThrough + 1; number <= through; number += 1) {
       const stored = await this.event(number);
-      if (stored?.event.type === "submit" && !stored.committed) committedIds.push(stored.event.id);
+      if (stored?.event.type === "submit") committedIds.push(stored.event.id);
     }
     if (runEvent) {
-      const stored: StoredEvent = { event: runEvent, received: false, sent: false, committed: false, bytes: encoder.encode(runEvent.script).byteLength };
+      const stored: StoredEvent = { event: runEvent, received: false, sent: false, bytes: encoder.encode(runEvent.script).byteLength };
       await this.ctx.storage.transaction(async transaction => {
-        for (let number = 1; number <= through; number += 1) {
+        for (let number = committedThrough + 1; number <= through; number += 1) {
           const storedEvent = await transaction.get<StoredEvent>(`event:${number}`);
-          if (storedEvent?.event.type === "submit") { storedEvent.committed = true; await transaction.put(`event:${number}`, storedEvent); }
+          if (storedEvent?.event.type === "submit") await transaction.delete(`event:${number}`);
         }
         await transaction.put(`event:${nextEventNumber}`, stored);
         await transaction.put("next_event_number", nextEventNumber + 1);
@@ -964,14 +986,14 @@ export class Session extends DurableObject<Env> {
         await transaction.put("history_bytes", nextHistoryBytes);
         await transaction.put("queued_event_count", stats.count + 1);
         await transaction.put("queued_event_bytes", stats.bytes + stored.bytes);
-        await transaction.put(`commit:${commitId}`, { ok: true, type: "committed", through, considered_through: through, frontier: nextEventNumber, page_event: nextEventNumber, page_hash: nextPageHash, events: committedIds, run_ui: { event_number: nextEventNumber, considered_through: through } });
+        await transaction.put(`commit:${commitId}`, { ok: true, type: "committed", through, considered_through: through, frontier: nextEventNumber, page_event: nextEventNumber, page_hash: nextPageHash, events: committedIds, workspace_version: nextVersion, run_ui: { event_number: nextEventNumber, considered_through: through } });
       });
       await this.deleteUnreferencedWorkspaceObjects(manifest).catch(() => {});
     } else {
       await this.ctx.storage.transaction(async transaction => {
-        for (let number = 1; number <= through; number += 1) {
+        for (let number = committedThrough + 1; number <= through; number += 1) {
           const storedEvent = await transaction.get<StoredEvent>(`event:${number}`);
-          if (storedEvent?.event.type === "submit") { storedEvent.committed = true; await transaction.put(`event:${number}`, storedEvent); }
+          if (storedEvent?.event.type === "submit") await transaction.delete(`event:${number}`);
         }
         await transaction.put("workspace_version", nextVersion);
         await transaction.put("current_manifest", manifest);

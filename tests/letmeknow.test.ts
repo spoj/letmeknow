@@ -206,7 +206,7 @@ describe("LetMeKnow service", () => {
     const response = await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ hashes: [{ hash: first, size: 100 * 1024 * 1024 }, { hash: second, size: 1 }] })
     }));
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(413);
     expect(await response.json()).toEqual({ error: "session blob quota exceeded" });
     producer.socket.close(1000, "done");
   });
@@ -254,6 +254,7 @@ describe("LetMeKnow service", () => {
     const update = await nextType(client, "run_ui");
     const result = await resultPromise;
     expect(result).toMatchObject({ ok: true, frontier: submission.event_number + 1, page_event: submission.event_number + 1, events: [id] });
+    expect((await commit(producer, workspace, submission.event_number)).events).toEqual([]);
     expect(update).toMatchObject({ event_number: result.page_event, script: "document.body.dataset.updated = 'yes';" });
     const page = await SELF.fetch(new Request(url));
     const pageText = await page.text();

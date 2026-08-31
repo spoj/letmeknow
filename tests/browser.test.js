@@ -103,10 +103,7 @@ const initialPage = documentPage(history, "Initial", body);
 const replayedPage = documentPage(liveHistory, "Initial", body);
 const idbPage = documentPage([], "IndexedDB", `<form id="idb-review"><input name="message" value="retry"><button id="idb-submit">Submit</button><output data-letmeknow-status></output></form><script>
   const open = indexedDB.open;
-  let failures = 2;
-  Object.defineProperty(indexedDB, 'open', { configurable: true, value: (...args) => {
-    if (!failures) return open.call(indexedDB, ...args);
-    failures -= 1;
+  Object.defineProperty(indexedDB, 'open', { configurable: true, value: () => {
     const request = {};
     setTimeout(() => request.onerror?.(), 0);
     return request;

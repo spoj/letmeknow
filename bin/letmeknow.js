@@ -217,7 +217,7 @@ async function start(directory) {
     const id = packet.id || packet.request_id || randomUUID();
     packet = { ...packet, id };
     return new Promise((resolveRequest, rejectRequest) => {
-      pending.set(id, { expected, resolve: resolveRequest, reject: rejectRequest });
+      pending.set(id, { packet, expected, resolve: resolveRequest, reject: rejectRequest });
       if (!sendPacket(packet)) {
         pending.delete(id);
         rejectRequest(new Error("producer is not connected"));
@@ -491,6 +491,8 @@ async function start(directory) {
         void writeStream({ type: "ready", url: sessionUrl, session_path: sessionDirectory, frontier: packet.frontier, page_event: packet.page_event, page_hash: packet.page_hash });
         for (const value of streamBeforeReady) void writeStream(value);
         streamBeforeReady.length = 0;
+      } else {
+        for (const waiter of pending.values()) sendPacket(waiter.packet);
       }
     } else if (packet.type === "submit" || packet.type === "run_ui") {
       receiptChain = receiptChain.then(() => persistEvent(packet)).catch(cause => { void stop(1); throw cause; });
@@ -553,7 +555,7 @@ async function start(directory) {
       if (socket !== current || stopped) return;
       clearTimeout(connectionTimer);
       socket = undefined;
-      rejectPending(new Error("producer connection closed"));
+      if (!ready) rejectPending(new Error("producer connection closed"));
       if (!credential || !sessionUrl) return void stop(1);
       if (!retryUntil) retryUntil = Date.now() + RECONNECT_RETRY_SECONDS * 1_000;
       retry();
