@@ -438,10 +438,28 @@ async function start(directory) {
   const initialize = async () => {
     await credentialReady;
     await provisionReady;
+    if (ready) return;
     const snapshot = await scanWorkspace(root);
+    if (ready) return;
     await scanAndUpload(snapshot);
+    if (ready) return;
     const session = await request({ type: "open", index_hash: snapshot.index.hash, index_size: snapshot.index.size, manifest: { files: snapshot.files } }, "session");
     if (!session.url) throw new Error("session URL is missing");
+  };
+
+  let initializing = false;
+  const beginInitialization = () => {
+    if (initializing || ready || stopped) return;
+    initializing = true;
+    void initialize().catch(cause => {
+      if (socket?.readyState === WebSocket.OPEN && !stopped) {
+        process.stderr.write(`letmeknow: ${cause.message}\n`);
+        void stop(1);
+      }
+    }).finally(() => {
+      initializing = false;
+      if (socket?.readyState === WebSocket.OPEN && !ready && !stopped) beginInitialization();
+    });
   };
 
   const handlePacket = packet => {
@@ -522,7 +540,7 @@ async function start(directory) {
       clearTimeout(connectionTimer);
       retryDelay = 100;
       if (reconnecting) retryUntil = 0;
-      if (!reconnecting) void initialize().catch(cause => { process.stderr.write(`letmeknow: ${cause.message}\n`); void stop(1); });
+      if (!ready) beginInitialization();
     });
     current.addEventListener("message", event => {
       if (typeof event.data !== "string") return;
