@@ -11,6 +11,8 @@ import { WebSocketServer } from "ws";
 
 const cli = fileURLToPath(new URL("../bin/letmeknow.js", import.meta.url));
 const MAX_BODY_BYTES = 1024 * 1024;
+const COMMAND_TIMEOUT_MS = 10_000;
+const STARTUP_TIMEOUT_MS = 10_000;
 
 function localWebSocketEnvironment(port) {
   const folder = mkdtempSync(join(tmpdir(), "letmeknow-hook-"));
@@ -27,16 +29,33 @@ function dirname(path) {
   return path.slice(0, path.lastIndexOf("/"));
 }
 
+async function stopChild(child) {
+  if (!child || child.exitCode !== null) return;
+  child.kill("SIGTERM");
+  await Promise.race([once(child, "exit"), new Promise(resolve => setTimeout(resolve, 2_000))]);
+  if (child.exitCode === null) {
+    child.kill("SIGKILL");
+    await once(child, "exit");
+  }
+}
+
 async function runCommand(args, input) {
   const child = spawn(process.execPath, [cli, ...args], { stdio: ["pipe", "pipe", "pipe"] });
   let stdout = "";
   let stderr = "";
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    void stopChild(child);
+  }, COMMAND_TIMEOUT_MS);
   child.stdout.on("data", chunk => { stdout += chunk; });
   child.stderr.on("data", chunk => { stderr += chunk; });
+  child.once("error", cause => { stderr += `${cause.message}\n`; });
   if (input === undefined) child.stdin.end();
   else child.stdin.end(input);
-  const [code] = await once(child, "exit");
-  return { code, stdout, stderr };
+  const [code] = await once(child, "close");
+  clearTimeout(timer);
+  return { code: timedOut ? 124 : code, stdout, stderr };
 }
 
 async function command(args, input) {
@@ -57,7 +76,16 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
   let stderr = "";
   child.stderr.on("data", chunk => { stderr += chunk; });
   let readyOutput = "";
+  let readyTimer;
+  let readySettled = false;
   const ready = new Promise((resolve, reject) => {
+    const fail = cause => {
+      if (readySettled) return;
+      readySettled = true;
+      clearTimeout(readyTimer);
+      reject(cause instanceof Error ? cause : new Error(String(cause)));
+    };
+    readyTimer = setTimeout(() => fail(new Error(`serve did not become ready${stderr ? `: ${stderr.trim()}` : ""}`)), STARTUP_TIMEOUT_MS);
     child.stdout.on("data", chunk => {
       readyOutput += chunk.toString();
       const lines = readyOutput.split("\n");
@@ -65,17 +93,23 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
       for (const line of lines.filter(Boolean)) {
         try {
           const value = JSON.parse(line);
-          if (value.type === "ready") resolve(value);
+          if (value.type === "ready") {
+            readySettled = true;
+            clearTimeout(readyTimer);
+            resolve(value);
+          }
         } catch {}
       }
     });
-    child.once("error", reject);
+    child.once("error", cause => fail(cause));
+    child.once("close", (code, signal) => fail(new Error(`serve exited before ready${code === null ? ` (${signal})` : ` (code ${code})`}${stderr ? `: ${stderr.trim()}` : ""}`)));
   });
   let producer;
   const updates = [];
   const waiters = new Map();
   const connected = new Promise((resolve, reject) => {
     relay.once("error", reject);
+    child.once("close", (code, signal) => reject(new Error(`serve exited before connecting${code === null ? ` (${signal})` : ` (code ${code})`}${stderr ? `: ${stderr.trim()}` : ""}`)));
     relay.once("connection", socket => {
       producer = socket;
       socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
@@ -93,16 +127,7 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
       });
     });
   });
-  await Promise.all([connected, ready]);
-  let requestNumber = 0;
-  const request = (method, path, headers = {}, body = Buffer.alloc(0)) => {
-    const request_id = `request-${++requestNumber}`;
-    return new Promise(resolve => {
-      waiters.set(request_id, resolve);
-      producer.send(JSON.stringify({ type: "http_request", request_id, method, path, headers, body: body.toString("base64") }));
-    });
-  };
-  const stop = async () => {
+  const cleanup = async () => {
     if (child.exitCode === null) {
       child.kill("SIGTERM");
       await once(child, "exit");
@@ -111,6 +136,21 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
     local.close();
     rmSync(folder, { recursive: true, force: true });
   };
+  try {
+    await Promise.all([connected, ready]);
+  } catch (cause) {
+    await cleanup();
+    throw cause;
+  }
+  let requestNumber = 0;
+  const request = (method, path, headers = {}, body = Buffer.alloc(0)) => {
+    const request_id = `request-${++requestNumber}`;
+    return new Promise(resolve => {
+      waiters.set(request_id, resolve);
+      producer.send(JSON.stringify({ type: "http_request", request_id, method, path, headers, body: body.toString("base64") }));
+    });
+  };
+  const stop = cleanup;
   return { folder, child, request, updates, ready: await ready, stderr: () => stderr, stop };
 }
 
