@@ -145,6 +145,7 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
     await new Promise(resolve => relay.close(resolve));
     local.close();
     rmSync(folder, { recursive: true, force: true });
+    if (streamError) throw streamError;
   };
   try {
     await Promise.all([connected, ready]);
