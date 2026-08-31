@@ -205,6 +205,10 @@ describe("LetMeKnow outbound relay", () => {
     expect(runtime.status).toBe(200);
     expect(await runtime.text()).toContain("Sent. Waiting for an update");
 
+    const idiomorph = await SELF.fetch(new Request(new URL("_letmeknow/idiomorph.js", url)));
+    expect(idiomorph.status).toBe(200);
+    expect(await idiomorph.text()).toContain("export { Idiomorph }");
+
     const head = await SELF.fetch(new Request(runtimeUrl, { method: "HEAD" }));
     expect(head.status).toBe(200);
     expect(await head.text()).toBe("");

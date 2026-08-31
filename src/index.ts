@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import clientSource from "./runtime.client.js";
+import idiomorphSource from "./idiomorph.client.js";
 
 interface Env {
   SESSIONS: DurableObjectNamespace<Session>;
@@ -24,6 +25,7 @@ const PROXY_TIMEOUT_MS = 30 * 1_000;
 const encoder = new TextEncoder();
 const hopHeaders = new Set(["connection", "host", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "x-forwarded-host", "x-letmeknow-path", "x-letmeknow-route"]);
 const runtimePath = "/_letmeknow/client.js";
+const idiomorphPath = "/_letmeknow/idiomorph.js";
 const clientSocketPath = "/_letmeknow/client";
 const pageEventHeader = "x-letmeknow-page-event";
 
@@ -386,8 +388,9 @@ export default {
     if (target) {
       const headers = new Headers(request.headers);
       if (target.path === clientSocketPath) headers.set("x-letmeknow-route", "client");
-      else if (target.path === runtimePath) {
-        if (request.method === "GET") return new Response(clientSource, { headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" } });
+      else if (target.path === runtimePath || target.path === idiomorphPath) {
+        const source = target.path === runtimePath ? clientSource : idiomorphSource;
+        if (request.method === "GET") return new Response(source, { headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" } });
         if (request.method === "HEAD") return new Response(null, { headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" } });
         return new Response(null, { status: 405, headers: { Allow: "GET, HEAD", "Cache-Control": "no-store" } });
       } else {
