@@ -94,6 +94,20 @@ async function open(options: { index?: string; files?: Record<string, WorkspaceF
   return { producer, url: session.url, workspace };
 }
 
+async function uploadAttachment(producer: Peer, url: string, data: Uint8Array): Promise<{ hash: string; size: number }> {
+  const hash = digest(data);
+  const reservation = await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hashes: [{ hash, size: data.byteLength }] })
+  }));
+  expect(reservation.status).toBe(200);
+  expect(await reservation.json()).toEqual({ missing: [{ hash, size: data.byteLength }] });
+  const upload = await SELF.fetch(new Request(new URL(`_letmeknow/attachments/${hash}`, url), { method: "PUT", body: data }));
+  expect(upload.status).toBe(204);
+  return { hash, size: data.byteLength };
+}
+
 async function connectClient(url: string): Promise<Peer> {
   const response = await SELF.fetch(new Request(new URL("_letmeknow/client", url), { headers: { Upgrade: "websocket" } }));
   expect(response.status).toBe(101);
@@ -136,6 +150,65 @@ describe("LetMeKnow service", () => {
     producer.send({ type: "commit", id: randomUUID(), request_id: randomUUID(), through: 0, ...changedIndex });
     expect(await nextType(producer, "error")).toMatchObject({ message: "index.html cannot change during a session" });
     expect((await SELF.fetch(new Request(url))).status).toBe(200);
+  });
+
+  it("reserves browser attachments, delivers metadata, and allows producer downloads only", async () => {
+    const { producer, url } = await open();
+    const data = new TextEncoder().encode("attachment bytes");
+    const attachment = await uploadAttachment(producer, url, data);
+    const wrongData = new TextEncoder().encode("different bytes!");
+    const wrongHash = digest(wrongData);
+    const wrongReservation = await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ hashes: [{ hash: wrongHash, size: wrongData.byteLength }] })
+    }));
+    expect((await wrongReservation.json() as Event).missing).toEqual([{ hash: wrongHash, size: wrongData.byteLength }]);
+    expect((await SELF.fetch(new Request(new URL(`_letmeknow/attachments/${wrongHash}`, url), { method: "PUT", body: data }))).status).toBe(400);
+    const path = new URL(`_letmeknow/attachments/${attachment.hash}`, url);
+    expect((await SELF.fetch(new Request(path))).status).toBe(401);
+    expect((await SELF.fetch(new Request(path, { headers: { Authorization: "Bearer wrong" } }))).status).toBe(401);
+    const download = await SELF.fetch(new Request(path, { headers: { Authorization: `Bearer ${producer.credential}` } }));
+    expect(download.status).toBe(200);
+    expect(new Uint8Array(await download.arrayBuffer())).toEqual(data);
+    const id = randomUUID();
+    const response = await SELF.fetch(new Request(new URL("_letmeknow/submit", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id, page_event: 0, form_id: "review", action: "/review", trigger: null, values: { comment: "see it" }, attachments: [{ field: "evidence", name: "../../report.txt", content_type: "text/plain", ...attachment }] })
+    }));
+    expect(response.status).toBe(202);
+    const event = await nextType(producer, "submit");
+    expect(event.attachments).toEqual([{ field: "evidence", name: "../../report.txt", content_type: "text/plain", ...attachment }]);
+    producer.send({ type: "event_ack", event_number: event.event_number });
+  });
+
+  it("deduplicates attachment reservations and rejects invalid references", async () => {
+    const { producer, url } = await open();
+    const data = new TextEncoder().encode("same");
+    const hash = digest(data);
+    const reserve = () => SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ hashes: [{ hash, size: data.byteLength }, { hash, size: data.byteLength }] })
+    }));
+    expect(await (await reserve()).json()).toEqual({ missing: [{ hash, size: data.byteLength }] });
+    expect(await (await reserve()).json()).toEqual({ missing: [{ hash, size: data.byteLength }] });
+    expect((await SELF.fetch(new Request(new URL("_letmeknow/submit", url), {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: randomUUID(), page_event: 0, form_id: null, action: "/", trigger: null, values: {}, attachments: [{ field: "file", name: "file", content_type: "text/plain", hash, size: data.byteLength }] })
+    }))).status).toBe(400);
+    expect((await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ hashes: [{ hash, size: data.byteLength + 1 }] })
+    }))).status).toBe(400);
+    producer.socket.close(1000, "done");
+  });
+
+  it("rejects browser attachment reservations beyond the aggregate quota", async () => {
+    const { producer, url } = await open();
+    const first = "1".repeat(64);
+    const second = "2".repeat(64);
+    const response = await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ hashes: [{ hash: first, size: 100 * 1024 * 1024 }, { hash: second, size: 1 }] })
+    }));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "session blob quota exceeded" });
+    producer.socket.close(1000, "done");
   });
 
   it("accepts submissions while the producer is disconnected and redelivers them in order", async () => {
@@ -239,14 +312,18 @@ describe("LetMeKnow service", () => {
     expect(await nextType(producer, "error")).toMatchObject({ message: "page history is too large" });
   });
 
-  it("expires the session and removes its public workspace", async () => {
+  it("expires the session and removes its public workspace and attachments", async () => {
     const now = Date.now();
     vi.useFakeTimers({ now });
     const { producer, url } = await open();
+    const attachment = await uploadAttachment(producer, url, new TextEncoder().encode("temporary"));
     const code = new URL(url).hostname.split(".")[0];
+    const uploads = (env as unknown as { UPLOADS: { head(key: string): Promise<unknown> } }).UPLOADS;
+    expect(await uploads.head(`sessions/${code}/objects/${attachment.hash}`)).not.toBeNull();
     vi.setSystemTime(now + SESSION_LIFETIME_MS + 1);
     expect(await runDurableObjectAlarm(env.SESSIONS.getByName(code))).toBe(true);
     expect((await SELF.fetch(new Request(url))).status).toBe(404);
+    expect(await uploads.head(`sessions/${code}/objects/${attachment.hash}`)).toBeNull();
     expect(producer.socket.readyState).not.toBe(WebSocket.OPEN);
   });
 });

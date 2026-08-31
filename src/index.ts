@@ -14,6 +14,7 @@ interface RateLimitBinding {
 type Packet = Record<string, unknown>;
 type ManifestEntry = { hash: string; size: number; content_type: string };
 type Manifest = { files: Record<string, ManifestEntry> };
+type AttachmentDescriptor = { field: string; name: string; content_type: string; size: number; hash: string };
 type SubmitEvent = {
   type: "submit";
   id: string;
@@ -23,6 +24,7 @@ type SubmitEvent = {
   action: string;
   trigger: Record<string, unknown> | null;
   values: Record<string, unknown>;
+  attachments?: AttachmentDescriptor[];
 };
 type RunUIEvent = {
   type: "run_ui";
@@ -53,6 +55,10 @@ const MAX_QUEUED_BYTES = 32 * 1024 * 1024;
 const MAX_HISTORY_BYTES = MAX_BODY_BYTES;
 const MAX_PACKET_BYTES = 6 * MAX_BODY_BYTES + 4096;
 const MAX_MANIFEST_BYTES = 512 * 1024;
+const MAX_ATTACHMENTS = 32;
+const MAX_ATTACHMENT_FIELD_BYTES = 256;
+const MAX_ATTACHMENT_NAME_BYTES = 512;
+const MAX_ATTACHMENT_CONTENT_TYPE_BYTES = 200;
 const runtimePath = "/_letmeknow/client.js";
 const clientSocketPath = "/_letmeknow/client";
 const encoder = new TextEncoder();
@@ -188,6 +194,26 @@ function safePublicPath(value: unknown): value is string {
   return parts.every(part => part !== "" && part !== "." && part !== ".." && !privateNames.has(part) && !privateFilePattern.test(part));
 }
 
+function attachmentDescriptors(value: unknown): AttachmentDescriptor[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > MAX_ATTACHMENTS) throw new Error("invalid attachments");
+  return value.map(raw => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid attachment");
+    const input = raw as Record<string, unknown>;
+    const field = input.field;
+    const name = input.name;
+    const contentType = input.content_type;
+    const size = input.size;
+    const hash = input.hash;
+    if (typeof field !== "string" || field.length === 0 || encoder.encode(field).byteLength > MAX_ATTACHMENT_FIELD_BYTES || field.includes("\0")) throw new Error("invalid attachment field");
+    if (typeof name !== "string" || name.length === 0 || encoder.encode(name).byteLength > MAX_ATTACHMENT_NAME_BYTES || name.includes("\0")) throw new Error("invalid attachment name");
+    if (typeof contentType !== "string" || contentType.length === 0 || encoder.encode(contentType).byteLength > MAX_ATTACHMENT_CONTENT_TYPE_BYTES || contentType.includes("\0")) throw new Error("invalid attachment content type");
+    if (!Number.isSafeInteger(size) || (size as number) < 0) throw new Error("invalid attachment size");
+    if (typeof hash !== "string" || !hashPattern.test(hash)) throw new Error("invalid attachment hash");
+    return { field, name, content_type: contentType, size: size as number, hash };
+  });
+}
+
 function objectManifest(value: unknown): Manifest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("manifest is required");
   const files = (value as Record<string, unknown>).files;
@@ -227,6 +253,7 @@ export class Session extends DurableObject<Env> {
     const route = request.headers.get("x-letmeknow-route");
     if (route === "producer") return this.mutate(() => this.acceptProducer(request));
     if (route === "workspace") return this.uploadWorkspace(request);
+    if (route === "attachments") return this.attachmentRequest(request);
     if (route === "client") return this.mutate(() => this.acceptClient(request));
     if (route === "browser") return this.browserRequest(request);
     return error("not found", 404);
@@ -355,6 +382,41 @@ export class Session extends DurableObject<Env> {
     if (!record.stored) {
       records[hash] = { ...record, stored: true };
       await this.ctx.storage.put("blob_records", records);
+    }
+  }
+
+  private async reserveBrowserObjects(items: Array<{ hash: string; size: number }>): Promise<void> {
+    const records = await this.blobRecords();
+    const next = { ...records };
+    let reserved = await this.ctx.storage.get<number>("reserved_blob_bytes") ?? 0;
+    const requested = new Map<string, number>();
+    for (const item of items) {
+      const prior = requested.get(item.hash);
+      if (prior !== undefined && prior !== item.size) throw new Error("attachment hash has conflicting sizes");
+      requested.set(item.hash, item.size);
+    }
+    for (const [hash, size] of requested) {
+      const existing = next[hash];
+      if (existing) {
+        if (existing.kind !== "browser") throw new Error("attachment hash is not a browser object");
+        if (existing.size !== size) throw new Error("attachment hash has the wrong size");
+        continue;
+      }
+      if (reserved + size > MAX_SESSION_BLOB_BYTES) throw new Error("session blob quota exceeded");
+      next[hash] = { size, stored: false, kind: "browser" };
+      reserved += size;
+    }
+    await this.ctx.storage.transaction(async transaction => {
+      await transaction.put("blob_records", next);
+      await transaction.put("reserved_blob_bytes", reserved);
+    });
+  }
+
+  private async validateBrowserAttachments(attachments: AttachmentDescriptor[]): Promise<void> {
+    const records = await this.blobRecords();
+    for (const attachment of attachments) {
+      const record = records[attachment.hash];
+      if (!record || record.kind !== "browser" || !record.stored || record.size !== attachment.size) throw new Error("attachment is missing or has the wrong size");
     }
   }
 
@@ -528,6 +590,101 @@ export class Session extends DurableObject<Env> {
     }
   }
 
+  private async attachmentRequest(request: Request): Promise<Response> {
+    let path: string;
+    try { path = pathFromRequest(request); } catch { return error("bad request", 400); }
+    if (path === "/_letmeknow/attachments") {
+      if (request.method !== "POST") return error("method not allowed", 405);
+      let body: Uint8Array;
+      try { body = await this.readBody(request); } catch { return error("attachments are too large", 413); }
+      if ((request.headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase() !== "application/json") return error("JSON attachments are required", 400);
+      let value: unknown;
+      try { value = JSON.parse(new TextDecoder().decode(body)); } catch { return error("invalid attachments JSON", 400); }
+      if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray((value as Record<string, unknown>).hashes)) return error("attachment hashes are required", 400);
+      const hashes = (value as Record<string, unknown>).hashes as unknown[];
+      if (hashes.length > MAX_ATTACHMENTS) return error("too many attachments", 400);
+      const items: Array<{ hash: string; size: number }> = [];
+      try {
+        for (const raw of hashes) {
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid attachment hash");
+          const item = raw as Record<string, unknown>;
+          if (typeof item.hash !== "string" || !hashPattern.test(item.hash) || !Number.isSafeInteger(item.size) || (item.size as number) < 0) throw new Error("invalid attachment hash");
+          items.push({ hash: item.hash, size: item.size as number });
+        }
+        await this.mutate(async () => {
+          if (!(await this.ctx.storage.get<boolean>("opened"))) throw new Error("session not found");
+          if (await this.sessionExpired()) { await this.expireSession(); throw new Error("session expired"); }
+          await this.reserveBrowserObjects(items);
+        });
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : "could not reserve attachments";
+        return error(message, message === "session not found" || message === "session expired" ? 404 : 400);
+      }
+      const missing: Array<{ hash: string; size: number }> = [];
+      for (const item of new Map(items.map(item => [item.hash, item])).values()) {
+        const object = await this.env.UPLOADS.head(await this.objectKey(item.hash));
+        if (!object || object.size !== item.size) missing.push(item);
+      }
+      return Response.json({ missing }, { headers: { "Cache-Control": "no-store" } });
+    }
+    const match = path.match(/^\/\_letmeknow\/attachments\/([0-9a-f]{64})$/);
+    if (!match) return error("not found", 404);
+    if (request.method === "GET") {
+      const credential = request.headers.get("authorization")?.match(/^Bearer (.+)$/)?.[1];
+      if (!credential || credential !== await this.ctx.storage.get<string>("credential") || !this.producer()) return error("unauthorized", 401);
+      if (!(await this.ctx.storage.get<boolean>("opened"))) return error("session not found", 404);
+      if (await this.sessionExpired()) { await this.mutate(() => this.expireSession()); return error("session expired", 404); }
+      const record = (await this.blobRecords())[match[1]];
+      if (!record || record.kind !== "browser" || !record.stored) return error("attachment not found", 404);
+      const object = await this.env.UPLOADS.get(await this.objectKey(match[1]));
+      if (!object) return error("attachment not found", 404);
+      return new Response(object.body, { status: 200, headers: { "Content-Type": "application/octet-stream", "Content-Length": String(object.size), "Cache-Control": "no-store" } });
+    }
+    if (request.method !== "PUT") return error("method not allowed", 405);
+    if (!(await this.ctx.storage.get<boolean>("opened"))) return error("session not found", 404);
+    if (await this.sessionExpired()) { await this.mutate(() => this.expireSession()); return error("session expired", 404); }
+    const hash = match[1];
+    const record = (await this.blobRecords())[hash];
+    if (!record || record.kind !== "browser") return error("attachment was not reserved", 409);
+    const key = await this.objectKey(hash);
+    const existing = await this.env.UPLOADS.head(key);
+    if (record.stored && existing?.size === record.size) return new Response(null, { status: 204 });
+    if (existing) await this.env.UPLOADS.delete(key);
+    const reader = request.body?.getReader();
+    const fixed = new FixedLengthStream(record.size);
+    const writer = fixed.writable.getWriter();
+    let count = 0;
+    const pump = async () => {
+      try {
+        while (reader) {
+          const part = await reader.read();
+          if (part.done) break;
+          count += part.value.byteLength;
+          if (count > record.size) throw new Error("attachment size is invalid");
+          await writer.write(part.value);
+        }
+        if (count !== record.size) throw new Error("attachment size is invalid");
+        await writer.close();
+      } catch (cause) {
+        await writer.abort(cause);
+        throw cause;
+      }
+    };
+    try {
+      await Promise.all([this.env.UPLOADS.put(key, fixed.readable, { sha256: hash }), pump()]);
+      await this.mutate(async () => {
+        const current = (await this.blobRecords())[hash];
+        if (!current || current.kind !== "browser" || current.size !== record.size) throw new Error("attachment reservation changed");
+        current.stored = true;
+        await this.ctx.storage.put("blob_records", { ...(await this.blobRecords()), [hash]: current });
+      });
+      return new Response(null, { status: 204 });
+    } catch {
+      await this.env.UPLOADS.delete(key);
+      return error("could not store attachment", 400);
+    }
+  }
+
   private async readBody(request: Request): Promise<Uint8Array> {
     const contentLength = request.headers.get("content-length");
     if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > MAX_BODY_BYTES) throw new Error("submission is too large");
@@ -551,17 +708,22 @@ export class Session extends DurableObject<Env> {
     if (typeof input.action !== "string") return error("action is required", 400);
     if (input.trigger !== null && (!input.trigger || typeof input.trigger !== "object" || Array.isArray(input.trigger))) return error("trigger must be an object or null", 400);
     if (!input.values || typeof input.values !== "object" || Array.isArray(input.values)) return error("values are required", 400);
+    let attachments: AttachmentDescriptor[] | undefined;
+    try { attachments = attachmentDescriptors(input.attachments); }
+    catch (cause) { return error(cause instanceof Error ? cause.message : "invalid attachments", 400); }
     const id = input.id as string;
     const hash = await sha256(body);
     return this.mutate(async () => {
       if (!(await this.ctx.storage.get<boolean>("opened"))) return error("session not found", 404);
       if (await this.sessionExpired()) { await this.expireSession(); return error("session expired", 404); }
+      try { if (attachments) await this.validateBrowserAttachments(attachments); }
+      catch (cause) { return error(cause instanceof Error ? cause.message : "invalid attachments", 400); }
       const duplicate = await this.ctx.storage.get<SubmissionRecord>(`submission:${id}`);
       if (duplicate) return duplicate.hash === hash ? new Response(null, { status: 202 }) : error("submission id was already used", 409);
       const stats = await this.queuedStats();
       if (stats.count >= MAX_QUEUED_EVENTS || stats.bytes + body.byteLength > MAX_QUEUED_BYTES) return error("submission queue is full", 503);
       const number = await this.eventFrontier() + 1;
-      const event: SubmitEvent = { type: "submit", id, event_number: number, page_event: input.page_event as number, form_id: input.form_id as string | null, action: input.action as string, trigger: input.trigger as Record<string, unknown> | null, values: input.values as Record<string, unknown> };
+      const event: SubmitEvent = { type: "submit", id, event_number: number, page_event: input.page_event as number, form_id: input.form_id as string | null, action: input.action as string, trigger: input.trigger as Record<string, unknown> | null, values: input.values as Record<string, unknown>, ...(attachments ? { attachments } : {}) };
       const stored: StoredEvent = { event, received: false, sent: false, committed: false, bytes: body.byteLength };
       await this.ctx.storage.transaction(async transaction => {
         await transaction.put(`submission:${id}`, { event_number: number, hash });
@@ -579,6 +741,7 @@ export class Session extends DurableObject<Env> {
     let path: string;
     try { path = pathFromRequest(request); } catch { return error("bad request", 400); }
     if (path === "/_letmeknow/submit") return this.acceptSubmission(request);
+    if (path === "/_letmeknow/attachments" || path.startsWith("/_letmeknow/attachments/")) return this.attachmentRequest(request);
     if (!(await this.ctx.storage.get<boolean>("opened"))) return isDocumentRequest(request) ? runtimePage("Session not found", "This preview is no longer available.", 404) : error("session not found", 404);
     if (await this.sessionExpired()) { await this.mutate(() => this.expireSession()); return isDocumentRequest(request) ? runtimePage("Session not found", "This preview is no longer available.", 404) : error("session not found", 404); }
     if (request.method !== "GET" && request.method !== "HEAD") return error("method not allowed", 405);
@@ -715,7 +878,7 @@ export class Session extends DurableObject<Env> {
       stored.sent = true;
       const stats = await this.queuedStats();
       const bytes = stored.bytes;
-      if (stored.event.type === "submit") stored.event = { type: "submit", id: stored.event.id, event_number: stored.event.event_number, page_event: stored.event.page_event, form_id: stored.event.form_id, action: stored.event.action, trigger: stored.event.trigger, values: {} };
+      if (stored.event.type === "submit") stored.event = { ...stored.event, values: {} };
       await this.ctx.storage.transaction(async transaction => {
         await transaction.put(`event:${number}`, stored);
         await transaction.put("producer_received", number);
