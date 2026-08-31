@@ -59,6 +59,7 @@ const MAX_MANIFEST_BYTES = 512 * 1024;
 const MAX_ATTACHMENTS = 32;
 const MAX_BROWSER_BLOB_RECORDS = 1024;
 const ATTACHMENT_RESERVATION_LEASE_MS = 30 * 60 * 1_000;
+const ATTACHMENT_RECLAIM_RETRY_MS = 60 * 1_000;
 const MAX_ATTACHMENT_FIELD_BYTES = 256;
 const MAX_ATTACHMENT_NAME_BYTES = 512;
 const MAX_ATTACHMENT_CONTENT_TYPE_BYTES = 200;
@@ -403,7 +404,7 @@ export class Session extends DurableObject<Env> {
       const object = await this.env.UPLOADS.head(await this.objectKey(hash));
       if (object?.size === record.size) {
         if (!record.stored || record.expires_at !== undefined) {
-          records[hash] = { ...record, stored: true, expires_at: record.expires_at ?? Date.now() + ATTACHMENT_RESERVATION_LEASE_MS };
+          records[hash] = { ...record, stored: true, ...(record.expires_at === undefined ? {} : { expires_at: Date.now() + ATTACHMENT_RESERVATION_LEASE_MS }) };
           await this.ctx.storage.put("blob_records", records);
         }
         await this.scheduleAlarm();
@@ -452,22 +453,32 @@ export class Session extends DurableObject<Env> {
     if (!expired.length) return;
     const next = { ...records };
     let reserved = await this.ctx.storage.get<number>("reserved_blob_bytes") ?? 0;
-    const remove: string[] = [];
+    const remove: Array<[string, BlobRecord]> = [];
     for (const [hash, record] of expired) {
       if (record.kind === "shared" && workspaceReferences.has(hash)) {
         next[hash] = { ...record, kind: "workspace" };
         delete next[hash].expires_at;
       } else {
-        delete next[hash];
-        reserved -= record.size;
-        remove.push(hash);
+        remove.push([hash, record]);
       }
     }
-    if (remove.length) await this.env.UPLOADS.delete(await Promise.all(remove.map(hash => this.objectKey(hash))));
+    if (remove.length) {
+      try {
+        await this.env.UPLOADS.delete(await Promise.all(remove.map(([hash]) => this.objectKey(hash))));
+        for (const [hash, record] of remove) {
+          delete next[hash];
+          reserved -= record.size;
+        }
+      } catch {
+        const retryAt = Date.now() + ATTACHMENT_RECLAIM_RETRY_MS;
+        for (const [hash, record] of remove) next[hash] = { ...record, expires_at: retryAt };
+      }
+    }
     await this.ctx.storage.transaction(async transaction => {
       await transaction.put("blob_records", next);
       await transaction.put("reserved_blob_bytes", Math.max(0, reserved));
     });
+    await this.scheduleAlarm();
   }
 
   private async scheduleAlarm(): Promise<void> {
@@ -571,8 +582,8 @@ export class Session extends DurableObject<Env> {
 
   private async deleteUnreferencedObjects(manifest: Manifest): Promise<void> {
     const keep = new Set<string>([await this.ctx.storage.get<string>("base_index_hash") || "", ...Object.values(manifest.files).map(entry => entry.hash)]);
-    await this.cleanupObjects(keep);
     await this.reclaimExpiredBrowserObjects();
+    await this.cleanupObjects(keep);
     await this.ctx.storage.delete("staging_hashes");
   }
 
@@ -834,7 +845,10 @@ export class Session extends DurableObject<Env> {
     } finally {
       const count = this.activeBrowserUploads.get(hash) ?? 0;
       if (count > 1) this.activeBrowserUploads.set(hash, count - 1);
-      else this.activeBrowserUploads.delete(hash);
+      else {
+        this.activeBrowserUploads.delete(hash);
+        await this.scheduleAlarm();
+      }
     }
   }
 

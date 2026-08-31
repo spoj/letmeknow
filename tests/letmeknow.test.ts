@@ -351,6 +351,34 @@ describe("LetMeKnow service", () => {
     producer.socket.close(1000, "done");
   });
 
+  it("accepts a submission after reconciling an existing object for an expired attachment lease", async () => {
+    const now = Date.now();
+    vi.useFakeTimers({ now });
+    const { producer, url } = await open();
+    const data = new TextEncoder().encode("reconciled expired attachment");
+    const hash = digest(data);
+    const reservation = await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hashes: [{ hash, size: data.byteLength }] })
+    }));
+    expect(await reservation.json()).toEqual({ missing: [{ hash, size: data.byteLength }] });
+    vi.setSystemTime(now + 30 * 60 * 1_000 + 1);
+    const code = new URL(url).hostname.split(".")[0];
+    const uploads = (env as unknown as { UPLOADS: { put(key: string, value: Uint8Array, options: { sha256: string }): Promise<unknown> } }).UPLOADS;
+    await uploads.put(`sessions/${code}/objects/${hash}`, data, { sha256: hash });
+    expect((await SELF.fetch(new Request(new URL(`_letmeknow/attachments/${hash}`, url), { method: "PUT", body: data }))).status).toBe(204);
+    const id = randomUUID();
+    expect((await SELF.fetch(new Request(new URL("_letmeknow/submit", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id, page_event: 0, form_id: null, action: "/", trigger: null, values: {}, attachments: [{ field: "file", name: "file", content_type: "text/plain", hash, size: data.byteLength }] })
+    }))).status).toBe(202);
+    const event = await nextType(producer, "submit");
+    producer.send({ type: "event_ack", event_number: event.event_number });
+    producer.socket.close(1000, "done");
+  });
+
   it("reconciles an attachment object that exists before its metadata is marked stored", async () => {
     const { producer, url } = await open();
     const data = new TextEncoder().encode("orphaned attachment");
@@ -397,6 +425,34 @@ describe("LetMeKnow service", () => {
     expect(await uploads.head(key)).not.toBeNull();
     await commit(producer, workspace, second.event_number);
     expect(await uploads.head(key)).toBeNull();
+  });
+
+  it("retries attachment cleanup after a transient object deletion failure", async () => {
+    const now = Date.now();
+    vi.useFakeTimers({ now });
+    const { producer, url, workspace } = await open();
+    const data = new TextEncoder().encode("retry attachment cleanup");
+    const attachment = await uploadAttachment(producer, url, data);
+    const response = await SELF.fetch(new Request(new URL("_letmeknow/submit", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: randomUUID(), page_event: 0, form_id: null, action: "/", trigger: null, values: {}, attachments: [{ field: "file", name: "file", content_type: "text/plain", ...attachment }] })
+    }));
+    expect(response.status).toBe(202);
+    const event = await nextType(producer, "submit");
+    producer.send({ type: "event_ack", event_number: event.event_number });
+    const code = new URL(url).hostname.split(".")[0];
+    const key = `sessions/${code}/objects/${attachment.hash}`;
+    const uploads = (env as unknown as { UPLOADS: { delete(keys: string | string[]): Promise<void>; head(key: string): Promise<unknown> } }).UPLOADS;
+    const deleteObject = vi.spyOn(uploads, "delete").mockRejectedValueOnce(new Error("temporary delete failure"));
+    await commit(producer, workspace, event.event_number);
+    expect(deleteObject).toHaveBeenCalledWith([key]);
+    expect(await uploads.head(key)).not.toBeNull();
+    deleteObject.mockRestore();
+    vi.setSystemTime(now + 60 * 1_000 + 1);
+    expect(await runDurableObjectAlarm(env.SESSIONS.getByName(code))).toBe(true);
+    expect(await uploads.head(key)).toBeNull();
+    producer.socket.close(1000, "done");
   });
 
   it("redelivers an in-flight event after producer reconnect", async () => {
