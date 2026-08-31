@@ -168,11 +168,12 @@ function elementsWithId(node, id, matches = []) {
 
 function containsScript(node) {
   if (node.nodeName === "script") return true;
+  if (node.content && containsScript(node.content)) return true;
   return (node.childNodes || []).some(containsScript);
 }
 
-function updateFragment(target, html) {
-  const fragment = parseFragment(html);
+function updateFragment(target, html, context) {
+  const fragment = parseFragment(context, html);
   const meaningful = (fragment.childNodes || []).filter(node => node.nodeName !== "#text" || node.value.trim() !== "");
   if (meaningful.length !== 1 || meaningful[0].nodeName === "#comment" || meaningful[0].nodeName?.startsWith("#")) throw new Error(`update for ${target} must contain exactly one root element`);
   const root = meaningful[0];
@@ -186,7 +187,7 @@ function replaceElement(document, target, html) {
   const parent = target.parentNode;
   const index = parent?.childNodes.indexOf(target);
   if (!parent || index === undefined || index < 0) throw new Error("update target has no parent");
-  const replacement = updateFragment(nodeId(target), html);
+  const replacement = updateFragment(nodeId(target), html, parent);
   parent.childNodes[index] = replacement;
   replacement.parentNode = parent;
   target.parentNode = null;
