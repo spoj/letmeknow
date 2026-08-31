@@ -12,6 +12,7 @@ import { lookup } from "mrmime";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const UPDATE_BATCH_MAX_BYTES = 16 * MAX_BODY_BYTES;
+const MAX_BATCH_TOKENS = 100_000;
 const MAX_UNIQUE_SUBMISSIONS = 100_000;
 const MAX_RETAINED_SUBMISSION_BYTES = 256 * 1024 * 1024;
 const CONTROL_MAX_BYTES = UPDATE_BATCH_MAX_BYTES * 2;
@@ -385,19 +386,23 @@ async function start(directory) {
   let expiryTimer;
   let stopped = false;
   let ready = false;
+  let stopSession = () => {};
 
   const batch = () => {
     const start = committedBrowserCursor;
     const end = start + browserEvents.length;
     const key = `${pageEvent}:${start}:${end}`;
-    const existing = pendingTokens.get(key);
-    if (existing) return existing;
-    const token = randomUUID();
-    const events = browserEvents.slice();
-    tokens.set(token, { start, end, page_event: pageEvent, status: "pending", key, updates_hash: null });
-    const result = { ok: true, type: "batch", token, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash(), events };
-    pendingTokens.set(key, result);
-    return result;
+    let token = pendingTokens.get(key)?.token;
+    if (!token) {
+      if (tokens.size >= MAX_BATCH_TOKENS) {
+        stopSession();
+        throw new Error("session batch token limit exceeded");
+      }
+      token = randomUUID();
+      tokens.set(token, { start, end, page_event: pageEvent, status: "pending", key, updates_hash: null });
+      pendingTokens.set(key, { token });
+    }
+    return { ok: true, type: "batch", token, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash(), events: browserEvents.slice() };
   };
 
   const notifyPullWaiters = () => {
@@ -509,7 +514,6 @@ async function start(directory) {
     });
   }).catch(cause => { throw new Error(`cannot start local control channel: ${cause.message}`); });
 
-  let stopSession = () => {};
   const recordInteraction = (event, bytes) => mutate(async () => {
     if (seenEvents.has(event.id)) return;
     if (seenEvents.size >= MAX_UNIQUE_SUBMISSIONS || retainedSubmissionBytes + bytes > MAX_RETAINED_SUBMISSION_BYTES) {

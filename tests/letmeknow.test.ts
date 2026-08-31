@@ -15,7 +15,7 @@ const SESSION_LIFETIME_MS = 24 * 60 * 60 * 1_000;
 const sockets: WebSocket[] = [];
 let ipCounter = 0;
 
-type SessionInternals = { ctx: { storage: { get<T>(key: string): Promise<T | undefined>; getAlarm(): Promise<number | null>; put<T>(key: string, value: T): Promise<void>; setAlarm(scheduledTime: number): Promise<void> } } };
+type SessionInternals = { ctx: { storage: { get<T>(key: string): Promise<T | undefined>; getAlarm(): Promise<number | null>; put<T>(key: string, value: T): Promise<void> } } };
 
 function sessionValue<T>(code: string, key: string): Promise<T | undefined> {
   return runInDurableObject(env.SESSIONS.getByName(code), (instance) => (instance as unknown as SessionInternals).ctx.storage.get<T>(key));

@@ -130,10 +130,7 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
     });
   });
   const cleanup = async () => {
-    if (child.exitCode === null) {
-      child.kill("SIGTERM");
-      await once(child, "exit");
-    }
+    await stopChild(child);
     await new Promise(resolve => relay.close(resolve));
     local.close();
     rmSync(folder, { recursive: true, force: true });
@@ -239,6 +236,9 @@ describe("LetMeKnow CLI", () => {
       const duplicate = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(ids[0]));
       assert.equal(duplicate.status, 202);
       const batch = await command(["pull", session.folder]);
+      const repeated = await command(["pull", session.folder]);
+      assert.equal(repeated.token, batch.token);
+      assert.deepEqual(repeated.events, batch.events);
       assert.equal(batch.page_event, 0);
       assert.equal(batch.frontier, 10);
       assert.equal(batch.events.length, 10);
