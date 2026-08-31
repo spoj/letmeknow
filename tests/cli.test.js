@@ -78,24 +78,33 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
   const stream = [];
   const streamWaiters = [];
   let streamInput = "";
+  let streamError;
   child.stdout.on("data", chunk => {
     streamInput += chunk.toString();
     const lines = streamInput.split("\n");
     streamInput = lines.pop();
     for (const line of lines.filter(Boolean)) {
-      try {
-        const value = JSON.parse(line);
-        stream.push(value);
-        for (let index = streamWaiters.length - 1; index >= 0; index -= 1) {
-          if (!streamWaiters[index].predicate(value)) continue;
-          const waiter = streamWaiters.splice(index, 1)[0];
+      let value;
+      try { value = JSON.parse(line); }
+      catch { streamError = new Error(`invalid serve stream JSON: ${line}`); }
+      if (streamError) {
+        for (const waiter of streamWaiters.splice(0)) {
           clearTimeout(waiter.timer);
-          waiter.resolve(value);
+          waiter.reject(streamError);
         }
-      } catch {}
+        return;
+      }
+      stream.push(value);
+      for (let index = streamWaiters.length - 1; index >= 0; index -= 1) {
+        if (!streamWaiters[index].predicate(value)) continue;
+        const waiter = streamWaiters.splice(index, 1)[0];
+        clearTimeout(waiter.timer);
+        waiter.resolve(value);
+      }
     }
   });
   const waitStream = (predicate, timeout = STARTUP_TIMEOUT_MS) => {
+    if (streamError) return Promise.reject(streamError);
     const value = stream.find(predicate);
     if (value) return Promise.resolve(value);
     return new Promise((resolve, reject) => {
