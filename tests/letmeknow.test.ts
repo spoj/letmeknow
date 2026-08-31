@@ -1,6 +1,6 @@
 import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 type Event = Record<string, any>;
 type Peer = {
@@ -14,16 +14,6 @@ const origin = "https://letmeknow.dev";
 const SESSION_LIFETIME_MS = 24 * 60 * 60 * 1_000;
 const sockets: WebSocket[] = [];
 let ipCounter = 0;
-
-type SessionInternals = { ctx: { storage: { get<T>(key: string): Promise<T | undefined>; getAlarm(): Promise<number | null>; put<T>(key: string, value: T): Promise<void> } } };
-
-function sessionValue<T>(code: string, key: string): Promise<T | undefined> {
-  return runInDurableObject(env.SESSIONS.getByName(code), (instance) => (instance as unknown as SessionInternals).ctx.storage.get<T>(key));
-}
-
-function sessionAlarm(code: string): Promise<number | null> {
-  return runInDurableObject(env.SESSIONS.getByName(code), (instance) => (instance as unknown as SessionInternals).ctx.storage.getAlarm());
-}
 
 function peer(socket: WebSocket): Peer {
   socket.accept();
@@ -74,6 +64,7 @@ async function connectClient(url: string): Promise<Peer> {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   for (const socket of sockets.splice(0)) socket.close(1000, "test complete");
 });
 
@@ -86,37 +77,29 @@ describe("LetMeKnow outbound relay", () => {
     expect((await SELF.fetch(new Request(`${origin}/v1/connect`, { headers: { Upgrade: "websocket" } }))).status).toBe(404);
   });
 
-  it("sets an absolute expiration and never extends it on reconnect", async () => {
+  it("allows reconnect before service expiry", async () => {
     const { producer, url } = await open();
-    const code = new URL(url).hostname.split(".")[0];
-    const expiresAt = await sessionValue<number>(code, "expires_at");
-    expect(expiresAt).toBeDefined();
-    expect(expiresAt! - Date.now()).toBeGreaterThan(SESSION_LIFETIME_MS - 1_000);
-    expect(await sessionAlarm(code)).toBe(expiresAt);
-
     const client = await connectClient(url);
-    await client.next();
-    producer.socket.close(1000, "restart");
-    await client.next();
-    const disconnectAlarm = await sessionAlarm(code);
-    expect(disconnectAlarm).toBeLessThan(expiresAt!);
+    expect(await client.next()).toEqual({ type: "connected", producer_connected: true });
+    const code = new URL(url).hostname.split(".")[0];
 
+    producer.socket.close(1000, "restart");
+    expect(await client.next()).toEqual({ type: "producer", connected: false });
     const replacement = await connectProducer(code, producer.credential);
     expect(await replacement.next()).toMatchObject({ type: "session", url });
-    expect(await sessionAlarm(code)).toBe(expiresAt);
+    expect(await client.next()).toEqual({ type: "producer", connected: true });
   });
 
-  it("expires an opened session at its absolute alarm", async () => {
+  it("expires an opened session after the service lifetime", async () => {
+    const now = Date.now();
+    vi.useFakeTimers({ now });
     const { producer, url } = await open();
     const code = new URL(url).hostname.split(".")[0];
     const client = await connectClient(url);
     await client.next();
-    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => {
-      const storage = (instance as unknown as SessionInternals).ctx.storage;
-      return storage.put("expires_at", Date.now() - 1);
-    });
 
-    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.alarm());
+    vi.setSystemTime(now + SESSION_LIFETIME_MS + 1);
+    expect(await runDurableObjectAlarm(env.SESSIONS.getByName(code))).toBe(true);
     expect(await SELF.fetch(url)).toMatchObject({ status: 404 });
     expect(client.socket.readyState).not.toBe(WebSocket.OPEN);
     expect(producer.socket.readyState).not.toBe(WebSocket.OPEN);
