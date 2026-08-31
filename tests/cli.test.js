@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import net from "node:net";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
@@ -196,6 +197,103 @@ describe("LetMeKnow CLI", () => {
     const invalid = await runCommand(["commit", "/tmp", "--through", "1.5"]);
     assert.equal(invalid.code, 1);
     assert.match(invalid.stderr, /--through must be a non-negative safe integer/);
+  });
+
+  it("restarts after an unclean termination", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "letmeknow-restart-"));
+    writeFileSync(join(folder, "index.html"), "<!doctype html><html><body>initial</body></html>");
+    const root = realpathSync(folder);
+    const controlSocket = join(tmpdir(), `letmeknow-control-${createHash("sha256").update(root).digest("hex").slice(0, 32)}.sock`);
+    let first;
+    let restarted;
+    try {
+      rmSync(controlSocket, { force: true });
+      first = spawn(process.execPath, [cli, "serve", folder], { stdio: ["ignore", "ignore", "pipe"] });
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("serve did not create its control socket")), STARTUP_TIMEOUT_MS);
+        const check = () => {
+          if (existsSync(controlSocket)) {
+            clearTimeout(timer);
+            resolve();
+          } else if (first.exitCode !== null) reject(new Error("serve exited before creating its control socket"));
+          else setTimeout(check, 25);
+        };
+        check();
+      });
+      first.kill("SIGKILL");
+      await once(first, "exit");
+
+      restarted = spawn(process.execPath, [cli, "serve", folder], { stdio: ["ignore", "ignore", "pipe"] });
+      await new Promise((resolve, reject) => {
+        const deadline = Date.now() + STARTUP_TIMEOUT_MS;
+        const check = () => {
+          if (restarted.exitCode !== null || restarted.signalCode !== null) return reject(new Error("restarted serve exited"));
+          const probe = net.createConnection(controlSocket);
+          probe.once("connect", () => {
+            probe.destroy();
+            resolve();
+          });
+          probe.once("error", () => {
+            probe.destroy();
+            if (Date.now() >= deadline) reject(new Error("serve did not reclaim its control socket"));
+            else setTimeout(check, 25);
+          });
+        };
+        check();
+      });
+      assert.equal(restarted.exitCode, null);
+    } finally {
+      for (const child of [first, restarted]) {
+        if (!child || child.exitCode !== null || child.signalCode !== null) continue;
+        await new Promise(resolve => {
+          child.once("exit", resolve);
+          child.kill("SIGKILL");
+        });
+      }
+      rmSync(controlSocket, { force: true });
+      rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  it("applies stdout backpressure to accepted submissions", async () => {
+    const session = await startSession();
+    try {
+      session.child.stdout.pause();
+      const requests = Array.from({ length: 4096 }, () => session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(randomUUID(), 0, { value: "" })));
+      let settled = false;
+      const complete = Promise.all(requests).then(results => {
+        settled = true;
+        return results;
+      });
+      await new Promise(resolve => setTimeout(resolve, 1_000));
+      assert.equal(settled, false);
+      session.child.stdout.resume();
+      const results = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("submissions did not drain after stdout resumed")), STARTUP_TIMEOUT_MS);
+        complete.then(value => { clearTimeout(timer); resolve(value); }, cause => { clearTimeout(timer); reject(cause); });
+      });
+      assert.deepEqual(results.map(result => result.status), Array(requests.length).fill(202));
+    } finally {
+      session.child.stdout.resume();
+      await session.stop();
+    }
+  });
+
+  it("stops cleanly when stdout closes", async () => {
+    const session = await startSession();
+    try {
+      session.child.stdout.destroy();
+      void session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(randomUUID()));
+      const [code, signal] = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("serve did not stop after stdout closed")), STARTUP_TIMEOUT_MS);
+        session.child.once("exit", (...args) => { clearTimeout(timer); resolve(args); });
+      });
+      assert.equal(code, 1);
+      assert.equal(signal, null);
+      assert.doesNotMatch(session.stderr(), /Unhandled|write EPIPE|EPIPE/);
+    } finally {
+      await session.stop();
+    }
   });
 
   it("serves the initial replayable page, stream metadata, and live assets", async () => {

@@ -19,6 +19,7 @@ const CONTROL_MAX_BYTES = MAX_PACKET_BYTES;
 const RECONNECT_RETRY_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
 const CONTROL_TIMEOUT = 35_000;
+const STREAM_SHUTDOWN_TIMEOUT = 2_000;
 const CONTROL_PREFIX = "letmeknow-control-";
 const CONTROL_URL = "https://letmeknow.dev";
 const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
@@ -256,6 +257,25 @@ function controlPath(root) {
   return join(tmpdir(), `${CONTROL_PREFIX}${key}.sock`);
 }
 
+async function removeStaleControlSocket(path) {
+  if (!existsSync(path)) return;
+  await new Promise(resolve => {
+    const probe = net.createConnection(path);
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      probe.destroy();
+      resolve();
+    };
+    probe.once("connect", finish);
+    probe.once("error", cause => {
+      if (cause?.code === "ECONNREFUSED" || cause?.code === "ENOENT") void unlink(path).then(finish, finish);
+      else finish();
+    });
+  });
+}
+
 function mutateQueue() {
   let chain = Promise.resolve();
   return operation => {
@@ -327,15 +347,33 @@ async function start(directory) {
   let stopped = false;
   let ready = false;
   let stopSession = () => {};
+  let stop = async () => {};
+  let streamFailure;
+  let streamWrite = Promise.resolve();
   const streamBeforeReady = [];
 
   const writeStream = value => {
     if (!ready) {
       streamBeforeReady.push(value);
-      return;
+      return Promise.resolve();
     }
-    process.stdout.write(`${JSON.stringify(value)}\n`);
+    const pending = streamWrite.then(() => {
+      if (streamFailure) throw streamFailure;
+      return new Promise((resolve, reject) => {
+        try {
+          process.stdout.write(`${JSON.stringify(value)}\n`, cause => cause ? reject(cause) : resolve());
+        } catch (cause) { reject(cause); }
+      });
+    });
+    streamWrite = pending.then(undefined, cause => { streamFailure ??= cause; throw cause; });
+    streamWrite.catch(() => {});
+    return pending;
   };
+
+  process.stdout.once("error", cause => {
+    streamFailure ??= cause;
+    void stop(1);
+  });
 
   const commit = async (through, requestedScript) => {
     validateScript(requestedScript);
@@ -351,6 +389,7 @@ async function start(directory) {
     if (requestedScript !== undefined) {
       runEvent = { type: "run_ui", event_number: eventNumber + 1, considered_through: through, script: requestedScript };
       nextPage = replayablePage(basePage, [...history, runEvent]);
+      await writeStream({ type: "run_ui", event_number: runEvent.event_number, considered_through: through, frontier: runEvent.event_number, page_event: runEvent.event_number, page_hash: pageHash(nextPage) });
     }
 
     retainedSubmissionBytes -= browserEventBytes.slice(0, committedCount).reduce((total, bytes) => total + bytes, 0);
@@ -374,10 +413,7 @@ async function start(directory) {
       events: committedEvents,
       ...(runEvent ? { run_ui: { event_number: runEvent.event_number, considered_through: through } } : {})
     };
-    if (runEvent) {
-      send(runEvent);
-      writeStream({ type: "run_ui", event_number: runEvent.event_number, considered_through: through, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash() });
-    }
+    if (runEvent) send(runEvent);
     return result;
   };
 
@@ -415,10 +451,12 @@ async function start(directory) {
     connection.on("close", () => controlConnections.delete(connection));
     connection.on("error", () => controlConnections.delete(connection));
   });
+  const controlSocket = controlPath(root);
+  await removeStaleControlSocket(controlSocket);
   await new Promise((resolveListen, reject) => {
     controlServer.once("error", reject);
-    controlServer.listen(controlPath(root), async () => {
-      try { await chmod(controlPath(root), 0o600); } catch (cause) { controlServer.close(() => reject(cause)); return; }
+    controlServer.listen(controlSocket, async () => {
+      try { await chmod(controlSocket, 0o600); } catch (cause) { controlServer.close(() => reject(cause)); return; }
       controlServer.off("error", reject);
       resolveListen();
     });
@@ -430,16 +468,16 @@ async function start(directory) {
       stopSession();
       throw new Error("session submission limit exceeded");
     }
+    const numbered = { ...event, event_number: eventNumber + 1 };
+    await writeStream(numbered);
     seenEvents.add(event.id);
     retainedSubmissionBytes += bytes;
-    eventNumber += 1;
-    const numbered = { ...event, event_number: eventNumber };
+    eventNumber = numbered.event_number;
     browserEvents.push(numbered);
     browserEventBytes.push(bytes);
-    writeStream(numbered);
   });
 
-  const stop = async code => {
+  stop = async code => {
     if (stopped) return;
     stopped = true;
     clearTimeout(retryTimer);
@@ -448,7 +486,8 @@ async function start(directory) {
     try { socket?.close(); } catch {}
     for (const connection of controlConnections) connection.destroy();
     await new Promise(resolveClose => controlServer.close(() => resolveClose()));
-    await unlink(controlPath(root)).catch(() => {});
+    await unlink(controlSocket).catch(() => {});
+    await Promise.race([streamWrite.catch(() => {}), new Promise(resolve => setTimeout(resolve, STREAM_SHUTDOWN_TIMEOUT))]);
     process.exit(code);
   };
   stopSession = () => { void stop(1); };
