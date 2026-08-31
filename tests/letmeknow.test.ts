@@ -419,6 +419,16 @@ describe("LetMeKnow service", () => {
     expect(await nextType(producer, "error")).toMatchObject({ message: "page history is too large" });
   });
 
+  it("expires the session idempotently when alarms race", async () => {
+    const now = Date.now();
+    vi.useFakeTimers({ now });
+    const { producer, url } = await open();
+    vi.setSystemTime(now + SESSION_LIFETIME_MS + 1);
+    const responses = await Promise.all([SELF.fetch(new Request(url)), SELF.fetch(new Request(url))]);
+    expect(responses.map(response => response.status)).toEqual([404, 404]);
+    producer.socket.close(1000, "done");
+  });
+
   it("expires the session and removes its public workspace and attachments", async () => {
     const now = Date.now();
     vi.useFakeTimers({ now });
