@@ -63,7 +63,7 @@ async function open(): Promise<{ producer: Peer; url: string }> {
   const producer = await connectProducer();
   producer.send({ type: "open", id: "open" });
   const session = await producer.next();
-  expect(session).toEqual({ type: "session", id: "open", url: session.url, expires_after_disconnect: 600 });
+  expect(session).toEqual({ type: "session", id: "open", url: session.url });
   return { producer, url: session.url };
 }
 
@@ -102,7 +102,7 @@ describe("LetMeKnow outbound relay", () => {
     expect(disconnectAlarm).toBeLessThan(expiresAt!);
 
     const replacement = await connectProducer(code, producer.credential);
-    expect(await replacement.next()).toMatchObject({ type: "session", url, expires_after_disconnect: 600 });
+    expect(await replacement.next()).toMatchObject({ type: "session", url });
     expect(await sessionAlarm(code)).toBe(expiresAt);
   });
 

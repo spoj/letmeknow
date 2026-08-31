@@ -114,7 +114,7 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
     relay.once("connection", socket => {
       producer = socket;
       socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
-      socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.letmeknow.dev/", expires_after_disconnect: 600 }));
+      socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.letmeknow.dev/" }));
       socket.on("message", data => {
         const packet = JSON.parse(data.toString());
         if (packet.type === "open") resolve();
