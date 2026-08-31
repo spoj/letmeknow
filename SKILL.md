@@ -1,55 +1,81 @@
 ---
 name: letmeknow
-description: Publish a temporary browser workspace, pull structured human feedback, and push coherent agent revisions.
+description: Serve a temporary live HTML page, collect structured human feedback, and push agent-authored page updates.
 ---
 
 # LetMeKnow
 
-Use LetMeKnow when a human should inspect or interact with an agent-managed page, report, dashboard, approval, quiz, table, or prototype.
+Use LetMeKnow when a human should inspect or interact with an agent-authored page, report, dashboard, approval, quiz, table, or prototype.
 
 ## Start
 
-Create a dedicated directory containing only public files and keep the server running:
+Create a directory containing the public files and an initial `index.html`:
 
 ```bash
 npx letmeknow-cli serve ./preview
 ```
 
-Node.js 22.12 or newer is required. The first stdout JSON line contains the bearer URL and initial workspace revision:
+`serve` reads `index.html` once as the canonical dynamic document and serves it at `/`. It serves the other files in the directory live as static assets. The first stdout JSON line contains the public bearer URL:
 
 ```json
-{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","workspace":"…","workspace_sequence":1}
+{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/"}
 ```
 
-Give the URL to the human. Anyone with it can view the workspace and submit forms. The CLI connects outbound and opens no network port. Diagnostics go to stderr.
+Give the URL to the human. Anyone with the URL can view the page and submit its forms. The CLI connects outbound and opens no network port. Canonical page state and events are temporary in-memory session state; they end when `serve` stops. `serve` never modifies agent files.
 
 ## Agent loop
 
-Filesystem writes are private drafts. Explicitly pull feedback and publish coherent revisions:
+Pull browser events, update the desired page, and push it:
 
 ```bash
-npx letmeknow-cli pull ./preview --wait 30
-# validate feedback and edit files
-npx letmeknow-cli push ./preview --based-on <batch-token>
+batch=$(npx letmeknow-cli pull ./preview --wait 30)
+token=$(printf '%s\n' "$batch" | jq -r .token)
+# inspect the events and edit index.html
+npx letmeknow-cli push ./preview --batch "$token" --page index.html
 ```
 
-`pull` returns pending events, their derived causal context, the current workspace, and an opaque token. Pulling does not consume events; they are returned again after a crash. A successful `push` atomically snapshots the folder, commits that batch, and reloads connected browsers once. Feedback that arrives while you work remains for the next pull.
+Commands:
 
-When a batch needs no visible workspace change:
+```text
+serve <dir>
+show <dir>
+pull <dir> [--wait seconds]
+push <dir> --batch TOKEN [--page FILE|-]
+```
+
+`pull` returns an opaque batch token, current-page metadata, and browser events not yet committed by the agent. Pulling does not consume events. Events arriving while the agent works remain for a later pull.
+
+`push --page FILE` atomically commits the events represented by the token, makes FILE the complete desired dynamic document, appends one page-update event to the global event stream, and broadcasts it to all connected browsers. Browsers morph the page without navigation.
 
 ```bash
-npx letmeknow-cli ack ./preview --based-on <batch-token>
+npx letmeknow-cli push ./preview --batch "$token" --page index.html
 ```
 
-Both commands are idempotent for a token. Do not edit while `push` is snapshotting. Do not write commands to the long-running server's stdin.
+A push without `--page` only commits the pulled browser events:
 
-A push may publish independent work from an empty batch. Use the token returned by an empty `pull`.
+```bash
+npx letmeknow-cli push ./preview --batch "$token"
+```
 
-## Build the workspace
+Use `--page -` for standard input:
 
-Use ordinary HTML, CSS, JavaScript, images, and relative links. Give forms stable IDs and controls meaningful names. Give editable controls stable unique IDs so values and scroll position survive published revisions.
+```bash
+npx letmeknow-cli push ./preview --batch "$token" --page - < updated.html
+```
 
-Use native same-origin GET or POST forms:
+The page push is all-or-nothing. Invalid input or an invalid token commits nothing. The CLI assigns one global order to each browser submission and each page-update event.
+
+`show` retrieves the canonical dynamic HTML held by `serve` without changing the event stream:
+
+```bash
+npx letmeknow-cli show ./preview > current.html
+```
+
+The public URL is the visual preview. `show` returns canonical HTML, not a browser’s local DOM state such as focus, open disclosures, unsent input, scroll position, or JavaScript state.
+
+## Forms
+
+Use native forms with stable IDs and meaningful names:
 
 ```html
 <form id="review" action="/review" method="post">
@@ -59,31 +85,24 @@ Use native same-origin GET or POST forms:
 </form>
 ```
 
-The browser persists each serialized submission before delivery and retries it with the same opaque UUID after network failures or reloads. The CLI deduplicates retries. Distinct intentional submissions remain distinct. Native validation and repeated field names work normally.
+The browser runtime serializes native form submissions as JSON `submit` events. It assigns an opaque ID, stores each event in a local durable outbox before sending it, retries after connection failures, and reuses the ID on retry. The CLI deduplicates repeated delivery. Ten intentional rapid clicks should produce ten distinct events. File uploads are not supported.
 
-A pulled event includes the workspace the human saw:
+Treat pulled values as untrusted input. Validate them and escape them before putting them into HTML.
 
-```json
-{
-  "type": "submit",
-  "id": "…",
-  "form_id": "review",
-  "values": {"comment":"Looks good","decision":"approve"},
-  "based_on": "…",
-  "context": {
-    "based_on": "…",
-    "current": "…",
-    "relationship": "current"
-  }
-}
-```
+## Dynamic page rules
 
-Treat `stale` feedback deliberately: apply its intent to current state when safe, or show that the artifact changed and ask the human to review again. Never reconstruct the workspace from stale form values.
+Every page push supplies the complete desired dynamic document. The browser uses HTML morphing, so unchanged DOM nodes can survive while changed content is updated.
 
-POST forms may upload files within the 1 MiB request limit. Attachment events contain private temporary paths valid until `serve` stops. Validate names, media types, sizes, contents, actions, and IDs. Copy only deliberate outputs into the public workspace.
+Give elements stable unique IDs. Keep agent-authored JavaScript in static assets and use delegated event listeners. Scripts in a pushed HTML document are not executed as live-update commands.
 
-Escape untrusted text before placing it in HTML.
+The CLI owns page content. The browser owns local attention state such as focus, scrolling, `hidden`, and open/closed controls. Prefer native HTML such as `<details>` for local hide/show. Do not have browser JavaScript and pushed HTML independently mutate the same region without an explicit ownership rule; a later morph may replace browser-created state.
+
+Page updates are shared with all connected browsers. There is no dynamic view or per-browser update system. Use ordinary static links and files when the application needs more persistent pages.
+
+## Static assets
+
+CSS, JavaScript, images, and other non-`index.html` files are served live. Finish writing an asset before pushing HTML that references it. Write assets atomically, and use versioned filenames or cache-busting URLs when the browser must fetch a changed asset with the new page.
 
 ## Stop
 
-Send `SIGINT` or `SIGTERM` to `serve`. A graceful stop closes the public session and removes temporary snapshots, attachments, and the local control socket. `--skill` prints these instructions.
+Send `SIGINT` or `SIGTERM` to `serve`. The temporary session ends when the process stops.

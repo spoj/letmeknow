@@ -1,76 +1,87 @@
 # LetMeKnow
 
-LetMeKnow gives an agent a temporary public browser surface and structured human feedback. The agent edits an ordinary folder, explicitly publishes coherent revisions, and pulls form submissions as JSON. The CLI connects outbound to the hosted relay and does not listen on a network port.
+LetMeKnow gives an agent a temporary public browser surface and structured human feedback. The agent authors ordinary HTML and static assets; a running CLI serves them and accepts page updates over a single ordered event stream.
 
 ## Start a session
 
-Node.js 22.12 or newer is required. Create a dedicated directory containing only public files, then keep the server running:
+Create a directory containing the public files, including an initial `index.html`, then run:
 
 ```bash
 npx letmeknow-cli serve ./preview
 ```
 
-The server prints one JSON line containing the public bearer URL and initial workspace revision:
+`serve` reads `index.html` once as the canonical dynamic page and serves it at `/`. Other files in the directory—such as CSS, JavaScript, images, and data—are served live as static assets. The CLI prints one JSON line containing the public bearer URL:
 
 ```json
-{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","workspace":"…","workspace_sequence":1}
+{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/"}
 ```
 
-Anyone with the URL can view the published workspace and submit its forms. A graceful stop closes the session; an unexpected relay disconnect can reconnect for up to ten minutes. Diagnostics go to stderr.
+Give the URL to the human. Anyone with the URL can view the page and submit its forms. Canonical page state and the event stream live in memory while `serve` runs; they do not survive a stopped session. The CLI connects outbound and does not listen on a network port.
 
-## Publish revisions
+The agent’s files are never modified by `serve`.
 
-`serve` snapshots the initial folder. Later filesystem changes remain private until explicitly published:
+## Agent workflow
+
+Pull browser events, update the page, and push the resulting page:
 
 ```bash
-npx letmeknow-cli pull ./preview --wait 30
-npx letmeknow-cli push ./preview --based-on <batch-token>
+batch=$(npx letmeknow-cli pull ./preview --wait 30)
+token=$(printf '%s\n' "$batch" | jq -r .token)
+# inspect events, edit index.html, then:
+npx letmeknow-cli push ./preview --batch "$token" --page index.html
 ```
 
-`pull` returns pending browser interactions, the current workspace, and an opaque batch token:
+`pull` returns an opaque batch token, current-page metadata, and the browser events not yet committed by the agent. Pulling does not consume events. Events that arrive while the agent works remain for a later pull.
 
-```json
-{
-  "ok": true,
-  "type": "batch",
-  "token": "…",
-  "workspace": "…",
-  "workspace_sequence": 1,
-  "frontier": 1,
-  "events": [
-    {
-      "type": "submit",
-      "id": "…",
-      "form_id": "decision",
-      "values": {"decision":"approve"},
-      "based_on": "…",
-      "context": {"based_on":"…","current":"…","relationship":"current"}
-    }
-  ]
-}
-```
-
-A repeated pull returns uncommitted events again. `push` atomically snapshots the folder, commits the batch, and reloads connected browsers once. Events arriving while the agent works remain for the next pull. A push can also publish independent work from an empty batch.
-
-If a batch requires no workspace change, commit it without publishing:
+A push with a page:
 
 ```bash
-npx letmeknow-cli ack ./preview --based-on <batch-token>
+npx letmeknow-cli push ./preview --batch "$token" --page index.html
 ```
 
-`push` and `ack` are idempotent for a token. They fail if another command has moved the workspace or event cursor first.
+atomically commits the events represented by the token, replaces the canonical dynamic page with the complete HTML from `index.html`, appends one page-update event to the global event stream, and broadcasts that page to connected browsers. Browsers morph the page without navigating or reloading.
 
-The commands communicate with `serve` through a private local Unix socket. `--skill` prints agent instructions without starting a session.
+A push without `--page` only commits the pulled browser events:
 
-## Workspace behavior
+```bash
+npx letmeknow-cli push ./preview --batch "$token"
+```
 
-A published workspace is an immutable temporary snapshot of the selected folder. It may contain HTML, CSS, JavaScript, images, data, and linked pages. The relay injects a small runtime into HTML and serves all files from the same workspace revision.
+Use `--page -` to read the complete desired page from standard input:
 
-A successful push sends one revision notification. Browsers reload and preserve scroll position plus the values, checked state, and selected state of controls with stable unique IDs. Missing pages and connection-status pages remain live and recover on a later publication or reconnect.
+```bash
+npx letmeknow-cli push ./preview --batch "$token" --page - < updated.html
+```
+
+The update is all-or-nothing. If the token or page input is invalid, neither the browser events nor the page update is committed.
+
+## Inspect the current page
+
+`show` writes the canonical dynamic HTML held by `serve` to standard output:
+
+```bash
+npx letmeknow-cli show ./preview > current.html
+```
+
+It is read-only and does not create or commit an event. This is different from opening the public URL: `show` returns canonical HTML, while the URL shows a particular browser’s rendered DOM, including local focus, open/closed controls, unsent values, and JavaScript state.
+
+## The event stream
+
+Browser submissions and CLI page updates share one ordered, in-memory event stream:
+
+```text
+submit       browser
+submit       browser
+update_ui    CLI: complete desired HTML page
+```
+
+Browser submission events are delivered to the agent through `pull`. Page-update events are broadcast to all connected browsers. There is no per-browser audience or dynamic view system in the initial model.
+
+The CLI assigns the event order. The number indicates acceptance order, not the physical time a person clicked. Submission IDs make retries distinguishable from new intentional submissions.
 
 ## Forms
 
-Use native same-origin GET or POST forms:
+Use ordinary HTML forms with stable IDs and meaningful field names:
 
 ```html
 <form id="decision" action="/decide" method="post">
@@ -80,19 +91,33 @@ Use native same-origin GET or POST forms:
 </form>
 ```
 
-Before delivery, the runtime gives each logical submission an opaque UUID and persists the serialized request in IndexedDB. Network retries and page reloads reuse that UUID. The CLI deduplicates accepted events, so a transport retry does not become another interaction. Distinct intentional submissions receive distinct IDs.
+The runtime intercepts native form submission and turns it into a durable JSON `submit` event. It assigns an opaque UUID, stores the event in the browser’s local outbox before delivery, retries after connection failures, and reuses the UUID on retry. The CLI deduplicates repeated delivery of the same event. Distinct submissions remain distinct, including rapid repeated clicks.
 
-The runtime displays **Sending…** or **Uploading…**, followed by **Sent. Waiting for an update…** or an error. Add `[data-letmeknow-status]` to choose the status location. Native validation runs before submission. Repeated field names become arrays.
+Form values are untrusted input and should be validated by the agent. File uploads are not supported.
 
-POST forms may include files within the 1 MiB total request limit. `pull` events contain attachment metadata and private temporary paths. Attachments remain available until `serve` stops and are not public unless deliberately copied into the workspace and pushed.
+## Authoring the dynamic page
 
-Every submission records the exact workspace revision shown to the user. Its derived `context.relationship` is `current`, `stale`, or `unknown`, allowing the agent to decide whether to apply, rebase, or reject old feedback.
+Each page update supplies the complete desired HTML document. The browser morphs the current document toward it, so a small change such as a counter update need not recreate the whole DOM.
+
+Give elements stable unique IDs. They help the morphing runtime retain unchanged elements, including controls whose local state should survive an update:
+
+```html
+<output id="count">0</output>
+```
+
+Keep the LetMeKnow runtime outside the agent-controlled content where possible. Agent-authored JavaScript should be loaded as a static asset and use delegated event listeners. Scripts in an incoming page update are not executed as live-update commands.
+
+The CLI owns the rendered page content. The browser owns local attention state such as focus, scrolling, `hidden`, and open/closed disclosure controls. Prefer native HTML such as `<details>` for local hide/show behavior. Avoid having browser JavaScript and incoming HTML independently mutate the same region unless their ownership is explicit; otherwise a later morph may replace browser-created state.
+
+A page update is shared with all browsers. Keep private or browser-specific behavior local unless a future requirement introduces targeted updates.
+
+## Static assets
+
+Static assets are read live from the directory, independently of the canonical dynamic page. An agent can change CSS, JavaScript, images, and other assets without a page push. Finish an asset before pushing HTML that references it, write files atomically, and use versioned filenames or cache-busting URLs when cached assets must change with the page.
 
 ## Security
 
-The URL is a bearer capability. The relay receives published files and submitted values. Keep secrets and unrelated files outside the preview directory.
-
-The CLI excludes `.env`, `.git`, SSH keys, private-key files, and database files, and prevents symlink escapes. Processes that can write the workspace and invoke `push` are trusted publishers. Browser values, filenames, media types, and attachment contents remain untrusted input.
+The URL is a bearer capability. Anyone who has it can view the page and submit forms. Keep secrets and unrelated files outside the served directory. Browser values are untrusted input; escape them before placing them in HTML.
 
 ## Development
 
