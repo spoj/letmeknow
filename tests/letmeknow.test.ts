@@ -105,13 +105,13 @@ describe("LetMeKnow outbound relay", () => {
     expect(producer.socket.readyState).not.toBe(WebSocket.OPEN);
   });
 
-  it("allows multiple clients and broadcasts UI updates and producer lifecycle", async () => {
+  it("allows multiple clients and broadcasts opaque UI scripts and producer lifecycle", async () => {
     const { producer, url } = await open();
     const first = await connectClient(url);
     const second = await connectClient(url);
     expect(await first.next()).toEqual({ type: "connected", producer_connected: true });
     expect(await second.next()).toEqual({ type: "connected", producer_connected: true });
-    const update = { type: "update_ui", event_number: 1, target: "counter", html: "<output id=\"counter\">1</output>" };
+    const update = { type: "run_ui", event_number: 1, script: "document.querySelector('#items').append('item')" };
     producer.send(update);
     expect(await first.next()).toEqual(update);
     expect(await second.next()).toEqual(update);
@@ -120,16 +120,16 @@ describe("LetMeKnow outbound relay", () => {
     expect(await second.next()).toEqual({ type: "producer", connected: false });
   });
 
-  it("rejects invalid UI updates", async () => {
+  it("rejects invalid UI scripts", async () => {
     const { producer } = await open();
-    producer.send({ type: "update_ui", event_number: -1, target: "counter", html: "<p>bad</p>" });
+    producer.send({ type: "run_ui", event_number: -1, script: "document.body" });
     expect(await producer.next()).toEqual({ type: "error", message: "event_number must be a nonnegative safe integer" });
-    producer.send({ type: "update_ui", event_number: 0, html: "<p>bad</p>" });
-    expect(await producer.next()).toEqual({ type: "error", message: "target is required" });
-    producer.send({ type: "update_ui", event_number: 0, target: "", html: "<p>bad</p>" });
-    expect(await producer.next()).toEqual({ type: "error", message: "target is required" });
-    producer.send({ type: "update_ui", event_number: 0, target: "counter", html: 42 });
-    expect(await producer.next()).toEqual({ type: "error", message: "html is required" });
+    producer.send({ type: "run_ui", event_number: 0 });
+    expect(await producer.next()).toEqual({ type: "error", message: "script is required" });
+    producer.send({ type: "run_ui", event_number: 0, script: 42 });
+    expect(await producer.next()).toEqual({ type: "error", message: "script is required" });
+    producer.send({ type: "run_ui", event_number: 0, script: "x".repeat(1024 * 1024 + 1) });
+    expect(await producer.next()).toEqual({ type: "error", message: "script is too large" });
   });
 
   it("injects the relay runtime into HTML but not other responses or submissions", async () => {
@@ -324,7 +324,7 @@ describe("LetMeKnow outbound relay", () => {
     const page = SELF.fetch(new Request(url));
     const request = await replacement.next();
     const staleSocket = { deserializeAttachment: () => ({ role: "producer", id: "stale-producer", url, opened: true, closing: false }), close: () => {}, send: () => {} } as unknown as WebSocket;
-    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.webSocketMessage(staleSocket, JSON.stringify({ type: "update_ui", event_number: 99, target: "counter", html: "<output id=\"counter\">stale</output>" })));
+    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.webSocketMessage(staleSocket, JSON.stringify({ type: "run_ui", event_number: 99, script: "document.body.append('stale')" })));
     expect(await Promise.race([client.next(), new Promise((resolve) => setTimeout(() => resolve(undefined), 50))])).toBeUndefined();
     await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.webSocketClose(staleSocket, 1000, "stale"));
     replacement.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
