@@ -1,7 +1,7 @@
 {
   "name": "letmeknow-cli",
-  "version": "0.6.1",
-  "description": "A live static preview with agent-readable form submissions.",
+  "version": "0.7.0",
+  "description": "A live agent-authored page with structured browser feedback.",
   "files": [
     "bin",
     "SKILL.md"
