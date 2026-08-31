@@ -252,7 +252,11 @@ async function readUpdatesInput(filename) {
       html = item.html;
     } else {
       if (typeof item.file !== "string" || item.file === "") throw new Error(`update file for ${item.target} must be a path`);
-      html = (await readFile(resolve(base, item.file))).toString("utf8");
+      const file = resolve(base, item.file);
+      const info = await stat(file);
+      if (!info.isFile()) throw new Error(`update file for ${item.target} must be a regular file`);
+      if (info.size > UPDATE_BATCH_MAX_BYTES - bytes) throw new Error("updates are too large");
+      html = (await readFile(file)).toString("utf8");
     }
     bytes += Buffer.byteLength(html, "utf8");
     if (bytes > UPDATE_BATCH_MAX_BYTES) throw new Error("updates are too large");
@@ -357,7 +361,6 @@ async function start(directory) {
   let pageEvent = 0;
   let eventNumber = 0;
   const currentPageHash = () => pageHash(page);
-  const eventLog = [];
   const browserEvents = [];
   let committedBrowserCursor = 0;
   const seenEvents = new Set();
@@ -379,12 +382,12 @@ async function start(directory) {
 
   const batch = () => {
     const start = committedBrowserCursor;
-    const end = browserEvents.length;
+    const end = start + browserEvents.length;
     const key = `${pageEvent}:${start}:${end}`;
     const existing = pendingTokens.get(key);
     if (existing) return existing;
     const token = randomUUID();
-    const events = browserEvents.slice(start, end);
+    const events = browserEvents.slice();
     tokens.set(token, { start, end, page_event: pageEvent, status: "pending", key, updates_hash: null });
     const result = { ok: true, type: "batch", token, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash(), events };
     pendingTokens.set(key, result);
@@ -393,7 +396,7 @@ async function start(directory) {
 
   const notifyPullWaiters = () => {
     for (const waiter of [...pullWaiters]) {
-      if (browserEvents.length === committedBrowserCursor) continue;
+      if (browserEvents.length === 0) continue;
       pullWaiters.delete(waiter);
       clearTimeout(waiter.timer);
       waiter.resolve(batch());
@@ -401,7 +404,7 @@ async function start(directory) {
   };
 
   const pull = waitSeconds => {
-    if (browserEvents.length > committedBrowserCursor || waitSeconds <= 0) return Promise.resolve(batch());
+    if (browserEvents.length > 0 || waitSeconds <= 0) return Promise.resolve(batch());
     return new Promise(resolve => {
       const waiter = { resolve, timer: setTimeout(() => { pullWaiters.delete(waiter); resolve(batch()); }, waitSeconds * 1_000) };
       pullWaiters.add(waiter);
@@ -428,7 +431,8 @@ async function start(directory) {
     try { if (updates.length) nextPage = applyUpdates(page, updates); } catch (cause) {
       throw new Error(cause instanceof Error ? cause.message : "invalid page updates");
     }
-    const committedEvents = browserEvents.slice(record.start, record.end).map(event => event.id);
+    const committedCount = record.end - record.start;
+    const committedEvents = browserEvents.slice(0, committedCount).map(event => event.id);
     const updateEvents = [];
     for (const update of updates) {
       eventNumber += 1;
@@ -436,7 +440,7 @@ async function start(directory) {
     }
     page = nextPage;
     pageEvent = updateEvents.at(-1)?.event_number ?? pageEvent;
-    eventLog.push(...updateEvents);
+    browserEvents.splice(0, committedCount);
     committedBrowserCursor = record.end;
     pendingTokens.delete(record.key);
     record.status = "committed";
@@ -502,7 +506,6 @@ async function start(directory) {
     seenEvents.add(event.id);
     eventNumber += 1;
     const numbered = { ...event, event_number: eventNumber };
-    eventLog.push(numbered);
     browserEvents.push(numbered);
     notifyPullWaiters();
   });

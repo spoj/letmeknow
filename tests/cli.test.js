@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -11,6 +11,7 @@ import { WebSocketServer } from "ws";
 
 const cli = fileURLToPath(new URL("../bin/letmeknow.js", import.meta.url));
 const MAX_BODY_BYTES = 1024 * 1024;
+const UPDATE_BATCH_MAX_BYTES = 16 * MAX_BODY_BYTES;
 const COMMAND_TIMEOUT_MS = 10_000;
 const STARTUP_TIMEOUT_MS = 10_000;
 
@@ -248,6 +249,26 @@ describe("LetMeKnow CLI", () => {
     }
   });
 
+  it("rejects non-regular and oversized update files before connecting", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "letmeknow-updates-"));
+    const updatesDirectory = join(folder, "updates");
+    mkdirSync(updatesDirectory);
+    writeFileSync(join(folder, "index.html"), "unused");
+    mkdirSync(join(updatesDirectory, "directory"));
+    writeFileSync(join(updatesDirectory, "oversized.html"), "");
+    truncateSync(join(updatesDirectory, "oversized.html"), UPDATE_BATCH_MAX_BYTES + 1);
+    try {
+      const nonRegular = await runCommand(["push", folder, "--batch", "token", "--updates", "-"], manifest([{ target: "count", file: join(updatesDirectory, "directory") }]));
+      assert.equal(nonRegular.code, 1);
+      assert.match(nonRegular.stderr, /must be a regular file/);
+      const oversized = await runCommand(["push", folder, "--batch", "token", "--updates", "-"], manifest([{ target: "count", file: join(updatesDirectory, "oversized.html") }]));
+      assert.equal(oversized.code, 1);
+      assert.match(oversized.stderr, /updates are too large/);
+    } finally {
+      rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
   it("applies dozens of replacements in order and resolves fragments relative to the manifest", async () => {
     const elements = Array.from({ length: 40 }, (_, index) => `<output id="value-${index}">old-${index}</output>`).join("");
     const session = await startSession({ index: `<!doctype html><html><body><main id="letmeknow-root"><section id="values">${elements}</section><div id="container">empty</div></main></body></html>` });
@@ -357,6 +378,31 @@ describe("LetMeKnow CLI", () => {
       const noUpdates = await command(["push", session.folder, "--batch", later.token]);
       assert.deepEqual(noUpdates.updates, []);
       assert.deepEqual(await command(["push", session.folder, "--batch", later.token]), noUpdates);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("rejects overlapping pulls after an earlier token commits", async () => {
+    const session = await startSession();
+    try {
+      const firstId = randomUUID();
+      const secondId = randomUUID();
+      const submit = body => session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, body);
+      assert.equal((await submit(jsonSubmission(firstId))).status, 202);
+      const first = await command(["pull", session.folder]);
+      assert.equal((await submit(jsonSubmission(secondId))).status, 202);
+      const overlapping = await command(["pull", session.folder]);
+      assert.deepEqual(overlapping.events.map(event => event.id), [firstId, secondId]);
+
+      const committed = await command(["push", session.folder, "--batch", first.token]);
+      assert.deepEqual(committed.events, [firstId]);
+      const stale = await runCommand(["push", session.folder, "--batch", overlapping.token]);
+      assert.equal(stale.code, 1);
+      assert.match(stale.stdout, /old page or browser cursor/);
+
+      const current = await command(["pull", session.folder]);
+      assert.deepEqual(current.events.map(event => event.id), [secondId]);
     } finally {
       await session.stop();
     }
