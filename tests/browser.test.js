@@ -124,6 +124,7 @@ describe("browser runtime", () => {
     const posts = [];
     const attachmentReservations = [];
     const attachmentUploads = new Map();
+    let attachmentUploadFailures = 0;
     const sockets = [];
     const wsServer = new WebSocketServer({ noServer: true });
     const httpServer = http.createServer((req, res) => {
@@ -165,6 +166,12 @@ describe("browser runtime", () => {
         req.on("data", chunk => chunks.push(chunk));
         req.on("end", () => {
           const bytes = Buffer.concat(chunks);
+          if (attachmentUploadFailures > 0) {
+            attachmentUploadFailures -= 1;
+            res.writeHead(503);
+            res.end();
+            return;
+          }
           attachmentUploads.set(hash, bytes);
           res.writeHead(204);
           res.end();
@@ -263,6 +270,14 @@ describe("browser runtime", () => {
       assert.deepEqual(attachmentReservations, [{ hashes: [{ hash: attachment.hash, size: attachment.size }] }]);
       assert.deepEqual(attachmentUploads.get(attachment.hash), Buffer.from(uploadBody));
       await waitFor(async () => await execute("return document.querySelector('#upload-status')?.textContent") === "Sent. Waiting for an update…", "file submission was not acknowledged");
+
+      attachmentUploadFailures = 1;
+      const retryBody = "retryable browser attachment";
+      await execute(`const input = document.querySelector('#upload'); const transfer = new DataTransfer(); transfer.items.add(new File([${JSON.stringify(retryBody)}], 'retry.txt', { type: 'text/plain' })); input.files = transfer.files; document.querySelector('#upload-submit').click();`);
+      await waitFor(async () => await execute("return document.querySelector('#upload-status')?.textContent") === "Couldn’t send. Try again.", "failed attachment did not report a retryable error");
+      assert.equal(posts.length, appPosts + 1);
+      await waitFor(() => posts.length === appPosts + 2, "retryable file submission was not retried");
+      await waitFor(async () => await execute("return document.querySelector('#upload-status')?.textContent") === "Sent. Waiting for an update…", "retried file submission was not acknowledged");
 
       await execute("window.originalItemOne = document.querySelector('#item-one'); document.querySelector('#message').value = 'focused draft'; document.querySelector('#tag').checked = true; document.querySelector('#more').open = true; document.querySelector('#message').focus();");
       sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 2, considered_through: 1, script: "document.querySelector('#items').insertAdjacentHTML('beforeend', '<li id=\"item-three\">Three</li>');" }));
