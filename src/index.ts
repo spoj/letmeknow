@@ -11,7 +11,7 @@ interface RateLimitBinding {
 }
 
 type Packet = Record<string, unknown>;
-type ProducerAttachment = { role: "producer"; url: string; opened: boolean; closing: boolean };
+type ProducerAttachment = { role: "producer"; id: string; url: string; opened: boolean; closing: boolean };
 type ClientAttachment = { role: "client" };
 type Attachment = ProducerAttachment | ClientAttachment;
 type PendingProxy = { resolve(response: Response): void; timer: ReturnType<typeof setTimeout>; document: boolean };
@@ -19,7 +19,9 @@ type PendingProxy = { resolve(response: Response): void; timer: ReturnType<typeo
 const CODE_LENGTH = 20;
 const PRODUCER_GRACE_MS = 10 * 60 * 1_000;
 const OPEN_DEADLINE_MS = 30 * 1_000;
+const SESSION_LIFETIME_MS = 24 * 60 * 60 * 1_000;
 const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_PENDING_PROXY = 256;
 const PROXY_TIMEOUT_MS = 30 * 1_000;
 const encoder = new TextEncoder();
 const hopHeaders = new Set(["connection", "host", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "x-forwarded-host", "x-letmeknow-path", "x-letmeknow-route"]);
@@ -154,6 +156,19 @@ export class Session extends DurableObject<Env> {
     return this.ctx.getWebSockets().filter((socket) => (socket.deserializeAttachment() as Attachment).role === "client");
   }
 
+  private async sessionExpired(): Promise<boolean> {
+    const expiresAt = await this.ctx.storage.get<number>("expires_at");
+    return typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) || expiresAt <= Date.now();
+  }
+
+  private async expireSession(): Promise<void> {
+    this.failProxyRequests();
+    this.sendClients({ type: "closed", message: "Session expired" });
+    for (const client of this.clients()) client.close(1000, "session expired");
+    this.producer()?.close(1000, "session expired");
+    await this.ctx.storage.deleteAll();
+  }
+
   private async acceptProducer(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return error("websocket upgrade required", 426);
     const credential = request.headers.get("x-letmeknow-credential");
@@ -162,6 +177,10 @@ export class Session extends DurableObject<Env> {
     const opened = await this.ctx.storage.get<boolean>("opened") ?? false;
     const reconnectRequested = request.headers.get("x-letmeknow-reconnect") === "true";
     const reconnect = storedCredential !== undefined;
+    if (opened && await this.sessionExpired()) {
+      await this.expireSession();
+      return error("session expired", 404);
+    }
     if (reconnectRequested) {
       if (!reconnect || credential !== storedCredential || protocol !== credential) return error("invalid producer credential", 401);
     } else {
@@ -172,11 +191,13 @@ export class Session extends DurableObject<Env> {
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    const attachment: ProducerAttachment = { role: "producer", url: request.headers.get("x-letmeknow-url")!, opened: reconnect && opened, closing: false };
+    const attachment: ProducerAttachment = { role: "producer", id: crypto.randomUUID(), url: request.headers.get("x-letmeknow-url")!, opened: reconnect && opened, closing: false };
     server.serializeAttachment(attachment);
     this.ctx.acceptWebSocket(server);
-    if (reconnect && opened) await this.ctx.storage.deleteAlarm();
-    else await this.ctx.storage.setAlarm(Date.now() + OPEN_DEADLINE_MS);
+    if (reconnect && opened) {
+      const expiresAt = await this.ctx.storage.get<number>("expires_at");
+      await this.ctx.storage.setAlarm(expiresAt!);
+    } else await this.ctx.storage.setAlarm(Date.now() + OPEN_DEADLINE_MS);
     if (!reconnect) server.send(JSON.stringify({ type: "credential", credential }));
     if (reconnect && opened) {
       server.send(JSON.stringify({ type: "session", url: attachment.url, expires_after_disconnect: PRODUCER_GRACE_MS / 1000 }));
@@ -189,6 +210,10 @@ export class Session extends DurableObject<Env> {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return error("websocket upgrade required", 426);
     const opened = await this.ctx.storage.get<boolean>("opened");
     if (!opened) return error("session not found", 404);
+    if (await this.sessionExpired()) {
+      await this.expireSession();
+      return error("session expired", 404);
+    }
     if (request.headers.get("Sec-WebSocket-Protocol")) return error("client credentials are not supported", 400);
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -202,6 +227,10 @@ export class Session extends DurableObject<Env> {
     if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") return error("websockets are not supported", 426);
     const document = isDocumentRequest(request);
     if (!(await this.ctx.storage.get<boolean>("opened"))) return document ? runtimePage("Session not found", "This preview is no longer available.", 404) : error("session not found", 404);
+    if (await this.sessionExpired()) {
+      await this.mutate(() => this.expireSession());
+      return document ? runtimePage("Session not found", "This preview is no longer available.", 404) : error("session not found", 404);
+    }
     let response: Response;
     if (!this.producer()) response = document ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503);
     else {
@@ -216,6 +245,7 @@ export class Session extends DurableObject<Env> {
   private async proxyRequest(request: Request): Promise<Response> {
     const producer = this.producer();
     if (!producer) return isDocumentRequest(request) ? runtimePage("Connection lost", "Waiting for the preview producer to reconnect…", 503) : error("producer disconnected", 503);
+    if (this.pendingProxy.size >= MAX_PENDING_PROXY) return error("too many pending proxy requests", 503);
     const contentLength = request.headers.get("content-length");
     if (contentLength !== null && /^\d+$/.test(contentLength) && BigInt(contentLength) > BigInt(MAX_BODY_BYTES)) return error("request body is too large", 413);
     const reader = request.body?.getReader();
@@ -290,18 +320,26 @@ export class Session extends DurableObject<Env> {
   }
 
   private async producerCommand(socket: WebSocket, attachment: ProducerAttachment, packet: Packet): Promise<void> {
+    const active = this.producer();
+    if (!active || (active.deserializeAttachment() as ProducerAttachment).id !== attachment.id) return;
+    if (attachment.opened && await this.sessionExpired()) {
+      await this.expireSession();
+      return;
+    }
     if (typeof packet.type !== "string") throw new Error("type is required");
     if (packet.id !== undefined && typeof packet.id !== "string") throw new Error("id must be a string");
     if (attachment.closing) throw new Error("session is closing");
     if (packet.type === "open") {
       if (attachment.opened) throw new Error("open must be the first command");
+      const expiresAt = Date.now() + SESSION_LIFETIME_MS;
       await this.ctx.storage.transaction(async (txn) => {
         if (!(await txn.get<string>("credential"))) throw new Error("session expired");
         await txn.put("opened", true);
+        await txn.put("expires_at", expiresAt);
       });
       attachment.opened = true;
       socket.serializeAttachment(attachment);
-      await this.ctx.storage.deleteAlarm();
+      await this.ctx.storage.setAlarm(expiresAt);
       socket.send(JSON.stringify({ type: "session", ...(packet.id !== undefined ? { id: packet.id } : {}), url: attachment.url, expires_after_disconnect: PRODUCER_GRACE_MS / 1000 }));
       return;
     }
@@ -345,10 +383,13 @@ export class Session extends DurableObject<Env> {
     await this.mutate(async () => {
       if (attachment.role === "producer") {
         const active = this.producer();
-        if (active && active !== socket) return;
+        if (active && (active.deserializeAttachment() as ProducerAttachment).id !== attachment.id) return;
         this.failProxyRequests();
         this.sendClients({ type: "producer", connected: false });
-        if (attachment.opened && await this.ctx.storage.get<boolean>("opened")) await this.ctx.storage.setAlarm(Date.now() + PRODUCER_GRACE_MS);
+        if (attachment.opened && await this.ctx.storage.get<boolean>("opened")) {
+          const expiresAt = await this.ctx.storage.get<number>("expires_at");
+          await this.ctx.storage.setAlarm(typeof expiresAt === "number" ? Math.min(expiresAt, Date.now() + PRODUCER_GRACE_MS) : Date.now() + PRODUCER_GRACE_MS);
+        }
       }
     });
     if (code === 1005 || code === 1006 || code === 1015) socket.close();
@@ -362,12 +403,12 @@ export class Session extends DurableObject<Env> {
   async alarm(): Promise<void> {
     await this.mutate(async () => {
       const producer = this.producer();
-      if (producer && (producer.deserializeAttachment() as ProducerAttachment).opened) return;
-      this.failProxyRequests();
-      this.sendClients({ type: "closed", message: "Session expired" });
-      for (const client of this.clients()) client.close(1000, "session expired");
-      producer?.close(1000, "session expired");
-      await this.ctx.storage.deleteAll();
+      const expiresAt = await this.ctx.storage.get<number>("expires_at");
+      if (producer && (producer.deserializeAttachment() as ProducerAttachment).opened && typeof expiresAt === "number" && Number.isSafeInteger(expiresAt) && expiresAt > Date.now()) {
+        await this.ctx.storage.setAlarm(expiresAt);
+        return;
+      }
+      await this.expireSession();
     });
   }
 }

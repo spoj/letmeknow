@@ -11,8 +11,19 @@ type Peer = {
 };
 
 const origin = "https://letmeknow.dev";
+const SESSION_LIFETIME_MS = 24 * 60 * 60 * 1_000;
 const sockets: WebSocket[] = [];
 let ipCounter = 0;
+
+type SessionInternals = { ctx: { storage: { get<T>(key: string): Promise<T | undefined>; getAlarm(): Promise<number | null>; put<T>(key: string, value: T): Promise<void>; setAlarm(scheduledTime: number): Promise<void> } } };
+
+function sessionValue<T>(code: string, key: string): Promise<T | undefined> {
+  return runInDurableObject(env.SESSIONS.getByName(code), (instance) => (instance as unknown as SessionInternals).ctx.storage.get<T>(key));
+}
+
+function sessionAlarm(code: string): Promise<number | null> {
+  return runInDurableObject(env.SESSIONS.getByName(code), (instance) => (instance as unknown as SessionInternals).ctx.storage.getAlarm());
+}
 
 function peer(socket: WebSocket): Peer {
   socket.accept();
@@ -73,6 +84,42 @@ describe("LetMeKnow outbound relay", () => {
     expect((await SELF.fetch(new Request(`${origin}/s/01234567890123456789/`))).status).toBe(404);
     expect((await SELF.fetch(new Request("https://preview.example/v2/connect", { headers: { Upgrade: "websocket" } }))).status).toBe(404);
     expect((await SELF.fetch(new Request(`${origin}/v1/connect`, { headers: { Upgrade: "websocket" } }))).status).toBe(404);
+  });
+
+  it("sets an absolute expiration and never extends it on reconnect", async () => {
+    const { producer, url } = await open();
+    const code = new URL(url).hostname.split(".")[0];
+    const expiresAt = await sessionValue<number>(code, "expires_at");
+    expect(expiresAt).toBeDefined();
+    expect(expiresAt! - Date.now()).toBeGreaterThan(SESSION_LIFETIME_MS - 1_000);
+    expect(await sessionAlarm(code)).toBe(expiresAt);
+
+    const client = await connectClient(url);
+    await client.next();
+    producer.socket.close(1000, "restart");
+    await client.next();
+    const disconnectAlarm = await sessionAlarm(code);
+    expect(disconnectAlarm).toBeLessThan(expiresAt!);
+
+    const replacement = await connectProducer(code, producer.credential);
+    expect(await replacement.next()).toMatchObject({ type: "session", url });
+    expect(await sessionAlarm(code)).toBe(expiresAt);
+  });
+
+  it("expires an opened session at its absolute alarm", async () => {
+    const { producer, url } = await open();
+    const code = new URL(url).hostname.split(".")[0];
+    const client = await connectClient(url);
+    await client.next();
+    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => {
+      const storage = (instance as unknown as SessionInternals).ctx.storage;
+      return storage.put("expires_at", Date.now() - 1);
+    });
+
+    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.alarm());
+    expect(await client.next()).toEqual({ type: "closed", message: "Session expired" });
+    expect((await SELF.fetch(url)).status).toBe(404);
+    expect(producer.socket.readyState).not.toBe(WebSocket.OPEN);
   });
 
   it("allows multiple clients and broadcasts UI updates and producer lifecycle", async () => {
@@ -235,6 +282,20 @@ describe("LetMeKnow outbound relay", () => {
     expect(body).not.toContain("data-letmeknow-page-event");
   });
 
+  it("caps concurrent proxied requests per session", async () => {
+    const { producer, url } = await open();
+    const requests = Array.from({ length: 256 }, (_, index) => SELF.fetch(new Request(new URL(`asset-${index}`, url))));
+    const forwarded = await Promise.all(Array.from({ length: 256 }, () => producer.next()));
+    expect(forwarded).toHaveLength(256);
+
+    const excess = await SELF.fetch(new Request(new URL("overflow", url)));
+    expect(excess.status).toBe(503);
+    expect(await excess.json()).toEqual({ error: "too many pending proxy requests" });
+
+    for (const request of forwarded) producer.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
+    expect((await Promise.all(requests)).every((response) => response.status === 200)).toBe(true);
+  });
+
   it("relays requests and preserves late-response and size boundaries", async () => {
     const { producer, url } = await open();
     const page = SELF.fetch(new Request(url));
@@ -279,7 +340,9 @@ describe("LetMeKnow outbound relay", () => {
     await client.next();
     const page = SELF.fetch(new Request(url));
     const request = await replacement.next();
-    const staleSocket = { deserializeAttachment: () => ({ role: "producer", url, opened: true, closing: false }), close: () => {} } as unknown as WebSocket;
+    const staleSocket = { deserializeAttachment: () => ({ role: "producer", id: "stale-producer", url, opened: true, closing: false }), close: () => {}, send: () => {} } as unknown as WebSocket;
+    await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.webSocketMessage(staleSocket, JSON.stringify({ type: "update_ui", event_number: 99, target: "counter", html: "<output id=\"counter\">stale</output>" })));
+    expect(await Promise.race([client.next(), new Promise((resolve) => setTimeout(() => resolve(undefined), 50))])).toBeUndefined();
     await runInDurableObject(env.SESSIONS.getByName(code), (instance) => instance.webSocketClose(staleSocket, 1000, "stale"));
     replacement.send({ type: "http_response", request_id: request.request_id, status: 200, headers: {}, body: "" });
     expect((await page).status).toBe(200);
