@@ -1,6 +1,6 @@
 ---
 name: letmeknow
-description: Serve a temporary live HTML page, collect structured human feedback, and push ordered HTML replacements.
+description: Serve a temporary live HTML page, collect structured browser feedback, and run ordered agent-authored JavaScript.
 ---
 
 # LetMeKnow
@@ -9,132 +9,93 @@ Use LetMeKnow when a human should inspect or interact with an agent-authored pag
 
 ## Start
 
-Create a directory containing the public files and an initial `index.html`, then run:
+Create a directory containing the public files and an initial `index.html`:
 
 ```bash
 npx letmeknow-cli serve ./preview
 ```
 
-`serve` reads `index.html` once as the initial canonical dynamic page and serves it at `/`. Other files—such as CSS, JavaScript, images, and data—are served live from the directory. The first stdout JSON line contains the public bearer URL and initial page metadata:
+`serve` reads `index.html` as the base document and serves it at `/`. Other files—such as CSS, JavaScript, images, and data—are served live from the directory. The first stdout JSON line contains the public URL and initial page metadata:
 
 ```json
 {"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","page_event":0,"page_hash":"…"}
 ```
 
-The initial page should have a stable shell and a dynamic root:
+The base page should contain the application shell and any agent-authored static scripts:
 
 ```html
-<body>
-  <main id="letmeknow-root">
-    ...
-  </main>
-  <script type="module" src="/app.js"></script>
-</body>
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Counter</title>
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <main id="app">
+      <output id="counter">0</output>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
 ```
 
-The runtime is injected into the page separately. Keep agent-authored scripts and the runtime outside normal replacement targets.
-
-## Session lifetime and reconnect
-
-A producer must successfully send `open` shortly after connecting. Sessions are temporary and may be expired by the service at any time.
-
-If an opened producer disconnects, reconnect is best-effort and may be available only for a limited period. A reconnect uses the existing session credential, but clients must handle disconnects without assuming that reconnect will succeed. When the service expires a session, the session and its browser connections end.
+Give the public URL to the human. It is the way to inspect the resulting global state.
 
 ## Agent loop
 
-Pull browser events, update one or more HTML fragments, and push the replacements:
+Pull browser events, inspect them, then push an optional browser script:
 
 ```bash
 batch=$(npx letmeknow-cli pull ./preview --wait 30)
 token=$(printf '%s\n' "$batch" | jq -r .token)
-# inspect events and write fragments such as counter.html and status.html
-npx letmeknow-cli push ./preview --batch "$token" --updates updates.json
+npx letmeknow-cli push ./preview --batch "$token" --script update.js
 ```
 
 Commands:
 
 ```text
 serve <dir>
-show <dir>
 pull <dir> [--wait seconds]
-push <dir> --batch TOKEN [--updates FILE|-]
+push <dir> --batch TOKEN [--script FILE|-]
 ```
 
-`show` returns the current canonical page without changing the event stream:
+`--script FILE` reads a JavaScript snippet from a file. `--script -` reads it from standard input. A push without `--script` commits the pulled browser events without running UI code.
 
-```bash
-npx letmeknow-cli show ./preview > current.html
+## Browser scripts
+
+Scripts are trusted, agent-authored JavaScript. They execute directly in connected browsers, in the order committed. Use the normal browser DOM and platform APIs:
+
+```js
+const list = document.querySelector("#items");
+list.insertAdjacentHTML(
+  "beforeend",
+  '<li id="item-42"><input name="label" value="New item"></li>'
+);
 ```
 
-The public URL is the visual preview. `show` returns canonical HTML, not a browser's local focus, open disclosures, unsent input, scroll position, or JavaScript state.
+This exposes the underlying browser capability: scripts can insert, remove, move, replace, and modify any DOM content, as well as use browser APIs. Unaffected DOM nodes retain their browser-owned state.
 
-## Push updates
+The initial `index.html` is the base for the session. New or reloaded browsers load that base and replay committed `run_ui` scripts in order. Keep committed scripts generally synchronous and replayable. A script that uses randomness, current time, network requests, or external side effects can produce different results or run its side effects again when a browser reloads.
 
-A push accepts one JSON document:
+A failed script reports an error but does not stop later scripts. A later script may repair the page. Reloading replays the committed sequence, including the failed script, so later corrective scripts should remain safe to run after it.
 
-```json
-{
-  "updates": [
-    {"target": "counter", "file": "counter.html"},
-    {"target": "status", "html": "<output id=\"status\">Saved</output>"}
-  ]
-}
-```
+There is no `show` command. Use the public URL to inspect global state. The CLI serves the base document and the script event log; it does not attempt to materialize the live browser DOM.
 
-Each update must contain exactly one of `html` or `file`. A file supplies the replacement HTML. The normal operation is direct replacement of one element identified by its unique stable `id`:
+## Event stream and atomic pushes
 
-```html
-<output id="counter">41</output>
-```
-
-```json
-{"updates":[{"target":"counter","html":"<output id=\"counter\">42</output>"}]}
-```
-
-The replacement must contain exactly one element, and that element must have the same ID as the target. Replacement HTML cannot contain scripts. The target must exist when the replacement is applied.
-
-Use small output regions for ordinary updates. The replacement is destructive inside its target but leaves the rest of the page alone, so a counter update does not disturb a form or button elsewhere.
-
-The document root is just another target. To intentionally replace all dynamic content, target the root:
-
-```html
-<main id="letmeknow-root">
-  ...
-</main>
-```
-
-```json
-{"updates":[{"target":"letmeknow-root","file":"root.html"}]}
-```
-
-Replacing the root intentionally discards browser-local state inside it. Use it when that is acceptable, not for every small change.
-
-A single push may contain many replacements. They are applied in the order listed. Later replacements may target elements introduced by earlier replacements in the same push, so introduce a target before updating it. Conversely, a replacement that removes a later target makes a following update invalid. The CLI validates the complete ordered batch before committing anything.
-
-Each replacement becomes its own `update_ui` event with its own global event number. The complete push is still atomic: either all replacements and the pulled browser-event batch commit, or none do. Connected browsers receive committed replacements in order.
-
-A push without `--updates` commits the pulled browser events without changing the page:
-
-```bash
-npx letmeknow-cli push ./preview --batch "$token"
-```
-
-There is no separate acknowledgement command and no `--page` mode. Replacing `letmeknow-root` provides the broad page-update case.
-
-## Event stream and page causality
-
-Browser submissions and CLI page replacements share one ordered, in-memory event stream:
+Browser submissions and UI scripts share one ordered, in-memory event stream:
 
 ```text
 submit       browser
 submit       browser
-update_ui    CLI: replace #counter
-update_ui    CLI: replace #status
+run_ui       CLI: execute update.js
+run_ui       CLI: execute repair.js
 ```
 
-The CLI assigns event numbers in acceptance order. They do not claim to be the physical order in which people clicked. Browser submissions are delivered to the agent through `pull`; raw submissions are not broadcast to other browsers. Page replacements are broadcast to all connected browsers.
+The CLI assigns event numbers in acceptance order. They do not claim to be the physical order in which people clicked or browsers executed code. Browser submissions are delivered to the agent through `pull`; raw submissions are not broadcast to other browsers. UI scripts are broadcast to connected browsers and replayed by later browsers.
 
-`pull` returns an opaque batch token, current-page metadata, and browser events not yet committed by the agent. Pulling does not consume events. Events arriving while the agent works remain for a later pull.
+`pull` returns an opaque batch token, current-page metadata, and browser events not yet committed by the agent. Pulling does not consume events. Events arriving while the agent works remain for a later pull:
 
 ```json
 {
@@ -157,9 +118,9 @@ The CLI assigns event numbers in acceptance order. They do not claim to be the p
 }
 ```
 
-`page_event` is the page-update event number displayed when the browser submitted. Compare each event's `page_event` with the batch's current page before applying old input to the current HTML. `frontier` is the latest global event number, including events that are not browser submissions.
+`page_event` is the last committed UI-script event displayed when the browser submitted. Compare it with the batch's current page before applying old input to the current global state. `frontier` is the latest global event number, including submissions and UI scripts.
 
-The token identifies exactly the browser-event frontier the agent saw. A successful push commits that frontier and its ordered replacements together. Browser events accepted after the pull remain for the next batch.
+A successful push commits the exact pulled browser-event frontier and its optional script together, or commits neither. The script becomes one `run_ui` event and receives one global event number. Browser events accepted after the pull remain for the next batch. Repeating a push with the same token and script is idempotent; changing the script for an already committed token is rejected.
 
 ## Forms
 
@@ -175,32 +136,32 @@ Use ordinary same-origin forms with stable IDs and meaningful field names:
 
 The runtime converts native form submission into a JSON `submit` event. It assigns an opaque UUID, stores each event in a durable browser outbox before delivery, retries after connection failures, and reuses the UUID on retry. The CLI deduplicates repeated delivery of the same event. Distinct intentional submissions remain distinct, including rapid repeated clicks. File uploads are not supported.
 
-Treat pulled values as untrusted input. Validate them and escape them before putting them into HTML.
+Form values are untrusted input. Validate them and escape them before putting them into HTML or scripts.
 
-## Browser and HTML rules
+## Static assets and reconnects
 
-Normal updates are direct replacements, not DOM morphs. Stable IDs are therefore important for naming update boundaries, not for preserving DOM nodes.
+CSS, JavaScript, images, and other non-`index.html` files are served live. Finish writing an asset before relying on it from a script, write files atomically, and use versioned filenames or cache-busting URLs when a changed asset must be fetched.
 
-- The CLI owns content inside replacement targets.
-- The browser owns local focus, open/closed disclosure state, and hide/show behavior outside deliberately replaced targets.
-- A root replacement can destroy all local state inside the root.
-- Load agent-authored JavaScript from the initial page as a static asset.
-- Use delegated event listeners because replaced elements are new DOM nodes.
-- Scripts in update fragments are not executed.
-- Do not have browser JavaScript and pushed HTML independently own the same state.
+The public URL is a bearer capability. If the producer disconnects, browsers show a disconnected state and may reconnect; reconnect is best-effort. Sessions are temporary and may be expired by the service. Do not make application correctness depend on reconnect succeeding.
 
-When a session ends, the browser shows a permanent closed status and discards unsent submissions rather than retrying them.
-
-## Static assets
-
-CSS, JavaScript, images, and other non-`index.html` files are served live. Finish writing an asset before pushing HTML that references it. Write assets atomically, and use versioned filenames or cache-busting URLs when the browser must fetch a changed asset with the page update.
-
-This design intentionally does not provide atomic publication of the whole directory. The dynamic page changes through ordered replacements; other files can change as soon as they are written.
+When the producer intentionally closes the session, the browser receives a terminal close notification, stops reconnecting, and discards unsent submissions. Service expiry and ordinary network loss are disconnects, not application-script events.
 
 ## Security
 
-The URL is a bearer capability. Anyone who has it can view the page and submit forms. Keep secrets and unrelated files outside the served directory. Browser values are untrusted input; escape them before placing them in HTML.
+Scripts are trusted agent-authored code and execute in every connected browser. Do not put secrets in scripts or in the served directory. Anyone with the public URL can view the page and submit forms.
 
 ## Stop
 
 Send `SIGINT` or `SIGTERM` to `serve`. The temporary session ends when the process stops.
+
+## Development
+
+```bash
+npm install
+npm test
+npm run test:browser
+npm run dev
+npm run deploy
+```
+
+The browser test requires Firefox and geckodriver. `npm run dev` and `npm run deploy` operate the Cloudflare relay.
