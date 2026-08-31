@@ -254,7 +254,6 @@ export class Session extends DurableObject<Env> {
     const route = request.headers.get("x-letmeknow-route");
     if (route === "producer") return this.mutate(() => this.acceptProducer(request));
     if (route === "workspace") return this.uploadWorkspace(request);
-    if (route === "attachments") return this.attachmentRequest(request);
     if (route === "client") return this.mutate(() => this.acceptClient(request));
     if (route === "browser") return this.browserRequest(request);
     return error("not found", 404);
