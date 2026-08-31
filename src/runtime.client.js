@@ -8,10 +8,13 @@ import { Idiomorph } from "/_letmeknow/idiomorph.js";
   let terminal = false;
   let producerKnown = false;
   let producerConnected = false;
-  let pageEvent = readPageEvent(document) ?? 0;
+  const initialPageEvent = readPageEvent(document);
+  let dynamicPage = initialPageEvent !== null;
+  let pageEvent = initialPageEvent ?? 0;
   let resyncPromise;
   let resyncing = false;
   const bufferedUpdates = [];
+  const dirtyControlIds = new Set();
   const submissionForms = new Map();
   const OUTBOX_RETRY_MS = 1000;
   let outboxDatabasePromise;
@@ -173,15 +176,55 @@ import { Idiomorph } from "/_letmeknow/idiomorph.js";
     return node?.nodeType === 1 ? node.localName : "";
   }
 
-  function runtimeScript(node) {
-    return nodeName(node) === "script" && node.hasAttribute("data-letmeknow-runtime");
+  function script(node) {
+    return nodeName(node) === "script";
+  }
+
+  function dirtyControlState() {
+    const state = new Map();
+    for (const id of dirtyControlIds) {
+      const control = document.getElementById(id);
+      if (control instanceof HTMLInputElement && control.type !== "file") {
+        state.set(id, control.type === "checkbox" || control.type === "radio" ? { checked: control.checked } : { value: control.value });
+      } else if (control instanceof HTMLTextAreaElement) state.set(id, { value: control.value });
+      else if (control instanceof HTMLSelectElement) state.set(id, { selected: Array.from(control.selectedOptions, option => option.value) });
+    }
+    return state;
+  }
+
+  function restoreDirtyControls(state) {
+    for (const [id, saved] of state) {
+      const control = document.getElementById(id);
+      if (control instanceof HTMLInputElement && "checked" in saved) control.checked = saved.checked;
+      else if ((control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) && "value" in saved && control.value !== saved.value) control.value = saved.value;
+      else if (control instanceof HTMLSelectElement && "selected" in saved) {
+        const selected = new Set(saved.selected);
+        for (const option of control.options) option.selected = selected.has(option.value);
+      }
+    }
+  }
+
+  function localElementState() {
+    const state = new Map();
+    for (const details of document.querySelectorAll("details[id]")) state.set(details.id, { open: details.open });
+    for (const element of document.querySelectorAll("[data-letmeknow-local][id]")) state.set(element.id, { ...state.get(element.id), hidden: element.hidden });
+    return state;
+  }
+
+  function restoreLocalElements(state) {
+    for (const [id, saved] of state) {
+      const element = document.getElementById(id);
+      if (!element) continue;
+      if (element instanceof HTMLDetailsElement && "open" in saved) element.open = saved.open;
+      if (element.hasAttribute("data-letmeknow-local") && "hidden" in saved) element.hidden = saved.hidden;
+    }
   }
 
   const morphOptions = {
     ignoreActiveValue: true,
     head: {
       style: "merge",
-      shouldPreserve: runtimeScript
+      shouldPreserve: script
     },
     callbacks: {
       beforeNodeAdded(node) {
@@ -191,7 +234,7 @@ import { Idiomorph } from "/_letmeknow/idiomorph.js";
         return nodeName(oldNode) !== "script" && nodeName(newNode) !== "script";
       },
       beforeNodeRemoved(node) {
-        return !runtimeScript(node);
+        return !script(node);
       }
     }
   };
@@ -200,10 +243,18 @@ import { Idiomorph } from "/_letmeknow/idiomorph.js";
     const parsed = new DOMParser().parseFromString(html, "text/html");
     parsed.doctype?.remove();
     for (const script of parsed.querySelectorAll("script")) script.remove();
+    const controlState = dirtyControlState();
+    const elementState = localElementState();
+    const x = scrollX;
+    const y = scrollY;
     Idiomorph.morph(document.documentElement, parsed.documentElement, morphOptions);
+    restoreDirtyControls(controlState);
+    restoreLocalElements(elementState);
+    scrollTo(x, y);
   }
 
   function setPageEvent(value) {
+    dynamicPage = true;
     pageEvent = value;
     document.querySelector("script[data-letmeknow-runtime]")?.setAttribute("data-letmeknow-page-event", String(value));
   }
@@ -219,7 +270,7 @@ import { Idiomorph } from "/_letmeknow/idiomorph.js";
   }
 
   function receiveUpdate(update) {
-    if (!Number.isSafeInteger(update.event_number) || update.event_number <= pageEvent || typeof update.html !== "string") return;
+    if (!dynamicPage || !Number.isSafeInteger(update.event_number) || update.event_number <= pageEvent || typeof update.html !== "string") return;
     if (resyncing) bufferedUpdates.push(update);
     else applyUpdate(update);
   }
@@ -324,7 +375,7 @@ import { Idiomorph } from "/_letmeknow/idiomorph.js";
   }
 
   async function submit(form, submitter) {
-    if (!form.noValidate && !form.checkValidity()) {
+    if (!form.noValidate && !submitter?.formNoValidate && !form.checkValidity()) {
       form.reportValidity();
       return;
     }
@@ -362,6 +413,20 @@ import { Idiomorph } from "/_letmeknow/idiomorph.js";
     }
   }
 
+  document.addEventListener("input", event => {
+    if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) {
+      if (event.target.id) dirtyControlIds.add(event.target.id);
+    }
+  });
+  document.addEventListener("change", event => {
+    if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) {
+      if (event.target.id) dirtyControlIds.add(event.target.id);
+    }
+  });
+  document.addEventListener("reset", event => {
+    if (!(event.target instanceof HTMLFormElement)) return;
+    for (const control of event.target.elements) if (control.id) dirtyControlIds.delete(control.id);
+  });
   document.addEventListener("submit", (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;

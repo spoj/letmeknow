@@ -18,7 +18,7 @@ npx letmeknow-cli serve ./preview
 `serve` reads `index.html` once as the canonical dynamic document and serves it at `/`. It serves the other files in the directory live as static assets. The first stdout JSON line contains the public bearer URL:
 
 ```json
-{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/"}
+{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","page_event":0,"page_hash":"…"}
 ```
 
 Give the URL to the human. Anyone with the URL can view the page and submit its forms. The CLI connects outbound and opens no network port. Canonical page state and events are temporary in-memory session state; they end when `serve` stops. `serve` never modifies agent files.
@@ -95,7 +95,7 @@ Every page push supplies the complete desired dynamic document. The browser uses
 
 Give elements stable unique IDs. Keep agent-authored JavaScript in static assets and use delegated event listeners. Scripts in a pushed HTML document are not executed as live-update commands.
 
-The CLI owns page content. The browser owns local attention state such as focus, scrolling, `hidden`, and open/closed controls. Prefer native HTML such as `<details>` for local hide/show. Do not have browser JavaScript and pushed HTML independently mutate the same region without an explicit ownership rule; a later morph may replace browser-created state.
+The CLI owns page content. The browser preserves focus, scrolling, dirty controls with stable IDs, and the open state of `<details id="…">`. Mark an element with a stable ID and `data-letmeknow-local` when its `hidden` state is browser-owned. Do not have browser JavaScript and pushed HTML otherwise mutate the same state; a later morph may replace browser-created changes.
 
 Page updates are shared with all connected browsers. There is no dynamic view or per-browser update system. Use ordinary static links and files when the application needs more persistent pages.
 

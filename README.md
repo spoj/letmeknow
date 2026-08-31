@@ -13,7 +13,7 @@ npx letmeknow-cli serve ./preview
 `serve` reads `index.html` once as the canonical dynamic page and serves it at `/`. Other files in the directory—such as CSS, JavaScript, images, and data—are served live as static assets. The CLI prints one JSON line containing the public bearer URL:
 
 ```json
-{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/"}
+{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","page_event":0,"page_hash":"…"}
 ```
 
 Give the URL to the human. Anyone with the URL can view the page and submit its forms. Canonical page state and the event stream live in memory while `serve` runs; they do not survive a stopped session. The CLI connects outbound and does not listen on a network port.
@@ -107,7 +107,7 @@ Give elements stable unique IDs. They help the morphing runtime retain unchanged
 
 Keep the LetMeKnow runtime outside the agent-controlled content where possible. Agent-authored JavaScript should be loaded as a static asset and use delegated event listeners. Scripts in an incoming page update are not executed as live-update commands.
 
-The CLI owns the rendered page content. The browser owns local attention state such as focus, scrolling, `hidden`, and open/closed disclosure controls. Prefer native HTML such as `<details>` for local hide/show behavior. Avoid having browser JavaScript and incoming HTML independently mutate the same region unless their ownership is explicit; otherwise a later morph may replace browser-created state.
+The CLI owns rendered page content. The browser preserves focus, scrolling, dirty controls with stable IDs, and the open state of `<details id="…">`. Mark an element with a stable ID and `data-letmeknow-local` when its `hidden` state is browser-owned. Avoid having browser JavaScript and pushed HTML otherwise mutate the same state; a later morph may replace browser-created changes.
 
 A page update is shared with all browsers. Keep private or browser-specific behavior local unless a future requirement introduces targeted updates.
 

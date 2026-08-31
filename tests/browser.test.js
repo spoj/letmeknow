@@ -71,12 +71,15 @@ const initialPage = documentPage(10, "Initial", `
     <output id="counter">0</output>
     <form id="review" action="/review" method="post">
       <label>Message <textarea id="message" name="message"></textarea></label>
+      <label>Other <input id="other" name="other"></label>
       <label><input id="tag-one" type="checkbox" name="tag" value="one"> One</label>
       <label><input id="tag-two" type="checkbox" name="tag" value="two"> Two</label>
       <button id="submit" name="decision" value="approve">Approve</button>
       <input id="file" type="file" name="attachment">
       <output id="status" data-letmeknow-status role="status"></output>
     </form>
+    <details id="more"><summary>More</summary><p>Details</p></details>
+    <section id="local-panel" data-letmeknow-local hidden>Local</section>
   </main>
   <script id="agent-script">window.agentScriptRuns = (window.agentScriptRuns || 0) + 1;</script>
 `);
@@ -87,12 +90,15 @@ const updatedPage = documentPage(20, "Updated", `
     <output id="counter">1</output>
     <form id="review" action="/review" method="post">
       <label>Message <textarea id="message" name="message"></textarea></label>
+      <label>Other <input id="other" name="other"></label>
       <label><input id="tag-one" type="checkbox" name="tag" value="one"> One</label>
       <label><input id="tag-two" type="checkbox" name="tag" value="two"> Two</label>
       <button id="submit" name="decision" value="approve">Approve</button>
       <input id="file" type="file" name="attachment">
       <output id="status" data-letmeknow-status role="status"></output>
     </form>
+    <details id="more"><summary>More</summary><p>Updated details</p></details>
+    <section id="local-panel" data-letmeknow-local hidden>Updated local</section>
   </main>
   <script id="agent-script">window.agentScriptRuns = (window.agentScriptRuns || 0) + 100;</script>
   <script>window.liveScriptRuns = (window.liveScriptRuns || 0) + 1;</script>
@@ -224,21 +230,25 @@ describe("browser runtime", () => {
       }`);
       assert.deepEqual(initialState, { title: "Initial", heading: "Initial", pageEvent: "10", agentScriptRuns: 1, runtimeScripts: 1 });
 
-      await execute("document.querySelector('#message').value = 'draft'; document.querySelector('#tag-one').checked = true; document.querySelector('#tag-two').checked = true; document.querySelector('#message').focus();");
+      await execute("document.querySelector('#message').value = 'draft'; document.querySelector('#other').value = 'other draft'; document.querySelector('#other').dispatchEvent(new Event('input', { bubbles: true })); document.querySelector('#tag-one').checked = true; document.querySelector('#tag-two').checked = true; document.querySelector('#more').open = true; document.querySelector('#local-panel').hidden = false; document.querySelector('#message').focus();");
       sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 20, html: updatedPage }));
       await waitFor(async () => (await execute("return document.title")) === "Updated", "full-page update was not applied");
       const updatedState = await execute(`return {
         heading: document.querySelector('#heading').textContent,
         counter: document.querySelector('#counter').textContent,
         draft: document.querySelector('#message').value,
+        otherDraft: document.querySelector('#other').value,
         one: document.querySelector('#tag-one').checked,
         two: document.querySelector('#tag-two').checked,
         agentScriptRuns: window.agentScriptRuns,
         liveScriptRuns: window.liveScriptRuns || 0,
         listeners: document.querySelectorAll('script[data-letmeknow-runtime]').length,
+        agentScripts: document.querySelectorAll('#agent-script').length,
+        detailsOpen: document.querySelector('#more').open,
+        localHidden: document.querySelector('#local-panel').hidden,
         pageEvent: document.querySelector('script[data-letmeknow-runtime]').dataset.letmeknowPageEvent
       }`);
-      assert.deepEqual(updatedState, { heading: "Updated", counter: "1", draft: "draft", one: false, two: false, agentScriptRuns: 1, liveScriptRuns: 0, listeners: 1, pageEvent: "20" });
+      assert.deepEqual(updatedState, { heading: "Updated", counter: "1", draft: "draft", otherDraft: "other draft", one: false, two: false, agentScriptRuns: 1, liveScriptRuns: 0, listeners: 1, agentScripts: 1, detailsOpen: true, localHidden: false, pageEvent: "20" });
 
       sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 19, html: documentPage(19, "Old", "<main id=\"letmeknow-root\"><h1 id=\"heading\">Old</h1></main>") }));
       await sleep(100);
