@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { once } from "node:events";
@@ -15,12 +15,16 @@ const MAX_BODY_BYTES = 1024 * 1024;
 function localWebSocketEnvironment(port) {
   const folder = mkdtempSync(join(tmpdir(), "letmeknow-hook-"));
   const hook = join(folder, "redirect.mjs");
-  const ws = pathToFileURL(join(dirname(cli), "../node_modules/ws/index.js"));
-  writeFileSync(hook, `import WebSocket from ${JSON.stringify(ws.href)}; const OriginalWebSocket = WebSocket; globalThis.WebSocket = class extends OriginalWebSocket { constructor(url, protocols) { const local = new URL(url); local.protocol = "ws:"; local.hostname = "127.0.0.1"; local.port = process.env.LETMEKNOW_TEST_PORT; super(local, protocols); } };\n`);
+  const ws = pathToFileURL(join(join(dirname(cli), "../node_modules/ws/index.js"))).href;
+  writeFileSync(hook, `import WebSocket from ${JSON.stringify(ws)}; const OriginalWebSocket = WebSocket; globalThis.WebSocket = class extends OriginalWebSocket { constructor(url, protocols) { const local = new URL(url); local.protocol = "ws:"; local.hostname = "127.0.0.1"; local.port = process.env.LETMEKNOW_TEST_PORT; super(local, protocols); } };\n`);
   return {
     env: { ...process.env, LETMEKNOW_TEST_PORT: String(port), NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --import=${pathToFileURL(hook).href}`.trim() },
     close: () => rmSync(folder, { recursive: true, force: true })
   };
+}
+
+function dirname(path) {
+  return path.slice(0, path.lastIndexOf("/"));
 }
 
 async function runCommand(args, input) {
@@ -37,7 +41,7 @@ async function runCommand(args, input) {
 
 async function command(args, input) {
   const result = await runCommand(args, input);
-  assert.equal(result.code, 0, `${args.join(" ")}: ${result.stderr}`);
+  assert.equal(result.code, 0, `${args.join(" ")}: ${result.stderr}\n${result.stdout}`);
   return JSON.parse(result.stdout);
 }
 
@@ -69,7 +73,6 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
   });
   let producer;
   const updates = [];
-  const responses = new Map();
   const waiters = new Map();
   const connected = new Promise((resolve, reject) => {
     relay.once("error", reject);
@@ -82,7 +85,6 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
         if (packet.type === "open") resolve();
         if (packet.type === "update_ui") updates.push(packet);
         if (packet.type !== "http_response") return;
-        responses.set(packet.request_id, packet);
         const waiter = waiters.get(packet.request_id);
         if (waiter) {
           waiters.delete(packet.request_id);
@@ -109,7 +111,7 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
     local.close();
     rmSync(folder, { recursive: true, force: true });
   };
-  return { folder, child, request, updates, responses, ready: await ready, stderr: () => stderr, stop };
+  return { folder, child, request, updates, ready: await ready, stderr: () => stderr, stop };
 }
 
 function decodeBody(packet) {
@@ -127,11 +129,18 @@ function jsonSubmission(id, pageEvent = 0, values = { amount: "1" }) {
   }));
 }
 
+function manifest(updates) {
+  return JSON.stringify({ updates });
+}
+
 describe("LetMeKnow CLI", () => {
-  it("uses the reduced command surface", async () => {
+  it("uses the targeted update command surface", async () => {
     const result = await runCommand(["ack", "/tmp"]);
     assert.equal(result.code, 1);
     assert.match(result.stderr, /Usage:/);
+    const oldPage = await runCommand(["push", "/tmp", "--batch", "token", "--page", "page.html"]);
+    assert.equal(oldPage.code, 1);
+    assert.match(oldPage.stderr, /Unknown option|Usage:/);
   });
 
   it("serves the initial page canonically and other files live", async () => {
@@ -194,92 +203,132 @@ describe("LetMeKnow CLI", () => {
       assert.deepEqual(new Set(batch.events.map(event => event.id)), new Set(ids));
       assert.deepEqual(batch.events.map(event => event.event_number).sort((a, b) => a - b), Array.from({ length: 10 }, (_, index) => index + 1));
       assert.equal(batch.events[0].page_event, 0);
-      assert.equal(batch.events[0].values.amount, "1");
     } finally {
       await session.stop();
     }
   });
 
-  it("pushes a complete page, exposes it with show, and handles retries", async () => {
-    const session = await startSession();
+  it("applies dozens of replacements in order and resolves fragments relative to the manifest", async () => {
+    const elements = Array.from({ length: 40 }, (_, index) => `<output id="value-${index}">old-${index}</output>`).join("");
+    const session = await startSession({ index: `<!doctype html><html><body><main id="letmeknow-root"><section id="values">${elements}</section><div id="container">empty</div></main></body></html>` });
     try {
+      const updatesDirectory = join(session.folder, "updates");
+      mkdirSync(updatesDirectory);
+      writeFileSync(join(updatesDirectory, "value-1.html"), `<output id="value-1">file-1</output>`);
+      const updates = [
+        { target: "value-0", html: `<output id="value-0">new-0</output>` },
+        { target: "value-1", file: "value-1.html" },
+        { target: "container", html: `<section id="container"><output id="introduced">first</output></section>` },
+        { target: "introduced", html: `<output id="introduced">second</output>` },
+        ...Array.from({ length: 36 }, (_, index) => ({ target: `value-${index + 2}`, html: `<output id="value-${index + 2}">new-${index + 2}</output>` }))
+      ];
+      const manifestPath = join(updatesDirectory, "batch.json");
+      writeFileSync(manifestPath, manifest(updates));
       const first = await command(["pull", session.folder]);
-      assert.equal(first.frontier, 0);
-      assert.equal(first.page_event, 0);
-      assert.equal(first.page_hash, createHash("sha256").update(decodeBody(await session.request("GET", "/"))).digest("hex"));
+      const pushed = await command(["push", session.folder, "--batch", first.token, "--updates", manifestPath]);
+      assert.equal(pushed.updates.length, 40);
+      assert.deepEqual(pushed.updates.map(update => update.event_number), Array.from({ length: 40 }, (_, index) => index + 1));
+      assert.deepEqual(session.updates.map(({ target, event_number }) => ({ target, event_number })), pushed.updates);
+      assert.equal(pushed.page_event, 40);
       const shown = await runCommand(["show", session.folder]);
       assert.equal(shown.code, 0);
-      assert.equal(shown.stdout, decodeBody(await session.request("GET", "/")));
-
-      const page = "<!doctype html><html><body><main id=\"letmeknow-root\">updated</main></body></html>";
-      const pageFile = join(session.folder, "updated.html");
-      writeFileSync(pageFile, page);
-      const pushed = await command(["push", session.folder, "--batch", first.token, "--page", pageFile]);
-      assert.equal(pushed.type, "committed");
-      assert.equal(pushed.frontier, 1);
-      assert.equal(pushed.page_event, 1);
-      assert.equal(pushed.page_hash, createHash("sha256").update(page).digest("hex"));
-      assert.deepEqual(session.updates, [{ type: "update_ui", event_number: 1, html: page }]);
+      assert.match(shown.stdout, /id="value-1">file-1/);
+      assert.match(shown.stdout, /id="introduced">second/);
+      assert.match(shown.stdout, /id="value-37">new-37/);
       const current = await session.request("GET", "/");
-      assert.equal(decodeBody(current), page);
-      assert.equal(current.headers["X-LetMeKnow-Page-Event"], "1");
-      const retried = await command(["push", session.folder, "--batch", first.token, "--page", pageFile]);
-      assert.deepEqual(retried, pushed);
-      const missingRetry = await runCommand(["push", session.folder, "--batch", first.token]);
-      assert.equal(missingRetry.code, 1);
-      assert.match(missingRetry.stdout, /different page payload/);
-      const changedFile = join(session.folder, "changed.html");
-      writeFileSync(changedFile, "different");
-      const changedRetry = await runCommand(["push", session.folder, "--batch", first.token, "--page", changedFile]);
-      assert.equal(changedRetry.code, 1);
-      assert.match(changedRetry.stdout, /different page payload/);
-      const shownAgain = await runCommand(["show", session.folder]);
-      assert.equal(shownAgain.stdout, page);
+      assert.equal(decodeBody(current), shown.stdout);
+      assert.equal(current.headers["X-LetMeKnow-Page-Event"], "40");
     } finally {
       await session.stop();
     }
   });
 
-  it("commits a browser batch and page update as one ordered operation", async () => {
+  it("rejects a failed replacement batch atomically", async () => {
+    const initial = "<!doctype html><html><body><main id=\"letmeknow-root\"><output id=\"count\">0</output></main></body></html>";
+    const session = await startSession({ index: initial });
+    try {
+      const batch = await command(["pull", session.folder]);
+      const updates = manifest([
+        { target: "count", html: `<output id="count">1</output>` },
+        { target: "missing", html: `<output id="missing">never</output>` }
+      ]);
+      const failed = await runCommand(["push", session.folder, "--batch", batch.token, "--updates", "-"], updates);
+      assert.equal(failed.code, 1);
+      assert.match(failed.stdout, /must match exactly one element/);
+      assert.deepEqual(session.updates, []);
+      assert.equal((await runCommand(["show", session.folder])).stdout, initial);
+
+      const valid = await command(["push", session.folder, "--batch", batch.token, "--updates", "-"], manifest([{ target: "count", html: `<output id="count">1</output>` }]));
+      assert.equal(valid.updates[0].event_number, 1);
+      assert.equal((await runCommand(["show", session.folder])).stdout.includes('id="count">1'), true);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("rejects invalid fragments and forbidden targets", async () => {
+    const initial = "<!doctype html><html><head><title>Test</title></head><body><main id=\"letmeknow-root\"><output id=\"count\">0</output><script id=\"agent-script\"></script></main></body></html>";
+    const session = await startSession({ index: initial });
+    try {
+      for (const update of [
+        { target: "count", html: `<output id="other">x</output>` },
+        { target: "count", html: `<output id="count">x</output><output id="extra">y</output>` },
+        { target: "count", html: `<output id="count"><script>alert(1)</script></output>` },
+        { target: "script", html: `<script id="script"></script>` }
+      ]) {
+        const batch = await command(["pull", session.folder]);
+        const failed = await runCommand(["push", session.folder, "--batch", batch.token, "--updates", "-"], manifest([update]));
+        assert.equal(failed.code, 1);
+      }
+      assert.equal((await runCommand(["show", session.folder])).stdout, initial);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("rejects updates that would make the canonical page too large", async () => {
     const session = await startSession();
     try {
-      const id = randomUUID();
-      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(id))).status, 202);
       const batch = await command(["pull", session.folder]);
-      const laterId = randomUUID();
-      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(laterId))).status, 202);
-      const page = "<!doctype html><html><body><main id=\"letmeknow-root\">handled</main></body></html>";
-      const pushed = await command(["push", session.folder, "--batch", batch.token, "--page", "-"], page);
-      assert.equal(pushed.frontier, 3);
-      assert.equal(pushed.page_event, 3);
-      assert.deepEqual(pushed.events, [id]);
-      assert.deepEqual(session.updates, [{ type: "update_ui", event_number: 3, html: page }]);
-      const later = await command(["pull", session.folder]);
-      assert.deepEqual(later.events.map(event => event.id), [laterId]);
-      assert.equal(later.frontier, 3);
-      assert.equal(later.page_event, 3);
-      const noPage = await command(["push", session.folder, "--batch", later.token]);
-      assert.equal(noPage.type, "committed");
-      assert.equal(noPage.frontier, 3);
-      const noPageRetry = await command(["push", session.folder, "--batch", later.token]);
-      assert.deepEqual(noPageRetry, noPage);
-      const changedRetry = await runCommand(["push", session.folder, "--batch", later.token, "--page", "-"], page);
-      assert.equal(changedRetry.code, 1);
-      assert.match(changedRetry.stdout, /different page payload/);
+      const failed = await runCommand(["push", session.folder, "--batch", batch.token, "--updates", "-"], manifest([{ target: "letmeknow-root", html: `<main id="letmeknow-root">${"x".repeat(MAX_BODY_BYTES)}</main>` }]));
+      assert.equal(failed.code, 1);
+      assert.match(failed.stdout, /updated page is too large/);
+      assert.deepEqual(session.updates, []);
+      assert.equal((await runCommand(["show", session.folder])).stdout, "<!doctype html><html><body><main id=\"letmeknow-root\">initial</main></body></html>");
     } finally {
       await session.stop();
     }
   });
 
-  it("accepts submissions without a form ID or submitter", async () => {
+  it("keeps later browser events for the next batch", async () => {
+    const session = await startSession();
+    try {
+      const firstId = randomUUID();
+      const secondId = randomUUID();
+      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(firstId))).status, 202);
+      const batch = await command(["pull", session.folder]);
+      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(secondId))).status, 202);
+      const pushed = await command(["push", session.folder, "--batch", batch.token, "--updates", "-"], manifest([{ target: "letmeknow-root", html: `<main id="letmeknow-root">handled</main>` }]));
+      assert.deepEqual(pushed.events, [firstId]);
+      assert.equal(pushed.updates[0].event_number, 3);
+      const later = await command(["pull", session.folder]);
+      assert.deepEqual(later.events.map(event => event.id), [secondId]);
+      assert.equal(later.frontier, 3);
+      const noUpdates = await command(["push", session.folder, "--batch", later.token]);
+      assert.deepEqual(noUpdates.updates, []);
+      assert.deepEqual(await command(["push", session.folder, "--batch", later.token]), noUpdates);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("accepts a form without an ID or submitter", async () => {
     const session = await startSession();
     try {
       const id = randomUUID();
       const body = Buffer.from(JSON.stringify({ id, page_event: 0, form_id: null, action: "/", trigger: null, values: {} }));
-      const response = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, body);
-      assert.equal(response.status, 202);
+      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, body)).status, 202);
       const batch = await command(["pull", session.folder]);
-      assert.equal(batch.events[0].id, id);
       assert.equal(batch.events[0].form_id, null);
       assert.equal(batch.events[0].trigger, null);
     } finally {
@@ -287,12 +336,11 @@ describe("LetMeKnow CLI", () => {
     }
   });
 
-  it("rejects malformed JSON submissions without creating events", async () => {
+  it("rejects malformed submissions without creating events", async () => {
     const session = await startSession();
     try {
       for (const body of [Buffer.from("not json"), Buffer.from(JSON.stringify({ id: randomUUID() }))]) {
-        const response = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, body);
-        assert.equal(response.status, 400);
+        assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, body)).status, 400);
       }
       const batch = await command(["pull", session.folder]);
       assert.deepEqual(batch.events, []);

@@ -24,13 +24,13 @@
     "@cloudflare/vitest-plugin": "^1.1.0",
     "@cloudflare/workers-types": "^5.20260825.1",
     "@types/node": "^22.15.17",
-    "idiomorph": "0.7.4",
     "typescript": "^5.9.2",
     "vitest": "^4.1.11",
     "wrangler": "^4.126.0",
     "ws": "^8.21.3"
   },
   "dependencies": {
-    "mrmime": "^2.0.1"
+    "mrmime": "^2.0.1",
+    "parse5": "^8.0.1"
   }
 }
