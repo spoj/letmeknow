@@ -13,7 +13,6 @@ import { lookup } from "mrmime";
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_SCRIPT_BYTES = MAX_BODY_BYTES;
 const MAX_PACKET_BYTES = 6 * MAX_SCRIPT_BYTES + 4096;
-const MAX_BATCH_TOKENS = 100_000;
 const MAX_UNIQUE_SUBMISSIONS = 100_000;
 const MAX_RETAINED_SUBMISSION_BYTES = 256 * 1024 * 1024;
 const CONTROL_MAX_BYTES = MAX_PACKET_BYTES;
@@ -189,10 +188,6 @@ function replayablePage(page, history) {
   return result;
 }
 
-function scriptHash(script) {
-  return createHash("sha256").update(JSON.stringify(script === undefined ? null : script)).digest("hex");
-}
-
 function validateScript(script) {
   if (script !== undefined && typeof script !== "string") throw new Error("script must be text");
   if (script !== undefined && Buffer.byteLength(script, "utf8") > MAX_SCRIPT_BYTES) throw new Error("script is too large");
@@ -272,7 +267,7 @@ function mutateQueue() {
 }
 
 function connectControl(root, packet) {
-  const timeout = Math.max(CONTROL_TIMEOUT, ((packet.wait_seconds || 0) + 5) * 1_000);
+  const timeout = CONTROL_TIMEOUT;
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(controlPath(root));
     let output = "";
@@ -317,11 +312,8 @@ async function start(directory) {
   const browserEvents = [];
   const browserEventBytes = [];
   let retainedSubmissionBytes = 0;
-  let committedBrowserCursor = 0;
+  let acknowledgedThrough = 0;
   const seenEvents = new Set();
-  const tokens = new Map();
-  const pendingTokens = new Map();
-  const pullWaiters = new Set();
   const mutate = mutateQueue();
   let controlServer;
   let send = () => false;
@@ -335,100 +327,65 @@ async function start(directory) {
   let stopped = false;
   let ready = false;
   let stopSession = () => {};
+  const streamBeforeReady = [];
 
-  const batch = () => {
-    const start = committedBrowserCursor;
-    const end = start + browserEvents.length;
-    const key = `${pageEvent}:${start}:${end}`;
-    let token = pendingTokens.get(key)?.token;
-    if (!token) {
-      if (tokens.size >= MAX_BATCH_TOKENS) {
-        stopSession();
-        throw new Error("session batch token limit exceeded");
-      }
-      token = randomUUID();
-      tokens.set(token, { start, end, page_event: pageEvent, status: "pending", key, script_hash: null });
-      pendingTokens.set(key, { token });
+  const writeStream = value => {
+    if (!ready) {
+      streamBeforeReady.push(value);
+      return;
     }
-    return { ok: true, type: "batch", token, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash(), events: browserEvents.slice() };
+    process.stdout.write(`${JSON.stringify(value)}\n`);
   };
 
-  const notifyPullWaiters = () => {
-    for (const waiter of [...pullWaiters]) {
-      if (browserEvents.length === 0) continue;
-      pullWaiters.delete(waiter);
-      clearTimeout(waiter.timer);
-      waiter.resolve(batch());
-    }
-  };
-
-  const pull = waitSeconds => {
-    if (browserEvents.length > 0 || waitSeconds <= 0) return Promise.resolve(batch());
-    return new Promise(resolve => {
-      const waiter = { resolve, timer: setTimeout(() => { pullWaiters.delete(waiter); resolve(batch()); }, waitSeconds * 1_000) };
-      pullWaiters.add(waiter);
-    });
-  };
-
-  const commit = async (token, requestedScript) => {
-    const record = tokens.get(token);
-    if (!record) return { ok: false, error: "unknown batch token" };
+  const commit = async (through, requestedScript) => {
     validateScript(requestedScript);
-    const requestedScriptHash = scriptHash(requestedScript);
-    if (record.status !== "pending") {
-      if (record.script_hash === requestedScriptHash) return record.result;
-      return { ok: false, error: "batch was already committed with a different script" };
-    }
-    if (record.page_event !== pageEvent || record.start !== committedBrowserCursor) {
-      record.script_hash = requestedScriptHash;
-      pendingTokens.delete(record.key);
-      record.status = "failed";
-      record.result = { ok: false, error: "batch is based on an old page or browser cursor", frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash() };
-      return record.result;
-    }
-    const committedCount = record.end - record.start;
+    if (!Number.isSafeInteger(through) || through < 0) return { ok: false, error: "through must be a non-negative safe integer" };
+    if (through > eventNumber) return { ok: false, error: "through is beyond the current event frontier" };
+    if (through < acknowledgedThrough) return { ok: false, error: "through is before the acknowledged submission frontier" };
+
+    let committedCount = 0;
+    while (committedCount < browserEvents.length && browserEvents[committedCount].event_number <= through) committedCount += 1;
     const committedEvents = browserEvents.slice(0, committedCount).map(event => event.id);
     let runEvent;
     let nextPage = page;
     if (requestedScript !== undefined) {
-      runEvent = { type: "run_ui", event_number: eventNumber + 1, script: requestedScript };
+      runEvent = { type: "run_ui", event_number: eventNumber + 1, considered_through: through, script: requestedScript };
       nextPage = replayablePage(basePage, [...history, runEvent]);
     }
+
     retainedSubmissionBytes -= browserEventBytes.slice(0, committedCount).reduce((total, bytes) => total + bytes, 0);
+    browserEvents.splice(0, committedCount);
+    browserEventBytes.splice(0, committedCount);
     if (runEvent) {
       eventNumber = runEvent.event_number;
       pageEvent = runEvent.event_number;
       history.push(runEvent);
     }
     page = nextPage;
-    browserEvents.splice(0, committedCount);
-    browserEventBytes.splice(0, committedCount);
-    committedBrowserCursor = record.end;
-    pendingTokens.delete(record.key);
-    record.status = "committed";
-    record.script_hash = requestedScriptHash;
-    record.result = {
+    acknowledgedThrough = through;
+    const result = {
       ok: true,
       type: "committed",
-      token,
+      through,
+      considered_through: through,
       frontier: eventNumber,
       page_event: pageEvent,
       page_hash: currentPageHash(),
       events: committedEvents,
-      ...(runEvent ? { run_ui: { event_number: runEvent.event_number } } : {})
+      ...(runEvent ? { run_ui: { event_number: runEvent.event_number, considered_through: through } } : {})
     };
-    if (runEvent) send(runEvent);
-    return record.result;
+    if (runEvent) {
+      send(runEvent);
+      writeStream({ type: "run_ui", event_number: runEvent.event_number, considered_through: through, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash() });
+    }
+    return result;
   };
 
   const dispatchControl = async request => {
     if (!request || typeof request !== "object") return { ok: false, error: "invalid control request" };
-    if (request.type === "pull") return pull(Number.isFinite(request.wait_seconds) ? Math.max(0, request.wait_seconds) : 0);
-    if (request.type === "push") {
-      if (typeof request.token !== "string") return { ok: false, error: "batch token is required" };
-      return commit(request.token, request.script);
-    }
-    return { ok: false, error: "unknown control request" };
+    if (request.type !== "commit") return { ok: false, error: "unknown control request" };
+    if (!ready) return { ok: false, error: "serve is not ready" };
+    return commit(request.through, request.script);
   };
 
   const controlConnections = new Set();
@@ -451,7 +408,7 @@ async function start(directory) {
       let result;
       try {
         const request = JSON.parse(input.slice(0, newline));
-        result = request.type === "pull" ? await dispatchControl(request) : await mutate(() => dispatchControl(request));
+        result = await mutate(() => dispatchControl(request));
       } catch (cause) { result = { ok: false, error: cause instanceof Error ? cause.message : "control request failed" }; }
       connection.end(JSON.stringify(result) + "\n");
     });
@@ -479,7 +436,7 @@ async function start(directory) {
     const numbered = { ...event, event_number: eventNumber };
     browserEvents.push(numbered);
     browserEventBytes.push(bytes);
-    notifyPullWaiters();
+    writeStream(numbered);
   });
 
   const stop = async code => {
@@ -534,7 +491,12 @@ async function start(directory) {
       } else if (packet.type === "session") {
         if (!validSessionUrl(packet.url)) return void stop(1);
         sessionUrl = packet.url;
-        if (!ready) { ready = true; process.stdout.write(`${JSON.stringify({ type: "ready", url: sessionUrl, page_event: pageEvent, page_hash: currentPageHash() })}\n`); }
+        if (!ready) {
+          ready = true;
+          writeStream({ type: "ready", url: sessionUrl, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash() });
+          for (const value of streamBeforeReady) writeStream(value);
+          streamBeforeReady.length = 0;
+        }
       } else if (packet.type === "http_request") {
         const requestPage = page;
         void handleRequest(root, requestPage, packet, recordInteraction).then(result => send(result)).catch(() => send(errorResponse(packet, 500, "preview request failed")));
@@ -581,7 +543,7 @@ function validSessionUrl(value) {
 }
 
 function usage() {
-  return "Usage:\n  npx letmeknow-cli serve <directory>\n  npx letmeknow-cli pull <directory> [--wait <seconds>]\n  npx letmeknow-cli push <directory> --batch <token> [--script <file|->]\n";
+  return "Usage:\n  npx letmeknow-cli serve <directory>\n  npx letmeknow-cli commit <directory> --through <event-number> [--script <file|->]\n";
 }
 
 function commandArgs() {
@@ -592,8 +554,7 @@ function commandArgs() {
       options: {
         skill: { type: "boolean" },
         help: { type: "boolean", short: "h" },
-        wait: { type: "string" },
-        batch: { type: "string" },
+        through: { type: "string" },
         script: { type: "string" }
       },
       allowPositionals: true,
@@ -603,22 +564,21 @@ function commandArgs() {
     throw new Error(cause instanceof Error ? cause.message : "invalid arguments");
   }
   if (parsed.values.skill || parsed.values.help) {
-    if (parsed.positionals.length || parsed.values.wait !== undefined || parsed.values.batch !== undefined || parsed.values.script !== undefined) throw new Error(usage());
+    if (parsed.positionals.length || parsed.values.through !== undefined || parsed.values.script !== undefined) throw new Error(usage());
     return { command: parsed.values.skill ? "skill" : "help" };
   }
   const [command, directory, ...extra] = parsed.positionals;
   if (!command || !directory || extra.length) throw new Error(usage());
-  if (!["serve", "pull", "push"].includes(command)) throw new Error(usage());
-  if (command === "serve" && (parsed.values.wait !== undefined || parsed.values.batch !== undefined || parsed.values.script !== undefined)) throw new Error(usage());
-  if (command === "pull" && (parsed.values.batch !== undefined || parsed.values.script !== undefined)) throw new Error(usage());
-  if (command === "push" && parsed.values.wait !== undefined) throw new Error(usage());
-  let wait = 0;
-  if (parsed.values.wait !== undefined) {
-    wait = Number(parsed.values.wait);
-    if (!Number.isFinite(wait) || wait < 0) throw new Error("--wait must be a non-negative number");
+  if (!["serve", "commit"].includes(command)) throw new Error(usage());
+  if (command === "serve" && (parsed.values.through !== undefined || parsed.values.script !== undefined)) throw new Error(usage());
+  if (command === "commit" && typeof parsed.values.through !== "string") throw new Error("--through is required");
+  let through;
+  if (command === "commit") {
+    if (!/^\d+$/.test(parsed.values.through)) throw new Error("--through must be a non-negative safe integer");
+    through = Number(parsed.values.through);
+    if (!Number.isSafeInteger(through)) throw new Error("--through must be a non-negative safe integer");
   }
-  if (command === "push" && typeof parsed.values.batch !== "string") throw new Error("--batch is required");
-  return { command, directory, wait, token: parsed.values.batch, script: parsed.values.script };
+  return { command, directory, through, script: parsed.values.script };
 }
 
 
@@ -630,12 +590,8 @@ try {
   else if (command.command === "serve") await start(command.directory);
   else {
     const { root } = await options(command.directory);
-    let packet;
-    if (command.command === "pull") packet = { type: "pull", wait_seconds: command.wait };
-    else {
-      packet = { type: "push", token: command.token };
-      if (command.script !== undefined) packet.script = await readScriptInput(command.script);
-    }
+    const packet = { type: "commit", through: command.through };
+    if (command.script !== undefined) packet.script = await readScriptInput(command.script);
     const result = await connectControl(root, packet);
     process.stdout.write(`${JSON.stringify(result)}\n`);
     if (!result.ok) process.exitCode = 1;

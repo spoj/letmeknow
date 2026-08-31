@@ -15,11 +15,13 @@ Create a directory containing the public files and an initial `index.html`:
 npx letmeknow-cli serve ./preview
 ```
 
-`serve` reads `index.html` as the base document and serves it at `/`. Other files—such as CSS, JavaScript, images, and data—are served live from the directory. The first stdout JSON line contains the public URL and initial page metadata:
+Run `serve` in a monitored background process and consume its stdout as a newline-delimited JSON event stream. Its first line is ready metadata:
 
 ```json
-{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","page_event":0,"page_hash":"…"}
+{"type":"ready","url":"https://0123456789abcdef0123.letmeknow.dev/","frontier":0,"page_event":0,"page_hash":"…"}
 ```
+
+`frontier` is the latest authoritative global event number. `page_event` is the latest committed UI-script event, and `page_hash` identifies the replayable page at that point. Give the public URL to the human. It is the way to inspect the resulting global state.
 
 The base page should contain the application shell and any agent-authored static scripts:
 
@@ -40,27 +42,27 @@ The base page should contain the application shell and any agent-authored static
 </html>
 ```
 
-Give the public URL to the human. It is the way to inspect the resulting global state.
-
 ## Agent loop
 
-Pull browser events, inspect them, then push an optional browser script:
+Read each accepted submission from the monitored `serve` stdout. It already has its authoritative global event number:
+
+```json
+{"type":"submit","id":"…","event_number":7,"page_event":5,"form_id":"decision","action":"/decide","trigger":{"name":"decision","value":"approve"},"values":{"comment":"Looks good","decision":"approve"}}
+```
+
+After considering events through event 7, acknowledge that inclusive prefix and optionally run an update:
 
 ```bash
-batch=$(npx letmeknow-cli pull ./preview --wait 30)
-token=$(printf '%s\n' "$batch" | jq -r .token)
-npx letmeknow-cli push ./preview --batch "$token" --script update.js
+npx letmeknow-cli commit ./preview --through 7 --script update.js
 ```
 
-Commands:
+A script supplied with `--script FILE` is read from a file. `--script -` reads it from standard input. A commit without `--script` only acknowledges browser submissions. A proactive first update uses `--through 0`:
 
-```text
-serve <dir>
-pull <dir> [--wait seconds]
-push <dir> --batch TOKEN [--script FILE|-]
+```bash
+npx letmeknow-cli commit ./preview --through 0 --script initialize.js
 ```
 
-`--script FILE` reads a JavaScript snippet from a file. `--script -` reads it from standard input. A push without `--script` commits the pulled browser events without running UI code.
+There is no polling or recovery command. If the serve process or its stdout is lost, start a new session.
 
 ## Browser scripts
 
@@ -78,51 +80,35 @@ This exposes the underlying browser capability: scripts can insert, remove, move
 
 Scripts run in a fresh `Function` scope with `this` set to `window`. Put helpers and persistent state on `globalThis` or in the DOM; declarations do not persist between snippets. Execution is synchronous at the runtime boundary: promises and other asynchronous work are not awaited and may interleave with later scripts. Pages need a CSP that permits eval-like `Function` execution.
 
-Scripts are trusted page code and can interfere with the page or runtime, so avoid monkey-patching runtime infrastructure. The initial `index.html` is the base for the session. New or reloaded browsers load that base and replay committed `run_ui` scripts in order. A script that uses randomness, current time, network requests, or external side effects can produce different results or run its side effects again when a browser reloads.
+Scripts are trusted page code and can interfere with the page or runtime, so avoid monkey-patching runtime infrastructure. The initial `index.html` is the base document. New or reloaded browsers load that base and replay committed scripts in order. A script that uses randomness, current time, network requests, or external side effects can produce different results or run its side effects again when a browser reloads.
 
 A failed script reports an error but does not stop later scripts. A later script may repair the page. Reloading replays the committed sequence, including the failed script, so later corrective scripts should remain safe to run after it.
 
 Use the public URL to inspect global state. The CLI serves the base document and the script event log; it does not attempt to materialize the live browser DOM.
 
-## Event stream and atomic pushes
+## Event stream and concurrent commits
 
-Browser submissions and UI scripts share one ordered, in-memory event stream:
+Browser submissions and UI scripts share one authoritative, in-memory event stream:
 
 ```text
-submit       browser
-submit       browser
-run_ui       CLI: execute update.js
-run_ui       CLI: execute repair.js
+submit       browser, event 1
+submit       browser, event 2
+run_ui       CLI,     event 3, considered_through 2
+submit       browser, event 4
+run_ui       CLI,     event 5, considered_through 4
 ```
 
-The CLI assigns event numbers in acceptance order. They do not claim to be the physical order in which people clicked or browsers executed code. Browser submissions are delivered to the agent through `pull`; raw submissions are not broadcast to other browsers. UI scripts are broadcast to connected browsers and replayed by later browsers.
-
-`pull` returns an opaque batch token, current-page metadata, and browser events not yet committed by the agent. Pulling does not consume events. Events arriving while the agent works remain for a later pull:
+The CLI assigns event numbers in acceptance order. They do not claim to be the physical order in which people clicked or browsers executed code. Every accepted submission is printed once on the `serve` stream. UI scripts are sent to connected browsers and replayed by later browsers; the stream prints concise metadata for each committed UI script:
 
 ```json
-{
-  "token": "…",
-  "frontier": 7,
-  "page_event": 5,
-  "page_hash": "…",
-  "events": [
-    {
-      "type": "submit",
-      "id": "…",
-      "event_number": 7,
-      "page_event": 5,
-      "form_id": "decision",
-      "action": "/decide",
-      "trigger": {"name": "decision", "value": "approve"},
-      "values": {"comment": "Looks good", "decision": "approve"}
-    }
-  ]
-}
+{"type":"run_ui","event_number":3,"considered_through":2,"frontier":3,"page_event":3,"page_hash":"…"}
 ```
 
-`page_event` is the last committed UI-script event displayed when the browser submitted. Compare it with the batch's current page before applying old input to the current global state. `frontier` is the latest global event number, including submissions and UI scripts.
+`commit --through N` means that the agent considered every authoritative browser submission with a number less than or equal to N. N must be a non-negative safe integer, no greater than the current frontier, and no less than the last acknowledged submission frontier. UI events do not need to be included in this cursor, so the same N may be used for repeated no-script acknowledgements or repeated proactive scripts. Scripts are not content-deduplicated; every successful script commit creates a new UI event. A local command retry may therefore run the script again.
 
-A successful push commits the exact pulled browser-event frontier and its optional script together, or commits neither. The script becomes one `run_ui` event and receives one global event number. Browser events accepted after the pull remain for the next batch. Repeating a push with the same token and script is idempotent; changing the script for an already committed token is rejected.
+A successful commit removes only pending browser submissions with event numbers through N. New submissions arriving after N remain pending even if they arrive while the agent is preparing the commit. A script, if supplied, becomes the next global event and records `considered_through: N`; it is sent to browsers and included in replay history. A no-script commit only acknowledges the prefix. The page always applies scripts in commit order, even when a script's considered cursor is below the current UI event number.
+
+Commits are serialized with browser acceptance. The replayable page is built before any state is changed. If page size validation fails, the commit fails without acknowledging submissions, advancing the page, or consuming the declared frontier; retry it with the same N and a smaller script.
 
 ## Forms
 

@@ -84,17 +84,17 @@ const body = `
 `;
 
 const history = [
-  { event_number: 1, script: "window.historyRuns = (window.historyRuns || 0) + 1; document.querySelector('#heading').textContent = 'History';" }
+  { event_number: 1, considered_through: 0, script: "window.historyRuns = (window.historyRuns || 0) + 1; document.querySelector('#heading').textContent = 'History';" }
 ];
 const liveHistory = [
   ...history,
-  { event_number: 2, script: "document.querySelector('#items').insertAdjacentHTML('beforeend', '<li id=\"item-three\">Three</li>');" },
-  { event_number: 3, script: "document.querySelector('#items').prepend(document.querySelector('#item-two'));" },
-  { event_number: 4, script: "document.querySelector('#count').textContent = '42'; document.querySelector('#item-two').setAttribute('data-state', 'changed'); document.querySelector('#local-panel').hidden = false;" },
-  { event_number: 5, script: "document.querySelector('#item-three').remove();" },
-  { event_number: 6, script: "document.querySelector('#message').value = 'partial'; throw new Error('intentional update failure');" },
-  { event_number: 7, script: "document.querySelector('#heading').textContent = 'Corrected';" },
-  { event_number: 8, script: "if (location.search === '?replay-submit') { document.querySelector('#message').value = 'replayed'; document.querySelector('#review').requestSubmit(); }" }
+  { event_number: 2, considered_through: 1, script: "document.querySelector('#items').insertAdjacentHTML('beforeend', '<li id=\"item-three\">Three</li>');" },
+  { event_number: 3, considered_through: 2, script: "document.querySelector('#items').prepend(document.querySelector('#item-two'));" },
+  { event_number: 4, considered_through: 3, script: "document.querySelector('#count').textContent = '42'; document.querySelector('#item-two').setAttribute('data-state', 'changed'); document.querySelector('#local-panel').hidden = false;" },
+  { event_number: 5, considered_through: 4, script: "document.querySelector('#item-three').remove();" },
+  { event_number: 6, considered_through: 5, script: "document.querySelector('#message').value = 'partial'; throw new Error('intentional update failure');" },
+  { event_number: 7, considered_through: 6, script: "document.querySelector('#heading').textContent = 'Corrected';" },
+  { event_number: 8, considered_through: 7, script: "if (location.search === '?replay-submit') { document.querySelector('#message').value = 'replayed'; document.querySelector('#review').requestSubmit(); }" }
 ];
 
 const initialPage = documentPage(history, "Initial", body);
@@ -205,10 +205,10 @@ describe("browser runtime", () => {
       assert.equal(await execute("return location.pathname"), "/");
 
       await execute("window.originalItemOne = document.querySelector('#item-one'); document.querySelector('#message').value = 'focused draft'; document.querySelector('#tag').checked = true; document.querySelector('#more').open = true; document.querySelector('#message').focus();");
-      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 2, script: "document.querySelector('#items').insertAdjacentHTML('beforeend', '<li id=\"item-three\">Three</li>');" }));
-      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 3, script: "document.querySelector('#items').prepend(document.querySelector('#item-two'));" }));
-      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 4, script: "document.querySelector('#count').textContent = '42'; document.querySelector('#item-two').setAttribute('data-state', 'changed'); document.querySelector('#local-panel').hidden = false;" }));
-      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 5, script: "document.querySelector('#item-three').remove();" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 2, considered_through: 1, script: "document.querySelector('#items').insertAdjacentHTML('beforeend', '<li id=\"item-three\">Three</li>');" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 3, considered_through: 2, script: "document.querySelector('#items').prepend(document.querySelector('#item-two'));" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 4, considered_through: 3, script: "document.querySelector('#count').textContent = '42'; document.querySelector('#item-two').setAttribute('data-state', 'changed'); document.querySelector('#local-panel').hidden = false;" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 5, considered_through: 4, script: "document.querySelector('#item-three').remove();" }));
       await waitFor(async () => await execute("return document.querySelector('#count')?.textContent") === "42", "UI scripts did not execute");
       assert.deepEqual(await execute(`return {
         items: Array.from(document.querySelectorAll('#items > li')).map(item => item.id),
@@ -222,14 +222,14 @@ describe("browser runtime", () => {
       }`), { items: ["item-two", "item-one"], message: "focused draft", focused: "message", checked: true, details: true, movedNodePreserved: true, attribute: "changed", localHidden: false });
 
       const beforeErrorRequests = rootRequests;
-      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 6, script: "document.querySelector('#message').value = 'partial'; throw new Error('intentional update failure');" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 6, considered_through: 5, script: "document.querySelector('#message').value = 'partial'; throw new Error('intentional update failure');" }));
       await waitFor(async () => (await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"))?.includes("failed"), "failed UI script was not reported");
       assert.equal(rootRequests, beforeErrorRequests);
       const failedBaselinePosts = posts.length;
       await execute("document.querySelector('#submit').click();");
       await waitFor(() => posts.length === failedBaselinePosts + 1, "submission after failed UI script was not delivered");
       assert.equal(JSON.parse(posts.at(-1).body).page_event, 6);
-      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 7, script: "document.querySelector('#heading').textContent = 'Corrected';" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 7, considered_through: 6, script: "document.querySelector('#heading').textContent = 'Corrected';" }));
       await waitFor(async () => await execute("return document.querySelector('#heading')?.textContent") === "Corrected", "correction script did not execute");
       currentPage = replayedPage;
 
@@ -259,7 +259,7 @@ describe("browser runtime", () => {
       sockets.at(-1).send(JSON.stringify({ type: "closed", message: "Session closed" }));
       await waitFor(async () => await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent") === "Session closed", "terminal status was not shown");
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: true }));
-      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 9, script: "document.querySelector('#heading').textContent = 'Unexpected';" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 9, considered_through: 8, script: "document.querySelector('#heading').textContent = 'Unexpected';" }));
       await sleep(100);
       assert.equal(posts.length, baselinePosts + 1);
       assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session closed");
@@ -278,7 +278,7 @@ describe("browser runtime", () => {
       const beforeStatic = sockets.length;
       await command("POST", "/url", { url: `http://127.0.0.1:${port}/static.html` });
       await waitFor(() => sockets.length > beforeStatic, "static runtime did not connect");
-      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 99, script: "document.querySelector('#static-heading').textContent = 'Changed';" }));
+      sockets.at(-1).send(JSON.stringify({ type: "run_ui", event_number: 99, considered_through: 98, script: "document.querySelector('#static-heading').textContent = 'Changed';" }));
       await sleep(100);
       assert.equal(await execute("return document.title"), "Static");
       assert.equal(await execute("return document.querySelector('#static-heading').textContent"), "Static");

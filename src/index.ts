@@ -351,6 +351,7 @@ export class Session extends DurableObject<Env> {
     }
     if (packet.type === "run_ui") {
       if (!Number.isSafeInteger(packet.event_number) || (packet.event_number as number) < 0) throw new Error("event_number must be a nonnegative safe integer");
+      if (!Number.isSafeInteger(packet.considered_through) || (packet.considered_through as number) < 0) throw new Error("considered_through must be a nonnegative safe integer");
       if (typeof packet.script !== "string") throw new Error("script is required");
       if (encoder.encode(packet.script).byteLength > MAX_BODY_BYTES) throw new Error("script is too large");
       this.sendClients(packet);
@@ -409,7 +410,7 @@ export class Session extends DurableObject<Env> {
 }
 
 function home(): Response {
-  return new Response(`# LetMeKnow\n\nServe a temporary browser page:\n\n  npx letmeknow-cli serve ./public\n\nThe CLI connects outbound. Use its pull and push commands to exchange feedback and page updates.\n`, { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
+  return new Response(`# LetMeKnow\n\nServe a temporary browser page:\n\n  npx letmeknow-cli serve ./public\n\nThe CLI prints an ordered event stream and accepts updates with commit --through.\n`, { headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
 export default {
