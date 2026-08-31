@@ -12,7 +12,6 @@ import { WebSocketServer } from "ws";
 const cli = fileURLToPath(new URL("../bin/letmeknow.js", import.meta.url));
 const MAX_BODY_BYTES = 1024 * 1024;
 const UPDATE_BATCH_MAX_BYTES = 16 * MAX_BODY_BYTES;
-const SESSION_LIFETIME_MS = 24 * 60 * 60 * 1_000;
 const COMMAND_TIMEOUT_MS = 10_000;
 const STARTUP_TIMEOUT_MS = 10_000;
 
@@ -66,7 +65,7 @@ async function command(args, input) {
   return JSON.parse(result.stdout);
 }
 
-async function startSession({ index = "<!doctype html><html><body><main id=\"letmeknow-root\">initial</main></body></html>", expiresAt = Date.now() + SESSION_LIFETIME_MS } = {}) {
+async function startSession({ index = "<!doctype html><html><body><main id=\"letmeknow-root\">initial</main></body></html>" } = {}) {
   const folder = mkdtempSync(join(tmpdir(), "letmeknow-"));
   writeFileSync(join(folder, "index.html"), index);
   mkdirSync(join(folder, "assets"));
@@ -115,7 +114,7 @@ async function startSession({ index = "<!doctype html><html><body><main id=\"let
     relay.once("connection", socket => {
       producer = socket;
       socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
-      socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.letmeknow.dev/", expires_at: expiresAt, expires_after_disconnect: 600 }));
+      socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.letmeknow.dev/", expires_after_disconnect: 600 }));
       socket.on("message", data => {
         const packet = JSON.parse(data.toString());
         if (packet.type === "open") resolve();
@@ -432,19 +431,6 @@ describe("LetMeKnow CLI", () => {
       const batch = await command(["pull", session.folder]);
       assert.deepEqual(batch.events, []);
       assert.equal(batch.frontier, 0);
-    } finally {
-      await session.stop();
-    }
-  });
-
-  it("stops at the advertised session expiration", async () => {
-    const session = await startSession({ expiresAt: Date.now() + 500 });
-    try {
-      const exited = await Promise.race([
-        once(session.child, "exit").then(([code]) => code),
-        new Promise(resolve => setTimeout(() => resolve("timeout"), 2_000))
-      ]);
-      assert.equal(exited, 0);
     } finally {
       await session.stop();
     }

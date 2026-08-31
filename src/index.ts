@@ -164,11 +164,8 @@ export class Session extends DurableObject<Env> {
 
   private async expireSession(): Promise<void> {
     this.failProxyRequests();
-    this.sendClients({ type: "closed", message: "Session expired" });
-    const producer = this.producer();
-    try { producer?.send(JSON.stringify({ type: "closed", message: "Session expired" })); } catch {}
     for (const client of this.clients()) client.close(1000, "session expired");
-    producer?.close(1000, "session expired");
+    this.producer()?.close(1000, "session expired");
     await this.ctx.storage.deleteAll();
   }
 
@@ -203,7 +200,7 @@ export class Session extends DurableObject<Env> {
     if (!reconnect) server.send(JSON.stringify({ type: "credential", credential }));
     if (reconnect && opened) {
       if (expiresAt === undefined) throw new Error("session expired");
-      server.send(JSON.stringify({ type: "session", url: attachment.url, expires_at: expiresAt, expires_after_disconnect: PRODUCER_GRACE_MS / 1000 }));
+      server.send(JSON.stringify({ type: "session", url: attachment.url, expires_after_disconnect: PRODUCER_GRACE_MS / 1000 }));
       this.sendClients({ type: "producer", connected: true });
     }
     return new Response(null, { status: 101, webSocket: client, ...(protocol ? { headers: { "Sec-WebSocket-Protocol": protocol } } : {}) });
@@ -348,7 +345,7 @@ export class Session extends DurableObject<Env> {
       attachment.opened = true;
       socket.serializeAttachment(attachment);
       await this.ctx.storage.setAlarm(expiresAt);
-      socket.send(JSON.stringify({ type: "session", ...(packet.id !== undefined ? { id: packet.id } : {}), url: attachment.url, expires_at: expiresAt, expires_after_disconnect: PRODUCER_GRACE_MS / 1000 }));
+      socket.send(JSON.stringify({ type: "session", ...(packet.id !== undefined ? { id: packet.id } : {}), url: attachment.url, expires_after_disconnect: PRODUCER_GRACE_MS / 1000 }));
       return;
     }
     if (!attachment.opened) throw new Error("open must be the first command");
