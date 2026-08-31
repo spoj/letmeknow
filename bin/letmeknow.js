@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-import { createReadStream, createWriteStream, existsSync, readFileSync, readdirSync, writeSync } from "node:fs";
-import { chmod, mkdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { constants, createReadStream, createWriteStream, existsSync, readFileSync, readdirSync, writeSync } from "node:fs";
+import { chmod, mkdir, open, realpath, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import net from "node:net";
-import { join, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { parseArgs } from "node:util";
 import { lookup } from "mrmime";
@@ -43,22 +43,54 @@ function safeWorkspacePath(pathname) {
   return pathname && !pathname.startsWith("/") && !pathname.includes("\\") && !pathname.includes("\0") && !deniedPath(pathname) && pathname.split("/").every(part => part !== "" && part !== "." && part !== "..");
 }
 
-async function hashFile(filename) {
-  const digest = createHash("sha256");
-  let size = 0;
-  for await (const chunk of createReadStream(filename)) {
-    size += chunk.byteLength;
-    digest.update(chunk);
+function inside(root, target) {
+  const path = relative(root, target);
+  return path === "" || (path !== ".." && !path.startsWith(".." + sep));
+}
+
+async function workspaceDirectory(filename, root) {
+  const handle = await open(filename, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    if (!(await handle.stat()).isDirectory()) throw new Error("workspace directory is not a directory");
+    const target = await realpath(`/proc/self/fd/${handle.fd}`);
+    if (!inside(root, target)) throw new Error("workspace path escapes root");
+    return handle;
+  } catch (cause) {
+    await handle.close().catch(() => {});
+    throw cause;
   }
-  return { hash: digest.digest("hex"), size };
+}
+
+async function workspaceFile(filename, root, pathname) {
+  const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const infoBefore = await handle.stat();
+    const target = await realpath(`/proc/self/fd/${handle.fd}`);
+    if (!inside(root, target) || !infoBefore.isFile()) throw new Error(`workspace file is not regular: ${pathname}`);
+    const digest = createHash("sha256");
+    let size = 0;
+    for await (const chunk of createReadStream(null, { fd: handle.fd, autoClose: false, start: 0 })) {
+      size += chunk.byteLength;
+      digest.update(chunk);
+    }
+    const infoAfter = await handle.stat();
+    if (infoAfter.dev !== infoBefore.dev || infoAfter.ino !== infoBefore.ino || infoAfter.size !== infoBefore.size || size !== infoAfter.size) throw new Error(`workspace file changed while being read: ${pathname}`);
+    return { handle, hash: digest.digest("hex"), size };
+  } catch (cause) {
+    await handle.close().catch(() => {});
+    throw cause;
+  }
 }
 
 async function scanWorkspace(root) {
   const files = {};
   const paths = new Map();
   let index;
+  const handles = [];
+  const rootHandle = await workspaceDirectory(root, root);
   const visit = async (directory, prefix) => {
-    const entries = readdirSync(directory, { withFileTypes: true });
+    const directoryPath = `/proc/self/fd/${directory.fd}`;
+    const entries = readdirSync(directoryPath, { withFileTypes: true });
     for (const entry of entries) {
       const pathname = prefix ? `${prefix}/${entry.name}` : entry.name;
       if (!safeWorkspacePath(pathname)) {
@@ -66,24 +98,36 @@ async function scanWorkspace(root) {
         if (entry.name === "." || entry.name === "..") continue;
         throw new Error(`invalid workspace path: ${pathname}`);
       }
-      const filename = join(directory, entry.name);
+      const filename = join(directoryPath, entry.name);
       if (entry.isDirectory()) {
-        await visit(filename, pathname);
+        const child = await workspaceDirectory(filename, root);
+        handles.push(child);
+        try { await visit(child, pathname); }
+        finally { await child.close(); }
         continue;
       }
       if (!entry.isFile()) throw new Error(`workspace file is not regular: ${pathname}`);
-      const infoBefore = await stat(filename);
-      const file = { ...(await hashFile(filename)), content_type: getMimeType(pathname) };
-      const infoAfter = await stat(filename);
-      if (infoAfter.size !== infoBefore.size || file.size !== infoAfter.size) throw new Error(`workspace file changed while being read: ${pathname}`);
-      paths.set(file.hash, { filename, size: file.size });
-      if (pathname === "index.html") index = { ...file, filename };
-      else files[pathname] = { hash: file.hash, size: file.size, content_type: file.content_type };
+      const file = await workspaceFile(filename, root, pathname);
+      if (paths.has(file.hash)) await file.handle.close();
+      else {
+        paths.set(file.hash, { handle: file.handle, size: file.size });
+        handles.push(file.handle);
+      }
+      const metadata = { hash: file.hash, size: file.size, content_type: getMimeType(pathname) };
+      if (pathname === "index.html") index = metadata;
+      else files[pathname] = metadata;
     }
   };
-  await visit(root, "");
-  if (!index) throw new Error("index.html is required");
-  return { index, files, paths };
+  try {
+    handles.push(rootHandle);
+    await visit(rootHandle, "");
+    await rootHandle.close();
+    if (!index) throw new Error("index.html is required");
+    return { index, files, paths };
+  } catch (cause) {
+    await Promise.all(handles.map(handle => handle.close().catch(() => {})));
+    throw cause;
+  }
 }
 
 function controlPath(root) {
@@ -160,6 +204,7 @@ async function start(directory) {
   await removeStaleControlSocket(socketPath);
 
   let controlServer;
+  const controlConnections = new Set();
   let socket;
   let credential;
   let resolveCredential;
@@ -362,14 +407,18 @@ async function start(directory) {
   };
 
   const scanAndUpload = async snapshot => {
-    const hashes = Object.values(snapshot.files).map(file => ({ hash: file.hash, size: file.size }));
-    const result = await request({ type: "workspace_manifest", hashes, index: { hash: snapshot.index.hash, size: snapshot.index.size } }, "workspace_manifest");
-    for (const item of result.missing) {
-      const file = snapshot.paths.get(item.hash);
-      if (!file || file.size !== item.size) throw new Error("workspace snapshot is inconsistent");
-      const uploadUrl = new URL(`_letmeknow/workspace/${item.hash}`, sessionUrl);
-      const response = await fetch(uploadUrl, { method: "PUT", headers: { Authorization: `Bearer ${credential}`, "Content-Length": String(file.size) }, body: createReadStream(file.filename), duplex: "half" });
-      if (!response.ok) throw new Error(`workspace upload failed: ${response.status}`);
+    try {
+      const hashes = Object.values(snapshot.files).map(file => ({ hash: file.hash, size: file.size }));
+      const result = await request({ type: "workspace_manifest", hashes, index: { hash: snapshot.index.hash, size: snapshot.index.size } }, "workspace_manifest");
+      for (const item of result.missing) {
+        const file = snapshot.paths.get(item.hash);
+        if (!file || file.size !== item.size) throw new Error("workspace snapshot is inconsistent");
+        const uploadUrl = new URL(`_letmeknow/workspace/${item.hash}`, sessionUrl);
+        const response = await fetch(uploadUrl, { method: "PUT", headers: { Authorization: `Bearer ${credential}`, "Content-Length": String(file.size) }, body: createReadStream(null, { fd: file.handle.fd, autoClose: false, start: 0 }), duplex: "half" });
+        if (!response.ok) throw new Error(`workspace upload failed: ${response.status}`);
+      }
+    } finally {
+      await Promise.all([...snapshot.paths.values()].map(file => file.handle.close().catch(() => {})));
     }
   };
 
@@ -399,6 +448,8 @@ async function start(directory) {
   };
 
   controlServer = net.createServer(connection => {
+    controlConnections.add(connection);
+    connection.once("close", () => controlConnections.delete(connection));
     connection.setEncoding("utf8");
     let input = "";
     let handled = false;
@@ -449,10 +500,11 @@ async function start(directory) {
 
   let initializing = false;
   const beginInitialization = () => {
-    if (initializing || ready || stopped) return;
+    if (initializing || ready || stopped || !socket) return;
+    const generation = socket;
     initializing = true;
     void initialize().catch(cause => {
-      if (socket?.readyState === WebSocket.OPEN && !stopped) {
+      if (socket === generation && generation.readyState === WebSocket.OPEN && !stopped) {
         process.stderr.write(`letmeknow: ${cause.message}\n`);
         void stop(1);
       }
@@ -512,6 +564,7 @@ async function start(directory) {
     clearTimeout(connectionTimer);
     rejectPending(new Error("serve stopped"));
     try { socket?.close(); } catch {}
+    for (const connection of controlConnections) connection.destroy();
     await new Promise(resolveClose => controlServer.close(() => resolveClose()));
     await unlink(socketPath).catch(() => {});
     await Promise.race([streamWrite.catch(() => {}), new Promise(resolveTimeout => setTimeout(resolveTimeout, STREAM_SHUTDOWN_TIMEOUT))]);

@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import net from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { once } from "node:events";
 import { describe, it } from "node:test";
@@ -64,7 +65,7 @@ function serviceEvent(id, eventNumber, value = "one", attachments) {
   return { type: "submit", id, event_number: eventNumber, page_event: 0, form_id: "review", action: "/review", trigger: null, values: { value }, ...(attachments ? { attachments } : {}) };
 }
 
-async function startSession({ index = "<!doctype html><html><body><main id=app>initial</main></body></html>", files = { "assets/app.js": "initial" } } = {}) {
+async function startSession({ index = "<!doctype html><html><body><main id=app>initial</main></body></html>", files = { "assets/app.js": "initial" }, onWorkspaceManifest } = {}) {
   const folder = mkdtempSync(join(tmpdir(), "letmeknow-"));
   writeFileSync(join(folder, "index.html"), index);
   for (const [pathname, value] of Object.entries(files)) {
@@ -131,6 +132,7 @@ async function startSession({ index = "<!doctype html><html><body><main id=app>i
     socket.on("message", async data => {
       const packet = JSON.parse(data.toString());
       if (packet.type === "workspace_manifest") {
+        if (onWorkspaceManifest) await onWorkspaceManifest(packet);
         const items = [packet.index, ...(packet.hashes || [])].filter(Boolean);
         const missing = items.filter(item => state.uploaded.get(item.hash)?.size !== item.size);
         socket.send(JSON.stringify({ type: "workspace_manifest", id: packet.id, missing }));
@@ -309,6 +311,41 @@ describe("LetMeKnow CLI", () => {
     }
   });
 
+  it("keeps workspace uploads pinned to files opened during the scan", async () => {
+    let manifests = 0;
+    let resolveManifest;
+    const manifestSeen = new Promise(resolve => { resolveManifest = resolve; });
+    let releaseManifest;
+    const manifestGate = new Promise(resolve => { releaseManifest = resolve; });
+    const session = await startSession({ onWorkspaceManifest: async () => {
+      manifests += 1;
+      if (manifests === 2) {
+        resolveManifest();
+        await manifestGate;
+      }
+    } });
+    const outside = join(tmpdir(), `letmeknow-outside-${randomUUID()}`);
+    const filename = join(session.folder, "assets/app.js");
+    const moved = `${filename}.moved`;
+    const expected = Buffer.from("updated inside workspace");
+    try {
+      writeFileSync(filename, expected);
+      writeFileSync(outside, "outside workspace");
+      const resultPromise = command(["commit", session.folder, "--through", "0"]);
+      await manifestSeen;
+      renameSync(filename, moved);
+      symlinkSync(outside, filename);
+      releaseManifest();
+      const result = await resultPromise;
+      assert.equal(result.ok, true);
+      const hash = createHash("sha256").update(expected).digest("hex");
+      assert.deepEqual(session.state.uploaded.get(hash).data, expected);
+    } finally {
+      await session.stop();
+      rmSync(outside, { force: true });
+    }
+  });
+
   it("persists complete events, handles redelivery, and cleans acknowledged files", async () => {
     const session = await startSession();
     try {
@@ -414,6 +451,22 @@ describe("LetMeKnow CLI", () => {
       assert.equal(signal, null);
       assert.doesNotMatch(session.stderr(), /Unhandled|write EPIPE|EPIPE/);
     } finally {
+      await session.stop();
+    }
+  });
+
+  it("does not hang while stopping with an idle control connection", async () => {
+    const session = await startSession();
+    const idle = net.createConnection(controlPath(session.folder));
+    try {
+      await once(idle, "connect");
+      const exit = once(session.child, "exit");
+      session.child.kill("SIGTERM");
+      const [code, signal] = await Promise.race([exit, new Promise((_, reject) => setTimeout(() => reject(new Error("serve did not stop")), 1_000))]);
+      assert.equal(code, 0);
+      assert.equal(signal, null);
+    } finally {
+      idle.destroy();
       await session.stop();
     }
   });
