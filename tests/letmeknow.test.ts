@@ -211,6 +211,112 @@ describe("LetMeKnow service", () => {
     producer.socket.close(1000, "done");
   });
 
+  it("bounds browser attachment records, including zero-byte reservations", async () => {
+    const { producer, url } = await open();
+    const hashes = Array.from({ length: 1024 }, (_, index) => index.toString(16).padStart(64, "0"));
+    for (let index = 0; index < hashes.length; index += 32) {
+      const response = await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ hashes: hashes.slice(index, index + 32).map(hash => ({ hash, size: 0 })) })
+      }));
+      expect(response.status).toBe(200);
+      expect((await response.json() as Event).missing).toHaveLength(32);
+    }
+    const overflow = await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hashes: [{ hash: "f".repeat(64), size: 0 }] })
+    }));
+    expect(overflow.status).toBe(413);
+    expect(await overflow.json()).toEqual({ error: "attachment object limit exceeded" });
+    producer.socket.close(1000, "done");
+  });
+
+  it("reclaims abandoned attachment reservations after their lease", async () => {
+    const now = Date.now();
+    vi.useFakeTimers({ now });
+    const { producer, url } = await open();
+    const size = 60 * 1024 * 1024;
+    const first = "a".repeat(64);
+    const second = "b".repeat(64);
+    const reserve = (hash: string) => SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hashes: [{ hash, size }] })
+    }));
+    expect((await reserve(first)).status).toBe(200);
+    vi.setSystemTime(now + 5 * 60 * 1_000 + 1);
+    expect(await runDurableObjectAlarm(env.SESSIONS.getByName(new URL(url).hostname.split(".")[0]))).toBe(true);
+    expect((await reserve(second)).status).toBe(200);
+    producer.socket.close(1000, "done");
+  });
+
+  it("reconciles an attachment object that exists before its metadata is marked stored", async () => {
+    const { producer, url } = await open();
+    const data = new TextEncoder().encode("orphaned attachment");
+    const hash = digest(data);
+    const reserve = () => SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hashes: [{ hash, size: data.byteLength }] })
+    }));
+    expect(await (await reserve()).json()).toEqual({ missing: [{ hash, size: data.byteLength }] });
+    const code = new URL(url).hostname.split(".")[0];
+    const uploads = (env as unknown as { UPLOADS: { put(key: string, value: Uint8Array, options: { sha256: string }): Promise<unknown> } }).UPLOADS;
+    await uploads.put(`sessions/${code}/objects/${hash}`, data, { sha256: hash });
+    expect(await (await reserve()).json()).toEqual({ missing: [] });
+    const id = randomUUID();
+    expect((await SELF.fetch(new Request(new URL("_letmeknow/submit", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id, page_event: 0, form_id: null, action: "/", trigger: null, values: {}, attachments: [{ field: "file", name: "file", content_type: "text/plain", hash, size: data.byteLength }] })
+    }))).status).toBe(202);
+    const event = await nextType(producer, "submit");
+    producer.send({ type: "event_ack", event_number: event.event_number });
+  });
+
+  it("releases accepted attachments after commit but preserves pending shared references", async () => {
+    const { producer, url, workspace } = await open();
+    const data = new TextEncoder().encode("shared attachment");
+    const attachment = await uploadAttachment(producer, url, data);
+    const submit = (id: string) => SELF.fetch(new Request(new URL("_letmeknow/submit", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id, page_event: 0, form_id: null, action: "/", trigger: null, values: {}, attachments: [{ field: "file", name: "file", content_type: "text/plain", ...attachment }] })
+    }));
+    expect((await submit(randomUUID())).status).toBe(202);
+    const first = await nextType(producer, "submit");
+    producer.send({ type: "event_ack", event_number: first.event_number });
+    expect((await submit(randomUUID())).status).toBe(202);
+    const second = await nextType(producer, "submit");
+    producer.send({ type: "event_ack", event_number: second.event_number });
+    const code = new URL(url).hostname.split(".")[0];
+    const uploads = (env as unknown as { UPLOADS: { head(key: string): Promise<unknown> } }).UPLOADS;
+    const key = `sessions/${code}/objects/${attachment.hash}`;
+    await commit(producer, workspace, first.event_number);
+    expect(await uploads.head(key)).not.toBeNull();
+    await commit(producer, workspace, second.event_number);
+    expect(await uploads.head(key)).toBeNull();
+  });
+
+  it("redelivers an in-flight event after producer reconnect", async () => {
+    const { producer, url } = await open();
+    const code = new URL(url).hostname.split(".")[0];
+    const id = randomUUID();
+    expect((await SELF.fetch(new Request(new URL("_letmeknow/submit", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id, page_event: 0, form_id: null, action: "/", trigger: null, values: {} })
+    }))).status).toBe(202);
+    expect((await nextType(producer, "submit")).id).toBe(id);
+    producer.socket.close(1000, "restart");
+    const replacement = await connectProducer(code, producer.credential);
+    await nextType(replacement, "session");
+    expect((await nextType(replacement, "submit")).id).toBe(id);
+    replacement.socket.close(1000, "done");
+  });
+
   it("accepts submissions while the producer is disconnected and redelivers them in order", async () => {
     const { producer, url } = await open();
     const code = new URL(url).hostname.split(".")[0];
