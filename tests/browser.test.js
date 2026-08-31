@@ -255,18 +255,18 @@ describe("browser runtime", () => {
       await sleep(100);
       assert.equal(posts.length, terminalBaselinePosts);
       await execute("document.querySelector('#submit').click();");
-      sockets.at(-1).send(JSON.stringify({ type: "closed", message: "Session expired" }));
-      await waitFor(async () => await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent") === "Session expired", "terminal status was not shown");
+      sockets.at(-1).send(JSON.stringify({ type: "closed", message: "Session closed" }));
+      await waitFor(async () => await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent") === "Session closed", "terminal status was not shown");
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: true }));
       sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 54, target: "heading", html: "<h1 id=\"heading\">Unexpected</h1>" }));
       await sleep(100);
       assert.equal(posts.length, terminalBaselinePosts);
-      assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session expired");
+      assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session closed");
       assert.equal(await execute("return document.querySelector('#heading').textContent"), "Recovered");
       await execute("document.querySelector('#submit').click();");
       await sleep(100);
       assert.equal(posts.length, terminalBaselinePosts);
-      assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session expired");
+      assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session closed");
 
       const beforeTerminalReloadSockets = sockets.length;
       await command("POST", "/url", { url: `http://127.0.0.1:${port}/` });
