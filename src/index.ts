@@ -364,6 +364,7 @@ export class Session extends DurableObject<Env> {
     for (const [hash, size] of requested) {
       const existing = next[hash];
       if (existing) {
+        if (existing.kind !== "workspace") throw new Error("workspace hash is not a workspace object");
         if (existing.size !== size) throw new Error("workspace object has the wrong size");
         continue;
       }
