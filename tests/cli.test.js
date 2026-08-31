@@ -1,376 +1,289 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { basename, dirname, join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { once } from "node:events";
 import { describe, it } from "node:test";
 import { WebSocketServer } from "ws";
 
-const cli = new URL("../bin/letmeknow.js", import.meta.url);
-
+const cli = fileURLToPath(new URL("../bin/letmeknow.js", import.meta.url));
 const MAX_BODY_BYTES = 1024 * 1024;
-
-function multipartBody(boundary, parts) {
-  const chunks = [];
-  for (const part of parts) {
-    chunks.push(Buffer.from(`--${boundary}\r\n${part.headers}\r\n\r\n`));
-    chunks.push(Buffer.isBuffer(part.body) ? part.body : Buffer.from(part.body));
-    chunks.push(Buffer.from("\r\n"));
-  }
-  chunks.push(Buffer.from(`--${boundary}--\r\n`));
-  return Buffer.concat(chunks);
-}
 
 function localWebSocketEnvironment(port) {
   const folder = mkdtempSync(join(tmpdir(), "letmeknow-hook-"));
   const hook = join(folder, "redirect.mjs");
-  const ws = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "../node_modules/ws/index.js"));
-  writeFileSync(hook, `import WebSocket from ${JSON.stringify(ws.href)};\nconst OriginalWebSocket = WebSocket;\nglobalThis.WebSocket = class extends OriginalWebSocket { constructor(url, protocols) { const local = new URL(url); local.protocol = "ws:"; local.hostname = "127.0.0.1"; local.port = process.env.LETMEKNOW_TEST_PORT; super(local, protocols); } };\n`);
+  const ws = pathToFileURL(join(dirname(cli), "../node_modules/ws/index.js"));
+  writeFileSync(hook, `import WebSocket from ${JSON.stringify(ws.href)}; const OriginalWebSocket = WebSocket; globalThis.WebSocket = class extends OriginalWebSocket { constructor(url, protocols) { const local = new URL(url); local.protocol = "ws:"; local.hostname = "127.0.0.1"; local.port = process.env.LETMEKNOW_TEST_PORT; super(local, protocols); } };\n`);
   return {
     env: { ...process.env, LETMEKNOW_TEST_PORT: String(port), NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --import=${pathToFileURL(hook).href}`.trim() },
     close: () => rmSync(folder, { recursive: true, force: true })
   };
 }
 
-async function cliCommand(args) {
-  const child = spawn(process.execPath, [cli.pathname, ...args], { stdio: ["ignore", "pipe", "pipe"] });
-  let output = "";
-  let error = "";
-  child.stdout.on("data", chunk => { output += chunk; });
-  child.stderr.on("data", chunk => { error += chunk; });
+async function runCommand(args, input) {
+  const child = spawn(process.execPath, [cli, ...args], { stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", chunk => { stdout += chunk; });
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  if (input === undefined) child.stdin.end();
+  else child.stdin.end(input);
   const [code] = await once(child, "exit");
-  assert.equal(code, 0, `${args.join(" ")}: ${error}`);
-  return JSON.parse(output);
+  return { code, stdout, stderr };
 }
 
-async function runRelayScenario() {
+async function command(args, input) {
+  const result = await runCommand(args, input);
+  assert.equal(result.code, 0, `${args.join(" ")}: ${result.stderr}`);
+  return JSON.parse(result.stdout);
+}
+
+async function startSession({ index = "<!doctype html><html><body><main id=\"letmeknow-root\">initial</main></body></html>" } = {}) {
   const folder = mkdtempSync(join(tmpdir(), "letmeknow-"));
-  const outside = mkdtempSync(join(tmpdir(), "letmeknow-outside-"));
-  mkdirSync(join(folder, "nested"));
+  writeFileSync(join(folder, "index.html"), index);
   mkdirSync(join(folder, "assets"));
-  writeFileSync(join(folder, "index.html"), `<!doctype html><html><head><script>const marker = "</body>";</script><link rel="stylesheet" href="/assets/app.css"></head><body><form id="contact" action="/save" method="post"><input name="name"><button name="kind" value="send">Send</button></form></body></html>`);
-  writeFileSync(join(folder, "page.htm"), "legacy html");
-  writeFileSync(join(folder, "nested", "index.html"), "nested");
-  writeFileSync(join(folder, "assets", "app.css"), "body { color: red }\n");
-  writeFileSync(join(folder, "assets", "app.js"), "console.log('ok')\n");
-  symlinkSync(join(folder, "assets"), join(folder, "assets-alias"));
-  writeFileSync(join(folder, "space file.css"), "body {}\n");
-  writeFileSync(join(folder, "credentials.PEM"), "secret");
-  symlinkSync(join(folder, "credentials.PEM"), join(folder, "private-alias.txt"));
-  writeFileSync(join(folder, "large.bin"), "");
-  truncateSync(join(folder, "large.bin"), MAX_BODY_BYTES + 1);
-  mkdirSync(join(folder, "large-index"));
-  writeFileSync(join(folder, "large-index", "index.html"), "");
-  truncateSync(join(folder, "large-index", "index.html"), MAX_BODY_BYTES + 1);
-  writeFileSync(join(outside, "secret.txt"), "outside");
-  symlinkSync(join(outside, "secret.txt"), join(folder, "escape.txt"));
+  writeFileSync(join(folder, "assets", "app.js"), "initial");
   const relay = new WebSocketServer({ port: 0, handleProtocols(protocols) { return [...protocols][0]; } });
   await once(relay, "listening");
-  const port = relay.address().port;
-  const local = localWebSocketEnvironment(port);
-  const child = spawn(process.execPath, [cli.pathname, "serve", folder], {
-    env: local.env,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-  let error = "";
-  const lines = [];
-  let pendingOutput = "";
-  const responses = new Map();
-  const updates = [];
-  let connectionUrl;
-  let pulledBatch;
-  let waitingBatch;
-  let acknowledgedEvents = [];
-  const requests = [
-    { request_id: "page", method: "GET", path: "/", headers: { accept: "text/html" } },
-    { request_id: "legacyPage", method: "GET", path: "/page.htm", headers: {} },
-    { request_id: "asset", method: "GET", path: "/assets/app.js?cache=1", headers: {} },
-    { request_id: "assetAlias", method: "GET", path: "/assets-alias/app.js", headers: {} },
-    { request_id: "head", method: "HEAD", path: "/assets/app.js?cache=1", headers: {} },
-    { request_id: "redirect", method: "GET", path: "/nested", headers: {} },
-    { request_id: "encodedUpper", method: "GET", path: "/nested%2F?view=upper", headers: {} },
-    { request_id: "encodedLower", method: "GET", path: "/nested%2f?view=lower", headers: {} },
-    { request_id: "directory", method: "GET", path: "/nested/", headers: {} },
-    { request_id: "encoded", method: "GET", path: "/space%20file.css?x=1", headers: {} },
-    { request_id: "missing", method: "GET", path: "/missing", headers: {} },
-    { request_id: "escape", method: "GET", path: "/escape.txt", headers: {} },
-    { request_id: "private", method: "GET", path: "/credentials.PEM", headers: {} },
-    { request_id: "privateAlias", method: "GET", path: "/private-alias.txt", headers: {} },
-    { request_id: "large", method: "GET", path: "/large.bin", headers: {} },
-    { request_id: "largeIndex", method: "GET", path: "/large-index/", headers: {} },
-    { request_id: "form", method: "POST", path: "/save", headers: {
-      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-      "x-letmeknow-submission": "1",
-      "x-letmeknow-id": "local-test",
-      "x-letmeknow-form-id": "contact",
-      "x-letmeknow-action": "%2Fsave",
-      "x-letmeknow-trigger-name": "kind",
-      "x-letmeknow-trigger-value": "send",
-      "x-letmeknow-based-on": "workspace-test"
-    }, body: Buffer.from("name=Ada&kind=send").toString("base64") },
-    { request_id: "formRetry", method: "POST", path: "/save", headers: {
-      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-      "x-letmeknow-submission": "1",
-      "x-letmeknow-id": "local-test",
-      "x-letmeknow-form-id": "contact",
-      "x-letmeknow-action": "%2Fsave",
-      "x-letmeknow-trigger-name": "kind",
-      "x-letmeknow-trigger-value": "send",
-      "x-letmeknow-based-on": "workspace-test"
-    }, body: Buffer.from("name=Ada&kind=send").toString("base64") },
-    { request_id: "multipart", method: "POST", path: "/review", headers: {
-      "content-type": "multipart/form-data; boundary=----letmeknow-test",
-      "x-letmeknow-submission": "1",
-      "x-letmeknow-id": "multipart-test"
-    }, body: multipartBody("----letmeknow-test", [
-      { headers: 'Content-Disposition: form-data; name="comment"', body: "Review these files" },
-      { headers: 'Content-Disposition: form-data; name="empty"; filename=""\r\nContent-Type: application/octet-stream', body: "" },
-      { headers: 'Content-Disposition: form-data; name="upload"; filename="../../secret.txt"\r\nContent-Type: text/plain', body: Buffer.from([0, 1, 2, 255]) },
-      { headers: 'Content-Disposition: form-data; name="upload"; filename="report.bin"\r\nContent-Type: application/octet-stream', body: Buffer.from("report bytes") }
-    ]).toString("base64") }
-  ];
-  const done = new Promise((resolve, reject) => {
-    relay.on("connection", (socket, request) => {
-      connectionUrl = request.url;
-      socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
-      socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.letmeknow.dev/", expires_after_disconnect: 600 }));
-      const next = () => {
-        const request = requests[responses.size];
-        if (request) socket.send(JSON.stringify({ type: "http_request", body: "", ...request }));
-        else {
-          const timer = setTimeout(() => reject(new Error("revision timed out")), 5_000);
-          socket.on("message", data => {
-            const packet = JSON.parse(data.toString());
-            if (packet.type === "revision") updates.push(packet);
-          });
-          void (async () => {
-            pulledBatch = await waitingBatch;
-            assert.equal(pulledBatch.events.length, 1);
-            assert.ok(pulledBatch.token);
-            writeFileSync(join(folder, "space file.css"), "body { color: blue }\n");
-            writeFileSync(join(folder, "assets", "app.js"), "console.log('changed')\n");
-            await new Promise(resolve => setTimeout(resolve, 350));
-            assert.equal(updates.length, 0, "file changes must not publish automatically");
-            const pushed = await cliCommand(["push", folder, "--based-on", pulledBatch.token]);
-            assert.equal(pushed.type, "published");
-            const retried = await cliCommand(["push", folder, "--based-on", pulledBatch.token]);
-            assert.deepEqual(retried, pushed);
-            const empty = await cliCommand(["pull", folder]);
-            assert.ok(empty.token);
-            assert.deepEqual(empty.events, []);
-            writeFileSync(join(folder, "assets", "app.js"), "console.log('independent change')\n");
-            const independent = await cliCommand(["push", folder, "--based-on", empty.token]);
-            assert.equal(independent.type, "published");
-            assert.deepEqual(independent.events, []);
-            setTimeout(() => { clearTimeout(timer); resolve(); }, 150);
-          })().catch(reject);
-        }
-      };
-      socket.on("message", data => {
-        const packet = JSON.parse(data.toString());
-        if (packet.type === "open") next();
-        else if (packet.type === "http_response") {
-          responses.set(packet.request_id, packet);
-          if (packet.request_id === "form") {
-            void (async () => {
-              const batch = await cliCommand(["pull", folder]);
-              assert.equal(batch.events.length, 1);
-              assert.deepEqual(await cliCommand(["pull", folder]), batch);
-              const acknowledged = await cliCommand(["ack", folder, "--based-on", batch.token]);
-              assert.equal(acknowledged.type, "acknowledged");
-              acknowledgedEvents = batch.events;
-              waitingBatch = cliCommand(["pull", folder, "--wait", "2"]);
-              next();
-            })().catch(reject);
-          } else next();
-        }
-      });
-    });
-    relay.on("error", reject);
-  });
-  child.stdout.on("data", chunk => {
-    pendingOutput += chunk.toString();
-    const complete = pendingOutput.split("\n");
-    pendingOutput = complete.pop();
-    lines.push(...complete.filter(Boolean).map(line => JSON.parse(line)));
-  });
-  child.stderr.on("data", chunk => { error += chunk; });
-  try {
-    await Promise.race([done, new Promise((_, reject) => setTimeout(() => reject(new Error(`relay timed out: ${error}`)), 10_000))]);
-    assert.deepEqual(lines.filter(line => line.type === "submit"), []);
-    const events = [...acknowledgedEvents, ...pulledBatch.events];
-    const attachmentPaths = events.flatMap(line => line.attachments || []).map(attachment => attachment.path);
-    const attachmentBytes = attachmentPaths.map(path => readFileSync(path));
-    const code = await new Promise(resolve => { child.once("exit", resolve); child.kill("SIGTERM"); });
-    const decoded = request_id => ({ ...responses.get(request_id), body: Buffer.from(responses.get(request_id).body, "base64").toString() });
-    return { code, response: decoded, responses, updates, connectionUrl, events, event: events[0], attachmentPaths, attachmentBytes, ready: lines.find(line => line.type === "ready") };
-  } finally {
-    if (!child.killed) child.kill("SIGTERM");
-    await new Promise(resolve => relay.close(resolve));
-    rmSync(folder, { recursive: true, force: true });
-    rmSync(outside, { recursive: true, force: true });
-    local.close();
-  }
-}
-
-async function runStaticRequests(paths) {
-  const folder = mkdtempSync(join(tmpdir(), "letmeknow-sensitive-"));
-  const publicPaths = ["public.txt", "id_rsa.pub"];
-  for (const path of [...paths, ...publicPaths]) {
-    const file = join(folder, path);
-    mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, paths.includes(path) ? "private" : "public");
-  }
-  const relay = new WebSocketServer({ port: 0, handleProtocols(protocols) { return [...protocols][0]; } });
-  await once(relay, "listening");
-  const responses = new Map();
-  const requestPaths = [...paths, ".ssh/", ...publicPaths];
-  const requests = requestPaths.map(path => ({ request_id: path, method: "GET", path: "/" + path, headers: {} }));
-  const done = new Promise((resolve, reject) => {
-    relay.on("error", reject);
-    relay.on("connection", socket => {
-      socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
-      socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.letmeknow.dev/", expires_after_disconnect: 600 }));
-      let opened = false;
-      let index = 0;
-      const next = () => {
-        if (index === requests.length) return resolve(responses);
-        socket.send(JSON.stringify({ type: "http_request", body: "", ...requests[index++] }));
-      };
-      socket.on("message", data => {
-        const packet = JSON.parse(data.toString());
-        if (packet.type === "open" && !opened) { opened = true; next(); }
-        else if (packet.type === "http_response") { responses.set(packet.request_id, packet); next(); }
-      });
-    });
-  });
   const local = localWebSocketEnvironment(relay.address().port);
-  const child = spawn(process.execPath, [cli.pathname, "serve", folder], {
-    env: local.env,
-    stdio: ["ignore", "pipe", "pipe"]
+  const child = spawn(process.execPath, [cli, "serve", folder], { env: local.env, stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  let readyOutput = "";
+  const ready = new Promise((resolve, reject) => {
+    child.stdout.on("data", chunk => {
+      readyOutput += chunk.toString();
+      const lines = readyOutput.split("\n");
+      readyOutput = lines.pop();
+      for (const line of lines.filter(Boolean)) {
+        try {
+          const value = JSON.parse(line);
+          if (value.type === "ready") resolve(value);
+        } catch {}
+      }
+    });
+    child.once("error", reject);
   });
-  let timer;
-  try {
-    return await Promise.race([done, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("sensitive-file request timed out")), 10_000); })]);
-  } finally {
-    clearTimeout(timer);
+  let producer;
+  const updates = [];
+  const responses = new Map();
+  const waiters = new Map();
+  const connected = new Promise((resolve, reject) => {
+    relay.once("error", reject);
+    relay.once("connection", socket => {
+      producer = socket;
+      socket.send(JSON.stringify({ type: "credential", credential: "private-test-credential" }));
+      socket.send(JSON.stringify({ type: "session", url: "https://0123456789abcdef0123.letmeknow.dev/", expires_after_disconnect: 600 }));
+      socket.on("message", data => {
+        const packet = JSON.parse(data.toString());
+        if (packet.type === "open") resolve();
+        if (packet.type === "update_ui") updates.push(packet);
+        if (packet.type !== "http_response") return;
+        responses.set(packet.request_id, packet);
+        const waiter = waiters.get(packet.request_id);
+        if (waiter) {
+          waiters.delete(packet.request_id);
+          waiter(packet);
+        }
+      });
+    });
+  });
+  await Promise.all([connected, ready]);
+  let requestNumber = 0;
+  const request = (method, path, headers = {}, body = Buffer.alloc(0)) => {
+    const request_id = `request-${++requestNumber}`;
+    return new Promise(resolve => {
+      waiters.set(request_id, resolve);
+      producer.send(JSON.stringify({ type: "http_request", request_id, method, path, headers, body: body.toString("base64") }));
+    });
+  };
+  const stop = async () => {
     if (child.exitCode === null) {
       child.kill("SIGTERM");
       await once(child, "exit");
     }
     await new Promise(resolve => relay.close(resolve));
-    rmSync(folder, { recursive: true, force: true });
     local.close();
-  }
+    rmSync(folder, { recursive: true, force: true });
+  };
+  return { folder, child, request, updates, responses, ready: await ready, stderr: () => stderr, stop };
+}
+
+function decodeBody(packet) {
+  return Buffer.from(packet.body, "base64").toString("utf8");
+}
+
+function jsonSubmission(id, pageEvent = 0, values = { amount: "1" }) {
+  return Buffer.from(JSON.stringify({
+    id,
+    page_event: pageEvent,
+    form_id: "counter",
+    action: "/increment",
+    trigger: { id: "increment", name: "amount", value: "1" },
+    values
+  }));
 }
 
 describe("LetMeKnow CLI", () => {
-  it("requires the serve command and directory", async () => {
-    for (const args of [[], ["serve", "one", "two"]]) {
-      const child = spawn(process.execPath, [cli.pathname, ...args], { stdio: ["ignore", "pipe", "pipe"] });
-      let error = "";
-      child.stderr.on("data", chunk => { error += chunk; });
-      const [code] = await once(child, "exit");
-      assert.equal(code, 1);
-      assert.match(error, /Usage:/);
+  it("uses the reduced command surface", async () => {
+    const result = await runCommand(["ack", "/tmp"]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /Usage:/);
+  });
+
+  it("serves the initial page canonically and other files live", async () => {
+    const session = await startSession({ index: "<!doctype html><html><body><main id=\"letmeknow-root\">old</main></body></html>" });
+    try {
+      const page = await session.request("GET", "/", { accept: "text/html" });
+      const index = await session.request("GET", "/index.html", { accept: "text/html" });
+      const asset = await session.request("GET", "/assets/app.js");
+      assert.equal(page.status, 200);
+      assert.equal(decodeBody(page), "<!doctype html><html><body><main id=\"letmeknow-root\">old</main></body></html>");
+      assert.equal(decodeBody(index), decodeBody(page));
+      assert.equal(page.headers["X-LetMeKnow-Page-Event"], "0");
+      assert.equal(decodeBody(asset), "initial");
+
+      writeFileSync(join(session.folder, "index.html"), "changed draft");
+      writeFileSync(join(session.folder, "assets", "app.js"), "changed asset");
+      const unchangedPage = await session.request("GET", "/", { accept: "text/html" });
+      const changedAsset = await session.request("GET", "/assets/app.js");
+      assert.equal(decodeBody(unchangedPage), decodeBody(page));
+      assert.equal(decodeBody(changedAsset), "changed asset");
+    } finally {
+      await session.stop();
     }
   });
 
-  it("denies SSH private-key paths but serves public files", async () => {
-    const protectedPaths = [
-      ".env", ".env.local", ".git/config",
-      ".ssh/id_ed25519", ".ssh/id_rsa", ".ssh/id_ecdsa", ".ssh/id_dsa",
-      "id_ed25519", "id_rsa", "id_ecdsa", "id_dsa",
-      "server.key", "server.pem", "bundle.p12", "putty.ppk", "private.p8",
-      "app.sqlite3", "cache.db3", "app.sqlite-wal", "app.sqlite-shm", "app.sqlite-journal"
-    ];
-    const responses = await runStaticRequests(protectedPaths);
-    for (const path of protectedPaths) assert.equal(responses.get(path).status, 403, path);
-    assert.equal(responses.get(".ssh/").status, 403);
-    for (const path of ["public.txt", "id_rsa.pub"]) {
-      const result = responses.get(path);
-      assert.equal(result.status, 200, path);
-      assert.equal(Buffer.from(result.body, "base64").toString(), "public");
+  it("serves static paths securely", async () => {
+    const session = await startSession();
+    const outside = mkdtempSync(join(tmpdir(), "letmeknow-outside-"));
+    try {
+      writeFileSync(join(session.folder, "public.txt"), "public");
+      writeFileSync(join(outside, "secret.txt"), "secret");
+      symlinkSync(join(outside, "secret.txt"), join(session.folder, "escape.txt"));
+      const publicFile = await session.request("GET", "/public.txt");
+      const escape = await session.request("GET", "/escape.txt");
+      const privateFile = await session.request("GET", "/.env");
+      assert.equal(publicFile.status, 200);
+      assert.equal(decodeBody(publicFile), "public");
+      assert.equal(escape.status, 403);
+      assert.equal(privateFile.status, 403);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+      await session.stop();
     }
   });
 
-  it("prints the skill file without connecting", async () => {
-    const child = spawn(process.execPath, [cli.pathname, "--skill"], { stdio: ["ignore", "pipe", "pipe"] });
-    let output = "";
-    let error = "";
-    child.stdout.on("data", chunk => { output += chunk; });
-    child.stderr.on("data", chunk => { error += chunk; });
-    const [code] = await once(child, "exit");
-    assert.equal(code, 0);
-    assert.equal(error, "");
-    assert.equal(output, readFileSync(new URL("../SKILL.md", import.meta.url), "utf8"));
+  it("accepts independent JSON submissions and numbers them globally", async () => {
+    const session = await startSession();
+    try {
+      const invalid = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission("not-a-uuid"));
+      assert.equal(invalid.status, 400);
+      const ids = Array.from({ length: 10 }, () => randomUUID());
+      const submissions = await Promise.all(ids.map(id => session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(id))));
+      assert.deepEqual(submissions.map(result => result.status), Array(10).fill(202));
+      const duplicate = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(ids[0]));
+      assert.equal(duplicate.status, 202);
+      const batch = await command(["pull", session.folder]);
+      assert.equal(batch.page_event, 0);
+      assert.equal(batch.frontier, 10);
+      assert.equal(batch.events.length, 10);
+      assert.deepEqual(new Set(batch.events.map(event => event.id)), new Set(ids));
+      assert.deepEqual(batch.events.map(event => event.event_number).sort((a, b) => a - b), Array.from({ length: 10 }, (_, index) => index + 1));
+      assert.equal(batch.events[0].page_event, 0);
+      assert.equal(batch.events[0].values.amount, "1");
+    } finally {
+      await session.stop();
+    }
   });
 
-  it("serves static files securely and forwards URL-encoded form submissions", async () => {
-    const result = await runRelayScenario();
-    assert.equal(result.code, 0);
-    assert.equal(result.connectionUrl, "/v2/connect");
-    assert.equal(result.ready.workspace_sequence, 1);
-    assert.equal(result.response("page").status, 200);
-    assert.equal(result.response("page").body, `<!doctype html><html><head><script>const marker = "</body>";</script><link rel="stylesheet" href="/assets/app.css"></head><body><form id="contact" action="/save" method="post"><input name="name"><button name="kind" value="send">Send</button></form></body></html>`);
-    assert.equal(result.response("page").headers["Content-Type"], "text/html; charset=utf-8");
-    assert.match(result.response("page").headers["X-LetMeKnow-Workspace"], /^[0-9a-f-]{36}$/);
-    assert.equal(result.response("legacyPage").body, "legacy html");
-    assert.equal(result.response("legacyPage").headers["Content-Type"], "text/html; charset=utf-8");
-    assert.equal(result.response("asset").status, 200);
-    assert.equal(result.response("asset").headers["Content-Type"], "text/javascript; charset=utf-8");
-    assert.equal(result.response("assetAlias").body, "console.log('ok')\n");
-    assert.equal(result.response("head").status, 200);
-    assert.equal(result.response("head").body, "");
-    assert.equal(result.response("head").headers["Content-Length"], String(Buffer.byteLength("console.log('ok')\n")));
-    assert.equal(result.response("redirect").status, 301);
-    assert.equal(result.response("redirect").headers.Location, "nested/");
-    assert.equal(result.response("encodedUpper").status, 301);
-    assert.equal(result.response("encodedUpper").headers.Location, "nested%2F/?view=upper");
-    assert.equal(result.response("encodedLower").status, 301);
-    assert.equal(result.response("encodedLower").headers.Location, "nested%2f/?view=lower");
-    assert.equal(result.response("directory").body, "nested");
-    assert.equal(result.response("encoded").status, 200);
-    assert.equal(result.response("missing").status, 404);
-    assert.equal(result.response("escape").status, 403);
-    assert.equal(result.response("private").status, 403);
-    assert.equal(result.response("privateAlias").status, 404);
-    assert.equal(result.response("large").status, 413);
-    assert.equal(result.response("largeIndex").status, 413);
-    assert.deepEqual(result.event, {
-      type: "submit",
-      id: "local-test",
-      method: "POST",
-      action: "/save",
-      form_id: "contact",
-      trigger: { id: null, name: "kind", value: "send" },
-      values: { name: "Ada", kind: "send" },
-      based_on: "workspace-test",
-      context: {
-        based_on: "workspace-test",
-        current: result.ready.workspace,
-        relationship: "unknown"
+  it("pushes a complete page, exposes it with show, and handles retries", async () => {
+    const session = await startSession();
+    try {
+      const first = await command(["pull", session.folder]);
+      assert.equal(first.frontier, 0);
+      assert.equal(first.page_event, 0);
+      assert.equal(first.page_hash, createHash("sha256").update(decodeBody(await session.request("GET", "/"))).digest("hex"));
+      const shown = await runCommand(["show", session.folder]);
+      assert.equal(shown.code, 0);
+      assert.equal(shown.stdout, decodeBody(await session.request("GET", "/")));
+
+      const page = "<!doctype html><html><body><main id=\"letmeknow-root\">updated</main></body></html>";
+      const pageFile = join(session.folder, "updated.html");
+      writeFileSync(pageFile, page);
+      const pushed = await command(["push", session.folder, "--batch", first.token, "--page", pageFile]);
+      assert.equal(pushed.type, "committed");
+      assert.equal(pushed.frontier, 1);
+      assert.equal(pushed.page_event, 1);
+      assert.equal(pushed.page_hash, createHash("sha256").update(page).digest("hex"));
+      assert.deepEqual(session.updates, [{ type: "update_ui", event_number: 1, html: page }]);
+      const current = await session.request("GET", "/");
+      assert.equal(decodeBody(current), page);
+      assert.equal(current.headers["X-LetMeKnow-Page-Event"], "1");
+      const retried = await command(["push", session.folder, "--batch", first.token, "--page", pageFile]);
+      assert.deepEqual(retried, pushed);
+      const changedFile = join(session.folder, "changed.html");
+      writeFileSync(changedFile, "different");
+      const changedRetry = await runCommand(["push", session.folder, "--batch", first.token, "--page", changedFile]);
+      assert.equal(changedRetry.code, 1);
+      assert.match(changedRetry.stdout, /different page payload/);
+      const shownAgain = await runCommand(["show", session.folder]);
+      assert.equal(shownAgain.stdout, page);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("commits a browser batch and page update as one ordered operation", async () => {
+    const session = await startSession();
+    try {
+      const id = randomUUID();
+      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(id))).status, 202);
+      const batch = await command(["pull", session.folder]);
+      const page = "<!doctype html><html><body><main id=\"letmeknow-root\">handled</main></body></html>";
+      const pushed = await command(["push", session.folder, "--batch", batch.token, "--page", "-"], page);
+      assert.equal(pushed.frontier, 2);
+      assert.equal(pushed.page_event, 2);
+      assert.deepEqual(pushed.events, [id]);
+      assert.deepEqual(session.updates, [{ type: "update_ui", event_number: 2, html: page }]);
+      const empty = await command(["pull", session.folder]);
+      assert.deepEqual(empty.events, []);
+      assert.equal(empty.frontier, 2);
+      assert.equal(empty.page_event, 2);
+      const noPage = await command(["push", session.folder, "--batch", empty.token]);
+      assert.equal(noPage.type, "committed");
+      assert.equal(noPage.frontier, 2);
+      const noPageRetry = await command(["push", session.folder, "--batch", empty.token]);
+      assert.deepEqual(noPageRetry, noPage);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("rejects malformed JSON submissions without creating events", async () => {
+    const session = await startSession();
+    try {
+      for (const body of [Buffer.from("not json"), Buffer.from(JSON.stringify({ id: randomUUID() }))]) {
+        const response = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, body);
+        assert.equal(response.status, 400);
       }
-    });
-    assert.equal(result.responses.get("form").status, 202);
-    assert.equal(result.responses.get("formRetry").status, 202);
-    const multipartEvent = result.events.find(line => line.id === "multipart-test");
-    assert.deepEqual(multipartEvent.values, { comment: "Review these files" });
-    assert.equal(multipartEvent.attachments.length, 2);
-    assert.deepEqual(multipartEvent.attachments.map(({ field, name, type, size }) => ({ field, name, type, size })), [
-      { field: "upload", name: "../../secret.txt", type: "text/plain", size: 4 },
-      { field: "upload", name: "report.bin", type: "application/octet-stream", size: 12 }
-    ]);
-    assert.deepEqual(result.attachmentBytes[0], Buffer.from([0, 1, 2, 255]));
-    assert.deepEqual(result.attachmentBytes[1], Buffer.from("report bytes"));
-    assert.equal(dirname(multipartEvent.attachments[0].path), dirname(multipartEvent.attachments[1].path));
-    assert.notEqual(basename(multipartEvent.attachments[0].path), "../../secret.txt");
-    assert.equal(existsSync(multipartEvent.attachments[0].path), false);
-    assert.equal(existsSync(multipartEvent.attachments[1].path), false);
-    assert.equal(result.responses.get("multipart").status, 202);
-    assert.equal(result.updates.length, 2);
-    assert.deepEqual(result.updates, [{ type: "revision" }, { type: "revision" }]);
-  }, { timeout: 15_000 });
+      const batch = await command(["pull", session.folder]);
+      assert.deepEqual(batch.events, []);
+      assert.equal(batch.frontier, 0);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("rejects oversized initial pages", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "letmeknow-large-"));
+    writeFileSync(join(folder, "index.html"), Buffer.alloc(MAX_BODY_BYTES + 1, 97));
+    const result = await runCommand(["serve", folder]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /index.html is too large/);
+    rmSync(folder, { recursive: true, force: true });
+  });
 });

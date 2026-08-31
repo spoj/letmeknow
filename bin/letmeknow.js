@@ -1,25 +1,25 @@
 #!/usr/bin/env node
 
 import { constants, existsSync, readFileSync, statSync, writeSync } from "node:fs";
-import { chmod, copyFile, lstat, mkdtemp, mkdir, open, readdir, readlink, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, open, readFile, realpath, stat, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import net from "node:net";
-import { dirname, extname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { parseArgs } from "node:util";
 import { lookup } from "mrmime";
 
 const MAX_BODY_BYTES = 1024 * 1024;
+const CONTROL_MAX_BYTES = MAX_BODY_BYTES * 2 + 16 * 1024;
 const GRACE_SECONDS = 10 * 60;
 const CONNECTION_TIMEOUT = 10_000;
 const CONTROL_TIMEOUT = 35_000;
-const MAX_RETRY_DELAY = 5_000;
 const CONTROL_PREFIX = "letmeknow-control-";
-const SNAPSHOT_PREFIX = "letmeknow-snapshot-";
 const CONTROL_URL = "https://letmeknow.dev";
 const credentialPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const privateNames = new Set([".env", ".git", ".ssh", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]);
 const privateFilePattern = /^\.env\.|\.(?:key|pem|p12|ppk|p8|sqlite|sqlite3|db|db3)$|-(?:wal|shm|journal)$/i;
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function getMimeType(filename) {
   const type = lookup(filename);
@@ -32,17 +32,6 @@ function getMimeType(filename) {
 function header(packet, name) {
   const entry = Object.entries(packet.headers || {}).find(([key]) => key.toLowerCase() === name);
   return typeof entry?.[1] === "string" && entry[1] !== "" ? entry[1] : null;
-}
-
-function encodedHeader(packet, name) {
-  const value = header(packet, name);
-  if (value === null) return null;
-  try { return decodeURIComponent(value); } catch { return null; }
-}
-
-function addValue(values, name, value) {
-  if (Object.prototype.hasOwnProperty.call(values, name)) values[name] = Array.isArray(values[name]) ? [...values[name], value] : [values[name], value];
-  else values[name] = value;
 }
 
 function response(packet, status, body = Buffer.alloc(0), headers = {}) {
@@ -93,12 +82,15 @@ function requestUrl(packet) {
   return { pathname, encodedPathname: url.pathname, search: url.search };
 }
 
-async function staticResponse(root, packet, workspaceId) {
-  const published = (status, body = Buffer.alloc(0), headers = {}) => response(packet, status, body, { ...headers, "X-LetMeKnow-Workspace": workspaceId });
+async function staticResponse(root, packet, page, pageEvent) {
+  const published = (status, body = Buffer.alloc(0), headers = {}) => response(packet, status, body, headers);
   const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
   if (method !== "GET" && method !== "HEAD") return errorResponse(packet, 405, "method not allowed");
   let request;
   try { request = requestUrl(packet); } catch { return errorResponse(packet, 400, "bad request"); }
+  if (request.pathname === "/" || request.pathname === "/index.html") {
+    return published(200, Buffer.from(page), { "Content-Type": "text/html; charset=utf-8", "X-LetMeKnow-Page-Event": String(pageEvent) });
+  }
   if (deniedPath(request.pathname)) return errorResponse(packet, 403, "forbidden");
   const candidate = resolve(root, "." + request.pathname);
   if (!inside(root, candidate)) return errorResponse(packet, 403, "forbidden");
@@ -151,69 +143,44 @@ async function staticResponse(root, packet, workspaceId) {
   }
 }
 
-async function multipartSubmission(body, contentType, getAttachmentInbox) {
-  const formData = await new Request("http://letmeknow.local", {
-    method: "POST",
-    headers: { "Content-Type": contentType },
-    body
-  }).formData();
-  const values = Object.create(null);
-  const attachments = [];
-  for (const [name, value] of formData) {
-    if (typeof value === "string") {
-      addValue(values, name, value);
-      continue;
-    }
-    if (value.name === "") continue;
-    const bytes = Buffer.from(await value.arrayBuffer());
-    const path = join(await getAttachmentInbox(), randomUUID());
-    await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
-    attachments.push({ field: name, name: value.name, type: value.type, size: bytes.byteLength, path });
-  }
-  return { values, attachments };
+async function readInitialPage(root) {
+  const candidate = join(root, "index.html");
+  const target = await safeRealpath(root, candidate);
+  if (target === null || target === undefined) throw new Error("index.html is required");
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error("index.html must be a file");
+  if (info.size > MAX_BODY_BYTES) throw new Error("index.html is too large");
+  return (await readFile(target)).toString("utf8");
 }
 
-async function submission(packet, getAttachmentInbox, recordInteraction) {
-  const url = requestUrl(packet);
+async function submission(packet, recordInteraction) {
+  const request = requestUrl(packet);
   const method = typeof packet.method === "string" ? packet.method.toUpperCase() : "";
-  const values = Object.create(null);
-  let attachments;
-  if (method === "GET") {
-    for (const [name, value] of new URLSearchParams(url.search)) addValue(values, name, value);
-  } else if (method === "POST") {
-    const body = Buffer.from(typeof packet.body === "string" ? packet.body : "", "base64");
-    if (body.byteLength > MAX_BODY_BYTES) throw new Error("submission is too large");
-    const contentTypeHeader = header(packet, "content-type");
-    const contentType = contentTypeHeader?.split(";", 1)[0].trim().toLowerCase();
-    if (contentType === "application/x-www-form-urlencoded") {
-      for (const [name, value] of new URLSearchParams(body.toString("utf8"))) addValue(values, name, value);
-    } else if (contentType === "multipart/form-data" && contentTypeHeader) {
-      const parsed = await multipartSubmission(body, contentTypeHeader, getAttachmentInbox);
-      Object.assign(values, parsed.values);
-      attachments = parsed.attachments;
-    } else throw new Error("unsupported submission encoding");
-  } else throw new Error("unsupported submission method");
-  const event = {
-    type: "submit",
-    id: encodedHeader(packet, "x-letmeknow-id") || randomUUID(),
-    method,
-    action: encodedHeader(packet, "x-letmeknow-action") || url.pathname,
-    form_id: encodedHeader(packet, "x-letmeknow-form-id"),
-    trigger: { id: encodedHeader(packet, "x-letmeknow-trigger-id"), name: encodedHeader(packet, "x-letmeknow-trigger-name"), value: encodedHeader(packet, "x-letmeknow-trigger-value") },
-    values
-  };
-  const basedOn = encodedHeader(packet, "x-letmeknow-based-on");
-  if (basedOn !== null) event.based_on = basedOn;
-  if (attachments?.length) event.attachments = attachments;
-  await recordInteraction(event);
+  if (method !== "POST" || request.pathname !== "/_letmeknow/submit") throw new Error("invalid submission endpoint");
+  const contentType = header(packet, "content-type")?.split(";", 1)[0].trim().toLowerCase();
+  if (contentType !== "application/json") throw new Error("JSON submission is required");
+  const body = Buffer.from(typeof packet.body === "string" ? packet.body : "", "base64");
+  if (body.byteLength > MAX_BODY_BYTES) throw new Error("submission is too large");
+  let value;
+  try { value = JSON.parse(body.toString("utf8")); } catch { throw new Error("invalid submission JSON"); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("submission must be an object");
+  if (typeof value.id !== "string" || !uuidPattern.test(value.id)) throw new Error("submission id must be a UUID");
+  if (!Number.isSafeInteger(value.page_event) || value.page_event < 0) throw new Error("page_event must be a non-negative integer");
+  if (typeof value.form_id !== "string") throw new Error("form_id is required");
+  if (typeof value.action !== "string") throw new Error("action is required");
+  if (!value.trigger || typeof value.trigger !== "object" || Array.isArray(value.trigger)) throw new Error("trigger is required");
+  if (!value.values || typeof value.values !== "object" || Array.isArray(value.values)) throw new Error("values are required");
+  await recordInteraction({ type: "submit", id: value.id, page_event: value.page_event, form_id: value.form_id, action: value.action, trigger: value.trigger, values: value.values });
   return response(packet, 202);
 }
 
-async function handleRequest(root, workspaceId, packet, getAttachmentInbox, recordInteraction) {
-  if (header(packet, "x-letmeknow-submission") === "1") {
-    try { return await submission(packet, getAttachmentInbox, recordInteraction); } catch (cause) { return errorResponse(packet, cause?.message === "submission is too large" ? 413 : 400, cause instanceof Error ? cause.message : "invalid submission"); }
+async function handleRequest(root, page, pageEvent, packet, recordInteraction) {
+  let request;
+  try { request = requestUrl(packet); } catch { return errorResponse(packet, 400, "bad request"); }
+  if (request.pathname === "/_letmeknow/submit") {
+    try { return await submission(packet, recordInteraction); } catch (cause) { return errorResponse(packet, cause?.message === "submission is too large" ? 413 : 400, cause instanceof Error ? cause.message : "invalid submission"); }
   }
-  return staticResponse(root, packet, workspaceId);
+  return staticResponse(root, packet, page, pageEvent);
 }
 
 function options(directory) {
@@ -225,41 +192,6 @@ function options(directory) {
 function controlPath(root) {
   const key = createHash("sha256").update(root).digest("hex").slice(0, 32);
   return join(tmpdir(), `${CONTROL_PREFIX}${key}.sock`);
-}
-
-async function copyDirectory(source, target, root, visited = new Set()) {
-  const sourceReal = await realpath(source);
-  if (visited.has(sourceReal)) return;
-  visited.add(sourceReal);
-  await mkdir(target, { recursive: true });
-  for (const entry of await readdir(sourceReal, { withFileTypes: true })) {
-    const candidate = join(sourceReal, entry.name);
-    const pathname = "/" + relative(root, candidate).split(sep).join("/");
-    if (deniedPath(pathname)) continue;
-    const targetPath = join(target, entry.name);
-    const targetReal = await safeRealpath(root, candidate);
-    if (targetReal === null) {
-      if ((await lstat(candidate)).isSymbolicLink()) await symlink(await readlink(candidate), targetPath);
-      continue;
-    }
-    if (targetReal === undefined) continue;
-    if (deniedPath("/" + relative(root, targetReal).split(sep).join("/"))) continue;
-    const info = await stat(targetReal);
-    if (info.isDirectory()) await copyDirectory(targetReal, targetPath, root, visited);
-    else if (info.isFile()) await copyFile(targetReal, targetPath);
-  }
-  visited.delete(sourceReal);
-}
-
-async function snapshotDirectory(root) {
-  const snapshot = await mkdtemp(join(tmpdir(), SNAPSHOT_PREFIX));
-  try {
-    await copyDirectory(root, snapshot, root);
-    return snapshot;
-  } catch (cause) {
-    await rm(snapshot, { recursive: true, force: true });
-    throw cause;
-  }
 }
 
 function mutateQueue() {
@@ -303,20 +235,19 @@ function connectControl(root, packet) {
   });
 }
 
+function pageHash(page) {
+  return createHash("sha256").update(page).digest("hex");
+}
+
 async function start(directory) {
   const { root } = await options(directory);
-  let attachmentInboxPromise;
-  const getAttachmentInbox = () => {
-    attachmentInboxPromise ??= mkdtemp(join(tmpdir(), "letmeknow-attachments-"));
-    return attachmentInboxPromise;
-  };
-  const socketPath = controlPath(root);
-  let publishedRoot = await snapshotDirectory(root);
-  let workspaceId = randomUUID();
-  let workspaceSequence = 1;
-  const workspaceIds = new Set([workspaceId]);
+  let page = await readInitialPage(root);
+  let pageEvent = 0;
+  let eventNumber = 0;
+  const currentPageHash = () => pageHash(page);
   const eventLog = [];
-  let committedCursor = 0;
+  const browserEvents = [];
+  let committedBrowserCursor = 0;
   const seenEvents = new Set();
   const tokens = new Map();
   const pendingTokens = new Map();
@@ -333,32 +264,24 @@ async function start(directory) {
   let retryUntil = 0;
   let stopped = false;
   let ready = false;
-  let initialPublished = false;
 
   const batch = () => {
-    const start = committedCursor;
-    const end = eventLog.length;
-    const key = `${workspaceId}:${start}:${end}`;
+    const start = committedBrowserCursor;
+    const end = browserEvents.length;
+    const key = `${pageEvent}:${start}:${end}`;
     const existing = pendingTokens.get(key);
     if (existing) return existing;
     const token = randomUUID();
-    const events = eventLog.slice(start, end).map(event => ({
-      ...event,
-      context: {
-        based_on: event.based_on ?? null,
-        current: workspaceId,
-        relationship: event.based_on === workspaceId ? "current" : workspaceIds.has(event.based_on) ? "stale" : "unknown"
-      }
-    }));
-    tokens.set(token, { start, end, parent: workspaceId, status: "pending", key });
-    const result = { ok: true, type: "batch", token, workspace: workspaceId, workspace_sequence: workspaceSequence, frontier: end, events };
+    const events = browserEvents.slice(start, end);
+    tokens.set(token, { start, end, page_event: pageEvent, status: "pending", key, page_hash: currentPageHash(), has_page: null, requested_page_hash: null });
+    const result = { ok: true, type: "batch", token, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash(), events };
     pendingTokens.set(key, result);
     return result;
   };
 
   const notifyPullWaiters = () => {
     for (const waiter of [...pullWaiters]) {
-      if (eventLog.length === committedCursor) continue;
+      if (browserEvents.length === committedBrowserCursor) continue;
       pullWaiters.delete(waiter);
       clearTimeout(waiter.timer);
       waiter.resolve(batch());
@@ -366,53 +289,57 @@ async function start(directory) {
   };
 
   const pull = waitSeconds => {
-    if (eventLog.length > committedCursor || waitSeconds <= 0) return Promise.resolve(batch());
+    if (browserEvents.length > committedBrowserCursor || waitSeconds <= 0) return Promise.resolve(batch());
     return new Promise(resolve => {
       const waiter = { resolve, timer: setTimeout(() => { pullWaiters.delete(waiter); resolve(batch()); }, waitSeconds * 1_000) };
       pullWaiters.add(waiter);
     });
   };
 
-  const commit = async (token, publish) => {
+  const commit = async (token, requestedPage) => {
     const record = tokens.get(token);
     if (!record) return { ok: false, error: "unknown batch token" };
-    if (record.status !== "pending") return record.result;
-    if (record.start < committedCursor && record.end <= committedCursor) {
-      pendingTokens.delete(record.key);
-      record.status = "committed";
-      record.result = { ok: true, type: "already_committed", token, workspace: workspaceId, workspace_sequence: workspaceSequence, frontier: committedCursor };
-      return record.result;
+    const hasPage = requestedPage !== undefined;
+    const requestedPageHash = hasPage ? pageHash(requestedPage) : null;
+    if (record.status !== "pending") {
+      if (record.has_page === hasPage && record.requested_page_hash === requestedPageHash) return record.result;
+      return { ok: false, error: "batch was already committed with a different page payload" };
     }
-    if (record.parent !== workspaceId || record.start !== committedCursor) {
+    if (record.page_event !== pageEvent || record.start !== committedBrowserCursor) {
       pendingTokens.delete(record.key);
       record.status = "failed";
-      record.result = { ok: false, error: "batch is based on an old workspace or cursor", current_workspace: workspaceId, frontier: committedCursor };
+      record.result = { ok: false, error: "batch is based on an old page or browser cursor", frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash() };
       return record.result;
     }
-    if (publish) {
-      const nextRoot = await snapshotDirectory(root);
-      const previousRoot = publishedRoot;
-      publishedRoot = nextRoot;
-      workspaceId = randomUUID();
-      workspaceIds.add(workspaceId);
-      workspaceSequence += 1;
-      record.result = { ok: true, type: "published", token, workspace: workspaceId, workspace_sequence: workspaceSequence, parent: record.parent, frontier: record.end, events: eventLog.slice(record.start, record.end).map(event => event.id) };
-      void rm(previousRoot, { recursive: true, force: true }).catch(() => {});
-    } else {
-      record.result = { ok: true, type: "acknowledged", token, workspace: workspaceId, workspace_sequence: workspaceSequence, frontier: record.end, events: eventLog.slice(record.start, record.end).map(event => event.id) };
+    if (hasPage && Buffer.byteLength(requestedPage, "utf8") > MAX_BODY_BYTES) return { ok: false, error: "page is too large" };
+    record.has_page = hasPage;
+    record.requested_page_hash = requestedPageHash;
+    const committedEvents = browserEvents.slice(record.start, record.end).map(event => event.id);
+    let update;
+    if (hasPage) {
+      page = requestedPage;
+      eventNumber += 1;
+      pageEvent = eventNumber;
+      update = { type: "update_ui", event_number: pageEvent, html: page };
+      eventLog.push(update);
     }
-    committedCursor = record.end;
+    committedBrowserCursor = record.end;
     pendingTokens.delete(record.key);
     record.status = "committed";
-    if (publish) send({ type: "revision" });
+    record.result = { ok: true, type: "committed", token, frontier: eventNumber, page_event: pageEvent, page_hash: currentPageHash(), events: committedEvents };
+    if (update) send(update);
     return record.result;
   };
 
   const dispatchControl = async request => {
     if (!request || typeof request !== "object") return { ok: false, error: "invalid control request" };
     if (request.type === "pull") return pull(Number.isFinite(request.wait_seconds) ? Math.max(0, request.wait_seconds) : 0);
-    if (request.type === "push") return commit(typeof request.token === "string" ? request.token : "", true);
-    if (request.type === "ack") return commit(typeof request.token === "string" ? request.token : "", false);
+    if (request.type === "show") return { ok: true, type: "page", page_event: pageEvent, page_hash: currentPageHash(), html: page };
+    if (request.type === "push") {
+      if (typeof request.token !== "string") return { ok: false, error: "batch token is required" };
+      if (request.page !== undefined && typeof request.page !== "string") return { ok: false, error: "page must be text" };
+      return commit(request.token, request.page);
+    }
     return { ok: false, error: "unknown control request" };
   };
 
@@ -424,7 +351,7 @@ async function start(directory) {
     let handled = false;
     connection.on("data", async chunk => {
       input += chunk;
-      if (input.length > MAX_BODY_BYTES || handled) return;
+      if (input.length > CONTROL_MAX_BYTES || handled) return;
       const newline = input.indexOf("\n");
       if (newline < 0) return;
       handled = true;
@@ -440,20 +367,20 @@ async function start(directory) {
   });
   await new Promise((resolveListen, reject) => {
     controlServer.once("error", reject);
-    controlServer.listen(socketPath, async () => {
-      try { await chmod(socketPath, 0o600); } catch (cause) { controlServer.close(() => reject(cause)); return; }
+    controlServer.listen(controlPath(root), async () => {
+      try { await chmod(controlPath(root), 0o600); } catch (cause) { controlServer.close(() => reject(cause)); return; }
       controlServer.off("error", reject);
       resolveListen();
     });
-  }).catch(async cause => {
-    await rm(publishedRoot, { recursive: true, force: true });
-    throw new Error(`cannot start local control channel: ${cause.message}`);
-  });
+  }).catch(cause => { throw new Error(`cannot start local control channel: ${cause.message}`); });
 
   const recordInteraction = event => mutate(async () => {
     if (seenEvents.has(event.id)) return;
     seenEvents.add(event.id);
-    eventLog.push(event);
+    eventNumber += 1;
+    const numbered = { ...event, event_number: eventNumber };
+    eventLog.push(numbered);
+    browserEvents.push(numbered);
     notifyPullWaiters();
   });
 
@@ -466,11 +393,7 @@ async function start(directory) {
     try { socket?.close(); } catch {}
     for (const connection of controlConnections) connection.destroy();
     await new Promise(resolveClose => controlServer.close(() => resolveClose()));
-    await unlink(socketPath).catch(() => {});
-    await rm(publishedRoot, { recursive: true, force: true });
-    if (attachmentInboxPromise) {
-      try { await rm(await attachmentInboxPromise, { recursive: true, force: true }); } catch {}
-    }
+    await unlink(controlPath(root)).catch(() => {});
     process.exit(code);
   };
   process.once("SIGINT", () => void stop(0));
@@ -479,7 +402,7 @@ async function start(directory) {
   const retry = () => {
     if (stopped || Date.now() >= retryUntil) return void stop(1);
     retryTimer = setTimeout(() => { retryTimer = undefined; connect(); }, retryDelay);
-    retryDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);
+    retryDelay = Math.min(retryDelay * 2, 5_000);
   };
 
   const connect = () => {
@@ -512,15 +435,11 @@ async function start(directory) {
       } else if (packet.type === "session") {
         if (!validSessionUrl(packet.url)) return void stop(1);
         sessionUrl = packet.url;
-        if (!initialPublished) {
-          initialPublished = true;
-          send({ type: "revision" });
-        }
-        if (!ready) { ready = true; process.stdout.write(`${JSON.stringify({ type: "ready", url: sessionUrl, workspace: workspaceId, workspace_sequence: workspaceSequence })}\n`); }
+        if (!ready) { ready = true; process.stdout.write(`${JSON.stringify({ type: "ready", url: sessionUrl, page_event: pageEvent, page_hash: currentPageHash() })}\n`); }
       } else if (packet.type === "http_request") {
-        const requestRoot = publishedRoot;
-        const requestWorkspace = workspaceId;
-        void handleRequest(requestRoot, requestWorkspace, packet, getAttachmentInbox, recordInteraction).then(result => send(result)).catch(() => send(errorResponse(packet, 500, "preview request failed")));
+        const requestPage = page;
+        const requestPageEvent = pageEvent;
+        void handleRequest(root, requestPage, requestPageEvent, packet, recordInteraction).then(result => send(result)).catch(() => send(errorResponse(packet, 500, "preview request failed")));
       } else if (packet.type === "closed") {
         void stop(0);
       } else if (packet.type === "error") {
@@ -564,7 +483,7 @@ function validSessionUrl(value) {
 }
 
 function usage() {
-  return "Usage:\n  npx letmeknow-cli serve <directory>\n  npx letmeknow-cli pull <directory> [--wait <seconds>]\n  npx letmeknow-cli push <directory> --based-on <token>\n  npx letmeknow-cli ack <directory> --based-on <token>\n";
+  return "Usage:\n  npx letmeknow-cli serve <directory>\n  npx letmeknow-cli show <directory>\n  npx letmeknow-cli pull <directory> [--wait <seconds>]\n  npx letmeknow-cli push <directory> --batch <token> [--page <file|->]\n";
 }
 
 function commandArgs() {
@@ -576,7 +495,8 @@ function commandArgs() {
         skill: { type: "boolean" },
         help: { type: "boolean", short: "h" },
         wait: { type: "string" },
-        "based-on": { type: "string" }
+        batch: { type: "string" },
+        page: { type: "string" }
       },
       allowPositionals: true,
       strict: true
@@ -585,22 +505,40 @@ function commandArgs() {
     throw new Error(cause instanceof Error ? cause.message : "invalid arguments");
   }
   if (parsed.values.skill || parsed.values.help) {
-    if (parsed.positionals.length || parsed.values.wait !== undefined || parsed.values["based-on"] !== undefined) throw new Error(usage());
+    if (parsed.positionals.length || parsed.values.wait !== undefined || parsed.values.batch !== undefined || parsed.values.page !== undefined) throw new Error(usage());
     return { command: parsed.values.skill ? "skill" : "help" };
   }
   const [command, directory, ...extra] = parsed.positionals;
   if (!command || !directory || extra.length) throw new Error(usage());
-  if (command === "serve" && (parsed.values.wait !== undefined || parsed.values["based-on"] !== undefined)) throw new Error(usage());
-  if (command === "pull" && parsed.values["based-on"] !== undefined) throw new Error(usage());
-  if ((command === "push" || command === "ack") && parsed.values.wait !== undefined) throw new Error(usage());
-  if (!["serve", "pull", "push", "ack"].includes(command)) throw new Error(usage());
+  if (!["serve", "show", "pull", "push"].includes(command)) throw new Error(usage());
+  if ((command === "serve" || command === "show") && (parsed.values.wait !== undefined || parsed.values.batch !== undefined || parsed.values.page !== undefined)) throw new Error(usage());
+  if (command === "pull" && (parsed.values.batch !== undefined || parsed.values.page !== undefined)) throw new Error(usage());
+  if (command === "push" && parsed.values.wait !== undefined) throw new Error(usage());
   let wait = 0;
   if (parsed.values.wait !== undefined) {
     wait = Number(parsed.values.wait);
     if (!Number.isFinite(wait) || wait < 0) throw new Error("--wait must be a non-negative number");
   }
-  if ((command === "push" || command === "ack") && typeof parsed.values["based-on"] !== "string") throw new Error("--based-on is required");
-  return { command, directory, wait, token: parsed.values["based-on"] };
+  if (command === "push" && typeof parsed.values.batch !== "string") throw new Error("--batch is required");
+  return { command, directory, wait, token: parsed.values.batch, page: parsed.values.page };
+}
+
+async function readPageInput(filename) {
+  const chunks = [];
+  let length = 0;
+  if (filename === "-") {
+    for await (const chunk of process.stdin) {
+      const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      length += value.byteLength;
+      if (length > MAX_BODY_BYTES) throw new Error("page is too large");
+      chunks.push(value);
+    }
+  } else {
+    const body = await readFile(resolve(filename));
+    if (body.byteLength > MAX_BODY_BYTES) throw new Error("page is too large");
+    chunks.push(body);
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 let command;
@@ -611,8 +549,16 @@ try {
   else if (command.command === "serve") await start(command.directory);
   else {
     const { root } = await options(command.directory);
-    const result = await connectControl(root, command.command === "pull" ? { type: "pull", wait_seconds: command.wait } : { type: command.command, token: command.token });
-    process.stdout.write(`${JSON.stringify(result)}\n`);
+    let packet;
+    if (command.command === "pull") packet = { type: "pull", wait_seconds: command.wait };
+    else if (command.command === "show") packet = { type: "show" };
+    else {
+      packet = { type: "push", token: command.token };
+      if (command.page !== undefined) packet.page = await readPageInput(command.page);
+    }
+    const result = await connectControl(root, packet);
+    if (command.command === "show" && result.ok) process.stdout.write(result.html);
+    else process.stdout.write(`${JSON.stringify(result)}\n`);
     if (!result.ok) process.exitCode = 1;
   }
 } catch (cause) {
