@@ -37,6 +37,9 @@
       request.onupgradeneeded = () => request.result.createObjectStore("submissions", { keyPath: "id" });
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error || new Error("could not open submission outbox"));
+    }).catch(error => {
+      outboxDatabasePromise = undefined;
+      throw error;
     });
     return outboxDatabasePromise;
   }
@@ -101,14 +104,17 @@
       });
       if (response.status === 202) {
         await outboxDelete(record.id);
+        if (terminal) return;
         setSubmissionStatus(record.id, "Sent. Waiting for an update…", record.form_id);
         submissionForms.delete(record.id);
         return;
       }
       if (response.status >= 400 && response.status < 500) await outboxDelete(record.id);
+      if (terminal) return;
       setSubmissionStatus(record.id, response.status === 413 ? "Submission is too large." : "Couldn’t send. Try again.", record.form_id);
       if (response.status >= 500) scheduleOutboxFlush();
     } catch {
+      if (terminal) return;
       setSubmissionStatus(record.id, "Couldn’t send. Try again.", record.form_id);
       scheduleOutboxFlush();
     }
