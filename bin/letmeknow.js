@@ -146,7 +146,7 @@ async function staticResponse(root, packet, page, pageEvent) {
 async function readInitialPage(root) {
   const candidate = join(root, "index.html");
   const target = await safeRealpath(root, candidate);
-  if (target === null || target === undefined) throw new Error("index.html is required");
+  if (target === null || target === undefined || deniedPath("/" + relative(root, target).split(sep).join("/"))) throw new Error("index.html is required");
   const info = await stat(target);
   if (!info.isFile()) throw new Error("index.html must be a file");
   if (info.size > MAX_BODY_BYTES) throw new Error("index.html is too large");
@@ -166,9 +166,9 @@ async function submission(packet, recordInteraction) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("submission must be an object");
   if (typeof value.id !== "string" || !uuidPattern.test(value.id)) throw new Error("submission id must be a UUID");
   if (!Number.isSafeInteger(value.page_event) || value.page_event < 0) throw new Error("page_event must be a non-negative integer");
-  if (typeof value.form_id !== "string") throw new Error("form_id is required");
+  if (value.form_id !== null && typeof value.form_id !== "string") throw new Error("form_id must be text or null");
   if (typeof value.action !== "string") throw new Error("action is required");
-  if (!value.trigger || typeof value.trigger !== "object" || Array.isArray(value.trigger)) throw new Error("trigger is required");
+  if (value.trigger !== null && (typeof value.trigger !== "object" || Array.isArray(value.trigger))) throw new Error("trigger must be an object or null");
   if (!value.values || typeof value.values !== "object" || Array.isArray(value.values)) throw new Error("values are required");
   await recordInteraction({ type: "submit", id: value.id, page_event: value.page_event, form_id: value.form_id, action: value.action, trigger: value.trigger, values: value.values });
   return response(packet, 202);
@@ -305,6 +305,8 @@ async function start(directory) {
       if (record.has_page === hasPage && record.requested_page_hash === requestedPageHash) return record.result;
       return { ok: false, error: "batch was already committed with a different page payload" };
     }
+    record.has_page = hasPage;
+    record.requested_page_hash = requestedPageHash;
     if (record.page_event !== pageEvent || record.start !== committedBrowserCursor) {
       pendingTokens.delete(record.key);
       record.status = "failed";
@@ -312,8 +314,6 @@ async function start(directory) {
       return record.result;
     }
     if (hasPage && Buffer.byteLength(requestedPage, "utf8") > MAX_BODY_BYTES) return { ok: false, error: "page is too large" };
-    record.has_page = hasPage;
-    record.requested_page_hash = requestedPageHash;
     const committedEvents = browserEvents.slice(record.start, record.end).map(event => event.id);
     let update;
     if (hasPage) {

@@ -225,6 +225,9 @@ describe("LetMeKnow CLI", () => {
       assert.equal(current.headers["X-LetMeKnow-Page-Event"], "1");
       const retried = await command(["push", session.folder, "--batch", first.token, "--page", pageFile]);
       assert.deepEqual(retried, pushed);
+      const missingRetry = await runCommand(["push", session.folder, "--batch", first.token]);
+      assert.equal(missingRetry.code, 1);
+      assert.match(missingRetry.stdout, /different page payload/);
       const changedFile = join(session.folder, "changed.html");
       writeFileSync(changedFile, "different");
       const changedRetry = await runCommand(["push", session.folder, "--batch", first.token, "--page", changedFile]);
@@ -243,21 +246,42 @@ describe("LetMeKnow CLI", () => {
       const id = randomUUID();
       assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(id))).status, 202);
       const batch = await command(["pull", session.folder]);
+      const laterId = randomUUID();
+      assert.equal((await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, jsonSubmission(laterId))).status, 202);
       const page = "<!doctype html><html><body><main id=\"letmeknow-root\">handled</main></body></html>";
       const pushed = await command(["push", session.folder, "--batch", batch.token, "--page", "-"], page);
-      assert.equal(pushed.frontier, 2);
-      assert.equal(pushed.page_event, 2);
+      assert.equal(pushed.frontier, 3);
+      assert.equal(pushed.page_event, 3);
       assert.deepEqual(pushed.events, [id]);
-      assert.deepEqual(session.updates, [{ type: "update_ui", event_number: 2, html: page }]);
-      const empty = await command(["pull", session.folder]);
-      assert.deepEqual(empty.events, []);
-      assert.equal(empty.frontier, 2);
-      assert.equal(empty.page_event, 2);
-      const noPage = await command(["push", session.folder, "--batch", empty.token]);
+      assert.deepEqual(session.updates, [{ type: "update_ui", event_number: 3, html: page }]);
+      const later = await command(["pull", session.folder]);
+      assert.deepEqual(later.events.map(event => event.id), [laterId]);
+      assert.equal(later.frontier, 3);
+      assert.equal(later.page_event, 3);
+      const noPage = await command(["push", session.folder, "--batch", later.token]);
       assert.equal(noPage.type, "committed");
-      assert.equal(noPage.frontier, 2);
-      const noPageRetry = await command(["push", session.folder, "--batch", empty.token]);
+      assert.equal(noPage.frontier, 3);
+      const noPageRetry = await command(["push", session.folder, "--batch", later.token]);
       assert.deepEqual(noPageRetry, noPage);
+      const changedRetry = await runCommand(["push", session.folder, "--batch", later.token, "--page", "-"], page);
+      assert.equal(changedRetry.code, 1);
+      assert.match(changedRetry.stdout, /different page payload/);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it("accepts submissions without a form ID or submitter", async () => {
+    const session = await startSession();
+    try {
+      const id = randomUUID();
+      const body = Buffer.from(JSON.stringify({ id, page_event: 0, form_id: null, action: "/", trigger: null, values: {} }));
+      const response = await session.request("POST", "/_letmeknow/submit", { "content-type": "application/json" }, body);
+      assert.equal(response.status, 202);
+      const batch = await command(["pull", session.folder]);
+      assert.equal(batch.events[0].id, id);
+      assert.equal(batch.events[0].form_id, null);
+      assert.equal(batch.events[0].trigger, null);
     } finally {
       await session.stop();
     }
