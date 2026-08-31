@@ -91,6 +91,8 @@ const recoveredPage = documentPage(52, "Recovered", `
       <button id="submit" name="decision" value="approve">Approve</button>
       <output id="status" data-letmeknow-status role="status"></output>
     </form>
+    <table><tbody><tr id="row"><td>old row</td></tr></tbody></table>
+    <select><option id="choice">old choice</option></select>
   </main>
 `);
 
@@ -241,9 +243,19 @@ describe("browser runtime", () => {
       assert.equal(scriptHits, 0, "scripts in rejected replacements must not execute");
 
       await waitFor(() => sockets.length > beforeRecoverySockets, "recovered page runtime did not connect");
+      const beforeContextRecovery = rootRequests;
+      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 53, target: "row", html: `<tr id="row"><td>new row</td></tr>` }));
+      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 54, target: "choice", html: `<option id="choice">new choice</option>` }));
+      await waitFor(async () => await execute("return document.querySelector('#row')?.textContent === 'new row' && document.querySelector('#choice')?.textContent === 'new choice'"), "contextual replacements were not applied");
+      assert.equal(rootRequests, beforeContextRecovery, "contextual replacements must not trigger recovery");
+      assert.deepEqual(await execute(`return {
+        rowParent: document.querySelector('#row').parentElement.localName,
+        choiceParent: document.querySelector('#choice').parentElement.localName
+      }`), { rowParent: "tbody", choiceParent: "select" });
+
       const beforeCommentRecovery = rootRequests;
       const beforeCommentRecoverySockets = sockets.length;
-      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 53, target: "counter", html: "<!-- comment --><output id=\"counter\">bad</output>" }));
+      sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 55, target: "counter", html: "<!-- comment --><output id=\"counter\">bad</output>" }));
       await waitFor(() => rootRequests > beforeCommentRecovery, "comment-wrapped replacement did not trigger recovery");
       await waitFor(() => sockets.length > beforeCommentRecoverySockets, "comment recovery runtime did not connect");
       await waitFor(async () => await execute("return document.title") === "Recovered", "comment recovery did not load the canonical page");

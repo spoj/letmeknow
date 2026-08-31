@@ -304,6 +304,24 @@ describe("LetMeKnow CLI", () => {
     }
   });
 
+  it("replaces contextual table rows and select options", async () => {
+    const initial = "<!doctype html><html><body><main id=\"letmeknow-root\"><table><tbody><tr id=\"row\"><td>old row</td></tr></tbody></table><select><option id=\"choice\">old choice</option></select></main></body></html>";
+    const session = await startSession({ index: initial });
+    try {
+      const batch = await command(["pull", session.folder]);
+      const pushed = await command(["push", session.folder, "--batch", batch.token, "--updates", "-"], manifest([
+        { target: "row", html: `<tr id="row"><td>new row</td></tr>` },
+        { target: "choice", html: `<option id="choice">new choice</option>` }
+      ]));
+      assert.deepEqual(pushed.updates.map(update => update.target), ["row", "choice"]);
+      const shown = (await runCommand(["show", session.folder])).stdout;
+      assert.match(shown, /<table><tbody><tr id="row"><td>new row<\/td><\/tr><\/tbody><\/table>/);
+      assert.match(shown, /<select><option id="choice">new choice<\/option><\/select>/);
+    } finally {
+      await session.stop();
+    }
+  });
+
   it("rejects a failed replacement batch atomically", async () => {
     const initial = "<!doctype html><html><body><main id=\"letmeknow-root\"><output id=\"count\">0</output></main></body></html>";
     const session = await startSession({ index: initial });
