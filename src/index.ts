@@ -37,7 +37,7 @@ type RunUIEvent = {
 };
 type CanonicalEvent = SubmitEvent | RunUIEvent;
 type StoredEvent = { event: CanonicalEvent; received: boolean; sent: boolean; bytes: number };
-type BlobRecord = { size: number; stored: boolean; kind: "workspace" | "browser"; expires_at?: number };
+type BlobRecord = { size: number; stored: boolean; kind: "workspace" | "browser" | "shared"; expires_at?: number };
 type SubmissionRecord = { event_number: number; hash: string };
 type ProducerAttachment = { role: "producer"; id: string; url: string; opened: boolean; closing: boolean };
 type ClientAttachment = { role: "client" };
@@ -58,7 +58,7 @@ const MAX_PACKET_BYTES = 6 * MAX_BODY_BYTES + 4096;
 const MAX_MANIFEST_BYTES = 512 * 1024;
 const MAX_ATTACHMENTS = 32;
 const MAX_BROWSER_BLOB_RECORDS = 1024;
-const ATTACHMENT_RESERVATION_LEASE_MS = 5 * 60 * 1_000;
+const ATTACHMENT_RESERVATION_LEASE_MS = 30 * 60 * 1_000;
 const MAX_ATTACHMENT_FIELD_BYTES = 256;
 const MAX_ATTACHMENT_NAME_BYTES = 512;
 const MAX_ATTACHMENT_CONTENT_TYPE_BYTES = 200;
@@ -364,7 +364,8 @@ export class Session extends DurableObject<Env> {
     for (const [hash, size] of requested) {
       const existing = next[hash];
       if (existing) {
-        if (existing.kind !== "workspace") throw new Error("workspace hash is not a workspace object");
+        if (existing.kind === "browser") next[hash] = { ...existing, kind: "shared" };
+        else if (existing.kind !== "workspace" && existing.kind !== "shared") throw new Error("workspace hash is not a workspace object");
         if (existing.size !== size) throw new Error("workspace object has the wrong size");
         continue;
       }
@@ -383,7 +384,7 @@ export class Session extends DurableObject<Env> {
   private async markWorkspaceObjectStored(hash: string, size: number): Promise<void> {
     const records = await this.blobRecords();
     const record = records[hash];
-    if (!record || record.kind !== "workspace" || record.size !== size) throw new Error("workspace blob was not reserved");
+    if (!record || (record.kind !== "workspace" && record.kind !== "shared") || record.size !== size) throw new Error("workspace blob was not reserved");
     if (!record.stored) {
       records[hash] = { ...record, stored: true };
       await this.ctx.storage.put("blob_records", records);
@@ -397,7 +398,7 @@ export class Session extends DurableObject<Env> {
       await this.reclaimExpiredBrowserObjects();
       const records = await this.blobRecords();
       const record = records[hash];
-      if (!record || record.kind !== "browser") throw new Error("attachment was not reserved");
+      if (!record || (record.kind !== "browser" && record.kind !== "shared")) throw new Error("attachment was not reserved");
       const object = await this.env.UPLOADS.head(await this.objectKey(hash));
       if (object?.size === record.size) {
         if (!record.stored || record.expires_at !== undefined) {
@@ -419,7 +420,7 @@ export class Session extends DurableObject<Env> {
   private async markBrowserObjectStored(hash: string, size: number): Promise<void> {
     const records = await this.blobRecords();
     const record = records[hash];
-    if (!record || record.kind !== "browser" || record.size !== size) throw new Error("attachment reservation changed");
+    if (!record || (record.kind !== "browser" && record.kind !== "shared") || record.size !== size) throw new Error("attachment reservation changed");
     records[hash] = { ...record, stored: true, ...(record.expires_at === undefined ? {} : { expires_at: record.expires_at }) };
     await this.ctx.storage.put("blob_records", records);
     await this.scheduleAlarm();
@@ -440,17 +441,24 @@ export class Session extends DurableObject<Env> {
     const referenced = await this.referencedBrowserObjects();
     const now = Date.now();
     const expired = Object.entries(records).filter(([hash, record]) => {
-      if (record.kind !== "browser" || referenced.has(hash)) return false;
+      if ((record.kind !== "browser" && record.kind !== "shared") || referenced.has(hash)) return false;
       return record.expires_at === undefined ? !record.stored : record.expires_at <= now;
     });
     if (!expired.length) return;
     const next = { ...records };
     let reserved = await this.ctx.storage.get<number>("reserved_blob_bytes") ?? 0;
+    const remove: string[] = [];
     for (const [hash, record] of expired) {
-      delete next[hash];
-      reserved -= record.size;
+      if (record.kind === "shared") {
+        next[hash] = { ...record, kind: "workspace" };
+        delete next[hash].expires_at;
+      } else {
+        delete next[hash];
+        reserved -= record.size;
+        remove.push(hash);
+      }
     }
-    await this.env.UPLOADS.delete(await Promise.all(expired.map(([hash]) => this.objectKey(hash))));
+    if (remove.length) await this.env.UPLOADS.delete(await Promise.all(remove.map(hash => this.objectKey(hash))));
     await this.ctx.storage.transaction(async transaction => {
       await transaction.put("blob_records", next);
       await transaction.put("reserved_blob_bytes", Math.max(0, reserved));
@@ -475,7 +483,7 @@ export class Session extends DurableObject<Env> {
     const records = await this.blobRecords();
     const next = { ...records };
     let reserved = await this.ctx.storage.get<number>("reserved_blob_bytes") ?? 0;
-    let browserRecords = Object.values(next).filter(record => record.kind === "browser").length;
+    let browserRecords = Object.values(next).filter(record => record.kind === "browser" || record.kind === "shared").length;
     const requested = new Map<string, number>();
     for (const item of items) {
       const prior = requested.get(item.hash);
@@ -485,7 +493,11 @@ export class Session extends DurableObject<Env> {
     for (const [hash, size] of requested) {
       const existing = next[hash];
       if (existing) {
-        if (existing.kind !== "browser") throw new Error("attachment hash is not a browser object");
+        if (existing.kind === "workspace") {
+          if (browserRecords >= MAX_BROWSER_BLOB_RECORDS) throw new Error("attachment object limit exceeded");
+          next[hash] = { ...existing, kind: "shared", expires_at: Date.now() + ATTACHMENT_RESERVATION_LEASE_MS };
+          browserRecords += 1;
+        } else if (existing.kind !== "browser" && existing.kind !== "shared") throw new Error("attachment hash is not a browser object");
         if (existing.size !== size) throw new Error("attachment hash has the wrong size");
         continue;
       }
@@ -518,17 +530,28 @@ export class Session extends DurableObject<Env> {
     const records = await this.blobRecords();
     for (const attachment of attachments) {
       const record = records[attachment.hash];
-      if (!record || record.kind !== "browser" || !record.stored || record.size !== attachment.size) throw new Error("attachment is missing or has the wrong size");
+      if (!record || (record.kind !== "browser" && record.kind !== "shared") || !record.stored || record.size !== attachment.size) throw new Error("attachment is missing or has the wrong size");
     }
     return records;
   }
 
   private async cleanupObjects(keep: Set<string>): Promise<void> {
     const records = await this.blobRecords();
+    const referenced = await this.referencedBrowserObjects();
     let reserved = await this.ctx.storage.get<number>("reserved_blob_bytes") ?? 0;
     const remove: string[] = [];
     for (const [hash, record] of Object.entries(records)) {
-      if (record.kind !== "workspace" || keep.has(hash)) continue;
+      if (keep.has(hash) || record.kind === "browser") continue;
+      if (record.kind === "shared") {
+        if (referenced.has(hash) || record.expires_at !== undefined) records[hash] = { ...record, kind: "browser" };
+        else {
+          remove.push(hash);
+          reserved -= record.size;
+          delete records[hash];
+        }
+        continue;
+      }
+      if (record.kind !== "workspace") continue;
       remove.push(hash);
       reserved -= record.size;
       delete records[hash];
@@ -547,14 +570,21 @@ export class Session extends DurableObject<Env> {
     const next = { ...records };
     let reserved = await this.ctx.storage.get<number>("reserved_blob_bytes") ?? 0;
     const remove: string[] = [];
+    let changed = false;
     for (const [hash, record] of Object.entries(records)) {
-      if (record.kind !== "browser" || !record.stored || record.expires_at !== undefined || referenced.has(hash)) continue;
+      if ((record.kind !== "browser" && record.kind !== "shared") || !record.stored || record.expires_at !== undefined || referenced.has(hash)) continue;
+      if (record.kind === "shared") {
+        next[hash] = { ...record, kind: "workspace" };
+        delete next[hash].expires_at;
+        changed = true;
+        continue;
+      }
       remove.push(hash);
       reserved -= record.size;
       delete next[hash];
     }
-    if (!remove.length) return;
-    await this.env.UPLOADS.delete(await Promise.all(remove.map(hash => this.objectKey(hash))));
+    if (!remove.length && !changed) return;
+    if (remove.length) await this.env.UPLOADS.delete(await Promise.all(remove.map(hash => this.objectKey(hash))));
     await this.ctx.storage.transaction(async transaction => {
       await transaction.put("blob_records", next);
       await transaction.put("reserved_blob_bytes", Math.max(0, reserved));
@@ -689,7 +719,7 @@ export class Session extends DurableObject<Env> {
     const hash = match[1];
     const records = await this.blobRecords();
     const record = records[hash];
-    if (!record || record.kind !== "workspace") return error("workspace object was not reserved", 409);
+    if (!record || (record.kind !== "workspace" && record.kind !== "shared")) return error("workspace object was not reserved", 409);
     const key = await this.objectKey(hash);
     const existing = await this.env.UPLOADS.head(key);
     if (record.stored && existing?.size === record.size) return new Response(null, { status: 204 });
@@ -767,7 +797,7 @@ export class Session extends DurableObject<Env> {
       if (!(await this.ctx.storage.get<boolean>("opened"))) return error("session not found", 404);
       if (await this.sessionExpired()) { await this.mutate(() => this.expireSession()); return error("session expired", 404); }
       const record = (await this.blobRecords())[match[1]];
-      if (!record || record.kind !== "browser" || !record.stored) return error("attachment not found", 404);
+      if (!record || (record.kind !== "browser" && record.kind !== "shared") || !record.stored) return error("attachment not found", 404);
       const object = await this.env.UPLOADS.get(await this.objectKey(match[1]));
       if (!object) return error("attachment not found", 404);
       return new Response(object.body, { status: 200, headers: { "Content-Type": "application/octet-stream", "Content-Length": String(object.size), "Cache-Control": "no-store" } });

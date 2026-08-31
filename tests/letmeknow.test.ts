@@ -233,6 +233,37 @@ describe("LetMeKnow service", () => {
     producer.socket.close(1000, "done");
   });
 
+  it("shares a workspace object with a browser attachment", async () => {
+    const data = new TextEncoder().encode("shared workspace bytes");
+    const { producer, url, workspace } = await open({ files: { "shared.bin": { data, content_type: "text/plain" } } });
+    const attachment = { hash: digest(data), size: data.byteLength };
+    const reservation = await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hashes: [attachment] })
+    }));
+    expect(await reservation.json()).toEqual({ missing: [] });
+    const id = randomUUID();
+    expect((await SELF.fetch(new Request(new URL("_letmeknow/submit", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id, page_event: 0, form_id: null, action: "/", trigger: null, values: {}, attachments: [{ field: "file", name: "file", content_type: "text/plain", ...attachment }] })
+    }))).status).toBe(202);
+    const event = await nextType(producer, "submit");
+    producer.send({ type: "event_ack", event_number: event.event_number });
+    await commit(producer, workspace, event.event_number);
+    expect(await (await SELF.fetch(new Request(new URL("shared.bin", url)))).text()).toBe("shared workspace bytes");
+  });
+
+  it("promotes a browser object when a workspace later uses the same hash", async () => {
+    const { producer, url } = await open();
+    const data = new TextEncoder().encode("browser workspace bytes");
+    await uploadAttachment(producer, url, data);
+    const next = await uploadWorkspace(producer, url, new TextEncoder().encode("<!doctype html><html><body><main id=app>initial</main></body></html>"), { "shared.bin": { data, content_type: "text/plain" } });
+    await commit(producer, next, 0);
+    expect(await (await SELF.fetch(new Request(new URL("shared.bin", url)))).text()).toBe("browser workspace bytes");
+  });
+
   it("reclaims abandoned attachment reservations after their lease", async () => {
     const now = Date.now();
     vi.useFakeTimers({ now });
@@ -246,7 +277,7 @@ describe("LetMeKnow service", () => {
       body: JSON.stringify({ hashes: [{ hash, size }] })
     }));
     expect((await reserve(first)).status).toBe(200);
-    vi.setSystemTime(now + 5 * 60 * 1_000 + 1);
+    vi.setSystemTime(now + 30 * 60 * 1_000 + 1);
     expect(await runDurableObjectAlarm(env.SESSIONS.getByName(new URL(url).hostname.split(".")[0]))).toBe(true);
     expect((await reserve(second)).status).toBe(200);
     producer.socket.close(1000, "done");
