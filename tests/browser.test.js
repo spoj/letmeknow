@@ -189,8 +189,6 @@ describe("browser runtime", () => {
 
       const command = (method, path, body) => request(driverPort, method, `/session/${sessionId}${path}`, body);
       const execute = script => command("POST", "/execute/sync", { script, args: [] }).then(result => result.value);
-      const executeAsync = script => command("POST", "/execute/async", { script, args: [] }).then(result => result.value);
-      const outboxCount = () => executeAsync(`const done = arguments[0]; const request = indexedDB.open("letmeknow-outbox-v2:" + location.origin); request.onerror = () => done(-1); request.onsuccess = () => { const transaction = request.result.transaction("submissions", "readonly"); const get = transaction.objectStore("submissions").getAll(); get.onerror = () => done(-1); get.onsuccess = () => done(get.result.length); };`);
       await command("POST", "/url", { url: `http://127.0.0.1:${port}/` });
       await waitFor(async () => (await execute("return document.readyState")) === "complete", "initial page did not load");
       await waitFor(() => sockets.length === 1, "browser did not connect to runtime");
@@ -250,24 +248,32 @@ describe("browser runtime", () => {
       await waitFor(() => sockets.length > beforeCommentRecoverySockets, "comment recovery runtime did not connect");
       await waitFor(async () => await execute("return document.title") === "Recovered", "comment recovery did not load the canonical page");
 
+      const terminalBaselinePosts = posts.length;
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: false }));
       await waitFor(async () => await execute("return document.documentElement.hasAttribute('data-letmeknow-disconnected')"), "producer disconnect was not reflected");
       await execute("document.querySelector('#submit').click();");
-      await waitFor(async () => await outboxCount() === 1, "offline submission was not queued");
+      await sleep(100);
+      assert.equal(posts.length, terminalBaselinePosts);
       await execute("document.querySelector('#submit').click();");
       sockets.at(-1).send(JSON.stringify({ type: "closed", message: "Session expired" }));
       await waitFor(async () => await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent") === "Session expired", "terminal status was not shown");
-      await waitFor(async () => await outboxCount() === 0, "terminal session did not clear the outbox");
       sockets.at(-1).send(JSON.stringify({ type: "producer", connected: true }));
       sockets.at(-1).send(JSON.stringify({ type: "update_ui", event_number: 54, target: "heading", html: "<h1 id=\"heading\">Unexpected</h1>" }));
       await sleep(100);
-      assert.equal(await outboxCount(), 0);
+      assert.equal(posts.length, terminalBaselinePosts);
       assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session expired");
       assert.equal(await execute("return document.querySelector('#heading').textContent"), "Recovered");
       await execute("document.querySelector('#submit').click();");
       await sleep(100);
-      assert.equal(await outboxCount(), 0);
+      assert.equal(posts.length, terminalBaselinePosts);
       assert.equal(await execute("return document.querySelector('[data-letmeknow-system-status]')?.textContent"), "Session expired");
+
+      const beforeTerminalReloadSockets = sockets.length;
+      await command("POST", "/url", { url: `http://127.0.0.1:${port}/` });
+      await waitFor(() => sockets.length > beforeTerminalReloadSockets, "fresh runtime did not connect after terminal reload");
+      await waitFor(async () => await execute("return document.title") === "Recovered", "fresh runtime did not load the canonical page");
+      await sleep(200);
+      assert.equal(posts.length, terminalBaselinePosts, "terminal submissions must not be delivered after reload");
 
       const beforeStatic = sockets.length;
       await command("POST", "/url", { url: `http://127.0.0.1:${port}/static.html` });
