@@ -590,7 +590,7 @@ function readScriptInput(filename) {
 }
 
 function usage() {
-  return "Usage:\n  npx letmeknow serve <directory>\n  npx letmeknow commit <directory> --through <event-number> [--script <file|->]\n";
+  return "Usage:\n  npx letmeknow-cli serve <directory>\n  npx letmeknow-cli commit <directory> --through <event-number> [--script <file|->]\n";
 }
 
 function commandArgs() {

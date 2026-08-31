@@ -12,7 +12,7 @@ Use LetMeKnow when a human should inspect or interact with an agent-authored pag
 Create a directory containing an `index.html` and the workspace files:
 
 ```bash
-npx letmeknow serve ./preview
+npx letmeknow-cli serve ./preview
 ```
 
 `serve` scans and uploads the initial workspace before making the session public. Run it in a monitored background process and consume its stdout as newline-delimited JSON notifications. Its first line is ready metadata:
@@ -38,7 +38,7 @@ Read each compact submission notification from the monitored `serve` stdout, the
 After reading and considering submissions through event 7, acknowledge that inclusive prefix and optionally publish the current workspace plus an update:
 
 ```bash
-npx letmeknow commit ./preview --through 7 --script update.js
+npx letmeknow-cli commit ./preview --through 7 --script update.js
 ```
 
 The notification stream contains pointers rather than submission values. This keeps long responses out of monitor output limits. The event file is local to the `serve` process and contains the complete structured event.
@@ -50,7 +50,7 @@ A commit scans the current workspace, uploads content-addressed files that the s
 A commit without `--script` only publishes the workspace and acknowledges the requested submission prefix; it does not consume a global event number. A script commit creates the next global `run_ui` event. For a proactive first update, use `--through 0`:
 
 ```bash
-npx letmeknow commit ./preview --through 0 --script initialize.js
+npx letmeknow-cli commit ./preview --through 0 --script initialize.js
 ```
 
 `N` must be a non-negative safe integer, no greater than the current service frontier and no less than the last acknowledged submission cursor. The CLI must already have received the contiguous event prefix through `N`; otherwise the service rejects the commit. UI event numbers may lie in that range, but only submission events are acknowledged by the cursor.
@@ -117,13 +117,15 @@ Use ordinary same-origin forms with stable IDs and meaningful field names:
 </form>
 ```
 
-The runtime captures native form submissions by default and converts them into JSON `submit` events. It stores the small structured event in a durable browser outbox before delivery, retries after connection failures, and reuses the same UUID on retry. The browser sends it to the service even when the producer is disconnected; the disconnected indicator describes the producer, not service acceptance. An application handler can claim a submission by calling `event.preventDefault()` before the runtime handler runs. `form.submit()` and direct `fetch()` bypass the structured outbox.
+The runtime captures native form submissions by default and converts them into JSON `submit` events. It stores the structured event and selected files in a durable browser outbox before delivery, retries after connection failures, and reuses the same UUID and content hashes on retry. The browser sends it to the service even when the producer is disconnected; the disconnected indicator describes the producer, not service acceptance. An application handler can claim a submission by calling `event.preventDefault()` before the runtime handler runs. `form.submit()` and direct `fetch()` bypass the structured outbox.
 
-File uploads are not supported yet. Form values are untrusted input. Validate them and escape them before putting them into HTML or scripts.
+Files are uploaded privately before the submission is accepted. Attachment descriptors contain `field`, `name`, `content_type`, `size`, and `hash`; file values are excluded from `values`. Before acknowledging the event, the CLI downloads and verifies each file and adds a safe local `path` in the complete event at `event_path`. The original filename never determines the local path. Successful commit cleanup removes acknowledged local event and attachment files.
+
+Form values, attachment metadata, and attachment contents are untrusted input. Validate them and escape text before putting it into HTML or scripts.
 
 ## Workspace and storage limits
 
-LetMeKnow is not a general file host. Each session has one aggregate 100 MiB blob-storage limit covering the workspace and future session attachments. The service reserves this quota before accepting workspace bytes. There is no separate application per-file, workspace-size, or file-count quota; a single file or workspace may consume the remaining session quota. Protocol metadata and messages still have bounded sizes.
+LetMeKnow is not a general file host. Each session has one aggregate 100 MiB blob-storage limit covering the committed and staged workspace plus browser attachments. The service reserves this quota before accepting bytes. There is no separate application per-file, workspace-size, or file-count quota; a single file or workspace may consume the remaining session quota. Protocol metadata, submissions, and replay history still have bounded sizes.
 
 ## Reconnect and expiry
 
