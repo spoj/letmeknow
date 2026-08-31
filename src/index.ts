@@ -246,6 +246,7 @@ function pathFromRequest(request: Request): string {
 
 export class Session extends DurableObject<Env> {
   private stateMutation: Promise<void> = Promise.resolve();
+  private activeBrowserUploads = new Map<string, number>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -419,7 +420,7 @@ export class Session extends DurableObject<Env> {
     const records = await this.blobRecords();
     const record = records[hash];
     if (!record || (record.kind !== "browser" && record.kind !== "shared") || record.size !== size) throw new Error("attachment reservation changed");
-    records[hash] = { ...record, stored: true };
+    records[hash] = { ...record, stored: true, expires_at: Date.now() + ATTACHMENT_RESERVATION_LEASE_MS };
     await this.ctx.storage.put("blob_records", records);
     await this.scheduleAlarm();
   }
@@ -437,9 +438,15 @@ export class Session extends DurableObject<Env> {
   private async reclaimExpiredBrowserObjects(): Promise<void> {
     const records = await this.blobRecords();
     const referenced = await this.referencedBrowserObjects();
+    const workspaceReferences = new Set<string>();
+    const base = await this.ctx.storage.get<string>("base_index_hash");
+    if (base) workspaceReferences.add(base);
+    const manifest = await this.ctx.storage.get<Manifest>("current_manifest");
+    for (const entry of Object.values(manifest?.files || {})) workspaceReferences.add(entry.hash);
+    for (const hash of await this.stagingHashes()) workspaceReferences.add(hash);
     const now = Date.now();
     const expired = Object.entries(records).filter(([hash, record]) => {
-      if ((record.kind !== "browser" && record.kind !== "shared") || referenced.has(hash)) return false;
+      if ((this.activeBrowserUploads.get(hash) ?? 0) > 0 || (record.kind !== "browser" && record.kind !== "shared") || referenced.has(hash)) return false;
       return record.expires_at === undefined ? !record.stored : record.expires_at <= now;
     });
     if (!expired.length) return;
@@ -447,7 +454,7 @@ export class Session extends DurableObject<Env> {
     let reserved = await this.ctx.storage.get<number>("reserved_blob_bytes") ?? 0;
     const remove: string[] = [];
     for (const [hash, record] of expired) {
-      if (record.kind === "shared") {
+      if (record.kind === "shared" && workspaceReferences.has(hash)) {
         next[hash] = { ...record, kind: "workspace" };
         delete next[hash].expires_at;
       } else {
@@ -721,7 +728,6 @@ export class Session extends DurableObject<Env> {
     const key = await this.objectKey(hash);
     const existing = await this.env.UPLOADS.head(key);
     if (record.stored && existing?.size === record.size) return new Response(null, { status: 204 });
-    if (existing) await this.env.UPLOADS.delete(key);
     const reader = request.body?.getReader();
     const fixed = new FixedLengthStream(record.size);
     const writer = fixed.writable.getWriter();
@@ -747,7 +753,6 @@ export class Session extends DurableObject<Env> {
       await this.mutate(() => this.markWorkspaceObjectStored(hash, record.size));
       return new Response(null, { status: 204 });
     } catch {
-      await this.env.UPLOADS.delete(key);
       return error("could not store workspace object", 503);
     }
   }
@@ -783,7 +788,7 @@ export class Session extends DurableObject<Env> {
         const message = cause instanceof Error ? cause.message : "could not reserve attachments";
         const status = message === "session not found" || message === "session expired" ? 404
           : message === "session blob quota exceeded" || message === "attachment object limit exceeded" ? 413
-          : message.startsWith("attachment hash") ? 400 : 503;
+          : message === "invalid attachment hash" || message.startsWith("attachment hash") ? 400 : 503;
         return error(message, status);
       }
     }
@@ -802,53 +807,60 @@ export class Session extends DurableObject<Env> {
     }
     if (request.method !== "PUT") return error("method not allowed", 405);
     const hash = match[1];
-    let record: { size: number; stored: boolean };
+    this.activeBrowserUploads.set(hash, (this.activeBrowserUploads.get(hash) ?? 0) + 1);
     try {
-      record = await this.prepareBrowserUpload(hash);
-    } catch (cause) {
-      const message = cause instanceof Error ? cause.message : "could not prepare attachment";
-      const status = message === "session not found" || message === "session expired" ? 404 : message === "attachment was not reserved" ? 409 : 503;
-      return error(message, status);
-    }
-    if (record.stored) return new Response(null, { status: 204 });
-    const key = await this.objectKey(hash);
-    const reader = request.body?.getReader();
-    const fixed = new FixedLengthStream(record.size);
-    const writer = fixed.writable.getWriter();
-    let count = 0;
-    let sizeError = false;
-    const pump = async () => {
+      let record: { size: number; stored: boolean };
       try {
-        while (reader) {
-          const part = await reader.read();
-          if (part.done) break;
-          count += part.value.byteLength;
-          if (count > record.size) {
+        record = await this.prepareBrowserUpload(hash);
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : "could not prepare attachment";
+        const status = message === "session not found" || message === "session expired" ? 404 : message === "attachment was not reserved" ? 409 : 503;
+        return error(message, status);
+      }
+      if (record.stored) return new Response(null, { status: 204 });
+      const key = await this.objectKey(hash);
+      const reader = request.body?.getReader();
+      const fixed = new FixedLengthStream(record.size);
+      const writer = fixed.writable.getWriter();
+      let count = 0;
+      let sizeError = false;
+      const pump = async () => {
+        try {
+          while (reader) {
+            const part = await reader.read();
+            if (part.done) break;
+            count += part.value.byteLength;
+            if (count > record.size) {
+              sizeError = true;
+              throw new Error("attachment size is invalid");
+            }
+            await writer.write(part.value);
+          }
+          if (count !== record.size) {
             sizeError = true;
             throw new Error("attachment size is invalid");
           }
-          await writer.write(part.value);
+          await writer.close();
+        } catch (cause) {
+          await writer.abort(cause);
+          throw cause;
         }
-        if (count !== record.size) {
-          sizeError = true;
-          throw new Error("attachment size is invalid");
-        }
-        await writer.close();
+      };
+      const pumpPromise = pump();
+      try {
+        await Promise.all([this.env.UPLOADS.put(key, fixed.readable, { sha256: hash }), pumpPromise]);
+        await this.mutate(() => this.markBrowserObjectStored(hash, record.size));
+        return new Response(null, { status: 204 });
       } catch (cause) {
-        await writer.abort(cause);
-        throw cause;
+        await pumpPromise.catch(() => {});
+        const checksumError = cause instanceof Error && cause.message.includes("checksum you specified did not match");
+        const malformed = sizeError || checksumError;
+        return error(malformed ? (sizeError ? "attachment size is invalid" : "attachment content is invalid") : "could not store attachment", malformed ? 400 : 503);
       }
-    };
-    const pumpPromise = pump();
-    try {
-      await Promise.all([this.env.UPLOADS.put(key, fixed.readable, { sha256: hash }), pumpPromise]);
-      await this.mutate(() => this.markBrowserObjectStored(hash, record.size));
-      return new Response(null, { status: 204 });
-    } catch (cause) {
-      await pumpPromise.catch(() => {});
-      const checksumError = cause instanceof Error && cause.message.includes("checksum you specified did not match");
-      const malformed = sizeError || checksumError;
-      return error(malformed ? (sizeError ? "attachment size is invalid" : "attachment content is invalid") : "could not store attachment", malformed ? 400 : 503);
+    } finally {
+      const count = this.activeBrowserUploads.get(hash) ?? 0;
+      if (count > 1) this.activeBrowserUploads.set(hash, count - 1);
+      else this.activeBrowserUploads.delete(hash);
     }
   }
 

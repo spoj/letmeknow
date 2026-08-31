@@ -196,6 +196,9 @@ describe("LetMeKnow service", () => {
     expect((await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ hashes: [{ hash, size: data.byteLength + 1 }] })
     }))).status).toBe(400);
+    expect((await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ hashes: [{ hash: "invalid", size: 0 }] })
+    }))).status).toBe(400);
     producer.socket.close(1000, "done");
   });
 
@@ -264,6 +267,32 @@ describe("LetMeKnow service", () => {
     expect(await (await SELF.fetch(new Request(new URL("shared.bin", url)))).text()).toBe("browser workspace bytes");
   });
 
+  it("keeps an existing shared object when a workspace upload fails", async () => {
+    const { producer, url } = await open();
+    const data = new TextEncoder().encode("existing shared workspace bytes");
+    const hash = digest(data);
+    const reservation = await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hashes: [{ hash, size: data.byteLength }] })
+    }));
+    expect(await reservation.json()).toEqual({ missing: [{ hash, size: data.byteLength }] });
+    const code = new URL(url).hostname.split(".")[0];
+    const uploads = (env as unknown as { UPLOADS: { put(key: string, value: Uint8Array, options: { sha256: string }): Promise<unknown>; get(key: string): Promise<{ arrayBuffer(): Promise<ArrayBuffer> } | null> } }).UPLOADS;
+    const key = `sessions/${code}/objects/${hash}`;
+    await uploads.put(key, data, { sha256: hash });
+    await uploadWorkspace(producer, url, new TextEncoder().encode("<!doctype html><html><body><main id=app>initial</main></body></html>"), { "shared.bin": { data, content_type: "text/plain" } });
+    const bad = new Uint8Array(data.length).fill(120);
+    const failed = await SELF.fetch(new Request(new URL(`_letmeknow/workspace/${hash}`, url), {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${producer.credential}` },
+      body: bad
+    }));
+    expect(failed.status).toBe(503);
+    expect(new Uint8Array(await (await uploads.get(key))!.arrayBuffer())).toEqual(data);
+    producer.socket.close(1000, "done");
+  });
+
   it("reclaims abandoned attachment reservations after their lease", async () => {
     const now = Date.now();
     vi.useFakeTimers({ now });
@@ -280,6 +309,45 @@ describe("LetMeKnow service", () => {
     vi.setSystemTime(now + 30 * 60 * 1_000 + 1);
     expect(await runDurableObjectAlarm(env.SESSIONS.getByName(new URL(url).hostname.split(".")[0]))).toBe(true);
     expect((await reserve(second)).status).toBe(200);
+    producer.socket.close(1000, "done");
+  });
+
+  it("reclaims an expired shared object abandoned by workspace staging", async () => {
+    const now = Date.now();
+    vi.useFakeTimers({ now });
+    const data = new TextEncoder().encode("abandoned shared workspace bytes");
+    const replacement = new TextEncoder().encode("replacement workspace bytes");
+    const { producer, url } = await open();
+    await uploadAttachment(producer, url, data);
+    await uploadWorkspace(producer, url, new TextEncoder().encode("<!doctype html><html><body><main id=app>initial</main></body></html>"), { "stale.bin": { data, content_type: "text/plain" } });
+    await uploadWorkspace(producer, url, new TextEncoder().encode("<!doctype html><html><body><main id=app>initial</main></body></html>"), { "replacement.bin": { data: replacement, content_type: "text/plain" } });
+    vi.setSystemTime(now + 30 * 60 * 1_000 + 1);
+    expect(await runDurableObjectAlarm(env.SESSIONS.getByName(new URL(url).hostname.split(".")[0]))).toBe(true);
+    const uploads = (env as unknown as { UPLOADS: { head(key: string): Promise<unknown> } }).UPLOADS;
+    const code = new URL(url).hostname.split(".")[0];
+    expect(await uploads.head(`sessions/${code}/objects/${digest(data)}`)).toBeNull();
+    producer.socket.close(1000, "done");
+  });
+
+  it("renews an attachment lease after a successful upload", async () => {
+    const now = Date.now();
+    vi.useFakeTimers({ now });
+    const { producer, url } = await open();
+    const data = new TextEncoder().encode("browser attachment lease");
+    const hash = digest(data);
+    const reservation = await SELF.fetch(new Request(new URL("_letmeknow/attachments", url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hashes: [{ hash, size: data.byteLength }] })
+    }));
+    expect(await reservation.json()).toEqual({ missing: [{ hash, size: data.byteLength }] });
+    vi.setSystemTime(now + 10 * 60 * 1_000);
+    expect((await SELF.fetch(new Request(new URL(`_letmeknow/attachments/${hash}`, url), { method: "PUT", body: data }))).status).toBe(204);
+    vi.setSystemTime(now + 30 * 60 * 1_000 + 1);
+    expect(await runDurableObjectAlarm(env.SESSIONS.getByName(new URL(url).hostname.split(".")[0]))).toBe(true);
+    const uploads = (env as unknown as { UPLOADS: { head(key: string): Promise<unknown> } }).UPLOADS;
+    const code = new URL(url).hostname.split(".")[0];
+    expect(await uploads.head(`sessions/${code}/objects/${hash}`)).not.toBeNull();
     producer.socket.close(1000, "done");
   });
 
