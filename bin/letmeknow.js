@@ -29,7 +29,7 @@ const hashPattern = /^[0-9a-f]{64}$/;
 
 function getMimeType(filename) {
   const type = lookup(filename);
-  if (!type) return "application/octet-stream";
+  if (typeof type !== "string") return "application/octet-stream";
   return type.startsWith("text/") || type === "application/json" || type === "application/xml" || type === "application/manifest+json"
     ? `${type}; charset=utf-8`
     : type;
@@ -81,7 +81,7 @@ async function workspaceFile(filename, root, pathname) {
 }
 
 async function scanWorkspace(root) {
-  const files = {};
+  const files = Object.create(null);
   const paths = new Map();
   let index;
   const rootHandle = await workspaceDirectory(root, root);

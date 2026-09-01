@@ -137,6 +137,15 @@ describe("LetMeKnow service", () => {
     producer.socket.close(1000, "done");
   });
 
+  it("serves a workspace file named __proto__", async () => {
+    const files = Object.fromEntries([["__proto__", { data: new TextEncoder().encode("prototype-safe"), content_type: "text/plain" }]]);
+    const { producer, url } = await open({ files });
+    const response = await SELF.fetch(new Request(new URL("__proto__", url)));
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("prototype-safe");
+    producer.socket.close(1000, "done");
+  });
+
   it("serves the pinned index and switches assets only on commit", async () => {
     const { producer, url, workspace } = await open({ index: "<!doctype html><html><body>original</body></html>", files: { "app.js": { data: new TextEncoder().encode("one"), content_type: "text/javascript" } } });
     expect(await (await SELF.fetch(new Request(new URL("app.js", url)))).text()).toBe("one");

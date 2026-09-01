@@ -311,6 +311,17 @@ describe("LetMeKnow CLI", () => {
     }
   });
 
+  it("uploads a workspace file named __proto__", async () => {
+    const data = "prototype-safe";
+    const hash = createHash("sha256").update(data).digest("hex");
+    const session = await startSession({ files: Object.fromEntries([["__proto__", data]]) });
+    try {
+      assert.deepEqual(session.state.uploaded.get(hash)?.data.toString(), data);
+    } finally {
+      await session.stop();
+    }
+  });
+
   it("fails safely when a workspace file is replaced before upload", async () => {
     let manifests = 0;
     let resolveManifest;

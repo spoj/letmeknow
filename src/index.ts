@@ -223,7 +223,7 @@ function objectManifest(value: unknown): Manifest {
   const files = (value as Record<string, unknown>).files;
   if (!files || typeof files !== "object" || Array.isArray(files)) throw new Error("manifest files are required");
   if (encoder.encode(JSON.stringify(value)).byteLength > MAX_MANIFEST_BYTES) throw new Error("manifest is too large");
-  const output: Record<string, ManifestEntry> = {};
+  const output: Record<string, ManifestEntry> = Object.create(null);
   for (const [path, raw] of Object.entries(files)) {
     if (!safePublicPath(path) || path === "index.html") throw new Error("invalid workspace path");
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid workspace file");
