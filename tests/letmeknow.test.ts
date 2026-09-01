@@ -572,15 +572,26 @@ describe("LetMeKnow service", () => {
     producer.socket.close(1000, "done");
   });
 
-  it("rejects commits that would exceed the replay history bound", async () => {
-    const { producer, workspace } = await open();
+  it("cleans staged workspace objects after a failed commit", async () => {
+    const { producer, url, workspace } = await open();
     const firstScript = "x".repeat(MAX_BODY_BYTES - 300);
     const first = await commit(producer, workspace, 0, firstScript);
     expect(first.ok).toBe(true);
     producer.send({ type: "event_ack", event_number: first.run_ui.event_number });
+
+    const replacement = new TextEncoder().encode("staged but uncommitted");
+    const nextWorkspace = await uploadWorkspace(producer, url, new TextEncoder().encode("<!doctype html><html><body><main id=app>initial</main></body></html>"), {
+      "replacement.txt": { data: replacement, content_type: "text/plain" }
+    });
+    const code = new URL(url).hostname.split(".")[0];
+    const uploads = (env as unknown as { UPLOADS: { head(key: string): Promise<unknown> } }).UPLOADS;
+    const key = `sessions/${code}/objects/${digest(replacement)}`;
+    expect(await uploads.head(key)).not.toBeNull();
+
     const id = randomUUID();
-    producer.send({ type: "commit", id, request_id: id, through: 0, ...workspace, script: "small" });
+    producer.send({ type: "commit", id, request_id: id, through: 0, ...nextWorkspace, script: "small" });
     expect(await nextType(producer, "error")).toMatchObject({ message: "page history is too large" });
+    expect(await uploads.head(key)).toBeNull();
   });
 
   it("expires the session idempotently when alarms race", async () => {

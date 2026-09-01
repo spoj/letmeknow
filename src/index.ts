@@ -1119,7 +1119,10 @@ export class Session extends DurableObject<Env> {
       try { await this.commit(socket, attachment, packet); }
       catch (cause) {
         const current = await this.ctx.storage.get<Manifest>("current_manifest");
-        if (current) await this.deleteUnreferencedObjects(current).catch(() => {});
+        if (current) {
+          await this.ctx.storage.delete("staging_hashes");
+          await this.deleteUnreferencedObjects(current).catch(() => {});
+        }
         throw cause;
       }
       return;
