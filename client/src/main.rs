@@ -36,6 +36,8 @@ enum Command {
         #[arg(long, env = "LETMEKNOW_RELAY", default_value = "https://letmeknow.dev")]
         relay: String,
     },
+    /// Print instructions for agents (SKILL.md)
+    Skill,
     #[command(flatten)]
     Request(Request),
 }
@@ -59,6 +61,10 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Listen { name, relay } => listen(&cli.session, name, relay).await,
+        Command::Skill => {
+            print!("{}", include_str!("../../SKILL.md"));
+            Ok(())
+        }
         Command::Request(request) => call(&cli.session, request).await,
     };
     match result {
@@ -108,29 +114,33 @@ async fn listen(session: &str, name: Option<String>, relay: String) -> Result<()
     });
     println!("{}", json!({ "type": "ready", "session": session, "member": state.person(), "state": dir }));
 
+    let mut shutdown = std::pin::pin!(shutdown());
     loop {
         tokio::select! {
             Some(event) = queue.recv() => state.handle(event).await,
-            _ = tokio::signal::ctrl_c() => break,
-            _ = terminated() => break,
+            _ = &mut shutdown => break,
         }
     }
     let _ = std::fs::remove_file(&endpoint_path);
     Ok(())
 }
 
-#[cfg(unix)]
-async fn terminated() {
-    use tokio::signal::unix::{SignalKind, signal};
-    match signal(SignalKind::terminate()) {
-        Ok(mut terminate) => drop(terminate.recv().await),
-        Err(_) => std::future::pending().await,
+/// Resolves on Ctrl-C or, on Unix, SIGTERM. Created once so a signal arriving mid-request is not lost.
+async fn shutdown() {
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => drop(terminate.recv().await),
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate => {}
     }
-}
-
-#[cfg(not(unix))]
-async fn terminated() {
-    std::future::pending().await
 }
 
 #[cfg(unix)]

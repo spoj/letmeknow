@@ -44,7 +44,11 @@ class Listener:
 
     def stop(self):
         self.proc.terminate()
-        self.proc.wait()
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            sys.exit(f"{self.session}: listen ignored SIGTERM")
 
 
 def check(condition, message):
