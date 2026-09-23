@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "letmeknow",
+  "main": "src/index.ts",
+  "account_id": "7a70f73ca6868c580737f00a3ddbf79b",
+  "compatibility_date": "2025-03-01",
+  "workers_dev": true,
+  "routes": ["letmeknow.dev/*"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "GROUPS", "class_name": "Group" },
+      { "name": "INVITES", "class_name": "Invite" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Question"] },
+    { "tag": "v2", "deleted_classes": ["Question"] },
+    { "tag": "v3", "new_sqlite_classes": ["Session"] },
+    { "tag": "v4", "deleted_classes": ["Session"], "new_sqlite_classes": ["Group", "Invite"] }
+  ]
+}

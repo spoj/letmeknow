@@ -1,0 +1,19 @@
+{
+  "name": "letmeknow-relay",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "npm run check && vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.1.0",
+    "@cloudflare/workers-types": "^5.20260825.1",
+    "@types/node": "^22.15.17",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.126.0"
+  }
+}
