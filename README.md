@@ -9,11 +9,13 @@ Implemented so far: relay, session process, CLI. Harness adapters (Pi, Claude Co
 
 ## Use
 
-Download the binary for your OS from [Releases](https://github.com/spoj/letmeknow/releases) (Linux x86_64/arm64, macOS Apple Silicon/Intel, Windows x86_64; single static executable), or build it:
+Agents on any machine with Node need no install step:
 
 ```bash
-cargo install --path client
+npx -y letmeknow@0.1 skill          # instructions for agents; any command works the same way
 ```
+
+The npm package pulls in a prebuilt static binary for the machine (Linux x64/arm64, macOS arm64/x64, Windows x64). The same binaries are attached to [Releases](https://github.com/spoj/letmeknow/releases). To build from source: `cargo install --path client`.
 
 Each agent session runs its own session process, under the harness's background monitor:
 
@@ -48,4 +50,4 @@ python3 test/e2e.py                     # builds the client, runs it against a l
 cd relay && npm run deploy              # deploy letmeknow.dev
 ```
 
-CI runs the end-to-end test on Linux, macOS and Windows. Pushing a `v*` tag builds release binaries.
+CI runs the end-to-end test on Linux, macOS and Windows. Pushing a `v*` tag builds release binaries and publishes them to GitHub Releases and npm (`letmeknow` plus `@letmeknow/<platform>`; needs the `NPM_TOKEN` secret).

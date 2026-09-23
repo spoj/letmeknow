@@ -5,17 +5,18 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build:
     strategy:
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
-          - { os: macos-latest, target: aarch64-apple-darwin }
-          - { os: macos-latest, target: x86_64-apple-darwin }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, npm: linux-x64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, npm: linux-arm64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, npm: darwin-arm64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, npm: darwin-x64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, npm: win32-x64 }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -31,28 +32,51 @@ jobs:
         working-directory: client
       - name: Package
         run: |
+          exe=letmeknow; [[ "${{ matrix.target }}" == *windows* ]] && exe=letmeknow.exe
           name=letmeknow-${{ github.ref_name }}-${{ matrix.target }}
-          mkdir "$name"
-          cp README.md "$name/"
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            cp client/target/${{ matrix.target }}/release/letmeknow.exe "$name/"
-            7z a "$name.zip" "$name"
-          else
-            cp client/target/${{ matrix.target }}/release/letmeknow "$name/"
-            tar czf "$name.tar.gz" "$name"
-          fi
+          mkdir -p "$name" "npm/${{ matrix.npm }}/bin"
+          cp README.md SKILL.md "client/target/${{ matrix.target }}/release/$exe" "$name/"
+          cp "client/target/${{ matrix.target }}/release/$exe" "npm/${{ matrix.npm }}/bin/"
+          if [[ "$exe" == *.exe ]]; then 7z a "$name.zip" "$name"; else tar czf "$name.tar.gz" "$name"; fi
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: archive-${{ matrix.target }}
           path: letmeknow-*.*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.npm }}
+          path: npm/${{ matrix.npm }}
 
   publish:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
       - uses: actions/download-artifact@v4
         with:
-          merge-multiple: true
-      - run: gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --generate-notes letmeknow-*
+          path: dist
+      - name: GitHub release
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes dist/archive-*/*
         env:
           GH_TOKEN: ${{ github.token }}
+      - name: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          for dir in dist/npm-*; do
+            platform=${dir#dist/npm-}
+            os=${platform%-*} cpu=${platform#*-}
+            chmod +x "$dir"/bin/*
+            cat > "$dir/package.json" <<EOF
+          {"name":"@letmeknow/$platform","version":"$version","description":"letmeknow binary for $platform","repository":"github:spoj/letmeknow","os":["$os"],"cpu":["$cpu"],"files":["bin"]}
+          EOF
+            (cd "$dir" && npm publish --access public --provenance)
+            (cd npm/letmeknow && npm pkg set "optionalDependencies.@letmeknow/$platform=$version")
+          done
+          cp README.md npm/letmeknow/
+          cd npm/letmeknow && npm pkg set version="$version" && npm publish --provenance
