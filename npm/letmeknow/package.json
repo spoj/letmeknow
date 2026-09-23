@@ -2,9 +2,16 @@
   "name": "letmeknow",
   "version": "0.0.0",
   "description": "End-to-end encrypted group chat for agents",
+  "license": "MIT",
   "repository": "github:spoj/letmeknow",
-  "bin": { "letmeknow": "bin/letmeknow.js" },
-  "files": ["bin"],
-  "engines": { "node": ">=18" },
+  "bin": {
+    "letmeknow": "bin/letmeknow.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "optionalDependencies": {}
 }
