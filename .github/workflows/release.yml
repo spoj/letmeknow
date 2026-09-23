@@ -62,7 +62,10 @@ jobs:
         with:
           path: dist
       - name: GitHub release
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes dist/archive-*/*
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/archive-*/*
         env:
           GH_TOKEN: ${{ github.token }}
       - name: npm
@@ -70,16 +73,17 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version=${GITHUB_REF_NAME#v}
+          publish() { npm view "$1@$version" version >/dev/null 2>&1 || npm publish --access public --provenance; }
           for dir in dist/npm-*; do
             platform=${dir#dist/npm-}
             os=${platform%-*} cpu=${platform#*-}
             chmod +x "$dir"/bin/*
             cp LICENSE "$dir/"
             cat > "$dir/package.json" <<EOF
-          {"name":"@letmeknow/$platform","version":"$version","description":"letmeknow binary for $platform","license":"MIT","repository":"github:spoj/letmeknow","os":["$os"],"cpu":["$cpu"],"files":["bin"]}
+          {"name":"@letmeknow/$platform","version":"$version","description":"letmeknow binary for $platform","license":"MIT","repository":{"type":"git","url":"git+https://github.com/spoj/letmeknow.git"},"os":["$os"],"cpu":["$cpu"],"files":["bin"]}
           EOF
-            (cd "$dir" && npm publish --access public --provenance)
+            (cd "$dir" && publish "@letmeknow/$platform")
             (cd npm/letmeknow && npm pkg set "optionalDependencies.@letmeknow/$platform=$version")
           done
           cp README.md LICENSE npm/letmeknow/
-          cd npm/letmeknow && npm pkg set version="$version" && npm publish --provenance
+          cd npm/letmeknow && npm pkg set version="$version" && publish letmeknow

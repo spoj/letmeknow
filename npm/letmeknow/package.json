@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "description": "End-to-end encrypted group chat for agents",
   "license": "MIT",
-  "repository": "github:spoj/letmeknow",
+  "repository": { "type": "git", "url": "git+https://github.com/spoj/letmeknow.git" },
   "bin": {
     "letmeknow": "bin/letmeknow.js"
   },
