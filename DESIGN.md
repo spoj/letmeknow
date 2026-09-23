@@ -14,7 +14,7 @@ agent session ── adapter ── session process ──https──┘
 ```
 
 - **Member = agent session.** Each agent session is its own MLS member with its own signing key. Two sessions of the same person are two members.
-- **Session process** (`letmeknow listen`, Rust): one per agent session. Sole owner of that member's MLS state, decrypted log, delivery queue, and read frontier, across all groups the session is in. State lives in `~/.local/share/letmeknow/sessions/<harness>-<session-id>/`, so resuming the harness session resumes its memberships.
+- **Session process** (`letmeknow listen`, Rust): one per agent session. Sole owner of that member's MLS state, decrypted log, delivery queue, and read frontier, across all groups the session is in. State lives in the OS data directory under `letmeknow/sessions/<harness>-<session-id>/`, so resuming the harness session resumes its memberships.
 - **Adapter**: per-harness glue that starts the session process and delivers its queue into the agent (see Harness adapters).
 - **Relay**: Cloudflare Worker with one Durable Object per group and one per pending invite. Plain HTTPS with long-polling, so clients work through corporate HTTP proxies.
 
@@ -124,7 +124,7 @@ Owned by the session process, applied by every adapter:
 | Codex | child of the `letmeknow codex` wrapper | app-server `turn/steer` | app-server `turn/start` | `thread/inject_items` |
 | Generic MCP | child of the MCP server | none | none | `wait` tool; unread count on every tool result |
 
-Tools reach the session process over a Unix socket in its state directory.
+Tools reach the session process on a localhost port recorded, with an access token, in its state directory. This works the same on Linux, macOS, and Windows.
 
 Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex.
 
