@@ -85,5 +85,9 @@ jobs:
             (cd "$dir" && publish "@letmeknow/$platform")
             (cd npm/cli && npm pkg set "optionalDependencies.@letmeknow/$platform=$version")
           done
+          for dir in dist/npm-*; do
+            package=@letmeknow/${dir#dist/npm-}@$version
+            until npm view "$package" version --prefer-online >/dev/null 2>&1; do sleep 10; done
+          done
           cp README.md LICENSE npm/cli/
           cd npm/cli && npm pkg set version="$version" && publish @letmeknow/cli
