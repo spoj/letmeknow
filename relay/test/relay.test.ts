@@ -26,24 +26,8 @@ function mls(gid: string, epoch: number, contentType: number): Uint8Array {
 const post = (gid: string, body: Uint8Array) =>
   SELF.fetch(`${origin}/g/${gid}/messages`, { method: "POST", body });
 
-function frames(socket: WebSocket) {
-  socket.accept();
-  const queued: any[] = [];
-  const waiting: Array<(frame: any) => void> = [];
-  socket.addEventListener("message", event => {
-    const frame = JSON.parse(event.data as string);
-    const resolve = waiting.shift();
-    if (resolve) resolve(frame);
-    else queued.push(frame);
-  });
-  return () => queued.length ? Promise.resolve(queued.shift()) : new Promise<any>(resolve => waiting.push(resolve));
-}
-
-async function connect(path: string) {
-  const response = await SELF.fetch(`${origin}${path}`, { headers: { Upgrade: "websocket" } });
-  expect(response.status).toBe(101);
-  return frames(response.webSocket!);
-}
+const poll = (gid: string, after: number, wait = 0) =>
+  SELF.fetch(`${origin}/g/${gid}/messages?after=${after}&wait=${wait}`).then(r => r.json<any[]>());
 
 describe("group", () => {
   it("accepts one commit per epoch and any application message", async () => {
@@ -62,23 +46,20 @@ describe("group", () => {
     expect((await post(gid, new Uint8Array([1, 2, 3]))).status).toBe(400);
   });
 
-  it("replays after a cursor, then streams live", async () => {
+  it("returns messages after a cursor, holding the request until one arrives", async () => {
     const gid = hex(16);
     const first = mls(gid, 0, COMMIT);
     await post(gid, first);
     await post(gid, mls(gid, 1, APPLICATION));
 
-    const listed = await (await SELF.fetch(`${origin}/g/${gid}/messages?after=1`)).json<any[]>();
-    expect(listed.map(m => m.seq)).toEqual([2]);
+    const all = await poll(gid, 0);
+    expect(all.map(m => m.seq)).toEqual([1, 2]);
+    expect(Buffer.from(all[0].data, "base64")).toEqual(Buffer.from(first));
+    expect(await poll(gid, 2)).toEqual([]);
 
-    const next = await connect(`/g/${gid}/ws?after=0`);
-    const replayed = await next();
-    expect(replayed.seq).toBe(1);
-    expect(Buffer.from(replayed.data, "base64")).toEqual(Buffer.from(first));
-    expect((await next()).seq).toBe(2);
-    expect(await next()).toEqual({ synced: true });
+    const pending = poll(gid, 2, 10);
     await post(gid, mls(gid, 1, APPLICATION));
-    expect((await next()).seq).toBe(3);
+    expect((await pending).map(m => m.seq)).toEqual([3]);
   });
 
   it("expires old messages but keeps the epoch", async () => {
@@ -89,7 +70,7 @@ describe("group", () => {
       state.storage.sql.exec("UPDATE messages SET at = 0");
     });
     await runDurableObjectAlarm(stub);
-    expect(await (await SELF.fetch(`${origin}/g/${gid}/messages`)).json()).toEqual([]);
+    expect(await poll(gid, 0)).toEqual([]);
     expect((await post(gid, mls(gid, 0, COMMIT))).status).toBe(409);
   });
 });
@@ -115,15 +96,18 @@ describe("invite", () => {
     expect((await create(id)).status).toBe(201);
     expect((await create(id)).status).toBe(409);
 
-    const inviter = await connect(`/i/${id}/ws?role=inviter`);
+    const receive = (action: string, wait = 0) =>
+      SELF.fetch(`${origin}/i/${id}/${action}?wait=${wait}`).then(r => r.status === 204 ? null : r.json());
+
+    expect(await receive("join")).toBeNull();
+    const join = receive("join", 10);
     expect((await send(id, "join", "kp")).status).toBe(204);
-    expect(await inviter()).toEqual({ join: "kp" });
+    expect(await join).toEqual({ data: "kp" });
     expect((await send(id, "join", "again")).status).toBe(409);
 
     expect((await send(id, "welcome", "w")).status).toBe(403);
     expect((await send(id, "welcome", "w", owner)).status).toBe(204);
-    const joiner = await connect(`/i/${id}/ws?role=joiner`);
-    expect(await joiner()).toEqual({ welcome: "w" });
+    expect(await receive("welcome")).toEqual({ data: "w" });
   });
 
   it("disappears at expiry", async () => {

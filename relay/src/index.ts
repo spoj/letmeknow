@@ -12,6 +12,7 @@ const OWNER = /^[0-9a-f]{64}$/;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_MESSAGE_BYTES = 256 * 1024;
 const MAX_INVITE_TTL_S = 24 * 60 * 60;
+const MAX_WAIT_S = 30;
 const COMMIT = 3;
 const PRIVATE_MESSAGE = 2;
 
@@ -43,6 +44,7 @@ export default {
 
 export class Group extends DurableObject<Env> {
   sql = this.ctx.storage.sql;
+  waiters = new Set<() => void>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -53,16 +55,16 @@ export class Group extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const [, , gid, action] = url.pathname.split("/");
-    const after = Number(url.searchParams.get("after") ?? 0);
-    if (action === "ws" && request.headers.get("Upgrade") === "websocket") {
-      const [client, server] = Object.values(new WebSocketPair());
-      this.ctx.acceptWebSocket(server);
-      for (const message of this.since(after)) server.send(JSON.stringify(message));
-      server.send(JSON.stringify({ synced: true }));
-      return new Response(null, { status: 101, webSocket: client });
-    }
     if (action !== "messages") return text("not found", 404);
-    if (request.method === "GET") return Response.json(this.since(after));
+    if (request.method === "GET") {
+      const after = Number(url.searchParams.get("after") ?? 0);
+      let messages = this.since(after);
+      if (!messages.length) {
+        await wait(this.waiters, url);
+        messages = this.since(after);
+      }
+      return Response.json(messages);
+    }
     if (request.method !== "POST") return text("method not allowed", 405);
 
     const data = new Uint8Array(await request.arrayBuffer());
@@ -83,8 +85,7 @@ export class Group extends DurableObject<Env> {
     const seq = this.sql.exec<{ seq: number }>(
       "INSERT INTO messages (at, data) VALUES (?, ?) RETURNING seq", Date.now(), data
     ).one().seq;
-    const frame = JSON.stringify({ seq, data: base64(data) });
-    for (const socket of this.ctx.getWebSockets()) socket.send(frame);
+    wake(this.waiters);
     if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + RETENTION_MS);
     return Response.json({ seq });
   }
@@ -95,26 +96,24 @@ export class Group extends DurableObject<Env> {
     if (oldest) await this.ctx.storage.setAlarm(oldest.at + RETENTION_MS);
   }
 
-  webSocketClose(socket: WebSocket, code: number) {
-    socket.close(code === 1005 ? 1000 : code);
-  }
-
   private epoch(): number {
     return this.sql.exec<{ epoch: number }>("SELECT epoch FROM state").toArray()[0]?.epoch ?? 0;
   }
 
   private since(after: number) {
     return this.sql.exec<{ seq: number; data: ArrayBuffer }>(
-      "SELECT seq, data FROM messages WHERE seq > ? ORDER BY seq", after
+      "SELECT seq, data FROM messages WHERE seq > ? ORDER BY seq LIMIT 500", after
     ).toArray().map(row => ({ seq: row.seq, data: base64(new Uint8Array(row.data)) }));
   }
 }
 
 export class Invite extends DurableObject<Env> {
+  waiters = new Set<() => void>();
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const action = url.pathname.split("/")[3];
-    const invite = await this.ctx.storage.get<InviteState>("invite");
+    let invite = await this.ctx.storage.get<InviteState>("invite");
 
     if (request.method === "PUT" && action === undefined) {
       if (invite) return text("invite exists", 409);
@@ -128,14 +127,13 @@ export class Invite extends DurableObject<Env> {
     }
     if (!invite || invite.expires <= Date.now()) return text("invite not found or expired", 404);
 
-    if (action === "ws" && request.headers.get("Upgrade") === "websocket") {
-      const role = url.searchParams.get("role");
-      if (role !== "inviter" && role !== "joiner") return text("bad role", 400);
-      const [client, server] = Object.values(new WebSocketPair());
-      this.ctx.acceptWebSocket(server, [role]);
-      if (role === "inviter" && invite.join) server.send(JSON.stringify({ join: invite.join }));
-      if (role === "joiner" && invite.welcome) server.send(JSON.stringify({ welcome: invite.welcome }));
-      return new Response(null, { status: 101, webSocket: client });
+    if (request.method === "GET" && (action === "join" || action === "welcome")) {
+      if (!invite[action]) {
+        await wait(this.waiters, url);
+        invite = await this.ctx.storage.get<InviteState>("invite");
+      }
+      const data = invite?.[action];
+      return data ? Response.json({ data }) : new Response(null, { status: 204 });
     }
     if (request.method !== "POST") return text("not found", 404);
     const { data } = await request.json<{ data: unknown }>();
@@ -144,27 +142,42 @@ export class Invite extends DurableObject<Env> {
     if (action === "join") {
       if (invite.join) return text("invite already used", 409);
       await this.ctx.storage.put("invite", { ...invite, join: data });
-      for (const socket of this.ctx.getWebSockets("inviter")) socket.send(JSON.stringify({ join: data }));
+      wake(this.waiters);
       return new Response(null, { status: 204 });
     }
     if (action === "welcome") {
       if (request.headers.get("Authorization") !== `Bearer ${invite.owner}`) return text("forbidden", 403);
       if (!invite.join || invite.welcome) return text("no pending join", 409);
       await this.ctx.storage.put("invite", { ...invite, welcome: data });
-      for (const socket of this.ctx.getWebSockets("joiner")) socket.send(JSON.stringify({ welcome: data }));
+      wake(this.waiters);
       return new Response(null, { status: 204 });
     }
     return text("not found", 404);
   }
 
   async alarm() {
-    for (const socket of this.ctx.getWebSockets()) socket.close(1000, "invite expired");
     await this.ctx.storage.deleteAll();
+    wake(this.waiters);
   }
+}
 
-  webSocketClose(socket: WebSocket, code: number) {
-    socket.close(code === 1005 ? 1000 : code);
-  }
+// Long-poll: hold the request until wake() or `wait` seconds (max 30) pass.
+function wait(waiters: Set<() => void>, url: URL): Promise<void> {
+  const seconds = Math.min(Number(url.searchParams.get("wait") ?? 0) || 0, MAX_WAIT_S);
+  if (seconds <= 0) return Promise.resolve();
+  return new Promise(resolve => {
+    const done = () => {
+      clearTimeout(timer);
+      waiters.delete(done);
+      resolve();
+    };
+    const timer = setTimeout(done, seconds * 1000);
+    waiters.add(done);
+  });
+}
+
+function wake(waiters: Set<() => void>) {
+  for (const done of [...waiters]) done();
 }
 
 type Header = { groupId: string; epoch: number; contentType: number };
