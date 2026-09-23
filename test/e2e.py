@@ -3,7 +3,7 @@
 import json, os, queue, shutil, subprocess, sys, tempfile, threading, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, "client/target/debug/letmeknow")
+BIN = os.path.join(ROOT, "client", "target", "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
 PORT = 8798
 RELAY = f"http://localhost:{PORT}"
 HOME = tempfile.mkdtemp(prefix="lmk-e2e-")
@@ -21,7 +21,7 @@ class Listener:
     def __init__(self, session):
         self.session, self.lines = session, queue.Queue()
         self.proc = subprocess.Popen([BIN, "--session", session, "listen", "--name", session.title()],
-                                     env=ENV, stdout=subprocess.PIPE, text=True)
+                                     env=ENV, stdout=subprocess.PIPE, text=True, encoding="utf-8")
         threading.Thread(target=self.read, daemon=True).start()
         self.expect(lambda e: e["type"] == "ready")
 
@@ -55,7 +55,8 @@ def check(condition, message):
 
 def main():
     subprocess.run(["cargo", "build", "-q"], cwd=os.path.join(ROOT, "client"), check=True)
-    relay = subprocess.Popen(["npx", "wrangler", "dev", "--port", str(PORT)], cwd=os.path.join(ROOT, "relay"),
+    subprocess.run([shutil.which("npm"), "install", "--silent"], cwd=os.path.join(ROOT, "relay"), check=True)
+    relay = subprocess.Popen([shutil.which("npx"), "wrangler", "dev", "--port", str(PORT)], cwd=os.path.join(ROOT, "relay"),
                              env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     listeners = []
     try:

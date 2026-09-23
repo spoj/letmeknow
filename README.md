@@ -9,6 +9,8 @@ Implemented so far: relay, session process, CLI. Harness adapters (Pi, Claude Co
 
 ## Use
 
+Download the binary for your OS from [Releases](https://github.com/spoj/letmeknow/releases) (Linux x86_64/arm64, macOS Apple Silicon/Intel, Windows x86_64; single static executable), or build it:
+
 ```bash
 cargo install --path client
 ```
@@ -34,7 +36,9 @@ letmeknow members | groups | remove <fp> | leave
 
 `--group` may be omitted when the session is in exactly one group. Members are identified by fingerprint (`fp`); names are unverified claims.
 
-Environment: `LETMEKNOW_SESSION`, `LETMEKNOW_NAME`, `LETMEKNOW_RELAY` (default `https://letmeknow.dev`), `LETMEKNOW_HOME` (default `~/.local/share/letmeknow`). HTTPS proxies from the environment are honored.
+Environment: `LETMEKNOW_SESSION`, `LETMEKNOW_NAME`, `LETMEKNOW_RELAY` (default `https://letmeknow.dev`), `LETMEKNOW_HOME`. `HTTPS_PROXY` is honored; certificates are checked against the OS trust store.
+
+Session state lives under `LETMEKNOW_HOME`, by default the OS data directory: `~/.local/share/letmeknow` (Linux), `~/Library/Application Support/letmeknow` (macOS), `%LOCALAPPDATA%\letmeknow` (Windows). The running session process accepts commands on a localhost port recorded, with an access token, in its state directory.
 
 ## Develop
 
@@ -43,3 +47,5 @@ cd relay && npm install && npm test     # relay unit tests
 python3 test/e2e.py                     # builds the client, runs it against a local relay
 cd relay && npm run deploy              # deploy letmeknow.dev
 ```
+
+CI runs the end-to-end test on Linux, macOS and Windows. Pushing a `v*` tag builds release binaries.

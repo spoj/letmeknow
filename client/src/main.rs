@@ -4,15 +4,14 @@ mod store;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use session::{Event, Request, Session};
 use std::io::Read;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 /// End-to-end encrypted group chat for agents.
@@ -30,7 +29,7 @@ struct Cli {
 enum Command {
     /// Run the session process and print delivered messages as NDJSON
     Listen {
-        /// Display name, fixed when the session is created [default: $USER/<session>]
+        /// Display name, fixed when the session is created [default: <user>/<session>]
         #[arg(long, env = "LETMEKNOW_NAME")]
         name: Option<String>,
         /// Relay for groups this session creates
@@ -41,8 +40,22 @@ enum Command {
     Request(Request),
 }
 
+/// Where a running session process accepts requests: a localhost port guarded by a token.
+#[derive(Serialize, Deserialize)]
+struct Endpoint {
+    port: u16,
+    token: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Call {
+    token: String,
+    request: Request,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    rustls::crypto::ring::default_provider().install_default().expect("first crypto provider");
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Listen { name, relay } => listen(&cli.session, name, relay).await,
@@ -63,60 +76,100 @@ fn session_dir(session: &str) -> Result<PathBuf> {
     }
     let home = match std::env::var_os("LETMEKNOW_HOME") {
         Some(home) => PathBuf::from(home),
-        None => match std::env::var_os("XDG_DATA_HOME") {
-            Some(data) => PathBuf::from(data).join("letmeknow"),
-            None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".local/share/letmeknow"),
-        },
+        None => dirs::data_local_dir().context("no local data directory")?.join("letmeknow"),
     };
     Ok(home.join("sessions").join(session))
 }
 
 async fn listen(session: &str, name: Option<String>, relay: String) -> Result<()> {
     let dir = session_dir(session)?;
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
-    let socket = dir.join("sock");
-    if UnixStream::connect(&socket).await.is_ok() {
+    private_dir(&dir)?;
+    let endpoint_path = dir.join("endpoint");
+    if connect(&endpoint_path).await.is_ok() {
         bail!("session {session} is already running");
     }
-    let _ = std::fs::remove_file(&socket);
 
     let (events, mut queue) = mpsc::unbounded_channel();
-    let default_name = format!("{}/{session}", std::env::var("USER").unwrap_or_else(|_| "agent".into()));
+    let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "agent".into());
     let rename = name.is_some();
-    let mut state = Session::open(&dir, name.unwrap_or(default_name), rename, relay.trim_end_matches('/').to_owned(), events.clone())?;
-    let listener = UnixListener::bind(&socket)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    let name = name.unwrap_or_else(|| format!("{user}/{session}"));
+    let mut state = Session::open(&dir, name, rename, relay.trim_end_matches('/').to_owned(), events.clone())?;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let mut token = [0u8; 32];
+    getrandom::fill(&mut token).map_err(|e| anyhow::anyhow!("randomness: {e}"))?;
+    let endpoint = Endpoint { port: listener.local_addr()?.port(), token: hex::encode(token) };
+    private_file(&endpoint_path, &serde_json::to_vec(&endpoint)?)?;
+    let token = endpoint.token;
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(serve(stream, events.clone()));
+            tokio::spawn(serve(stream, token.clone(), events.clone()));
         }
     });
-    println!("{}", json!({ "type": "ready", "session": session, "member": state.person(), "socket": socket }));
+    println!("{}", json!({ "type": "ready", "session": session, "member": state.person(), "state": dir }));
 
-    let mut terminate = signal(SignalKind::terminate())?;
     loop {
         tokio::select! {
             Some(event) = queue.recv() => state.handle(event).await,
             _ = tokio::signal::ctrl_c() => break,
-            _ = terminate.recv() => break,
+            _ = terminated() => break,
         }
     }
-    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(&endpoint_path);
     Ok(())
 }
 
-async fn serve(stream: UnixStream, events: mpsc::UnboundedSender<Event>) {
+#[cfg(unix)]
+async fn terminated() {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut terminate) => drop(terminate.recv().await),
+        Err(_) => std::future::pending().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminated() {
+    std::future::pending().await
+}
+
+#[cfg(unix)]
+fn private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    Ok(std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?)
+}
+
+#[cfg(not(unix))]
+fn private_dir(dir: &Path) -> Result<()> {
+    Ok(std::fs::create_dir_all(dir)?)
+}
+
+#[cfg(unix)]
+fn private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    Ok(file.write_all(contents)?)
+}
+
+#[cfg(not(unix))]
+fn private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    Ok(std::fs::write(path, contents)?)
+}
+
+async fn serve(stream: TcpStream, token: String, events: mpsc::UnboundedSender<Event>) {
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
     if BufReader::new(read).read_line(&mut line).await.is_err() {
         return;
     }
-    let response = match serde_json::from_str::<Request>(&line) {
-        Ok(request) => {
+    let response = match serde_json::from_str::<Call>(&line) {
+        Ok(call) if call.token == token => {
             let (reply, answer) = oneshot::channel();
-            let _ = events.send(Event::Request(request, reply));
+            let _ = events.send(Event::Request(call.request, reply));
             answer.await.unwrap_or_else(|_| json!({ "error": "session process stopped" }))
         }
+        Ok(_) => json!({ "error": "bad token" }),
         Err(error) => json!({ "error": format!("bad request: {error}") }),
     };
     let _ = write.write_all(format!("{response}\n").as_bytes()).await;
@@ -129,10 +182,11 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
         text.clear();
         std::io::stdin().read_to_string(text)?;
     }
-    let socket = session_dir(session)?.join("sock");
-    let stream = connect(&socket, session).await?;
+    let (stream, token) = connect(&session_dir(session)?.join("endpoint"))
+        .await
+        .with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen`"))?;
     let (read, mut write) = stream.into_split();
-    write.write_all(format!("{}\n", serde_json::to_string(&request)?).as_bytes()).await?;
+    write.write_all(format!("{}\n", serde_json::to_string(&Call { token, request })?).as_bytes()).await?;
     let mut line = String::new();
     BufReader::new(read).read_line(&mut line).await?;
     let response: Value = serde_json::from_str(&line).context("session process closed the connection")?;
@@ -143,8 +197,7 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
     Ok(())
 }
 
-async fn connect(socket: &Path, session: &str) -> Result<UnixStream> {
-    UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("session {session} is not running; start it with `letmeknow listen --session {session}`"))
+async fn connect(endpoint: &Path) -> Result<(TcpStream, String)> {
+    let endpoint: Endpoint = serde_json::from_slice(&std::fs::read(endpoint)?)?;
+    Ok((TcpStream::connect(("127.0.0.1", endpoint.port)).await?, endpoint.token))
 }
