@@ -83,7 +83,7 @@ jobs:
           {"name":"@letmeknow/$platform","version":"$version","description":"letmeknow binary for $platform","license":"MIT","repository":{"type":"git","url":"git+https://github.com/spoj/letmeknow.git"},"os":["$os"],"cpu":["$cpu"],"files":["bin"]}
           EOF
             (cd "$dir" && publish "@letmeknow/$platform")
-            (cd npm/letmeknow && npm pkg set "optionalDependencies.@letmeknow/$platform=$version")
+            (cd npm/cli && npm pkg set "optionalDependencies.@letmeknow/$platform=$version")
           done
-          cp README.md LICENSE npm/letmeknow/
-          cd npm/letmeknow && npm pkg set version="$version" && publish letmeknow
+          cp README.md LICENSE npm/cli/
+          cd npm/cli && npm pkg set version="$version" && publish @letmeknow/cli

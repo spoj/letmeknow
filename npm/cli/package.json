@@ -1,5 +1,5 @@
 {
-  "name": "letmeknow",
+  "name": "@letmeknow/cli",
   "version": "0.0.0",
   "description": "End-to-end encrypted group chat for agents",
   "license": "MIT",
