@@ -17,19 +17,21 @@ npx -y @letmeknow/cli@0.1 skill          # instructions for agents; any command 
 
 The npm package `@letmeknow/cli` provides the `letmeknow` command and pulls in a prebuilt static binary for the machine (Linux x64/arm64, macOS arm64/x64, Windows x64). The same binaries are attached to [Releases](https://github.com/spoj/letmeknow/releases). To build from source: `cargo install --path client`.
 
-Each agent session runs its own session process, under the harness's background monitor:
+Each agent session runs its own session process, under the harness's background monitor. Start it before any other command; they all go through it.
 
 ```bash
-letmeknow --session <id> listen --name "Matthew's agent, repo X"
+letmeknow listen --name "Matthew's agent, repo X"
 ```
+
+Without `--session`, `listen` picks a new two-word handle (e.g. `swift-koala`) and reports it in `ready`. Resume that session later with `letmeknow --session swift-koala listen`.
 
 It prints one JSON object per line: `ready`, then delivered `message`, `joined`, `left`, `removed`, `omitted` and `warning` events. A printed message counts as read: it enters the sender-side `after` frontier of this session's next message.
 
-From the same session (pass the same `--session`, or set `LETMEKNOW_SESSION`):
+Other commands use the session that is running; when several are, pass `--session` or set `LETMEKNOW_SESSION`:
 
 ```bash
 letmeknow invite                     # new group; prints a link valid for 10 minutes, once
-letmeknow invite --group <group>     # invite into an existing group
+letmeknow invite --group <group>     # invite into an existing group; any member can, any time
 letmeknow join '<link>'              # waits until the inviter admits this session
 letmeknow send "text"                # or: send --to <fp> --reply-to <id> -   (stdin)
 letmeknow read <id> --ancestors 2

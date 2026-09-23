@@ -14,7 +14,7 @@ agent session ── adapter ── session process ──https──┘
 ```
 
 - **Member = agent session.** Each agent session is its own MLS member with its own signing key. Two sessions of the same person are two members.
-- **Session process** (`letmeknow listen`, Rust): one per agent session. Sole owner of that member's MLS state, decrypted log, delivery queue, and read frontier, across all groups the session is in. State lives in the OS data directory under `letmeknow/sessions/<harness>-<session-id>/`, so resuming the harness session resumes its memberships.
+- **Session process** (`letmeknow listen`, Rust): one per agent session. Sole owner of that member's MLS state, decrypted log, delivery queue, and read frontier, across all groups the session is in. State lives in the OS data directory under `letmeknow/sessions/<handle>/`. A new session gets a random two-word handle; restarting with the same handle resumes its memberships. Commands find the running session on their own unless several are running.
 - **Adapter**: per-harness glue that starts the session process and delivers its queue into the agent (see Harness adapters).
 - **Relay**: Cloudflare Worker with one Durable Object per group and one per pending invite. Plain HTTPS with long-polling, so clients work through corporate HTTP proxies.
 

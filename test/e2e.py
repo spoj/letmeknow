@@ -10,20 +10,21 @@ HOME = tempfile.mkdtemp(prefix="lmk-e2e-")
 ENV = {**os.environ, "LETMEKNOW_HOME": HOME, "LETMEKNOW_RELAY": RELAY, "NO_PROXY": "localhost,127.0.0.1"}
 
 
-def run(session, *args, ok=True):
-    result = subprocess.run([BIN, "--session", session, *args], env=ENV, capture_output=True, text=True, timeout=60)
+def run(session, *args, ok=True, env=ENV):
+    flags = ["--session", session] if session else []
+    result = subprocess.run([BIN, *flags, *args], env=env, capture_output=True, text=True, timeout=60)
     if ok and result.returncode:
         sys.exit(f"{session} {args}: {result.stderr}")
     return json.loads(result.stdout) if result.returncode == 0 else result.stderr
 
 
 class Listener:
-    def __init__(self, session):
+    def __init__(self, session, env=ENV):
         self.session, self.lines = session, queue.Queue()
-        self.proc = subprocess.Popen([BIN, "--session", session, "listen", "--name", session.title()],
-                                     env=ENV, stdout=subprocess.PIPE, text=True, encoding="utf-8")
+        flags = ["--session", session, "listen", "--name", session.title()] if session else ["listen"]
+        self.proc = subprocess.Popen([BIN, *flags], env=env, stdout=subprocess.PIPE, text=True, encoding="utf-8")
         threading.Thread(target=self.read, daemon=True).start()
-        self.expect(lambda e: e["type"] == "ready")
+        self.ready = self.expect(lambda e: e["type"] == "ready")
 
     def read(self):
         for line in self.proc.stdout:
@@ -122,6 +123,15 @@ def main():
         omitted = alice.expect(lambda e: e["type"] == "omitted")
         first = alice.expect(lambda e: e["type"] == "message")
         check(omitted["count"] == 2 and first["content"] == "message 2", "restart catches up on the last 20 messages")
+
+        check("several sessions are running" in run(None, "groups", ok=False), "without --session, several running sessions are ambiguous")
+        solo_env = {**ENV, "LETMEKNOW_HOME": os.path.join(HOME, "solo")}
+        check("no session is running" in run(None, "groups", ok=False, env=solo_env), "without --session, none running is an error")
+        solo = Listener(None, env=solo_env)
+        listeners.append(solo)
+        handle = solo.ready["session"]
+        check(len(handle.split("-")) == 2, f"listen without --session picks a handle ({handle})")
+        check(run(None, "groups", env=solo_env) == [], "commands use the one running session")
         print("all passed")
     finally:
         for listener in listeners:

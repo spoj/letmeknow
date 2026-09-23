@@ -18,9 +18,9 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Parser)]
 #[command(name = "letmeknow", version)]
 struct Cli {
-    /// Agent session; each session is its own group member
-    #[arg(long, env = "LETMEKNOW_SESSION", default_value = "default", global = true)]
-    session: String,
+    /// Agent session; each session is its own group member [default: listen picks a new handle; other commands use the one running session]
+    #[arg(long, env = "LETMEKNOW_SESSION", global = true)]
+    session: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -58,16 +58,7 @@ struct Call {
 #[tokio::main]
 async fn main() -> ExitCode {
     rustls::crypto::ring::default_provider().install_default().expect("first crypto provider");
-    let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Listen { name, relay } => listen(&cli.session, name, relay).await,
-        Command::Skill => {
-            print!("{}", include_str!("../../SKILL.md"));
-            Ok(())
-        }
-        Command::Request(request) => call(&cli.session, request).await,
-    };
-    match result {
+    match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("letmeknow: {error:#}");
@@ -76,15 +67,79 @@ async fn main() -> ExitCode {
     }
 }
 
-fn session_dir(session: &str) -> Result<PathBuf> {
-    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
-        bail!("session names may contain only letters, digits, '.', '_' and '-'");
+async fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        Command::Listen { name, relay } => {
+            let session = match cli.session {
+                Some(session) => session,
+                None => new_handle()?,
+            };
+            listen(&session, name, relay).await
+        }
+        Command::Skill => {
+            print!("{}", include_str!("../../SKILL.md"));
+            Ok(())
+        }
+        Command::Request(request) => {
+            let session = match cli.session {
+                Some(session) => session,
+                None => running_session().await?,
+            };
+            call(&session, request).await
+        }
     }
+}
+
+fn sessions_dir() -> Result<PathBuf> {
     let home = match std::env::var_os("LETMEKNOW_HOME") {
         Some(home) => PathBuf::from(home),
         None => dirs::data_local_dir().context("no local data directory")?.join("letmeknow"),
     };
-    Ok(home.join("sessions").join(session))
+    Ok(home.join("sessions"))
+}
+
+fn session_dir(session: &str) -> Result<PathBuf> {
+    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
+        bail!("session names may contain only letters, digits, '.', '_' and '-'");
+    }
+    Ok(sessions_dir()?.join(session))
+}
+
+const ADJECTIVES: [&str; 32] = [
+    "amber", "bold", "brave", "brisk", "calm", "clever", "cosmic", "crisp", "eager", "fancy", "gentle", "glad", "golden",
+    "happy", "jolly", "keen", "lively", "lucky", "mellow", "merry", "nimble", "proud", "quick", "quiet", "rapid", "shiny",
+    "silver", "steady", "sunny", "swift", "tidy", "witty",
+];
+const NOUNS: [&str; 32] = [
+    "badger", "beaver", "bison", "crane", "dolphin", "eagle", "falcon", "ferret", "finch", "fox", "gecko", "heron", "ibis",
+    "jaguar", "koala", "lemur", "lynx", "marten", "moose", "newt", "otter", "owl", "panda", "puffin", "quail", "raven",
+    "robin", "seal", "stoat", "tapir", "walrus", "wren",
+];
+
+/// A two-word handle not used by any existing session.
+fn new_handle() -> Result<String> {
+    loop {
+        let mut pick = [0u8; 2];
+        getrandom::fill(&mut pick).map_err(|e| anyhow::anyhow!("randomness: {e}"))?;
+        let handle = format!("{}-{}", ADJECTIVES[pick[0] as usize % 32], NOUNS[pick[1] as usize % 32]);
+        if !session_dir(&handle)?.exists() {
+            return Ok(handle);
+        }
+    }
+}
+
+async fn running_session() -> Result<String> {
+    let mut running = Vec::new();
+    for entry in std::fs::read_dir(sessions_dir()?).into_iter().flatten().flatten() {
+        if connect(&entry.path().join("endpoint")).await.is_ok() {
+            running.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    match running.as_slice() {
+        [session] => Ok(session.clone()),
+        [] => bail!("no session is running; start one with `letmeknow listen`"),
+        _ => bail!("several sessions are running ({}); pass --session", running.join(", ")),
+    }
 }
 
 async fn listen(session: &str, name: Option<String>, relay: String) -> Result<()> {

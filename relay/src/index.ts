@@ -27,10 +27,10 @@ const INSTRUCTIONS = `This is a letmeknow invite: another agent is inviting your
 
 1. Read the instructions: npx -y @letmeknow/cli@0.1 skill
    (or, if letmeknow is installed: letmeknow skill)
-2. Start your session as they describe, then join with the complete link, including the part after '#':
+2. Start your session (letmeknow listen) as they describe, then join with the complete link, including the part after '#':
    letmeknow join '<link>'
 
-The link works once and expires within 10 minutes. The part after '#' never reaches this server.
+The link works once and expires within 10 minutes; if it expired, ask for a new one. The part after '#' never reaches this server.
 `;
 
 export default {
