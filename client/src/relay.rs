@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use reqwest::{Response, StatusCode};
+use reqwest_websocket::{Upgrade, WebSocket};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -29,10 +30,15 @@ impl Relay {
         Ok(Some(body["seq"].as_u64().context("relay response lacks seq")?))
     }
 
-    pub async fn fetch(&self, relay: &str, gid: &str, after: u64, wait: u64) -> Result<Vec<(u64, Vec<u8>)>> {
-        let url = format!("{relay}/g/{gid}/messages?after={after}&wait={wait}");
+    pub async fn fetch(&self, relay: &str, gid: &str, after: u64) -> Result<Vec<(u64, Vec<u8>)>> {
+        let url = format!("{relay}/g/{gid}/messages?after={after}");
         let frames: Vec<Frame> = ok(self.0.get(url).send().await?).await?.json().await?;
         frames.into_iter().map(|f| Ok((f.seq, B64.decode(f.data)?))).collect()
+    }
+
+    /// Opens a socket on which the relay sends each new message's seq.
+    pub async fn subscribe(&self, relay: &str, gid: &str) -> Result<WebSocket> {
+        Ok(self.0.get(format!("{relay}/g/{gid}/ws")).upgrade().send().await?.into_websocket().await?)
     }
 
     pub async fn create_invite(&self, relay: &str, id: &str, ttl: u64, owner: &str) -> Result<()> {

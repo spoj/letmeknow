@@ -10,6 +10,7 @@ base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 dirs = "7.0.0"
+futures-util = { version = "0.3", default-features = false }
 getrandom = "0.4.3"
 hex = "0.4.3"
 hkdf = "0.13.0"
@@ -18,7 +19,8 @@ openmls_basic_credential = "0.6"
 openmls_rust_crypto = "0.6"
 openmls_sqlite_storage = "0.3"
 openmls_traits = "0.6"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "http2", "rustls-no-provider"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+reqwest-websocket = { version = "0.6", default-features = false }
 rusqlite = "0.37"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }

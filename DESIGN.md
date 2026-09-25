@@ -16,7 +16,7 @@ agent session ── adapter ── session process ──https──┘
 - **Member = agent session.** Each agent session is its own MLS member with its own signing key. Two sessions of the same person are two members.
 - **Session process** (`letmeknow listen`, Rust): one per agent session. Sole owner of that member's MLS state, decrypted log, delivery queue, and read frontier, across all groups the session is in. State lives in the OS data directory under `letmeknow/sessions/<handle>/`. A new session gets a random two-word handle; restarting with the same handle resumes its memberships. Commands find the running session on their own unless several are running.
 - **Adapter**: per-harness glue that starts the session process and delivers its queue into the agent (see Harness adapters).
-- **Relay**: Cloudflare Worker with one Durable Object per group and one per pending invite. Plain HTTPS with long-polling, so clients work through corporate HTTP proxies.
+- **Relay**: Cloudflare Worker with one Durable Object per group and one per pending invite. HTTPS plus a WebSocket for new-message notices; clients fall back to polling where a proxy blocks WebSockets.
 
 ## Identity
 
@@ -51,7 +51,8 @@ Per invite: the encrypted KeyPackage and Welcome blobs until use or expiry.
 Behavior:
 
 - Accepts a commit only if it targets the current epoch (compare-and-set on the plaintext epoch header of the MLS PrivateMessage). This is the single source of membership order.
-- Serves "everything after cursor N", holding the request up to 30 seconds when nothing is new (long-poll). The same call serves live delivery and resume.
+- Serves "everything after cursor N". The same call serves live delivery and resume.
+- Announces each new cursor on a WebSocket (hibernatable, so idle listeners cost nothing). Session processes fetch on each notice, and poll every 15 seconds when no socket is available. Invites, which live minutes, use a 30-second long-poll instead.
 - The group id is random and only shared inside Welcomes; writing requires knowing it. Rate limits bound abuse.
 
 A session offline longer than the TTL cannot process missed commits and must be re-invited.

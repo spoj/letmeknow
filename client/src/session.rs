@@ -14,6 +14,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Duration;
+use futures_util::{SinkExt, StreamExt};
+use reqwest_websocket::{Message, WebSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -21,6 +24,8 @@ const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA2
 const MAX_PAST_EPOCHS: usize = 5;
 const INVITE_TTL_S: u64 = 600;
 const POLL_WAIT_S: u64 = 25;
+const POLL_S: u64 = 15;
+const PING_S: u64 = 30;
 const PAGE: usize = 500;
 const CATCH_UP: usize = 20;
 
@@ -538,7 +543,7 @@ impl Session {
             }
             let group = &self.groups[gid];
             let (relay, cursor) = (group.relay.clone(), group.cursor);
-            for (seq, data) in self.relay.fetch(&relay, gid, cursor, 0).await? {
+            for (seq, data) in self.relay.fetch(&relay, gid, cursor).await? {
                 if let Err(error) = self.receive(gid, seq, &data).await {
                     self.warn(Some(gid), format!("{error:#}"));
                 }
@@ -570,23 +575,19 @@ impl Session {
     fn track(&mut self, gid: String, relay: String, cursor: u64, mls: MlsGroup) {
         let (http, events, poll_gid, poll_relay) = (self.relay.clone(), self.events.clone(), gid.clone(), relay.clone());
         let poller = tokio::spawn(async move {
-            let (mut after, mut wait) = (cursor, 0);
+            let (mut after, mut synced) = (cursor, false);
             loop {
-                match http.fetch(&poll_relay, &poll_gid, after, wait).await {
-                    Ok(messages) => {
-                        let synced = messages.len() < PAGE;
-                        if let Some((seq, _)) = messages.last() {
-                            after = *seq;
-                        }
-                        if (!messages.is_empty() || wait == 0)
-                            && events.send(Event::Batch { gid: poll_gid.clone(), messages, synced }).is_err()
-                        {
-                            return;
-                        }
-                        wait = if synced { POLL_WAIT_S } else { 0 };
+                let mut socket = http.subscribe(&poll_relay, &poll_gid).await.ok();
+                loop {
+                    if catch_up(&http, &events, &poll_relay, &poll_gid, &mut after, &mut synced).await.is_err() {
+                        break;
                     }
-                    Err(_) => tokio::time::sleep(std::time::Duration::from_secs(5)).await,
+                    let Some(ws) = &mut socket else { break };
+                    if !notified(ws).await {
+                        break;
+                    }
                 }
+                tokio::time::sleep(Duration::from_secs(POLL_S)).await;
             }
         });
         self.groups.insert(gid, Group { mls, relay, cursor, poller });
@@ -714,6 +715,49 @@ fn open(key: &[u8; 32], label: &[u8], data: &str) -> Result<Vec<u8>> {
     cipher
         .decrypt(&nonce.into(), Aad { msg: sealed, aad: label })
         .map_err(|_| anyhow::anyhow!("cannot decrypt: wrong invite secret or tampered data"))
+}
+
+async fn catch_up(
+    http: &Relay,
+    events: &mpsc::UnboundedSender<Event>,
+    relay: &str,
+    gid: &str,
+    after: &mut u64,
+    synced: &mut bool,
+) -> Result<()> {
+    loop {
+        let messages = http.fetch(relay, gid, *after).await?;
+        let was_synced = std::mem::replace(synced, messages.len() < PAGE);
+        if let Some((seq, _)) = messages.last() {
+            *after = *seq;
+        }
+        if !messages.is_empty() || !was_synced {
+            let _ = events.send(Event::Batch { gid: gid.to_owned(), messages, synced: *synced });
+        }
+        if *synced {
+            return Ok(());
+        }
+    }
+}
+
+/// Waits for the relay to announce a new message; false once the socket is gone.
+async fn notified(ws: &mut WebSocket) -> bool {
+    let mut unanswered = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(PING_S), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) if text == "pong" => unanswered = false,
+            Ok(Some(Ok(Message::Text(_)))) => return true,
+            Ok(Some(Ok(_))) => {}
+            Ok(_) => return false,
+            Err(_) if unanswered => return false,
+            Err(_) => {
+                unanswered = true;
+                if ws.send(Message::Text("ping".into())).await.is_err() {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 fn invite_key(secret: &[u8], id: &str) -> [u8; 32] {

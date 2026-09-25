@@ -48,10 +48,10 @@ export default {
 
 export class Group extends DurableObject<Env> {
   sql = this.ctx.storage.sql;
-  waiters = new Set<() => void>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.sql.exec("CREATE TABLE IF NOT EXISTS messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, data BLOB NOT NULL)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS state (epoch INTEGER NOT NULL)");
   }
@@ -59,15 +59,16 @@ export class Group extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const [, , gid, action] = url.pathname.split("/");
+    if (action === "ws") {
+      if (request.headers.get("Upgrade") !== "websocket") return text("expected websocket", 426);
+      const { 0: client, 1: server } = new WebSocketPair();
+      this.ctx.acceptWebSocket(server);
+      return new Response(null, { status: 101, webSocket: client });
+    }
     if (action !== "messages") return text("not found", 404);
     if (request.method === "GET") {
-      const after = Number(url.searchParams.get("after") ?? 0);
-      let messages = this.since(after);
-      if (!messages.length) {
-        await wait(this.waiters, url);
-        messages = this.since(after);
-      }
-      return Response.json(messages);
+      if (url.searchParams.has("wait")) return text("long-polling was removed; upgrade letmeknow", 410);
+      return Response.json(this.since(Number(url.searchParams.get("after") ?? 0)));
     }
     if (request.method !== "POST") return text("method not allowed", 405);
 
@@ -89,9 +90,13 @@ export class Group extends DurableObject<Env> {
     const seq = this.sql.exec<{ seq: number }>(
       "INSERT INTO messages (at, data) VALUES (?, ?) RETURNING seq", Date.now(), data
     ).one().seq;
-    wake(this.waiters);
+    for (const socket of this.ctx.getWebSockets()) socket.send(String(seq));
     if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + RETENTION_MS);
     return Response.json({ seq });
+  }
+
+  webSocketClose(socket: WebSocket) {
+    socket.close();
   }
 
   async alarm() {

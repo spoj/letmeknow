@@ -26,8 +26,15 @@ function mls(gid: string, epoch: number, contentType: number): Uint8Array {
 const post = (gid: string, body: Uint8Array) =>
   SELF.fetch(`${origin}/g/${gid}/messages`, { method: "POST", body });
 
-const poll = (gid: string, after: number, wait = 0) =>
-  SELF.fetch(`${origin}/g/${gid}/messages?after=${after}&wait=${wait}`).then(r => r.json<any[]>());
+const poll = (gid: string, after: number) =>
+  SELF.fetch(`${origin}/g/${gid}/messages?after=${after}`).then(r => r.json<any[]>());
+
+async function subscribe(gid: string) {
+  const socket = (await SELF.fetch(`${origin}/g/${gid}/ws`, { headers: { Upgrade: "websocket" } })).webSocket!;
+  socket.accept();
+  const next = () => new Promise<string>(resolve => socket.addEventListener("message", e => resolve(e.data as string), { once: true }));
+  return { socket, next };
+}
 
 describe("group", () => {
   it("accepts one commit per epoch and any application message", async () => {
@@ -46,7 +53,7 @@ describe("group", () => {
     expect((await post(gid, new Uint8Array([1, 2, 3]))).status).toBe(400);
   });
 
-  it("returns messages after a cursor, holding the request until one arrives", async () => {
+  it("returns messages after a cursor", async () => {
     const gid = hex(16);
     const first = mls(gid, 0, COMMIT);
     await post(gid, first);
@@ -56,10 +63,19 @@ describe("group", () => {
     expect(all.map(m => m.seq)).toEqual([1, 2]);
     expect(Buffer.from(all[0].data, "base64")).toEqual(Buffer.from(first));
     expect(await poll(gid, 2)).toEqual([]);
+    expect((await SELF.fetch(`${origin}/g/${gid}/messages?after=2&wait=30`)).status).toBe(410);
+  });
 
-    const pending = poll(gid, 2, 10);
-    await post(gid, mls(gid, 1, APPLICATION));
-    expect((await pending).map(m => m.seq)).toEqual([3]);
+  it("notifies websockets of new messages and answers pings", async () => {
+    const gid = hex(16);
+    const { socket, next } = await subscribe(gid);
+    let message = next();
+    await post(gid, mls(gid, 0, COMMIT));
+    expect(await message).toBe("1");
+    message = next();
+    socket.send("ping");
+    expect(await message).toBe("pong");
+    socket.close();
   });
 
   it("expires old messages but keeps the epoch", async () => {
