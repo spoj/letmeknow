@@ -37,10 +37,10 @@ class Listener:
                 event = self.lines.get(timeout=deadline - time.time())
             except queue.Empty:
                 break
-            if event["type"] == "warning":
-                sys.exit(f"{self.session} warning: {event}")
             if predicate(event):
                 return event
+            if event["type"] == "warning":
+                sys.exit(f"{self.session} warning: {event}")
         sys.exit(f"{self.session}: expected event not seen")
 
     def stop(self):
@@ -74,7 +74,10 @@ def main():
         alice, bob, carol = (Listener(s) for s in ("alice", "bob", "carol"))
         listeners += [alice, bob, carol]
 
-        link = run("alice", "invite")["link"]
+        invite = run("alice", "invite")
+        link, code = invite["link"], invite["code"]
+        slot, words = code.split("-", 1)
+        check(link == f"{RELAY}/i/{slot}#{words}" and len(words.split("-")) == 2, f"invite gives a short code ({code}) and its link")
         joined = run("bob", "join", link)
         group = joined["group"]
         check(len(joined["members"]) == 2, "bob joins alice's group through the link")
@@ -92,9 +95,14 @@ def main():
         history = run("alice", "read", reply, "--ancestors", "1")
         check([m["id"] for m in history] == [hello, reply], "bob's read frontier covers alice's message")
 
-        run("carol", "join", run("bob", "invite", "--group", group)["link"])
+        slot = run("bob", "invite", "--group", group)["code"].split("-")[0]
+        check("wrong invite code" in run("carol", "join", f"{slot}-wrong-guess", ok=False), "a wrong code fails for the joiner")
+        bob.expect(lambda e: e["type"] == "warning" and "wrong invite code" in e["text"])
+        check("invite already used" in run("carol", "join", f"{slot}-other-guess", ok=False), "and uses up the invite")
+
+        run("carol", "join", run("bob", "invite", "--group", group)["code"].upper())
         alice.expect(lambda e: e["type"] == "joined" and e["member"]["name"] == "Carol" and e["by"]["name"] == "Bob")
-        check(True, "any member can invite; others see who added whom")
+        check(True, "a typed code works, in any case; any member can invite; others see who added whom")
 
         run("carol", "send", "--to", fp["Alice"], "question for alice")
         check(alice.expect(lambda e: e["type"] == "message")["direct"], "direct message is marked direct for its target")

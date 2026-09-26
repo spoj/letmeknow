@@ -12,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
@@ -23,6 +24,9 @@ use tokio::task::JoinHandle;
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 const MAX_PAST_EPOCHS: usize = 5;
 const INVITE_TTL_S: u64 = 600;
+const INVITE_SLOTS: usize = 999;
+const PAKE_ID: &[u8] = b"letmeknow invite v2";
+const WORDS: &str = include_str!("words.txt");
 const POLL_WAIT_S: u64 = 25;
 const POLL_S: u64 = 15;
 const PING_S: u64 = 30;
@@ -33,13 +37,13 @@ const CATCH_UP: usize = 20;
 #[derive(Subcommand, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    /// Create an invite link; creates a new group unless --group is given
+    /// Create a one-time invite code and link; creates a new group unless --group is given
     Invite {
         #[arg(long)]
         group: Option<String>,
     },
-    /// Join a group through an invite link
-    Join { link: String },
+    /// Join a group through an invite code or link
+    Join { code: String },
     /// Send a message ("-" reads the text from stdin)
     Send {
         #[arg(long)]
@@ -81,15 +85,13 @@ pub enum Request {
 pub enum Event {
     Request(Request, oneshot::Sender<Value>),
     Batch { gid: String, messages: Vec<(u64, Vec<u8>)>, synced: bool },
-    JoinRequest { invite: Invite, data: String },
-    Welcome { invite: Invite, data: String, reply: oneshot::Sender<Value> },
+    JoinRequest { invite: Invite, spake: Spake2<Ed25519Group>, data: String },
+    Welcome { relay: String, key: [u8; 32], data: String, reply: oneshot::Sender<Value> },
 }
 
-#[derive(Clone)]
 pub struct Invite {
     relay: String,
     id: String,
-    key: [u8; 32],
     owner: String,
     gid: String,
 }
@@ -189,8 +191,8 @@ impl Session {
 
     pub async fn handle(&mut self, event: Event) {
         match event {
-            Event::Request(Request::Join { link }, reply) => {
-                if let Err(error) = self.join(link, reply).await {
+            Event::Request(Request::Join { code }, reply) => {
+                if let Err(error) = self.join(code, reply).await {
                     self.warn(None, format!("join: {error:#}"));
                 }
             }
@@ -214,13 +216,13 @@ impl Session {
                     }
                 }
             }
-            Event::JoinRequest { invite, data } => {
-                if let Err(error) = self.admit(&invite, &data).await {
+            Event::JoinRequest { invite, spake, data } => {
+                if let Err(error) = self.admit(&invite, spake, &data).await {
                     self.warn(Some(&invite.gid), format!("invite {}: {error:#}", invite.id));
                 }
             }
-            Event::Welcome { invite, data, reply } => {
-                let result = self.welcome(invite, &data);
+            Event::Welcome { relay, key, data, reply } => {
+                let result = self.welcome(&relay, &key, &data);
                 let _ = reply.send(result.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
             }
         }
@@ -253,27 +255,52 @@ impl Session {
             None => self.create_group()?,
         };
         let relay = self.groups[&gid].relay.clone();
-        let id = hex::encode(self.provider.rand().random_array::<16>()?);
-        let secret: [u8; 32] = self.provider.rand().random_array()?;
+        let words: Vec<&str> = WORDS.lines().collect();
+        let words = format!("{}-{}", words[self.random_below(words.len())?], words[self.random_below(words.len())?]);
+        let (spake, pake) = Spake2::<Ed25519Group>::start_symmetric(&Password::new(&words), &Identity::new(PAKE_ID));
         let owner = hex::encode(self.provider.rand().random_array::<32>()?);
-        self.relay.create_invite(&relay, &id, INVITE_TTL_S, &owner).await?;
-        let invite = Invite { relay: relay.clone(), id: id.clone(), key: invite_key(&secret, &id), owner, gid: gid.clone() };
+        let mut slot = None;
+        for _ in 0..10 {
+            let id = (self.random_below(INVITE_SLOTS)? + 1).to_string();
+            if self.relay.create_invite(&relay, &id, INVITE_TTL_S, &owner, &B64.encode(&pake)).await? {
+                slot = Some(id);
+                break;
+            }
+        }
+        let id = slot.context("no free invite slot on the relay; try again")?;
+        let invite = Invite { relay: relay.clone(), id: id.clone(), owner, gid: gid.clone() };
 
         let (http, events) = (self.relay.clone(), self.events.clone());
         tokio::spawn(async move {
             loop {
                 match http.invite_get(&invite.relay, &invite.id, "join", POLL_WAIT_S).await {
-                    Ok(Some(data)) => return drop(events.send(Event::JoinRequest { invite, data })),
+                    Ok(Some(data)) => return drop(events.send(Event::JoinRequest { invite, spake, data })),
                     Ok(None) => {}
                     Err(_) => return,
                 }
             }
         });
-        Ok(json!({ "group": gid, "link": format!("{relay}/i/{id}#{}", hex::encode(secret)), "expires_in": INVITE_TTL_S }))
+        Ok(json!({
+            "group": gid,
+            "code": format!("{id}-{words}"),
+            "link": format!("{relay}/i/{id}#{words}"),
+            "expires_in": INVITE_TTL_S,
+        }))
     }
 
-    async fn admit(&mut self, invite: &Invite, data: &str) -> Result<()> {
-        let bytes = open(&invite.key, b"join", data)?;
+    async fn admit(&mut self, invite: &Invite, spake: Spake2<Ed25519Group>, data: &str) -> Result<()> {
+        let join: Value = serde_json::from_str(data)?;
+        let pake = B64.decode(join["pake"].as_str().context("join request lacks pake")?)?;
+        let key = invite_key(&spake.finish(&pake)?, &invite.id);
+        let bytes = match open(&key, b"join", join["key_package"].as_str().context("join request lacks key package")?) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                // Sealed under our key, so a joiner with a wrong code cannot open it and stops waiting.
+                let sealed = self.seal(&key, b"welcome", b"")?;
+                self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
+                return Err(error);
+            }
+        };
         let MlsMessageBodyIn::KeyPackage(key_package) = MlsMessageIn::tls_deserialize_exact_bytes(&bytes)?.extract() else {
             bail!("join request is not a key package");
         };
@@ -289,24 +316,30 @@ impl Session {
             .await?;
         let welcome = welcome.context("no welcome")?.to_bytes()?;
         let envelope = json!({ "group": invite.gid, "seq": seq, "welcome": B64.encode(welcome) });
-        let sealed = self.seal(&invite.key, b"welcome", &serde_json::to_vec(&envelope)?)?;
+        let sealed = self.seal(&key, b"welcome", &serde_json::to_vec(&envelope)?)?;
         self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
         Ok(())
     }
 
-    async fn join(&mut self, link: String, reply: oneshot::Sender<Value>) -> Result<()> {
+    async fn join(&mut self, code: String, reply: oneshot::Sender<Value>) -> Result<()> {
         let prepared = async {
-            let (relay, fragment) = link.split_once('#').context("link lacks the secret after '#'")?;
-            let (relay, id) = relay.rsplit_once("/i/").context("not an invite link")?;
-            let secret = hex::decode(fragment).context("bad invite secret")?;
-            let key = invite_key(&secret, id);
+            let (target, words) = code
+                .trim()
+                .split_once('#')
+                .or_else(|| code.trim().split_once('-'))
+                .context("expected an invite code like 417-acid-zebra, or its link")?;
+            let (relay, id) = target.rsplit_once("/i/").unwrap_or((self.default_relay.as_str(), target));
+            let pake = self.relay.invite_get(relay, id, "pake", 0).await?.context("invite lacks the inviter's pake message")?;
+            let (spake, message) = Spake2::<Ed25519Group>::start_symmetric(&Password::new(words.to_lowercase()), &Identity::new(PAKE_ID));
+            let key = invite_key(&spake.finish(&B64.decode(pake)?)?, id);
             let bundle = KeyPackage::builder().build(CIPHERSUITE, &self.provider, &self.signer, self.me.clone())?;
             let bytes = MlsMessageOut::from(bundle.key_package().clone()).to_bytes()?;
-            self.relay.invite_post(relay, id, "join", &self.seal(&key, b"join", &bytes)?, None).await?;
-            anyhow::Ok(Invite { relay: relay.to_owned(), id: id.to_owned(), key, owner: String::new(), gid: String::new() })
+            let join = json!({ "pake": B64.encode(message), "key_package": self.seal(&key, b"join", &bytes)? });
+            self.relay.invite_post(relay, id, "join", &join.to_string(), None).await?;
+            anyhow::Ok((relay.to_owned(), id.to_owned(), key))
         };
-        let invite = match prepared.await {
-            Ok(invite) => invite,
+        let (relay, id, key) = match prepared.await {
+            Ok(prepared) => prepared,
             Err(error) => {
                 let _ = reply.send(json!({ "error": format!("{error:#}") }));
                 return Ok(());
@@ -315,8 +348,8 @@ impl Session {
         let (http, events) = (self.relay.clone(), self.events.clone());
         tokio::spawn(async move {
             loop {
-                match http.invite_get(&invite.relay, &invite.id, "welcome", POLL_WAIT_S).await {
-                    Ok(Some(data)) => return drop(events.send(Event::Welcome { invite, data, reply })),
+                match http.invite_get(&relay, &id, "welcome", POLL_WAIT_S).await {
+                    Ok(Some(data)) => return drop(events.send(Event::Welcome { relay, key, data, reply })),
                     Ok(None) => {}
                     Err(error) => return drop(reply.send(json!({ "error": format!("waiting for welcome: {error:#}") }))),
                 }
@@ -325,8 +358,8 @@ impl Session {
         Ok(())
     }
 
-    fn welcome(&mut self, invite: Invite, data: &str) -> Result<Value> {
-        let envelope: Value = serde_json::from_slice(&open(&invite.key, b"welcome", data)?)?;
+    fn welcome(&mut self, relay: &str, key: &[u8; 32], data: &str) -> Result<Value> {
+        let envelope: Value = serde_json::from_slice(&open(key, b"welcome", data)?)?;
         let gid = envelope["group"].as_str().context("welcome lacks group")?.to_owned();
         let seq = envelope["seq"].as_u64().context("welcome lacks seq")?;
         let bytes = B64.decode(envelope["welcome"].as_str().context("welcome lacks message")?)?;
@@ -342,7 +375,7 @@ impl Session {
         if mls.group_id().as_slice() != gid.as_bytes() {
             bail!("welcome is for a different group");
         }
-        self.add_group(&gid, &invite.relay, seq, mls)?;
+        self.add_group(&gid, relay, seq, mls)?;
         self.print(json!({ "type": "joined", "group": gid, "member": self.person }));
         Ok(json!({ "group": gid, "members": self.members(&gid) }))
     }
@@ -694,6 +727,10 @@ impl Session {
         println!("{}", json!({ "type": "warning", "group": gid, "text": text }));
     }
 
+    fn random_below(&self, n: usize) -> Result<usize> {
+        Ok(u32::from_le_bytes(self.provider.rand().random_array()?) as usize % n)
+    }
+
     fn seal(&self, key: &[u8; 32], label: &[u8], plaintext: &[u8]) -> Result<String> {
         let nonce: [u8; 12] = self.provider.rand().random_array()?;
         let cipher = ChaCha20Poly1305::new_from_slice(key).expect("32-byte key");
@@ -714,7 +751,7 @@ fn open(key: &[u8; 32], label: &[u8], data: &str) -> Result<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new_from_slice(key).expect("32-byte key");
     cipher
         .decrypt(&nonce.into(), Aad { msg: sealed, aad: label })
-        .map_err(|_| anyhow::anyhow!("cannot decrypt: wrong invite secret or tampered data"))
+        .map_err(|_| anyhow::anyhow!("cannot decrypt: wrong invite code or tampered data"))
 }
 
 async fn catch_up(
@@ -763,7 +800,7 @@ async fn notified(ws: &mut WebSocket) -> bool {
 fn invite_key(secret: &[u8], id: &str) -> [u8; 32] {
     let mut key = [0; 32];
     Hkdf::<Sha256>::new(None, secret)
-        .expand(format!("letmeknow invite v1 {id}").as_bytes(), &mut key)
+        .expand(format!("letmeknow invite v2 {id}").as_bytes(), &mut key)
         .expect("32 bytes is a valid HKDF output length");
     key
 }

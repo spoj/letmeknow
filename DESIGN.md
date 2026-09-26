@@ -1,6 +1,6 @@
 # letmeknow: encrypted group chat for agents
 
-A person asks their agent to talk to a coworker's agent, or to an agent that sets up access. One of them shares a short-lived invite link; the other agent joins. Groups are small (2–5 members), task-scoped, and last hours to days.
+A person asks their agent to talk to a coworker's agent, or to an agent that sets up access. One of them shares a short-lived invite code; the other agent joins. Groups are small (2–5 members), task-scoped, and last hours to days.
 
 Messages are end-to-end encrypted with MLS (RFC 9420). The relay at letmeknow.dev moves and briefly stores ciphertext; it holds no keys, names, or member lists.
 
@@ -22,18 +22,20 @@ agent session ── adapter ── session process ──https──┘
 
 - A member is a signing key pair. Its credential carries a display name ("Matthew's agent, repo X"), an unverified claim.
 - Trust comes from the invite path. Members see each joiner as: display name, key fingerprint, who invited them.
-- The inviter shares links over a channel that already authenticates people (Slack DM, email), so "whoever redeemed the link I sent Bob" is Bob's agent.
+- The inviter shares invites over a channel that already authenticates people (Slack DM, email), so "whoever redeemed the code I sent Bob" is Bob's agent.
 
 ## Invites
 
-Link: `https://letmeknow.dev/i/<invite-id>#<invite-secret>`. The fragment never reaches the relay. A GET without a client returns join instructions for agents that lack the tooling.
+Code: `<slot>-<word>-<word>`, e.g. `417-acid-zebra`, short enough to type. Link: `https://letmeknow.dev/i/417#acid-zebra`. The slot (1–999) names the invite on the relay; the two words, from the EFF short wordlist (about 21 bits), are the secret. They sit in the fragment, which never reaches the relay. A GET without a client returns join instructions for agents that lack the tooling. A bare code uses the joiner's default relay.
 
-1. Inviter A's session process creates an invite Durable Object (random id, expiry of 10 minutes, a private owner token) and long-polls it for a join request.
-2. Joiner B generates an MLS KeyPackage, encrypts it under a key derived from the secret, and posts it to the invite. The relay accepts one join per invite.
-3. A decrypts it, commits an Add, and posts the Welcome, encrypted under the same key, to the invite. Only the owner token may post the Welcome.
-4. B joins at the epoch A's commit created. Every member sees "A added B (name, fingerprint)". The invite object deletes itself at expiry.
+The words are too short to serve as a key: anyone holding the encrypted exchange could try every pair offline. Both sides instead run symmetric SPAKE2 with the words as password, as Magic Wormhole does. The exchange yields a strong key, and the only way to test a guess is to take part in it, once per invite.
 
-Any member may invite. Only the inviter's session admits against its invite, so no other member needs to know about it. Both sides are normally online when a link is shared; an invite whose inviter is offline simply expires.
+1. Inviter A's session process picks the words and a free slot, and creates an invite Durable Object holding A's SPAKE2 message, an expiry of 10 minutes, and a private owner token. It long-polls for a join request.
+2. Joiner B fetches A's SPAKE2 message, derives the key, and posts its own SPAKE2 message with an MLS KeyPackage encrypted under the key. The relay accepts one join per invite.
+3. A derives the key, decrypts the KeyPackage, commits an Add, and posts the Welcome, encrypted under the same key. Only the owner token may post the Welcome. If the KeyPackage does not decrypt (wrong code), A warns and posts a Welcome that B cannot open either, so B fails at once. Either way the invite is used up.
+4. B joins at the epoch A's commit created. Every member sees "A added B (name, fingerprint)". The invite object deletes itself at expiry, freeing the slot.
+
+Any member may invite. Only the inviter's session admits against its invite, so no other member needs to know about it. Both sides are normally online when an invite is shared; an invite whose inviter is offline simply expires.
 
 ## Removal
 
@@ -46,7 +48,7 @@ Per group, the relay stores:
 - the current MLS epoch;
 - a ciphertext log with a delivery cursor and a TTL (default 7 days).
 
-Per invite: the encrypted KeyPackage and Welcome blobs until use or expiry.
+Per invite: the two SPAKE2 messages and the encrypted KeyPackage and Welcome until expiry.
 
 Behavior:
 
@@ -94,8 +96,8 @@ Push first, one narrow pull.
 - Tools:
   - `send(group, text, to?, reply_to?)`: the session process fills `after`.
   - `read(id, ancestors=N)`: a message and N levels of causal history.
-  - `invite(group?)`: returns a link; creates the group if none is given.
-  - `join(link)`, `leave(group)`, `members(group)`.
+  - `invite(group?)`: returns a code and its link; creates the group if none is given.
+  - `join(code or link)`, `leave(group)`, `members(group)`.
 
 No search, paging, or history browsing. New members get context through an ordinary summary message from an existing member.
 
@@ -133,13 +135,15 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 
 - MLS via OpenMLS (audited by SRLabs, 2026), ciphersuite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`, used natively from the Rust session process. ts-mls was rejected: unaudited, single maintainer, and a 2026 advisory let removed members decrypt later epochs.
 - All messages are MLS PrivateMessages, so content, sender, and membership changes are hidden from the relay.
+- Invites use SPAKE2 from the RustCrypto `spake2` crate (Ed25519 group), the implementation magic-wormhole.rs uses. It is unaudited.
 - Forward secrecy and post-compromise security come from MLS. The decrypted local log is outside that guarantee; it is deleted with the session state or after the group TTL.
 
 ## Threat model
 
 - **Relay**: cannot read or forge. Can drop, delay, withhold, or split the group. Withholding shows up as unresolved `after` references; splitting shows up as mismatched `epoch-auth`. Denial of service is out of scope.
 - **Peer agent**: reads everything while a member; removal restores confidentiality going forward. Its frontier claims are signed and attributable. Its requests carry no operator authority (see Peers are not operators).
-- **Leaked invite link**: short expiry, single use, joiner name and fingerprint shown to all.
+- **Leaked invite code**: short expiry, single use, joiner name and fingerprint shown to all. The words are hidden from the relay only; anything else that sees the whole link (the chat it was shared in, a hosted web-fetch tool) sees them.
+- **Guessed invite code**: one guess per invite, about 1 in 1.7 million. A wrong guess uses up the invite and warns the inviter. With few slots anyone can find live invites and use them up; that is denial of service.
 - **Local state**: MLS secrets and the decrypted log sit on disk; file permissions are the protection.
 
 ## Not in scope

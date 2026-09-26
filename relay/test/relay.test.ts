@@ -94,7 +94,7 @@ describe("group", () => {
 describe("invite", () => {
   const owner = hex(32);
   const create = (id: string, ttl = 600) =>
-    SELF.fetch(`${origin}/i/${id}`, { method: "PUT", body: JSON.stringify({ ttl, owner }) });
+    SELF.fetch(`${origin}/i/${id}`, { method: "PUT", body: JSON.stringify({ ttl, owner, pake: "a" }) });
   const send = (id: string, action: string, data: string, token?: string) =>
     SELF.fetch(`${origin}/i/${id}/${action}`, {
       method: "POST",
@@ -103,18 +103,23 @@ describe("invite", () => {
     });
 
   it("shows join instructions to plain GETs", async () => {
-    const response = await SELF.fetch(`${origin}/i/${hex(16)}`);
+    const response = await SELF.fetch(`${origin}/i/417`);
     expect(await response.text()).toContain("letmeknow join");
   });
 
-  it("carries one join and one welcome", async () => {
-    const id = hex(16);
+  it("only accepts short slot numbers", async () => {
+    for (const id of ["0", "1000", "07", hex(16)]) expect((await create(id)).status).toBe(404);
+  });
+
+  it("carries the inviter's pake message, one join and one welcome", async () => {
+    const id = "1";
     expect((await create(id)).status).toBe(201);
     expect((await create(id)).status).toBe(409);
 
     const receive = (action: string, wait = 0) =>
       SELF.fetch(`${origin}/i/${id}/${action}?wait=${wait}`).then(r => r.status === 204 ? null : r.json());
 
+    expect(await receive("pake")).toEqual({ data: "a" });
     expect(await receive("join")).toBeNull();
     const join = receive("join", 10);
     expect((await send(id, "join", "kp")).status).toBe(204);
@@ -126,10 +131,11 @@ describe("invite", () => {
     expect(await receive("welcome")).toEqual({ data: "w" });
   });
 
-  it("disappears at expiry", async () => {
-    const id = hex(16);
+  it("disappears at expiry, freeing the slot", async () => {
+    const id = "999";
     await create(id);
     await runDurableObjectAlarm(env.INVITES.get(env.INVITES.idFromName(id)));
     expect((await send(id, "join", "kp")).status).toBe(404);
+    expect((await create(id)).status).toBe(201);
   });
 });

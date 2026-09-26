@@ -41,10 +41,15 @@ impl Relay {
         Ok(self.0.get(format!("{relay}/g/{gid}/ws")).upgrade().send().await?.into_websocket().await?)
     }
 
-    pub async fn create_invite(&self, relay: &str, id: &str, ttl: u64, owner: &str) -> Result<()> {
-        let body = json!({ "ttl": ttl, "owner": owner });
-        ok(self.0.put(format!("{relay}/i/{id}")).json(&body).send().await?).await?;
-        Ok(())
+    /// `false` means the slot is taken.
+    pub async fn create_invite(&self, relay: &str, id: &str, ttl: u64, owner: &str, pake: &str) -> Result<bool> {
+        let body = json!({ "ttl": ttl, "owner": owner, "pake": pake });
+        let response = self.0.put(format!("{relay}/i/{id}")).json(&body).send().await?;
+        if response.status() == StatusCode::CONFLICT {
+            return Ok(false);
+        }
+        ok(response).await?;
+        Ok(true)
     }
 
     pub async fn invite_post(&self, relay: &str, id: &str, action: &str, data: &str, owner: Option<&str>) -> Result<()> {

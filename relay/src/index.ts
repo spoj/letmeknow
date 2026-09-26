@@ -5,13 +5,15 @@ interface Env {
   INVITES: DurableObjectNamespace<Invite>;
 }
 
-type InviteState = { expires: number; owner: string; join?: string; welcome?: string };
+type InviteState = { expires: number; owner: string; pake: string; join?: string; welcome?: string };
 
-const ID = /^[0-9a-f]{32}$/;
+const GROUP = /^[0-9a-f]{32}$/;
+const SLOT = /^[1-9][0-9]{0,2}$/;
 const OWNER = /^[0-9a-f]{64}$/;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_MESSAGE_BYTES = 256 * 1024;
 const MAX_INVITE_TTL_S = 24 * 60 * 60;
+const MAX_PAKE_CHARS = 1024;
 const MAX_WAIT_S = 30;
 const COMMIT = 3;
 const PRIVATE_MESSAGE = 2;
@@ -30,7 +32,7 @@ const INSTRUCTIONS = `This is a letmeknow invite: another agent is inviting your
 2. Start your session (letmeknow listen) as they describe, then join with the complete link, including the part after '#':
    letmeknow join '<link>'
 
-The link works once and expires within 10 minutes; if it expired, ask for a new one. The part after '#' never reaches this server.
+The link works once and expires within 10 minutes; a mistyped code also uses it up. If it failed, ask for a new one. The part after '#' is the secret code; it never reaches this server.
 `;
 
 export default {
@@ -38,9 +40,8 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/") return new Response(ABOUT);
     const [kind, id, action] = url.pathname.split("/").slice(1);
-    if (!ID.test(id ?? "")) return text("not found", 404);
-    if (kind === "g") return env.GROUPS.get(env.GROUPS.idFromName(id)).fetch(request);
-    if (kind !== "i") return text("not found", 404);
+    if (kind === "g" && GROUP.test(id ?? "")) return env.GROUPS.get(env.GROUPS.idFromName(id)).fetch(request);
+    if (kind !== "i" || !SLOT.test(id ?? "")) return text("not found", 404);
     if (request.method === "GET" && action === undefined) return new Response(INSTRUCTIONS);
     return env.INVITES.get(env.INVITES.idFromName(id)).fetch(request);
   }
@@ -125,18 +126,19 @@ export class Invite extends DurableObject<Env> {
     let invite = await this.ctx.storage.get<InviteState>("invite");
 
     if (request.method === "PUT" && action === undefined) {
-      if (invite) return text("invite exists", 409);
-      const { ttl, owner } = await request.json<{ ttl: unknown; owner: unknown }>();
+      if (invite && invite.expires > Date.now()) return text("invite exists", 409);
+      const { ttl, owner, pake } = await request.json<{ ttl: unknown; owner: unknown; pake: unknown }>();
       if (!Number.isInteger(ttl) || (ttl as number) < 1 || (ttl as number) > MAX_INVITE_TTL_S) return text("bad ttl", 400);
       if (typeof owner !== "string" || !OWNER.test(owner)) return text("bad owner", 400);
+      if (typeof pake !== "string" || pake.length > MAX_PAKE_CHARS) return text("bad pake", 400);
       const expires = Date.now() + (ttl as number) * 1000;
-      await this.ctx.storage.put("invite", { expires, owner });
+      await this.ctx.storage.put("invite", { expires, owner, pake });
       await this.ctx.storage.setAlarm(expires);
       return new Response(null, { status: 201 });
     }
     if (!invite || invite.expires <= Date.now()) return text("invite not found or expired", 404);
 
-    if (request.method === "GET" && (action === "join" || action === "welcome")) {
+    if (request.method === "GET" && (action === "pake" || action === "join" || action === "welcome")) {
       if (!invite[action]) {
         await wait(this.waiters, url);
         invite = await this.ctx.storage.get<InviteState>("invite");

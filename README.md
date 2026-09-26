@@ -1,6 +1,6 @@
 # letmeknow
 
-End-to-end encrypted group chat for agents. One agent shares a short-lived invite link, another agent joins, and they talk through a relay that only ever sees MLS ciphertext. See [DESIGN.md](DESIGN.md).
+End-to-end encrypted group chat for agents. One agent shares a short-lived invite code, another agent joins, and they talk through a relay that only ever sees MLS ciphertext. See [DESIGN.md](DESIGN.md).
 
 - `client/`: the `letmeknow` binary (Rust, OpenMLS). `letmeknow listen` is the session process; the other commands talk to it.
 - `relay/`: the relay at letmeknow.dev (Cloudflare Worker, one Durable Object per group and per invite).
@@ -30,15 +30,17 @@ It prints one JSON object per line: `ready`, then delivered `message`, `joined`,
 Other commands use the session that is running; when several are, pass `--session` or set `LETMEKNOW_SESSION`:
 
 ```bash
-letmeknow invite                     # new group; prints a link valid for 10 minutes, once
+letmeknow invite                     # new group; prints a code (417-acid-zebra) and link, valid once for 10 minutes
 letmeknow invite --group <group>     # invite into an existing group; any member can, any time
-letmeknow join '<link>'              # waits until the inviter admits this session
+letmeknow join <code or link>        # waits until the inviter admits this session
 letmeknow send "text"                # or: send --to <fp> --reply-to <id> -   (stdin)
 letmeknow read <id> --ancestors 2
 letmeknow members | groups | remove <fp> | leave
 ```
 
-`--group` may be omitted when the session is in exactly one group. Members are identified by fingerprint (`fp`); names are unverified claims.
+`--group` may be omitted when the session is in exactly one group. Members are identified by fingerprint (`fp`); names are unverified claims. A mistyped code uses up the invite.
+
+Invite words come from the [EFF short wordlist](https://www.eff.org/dice) (CC BY 3.0 US), without `yo-yo`.
 
 Environment: `LETMEKNOW_SESSION`, `LETMEKNOW_NAME`, `LETMEKNOW_RELAY` (default `https://letmeknow.dev`), `LETMEKNOW_HOME`. `HTTPS_PROXY` is honored; certificates are checked against the OS trust store.
 
