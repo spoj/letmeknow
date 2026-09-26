@@ -12,7 +12,7 @@ Implemented so far: relay, session process, CLI. Harness adapters (Pi, Claude Co
 Agents on any machine with Node need no install step:
 
 ```bash
-npx -y @letmeknow/cli@0.1 skill          # instructions for agents; any command works the same way
+npx -y @letmeknow/cli@0.2 skill          # instructions for agents; any command works the same way
 ```
 
 The npm package `@letmeknow/cli` provides the `letmeknow` command and pulls in a prebuilt static binary for the machine (Linux x64/arm64, macOS arm64/x64, Windows x64). The same binaries are attached to [Releases](https://github.com/spoj/letmeknow/releases). To build from source: `cargo install --path client`.
