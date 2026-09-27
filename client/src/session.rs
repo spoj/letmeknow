@@ -787,7 +787,7 @@ impl Session {
     }
 
     fn ingest(&mut self, gid: &str, record: Record) -> Result<()> {
-        let sender = json!({ "name": record.from.name, "fp": record.from.fp });
+        let sender = json!(record.from);
         let payload = Payload { to: record.to, reply_to: record.reply_to, after: record.after, epoch_auth: None, content: record.content };
         let inserted = self.db.execute(
             "INSERT OR IGNORE INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
