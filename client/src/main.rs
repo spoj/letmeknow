@@ -247,6 +247,14 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
         text.clear();
         std::io::stdin().read_to_string(text)?;
     }
+    // The session process runs in another directory, so folder paths are made absolute here.
+    if let Request::Join { target } = &mut request
+        && !target.contains("://")
+        && (target.contains(['/', '\\']) || Path::new(target).is_dir())
+    {
+        let path: PathBuf = std::path::absolute(&*target)?.components().collect();
+        *target = path.to_str().context("folder path is not UTF-8")?.to_owned();
+    }
     let (stream, token) = connect(&session_dir(session)?.join("endpoint"))
         .await
         .with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen`"))?;

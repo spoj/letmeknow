@@ -14,9 +14,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError};
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use reqwest_websocket::{Message, WebSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -42,8 +45,8 @@ pub enum Request {
         #[arg(long)]
         group: Option<String>,
     },
-    /// Join a group through an invite code or link
-    Join { code: String },
+    /// Join a group through an invite code or link, or a shared folder (a path with a slash, or an existing directory)
+    Join { target: String },
     /// Send a message ("-" reads the text from stdin)
     Send {
         #[arg(long)]
@@ -85,6 +88,7 @@ pub enum Request {
 pub enum Event {
     Request(Request, oneshot::Sender<Value>),
     Batch { gid: String, messages: Vec<(u64, Vec<u8>)>, synced: bool },
+    Files { gid: String, records: Vec<Record> },
     JoinRequest { invite: Invite, spake: Spake2<Ed25519Group>, data: String },
     Welcome { relay: String, key: [u8; 32], data: String, reply: oneshot::Sender<Value> },
 }
@@ -104,8 +108,28 @@ struct Payload {
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_to: Option<String>,
     after: Vec<String>,
-    epoch_auth: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch_auth: Option<String>,
     content: String,
+}
+
+/// A folder group message: the file `<id>.json`.
+#[derive(Serialize, Deserialize)]
+pub struct Record {
+    id: String,
+    from: Person,
+    content: String,
+    after: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Person {
+    name: String,
+    fp: String,
 }
 
 struct Group {
@@ -121,6 +145,12 @@ impl Drop for Group {
     }
 }
 
+/// Keeps a folder's scanning thread alive; dropping it closes the wake channel, which stops the thread.
+struct Folder {
+    _watcher: Option<RecommendedWatcher>,
+    _wake: std_mpsc::Sender<()>,
+}
+
 pub struct Session {
     db: Connection,
     provider: Provider,
@@ -131,6 +161,7 @@ pub struct Session {
     relay: Relay,
     default_relay: String,
     groups: HashMap<String, Group>,
+    folders: HashMap<String, Folder>,
     backlog: HashMap<String, Vec<Value>>,
     events: mpsc::UnboundedSender<Event>,
 }
@@ -169,6 +200,7 @@ impl Session {
             relay: Relay::new()?,
             default_relay,
             groups: HashMap::new(),
+            folders: HashMap::new(),
             backlog: HashMap::new(),
             events,
         };
@@ -182,6 +214,11 @@ impl Session {
             session.backlog.insert(gid.clone(), Vec::new());
             session.track(gid, relay, cursor, mls);
         }
+        let folders: Vec<String> = session.db.prepare("SELECT gid FROM folders")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        for gid in folders {
+            session.backlog.insert(gid.clone(), Vec::new());
+            session.watch(gid);
+        }
         Ok(session)
     }
 
@@ -191,8 +228,8 @@ impl Session {
 
     pub async fn handle(&mut self, event: Event) {
         match event {
-            Event::Request(Request::Join { code }, reply) => {
-                if let Err(error) = self.join(code, reply).await {
+            Event::Request(Request::Join { target }, reply) if !Path::new(&target).is_absolute() => {
+                if let Err(error) = self.join(target, reply).await {
                     self.warn(None, format!("join: {error:#}"));
                 }
             }
@@ -206,15 +243,20 @@ impl Session {
                         self.warn(Some(&gid), format!("{error:#}"));
                     }
                 }
-                if synced && let Some(items) = self.backlog.remove(&gid) {
-                    let omitted = items.len().saturating_sub(CATCH_UP);
-                    if omitted > 0 {
-                        self.print(json!({ "type": "omitted", "group": gid, "count": omitted }));
-                    }
-                    for item in items.into_iter().skip(omitted) {
-                        self.print(item);
+                if synced {
+                    self.flush(&gid);
+                }
+            }
+            Event::Files { gid, records } => {
+                if !self.folders.contains_key(&gid) {
+                    return;
+                }
+                for record in records {
+                    if let Err(error) = self.ingest(&gid, record) {
+                        self.warn(Some(&gid), format!("{error:#}"));
                     }
                 }
+                self.flush(&gid);
             }
             Event::JoinRequest { invite, spake, data } => {
                 if let Err(error) = self.admit(&invite, spake, &data).await {
@@ -231,19 +273,24 @@ impl Session {
     async fn request(&mut self, request: Request) -> Result<Value> {
         match request {
             Request::Invite { group } => self.invite(group).await,
-            Request::Join { .. } => unreachable!("handled with its reply channel"),
+            Request::Join { target } => self.join_folder(target),
             Request::Send { group, to, reply_to, text } => self.send(group, to, reply_to, text).await,
             Request::Read { id, ancestors } => self.read(&id, ancestors),
             Request::Members { group } => {
                 let gid = self.resolve(group)?;
-                Ok(json!({ "group": gid, "members": self.members(&gid) }))
+                Ok(json!({ "group": gid, "members": self.members(&gid)? }))
             }
-            Request::Groups => Ok(Value::Array(
-                self.groups
+            Request::Groups => {
+                let mut groups: Vec<Value> = self
+                    .groups
                     .iter()
                     .map(|(gid, g)| json!({ "group": gid, "members": g.mls.members().count(), "relay": g.relay }))
-                    .collect(),
-            )),
+                    .collect();
+                for gid in self.folders.keys() {
+                    groups.push(json!({ "group": gid, "members": self.members(gid)?.len(), "folder": gid }));
+                }
+                Ok(Value::Array(groups))
+            }
             Request::Remove { group, member } => self.remove(group, &member).await,
             Request::Leave { group } => self.leave(group).await,
         }
@@ -254,7 +301,7 @@ impl Session {
             Some(_) => self.resolve(group)?,
             None => self.create_group()?,
         };
-        let relay = self.groups[&gid].relay.clone();
+        let relay = self.groups.get(&gid).context("folder groups need no invite; share the folder path")?.relay.clone();
         let words: Vec<&str> = WORDS.lines().collect();
         let words = format!("{}-{}", words[self.random_below(words.len())?], words[self.random_below(words.len())?]);
         let (spake, pake) = Spake2::<Ed25519Group>::start_symmetric(&Password::new(&words), &Identity::new(PAKE_ID));
@@ -321,13 +368,24 @@ impl Session {
         Ok(())
     }
 
+    fn join_folder(&mut self, gid: String) -> Result<Value> {
+        if !self.folders.contains_key(&gid) {
+            std::fs::create_dir_all(&gid)?;
+            self.db.execute("INSERT INTO folders (gid) VALUES (?)", [&gid])?;
+            self.backlog.insert(gid.clone(), Vec::new());
+            self.watch(gid.clone());
+            self.print(json!({ "type": "joined", "group": gid, "member": self.person }));
+        }
+        Ok(json!({ "group": gid, "members": self.members(&gid)? }))
+    }
+
     async fn join(&mut self, code: String, reply: oneshot::Sender<Value>) -> Result<()> {
         let prepared = async {
             let (target, words) = code
                 .trim()
                 .split_once('#')
                 .or_else(|| code.trim().split_once('-'))
-                .context("expected an invite code like 417-acid-zebra, or its link")?;
+                .context("expected an invite code like 417-acid-zebra, its link, or a folder path like ./chat")?;
             let (relay, id) = target.rsplit_once("/i/").unwrap_or((self.default_relay.as_str(), target));
             let pake = self.relay.invite_get(relay, id, "pake", 0).await?.context("invite lacks the inviter's pake message")?;
             let (spake, message) = Spake2::<Ed25519Group>::start_symmetric(&Password::new(words.to_lowercase()), &Identity::new(PAKE_ID));
@@ -377,13 +435,13 @@ impl Session {
         }
         self.add_group(&gid, relay, seq, mls)?;
         self.print(json!({ "type": "joined", "group": gid, "member": self.person }));
-        Ok(json!({ "group": gid, "members": self.members(&gid) }))
+        Ok(json!({ "group": gid, "members": self.members(&gid)? }))
     }
 
     async fn send(&mut self, group: Option<String>, to: Option<String>, reply_to: Option<String>, text: String) -> Result<Value> {
         let gid = self.resolve(group)?;
         if let Some(to) = &to
-            && !self.members(&gid).iter().any(|m| m["fp"] == *to)
+            && !self.members(&gid)?.iter().any(|m| m["fp"] == *to)
         {
             bail!("{to} is not a member of {gid}");
         }
@@ -392,25 +450,35 @@ impl Session {
         {
             bail!("unknown message {reply_to}");
         }
-        let group = &self.groups[&gid];
-        let payload = Payload {
-            to,
-            reply_to,
-            after: self.tips(&gid)?,
-            epoch_auth: hex::encode(group.mls.epoch_authenticator().as_slice()),
-            content: text,
+        let mut payload = Payload { to, reply_to, after: self.tips(&gid)?, epoch_auth: None, content: text };
+        let id = match self.groups.get_mut(&gid) {
+            Some(group) => {
+                payload.epoch_auth = Some(hex::encode(group.mls.epoch_authenticator().as_slice()));
+                let bytes = group.mls.create_message(&self.provider, &self.signer, &serde_json::to_vec(&payload)?)?.to_bytes()?;
+                let (id, relay) = (digest(&bytes), group.relay.clone());
+                self.db.execute("INSERT INTO posted (id) VALUES (?)", [&id])?;
+                self.relay.post(&relay, &gid, &bytes).await?;
+                id
+            }
+            None => {
+                let record = Record {
+                    id: hex::encode(self.provider.rand().random_array::<16>()?),
+                    from: serde_json::from_value(self.person.clone())?,
+                    content: payload.content.clone(),
+                    after: payload.after.clone(),
+                    to: payload.to.clone(),
+                    reply_to: payload.reply_to.clone(),
+                };
+                let (dir, temp) = (Path::new(&gid), format!(".{}.tmp", record.id));
+                std::fs::write(dir.join(&temp), serde_json::to_vec(&record)?)?;
+                std::fs::rename(dir.join(&temp), dir.join(format!("{}.json", record.id)))?;
+                record.id
+            }
         };
-        let relay = group.relay.clone();
-        let json = serde_json::to_string(&payload)?;
-        let group = self.groups.get_mut(&gid).expect("resolved");
-        let bytes = group.mls.create_message(&self.provider, &self.signer, json.as_bytes())?.to_bytes()?;
-        let id = digest(&bytes);
-        self.db.execute("INSERT INTO posted (id) VALUES (?)", [&id])?;
         self.db.execute(
             "INSERT INTO messages (id, gid, sender, payload, seen) VALUES (?, ?, ?, ?, 1)",
-            params![id, gid, self.person.to_string(), json],
+            params![id, gid, self.person.to_string(), serde_json::to_string(&payload)?],
         )?;
-        self.relay.post(&relay, &gid, &bytes).await?;
         Ok(json!({ "id": id }))
     }
 
@@ -442,19 +510,20 @@ impl Session {
 
     async fn remove(&mut self, group: Option<String>, member: &str) -> Result<Value> {
         let gid = self.resolve(group)?;
-        let target = self.groups[&gid]
+        let group = self.groups.get(&gid).context("folder groups have no removal; whoever can write the folder is a member")?;
+        let target = group
             .mls
             .members()
-            .find(|m| fingerprint(&m.signature_key) == member && m.index != self.groups[&gid].mls.own_leaf_index())
+            .find(|m| fingerprint(&m.signature_key) == member && m.index != group.mls.own_leaf_index())
             .context("no such member")?;
         self.commit_retrying(&gid, |mls, provider, signer| Ok(mls.remove_members(provider, signer, &[target.index])?.0))
             .await?;
-        Ok(json!({ "group": gid, "members": self.members(&gid) }))
+        Ok(json!({ "group": gid, "members": self.members(&gid)? }))
     }
 
     async fn leave(&mut self, group: Option<String>) -> Result<Value> {
         let gid = self.resolve(group)?;
-        if self.groups[&gid].mls.members().count() == 1 {
+        if self.groups.get(&gid).is_none_or(|g| g.mls.members().count() == 1) {
             self.drop_group(&gid)?;
             return Ok(json!({ "group": gid, "left": true }));
         }
@@ -499,7 +568,7 @@ impl Session {
                     .db
                     .query_row("SELECT auth FROM epochs WHERE gid = ? AND epoch = ?", params![gid, epoch], |r| r.get(0))
                     .optional()?;
-                if auth.as_deref() != Some(payload.epoch_auth.as_str()) {
+                if auth != payload.epoch_auth {
                     self.warn(Some(gid), format!("message {id} was sent from a different view of epoch {epoch}; the relay may be splitting the group"));
                 }
                 self.db.execute(
@@ -630,8 +699,9 @@ impl Session {
         if let Some(mut group) = self.groups.remove(gid) {
             group.mls.delete(self.provider.storage())?;
         }
+        self.folders.remove(gid);
         self.backlog.remove(gid);
-        for table in ["groups", "epochs", "messages"] {
+        for table in ["groups", "folders", "epochs", "messages"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [gid])?;
         }
         Ok(())
@@ -647,24 +717,100 @@ impl Session {
     }
 
     fn resolve(&self, group: Option<String>) -> Result<String> {
+        let mut gids = self.groups.keys().chain(self.folders.keys());
         match group {
-            Some(gid) if self.groups.contains_key(&gid) => Ok(gid),
+            Some(gid) if self.groups.contains_key(&gid) || self.folders.contains_key(&gid) => Ok(gid),
             Some(gid) => bail!("unknown group {gid}"),
-            None if self.groups.len() == 1 => Ok(self.groups.keys().next().expect("one").clone()),
-            None if self.groups.is_empty() => bail!("this session is in no group; create one with `invite` or join one with `join`"),
-            None => bail!("this session is in several groups; pass --group"),
+            None => match (gids.next(), gids.next()) {
+                (Some(gid), None) => Ok(gid.clone()),
+                (None, _) => bail!("this session is in no group; create one with `invite`, or join one with `join`"),
+                _ => bail!("this session is in several groups; pass --group"),
+            },
         }
     }
 
-    fn members(&self, gid: &str) -> Vec<Value> {
-        let mls = &self.groups[gid].mls;
-        mls.members()
+    /// Relay groups: the MLS members. Folder groups: this session and every sender seen in the folder.
+    fn members(&self, gid: &str) -> Result<Vec<Value>> {
+        let Some(group) = self.groups.get(gid) else {
+            let senders: Vec<String> = self
+                .db
+                .prepare("SELECT sender FROM messages WHERE gid = ? GROUP BY sender ORDER BY MIN(rowid)")?
+                .query_map([gid], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            let mut members = vec![self.person.clone()];
+            for sender in senders {
+                let sender: Value = serde_json::from_str(&sender)?;
+                if !members.iter().any(|m| m["fp"] == sender["fp"]) {
+                    members.push(sender);
+                }
+            }
+            for member in &mut members {
+                member["you"] = json!(member["fp"] == self.fp.as_str());
+            }
+            return Ok(members);
+        };
+        let mls = &group.mls;
+        Ok(mls
+            .members()
             .map(|m| {
                 let mut entry = person(&m.credential, &m.signature_key);
                 entry["you"] = json!(m.index == mls.own_leaf_index());
                 entry
             })
-            .collect()
+            .collect())
+    }
+
+    /// Scans the folder on each OS file notification, and every POLL_S seconds for filesystems that send none.
+    fn watch(&mut self, gid: String) {
+        let dir = PathBuf::from(&gid);
+        let (wake, woken) = std_mpsc::channel();
+        let notifier = wake.clone();
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            if !matches!(event, Ok(e) if e.kind.is_access()) {
+                let _ = notifier.send(());
+            }
+        })
+        .and_then(|mut watcher| watcher.watch(&dir, RecursiveMode::NonRecursive).map(|()| watcher))
+        .ok();
+        let (events, scan_gid) = (self.events.clone(), gid.clone());
+        std::thread::spawn(move || {
+            let mut seen = HashSet::new();
+            loop {
+                while woken.try_recv().is_ok() {}
+                let _ = events.send(Event::Files { gid: scan_gid.clone(), records: scan(&dir, &mut seen) });
+                if let Err(RecvTimeoutError::Disconnected) = woken.recv_timeout(Duration::from_secs(POLL_S)) {
+                    return;
+                }
+            }
+        });
+        self.folders.insert(gid, Folder { _watcher: watcher, _wake: wake });
+    }
+
+    fn ingest(&mut self, gid: &str, record: Record) -> Result<()> {
+        let sender = json!({ "name": record.from.name, "fp": record.from.fp });
+        let payload = Payload { to: record.to, reply_to: record.reply_to, after: record.after, epoch_auth: None, content: record.content };
+        let inserted = self.db.execute(
+            "INSERT OR IGNORE INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
+            params![record.id, gid, sender.to_string(), serde_json::to_string(&payload)?],
+        )?;
+        if inserted > 0 {
+            let item = self.message_json(gid, &record.id, sender, &payload);
+            self.deliver(gid, item);
+        }
+        Ok(())
+    }
+
+    /// Prints what arrived while catching up: the last CATCH_UP items, after an `omitted` count.
+    fn flush(&mut self, gid: &str) {
+        if let Some(items) = self.backlog.remove(gid) {
+            let omitted = items.len().saturating_sub(CATCH_UP);
+            if omitted > 0 {
+                self.print(json!({ "type": "omitted", "group": gid, "count": omitted }));
+            }
+            for item in items.into_iter().skip(omitted) {
+                self.print(item);
+            }
+        }
     }
 
     /// Read-frontier tips: seen messages that no other seen message lists in `after`.
@@ -795,6 +941,33 @@ async fn notified(ws: &mut WebSocket) -> bool {
             }
         }
     }
+}
+
+/// Records in `dir` not yet in `seen`, in causal order. Temp files are skipped; files that fail to parse are retried next scan.
+fn scan(dir: &Path, seen: &mut HashSet<OsString>) -> Vec<Record> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let (name, path) = (entry.file_name(), entry.path());
+        if path.extension() != Some(OsStr::new("json")) || seen.contains(&name) {
+            continue;
+        }
+        let Some(record) = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok()) else {
+            continue;
+        };
+        found.push((entry.metadata().and_then(|m| m.modified()).ok(), record));
+        seen.insert(name);
+    }
+    found.sort_by_key(|(modified, _)| *modified);
+    let mut records: Vec<Record> = found.into_iter().map(|(_, record)| record).collect();
+    let mut pending: HashSet<String> = records.iter().map(|r| r.id.clone()).collect();
+    let mut ordered = Vec::with_capacity(records.len());
+    while !records.is_empty() {
+        let next = records.iter().position(|r| r.after.iter().all(|a| !pending.contains(a))).unwrap_or(0);
+        let record = records.remove(next);
+        pending.remove(&record.id);
+        ordered.push(record);
+    }
+    ordered
 }
 
 fn invite_key(secret: &[u8], id: &str) -> [u8; 32] {

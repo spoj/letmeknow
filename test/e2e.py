@@ -10,9 +10,9 @@ HOME = tempfile.mkdtemp(prefix="lmk-e2e-")
 ENV = {**os.environ, "LETMEKNOW_HOME": HOME, "LETMEKNOW_RELAY": RELAY, "NO_PROXY": "localhost,127.0.0.1"}
 
 
-def run(session, *args, ok=True, env=ENV):
+def run(session, *args, ok=True, env=ENV, cwd=None):
     flags = ["--session", session] if session else []
-    result = subprocess.run([BIN, *flags, *args], env=env, capture_output=True, text=True, timeout=60)
+    result = subprocess.run([BIN, *flags, *args], env=env, cwd=cwd, capture_output=True, text=True, timeout=60)
     if ok and result.returncode:
         sys.exit(f"{session} {args}: {result.stderr}")
     return json.loads(result.stdout) if result.returncode == 0 else result.stderr
@@ -131,6 +131,53 @@ def main():
         omitted = alice.expect(lambda e: e["type"] == "omitted")
         first = alice.expect(lambda e: e["type"] == "message")
         check(omitted["count"] == 2 and first["content"] == "message 2", "restart catches up on the last 20 messages")
+
+        folder = os.path.join(HOME, "shared", "chat")
+        erin, frank = Listener("erin"), Listener("frank")
+        listeners += [erin, frank]
+        erin_fp = erin.ready["member"]["fp"]
+        check(run("erin", "join", folder)["group"] == folder and os.path.isdir(folder), "joining a folder creates it; the group is its path")
+        erin.expect(lambda e: e["type"] == "joined" and e["group"] == folder)
+        check(os.path.samefile(run("frank", "join", "shared/chat", cwd=HOME)["group"], folder), "a relative path is resolved where the command runs")
+
+        hello = run("erin", "send", "hello frank")["id"]
+        got = frank.expect(lambda e: e["type"] == "message")
+        check(got["id"] == hello and got["from"]["name"] == "Erin" and not got["direct"], "frank receives erin's folder message")
+        check([m["fp"] for m in run("frank", "members")["members"]] == [frank.ready["member"]["fp"], erin_fp], "folder members are this session and the senders seen")
+        check("is not a member" in run("frank", "send", "--to", "0123456789abcdef", "x", ok=False), "--to must be a known sender")
+
+        reply = run("frank", "send", "--to", erin_fp, "--reply-to", hello, "hi erin")["id"]
+        got = erin.expect(lambda e: e["type"] == "message")
+        check(got["id"] == reply and got["direct"] and got["reply_to"] == hello, "erin receives frank's direct reply")
+        check([m["id"] for m in run("erin", "read", reply, "--ancestors", "1")] == [hello, reply], "frank's read frontier covers erin's message")
+        with open(os.path.join(folder, reply + ".json"), encoding="utf-8") as f:
+            record = json.load(f)
+        check(record == {"id": reply, "from": {"name": "Frank", "fp": frank.ready["member"]["fp"]}, "content": "hi erin",
+                         "after": [hello], "to": erin_fp, "reply_to": hello}, "the file is the message plus after")
+
+        hand = {"from": {"name": "Hand", "fp": "00"}, "after": []}
+        whole = json.dumps({**hand, "id": "partial", "content": "was partial"})
+        with open(os.path.join(folder, "partial.json"), "w", encoding="utf-8") as f:
+            f.write(whole[:20])
+        with open(os.path.join(folder, ".temp.tmp"), "w", encoding="utf-8") as f:
+            json.dump({**hand, "id": "temp", "content": "was temp"}, f)
+        run("frank", "send", "after the partial file")
+        check(erin.expect(lambda e: e["type"] == "message")["content"] == "after the partial file", "partial and temp files are not delivered")
+        with open(os.path.join(folder, "partial.json"), "w", encoding="utf-8") as f:
+            f.write(whole)
+        os.replace(os.path.join(folder, ".temp.tmp"), os.path.join(folder, "temp.json"))
+        got = {erin.expect(lambda e: e["type"] == "message")["content"] for _ in range(2)}
+        check(got == {"was partial", "was temp"}, "once complete, they are delivered")
+
+        erin.stop()
+        for i in range(22):
+            run("frank", "send", f"folder {i}")
+        erin = Listener("erin")
+        listeners.append(erin)
+        omitted = erin.expect(lambda e: e["type"] == "omitted")
+        got = [erin.expect(lambda e: e["type"] == "message")["content"] for _ in range(20)]
+        check(omitted["count"] == 2 and got == [f"folder {i}" for i in range(2, 22)], "restart catches up on the folder's last 20 messages, in order")
+        check(run("frank", "leave")["left"] and run("frank", "groups") == [], "leaving a folder group")
 
         check("several sessions are running" in run(None, "groups", ok=False), "without --session, several running sessions are ambiguous")
         solo_env = {**ENV, "LETMEKNOW_HOME": os.path.join(HOME, "solo")}
