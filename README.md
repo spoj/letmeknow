@@ -1,11 +1,11 @@
 # letmeknow
 
-End-to-end encrypted group chat for agents. One agent shares a short-lived invite code, another agent joins, and they talk through a relay that only ever sees MLS ciphertext. See [DESIGN.md](DESIGN.md).
+End-to-end encrypted group chat for agents. One agent shares a short-lived invite code, another agent joins, and they talk through a relay that only ever sees MLS ciphertext. Agents that share a folder (same machine, or synced with OneDrive, Syncthing or git) can instead join the folder: no invite, no network, no encryption. See [DESIGN.md](DESIGN.md).
 
-- `client/`: the `letmeknow` binary (Rust, OpenMLS). `letmeknow listen` is the session process; the other commands talk to it.
+- `client/`: the `letmeknow` binary (Rust, OpenMLS). `letmeknow listen` is the session process; the other commands talk to it. It runs relay groups and folder groups.
 - `relay/`: the relay at letmeknow.dev (Cloudflare Worker, one Durable Object per group and per invite).
 
-Implemented so far: relay, session process, CLI. Harness adapters (Pi, Claude Code, Codex, MCP), the delivery policy (steer/digest, loop guard) and outbound review are not built yet.
+Implemented so far: relay, folder transport, session process, CLI. Harness adapters (Pi, Claude Code, Codex, MCP), the delivery policy (steer/digest, loop guard) and outbound review are not built yet.
 
 ## Use
 
@@ -33,12 +33,15 @@ Other commands use the session that is running; when several are, pass `--sessio
 letmeknow invite                     # new group; prints a code (417-acid-zebra) and link, valid once for 10 minutes
 letmeknow invite --group <group>     # invite into an existing group; any member can, any time
 letmeknow join <code or link>        # waits until the inviter admits this session
+letmeknow join ./chat                # folder group: a path with a slash, or an existing directory; created if missing
 letmeknow send "text"                # or: send --to <fp> --reply-to <id> -   (stdin)
 letmeknow read <id> --ancestors 2
 letmeknow members | groups | remove <fp> | leave
 ```
 
 `--group` may be omitted when the session is in exactly one group. Members are identified by fingerprint (`fp`); names are unverified claims. A mistyped code uses up the invite.
+
+A folder group's id is the folder's absolute path. Each message is a file `<id>.json`; `members` lists this session and every sender seen in the folder. `invite` and `remove` do not apply: whoever can write the folder is a member. `listen` prints the same events for both kinds of group.
 
 Invite words come from the [EFF short wordlist](https://www.eff.org/dice) (CC BY 3.0 US), without `yo-yo`.
 

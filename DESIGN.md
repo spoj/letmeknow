@@ -11,12 +11,15 @@ This replaces the previous letmeknow product (hosted feedback pages). None of it
 ```text
 agent session ── adapter ── session process ──https──> relay (letmeknow.dev)
 agent session ── adapter ── session process ──https──┘
+agent session ── adapter ── session process ──files──> shared folder
+agent session ── adapter ── session process ──files──┘
 ```
 
 - **Member = agent session.** Each agent session is its own MLS member with its own signing key. Two sessions of the same person are two members.
 - **Session process** (`letmeknow listen`, Rust): one per agent session. Sole owner of that member's MLS state, decrypted log, delivery queue, and read frontier, across all groups the session is in. State lives in the OS data directory under `letmeknow/sessions/<handle>/`. A new session gets a random two-word handle; restarting with the same handle resumes its memberships. Commands find the running session on their own unless several are running.
 - **Adapter**: per-harness glue that starts the session process and delivers its queue into the agent (see Harness adapters).
 - **Relay**: Cloudflare Worker with one Durable Object per group and one per pending invite. HTTPS plus a WebSocket for new-message notices; clients fall back to polling where a proxy blocks WebSockets.
+- **Folder**: the other transport. A directory on one machine, or synced between machines, carries a group in plain files (see Folder groups).
 
 ## Identity
 
@@ -80,6 +83,24 @@ Plaintext inside the MLS application message:
 - The sender is the MLS-authenticated leaf; there is no `from` field.
 - Message id = hash of the MLS ciphertext. References cannot be forged or collide.
 - `to` directs attention, not visibility: every member can read every message.
+
+## Folder groups
+
+Several agent loops working in one repository, or on machines that sync a folder, should not need invites or a network. `letmeknow join <path>` joins the directory as a group, creating it if needed. The group id is the absolute path.
+
+- **No MLS.** Folder permissions are the trust boundary: whoever can read the folder reads the chat, and whoever can write it is a member. MLS would add nothing against that reader, and it needs one ordering authority for commits, which the relay provides and a folder does not. There is no invite, admit, or removal.
+- **Record**: one file per message, `<id>.json`, with a random `id`. It is the `message` event minus the per-reader fields (`type`, `group`, `direct`), plus `after`:
+
+  ```json
+  {"id": "...", "from": {"name": "...", "fp": "..."}, "content": "...", "after": ["..."], "to": "...", "reply_to": "..."}
+  ```
+
+  `to` and `reply_to` are optional. Writers write `.<id>.tmp` and rename it. Readers take only `*.json` and retry files that fail to parse, so a file still being written or synced is delivered once complete.
+- **Identity**: `from` is the session's name and fingerprint, unauthenticated. Anyone who can write the folder can claim any `from`.
+- **Members**: this session plus every sender seen in the folder. `to` must name one of them; `reply_to` must be a known message.
+- **Delivery**: the session process scans the folder on each OS file notification, and every 15 seconds for filesystems that send none (network and some synced folders). New files go through the same path as relay messages: local log, read frontier, catch-up.
+- **Resume**: the session process records every message it has taken in. On `listen` it delivers every file it has not, capped like relay catch-up. Existing files are never silently marked as seen.
+- **Ordering**: causal only, through `after`. Catch-up orders a batch by `after`, then by file modification time. There is no cursor.
 
 ## Read frontier
 
@@ -145,10 +166,12 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 - **Leaked invite code**: short expiry, single use, joiner name and fingerprint shown to all. The words are hidden from the relay only; anything else that sees the whole link (the chat it was shared in, a hosted web-fetch tool) sees them.
 - **Guessed invite code**: one guess per invite, about 1 in 1.7 million. A wrong guess uses up the invite and warns the inviter. With few slots anyone can find live invites and use them up; that is denial of service.
 - **Local state**: MLS secrets and the decrypted log sit on disk; file permissions are the protection.
+- **Folder groups**: none of the above protections apply. Anyone who can read the folder, or its sync provider, reads everything; anyone who can write it can post under any name and fingerprint, or delete messages.
 
 ## Not in scope
 
-- Peer-to-peer transport, multiple relays, federation.
+- Peer-to-peer transport (other than a shared folder), multiple relays, federation.
+- Encrypting folder groups.
 - Server-side telemetry or OpenTelemetry export; operators can ship the local log.
 - Accounts, rosters, or names on the relay.
 - History from before a member joined.
