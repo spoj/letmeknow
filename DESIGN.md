@@ -70,18 +70,18 @@ A session offline longer than the TTL cannot process missed commits and must be 
 
 ## Message format
 
-Plaintext inside the MLS application message:
+Both transports carry the same JSON message. On the relay it is the plaintext inside the MLS application message; in a folder it is the file body, with `id` and `from` added (see Folder groups).
 
 | Field | Required | Meaning |
 |---|---|---|
-| `to` | No | Recipient fingerprint; omit to address the group |
-| `reply-to` | No | Message id being answered; must be covered by `after` |
-| `after` | Yes | Tips of the sender's read frontier (may be empty) |
-| `epoch-auth` | Yes | MLS epoch authenticator, to detect a relay that splits the group |
 | `content` | Yes | Message text |
+| `after` | Yes | Tips of the sender's read frontier (may be empty) |
+| `to` | No | Recipient fingerprint; omit to address the group |
+| `reply_to` | No | Message id being answered; must be covered by `after` |
+| `epoch_auth` | Relay only | MLS epoch authenticator, to detect a relay that splits the group |
 
-- The sender is the MLS-authenticated leaf; there is no `from` field.
-- Message id = hash of the MLS ciphertext. References cannot be forged or collide.
+- On the relay, the sender is the MLS-authenticated leaf; there is no `from` field.
+- On the relay, message id = hash of the MLS ciphertext. References cannot be forged or collide.
 - `to` directs attention, not visibility: every member can read every message.
 
 ## Folder groups
@@ -89,7 +89,7 @@ Plaintext inside the MLS application message:
 Several agent loops working in one repository, or on machines that sync a folder, should not need invites or a network. `letmeknow join <path>` joins the directory as a group, creating it if needed. The group id is the absolute path.
 
 - **No MLS.** Folder permissions are the trust boundary: whoever can read the folder reads the chat, and whoever can write it is a member. MLS would add nothing against that reader, and it needs one ordering authority for commits, which the relay provides and a folder does not. There is no invite, admit, or removal.
-- **Format**: the folder and file format of [spoj/messages](https://github.com/spoj/messages). One file per message, `<id>.json`, with a random `id`. The record is the `message` event minus the per-reader fields (`type`, `group`, `direct`), plus `after`.
+- **Format**: the folder and file format of [spoj/messages](https://github.com/spoj/messages). One file per message, `<id>.json`: the message (see Message format) plus a random `id` and the sender as `from`.
 - **Identity**: `from` is the session's name and fingerprint (first 8 bytes of the SHA-256 of its Ed25519 signing key), unauthenticated. Anyone who can write the folder can claim any `from`.
 - **Members**: this session plus every sender seen in the folder. `to` must name one of them; `reply_to` must be a known message.
 - **Writing**: the complete record goes to `.<id>.tmp` in the folder, then is renamed to `<id>.json`. Files are never modified or deleted.
@@ -157,7 +157,7 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 
 ## Threat model
 
-- **Relay**: cannot read or forge. Can drop, delay, withhold, or split the group. Withholding shows up as unresolved `after` references; splitting shows up as mismatched `epoch-auth`. Denial of service is out of scope.
+- **Relay**: cannot read or forge. Can drop, delay, withhold, or split the group. Withholding shows up as unresolved `after` references; splitting shows up as mismatched `epoch_auth`. Denial of service is out of scope.
 - **Peer agent**: reads everything while a member; removal restores confidentiality going forward. Its frontier claims are signed and attributable. Its requests carry no operator authority (see Peers are not operators).
 - **Leaked invite code**: short expiry, single use, joiner name and fingerprint shown to all. The words are hidden from the relay only; anything else that sees the whole link (the chat it was shared in, a hosted web-fetch tool) sees them.
 - **Guessed invite code**: one guess per invite, about 1 in 1.7 million. A wrong guess uses up the invite and warns the inviter. With few slots anyone can find live invites and use them up; that is denial of service.

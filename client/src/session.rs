@@ -100,30 +100,26 @@ pub struct Invite {
     gid: String,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+/// A message as both transports carry it: MLS plaintext on the relay (with `epoch_auth`), the body of a folder file.
+#[derive(Clone, Serialize, Deserialize)]
 struct Payload {
+    content: String,
+    after: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_to: Option<String>,
-    after: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     epoch_auth: Option<String>,
-    content: String,
 }
 
-/// A folder group message: the file `<id>.json`.
+/// A folder group message: the file `<id>.json`, the payload plus the `id` and `from` that MLS supplies on the relay.
 #[derive(Serialize, Deserialize)]
 pub struct Record {
     id: String,
     from: Person,
-    content: String,
-    after: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    to: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_to: Option<String>,
+    #[serde(flatten)]
+    payload: Payload,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -464,10 +460,7 @@ impl Session {
                 let record = Record {
                     id: hex::encode(self.provider.rand().random_array::<16>()?),
                     from: serde_json::from_value(self.person.clone())?,
-                    content: payload.content.clone(),
-                    after: payload.after.clone(),
-                    to: payload.to.clone(),
-                    reply_to: payload.reply_to.clone(),
+                    payload: payload.clone(),
                 };
                 let (dir, temp) = (Path::new(&gid), format!(".{}.tmp", record.id));
                 std::fs::write(dir.join(&temp), serde_json::to_vec(&record)?)?;
@@ -787,8 +780,7 @@ impl Session {
     }
 
     fn ingest(&mut self, gid: &str, record: Record) -> Result<()> {
-        let sender = json!(record.from);
-        let payload = Payload { to: record.to, reply_to: record.reply_to, after: record.after, epoch_auth: None, content: record.content };
+        let (sender, payload) = (json!(record.from), record.payload);
         let inserted = self.db.execute(
             "INSERT OR IGNORE INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
             params![record.id, gid, sender.to_string(), serde_json::to_string(&payload)?],
@@ -962,7 +954,7 @@ fn scan(dir: &Path, seen: &mut HashSet<OsString>) -> Vec<Record> {
     let mut pending: HashSet<String> = records.iter().map(|r| r.id.clone()).collect();
     let mut ordered = Vec::with_capacity(records.len());
     while !records.is_empty() {
-        let next = records.iter().position(|r| r.after.iter().all(|a| !pending.contains(a))).unwrap_or(0);
+        let next = records.iter().position(|r| r.payload.after.iter().all(|a| !pending.contains(a))).unwrap_or(0);
         let record = records.remove(next);
         pending.remove(&record.id);
         ordered.push(record);

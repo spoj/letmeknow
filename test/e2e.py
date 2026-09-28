@@ -153,7 +153,7 @@ def main():
         with open(os.path.join(folder, reply + ".json"), encoding="utf-8") as f:
             record = json.load(f)
         check(record == {"id": reply, "from": {"name": "Frank", "fp": frank.ready["member"]["fp"]}, "content": "hi erin",
-                         "after": [hello], "to": erin_fp, "reply_to": hello}, "the file is the message plus after")
+                         "after": [hello], "to": erin_fp, "reply_to": hello}, "the file is the message plus id and from")
 
         hand = {"from": {"name": "Hand", "fp": "00"}, "after": []}
         whole = json.dumps({**hand, "id": "partial", "content": "was partial"})
