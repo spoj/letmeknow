@@ -90,8 +90,10 @@ Several agent loops working in one repository, or on machines that sync a folder
 
 - **No MLS.** Folder permissions are the trust boundary: whoever can read the folder reads the chat, and whoever can write it is a member. MLS would add nothing against that reader, and it needs one ordering authority for commits, which the relay provides and a folder does not. There is no invite, admit, or removal.
 - **Format**: the folder and file format of [spoj/messages](https://github.com/spoj/messages). One file per message, `<id>.json`, with a random `id`. The record is the `message` event minus the per-reader fields (`type`, `group`, `direct`), plus `after`.
-- **Identity**: `from` is the session's name and fingerprint, unauthenticated. Anyone who can write the folder can claim any `from`.
+- **Identity**: `from` is the session's name and fingerprint (first 8 bytes of the SHA-256 of its Ed25519 signing key), unauthenticated. Anyone who can write the folder can claim any `from`.
 - **Members**: this session plus every sender seen in the folder. `to` must name one of them; `reply_to` must be a known message.
+- **Writing**: the complete record goes to `.<id>.tmp` in the folder, then is renamed to `<id>.json`. Files are never modified or deleted.
+- **Reading**: only `*.json` files are taken, each once, tracked by filename. Files that fail to parse are retried on later scans, so a file still being written or synced is delivered once complete.
 - **Delivery**: the session process scans the folder on each OS file notification, and every 15 seconds for filesystems that send none (network and some synced folders). New files go through the same path as relay messages: local log, read frontier, catch-up.
 - **Resume**: the session process records every message it has taken in. On `listen` it delivers every file it has not, capped like relay catch-up. Existing files are never silently marked as seen.
 - **Ordering**: causal only, through `after`. Catch-up orders a batch by `after`, then by file modification time. There is no cursor.
