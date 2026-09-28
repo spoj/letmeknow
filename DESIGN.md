@@ -70,7 +70,7 @@ A session offline longer than the TTL cannot process missed commits and must be 
 
 ## Message format
 
-Both transports carry the same JSON message. On the relay it is the plaintext inside the MLS application message; in a folder it is the file body, with `id` and `from` added (see Folder groups).
+Both transports carry the same JSON message. On the relay it is the plaintext inside the MLS application message; in a folder it is the file body, with `from` added (see Folder groups).
 
 | Field | Required | Meaning |
 |---|---|---|
@@ -81,7 +81,7 @@ Both transports carry the same JSON message. On the relay it is the plaintext in
 | `epoch_auth` | Relay only | MLS epoch authenticator, to detect a relay that splits the group |
 
 - On the relay, the sender is the MLS-authenticated leaf; there is no `from` field.
-- On the relay, message id = hash of the MLS ciphertext. References cannot be forged or collide.
+- Message id = SHA-256 of the stored bytes: the MLS ciphertext on the relay, the file in a folder. A reference names exactly one content.
 - `to` directs attention, not visibility: every member can read every message.
 
 ## Folder groups
@@ -89,10 +89,11 @@ Both transports carry the same JSON message. On the relay it is the plaintext in
 Several agent loops working in one repository, or on machines that sync a folder, should not need invites or a network. `letmeknow join <path>` joins the directory as a group, creating it if needed. The group id is the absolute path.
 
 - **No MLS.** Folder permissions are the trust boundary: whoever can read the folder reads the chat, and whoever can write it is a member. MLS would add nothing against that reader, and it needs one ordering authority for commits, which the relay provides and a folder does not. There is no invite, admit, or removal.
-- **Format**: the folder and file format of [spoj/messages](https://github.com/spoj/messages). One file per message, `<id>.json`: the message (see Message format) plus a random `id` and the sender as `from`.
+- **Format**: the folder and file format of [spoj/messages](https://github.com/spoj/messages). One file per message, `<id>.json`: the message (see Message format) plus the sender as `from`. The id is the SHA-256 of the file's bytes.
 - **Identity**: `from` is the session's name and fingerprint (first 8 bytes of the SHA-256 of its Ed25519 signing key), unauthenticated. Anyone who can write the folder can claim any `from`.
 - **Members**: this session plus every sender seen in the folder. `to` must name one of them; `reply_to` must be a known message.
 - **Writing**: the complete record goes to `.<id>.tmp` in the folder, then is renamed to `<id>.json`. Files are never modified or deleted.
+- **Checking**: a file whose name is not the SHA-256 of its bytes is ignored with a warning. This catches edited and misnamed files; it does not authenticate the sender.
 - **Reading**: only `*.json` files are taken, each once, tracked by filename. Files that fail to parse are retried on later scans, so a file still being written or synced is delivered once complete.
 - **Delivery**: the session process scans the folder on each OS file notification, and every 15 seconds for filesystems that send none (network and some synced folders). New files go through the same path as relay messages: local log, read frontier, catch-up.
 - **Resume**: the session process records every message it has taken in. On `listen` it delivers every file it has not, capped like relay catch-up. Existing files are never silently marked as seen.

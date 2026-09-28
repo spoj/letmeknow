@@ -88,7 +88,7 @@ pub enum Request {
 pub enum Event {
     Request(Request, oneshot::Sender<Value>),
     Batch { gid: String, messages: Vec<(u64, Vec<u8>)>, synced: bool },
-    Files { gid: String, records: Vec<Record> },
+    Files { gid: String, records: Vec<(String, Record)>, ignored: Vec<String> },
     JoinRequest { invite: Invite, spake: Spake2<Ed25519Group>, data: String },
     Welcome { relay: String, key: [u8; 32], data: String, reply: oneshot::Sender<Value> },
 }
@@ -113,10 +113,9 @@ struct Payload {
     epoch_auth: Option<String>,
 }
 
-/// A folder group message: the file `<id>.json`, the payload plus the `id` and `from` that MLS supplies on the relay.
+/// A folder group message: the file `<id>.json`, whose id is the SHA-256 of the file. It holds the payload plus the `from` that MLS supplies on the relay.
 #[derive(Serialize, Deserialize)]
 pub struct Record {
-    id: String,
     from: Person,
     #[serde(flatten)]
     payload: Payload,
@@ -243,12 +242,15 @@ impl Session {
                     self.flush(&gid);
                 }
             }
-            Event::Files { gid, records } => {
+            Event::Files { gid, records, ignored } => {
                 if !self.folders.contains_key(&gid) {
                     return;
                 }
-                for record in records {
-                    if let Err(error) = self.ingest(&gid, record) {
+                if !ignored.is_empty() {
+                    self.warn(Some(&gid), format!("ignored files not named by the SHA-256 of their content: {}", ignored.join(", ")));
+                }
+                for (id, record) in records {
+                    if let Err(error) = self.ingest(&gid, &id, record) {
                         self.warn(Some(&gid), format!("{error:#}"));
                     }
                 }
@@ -457,15 +459,12 @@ impl Session {
                 id
             }
             None => {
-                let record = Record {
-                    id: hex::encode(self.provider.rand().random_array::<16>()?),
-                    from: serde_json::from_value(self.person.clone())?,
-                    payload: payload.clone(),
-                };
-                let (dir, temp) = (Path::new(&gid), format!(".{}.tmp", record.id));
-                std::fs::write(dir.join(&temp), serde_json::to_vec(&record)?)?;
-                std::fs::rename(dir.join(&temp), dir.join(format!("{}.json", record.id)))?;
-                record.id
+                let bytes = serde_json::to_vec(&Record { from: serde_json::from_value(self.person.clone())?, payload: payload.clone() })?;
+                let (dir, id) = (Path::new(&gid), digest(&bytes));
+                let temp = dir.join(format!(".{id}.tmp"));
+                std::fs::write(&temp, bytes)?;
+                std::fs::rename(&temp, dir.join(format!("{id}.json")))?;
+                id
             }
         };
         self.db.execute(
@@ -770,7 +769,8 @@ impl Session {
             let mut seen = HashSet::new();
             loop {
                 while woken.try_recv().is_ok() {}
-                let _ = events.send(Event::Files { gid: scan_gid.clone(), records: scan(&dir, &mut seen) });
+                let (records, ignored) = scan(&dir, &mut seen);
+                let _ = events.send(Event::Files { gid: scan_gid.clone(), records, ignored });
                 if let Err(RecvTimeoutError::Disconnected) = woken.recv_timeout(Duration::from_secs(POLL_S)) {
                     return;
                 }
@@ -779,14 +779,14 @@ impl Session {
         self.folders.insert(gid, Folder { _watcher: watcher, _wake: wake });
     }
 
-    fn ingest(&mut self, gid: &str, record: Record) -> Result<()> {
+    fn ingest(&mut self, gid: &str, id: &str, record: Record) -> Result<()> {
         let (sender, payload) = (json!(record.from), record.payload);
         let inserted = self.db.execute(
             "INSERT OR IGNORE INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
-            params![record.id, gid, sender.to_string(), serde_json::to_string(&payload)?],
+            params![id, gid, sender.to_string(), serde_json::to_string(&payload)?],
         )?;
         if inserted > 0 {
-            let item = self.message_json(gid, &record.id, sender, &payload);
+            let item = self.message_json(gid, id, sender, &payload);
             self.deliver(gid, item);
         }
         Ok(())
@@ -935,31 +935,36 @@ async fn notified(ws: &mut WebSocket) -> bool {
     }
 }
 
-/// Records in `dir` not yet in `seen`, in causal order. Temp files are skipped; files that fail to parse are retried next scan.
-fn scan(dir: &Path, seen: &mut HashSet<OsString>) -> Vec<Record> {
-    let mut found = Vec::new();
+/// Messages in `dir` not yet in `seen`, in causal order, and the names of files not named by their content's hash.
+/// Temp files are skipped; files that fail to parse are retried next scan.
+fn scan(dir: &Path, seen: &mut HashSet<OsString>) -> (Vec<(String, Record)>, Vec<String>) {
+    let (mut found, mut ignored) = (Vec::new(), Vec::new());
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let (name, path) = (entry.file_name(), entry.path());
         if path.extension() != Some(OsStr::new("json")) || seen.contains(&name) {
             continue;
         }
-        let Some(record) = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok()) else {
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(record) = serde_json::from_slice::<Record>(&bytes) else { continue };
+        seen.insert(name.clone());
+        let id = digest(&bytes);
+        if path.file_stem() != Some(OsStr::new(&id)) {
+            ignored.push(name.to_string_lossy().into_owned());
             continue;
-        };
-        found.push((entry.metadata().and_then(|m| m.modified()).ok(), record));
-        seen.insert(name);
+        }
+        found.push((entry.metadata().and_then(|m| m.modified()).ok(), id, record));
     }
-    found.sort_by_key(|(modified, _)| *modified);
-    let mut records: Vec<Record> = found.into_iter().map(|(_, record)| record).collect();
-    let mut pending: HashSet<String> = records.iter().map(|r| r.id.clone()).collect();
+    found.sort_by_key(|(modified, ..)| *modified);
+    let mut records: Vec<(String, Record)> = found.into_iter().map(|(_, id, record)| (id, record)).collect();
+    let mut pending: HashSet<String> = records.iter().map(|(id, _)| id.clone()).collect();
     let mut ordered = Vec::with_capacity(records.len());
     while !records.is_empty() {
-        let next = records.iter().position(|r| r.payload.after.iter().all(|a| !pending.contains(a))).unwrap_or(0);
-        let record = records.remove(next);
-        pending.remove(&record.id);
-        ordered.push(record);
+        let next = records.iter().position(|(_, r)| r.payload.after.iter().all(|a| !pending.contains(a))).unwrap_or(0);
+        let (id, record) = records.remove(next);
+        pending.remove(&id);
+        ordered.push((id, record));
     }
-    ordered
+    (ordered, ignored)
 }
 
 fn invite_key(secret: &[u8], id: &str) -> [u8; 32] {

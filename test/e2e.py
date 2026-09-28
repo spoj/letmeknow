@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end test: local relay (wrangler dev) plus several session processes."""
-import json, os, queue, shutil, subprocess, sys, tempfile, threading, time, urllib.request
+import hashlib, json, os, queue, shutil, subprocess, sys, tempfile, threading, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "client", "target", "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
@@ -150,24 +150,31 @@ def main():
         got = erin.expect(lambda e: e["type"] == "message")
         check(got["id"] == reply and got["direct"] and got["reply_to"] == hello, "erin receives frank's direct reply")
         check([m["id"] for m in run("erin", "read", reply, "--ancestors", "1")] == [hello, reply], "frank's read frontier covers erin's message")
-        with open(os.path.join(folder, reply + ".json"), encoding="utf-8") as f:
-            record = json.load(f)
-        check(record == {"id": reply, "from": {"name": "Frank", "fp": frank.ready["member"]["fp"]}, "content": "hi erin",
-                         "after": [hello], "to": erin_fp, "reply_to": hello}, "the file is the message plus id and from")
+        with open(os.path.join(folder, reply + ".json"), "rb") as f:
+            data = f.read()
+        check(hashlib.sha256(data).hexdigest() == reply and json.loads(data) == {"from": {"name": "Frank", "fp": frank.ready["member"]["fp"]},
+              "content": "hi erin", "after": [hello], "to": erin_fp, "reply_to": hello}, "the file is the message plus from, named by its hash")
 
         hand = {"from": {"name": "Hand", "fp": "00"}, "after": []}
-        whole = json.dumps({**hand, "id": "partial", "content": "was partial"})
-        with open(os.path.join(folder, "partial.json"), "w", encoding="utf-8") as f:
-            f.write(whole[:20])
-        with open(os.path.join(folder, ".temp.tmp"), "w", encoding="utf-8") as f:
-            json.dump({**hand, "id": "temp", "content": "was temp"}, f)
+        partial, temp = (json.dumps({**hand, "content": text}).encode() for text in ("was partial", "was temp"))
+        named = lambda data: os.path.join(folder, hashlib.sha256(data).hexdigest() + ".json")
+        with open(named(partial), "wb") as f:
+            f.write(partial[:20])
+        with open(os.path.join(folder, ".temp.tmp"), "wb") as f:
+            f.write(temp)
         run("frank", "send", "after the partial file")
         check(erin.expect(lambda e: e["type"] == "message")["content"] == "after the partial file", "partial and temp files are not delivered")
-        with open(os.path.join(folder, "partial.json"), "w", encoding="utf-8") as f:
-            f.write(whole)
-        os.replace(os.path.join(folder, ".temp.tmp"), os.path.join(folder, "temp.json"))
+        with open(named(partial), "wb") as f:
+            f.write(partial)
+        os.replace(os.path.join(folder, ".temp.tmp"), named(temp))
         got = {erin.expect(lambda e: e["type"] == "message")["content"] for _ in range(2)}
         check(got == {"was partial", "was temp"}, "once complete, they are delivered")
+        misnamed = os.path.join(folder, "0" * 64 + ".json")
+        with open(misnamed, "wb") as f:
+            f.write(json.dumps({**hand, "content": "misnamed"}).encode())
+        warning = erin.expect(lambda e: e["type"] == "warning")
+        check(os.path.basename(misnamed) in warning["text"], "a file not named by its hash is ignored with a warning")
+        os.remove(misnamed)
 
         erin.stop()
         for i in range(22):
