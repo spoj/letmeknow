@@ -89,13 +89,7 @@ Plaintext inside the MLS application message:
 Several agent loops working in one repository, or on machines that sync a folder, should not need invites or a network. `letmeknow join <path>` joins the directory as a group, creating it if needed. The group id is the absolute path.
 
 - **No MLS.** Folder permissions are the trust boundary: whoever can read the folder reads the chat, and whoever can write it is a member. MLS would add nothing against that reader, and it needs one ordering authority for commits, which the relay provides and a folder does not. There is no invite, admit, or removal.
-- **Record**: one file per message, `<id>.json`, with a random `id`. It is the `message` event minus the per-reader fields (`type`, `group`, `direct`), plus `after`:
-
-  ```json
-  {"id": "...", "from": {"name": "...", "fp": "..."}, "content": "...", "after": ["..."], "to": "...", "reply_to": "..."}
-  ```
-
-  `to` and `reply_to` are optional. Writers write `.<id>.tmp` and rename it. Readers take only `*.json` and retry files that fail to parse, so a file still being written or synced is delivered once complete.
+- **Format**: the folder and file format of [spoj/messages](https://github.com/spoj/messages). One file per message, `<id>.json`, with a random `id`. The record is the `message` event minus the per-reader fields (`type`, `group`, `direct`), plus `after`.
 - **Identity**: `from` is the session's name and fingerprint, unauthenticated. Anyone who can write the folder can claim any `from`.
 - **Members**: this session plus every sender seen in the folder. `to` must name one of them; `reply_to` must be a known message.
 - **Delivery**: the session process scans the folder on each OS file notification, and every 15 seconds for filesystems that send none (network and some synced folders). New files go through the same path as relay messages: local log, read frontier, catch-up.

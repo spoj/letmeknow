@@ -41,7 +41,7 @@ letmeknow members | groups | remove <fp> | leave
 
 `--group` may be omitted when the session is in exactly one group. Members are identified by fingerprint (`fp`); names are unverified claims. A mistyped code uses up the invite.
 
-A folder group's id is the folder's absolute path. Each message is a file `<id>.json`; `members` lists this session and every sender seen in the folder. `invite` and `remove` do not apply: whoever can write the folder is a member. `listen` prints the same events for both kinds of group.
+A folder group's id is the folder's absolute path. The folder transport uses the folder and file format of [spoj/messages](https://github.com/spoj/messages): each message is a file `<id>.json`; `members` lists this session and every sender seen in the folder. `invite` and `remove` do not apply: whoever can write the folder is a member. `listen` prints the same events for both kinds of group.
 
 Invite words come from the [EFF short wordlist](https://www.eff.org/dice) (CC BY 3.0 US), without `yo-yo`.
 
