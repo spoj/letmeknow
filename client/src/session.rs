@@ -271,7 +271,7 @@ impl Session {
     async fn request(&mut self, request: Request) -> Result<Value> {
         match request {
             Request::Invite { group } => self.invite(group).await,
-            Request::Join { target } => self.join_folder(target),
+            Request::Join { target } => self.join_folder(target).await,
             Request::Send { group, to, reply_to, text } => self.send(group, to, reply_to, text).await,
             Request::Read { id, ancestors } => self.read(&id, ancestors),
             Request::Members { group } => {
@@ -366,13 +366,15 @@ impl Session {
         Ok(())
     }
 
-    fn join_folder(&mut self, gid: String) -> Result<Value> {
+    /// A folder has no membership record, so joining posts a message: senders are members, and this makes the new one visible and addressable before it speaks.
+    async fn join_folder(&mut self, gid: String) -> Result<Value> {
         if !self.folders.contains_key(&gid) {
             std::fs::create_dir_all(&gid)?;
             self.db.execute("INSERT INTO folders (gid) VALUES (?)", [&gid])?;
             self.backlog.insert(gid.clone(), Vec::new());
             self.watch(gid.clone());
             self.print(json!({ "type": "joined", "group": gid, "member": self.person }));
+            self.send(Some(gid.clone()), None, None, "joined".into()).await?;
         }
         Ok(json!({ "group": gid, "members": self.members(&gid)? }))
     }

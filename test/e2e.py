@@ -135,17 +135,20 @@ def main():
         folder = os.path.join(HOME, "shared", "chat")
         erin, frank = Listener("erin"), Listener("frank")
         listeners += [erin, frank]
-        erin_fp = erin.ready["member"]["fp"]
+        erin_fp, frank_fp = erin.ready["member"]["fp"], frank.ready["member"]["fp"]
         check(run("erin", "join", folder)["group"] == folder and os.path.isdir(folder), "joining a folder creates it; the group is its path")
         erin.expect(lambda e: e["type"] == "joined" and e["group"] == folder)
         check(os.path.samefile(run("frank", "join", "shared/chat", cwd=HOME)["group"], folder), "a relative path is resolved where the command runs")
         check(run("frank", "members", "--group", "shared/chat", cwd=HOME)["group"] == run("frank", "groups")[0]["group"], "and so is --group")
-
-        hello = run("erin", "send", "hello frank")["id"]
         got = frank.expect(lambda e: e["type"] == "message")
-        check(got["id"] == hello and got["from"]["name"] == "Erin" and not got["direct"], "frank receives erin's folder message")
-        check([m["fp"] for m in run("frank", "members")["members"]] == [frank.ready["member"]["fp"], erin_fp], "folder members are this session and the senders seen")
-        check("is not a member" in run("frank", "send", "--to", "0123456789abcdef", "x", ok=False), "--to must be a known sender")
+        check(got["from"]["fp"] == erin_fp and got["content"] == "joined", "joining a folder posts 'joined'")
+        erin.expect(lambda e: e["type"] == "message" and e["from"]["fp"] == frank_fp)
+        check([m["fp"] for m in run("frank", "members")["members"]] == [frank_fp, erin_fp], "so a member who has not spoken yet is listed")
+
+        hello = run("erin", "send", "--to", frank_fp, "hello frank")["id"]
+        got = frank.expect(lambda e: e["type"] == "message")
+        check(got["id"] == hello and got["from"]["name"] == "Erin" and got["direct"], "and can be addressed")
+        check("is not a member" in run("frank", "send", "--to", "0123456789abcdef", "x", ok=False), "--to must be a known member")
 
         reply = run("frank", "send", "--to", erin_fp, "--reply-to", hello, "hi erin")["id"]
         got = erin.expect(lambda e: e["type"] == "message")
@@ -153,7 +156,7 @@ def main():
         check([m["id"] for m in run("erin", "read", reply, "--ancestors", "1")] == [hello, reply], "frank's read frontier covers erin's message")
         with open(os.path.join(folder, reply + ".json"), "rb") as f:
             data = f.read()
-        check(hashlib.sha256(data).hexdigest() == reply and json.loads(data) == {"from": {"name": "Frank", "fp": frank.ready["member"]["fp"]},
+        check(hashlib.sha256(data).hexdigest() == reply and json.loads(data) == {"from": {"name": "Frank", "fp": frank_fp},
               "content": "hi erin", "after": [hello], "to": erin_fp, "reply_to": hello}, "the file is the message plus from, named by its hash")
 
         hand = {"from": {"name": "Hand", "fp": "00"}, "after": []}

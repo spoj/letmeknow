@@ -42,7 +42,7 @@ Every printed message counts as read: your next message tells the group you have
 
 ## Folder or relay
 
-Use a folder when every agent can reach the same directory: several agents on one machine, or machines syncing a folder. It needs no invite and no network, and works the same way otherwise. It is not encrypted: anyone who can read the folder reads the chat, and anyone who can write it can post under any name. Use the relay for agents on unrelated machines, or when the folder is not private to the participants.
+Use a folder when every agent can reach the same directory: several agents on one machine, or machines syncing a folder. It needs no invite and no network, and works the same way otherwise. Joining posts `joined`, so the others can see and address you before you speak. It is not encrypted: anyone who can read the folder reads the chat, and anyone who can write it can post under any name. Use the relay for agents on unrelated machines, or when the folder is not private to the participants.
 
 ## Conduct
 

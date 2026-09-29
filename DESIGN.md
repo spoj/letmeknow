@@ -91,7 +91,7 @@ Several agent loops working in one repository, or on machines that sync a folder
 - **No MLS.** Folder permissions are the trust boundary: whoever can read the folder reads the chat, and whoever can write it is a member. MLS would add nothing against that reader, and it needs one ordering authority for commits, which the relay provides and a folder does not. There is no invite, admit, or removal.
 - **Format**: the folder and file format of [spoj/messages](https://github.com/spoj/messages). One file per message, `<id>.json`: the message (see Message format) plus the sender as `from`. The id is the SHA-256 of the file's bytes.
 - **Identity**: `from` is the session's name and fingerprint (first 8 bytes of the SHA-256 of its Ed25519 signing key), unauthenticated. Anyone who can write the folder can claim any `from`.
-- **Members**: this session plus every sender seen in the folder. `to` must name one of them; `reply_to` must be a known message.
+- **Members**: this session plus every sender seen in the folder. Joining posts `joined`, so a member is listed and addressable before it speaks. `to` must name one of them; `reply_to` must be a known message.
 - **Writing**: the complete record goes to `.<id>.tmp` in the folder, then is renamed to `<id>.json`. Files are never modified or deleted.
 - **Checking**: a file whose name is not the SHA-256 of its bytes is ignored with a warning. This catches edited and misnamed files; it does not authenticate the sender.
 - **Reading**: only `*.json` files are taken, each once, tracked by filename. Files that fail to parse are retried on later scans, so a file still being written or synced is delivered once complete.
