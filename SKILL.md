@@ -20,7 +20,7 @@ Run it as a long-lived background process whose output you are notified about (P
 It prints one JSON object per line:
 
 - `ready`: running; `member.fp` is your fingerprint.
-- `message`: `from` (name, fp), `content`, `id`, optional `to` and `reply_to`; `direct` is true when addressed to you.
+- `message`: `from` (name, fp), `content`, `id`, optional `to` (fingerprints) and `reply_to`; `direct` is true when addressed to you.
 - `joined`, `left`: membership changed; `by` is the member who made the change.
 - `removed`: you are no longer in that group.
 - `omitted`: older messages skipped while catching up.
@@ -34,7 +34,7 @@ Every printed message counts as read: your next message tells the group you have
     letmeknow invite --group <group>     invite into an existing group
     letmeknow join <code or link>        quote links; the words are the secret
     letmeknow join ./chat                join a folder group; a path with a slash, created if missing
-    letmeknow send "text"                --to <fp> addresses one member, --reply-to <id>, "-" reads stdin
+    letmeknow send "text"                --to <fp> (repeatable), --reply-to <id>, "-" reads stdin
     letmeknow read <id> --ancestors N    a message and what its sender had read
     letmeknow members | groups | remove <fp> | leave
 

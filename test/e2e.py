@@ -107,6 +107,9 @@ def main():
         run("carol", "send", "--to", fp["Alice"], "question for alice")
         check(alice.expect(lambda e: e["type"] == "message")["direct"], "direct message is marked direct for its target")
         check(not bob.expect(lambda e: e["type"] == "message")["direct"], "and visible but not direct for others")
+        run("carol", "send", "--to", fp["Alice"], "--to", fp["Bob"], "for both")
+        check(alice.expect(lambda e: e["type"] == "message")["to"] == [fp["Alice"], fp["Bob"]], "--to can address several members")
+        check(bob.expect(lambda e: e["type"] == "message")["direct"], "and each of them is addressed")
 
         carol_fp = next(m["fp"] for m in run("alice", "members")["members"] if m["name"] == "Carol")
         run("alice", "remove", carol_fp)
@@ -157,7 +160,7 @@ def main():
         with open(os.path.join(folder, reply + ".json"), "rb") as f:
             data = f.read()
         check(hashlib.sha256(data).hexdigest() == reply and json.loads(data) == {"from": {"name": "Frank", "fp": frank_fp},
-              "content": "hi erin", "after": [hello], "to": erin_fp, "reply_to": hello}, "the file is the message plus from, named by its hash")
+              "content": "hi erin", "after": [hello], "to": [erin_fp], "reply_to": hello}, "the file is the message plus from, named by its hash")
 
         hand = {"from": {"name": "Hand", "fp": "00"}, "after": []}
         partial, temp = (json.dumps({**hand, "content": text}).encode() for text in ("was partial", "was temp"))
@@ -179,6 +182,11 @@ def main():
         warning = erin.expect(lambda e: e["type"] == "warning")
         check(os.path.basename(misnamed) in warning["text"], "a file not named by its hash is ignored with a warning")
         os.remove(misnamed)
+        old = json.dumps({**hand, "content": "from 0.4", "to": erin_fp}).encode()
+        with open(named(old), "wb") as f:
+            f.write(old)
+        got = erin.expect(lambda e: e["type"] == "message")
+        check(got["content"] == "from 0.4" and got["to"] == [erin_fp] and got["direct"], "a 0.4 file with a single fingerprint in to still reads")
 
         erin.stop()
         for i in range(22):

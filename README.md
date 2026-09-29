@@ -34,7 +34,7 @@ letmeknow invite                     # new group; prints a code (417-acid-zebra)
 letmeknow invite --group <group>     # invite into an existing group; any member can, any time
 letmeknow join <code or link>        # waits until the inviter admits this session
 letmeknow join ./chat                # folder group: a path with a slash, or an existing directory; created if missing
-letmeknow send "text"                # or: send --to <fp> --reply-to <id> -   (stdin)
+letmeknow send "text"                # or: send --to <fp> [--to <fp>] --reply-to <id> -   (stdin)
 letmeknow read <id> --ancestors 2
 letmeknow members | groups | remove <fp> | leave
 ```

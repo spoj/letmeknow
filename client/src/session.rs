@@ -51,9 +51,9 @@ pub enum Request {
     Send {
         #[arg(long)]
         group: Option<String>,
-        /// Fingerprint of the member this message is addressed to
+        /// Fingerprint of a member this message is addressed to; repeat for several
         #[arg(long)]
-        to: Option<String>,
+        to: Vec<String>,
         /// Id of the message this answers
         #[arg(long)]
         reply_to: Option<String>,
@@ -105,12 +105,26 @@ pub struct Invite {
 struct Payload {
     content: String,
     after: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    to: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "one_or_many")]
+    to: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     epoch_auth: Option<String>,
+}
+
+/// Reads `to` as a list, or as the single fingerprint that 0.4 wrote, so older folder files and stored messages still parse.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum To {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match To::deserialize(deserializer)? {
+        To::One(fp) => vec![fp],
+        To::Many(fps) => fps,
+    })
 }
 
 /// A folder group message: the file `<id>.json`, whose id is the SHA-256 of the file. It holds the payload plus the `from` that MLS supplies on the relay.
@@ -374,7 +388,7 @@ impl Session {
             self.backlog.insert(gid.clone(), Vec::new());
             self.watch(gid.clone());
             self.print(json!({ "type": "joined", "group": gid, "member": self.person }));
-            self.send(Some(gid.clone()), None, None, "joined".into()).await?;
+            self.send(Some(gid.clone()), Vec::new(), None, "joined".into()).await?;
         }
         Ok(json!({ "group": gid, "members": self.members(&gid)? }))
     }
@@ -438,11 +452,10 @@ impl Session {
         Ok(json!({ "group": gid, "members": self.members(&gid)? }))
     }
 
-    async fn send(&mut self, group: Option<String>, to: Option<String>, reply_to: Option<String>, text: String) -> Result<Value> {
+    async fn send(&mut self, group: Option<String>, to: Vec<String>, reply_to: Option<String>, text: String) -> Result<Value> {
         let gid = self.resolve(group)?;
-        if let Some(to) = &to
-            && !self.members(&gid)?.iter().any(|m| m["fp"] == *to)
-        {
+        let members = self.members(&gid)?;
+        if let Some(to) = to.iter().find(|to| !members.iter().any(|m| m["fp"] == to.as_str())) {
             bail!("{to} is not a member of {gid}");
         }
         if let Some(reply_to) = &reply_to
@@ -835,11 +848,11 @@ impl Session {
             "group": gid,
             "id": id,
             "from": from,
-            "direct": payload.to.as_deref() == Some(self.fp.as_str()),
+            "direct": payload.to.contains(&self.fp),
             "content": payload.content,
         });
-        if let Some(to) = &payload.to {
-            item["to"] = json!(to);
+        if !payload.to.is_empty() {
+            item["to"] = json!(payload.to);
         }
         if let Some(reply_to) = &payload.reply_to {
             item["reply_to"] = json!(reply_to);
