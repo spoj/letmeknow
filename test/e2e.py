@@ -19,10 +19,10 @@ def run(session, *args, ok=True, env=ENV, cwd=None):
 
 
 class Listener:
-    def __init__(self, session, env=ENV):
+    def __init__(self, session, env=ENV, hold=0):
         self.session, self.lines = session, queue.Queue()
         flags = ["--session", session, "listen", "--name", session.title()] if session else ["listen"]
-        self.proc = subprocess.Popen([BIN, *flags], env=env, stdout=subprocess.PIPE, text=True, encoding="utf-8")
+        self.proc = subprocess.Popen([BIN, *flags, "--hold", str(hold)], env=env, stdout=subprocess.PIPE, text=True, encoding="utf-8")
         threading.Thread(target=self.read, daemon=True).start()
         self.ready = self.expect(lambda e: e["type"] == "ready")
 
@@ -42,6 +42,12 @@ class Listener:
             if event["type"] == "warning":
                 sys.exit(f"{self.session} warning: {event}")
         sys.exit(f"{self.session}: expected event not seen")
+
+    def poll(self, timeout):
+        try:
+            return self.lines.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
     def stop(self):
         self.proc.terminate()
@@ -197,6 +203,42 @@ def main():
         got = [erin.expect(lambda e: e["type"] == "message")["content"] for _ in range(20)]
         check(omitted["count"] == 2 and got == [f"folder {i}" for i in range(2, 22)], "restart catches up on the folder's last 20 messages, in order")
         check(run("frank", "leave")["left"] and run("frank", "groups") == [], "leaving a folder group")
+
+        board = os.path.join(HOME, "board")
+        gina, hank = Listener("gina", hold=600), Listener("hank")
+        listeners += [gina, hank]
+        gina_fp, hank_fp = gina.ready["member"]["fp"], hank.ready["member"]["fp"]
+        run("gina", "join", board)
+        gina.expect(lambda e: e["type"] == "joined")
+        run("hank", "join", board)
+        check(gina.poll(2) is None, "a message not addressed to the session waits")
+        for _ in range(20):
+            if len(run("gina", "members")["members"]) == 2:
+                break
+            time.sleep(0.5)
+        check(gina.expect(lambda e: e["type"] == "message")["from"]["fp"] == hank_fp, "until the agent runs a command")
+
+        run("hank", "send", "for everyone")
+        check(gina.poll(2) is None, "a message to the group waits too")
+        run("hank", "send", "--to", gina_fp, "for gina")
+        got = [gina.expect(lambda e: e["type"] == "message")["content"] for _ in range(2)]
+        check(got == ["for everyone", "for gina"], "a message addressed to the session wakes it, after the held ones")
+        run("hank", "send", "--urgent", "all hands")
+        check(gina.expect(lambda e: e["type"] == "message")["urgent"], "so does an urgent message")
+        question = run("gina", "send", "any news?")["id"]
+        hank.expect(lambda e: e.get("id") == question)
+        run("hank", "send", "--reply-to", question, "yes")
+        got = gina.expect(lambda e: e["type"] == "message")
+        check(got["reply_to"] == question and not got["direct"], "and a reply to one of its messages")
+
+        jill = Listener("jill", hold=2)
+        listeners.append(jill)
+        run("jill", "join", board)
+        jill.expect(lambda e: e.get("content") == "yes")
+        start = time.time()
+        run("hank", "send", "later")
+        jill.expect(lambda e: e.get("content") == "later")
+        check(time.time() - start >= 2, "a held message is printed once --hold runs out")
 
         check("several sessions are running" in run(None, "groups", ok=False), "without --session, several running sessions are ambiguous")
         solo_env = {**ENV, "LETMEKNOW_HOME": os.path.join(HOME, "solo")}

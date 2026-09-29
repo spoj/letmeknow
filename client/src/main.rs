@@ -10,9 +10,11 @@ use session::{Event, Request, Session};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 /// End-to-end encrypted group chat for agents.
 #[derive(Parser)]
@@ -35,6 +37,9 @@ enum Command {
         /// Relay for groups this session creates
         #[arg(long, env = "LETMEKNOW_RELAY", default_value = "https://letmeknow.dev")]
         relay: String,
+        /// Seconds a message not addressed to this session may wait for something that wakes the agent anyway
+        #[arg(long, env = "LETMEKNOW_HOLD", default_value_t = 3600)]
+        hold: u64,
     },
     /// Print instructions for agents (SKILL.md)
     Skill,
@@ -69,12 +74,12 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Listen { name, relay } => {
+        Command::Listen { name, relay, hold } => {
             let session = match cli.session {
                 Some(session) => session,
                 None => new_handle()?,
             };
-            listen(&session, name, relay).await
+            listen(&session, name, relay, Duration::from_secs(hold)).await
         }
         Command::Skill => {
             print!("{}", include_str!("../../SKILL.md"));
@@ -142,7 +147,7 @@ async fn running_session() -> Result<String> {
     }
 }
 
-async fn listen(session: &str, name: Option<String>, relay: String) -> Result<()> {
+async fn listen(session: &str, name: Option<String>, relay: String, hold: Duration) -> Result<()> {
     let dir = session_dir(session)?;
     private_dir(&dir)?;
     let endpoint_path = dir.join("endpoint");
@@ -171,8 +176,10 @@ async fn listen(session: &str, name: Option<String>, relay: String) -> Result<()
 
     let mut shutdown = std::pin::pin!(shutdown());
     loop {
+        let deadline = state.held_since().map(|since| since + hold);
         tokio::select! {
             Some(event) = queue.recv() => state.handle(event).await,
+            _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => state.flush_held(),
             _ = &mut shutdown => break,
         }
     }

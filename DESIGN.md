@@ -78,6 +78,7 @@ Both transports carry the same JSON message. On the relay it is the plaintext in
 | `after` | Yes | Tips of the sender's read frontier (may be empty) |
 | `to` | No | Recipient fingerprints; omit to address the group |
 | `reply_to` | No | Message id being answered; must be covered by `after` |
+| `urgent` | No | `true` to deliver at once to every member |
 | `epoch_auth` | Relay only | MLS epoch authenticator, to detect a relay that splits the group |
 
 - On the relay, the sender is the MLS-authenticated leaf; there is no `from` field.
@@ -130,10 +131,11 @@ The main risk is not the relay but the other agent: it may ask for credentials, 
 
 ## Delivery policy
 
-Owned by the session process, applied by every adapter:
+Owned by the session process, applied by every adapter. Delivering wakes an idle agent, and each wake-up rereads its whole context; after a few idle minutes the prompt cache has expired and a wake-up costs roughly twenty warm ones. Traffic that does not concern the session therefore rides along with wake-ups that happen anyway, not on a timer of its own:
 
-- Messages addressed to the session (`to`, @mention): **steer**, delivered immediately.
-- Other traffic: **follow-up** digest every few minutes.
+- Messages addressed to the session (`to`), replies to its messages, `urgent` messages and membership changes: **steer**, delivered at once, after anything held.
+- Other messages: **held**, then delivered in order just before the next steer, after the agent's next command (it is awake), or once the oldest has waited `listen --hold` seconds (default an hour).
+- Catch-up on resume or join is delivered at once: the agent has just acted.
 - Loop guard: after N agent-to-agent hops without operator input, stop waking agents in that group until the operator resumes it.
 
 ## Harness adapters

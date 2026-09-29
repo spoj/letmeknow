@@ -23,6 +23,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use reqwest_websocket::{Message, WebSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 const MAX_PAST_EPOCHS: usize = 5;
@@ -57,6 +58,9 @@ pub enum Request {
         /// Id of the message this answers
         #[arg(long)]
         reply_to: Option<String>,
+        /// Deliver at once to every member, not only those addressed
+        #[arg(long)]
+        urgent: bool,
         text: String,
     },
     /// Show a message and its causal history
@@ -109,6 +113,8 @@ struct Payload {
     to: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    urgent: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     epoch_auth: Option<String>,
 }
@@ -172,6 +178,8 @@ pub struct Session {
     groups: HashMap<String, Group>,
     folders: HashMap<String, Folder>,
     backlog: HashMap<String, Vec<Value>>,
+    held: Vec<Value>,
+    held_since: Option<Instant>,
     events: mpsc::UnboundedSender<Event>,
 }
 
@@ -211,6 +219,8 @@ impl Session {
             groups: HashMap::new(),
             folders: HashMap::new(),
             backlog: HashMap::new(),
+            held: Vec::new(),
+            held_since: None,
             events,
         };
         let rows: Vec<(String, String, u64)> = session
@@ -241,10 +251,12 @@ impl Session {
                 if let Err(error) = self.join(target, reply).await {
                     self.warn(None, format!("join: {error:#}"));
                 }
+                self.flush_held();
             }
             Event::Request(request, reply) => {
                 let result = self.request(request).await;
                 let _ = reply.send(result.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
+                self.flush_held();
             }
             Event::Batch { gid, messages, synced } => {
                 for (seq, data) in messages {
@@ -286,7 +298,7 @@ impl Session {
         match request {
             Request::Invite { group } => self.invite(group).await,
             Request::Join { target } => self.join_folder(target).await,
-            Request::Send { group, to, reply_to, text } => self.send(group, to, reply_to, text).await,
+            Request::Send { group, to, reply_to, urgent, text } => self.send(group, to, reply_to, urgent, text).await,
             Request::Read { id, ancestors } => self.read(&id, ancestors),
             Request::Members { group } => {
                 let gid = self.resolve(group)?;
@@ -388,7 +400,7 @@ impl Session {
             self.backlog.insert(gid.clone(), Vec::new());
             self.watch(gid.clone());
             self.print(json!({ "type": "joined", "group": gid, "member": self.person }));
-            self.send(Some(gid.clone()), Vec::new(), None, "joined".into()).await?;
+            self.send(Some(gid.clone()), Vec::new(), None, false, "joined".into()).await?;
         }
         Ok(json!({ "group": gid, "members": self.members(&gid)? }))
     }
@@ -452,7 +464,7 @@ impl Session {
         Ok(json!({ "group": gid, "members": self.members(&gid)? }))
     }
 
-    async fn send(&mut self, group: Option<String>, to: Vec<String>, reply_to: Option<String>, text: String) -> Result<Value> {
+    async fn send(&mut self, group: Option<String>, to: Vec<String>, reply_to: Option<String>, urgent: bool, text: String) -> Result<Value> {
         let gid = self.resolve(group)?;
         let members = self.members(&gid)?;
         if let Some(to) = to.iter().find(|to| !members.iter().any(|m| m["fp"] == to.as_str())) {
@@ -463,7 +475,7 @@ impl Session {
         {
             bail!("unknown message {reply_to}");
         }
-        let mut payload = Payload { to, reply_to, after: self.tips(&gid)?, epoch_auth: None, content: text };
+        let mut payload = Payload { to, reply_to, urgent, after: self.tips(&gid)?, epoch_auth: None, content: text };
         let id = match self.groups.get_mut(&gid) {
             Some(group) => {
                 payload.epoch_auth = Some(hex::encode(group.mls.epoch_authenticator().as_slice()));
@@ -857,13 +869,44 @@ impl Session {
         if let Some(reply_to) = &payload.reply_to {
             item["reply_to"] = json!(reply_to);
         }
+        if payload.urgent {
+            item["urgent"] = json!(true);
+        }
         item
     }
 
+    /// Printing wakes the agent, so only what concerns this session is printed at once, after anything held.
+    /// Other messages are held until then, until the agent's next command, or until `listen --hold` runs out.
     fn deliver(&mut self, gid: &str, item: Value) {
-        match self.backlog.get_mut(gid) {
-            Some(backlog) => backlog.push(item),
-            None => self.print(item),
+        if let Some(backlog) = self.backlog.get_mut(gid) {
+            backlog.push(item);
+        } else if self.wakes(&item) {
+            self.flush_held();
+            self.print(item);
+        } else {
+            self.held_since.get_or_insert_with(Instant::now);
+            self.held.push(item);
+        }
+    }
+
+    /// Membership changes, and messages addressed to this session, answering one of its messages, or urgent.
+    fn wakes(&self, item: &Value) -> bool {
+        item["type"] != "message"
+            || item["direct"] == true
+            || item["urgent"] == true
+            || item["reply_to"]
+                .as_str()
+                .is_some_and(|id| matches!(self.message(id), Ok(Some((_, from, _))) if from["fp"] == self.fp.as_str()))
+    }
+
+    pub fn held_since(&self) -> Option<Instant> {
+        self.held_since
+    }
+
+    pub fn flush_held(&mut self) {
+        self.held_since = None;
+        for item in std::mem::take(&mut self.held) {
+            self.print(item);
         }
     }
 
