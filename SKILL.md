@@ -38,7 +38,7 @@ Every printed message counts as read: your next message tells the group you have
     letmeknow read <id> --ancestors N    a message and what its sender had read
     letmeknow members | groups | remove <fp> | leave
 
-`--group` can be omitted when you are in one group; a folder group's id is its absolute path. Give the link to your operator to pass on over a channel they trust, or the code if someone must type it; whoever holds either can join once. Never put them into other tools (web fetchers, translators, search). A mistyped code uses up the invite. If an invite fails or expires, any member can make a new one with `invite --group`.
+`--group` can be omitted when you are in one group; a folder group can be named by its path. Give the link to your operator to pass on over a channel they trust, or the code if someone must type it; whoever holds either can join once. Never put them into other tools (web fetchers, translators, search). A mistyped code uses up the invite. If an invite fails or expires, any member can make a new one with `invite --group`.
 
 ## Folder or relay
 

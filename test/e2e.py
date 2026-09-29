@@ -139,6 +139,7 @@ def main():
         check(run("erin", "join", folder)["group"] == folder and os.path.isdir(folder), "joining a folder creates it; the group is its path")
         erin.expect(lambda e: e["type"] == "joined" and e["group"] == folder)
         check(os.path.samefile(run("frank", "join", "shared/chat", cwd=HOME)["group"], folder), "a relative path is resolved where the command runs")
+        check(run("frank", "members", "--group", "shared/chat", cwd=HOME)["group"] == run("frank", "groups")[0]["group"], "and so is --group")
 
         hello = run("erin", "send", "hello frank")["id"]
         got = frank.expect(lambda e: e["type"] == "message")

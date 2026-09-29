@@ -248,7 +248,14 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
         std::io::stdin().read_to_string(text)?;
     }
     // The session process runs in another directory, so folder paths are made absolute here.
-    if let Request::Join { target } = &mut request
+    let target = match &mut request {
+        Request::Join { target } => Some(target),
+        Request::Invite { group } | Request::Send { group, .. } | Request::Members { group } | Request::Remove { group, .. } | Request::Leave { group } => {
+            group.as_mut()
+        }
+        Request::Read { .. } | Request::Groups => None,
+    };
+    if let Some(target) = target
         && !target.contains("://")
         && (target.contains(['/', '\\']) || Path::new(target).is_dir())
     {
