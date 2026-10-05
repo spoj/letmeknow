@@ -37,13 +37,14 @@ async function subscribe(gid: string) {
 }
 
 describe("group", () => {
-  it("accepts one commit per epoch and any application message", async () => {
+  it("accepts messages for the current epoch only; a commit moves it on", async () => {
     const gid = hex(16);
     expect(await (await post(gid, mls(gid, 0, COMMIT))).json()).toEqual({ seq: 1 });
     const stale = await post(gid, mls(gid, 0, COMMIT));
     expect(stale.status).toBe(409);
     expect(await stale.json()).toEqual({ epoch: 1 });
-    expect(await (await post(gid, mls(gid, 0, APPLICATION))).json()).toEqual({ seq: 2 });
+    expect((await post(gid, mls(gid, 0, APPLICATION))).status).toBe(409);
+    expect(await (await post(gid, mls(gid, 1, APPLICATION))).json()).toEqual({ seq: 2 });
     expect(await (await post(gid, mls(gid, 1, COMMIT))).json()).toEqual({ seq: 3 });
   });
 

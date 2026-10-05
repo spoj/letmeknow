@@ -376,8 +376,8 @@ impl Session {
         let key_package = key_package.validate(self.provider.crypto(), ProtocolVersion::Mls10)?;
 
         let mut welcome = None;
-        let seq = self
-            .commit_retrying(&invite.gid, |mls, provider, signer| {
+        let (_, seq) = self
+            .post_retrying(&invite.gid, |mls, provider, signer| {
                 let (commit, message, _) = mls.add_members(provider, signer, std::slice::from_ref(&key_package))?;
                 welcome = Some(message);
                 Ok(commit)
@@ -474,22 +474,16 @@ impl Session {
             bail!("unknown message {reply_to}");
         }
         let payload = Payload { to, reply_to, urgent, after: self.tips(&gid)?, content: text };
-        let id = match self.groups.get_mut(&gid) {
-            Some(group) => {
-                let bytes = group.mls.create_message(&self.provider, &self.signer, &serde_json::to_vec(&payload)?)?.to_bytes()?;
-                let (id, relay) = (digest(&bytes), group.relay.clone());
-                self.db.execute("INSERT INTO posted (id) VALUES (?)", [&id])?;
-                self.relay.post(&relay, &gid, &bytes).await?;
-                id
-            }
-            None => {
-                let bytes = serde_json::to_vec(&Record { from: serde_json::from_value(self.person.clone())?, payload: payload.clone() })?;
-                let (dir, id) = (Path::new(&gid), digest(&bytes));
-                let temp = dir.join(format!(".{id}.tmp"));
-                std::fs::write(&temp, bytes)?;
-                std::fs::rename(&temp, dir.join(format!("{id}.json")))?;
-                id
-            }
+        let id = if self.groups.contains_key(&gid) {
+            let bytes = serde_json::to_vec(&payload)?;
+            self.post_retrying(&gid, |mls, provider, signer| Ok(mls.create_message(provider, signer, &bytes)?)).await?.0
+        } else {
+            let bytes = serde_json::to_vec(&Record { from: serde_json::from_value(self.person.clone())?, payload: payload.clone() })?;
+            let (dir, id) = (Path::new(&gid), digest(&bytes));
+            let temp = dir.join(format!(".{id}.tmp"));
+            std::fs::write(&temp, bytes)?;
+            std::fs::rename(&temp, dir.join(format!("{id}.json")))?;
+            id
         };
         self.db.execute(
             "INSERT INTO messages (id, gid, sender, payload, seen) VALUES (?, ?, ?, ?, 1)",
@@ -532,7 +526,7 @@ impl Session {
             .members()
             .find(|m| fingerprint(&m.signature_key) == member && m.index != group.mls.own_leaf_index())
             .context("no such member")?;
-        self.commit_retrying(&gid, |mls, provider, signer| Ok(mls.remove_members(provider, signer, &[target.index])?.0))
+        self.post_retrying(&gid, |mls, provider, signer| Ok(mls.remove_members(provider, signer, &[target.index])?.0))
             .await?;
         Ok(json!({ "group": gid, "members": self.members(&gid)? }))
     }
@@ -543,11 +537,7 @@ impl Session {
             self.drop_group(&gid)?;
             return Ok(json!({ "group": gid, "left": true }));
         }
-        let group = self.groups.get_mut(&gid).expect("resolved");
-        let bytes = group.mls.leave_group(&self.provider, &self.signer)?.to_bytes()?;
-        let relay = group.relay.clone();
-        self.db.execute("INSERT INTO posted (id) VALUES (?)", [digest(&bytes)])?;
-        self.relay.post(&relay, &gid, &bytes).await?;
+        self.post_retrying(&gid, |mls, provider, signer| Ok(mls.leave_group(provider, signer)?)).await?;
         Ok(json!({ "group": gid, "left": false, "status": "waiting for another member to commit the removal" }))
     }
 
@@ -591,7 +581,7 @@ impl Session {
                     bail!("unsupported proposal");
                 }
                 group.mls.store_pending_proposal(self.provider.storage(), *proposal)?;
-                self.commit(gid, |mls, provider, signer| Ok(mls.commit_to_pending_proposals(provider, signer)?.0)).await?;
+                self.post(gid, |mls, provider, signer| Ok(mls.commit_to_pending_proposals(provider, signer)?.0)).await?;
             }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 let changes = membership_changes(&group.mls, &staged, &sender);
@@ -611,43 +601,42 @@ impl Session {
         Ok(())
     }
 
-    /// Posts a commit built by `build`. Returns the relay sequence number, or `None` if another commit won the epoch.
-    async fn commit(
+    /// Posts the message `build` makes from the current epoch, and merges it if it is a commit. Returns its id and relay
+    /// sequence number, or `None` if the relay has seen a commit this session has not: it only takes messages for its epoch.
+    async fn post(
         &mut self,
         gid: &str,
         build: impl FnOnce(&mut MlsGroup, &Provider, &SignatureKeyPair) -> Result<MlsMessageOut>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<(String, u64)>> {
         let group = self.groups.get_mut(gid).context("unknown group")?;
         let bytes = build(&mut group.mls, &self.provider, &self.signer)?.to_bytes()?;
-        let relay = group.relay.clone();
+        let (id, relay) = (digest(&bytes), group.relay.clone());
+        self.db.execute("INSERT INTO posted (id) VALUES (?)", [&id])?;
         let posted = self.relay.post(&relay, gid, &bytes).await;
-        let group = self.groups.get_mut(gid).expect("still tracked");
-        match posted {
-            Ok(Some(seq)) => {
-                self.db.execute("INSERT INTO posted (id) VALUES (?)", [digest(&bytes)])?;
-                let staged = group.mls.pending_commit().context("no pending commit")?;
-                let changes = membership_changes(&group.mls, staged, &self.person);
-                group.mls.merge_pending_commit(&self.provider)?;
-                for change in changes {
-                    self.deliver(gid, change);
-                }
-                Ok(Some(seq))
-            }
-            other => {
-                group.mls.clear_pending_commit(self.provider.storage())?;
-                other
+        let mls = &mut self.groups.get_mut(gid).expect("still tracked").mls;
+        let Ok(Some(seq)) = posted else {
+            mls.clear_pending_commit(self.provider.storage())?;
+            return posted.map(|_| None);
+        };
+        if let Some(staged) = mls.pending_commit() {
+            let changes = membership_changes(mls, staged, &self.person);
+            mls.merge_pending_commit(&self.provider)?;
+            for change in changes {
+                self.deliver(gid, change);
             }
         }
+        Ok(Some((id, seq)))
     }
 
-    async fn commit_retrying(
+    /// Like `post`, but on `None` catches up and builds the message again.
+    async fn post_retrying(
         &mut self,
         gid: &str,
         mut build: impl FnMut(&mut MlsGroup, &Provider, &SignatureKeyPair) -> Result<MlsMessageOut>,
-    ) -> Result<u64> {
+    ) -> Result<(String, u64)> {
         for _ in 0..3 {
-            if let Some(seq) = self.commit(gid, &mut build).await? {
-                return Ok(seq);
+            if let Some(posted) = self.post(gid, &mut build).await? {
+                return Ok(posted);
             }
             let group = &self.groups[gid];
             let (relay, cursor) = (group.relay.clone(), group.cursor);

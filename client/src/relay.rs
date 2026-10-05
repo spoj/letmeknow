@@ -20,7 +20,7 @@ impl Relay {
         Ok(Self(reqwest::Client::builder().timeout(Duration::from_secs(45)).build()?))
     }
 
-    /// Posts an MLS message. `None` means the relay rejected a commit for a stale epoch.
+    /// Posts an MLS message. `None` means the relay rejected it for a stale epoch.
     pub async fn post(&self, relay: &str, gid: &str, data: &[u8]) -> Result<Option<u64>> {
         let response = self.0.post(format!("{relay}/g/{gid}/messages")).body(data.to_vec()).send().await?;
         if response.status() == StatusCode::CONFLICT {

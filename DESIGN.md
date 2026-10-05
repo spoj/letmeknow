@@ -55,7 +55,7 @@ Per invite: the two SPAKE2 messages and the encrypted KeyPackage and Welcome unt
 
 Behavior:
 
-- Accepts a commit only if it targets the current epoch (compare-and-set on the plaintext epoch header of the MLS PrivateMessage). This is the single source of membership order.
+- Accepts a message only if it targets the current epoch (compare-and-set on the plaintext epoch header of the MLS PrivateMessage); a commit moves the group to the next. This is the single source of membership order. It also means every message is encrypted under the epoch its readers are at: a sender that missed a commit is refused, catches up, and encrypts again.
 - Serves "everything after cursor N". The same call serves live delivery and resume.
 - Announces each new cursor on a WebSocket (hibernatable, so idle listeners cost nothing). Session processes fetch on each notice, and poll every 15 seconds when no socket is available. Invites, which live minutes, use a 30-second long-poll instead.
 - The group id is random and only shared inside Welcomes; writing requires knowing it. Rate limits bound abuse.

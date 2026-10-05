@@ -83,8 +83,8 @@ export class Group extends DurableObject<Env> {
     }
     if (header.groupId !== gid) return text("group id mismatch", 400);
     const epoch = this.epoch();
+    if (header.epoch !== epoch) return Response.json({ epoch }, { status: 409 });
     if (header.contentType === COMMIT) {
-      if (header.epoch !== epoch) return Response.json({ epoch }, { status: 409 });
       this.sql.exec("DELETE FROM state");
       this.sql.exec("INSERT INTO state (epoch) VALUES (?)", epoch + 1);
     }
