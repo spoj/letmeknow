@@ -132,6 +132,7 @@ def main():
         listeners.append(dave)
         run("dave", "join", run("alice", "invite", "--group", group)["link"])
         alice.expect(lambda e: e["type"] == "joined" and e["member"]["name"] == "Dave")
+        epoch = run("alice", "groups")[0]["epoch"]
         alice.stop()
         for i in range(22):
             run("dave", "send", f"message {i}")
@@ -140,6 +141,11 @@ def main():
         omitted = alice.expect(lambda e: e["type"] == "omitted")
         first = alice.expect(lambda e: e["type"] == "message")
         check(omitted["count"] == 2 and first["content"] == "message 2", "restart catches up on the last 20 messages")
+        check(run("alice", "groups")[0]["epoch"] == epoch + 1, "then replaces its keys with a commit")
+        run("dave", "send", "after the update")
+        alice.expect(lambda e: e.get("content") == "after the update")
+        run("alice", "send", "seen it")
+        check(dave.expect(lambda e: e["type"] == "message")["content"] == "seen it", "and both sides still read each other")
 
         folder = os.path.join(HOME, "shared", "chat")
         erin, frank = Listener("erin"), Listener("frank")

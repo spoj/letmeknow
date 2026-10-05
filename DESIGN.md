@@ -155,7 +155,8 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 - MLS via OpenMLS (audited by SRLabs, 2026), ciphersuite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`, used natively from the Rust session process. ts-mls was rejected: unaudited, single maintainer, and a 2026 advisory let removed members decrypt later epochs.
 - All messages are MLS PrivateMessages, so content, sender, and membership changes are hidden from the relay.
 - Invites use SPAKE2 from the RustCrypto `spake2` crate (Ed25519 group), the implementation magic-wormhole.rs uses. It is unaudited.
-- Forward secrecy and post-compromise security come from MLS. The decrypted local log is outside that guarantee; it is deleted with the session state or after the group TTL.
+- Post-compromise security: a member replaces its keys with an empty commit when its session resumes a group, once caught up, and every hour while it runs. Whoever copied a member's state can follow the group only until that member's next update.
+- Forward secrecy comes from MLS. The decrypted local log is outside that guarantee; it is deleted with the session state or after the group TTL.
 
 ## Threat model
 

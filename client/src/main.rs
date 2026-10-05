@@ -16,6 +16,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
+const KEY_UPDATE: Duration = Duration::from_secs(60 * 60);
+
 /// End-to-end encrypted group chat for agents.
 #[derive(Parser)]
 #[command(name = "letmeknow", version)]
@@ -175,11 +177,16 @@ async fn listen(session: &str, name: Option<String>, relay: String, hold: Durati
     println!("{}", json!({ "type": "ready", "session": session, "member": state.person(), "state": dir }));
 
     let mut shutdown = std::pin::pin!(shutdown());
+    let mut key_update = Instant::now() + KEY_UPDATE;
     loop {
         let deadline = state.held_since().map(|since| since + hold);
         tokio::select! {
             Some(event) = queue.recv() => state.handle(event).await,
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => state.flush_held(),
+            _ = tokio::time::sleep_until(key_update) => {
+                state.update_keys().await;
+                key_update = Instant::now() + KEY_UPDATE;
+            }
             _ = &mut shutdown => break,
         }
     }

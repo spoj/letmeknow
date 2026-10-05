@@ -262,8 +262,9 @@ impl Session {
                         self.warn(Some(&gid), format!("{error:#}"));
                     }
                 }
-                if synced {
+                if synced && self.backlog.contains_key(&gid) {
                     self.flush(&gid);
+                    self.update_key(&gid).await;
                 }
             }
             Event::Files { gid, records, ignored } => {
@@ -306,7 +307,7 @@ impl Session {
                 let mut groups: Vec<Value> = self
                     .groups
                     .iter()
-                    .map(|(gid, g)| json!({ "group": gid, "members": g.mls.members().count(), "relay": g.relay }))
+                    .map(|(gid, g)| json!({ "group": gid, "members": g.mls.members().count(), "relay": g.relay, "epoch": g.mls.epoch().as_u64() }))
                     .collect();
                 for gid in self.folders.keys() {
                     groups.push(json!({ "group": gid, "members": self.members(gid)?.len(), "folder": gid }));
@@ -647,6 +648,33 @@ impl Session {
             }
         }
         bail!("the group kept changing; try again")
+    }
+
+    /// Replaces this member's keys with an empty commit, so whoever copied the old ones cannot follow the group past it.
+    async fn update_key(&mut self, gid: &str) {
+        // Not from the proposal store: after `leave` it holds this member's own removal, which only another member may commit.
+        let updated = self
+            .post_retrying(gid, |mls, provider, signer| {
+                Ok(mls
+                    .commit_builder()
+                    .consume_proposal_store(false)
+                    .force_self_update(true)
+                    .load_psks(provider.storage())?
+                    .build(provider.rand(), provider.crypto(), signer, |_| true)?
+                    .stage_commit(provider)?
+                    .into_commit())
+            })
+            .await;
+        if let Err(error) = updated {
+            self.warn(Some(gid), format!("key update: {error:#}"));
+        }
+    }
+
+    /// Run periodically by `listen`; a resumed group also updates once caught up.
+    pub async fn update_keys(&mut self) {
+        for gid in self.groups.keys().cloned().collect::<Vec<_>>() {
+            self.update_key(&gid).await;
+        }
     }
 
     fn create_group(&mut self) -> Result<String> {
