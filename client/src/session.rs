@@ -104,7 +104,7 @@ pub struct Invite {
     gid: String,
 }
 
-/// A message as both transports carry it: MLS plaintext on the relay (with `epoch_auth`), the body of a folder file.
+/// A message as both transports carry it: MLS plaintext on the relay, the body of a folder file.
 #[derive(Clone, Serialize, Deserialize)]
 struct Payload {
     content: String,
@@ -115,8 +115,6 @@ struct Payload {
     reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     urgent: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    epoch_auth: Option<String>,
 }
 
 /// Reads `to` as a list, or as the single fingerprint that 0.4 wrote, so older folder files and stored messages still parse.
@@ -475,10 +473,9 @@ impl Session {
         {
             bail!("unknown message {reply_to}");
         }
-        let mut payload = Payload { to, reply_to, urgent, after: self.tips(&gid)?, epoch_auth: None, content: text };
+        let payload = Payload { to, reply_to, urgent, after: self.tips(&gid)?, content: text };
         let id = match self.groups.get_mut(&gid) {
             Some(group) => {
-                payload.epoch_auth = Some(hex::encode(group.mls.epoch_authenticator().as_slice()));
                 let bytes = group.mls.create_message(&self.provider, &self.signer, &serde_json::to_vec(&payload)?)?.to_bytes()?;
                 let (id, relay) = (digest(&bytes), group.relay.clone());
                 self.db.execute("INSERT INTO posted (id) VALUES (?)", [&id])?;
@@ -573,7 +570,6 @@ impl Session {
         let message = MlsMessageIn::tls_deserialize_exact_bytes(data)?.try_into_protocol_message()?;
         let group = self.groups.get_mut(gid).expect("checked by receive");
         let processed = group.mls.process_message(&self.provider, message)?;
-        let epoch = processed.epoch().as_u64();
         let sender = match processed.sender() {
             Sender::Member(leaf) => group.mls.member_at(*leaf).map(|m| person(&m.credential, &m.signature_key)),
             _ => None,
@@ -583,13 +579,6 @@ impl Session {
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(message) => {
                 let payload: Payload = serde_json::from_slice(&message.into_bytes())?;
-                let auth: Option<String> = self
-                    .db
-                    .query_row("SELECT auth FROM epochs WHERE gid = ? AND epoch = ?", params![gid, epoch], |r| r.get(0))
-                    .optional()?;
-                if auth != payload.epoch_auth {
-                    self.warn(Some(gid), format!("message {id} was sent from a different view of epoch {epoch}; the relay may be splitting the group"));
-                }
                 self.db.execute(
                     "INSERT OR IGNORE INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
                     params![id, gid, sender.to_string(), serde_json::to_string(&payload)?],
@@ -613,7 +602,6 @@ impl Session {
                     self.print(json!({ "type": "removed", "group": gid, "by": sender }));
                     return Ok(());
                 }
-                self.record_epoch(gid)?;
                 for change in changes {
                     self.deliver(gid, change);
                 }
@@ -640,7 +628,6 @@ impl Session {
                 let staged = group.mls.pending_commit().context("no pending commit")?;
                 let changes = membership_changes(&group.mls, staged, &self.person);
                 group.mls.merge_pending_commit(&self.provider)?;
-                self.record_epoch(gid)?;
                 for change in changes {
                     self.deliver(gid, change);
                 }
@@ -690,7 +677,7 @@ impl Session {
     fn add_group(&mut self, gid: &str, relay: &str, cursor: u64, mls: MlsGroup) -> Result<()> {
         self.db.execute("INSERT INTO groups (gid, relay, cursor) VALUES (?, ?, ?)", params![gid, relay, cursor])?;
         self.track(gid.to_owned(), relay.to_owned(), cursor, mls);
-        self.record_epoch(gid)
+        Ok(())
     }
 
     fn track(&mut self, gid: String, relay: String, cursor: u64, mls: MlsGroup) {
@@ -720,18 +707,9 @@ impl Session {
         }
         self.folders.remove(gid);
         self.backlog.remove(gid);
-        for table in ["groups", "folders", "epochs", "messages"] {
+        for table in ["groups", "folders", "messages"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [gid])?;
         }
-        Ok(())
-    }
-
-    fn record_epoch(&self, gid: &str) -> Result<()> {
-        let mls = &self.groups[gid].mls;
-        self.db.execute(
-            "INSERT OR REPLACE INTO epochs (gid, epoch, auth) VALUES (?, ?, ?)",
-            params![gid, mls.epoch().as_u64(), hex::encode(mls.epoch_authenticator().as_slice())],
-        )?;
         Ok(())
     }
 

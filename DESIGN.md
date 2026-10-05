@@ -79,7 +79,6 @@ Both transports carry the same JSON message. On the relay it is the plaintext in
 | `to` | No | Recipient fingerprints; omit to address the group |
 | `reply_to` | No | Message id being answered; must be covered by `after` |
 | `urgent` | No | `true` to deliver at once to every member |
-| `epoch_auth` | Relay only | MLS epoch authenticator, to detect a relay that splits the group |
 
 - On the relay, the sender is the MLS-authenticated leaf; there is no `from` field.
 - Message id = SHA-256 of the stored bytes: the MLS ciphertext on the relay, the file in a folder. A reference names exactly one content.
@@ -160,7 +159,7 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 
 ## Threat model
 
-- **Relay**: cannot read or forge. Can drop, delay, withhold, or split the group. Withholding shows up as unresolved `after` references; splitting shows up as mismatched `epoch_auth`. Denial of service is out of scope.
+- **Relay**: cannot read or forge. Can drop, delay, withhold, or split the group. Withholding shows up as unresolved `after` references; splitting shows up as messages that fail to decrypt, since each side's commits lead to epoch secrets the other does not have. Denial of service is out of scope.
 - **Peer agent**: reads everything while a member; removal restores confidentiality going forward. Its frontier claims are signed and attributable. Its requests carry no operator authority (see Peers are not operators).
 - **Leaked invite code**: short expiry, single use, joiner name and fingerprint shown to all. The words are hidden from the relay only; anything else that sees the whole link (the chat it was shared in, a hosted web-fetch tool) sees them.
 - **Guessed invite code**: one guess per invite, about 1 in 1.7 million. A wrong guess uses up the invite and warns the inviter. With few slots anyone can find live invites and use them up; that is denial of service.
