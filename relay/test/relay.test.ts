@@ -9,9 +9,9 @@ const COMMIT = 3;
 
 const hex = (bytes: number) => randomBytes(bytes).toString("hex");
 
-function mls(gid: string, epoch: number, contentType: number): Uint8Array {
+function mls(gid: string, epoch: number, contentType: number, body = 16): Uint8Array {
   const id = new TextEncoder().encode(gid);
-  const data = new Uint8Array(4 + 1 + id.length + 8 + 1 + 16);
+  const data = new Uint8Array(4 + 1 + id.length + 8 + 1 + body);
   const view = new DataView(data.buffer);
   view.setUint16(0, 1);
   view.setUint16(2, 2);
@@ -65,6 +65,14 @@ describe("group", () => {
     expect(Buffer.from(all[0].data, "base64")).toEqual(Buffer.from(first));
     expect(await poll(gid, 2)).toEqual([]);
     expect((await SELF.fetch(`${origin}/g/${gid}/messages?after=2&wait=30`)).status).toBe(410);
+  });
+
+  it("caps messages at 1 MiB and pages at 2 MiB", async () => {
+    const gid = hex(16);
+    expect((await post(gid, mls(gid, 0, APPLICATION, 1024 * 1024))).status).toBe(413);
+    for (let i = 0; i < 3; i++) await post(gid, mls(gid, 0, APPLICATION, 800 * 1024));
+    expect((await poll(gid, 0)).map(m => m.seq)).toEqual([1, 2]);
+    expect((await poll(gid, 2)).map(m => m.seq)).toEqual([3]);
   });
 
   it("notifies websockets of new messages and answers pings", async () => {

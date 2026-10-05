@@ -34,7 +34,6 @@ const WORDS: &str = include_str!("words.txt");
 const POLL_WAIT_S: u64 = 25;
 const POLL_S: u64 = 15;
 const PING_S: u64 = 30;
-const PAGE: usize = 500;
 const CATCH_UP: usize = 20;
 
 /// Requests an agent sends to its session process.
@@ -975,7 +974,7 @@ async fn catch_up(
 ) -> Result<()> {
     loop {
         let messages = http.fetch(relay, gid, *after).await?;
-        let was_synced = std::mem::replace(synced, messages.len() < PAGE);
+        let was_synced = std::mem::replace(synced, messages.is_empty());
         if let Some((seq, _)) = messages.last() {
             *after = *seq;
         }

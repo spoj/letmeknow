@@ -3,6 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 interface Env {
   GROUPS: DurableObjectNamespace<Group>;
   INVITES: DurableObjectNamespace<Invite>;
+  WRITES: RateLimit;
 }
 
 type InviteState = { expires: number; owner: string; pake: string; join?: string; welcome?: string };
@@ -11,7 +12,8 @@ const GROUP = /^[0-9a-f]{32}$/;
 const SLOT = /^[1-9][0-9]{0,2}$/;
 const OWNER = /^[0-9a-f]{64}$/;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-const MAX_MESSAGE_BYTES = 256 * 1024;
+const MAX_MESSAGE_BYTES = 1024 * 1024;
+const PAGE_BYTES = 2 * MAX_MESSAGE_BYTES;
 const MAX_INVITE_TTL_S = 24 * 60 * 60;
 const MAX_PAKE_CHARS = 1024;
 const MAX_WAIT_S = 30;
@@ -39,6 +41,10 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/") return new Response(ABOUT);
+    if (request.method !== "GET") {
+      const { success } = await env.WRITES.limit({ key: request.headers.get("CF-Connecting-IP") ?? "" });
+      if (!success) return text("too many writes from this address; try again in a minute", 429);
+    }
     const [kind, id, action] = url.pathname.split("/").slice(1);
     if (kind === "g" && GROUP.test(id ?? "")) return env.GROUPS.get(env.GROUPS.idFromName(id)).fetch(request);
     if (kind !== "i" || !SLOT.test(id ?? "")) return text("not found", 404);
@@ -74,7 +80,7 @@ export class Group extends DurableObject<Env> {
     if (request.method !== "POST") return text("method not allowed", 405);
 
     const data = new Uint8Array(await request.arrayBuffer());
-    if (data.length > MAX_MESSAGE_BYTES) return text("message too large", 413);
+    if (data.length > MAX_MESSAGE_BYTES) return text("message too large (limit 1 MiB)", 413);
     let header: Header;
     try {
       header = parseHeader(data);
@@ -110,10 +116,16 @@ export class Group extends DurableObject<Env> {
     return this.sql.exec<{ epoch: number }>("SELECT epoch FROM state").toArray()[0]?.epoch ?? 0;
   }
 
+  // A page stops before PAGE_BYTES, so a large backlog never has to fit in memory at once; clients fetch until a page is empty.
   private since(after: number) {
-    return this.sql.exec<{ seq: number; data: ArrayBuffer }>(
-      "SELECT seq, data FROM messages WHERE seq > ? ORDER BY seq LIMIT 500", after
-    ).toArray().map(row => ({ seq: row.seq, data: base64(new Uint8Array(row.data)) }));
+    const page: { seq: number; data: string }[] = [];
+    let bytes = 0;
+    for (const row of this.sql.exec<{ seq: number; data: ArrayBuffer }>("SELECT seq, data FROM messages WHERE seq > ? ORDER BY seq", after)) {
+      bytes += row.data.byteLength;
+      if (bytes > PAGE_BYTES) break;
+      page.push({ seq: row.seq, data: base64(new Uint8Array(row.data)) });
+    }
+    return page;
   }
 }
 

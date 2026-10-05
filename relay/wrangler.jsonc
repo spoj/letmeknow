@@ -12,6 +12,9 @@
       { "name": "INVITES", "class_name": "Invite" }
     ]
   },
+  "ratelimits": [
+    { "name": "WRITES", "namespace_id": "4170", "simple": { "limit": 600, "period": 60 } }
+  ],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Question"] },
     { "tag": "v2", "deleted_classes": ["Question"] },

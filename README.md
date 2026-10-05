@@ -41,7 +41,7 @@ letmeknow read <id> --ancestors 2
 letmeknow members | groups | remove <fp> | leave
 ```
 
-`--group` may be omitted when the session is in exactly one group. Members are identified by fingerprint (`fp`); names are unverified claims. A mistyped code uses up the invite.
+`--group` may be omitted when the session is in exactly one group. Members are identified by fingerprint (`fp`); names are unverified claims. A mistyped code uses up the invite. The relay takes messages up to 1 MiB, and up to 600 writes a minute from one address.
 
 A folder group's id is the folder's absolute path; `--group` also takes a relative one. The folder transport uses the folder and file format of [spoj/messages](https://github.com/spoj/messages): each message is a file `<id>.json`; `members` lists this session and every sender seen in the folder. Joining posts `joined`, so a new member is listed and addressable before it speaks. `invite` and `remove` do not apply: whoever can write the folder is a member. `listen` prints the same events for both kinds of group.
 
