@@ -10,9 +10,9 @@ HOME = tempfile.mkdtemp(prefix="lmk-e2e-")
 ENV = {**os.environ, "LETMEKNOW_HOME": HOME, "LETMEKNOW_RELAY": RELAY, "NO_PROXY": "localhost,127.0.0.1"}
 
 
-def run(session, *args, ok=True, env=ENV, cwd=None):
+def run(session, *args, ok=True, env=ENV, cwd=None, input=None):
     flags = ["--session", session] if session else []
-    result = subprocess.run([BIN, *flags, *args], env=env, cwd=cwd, capture_output=True, text=True, timeout=60)
+    result = subprocess.run([BIN, *flags, *args], env=env, cwd=cwd, input=input, capture_output=True, text=True, timeout=60)
     if ok and result.returncode:
         sys.exit(f"{session} {args}: {result.stderr}")
     return json.loads(result.stdout) if result.returncode == 0 else result.stderr
@@ -58,6 +58,13 @@ class Listener:
             sys.exit(f"{self.session}: listen ignored SIGTERM")
 
 
+def in_state(listener, *texts):
+    """Whether any of `texts` appears in the files of the listener's state directory."""
+    state = listener.ready["state"]
+    files = [os.path.join(state, f) for f in os.listdir(state)]
+    return any(text in open(f, "rb").read() for f in files if os.path.isfile(f) for text in texts)
+
+
 def check(condition, message):
     if not condition:
         sys.exit(f"FAIL: {message}")
@@ -101,9 +108,18 @@ def main():
         history = run("alice", "read", reply, "--ancestors", "1")
         check([m["id"] for m in history] == [hello, reply], "bob's read frontier covers alice's message")
         check([m["content"] for m in history] == [None, None], "the text of delivered messages is not kept")
-        state = alice.ready["state"]
-        files = [os.path.join(state, f) for f in os.listdir(state) if os.path.isfile(os.path.join(state, f))]
-        check(not any(text in open(f, "rb").read() for f in files for text in (b"hello bob", b"hi alice")), "not even in the session's files")
+        check(not in_state(alice, b"hello bob", b"hi alice"), "not even in the session's files")
+
+        token = os.path.join(HOME, "token.txt")
+        with open(token, "w") as f:
+            f.write("s3cret-token")
+        run("alice", "send", "--attach", token, "the staging token")
+        got = bob.expect(lambda e: e["type"] == "message")
+        attachment = got["attachment"]
+        with open(attachment) as f:
+            check(got["content"] == "the staging token" and f.read() == "s3cret-token", "an attachment arrives as a file, with the text")
+        check(os.name == "nt" or os.stat(attachment).st_mode & 0o777 == 0o600, "that only its owner can read")
+        check(not in_state(alice, b"s3cret") and not in_state(bob, b"s3cret"), "and that is its only copy")
 
         slot = run("bob", "invite", "--group", group)["code"].split("-")[0]
         check("wrong invite code" in run("carol", "join", f"{slot}-wrong-guess", ok=False), "a wrong code fails for the joiner")
@@ -131,6 +147,7 @@ def main():
         alice.expect(lambda e: e["type"] == "left" and e["member"]["name"] == "Bob")
         bob.expect(lambda e: e["type"] == "removed")
         check([m["name"] for m in run("alice", "members")["members"]] == ["Alice"], "leaving is committed by a remaining member")
+        check(not os.path.exists(attachment), "attachments are deleted when the session leaves the group")
 
         dave = Listener("dave")
         listeners.append(dave)
@@ -179,6 +196,9 @@ def main():
             data = f.read()
         check(hashlib.sha256(data).hexdigest() == reply and json.loads(data) == {"from": {"name": "Frank", "fp": frank_fp},
               "content": "hi erin", "after": [hello], "to": [erin_fp], "reply_to": hello}, "the file is the message plus from, named by its hash")
+        run("frank", "send", "--attach", "-", "from stdin", input="piped")
+        with open(erin.expect(lambda e: e["type"] == "message")["attachment"]) as f:
+            check(f.read() == "piped", "--attach - reads stdin; folder groups carry attachments too")
 
         hand = {"from": {"name": "Hand", "fp": "00"}, "after": []}
         partial, temp = (json.dumps({**hand, "content": text}).encode() for text in ("was partial", "was temp"))

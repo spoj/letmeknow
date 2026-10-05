@@ -60,6 +60,9 @@ pub enum Request {
         /// Deliver at once to every member, not only those addressed
         #[arg(long)]
         urgent: bool,
+        /// File to attach ("-" reads stdin); recipients get the path of a private copy, not the content
+        #[arg(long, value_name = "FILE")]
+        attach: Option<String>,
         text: String,
     },
     /// Show a message and its causal history
@@ -115,6 +118,9 @@ struct Payload {
     reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     urgent: bool,
+    /// Base64 file content. Recipients get it as a private file; the session's log never holds it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachment: Option<String>,
 }
 
 /// Reads `to` as a list, or as the single fingerprint that 0.4 wrote, so older folder files and stored messages still parse.
@@ -179,6 +185,7 @@ pub struct Session {
     held: Vec<Value>,
     held_since: Option<Instant>,
     keep_log: bool,
+    attachments: PathBuf,
     events: mpsc::UnboundedSender<Event>,
 }
 
@@ -231,6 +238,7 @@ impl Session {
             held: Vec::new(),
             held_since: None,
             keep_log,
+            attachments: dir.join("attachments"),
             events,
         };
         let rows: Vec<(String, String, u64)> = session
@@ -287,7 +295,7 @@ impl Session {
                     self.warn(Some(&gid), format!("ignored files not named by the SHA-256 of their content: {}", ignored.join(", ")));
                 }
                 for (id, record) in records {
-                    if let Err(error) = self.ingest(&gid, &id, record) {
+                    if let Err(error) = self.ingest(&gid, &id, json!(record.from), record.payload) {
                         self.warn(Some(&gid), format!("{error:#}"));
                     }
                 }
@@ -309,7 +317,7 @@ impl Session {
         match request {
             Request::Invite { group } => self.invite(group).await,
             Request::Join { target } => self.join_folder(target).await,
-            Request::Send { group, to, reply_to, urgent, text } => self.send(group, to, reply_to, urgent, text).await,
+            Request::Send { group, to, reply_to, urgent, attach, text } => self.send(group, to, reply_to, urgent, attach, text).await,
             Request::Read { id, ancestors } => self.read(&id, ancestors),
             Request::Members { group } => {
                 let gid = self.resolve(group)?;
@@ -411,7 +419,7 @@ impl Session {
             self.backlog.insert(gid.clone(), Vec::new());
             self.watch(gid.clone());
             self.print(json!({ "type": "joined", "group": gid, "member": self.person }));
-            self.send(Some(gid.clone()), Vec::new(), None, false, "joined".into()).await?;
+            self.send(Some(gid.clone()), Vec::new(), None, false, None, "joined".into()).await?;
         }
         Ok(json!({ "group": gid, "members": self.members(&gid)? }))
     }
@@ -475,7 +483,15 @@ impl Session {
         Ok(json!({ "group": gid, "members": self.members(&gid)? }))
     }
 
-    async fn send(&mut self, group: Option<String>, to: Vec<String>, reply_to: Option<String>, urgent: bool, text: String) -> Result<Value> {
+    async fn send(
+        &mut self,
+        group: Option<String>,
+        to: Vec<String>,
+        reply_to: Option<String>,
+        urgent: bool,
+        attachment: Option<String>,
+        text: String,
+    ) -> Result<Value> {
         let gid = self.resolve(group)?;
         let members = self.members(&gid)?;
         if let Some(to) = to.iter().find(|to| !members.iter().any(|m| m["fp"] == to.as_str())) {
@@ -486,7 +502,7 @@ impl Session {
         {
             bail!("unknown message {reply_to}");
         }
-        let payload = Payload { to, reply_to, urgent, after: self.tips(&gid)?, content: Some(text) };
+        let mut payload = Payload { to, reply_to, urgent, attachment, after: self.tips(&gid)?, content: Some(text) };
         let id = if self.groups.contains_key(&gid) {
             let bytes = serde_json::to_vec(&payload)?;
             self.post_retrying(&gid, |mls, provider, signer| Ok(mls.create_message(provider, signer, &bytes)?)).await?.0
@@ -498,6 +514,7 @@ impl Session {
             std::fs::rename(&temp, dir.join(format!("{id}.json")))?;
             id
         };
+        payload.attachment = None;
         self.db.execute(
             "INSERT INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
             params![id, gid, self.person.to_string(), serde_json::to_string(&payload)?],
@@ -582,13 +599,7 @@ impl Session {
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(message) => {
-                let payload: Payload = serde_json::from_slice(&message.into_bytes())?;
-                self.db.execute(
-                    "INSERT OR IGNORE INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
-                    params![id, gid, sender.to_string(), serde_json::to_string(&payload)?],
-                )?;
-                let item = self.message_json(gid, id, sender, &payload);
-                self.deliver(gid, item);
+                self.ingest(gid, id, sender, serde_json::from_slice(&message.into_bytes())?)?;
             }
             ProcessedMessageContent::ProposalMessage(proposal) => {
                 if !matches!(proposal.proposal(), Proposal::Remove(_)) {
@@ -740,6 +751,10 @@ impl Session {
         for table in ["groups", "folders", "messages"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [gid])?;
         }
+        let attachments = self.attachments.join(&digest(gid.as_bytes())[..16]);
+        if attachments.exists() {
+            std::fs::remove_dir_all(attachments)?;
+        }
         Ok(())
     }
 
@@ -814,16 +829,24 @@ impl Session {
         self.folders.insert(gid, Folder { _watcher: watcher, _wake: wake });
     }
 
-    fn ingest(&mut self, gid: &str, id: &str, record: Record) -> Result<()> {
-        let (sender, payload) = (json!(record.from), record.payload);
+    /// Logs a received message and delivers it, with its attachment written to a file only this user can read.
+    fn ingest(&mut self, gid: &str, id: &str, sender: Value, mut payload: Payload) -> Result<()> {
+        let attachment = payload.attachment.take().map(|data| B64.decode(data)).transpose()?;
         let inserted = self.db.execute(
             "INSERT OR IGNORE INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
             params![id, gid, sender.to_string(), serde_json::to_string(&payload)?],
         )?;
-        if inserted > 0 {
-            let item = self.message_json(gid, id, sender, &payload);
-            self.deliver(gid, item);
+        if inserted == 0 {
+            return Ok(());
         }
+        let mut item = self.message_json(gid, id, sender, &payload);
+        if let Some(bytes) = attachment {
+            let dir = self.attachments.join(&digest(gid.as_bytes())[..16]);
+            std::fs::create_dir_all(&dir)?;
+            crate::private_file(&dir.join(id), &bytes)?;
+            item["attachment"] = json!(dir.join(id));
+        }
+        self.deliver(gid, item);
         Ok(())
     }
 

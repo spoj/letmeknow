@@ -37,6 +37,7 @@ letmeknow invite --group <group>     # invite into an existing group; any member
 letmeknow join <code or link>        # waits until the inviter admits this session
 letmeknow join ./chat                # folder group: a path with a slash, or an existing directory; created if missing
 letmeknow send "text"                # or: send --to <fp> [--to <fp>] --reply-to <id> --urgent -   (stdin)
+letmeknow send --attach token.txt "staging token"   # recipients get the path of a private copy, not the content
 letmeknow read <id> --ancestors 2
 letmeknow members | groups | remove <fp> | leave
 ```

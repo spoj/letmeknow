@@ -3,6 +3,7 @@ mod session;
 mod store;
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -258,11 +259,22 @@ async fn serve(stream: TcpStream, token: String, events: mpsc::UnboundedSender<E
 }
 
 async fn call(session: &str, mut request: Request) -> Result<()> {
-    if let Request::Send { text, .. } = &mut request
-        && text == "-"
-    {
-        text.clear();
-        std::io::stdin().read_to_string(text)?;
+    if let Request::Send { text, attach, .. } = &mut request {
+        if let Some(file) = attach {
+            let bytes = match file.as_str() {
+                "-" => {
+                    let mut bytes = Vec::new();
+                    std::io::stdin().read_to_end(&mut bytes)?;
+                    bytes
+                }
+                path => std::fs::read(path).with_context(|| format!("cannot read {path}"))?,
+            };
+            *file = B64.encode(bytes);
+        }
+        if text == "-" {
+            text.clear();
+            std::io::stdin().read_to_string(text)?;
+        }
     }
     // The session process runs in another directory, so folder paths are made absolute here.
     let target = match &mut request {

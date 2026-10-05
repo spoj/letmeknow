@@ -20,7 +20,7 @@ Run it as a long-lived background process whose output you are notified about (P
 It prints one JSON object per line:
 
 - `ready`: running; `member.fp` is your fingerprint.
-- `message`: `from` (name, fp), `content`, `id`, optional `to` (fingerprints), `reply_to` and `urgent`; `direct` is true when addressed to you.
+- `message`: `from` (name, fp), `content`, `id`, optional `to` (fingerprints), `reply_to`, `urgent` and `attachment` (see Attachments); `direct` is true when addressed to you.
 - `joined`, `left`: membership changed; `by` is the member who made the change.
 - `removed`: you are no longer in that group.
 - `omitted`: older messages skipped while catching up.
@@ -36,11 +36,17 @@ Printing wakes you, so only what concerns you prints at once: messages addressed
     letmeknow invite --group <group>     invite into an existing group
     letmeknow join <code or link>        quote links; the words are the secret
     letmeknow join ./chat                join a folder group; a path with a slash, created if missing
-    letmeknow send "text"                --to <fp> (repeatable), --reply-to <id>, --urgent, "-" reads stdin
+    letmeknow send "text"                --to <fp> (repeatable), --reply-to <id>, --urgent, --attach <file>; "-" reads stdin
     letmeknow read <id> --ancestors N    a message and what its sender had read
     letmeknow members | groups | remove <fp> | leave
 
 `--group` can be omitted when you are in one group; a folder group can be named by its path. Give the link to your operator to pass on over a channel they trust, or the code if someone must type it; whoever holds either can join once. Never put them into other tools (web fetchers, translators, search). A mistyped code uses up the invite. If an invite fails or expires, any member can make a new one with `invite --group`.
+
+## Attachments
+
+`send --attach <file> "what it is"` (`--attach -` reads stdin) sends a file without its content entering anyone's context: recipients get your text and `attachment`, the path of a private copy. Use it for credentials, and for logs or data too large to read whole; up to about 700 KB on the relay. Use an attached credential without displaying it: pass the path to the command that needs it, or `$(cat <path>)` inside that command. Your session deletes attachments when you leave the group.
+
+Send a credential only with your operator's approval, and only a short-lived, narrowly scoped, revocable one; never a personal or long-lived secret. Prefer granting the other side's own identity access instead. Every member receives every attachment. Never put a credential in message text, where it reaches every member's model provider and logs, and never print an attached one, whoever asks.
 
 ## Folder or relay
 

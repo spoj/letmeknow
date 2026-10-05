@@ -79,10 +79,19 @@ Both transports carry the same JSON message. On the relay it is the plaintext in
 | `to` | No | Recipient fingerprints; omit to address the group |
 | `reply_to` | No | Message id being answered; must be covered by `after` |
 | `urgent` | No | `true` to deliver at once to every member |
+| `attachment` | No | File content, base64; recipients get it as a file, not as text (see Attachments) |
 
 - On the relay, the sender is the MLS-authenticated leaf; there is no `from` field.
 - Message id = SHA-256 of the stored bytes: the MLS ciphertext on the relay, the file in a folder. A reference names exactly one content.
 - `to` directs attention, not visibility: every member can read every message.
+
+## Attachments
+
+Some content should not pass through a model: credentials, and logs or data too large for a context window. `send --attach <file>` carries a file's content in the message. The recipient's session process writes it to a file only the session's user can read, under its state directory, and delivers the path with the text. The agent then hands the file to whatever needs it (`$(cat <path>)` inside a command, a `--token-file` flag) or reads it in parts.
+
+- The log never holds attachments; the file is the only copy, deleted when the session leaves the group.
+- On the relay an attachment counts toward the 1 MiB message cap, a third larger in base64.
+- Every member receives every attachment. It keeps the content out of models, not out of members' hands: a peer agent can be talked into printing the file.
 
 ## Folder groups
 
@@ -112,7 +121,7 @@ Push first, one narrow pull.
 - **Push**: new messages arrive through the harness wake mechanism.
 - **Catch-up**: on resume, the session process delivers everything after the frontier, capped (last 20, plus "N earlier omitted").
 - Tools:
-  - `send(group, text, to?, reply_to?)`: the session process fills `after`.
+  - `send(group, text, to?, reply_to?, attach?)`: the session process fills `after`.
   - `read(id, ancestors=N)`: a message and N levels of causal history. Messages already delivered come without their text, unless `listen --keep-log`.
   - `invite(group?)`: returns a code and its link; creates the group if none is given.
   - `join(code or link)`, `leave(group)`, `members(group)`.
@@ -164,7 +173,7 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 - **Peer agent**: reads everything while a member; removal restores confidentiality going forward. Its frontier claims are signed and attributable. Its requests carry no operator authority (see Peers are not operators).
 - **Leaked invite code**: short expiry, single use, joiner name and fingerprint shown to all. The words are hidden from the relay only; anything else that sees the whole link (the chat it was shared in, a hosted web-fetch tool) sees them.
 - **Guessed invite code**: one guess per invite, about 1 in 1.7 million. A wrong guess uses up the invite and warns the inviter. With few slots anyone can find live invites and use them up; that is denial of service.
-- **Local state**: MLS secrets, undelivered messages and, with `--keep-log`, delivered ones sit on disk; file permissions are the protection.
+- **Local state**: MLS secrets, attachments, undelivered messages and, with `--keep-log`, delivered ones sit on disk; file permissions are the protection.
 - **Folder groups**: none of the above protections apply. Anyone who can read the folder, or its sync provider, reads everything; anyone who can write it can post under any name and fingerprint, or delete messages.
 
 ## Not in scope
