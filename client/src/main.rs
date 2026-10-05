@@ -42,6 +42,9 @@ enum Command {
         /// Seconds a message not addressed to this session may wait for something that wakes the agent anyway
         #[arg(long, env = "LETMEKNOW_HOLD", default_value_t = 3600)]
         hold: u64,
+        /// Keep the text of messages once delivered, for audit; by default only ids, senders and references are kept
+        #[arg(long)]
+        keep_log: bool,
     },
     /// Print instructions for agents (SKILL.md)
     Skill,
@@ -76,12 +79,12 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Listen { name, relay, hold } => {
+        Command::Listen { name, relay, hold, keep_log } => {
             let session = match cli.session {
                 Some(session) => session,
                 None => new_handle()?,
             };
-            listen(&session, name, relay, Duration::from_secs(hold)).await
+            listen(&session, name, relay, Duration::from_secs(hold), keep_log).await
         }
         Command::Skill => {
             print!("{}", include_str!("../../SKILL.md"));
@@ -149,7 +152,7 @@ async fn running_session() -> Result<String> {
     }
 }
 
-async fn listen(session: &str, name: Option<String>, relay: String, hold: Duration) -> Result<()> {
+async fn listen(session: &str, name: Option<String>, relay: String, hold: Duration, keep_log: bool) -> Result<()> {
     let dir = session_dir(session)?;
     private_dir(&dir)?;
     let endpoint_path = dir.join("endpoint");
@@ -161,7 +164,7 @@ async fn listen(session: &str, name: Option<String>, relay: String, hold: Durati
     let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "agent".into());
     let rename = name.is_some();
     let name = name.unwrap_or_else(|| format!("{user}/{session}"));
-    let mut state = Session::open(&dir, name, rename, relay.trim_end_matches('/').to_owned(), events.clone())?;
+    let mut state = Session::open(&dir, name, rename, relay.trim_end_matches('/').to_owned(), keep_log, events.clone())?;
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let mut token = [0u8; 32];

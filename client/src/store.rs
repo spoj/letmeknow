@@ -28,7 +28,9 @@ pub struct Provider {
 
 impl Provider {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut storage = Storage::new(Connection::open(path)?);
+        let connection = Connection::open(path)?;
+        connection.execute_batch("PRAGMA secure_delete = ON")?;
+        let mut storage = Storage::new(connection);
         storage.run_migrations()?;
         Ok(Self { crypto: RustCrypto::default(), storage })
     }
@@ -53,7 +55,8 @@ impl OpenMlsProvider for Provider {
 }
 
 pub const SCHEMA: &str = "
-PRAGMA journal_mode = WAL;
+PRAGMA journal_mode = DELETE;
+PRAGMA secure_delete = ON;
 CREATE TABLE IF NOT EXISTS identity (name TEXT NOT NULL, public BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS groups (gid TEXT PRIMARY KEY, relay TEXT NOT NULL, cursor INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS folders (gid TEXT PRIMARY KEY);

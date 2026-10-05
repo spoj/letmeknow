@@ -19,10 +19,10 @@ def run(session, *args, ok=True, env=ENV, cwd=None):
 
 
 class Listener:
-    def __init__(self, session, env=ENV, hold=0):
+    def __init__(self, session, env=ENV, hold=0, extra=()):
         self.session, self.lines = session, queue.Queue()
         flags = ["--session", session, "listen", "--name", session.title()] if session else ["listen"]
-        self.proc = subprocess.Popen([BIN, *flags, "--hold", str(hold)], env=env, stdout=subprocess.PIPE, text=True, encoding="utf-8")
+        self.proc = subprocess.Popen([BIN, *flags, "--hold", str(hold), *extra], env=env, stdout=subprocess.PIPE, text=True, encoding="utf-8")
         threading.Thread(target=self.read, daemon=True).start()
         self.ready = self.expect(lambda e: e["type"] == "ready")
 
@@ -100,6 +100,10 @@ def main():
         check(got["reply_to"] == hello, "alice receives bob's reply")
         history = run("alice", "read", reply, "--ancestors", "1")
         check([m["id"] for m in history] == [hello, reply], "bob's read frontier covers alice's message")
+        check([m["content"] for m in history] == [None, None], "the text of delivered messages is not kept")
+        state = alice.ready["state"]
+        files = [os.path.join(state, f) for f in os.listdir(state) if os.path.isfile(os.path.join(state, f))]
+        check(not any(text in open(f, "rb").read() for f in files for text in (b"hello bob", b"hi alice")), "not even in the session's files")
 
         slot = run("bob", "invite", "--group", group)["code"].split("-")[0]
         check("wrong invite code" in run("carol", "join", f"{slot}-wrong-guess", ok=False), "a wrong code fails for the joiner")
@@ -148,7 +152,7 @@ def main():
         check(dave.expect(lambda e: e["type"] == "message")["content"] == "seen it", "and both sides still read each other")
 
         folder = os.path.join(HOME, "shared", "chat")
-        erin, frank = Listener("erin"), Listener("frank")
+        erin, frank = Listener("erin", extra=["--keep-log"]), Listener("frank")
         listeners += [erin, frank]
         erin_fp, frank_fp = erin.ready["member"]["fp"], frank.ready["member"]["fp"]
         check(run("erin", "join", folder)["group"] == folder and os.path.isdir(folder), "joining a folder creates it; the group is its path")
@@ -168,7 +172,9 @@ def main():
         reply = run("frank", "send", "--to", erin_fp, "--reply-to", hello, "hi erin")["id"]
         got = erin.expect(lambda e: e["type"] == "message")
         check(got["id"] == reply and got["direct"] and got["reply_to"] == hello, "erin receives frank's direct reply")
-        check([m["id"] for m in run("erin", "read", reply, "--ancestors", "1")] == [hello, reply], "frank's read frontier covers erin's message")
+        history = run("erin", "read", reply, "--ancestors", "1")
+        check([m["id"] for m in history] == [hello, reply], "frank's read frontier covers erin's message")
+        check([m["content"] for m in history] == ["hello frank", "hi erin"], "listen --keep-log keeps it")
         with open(os.path.join(folder, reply + ".json"), "rb") as f:
             data = f.read()
         check(hashlib.sha256(data).hexdigest() == reply and json.loads(data) == {"from": {"name": "Frank", "fp": frank_fp},

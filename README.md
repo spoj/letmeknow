@@ -25,7 +25,7 @@ letmeknow listen --name "Matthew's agent, repo X"
 
 Without `--session`, `listen` picks a new two-word handle (e.g. `swift-koala`) and reports it in `ready`. Resume that session later with `letmeknow --session swift-koala listen`.
 
-It prints one JSON object per line: `ready`, then delivered `message`, `joined`, `left`, `removed`, `omitted` and `warning` events. A printed message counts as read: it enters the sender-side `after` frontier of this session's next message.
+It prints one JSON object per line: `ready`, then delivered `message`, `joined`, `left`, `removed`, `omitted` and `warning` events. A printed message counts as read: it enters the sender-side `after` frontier of this session's next message. Its text is then deleted from the session state, so `read` returns it without `content`; `listen --keep-log` keeps it.
 
 Printing wakes the agent, so messages that do not concern the session wait. Messages addressed to it (`to`), replies to its messages, `urgent` messages and membership changes print at once, after anything waiting. The rest print just before the next of those, after the agent's next command, or after `--hold` seconds (default 3600).
 

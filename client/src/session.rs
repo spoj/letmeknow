@@ -107,7 +107,8 @@ pub struct Invite {
 /// A message as both transports carry it: MLS plaintext on the relay, the body of a folder file.
 #[derive(Clone, Serialize, Deserialize)]
 struct Payload {
-    content: String,
+    /// `None` in the session's log once delivered, unless `listen --keep-log`.
+    content: Option<String>,
     after: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "one_or_many")]
     to: Vec<String>,
@@ -178,14 +179,25 @@ pub struct Session {
     backlog: HashMap<String, Vec<Value>>,
     held: Vec<Value>,
     held_since: Option<Instant>,
+    keep_log: bool,
     events: mpsc::UnboundedSender<Event>,
 }
 
 impl Session {
-    pub fn open(dir: &Path, name: String, rename: bool, default_relay: String, events: mpsc::UnboundedSender<Event>) -> Result<Self> {
+    pub fn open(
+        dir: &Path,
+        name: String,
+        rename: bool,
+        default_relay: String,
+        keep_log: bool,
+        events: mpsc::UnboundedSender<Event>,
+    ) -> Result<Self> {
         let provider = Provider::open(&dir.join("mls.db"))?;
         let db = Connection::open(dir.join("session.db"))?;
         db.execute_batch(SCHEMA)?;
+        if !keep_log {
+            db.execute("UPDATE messages SET payload = json_remove(payload, '$.content') WHERE seen = 1", [])?;
+        }
         let stored: Option<(String, Vec<u8>)> =
             db.query_row("SELECT name, public FROM identity", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         let (name, signer) = match stored {
@@ -219,6 +231,7 @@ impl Session {
             backlog: HashMap::new(),
             held: Vec::new(),
             held_since: None,
+            keep_log,
             events,
         };
         let rows: Vec<(String, String, u64)> = session
@@ -470,11 +483,11 @@ impl Session {
             bail!("{to} is not a member of {gid}");
         }
         if let Some(reply_to) = &reply_to
-            && self.db.execute("UPDATE messages SET seen = 1 WHERE id = ? AND gid = ?", params![reply_to, gid])? == 0
+            && !self.mark_seen(&gid, reply_to)?
         {
             bail!("unknown message {reply_to}");
         }
-        let payload = Payload { to, reply_to, urgent, after: self.tips(&gid)?, content: text };
+        let payload = Payload { to, reply_to, urgent, after: self.tips(&gid)?, content: Some(text) };
         let id = if self.groups.contains_key(&gid) {
             let bytes = serde_json::to_vec(&payload)?;
             self.post_retrying(&gid, |mls, provider, signer| Ok(mls.create_message(provider, signer, &bytes)?)).await?.0
@@ -487,9 +500,10 @@ impl Session {
             id
         };
         self.db.execute(
-            "INSERT INTO messages (id, gid, sender, payload, seen) VALUES (?, ?, ?, ?, 1)",
+            "INSERT INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
             params![id, gid, self.person.to_string(), serde_json::to_string(&payload)?],
         )?;
+        self.mark_seen(&gid, &id)?;
         Ok(json!({ "id": id }))
     }
 
@@ -509,7 +523,7 @@ impl Session {
                     }
                     continue;
                 };
-                self.db.execute("UPDATE messages SET seen = 1 WHERE id = ?", [&id])?;
+                self.mark_seen(&gid, &id)?;
                 next.extend(payload.after.iter().cloned());
                 found.push(self.message_json(&gid, &id, sender, &payload));
             }
@@ -907,11 +921,17 @@ impl Session {
 
     fn print(&self, item: Value) {
         if item["type"] == "message"
-            && let Some(id) = item["id"].as_str()
+            && let (Some(gid), Some(id)) = (item["group"].as_str(), item["id"].as_str())
         {
-            let _ = self.db.execute("UPDATE messages SET seen = 1 WHERE id = ?", [id]);
+            let _ = self.mark_seen(gid, id);
         }
         println!("{item}");
+    }
+
+    /// Records that a message entered the agent's context. Its text is then deleted, unless `listen --keep-log`.
+    fn mark_seen(&self, gid: &str, id: &str) -> Result<bool> {
+        let forget = if self.keep_log { "" } else { ", payload = json_remove(payload, '$.content')" };
+        Ok(self.db.execute(&format!("UPDATE messages SET seen = 1{forget} WHERE id = ? AND gid = ?"), [id, gid])? > 0)
     }
 
     fn warn(&self, gid: Option<&str>, text: String) {

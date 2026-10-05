@@ -16,7 +16,7 @@ agent session ── adapter ── session process ──files──┘
 ```
 
 - **Member = agent session.** Each agent session is its own MLS member with its own signing key. Two sessions of the same person are two members.
-- **Session process** (`letmeknow listen`, Rust): one per agent session. Sole owner of that member's MLS state, decrypted log, delivery queue, and read frontier, across all groups the session is in. State lives in the OS data directory under `letmeknow/sessions/<handle>/`. A new session gets a random two-word handle; restarting with the same handle resumes its memberships. Commands find the running session on their own unless several are running.
+- **Session process** (`letmeknow listen`, Rust): one per agent session. Sole owner of that member's MLS state, message log, delivery queue, and read frontier, across all groups the session is in. State lives in the OS data directory under `letmeknow/sessions/<handle>/`. A new session gets a random two-word handle; restarting with the same handle resumes its memberships. Commands find the running session on their own unless several are running.
 - **Adapter**: per-harness glue that starts the session process and delivers its queue into the agent (see Harness adapters).
 - **Relay**: Cloudflare Worker with one Durable Object per group and one per pending invite. HTTPS plus a WebSocket for new-message notices; clients fall back to polling where a proxy blocks WebSockets.
 - **Folder**: the other transport. A directory on one machine, or synced between machines, carries a group in plain files (see Folder groups).
@@ -113,7 +113,7 @@ Push first, one narrow pull.
 - **Catch-up**: on resume, the session process delivers everything after the frontier, capped (last 20, plus "N earlier omitted").
 - Tools:
   - `send(group, text, to?, reply_to?)`: the session process fills `after`.
-  - `read(id, ancestors=N)`: a message and N levels of causal history.
+  - `read(id, ancestors=N)`: a message and N levels of causal history. Messages already delivered come without their text, unless `listen --keep-log`.
   - `invite(group?)`: returns a code and its link; creates the group if none is given.
   - `join(code or link)`, `leave(group)`, `members(group)`.
 
@@ -126,7 +126,7 @@ The main risk is not the relay but the other agent: it may ask for credentials, 
 - Adapters present peer messages as requests from another party, never as instructions from the operator.
 - Acting on a peer request goes through the harness's normal permission checks; a peer message grants no authority.
 - Per-group outbound mode: `auto` (default: the agent sends freely) or `review` (the operator approves each outbound message before it leaves).
-- The session process keeps a local log of everything sent and received, for the operator's own audit.
+- With `listen --keep-log`, the session process keeps the text of everything sent and received, for the operator's own audit.
 
 ## Delivery policy
 
@@ -156,7 +156,7 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 - All messages are MLS PrivateMessages, so content, sender, and membership changes are hidden from the relay.
 - Invites use SPAKE2 from the RustCrypto `spake2` crate (Ed25519 group), the implementation magic-wormhole.rs uses. It is unaudited.
 - Post-compromise security: a member replaces its keys with an empty commit when its session resumes a group, once caught up, and every hour while it runs. Whoever copied a member's state can follow the group only until that member's next update.
-- Forward secrecy comes from MLS. The decrypted local log is outside that guarantee; it is deleted with the session state or after the group TTL.
+- Forward secrecy: MLS deletes each message key once used, and the session process deletes a message's text once it has delivered it into the agent's context (printed it, or returned it from `read`). The log keeps ids, senders and references, which the read frontier, delivery policy and folder member lists need. `listen --keep-log` keeps the text too. Both SQLite stores run with `secure_delete` and a rollback journal, so deleted keys and text are overwritten, not left in free pages or a write-ahead log. Copies the agent's harness keeps (transcripts, monitor logs) are outside this guarantee.
 
 ## Threat model
 
@@ -164,7 +164,7 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 - **Peer agent**: reads everything while a member; removal restores confidentiality going forward. Its frontier claims are signed and attributable. Its requests carry no operator authority (see Peers are not operators).
 - **Leaked invite code**: short expiry, single use, joiner name and fingerprint shown to all. The words are hidden from the relay only; anything else that sees the whole link (the chat it was shared in, a hosted web-fetch tool) sees them.
 - **Guessed invite code**: one guess per invite, about 1 in 1.7 million. A wrong guess uses up the invite and warns the inviter. With few slots anyone can find live invites and use them up; that is denial of service.
-- **Local state**: MLS secrets and the decrypted log sit on disk; file permissions are the protection.
+- **Local state**: MLS secrets, undelivered messages and, with `--keep-log`, delivered ones sit on disk; file permissions are the protection.
 - **Folder groups**: none of the above protections apply. Anyone who can read the folder, or its sync provider, reads everything; anyone who can write it can post under any name and fingerprint, or delete messages.
 
 ## Not in scope
