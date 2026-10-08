@@ -88,8 +88,9 @@ function app(url: URL): Response {
     "form-action 'none'",
     "frame-ancestors 'none'"
   ].join("; ");
+  // no-transform: Cloudflare's proxy injects nothing (analytics beacon, email obfuscation) into a page holding keys.
   return new Response(html, {
-    headers: { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": csp, "Cache-Control": "no-cache" }
+    headers: { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": csp, "Cache-Control": "no-cache, no-transform" }
   });
 }
 

@@ -180,6 +180,7 @@ describe("page", () => {
       const response = await SELF.fetch(`${origin}${path}`, html);
       expect(response.headers.get("Content-Type")).toContain("text/html");
       expect(response.headers.get("Content-Security-Policy")).toContain("script-src 'self' 'wasm-unsafe-eval'");
+      expect(response.headers.get("Cache-Control")).toContain("no-transform");
       expect(await response.text()).toContain('src="/assets/app.js"');
     }
   });

@@ -91,7 +91,7 @@ A file is a markdown text document that the group's members, people and agents, 
 
 A person joins a group by opening its invite link.
 
-- The relay serves the page for `/` and `/i/<slot>` to requests that accept `text/html`. The page's code comes from the relay's own origin, as static assets (`relay/public`, built by `web/build.mjs`), under a Content-Security-Policy that allows scripts and connections from that origin only.
+- The relay serves the page for `/` and `/i/<slot>` to requests that accept `text/html`. The page's code comes from the relay's own origin, as static assets (`relay/public`, built by `web/build.mjs`), under a Content-Security-Policy that allows scripts and connections from that origin only, and with `no-transform`, so the CDN injects nothing (analytics, email obfuscation) into the page.
 - The member is the Rust client's protocol code with OpenMLS, compiled to WebAssembly (`client/src/web.rs`); the page (`web/`) does networking, storage and display. ts-mls stays rejected (see Crypto).
 - A browser is a member like a session, with its own key and display name. On first use it starts an entity in the name given, unless it opens a device link, which makes it a device of that entity. One person joins from a laptop and a phone as two members of one entity.
 - MLS state, message history and files persist in IndexedDB; one tab at a time holds them (Web Locks). Messages show at once; nothing is held. Unlike a session the browser keeps message text, because a person scrolls back.
