@@ -1,5 +1,5 @@
 mod device;
-mod files;
+mod doc;
 mod relay;
 mod session;
 mod store;
@@ -9,7 +9,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use session::{Event, FileOp, Request, Session};
+use session::{DocOp, Event, Request, Session};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -264,7 +264,7 @@ async fn serve(stream: TcpStream, token: String, events: mpsc::UnboundedSender<E
 }
 
 async fn call(session: &str, mut request: Request) -> Result<()> {
-    if let Request::Send { text, attach, .. } = &mut request {
+    if let Request::Send { text, attach, attach_name, .. } = &mut request {
         if let Some(file) = attach {
             let bytes = match file.as_str() {
                 "-" => {
@@ -274,6 +274,7 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
                 }
                 path => std::fs::read(path).with_context(|| format!("cannot read {path}"))?,
             };
+            *attach_name = Path::new(file.as_str()).file_name().map_or_else(|| "attachment".into(), |n| n.to_string_lossy().into_owned());
             *file = B64.encode(bytes);
         }
         if text == "-" {
@@ -282,11 +283,11 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
         }
     }
     // The session process reads the file itself, from another directory.
-    if let Request::File { op: FileOp::Attach { path, .. } } = &mut request {
+    if let Request::Doc { op: DocOp::Attach { path, .. } } = &mut request {
         let absolute: PathBuf = std::path::absolute(&*path)?.components().collect();
         *path = absolute.to_str().context("path is not UTF-8")?.to_owned();
     }
-    if let Request::File { op: FileOp::Edit { text, .. } | FileOp::Create { text, .. } } = &mut request {
+    if let Request::Doc { op: DocOp::Edit { text, .. } } = &mut request {
         let read = match text.as_str() {
             "-" => {
                 let mut text = String::new();
@@ -295,7 +296,7 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
             }
             path => std::fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?,
         };
-        // Files are LF only: the browser's editor counts "\r\n" as one character, the CRDT as two.
+        // The text is LF only: the browser's editor counts "\r\n" as one character, the CRDT as two.
         *text = read.replace("\r\n", "\n");
     }
     // The session process runs in another directory, so folder paths are made absolute here.
@@ -304,12 +305,8 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
         Request::Invite { group, .. } | Request::Open { group, .. } | Request::Name { group, .. } | Request::Send { group, .. } | Request::Members { group } | Request::Remove { group, .. } | Request::Leave { group } => {
             group.as_mut()
         }
-        Request::File {
-            op: FileOp::Ls { group } | FileOp::Show { group, .. } | FileOp::Edit { group, .. } | FileOp::Create { group, .. } | FileOp::Attach { group, .. } | FileOp::Fetch { group, .. },
-        } => {
-            group.as_mut()
-        }
-        Request::Read { .. } | Request::Groups | Request::Entity { .. } => None,
+        Request::Doc { op: DocOp::Show { group } | DocOp::Edit { group, .. } | DocOp::Attach { group, .. } } => group.as_mut(),
+        Request::Read { .. } | Request::Groups | Request::Fetch { .. } | Request::Entity { .. } => None,
     };
     if let Some(target) = target
         && !target.contains("://")

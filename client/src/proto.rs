@@ -18,44 +18,83 @@ pub const PAKE_ID: &[u8] = b"letmeknow invite v2";
 const MAX_PAST_EPOCHS: usize = 5;
 const WORDS: &str = include_str!("words.txt");
 
-/// A message as both transports carry it: MLS plaintext on the relay, the body of a folder file.
-/// A message with `settings` or `file` carries no text and stays out of the conversation: it is never
-/// delivered as a message, and never listed in `after`.
+/// The kinds of group: the one thing a group shares, fixed when it is made. A chat shares messages in order; a document
+/// (`doc`) shares one text that its members edit at once.
+pub const CHAT: &str = "chat";
+pub const DOC: &str = "doc";
+pub const KINDS: [&str; 2] = [CHAT, DOC];
+
+/// A message as both transports carry it: MLS plaintext on the relay, the body of a folder file. `settings` belongs to
+/// every kind of group, each other type to one kind.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Payload {
+    Settings(Settings),
+    /// A session joined a folder group, whose members are whoever wrote to it. A relay group's members are its MLS group's.
+    Joined,
+    Message(Message),
+    Edit(Edit),
+}
+
+impl Payload {
+    /// The kind of group this type belongs to; `None` for every kind.
+    pub fn kind(&self) -> Option<&'static str> {
+        match self {
+            Payload::Settings(_) | Payload::Joined => None,
+            Payload::Message(_) => Some(CHAT),
+            Payload::Edit(_) => Some(DOC),
+        }
+    }
+
+    /// The messages this one comes after (a chat message's read frontier), for ordering a folder's files.
+    pub fn after(&self) -> &[String] {
+        match self {
+            Payload::Message(message) => &message.after,
+            _ => &[],
+        }
+    }
+}
+
+/// A chat message.
 #[derive(Clone, Default, Serialize, Deserialize)]
-pub struct Payload {
+pub struct Message {
     /// `None` in a session's log once delivered, unless `listen --keep-log`.
     pub content: Option<String>,
+    /// The sender's read frontier: the latest messages it had seen.
     pub after: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "one_or_many")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub to: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub urgent: bool,
-    /// Base64 file content. Recipients get it as a private file; the session's log never holds it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub attachment: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub settings: Option<Settings>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file: Option<FileUpdate>,
+    pub attachment: Option<Attachment>,
 }
 
-/// A change to one of the group's files: a Yjs update. A file's first update, and the snapshot a member posts after
-/// adding someone, carry its name and its whole state.
+/// A file sent with a message: a blob's link (`lmk:<hash>#<key>`; in a folder group, a path in the folder), its name,
+/// size in bytes and media type, which may be empty.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct FileUpdate {
-    pub id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+pub struct Attachment {
+    pub link: String,
     pub name: String,
-    /// Base64 Yjs update, v1 encoding.
+    pub size: u64,
+    #[serde(default, rename = "type", skip_serializing_if = "String::is_empty")]
+    pub media: String,
+}
+
+/// A change to a document: a Yjs update, v1, in base64. The snapshot a member posts after adding someone is the whole
+/// state, as one.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Edit {
     pub update: String,
 }
 
-/// A group's settings, posted whole whenever one changes; the latest a member has seen wins. Whoever adds a member
-/// posts them again, so the new member has them too.
+/// A group's settings, posted whole whenever one changes; the latest a member has seen wins, except that `kind` never
+/// changes. A new member gets them with its welcome.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
+    pub kind: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     /// Entities whose sessions may join without an invite.
@@ -70,20 +109,6 @@ pub struct Settings {
 pub struct Opened {
     pub id: String,
     pub name: String,
-}
-
-/// Reads `to` as a list, or as the single fingerprint that 0.4 wrote, so older folder files and stored messages still parse.
-fn one_or_many<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum To {
-        One(String),
-        Many(Vec<String>),
-    }
-    Ok(match To::deserialize(deserializer)? {
-        To::One(fp) => vec![fp],
-        To::Many(fps) => fps,
-    })
 }
 
 pub fn create_config() -> MlsGroupCreateConfig {
@@ -148,13 +173,11 @@ fn open_bytes(key: &[u8; 32], label: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
     cipher.decrypt(&nonce.into(), Aad { msg: sealed, aad: label }).map_err(|_| anyhow::anyhow!("cannot decrypt: wrong key or tampered data"))
 }
 
-/// The relay's cap on a blob, sealed: its message cap.
-pub const MAX_BLOB_BYTES: usize = 1024 * 1024;
-/// What sealing adds to a blob: nonce and tag.
-pub const BLOB_OVERHEAD: usize = 12 + 16;
+/// The most a blob holds: the relay takes 10 MiB, sealed.
+pub const MAX_BLOB_BYTES: usize = 10 * 1024 * 1024;
 
-/// A blob is an image or other file that a group's files link as `lmk:<hash>#<key>`: sealed under a fresh key, which
-/// travels in the link, and stored by the SHA-256 of the sealed bytes.
+/// A blob is a file that a message or a document links as `lmk:<hash>#<key>`: sealed under a fresh key, which travels in
+/// the link, and stored on the relay by the SHA-256 of the sealed bytes.
 pub fn seal_blob(rand: &RustCrypto, key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
     seal_bytes(rand, key, b"blob", plaintext)
 }
@@ -184,7 +207,7 @@ pub fn blob_links(text: &str) -> Vec<(String, [u8; 32])> {
     links
 }
 
-/// The file extension of an image the browser shows inline: PNG, JPEG, GIF or WebP.
+/// The file extension of an image the browser shows inline, by its first bytes: PNG, JPEG, GIF or WebP.
 pub fn image_type(bytes: &[u8]) -> Option<&'static str> {
     match bytes {
         [0x89, b'P', b'N', b'G', ..] => Some("png"),
@@ -249,6 +272,6 @@ mod tests {
         assert_eq!(links[0].0, digest(&sealed));
         assert_eq!(open_blob(&links[0].1, &sealed).unwrap(), b"pixels");
         assert!(open_blob(&[0; 32], &sealed).is_err());
-        assert_eq!(sealed.len(), 6 + BLOB_OVERHEAD);
+        assert_eq!(sealed.len(), 6 + 12 + 16);
     }
 }

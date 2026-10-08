@@ -1,13 +1,13 @@
 use crate::device::{Device, Membership};
-use crate::files;
+use crate::doc;
 use crate::relay::{Notice, Relay, transient, whole};
 use crate::store::{Provider, SCHEMA};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::Subcommand;
 use letmeknow::proto::{
-    BLOB_OVERHEAD, CIPHERSUITE, FileUpdate, INVITE_SLOTS, INVITE_TTL_S, MAX_BLOB_BYTES, Opened, PAKE_ID, Payload, Settings, blob_link, blob_links, create_config, digest,
-    fingerprint, image_type, invite_key, invite_words, join_config, membership_changes, open, open_blob, person, random_below, seal, seal_blob,
+    Attachment, CHAT, CIPHERSUITE, DOC, Edit, INVITE_SLOTS, INVITE_TTL_S, KINDS, MAX_BLOB_BYTES, Message, Opened, PAKE_ID, Payload, Settings, blob_link, blob_links,
+    create_config, digest, fingerprint, image_type, invite_key, invite_words, join_config, membership_changes, open, open_blob, person, random_below, seal, seal_blob,
 };
 use letmeknow::entity::{self, JoinRequest, List, Member, Opening, place};
 use openmls::prelude::*;
@@ -24,7 +24,7 @@ use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError};
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use reqwest_websocket::{Message, WebSocket};
+use reqwest_websocket::{Message as Frame, WebSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -47,23 +47,32 @@ pub enum Request {
     Invite {
         #[arg(long)]
         group: Option<String>,
+        /// What a new group shares: a chat (messages in order) or a doc (one text everyone edits at once)
+        #[arg(long, value_parser = KINDS, default_value = CHAT, conflicts_with = "group")]
+        kind: String,
+        /// The new group's name
+        #[arg(long, conflicts_with = "group")]
+        name: Option<String>,
         /// What this session speaks as in a new group: one of its device's entities, "device" or "self" [default: the device's first entity]
         #[arg(long = "as", value_name = "ENTITY")]
         #[serde(rename = "as")]
         as_: Option<String>,
         /// Invite another device (a machine or a browser) into this entity, instead of a session into a group
-        #[arg(long, conflicts_with_all = ["group", "as_"])]
+        #[arg(long, conflicts_with_all = ["group", "as_", "name"])]
         entity: Option<String>,
     },
     /// Join a group through an invite code or link, or a shared folder (a path with a slash, or an existing directory); a device link adds this device to an entity
     Join {
         target: String,
+        /// What a new folder group shares: a chat or a doc; a folder that holds a group keeps its kind
+        #[arg(long, value_parser = KINDS, default_value = CHAT)]
+        kind: String,
         /// What this session speaks as in the group: one of its device's entities, "device" or "self" [default: the device's first entity]
         #[arg(long = "as", value_name = "ENTITY")]
         #[serde(rename = "as")]
         as_: Option<String>,
     },
-    /// Send a message ("-" reads the text from stdin)
+    /// Send a message in a chat ("-" reads the text from stdin)
     Send {
         #[arg(long)]
         group: Option<String>,
@@ -76,9 +85,13 @@ pub enum Request {
         /// Deliver at once to every member, not only those addressed
         #[arg(long)]
         urgent: bool,
-        /// File to attach ("-" reads stdin); recipients get the path of a private copy, not the content
+        /// File to attach, up to 10 MiB ("-" reads stdin); recipients get its link, which `fetch` turns into a private copy
         #[arg(long, value_name = "FILE")]
         attach: Option<String>,
+        /// The attached file's name, set from its path
+        #[arg(skip)]
+        #[serde(default)]
+        attach_name: String,
         text: String,
     },
     /// Show a message and its causal history
@@ -119,11 +132,14 @@ pub enum Request {
         group: Option<String>,
         name: String,
     },
-    /// The group's files: text documents every member can edit at once
-    File {
+    /// A doc group's text, which every member edits at once
+    Doc {
         #[command(subcommand)]
-        op: FileOp,
+        op: DocOp,
     },
+    /// The file an attachment's or the doc's link points to, decrypted into a file only you can read (in a folder group,
+    /// the file in the folder). Prints its path
+    Fetch { link: String },
     /// Entities this device is in: create one, list them, or take a member off one
     Entity {
         #[command(subcommand)]
@@ -133,50 +149,29 @@ pub enum Request {
 
 #[derive(Subcommand, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FileOp {
-    /// The group's files
-    Ls {
-        #[arg(long)]
-        group: Option<String>,
-    },
-    /// A file's text, and its version for `file edit --base`
+pub enum DocOp {
+    /// The text, and its version for `doc edit --base`
     Show {
         #[arg(long)]
         group: Option<String>,
-        file: String,
     },
-    /// Make the file's text that of PATH ("-" reads stdin), read at version --base: lines you changed are changed where they are now, so what others changed since stays
+    /// Make the text that of PATH ("-" reads stdin), read at version --base: lines you changed are changed where they are
+    /// now, so what others changed since stays
     Edit {
         #[arg(long)]
         group: Option<String>,
         #[arg(long)]
         base: String,
-        file: String,
         #[arg(value_name = "PATH")]
         text: String,
     },
-    /// Create a file holding the text of PATH ("-" reads stdin)
-    Create {
-        #[arg(long)]
-        group: Option<String>,
-        name: String,
-        #[arg(value_name = "PATH")]
-        text: String,
-    },
-    /// Make an image or other file linkable from the group's files: on the relay, uploaded encrypted (up to about 1 MiB);
-    /// in a folder group, linked by its path in the folder (copied into attachments/ if it is elsewhere). Prints the
-    /// markdown link to put into a file with `file edit`
+    /// Make an image or other file (up to 10 MiB) linkable from the text: on the relay, uploaded encrypted; in a folder
+    /// group, linked by its path in the folder (copied into attachments/ if it is elsewhere). Prints the markdown link to
+    /// put into the text with `doc edit`
     Attach {
         #[arg(long)]
         group: Option<String>,
         path: String,
-    },
-    /// The file a link in a file points to: a relay group's (lmk:<hash>#<key>) decrypted into a file only you can read,
-    /// a folder group's where it is in the folder; prints its path
-    Fetch {
-        #[arg(long)]
-        group: Option<String>,
-        link: String,
     },
 }
 
@@ -277,7 +272,7 @@ pub struct Session {
     home: PathBuf,
     /// Entity lists fetched lately, by entity id.
     lists: HashMap<String, (Instant, List)>,
-    /// Blobs linked from files that could not be fetched, warned about once.
+    /// Blobs a doc links that could not be fetched, warned about once.
     missing: HashSet<String>,
     /// Welcomes for admitted join requests not yet written to their reply box, by its address.
     replies: HashMap<String, String>,
@@ -293,8 +288,20 @@ impl Session {
         keep_log: bool,
         events: mpsc::UnboundedSender<Event>,
     ) -> Result<Self> {
+        let mut name = name;
+        let path = dir.join("session.db");
+        if path.exists() {
+            let old = Connection::open(&path)?;
+            if old.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))? == 0 {
+                // Made before groups had kinds: the session starts over, under its name.
+                name = old.query_row("SELECT name FROM identity", [], |r| r.get(0))?;
+                drop(old);
+                std::fs::remove_file(&path)?;
+                std::fs::remove_file(dir.join("mls.db"))?;
+            }
+        }
         let provider = Provider::open(&dir.join("mls.db"))?;
-        let db = Connection::open(dir.join("session.db"))?;
+        let db = Connection::open(&path)?;
         db.execute_batch(SCHEMA)?;
         if !keep_log {
             db.execute("UPDATE messages SET payload = json_remove(payload, '$.content') WHERE seen = 1", [])?;
@@ -364,7 +371,7 @@ impl Session {
 
     pub async fn handle(&mut self, event: Event) {
         match event {
-            Event::Request(Request::Join { target, as_ }, reply) if !Path::new(&target).is_absolute() => {
+            Event::Request(Request::Join { target, as_, .. }, reply) if !Path::new(&target).is_absolute() => {
                 let joined = if target.len() == 32 && target.chars().all(|c| c.is_ascii_hexdigit()) {
                     self.join_open(target, as_, reply).await
                 } else {
@@ -436,19 +443,21 @@ impl Session {
 
     async fn request(&mut self, request: Request) -> Result<Value> {
         match request {
-            Request::Invite { group, as_, entity } => self.invite(group, as_, entity).await,
-            Request::Join { target, .. } => self.join_folder(target).await,
-            Request::Send { group, to, reply_to, urgent, attach, text } => self.send(group, to, reply_to, urgent, attach, text).await,
+            Request::Invite { group, kind, name, as_, entity } => self.invite(group, kind, name, as_, entity).await,
+            Request::Join { target, kind, .. } => self.join_folder(target, kind).await,
+            Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
+                self.send(group, to, reply_to, urgent, attach.map(|data| (data, attach_name)), text).await
+            }
             Request::Read { id, ancestors } => self.read(&id, ancestors),
             Request::Members { group } => {
                 let gid = self.resolve(group)?;
-                Ok(json!({ "group": gid, "members": self.described_members(&gid).await? }))
+                Ok(json!({ "group": gid, "kind": self.settings(&gid)?.kind, "members": self.described_members(&gid).await? }))
             }
             Request::Groups => {
                 let mut groups = Vec::new();
                 for (gid, g) in &self.groups {
-                    let mut group = json!({ "group": gid, "members": g.mls.members().count(), "relay": g.relay, "epoch": g.mls.epoch().as_u64() });
                     let settings = self.settings(gid)?;
+                    let mut group = json!({ "group": gid, "kind": settings.kind, "members": g.mls.members().count(), "relay": g.relay, "epoch": g.mls.epoch().as_u64() });
                     if !settings.name.is_empty() {
                         group["name"] = json!(settings.name);
                     }
@@ -458,11 +467,11 @@ impl Session {
                     groups.push(group);
                 }
                 for gid in self.folders.keys() {
-                    groups.push(json!({ "group": gid, "members": self.members(gid)?.len(), "folder": gid }));
+                    groups.push(json!({ "group": gid, "kind": self.settings(gid)?.kind, "members": self.members(gid)?.len(), "folder": gid }));
                 }
                 for (opening, membership) in self.openings().await? {
                     if !self.groups.contains_key(&opening.group) {
-                        groups.push(json!({ "group": opening.group, "name": opening.name, "open_to": membership.name, "joined": false }));
+                        groups.push(json!({ "group": opening.group, "kind": opening.kind, "name": opening.name, "open_to": membership.name, "joined": false }));
                     }
                 }
                 Ok(Value::Array(groups))
@@ -475,14 +484,15 @@ impl Session {
                 let settings = Settings { name, ..self.settings(&gid)? };
                 self.set(&gid, settings).await
             }
-            Request::File { op } => self.file(op).await,
+            Request::Doc { op } => self.doc(op).await,
+            Request::Fetch { link } => self.fetch(link).await,
             Request::Entity { op: EntityOp::Create { name } } => self.entity_create(name).await,
             Request::Entity { op: EntityOp::List } => self.entities().await,
             Request::Entity { op: EntityOp::Remove { entity, member } } => self.entity_remove(entity, member).await,
         }
     }
 
-    async fn invite(&mut self, group: Option<String>, as_: Option<String>, entity: Option<String>) -> Result<Value> {
+    async fn invite(&mut self, group: Option<String>, kind: String, name: Option<String>, as_: Option<String>, entity: Option<String>) -> Result<Value> {
         // A device link announces itself in the pake message, so the joiner knows to send its device, not a key package.
         let (into, relay, kind) = match entity {
             Some(entity) => {
@@ -493,7 +503,7 @@ impl Session {
             None => {
                 let gid = match group {
                     Some(_) => self.resolve(group)?,
-                    None => self.create_group(as_.as_deref())?,
+                    None => self.create_group(as_.as_deref(), kind, name.unwrap_or_default()).await?,
                 };
                 let relay = self.groups.get(&gid).context("folder groups need no invite; share the folder path")?.relay.clone();
                 (Into::Group(gid), relay, "")
@@ -512,7 +522,7 @@ impl Session {
         }
         let id = slot.context("no free invite slot on the relay; try again")?;
         let target = match &into {
-            Into::Group(gid) => json!({ "group": gid }),
+            Into::Group(gid) => json!({ "group": gid, "kind": self.settings(gid)?.kind }),
             Into::Entity(membership) => json!({ "entity": membership.id, "name": membership.name }),
         };
         let invite = Box::new(Invite { relay: relay.clone(), id: id.clone(), owner, into });
@@ -587,20 +597,29 @@ impl Session {
             })
             .await?;
         let welcome = welcome.context("no welcome")?.to_bytes()?;
-        Ok(json!({ "group": gid, "seq": seq, "welcome": B64.encode(welcome) }))
+        Ok(json!({ "group": gid, "seq": seq, "welcome": B64.encode(welcome), "settings": self.settings(gid)? }))
     }
 
-    /// A folder has no membership record, so joining posts a message: senders are members, and this makes the new one visible and addressable before it speaks.
-    async fn join_folder(&mut self, gid: String) -> Result<Value> {
+    /// A folder has no membership record, so joining posts `joined`: whoever wrote to the folder is a member, and this
+    /// makes the new one visible and addressable before it speaks. A folder that holds no group yet gets one of `kind`.
+    async fn join_folder(&mut self, gid: String, kind: String) -> Result<Value> {
         if !self.folders.contains_key(&gid) {
             std::fs::create_dir_all(&gid)?;
             self.db.execute("INSERT INTO folders (gid) VALUES (?)", [&gid])?;
             self.backlog.insert(gid.clone(), Vec::new());
+            let held = scan(Path::new(&gid), &mut HashSet::new()).0.into_iter().find_map(|(_, record)| match record.payload {
+                Payload::Settings(settings) => Some(settings),
+                _ => None,
+            });
+            match held {
+                Some(settings) => self.store_settings(&gid, &settings)?,
+                None => _ = self.set(&gid, Settings { kind, ..Settings::default() }).await?,
+            }
+            self.post_payload(&gid, &Payload::Joined).await?;
             self.watch(gid.clone());
             self.print(json!({ "type": "joined", "group": gid, "member": self.person }));
-            self.send(Some(gid.clone()), Vec::new(), None, false, None, "joined".into()).await?;
         }
-        Ok(json!({ "group": gid, "members": self.members(&gid)? }))
+        Ok(json!({ "group": gid, "kind": self.settings(&gid)?.kind, "members": self.members(&gid)? }))
     }
 
     async fn join(&mut self, code: String, as_: Option<String>, reply: oneshot::Sender<Value>) -> Result<()> {
@@ -672,8 +691,10 @@ impl Session {
             bail!("welcome is for a different group");
         }
         self.add_group(&gid, relay, seq, mls)?;
+        let settings: Settings = serde_json::from_value(envelope["settings"].clone())?;
+        self.store_settings(&gid, &settings)?;
         self.print(json!({ "type": "joined", "group": gid, "member": self.person }));
-        Ok(json!({ "group": gid, "members": self.described_members(&gid).await? }))
+        Ok(json!({ "group": gid, "kind": settings.kind, "name": settings.name, "members": self.described_members(&gid).await? }))
     }
 
     async fn send(
@@ -682,10 +703,11 @@ impl Session {
         to: Vec<String>,
         reply_to: Option<String>,
         urgent: bool,
-        attachment: Option<String>,
+        attach: Option<(String, String)>,
         text: String,
     ) -> Result<Value> {
         let gid = self.resolve(group)?;
+        self.require(&gid, CHAT)?;
         let members = self.members(&gid)?;
         if let Some(to) = to.iter().find(|to| !members.iter().any(|m| m["fp"] == to.as_str())) {
             bail!("{to} is not a member of {gid}");
@@ -695,15 +717,45 @@ impl Session {
         {
             bail!("unknown message {reply_to}");
         }
-        let mut payload = Payload { to, reply_to, urgent, attachment, after: self.tips(&gid)?, content: Some(text), ..Payload::default() };
-        let id = self.post_payload(&gid, &payload).await?;
-        payload.attachment = None;
+        let attachment = match attach {
+            Some((data, name)) => Some(self.upload(&gid, &B64.decode(data)?, &name, Path::new(&name)).await?),
+            None => None,
+        };
+        let message = Message { to, reply_to, urgent, attachment, after: self.tips(&gid)?, content: Some(text) };
+        let id = self.post_payload(&gid, &Payload::Message(message.clone())).await?;
         self.db.execute(
             "INSERT INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
-            params![id, gid, self.person.to_string(), serde_json::to_string(&payload)?],
+            params![id, gid, self.person.to_string(), serde_json::to_string(&message)?],
         )?;
         self.mark_seen(&gid, &id)?;
         Ok(json!({ "id": id }))
+    }
+
+    /// Refuses what belongs to another kind of group.
+    fn require(&self, gid: &str, kind: &str) -> Result<()> {
+        match self.settings(gid)?.kind {
+            have if have == kind => Ok(()),
+            have if KINDS.contains(&have.as_str()) => bail!("{gid} is a {have} group; this works in a {kind} group"),
+            have => bail!("{gid} is a group of a kind this letmeknow does not know ({have:?}); upgrade it"),
+        }
+    }
+
+    /// Makes a file linkable: on the relay, a blob sealed under a fresh key (the link holds it); in a folder group, the
+    /// file's path in the folder, copied there from `source` if it is elsewhere.
+    async fn upload(&mut self, gid: &str, bytes: &[u8], name: &str, source: &Path) -> Result<Attachment> {
+        if bytes.len() > MAX_BLOB_BYTES {
+            bail!("{name} is {} bytes; files go up to {MAX_BLOB_BYTES}", bytes.len());
+        }
+        let link = if self.groups.contains_key(gid) {
+            let key = self.provider.rand().random_array()?;
+            let sealed = seal_blob(self.provider.rand(), &key, bytes)?;
+            self.put_blob(gid, &digest(&sealed), &sealed).await?;
+            blob_link(&key, &sealed)
+        } else {
+            folder_link(gid, source, name, bytes)?
+        };
+        let media = image_type(bytes).map(|t| format!("image/{}", if t == "jpg" { "jpeg" } else { t })).unwrap_or_default();
+        Ok(Attachment { link, name: name.to_owned(), size: bytes.len() as u64, media })
     }
 
     /// Posts a message to the relay or writes it to the folder; returns its id.
@@ -770,145 +822,122 @@ impl Session {
 
     /// Changes the group's settings for everyone in it.
     async fn set(&mut self, gid: &str, settings: Settings) -> Result<Value> {
-        self.post_payload(gid, &Payload { settings: Some(settings.clone()), ..Payload::default() }).await?;
+        self.post_payload(gid, &Payload::Settings(settings.clone())).await?;
         self.store_settings(gid, &settings)?;
         Ok(json!({ "group": gid, "settings": settings }))
     }
 
-    /// What a member who was just added needs from the others, who keep it: the settings, and a snapshot of every file.
-    /// It cannot read anything sent before it joined.
+    /// What a member just added needs from the others, who keep it: in a doc group, the text, as one edit, and the blobs it
+    /// links, kept on the relay. It cannot read what was sent before it joined; its welcome brought the settings.
     async fn post_state(&mut self, gid: &str) -> Result<()> {
+        if self.settings(gid)?.kind != DOC {
+            return Ok(());
+        }
         self.refresh_blobs(gid).await?;
-        let settings = self.settings(gid)?;
-        if settings != Settings::default() {
-            self.post_payload(gid, &Payload { settings: Some(settings), ..Payload::default() }).await?;
-        }
-        for (id, name, state) in self.files(gid)? {
-            self.post_file(gid, &id, &name, &state).await?;
-        }
+        let state = self.text(gid)?;
+        self.post_payload(gid, &Payload::Edit(Edit { update: B64.encode(&state) })).await?;
         Ok(())
     }
 
-    fn files(&self, gid: &str) -> Result<Vec<(String, String, Vec<u8>)>> {
-        Ok(self
-            .db
-            .prepare("SELECT id, name, state FROM files WHERE gid = ? ORDER BY rowid")?
-            .query_map([gid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<Result<_, _>>()?)
+    /// A doc group's text as this member has it: empty until the first edit arrives.
+    fn text(&self, gid: &str) -> Result<Vec<u8>> {
+        let state: Option<Vec<u8>> = self.db.query_row("SELECT state FROM docs WHERE gid = ?", [gid], |r| r.get(0)).optional()?;
+        Ok(state.unwrap_or_else(|| doc::new("")))
     }
 
-    /// A file by id, or by name if only one file has it.
-    fn find_file(&self, gid: &str, file: &str) -> Result<(String, String, Vec<u8>)> {
-        let mut found: Vec<_> = self.files(gid)?.into_iter().filter(|(id, name, _)| id == file || name == file).collect();
-        match found.len() {
-            1 => Ok(found.remove(0)),
-            0 => bail!("no file {file} in {gid}"),
-            n => bail!("{n} files are named {file}; use the id from `file ls`"),
-        }
-    }
-
-    fn store_file(&self, gid: &str, id: &str, name: &str, state: &[u8]) -> Result<()> {
-        self.db.execute(
-            "INSERT INTO files (gid, id, name, state) VALUES (?, ?, ?, ?)
-             ON CONFLICT (gid, id) DO UPDATE SET state = excluded.state, name = CASE WHEN excluded.name = '' THEN name ELSE excluded.name END",
-            params![gid, id, name, state],
-        )?;
+    fn store_text(&self, gid: &str, state: &[u8]) -> Result<()> {
+        self.db.execute("INSERT INTO docs (gid, state) VALUES (?, ?) ON CONFLICT (gid) DO UPDATE SET state = excluded.state", params![gid, state])?;
         Ok(())
     }
 
-    /// Records a version shown to the agent, which a later `file edit --base` may build on.
-    fn keep_version(&self, gid: &str, id: &str, state: &[u8]) -> Result<String> {
-        let version = files::version(state);
-        self.db.execute("INSERT OR IGNORE INTO versions (gid, file, version, state) VALUES (?, ?, ?, ?)", params![gid, id, version, state])?;
+    /// Records a version shown to the agent, which a later `doc edit --base` may build on.
+    fn keep_version(&self, gid: &str, state: &[u8]) -> Result<String> {
+        let version = doc::version(state);
+        self.db.execute("INSERT OR IGNORE INTO versions (gid, version, state) VALUES (?, ?, ?)", params![gid, version, state])?;
         Ok(version)
     }
 
-    async fn post_file(&mut self, gid: &str, id: &str, name: &str, update: &[u8]) -> Result<()> {
-        let file = FileUpdate { id: id.to_owned(), name: name.to_owned(), update: B64.encode(update) };
-        self.post_payload(gid, &Payload { file: Some(file), ..Payload::default() }).await?;
-        Ok(())
-    }
-
-    async fn file(&mut self, op: FileOp) -> Result<Value> {
+    async fn doc(&mut self, op: DocOp) -> Result<Value> {
         match op {
-            FileOp::Ls { group } => {
+            DocOp::Show { group } => {
                 let gid = self.resolve(group)?;
+                self.require(&gid, DOC)?;
                 self.catch_up_now(&gid).await?;
-                let mut listed = Vec::new();
-                for (id, name, state) in self.files(&gid)? {
-                    listed.push(json!({ "file": id, "name": name, "version": files::version(&state), "lines": files::text(&state)?.lines().count() }));
-                }
-                Ok(Value::Array(listed))
+                let state = self.text(&gid)?;
+                Ok(json!({ "group": gid, "version": self.keep_version(&gid, &state)?, "text": doc::text(&state)? }))
             }
-            FileOp::Show { group, file } => {
+            DocOp::Edit { group, base, text } => {
                 let gid = self.resolve(group)?;
+                self.require(&gid, DOC)?;
                 self.catch_up_now(&gid).await?;
-                let (id, name, state) = self.find_file(&gid, &file)?;
-                let version = self.keep_version(&gid, &id, &state)?;
-                Ok(json!({ "file": id, "name": name, "version": version, "text": files::text(&state)? }))
-            }
-            FileOp::Edit { group, base, file, text } => {
-                let gid = self.resolve(group)?;
-                self.catch_up_now(&gid).await?;
-                let (id, name, state) = self.find_file(&gid, &file)?;
+                let state = self.text(&gid)?;
                 let base_state: Vec<u8> = self
                     .db
-                    .query_row("SELECT state FROM versions WHERE gid = ? AND file = ? AND version = ?", params![gid, id, base], |r| r.get(0))
+                    .query_row("SELECT state FROM versions WHERE gid = ? AND version = ?", params![gid, base], |r| r.get(0))
                     .optional()?
-                    .with_context(|| format!("unknown version {base} of {name}; run `file show` for the current one"))?;
-                let (target, lost) = files::rebase(&files::text(&base_state)?, &text, &files::text(&state)?);
-                let update = files::edit(&state, &target)?;
-                let merged = files::apply(Some(&state), &update)?;
-                self.post_file(&gid, &id, "", &update).await?;
-                self.store_file(&gid, &id, &name, &merged)?;
-                let version = self.keep_version(&gid, &id, &merged)?;
-                Ok(json!({ "file": id, "version": version, "merged": base != files::version(&state), "lost": lost, "text": files::text(&merged)? }))
+                    .with_context(|| format!("unknown version {base}; run `doc show` for the current one"))?;
+                let (target, lost) = doc::rebase(&doc::text(&base_state)?, &text, &doc::text(&state)?);
+                let update = doc::edit(&state, &target)?;
+                let merged = doc::apply(&state, &update)?;
+                self.post_payload(&gid, &Payload::Edit(Edit { update: B64.encode(&update) })).await?;
+                self.store_text(&gid, &merged)?;
+                let version = self.keep_version(&gid, &merged)?;
+                Ok(json!({ "group": gid, "version": version, "merged": base != doc::version(&state), "lost": lost, "text": doc::text(&merged)? }))
             }
-            FileOp::Create { group, name, text } => {
+            DocOp::Attach { group, path } => {
                 let gid = self.resolve(group)?;
-                let id = hex::encode(self.provider.rand().random_array::<8>()?);
-                let state = files::new(&text);
-                self.post_file(&gid, &id, &name, &state).await?;
-                self.store_file(&gid, &id, &name, &state)?;
-                Ok(json!({ "file": id, "name": name, "version": self.keep_version(&gid, &id, &state)? }))
-            }
-            FileOp::Attach { group, path } => {
-                let gid = self.resolve(group)?;
+                self.require(&gid, DOC)?;
                 let bytes = std::fs::read(&path).with_context(|| format!("cannot read {path}"))?;
                 let name = Path::new(&path).file_name().map_or_else(String::new, |n| n.to_string_lossy().replace(['[', ']'], ""));
-                let link = if self.groups.contains_key(&gid) {
-                    if bytes.len() + BLOB_OVERHEAD > MAX_BLOB_BYTES {
-                        bail!("{path} is {} bytes; files link at most {}", bytes.len(), MAX_BLOB_BYTES - BLOB_OVERHEAD);
-                    }
-                    let key = self.provider.rand().random_array()?;
-                    let sealed = seal_blob(self.provider.rand(), &key, &bytes)?;
-                    self.put_blob(&gid, &digest(&sealed), &sealed).await?;
-                    blob_link(&key, &sealed)
-                } else {
-                    folder_link(&gid, Path::new(&path), &name, &bytes)?
-                };
-                let markdown = format!("{}[{name}]({link})", if image_type(&bytes).is_some() { "!" } else { "" });
-                Ok(json!({ "link": link, "markdown": markdown }))
-            }
-            FileOp::Fetch { group, link } => {
-                let gid = self.resolve(group)?;
-                if !self.groups.contains_key(&gid) {
-                    let path = folder_path(&gid, &link)?;
-                    let bytes = std::fs::metadata(&path).with_context(|| format!("no file {} in the folder", path.display()))?.len();
-                    return Ok(json!({ "path": path, "bytes": bytes }));
-                }
-                let (hash, key) = blob_links(&link).into_iter().next().context("expected a link like lmk:<hash>#<key>")?;
-                let bytes = open_blob(&key, &self.blob(&gid, &hash).await?)?;
-                let dir = self.attachments.join(&digest(gid.as_bytes())[..16]);
-                std::fs::create_dir_all(&dir)?;
-                let path = match image_type(&bytes) {
-                    Some(extension) => dir.join(format!("{}.{extension}", &hash[..16])),
-                    None => dir.join(&hash[..16]),
-                };
-                crate::private_file(&path, &bytes)?;
-                Ok(json!({ "path": path, "bytes": bytes.len() }))
+                let attachment = self.upload(&gid, &bytes, &name, Path::new(&path)).await?;
+                let markdown = format!("{}[{name}]({})", if attachment.media.is_empty() { "" } else { "!" }, attachment.link);
+                Ok(json!({ "link": attachment.link, "markdown": markdown }))
             }
         }
+    }
+
+    /// The file a message's attachment or a doc's text links: a blob, decrypted into a file only this user can read, or in
+    /// a folder group the file in the folder.
+    async fn fetch(&mut self, link: String) -> Result<Value> {
+        let (gid, name) = self.linking(&link)?.context("no message or doc here links that")?;
+        if self.folders.contains_key(&gid) {
+            let path = folder_path(&gid, &link)?;
+            let bytes = std::fs::metadata(&path).with_context(|| format!("no file {} in the folder", path.display()))?.len();
+            return Ok(json!({ "path": path, "bytes": bytes }));
+        }
+        let (hash, key) = blob_links(&link).into_iter().next().context("expected a link like lmk:<hash>#<key>")?;
+        let bytes = open_blob(&key, &self.blob(&gid, &hash).await?)?;
+        let dir = self.attachments.join(&digest(gid.as_bytes())[..16]);
+        std::fs::create_dir_all(&dir)?;
+        let file = match (name, image_type(&bytes)) {
+            (Some(name), _) => format!("{}-{}", &hash[..16], name.replace(|c: char| !c.is_ascii_alphanumeric() && !"._-".contains(c), "-")),
+            (None, Some(extension)) => format!("{}.{extension}", &hash[..16]),
+            (None, None) => hash[..16].to_owned(),
+        };
+        crate::private_file(&dir.join(&file), &bytes)?;
+        Ok(json!({ "path": dir.join(file), "bytes": bytes.len() }))
+    }
+
+    /// The group whose messages or doc link `link`, and the name of the file if a message attached it.
+    fn linking(&self, link: &str) -> Result<Option<(String, Option<String>)>> {
+        let attached = self
+            .db
+            .query_row(
+                "SELECT gid, json_extract(payload, '$.attachment.name') FROM messages WHERE json_extract(payload, '$.attachment.link') = ?",
+                [link],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if attached.is_some() {
+            return Ok(attached);
+        }
+        let docs: Vec<(String, Vec<u8>)> = self.db.prepare("SELECT gid, state FROM docs")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        for (gid, state) in docs {
+            if doc::text(&state)?.contains(link) {
+                return Ok(Some((gid, None)));
+            }
+        }
+        Ok(None)
     }
 
     /// Stores a blob on the relay, and keeps it here too.
@@ -936,44 +965,44 @@ impl Session {
         Ok(self.db.query_row("SELECT data FROM blobs WHERE gid = ? AND hash = ?", params![gid, hash], |r| r.get(0)).optional()?)
     }
 
-    /// Every blob the group's files link.
+    /// Every blob a doc group's text links.
     fn links(&self, gid: &str) -> Result<Vec<String>> {
-        let mut links = Vec::new();
-        for (_, _, state) in self.files(gid)? {
-            links.extend(blob_links(&files::text(&state)?).into_iter().map(|(hash, _)| hash));
+        if self.settings(gid)?.kind != DOC {
+            return Ok(Vec::new());
         }
-        Ok(links)
+        Ok(blob_links(&doc::text(&self.text(gid)?)?).into_iter().map(|(hash, _)| hash).collect())
     }
 
-    /// Fetches the blobs that a relay group's files link and this member lacks: the relay keeps them only for its message
-    /// TTL, so members keep them, and pass them on to the members they add.
+    /// Fetches the blobs that a doc group's text links and this member lacks: the relay keeps a blob for 7 days after it
+    /// was last put or kept, so members keep them, and pass them on to the members they add.
     async fn keep_blobs(&mut self, gid: &str) -> Result<()> {
         for hash in self.links(gid)? {
-            let kept = self.db.query_row("SELECT 1 FROM blobs WHERE gid = ? AND hash = ?", params![gid, hash], |_| Ok(())).optional()?;
-            if kept.is_some() || self.missing.contains(&hash) {
+            if self.kept_blob(gid, &hash)?.is_some() || self.missing.contains(&hash) {
                 continue;
             }
             if let Err(error) = self.blob(gid, &hash).await {
-                self.warn(Some(gid), format!("a file links blob {hash}, which cannot be fetched: {error:#}"));
+                self.warn(Some(gid), format!("the text links a file that cannot be fetched: {error:#}"));
                 self.missing.insert(hash);
             }
         }
         Ok(())
     }
 
-    /// Puts every blob the group's files link, that this member keeps, on the relay again, so a member just added can
-    /// fetch it and it stays there as long as a file links it.
+    /// Keeps every blob the text links on the relay for a member just added: for another 7 days where the relay has it,
+    /// put again from this member's copy where it no longer does.
     async fn refresh_blobs(&self, gid: &str) -> Result<()> {
         let relay = &self.groups[gid].relay;
         for hash in self.links(gid)? {
-            if let Some(sealed) = self.kept_blob(gid, &hash)? {
+            if !self.relay.keep_blob(relay, gid, &hash).await?
+                && let Some(sealed) = self.kept_blob(gid, &hash)?
+            {
                 self.relay.put_blob(relay, gid, &hash, &sealed).await?;
             }
         }
         Ok(())
     }
 
-    /// Takes in what the relay has for a group now, so a file is read, or a message built, from where the group stands.
+    /// Takes in what the relay has for a group now, so the doc is read, or a message built, from where the group stands.
     async fn catch_up_now(&mut self, gid: &str) -> Result<()> {
         loop {
             let Some(group) = self.groups.get(gid) else { return Ok(()) };
@@ -1005,7 +1034,7 @@ impl Session {
         if settings.requests.is_empty() {
             settings.requests = hex::encode(self.provider.rand().random_array::<32>()?);
         }
-        let opening = Opening { group: gid.clone(), relay, name: settings.name.clone(), requests: settings.requests.clone(), closed: close };
+        let opening = Opening { group: gid.clone(), relay, kind: settings.kind.clone(), name: settings.name.clone(), requests: settings.requests.clone(), closed: close };
         let (address, key) = place("inbox", &hex::decode(&membership.secret)?);
         let sealed = seal(self.provider.rand(), &key, b"inbox", &serde_json::to_vec(&opening)?)?;
         self.relay.append(&membership.relay, &address, &sealed).await?;
@@ -1144,15 +1173,15 @@ impl Session {
                 if !visited.insert(id.clone()) {
                     continue;
                 }
-                let Some((gid, sender, payload)) = self.message(&id)? else {
+                let Some((gid, sender, message)) = self.message(&id)? else {
                     if depth == 0 {
                         bail!("unknown message {id}");
                     }
                     continue;
                 };
                 self.mark_seen(&gid, &id)?;
-                next.extend(payload.after.iter().cloned());
-                found.push(self.message_json(&gid, &id, sender, &payload));
+                next.extend(message.after.iter().cloned());
+                found.push(self.message_json(&gid, &id, sender, &message));
             }
             level = next;
         }
@@ -1216,8 +1245,8 @@ impl Session {
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(message) => {
                 let payload: Payload = serde_json::from_slice(&message.into_bytes())?;
-                // A file update is never shown, so it does not meet the sender's entity.
-                let sender = self.describe(gid, sender, payload.file.is_none()).await?;
+                // An edit is never shown, so it does not meet the sender's entity.
+                let sender = self.describe(gid, sender, !matches!(payload, Payload::Edit(_))).await?;
                 self.ingest(gid, id, sender, payload)?;
             }
             ProcessedMessageContent::ProposalMessage(proposal) => {
@@ -1336,12 +1365,14 @@ impl Session {
         }
     }
 
-    fn create_group(&mut self, as_: Option<&str>) -> Result<String> {
+    /// A new group of `kind`: its settings are its first message.
+    async fn create_group(&mut self, as_: Option<&str>, kind: String, name: String) -> Result<String> {
         let gid = hex::encode(self.provider.rand().random_array::<16>()?);
         let me = self.credential(as_)?;
         let mls = MlsGroup::new_with_group_id(&self.provider, &self.signer, &create_config(), GroupId::from_slice(gid.as_bytes()), me)?;
         let relay = self.default_relay.clone();
         self.add_group(&gid, &relay, 0, mls)?;
+        self.set(&gid, Settings { kind, name, ..Settings::default() }).await?;
         Ok(gid)
     }
 
@@ -1386,7 +1417,7 @@ impl Session {
         }
         self.folders.remove(gid);
         self.backlog.remove(gid);
-        for table in ["groups", "folders", "messages", "settings", "applied", "files", "versions", "blobs", "pending"] {
+        for table in ["groups", "folders", "senders", "messages", "settings", "applied", "docs", "versions", "blobs", "pending"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [gid])?;
         }
         let attachments = self.attachments.join(&digest(gid.as_bytes())[..16]);
@@ -1442,7 +1473,7 @@ impl Session {
 
     /// Checks the entities a member says it speaks as against their lists: the first must list its device (or the
     /// member itself), each later one the one before. An entity is `new` until this session meets it: until it shows the
-    /// agent something from or about it (`meet`), which an admission check or a file update does not.
+    /// agent something from or about it (`meet`), which an admission check or a doc edit does not.
     async fn describe(&mut self, gid: &str, mut person: Value, meet: bool) -> Result<Value> {
         let Some(path) = person.as_object_mut().and_then(|p| p.remove("as")) else { return Ok(person) };
         let path: Vec<String> = serde_json::from_value(path)?;
@@ -1566,14 +1597,11 @@ impl Session {
         Ok(json!({ "entity": list.id, "name": list.name, "members": members }))
     }
 
-    /// Relay groups: the MLS members. Folder groups: this session and every sender seen in the folder.
+    /// Relay groups: the MLS members. Folder groups: this session and whoever wrote to the folder.
     fn members(&self, gid: &str) -> Result<Vec<Value>> {
         let Some(group) = self.groups.get(gid) else {
-            let senders: Vec<String> = self
-                .db
-                .prepare("SELECT sender FROM messages WHERE gid = ? GROUP BY sender ORDER BY MIN(rowid)")?
-                .query_map([gid], |r| r.get(0))?
-                .collect::<Result<_, _>>()?;
+            let senders: Vec<String> =
+                self.db.prepare("SELECT person FROM senders WHERE gid = ? ORDER BY rowid")?.query_map([gid], |r| r.get(0))?.collect::<Result<_, _>>()?;
             let mut members = vec![self.person.clone()];
             for sender in senders {
                 let sender: Value = serde_json::from_str(&sender)?;
@@ -1624,43 +1652,50 @@ impl Session {
         self.folders.insert(gid, Folder { _watcher: watcher, _wake: wake });
     }
 
-    /// Logs a received message and delivers it, with its attachment written to a file only this user can read.
-    fn ingest(&mut self, gid: &str, id: &str, sender: Value, mut payload: Payload) -> Result<()> {
-        if (payload.settings.is_some() || payload.file.is_some())
-            && self.db.execute("INSERT OR IGNORE INTO applied (id, gid) VALUES (?, ?)", params![id, gid])? == 0
+    /// Takes in a message: settings and edits change the group's state, chat messages are logged and delivered. A type
+    /// that belongs to another kind of group is ignored, and so is a change of kind.
+    fn ingest(&mut self, gid: &str, id: &str, sender: Value, payload: Payload) -> Result<()> {
+        if self.folders.contains_key(gid) {
+            self.db.execute("INSERT OR IGNORE INTO senders (gid, fp, person) VALUES (?, ?, ?)", params![gid, sender["fp"].as_str(), sender.to_string()])?;
+        }
+        let kind = self.settings(gid)?.kind;
+        if let Some(belongs) = payload.kind()
+            && !kind.is_empty()
+            && belongs != kind
         {
+            self.warn(Some(gid), format!("ignored a {belongs} message in this {kind} group"));
             return Ok(());
         }
-        // A file update changes the file and nothing else: it never wakes the agent.
-        if let Some(file) = payload.file.take() {
-            let state: Option<Vec<u8>> =
-                self.db.query_row("SELECT state FROM files WHERE gid = ? AND id = ?", params![gid, file.id], |r| r.get(0)).optional()?;
-            let state = files::apply(state.as_deref(), &B64.decode(&file.update)?)?;
-            return self.store_file(gid, &file.id, &file.name, &state);
+        if !matches!(payload, Payload::Message(_)) && self.db.execute("INSERT OR IGNORE INTO applied (id, gid) VALUES (?, ?)", params![id, gid])? == 0 {
+            return Ok(());
         }
-        if let Some(settings) = payload.settings.take() {
-            if settings != self.settings(gid)? {
-                self.store_settings(gid, &settings)?;
-                self.deliver(gid, json!({ "type": "settings", "group": gid, "settings": settings, "by": sender }));
+        match payload {
+            Payload::Settings(settings) if !kind.is_empty() && settings.kind != kind => {
+                self.warn(Some(gid), format!("ignored settings that would make this {kind} group a {} group", settings.kind));
             }
-            return Ok(());
+            Payload::Settings(settings) => {
+                if settings != self.settings(gid)? {
+                    self.store_settings(gid, &settings)?;
+                    self.deliver(gid, json!({ "type": "settings", "group": gid, "settings": settings, "by": sender }));
+                }
+            }
+            Payload::Joined => self.deliver(gid, json!({ "type": "joined", "group": gid, "member": sender })),
+            // An edit changes the text and nothing else: it never wakes the agent.
+            Payload::Edit(edit) => {
+                let state = doc::apply(&self.text(gid)?, &B64.decode(&edit.update)?)?;
+                self.store_text(gid, &state)?;
+            }
+            Payload::Message(message) => {
+                let inserted = self.db.execute(
+                    "INSERT OR IGNORE INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
+                    params![id, gid, sender.to_string(), serde_json::to_string(&message)?],
+                )?;
+                if inserted > 0 {
+                    let item = self.message_json(gid, id, sender, &message);
+                    self.deliver(gid, item);
+                }
+            }
         }
-        let attachment = payload.attachment.take().map(|data| B64.decode(data)).transpose()?;
-        let inserted = self.db.execute(
-            "INSERT OR IGNORE INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
-            params![id, gid, sender.to_string(), serde_json::to_string(&payload)?],
-        )?;
-        if inserted == 0 {
-            return Ok(());
-        }
-        let mut item = self.message_json(gid, id, sender, &payload);
-        if let Some(bytes) = attachment {
-            let dir = self.attachments.join(&digest(gid.as_bytes())[..16]);
-            std::fs::create_dir_all(&dir)?;
-            crate::private_file(&dir.join(id), &bytes)?;
-            item["attachment"] = json!(dir.join(id));
-        }
-        self.deliver(gid, item);
         Ok(())
     }
 
@@ -1685,13 +1720,13 @@ impl Session {
             .query_map([gid], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
         let mut covered = HashSet::new();
-        for (_, payload) in &seen {
-            covered.extend(serde_json::from_str::<Payload>(payload)?.after);
+        for (_, message) in &seen {
+            covered.extend(serde_json::from_str::<Message>(message)?.after);
         }
         Ok(seen.into_iter().map(|(id, _)| id).filter(|id| !covered.contains(id)).collect())
     }
 
-    fn message(&self, id: &str) -> Result<Option<(String, Value, Payload)>> {
+    fn message(&self, id: &str) -> Result<Option<(String, Value, Message)>> {
         let row: Option<(String, String, String)> = self
             .db
             .query_row("SELECT gid, sender, payload FROM messages WHERE id = ?", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -1699,23 +1734,26 @@ impl Session {
         row.map(|(gid, sender, payload)| Ok((gid, serde_json::from_str(&sender)?, serde_json::from_str(&payload)?))).transpose()
     }
 
-    fn message_json(&self, gid: &str, id: &str, from: Value, payload: &Payload) -> Value {
+    fn message_json(&self, gid: &str, id: &str, from: Value, message: &Message) -> Value {
         let mut item = json!({
             "type": "message",
             "group": gid,
             "id": id,
             "from": from,
-            "direct": payload.to.contains(&self.fp),
-            "content": payload.content,
+            "direct": message.to.contains(&self.fp),
+            "content": message.content,
         });
-        if !payload.to.is_empty() {
-            item["to"] = json!(payload.to);
+        if !message.to.is_empty() {
+            item["to"] = json!(message.to);
         }
-        if let Some(reply_to) = &payload.reply_to {
+        if let Some(reply_to) = &message.reply_to {
             item["reply_to"] = json!(reply_to);
         }
-        if payload.urgent {
+        if message.urgent {
             item["urgent"] = json!(true);
+        }
+        if let Some(attachment) = &message.attachment {
+            item["attachment"] = json!(attachment);
         }
         item
     }
@@ -1820,14 +1858,14 @@ async fn notified(ws: &mut WebSocket) -> Option<Notice> {
     let mut unanswered = false;
     loop {
         match tokio::time::timeout(Duration::from_secs(PING_S), ws.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) if text == "pong" => unanswered = false,
-            Ok(Some(Ok(Message::Text(text)))) => return Some(serde_json::from_str(&text).unwrap_or(Notice { seq: u64::MAX, data: None })),
+            Ok(Some(Ok(Frame::Text(text)))) if text == "pong" => unanswered = false,
+            Ok(Some(Ok(Frame::Text(text)))) => return Some(serde_json::from_str(&text).unwrap_or(Notice { seq: u64::MAX, data: None })),
             Ok(Some(Ok(_))) => {}
             Ok(_) => return None,
             Err(_) if unanswered => return None,
             Err(_) => {
                 unanswered = true;
-                ws.send(Message::Text("ping".into())).await.ok()?;
+                ws.send(Frame::Text("ping".into())).await.ok()?;
             }
         }
     }
@@ -1857,7 +1895,7 @@ fn scan(dir: &Path, seen: &mut HashSet<OsString>) -> (Vec<(String, Record)>, Vec
     let mut pending: HashSet<String> = records.iter().map(|(id, _)| id.clone()).collect();
     let mut ordered = Vec::with_capacity(records.len());
     while !records.is_empty() {
-        let next = records.iter().position(|(_, r)| r.payload.after.iter().all(|a| !pending.contains(a))).unwrap_or(0);
+        let next = records.iter().position(|(_, r)| r.payload.after().iter().all(|a| !pending.contains(a))).unwrap_or(0);
         let (id, record) = records.remove(next);
         pending.remove(&id);
         ordered.push((id, record));

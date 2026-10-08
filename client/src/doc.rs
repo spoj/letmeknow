@@ -1,14 +1,14 @@
-//! A group's files: Yjs documents holding one text, so the browser (Yjs) and the session process (yrs) edit the same
-//! document. A file's state is a Yjs update holding everything; the version shown to agents is a hash of it.
+//! A document group's text: a Yjs document holding one text, so the browser (Yjs) and the session process (yrs) edit the
+//! same document. Its state is a Yjs update holding everything; the version shown to agents is a hash of it.
 use anyhow::Result;
 use similar::{ChangeTag, DiffTag, TextDiff};
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, GetString, Options, ReadTxn, StateVector, Text, Transact, Update};
 
-/// The name of the text inside every file's document, which the browser binds to its editor.
+/// The name of the text inside the document, which the browser binds to its editor.
 const TEXT: &str = "text";
 
-/// The state of a new file holding `text`.
+/// The state of a new document holding `text`.
 pub fn new(text: &str) -> Vec<u8> {
     let doc = Doc::new();
     let body = doc.get_or_insert_text(TEXT);
@@ -23,10 +23,9 @@ fn load(state: &[u8]) -> Result<Doc> {
     Ok(doc)
 }
 
-/// Applies an update to a file's state (none for a file not seen before). An update may arrive before the updates it
-/// builds on; until those arrive it is kept as it came.
-pub fn apply(state: Option<&[u8]>, update: &[u8]) -> Result<Vec<u8>> {
-    let Some(state) = state else { return apply(Some(&new("")), update) };
+/// Applies an update to a document's state. An update may arrive before the updates it builds on; until those arrive
+/// it is kept as it came.
+pub fn apply(state: &[u8], update: &[u8]) -> Result<Vec<u8>> {
     let doc = load(state)?;
     doc.transact_mut().apply_update(Update::decode_v1(update)?)?;
     let txn = doc.transact();
@@ -203,7 +202,7 @@ mod tests {
         let state = new(BASE);
         let theirs = edit(&state, "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n- [ ] delta\n").unwrap();
         let ours = edit(&state, "- [x] alpha\n- [ ] beta\n- [ ] gamma\n").unwrap();
-        let merged = apply(Some(&apply(Some(&state), &theirs).unwrap()), &ours).unwrap();
+        let merged = apply(&apply(&state, &theirs).unwrap(), &ours).unwrap();
         assert_eq!(text(&merged).unwrap(), "- [x] alpha\n- [ ] beta\n- [ ] gamma\n- [ ] delta\n");
     }
 
@@ -211,9 +210,9 @@ mod tests {
     fn an_update_that_arrives_early_waits_for_the_one_it_builds_on() {
         let state = new(BASE);
         let first = edit(&state, "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n- [ ] delta\n").unwrap();
-        let second = edit(&apply(Some(&state), &first).unwrap(), "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n- [x] delta\n").unwrap();
-        let early = apply(Some(&state), &second).unwrap();
+        let second = edit(&apply(&state, &first).unwrap(), "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n- [x] delta\n").unwrap();
+        let early = apply(&state, &second).unwrap();
         assert_eq!(text(&early).unwrap(), BASE);
-        assert_eq!(text(&apply(Some(&early), &first).unwrap()).unwrap(), "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n- [x] delta\n");
+        assert_eq!(text(&apply(&early, &first).unwrap()).unwrap(), "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n- [x] delta\n");
     }
 }

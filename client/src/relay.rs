@@ -9,6 +9,9 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct Relay(reqwest::Client);
 
+/// A blob takes up to 10 MiB, which a slow link needs minutes for.
+const BLOB_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Whether a page whose entries are `sizes` bytes holds everything after its cursor. The relay ends a page early only
 /// before an entry that would take it past 2 MiB, and entries are at most 1 MiB, so a page of at most 1 MiB is whole:
 /// there is no need to ask for the next, empty one.
@@ -54,12 +57,22 @@ impl Relay {
 
     /// Stores a blob in the group, or refreshes it: the relay keeps it for its message TTL from now.
     pub async fn put_blob(&self, relay: &str, gid: &str, hash: &str, sealed: &[u8]) -> Result<()> {
-        ok(self.0.put(format!("{relay}/g/{gid}/blobs/{hash}")).body(sealed.to_vec()).send().await?).await?;
+        ok(self.0.put(format!("{relay}/g/{gid}/blobs/{hash}")).timeout(BLOB_TIMEOUT).body(sealed.to_vec()).send().await?).await?;
         Ok(())
     }
 
     pub async fn get_blob(&self, relay: &str, gid: &str, hash: &str) -> Result<Vec<u8>> {
-        Ok(ok(self.0.get(format!("{relay}/g/{gid}/blobs/{hash}")).send().await?).await?.bytes().await?.to_vec())
+        Ok(ok(self.0.get(format!("{relay}/g/{gid}/blobs/{hash}")).timeout(BLOB_TIMEOUT).send().await?).await?.bytes().await?.to_vec())
+    }
+
+    /// Keeps a blob the relay has for another 7 days; false if it has none.
+    pub async fn keep_blob(&self, relay: &str, gid: &str, hash: &str) -> Result<bool> {
+        let response = self.0.post(format!("{relay}/g/{gid}/blobs/{hash}")).send().await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        ok(response).await?;
+        Ok(true)
     }
 
     /// Opens a socket on which the relay announces each new message of a group (`g/<gid>`) or entry of a box

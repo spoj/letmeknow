@@ -201,6 +201,7 @@ pub fn place(label: &str, secret: &[u8]) -> (String, [u8; 32]) {
 pub struct Opening {
     pub group: String,
     pub relay: String,
+    pub kind: String,
     #[serde(default)]
     pub name: String,
     /// Key that seals join requests to the group's members.

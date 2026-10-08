@@ -358,7 +358,7 @@ pub fn open(key: &[u8], label: &str, data: &str) -> R<Vec<u8>> {
     crate::proto::open(&key32(key)?, label.as_bytes(), data).map_err(err)
 }
 
-/// A blob (an image a file links) sealed under its own fresh `key`; it is stored by the SHA-256 of the result.
+/// A blob (a file a message or the doc links) sealed under its own fresh `key`; it is stored by the SHA-256 of the result.
 #[wasm_bindgen]
 pub fn blob_seal(key: &[u8], data: &[u8]) -> R<Vec<u8>> {
     crate::proto::seal_blob(&RustCrypto::default(), &key32(key)?, data).map_err(err)
