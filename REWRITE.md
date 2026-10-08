@@ -76,7 +76,7 @@ A local folder signs nothing, but its sessions all read the folder directly, so 
 - The message id is the SHA-256 of its MLS ciphertext, as today; a member drops copies it already has. A missing message that `after` names is asked for from the members online.
 - A member accepts a message that decrypts under an epoch whose keys it still holds. It keeps an ended epoch's keys for 7 days by default, as its own setting, judged from when the epoch began, and never more than 256 ended epochs; a message later than that is lost. Keys are deleted after use as in MLS, so messages already read stay protected. A sender's messages may arrive up to 1000 out of order.
 - A chat's order is causal: each message names the tips of what its sender had read (`after`, as today). A message waits for those, up to 5 minutes, then is delivered anyway, naming what is missing.
-- A doc is a Yjs CRDT, kept in a file for agents as today. Its edits go live to the members online, as messages, and are not held. Two connected members compare their docs by a hash of each one's snapshot (deletions do not move a state vector), and if they differ, each sends the other a Yjs diff against the other's state vector, sealed under the current epoch. A doc therefore reaches a member however long it was away, and `keep` and the key window apply to messages and files only. Whoever admits a member links the doc's state, as a file (see Files), in the Welcome, so a doc's size is not bounded by any message limit. A diff is signed by the member that sends it, not by the edits' authors.
+- A doc is a Yjs CRDT, kept in a file for agents as today. Its edits go live to the members online, as messages, and are not held. Two connected members compare their docs by a hash of each one's snapshot (deletions do not move a state vector), and if they differ, each sends the other a Yjs diff against the other's state vector, sealed under the current epoch. A doc therefore reaches a member however long it was away, and `keep` and the key window apply to messages and files only. Whoever admits a member links the doc's state, as a file (see Files), beside the Welcome, so a doc's size is not bounded by any message limit. A diff is signed by the member that sends it, not by the edits' authors.
 - `send` returns once another member holds the message, or reports it pending when no member is online, or names the members that refused it (see Limits); the session keeps delivering while it runs.
 
 ## Files
@@ -102,7 +102,7 @@ A receiver that refuses a message records it as missing, so a reference to it sh
 ## Identity
 
 - **Device list**: a membership log on the service named in its first entry. The identity's id is the SHA-256 of that entry, so the id says where to look. The log's address and key derive from the id, so the service sees only ciphertext, and whoever knows the id can read the list. Each entry adds or removes a device key, names the entry before it, and is signed by a device on the list at that point.
-- **Devices group**: each identity has a private MLS group of its devices, kept in step with the list by the device that adds or removes one. It carries the identity's openings in its group context, and it is a chat the person can use.
+- **Devices group**: each identity has a private MLS group of its devices, kept in step with the list by the device that adds or removes one. It carries the identity's openings in its group context. Its members are devices: on a machine, the session process holding the device's lock acts for it; in a browser, the device is the session, so the person can also use the group as a chat.
 - **Device links**: an invite link marked as one. The new device sends its device key; the inviter adds it to the list and to the devices group.
 - **Credentials**: a session's credential names its device, with the device's signature on the session key, and the identity it speaks as (`--as`, as today). Members check it against the device list. A failed check marks the member; it never invalidates a commit.
 - **Revocation**: when a device leaves its identity's list, whichever member of each group notices first removes that device's sessions from the group.
@@ -124,7 +124,7 @@ Trust is local and travels one hop at most.
 ## Invites
 
 - An invite is a link, `https://letmeknow.dev/i#…`, whose fragment holds the inviter's iroh key, its relay if not ours, and a random 128-bit secret. The fragment never reaches the page server.
-- The joiner dials the inviter's key, which iroh authenticates, and presents the secret. It then sends a KeyPackage (from a new device: its device key). The inviter commits the Add and returns the Welcome, which carries the settings, the log position to read from, and for a doc its state.
+- The joiner dials the inviter's key, which iroh authenticates, and presents the secret. It then sends a KeyPackage (from a new device: its device key). The inviter commits the Add and returns the Welcome, which carries the settings, with the log position to read from and, for a doc, a link to its state.
 - Single use, valid for 10 minutes, and the inviter must be online. To open one on another device, scan its QR code.
 - No typed codes, and so no SPAKE2: the key in the link authenticates the inviter, and the secret authenticates the joiner.
 
