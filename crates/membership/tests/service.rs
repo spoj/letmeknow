@@ -17,12 +17,12 @@ use iroh_relay::{
     server::{CertConfig, QuicConfig, RelayConfig as RelayServerConfig, Server, ServerConfig, TlsConfig},
 };
 use lmk_membership::{
-    ALPN, Contradiction, Forged, Membership, Refused,
+    Contradiction, Forged, Membership, Refused,
     client::ServeClient,
     service::{Policy, Service},
     store::Store,
 };
-use lmk_proto::Bytes;
+use lmk_proto::{Bytes, frame::ALPN};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 struct Net {

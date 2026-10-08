@@ -103,8 +103,8 @@ impl Invites {
         })
     }
 
-    /// A new device presents the secret of a device link with its device key and its KeyPackage for the devices
-    /// group: it goes on `list` (by this device, `by`) and into `devices`.
+    /// A new device presents the secret of a device link with its KeyPackage for the devices group, whose credential
+    /// names the device: it goes on `list` (by this device, `by`) and into `devices`.
     #[allow(clippy::too_many_arguments)]
     pub fn admit_device<P: Provider>(
         &mut self,
@@ -114,20 +114,18 @@ impl Invites {
         list: &DeviceList,
         devices: &mut Group,
         secret: &[u8],
-        device: &[u8],
-        device_name: &str,
         key_package: &[u8],
         now: u64,
     ) -> Result<Admitting> {
         let (joiner, key) = key_package_credential(provider, key_package)?;
-        if joiner.device.0 != device || !signed_by_device(&joiner, &key) {
+        if !signed_by_device(&joiner, &key) {
             bail!("the KeyPackage is not the device's");
         }
         self.redeem(secret, now, |invite| {
             ensure!(invite.target == Target::Device, "not a device link");
             Ok(())
         })?;
-        let entry = list.add(by, device, device_name);
+        let entry = list.add(by, &joiner.device.0, &joiner.device_name);
         let commit =
             devices.commit(provider, session, Change { add: vec![key_package.to_vec()], ..Change::default() })?;
         Ok(Admitting {
@@ -144,7 +142,7 @@ impl Invites {
 mod tests {
     use lmk_proto::group::{IdentityRef, Kind, Opening, Payload, Service};
     use lmk_proto::links;
-    use lmk_proto::peer::{InviteRequest, Joiner};
+    use lmk_proto::peer::InviteRequest;
 
     use super::*;
     use crate::contacts::{Contact, Contacts, How};
@@ -173,10 +171,10 @@ mod tests {
         let parsed = links::Invite::parse(&link).unwrap();
         let request = InviteRequest {
             secret: parsed.secret.into(),
-            joiner: Joiner::Member { key_package: Bytes(bob.session.key_package(&bob.provider).unwrap()) },
+            key_package: Bytes(bob.session.key_package(&bob.provider).unwrap()),
         };
         let request: InviteRequest = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
-        let Joiner::Member { key_package } = &request.joiner else { panic!() };
+        let key_package = &request.key_package;
 
         let group = alice.group.as_mut().unwrap();
         assert!(
@@ -272,18 +270,14 @@ mod tests {
         let mut invites = Invites::default();
         let secret = invites.make(Target::Device, None, None, 0).secret;
 
-        // The new device: its device key, and a member of the devices group speaking as the identity.
+        // The new device, which does not know the identity yet: its credential names only the device.
         let phone_provider = MemoryProvider::default();
         let phone_device = Device::new("phone");
-        let identity = IdentityRef { id: id.into(), membership };
-        let phone_session =
-            Session::create(&phone_provider, &phone_device, "phone", Some(identity), leaf("phone")).unwrap();
+        let phone_session = Session::create(&phone_provider, &phone_device, "phone", None, leaf("phone")).unwrap();
         let request = InviteRequest {
             secret: secret.into(),
-            joiner: Joiner::Device { device: phone_device.public().into(), device_name: "phone".into() },
+            key_package: Bytes(phone_session.key_package(&phone_provider).unwrap()),
         };
-        let Joiner::Device { device, device_name } = &request.joiner else { panic!() };
-        let kp = phone_session.key_package(&phone_provider).unwrap();
 
         let group = laptop.group.as_mut().unwrap();
         let admitting = invites
@@ -294,9 +288,7 @@ mod tests {
                 &list,
                 group,
                 &request.secret.0,
-                &device.0,
-                device_name,
-                &kp,
+                &request.key_package.0,
                 5,
             )
             .unwrap();

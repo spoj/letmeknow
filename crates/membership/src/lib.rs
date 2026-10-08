@@ -20,9 +20,6 @@ use tokio::sync::mpsc;
 
 pub use chain::{Chain, Contradiction, Forged};
 
-/// The one ALPN all of letmeknow's own protocols share.
-pub const ALPN: &[u8] = b"letmeknow/1";
-
 /// The service refused an append: `size`, `rate` or `policy`.
 #[derive(Debug, thiserror::Error)]
 #[error("the membership service refused: {0}")]

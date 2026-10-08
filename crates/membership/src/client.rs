@@ -8,7 +8,7 @@ use ed25519_dalek::VerifyingKey;
 use iroh::{Endpoint, EndpointAddr, PublicKey, endpoint::Connection};
 use lmk_proto::{
     Answer, Bytes, frame,
-    frame::{Open, Stream},
+    frame::{ALPN, Open, Stream},
     group::Service,
     head::Head,
     membership::{Appended, Latest, Notice, Page, Request},
@@ -16,7 +16,7 @@ use lmk_proto::{
 use serde::de::DeserializeOwned;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{ALPN, Chain, Membership, Refused, Subscription, chain::Chains};
+use crate::{Chain, Membership, Refused, Subscription, chain::Chains};
 
 #[derive(Clone)]
 pub struct ServeClient(Arc<Inner>);

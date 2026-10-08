@@ -30,11 +30,10 @@ use iroh_relay::{
     },
 };
 use lmk_membership::{
-    ALPN,
     service::{Policy, Service},
     store::Store,
 };
-use lmk_proto::group;
+use lmk_proto::{frame::ALPN, group};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::{net::TcpListener, sync::Notify};
 use tokio_rustls_acme::{AcmeConfig, caches::DirCache};

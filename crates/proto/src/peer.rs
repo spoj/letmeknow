@@ -39,19 +39,11 @@ pub struct Hello {
     pub joined: u64,
 }
 
-/// The joiner's request on an `invite` stream.
+/// The joiner's request on an `invite` stream. For a device link, the KeyPackage's credential names the new device.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteRequest {
     pub secret: Bytes,
-    #[serde(flatten)]
-    pub joiner: Joiner,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Joiner {
-    Member { key_package: Bytes },
-    Device { device: Bytes, device_name: String },
+    pub key_package: Bytes,
 }
 
 /// The answer to an invite or a join: answered as `Answer<Admitted>` on an `invite` stream.
@@ -63,19 +55,4 @@ pub struct Admitted {
     /// For a doc: a file link to its state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invite_request_shapes() {
-        let member = InviteRequest { secret: Bytes(vec![1]), joiner: Joiner::Member { key_package: Bytes(vec![2]) } };
-        let json = serde_json::to_string(&member).unwrap();
-        assert_eq!(json, r#"{"secret":"AQ","key_package":"Ag"}"#);
-        assert_eq!(serde_json::from_str::<InviteRequest>(&json).unwrap(), member);
-        let device: InviteRequest = serde_json::from_str(r#"{"secret":"AQ","device":"Aw","device_name":"phone"}"#).unwrap();
-        assert_eq!(device.joiner, Joiner::Device { device: Bytes(vec![3]), device_name: "phone".into() });
-    }
 }
