@@ -66,7 +66,7 @@ A local folder signs nothing, but its sessions all read the folder directly, so 
 - `keep` (days, default 90) is how long members hold the group's messages, doc edits and files for one another. Each client may hold less.
 - Post-compromise security as today: a session replaces its keys with an empty commit when it resumes a group, once caught up, and hourly while it runs.
 - Removal as today: a member commits a Remove. A leaving session asks the others, in a message, to commit its removal (MLS lets no member commit its own), and is shown as having left.
-- Proposals travel inside the commits that apply them, never alone.
+- Every change (add, remove, key update, settings) is written inside the commit that applies it. MLS also lets a member send a change on its own, as a proposal that a later commit points to; we never do, because proposals are not in the membership log, and a member that missed one could not apply the commit.
 
 ## Messages and docs
 
