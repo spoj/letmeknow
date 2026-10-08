@@ -1,0 +1,8 @@
+dbs:
+  - path: /var/lib/letmeknow/membership.db
+    replica:
+      type: s3
+      bucket: letmeknow-litestream
+      path: @DOMAIN@/membership.db
+      endpoint: https://sgp1.digitaloceanspaces.com
+      region: sgp1

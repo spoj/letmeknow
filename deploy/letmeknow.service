@@ -1,0 +1,16 @@
+[Unit]
+Description=letmeknow serve: membership service, relay and web client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=letmeknow
+ExecStart=/usr/local/bin/letmeknow serve --domain @DOMAIN@ --state /var/lib/letmeknow --web /usr/local/share/letmeknow/web
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Environment=RUST_LOG=info
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

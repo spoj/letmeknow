@@ -17,9 +17,10 @@ use lmk_proto::group::Service;
 /// letmeknow.dev's relay, which links leave out.
 pub const RELAY: &str = "https://letmeknow.dev";
 
-/// letmeknow.dev's membership service. Its key is fixed when the service is first deployed.
+/// letmeknow.dev's membership service.
 pub fn letmeknow_dev() -> Service {
-    Service::Serve { key: Bytes(vec![0; 32]), relay: RELAY.into(), addrs: Vec::new() }
+    let key = hex::decode("50d422869a41e313ef48fa00284557a0c3d15374280b7f3d5d35a35c2393370f").unwrap();
+    Service::Serve { key: Bytes(key), relay: RELAY.into(), addrs: Vec::new() }
 }
 
 /// A membership service from its address: `letmeknow.dev`, `<iroh key>@<relay URL>`, or a folder's absolute path.
