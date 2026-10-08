@@ -516,6 +516,7 @@ def main():
         lap_file = write("list.md", "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n")
         doc = on(lap, "invite", "--kind", "doc", "--name", "List", lap_file)
         check(doc["kind"] == "doc" and os.path.samefile(doc["file"], lap_file), "a doc group is made by inviting into one, from a file that holds its first text")
+        check("already holds another doc" in on(lap, "invite", "--kind", "doc", lap_file, ok=False), "a file holds one doc")
         check("exists" in on(kim, "join", doc["link"], lap_file, ok=False), "a member joins into a new file, as the doc has its text already")
         kim_file = on(kim, "join", doc["link"])["file"]
         check(os.path.basename(kim_file).startswith("List-"), "or into one its session makes, named after the doc")

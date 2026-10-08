@@ -577,6 +577,12 @@ impl Session {
         if file.is_some() && kind != DOC {
             bail!("only a doc has a file: invite --kind doc <file>");
         }
+        // Two docs in one file would pass each one's text to the other's members.
+        if let Some(file) = &file
+            && self.bindings.values().any(|b| b.path == Path::new(file))
+        {
+            bail!("{file} already holds another doc");
+        }
         // A device link announces itself in the pake message, so the joiner knows to send its device, not a key package.
         let (into, relay, kind) = match entity {
             Some(entity) => {
