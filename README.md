@@ -55,7 +55,7 @@ A folder group's id is the folder's absolute path; `--group` also takes a relati
 
 Invite words come from the [EFF short wordlist](https://www.eff.org/dice) (CC BY 3.0 US), without `yo-yo`.
 
-Environment: `LETMEKNOW_SESSION`, `LETMEKNOW_NAME`, `LETMEKNOW_RELAY` (default `https://letmeknow.dev`), `LETMEKNOW_HOLD`, `LETMEKNOW_HOME`. `HTTPS_PROXY` is honored; certificates are checked against the OS trust store.
+Environment: `LETMEKNOW_SESSION`, `LETMEKNOW_NAME`, `LETMEKNOW_RELAY` (default `https://letmeknow.dev`), `LETMEKNOW_MEMBERSHIP` (`letmeknow.dev`, `<key, hex>@<relay URL>`, or a folder), `LETMEKNOW_HOLD`, `LETMEKNOW_HOME`. `HTTPS_PROXY` is honored; relay certificates are checked against Mozilla's roots, plus those in the PEM file `LETMEKNOW_CA` names, for a relay of one's own with a self-signed certificate.
 
 Session state and the device's key (`device.json`) live under `LETMEKNOW_HOME`, by default the OS data directory: `~/.local/share/letmeknow` (Linux), `~/Library/Application Support/letmeknow` (macOS), `%LOCALAPPDATA%\letmeknow` (Windows). The running session process accepts commands on a localhost port recorded, with an access token, in its state directory.
 

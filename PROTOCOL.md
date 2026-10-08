@@ -155,7 +155,7 @@ A `peer` stream joins two sessions that share a group, one stream per pair, kept
 | `{"commits": {"group", "entries", "head"}}` | Log entries the other lacks, judged by its head; also sent by a commit's author once the service has taken it |
 | `{"reconcile": {"group", "msg"}}` | A negentropy message (see below) |
 | `{"messages": {"group", "items"}}` | MLS ciphertexts the other lacks; also every new message as it is sent |
-| `{"receipt": {"group", "held": ["<id>"], "refused": [{"id", "reason"}]}}` | The answer to `messages`: the ids of the items the receiver took (held, or applied for an edit or diff), and of those it refused; items that wait for a commit are answered once applied, in a later receipt or not at all |
+| `{"receipt": {"group", "held": ["<id>"], "refused": [{"id", "reason"}]}}` | The answer to `messages`: the ids of the items the receiver took (held, or applied for an edit or diff), and of those it refused; items that wait for a commit are not answered |
 | `{"doc": {"group", "snapshot"}}` | SHA-256 of `txn.snapshot().encode_v1()` |
 | `{"doc_sv": {"group", "sv"}}` | A Yjs state vector, sent when the snapshots differ; answered by a `diff` message |
 | `{"want": {"group", "files"}}`, `{"have": {"group", "files"}}` | BLAKE3 hashes (see Files) |
