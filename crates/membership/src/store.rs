@@ -21,7 +21,10 @@ pub struct Store {
 }
 
 pub fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 impl Store {
@@ -35,7 +38,10 @@ impl Store {
                  hash BLOB NOT NULL, time INTEGER NOT NULL, PRIMARY KEY (log, position)) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS entries_time ON entries (time);",
         )?;
-        Ok(Store { db: Mutex::new(db), key })
+        Ok(Store {
+            db: Mutex::new(db),
+            key,
+        })
     }
 
     fn sign(&self, log: &[u8], length: u64, hash: [u8; 32]) -> Head {
@@ -67,7 +73,10 @@ impl Store {
             params![log, position, hash],
         )?;
         tx.commit()?;
-        Ok(Appended { position, head: self.sign(log, position, hash) })
+        Ok(Appended {
+            position,
+            head: self.sign(log, position, hash),
+        })
     }
 
     /// The entries after `after`, up to about `max_bytes`, or `None` if some of them have expired.
@@ -82,7 +91,8 @@ impl Store {
         while bytes < max_bytes
             && let Some(row) = rows.next()?
         {
-            let (position, entry, hash): (u64, Vec<u8>, [u8; 32]) = (row.get(0)?, row.get(1)?, row.get(2)?);
+            let (position, entry, hash): (u64, Vec<u8>, [u8; 32]) =
+                (row.get(0)?, row.get(1)?, row.get(2)?);
             if position != after + 1 + entries.len() as u64 {
                 return Ok(None);
             }
@@ -94,7 +104,10 @@ impl Store {
             return Ok(None);
         }
         let (length, hash) = last.unwrap_or((length, hash));
-        Ok(Some(Page { entries, head: self.sign(log, length, hash) }))
+        Ok(Some(Page {
+            entries,
+            head: self.sign(log, length, hash),
+        }))
     }
 
     pub fn head(&self, log: &[u8]) -> Result<Head> {
@@ -104,7 +117,11 @@ impl Store {
 
     /// Deletes entries appended before `time`; their logs keep their length and hash.
     pub fn expire(&self, time: u64) -> Result<usize> {
-        Ok(self.db.lock().unwrap().execute("DELETE FROM entries WHERE time < ?", [time])?)
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM entries WHERE time < ?", [time])?)
     }
 }
 
@@ -127,17 +144,29 @@ mod tests {
         assert_eq!(two.head.hash.0, expected);
 
         let page = store.read(b"g", 0, 1).unwrap().unwrap();
-        assert_eq!((page.entries, page.head.length), (vec![Bytes(b"one".to_vec())], 1));
+        assert_eq!(
+            (page.entries, page.head.length),
+            (vec![Bytes(b"one".to_vec())], 1)
+        );
         let page = store.read(b"g", 1, 1 << 20).unwrap().unwrap();
         assert_eq!((page.entries.len(), page.head.length), (1, 2));
         let page = store.read(b"g", 2, 1 << 20).unwrap().unwrap();
-        assert_eq!((page.entries.len(), page.head.hash.0), (0, expected.to_vec()));
+        assert_eq!(
+            (page.entries.len(), page.head.hash.0),
+            (0, expected.to_vec())
+        );
 
         assert_eq!(store.expire(now() + 1).unwrap(), 2);
         assert!(store.read(b"g", 0, 1 << 20).unwrap().is_none());
-        assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().head.length, 2);
+        assert_eq!(
+            store.read(b"g", 2, 1 << 20).unwrap().unwrap().head.length,
+            2
+        );
         assert_eq!(store.append(b"g", b"three").unwrap().position, 3);
-        assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().entries.len(), 1);
+        assert_eq!(
+            store.read(b"g", 2, 1 << 20).unwrap().unwrap().entries.len(),
+            1
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

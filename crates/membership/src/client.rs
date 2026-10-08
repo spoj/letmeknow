@@ -40,11 +40,18 @@ impl ServeClient {
             addr = addr.with_ip_addr(a.parse()?);
         }
         let chains = Chains::new(Some(VerifyingKey::from_bytes(&key)?));
-        Ok(ServeClient(Arc::new(Inner { endpoint, addr, chains, conn: Mutex::default() })))
+        Ok(ServeClient(Arc::new(Inner {
+            endpoint,
+            addr,
+            chains,
+            conn: Mutex::default(),
+        })))
     }
 
     pub fn for_service(endpoint: Endpoint, service: &Service) -> Result<Self> {
-        let Service::Serve { key, relay, addrs } = service else { anyhow::bail!("not a serve service") };
+        let Service::Serve { key, relay, addrs } = service else {
+            anyhow::bail!("not a serve service")
+        };
         Self::new(endpoint, &key.0, relay, addrs)
     }
 
@@ -62,7 +69,13 @@ impl ServeClient {
 
     async fn request<T: DeserializeOwned>(&self, request: Request) -> Result<T> {
         let (mut send, mut recv) = self.connection().await?.open_bi().await?;
-        frame::write(&mut send, &Open { stream: Stream::Membership }).await?;
+        frame::write(
+            &mut send,
+            &Open {
+                stream: Stream::Membership,
+            },
+        )
+        .await?;
         frame::write(&mut send, &request).await?;
         send.finish()?;
         match frame::read(&mut recv).await? {
@@ -74,23 +87,40 @@ impl ServeClient {
     /// Checks a notice and passes it on, first reading any entries it skips past.
     async fn deliver(&self, notice: Notice, out: &mpsc::Sender<Result<Notice>>) -> Result<()> {
         let log = notice.log.0.clone();
-        let after = notice.position.checked_sub(1).context("a notice at position 0")?;
-        let len = self.0.chains.get(&log).map(|c| c.len());
+        let after = notice
+            .position
+            .checked_sub(1)
+            .context("a notice at position 0")?;
+        let len = self.0.chains.get(&log).map(|c| c.length());
         if let Some(mut len) = len
             && after > len
         {
             while len < notice.position {
                 let page = self.read(&log, len).await?;
-                ensure!(!page.entries.is_empty(), "the service withholds entries it announced");
+                ensure!(
+                    !page.entries.is_empty(),
+                    "the service withholds entries it announced"
+                );
                 for entry in page.entries {
                     len += 1;
                     let head = page.head.clone();
-                    out.send(Ok(Notice { log: notice.log.clone(), position: len, entry, head })).await?;
+                    out.send(Ok(Notice {
+                        log: notice.log.clone(),
+                        position: len,
+                        entry,
+                        head,
+                    }))
+                    .await?;
                 }
             }
             return self.0.chains.head(&log, &notice.head);
         }
-        self.0.chains.page(&log, after, std::slice::from_ref(&notice.entry), &notice.head)?;
+        self.0.chains.page(
+            &log,
+            after,
+            std::slice::from_ref(&notice.entry),
+            &notice.head,
+        )?;
         if len.is_none_or(|len| notice.position > len) {
             out.send(Ok(notice)).await?;
         }
@@ -101,14 +131,29 @@ impl ServeClient {
 #[async_trait]
 impl Membership for ServeClient {
     async fn append(&self, log: &[u8], entry: &[u8]) -> Result<Appended> {
-        let appended: Appended = self.request(Request::Append { log: log.into(), entry: entry.into() }).await?;
-        let after = appended.position.checked_sub(1).context("appended at position 0")?;
-        self.0.chains.page(log, after, &[entry.into()], &appended.head)?;
+        let appended: Appended = self
+            .request(Request::Append {
+                log: log.into(),
+                entry: entry.into(),
+            })
+            .await?;
+        let after = appended
+            .position
+            .checked_sub(1)
+            .context("appended at position 0")?;
+        self.0
+            .chains
+            .page(log, after, &[entry.into()], &appended.head)?;
         Ok(appended)
     }
 
     async fn read(&self, log: &[u8], after: u64) -> Result<Page> {
-        let page: Page = self.request(Request::Read { log: log.into(), after }).await?;
+        let page: Page = self
+            .request(Request::Read {
+                log: log.into(),
+                after,
+            })
+            .await?;
         self.0.chains.page(log, after, &page.entries, &page.head)?;
         Ok(page)
     }
@@ -121,7 +166,13 @@ impl Membership for ServeClient {
 
     async fn subscribe(&self, logs: Vec<Bytes>) -> Result<Subscription> {
         let (mut send, mut recv) = self.connection().await?.open_bi().await?;
-        frame::write(&mut send, &Open { stream: Stream::Membership }).await?;
+        frame::write(
+            &mut send,
+            &Open {
+                stream: Stream::Membership,
+            },
+        )
+        .await?;
         frame::write(&mut send, &Request::Subscribe { logs }).await?;
         let (out, notices) = mpsc::channel(64);
         let client = self.clone();

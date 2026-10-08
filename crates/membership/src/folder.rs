@@ -55,7 +55,11 @@ fn last(dir: &Path) -> Result<u64> {
     let mut last = 0;
     for file in std::fs::read_dir(dir)? {
         let name = file?.file_name();
-        if let Some(position) = name.to_str().and_then(|n| n.strip_suffix(".entry")).and_then(|n| n.parse().ok()) {
+        if let Some(position) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".entry"))
+            .and_then(|n| n.parse().ok())
+        {
             last = last.max(position);
         }
     }
@@ -63,34 +67,43 @@ fn last(dir: &Path) -> Result<u64> {
 }
 
 fn unsigned(log: &[u8], length: u64, hash: [u8; 32]) -> Head {
-    Head { log: log.into(), length, hash: hash.into(), time: now(), sig: Bytes::default() }
+    Head {
+        log: log.into(),
+        length,
+        hash: hash.into(),
+        time: now(),
+        sig: Bytes::default(),
+    }
 }
 
 impl FolderClient {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        FolderClient(Arc::new(Inner { dir: dir.into(), chains: Chains::new(None) }))
+        FolderClient(Arc::new(Inner {
+            dir: dir.into(),
+            chains: Chains::new(None),
+        }))
     }
 
     fn log_dir(&self, log: &[u8]) -> PathBuf {
         self.0.dir.join(hex::encode(log))
     }
 
-    fn len(&self, log: &[u8]) -> u64 {
-        self.0.chains.get(log).map_or(0, |c| c.len())
+    fn length(&self, log: &[u8]) -> u64 {
+        self.0.chains.get(log).map_or(0, |c| c.length())
     }
 
     /// Reads a page and checks it against the chain, which first catches up to `after`.
     fn page(&self, log: &[u8], after: u64) -> Result<Page> {
         let dir = self.log_dir(log);
-        while self.len(log) < after {
-            let len = self.len(log);
+        while self.length(log) < after {
+            let len = self.length(log);
             let entries = entries(&dir, len)?;
             if entries.is_empty() {
                 break;
             }
             self.check(log, len, entries)?;
         }
-        let len = self.len(log);
+        let len = self.length(log);
         if after > len {
             return self.check(log, len, vec![]);
         }
@@ -98,8 +111,14 @@ impl FolderClient {
     }
 
     fn check(&self, log: &[u8], after: u64, entries: Vec<Bytes>) -> Result<Page> {
-        let start = self.0.chains.get(log).map_or_else(|| head::start(log), |c| c.hash_at(after).expect("within"));
-        let hash = entries.iter().fold(start, |hash, entry| head::next(&hash, &entry.0));
+        let start = self
+            .0
+            .chains
+            .get(log)
+            .map_or_else(|| head::start(log), |c| c.hash_at(after).expect("within"));
+        let hash = entries
+            .iter()
+            .fold(start, |hash, entry| head::next(&hash, &entry.0));
         let head = unsigned(log, after + entries.len() as u64, hash);
         self.0.chains.page(log, after, &entries, &head)?;
         Ok(Page { entries, head })
@@ -124,8 +143,16 @@ impl Membership for FolderClient {
         std::fs::remove_file(&tmp)?;
         linked?;
         self.page(log, position - 1)?;
-        let hash = self.0.chains.get(log).and_then(|c| c.hash_at(position)).expect("read back");
-        Ok(Appended { position, head: unsigned(log, position, hash) })
+        let hash = self
+            .0
+            .chains
+            .get(log)
+            .and_then(|c| c.hash_at(position))
+            .expect("read back");
+        Ok(Appended {
+            position,
+            head: unsigned(log, position, hash),
+        })
     }
 
     async fn read(&self, log: &[u8], after: u64) -> Result<Page> {
@@ -134,7 +161,7 @@ impl Membership for FolderClient {
 
     async fn head(&self, log: &[u8]) -> Result<Head> {
         loop {
-            let page = self.page(log, self.len(log))?;
+            let page = self.page(log, self.length(log))?;
             if page.entries.is_empty() {
                 return Ok(page.head);
             }
@@ -152,7 +179,7 @@ impl Membership for FolderClient {
             std::fs::create_dir_all(&dir)?;
             watcher.watch(&dir, RecursiveMode::NonRecursive)?;
             let start = match self.0.chains.get(&log.0) {
-                Some(chain) => chain.len(),
+                Some(chain) => chain.length(),
                 None => last(&dir)?,
             };
             next.insert(log, start);
@@ -179,7 +206,12 @@ impl Membership for FolderClient {
                         };
                         for entry in page.entries {
                             *after += 1;
-                            let notice = Notice { log: log.clone(), position: *after, entry, head: page.head.clone() };
+                            let notice = Notice {
+                                log: log.clone(),
+                                position: *after,
+                                entry,
+                                head: page.head.clone(),
+                            };
                             if out.send(Ok(notice)).await.is_err() {
                                 return;
                             }

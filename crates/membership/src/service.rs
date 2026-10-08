@@ -60,7 +60,11 @@ impl std::fmt::Debug for Service {
 impl Service {
     /// Serves `store`, and expires its entries hourly.
     pub fn new(store: Store, policy: Policy) -> Self {
-        let service = Service(Arc::new(Inner { store, policy, notices: broadcast::channel(1024).0 }));
+        let service = Service(Arc::new(Inner {
+            store,
+            policy,
+            notices: broadcast::channel(1024).0,
+        }));
         let weak = Arc::downgrade(&service.0);
         tokio::spawn(async move {
             let mut hourly = tokio::time::interval(Duration::from_secs(3600));
@@ -76,7 +80,12 @@ impl Service {
         service
     }
 
-    async fn stream(&self, mut send: SendStream, mut recv: RecvStream, appends: &Mutex<Window>) -> Result<()> {
+    async fn stream(
+        &self,
+        mut send: SendStream,
+        mut recv: RecvStream,
+        appends: &Mutex<Window>,
+    ) -> Result<()> {
         let open: Open = frame::read(&mut recv).await?;
         if open.stream != Stream::Membership {
             return Ok(());
@@ -92,7 +101,12 @@ impl Service {
                     refused("rate")
                 } else {
                     let appended = store.append(&log.0, &entry.0)?;
-                    let notice = Notice { log, position: appended.position, entry, head: appended.head.clone() };
+                    let notice = Notice {
+                        log,
+                        position: appended.position,
+                        entry,
+                        head: appended.head.clone(),
+                    };
                     let _ = self.0.notices.send(Arc::new(notice));
                     Answer::Ok(appended)
                 };
@@ -106,7 +120,13 @@ impl Service {
                 frame::write(&mut send, &answer).await?;
             }
             Request::Head { log } => {
-                frame::write(&mut send, &Answer::Ok(Latest { head: store.head(&log.0)? })).await?;
+                frame::write(
+                    &mut send,
+                    &Answer::Ok(Latest {
+                        head: store.head(&log.0)?,
+                    }),
+                )
+                .await?;
             }
             Request::Subscribe { logs } => return self.subscribe(send, recv, logs).await,
         }
@@ -114,7 +134,12 @@ impl Service {
         Ok(())
     }
 
-    async fn subscribe(&self, mut send: SendStream, mut recv: RecvStream, logs: Vec<Bytes>) -> Result<()> {
+    async fn subscribe(
+        &self,
+        mut send: SendStream,
+        mut recv: RecvStream,
+        logs: Vec<Bytes>,
+    ) -> Result<()> {
         let mut notices = self.0.notices.subscribe();
         let mut logs: HashSet<Bytes> = logs.into_iter().collect();
         let (requests, mut changes) = mpsc::channel(1);
@@ -142,7 +167,9 @@ impl Service {
 }
 
 fn refused<T>(reason: &str) -> Answer<T> {
-    Answer::Refused { refused: reason.into() }
+    Answer::Refused {
+        refused: reason.into(),
+    }
 }
 
 /// Appends counted per connection, in fixed one-minute windows.
@@ -154,7 +181,10 @@ struct Window {
 impl Window {
     fn take(&mut self, limit: u32) -> bool {
         if self.start.elapsed() >= Duration::from_secs(60) {
-            *self = Window { start: Instant::now(), count: 0 };
+            *self = Window {
+                start: Instant::now(),
+                count: 0,
+            };
         }
         self.count += 1;
         self.count <= limit
@@ -163,7 +193,10 @@ impl Window {
 
 impl ProtocolHandler for Service {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        let appends = Arc::new(Mutex::new(Window { start: Instant::now(), count: 0 }));
+        let appends = Arc::new(Mutex::new(Window {
+            start: Instant::now(),
+            count: 0,
+        }));
         while let Ok((send, recv)) = conn.accept_bi().await {
             let (service, appends) = (self.clone(), appends.clone());
             tokio::spawn(async move {

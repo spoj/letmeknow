@@ -35,36 +35,63 @@ pub struct Chain {
 impl Chain {
     pub fn new(log: &[u8]) -> Self {
         let h0 = head::start(log);
-        let head = Head { log: log.into(), length: 0, hash: h0.into(), time: 0, sig: Bytes::default() };
-        Chain { start: 0, hashes: vec![h0], head }
+        let head = Head {
+            log: log.into(),
+            length: 0,
+            hash: h0.into(),
+            time: 0,
+            sig: Bytes::default(),
+        };
+        Chain {
+            start: 0,
+            hashes: vec![h0],
+            head,
+        }
     }
 
     pub fn anchored(head: Head) -> Self {
-        let hash = head.hash.0.as_slice().try_into().expect("a verified head's hash is 32 bytes");
-        Chain { start: head.length, hashes: vec![hash], head }
+        let hash = head
+            .hash
+            .0
+            .as_slice()
+            .try_into()
+            .expect("a verified head's hash is 32 bytes");
+        Chain {
+            start: head.length,
+            hashes: vec![hash],
+            head,
+        }
     }
 
-    pub fn len(&self) -> u64 {
+    pub fn length(&self) -> u64 {
         self.start + self.hashes.len() as u64 - 1
     }
 
     pub fn hash_at(&self, position: u64) -> Option<[u8; 32]> {
-        position.checked_sub(self.start).and_then(|i| self.hashes.get(i as usize)).copied()
+        position
+            .checked_sub(self.start)
+            .and_then(|i| self.hashes.get(i as usize))
+            .copied()
     }
 
     /// Fails if `head` contradicts this chain: another hash at a length it covers.
-    pub fn check(&self, head: &Head) -> Result<(), Contradiction> {
+    pub fn check(&self, head: &Head) -> Result<()> {
         match self.hash_at(head.length) {
-            Some(hash) if hash.as_slice() != head.hash.0 => {
-                Err(Contradiction { ours: self.head.clone(), theirs: head.clone() })
+            Some(hash) if hash.as_slice() != head.hash.0 => Err(Contradiction {
+                ours: self.head.clone(),
+                theirs: head.clone(),
             }
+            .into()),
             _ => Ok(()),
         }
     }
 
     /// Adds `entries`, which follow position `after` (within the chain) and end at `head`.
-    pub fn extend(&mut self, after: u64, entries: &[Bytes], head: &Head) -> Result<(), Contradiction> {
-        let contradiction = || Contradiction { ours: self.head.clone(), theirs: head.clone() };
+    pub fn extend(&mut self, after: u64, entries: &[Bytes], head: &Head) -> Result<()> {
+        let contradiction = || Contradiction {
+            ours: self.head.clone(),
+            theirs: head.clone(),
+        };
         let mut hash = self.hash_at(after).expect("after is within the chain");
         let mut position = after;
         let mut fresh = Vec::new();
@@ -72,13 +99,13 @@ impl Chain {
             hash = head::next(&hash, &entry.0);
             position += 1;
             match self.hash_at(position) {
-                Some(ours) if ours != hash => return Err(contradiction()),
+                Some(ours) if ours != hash => return Err(contradiction().into()),
                 Some(_) => {}
                 None => fresh.push(hash),
             }
         }
         if position != head.length || hash.as_slice() != head.hash.0 {
-            return Err(contradiction());
+            return Err(contradiction().into());
         }
         self.hashes.extend(fresh);
         if head.length >= self.head.length {
@@ -96,7 +123,10 @@ pub(crate) struct Chains {
 
 impl Chains {
     pub fn new(key: Option<VerifyingKey>) -> Self {
-        Chains { key, chains: Mutex::default() }
+        Chains {
+            key,
+            chains: Mutex::default(),
+        }
     }
 
     pub fn get(&self, log: &[u8]) -> Option<Chain> {
@@ -104,7 +134,10 @@ impl Chains {
     }
 
     pub fn set(&self, chain: Chain) {
-        self.chains.lock().unwrap().insert(chain.head.log.0.clone(), chain);
+        self.chains
+            .lock()
+            .unwrap()
+            .insert(chain.head.log.0.clone(), chain);
     }
 
     fn signed(&self, log: &[u8], head: &Head) -> Result<()> {
@@ -128,10 +161,14 @@ impl Chains {
         self.signed(log, head)?;
         let mut chains = self.chains.lock().unwrap();
         if after == 0 {
-            chains.entry(log.to_vec()).or_insert_with(|| Chain::new(log));
+            chains
+                .entry(log.to_vec())
+                .or_insert_with(|| Chain::new(log));
         }
         match chains.get_mut(log) {
-            Some(chain) if !entries.is_empty() && chain.start <= after && after <= chain.len() => {
+            Some(chain)
+                if !entries.is_empty() && chain.start <= after && after <= chain.length() =>
+            {
                 chain.extend(after, entries, head)?
             }
             Some(chain) => chain.check(head)?,
@@ -164,10 +201,14 @@ mod tests {
         let chains = Chains::new(Some(key.verifying_key()));
         let hashes = chain_of(b"log", &[b"a", b"b", b"c"]);
         let head2 = Head::sign(&key, b"log", 2, hashes[2], 1);
-        chains.page(b"log", 0, &bytes(&[b"a", b"b"]), &head2).unwrap();
+        chains
+            .page(b"log", 0, &bytes(&[b"a", b"b"]), &head2)
+            .unwrap();
         let head3 = Head::sign(&key, b"log", 3, hashes[3], 2);
-        chains.page(b"log", 1, &bytes(&[b"b", b"c"]), &head3).unwrap();
-        assert_eq!(chains.get(b"log").unwrap().len(), 3);
+        chains
+            .page(b"log", 1, &bytes(&[b"b", b"c"]), &head3)
+            .unwrap();
+        assert_eq!(chains.get(b"log").unwrap().length(), 3);
         chains.head(b"log", &head2).unwrap();
 
         let forged = Head::sign(&SigningKey::from_bytes(&[2; 32]), b"log", 3, hashes[3], 2);
@@ -175,12 +216,26 @@ mod tests {
 
         let other = chain_of(b"log", &[b"a", b"x"]);
         let split = Head::sign(&key, b"log", 2, other[2], 3);
-        let err = chains.head(b"log", &split).unwrap_err().downcast::<Contradiction>().unwrap();
+        let err = chains
+            .head(b"log", &split)
+            .unwrap_err()
+            .downcast::<Contradiction>()
+            .unwrap();
         assert_eq!((err.ours, err.theirs), (head3.clone(), split.clone()));
-        assert!(chains.page(b"log", 1, &bytes(&[b"x"]), &split).unwrap_err().is::<Contradiction>());
+        assert!(
+            chains
+                .page(b"log", 1, &bytes(&[b"x"]), &split)
+                .unwrap_err()
+                .is::<Contradiction>()
+        );
 
         let lying = Head::sign(&key, b"log", 4, hashes[3], 4);
-        assert!(chains.page(b"log", 3, &bytes(&[b"d"]), &lying).unwrap_err().is::<Contradiction>());
+        assert!(
+            chains
+                .page(b"log", 3, &bytes(&[b"d"]), &lying)
+                .unwrap_err()
+                .is::<Contradiction>()
+        );
         assert_eq!(chains.get(b"log").unwrap().head, head3);
     }
 
@@ -193,10 +248,30 @@ mod tests {
         chains.page(b"log", 1, &bytes(&[b"b"]), &head2).unwrap();
         assert!(chains.get(b"log").is_none());
         chains.set(Chain::anchored(head2));
-        chains.page(b"log", 2, &bytes(&[b"c"]), &Head::sign(&key, b"log", 3, hashes[3], 2)).unwrap();
-        chains.head(b"log", &Head::sign(&key, b"log", 1, hashes[1], 3)).unwrap();
+        chains
+            .page(
+                b"log",
+                2,
+                &bytes(&[b"c"]),
+                &Head::sign(&key, b"log", 3, hashes[3], 2),
+            )
+            .unwrap();
+        chains
+            .head(b"log", &Head::sign(&key, b"log", 1, hashes[1], 3))
+            .unwrap();
         let wrong = Head::sign(&key, b"log", 4, hashes[3], 4);
-        assert!(chains.page(b"log", 3, &bytes(&[b"d"]), &wrong).unwrap_err().is::<Contradiction>());
-        assert_eq!((chains.get(b"log").unwrap().start, chains.get(b"log").unwrap().len()), (2, 3));
+        assert!(
+            chains
+                .page(b"log", 3, &bytes(&[b"d"]), &wrong)
+                .unwrap_err()
+                .is::<Contradiction>()
+        );
+        assert_eq!(
+            (
+                chains.get(b"log").unwrap().start,
+                chains.get(b"log").unwrap().length()
+            ),
+            (2, 3)
+        );
     }
 }
