@@ -26,8 +26,8 @@ def home(name):
     return os.path.join(TMP, name)
 
 
-def run(session, *args, ok=True, input=None):
-    env = {**ENV, "LETMEKNOW_HOME": home(session)}
+def run(session, *args, ok=True, input=None, device=None):
+    env = {**ENV, "LETMEKNOW_HOME": home(device or session)}
     result = subprocess.run([BIN, "--session", session, *args], env=env, input=input, capture_output=True, text=True, timeout=120)
     if ok and result.returncode:
         sys.exit(f"{session} {args}: {result.stderr}")
@@ -35,11 +35,11 @@ def run(session, *args, ok=True, input=None):
 
 
 class Listener:
-    """A session process, in its own home: its own device."""
+    """A session process, in its own home (its own device) unless it shares `device`'s."""
 
-    def __init__(self, session):
+    def __init__(self, session, device=None):
         self.session, self.lines = session, queue.Queue()
-        env = {**ENV, "LETMEKNOW_HOME": home(session)}
+        env = {**ENV, "LETMEKNOW_HOME": home(device or session)}
         args = [BIN, "--session", session, "listen", "--name", session.title(), "--hold", "0"]
         self.log = open(os.path.join(TMP, f"{session}.log"), "a")
         self.proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8")
@@ -173,6 +173,9 @@ def main():
         check(len(joined["members"]) == 3, "a member invites another")
         alice.expect("joined", lambda e: e["member"]["name"] == "Carol" and e["by"]["name"] == "Bob")
         check(any(c["name"] == "Carol" for c in run("bob", "contacts")["contacts"]), "carol is bob's contact")
+        desk = Listener("desk", device="bob")
+        check(any(c["name"] == "Carol" for c in run("desk", "contacts", device="bob")["contacts"]), "another session on bob's machine sees his contacts")
+        desk.stop()
 
         # A device link: bob's tablet joins his identity, and his contacts reach it.
         link = run("bob", "invite", "--identity", "Bob")["link"]

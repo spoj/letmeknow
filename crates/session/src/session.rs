@@ -1,5 +1,8 @@
 //! The session process: it runs this session's node (and, holding the device's lock, the device's), keeps docs in step
-//! with their files, and prints what concerns the agent.
+//! with their files, and prints what concerns the agent. The session process that holds the lock publishes the device's
+//! identities, contacts and openings to `device-state.json`, and answers the requests only the device's node can on the
+//! command channel `device-endpoint`, both in `LETMEKNOW_HOME`; the device's other session processes read the one and
+//! send such requests to the other.
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -8,10 +11,11 @@ use lmk_core::invite::Target;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::{Claim, Event, Member, Node, doc as ydoc};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, How, IdentityRef, Kind, Named, PROTOCOL, Payload, Service, Settings};
+use lmk_proto::group::{Attachment, How, IdentityRef, Kind, Named, Opening, PROTOCOL, Payload, Service, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -22,6 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::cli::{ContactsOp, IdentityOp, Request, private_file};
+use crate::Network;
 use crate::doc::{self, Quiet};
 use crate::policy::{Outbox, mentions, wakes};
 
@@ -31,6 +36,8 @@ const CAUSAL_WAIT: Duration = Duration::from_secs(300);
 const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
 const FETCH_WAIT: Duration = Duration::from_secs(60);
 const INVITE_TTL: u64 = 600;
+/// How often a session process that does not act for the device tries its lock.
+const DEVICE_RETRY: Duration = Duration::from_secs(10);
 
 pub type SessionNode = Node<SqliteProvider>;
 
@@ -49,6 +56,22 @@ pub enum Inbound {
     Request(Box<Request>, oneshot::Sender<Value>),
     /// A doc's file changed.
     FileChanged(Bytes),
+    /// A warning of the device's node: of its events, only these concern the agent.
+    DeviceWarning(String),
+}
+
+/// What the session process acting for the device publishes of it.
+#[derive(Default, Serialize, Deserialize)]
+struct DeviceState {
+    identities: Vec<(IdentityRef, String)>,
+    contacts: Vec<(Bytes, Contact)>,
+    openings: Vec<Opening>,
+}
+
+impl DeviceState {
+    fn of(device: &SessionNode) -> Result<Self> {
+        Ok(DeviceState { identities: device.identities(), contacts: device.contacts()?, openings: device.openings() })
+    }
 }
 
 /// A doc group's file, which the session keeps in step with the doc. Its base, the text both last had, is in the store.
@@ -85,6 +108,12 @@ pub struct Session {
     node: SessionNode,
     /// The device's node, when this process holds the device's lock.
     device: Option<SessionNode>,
+    lock: std::fs::File,
+    device_retry: Instant,
+    /// The device's state as last published.
+    published: String,
+    home: PathBuf,
+    network: Network,
     config: Config,
     outbox: Outbox,
     bindings: HashMap<Bytes, Binding>,
@@ -121,7 +150,8 @@ impl Session {
     pub async fn open(
         config: Config,
         node: SessionNode,
-        device: Option<SessionNode>,
+        home: &Path,
+        network: Network,
         inbound: mpsc::UnboundedSender<Inbound>,
     ) -> Result<Self> {
         let db = crate::store::open(&config.dir.join("session.db"))?;
@@ -133,10 +163,16 @@ impl Session {
             Some(_) => {}
             None => _ = db.execute("INSERT INTO session (name) VALUES (?)", [&config.name])?,
         }
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("device.lock"))?;
         let mut session = Self {
             db,
             node,
-            device,
+            device: None,
+            lock,
+            device_retry: Instant::now(),
+            published: String::new(),
+            home: home.to_path_buf(),
+            network,
             config,
             outbox: Outbox::default(),
             bindings: HashMap::new(),
@@ -145,6 +181,7 @@ impl Session {
             catching_up: Some(Instant::now() + CATCH_UP_WINDOW),
             inbound,
         };
+        session.take_device().await?;
         for gid in session.node.groups() {
             session.outbox.catch_up(&b64(&gid.0));
             // Messages that arrived but were never taken in, as when the session stopped while they waited.
@@ -174,11 +211,69 @@ impl Session {
     }
 
     /// This session as the agent sees it in `ready`.
-    pub fn me(&self) -> Value {
+    pub fn me(&self) -> Result<Value> {
         let device = self.node.device();
         let identities: Vec<Value> =
-            self.identities().into_iter().map(|(identity, name)| json!({ "id": identity.id, "name": name })).collect();
-        json!({ "name": self.config.name, "fp": fp(&self.node.key().0), "device": { "key": Bytes(device.public().to_vec()), "name": device.name }, "identities": identities })
+            self.identities()?.into_iter().map(|(identity, name)| json!({ "id": identity.id, "name": name })).collect();
+        Ok(json!({ "name": self.config.name, "fp": fp(&self.node.key().0), "device": { "key": Bytes(device.public().to_vec()), "name": device.name }, "identities": identities }))
+    }
+
+    /// Acts for the device if no other session process does: runs its node and answers its command channel.
+    async fn take_device(&mut self) -> Result<()> {
+        self.device_retry = Instant::now() + DEVICE_RETRY;
+        match self.lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        // Another session process may have acted for the device before, and changed it.
+        let device = lmk_core::device::Device::load(&self.device_file())?;
+        let provider = SqliteProvider::open(&self.home.join("device.db"))?;
+        let config = crate::node_config(&self.network, &self.home, &device.name, true, self.home.join("device-files"));
+        let (node, mut events) = Node::start(provider, device, config).await?;
+        let inbound = self.inbound.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if let Event::Warning { text, .. } = event {
+                    let _ = inbound.send(Inbound::DeviceWarning(text));
+                }
+            }
+        });
+        crate::cli::open_channel(&self.home.join("device-endpoint"), self.inbound.clone()).await?;
+        self.device = Some(node);
+        Ok(())
+    }
+
+    /// Writes the device's state where its other session processes read it, if this process acts for the device and
+    /// the state changed.
+    fn publish(&mut self) {
+        let Some(device) = &self.device else { return };
+        let published = DeviceState::of(device).map(|state| serde_json::to_string(&state).expect("JSON"));
+        let written = published.and_then(|state| {
+            if state != self.published {
+                let path = self.home.join("device-state.json");
+                let new = path.with_extension("new");
+                private_file(&new, state.as_bytes())?;
+                std::fs::rename(&new, &path)?;
+                self.published = state;
+            }
+            Ok(())
+        });
+        if let Err(error) = written {
+            self.warn(None, format!("publishing this device's state: {error:#}"));
+        }
+    }
+
+    /// The device's state: from its node if this process acts for the device, else as published.
+    fn device_state(&self) -> Result<DeviceState> {
+        if let Some(device) = &self.device {
+            return DeviceState::of(device);
+        }
+        match std::fs::read(self.home.join("device-state.json")) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DeviceState::default()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// When something is next due without anything arriving.
@@ -187,12 +282,20 @@ impl Session {
         let docs = self.bindings.values().filter_map(|b| b.quiet.due());
         let waiting = self.waiting.iter().map(|w| w.deadline);
         let fetches = self.fetches.iter().map(|f| f.deadline);
+        let device = self.device.is_none().then_some(self.device_retry);
         let later = Instant::now() + Duration::from_secs(3600);
-        held.into_iter().chain(docs).chain(waiting).chain(fetches).chain(self.catching_up).fold(later, Instant::min)
+        let due = held.into_iter().chain(docs).chain(waiting).chain(fetches).chain(device);
+        due.chain(self.catching_up).fold(later, Instant::min)
     }
 
     pub async fn tick(&mut self) {
         let now = Instant::now();
+        if self.device.is_none()
+            && self.device_retry <= now
+            && let Err(error) = self.take_device().await
+        {
+            self.warn(None, format!("acting for this device: {error:#}"));
+        }
         if self.outbox.deadline(self.config.hold).is_some_and(|at| at <= now) {
             self.outbox.flush_held();
         }
@@ -249,6 +352,8 @@ impl Session {
                     }
                 } else {
                     let result = self.request(request).await;
+                    // Before the answer, so that the device's other session processes read what the request changed.
+                    self.publish();
                     let _ = reply.send(result.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
                 }
                 self.outbox.flush_held();
@@ -258,6 +363,7 @@ impl Session {
                     binding.quiet.file_changed(Instant::now());
                 }
             }
+            Inbound::DeviceWarning(text) => self.warn(None, format!("this device: {text}")),
         }
     }
 
@@ -277,13 +383,6 @@ impl Session {
         };
         if let Err(error) = self.on(event).await {
             self.warn(group.as_ref(), format!("{error:#}"));
-        }
-    }
-
-    /// What the device's node tells: only its warnings concern the agent.
-    pub fn device_event(&mut self, event: Event) {
-        if let Event::Warning { text, .. } = event {
-            self.warn(None, format!("this device: {text}"));
         }
     }
 
@@ -336,26 +435,39 @@ impl Session {
         let Some(claim) = member.identity.clone().filter(|claim| claim.error.is_none()) else { return Ok(()) };
         if let Some(label) = &label {
             let contact = Contact { name: label.clone(), how: contacts::How::Verified, by: None, at: lmk_node::now() };
-            self.device()?.set_contact(&claim.identity.id.0, &contact).await?;
+            Box::pin(self.request(Request::SetContact { identity: claim.identity.id.clone(), contact })).await?;
         }
-        let name = label.unwrap_or_else(|| self.display_name(&claim));
+        let name = match label {
+            Some(label) => label,
+            None => self.display_name(&claim)?,
+        };
         self.node.send(&gid.0, &Payload::Introduce { identity: claim.identity, name, how }).await?;
         Ok(())
     }
 
     /// Records, in the devices group of each of this device's identities the group is open to, the group's opening.
     async fn refresh_opening(&mut self, gid: &Bytes) -> Result<()> {
-        let Some(device) = &self.device else { return Ok(()) };
         let Ok(settings) = self.node.settings(&gid.0) else { return Ok(()) };
-        for (identity, _) in device.identities() {
+        for (identity, _) in self.identities()? {
             if settings.open.iter().any(|named| named.id == identity.id) {
-                device.set_opening(&identity.id.0, self.node.opening(&gid.0)?).await?;
+                let opening = self.node.opening(&gid.0)?;
+                Box::pin(self.request(Request::SetOpening { identity: identity.id, opening })).await?;
             }
         }
         Ok(())
     }
 
     async fn request(&mut self, request: Request) -> Result<Value> {
+        let for_device = match &request {
+            Request::Identity { .. } | Request::SetContact { .. } | Request::SetOpening { .. } => true,
+            Request::Invite { identity, .. } => identity.is_some(),
+            Request::Join { target, .. } => Invite::parse(target.trim()).is_ok_and(|invite| invite.device),
+            _ => false,
+        };
+        if for_device && self.device.is_none() {
+            let channel = crate::cli::connect(&self.home.join("device-endpoint")).await;
+            return crate::cli::exchange(channel.context("no session process acts for this device")?, request).await;
+        }
         match request {
             Request::Invite { group, kind, name, file, keep, membership, as_, for_, to, qr: _, identity } => {
                 self.invite(group, kind, name, file, keep, membership, as_, for_, to, identity).await
@@ -414,6 +526,14 @@ impl Session {
             Request::Contacts { op: None } => self.contacts(),
             Request::Contacts { op: Some(ContactsOp::Accept { identity, name }) } => self.accept(&identity, name).await,
             Request::Introduce { group, member, to } => self.introduce(group, &member, &to).await,
+            Request::SetContact { identity, contact } => {
+                self.device()?.set_contact(&identity.0, &contact).await?;
+                Ok(json!({}))
+            }
+            Request::SetOpening { identity, opening } => {
+                self.device()?.set_opening(&identity.0, opening).await?;
+                Ok(json!({}))
+            }
         }
     }
 
@@ -443,7 +563,7 @@ impl Session {
         }
         let to = to.map(|to| self.contact(&to)).transpose()?;
         ensure!(
-            for_.is_none() || !self.identities().is_empty(),
+            for_.is_none() || !self.identities()?.is_empty(),
             "contacts belong to an identity: create one with `identity create`"
         );
         let mut answer = json!({ "expires_in": INVITE_TTL });
@@ -556,7 +676,7 @@ impl Session {
             groups.push(group);
         }
         let joined = self.node.groups();
-        for opening in self.openings() {
+        for opening in self.device_state()?.openings {
             if !joined.contains(&opening.group) {
                 groups.push(json!({ "group": b64(&opening.group.0), "kind": opening.kind, "name": opening.name, "joined": false }));
             }
@@ -641,7 +761,7 @@ impl Session {
             }
             self.node.join(&invite, as_).await?
         } else {
-            let opening = self.openings().into_iter().find(|o| b64(&o.group.0) == target || o.name == target);
+            let opening = self.device_state()?.openings.into_iter().find(|o| b64(&o.group.0) == target || o.name == target);
             let opening = opening.context("expected an invite link, or the id or name of a group open to your identity")?;
             let identity = as_.context("joining a group open to your identity needs one: this device is on none")?;
             self.node.join_open(&opening, identity).await?
@@ -1153,8 +1273,8 @@ impl Session {
     fn known(&self, gid: &Bytes, claim: &Claim) -> Result<Value> {
         let id = &claim.identity.id;
         let mut known = json!({ "id": id });
-        let own = self.identities().into_iter().find(|(identity, _)| &identity.id == id);
-        let contacts = self.contact_list();
+        let DeviceState { identities, contacts, .. } = self.device_state()?;
+        let own = identities.into_iter().find(|(identity, _)| &identity.id == id);
         let present = |by: &[u8]| {
             self.node.members(&gid.0).is_ok_and(|members| members.iter().any(|m| m.identity.as_ref().is_some_and(|c| c.identity.id.0 == by)))
         };
@@ -1198,15 +1318,16 @@ impl Session {
     }
 
     /// The name this identity gives another: its contact name, else the other's own claim.
-    fn display_name(&self, claim: &Claim) -> String {
-        let contact = self.contact_list().into_iter().find(|(id, _)| *id == claim.identity.id);
-        contact.map_or_else(|| claim.name.clone(), |(_, c)| c.name)
+    fn display_name(&self, claim: &Claim) -> Result<String> {
+        let contact = self.device_state()?.contacts.into_iter().find(|(id, _)| *id == claim.identity.id);
+        Ok(contact.map_or_else(|| claim.name.clone(), |(_, c)| c.name))
     }
 
     fn introduced(&mut self, gid: &Bytes, by: &Member, identity: IdentityRef, name: String, how: How) -> Result<()> {
         let sender = self.describe(gid, by)?;
-        let own = self.identities().iter().any(|(own, _)| own.id == identity.id);
-        let contact = self.contact_list().iter().any(|(id, _)| *id == identity.id);
+        let state = self.device_state()?;
+        let own = state.identities.iter().any(|(own, _)| own.id == identity.id);
+        let contact = state.contacts.iter().any(|(id, _)| *id == identity.id);
         if !own && !contact {
             let by_id = by.identity.as_ref().map_or_else(|| by.key.clone(), |claim| claim.identity.id.clone());
             self.db.execute(
@@ -1234,40 +1355,33 @@ impl Session {
 
     /// The device's node, which this process runs when it holds the device's lock.
     fn device(&self) -> Result<&SessionNode> {
-        self.device.as_ref().context("another session process acts for this device; run identity and contact commands there")
+        self.device.as_ref().context("this session process does not act for the device")
     }
 
     fn device_file(&self) -> PathBuf {
-        self.config.dir.parent().and_then(Path::parent).expect("a session lives in <home>/sessions").join("device.json")
+        self.home.join("device.json")
     }
 
-    /// This device's identities, with their names where the device's node is here to tell them.
-    fn identities(&self) -> Vec<(IdentityRef, String)> {
-        match &self.device {
-            Some(device) => device.identities(),
-            None => self.node.device().identities.into_iter().map(|identity| (identity, String::new())).collect(),
-        }
+    /// This device's identities, with their names.
+    fn identities(&self) -> Result<Vec<(IdentityRef, String)>> {
+        Ok(self.device_state()?.identities)
     }
 
-    fn contact_list(&self) -> Vec<(Bytes, Contact)> {
-        self.device.as_ref().and_then(|device| device.contacts().ok()).unwrap_or_default()
-    }
-
-    fn openings(&self) -> Vec<lmk_proto::group::Opening> {
-        self.device.as_ref().map(|device| device.openings()).unwrap_or_default()
+    fn contact_list(&self) -> Result<Vec<(Bytes, Contact)>> {
+        Ok(self.device_state()?.contacts)
     }
 
     /// The identity a new membership speaks as: the one named, or else the device's first.
     fn speaking_as(&self, as_: Option<String>) -> Result<Option<IdentityRef>> {
         match as_ {
             Some(as_) => Ok(Some(self.own_identity(&as_)?.0)),
-            None => Ok(self.identities().into_iter().next().map(|(identity, _)| identity)),
+            None => Ok(self.identities()?.into_iter().next().map(|(identity, _)| identity)),
         }
     }
 
     /// An identity this device is on, by id or name.
     fn own_identity(&self, name: &str) -> Result<(IdentityRef, String)> {
-        let identities = self.identities();
+        let identities = self.identities()?;
         identities
             .into_iter()
             .find(|(identity, own)| b64(&identity.id.0) == name || own == name)
@@ -1280,12 +1394,12 @@ impl Session {
             return Ok((identity.id, own));
         }
         let id = self.contact(name)?;
-        let (_, contact) = self.contact_list().into_iter().find(|(cid, _)| *cid == id).expect("found by contact");
+        let (_, contact) = self.contact_list()?.into_iter().find(|(cid, _)| *cid == id).expect("found by contact");
         Ok((id, contact.name))
     }
 
     fn contact(&self, name: &str) -> Result<Bytes> {
-        let contacts = self.contact_list();
+        let contacts = self.contact_list()?;
         let contact = contacts.iter().find(|(id, c)| b64(&id.0) == name || c.name.eq_ignore_ascii_case(name));
         Ok(contact.with_context(|| format!("no contact {name}; `contacts` lists them"))?.0.clone())
     }
@@ -1328,7 +1442,7 @@ impl Session {
     }
 
     fn contacts(&self) -> Result<Value> {
-        let contacts = self.contact_list();
+        let contacts = self.contact_list()?;
         let listed: Vec<Value> = contacts
             .iter()
             .map(|(id, c)| {
@@ -1357,7 +1471,7 @@ impl Session {
             .context("no introduction of that identity")?;
         let by: Bytes = serde_json::from_value(serde_json::from_str::<Value>(&introduction.1)?["by"].clone())?;
         let contact = Contact { name: name.unwrap_or(introduction.0), how: contacts::How::Introduced, by: Some(by), at: lmk_node::now() };
-        self.device()?.set_contact(&id, &contact).await?;
+        Box::pin(self.request(Request::SetContact { identity: Bytes(id.clone()), contact: contact.clone() })).await?;
         self.db.execute("DELETE FROM introductions WHERE identity = ?", [&id])?;
         Ok(json!({ "identity": Bytes(id), "name": contact.name, "how": contact.how }))
     }
@@ -1370,6 +1484,7 @@ impl Session {
         let _ = self.node.shutdown().await;
         if let Some(device) = &self.device {
             let _ = device.shutdown().await;
+            let _ = std::fs::remove_file(self.home.join("device-endpoint"));
         }
         let _ = std::fs::remove_file(self.config.dir.join("endpoint"));
     }
@@ -1381,19 +1496,18 @@ pub async fn run(
     mut session: Session,
     mut inbound: mpsc::UnboundedReceiver<Inbound>,
     mut events: mpsc::UnboundedReceiver<Event>,
-    mut device_events: mpsc::UnboundedReceiver<Event>,
     mut print: impl FnMut(String),
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    let ready = json!({ "type": "ready", "session": session.config.handle, "member": session.me(), "state": session.config.dir });
+    let ready = json!({ "type": "ready", "session": session.config.handle, "member": session.me()?, "state": session.config.dir });
     print(ready.to_string());
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
+        session.publish();
         session.emit(&mut print).await;
         tokio::select! {
             Some(item) = inbound.recv() => session.handle(item).await,
             Some(event) = events.recv() => session.event(event).await,
-            Some(event) = device_events.recv() => session.device_event(event),
             _ = tokio::time::sleep_until(session.next_due()) => session.tick().await,
             _ = &mut shutdown => break,
         }

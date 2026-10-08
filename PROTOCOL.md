@@ -122,7 +122,12 @@ An identity's contacts live in its devices group as a Yjs map, named `contacts`,
 
 ### Devices group
 
-An identity's devices group is a chat whose settings carry `devices_of`. Its members are devices, not sessions: on a machine, whichever session process holds the lock `LETMEKNOW_HOME/device.lock` acts for the device, as a member whose MLS key is the device key, with its own iroh key and its state in `LETMEKNOW_HOME/device.db`. The device's other session processes do without its contacts and openings. In a browser, the device is the session.
+An identity's devices group is a chat whose settings carry `devices_of`. Its members are devices, not sessions: on a machine, whichever session process holds the lock `LETMEKNOW_HOME/device.lock` acts for the device, as a member whose MLS key is the device key, with its own iroh key and its state in `LETMEKNOW_HOME/device.db`. The device's other session processes try the lock every 10 seconds, so one takes over when the holder stops. In a browser, the device is the session.
+
+On a machine, the holder shares the device with its other session processes through two files in `LETMEKNOW_HOME`:
+
+- `device-state.json`: `{"identities": [[<identity ref>, "<name>"]], "contacts": [["<identity id>", <contact>]], "openings": [<opening>]}`, rewritten whenever it changes, by writing `device-state.new` and renaming it over the old. The others read it whenever they need contacts, identities or openings.
+- `device-endpoint`: the holder's second command channel (`{"port", "token"}`, a localhost TCP port taking one JSON line `{"token", "request"}` and answering one line, as each session's own `endpoint`). The others send it the requests only the device's node can answer: `identity`, `invite --identity`, `join` with a device link, and two of their own, `{"cmd": "set_contact", "identity", "contact"}` and `{"cmd": "set_opening", "identity", "opening"}`. The holder rewrites `device-state.json` before it answers.
 
 An opening, in its settings: `{"group", "kind", "name", "membership", "members": ["<iroh key>"]}`. A member that is a device of the identity writes it, and refreshes `members` when the group's membership changes.
 

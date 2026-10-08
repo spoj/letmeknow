@@ -66,7 +66,12 @@ impl World {
 
     /// A session process in its own home: its own device.
     async fn start(&self, handle: &str, hold: Duration) -> Agent {
-        let home = self.root.join(handle);
+        self.start_in(handle, handle, hold).await
+    }
+
+    /// A session process in the home `device`.
+    async fn start_in(&self, device: &str, handle: &str, hold: Duration) -> Agent {
+        let home = self.root.join(device);
         let config = Config {
             handle: handle.into(),
             dir: session_dir(&home, handle).unwrap(),
@@ -537,5 +542,45 @@ fn a_restarted_session_resumes_its_groups_and_docs() {
         assert_eq!((groups[0]["name"].as_str(), groups[0]["file"].as_str()), (Some("Notes"), Some(file.as_str())));
         alice.cmd(&["leave"]).await.unwrap();
         assert!(!Path::new(&file).exists());
+    });
+}
+
+#[test]
+fn every_session_of_a_device_sees_its_state_and_changes_it() {
+    local(async {
+        let world = world("device").await;
+        let mut first = world.start("alice", HOUR).await;
+        let mut second = world.start_in("alice", "second", HOUR).await;
+        // The second session process acts through the first, which holds the device's lock.
+        second.cmd(&["identity", "create", "Alice"]).await.unwrap();
+        assert_eq!(first.cmd(&["identity", "list"]).await.unwrap()["identities"][0]["name"], "Alice");
+        let bob = world.start("bob", HOUR).await;
+        bob.cmd(&["identity", "create", "Robert"]).await.unwrap();
+        let invite = second.cmd(&["invite", "--for", "Bob (Acme)"]).await.unwrap();
+        bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        second.expect("joined").await;
+        for agent in [&first, &second] {
+            let contacts = agent.cmd(&["contacts"]).await.unwrap();
+            assert_eq!(contacts["contacts"][0]["name"], "Bob (Acme)", "{contacts}");
+        }
+        let members = second.cmd(&["members"]).await.unwrap();
+        let bob_seen = members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Bob").unwrap().clone();
+        assert_eq!(bob_seen["identity"]["how"], "verified");
+        // An opening the second records reaches the first.
+        second.cmd(&["open", "Alice"]).await.unwrap();
+        let groups = first.cmd(&["groups"]).await.unwrap();
+        assert_eq!((groups[0]["group"].as_str(), groups[0]["joined"].as_bool()), (invite["group"].as_str(), Some(false)));
+        // Once the first stops, the second acts for the device.
+        first.stop().await;
+        let mut listed = second.cmd(&["identity", "list"]).await;
+        for _ in 0..60 {
+            if listed.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            listed = second.cmd(&["identity", "list"]).await;
+        }
+        assert_eq!(listed.unwrap()["identities"][0]["name"], "Alice");
+        assert!(second.printed().await.iter().all(|e| e["type"] != "warning"));
     });
 }
