@@ -1152,6 +1152,11 @@ impl<C: Core, P: Peers, L: Log> Session<C, P, L> {
         if let Some((gid, link)) = self.doc_states.remove(&hash) {
             let state = self.peers.file(&link)?.context("an arrived file is held")?;
             self.merge_doc(&gid, &state)?;
+            let me = self.core.members(&gid.0)?.into_iter().find(|m| m.key == self.core.key()).context("a member of its group")?;
+            if let Some((by, _)) = me.added {
+                let by = self.describe_key(&gid, &by);
+                self.bindings.get_mut(&gid).expect("a doc is bound").editors.push(by);
+            }
         }
         Ok(())
     }

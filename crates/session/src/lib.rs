@@ -4,6 +4,10 @@ pub mod node;
 pub mod policy;
 pub mod session;
 mod store;
+#[cfg(test)]
+mod fake;
+#[cfg(test)]
+mod tests;
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
