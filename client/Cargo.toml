@@ -32,7 +32,9 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 reqwest-websocket = { version = "0.6", default-features = false }
 rusqlite = "0.37"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+similar = "3"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+yrs = "0.28"
 
 # The browser client: `web/build.mjs` compiles the library to WebAssembly.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -19,7 +19,7 @@ const MAX_PAST_EPOCHS: usize = 5;
 const WORDS: &str = include_str!("words.txt");
 
 /// A message as both transports carry it: MLS plaintext on the relay, the body of a folder file.
-/// A message with `settings` (or, later, a file) carries no text and stays out of the conversation: it is never
+/// A message with `settings` or `file` carries no text and stays out of the conversation: it is never
 /// delivered as a message, and never listed in `after`.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Payload {
@@ -37,6 +37,19 @@ pub struct Payload {
     pub attachment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings: Option<Settings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<FileUpdate>,
+}
+
+/// A change to one of the group's files: a Yjs update. A file's first update, and the snapshot a member posts after
+/// adding someone, carry its name and its whole state.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FileUpdate {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Base64 Yjs update, v1 encoding.
+    pub update: String,
 }
 
 /// A group's settings, posted whole whenever one changes; the latest a member has seen wins. Whoever adds a member

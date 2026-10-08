@@ -1,4 +1,5 @@
 mod device;
+mod files;
 mod relay;
 mod session;
 mod store;
@@ -8,7 +9,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use session::{Event, Request, Session};
+use session::{Event, FileOp, Request, Session};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -284,10 +285,23 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
             std::io::stdin().read_to_string(text)?;
         }
     }
+    if let Request::File { op: FileOp::Edit { text, .. } | FileOp::Create { text, .. } } = &mut request {
+        *text = match text.as_str() {
+            "-" => {
+                let mut text = String::new();
+                std::io::stdin().read_to_string(&mut text)?;
+                text
+            }
+            path => std::fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?,
+        };
+    }
     // The session process runs in another directory, so folder paths are made absolute here.
     let target = match &mut request {
         Request::Join { target, .. } => Some(target),
         Request::Invite { group, .. } | Request::Open { group, .. } | Request::Name { group, .. } | Request::Send { group, .. } | Request::Members { group } | Request::Remove { group, .. } | Request::Leave { group } => {
+            group.as_mut()
+        }
+        Request::File { op: FileOp::Ls { group } | FileOp::Show { group, .. } | FileOp::Edit { group, .. } | FileOp::Create { group, .. } } => {
             group.as_mut()
         }
         Request::Read { .. } | Request::Groups | Request::Entity { .. } => None,

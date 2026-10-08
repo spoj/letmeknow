@@ -65,6 +65,23 @@ def in_state(listener, *texts):
     return any(text in open(f, "rb").read() for f in files if os.path.isfile(f) for text in texts)
 
 
+def until(produce, accept, timeout=10):
+    """Calls `produce` until `accept` takes its result; folder groups see other members' files a moment later."""
+    deadline = time.time() + timeout
+    while True:
+        result = produce()
+        if accept(result) or time.time() > deadline:
+            return result
+        time.sleep(0.3)
+
+
+def write(name, text):
+    path = os.path.join(HOME, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
 def check(condition, message):
     if not condition:
         sys.exit(f"FAIL: {message}")
@@ -227,6 +244,15 @@ def main():
         got = erin.expect(lambda e: e["type"] == "message")
         check(got["content"] == "from 0.4" and got["to"] == [erin_fp] and got["direct"], "a 0.4 file with a single fingerprint in to still reads")
 
+        notes = run("erin", "file", "create", "notes.md", write("notes.md", "one\ntwo\n"))
+        base = until(lambda: run("frank", "file", "show", "notes.md", ok=False), lambda r: isinstance(r, dict))
+        erin_base = run("erin", "file", "show", "notes.md")["version"]
+        run("frank", "file", "edit", "--base", base["version"], "notes.md", write("frank.md", "one\ntwo\nthree\n"))
+        until(lambda: run("erin", "file", "show", "notes.md")["text"], lambda t: "three" in t)
+        edited = run("erin", "file", "edit", "--base", erin_base, "notes.md", write("erin.md", "ONE\ntwo\n"))
+        text = until(lambda: run("frank", "file", "show", "notes.md")["text"], lambda t: "ONE" in t)
+        check(edited["text"] == text == "ONE\ntwo\nthree\n" and notes["name"] == "notes.md", "files work the same in folder groups")
+
         erin.stop()
         for i in range(22):
             run("frank", "send", f"folder {i}")
@@ -322,11 +348,30 @@ def main():
         check(tick.expect(lambda e: e["type"] == "settings")["settings"]["name"] == "Priorities", "the member who admits it passes on the group's settings")
         check("not open to any entity" in run("later", "join", group["group"], env=homes["elsewhere"], ok=False), "the group is not open to other entities")
 
+        # Files: CRDT text documents in the group, edited from versions that others have changed since.
+        created = on(lap, "file", "create", "list.md", write("list.md", "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n"))
+        shown = on(kim, "file", "show", "list.md")
+        check(shown["file"] == created["file"] and shown["text"] == "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n", "a file one member creates reads the same for another")
+        old = on_tick("file", "show", "list.md")["version"]
+        on(kim, "file", "edit", "--base", shown["version"], "list.md", write("kim.md", "- [x] alpha\n- [ ] beta\n- [ ] gamma\n"))
+        moved = on(lap, "file", "show", "list.md")
+        on(lap, "file", "edit", "--base", moved["version"], "list.md", write("lap.md", "- [ ] gamma\n- [x] alpha\n- [ ] beta (asked Bob)\n"))
+        edited = on_tick("file", "edit", "--base", old, "list.md", write("tick.md", "- [ ] alpha\n- [x] beta\n- [x] gamma\n- [ ] delta\n"))
+        final = "- [x] gamma\n- [ ] delta\n- [x] alpha\n- [ ] beta (asked Bob)\n"
+        check(edited["merged"] and edited["text"] == final, "an edit from an old version lands on the lines where they are now; others' changes stay")
+        check(edited["lost"] == ["- [x] beta"], "a change to a line someone else changed meanwhile is reported as lost")
+        check(on(kim, "file", "show", "list.md")["text"] == final == on(lap, "file", "show", "list.md")["text"], "every member converges on the same text")
+        drained = [e for e in iter(lambda: kim.poll(1), None)]
+        check(not any(e["type"] == "message" for e in drained), "file updates never print, so they never wake an agent")
+        check([f["name"] for f in on(kim, "file", "ls")] == ["list.md"], "file ls lists the group's files")
+
         listed = on(lap, "entity", "remove", srv_device)["members"]
         check([m["name"] for m in listed] == [devices["entities"][0]["members"][0]["name"]], "a member can be taken off an entity's list")
         run("later", "join", on(lap, "invite", "--group", group["group"])["link"], env=homes["elsewhere"])
         seen = {m["name"]: m.get("entity") for m in run("later", "members", env=homes["elsewhere"])["members"]}
         check(seen["Srv"]["error"] == "not on Matthew's list" and seen["Lap"]["name"] == "Matthew", "after which its sessions no longer count as the entity")
+        shown = until(lambda: run("later", "file", "ls", env=homes["elsewhere"]), lambda files: files)
+        check(run("later", "file", "show", "list.md", env=homes["elsewhere"])["text"] == final, "a member added later gets the file from a snapshot, as it cannot read what came before")
 
         check("several sessions are running" in run(None, "groups", ok=False), "without --session, several running sessions are ambiguous")
         solo_env = {**ENV, "LETMEKNOW_HOME": os.path.join(HOME, "solo")}

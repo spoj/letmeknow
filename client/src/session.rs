@@ -1,11 +1,12 @@
 use crate::device::{Device, Membership};
+use crate::files;
 use crate::relay::Relay;
 use crate::store::{Provider, SCHEMA};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::Subcommand;
 use letmeknow::proto::{
-    CIPHERSUITE, INVITE_SLOTS, INVITE_TTL_S, Opened, PAKE_ID, Payload, Settings, create_config, digest, fingerprint, invite_key, invite_words, join_config,
+    CIPHERSUITE, FileUpdate, INVITE_SLOTS, INVITE_TTL_S, Opened, PAKE_ID, Payload, Settings, create_config, digest, fingerprint, invite_key, invite_words, join_config,
     membership_changes, open, person, random_below, seal,
 };
 use letmeknow::entity::{self, JoinRequest, List, Member, Opening, place};
@@ -114,10 +115,49 @@ pub enum Request {
         group: Option<String>,
         name: String,
     },
+    /// The group's files: text documents every member can edit at once
+    File {
+        #[command(subcommand)]
+        op: FileOp,
+    },
     /// Entities this device is in: create one, list them, or take a member off one
     Entity {
         #[command(subcommand)]
         op: EntityOp,
+    },
+}
+
+#[derive(Subcommand, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOp {
+    /// The group's files
+    Ls {
+        #[arg(long)]
+        group: Option<String>,
+    },
+    /// A file's text, and its version for `file edit --base`
+    Show {
+        #[arg(long)]
+        group: Option<String>,
+        file: String,
+    },
+    /// Make the file's text that of PATH ("-" reads stdin), read at version --base: lines you changed are changed where they are now, so what others changed since stays
+    Edit {
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(long)]
+        base: String,
+        file: String,
+        #[arg(value_name = "PATH")]
+        text: String,
+    },
+    /// Create a file holding the text of PATH ("-" reads stdin)
+    Create {
+        #[arg(long)]
+        group: Option<String>,
+        name: String,
+        #[arg(value_name = "PATH")]
+        text: String,
     },
 }
 
@@ -389,6 +429,7 @@ impl Session {
                 let settings = Settings { name, ..self.settings(&gid)? };
                 self.set(&gid, settings).await
             }
+            Request::File { op } => self.file(op).await,
             Request::Entity { op: EntityOp::Create { name } } => self.entity_create(name).await,
             Request::Entity { op: EntityOp::List } => self.entities().await,
             Request::Entity { op: EntityOp::Remove { entity, member } } => self.entity_remove(entity, member).await,
@@ -662,14 +703,117 @@ impl Session {
         Ok(json!({ "group": gid, "settings": settings }))
     }
 
-    /// What a member who was just added needs from the others: the settings.
+    /// What a member who was just added needs from the others, who keep it: the settings, and a snapshot of every file.
+    /// It cannot read anything sent before it joined.
     async fn post_state(&mut self, gid: &str) -> Result<()> {
         let settings = self.settings(gid)?;
         if settings != Settings::default() {
             self.post_payload(gid, &Payload { settings: Some(settings), ..Payload::default() }).await?;
         }
+        for (id, name, state) in self.files(gid)? {
+            self.post_file(gid, &id, &name, &state).await?;
+        }
         Ok(())
     }
+
+    fn files(&self, gid: &str) -> Result<Vec<(String, String, Vec<u8>)>> {
+        Ok(self
+            .db
+            .prepare("SELECT id, name, state FROM files WHERE gid = ? ORDER BY rowid")?
+            .query_map([gid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// A file by id, or by name if only one file has it.
+    fn find_file(&self, gid: &str, file: &str) -> Result<(String, String, Vec<u8>)> {
+        let mut found: Vec<_> = self.files(gid)?.into_iter().filter(|(id, name, _)| id == file || name == file).collect();
+        match found.len() {
+            1 => Ok(found.remove(0)),
+            0 => bail!("no file {file} in {gid}"),
+            n => bail!("{n} files are named {file}; use the id from `file ls`"),
+        }
+    }
+
+    fn store_file(&self, gid: &str, id: &str, name: &str, state: &[u8]) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO files (gid, id, name, state) VALUES (?, ?, ?, ?)
+             ON CONFLICT (gid, id) DO UPDATE SET state = excluded.state, name = CASE WHEN excluded.name = '' THEN name ELSE excluded.name END",
+            params![gid, id, name, state],
+        )?;
+        Ok(())
+    }
+
+    /// Records a version shown to the agent, which a later `file edit --base` may build on.
+    fn keep_version(&self, gid: &str, id: &str, state: &[u8]) -> Result<String> {
+        let version = files::version(state);
+        self.db.execute("INSERT OR IGNORE INTO versions (gid, file, version, state) VALUES (?, ?, ?, ?)", params![gid, id, version, state])?;
+        Ok(version)
+    }
+
+    async fn post_file(&mut self, gid: &str, id: &str, name: &str, update: &[u8]) -> Result<()> {
+        let file = FileUpdate { id: id.to_owned(), name: name.to_owned(), update: B64.encode(update) };
+        self.post_payload(gid, &Payload { file: Some(file), ..Payload::default() }).await?;
+        Ok(())
+    }
+
+    async fn file(&mut self, op: FileOp) -> Result<Value> {
+        match op {
+            FileOp::Ls { group } => {
+                let gid = self.resolve(group)?;
+                self.catch_up_now(&gid).await?;
+                let mut listed = Vec::new();
+                for (id, name, state) in self.files(&gid)? {
+                    listed.push(json!({ "file": id, "name": name, "version": files::version(&state), "lines": files::text(&state)?.lines().count() }));
+                }
+                Ok(Value::Array(listed))
+            }
+            FileOp::Show { group, file } => {
+                let gid = self.resolve(group)?;
+                self.catch_up_now(&gid).await?;
+                let (id, name, state) = self.find_file(&gid, &file)?;
+                let version = self.keep_version(&gid, &id, &state)?;
+                Ok(json!({ "file": id, "name": name, "version": version, "text": files::text(&state)? }))
+            }
+            FileOp::Edit { group, base, file, text } => {
+                let gid = self.resolve(group)?;
+                self.catch_up_now(&gid).await?;
+                let (id, name, state) = self.find_file(&gid, &file)?;
+                let base_state: Vec<u8> = self
+                    .db
+                    .query_row("SELECT state FROM versions WHERE gid = ? AND file = ? AND version = ?", params![gid, id, base], |r| r.get(0))
+                    .optional()?
+                    .with_context(|| format!("unknown version {base} of {name}; run `file show` for the current one"))?;
+                let (target, lost) = files::rebase(&files::text(&base_state)?, &text, &files::text(&state)?);
+                let update = files::edit(&state, &target)?;
+                let merged = files::apply(Some(&state), &update)?;
+                self.post_file(&gid, &id, "", &update).await?;
+                self.store_file(&gid, &id, &name, &merged)?;
+                let version = self.keep_version(&gid, &id, &merged)?;
+                Ok(json!({ "file": id, "version": version, "merged": base != files::version(&state), "lost": lost, "text": files::text(&merged)? }))
+            }
+            FileOp::Create { group, name, text } => {
+                let gid = self.resolve(group)?;
+                let id = hex::encode(self.provider.rand().random_array::<8>()?);
+                let state = files::new(&text);
+                self.post_file(&gid, &id, &name, &state).await?;
+                self.store_file(&gid, &id, &name, &state)?;
+                Ok(json!({ "file": id, "name": name, "version": self.keep_version(&gid, &id, &state)? }))
+            }
+        }
+    }
+
+    /// Takes in what the relay has for a group now, so a file is read, or a message built, from where the group stands.
+    async fn catch_up_now(&mut self, gid: &str) -> Result<()> {
+        let Some(group) = self.groups.get(gid) else { return Ok(()) };
+        let (relay, cursor) = (group.relay.clone(), group.cursor);
+        for (seq, data) in self.relay.fetch(&relay, gid, cursor).await? {
+            if let Err(error) = self.receive(gid, seq, &data).await {
+                self.warn(Some(gid), format!("{error:#}"));
+            }
+        }
+        Ok(())
+    }
+
 
     /// Opens the group to an entity: records it in the settings, and tells the entity's devices through its inbox.
     async fn open_to(&mut self, group: Option<String>, entity: String, close: bool) -> Result<Value> {
@@ -946,13 +1090,7 @@ impl Session {
             if let Some(posted) = self.post(gid, &mut build).await? {
                 return Ok(posted);
             }
-            let group = &self.groups[gid];
-            let (relay, cursor) = (group.relay.clone(), group.cursor);
-            for (seq, data) in self.relay.fetch(&relay, gid, cursor).await? {
-                if let Err(error) = self.receive(gid, seq, &data).await {
-                    self.warn(Some(gid), format!("{error:#}"));
-                }
-            }
+            self.catch_up_now(gid).await?;
         }
         bail!("the group kept changing; try again")
     }
@@ -1026,7 +1164,7 @@ impl Session {
         }
         self.folders.remove(gid);
         self.backlog.remove(gid);
-        for table in ["groups", "folders", "messages", "settings", "applied"] {
+        for table in ["groups", "folders", "messages", "settings", "applied", "files", "versions"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [gid])?;
         }
         let attachments = self.attachments.join(&digest(gid.as_bytes())[..16]);
@@ -1254,10 +1392,19 @@ impl Session {
 
     /// Logs a received message and delivers it, with its attachment written to a file only this user can read.
     fn ingest(&mut self, gid: &str, id: &str, sender: Value, mut payload: Payload) -> Result<()> {
+        if (payload.settings.is_some() || payload.file.is_some())
+            && self.db.execute("INSERT OR IGNORE INTO applied (id, gid) VALUES (?, ?)", params![id, gid])? == 0
+        {
+            return Ok(());
+        }
+        // A file update changes the file and nothing else: it never wakes the agent.
+        if let Some(file) = payload.file.take() {
+            let state: Option<Vec<u8>> =
+                self.db.query_row("SELECT state FROM files WHERE gid = ? AND id = ?", params![gid, file.id], |r| r.get(0)).optional()?;
+            let state = files::apply(state.as_deref(), &B64.decode(&file.update)?)?;
+            return self.store_file(gid, &file.id, &file.name, &state);
+        }
         if let Some(settings) = payload.settings.take() {
-            if self.db.execute("INSERT OR IGNORE INTO applied (id, gid) VALUES (?, ?)", params![id, gid])? == 0 {
-                return Ok(());
-            }
             if settings != self.settings(gid)? {
                 self.store_settings(gid, &settings)?;
                 self.deliver(gid, json!({ "type": "settings", "group": gid, "settings": settings, "by": sender }));
