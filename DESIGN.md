@@ -111,13 +111,13 @@ Per group, the relay stores:
 
 Per invite: the two SPAKE2 messages and the encrypted KeyPackage and Welcome until expiry.
 
-Per box: an append-only log of sealed entries, in the order the relay took them, with no expiry. Boxes hold entity lists, entity inboxes, open groups' join requests, and replies to them. A box's address and key derive from a secret (SHA-256 and HKDF of an entity id or random secret), so the relay learns neither what it holds nor who uses it. Reading waits up to 30 seconds for a new entry.
+Per box: an append-only log of sealed entries, in the order the relay took them, with no expiry. Boxes hold entity lists, entity inboxes, open groups' join requests, and replies to them. A box's address and key derive from a secret (SHA-256 and HKDF of an entity id or random secret), so the relay learns neither what it holds nor who uses it. Reading waits up to 30 seconds for a new entry, and a box announces new entries on WebSockets as a group does.
 
 Behavior:
 
 - Accepts a message only if it targets the current epoch (compare-and-set on the plaintext epoch header of the MLS PrivateMessage); a commit moves the group to the next. This is the single source of membership order. It also means every message is encrypted under the epoch its readers are at: a sender that missed a commit is refused, catches up, and encrypts again.
 - Serves "everything after cursor N" in pages of up to 2 MiB; clients fetch until a page comes back empty. The same call serves live delivery and resume.
-- Announces each new cursor on a WebSocket (hibernatable, so idle listeners cost nothing). Session processes fetch on each notice, and poll every 15 seconds when no socket is available. Invites, which live minutes, use a 30-second long-poll instead.
+- Announces each new message on a WebSocket (hibernatable, so idle listeners cost nothing; the relay answers `ping` with `pong` without waking the object). A socket opened with `?messages` gets the message itself in the notice, as a page row `{seq, at, data}`, with `data` left out above 64 KiB; others (0.7 clients) get the bare seq. Members fetch when they (re)connect, after a gap in the notices, and for messages too large to come in one; they poll every 15 seconds only while they have no socket, and close a socket whose ping goes unanswered. Each fetch costs a request, a notice nothing, so a group's members fetch only what they missed. Invites, which live minutes, use a 30-second long-poll instead.
 - The group id is random and only shared inside Welcomes; writing requires knowing it. Messages are capped at 1 MiB, and each client address at 600 writes a minute.
 
 A session offline longer than the TTL cannot process missed commits and must be re-invited.

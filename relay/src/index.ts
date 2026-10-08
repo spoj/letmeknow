@@ -19,6 +19,7 @@ const PAGE_BYTES = 2 * MAX_MESSAGE_BYTES;
 const MAX_INVITE_TTL_S = 24 * 60 * 60;
 const MAX_PAKE_CHARS = 1024;
 const MAX_WAIT_S = 30;
+const NOTICE_BYTES = 64 * 1024;
 const COMMIT = 3;
 const PRIVATE_MESSAGE = 2;
 
@@ -113,9 +114,8 @@ export class Group extends DurableObject<Env> {
     const [, , gid, action] = url.pathname.split("/");
     if (action === "ws") {
       if (request.headers.get("Upgrade") !== "websocket") return text("expected websocket", 426);
-      const { 0: client, 1: server } = new WebSocketPair();
-      this.ctx.acceptWebSocket(server);
-      return new Response(null, { status: 101, webSocket: client });
+      // Sockets that ask for messages get each one in its notice; 0.7 clients get the bare seq.
+      return accept(this.ctx, url.searchParams.has("messages") ? ["messages"] : []);
     }
     if (action !== "messages") return text("not found", 404);
     if (request.method === "GET") {
@@ -139,10 +139,9 @@ export class Group extends DurableObject<Env> {
       this.sql.exec("DELETE FROM state");
       this.sql.exec("INSERT INTO state (epoch) VALUES (?)", epoch + 1);
     }
-    const seq = this.sql.exec<{ seq: number }>(
-      "INSERT INTO messages (at, data) VALUES (?, ?) RETURNING seq", Date.now(), data
-    ).one().seq;
-    for (const socket of this.ctx.getWebSockets()) socket.send(String(seq));
+    const at = Date.now();
+    const seq = this.sql.exec<{ seq: number }>("INSERT INTO messages (at, data) VALUES (?, ?) RETURNING seq", at, data).one().seq;
+    announce(this.ctx, seq, at, data);
     if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + RETENTION_MS);
     return Response.json({ seq });
   }
@@ -175,6 +174,20 @@ function page(sql: SqlStorage, after: number) {
   return rows;
 }
 
+// Accepts a hibernatable socket for notices; the relay answers "ping" with "pong" without waking the object.
+function accept(ctx: DurableObjectState, tags: string[]): Response {
+  const { 0: client, 1: server } = new WebSocketPair();
+  ctx.acceptWebSocket(server, tags);
+  return new Response(null, { status: 101, webSocket: client });
+}
+
+// Tells each socket about a new entry: sockets tagged "messages" get it as a page row ({seq, at, data}, data left out
+// above NOTICE_BYTES, so those fetch it), others its seq alone.
+function announce(ctx: DurableObjectState, seq: number, at: number, data: Uint8Array) {
+  const row = JSON.stringify(data.length <= NOTICE_BYTES ? { seq, at, data: base64(data) } : { seq, at });
+  for (const socket of ctx.getWebSockets()) socket.send(ctx.getTags(socket).includes("messages") ? row : String(seq));
+}
+
 // An append-only log of opaque entries, kept until deleted by nobody: entity lists, entity inboxes, join requests and
 // their replies. Writers seal what they post; the order the relay gives is the order readers replay.
 export class Box extends DurableObject<Env> {
@@ -183,11 +196,16 @@ export class Box extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.sql.exec("CREATE TABLE IF NOT EXISTS messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, data BLOB NOT NULL)");
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname.split("/")[3] === "ws") {
+      if (request.headers.get("Upgrade") !== "websocket") return text("expected websocket", 426);
+      return accept(this.ctx, ["messages"]);
+    }
     if (request.method === "GET") {
       const after = Number(url.searchParams.get("after") ?? 0);
       if (page(this.sql, after).length === 0) await wait(this.waiters, url);
@@ -196,9 +214,15 @@ export class Box extends DurableObject<Env> {
     if (request.method !== "POST") return text("method not allowed", 405);
     const data = new Uint8Array(await request.arrayBuffer());
     if (data.length > MAX_MESSAGE_BYTES) return text("entry too large (limit 1 MiB)", 413);
-    const seq = this.sql.exec<{ seq: number }>("INSERT INTO messages (at, data) VALUES (?, ?) RETURNING seq", Date.now(), data).one().seq;
+    const at = Date.now();
+    const seq = this.sql.exec<{ seq: number }>("INSERT INTO messages (at, data) VALUES (?, ?) RETURNING seq", at, data).one().seq;
     wake(this.waiters);
+    announce(this.ctx, seq, at, data);
     return Response.json({ seq });
+  }
+
+  webSocketClose(socket: WebSocket) {
+    socket.close();
   }
 }
 
