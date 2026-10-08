@@ -23,16 +23,17 @@ pub fn letmeknow_dev() -> Service {
     Service::Serve { key: Bytes(key), relay: RELAY.into(), addrs: Vec::new() }
 }
 
-/// A membership service from its address: `letmeknow.dev`, `<iroh key>@<relay URL>`, or a folder's absolute path.
+/// A membership service from its address: `letmeknow.dev`, `<iroh key, hex>@<relay URL>`, or a folder's absolute path.
 pub fn service(address: &str) -> Result<Service> {
     if address == "letmeknow.dev" {
         return Ok(letmeknow_dev());
     }
-    if cli::is_folder(address) {
-        return Ok(Service::Folder(address.into()));
+    if let Some((key, relay)) = address.split_once("@https://") {
+        let key = Bytes(hex::decode(key).context("a service key is hex")?);
+        return Ok(Service::Serve { key, relay: format!("https://{relay}"), addrs: Vec::new() });
     }
-    let (key, relay) = address.split_once('@').context("a membership service is letmeknow.dev, <key>@<relay URL>, or a folder")?;
-    Ok(Service::Serve { key: Bytes(hex::decode(key).context("a service key is hex")?), relay: relay.into(), addrs: Vec::new() })
+    anyhow::ensure!(cli::is_folder(address), "a membership service is letmeknow.dev, <key>@<relay URL>, or a folder");
+    Ok(Service::Folder(address.into()))
 }
 
 /// The skill text for agents.

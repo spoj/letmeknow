@@ -124,6 +124,7 @@ def main():
         invite = run("alice", "invite", "--name", "Plans", "--for", "Bob (Acme)")
         check(invite["link"].startswith("https://letmeknow.dev/i#1.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
         group = invite["group"]
+        check("serve" in run("alice", "groups")[0]["membership"], "its log is on the local letmeknow serve")
         joined = run("bob", "join", invite["link"])
         check(joined["group"] == group and len(joined["members"]) == 2, "bob joins through the link")
         event = alice.expect("joined")

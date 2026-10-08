@@ -421,9 +421,9 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     Ok(response)
 }
 
-/// A membership address names a folder when it is a path.
+/// A membership address names a folder when it is a path, not a service at a relay.
 pub fn is_folder(address: &str) -> bool {
-    address.contains(['/', '\\']) || address.starts_with('.')
+    !address.contains("@https://") && (address.contains(['/', '\\']) || address.starts_with('.'))
 }
 
 fn absolute(path: &str) -> Result<String> {
@@ -472,6 +472,6 @@ mod tests {
     #[test]
     fn folders_are_paths() {
         assert!(super::is_folder("./chat") && super::is_folder("/tmp/x"));
-        assert!(!super::is_folder("letmeknow.dev"));
+        assert!(!super::is_folder("letmeknow.dev") && !super::is_folder("50d4@https://next.letmeknow.dev"));
     }
 }
