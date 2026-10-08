@@ -1,0 +1,12 @@
+[package]
+name = "letmeknow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "letmeknow"
+path = "src/main.rs"
+
+[dependencies]
+lmk-proto.workspace = true

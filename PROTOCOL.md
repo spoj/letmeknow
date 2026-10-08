@@ -1,6 +1,6 @@
 # letmeknow protocol (draft)
 
-The exact formats behind REWRITE.md, settled by the wave-1 prototypes on the `spike/*` branches (each has a FINDINGS.md).
+The exact formats behind REWRITE.md, settled by the wave-1 prototypes on the `spike/*` branches (each has a FINDINGS.md). The crate `lmk-proto` (`crates/proto`) implements the shared shapes; where the two differ, fix one of them.
 
 ## Conventions
 
@@ -125,7 +125,7 @@ An opening, in its settings: `{"group", "kind", "name", "membership", "members":
 
 ## Invites
 
-A link is `https://letmeknow.dev/i#<fragment>`, where the fragment is `1.<g|d>.<inviter's iroh key>.<secret>[.<relay>]`: version 1; `g` for a group, `d` for a device link; the key and a 16-byte random secret in unpadded base64url; the relay URL, percent-encoded, only if it is not letmeknow.dev's.
+A link is `https://letmeknow.dev/i#<fragment>`, where the fragment is `1.<g|d>.<inviter's iroh key>.<secret>[.<relay>]`: version 1; `g` for a group, `d` for a device link; then the key, a 16-byte random secret and, only if it is not letmeknow.dev's, the relay URL, each in unpadded base64url.
 
 The joiner opens an `invite` stream to the inviter's key and sends `{"secret", "key_package"}`, or `{"secret", "device": "<device key>", "device_name"}` for a device link. The inviter checks the secret (single use, 10 minutes), commits the Add (for a device link: appends to the device list and adds the device to the devices group), and answers `{"welcome", "position", "doc"}`: `position` is the log position the joiner reads from, and `doc`, for a doc, links the doc's state as a file (see Files). A wrong or used secret gets `{"refused"}`; with 128 bits there is nothing to guess, so it uses nothing up.
 
@@ -156,7 +156,8 @@ A `peer` stream joins two sessions that share a group, one stream per pair, kept
 | `{"doc": {"group", "snapshot"}}` | SHA-256 of `txn.snapshot().encode_v1()` |
 | `{"doc_sv": {"group", "sv"}}` | A Yjs state vector, sent when the snapshots differ; answered by a `diff` message |
 | `{"want": {"group", "files"}}`, `{"have": {"group", "files"}}` | BLAKE3 hashes (see Files) |
-| `{"join": {"group", "key_package"}}` | A request to join an open group, answered like an invite |
+| `{"join": {"group", "key_package"}}` | A request to join an open group, answered by `admitted` or `refused` |
+| `{"admitted": {"group", "admitted": {"welcome", "position", "doc"}}}`, `{"refused": {"group", "refused"}}` | The answer to `join`, as an invite's |
 
 Message sync, per group, starts once both sides have caught up on commits. It is negentropy (crate `negentropy` 0.5) over items whose timestamp is the epoch and whose id is the message id, from epoch max(the later `joined`, the lower `floor`). `reconcile` frames alternate until negentropy is done; then `messages` carries what each lacks, never older than the receiver's `floor`. Ids a member gave up on (beyond its key window) stay in its set, so they are not offered again.
 

@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["client"]
+
+[workspace.package]
+version = "0.10.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+lmk-proto = { path = "crates/proto" }
+lmk-core = { path = "crates/core" }
+lmk-membership = { path = "crates/membership" }
+lmk-net = { path = "crates/net" }
+lmk-serve = { path = "crates/serve" }
+anyhow = "1"
+base64 = "0.23"
+blake3 = "1.8.7"
+chacha20poly1305 = "0.11"
+ciborium = "0.2"
+clap = { version = "4.6", features = ["derive", "env"] }
+ed25519-dalek = "3.0"
+hex = "0.4"
+hkdf = "0.13"
+iroh = { version = "=1.3.0", default-features = false }
+iroh-blobs = { version = "=0.103.1", default-features = false }
+iroh-relay = { version = "=1.3.0", default-features = false }
+negentropy = "=0.5.1"
+notify = "8.2"
+openmls = "=0.9.1"
+openmls_basic_credential = "=0.6.0"
+openmls_memory_storage = "=0.6.0"
+openmls_rust_crypto = "=0.6.0"
+openmls_sqlite_storage = "=0.3.0"
+openmls_traits = "=0.6.0"
+rand = "0.9"
+rusqlite = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = "1.53"
+tokio-rustls-acme = "0.9"
+yrs = "0.28"
+
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
