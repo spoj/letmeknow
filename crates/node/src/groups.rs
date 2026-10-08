@@ -26,20 +26,13 @@ use crate::{
 
 /// A head that needs no signature: the empty log's.
 fn empty(log: &[u8]) -> Head {
-    Head {
-        log: log.into(),
-        length: 0,
-        hash: head::start(log).into(),
-        time: 0,
-        sig: Bytes::default(),
-    }
+    Head { log: log.into(), length: 0, hash: head::start(log).into(), time: 0, sig: Bytes::default() }
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Takes in a ciphertext from a peer: what became of it is told to the peer.
     pub(crate) fn take(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8]) -> Taken {
-        self.open(st, gid, ciphertext)
-            .unwrap_or_else(|error| Taken::Refused(format!("{error:#}")))
+        self.open(st, gid, ciphertext).unwrap_or_else(|error| Taken::Refused(format!("{error:#}")))
     }
 
     fn open(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8]) -> Result<Taken> {
@@ -48,10 +41,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if g.rec.items.iter().any(|item| item.id.0 == id) {
             return Ok(Taken::Held);
         }
-        ensure!(
-            !g.rec.given_up.iter().any(|(_, given)| given.0 == id),
-            "beyond the key window"
-        );
+        ensure!(!g.rec.given_up.iter().any(|(_, given)| given.0 == id), "beyond the key window");
         ensure!(ciphertext.len() <= MAX_MESSAGE, "larger than 1 MiB");
         let epoch = core::epoch_of(ciphertext)?;
         if epoch > g.mls.epoch() {
@@ -70,63 +60,31 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 return Err(error);
             }
         };
-        let sender = g
-            .mls
-            .members()
-            .into_iter()
-            .find(|m| m.key == opened.key)
-            .unwrap_or(core::Member {
-                index: opened.index,
-                key: opened.key.clone(),
-                credential: Some(opened.sender.clone()),
-                leaf: None,
-            });
-        let sender = st
-            .member(gid, &sender)
-            .context("the sender has no letmeknow credential")?;
+        let sender = g.mls.members().into_iter().find(|m| m.key == opened.key).unwrap_or(core::Member {
+            index: opened.index,
+            key: opened.key.clone(),
+            credential: Some(opened.sender.clone()),
+            leaf: None,
+        });
+        let sender = st.member(gid, &sender).context("the sender has no letmeknow credential")?;
         let group = Bytes(gid.to_vec());
         match opened.payload {
             payload @ (Payload::Message { .. } | Payload::Leave) => {
                 let g = st.groups.get_mut(gid).unwrap();
-                if let Payload::Message {
-                    attachment: Some(attachment),
-                    ..
-                } = &payload
-                {
+                if let Payload::Message { attachment: Some(attachment), .. } = &payload {
                     let link = FileLink::parse(&attachment.link)?;
                     g.rec.files.push(attachment.link.clone());
                     if link.size <= self.file_limit {
-                        self.work
-                            .send(Work::Fetch {
-                                group: gid.to_vec(),
-                                link,
-                            })
-                            .ok();
+                        self.work.send(Work::Fetch { group: gid.to_vec(), link }).ok();
                     }
                 }
                 if payload == Payload::Leave && opened.current.is_some() {
-                    self.work
-                        .send(Work::Remove {
-                            group: gid.to_vec(),
-                            key: opened.key.clone(),
-                        })
-                        .ok();
+                    self.work.send(Work::Remove { group: gid.to_vec(), key: opened.key.clone() }).ok();
                 }
                 let at = now();
-                g.rec.items.push(Item {
-                    epoch,
-                    id: Bytes(id.to_vec()),
-                    at,
-                });
+                g.rec.items.push(Item { epoch, id: Bytes(id.to_vec()), at });
                 st.provider.put(&ciphertext_key(&id), ciphertext)?;
-                let message = Message {
-                    id: Bytes(id.to_vec()),
-                    group,
-                    epoch,
-                    at,
-                    sender,
-                    payload,
-                };
+                let message = Message { id: Bytes(id.to_vec()), group, epoch, at, sender, payload };
                 put(&st.provider, &message_key(&id), &message)?;
                 st.save(gid)?;
                 if matches!(message.payload, Payload::Message { .. }) {
@@ -143,27 +101,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     let before = doc::links(&doc::text(&old)?);
                     for link in doc::links(&doc::text(&new)?) {
                         if !before.contains(&link) && link.size <= self.file_limit {
-                            self.work
-                                .send(Work::Fetch {
-                                    group: gid.to_vec(),
-                                    link,
-                                })
-                                .ok();
+                            self.work.send(Work::Fetch { group: gid.to_vec(), link }).ok();
                         }
                     }
                 }
                 self.events.send(Event::Edited { group, by: sender }).ok();
             }
             Payload::Introduce { identity, name, how } => {
-                self.events
-                    .send(Event::Introduced {
-                        group,
-                        by: sender,
-                        identity,
-                        name,
-                        how,
-                    })
-                    .ok();
+                self.events.send(Event::Introduced { group, by: sender, identity, name, how }).ok();
             }
         }
         Ok(Taken::Held)
@@ -184,19 +129,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let redeemed = {
             let mut st = self.state.lock().unwrap();
             let st = &mut *st;
-            st.invites
-                .redeem(&st.provider, &secret, &key_package, list.as_ref(), now)?
+            st.invites.redeem(&st.provider, &secret, &key_package, list.as_ref(), now)?
         };
         match redeemed.target {
             Target::Group(gid) => self.admit(&gid, key_package, How::Invite, redeemed.label).await,
             Target::Device(id) => {
                 let identity = {
                     let st = self.state.lock().unwrap();
-                    st.device
-                        .identities
-                        .iter()
-                        .find(|identity| identity.id.0 == id)
-                        .cloned()
+                    st.device.identities.iter().find(|identity| identity.id.0 == id).cloned()
                 };
                 let identity = identity.context("this device left the identity")?;
                 let list = self.list(&identity).await?;
@@ -205,17 +145,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     &redeemed.joiner.device.0,
                     &redeemed.joiner.device_name,
                 );
-                self.logs
-                    .client(&identity.membership)?
-                    .append(&lmk_proto::identity::address(&id), &entry)
-                    .await?;
+                self.logs.client(&identity.membership)?.append(&lmk_proto::identity::address(&id), &entry).await?;
                 self.list(&identity).await?;
-                let gid = self
-                    .state
-                    .lock()
-                    .unwrap()
-                    .devices_group(&id)
-                    .context("no devices group")?;
+                let gid = self.state.lock().unwrap().devices_group(&id).context("no devices group")?;
                 self.admit(&gid, key_package, How::Invite, None).await
             }
         }
@@ -228,10 +160,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let (joiner, key) = key_package_credential(&st.provider, &key_package)?;
             (joiner, key, st.group(gid)?.mls.settings().open)
         };
-        let identity = joiner
-            .identity
-            .clone()
-            .filter(|identity| open.iter().any(|named| named.id == identity.id));
+        let identity = joiner.identity.clone().filter(|identity| open.iter().any(|named| named.id == identity.id));
         let identity = identity.context("it speaks as no identity the group is open to")?;
         let list = self.list(&identity).await?;
         ensure!(
@@ -254,17 +183,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let (_, key) = key_package_credential(&st.provider, &key_package)?;
             st.labels.insert(key, label);
         }
-        let add = Change {
-            add: vec![key_package],
-            how: Some(how),
-            ..Change::default()
-        };
+        let add = Change { add: vec![key_package], how: Some(how), ..Change::default() };
         let (welcome, position) = self.commit(gid, |_| Ok(add.clone())).await?;
         let state = {
             let st = self.state.lock().unwrap();
-            doc_like(&st.group(gid)?.mls.settings())
-                .then(|| st.doc_state(gid))
-                .transpose()?
+            doc_like(&st.group(gid)?.mls.settings()).then(|| st.doc_state(gid)).transpose()?
         };
         let doc = match state {
             Some(state) => {
@@ -276,11 +199,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             None => None,
         };
-        Ok(Admitted {
-            welcome: Bytes(welcome.context("an add makes a Welcome")?),
-            position,
-            doc,
-        })
+        Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc })
     }
 
     fn answer(&self, group: Option<&[u8]>, admitted: Result<Admitted>) -> Answer<Admitted> {
@@ -288,9 +207,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Ok(admitted) => Answer::Ok(admitted),
             Err(error) => {
                 self.warn(group, format!("refused a join: {error:#}"));
-                Answer::Refused {
-                    refused: format!("{error:#}"),
-                }
+                Answer::Refused { refused: format!("{error:#}") }
             }
         }
     }
@@ -304,38 +221,19 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
         let st = self.state.lock().unwrap();
         st.groups.get(group).is_some_and(|g| {
-            g.mls
-                .members()
-                .iter()
-                .any(|m| m.leaf.as_ref().is_some_and(|leaf| leaf.key.0 == peer.as_bytes()))
+            g.mls.members().iter().any(|m| m.leaf.as_ref().is_some_and(|leaf| leaf.key.0 == peer.as_bytes()))
         })
     }
 
     fn hello(&self, group: &[u8]) -> Hello {
         let st = self.state.lock().unwrap();
         let Some(g) = st.groups.get(group) else {
-            return Hello {
-                group: group.into(),
-                epoch: 0,
-                head: empty(group),
-                floor: 0,
-                joined: 0,
-            };
+            return Hello { group: group.into(), epoch: 0, head: empty(group), floor: 0, joined: 0 };
         };
         let (epoch, joined) = (g.mls.epoch(), g.mls.joined());
-        let head = g
-            .rec
-            .chain
-            .as_ref()
-            .map_or_else(|| empty(group), |chain| chain.head.clone());
+        let head = g.rec.chain.as_ref().map_or_else(|| empty(group), |chain| chain.head.clone());
         let floor = joined.max(epoch.saturating_sub(self.window.epochs as u64));
-        Hello {
-            group: group.into(),
-            epoch,
-            head,
-            floor,
-            joined,
-        }
+        Hello { group: group.into(), epoch, head, floor, joined }
     }
 
     fn verify_head(&self, group: &[u8], head: &Head) -> bool {
@@ -349,8 +247,7 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         match g.mls.settings().membership {
             Service::Serve { key, .. } => {
                 let key: Option<[u8; 32]> = key.0.try_into().ok();
-                key.and_then(|key| VerifyingKey::from_bytes(&key).ok())
-                    .is_some_and(|key| head.verify(&key))
+                key.and_then(|key| VerifyingKey::from_bytes(&key).ok()).is_some_and(|key| head.verify(&key))
             }
             Service::Folder(_) => true,
         }
@@ -399,13 +296,7 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
 
     fn message(&self, group: &[u8], id: &[u8; 32]) -> Option<Vec<u8>> {
         let st = self.state.lock().unwrap();
-        st.groups
-            .get(group)?
-            .rec
-            .items
-            .iter()
-            .any(|item| item.id.0 == id)
-            .then_some(())?;
+        st.groups.get(group)?.rec.items.iter().any(|item| item.id.0 == id).then_some(())?;
         st.provider.get(&ciphertext_key(id)).ok()?
     }
 
@@ -422,9 +313,7 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
 
     fn doc_sv(&self, group: &[u8]) -> Vec<u8> {
         let st = self.state.lock().unwrap();
-        st.doc_state(group)
-            .and_then(|state| doc::state_vector(&state))
-            .unwrap_or_default()
+        st.doc_state(group).and_then(|state| doc::state_vector(&state)).unwrap_or_default()
     }
 
     fn diff(&self, group: &[u8], sv: &[u8]) -> Result<Vec<u8>> {
@@ -432,9 +321,7 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         let st = &mut *st;
         let update = doc::diff(&st.doc_state(group)?, sv)?;
         let g = st.groups.get_mut(group).context("not in that group")?;
-        Ok(g.mls
-            .seal(&st.provider, &st.session, &Payload::Diff { update: Bytes(update) })?
-            .1)
+        Ok(g.mls.seal(&st.provider, &st.session, &Payload::Diff { update: Bytes(update) })?.1)
     }
 
     fn files(&self, group: &[u8]) -> Vec<FileLink> {
@@ -442,12 +329,7 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         let Some(g) = st.groups.get(group) else {
             return Vec::new();
         };
-        let mut files: Vec<FileLink> = g
-            .rec
-            .files
-            .iter()
-            .filter_map(|link| FileLink::parse(link).ok())
-            .collect();
+        let mut files: Vec<FileLink> = g.rec.files.iter().filter_map(|link| FileLink::parse(link).ok()).collect();
         if g.mls.settings().kind == Kind::Doc
             && let Ok(text) = st.doc_state(group).and_then(|state| doc::text(&state))
         {

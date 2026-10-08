@@ -13,8 +13,13 @@ name = "letmeknow"
 path = "src/main.rs"
 
 [dependencies]
+lmk-core.workspace = true
+lmk-node.workspace = true
 lmk-proto.workspace = true
 lmk-serve.workspace = true
+iroh = { workspace = true, features = ["tls-ring"] }
+gethostname = "1"
+rustls-pki-types = { version = "1", features = ["std"] }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true

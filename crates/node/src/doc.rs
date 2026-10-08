@@ -56,9 +56,7 @@ pub fn state_vector(state: &[u8]) -> Result<Vec<u8>> {
 
 /// What a member whose state vector is `sv` lacks.
 pub fn diff(state: &[u8], sv: &[u8]) -> Result<Vec<u8>> {
-    Ok(load(state)?
-        .transact()
-        .encode_state_as_update_v1(&StateVector::decode_v1(sv)?))
+    Ok(load(state)?.transact().encode_state_as_update_v1(&StateVector::decode_v1(sv)?))
 }
 
 /// The update that makes the text of `state` read `new`, as edits on `state`.
@@ -90,11 +88,51 @@ pub fn edit(state: &[u8], new: &str) -> Result<Vec<u8>> {
 pub fn links(text: &str) -> Vec<FileLink> {
     text.match_indices("lmk:")
         .filter_map(|(at, _)| {
-            let link: String = text[at..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || ":.#".contains(*c))
-                .collect();
+            let link: String =
+                text[at..].chars().take_while(|c| c.is_ascii_alphanumeric() || ":.#".contains(*c)).collect();
             FileLink::parse(&link).ok()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n";
+
+    #[test]
+    fn edits_merge_with_concurrent_ones() {
+        let state = new(BASE);
+        let theirs = edit(&state, "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n- [ ] delta\n").unwrap();
+        let ours = edit(&state, "- [x] alpha\n- [ ] beta\n- [ ] gamma\n").unwrap();
+        let merged = apply(&apply(&state, &theirs).unwrap(), &ours).unwrap();
+        assert_eq!(text(&merged).unwrap(), "- [x] alpha\n- [ ] beta\n- [ ] gamma\n- [ ] delta\n");
+    }
+
+    #[test]
+    fn an_update_that_arrives_early_waits_for_the_one_it_builds_on() {
+        let state = new(BASE);
+        let first = edit(&state, "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n- [ ] delta\n").unwrap();
+        let second =
+            edit(&apply(&state, &first).unwrap(), "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n- [x] delta\n").unwrap();
+        let early = apply(&state, &second).unwrap();
+        assert_eq!(text(&early).unwrap(), BASE);
+        assert_eq!(
+            text(&apply(&early, &first).unwrap()).unwrap(),
+            "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n- [x] delta\n"
+        );
+    }
+
+    #[test]
+    fn members_that_differ_converge_by_diff() {
+        let state = new(BASE);
+        let ours = apply(&state, &edit(&state, "- [x] alpha\n- [ ] beta\n- [ ] gamma\n").unwrap()).unwrap();
+        let theirs = apply(&state, &edit(&state, "- [ ] alpha\n- [ ] gamma\n").unwrap()).unwrap();
+        assert_ne!(snapshot(&ours).unwrap(), snapshot(&theirs).unwrap());
+        let ours = apply(&ours, &diff(&theirs, &state_vector(&ours).unwrap()).unwrap()).unwrap();
+        let theirs = apply(&theirs, &diff(&ours, &state_vector(&theirs).unwrap()).unwrap()).unwrap();
+        assert_eq!(text(&ours).unwrap(), "- [x] alpha\n- [ ] gamma\n");
+        assert_eq!(snapshot(&ours).unwrap(), snapshot(&theirs).unwrap());
+    }
 }

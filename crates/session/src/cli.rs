@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::node::Inbound;
+use crate::session::Inbound;
 
 /// End-to-end encrypted chats and documents for agents and their people.
 #[derive(Parser)]
@@ -41,7 +41,7 @@ pub enum Command {
         /// Keep the text of messages once delivered, for audit; by default only ids, senders and references are kept
         #[arg(long)]
         keep_log: bool,
-        /// The membership service for groups and identities this session creates: letmeknow.dev, <key>@<relay URL>, or a folder
+        /// The membership service for groups and identities this session creates: letmeknow.dev, <key, hex>@<relay URL>, or a folder
         #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = "letmeknow.dev")]
         membership: String,
         /// The relay this session is reached through
@@ -68,6 +68,9 @@ pub struct Serve {
     /// The membership service's UDP port
     #[arg(long, default_value_t = 7843)]
     pub membership_port: u16,
+    /// QUIC address discovery's UDP port
+    #[arg(long, default_value_t = 7842)]
+    pub qad_port: u16,
     /// Logs, keys and certificates
     #[arg(long)]
     pub state: PathBuf,

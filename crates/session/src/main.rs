@@ -4,7 +4,6 @@ use letmeknow::session::Config;
 use std::process::ExitCode;
 use std::time::Duration;
 
-
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
@@ -19,13 +18,13 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let home = home_dir(cli.home)?;
     match cli.command {
-        Command::Listen { name, hold, keep_log, membership, relay: _ } => {
+        Command::Listen { name, hold, keep_log, membership, relay } => {
             let handle = match cli.session {
                 Some(session) => session,
                 None => new_handle(&home)?,
             };
             let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "agent".into());
-            let _config = Config {
+            let config = Config {
                 dir: session_dir(&home, &handle)?,
                 name: name.unwrap_or_else(|| format!("{user}/{handle}")),
                 handle,
@@ -33,8 +32,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 keep_log,
                 membership: letmeknow::service(&membership)?,
             };
-            // TODO(integration): letmeknow::listen(_config, <lmk-core, lmk-net on `relay`, lmk-membership>, println, shutdown()).
-            anyhow::bail!("this build has no group logic, peers or membership client yet")
+            let print = |line: String| println!("{line}");
+            letmeknow::listen(config, &home, letmeknow::Network::new(&relay)?, print, letmeknow::shutdown()).await
         }
         Command::Skill => {
             print!("{}", letmeknow::SKILL);

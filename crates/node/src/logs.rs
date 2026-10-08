@@ -16,10 +16,7 @@ pub(crate) struct Logs {
 
 impl Logs {
     pub fn new(endpoint: Endpoint) -> Self {
-        Logs {
-            endpoint,
-            clients: Mutex::default(),
-        }
+        Logs { endpoint, clients: Mutex::default() }
     }
 
     pub fn client(&self, service: &Service) -> Result<Arc<dyn Membership>> {
