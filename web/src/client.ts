@@ -77,6 +77,8 @@ export async function open(name = "", device = ""): Promise<Lmk> {
     const event = JSON.parse(json) as Event;
     for (const listener of listeners) listener(event);
   });
+  records = [];
+  files.clear();
   addEventListener("pagehide", () => lmk.flush());
   return lmk;
 }
