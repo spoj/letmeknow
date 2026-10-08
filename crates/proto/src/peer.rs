@@ -14,6 +14,8 @@ pub enum Frame {
     Reconcile { group: Bytes, msg: Bytes },
     /// MLS ciphertexts.
     Messages { group: Bytes, items: Vec<Bytes> },
+    /// The answer to `messages`: the ids of the items the receiver took, and of those it refused.
+    Receipt { group: Bytes, held: Vec<Bytes>, refused: Vec<Refusal> },
     /// SHA-256 of the doc's `txn.snapshot().encode_v1()`.
     Doc { group: Bytes, snapshot: Bytes },
     /// A Yjs state vector; answered by a `diff` message.
@@ -25,6 +27,12 @@ pub enum Frame {
     Join { group: Bytes, key_package: Bytes },
     Admitted { group: Bytes, admitted: Admitted },
     Refused { group: Bytes, refused: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub id: Bytes,
+    pub reason: String,
 }
 
 /// One group's state, in `hello`.

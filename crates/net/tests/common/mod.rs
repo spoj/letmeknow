@@ -11,14 +11,14 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use ed25519_dalek::SigningKey;
 use iroh::{EndpointId, RelayMap, RelayUrl, SecretKey, tls::CaTlsConfig};
 use iroh_relay::{
     RelayQuicConfig,
     server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig},
 };
-use lmk_net::{Admit, Config, Event, Groups, Net};
+use lmk_net::{Admit, Config, Event, Groups, Net, Taken};
 use lmk_proto::{
     Answer, Bytes,
     head::{self, Head},
@@ -269,27 +269,27 @@ impl Groups for Fake {
         self.groups.lock().unwrap()[group].held.get(id).map(|(_, ciphertext)| ciphertext.clone())
     }
 
-    fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Result<()> {
-        let epoch = u64::from_be_bytes(ciphertext[..8].try_into()?);
+    fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Taken {
+        let epoch = u64::from_be_bytes(ciphertext[..8].try_into().unwrap());
         let mut groups = self.groups.lock().unwrap();
         let g = groups.get_mut(group).unwrap();
         if epoch < g.floor {
             g.given_up.insert(id(ciphertext), epoch);
-            bail!("below the floor");
+            return Taken::Refused("below the floor".into());
         }
         if epoch > g.log.len() as u64 {
-            bail!("from a future epoch");
+            return Taken::Waiting;
         }
         match ciphertext[8] {
             0 => {
                 g.held.insert(id(ciphertext), (epoch, ciphertext.to_vec()));
             }
             _ => {
-                let update = Update::decode_v1(&ciphertext[9..])?;
-                g.doc.as_ref().unwrap().transact_mut().apply_update(update)?;
+                let update = Update::decode_v1(&ciphertext[9..]).unwrap();
+                g.doc.as_ref().unwrap().transact_mut().apply_update(update).unwrap();
             }
         }
-        Ok(())
+        Taken::Held
     }
 
     fn doc(&self, group: &[u8]) -> Option<[u8; 32]> {
