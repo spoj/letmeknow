@@ -229,6 +229,14 @@ try {
   check(tablet.run("identity", "list").identities[0].name === "Matt", "a native device joins the browser's identity by its link");
   tablet.proc.kill();
 
+  // With Ann gone, what the laptop sends to her chat is pending.
+  ann.proc.kill();
+  await laptop.locator(".group-list button", { hasText: "Plans" }).click();
+  await laptop.getByPlaceholder("Message").fill("anyone there?");
+  await laptop.getByPlaceholder("Message").press("Enter");
+  await laptop.locator(".messages li", { hasText: "anyone there?" }).locator(".status", { hasText: "Pending" }).waitFor();
+  check(true, "a message no other member holds shows as pending");
+
   for (const [name, page] of Object.entries(pages)) check((await page.evaluate(() => window.toasts)).length === 0, `${name} showed no error`);
 
   // The service worker serves the app with the page server unreachable.
