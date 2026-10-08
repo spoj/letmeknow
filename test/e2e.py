@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""End-to-end test: local relay (wrangler dev) plus several session processes."""
+"""End-to-end test: local relay (wrangler dev) plus several session processes, then the browser client in Chromium
+(web/e2e.mjs). --no-browser skips building and testing the browser client, which is the same on every OS."""
 import hashlib, json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14,6 +15,7 @@ def free_port():
 PORT = free_port()
 RELAY = f"http://localhost:{PORT}"
 HOME = tempfile.mkdtemp(prefix="lmk-e2e-")
+BROWSER = "--no-browser" not in sys.argv
 ENV = {**os.environ, "LETMEKNOW_HOME": HOME, "LETMEKNOW_RELAY": RELAY, "NO_PROXY": "localhost,127.0.0.1"}
 
 
@@ -99,8 +101,11 @@ def main():
     subprocess.run(["cargo", "build", "-q"], cwd=os.path.join(ROOT, "client"), check=True)
     subprocess.run([shutil.which("npm"), "install", "--silent"], cwd=os.path.join(ROOT, "relay"), check=True)
     web = os.path.join(ROOT, "web")
-    subprocess.run([shutil.which("npm"), "install", "--silent"], cwd=web, check=True)
-    subprocess.run([shutil.which("node"), "build.mjs"], cwd=web, check=True)
+    if BROWSER:
+        subprocess.run([shutil.which("npm"), "install", "--silent"], cwd=web, check=True)
+        subprocess.run([shutil.which("node"), "build.mjs"], cwd=web, check=True)
+    else:
+        os.makedirs(os.path.join(ROOT, "relay", "public"), exist_ok=True)
     os.makedirs(os.path.join(ROOT, "relay", ".wrangler"), exist_ok=True)
     log = open(os.path.join(ROOT, "relay", ".wrangler", "e2e.log"), "w")
     relay = subprocess.Popen([shutil.which("npx"), "wrangler", "dev", "--port", str(PORT), "--inspector-port", str(free_port())], cwd=os.path.join(ROOT, "relay"),
@@ -396,7 +401,7 @@ def main():
         handle = solo.ready["session"]
         check(len(handle.split("-")) == 2, f"listen without --session picks a handle ({handle})")
         check(run(None, "groups", env=solo_env) == [], "commands use the one running session")
-        if subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=web, env={**ENV, "RELAY": RELAY, "BIN": BIN}).returncode:
+        if BROWSER and subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=web, env={**ENV, "RELAY": RELAY, "BIN": BIN}).returncode:
             sys.exit("browser test failed")
         print("all passed")
     finally:

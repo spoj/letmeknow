@@ -8,6 +8,9 @@ permissions:
   id-token: write
 
 jobs:
+  # Tests run next to the builds; only publishing waits for both.
+  ci:
+    uses: ./.github/workflows/ci.yml
   build:
     strategy:
       matrix:
@@ -50,7 +53,7 @@ jobs:
           path: npm/${{ matrix.npm }}
 
   publish:
-    needs: build
+    needs: [ci, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +90,9 @@ jobs:
           done
           for dir in dist/npm-*; do
             package=@letmeknow/${dir#dist/npm-}@$version
-            until npm view "$package" version --prefer-online >/dev/null 2>&1; do sleep 10; done
+            # The registry can take a minute or two to show a package; after five, fail rather than hang.
+            for _ in $(seq 30); do npm view "$package" version --prefer-online >/dev/null 2>&1 && break; sleep 10; done
+            npm view "$package" version --prefer-online >/dev/null
           done
           cp README.md LICENSE npm/cli/
           cd npm/cli && npm pkg set version="$version" && publish @letmeknow/cli
