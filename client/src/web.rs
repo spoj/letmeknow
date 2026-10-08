@@ -187,6 +187,22 @@ impl Member {
         Ok(json!({ "commit": b64(&commit.to_bytes()?), "welcome": b64(&welcome.to_bytes()?) }).to_string())
     }
 
+    /// Commits removing the member with fingerprint `fp`. Settle once the relay answers.
+    pub fn remove(&mut self, gid: &str, fp: &str) -> R<Vec<u8>> {
+        let mls = self.groups.get_mut(gid).ok_or_else(|| JsError::new("unknown group"))?;
+        let target = mls
+            .members()
+            .find(|m| fingerprint(&m.signature_key) == fp && m.index != mls.own_leaf_index())
+            .ok_or_else(|| JsError::new("no such member"))?;
+        Ok(mls.remove_members(&self.provider, &self.signer, &[target.index])?.0.to_bytes()?)
+    }
+
+    /// A proposal to remove this member, which another member commits: MLS lets no member commit its own removal.
+    pub fn leave_proposal(&mut self, gid: &str) -> R<Vec<u8>> {
+        let mls = self.groups.get_mut(gid).ok_or_else(|| JsError::new("unknown group"))?;
+        Ok(mls.leave_group(&self.provider, &self.signer)?.to_bytes()?)
+    }
+
     /// The member a key package describes, to check a join request before adding it.
     pub fn applicant(&self, key_package: &[u8]) -> R<String> {
         let MlsMessageBodyIn::KeyPackage(key_package) = MlsMessageIn::tls_deserialize_exact_bytes(key_package)?.extract() else {

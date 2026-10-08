@@ -1,368 +1,923 @@
-// The page: one browser member, its groups, their chat and files. Joining from a link waits for a click, so link
-// scanners that open it join nothing.
+// The page: one browser member, its groups, their chat and files. Background jobs end in render(), which appends new
+// items and patches only what changed, so what a person is typing in, selecting or scrolling stays put. Joining from a
+// link waits for a click, so link scanners that open it join nothing.
 import "./app.css";
 import type { EditorView } from "@codemirror/view";
-import { Client, type Invite, type Item, type Membership, type Opening, type Person, inviteKind } from "./client";
-import { editor } from "./editor";
+import { Client, type Invite, type Item, type Membership, type Opening, type Person, type Settings, inviteKind } from "./client";
 
 type Child = Node | string | false | undefined | null | 0;
+type Message = Extract<Item, { type: "message" }>;
+const kids = (children: Child[]) => children.filter(c => c != null && c !== false && c !== 0) as (Node | string)[];
 function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Record<string, unknown> = {}, ...children: Child[]): HTMLElementTagNameMap[K] {
   const element = Object.assign(document.createElement(tag), props);
-  element.append(...(children.filter(c => c != null && c !== false && c !== 0) as (Node | string)[]));
+  element.append(...kids(children));
   return element;
 }
 
-/** Rebuilds `element` only when `key` changed, so that what a person is selecting or clicking stays put. */
+/** Rebuilds `element` only when `key` changed. */
 const shown = new WeakMap<HTMLElement, string>();
 function update(element: HTMLElement, key: string, build: () => Child[]) {
   if (shown.get(element) === key) return;
   shown.set(element, key);
-  element.replaceChildren(...(build().filter(c => c != null && c !== false && c !== 0) as (Node | string)[]));
+  element.replaceChildren(...kids(build()));
 }
 
-const root = document.getElementById("app")!;
-const agents = h("details", { className: "agents" }, h("summary", {}, "For agents"), document.getElementById("agents")!);
-const status = h("p", { className: "status", onclick: () => (status.textContent = "") });
-const fail = (error: unknown) => {
-  status.textContent = error instanceof Error ? error.message : String(error);
+const set = (element: HTMLElement, text: string) => element.textContent !== text && (element.textContent = text);
+const form = (submit: () => unknown, ...children: Child[]) =>
+  h("form", { onsubmit: (event: Event) => (event.preventDefault(), submit()) }, ...children);
+const field = (label: string, input: HTMLElement, hint?: string) => h("label", { className: "field" }, h("span", {}, label), input, hint && h("small", {}, hint));
+const b64 = (bytes: Uint8Array) => {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(s);
 };
+
+const root = document.getElementById("app")!;
+const agentsHelp = document.getElementById("agents")!;
+const toasts = h("div", { className: "toasts" });
+const narrow = matchMedia("(max-width: 699px)");
+const wide = matchMedia("(min-width: 1000px)");
+const touch = matchMedia("(pointer: coarse)");
 const slot = /^\/i\/([1-9][0-9]{0,2})$/.exec(location.pathname)?.[1];
 const invite = slot && location.hash.length > 1 ? { slot, words: decodeURIComponent(location.hash.slice(1)) } : undefined;
 
-let client: Client;
-let selected: string | undefined;
-let tab: "chat" | "files" = "chat";
-let file: string | undefined;
-let view: EditorView | undefined;
-let replyTo: string | undefined;
-let members: Person[] = [];
-const to = new Set<string>();
-let openings: { opening: Opening; entity: Membership }[] = [];
+function toast(error: unknown) {
+  const text = error instanceof Error ? error.message : String(error);
+  if ([...toasts.children].some(t => t.textContent === text)) return;
+  const note = h("div", { className: "toast", role: "status", onclick: () => note.remove() }, text);
+  toasts.append(note);
+  setTimeout(() => note.remove(), 8_000);
+}
 
-const nav = h("nav");
-const header = h("header");
-const panel = h("div", { className: "panel" });
-const tabs = h("div", { className: "tabs" });
-const messages = h("ol", { className: "messages" });
-const files = h("div", { className: "files" });
-const editorHost = h("div", { className: "editor" });
-const input = h("textarea", { placeholder: "Message (Enter sends, Shift+Enter for a new line)", rows: 2 });
-const urgent = h("input", { type: "checkbox" });
-const chips = h("div", { className: "chips" });
-const composer = h("div", { className: "composer" }, chips, input, h("label", {}, urgent, " urgent"), h("button", { onclick: submit }, "Send"));
-const chat = h("div", { className: "chat" }, messages, composer);
-const group = h("section", { className: "group" }, header, tabs, chat);
-const home = h("section", { className: "home" });
+/** Disables `button` and shows `label` on it while `job` runs. */
+async function busy(button: HTMLButtonElement, label: string, job: () => Promise<unknown>) {
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = label;
+  try {
+    await job();
+  } catch (error) {
+    toast(error);
+  } finally {
+    button.disabled = false;
+    button.textContent = was;
+  }
+}
+
+/** A button that asks once more before it runs `job`. */
+function confirmed(text: string, again: string, job: () => Promise<unknown>) {
+  const button = h("button", { type: "button", className: "danger" }, text);
+  button.onclick = () => {
+    if (!button.dataset.armed) return ((button.dataset.armed = "1"), (button.textContent = again));
+    busy(button, "…", job);
+  };
+  return button;
+}
+
+function modal(title: string, ...content: Child[]): HTMLDialogElement {
+  const dialog = h(
+    "dialog",
+    {},
+    h("header", {}, h("h2", {}, title), h("button", { type: "button", className: "icon quiet", title: "Close", ariaLabel: "Close", onclick: () => dialog.close() }, "×")),
+    h("div", { className: "dialog-body" }, ...content)
+  );
+  dialog.onclose = () => dialog.remove();
+  document.body.append(dialog);
+  dialog.showModal();
+  return dialog;
+}
+
+let client: Client;
+let page: "group" | "devices" | "start" = "start";
+let selected: string | undefined;
+let openings: { opening: Opening; entity: Membership }[] = [];
+/** Open groups this browser asked to join and waits on, by group id: their names. */
+const joining = new Map<string, string>();
 
 navigator.locks.request("letmeknow", { ifAvailable: true }, async lock => {
-  if (!lock) return root.prepend(h("p", { className: "notice" }, "letmeknow is open in another tab of this browser; use that one."));
-  await boot().catch(fail);
+  if (!lock) return root.replaceChildren(h("div", { className: "card notice" }, h("h1", {}, "letmeknow is open in another tab"), h("p", {}, "Use that one: one tab at a time holds this browser's keys.")));
+  await boot().catch(toast);
   await new Promise(() => {});
 });
 
 async function boot() {
-  root.prepend(status);
   client = await Client.start();
-  client.onerror = fail;
+  client.onerror = toast;
   client.onchange = render;
   const kind = invite ? await inviteKind(invite.slot) : null;
   if (!client.member) return welcome(kind);
   client.connect();
-  layout();
-  if (kind) {
-    const what = kind === "group" ? "You're invited to a group." : "This link adds this browser to an entity: it will speak as it.";
-    panel.replaceChildren(h("p", {}, what, " ", h("button", { onclick: () => redeem().catch(fail) }, kind === "group" ? "Join" : "Add this browser")));
-  }
+  enter();
+  if (invite) offer(kind);
 }
 
-function welcome(kind: "group" | "entity" | null) {
-  const heading = !invite
-    ? "End-to-end encrypted group chat for people and their agents."
-    : kind === "group"
-      ? "You're invited to an end-to-end encrypted group chat."
-      : kind === "entity"
-        ? "This link adds this browser to someone's devices."
-        : "This invite was used or has expired; ask for a new one.";
-  const name = h("input", { placeholder: "Your name", autofocus: true });
-  const button = h("button", {}, kind === "group" ? "Join" : kind === "entity" ? "Add this browser" : "Start");
-  button.onclick = async () => {
-    const label = name.value.trim();
-    if (!label) return name.focus();
-    button.disabled = true;
-    try {
-      await client.create(label, kind === "entity" ? undefined : label);
-      layout();
-      if (kind) await redeem();
-    } catch (error) {
-      button.disabled = false;
-      fail(error);
-    }
-  };
-  root.replaceChildren(status, h("div", { className: "welcome" }, h("h1", {}, "letmeknow"), h("p", {}, heading), name, button), agents);
-}
-
-async function redeem() {
-  panel.replaceChildren(h("p", {}, "Joining…"));
-  const gid = await client.redeem(invite!.slot, invite!.words);
-  history.replaceState(null, "", "/");
-  panel.replaceChildren();
-  if (gid) select(gid);
-  else devices();
-}
-
-function layout() {
-  root.replaceChildren(status, h("div", { className: "layout" }, nav, h("div", { className: "main" }, panel, group, home)), agents);
-  refreshOpenings();
-  setInterval(refreshOpenings, 60_000);
-  const first = [...client.groups.keys()][0];
-  if (first) select(first);
-  else devices();
-}
-
-async function refreshOpenings() {
-  openings = await client.openings().catch(error => (fail(error), openings));
-  render();
-}
-
-function select(gid: string | undefined) {
-  selected = gid;
-  tab = "chat";
-  closeFile();
-  to.clear();
-  replyTo = undefined;
-  panel.replaceChildren();
-  render();
-}
-
-function closeFile() {
-  view?.destroy();
-  view = undefined;
-  file = undefined;
-}
-
-let rendering = Promise.resolve();
-function render() {
-  rendering = rendering.then(draw).catch(fail);
-}
-
-async function draw() {
-  const groups = [...client.groups.values()].sort((a, b) => last(b.gid) - last(a.gid));
-  const unread = (gid: string) => (gid === selected ? 0 : client.items.get(gid)!.length - client.groups.get(gid)!.read);
-  const total = groups.reduce((n, g) => n + unread(g.gid), 0);
-  document.title = total ? `(${total}) letmeknow` : "letmeknow";
-  const key = JSON.stringify([selected, groups.map(g => [g.gid, g.settings.name, unread(g.gid)]), openings.map(o => o.opening.group)]);
-  update(nav, key, () => [
-    h("button", { className: "new", onclick: () => newGroup().catch(fail) }, "+ New group"),
-    ...groups.map(g =>
-      h("button", { className: g.gid === selected ? "on" : "", onclick: () => select(g.gid) }, title(g.gid), unread(g.gid) > 0 && h("b", {}, String(unread(g.gid))))
-    ),
-    openings.length > 0 && h("h3", {}, "Open to you"),
-    ...openings.map(o => h("div", { className: "opening" }, o.opening.name || `group ${o.opening.group.slice(0, 6)}`, h("button", { onclick: () => joinOpen(o) }, "Join"))),
-    h("button", { className: "devices", onclick: devices }, `${client.me.name} · devices`)
-  ]);
-  if (selected && !client.groups.has(selected)) selected = undefined;
-  group.hidden = !selected;
-  home.hidden = !!selected;
-  if (!selected) return;
-  const gid = selected!;
-  const items = client.items.get(gid)!;
-  if (client.groups.get(gid)!.read !== items.length) client.markRead(gid);
-  members = await client.members(gid);
-  const me = members.find(m => m.you)!;
-  const settings = client.groups.get(gid)!.settings;
-  update(header, JSON.stringify([gid, settings, members.map(label)]), () => [
-    h("h2", {}, title(gid)),
-    h("p", { className: "members" }, members.map(m => (m.you ? `${label(m)} (you)` : label(m))).join(", ")),
-    h("button", { onclick: () => rename(gid) }, "Rename"),
-    h("button", { onclick: () => inviteInto(gid) }, "Invite"),
-    ...client.me.entities.map(e =>
-      settings.open?.some(o => o.id === e.id)
-        ? h("button", { onclick: () => client.close(gid, e), title: `Stop letting sessions speaking as ${e.name} join` }, `Close to ${e.name}`)
-        : h("button", { onclick: () => client.open(gid, e), title: `Let any session speaking as ${e.name} join without an invite` }, `Open to ${e.name}`)
-    )
-  ]);
-  const fileList = client.filesOf(gid);
-  update(tabs, JSON.stringify([gid, tab, fileList.length]), () => [
-    h("button", { className: tab === "chat" ? "on" : "", onclick: () => ((tab = "chat"), closeFile(), render()) }, "Chat"),
-    h("button", { className: tab === "files" ? "on" : "", onclick: () => ((tab = "files"), render()) }, `Files (${fileList.length})`)
-  ]);
-  group.replaceChildren(header, tabs, tab === "chat" ? chat : files);
-  if (tab === "files") {
-    update(files, JSON.stringify([gid, file, fileList.map(f => [f.id, f.name])]), () => [
-      h("div", { className: "list" }, ...fileList.map(f => h("button", { className: f.id === file ? "on" : "", onclick: () => openFile(gid, f.id) }, f.name || f.id)), h("button", { onclick: () => newFile(gid) }, "+ New file")),
-      editorHost
-    ]);
-    return;
-  }
-  const atBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 40;
-  update(messages, JSON.stringify([gid, items.length]), () => items.map(item => line(item, items, me)));
-  if (atBottom) messages.scrollTop = messages.scrollHeight;
-  update(chips, JSON.stringify([gid, members.map(m => m.fp), [...to], replyTo]), () => [
-    "To: ",
-    ...members.filter(m => !m.you).map(m => h("button", { className: to.has(m.fp) ? "on" : "", onclick: () => (to.has(m.fp) ? to.delete(m.fp) : to.add(m.fp), render()) }, label(m))),
-    to.size === 0 && h("small", {}, "everyone"),
-    replyTo && h("span", { className: "replying" }, " · replying ", h("button", { onclick: () => ((replyTo = undefined), render()) }, "×"))
-  ]);
-}
-
-function line(item: Item, items: Item[], me: Person): HTMLElement {
-  const time = h("time", {}, new Date(item.at).toLocaleString([], { hour: "2-digit", minute: "2-digit", day: "numeric", month: "short" }));
-  switch (item.type) {
-    case "message": {
-      const parent = item.reply_to && (items.find(i => i.type === "message" && i.id === item.reply_to) as Extract<Item, { type: "message" }> | undefined);
-      const names = item.to?.map(fp => label(members.find(m => m.fp === fp) ?? { name: fp.slice(0, 8), fp }));
-      const classes = [item.from.fp === me.fp && "mine", item.to?.includes(me.fp) && "direct", item.urgent && "urgent"].filter(Boolean).join(" ");
-      return h(
-        "li",
-        { className: classes },
-        h("div", { className: "meta" }, who(item.from), names && ` → ${names.join(", ")}`, item.urgent && h("b", {}, " urgent"), " ", time, h("button", { onclick: () => ((replyTo = item.id), render(), input.focus()) }, "Reply")),
-        parent && h("blockquote", {}, `${label(parent.from)}: ${parent.content.slice(0, 200)}`),
-        h("div", { className: "text" }, item.content),
-        item.attachment && h("button", { onclick: () => download(item.attachment!) }, "Save attachment")
-      );
-    }
-    case "joined":
-    case "left":
-      return h("li", { className: "event" }, who(item.member), ` ${item.type}`, item.by.fp !== item.member.fp && h("span", {}, " · by ", who(item.by)), " ", time);
-    case "settings": {
-      const { name, open } = item.settings;
-      const said = [name && `named the group “${name}”`, open?.length ? `opened it to ${open.map(o => o.name).join(", ")}` : "closed it to entities"].filter(Boolean).join(" and ");
-      return h("li", { className: "event" }, who(item.by), ` ${said} `, time);
-    }
-    case "warning":
-      return h("li", { className: "event warn" }, item.text, " ", time);
-  }
-}
+// Names: whose a member is comes first, from its verified entity ("Matthew · phone").
 
 function label(p: Person): string {
   const entity = p.entity && !p.entity.error ? p.entity.name : undefined;
   return entity && entity !== p.name ? `${entity} · ${p.name}` : p.name;
 }
 
+function unverified(p: Person): string | undefined {
+  const error = p.entity?.error;
+  if (!error) return;
+  const name = /^not on (.*)'s list$/.exec(error)?.[1];
+  return name ? `Says it is ${name}'s, but is not on ${name}'s list of devices.` : `Could not check whose this is: ${error}`;
+}
+
 function who(p: Person): HTMLElement {
-  const title = p.entity?.error ? `${p.entity.error} (key ${p.fp})` : `key ${p.fp}`;
-  return h("span", { className: p.entity?.error ? "who warn" : "who", title }, label(p), p.entity?.new && h("small", {}, " new"));
+  const warning = unverified(p);
+  return h("span", { className: warning ? "who warn" : "who", title: [warning, `key ${p.fp}`].filter(Boolean).join("\n") }, warning && "⚠ ", label(p));
 }
 
 function title(gid: string): string {
-  return client.groups.get(gid)!.settings.name || `group ${gid.slice(0, 6)}`;
+  const others = (JSON.parse(client.member!.members(gid)) as Person[]).filter(m => !m.you).map(m => m.name);
+  return client.groups.get(gid)!.settings.name || others.join(", ") || "New group";
 }
 
-function last(gid: string): number {
-  return client.items.get(gid)!.at(-1)?.at ?? 0;
+function unread(gid: string): number {
+  const seen = gid === selected && page === "group" && document.visibilityState === "visible";
+  return seen ? 0 : client.items.get(gid)!.length - client.groups.get(gid)!.read;
 }
 
-async function submit() {
-  const content = input.value.trim();
-  if (!content || !selected) return;
-  input.value = "";
-  const options = { to: to.size ? [...to] : undefined, reply_to: replyTo, urgent: urgent.checked || undefined };
-  to.clear();
-  replyTo = undefined;
-  urgent.checked = false;
-  await client.send(selected, content, options).catch(() => (input.value = content));
-}
+// First visit, and invites.
 
-input.onkeydown = event => {
-  if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
-  event.preventDefault();
-  submit();
-};
-
-async function newGroup() {
-  select(await client.newGroup());
-  inviteInto(selected!);
-}
-
-function rename(gid: string) {
-  const name = prompt("Group name", client.groups.get(gid)!.settings.name ?? "");
-  if (name !== null) client.rename(gid, name.trim());
-}
-
-function inviteInto(gid: string) {
-  showInvite("Anyone with this code or link joins the group, once, within 10 minutes. Agents run: letmeknow join CODE", { gid });
-}
-
-/** The home view: what this browser speaks as, and the devices that speak as it too. */
-function devices() {
-  select(undefined);
-  const list = h("div");
-  const drawDevices = async () => {
-    const entities = await Promise.all(client.me.entities.map(async entity => ({ entity, list: await client.list(entity.id) })));
-    list.replaceChildren(
-      ...entities.map(({ entity, list: { members } }) => {
-        const box = h("div", { className: "entity" });
-        const link = () => showInvite(`Open the link on the other device, or run letmeknow join CODE there; its sessions then speak as ${entity.name}.`, { entity }, box).then(drawDevices);
-        box.append(
-          h("h3", {}, entity.name),
-          h("p", {}, `These devices speak as ${entity.name}:`),
-          h("ul", {}, ...members.map(m => h("li", {}, m.name, m.id === client.member!.fp() && " (this browser) ", h("button", { onclick: () => remove(entity, m) }, "Remove")))),
-          h("button", { onclick: link }, "Link a device")
-        );
-        return box;
-      })
-    );
-    if (!entities.length) {
-      const name = h("input", { placeholder: "Your name", value: client.me.name });
-      list.append(h("p", {}, "This browser speaks as no entity. ", name, h("button", { onclick: () => client.startEntity(name.value.trim()).then(drawDevices) }, "Start one")));
-    }
-  };
-  const remove = async (entity: Membership, m: { id: string; name: string }) => {
-    if (!confirm(`Remove ${m.name} from ${entity.name}? Its sessions will no longer count as ${entity.name}.`)) return;
-    await client.removeFromEntity(entity, m.id);
-    await drawDevices();
-  };
-  home.replaceChildren(
-    h("h2", {}, "letmeknow"),
-    h("p", {}, "End-to-end encrypted group chat for people and their agents. Start a group with + New group, then invite people and agents into it with a code."),
-    list
-  );
-  drawDevices().catch(fail);
-}
-
-/** Shows an invite until it is used, then resolves; one that fails stays, with why. */
-function showInvite(help: string, target: { gid: string } | { entity: Membership }, into: HTMLElement = panel) {
-  const box = h("div", { className: "invite" }, h("p", {}, "Creating an invite…"));
-  into.append(box);
-  return client
-    .invite(target, (invite: Invite) =>
-      box.replaceChildren(
-        h("p", {}, help),
-        h("p", {}, h("code", {}, invite.code), " ", h("button", { onclick: () => navigator.clipboard.writeText(invite.link) }, "Copy link")),
-        h("p", {}, h("code", {}, invite.link)),
-        h("p", { className: "state" }, "Waiting for someone to use it.")
+function welcome(kind: "group" | "entity" | null) {
+  const device = touch.matches ? "phone" : "laptop";
+  const name = h("input", { required: true, autocomplete: "name", autofocus: true, value: kind === "entity" ? device : "" });
+  const ready = () => name.reportValidity() && name.value.trim();
+  let body: Child[];
+  if (kind === "group") {
+    const join = h("button", { className: "primary" }, "Join group");
+    body = [
+      h("h1", {}, "You're invited to a group chat"),
+      h("p", {}, "Someone sent you this link to talk with them, and perhaps with their agents. Messages are end-to-end encrypted: only the group's members can read them."),
+      form(
+        () => ready() && busy(join, "Joining…", async () => {
+          await client.create(name.value.trim(), name.value.trim());
+          enter();
+          await redeem(invite!.slot, invite!.words);
+        }),
+        field("Your name", name, "Everyone in the group sees it."),
+        join
       )
-    )
-    .then(() => box.remove())
-    .catch(error => box.replaceChildren(h("p", { className: "warn" }, `The invite failed: ${error instanceof Error ? error.message : error}`)));
+    ];
+  } else if (kind === "entity") {
+    const add = h("button", { className: "primary" }, "Add this browser");
+    body = [
+      h("h1", {}, "Add this browser to your devices"),
+      h("p", {}, "This link comes from one of your other devices. Once added, this browser joins your groups and speaks for you there."),
+      form(
+        () => ready() && busy(add, "Adding…", async () => {
+          await client.create(name.value.trim());
+          enter();
+          await redeem(invite!.slot, invite!.words);
+        }),
+        field("Name this device", name, "Shown next to your name, as in “Matthew · phone”."),
+        add
+      )
+    ];
+  } else {
+    body = [
+      invite
+        ? [h("h1", {}, "This invite has expired"), h("p", {}, "An invite works once, within 10 minutes. Ask whoever sent it for a new one, or start your own group.")]
+        : [h("h1", {}, "letmeknow"), h("p", { className: "lede" }, "End-to-end encrypted group chat for you and your agents.")],
+      field("Your name", name, "Shown to everyone in your groups."),
+      ...starters(async kind => {
+        if (!ready()) return false;
+        await client.create(name.value.trim(), kind === "entity" ? undefined : name.value.trim());
+        enter();
+        return true;
+      }),
+      h("details", { className: "agents" }, h("summary", {}, "For agents"), agentsHelp)
+    ].flat();
+  }
+  root.replaceChildren(h("div", { className: "card welcome" }, ...body), toasts);
 }
 
-async function joinOpen(o: { opening: Opening; entity: Membership }) {
-  panel.replaceChildren(h("p", {}, `Asking to join as ${o.entity.name}; a member who is online lets you in…`));
+/**
+ * The two ways in: start a group, or join with a code. `before` runs first (on a first visit, it creates the member,
+ * which a device link adds to an entity) and says whether to go on.
+ */
+function starters(before: (kind: "group" | "entity") => Promise<boolean> = async () => true): HTMLElement[] {
+  const groupName = h("input", { placeholder: "e.g. Q3 plan" });
+  const startButton = h("button", { className: "primary" }, "Start group");
+  const code = h("input", { placeholder: "417-acid-zebra", autocomplete: "off", autocapitalize: "none", spellcheck: false });
+  const joinButton = h("button", {}, "Join");
+  const start = form(
+    () => busy(startButton, "Starting…", async () => (await before("group")) && select(await client.newGroup(groupName.value.trim()))),
+    h("h2", {}, "Start a group"),
+    field("Group name", groupName, "Optional. You can rename it later."),
+    startButton
+  );
+  const join = form(
+    () => busy(joinButton, "Joining…", async () => {
+      const parsed = parseCode(code.value);
+      if (!parsed) return code.setCustomValidity("A code looks like 417-acid-zebra."), code.reportValidity(), code.setCustomValidity("");
+      const kind = await inviteKind(parsed.slot);
+      if (!kind) return toast("That code was used or has expired. Ask for a new one.");
+      if (!(await before(kind))) return;
+      await redeem(parsed.slot, parsed.words);
+    }),
+    h("h2", {}, "Join with a code"),
+    field("Invite code or link", code, "A code works once, within 10 minutes of being made."),
+    joinButton
+  );
+  return [h("section", { className: "starter" }, start), h("div", { className: "or" }, "or"), h("section", { className: "starter" }, join)];
+}
+
+function parseCode(text: string): { slot: string; words: string } | undefined {
+  const match = /(?:^|\/i\/)([1-9][0-9]{0,2})(?:#|[\s-]+)([a-z]+)[\s-]+([a-z]+)\s*$/i.exec(text.trim());
+  return match ? { slot: match[1], words: `${match[2]}-${match[3]}`.toLowerCase() } : undefined;
+}
+
+/** For a browser that already has groups: asks before it uses the invite it was opened with. */
+function offer(kind: "group" | "entity" | null) {
+  history.replaceState(null, "", "/");
+  if (!kind) return toast("That invite was used or has expired. Ask for a new one.");
+  const go = h("button", { className: "primary", autofocus: true }, kind === "group" ? "Join group" : "Add this browser");
+  const dialog = modal(
+    kind === "group" ? "You're invited to a group" : "Add this browser to your devices",
+    h("p", {}, kind === "group" ? "Join to talk with whoever sent you the link, and perhaps their agents." : "This browser becomes one of the devices of whoever made this link: it joins their groups and speaks for them."),
+    h("div", { className: "buttons" }, go)
+  );
+  go.onclick = () => busy(go, "Joining…", async () => {
+    await redeem(invite!.slot, invite!.words);
+    dialog.close();
+  });
+}
+
+/** Uses an invite: lands in the group it joined, or, for a device link, joins every group open to this browser's person. */
+async function redeem(slot: string, words: string) {
+  const gid = await client.redeem(slot, words);
+  history.replaceState(null, "", "/");
+  if (!gid) {
+    showDevices();
+    openings = await client.openings();
+    openings.forEach(o => joinOpen(o, false));
+    return;
+  }
+  select(gid);
+  client.openToOwn(gid).catch(toast);
+}
+
+async function joinOpen(o: { opening: Opening; entity: Membership }, open = true) {
+  joining.set(o.opening.group, o.opening.name);
+  render();
   try {
     const gid = await client.joinOpen(o.opening, o.entity);
-    openings = openings.filter(x => x !== o);
-    select(gid);
+    openings = openings.filter(x => x.opening.group !== gid);
+    if (open) select(gid);
   } catch (error) {
-    panel.replaceChildren();
-    fail(error);
+    toast(`Could not join ${o.opening.name || "a group"}: ${error instanceof Error ? error.message : error}`);
+  } finally {
+    joining.delete(o.opening.group);
+    render();
   }
 }
 
-function openFile(gid: string, id: string) {
-  closeFile();
-  file = id;
+// The layout: groups on the side, the selected group or a page in the main area. Narrow screens show one at a time.
+
+const groupList = h("nav", { className: "group-list" });
+const navButtons = new Map<string, { button: HTMLButtonElement; name: HTMLElement; badge: HTMLElement }>();
+const openList = h("div", { className: "open-list" });
+const meName = h("b");
+const meButton = h("button", { className: "me quiet", onclick: () => showDevices() }, meName, h("small", {}, "Your devices"));
+const sidebar = h(
+  "aside",
+  { className: "sidebar" },
+  h("div", { className: "brand" }, "letmeknow"),
+  h(
+    "div",
+    { className: "side-actions" },
+    h("button", { onclick: newGroupDialog }, "New group"),
+    h("button", { onclick: joinDialog }, "Join with code")
+  ),
+  groupList,
+  openList,
+  meButton
+);
+const main = h("main", { className: "main" });
+const layout = h("div", { className: "layout" }, sidebar, main);
+const devicesPage = h("section", { className: "page" });
+const startPage = h("section", { className: "page" });
+const views = new Map<string, GroupView>();
+
+function enter() {
+  root.replaceChildren(layout, toasts);
+  refreshOpenings();
+  setInterval(refreshOpenings, 60_000);
+  const newest = [...client.groups.keys()].at(-1);
+  if (!newest) return showStart();
+  select(newest);
+  if (narrow.matches) layout.classList.remove("in-main");
+}
+
+async function refreshOpenings() {
+  openings = await client.openings().catch(error => (toast(error), openings));
   render();
-  view = editor(editorHost, client.files.get(`${gid} ${id}`)!.doc.getText("text"));
 }
 
-async function newFile(gid: string) {
-  const name = prompt("File name", "notes.md");
-  if (name?.trim()) openFile(gid, await client.createFile(gid, name.trim()));
+function show(element: HTMLElement) {
+  if (page === "group" && selected) views.get(selected)?.hide();
+  if (!element.isConnected) main.append(element);
+  for (const child of main.children) (child as HTMLElement).hidden = child !== element;
+  layout.classList.add("in-main");
 }
 
-function download(data: string) {
+function select(gid: string) {
+  let view = views.get(gid);
+  if (!view) views.set(gid, (view = new GroupView(gid)));
+  if (page !== "group" || selected !== gid) show(view.el);
+  page = "group";
+  selected = gid;
+  view.show();
+  render();
+}
+
+function showStart() {
+  show(startPage);
+  page = "start";
+  selected = undefined;
+  startPage.replaceChildren(
+    h("div", { className: "card" }, h("h1", {}, "Start talking"), h("p", {}, "Start a group and invite people and agents into it, or join one with a code someone gave you."), ...starters())
+  );
+  render();
+}
+
+function back() {
+  return h("button", { className: "back quiet icon", title: "All groups", onclick: () => layout.classList.remove("in-main") }, "‹");
+}
+
+let rendering = Promise.resolve();
+function render() {
+  rendering = rendering.then(draw).catch(toast);
+}
+
+async function draw() {
+  for (const [gid, view] of views) {
+    if (client.groups.has(gid)) continue;
+    view.el.remove();
+    view.closeFile();
+    views.delete(gid);
+    if (gid === selected) selected = undefined;
+  }
+  if (page === "group" && !selected) {
+    const newest = [...client.groups.keys()].at(-1);
+    if (newest) select(newest);
+    else showStart();
+  }
+  drawNav();
+  const total = [...client.groups.keys()].reduce((n, gid) => n + unread(gid), 0);
+  document.title = total ? `(${total}) letmeknow` : "letmeknow";
+  if (page !== "group" || !selected) return;
+  await views.get(selected)!.update();
+  const group = client.groups.get(selected);
+  if (group && document.visibilityState === "visible" && group.read !== client.items.get(selected)!.length) client.markRead(selected);
+}
+document.addEventListener("visibilitychange", render);
+
+function drawNav() {
+  for (const [gid, entry] of navButtons) {
+    if (client.groups.has(gid)) continue;
+    entry.button.remove();
+    navButtons.delete(gid);
+  }
+  for (const gid of client.groups.keys()) {
+    let entry = navButtons.get(gid);
+    if (!entry) {
+      const name = h("span"), badge = h("b");
+      entry = { button: h("button", { onclick: () => select(gid) }, name, badge), name, badge };
+      navButtons.set(gid, entry);
+      groupList.prepend(entry.button);
+    }
+    set(entry.name, title(gid));
+    const count = unread(gid);
+    set(entry.badge, count ? String(count) : "");
+    entry.button.classList.toggle("on", page === "group" && gid === selected);
+  }
+  const waiting = [...joining].filter(([gid]) => !client.groups.has(gid));
+  const offered = openings.filter(o => !joining.has(o.opening.group));
+  update(openList, JSON.stringify([waiting, offered.map(o => [o.opening.group, o.opening.name])]), () => [
+    (waiting.length > 0 || offered.length > 0) && h("h3", {}, "You can join"),
+    ...waiting.map(([, name]) => h("div", { className: "opening" }, h("span", {}, name || "Unnamed group"), h("small", {}, "joining…"))),
+    ...offered.map(o => h("div", { className: "opening" }, h("span", {}, o.opening.name || "Unnamed group"), h("button", { onclick: () => joinOpen(o) }, "Join")))
+  ]);
+  set(meName, client.me.entities[0]?.name ?? client.me.name);
+  meButton.classList.toggle("on", page === "devices");
+}
+
+function newGroupDialog() {
+  const name = h("input", { placeholder: "e.g. Q3 plan", autofocus: true });
+  const create = h("button", { className: "primary" }, "Start group");
+  const dialog = modal(
+    "New group",
+    form(() => busy(create, "Starting…", async () => {
+      select(await client.newGroup(name.value.trim()));
+      dialog.close();
+    }), field("Group name", name, "Optional. You can rename it later."), h("div", { className: "buttons" }, create))
+  );
+}
+
+function joinDialog() {
+  const code = h("input", { placeholder: "417-acid-zebra", autofocus: true, autocomplete: "off", autocapitalize: "none", spellcheck: false });
+  const join = h("button", { className: "primary" }, "Join");
+  const dialog = modal(
+    "Join with a code",
+    form(() => busy(join, "Joining…", async () => {
+      const parsed = parseCode(code.value);
+      if (!parsed) return code.setCustomValidity("A code looks like 417-acid-zebra."), code.reportValidity(), code.setCustomValidity("");
+      if (!(await inviteKind(parsed.slot))) return toast("That code was used or has expired. Ask for a new one.");
+      await redeem(parsed.slot, parsed.words);
+      dialog.close();
+    }), field("Invite code or link", code, "Codes work once, within 10 minutes of being made."), h("div", { className: "buttons" }, join))
+  );
+}
+
+// Your devices.
+
+async function showDevices() {
+  show(devicesPage);
+  page = "devices";
+  selected = undefined;
+  render();
+  const body = h("div", { className: "card" });
+  devicesPage.replaceChildren(h("header", { className: "page-head" }, back(), h("h1", {}, "Your devices")), body);
+  const draw = async (): Promise<void> => {
+    const entity = client.me.entities[0];
+    if (!entity) {
+      const name = h("input", { value: client.me.name, required: true });
+      const start = h("button", { className: "primary" }, "Start");
+      return body.replaceChildren(
+        h("p", {}, "This browser is not one of anyone's devices. Give your name to make it your first one; you can then add your other devices."),
+        form(() => name.reportValidity() && busy(start, "Starting…", () => client.startEntity(name.value.trim()).then(draw)), field("Your name", name), start)
+      );
+    }
+    const { members } = await client.list(entity.id);
+    const me = client.member!.fp();
+    body.replaceChildren(
+      h("p", {}, `The browsers and computers that are you, ${entity.name}. They join the groups that let your other devices join, and others see them as yours.`),
+      h(
+        "ul",
+        { className: "devices" },
+        ...members.map(m =>
+          h(
+            "li",
+            {},
+            h("span", { title: `key ${m.id}` }, m.name, m.id === me && h("small", {}, " this browser")),
+            confirmed("Remove", m.id === me ? "Remove this browser?" : `Remove ${m.name}?`, async () => {
+              await client.removeFromEntity(entity, m.id);
+              await draw();
+            })
+          )
+        )
+      ),
+      h("button", { className: "primary", onclick: () => inviteDialog({ entity }).then(draw) }, "Add a device"),
+      h("p", { className: "muted" }, "A removed device stays in the groups it is in until someone removes it there.")
+    );
+  };
+  await draw().catch(toast);
+}
+
+// Invites: a link, the code it holds, and a QR code of the link. Both work once, within 10 minutes.
+
+async function inviteDialog(target: { gid: string } | { entity: Membership }) {
+  const device = "entity" in target;
+  const { encode } = await import("uqr");
+  const body = h("div", { className: "invite" }, h("p", { className: "muted" }, "Making an invite…"));
+  const dialog = modal(device ? "Add a device" : "Invite someone", body);
+  const draw = (invite: Invite) => {
+    const { data, size } = encode(invite.link, { border: 0 });
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
+    svg.setAttribute("aria-label", "QR code of the link");
+    const path = document.createElementNS(ns, "path");
+    path.setAttribute("d", data.flatMap((row, y) => row.map((dark, x) => (dark ? `M${x} ${y}h1v1h-1z` : ""))).join(""));
+    svg.append(path);
+    body.replaceChildren(
+      h("p", {}, device ? "Open this link on your other device, or scan the QR code with its camera. Your groups then appear there." : "Send this link to a person or an agent. Whoever opens it first joins the group."),
+      h("div", { className: "qr" }, svg),
+      copyable(invite.link),
+      h("p", {}, "Or type the code ", h("code", { className: "code" }, invite.code), device ? " on the other device." : ` on ${location.host}.`),
+      h("p", {}, device ? "On a computer, an agent adds it with:" : "An agent joins with:"),
+      copyable(`letmeknow join '${invite.link}'`),
+      h("p", { className: "expiry" }, "It works once, within 10 minutes. Waiting for it to be used…")
+    );
+  };
+  await client
+    .invite(target, draw)
+    .then(() => {
+      body.replaceChildren(h("p", { className: "done" }, device ? "Added. The device now joins your groups." : "They joined the group."));
+      setTimeout(() => dialog.close(), 1_500);
+    })
+    .catch(error =>
+      body.replaceChildren(
+        h("p", { className: "warn" }, `This invite stopped working: ${error instanceof Error ? error.message : error}`),
+        h("div", { className: "buttons" }, h("button", { className: "primary", onclick: () => (dialog.close(), inviteDialog(target)) }, "Make a new one"))
+      )
+    );
+}
+
+function copyable(text: string) {
+  const button = h("button", { type: "button" }, "Copy");
+  button.onclick = async () => {
+    await navigator.clipboard.writeText(text);
+    button.textContent = "Copied";
+    setTimeout(() => (button.textContent = "Copy"), 1_500);
+  };
+  return h("div", { className: "copy" }, h("code", {}, text), button);
+}
+
+// A group: chat, and beside it (or, on narrow screens, behind a tab) its files.
+
+class GroupView {
+  readonly el: HTMLElement;
+  private heading = h("h2");
+  private people = h("button", { className: "people quiet" });
+  private list = h("ol", { className: "messages" });
+  private newer = h("button", { className: "newer", hidden: true }, "New messages ↓");
+  private empty = h("div", { className: "empty", hidden: true });
+  private input = h("textarea", { rows: 1, placeholder: "Message" });
+  private context = h("div", { className: "context" });
+  private chips = h("span", { className: "chips" });
+  private chipButtons = new Map<string, HTMLButtonElement>();
+  private urgent = h("input", { type: "checkbox" });
+  private picker = h("input", { type: "file", hidden: true });
+  private fileList = h("div", { className: "file-list" });
+  private editorHost = h("div", { className: "editor" });
+  private filesButton = h("button", { className: "files-toggle" }, "Files");
+  private chatTab = h("button", {}, "Chat");
+  private filesTab = h("button", {}, "Files");
+  private shown = 0;
+  private stuck = true;
+  private top = 0;
+  private to = new Set<string>();
+  private replyTo?: Message;
+  private attachment?: { name: string; size: number; data: string };
+  private members: Person[] = [];
+  private raw = "";
+  private file?: string;
+  private editor?: EditorView;
+  /** The settings the next settings item changes, the sender and time of the last message, and its day. */
+  private settings: Settings = {};
+  private last?: { fp: string; at: number };
+  private day = "";
+
+  constructor(readonly gid: string) {
+    const send = h("button", { className: "primary send", onclick: () => this.submit() }, "Send");
+    const attach = h("button", { className: "attach quiet icon", title: "Send a file or image, up to 700 KB", ariaLabel: "Attach a file", onclick: () => this.picker.click() }, "+");
+    this.el = h(
+      "section",
+      { className: "group" },
+      h(
+        "header",
+        { className: "group-head" },
+        back(),
+        h("div", { className: "title" }, this.heading, this.people),
+        h("div", { className: "head-actions" }, h("button", { onclick: () => inviteDialog({ gid }) }, "Invite"), this.filesButton, h("button", { className: "icon quiet", title: "Group settings", ariaLabel: "Group settings", onclick: () => this.settingsDialog() }, "⋯"))
+      ),
+      h("div", { className: "tabs" }, this.chatTab, this.filesTab),
+      h(
+        "div",
+        { className: "body" },
+        h(
+          "section",
+          { className: "chat" },
+          h("div", { className: "log" }, this.list, this.empty, this.newer),
+          h(
+            "div",
+            { className: "composer" },
+            this.context,
+            h("div", { className: "row" }, attach, this.picker, this.input, send),
+            h("div", { className: "options" }, h("span", { className: "muted" }, "To"), this.chips, h("label", { className: "urgent-toggle" }, this.urgent, "Urgent"))
+          )
+        ),
+        h("section", { className: "files" }, this.fileList, this.editorHost)
+      )
+    );
+    this.people.onclick = () => this.settingsDialog();
+    this.newer.onclick = () => this.bottom();
+    this.filesButton.onclick = () => this.setFiles(!this.el.classList.contains("files-open"));
+    this.chatTab.onclick = () => this.setFiles(false);
+    this.filesTab.onclick = () => this.setFiles(true);
+    this.list.onscroll = () => {
+      if (!this.list.clientHeight) return;
+      this.stuck = this.list.scrollHeight - this.list.scrollTop - this.list.clientHeight < 40;
+      if (this.stuck) this.newer.hidden = true;
+    };
+    new ResizeObserver(() => this.list.clientHeight && this.stuck && this.bottom()).observe(this.list);
+    this.input.oninput = () => this.grow();
+    this.input.onkeydown = event => {
+      if (event.key === "Escape" && this.replyTo) return ((this.replyTo = undefined), this.drawContext());
+      if (event.key !== "Enter" || event.shiftKey || event.isComposing || touch.matches) return;
+      event.preventDefault();
+      this.submit();
+    };
+    this.input.onpaste = event => {
+      const file = event.clipboardData?.files[0];
+      if (file) (event.preventDefault(), this.attach(file));
+    };
+    this.el.ondragover = event => event.preventDefault();
+    this.el.ondrop = event => {
+      const file = event.dataTransfer?.files[0];
+      if (!file || (event.target as HTMLElement).closest(".files")) return;
+      event.preventDefault();
+      this.attach(file);
+    };
+    this.picker.onchange = () => {
+      const file = this.picker.files?.[0];
+      this.picker.value = "";
+      if (file) this.attach(file);
+    };
+    this.setFiles(wide.matches && client.filesOf(gid).length > 0);
+  }
+
+  hide() {
+    this.top = this.list.scrollTop;
+  }
+
+  show() {
+    if (this.stuck) this.bottom();
+    else this.list.scrollTop = this.top;
+    this.editor?.requestMeasure();
+    if (!touch.matches && !this.el.contains(document.activeElement)) this.input.focus();
+  }
+
+  private bottom() {
+    this.list.scrollTop = this.list.scrollHeight;
+    this.stuck = true;
+    this.newer.hidden = true;
+  }
+
+  async update() {
+    set(this.heading, title(this.gid));
+    const raw = client.member!.members(this.gid);
+    if (raw !== this.raw) {
+      this.raw = raw;
+      this.members = await client.members(this.gid);
+      this.drawPeople();
+    }
+    const items = client.items.get(this.gid);
+    if (!items) return;
+    const added = items.length > this.shown;
+    for (; this.shown < items.length; this.shown++) {
+      const item = items[this.shown];
+      const day = new Date(item.at).toDateString();
+      const line = this.line(item, items);
+      if (!line) continue;
+      if (day !== this.day) this.list.append(h("li", { className: "day" }, dayName(item.at)));
+      this.day = day;
+      this.list.append(line);
+    }
+    if (added && this.stuck) this.bottom();
+    else if (added) this.newer.hidden = false;
+    this.drawFiles();
+  }
+
+  private line(item: Item, items: Item[]): HTMLElement | null {
+    const at = timeOf(item.at);
+    if (item.type !== "message") this.last = undefined;
+    switch (item.type) {
+      case "message": {
+        const mine = item.from.fp === client.member!.fp();
+        const plain = !item.reply_to && !item.to && !item.urgent;
+        const follows = plain && this.last?.fp === item.from.fp && item.at - this.last.at < 300_000;
+        this.last = { fp: item.from.fp, at: item.at };
+        const parent = item.reply_to ? (items.find(i => i.type === "message" && i.id === item.reply_to) as Message | undefined) : undefined;
+        const to = item.to?.map(fp => this.members.find(m => m.fp === fp)).filter(m => m != null);
+        const classes = ["message", mine && "mine", follows && "follows", item.to?.includes(client.member!.fp()) && "direct", item.urgent && "urgent"];
+        return h(
+          "li",
+          { className: classes.filter(Boolean).join(" "), tabIndex: -1 },
+          !follows && h("div", { className: "meta" }, who(item.from), to?.length && h("span", { className: "muted" }, "to ", to.map(label).join(", ")), item.urgent && h("span", { className: "tag" }, "Urgent"), at),
+          parent && h("blockquote", {}, h("b", {}, label(parent.from)), " ", parent.content.slice(0, 160)),
+          item.content && h("div", { className: "text" }, item.content),
+          item.attachment && this.attachmentView(item.attachment, item.content),
+          h("div", { className: "actions" }, h("button", { className: "quiet", onclick: () => this.reply(item) }, "Reply"))
+        );
+      }
+      case "joined":
+      case "left": {
+        const self = item.by.fp === item.member.fp;
+        const said = item.type === "joined" ? (self ? [who(item.member), " joined"] : [who(item.by), " added ", who(item.member)]) : self ? [who(item.member), " left"] : [who(item.by), " removed ", who(item.member)];
+        return h("li", { className: "event" }, ...said, at);
+      }
+      case "settings": {
+        const before = this.settings;
+        const after = item.settings;
+        this.settings = after;
+        const ids = (s: Settings) => (s.open ?? []).map(o => o.id);
+        const theirs = (id: string) => id === item.by.entity?.id;
+        const said = [
+          (after.name ?? "") !== (before.name ?? "") && (after.name ? `named the group “${after.name}”` : "removed the group's name"),
+          ...(after.open ?? []).filter(o => !ids(before).includes(o.id)).map(o => (theirs(o.id) ? "let their other devices join" : `let ${o.name}'s devices join`)),
+          ...(before.open ?? []).filter(o => !ids(after).includes(o.id)).map(o => (theirs(o.id) ? "stopped letting their other devices join" : `stopped letting ${o.name}'s devices join`))
+        ].filter(Boolean);
+        return said.length ? h("li", { className: "event" }, who(item.by), ` ${said.join(" and ")}`, at) : null;
+      }
+      case "warning":
+        return h("li", { className: "event warn" }, item.text, at);
+    }
+  }
+
+  private attachmentView(data: string, content: string): HTMLElement {
+    const head = atob(data.slice(0, 16));
+    const type = head.startsWith("\x89PNG") ? "image/png" : head.startsWith("\xff\xd8\xff") ? "image/jpeg" : head.startsWith("GIF8") ? "image/gif" : head.startsWith("RIFF") && head.slice(8, 12) === "WEBP" ? "image/webp" : undefined;
+    if (type) {
+      const image = h("img", { className: "image", src: `data:${type};base64,${data}`, alt: content || "image" });
+      image.onload = () => this.stuck && this.bottom();
+      return image;
+    }
+    const name = /^[^\s/\\]+\.[A-Za-z0-9]{1,8}$/.test(content) ? content : "attachment";
+    return h("button", { className: "download", onclick: () => download(data, name) }, `Download ${name}`);
+  }
+
+  private drawPeople() {
+    const others = this.members.filter(m => !m.you);
+    const warned = others.some(m => m.entity?.error);
+    this.people.replaceChildren(...(others.length ? [warned ? "⚠ " : "", others.map(label).join(", "), " and you"] : ["Only you so far"]));
+    this.people.classList.toggle("warn", warned);
+    this.empty.hidden = others.length > 0;
+    this.empty.replaceChildren(
+      h("p", {}, "Only you so far. Invite a person or an agent: they get a link and a code that work once, within 10 minutes."),
+      h("button", { className: "primary", onclick: () => inviteDialog({ gid: this.gid }) }, "Invite someone")
+    );
+    for (const fp of this.to) if (!others.some(m => m.fp === fp)) this.to.delete(fp);
+    const everyone = h("button", { type: "button", onclick: () => (this.to.clear(), this.drawChips()) }, "Everyone");
+    this.chipButtons = new Map([["", everyone]]);
+    for (const m of others) {
+      const chip = h("button", { type: "button", title: `key ${m.fp}`, onclick: () => (this.to.has(m.fp) ? this.to.delete(m.fp) : this.to.add(m.fp), this.drawChips()) }, label(m));
+      this.chipButtons.set(m.fp, chip);
+    }
+    this.chips.replaceChildren(...this.chipButtons.values());
+    this.drawChips();
+  }
+
+  private drawChips() {
+    for (const [fp, chip] of this.chipButtons) {
+      const on = fp ? this.to.has(fp) : this.to.size === 0;
+      chip.classList.toggle("on", on);
+      chip.setAttribute("aria-pressed", String(on));
+    }
+  }
+
+  private drawContext() {
+    const close = (job: () => void) => h("button", { className: "icon quiet", title: "Cancel", onclick: () => (job(), this.drawContext()) }, "×");
+    const { replyTo, attachment } = this;
+    this.context.replaceChildren(
+      ...kids([
+        replyTo && h("div", {}, h("span", {}, "Replying to ", h("b", {}, label(replyTo.from)), ": ", replyTo.content.slice(0, 80)), close(() => (this.replyTo = undefined))),
+        attachment && h("div", {}, h("span", {}, "Attached ", h("b", {}, attachment.name), ` · ${Math.ceil(attachment.size / 1000)} KB`), close(() => (this.attachment = undefined)))
+      ])
+    );
+  }
+
+  private reply(item: Message) {
+    this.replyTo = item;
+    this.drawContext();
+    this.input.focus();
+  }
+
+  private grow() {
+    this.input.style.height = "auto";
+    this.input.style.height = `${Math.min(this.input.scrollHeight + 2, 200)}px`;
+  }
+
+  private async attach(file: File) {
+    if (file.size > 700_000) return toast(`${file.name} is too large: files sent in chat can be up to 700 KB.`);
+    this.attachment = { name: file.name, size: file.size, data: b64(new Uint8Array(await file.arrayBuffer())) };
+    this.drawContext();
+    this.input.focus();
+  }
+
+  private async submit() {
+    const content = this.input.value.trim();
+    const { attachment } = this;
+    if (!content && !attachment) return;
+    const options = { to: this.to.size ? [...this.to] : undefined, reply_to: this.replyTo?.id, urgent: this.urgent.checked || undefined, attachment: attachment?.data };
+    this.input.value = "";
+    this.grow();
+    this.to.clear();
+    this.replyTo = undefined;
+    this.attachment = undefined;
+    this.urgent.checked = false;
+    this.drawChips();
+    this.drawContext();
+    this.stuck = true;
+    try {
+      await client.send(this.gid, content || attachment!.name, options);
+    } catch {
+      if (!this.input.value) this.input.value = content;
+      this.grow();
+    }
+  }
+
+  private setFiles(open: boolean) {
+    this.el.classList.toggle("files-open", open);
+    this.filesButton.setAttribute("aria-pressed", String(open));
+    this.chatTab.classList.toggle("on", !open);
+    this.filesTab.classList.toggle("on", open);
+    this.drawFiles();
+  }
+
+  private drawFiles() {
+    const files = client.filesOf(this.gid);
+    set(this.filesButton, files.length ? `Files · ${files.length}` : "Files");
+    set(this.filesTab, files.length ? `Files · ${files.length}` : "Files");
+    update(this.fileList, JSON.stringify([files.map(f => [f.id, f.name]), this.file]), () => [
+      ...files.map(f => h("button", { className: f.id === this.file ? "on" : "", onclick: () => this.openFile(f.id) }, f.name || "untitled")),
+      h("button", { className: "quiet", onclick: () => this.newFile() }, "+ New file"),
+      !files.length && h("p", { className: "muted" }, "Files are markdown documents that everyone in the group, people and agents, edits at once.")
+    ]);
+    if (this.el.classList.contains("files-open") && !this.file && files.length) this.openFile(files[0].id);
+  }
+
+  private async openFile(id: string) {
+    this.closeFile();
+    this.file = id;
+    this.drawFiles();
+    const { editor } = await import("./editor");
+    if (this.file !== id || this.editor) return;
+    this.editor = editor(this.editorHost, client.files.get(`${this.gid} ${id}`)!.doc.getText("text"));
+  }
+
+  closeFile() {
+    this.editor?.destroy();
+    this.editor = undefined;
+    this.file = undefined;
+  }
+
+  private newFile() {
+    const name = h("input", { value: "notes.md", autofocus: true });
+    const create = h("button", { className: "primary" }, "Create");
+    const dialog = modal(
+      "New file",
+      form(() => name.value.trim() && busy(create, "Creating…", async () => {
+        const id = await client.createFile(this.gid, name.value.trim());
+        this.setFiles(true);
+        await this.openFile(id);
+        dialog.close();
+      }), field("File name", name), h("div", { className: "buttons" }, create))
+    );
+    name.select();
+  }
+
+  private settingsDialog() {
+    const gid = this.gid;
+    const settings = client.groups.get(gid)!.settings;
+    const name = h("input", { value: settings.name ?? "", placeholder: title(gid) });
+    const save = h("button", {}, "Rename");
+    const entity = client.me.entities[0];
+    const open = h("input", { type: "checkbox", checked: !!entity && !!settings.open?.some(o => o.id === entity.id) });
+    open.onchange = async () => {
+      open.disabled = true;
+      await (open.checked ? client.open(gid, entity) : client.close(gid, entity)).catch(error => ((open.checked = !open.checked), toast(error)));
+      open.disabled = false;
+    };
+    const dialog = modal(
+      "Group",
+      form(() => busy(save, "Renaming…", () => client.rename(gid, name.value.trim())), field("Name", h("div", { className: "row" }, name, save))),
+      h("h3", {}, "People"),
+      h(
+        "ul",
+        { className: "people-list" },
+        ...this.members.map(m => {
+          const warning = unverified(m);
+          const item: HTMLLIElement = h(
+            "li",
+            {},
+            h("div", {}, who(m), m.you && h("small", { className: "muted" }, " you"), warning && h("p", { className: "warn" }, warning)),
+            !m.you && confirmed("Remove", `Remove ${label(m)}?`, async () => {
+              await client.removeMember(gid, m.fp);
+              item.remove();
+            })
+          );
+          return item;
+        })
+      ),
+      entity && h("label", { className: "switch" }, open, h("span", {}, h("b", {}, "Your other devices can join"), h("small", {}, "Devices you add join this group on their own, without an invite."))),
+      h("div", { className: "buttons leave" }, confirmed("Leave group", "Leave for good?", async () => {
+        await client.leave(gid);
+        dialog.close();
+      }))
+    );
+  }
+}
+
+function timeOf(at: number): HTMLElement {
+  return h("time", { dateTime: new Date(at).toISOString(), title: new Date(at).toLocaleString() }, new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+}
+
+function dayName(at: number): string {
+  const day = new Date(at).toDateString();
+  if (day === new Date().toDateString()) return "Today";
+  if (day === new Date(Date.now() - 86_400_000).toDateString()) return "Yesterday";
+  return new Date(at).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
+}
+
+function download(data: string, name: string) {
   const url = URL.createObjectURL(new Blob([Uint8Array.from(atob(data), c => c.charCodeAt(0))]));
-  h("a", { href: url, download: "attachment" }).click();
+  h("a", { href: url, download: name }).click();
   URL.revokeObjectURL(url);
 }
