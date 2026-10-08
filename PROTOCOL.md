@@ -1,6 +1,6 @@
 # letmeknow protocol (draft)
 
-The exact formats behind REWRITE.md. Sections marked **pending** wait on the wave-1 prototypes in `spike/*`.
+The exact formats behind REWRITE.md, settled by the wave-1 prototypes on the `spike/*` branches (each has a FINDINGS.md).
 
 ## Conventions
 
@@ -81,7 +81,7 @@ A leaf node extension, of type `0xff02`, whose data is JSON:
 {"key": "<iroh key>", "relay": "<url>", "push": {"endpoint", "p256dh", "auth", "vapid": "<private key>"}}
 ```
 
-`push` is present only for browsers (see Browser, pending). A changed relay or push key is an update commit.
+`push` is present only for browsers (see Browser). A changed relay or push key is an update commit.
 
 ### Credential
 
