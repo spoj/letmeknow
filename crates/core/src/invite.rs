@@ -96,7 +96,7 @@ mod tests {
     use crate::contacts::{self, Contact, Contacts};
     use crate::device::Device;
     use crate::group::tests::{Member, leaf, settings};
-    use crate::group::{Change, Group, Session, Window, introduction, with_opening};
+    use crate::group::{Change, Group, Session, Window, with_opening};
     use crate::identity::create;
     use crate::provider::MemoryProvider;
 
@@ -147,17 +147,11 @@ mod tests {
         assert!(matches!(bob.open(&reply, 3_000).unwrap().payload, Payload::Message { .. }));
         assert_eq!(alice.g().added()[0].member.name, "Bob");
 
-        // Alice tells the group who Bob is to her; Bob records who first introduced each identity.
+        // Alice tells the group who Bob is to her.
         let carol = IdentityRef { id: Bytes(vec![3; 32]), membership: Service::Folder("/tmp/lmk".into()) };
-        for (name, now) in [("Carol", 4_000), ("Not Carol", 5_000)] {
-            let introduce =
-                Payload::Introduce { identity: carol.clone(), name: name.into(), how: lmk_proto::group::How::Invite };
-            let group = alice.group.as_mut().unwrap();
-            let (_, sealed) = group.seal(&alice.provider, &alice.session, &introduce).unwrap();
-            bob.open(&sealed, now).unwrap();
-        }
-        let introduction = introduction(&bob.provider, &[3; 32]).unwrap().unwrap();
-        assert_eq!((introduction.name.as_str(), introduction.by.name.as_str()), ("Carol", "Alice"));
+        let introduce = Payload::Introduce { identity: carol, name: "Carol".into(), how: How::Invite };
+        let (_, sealed) = alice.group.as_mut().unwrap().seal(&alice.provider, &alice.session, &introduce).unwrap();
+        assert_eq!(bob.open(&sealed, 4_000).unwrap().payload, introduce);
     }
 
     #[test]

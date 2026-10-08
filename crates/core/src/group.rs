@@ -567,14 +567,6 @@ impl Group {
             }
         }
         let payload: Payload = serde_json::from_slice(&message.into_bytes())?;
-        if let Payload::Introduce { identity, name, how } = &payload {
-            let key = [b"introduced/".as_slice(), &identity.id.0].concat();
-            if provider.get(&key)?.is_none() {
-                let introduction =
-                    Introduction { name: name.clone(), how: *how, by: sender.clone(), group: self.id().into() };
-                provider.put(&key, &serde_json::to_vec(&introduction)?)?;
-            }
-        }
         Ok(Opened {
             id: Sha256::digest(bytes).into(),
             epoch,
@@ -585,20 +577,6 @@ impl Group {
             payload,
         })
     }
-}
-
-/// Who first introduced an identity to this session, and as whom.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Introduction {
-    pub name: String,
-    pub how: How,
-    pub by: Credential,
-    pub group: Bytes,
-}
-
-pub fn introduction<P: Provider>(provider: &P, identity: &[u8]) -> Result<Option<Introduction>> {
-    let key = [b"introduced/".as_slice(), identity].concat();
-    Ok(provider.get(&key)?.map(|bytes| serde_json::from_slice(&bytes)).transpose()?)
 }
 
 /// The settings of an identity's devices group.
