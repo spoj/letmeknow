@@ -6,7 +6,7 @@ The exact formats behind REWRITE.md. Sections marked **pending** wait on the wav
 
 - Our own structures are JSON, with bytes as unpadded base64url, except where a section gives a binary layout.
 - A signature covers an explicit byte string: a context string ending in a NUL byte, then the exact bytes being vouched for. Signers send the bytes they signed, and verifiers check those bytes, so nothing depends on canonical JSON.
-- Hashes are SHA-256, keys and signatures Ed25519, except files (see Files, pending).
+- Hashes are SHA-256, keys and signatures Ed25519, except files, which hash with BLAKE3 (see Files).
 - On a QUIC stream, every frame is a 4-byte big-endian length, then that many bytes of JSON.
 
 ## Keys
@@ -50,7 +50,7 @@ A log is a directory, `<folder>/<log id, hex>/`, holding one file per entry, `<p
 
 ### Gossip
 
-Two connected members exchange the newest signed heads they hold for the logs they share (see Peer protocol, pending). A head that a member's own chain contradicts (same length, other hash; or a shorter head that is not a prefix of its chain) is proof: the session reports both heads in a `warning`.
+Two connected members exchange the newest signed heads they hold for the logs they share (see Peer protocol). A head that a member's own chain contradicts (same length, other hash; or a shorter head that is not a prefix of its chain) is proof: the session reports both heads in a `warning`.
 
 ## Groups
 
@@ -92,7 +92,7 @@ A member checks `device_sig` and the identity's device list (see Identity) when 
 - Every change is inline in its commit; standalone proposals are never sent.
 - A member reads its group's log in order. For the epoch it is in, the first entry that is a valid commit for that epoch is applied; every other entry is skipped.
 - A committer posts its commit and merges it only if the log's answer shows it first for its epoch; otherwise it clears it, applies the winner, and redoes its change on the new epoch.
-- Once the log has taken a commit, its author sends it to the members online (see Peer protocol, pending).
+- Once the log has taken a commit, its author sends it to the members online (see Peer protocol).
 
 ## Identity
 
@@ -122,18 +122,35 @@ The plaintext of an MLS application message is JSON with a `type`:
 | `type` | Kind | Fields |
 |---|---|---|
 | `message` | chat | `content`, `after`, and optional `to`, `reply_to`, `urgent`, `attachment`, as today |
-| `edit` | doc | pending: Sync (per-edit updates or state-vector diffs) |
+| `edit` | doc | `update`: a Yjs v1 update, sent live to the members online and not held |
+| `diff` | doc | `update`: a Yjs v1 update answering `doc_sv` (see Peer protocol), not held |
 | `leave` | every | none: the sender asks to be removed; the first member to see it commits the Remove |
 
-A message's id is SHA-256 of its MLS ciphertext.
+A message's id is SHA-256 of its MLS ciphertext. A member holds `message` and `leave` for `keep` days, and only once it has decrypted and verified them. It takes no message from a removed sender that first reaches it more than 5 minutes after it applied the removal.
 
 ## Peer protocol
 
-**Pending: iroh, Sync, Files.** ALPN `letmeknow/peer/1`. It carries: an opening exchange of shared groups and signed heads; commit pushes; message sync; file want-lists and transfers; join requests to open groups. A peer serves a group's data only to current members of that group, recognised by the iroh key in their leaf.
+**Pending: iroh** (framing and connection handling). ALPN `letmeknow/peer/1`, between two sessions that share a group. Either side may send a frame at any time; every frame names its group, and a side serves a group only to a peer whose iroh key is in a leaf of that group's current epoch.
+
+| Frame | Meaning |
+|---|---|
+| `{"hello": {"groups": [{"group", "epoch", "head", "floor", "joined"}]}}` | For each group both are in: the epoch the sender is at, the newest signed head it holds, the lowest epoch it accepts, and the epoch it joined |
+| `{"commits": {"group", "entries", "head"}}` | Log entries the other lacks, judged by its head; also sent by a commit's author once the service has taken it |
+| `{"reconcile": {"group", "msg"}}` | A negentropy message (see below) |
+| `{"messages": {"group", "items"}}` | MLS ciphertexts the other lacks; also every new message as it is sent |
+| `{"doc": {"group", "snapshot"}}` | SHA-256 of `txn.snapshot().encode_v1()` |
+| `{"doc_sv": {"group", "sv"}}` | A Yjs state vector, sent when the snapshots differ; answered by a `diff` message |
+| `{"want": {"group", "files"}}`, `{"have": {"group", "files"}}` | BLAKE3 hashes (see Files) |
+| `{"join": {"group", "key_package"}}` | A request to join an open group, answered like an invite |
+
+Message sync, per group, starts once both sides have caught up on commits. It is negentropy (crate `negentropy` 0.5) over items whose timestamp is the epoch and whose id is the message id, from epoch max(the later `joined`, the lower `floor`). `reconcile` frames alternate until negentropy is done; then `messages` carries what each lacks, never older than the receiver's `floor`. Ids a member gave up on (beyond its key window) stay in its set, so they are not offered again.
 
 ## Files
 
-**Pending: Files.** Chunked sealing, BLAKE3 over the ciphertext, verified streaming, and the link format.
+- A file's key is 32 random bytes. Its ciphertext is the STREAM construction as in age: the plaintext in chunks of 65,520 bytes (the last shorter, and empty only for an empty file), each sealed with ChaCha20-Poly1305 under the key, with the nonce u88 big-endian chunk counter ‖ `0x01` for the last chunk, else `0x00`. Sealed chunks are 64 KiB.
+- Its hash is BLAKE3 over the whole ciphertext. A link is `lmk:<hash, hex>.<plaintext size>#<key, hex>`.
+- Transfer is iroh-blobs `=0.103.1` on its own ALPN, kept inside one module. A holder admits a connection only from the iroh key of a current member of a group the two share, a request only for a file one of those groups links, and checks again every 16 KiB it sends.
+- A member asks connected peers with `want`; each answers `have` with those it holds, and the member fetches from several holders at once, resuming where a transfer stopped. A browser keeps the ciphertext in its own storage (IndexedDB), since iroh-blobs keeps only memory there.
 
 ## Browser
 
