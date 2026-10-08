@@ -16,7 +16,7 @@ export type Item =
 /** An entity this browser is in. Its secret locates and seals the entity's inbox. */
 export type Membership = { id: string; name: string; secret: string };
 export type Opening = { group: string; relay: string; name: string; requests: string; closed?: boolean };
-export type Invite = { code: string; link: string; status: string };
+export type Invite = { code: string; link: string };
 export type List = { id: string; name: string; members: { id: string; key?: string; name: string }[] };
 export type FileDoc = { gid: string; id: string; name: string; doc: Y.Doc };
 /** `read` counts the items a person has seen. */
@@ -369,7 +369,7 @@ export class Client {
     });
   }
 
-  /** An invite into group `gid`, or with `entity`, for another device to join that entity. Admits whoever redeems it. */
+  /** An invite into group `gid`, or with `entity`, for another device to join that entity. Resolves once it admitted whoever redeemed it. */
   async invite(target: { gid: string } | { entity: Membership }, update: (invite: Invite) => void) {
     const words = invite_words();
     const pake = new Pake(words);
@@ -381,8 +381,7 @@ export class Client {
       if ((await http(`/i/${id}`, { method: "PUT", body })).status === 201) slot = id;
     }
     if (!slot) throw new Error("no free invite slot on the relay; try again");
-    const invite = { code: `${slot}-${words}`, link: `${origin}/i/${slot}#${words}`, status: "waiting for someone to use it" };
-    update(invite);
+    update({ code: `${slot}-${words}`, link: `${origin}/i/${slot}#${words}` });
     for (;;) {
       const response = await http(`/i/${slot}/join?wait=25`);
       if (response.status === 204) continue;
@@ -396,11 +395,9 @@ export class Client {
       } catch (error) {
         // Sealed under our key, so a joiner with a wrong code cannot open it and stops waiting.
         await welcome(new Uint8Array());
-        update({ ...invite, status: `not admitted: ${error}` });
-        return;
+        throw error;
       }
       if ("gid" in target) await this.run(() => this.postState(target.gid));
-      update({ ...invite, status: "used" });
       return;
     }
   }

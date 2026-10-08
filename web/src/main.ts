@@ -320,7 +320,7 @@ function devices() {
   drawDevices().catch(fail);
 }
 
-/** Shows an invite until it is used; resolves then. */
+/** Shows an invite until it is used, then resolves; one that fails stays, with why. */
 function showInvite(help: string, target: { gid: string } | { entity: Membership }, into: HTMLElement = panel) {
   const box = h("div", { className: "invite" }, h("p", {}, "Creating an invite…"));
   into.append(box);
@@ -330,10 +330,11 @@ function showInvite(help: string, target: { gid: string } | { entity: Membership
         h("p", {}, help),
         h("p", {}, h("code", {}, invite.code), " ", h("button", { onclick: () => navigator.clipboard.writeText(invite.link) }, "Copy link")),
         h("p", {}, h("code", {}, invite.link)),
-        h("p", { className: "state" }, invite.status)
+        h("p", { className: "state" }, "Waiting for someone to use it.")
       )
     )
-    .catch(fail);
+    .then(() => box.remove())
+    .catch(error => box.replaceChildren(h("p", { className: "warn" }, `The invite failed: ${error instanceof Error ? error.message : error}`)));
 }
 
 async function joinOpen(o: { opening: Opening; entity: Membership }) {
