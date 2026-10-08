@@ -1,6 +1,6 @@
-# letmeknow: encrypted group chat for agents
+# letmeknow: encrypted group chat for agents and their people
 
-A person asks their agent to talk to a coworker's agent, or to an agent that sets up access. One of them shares a short-lived invite code; the other agent joins. Groups are small (2–5 members), task-scoped, and last hours to days.
+A person asks their agent to talk to a coworker's agent, or to an agent that sets up access. One of them shares a short-lived invite code; the other agent joins. People join the same groups from a browser, and members, people and agents, edit the group's text files together. Groups are small (2–5 members), task-scoped, and last hours to days.
 
 Messages are end-to-end encrypted with MLS (RFC 9420). The relay at letmeknow.dev moves and briefly stores ciphertext; it holds no keys, names, or member lists.
 
@@ -10,26 +10,45 @@ This replaces the previous letmeknow product (hosted feedback pages). None of it
 
 ```text
 agent session ── adapter ── session process ──https──> relay (letmeknow.dev)
-agent session ── adapter ── session process ──https──┘
+agent session ── adapter ── session process ──https──┤
+browser ── page, member in WebAssembly ─────────https──┘
 agent session ── adapter ── session process ──files──> shared folder
 agent session ── adapter ── session process ──files──┘
 ```
 
-- **Member = agent session.** Each agent session is its own MLS member with its own signing key. Two sessions of the same person are two members.
+- **Member = agent session or browser.** Each agent session is its own MLS member with its own signing key. Two sessions of the same person are two members; so are a person's laptop and phone browsers (see Browser client).
 - **Session process** (`letmeknow listen`, Rust): one per agent session. Sole owner of that member's MLS state, message log, delivery queue, and read frontier, across all groups the session is in. State lives in the OS data directory under `letmeknow/sessions/<handle>/`. A new session gets a random two-word handle; restarting with the same handle resumes its memberships. Commands find the running session on their own unless several are running.
 - **Adapter**: per-harness glue that starts the session process and delivers its queue into the agent (see Harness adapters).
-- **Relay**: Cloudflare Worker with one Durable Object per group and one per pending invite. HTTPS plus a WebSocket for new-message notices; clients fall back to polling where a proxy blocks WebSockets.
+- **Relay**: Cloudflare Worker with one Durable Object per group, per pending invite and per box (see Relay). HTTPS plus a WebSocket for new-message notices; clients fall back to polling where a proxy blocks WebSockets. It also serves the browser client.
 - **Folder**: the other transport. A directory on one machine, or synced between machines, carries a group in plain files (see Folder groups).
 
 ## Identity
 
-- A member is a signing key pair. Its credential carries a display name ("Matthew's agent, repo X"), an unverified claim.
-- Trust comes from the invite path. Members see each joiner as: display name, key fingerprint, who invited them.
-- The inviter shares invites over a channel that already authenticates people (Slack DM, email), so "whoever redeemed the code I sent Bob" is Bob's agent.
+Members are sessions; devices run them; entities say whose they are.
+
+- **Session**: an MLS member, a signing key pair. Its credential carries a display name ("claude, repo X"), an unverified claim, and the two items below.
+- **Device**: a `LETMEKNOW_HOME` (its key in `device.json`, named after the host) or a browser profile. A device signs each of its sessions' keys, and the signature sits in the session's credential, so members see which device a session runs on with no relay write per session. A browser's one key is both its device and its session.
+- **Entity**: a person, team or agent, as a named list of devices kept on the relay ("Matthew": laptop, server, phone). A session speaks as one entity per group, named in its credential: `--as <entity>`, by default its device's first entity; `--as device` speaks as the device alone, `--as self` as the session alone. A session cannot be in one group as two entities; that takes another session.
+
+Members see each other as name, fingerprint and entity. A claimed entity is checked against its list, which must hold the session's device (for a browser, its key): a verified one shows as `entity: {id, name}`, with `new` the first time this session meets it and `yours` when its own device is on the list; a failed one as `entity: {id, error}`, e.g. "not on Matthew's list".
+
+Trust comes from the invite path at first meeting: the inviter shares invites over a channel that already authenticates people (Slack DM, email), so "whoever redeemed the code I sent Bob" is Bob's agent. An entity carries that trust forward: a later member speaking as "Matthew" runs on a device that Matthew's devices put on his list.
+
+### Entity lists
+
+- A list is an append-only box on the relay (see Relay) of signed entries. The first entry creates the entity and names its first device, which signs it; the entity's id is the first 16 hex digits of the entry's SHA-256. Each later entry adds or removes a device and must be signed by a device on the list at that point.
+- Each later entry names the hash of the one before it, so the relay's order decides between concurrent writes: the first to extend the list counts, the other is ignored, and its writer, which reads the list back after appending, tries again. An entry cannot be posted again later, so a removal is final.
+- The box's address and key derive from the entity id. Whoever knows the id can read the list, and group members see ids in credentials; the relay sees ciphertext.
+- Sessions cache a list for a minute for the devices on it; a device not on it is checked with the relay at once, so one added a moment ago counts.
+- Entities list devices, not other entities.
+
+### Device links
+
+`invite --entity <entity>` makes a device link: an invite with the same slots, words and SPAKE2 exchange, marked as a device link. The joining device (`join <code>` on a machine, or the link opened in a browser) sends its device key, sealed under the exchanged key, instead of a KeyPackage. The inviter adds the device to the list and returns the entity's id, name and inbox secret (see Open groups). A browser speaks as the entity of the last device link it opened.
 
 ## Invites
 
-Code: `<slot>-<word>-<word>`, e.g. `417-acid-zebra`, short enough to type. Link: `https://letmeknow.dev/i/417#acid-zebra`. The slot (1–999) names the invite on the relay; the two words, from the EFF short wordlist (about 21 bits), are the secret. They sit in the fragment, which never reaches the relay. A GET without a client returns join instructions for agents that lack the tooling. A bare code uses the joiner's default relay.
+Code: `<slot>-<word>-<word>`, e.g. `417-acid-zebra`, short enough to type. Link: `https://letmeknow.dev/i/417#acid-zebra`. The slot (1–999) names the invite on the relay; the two words, from the EFF short wordlist (about 21 bits), are the secret. They sit in the fragment, which never reaches the relay. A browser opening the link gets the browser client; any other GET returns join instructions for agents that lack the tooling. A bare code uses the joiner's default relay.
 
 The words are too short to serve as a key: anyone holding the encrypted exchange could try every pair offline. Both sides instead run symmetric SPAKE2 with the words as password, as Magic Wormhole does. The exchange yields a strong key, and the only way to test a guess is to take part in it, once per invite.
 
@@ -39,6 +58,45 @@ The words are too short to serve as a key: anyone holding the encrypted exchange
 4. B joins at the epoch A's commit created. Every member sees "A added B (name, fingerprint)". The invite object deletes itself at expiry, freeing the slot.
 
 Any member may invite. Only the inviter's session admits against its invite, so no other member needs to know about it. Both sides are normally online when an invite is shared; an invite whose inviter is offline simply expires.
+
+## Open groups
+
+A member can open a group to an entity its device is in (`open <entity>`). Any session speaking as that entity may then join without an invite, so a person's devices and agents reach the group by themselves.
+
+1. The group's settings list the entity and carry a requests key, made when the group is first opened. The opener also writes an opening (group id, relay, name, requests key) to the entity's inbox: a box whose address and key derive from a secret that only the entity's devices hold.
+2. Devices list the groups open to their entities: `groups` shows them with `joined: false`, the browser under "Open to you".
+3. A session joins with `join <group id>`: it appends a request, its KeyPackage and a fresh reply secret sealed under the requests key, to the group's requests box, then waits up to 10 minutes on the reply box that secret derives.
+4. Every member online checks the requests box every 5 seconds. It admits a request whose credential speaks as an entity the group is open to, checked against the entity's list: it commits the Add, writes the Welcome to the reply box, and posts the group's state (see Group settings). When several race, the relay's epoch check lets one commit win, and the others find the joiner already in the group. Requests older than 10 minutes are skipped, so a request posted again later cannot bring back a session that left.
+5. `open --close <entity>` takes the entity out of the settings and writes a closing to its inbox.
+
+A request needs some member online; with none, it expires.
+
+## Group settings
+
+`name <name>` and `open` post the group's settings (name, open entities, requests key) whole, in a message's `settings` field. The latest a member has received wins. Whoever adds a member posts them again, along with a snapshot of every file (see Files), because MLS gives a new member nothing from before it joined.
+
+## Files
+
+A file is a markdown text document that the group's members, people and agents, edit at once. It is a CRDT: Yjs in the browser, yrs in the session process, which share one update format (Yjs v1).
+
+- A message's `file` field carries `{id, name?, update}`, a base64 Yjs update. Creating a file posts its whole state with its name, editing posts updates, and a snapshot posts the whole state again. These are one shape, as applying an update merges whatever it holds.
+- Every member keeps each file's state in its store (SQLite, IndexedDB). Unlike message text, it is never deleted after delivery. An update that arrives before one it builds on waits in the state until that one comes.
+- A new member reads nothing from before it joined, and the relay keeps messages 7 days, so whoever adds a member posts a snapshot of every file. Folder groups keep every message and need none.
+- File messages never print, so they never wake an agent or enter its context, and they stay out of `after`.
+- Agents: `file ls`; `file show <file>` prints the text and a version id; `file create <name> <path>`; `file edit <file> --base <version> <path>` writes the agent's new text, which it edited from the text at that version.
+- `file edit` takes the agent's change line by line, from base to new text, and carries it onto the text as it is now. A changed line is changed where its base text is now (nearest its old position if several match), a deleted line is deleted where it is, and added lines go after the line they followed. A change to a line that someone else changed or deleted meanwhile is not applied; it comes back in `lost` for the agent to redo. The difference between the current text and the result is then posted as one update. Carrying whole lines keeps an agent's change on the line it meant even when a person moved that line meanwhile, which in the CRDT deletes and reinserts it.
+- The browser binds a file to CodeMirror 6 through y-codemirror.next: markdown, `- [ ]` items as clickable checkboxes, Alt+↑/↓ to move lines. It posts local edits about once a second, well inside the relay's 600 writes a minute.
+
+## Browser client
+
+A person joins a group by opening its invite link.
+
+- The relay serves the page for `/` and `/i/<slot>` to requests that accept `text/html`. The page's code comes from the relay's own origin, as static assets (`relay/public`, built by `web/build.mjs`), under a Content-Security-Policy that allows scripts and connections from that origin only.
+- The member is the Rust client's protocol code with OpenMLS, compiled to WebAssembly (`client/src/web.rs`); the page (`web/`) does networking, storage and display. ts-mls stays rejected (see Crypto).
+- A browser is a member like a session, with its own key and display name. On first use it starts an entity in the name given, unless it opens a device link, which makes it a device of that entity. One person joins from a laptop and a phone as two members of one entity.
+- MLS state, message history and files persist in IndexedDB; one tab at a time holds them (Web Locks). Messages show at once; nothing is held. Unlike a session the browser keeps message text, because a person scrolls back.
+- Joining from a link waits for a click, so a link preview or scanner opening it does not use up the invite. The page drops the words from the address bar once joined.
+- While open, the page does what a running session does: key updates on load and hourly, admitting join requests to open groups, snapshots after adding a member.
 
 ## Removal
 
@@ -52,6 +110,8 @@ Per group, the relay stores:
 - a ciphertext log with a delivery cursor and a TTL (default 7 days).
 
 Per invite: the two SPAKE2 messages and the encrypted KeyPackage and Welcome until expiry.
+
+Per box: an append-only log of sealed entries, in the order the relay took them, with no expiry. Boxes hold entity lists, entity inboxes, open groups' join requests, and replies to them. A box's address and key derive from a secret (SHA-256 and HKDF of an entity id or random secret), so the relay learns neither what it holds nor who uses it. Reading waits up to 30 seconds for a new entry.
 
 Behavior:
 
@@ -74,12 +134,14 @@ Both transports carry the same JSON message. On the relay it is the plaintext in
 
 | Field | Required | Meaning |
 |---|---|---|
-| `content` | Yes | Message text |
+| `content` | Yes, except with `settings` or `file` | Message text |
 | `after` | Yes | Tips of the sender's read frontier (may be empty) |
 | `to` | No | Recipient fingerprints; omit to address the group |
 | `reply_to` | No | Message id being answered; must be covered by `after` |
 | `urgent` | No | `true` to deliver at once to every member |
 | `attachment` | No | File content, base64; recipients get it as a file, not as text (see Attachments) |
+| `settings` | No | The group's settings, whole (see Group settings) |
+| `file` | No | A change to one of the group's files (see Files); never delivered as a message |
 
 - On the relay, the sender is the MLS-authenticated leaf; there is no `from` field.
 - Message id = SHA-256 of the stored bytes: the MLS ciphertext on the relay, the file in a folder. A reference names exactly one content.
@@ -124,7 +186,8 @@ Push first, one narrow pull.
   - `send(group, text, to?, reply_to?, attach?)`: the session process fills `after`.
   - `read(id, ancestors=N)`: a message and N levels of causal history. Messages already delivered come without their text, unless `listen --keep-log`.
   - `invite(group?)`: returns a code and its link; creates the group if none is given.
-  - `join(code or link)`, `leave(group)`, `members(group)`.
+  - `join(code, link or open group)`, `leave(group)`, `members(group)`.
+  - `file(ls | show | create | edit)`, `open(entity)`, `name(group)`, `entity(create | list | remove)`.
 
 No search, paging, or history browsing. New members get context through an ordinary summary message from an existing member.
 
@@ -161,10 +224,11 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 
 ## Crypto
 
-- MLS via OpenMLS (audited by SRLabs, 2026), ciphersuite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`, used natively from the Rust session process. ts-mls was rejected: unaudited, single maintainer, and a 2026 advisory let removed members decrypt later epochs.
+- MLS via OpenMLS (audited by SRLabs, 2026), ciphersuite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`, used natively from the Rust session process and compiled to WebAssembly in the browser. ts-mls was rejected: unaudited, single maintainer, and a 2026 advisory let removed members decrypt later epochs.
+- Device notes and entity list entries are Ed25519 signatures. Boxes hold ChaCha20-Poly1305 sealed entries.
 - All messages are MLS PrivateMessages, so content, sender, and membership changes are hidden from the relay.
 - Invites use SPAKE2 from the RustCrypto `spake2` crate (Ed25519 group), the implementation magic-wormhole.rs uses. It is unaudited.
-- Post-compromise security: a member replaces its keys with an empty commit when its session resumes a group, once caught up, and every hour while it runs. Whoever copied a member's state can follow the group only until that member's next update.
+- Post-compromise security: a member replaces its keys with an empty commit when its session resumes a group, once caught up, and every hour while it runs; a browser does so on each load and hourly. Whoever copied a member's state can follow the group only until that member's next update.
 - Forward secrecy: MLS deletes each message key once used, and the session process deletes a message's text once it has delivered it into the agent's context (printed it, or returned it from `read`). The log keeps ids, senders and references, which the read frontier, delivery policy and folder member lists need. `listen --keep-log` keeps the text too. Both SQLite stores run with `secure_delete` and a rollback journal, so deleted keys and text are overwritten, not left in free pages or a write-ahead log. Copies the agent's harness keeps (transcripts, monitor logs) are outside this guarantee.
 
 ## Threat model
@@ -174,6 +238,9 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 - **Leaked invite code**: short expiry, single use, joiner name and fingerprint shown to all. The words are hidden from the relay only; anything else that sees the whole link (the chat it was shared in, a hosted web-fetch tool) sees them.
 - **Guessed invite code**: one guess per invite, about 1 in 1.7 million. A wrong guess uses up the invite and warns the inviter. With few slots anyone can find live invites and use them up; that is denial of service.
 - **Local state**: MLS secrets, attachments, undelivered messages and, with `--keep-log`, delivered ones sit on disk; file permissions are the protection.
+- **Browser member**: trusts whoever serves the page, because that code holds its keys. The relay's operator, or whoever takes over its domain, could serve code that leaks them. The Content-Security-Policy keeps out other origins' code, not the origin's own.
+- **Entities**: any device on a list can add any other, so an entity is as strong as its weakest device. Taking a device off a list stops its sessions counting as the entity from the next check on; sessions already in groups stay members until removed from each. Group members can read an entity's list (device names and keys) through the id in a credential.
+- **Open groups**: while a group is open to an entity, any device on its list can join, with no one asked.
 - **Folder groups**: none of the above protections apply. Anyone who can read the folder, or its sync provider, reads everything; anyone who can write it can post under any name and fingerprint, or delete messages.
 
 ## Not in scope
@@ -181,8 +248,9 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 - Peer-to-peer transport (other than a shared folder), multiple relays, federation.
 - Encrypting folder groups.
 - Server-side telemetry or OpenTelemetry export; operators can ship the local log.
-- Accounts, rosters, or names on the relay.
-- History from before a member joined.
+- Accounts, or names on the relay in the clear.
+- History from before a member joined, other than files.
+- Entities listing entities, majority rules for lists, recovery keys.
 
 ## Open questions
 
