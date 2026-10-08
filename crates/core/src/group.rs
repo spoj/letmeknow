@@ -458,8 +458,9 @@ impl Group {
 
     pub fn set_window<P: Provider>(&mut self, provider: &P, window: Window) -> Result<()> {
         self.state.window = window;
-        self.mls.set_configuration(provider.storage(), &join_config(window))?;
+        // First: openmls's own resize, on a smaller cap, keeps the oldest epochs rather than the newest.
         self.expire(provider)?;
+        self.mls.set_configuration(provider.storage(), &join_config(window))?;
         self.save(provider)
     }
 
@@ -568,3 +569,7 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex) -> Result<(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "group_tests.rs"]
+pub(crate) mod tests;
