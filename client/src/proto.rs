@@ -150,8 +150,13 @@ pub fn membership_changes(mls: &MlsGroup, staged: &StagedCommit, by: &Value) -> 
         let leaf = p.add_proposal().key_package().leaf_node();
         json!({ "type": "joined", "group": gid, "member": person(leaf.credential(), leaf.signature_key().as_slice()), "by": by })
     });
-    let removed = staged.remove_proposals().filter_map(|p| mls.member_at(p.remove_proposal().removed())).map(|m| {
-        json!({ "type": "left", "group": gid, "member": person(&m.credential, &m.signature_key), "by": by })
+    // A member that left proposed its own removal, which another member committed: it is `by`.
+    let removed = staged.remove_proposals().filter_map(|p| {
+        let leaf = p.remove_proposal().removed();
+        let m = mls.member_at(leaf)?;
+        let member = person(&m.credential, &m.signature_key);
+        let left = matches!(p.sender(), Sender::Member(sender) if *sender == leaf);
+        Some(json!({ "type": "left", "group": gid, "by": if left { &member } else { by }, "member": member }))
     });
     added.chain(removed).collect()
 }
