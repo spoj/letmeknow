@@ -45,8 +45,11 @@ jobs:
         working-directory: client
       - run: cargo test
         working-directory: client
-      - run: npm ci && npx playwright install --with-deps chromium-headless-shell && npm run check
+      - run: npm ci && npx playwright install --with-deps chromium-headless-shell
         working-directory: web
         shell: bash
       - run: python -u test/e2e.py
         timeout-minutes: 10
+      # After e2e.py, which builds web/pkg, the WebAssembly bindings the app imports.
+      - run: npm run check
+        working-directory: web
