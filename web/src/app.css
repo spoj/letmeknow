@@ -92,7 +92,7 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 .sidebar { display: flex; flex-direction: column; gap: var(--s2); min-height: 0; padding: var(--s4) var(--s3); background: var(--side); border-right: 1px solid var(--line); }
 .brand { font-weight: 650; font-size: var(--t-lg); padding: 0 var(--s2); }
 .side-actions { display: flex; gap: var(--s2); padding: var(--s2) 0; }
-.side-actions button { flex: 1; padding: 0 var(--s2); font-size: var(--t-sm); }
+.side-actions button { flex: 1; padding: 0 var(--s1); font-size: var(--t-sm); white-space: nowrap; }
 .group-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
 .group-list button, .me { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); text-align: left; border: 0; background: none; padding: var(--s2) var(--s3); min-height: 36px; }
 .group-list button:hover, .me:hover { background: var(--hover); }
