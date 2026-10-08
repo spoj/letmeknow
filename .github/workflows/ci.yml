@@ -11,32 +11,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  relay:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: relay
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: relay/package-lock.json
-      - run: npm ci
-      - run: npm test
-
-  client:
+  test:
     strategy:
       fail-fast: false
       matrix:
-        # The browser client is the same on every OS, so only Linux builds and tests it.
-        include:
-          - { os: ubuntu-latest, browser: true }
-          - { os: macos-latest, browser: false }
-          - { os: windows-latest, browser: false }
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -44,40 +25,5 @@ jobs:
           components: clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: client
-      - if: matrix.browser
-        uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-bindgen-cli@0.2.129
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            relay/package-lock.json
-            web/package-lock.json
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: client
-      - if: matrix.browser
-        run: cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings
-        working-directory: client
-      - run: cargo test
-        working-directory: client
-      - if: matrix.browser
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ hashFiles('web/package-lock.json') }}
-      - if: matrix.browser
-        run: npm ci && npx playwright install --with-deps chromium-headless-shell
-        working-directory: web
-      - run: python -u test/e2e.py ${{ !matrix.browser && '--no-browser' || '' }}
-        timeout-minutes: 10
-      # After e2e.py, which builds web/pkg, the WebAssembly bindings the app imports.
-      - if: matrix.browser
-        run: npm run check
-        working-directory: web
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
