@@ -19,7 +19,7 @@ pub use lmk_proto::links::RELAY;
 
 /// letmeknow.dev's membership service.
 pub fn letmeknow_dev() -> Service {
-    let key = hex::decode("50d422869a41e313ef48fa00284557a0c3d15374280b7f3d5d35a35c2393370f").unwrap();
+    let key = hex::decode(lmk_proto::links::MEMBERSHIP_KEY).unwrap();
     Service::Serve { key: Bytes(key), relay: RELAY.into(), addrs: Vec::new() }
 }
 

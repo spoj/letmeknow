@@ -177,4 +177,12 @@ Message sync, per group, starts once both sides have caught up on commits. It is
 
 ## Browser
 
+- The client is lmk-node compiled to WebAssembly (`crates/web`), with a device key that is also its MLS key, so its credential's `device` is its own key. Its iroh key is separate, as natively, and it reaches every peer and membership service through relays.
+- Its records live in an IndexedDB database `lmk`. The store `records` holds the `Provider`'s, one record per key: openmls's own keys, and ours under `lmk/` (lmk-node's `node/…` and `session`, and the client's `web/…`: its device, name, and each group's timeline, refusals and settings as last seen). The page writes the records that changed every second and after each action. The store `files` holds the ciphertext of each file it holds, by BLAKE3 hash (hex); they are loaded back into iroh-blobs' memory store when the page opens.
+- It takes files up to 25 MiB without being asked.
+- Its relay and membership service are letmeknow.dev's, unless `localStorage` names others: `lmk relay` (a URL) and `lmk membership` (`<iroh key, hex>@<relay URL>`).
+- The page serves `/i` as the app, which reads the invite from the fragment.
+- A service worker caches exactly the files of one build, under a name derived from their contents, and serves navigations with its `index.html`. A new build installs beside it and waits; the page offers it, and on acceptance tells it `"skip"`, and every tab the old one served reloads.
+- One tab at a time runs the session, holding the Web Lock `letmeknow`; the others wait for it.
+
 Push notifications are deferred; the push prototype's design is on `spike/push` (see REWRITE.md, Later).

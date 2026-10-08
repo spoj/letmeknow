@@ -2977,6 +2977,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "lmk-web"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "iroh",
+ "js-sys",
+ "lmk-node",
+ "lmk-proto",
+ "n0-future",
+ "openmls_memory_storage",
+ "openmls_rust_crypto",
+ "openmls_traits",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

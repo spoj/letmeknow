@@ -1,13 +1,13 @@
-// The page: one browser member and its groups, each a chat or a doc. Background jobs end in render(), which appends new
-// items and patches only what changed, so what a person is typing in, selecting or scrolling stays put. Joining from a
-// link waits for a click, so link scanners that open it join nothing.
+// The page: this browser's session and its groups, each a chat or a doc. Background work ends in render(), which patches
+// only what changed, so what a person is typing, selecting or scrolling stays put. Joining from a link waits for a
+// click, so link scanners that open it join nothing.
 import "./app.css";
-import type { EditorView } from "@codemirror/view";
-import { type Attachment, Client, type Invite, type Item, MAX_BLOB_BYTES, type Membership, type Opening, type Person, type Settings, inviteKind, whose } from "./client";
+import * as client from "./client";
+import type { Attachment, Group, Item, Lmk, Me, Person } from "./client";
 
-type Child = Node | string | false | undefined | null | 0;
+type Child = Node | string | false | undefined | null | 0 | Child[];
 type Message = Extract<Item, { type: "message" }>;
-const kids = (children: Child[]) => children.filter(c => c != null && c !== false && c !== 0) as (Node | string)[];
+const kids = (children: Child[]) => (children as unknown[]).flat(Infinity).filter(c => c != null && c !== false && c !== 0) as (Node | string)[];
 function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Record<string, unknown> = {}, ...children: Child[]): HTMLElementTagNameMap[K] {
   const element = Object.assign(document.createElement(tag), props);
   element.append(...kids(children));
@@ -23,22 +23,20 @@ function update(element: HTMLElement, key: string, build: () => Child[]) {
 }
 
 const set = (element: HTMLElement, text: string) => element.textContent !== text && (element.textContent = text);
-const form = (submit: () => unknown, ...children: Child[]) =>
-  h("form", { onsubmit: (event: Event) => (event.preventDefault(), submit()) }, ...children);
+const form = (submit: () => unknown, ...children: Child[]) => h("form", { onsubmit: (event: Event) => (event.preventDefault(), submit()) }, ...children);
 const field = (label: string, input: HTMLElement, hint?: string) => h("label", { className: "field" }, h("span", {}, label), input, hint && h("small", {}, hint));
 const megabytes = (bytes: number) => (bytes < 1e6 ? `${Math.ceil(bytes / 1000)} KB` : `${(bytes / 1e6).toFixed(1)} MB`);
-/** What each kind of group is called, and the mark beside its name in the list. */
-const KINDS: Record<string, { name: string; mark: string }> = { chat: { name: "chat", mark: "💬" }, doc: { name: "document", mark: "📄" } };
-const kindOf = (gid: string) => KINDS[client.groups.get(gid)!.settings.kind];
+const KINDS = { chat: { name: "chat", mark: "💬" }, doc: { name: "document", mark: "📄" } };
+/** Files up to this size every member fetches; larger ones only on request. */
+const FILE_LIMIT = 25 << 20;
+const INVITE_PREFIX = "https://letmeknow.dev/i";
 
 const root = document.getElementById("app")!;
 const agentsHelp = document.getElementById("agents")!;
 const toasts = h("div", { className: "toasts" });
 const narrow = matchMedia("(max-width: 699px)");
-const wide = matchMedia("(min-width: 1000px)");
 const touch = matchMedia("(pointer: coarse)");
-const slot = /^\/i\/([1-9][0-9]{0,2})$/.exec(location.pathname)?.[1];
-const invite = slot && location.hash.length > 1 ? { slot, words: decodeURIComponent(location.hash.slice(1)) } : undefined;
+const invite = location.pathname === "/i" && location.hash.length > 1 ? INVITE_PREFIX + location.hash : undefined;
 
 function toast(error: unknown) {
   const text = error instanceof Error ? error.message : String(error);
@@ -86,78 +84,144 @@ function modal(title: string, ...content: Child[]): HTMLDialogElement {
   return dialog;
 }
 
-let client: Client;
+let lmk: Lmk;
+let me: Me;
+let groups: Group[] = [];
 let page: "group" | "devices" | "start" = "start";
 let selected: string | undefined;
-let openings: { opening: Opening; entity: Membership }[] = [];
-/** Open groups this browser asked to join and waits on, by group id: their names. */
-const joining = new Map<string, string>();
+/** Open groups this tab asked to join, and those it failed to join. */
+const tried = new Set<string>();
+const failed = new Set<string>();
+const group = (gid: string) => groups.find(g => g.group === gid && g.joined);
+const unread = (gid: string) => Number(localStorage.getItem(`unread ${gid}`) ?? 0);
 
+// The page is its own root of trust: a service worker serves this version until the person takes a new one.
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").then(registration => {
+    const offer = () => registration.waiting && navigator.serviceWorker.controller && offerUpdate(registration.waiting);
+    offer();
+    registration.onupdatefound = () => registration.installing?.addEventListener("statechange", offer);
+    setInterval(() => registration.update(), 3_600_000);
+  }, toast);
+  // A tab the old version served reloads once the new one takes over; the first one to install changes nothing.
+  let reload = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener("controllerchange", () => reload && ((reload = false), location.reload()));
+}
+
+function offerUpdate(waiting: ServiceWorker) {
+  if (document.querySelector(".banner")) return;
+  const take = h("button", { className: "primary", onclick: () => waiting.postMessage("skip") }, "Reload");
+  document.body.append(h("div", { className: "banner", role: "status" }, h("span", {}, "A new version of letmeknow is ready."), take));
+}
+
+// One tab at a time runs this browser's session; others wait for it to close.
 navigator.locks.request("letmeknow", { ifAvailable: true }, async lock => {
-  if (!lock) return root.replaceChildren(h("div", { className: "card notice" }, h("h1", {}, "letmeknow is open in another tab"), h("p", {}, "Use that one: one tab at a time holds this browser's keys.")));
-  await boot().catch(toast);
-  await new Promise(() => {});
+  if (lock) return run();
+  root.replaceChildren(h("div", { className: "card notice" }, h("h1", {}, "letmeknow is open in another tab"), h("p", {}, "This tab takes over when that one closes.")));
+  await navigator.locks.request("letmeknow", run);
 });
 
+async function run() {
+  await boot().catch(toast);
+  await new Promise(() => {});
+}
+
 async function boot() {
-  client = await Client.start();
-  client.onerror = toast;
-  client.onchange = render;
-  const kind = invite ? await inviteKind(invite.slot) : null;
-  if (!client.member) return welcome(kind);
-  client.connect();
+  const had = await client.prepare();
+  const kind = invite && client.kindOf(invite);
+  if (!had) return welcome(kind);
+  lmk = await client.open();
   enter();
   if (invite) offer(kind);
 }
 
-// Names: whose a member is comes first, from its verified entity ("Matthew · phone").
-
-function label(p: Person): string {
-  const entity = p.entity && !p.entity.error ? p.entity.name : undefined;
-  return entity && entity !== p.name ? `${entity} · ${p.name}` : p.name;
+async function start(name: string, device: string) {
+  lmk = await client.open(name, device);
+  navigator.storage?.persist?.();
+  enter();
 }
 
-function unverified(p: Person): string | undefined {
-  const error = p.entity?.error;
-  if (!error) return;
-  const name = /^not on (.*)'s list$/.exec(error)?.[1];
-  return name ? `Says it is ${name}'s, but is not on ${name}'s list of devices.` : `Could not check whose this is: ${error}`;
+client.listen(event => {
+  if (event.type === "message" && event.group && !(page === "group" && event.group === selected && document.visibilityState === "visible")) {
+    localStorage.setItem(`unread ${event.group}`, String(unread(event.group) + 1));
+  }
+  if (event.type === "warning") toast(event.text);
+  if (event.type === "removed") toast(`You were removed from ${title(event.group!)}${event.by ? ` by ${event.by}` : ""}.`);
+  if (event.type === "edited") docs.get(event.group!)?.edited();
+  if (lmk) render();
+});
+
+// Names: a member's identity first, as this browser knows it ("Matthew · phone"), else its own name.
+
+function label(p: Person): string {
+  return p.identity && !p.identity.error ? `${p.identity.name} · ${p.device}` : p.name;
+}
+
+/** What a member's name rests on: this browser's own identity, a contact, an introduction, or only its own word. */
+function standing(p: Person): string | undefined {
+  const i = p.identity;
+  if (!i) return "speaks as no identity";
+  if (i.error) return `unverified: ${i.error}`;
+  if (i.how === "self") return "you";
+  if (i.how === "verified") return "verified contact";
+  if (i.how === "introduced") return `introduced by ${i.by}`;
+  return i.introduced ? `their own name; ${i.introduced.by} says they are ${i.introduced.name}` : "their own name, not a contact";
 }
 
 function who(p: Person): HTMLElement {
-  const warning = unverified(p);
-  const first = p.entity?.new && `The first time you see anyone of ${p.entity.name}'s`;
-  return h("span", { className: warning ? "who warn" : "who", title: [warning, first, `key ${p.fp}`].filter(Boolean).join("\n") }, warning && "⚠ ", label(p), first && h("small", {}, " new"));
+  const i = p.identity;
+  const warning = i?.error ?? i?.warning ?? i?.new_device;
+  const level = p.you ? "self" : i && !i.error ? i.how : "unknown";
+  return h(
+    "span",
+    { className: warning ? "who warn" : "who", title: [standing(p), warning, `key ${p.fp}`].filter(Boolean).join("\n") },
+    warning && "⚠ ",
+    label(p),
+    level !== "self" && h("small", { className: `level ${level}` }, level === "verified" ? " ✓" : level === "introduced" ? " (introduced)" : level === "unknown" ? " (unverified)" : "")
+  );
 }
 
-/** The group's name, or else who else is in it, leaving out this person's other devices. */
+/** The group's name, or else who else is in it. */
 function title(gid: string): string {
-  const mine = client.me.entities.map(e => e.id);
-  const members: Person[] = client.people.get(gid) ?? JSON.parse(client.member!.members(gid));
-  const others = members.filter(m => !m.you && !mine.includes(m.entity?.id ?? m.as?.[0] ?? "")).map(whose);
-  return client.groups.get(gid)!.settings.name || [...new Set(others)].join(", ") || `New ${kindOf(gid)?.name ?? "group"}`;
-}
-
-/** The chat shown beside a doc on wide screens: the one picked for it there, while this browser is in it. */
-function beside(gid?: string): string | undefined {
-  const chat = gid && localStorage.getItem(`beside ${gid}`);
-  return chat && client.groups.get(chat)?.settings.kind === "chat" ? chat : undefined;
-}
-
-function unread(gid: string): number {
-  const visible = page === "group" && document.visibilityState === "visible";
-  const seen = visible && (gid === selected || (wide.matches && gid === beside(selected)));
-  return seen ? 0 : client.items.get(gid)!.length - client.groups.get(gid)!.read;
+  const g = group(gid) ?? groups.find(g => g.group === gid);
+  if (!g) return "a group";
+  if (g.settings.devices_of) return `${g.settings.name}'s devices`;
+  const others = (g.members ?? []).filter(m => !m.you).map(label);
+  return g.settings.name || [...new Set(others)].join(", ") || `New ${KINDS[g.settings.kind].name}`;
 }
 
 // First visit, and invites.
 
-function welcome(kind: "group" | "entity" | null) {
+function ios() {
+  const apple = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  return apple && !(navigator as { standalone?: boolean }).standalone && !matchMedia("(display-mode: standalone)").matches;
+}
+
+function welcome(kind: string | undefined) {
+  if (ios() && !sessionStorage.getItem("in safari")) {
+    const anyway = h("button", { onclick: () => (sessionStorage.setItem("in safari", "1"), welcome(kind)) }, "Use it in Safari instead");
+    return root.replaceChildren(
+      h(
+        "div",
+        { className: "card welcome" },
+        h("h1", {}, "Add letmeknow to your Home Screen first"),
+        h(
+          "p",
+          {},
+          "Tap Share, then Add to Home Screen, and open letmeknow from there. The Home Screen app keeps its own storage, apart from Safari's, so it is a device of its own; and Safari forgets a site's storage after a week without a visit."
+        ),
+        invite && h("p", { className: "muted" }, "To use this invite there, copy the link now and paste it into the app's Join."),
+        invite && copyable(invite),
+        anyway
+      ),
+      toasts
+    );
+  }
   const guess = touch.matches ? "phone" : "laptop";
-  const name = h("input", { required: true, autocomplete: "name", autofocus: true, value: kind === "entity" ? guess : "" });
+  const name = h("input", { required: true, autocomplete: "name", autofocus: true });
   const device = h("input", { required: true, value: guess });
   const deviceField = field("This device", device, "As in “Matthew · phone”, so you can tell your devices apart.");
-  const ready = () => name.reportValidity() && device.reportValidity() && name.value.trim();
+  const ready = () => name.reportValidity() && device.reportValidity();
   let body: Child[];
   if (kind === "group") {
     const join = h("button", { className: "primary" }, "Join");
@@ -165,42 +229,44 @@ function welcome(kind: "group" | "entity" | null) {
       h("h1", {}, "You're invited"),
       h("p", {}, "Someone sent you this link to share a chat or a document with you, and perhaps with their agents. It is end-to-end encrypted: only those in it can read it."),
       form(
-        () => ready() && busy(join, "Joining…", async () => {
-          await client.create(device.value.trim(), name.value.trim());
-          enter();
-          await redeem(invite!.slot, invite!.words);
-        }),
+        () =>
+          ready() &&
+          busy(join, "Joining…", async () => {
+            await start(name.value.trim(), device.value.trim());
+            await redeem(invite!);
+          }),
         field("Your name", name, "Everyone you share with sees it."),
         deviceField,
         join
       )
     ];
-  } else if (kind === "entity") {
+  } else if (kind === "device") {
     const add = h("button", { className: "primary" }, "Add this browser");
+    device.autofocus = true;
     body = [
       h("h1", {}, "Add this browser to your devices"),
       h("p", {}, "This link comes from one of your other devices. Once added, this browser joins your groups and speaks for you there."),
       form(
-        () => ready() && busy(add, "Adding…", async () => {
-          await client.create(name.value.trim());
-          enter();
-          await redeem(invite!.slot, invite!.words);
-        }),
-        field("Name this device", name, "Shown next to your name, as in “Matthew · phone”."),
+        () =>
+          device.reportValidity() &&
+          busy(add, "Adding…", async () => {
+            await start(device.value.trim(), device.value.trim());
+            await redeem(invite!);
+          }),
+        field("Name this device", device, "Shown next to your name, as in “Matthew · phone”."),
         add
       )
     ];
   } else {
     body = [
       invite
-        ? [h("h1", {}, "This invite has expired"), h("p", {}, "An invite works once, within 10 minutes. Ask whoever sent it for a new one, or start your own chat or document.")]
+        ? [h("h1", {}, "This is not a letmeknow invite"), h("p", {}, "Ask whoever sent it for a new link, or start your own chat or document.")]
         : [h("h1", {}, "letmeknow"), h("p", { className: "lede" }, "End-to-end encrypted chats and documents, for you and your agents on any computer.")],
       field("Your name", name, "Shown to everyone you share with."),
       deviceField,
-      ...starters(async kind => {
+      ...starters(async () => {
         if (!ready()) return false;
-        await client.create(device.value.trim(), kind === "entity" ? undefined : name.value.trim());
-        enter();
+        await start(name.value.trim(), device.value.trim());
         return true;
       }),
       h("details", { className: "agents" }, h("summary", {}, "For agents"), agentsHelp)
@@ -209,30 +275,23 @@ function welcome(kind: "group" | "entity" | null) {
   root.replaceChildren(h("div", { className: "card welcome" }, ...body), toasts);
 }
 
-/**
- * The ways in: start a chat or a document, or join with a code. `before` runs first (on a first visit, it creates the
- * member, which a device link adds to an entity) and says whether to go on.
- */
-function starters(before: (kind: "group" | "entity") => Promise<boolean> = async () => true): HTMLElement[] {
+/** The ways in: start a chat or a document, or join with a link. `before` runs first and says whether to go on. */
+function starters(before: () => Promise<boolean> = async () => true): HTMLElement[] {
   const name = h("input", { placeholder: "e.g. Q3 plan" });
   const chat = h("button", { className: "primary" }, "New chat");
   const doc = h("button", { type: "button" }, "New document");
-  const start = (kind: string, button: HTMLButtonElement) =>
-    busy(button, "Starting…", async () => (await before("group")) && select(await client.newGroup(kind, name.value.trim())));
-  doc.onclick = () => start("doc", doc);
-  const code = h("input", { placeholder: "417-acid-zebra", autocomplete: "off", autocapitalize: "none", spellcheck: false });
+  const create = (kind: string, button: HTMLButtonElement) => busy(button, "Starting…", async () => (await before()) && select(lmk.create(kind, name.value.trim())));
+  doc.onclick = () => create("doc", doc);
+  const link = h("input", { placeholder: "https://letmeknow.dev/i#…", autocomplete: "off", autocapitalize: "none", spellcheck: false });
   const joinButton = h("button", {}, "Join");
   const join = form(
-    () => busy(joinButton, "Joining…", async () => {
-      const parsed = parseCode(code.value);
-      if (!parsed) return code.setCustomValidity("A code looks like 417-acid-zebra."), code.reportValidity(), code.setCustomValidity("");
-      const kind = await inviteKind(parsed.slot);
-      if (!kind) return toast("That code was used or has expired. Ask for a new one.");
-      if (!(await before(kind))) return;
-      await redeem(parsed.slot, parsed.words);
-    }),
-    h("h2", {}, "Join with a code"),
-    field("Invite code or link", code, "A code works once, within 10 minutes of being made."),
+    () =>
+      busy(joinButton, "Joining…", async () => {
+        if (!client.kindOf(link.value.trim())) return toast("That is not a letmeknow invite link.");
+        if (await before()) await redeem(link.value.trim());
+      }),
+    h("h2", {}, "Join with a link"),
+    field("Invite link", link, "A link works once, within 10 minutes of being made."),
     joinButton
   );
   return [
@@ -240,7 +299,7 @@ function starters(before: (kind: "group" | "entity") => Promise<boolean> = async
       "section",
       { className: "starter" },
       form(
-        () => start("chat", chat),
+        () => create("chat", chat),
         h("h2", {}, "Start"),
         h("p", { className: "muted" }, "A chat, to talk back and forth with people and agents; or a document, one page that all of them edit at once, like a task list."),
         field("Name", name, "Optional. You can rename it later."),
@@ -252,54 +311,38 @@ function starters(before: (kind: "group" | "entity") => Promise<boolean> = async
   ];
 }
 
-function parseCode(text: string): { slot: string; words: string } | undefined {
-  const match = /(?:^|\/i\/)([1-9][0-9]{0,2})(?:#|[\s-]+)([a-z]+)[\s-]+([a-z]+)\s*$/i.exec(text.trim());
-  return match ? { slot: match[1], words: `${match[2]}-${match[3]}`.toLowerCase() } : undefined;
-}
-
-/** For a browser that already has groups: asks before it uses the invite it was opened with. */
-function offer(kind: "group" | "entity" | null) {
+/** For a browser that has a session already: asks before it uses the invite it was opened with. */
+function offer(kind: string | undefined) {
   history.replaceState(null, "", "/");
-  if (!kind) return toast("That invite was used or has expired. Ask for a new one.");
+  if (!kind) return toast("That is not a letmeknow invite link.");
   const go = h("button", { className: "primary", autofocus: true }, kind === "group" ? "Join" : "Add this browser");
   const dialog = modal(
     kind === "group" ? "You're invited" : "Add this browser to your devices",
-    h("p", {}, kind === "group" ? "Join to share a chat or a document with whoever sent you the link, and perhaps their agents." : "This browser becomes one of the devices of whoever made this link: it joins their chats and documents and speaks for them."),
+    h(
+      "p",
+      {},
+      kind === "group"
+        ? "Join to share a chat or a document with whoever sent you the link, and perhaps their agents."
+        : "This browser becomes one of the devices of whoever made this link: it joins their chats and documents and speaks for them."
+    ),
     h("div", { className: "buttons" }, go)
   );
-  go.onclick = () => busy(go, "Joining…", async () => {
-    await redeem(invite!.slot, invite!.words);
-    dialog.close();
-  });
+  go.onclick = () =>
+    busy(go, "Joining…", async () => {
+      await redeem(invite!);
+      dialog.close();
+    });
 }
 
-/** Uses an invite: lands in the group it joined, or, for a device link, joins every group open to this browser's person. */
-async function redeem(slot: string, words: string) {
-  const gid = await client.redeem(slot, words);
+/** Uses an invite link: lands in the group it joined, or, for a device link, on this browser's devices. */
+async function redeem(link: string) {
+  const joined = JSON.parse(await lmk.join(link));
   history.replaceState(null, "", "/");
-  if (gid) return select(gid);
-  showDevices();
-  openings = await client.openings();
-  openings.forEach(o => joinOpen(o, false));
-}
-
-async function joinOpen(o: { opening: Opening; entity: Membership }, open = true) {
-  joining.set(o.opening.group, o.opening.name);
-  render();
-  try {
-    const gid = await client.joinOpen(o.opening, o.entity);
-    openings = openings.filter(x => x.opening.group !== gid);
-    if (open) select(gid);
-  } catch (error) {
-    toast(`Could not join ${o.opening.name || `a ${KINDS[o.opening.kind]?.name ?? "group"}`}: ${error instanceof Error ? error.message : error}`);
-  } finally {
-    joining.delete(o.opening.group);
-    render();
-  }
+  if (joined.group) select(joined.group);
+  else showDevices();
 }
 
 // The layout: groups on the side, the selected group or a page in the main area. Narrow screens show one at a time.
-// On wide screens a doc may have a chat beside it.
 
 const groupList = h("nav", { className: "group-list" });
 const navButtons = new Map<string, { button: HTMLButtonElement; name: HTMLElement; badge: HTMLElement }>();
@@ -326,47 +369,33 @@ const layout = h("div", { className: "layout" }, sidebar, main);
 const devicesPage = h("section", { className: "page" });
 const startPage = h("section", { className: "page" });
 const views = new Map<string, View>();
+const docs = new Map<string, DocView>();
 
 function enter() {
+  me = JSON.parse(lmk.me());
+  groups = JSON.parse(lmk.groups());
   root.replaceChildren(layout, toasts);
-  refreshOpenings();
-  setInterval(refreshOpenings, 60_000);
   const last = localStorage.getItem("group");
-  const shown = last && client.groups.has(last) ? last : [...client.groups.keys()].at(-1);
+  const shown = last && group(last) ? last : groups.filter(g => g.joined).at(-1)?.group;
   if (!shown) return showStart();
   select(shown);
   if (narrow.matches) layout.classList.remove("in-main");
 }
 
-// Free while the inboxes' sockets are up; redrawing only on a change keeps an idle page from fetching anything.
-async function refreshOpenings() {
-  const found = await client.openings().catch(error => (toast(error), openings));
-  if (JSON.stringify(found) === JSON.stringify(openings)) return;
-  openings = found;
-  render();
-}
-
 function show(element: HTMLElement) {
-  if (page === "group" && selected) views.get(selected)?.hide();
   if (element.parentElement !== main) main.append(element);
   for (const child of main.children) (child as HTMLElement).hidden = child !== element;
   layout.classList.add("in-main");
 }
 
-function viewOf(gid: string): View {
+function select(gid: string) {
+  groups = JSON.parse(lmk.groups());
   let view = views.get(gid);
   if (!view) {
-    const kind = client.groups.get(gid)!.settings.kind;
-    view = kind === "chat" ? new ChatView(gid) : kind === "doc" ? new DocView(gid) : new View(gid);
+    view = group(gid)!.settings.kind === "doc" ? new DocView(gid) : new ChatView(gid);
     views.set(gid, view);
   }
-  return view;
-}
-
-function select(gid: string) {
-  const view = viewOf(gid);
-  if (page !== "group" || selected !== gid) show(view.el);
-  layout.classList.add("in-main");
+  show(view.el);
   page = "group";
   selected = gid;
   localStorage.setItem("group", gid);
@@ -380,7 +409,7 @@ function showStart() {
   selected = undefined;
   startPage.replaceChildren(
     h("header", { className: "page-head" }, back(), h("h1", {}, "Start")),
-    h("div", { className: "card" }, h("p", {}, "Start a chat or a document and invite people and agents into it, or join one with a code someone gave you."), ...starters())
+    h("div", { className: "card" }, h("p", {}, "Start a chat or a document and invite people and agents into it, or join one with a link someone gave you."), ...starters())
   );
   render();
 }
@@ -395,62 +424,72 @@ function render() {
 }
 
 async function draw() {
+  me = JSON.parse(lmk.me());
+  groups = JSON.parse(lmk.groups());
   for (const [gid, view] of views) {
-    if (client.groups.has(gid)) continue;
+    if (group(gid)) continue;
     view.el.remove();
     view.destroy();
     views.delete(gid);
+    docs.delete(gid);
     if (gid === selected) selected = undefined;
   }
   if (page === "group" && !selected) {
-    const newest = [...client.groups.keys()].at(-1);
-    if (newest) select(newest);
+    const newest = groups.filter(g => g.joined).at(-1);
+    if (newest) select(newest.group);
     else showStart();
   }
+  joinOpenings();
   drawNav();
-  const total = [...client.groups.keys()].reduce((n, gid) => n + unread(gid), 0);
+  const total = groups.reduce((n, g) => n + unread(g.group), 0);
   document.title = total ? `(${total}) letmeknow` : "letmeknow";
-  if (page !== "group" || !selected) return;
-  await views.get(selected)!.update();
-  for (const gid of [selected, beside(selected)]) {
-    const group = gid && client.groups.get(gid);
-    if (group && unread(gid!) === 0 && group.read !== client.items.get(gid!)!.length) client.markRead(gid!);
-  }
+  if (page === "group" && selected && document.visibilityState === "visible") localStorage.removeItem(`unread ${selected}`);
+  if (page === "group" && selected) views.get(selected)!.update();
+  if (page === "devices") drawDevices();
 }
 document.addEventListener("visibilitychange", render);
-wide.addEventListener("change", render);
+
+/** Devices of an identity join the groups open to it by themselves; one that fails waits for a click. */
+function joinOpenings() {
+  for (const g of groups) {
+    if (g.joined || tried.has(g.group)) continue;
+    tried.add(g.group);
+    lmk.join_open(g.group).then(render, () => (failed.add(g.group), render()));
+  }
+}
 
 function drawNav() {
   for (const [gid, entry] of navButtons) {
-    if (client.groups.has(gid)) continue;
+    if (group(gid)) continue;
     entry.button.remove();
     navButtons.delete(gid);
   }
-  for (const gid of client.groups.keys()) {
-    let entry = navButtons.get(gid);
+  for (const g of groups.filter(g => g.joined)) {
+    let entry = navButtons.get(g.group);
     if (!entry) {
-      const kind = kindOf(gid);
-      const name = h("span"), badge = h("b");
-      const mark = h("i", { className: "mark", title: kind ? `A ${kind.name}` : "A kind of group this version cannot show", ariaHidden: "true" }, kind?.mark ?? "?");
-      entry = { button: h("button", { onclick: () => select(gid) }, mark, name, badge), name, badge };
-      navButtons.set(gid, entry);
+      const name = h("span"),
+        badge = h("b");
+      const mark = h("i", { className: "mark", ariaHidden: "true" }, g.settings.devices_of ? "🔒" : KINDS[g.settings.kind].mark);
+      entry = { button: h("button", { onclick: () => select(g.group) }, mark, name, badge), name, badge };
+      navButtons.set(g.group, entry);
       groupList.prepend(entry.button);
     }
-    set(entry.name, title(gid));
-    const count = unread(gid);
-    set(entry.badge, count ? String(count) : "");
-    entry.button.classList.toggle("on", page === "group" && gid === selected);
+    set(entry.name, title(g.group));
+    set(entry.badge, unread(g.group) ? String(unread(g.group)) : "");
+    entry.button.classList.toggle("on", page === "group" && g.group === selected);
   }
-  const waiting = [...joining].filter(([gid]) => !client.groups.has(gid));
-  const offered = openings.filter(o => !joining.has(o.opening.group));
-  update(openList, JSON.stringify([waiting, offered.map(o => [o.opening.group, o.opening.name])]), () => [
-    (waiting.length > 0 || offered.length > 0) && h("h3", {}, "You can join"),
-    ...waiting.map(([, name]) => h("div", { className: "opening" }, h("span", {}, name || "Unnamed"), h("small", {}, "joining…"))),
-    ...offered.map(o =>
-      h("div", { className: "opening" }, h("span", {}, `${KINDS[o.opening.kind]?.mark ?? "?"} ${o.opening.name || `Unnamed ${KINDS[o.opening.kind]?.name ?? "group"}`}`), h("button", { onclick: () => joinOpen(o) }, "Join"))
-    )
+  const open = groups.filter(g => !g.joined);
+  update(openList, JSON.stringify(open.map(o => [o.group, o.settings.name, failed.has(o.group)])), () => [
+    open.length > 0 && h("h3", {}, "Open to you"),
+    ...open.map(o => {
+      const name = `${KINDS[o.settings.kind].mark} ${o.settings.name || `Unnamed ${KINDS[o.settings.kind].name}`}`;
+      if (!failed.has(o.group)) return h("div", { className: "opening" }, h("span", {}, name), h("small", {}, "joining…"));
+      const join = h("button", {}, "Join");
+      join.onclick = () => busy(join, "…", async () => select(JSON.parse(await lmk.join_open(o.group)).group));
+      return h("div", { className: "opening" }, h("span", {}, name), join);
+    })
   ]);
-  set(meName, client.me.entities[0]?.name ?? client.me.name);
+  set(meName, me.identities[0]?.name ?? me.name);
   meButton.classList.toggle("on", page === "devices");
 }
 
@@ -460,98 +499,114 @@ function newGroupDialog(kind: "chat" | "doc") {
   const dialog = modal(
     `New ${KINDS[kind].name}`,
     kind === "doc" && h("p", { className: "muted" }, "One page that everyone in it, people and agents, edits at once."),
-    form(() => busy(create, "Starting…", async () => {
-      select(await client.newGroup(kind, name.value.trim()));
-      dialog.close();
-    }), field("Name", name, "Optional. You can rename it later."), h("div", { className: "buttons" }, create))
+    form(
+      () =>
+        busy(create, "Starting…", async () => {
+          select(lmk.create(kind, name.value.trim()));
+          dialog.close();
+        }),
+      field("Name", name, "Optional. You can rename it later."),
+      h("div", { className: "buttons" }, create)
+    )
   );
 }
 
 function joinDialog() {
-  const code = h("input", { placeholder: "417-acid-zebra", autofocus: true, autocomplete: "off", autocapitalize: "none", spellcheck: false });
+  const link = h("input", { placeholder: "https://letmeknow.dev/i#…", autofocus: true, autocomplete: "off", autocapitalize: "none", spellcheck: false });
   const join = h("button", { className: "primary" }, "Join");
   const dialog = modal(
-    "Join with a code",
-    form(() => busy(join, "Joining…", async () => {
-      const parsed = parseCode(code.value);
-      if (!parsed) return code.setCustomValidity("A code looks like 417-acid-zebra."), code.reportValidity(), code.setCustomValidity("");
-      if (!(await inviteKind(parsed.slot))) return toast("That code was used or has expired. Ask for a new one.");
-      await redeem(parsed.slot, parsed.words);
-      dialog.close();
-    }), field("Invite code or link", code, "Codes work once, within 10 minutes of being made."), h("div", { className: "buttons" }, join))
+    "Join with a link",
+    form(
+      () =>
+        busy(join, "Joining…", async () => {
+          if (!client.kindOf(link.value.trim())) return toast("That is not a letmeknow invite link.");
+          await redeem(link.value.trim());
+          dialog.close();
+        }),
+      field("Invite link", link, "An invite into a group, or a device link from one of your devices. It works once, within 10 minutes."),
+      h("div", { className: "buttons" }, join)
+    )
   );
 }
 
-// Your devices.
+// Your devices: the identities this browser is a device of, their device lists, and their contacts.
 
-async function showDevices() {
+function showDevices() {
   show(devicesPage);
   page = "devices";
   selected = undefined;
+  devicesPage.replaceChildren(h("header", { className: "page-head" }, back(), h("h1", {}, "Your devices")), devicesBody);
+  shown.delete(devicesBody);
   render();
-  const body = h("div", { className: "card" });
-  devicesPage.replaceChildren(h("header", { className: "page-head" }, back(), h("h1", {}, "Your devices")), body);
-  const draw = async (): Promise<void> => {
-    const entity = client.me.entities[0];
-    if (!entity) {
-      const name = h("input", { value: client.me.name, required: true });
-      const start = h("button", { className: "primary" }, "Start");
-      return body.replaceChildren(
-        h("p", {}, "This browser is not one of anyone's devices. Give your name to make it your first one; you can then add your other devices."),
-        form(() => name.reportValidity() && busy(start, "Starting…", () => client.startEntity(name.value.trim()).then(draw)), field("Your name", name), start)
-      );
-    }
-    const { members } = await client.list(entity.id);
-    const me = client.member!.fp();
-    body.replaceChildren(
-      h("p", {}, `The browsers and computers that are you, ${entity.name}. They join the chats and documents that let your other devices join, and others see them as yours.`),
+}
+
+const devicesBody = h("div", { className: "card" });
+async function drawDevices() {
+  const identity = me.identities[0];
+  const contacts: client.Contacts = JSON.parse(lmk.contacts());
+  if (!identity) {
+    return update(devicesBody, "none", () => {
+      const name = h("input", { value: me.name, required: true });
+      const create = h("button", { className: "primary" }, "Start");
+      return [
+        h("p", {}, "This browser is no one's device yet. Give your name to make it your first device; you can then add your other devices, and others can tell it is you."),
+        form(() => name.reportValidity() && busy(create, "Starting…", async () => (await lmk.identity_create(name.value.trim()), render())), field("Your name", name), create),
+        h("p", { className: "muted" }, "To add this browser to an identity you have on another device, make a device link there and open it here, or paste it into Join.")
+      ];
+    });
+  }
+  const list: { devices: { key: string; name: string; you: boolean }[] } = await lmk.devices(identity.id).then(JSON.parse, () => ({ devices: [] }));
+  update(devicesBody, JSON.stringify([identity, list, contacts]), () => [
+    h("p", {}, `The browsers and computers that are you, ${identity.name}. They join the chats and documents open to you, and others see them as yours.`),
+    h(
+      "ul",
+      { className: "devices" },
+      ...list.devices.map(d =>
+        h(
+          "li",
+          {},
+          h("span", { title: `key ${d.key}` }, d.name, d.you && h("small", {}, " this browser")),
+          confirmed("Remove", d.you ? "Remove this browser?" : `Remove ${d.name}?`, async () => {
+            await lmk.remove_device(identity.id, d.key);
+            shown.delete(devicesBody);
+            render();
+          })
+        )
+      )
+    ),
+    h("button", { className: "primary", onclick: () => inviteDialog({ identity: identity.id }) }, "Add a device"),
+    h("h2", {}, "Contacts"),
+    contacts.contacts.length === 0 && h("p", { className: "muted" }, "Whoever joins through an invite you made for them becomes your contact."),
+    contacts.contacts.length > 0 &&
+      h("ul", { className: "devices" }, ...contacts.contacts.map(c => h("li", {}, h("span", {}, c.name), h("small", {}, c.how === "verified" ? "verified" : `introduced by ${c.by}`)))),
+    contacts.introductions.length > 0 && h("h3", {}, "Introduced to you"),
+    contacts.introductions.length > 0 &&
       h(
         "ul",
         { className: "devices" },
-        ...members.map(m =>
-          h(
-            "li",
-            {},
-            h("span", { title: `key ${m.id}` }, m.name, m.id === me && h("small", {}, " this browser")),
-            m.id === me && h("button", { className: "quiet", onclick: () => renameDialog().then(draw) }, "Rename"),
-            confirmed("Remove", m.id === me ? "Remove this browser?" : `Remove ${m.name}?`, async () => {
-              await client.removeFromEntity(entity, m.id);
-              await draw();
-            })
-          )
-        )
-      ),
-      h("button", { className: "primary", onclick: () => inviteDialog({ entity }).then(draw) }, "Add a device"),
-      h("p", { className: "muted" }, "A removed device stays in the chats and documents it is in until someone removes it there.")
-    );
-  };
-  await draw().catch(toast);
+        ...contacts.introductions.map(i => {
+          const accept = h("button", {}, "Accept");
+          accept.onclick = () => busy(accept, "…", async () => (await lmk.accept(i.id, undefined), render()));
+          return h("li", {}, h("span", {}, i.name, h("small", {}, ` by ${i.by}`)), accept);
+        })
+      )
+  ]);
 }
 
-function renameDialog(): Promise<void> {
-  const name = h("input", { required: true, value: client.me.name });
-  const rename = h("button", { className: "primary" }, "Rename");
-  const dialog = modal("Rename this device", form(
-    () => name.reportValidity() && busy(rename, "Renaming…", async () => {
-      await client.renameDevice(name.value.trim());
-      dialog.close();
-    }),
-    field("Name this device", name, "Everyone you share with sees the new name from now on."),
-    h("div", { className: "buttons" }, rename)
-  ));
-  return new Promise(resolve => dialog.addEventListener("close", () => resolve()));
-}
+// Invites: a link and its QR code, single use, within 10 minutes. A device link adds a device to an identity.
 
-// Invites: a link, the code it holds, and a QR code of the link. Both work once, within 10 minutes.
-
-async function inviteDialog(target: { gid: string } | { entity: Membership }) {
-  const device = "entity" in target;
-  const kind = device ? "" : (kindOf(target.gid)?.name ?? "group");
-  const { encode } = await import("uqr");
-  const body = h("div", { className: "invite" }, h("p", { className: "muted" }, "Making an invite…"));
+async function inviteDialog(target: { gid: string } | { identity: string }) {
+  const device = "identity" in target;
+  const g = device ? undefined : group(target.gid);
+  const kind = g ? KINDS[g.settings.kind].name : "";
+  const body = h("div", { className: "invite" });
   const dialog = modal(device ? "Add a device" : "Invite someone", body);
-  const draw = (invite: Invite) => {
-    const { data, size } = encode(invite.link, { border: 0 });
+  const make = async (label?: string) => {
+    // The link opens this server's app, which is letmeknow.dev's unless the person runs their own.
+    const made = new URL(device ? lmk.invite_device(target.identity) : lmk.invite(target.gid, label));
+    const link = location.origin + made.pathname + made.hash;
+    const { encode } = await import("uqr");
+    const { data, size } = encode(link, { border: 0 });
     const ns = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(ns, "svg");
     svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
@@ -560,27 +615,39 @@ async function inviteDialog(target: { gid: string } | { entity: Membership }) {
     path.setAttribute("d", data.flatMap((row, y) => row.map((dark, x) => (dark ? `M${x} ${y}h1v1h-1z` : ""))).join(""));
     svg.append(path);
     body.replaceChildren(
-      h("p", {}, device ? "Open this link on your other device, or scan the QR code with its camera. Your chats and documents then appear there." : `Send this link to a person or an agent. Whoever opens it first joins the ${kind}.`),
+      h(
+        "p",
+        {},
+        device
+          ? "Open this link on your other device, or scan the QR code with its camera. Your chats and documents then reach it."
+          : `Send this link to a person or an agent. Whoever opens it first joins the ${kind}${label ? ` as your contact “${label}”` : ""}.`
+      ),
       h("div", { className: "qr" }, svg),
-      copyable(invite.link),
-      h("p", {}, "Or type the code ", h("code", { className: "code" }, invite.code), device ? " on the other device." : ` on ${location.host}.`),
-      h("p", {}, device ? "On a computer, an agent adds it with:" : "An agent joins with:"),
-      copyable(`letmeknow join '${invite.link}'`),
-      h("p", { className: "expiry" }, "It works once, within 10 minutes. Waiting for it to be used…")
+      copyable(link),
+      h("p", {}, device ? "On a computer, an agent's session adds it with:" : "An agent joins with:"),
+      copyable(`letmeknow join '${link}'`),
+      h("p", { className: "expiry" }, "It works once, within 10 minutes, while this browser is open.")
     );
-  };
-  await client
-    .invite(target, draw)
-    .then(() => {
+    const gid = device ? groups.find(g => g.settings.devices_of === target.identity)?.group : target.gid;
+    const joined = (event: client.Event) => {
+      if (event.type !== "joined" || event.group !== gid || !dialog.open) return;
       body.replaceChildren(h("p", { className: "done" }, device ? "Added. The device now joins your chats and documents." : `They joined the ${kind}.`));
       setTimeout(() => dialog.close(), 1_500);
-    })
-    .catch(error =>
-      body.replaceChildren(
-        h("p", { className: "warn" }, `This invite stopped working: ${error instanceof Error ? error.message : error}`),
-        h("div", { className: "buttons" }, h("button", { className: "primary", onclick: () => (dialog.close(), inviteDialog(target)) }, "Make a new one"))
-      )
-    );
+    };
+    client.listen(joined);
+    dialog.addEventListener("close", () => client.unlisten(joined));
+  };
+  // Contacts belong to an identity, so only a browser that is a device of one labels its invites.
+  if (device || !me.identities.length) return make().catch(toast);
+  const label = h("input", { placeholder: "e.g. Bob (Acme)" });
+  const go = h("button", { className: "primary" }, "Make a link");
+  body.append(
+    form(
+      () => busy(go, "…", () => make(label.value.trim() || undefined)),
+      field("For", label, "Optional: who it is for. Whoever uses it becomes your contact by this name."),
+      h("div", { className: "buttons" }, go)
+    )
+  );
 }
 
 function copyable(text: string) {
@@ -593,18 +660,15 @@ function copyable(text: string) {
   return h("div", { className: "copy" }, h("code", {}, text), button);
 }
 
-// A group: its name and people on top, and below them what it shares, a chat or a doc. A kind of group this version
-// does not know shows only that.
+// A group: its name and people on top, and below them what it shares, a chat or a doc.
 
 class View {
   readonly el: HTMLElement;
   protected members: Person[] = [];
   private heading = h("h2");
   private people = h("button", { className: "people quiet" });
-  private raw = "";
-  private described = 0;
 
-  constructor(readonly gid: string, ...actions: Child[]) {
+  constructor(readonly gid: string) {
     this.el = h(
       "section",
       { className: "group" },
@@ -616,110 +680,115 @@ class View {
         h(
           "div",
           { className: "head-actions" },
-          ...actions,
           h("button", { onclick: () => inviteDialog({ gid }) }, "Invite"),
           h("button", { className: "icon quiet", title: "Settings", ariaLabel: "Settings", onclick: () => this.settingsDialog() }, "⋯")
         )
       )
     );
     this.people.onclick = () => this.settingsDialog();
-    if (!kindOf(gid)) this.el.append(h("div", { className: "empty" }, h("p", {}, "This is a kind of group this version of letmeknow cannot show. Reload the page to update it.")));
   }
 
-  async update() {
+  update() {
     set(this.heading, title(this.gid));
-    // Checked again on an update a minute later too, as a member's device may have been taken off its person's list.
-    const raw = client.member!.members(this.gid);
-    if (raw !== this.raw || Date.now() - this.described > 60_000) {
-      this.raw = raw;
-      this.described = Date.now();
-      this.members = await client.members(this.gid);
-      this.drawPeople();
-    }
+    const members = group(this.gid)?.members ?? [];
+    if (JSON.stringify(members) === JSON.stringify(this.members)) return;
+    this.members = members;
+    this.drawPeople();
   }
 
   protected drawPeople() {
     const others = this.members.filter(m => !m.you);
-    const warned = others.some(m => m.entity?.error);
-    const names = new Set(others.map(m => (m.entity?.yours && !m.entity.error ? `your ${m.name}` : label(m))));
-    this.people.replaceChildren(...(others.length ? [warned ? "⚠ " : "", [...names].join(", "), " and you"] : ["Only you so far"]));
+    const warned = others.some(m => m.identity?.error || m.identity?.warning);
+    this.people.replaceChildren(...(others.length ? [warned ? "⚠ " : "", [...new Set(others.map(label))].join(", "), " and you"] : ["Only you so far"]));
     this.people.classList.toggle("warn", warned);
   }
 
-  show(_focus = true) {}
-
-  hide() {}
+  show() {}
 
   destroy() {}
 
   private settingsDialog() {
     const gid = this.gid;
-    const settings = client.groups.get(gid)!.settings;
-    const kind = kindOf(gid)?.name ?? "group";
-    const name = h("input", { value: settings.name ?? "", placeholder: title(gid), ariaLabel: "Name" });
+    const settings = group(gid)!.settings;
+    const kind = KINDS[settings.kind].name;
+    const name = h("input", { value: settings.name, placeholder: title(gid), ariaLabel: "Name" });
     const save = h("button", {}, "Rename");
-    const entity = client.me.entities[0];
-    const open = h("input", { type: "checkbox", checked: !!entity && !!settings.open?.some(o => o.id === entity.id) });
-    open.onchange = async () => {
-      open.disabled = true;
-      await (open.checked ? client.open(gid, entity) : client.close(gid, entity)).catch(error => ((open.checked = !open.checked), toast(error)));
-      open.disabled = false;
+    const contacts: client.Contacts = JSON.parse(lmk.contacts());
+    const openable = [...me.identities.map(i => ({ ...i, own: true })), ...contacts.contacts.map(c => ({ id: c.id, name: c.name, own: false }))];
+    const toggle = (identity: { id: string; name: string; own: boolean }) => {
+      const box = h("input", { type: "checkbox", checked: !!settings.open?.some(o => o.id === identity.id) });
+      box.onchange = async () => {
+        box.disabled = true;
+        await lmk.set_open(gid, identity.id, identity.name, box.checked).catch(error => ((box.checked = !box.checked), toast(error)));
+        box.disabled = false;
+      };
+      const text = identity.own ? "Your other devices can join" : `${identity.name}'s devices can join`;
+      return h("label", { className: "switch" }, box, h("span", {}, h("b", {}, text), h("small", {}, `Their devices join this ${kind} on their own, without an invite.`)));
     };
     const dialog = modal(
-      kind[0].toUpperCase() + kind.slice(1),
-      form(() => busy(save, "Renaming…", () => client.rename(gid, name.value.trim())), field("Name", h("div", { className: "row" }, name, save))),
+      settings.devices_of ? title(gid) : kind[0].toUpperCase() + kind.slice(1),
+      !settings.devices_of && form(() => busy(save, "Renaming…", () => lmk.rename(gid, name.value.trim())), field("Name", h("div", { className: "row" }, name, save))),
       h("h3", {}, "People"),
       h(
         "ul",
         { className: "people-list" },
         ...this.members.map(m => {
-          const warning = unverified(m);
-          const item: HTMLLIElement = h(
+          const introduced = m.identity?.how === "unknown" && m.identity.introduced;
+          const accept = introduced && h("button", {}, `Accept as ${introduced.name}`);
+          if (accept) accept.onclick = () => busy(accept, "…", async () => (await lmk.accept(m.identity!.id, undefined), render(), dialog.close()));
+          return h(
             "li",
             {},
-            h("div", {}, who(m), m.you && h("small", { className: "muted" }, " you"), warning && h("p", { className: "warn" }, warning)),
-            !m.you && confirmed("Remove", `Remove ${label(m)}?`, async () => {
-              await client.removeMember(gid, m.fp);
-              item.remove();
-            })
+            h(
+              "div",
+              {},
+              who(m),
+              m.you && h("small", { className: "muted" }, " you"),
+              h("p", { className: m.identity?.error ? "warn" : "muted" }, standing(m)),
+              m.added_by && h("p", { className: "muted" }, `added by ${m.added_by.name ?? "a former member"} (${m.added_by.how})`)
+            ),
+            accept,
+            !m.you && !settings.devices_of && confirmed("Remove", `Remove ${label(m)}?`, () => lmk.remove(gid, m.key))
           );
-          return item;
         })
       ),
-      entity && h("label", { className: "switch" }, open, h("span", {}, h("b", {}, "Your other devices can join"), h("small", {}, `Devices you add join this ${kind} on their own, without an invite.`))),
-      h("div", { className: "buttons leave" }, confirmed(`Leave ${kind}`, "Leave for good?", async () => {
-        await client.leave(gid);
-        dialog.close();
-      }))
+      !settings.devices_of && openable.map(toggle),
+      !settings.devices_of &&
+        h(
+          "div",
+          { className: "buttons leave" },
+          confirmed(`Leave ${kind}`, "Leave for good?", async () => {
+            if (!(await lmk.leave(gid))) toast("Asked the others to remove you; you leave once one of them is online.");
+            render();
+            dialog.close();
+          })
+        )
     );
   }
 }
 
-/** A chat: messages in order, and a composer that sends text and a file, to everyone or to some. */
+/** A chat: its timeline, and a composer that sends text and a file, to everyone or to some. */
 class ChatView extends View {
   private list = h("ol", { className: "messages" });
   private newer = h("button", { className: "newer", hidden: true }, "New messages ↓");
   private empty = h("div", { className: "empty", hidden: true });
-  private input = h("textarea", { rows: 1, placeholder: "Message" });
+  private input = h("textarea", { rows: 1, placeholder: "Message", ariaLabel: "Message" });
   private context = h("div", { className: "context" });
   private chips = h("span", { className: "chips" });
   private chipButtons = new Map<string, HTMLButtonElement>();
   private urgent = h("input", { type: "checkbox" });
   private picker = h("input", { type: "file", hidden: true });
-  private shown = 0;
+  /** Each item's element, by its key, with the JSON it was drawn from. */
+  private lines = new Map<string, { json: string; el: HTMLElement }>();
   private stuck = true;
-  private top = 0;
   private to = new Set<string>();
   private replyTo?: Message;
   private attachment?: File;
-  /** The sender and time of the last message, and its day. */
-  private last?: { fp: string; at: number };
-  private day = "";
 
   constructor(gid: string) {
     super(gid);
     const send = h("button", { className: "primary send", onclick: () => this.submit() }, "Send");
-    const attach = h("button", { className: "attach quiet icon", title: "Send a file, up to 10 MB", ariaLabel: "Attach a file", onclick: () => this.picker.click() }, "+");
+    const attach = h("button", { className: "attach quiet icon", title: "Send a file", ariaLabel: "Attach a file", onclick: () => this.picker.click() }, "+");
     this.el.append(
       h("div", { className: "log" }, this.list, this.empty, this.newer),
       h(
@@ -762,19 +831,9 @@ class ChatView extends View {
     };
   }
 
-  hide() {
-    this.top = this.list.scrollTop;
-  }
-
-  show(focus = true) {
-    this.restore();
-    if (focus && !touch.matches && !this.el.contains(document.activeElement)) this.input.focus();
-  }
-
-  /** Back where the list was when it was hidden: the bottom if it was there. Its scroll position is lost while hidden. */
-  private restore() {
+  show() {
     if (this.stuck) this.bottom();
-    else this.list.scrollTop = this.top;
+    if (!touch.matches && !this.el.contains(document.activeElement)) this.input.focus();
   }
 
   private bottom() {
@@ -783,81 +842,103 @@ class ChatView extends View {
     this.newer.hidden = true;
   }
 
-  async update() {
-    await super.update();
-    const items = client.items.get(this.gid);
-    if (!items) return;
-    const added = items.length > this.shown;
-    for (; this.shown < items.length; this.shown++) {
-      const item = items[this.shown];
-      const day = new Date(item.at).toDateString();
-      const line = this.line(item, items);
-      if (!line) continue;
-      if (day !== this.day) this.list.append(h("li", { className: "day" }, dayName(item.at)));
-      this.day = day;
-      this.list.append(line);
+  update() {
+    super.update();
+    const items: Item[] = JSON.parse(lmk.items(this.gid));
+    const keep = new Set<string>();
+    let added = false;
+    let previous: Item | undefined;
+    let at: Element | null = this.list.firstElementChild;
+    for (const item of items) {
+      const key = "id" in item ? item.id : `${item.type} ${item.at}`;
+      const follows = item.type === "message" && previous?.type === "message" && previous.from.key === item.from.key && item.at - previous.at < 300_000 && !item.reply_to;
+      const json = JSON.stringify([item, follows, client.held.has(item.type === "message" && item.attachment ? client.hashOf(item.attachment.link) : "")]);
+      previous = item;
+      keep.add(key);
+      let line = this.lines.get(key);
+      if (line?.json !== json) {
+        if (line && at === line.el) at = at.nextElementSibling;
+        line?.el.remove();
+        added ||= !line;
+        line = { json, el: this.line(item, items, follows) };
+        this.lines.set(key, line);
+      }
+      if (line.el !== at) this.list.insertBefore(line.el, at);
+      at = line.el.nextElementSibling;
     }
+    for (const [key, line] of this.lines) if (!keep.has(key)) (line.el.remove(), this.lines.delete(key));
     if (added && this.stuck) this.bottom();
     else if (added) this.newer.hidden = false;
   }
 
-  private line(item: Item, items: Item[]): HTMLElement | null {
+  private line(item: Item, items: Item[], follows: boolean): HTMLElement {
     const at = timeOf(item.at);
-    if (item.type !== "message") this.last = undefined;
     switch (item.type) {
       case "message": {
-        const mine = item.from.fp === client.member!.fp();
-        const plain = !item.reply_to && !item.to && !item.urgent;
-        const follows = plain && this.last?.fp === item.from.fp && item.at - this.last.at < 300_000;
-        this.last = { fp: item.from.fp, at: item.at };
         const parent = item.reply_to ? (items.find(i => i.type === "message" && i.id === item.reply_to) as Message | undefined) : undefined;
         const to = item.to?.map(fp => this.members.find(m => m.fp === fp)).filter(m => m != null);
-        const classes = ["message", mine && "mine", follows && "follows", item.to?.includes(client.member!.fp()) && "direct", item.urgent && "urgent"];
+        const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent"];
+        const status = item.pending
+          ? h("p", { className: "status warn" }, "Pending: no other member holds it yet. It goes out when one is online while this browser is open.")
+          : item.refused && h("p", { className: "status warn" }, `Refused by ${item.refused.map(r => `${r.name} (${r.reason})`).join(", ")}`);
         return h(
           "li",
           { className: classes.filter(Boolean).join(" "), tabIndex: -1 },
-          !follows && h("div", { className: "meta" }, who(item.from), to?.length && h("span", { className: "muted" }, "to ", to.map(label).join(", ")), item.urgent && h("span", { className: "tag" }, "Urgent"), at),
-          parent && h("blockquote", {}, h("b", {}, label(parent.from)), " ", (parent.content || parent.attachment?.name || "").slice(0, 160)),
+          !follows &&
+            h(
+              "div",
+              { className: "meta" },
+              who(item.from),
+              to?.length && h("span", { className: "muted" }, "to ", to.map(label).join(", ")),
+              item.urgent && h("span", { className: "tag" }, "Urgent"),
+              at
+            ),
+          item.reply_to &&
+            h("blockquote", {}, parent ? [h("b", {}, label(parent.from)), " ", (parent.content || parent.attachment?.name || "").slice(0, 160)] : "a message this browser does not hold"),
           item.content && h("div", { className: "text" }, item.content),
           item.attachment && this.attachmentView(item.attachment),
+          status,
           h("div", { className: "actions" }, h("button", { className: "quiet", onclick: () => this.reply(item) }, "Reply"))
         );
       }
+      case "leave":
+        return h("li", { className: "event" }, who(item.from), " asked to leave", at);
       case "joined":
       case "left": {
-        const self = item.by.fp === item.member.fp;
-        const said = item.type === "joined" ? (self ? [who(item.member), " joined"] : [who(item.by), " added ", who(item.member)]) : self ? [who(item.member), " left"] : [who(item.by), " removed ", who(item.member)];
+        const self = item.by.key === item.member.key;
+        const said =
+          item.type === "joined" ? [who(item.by), item.how === "open" ? " let in " : " added ", who(item.member)] : self ? [who(item.member), " left"] : [who(item.by), " removed ", who(item.member)];
         return h("li", { className: "event" }, ...said, at);
       }
       case "settings": {
         const { before, settings: after } = item;
-        const ids = (s: Settings) => (s.open ?? []).map(o => o.id);
-        const theirs = (id: string) => id === item.by.entity?.id;
+        const ids = (s?: { open?: { id: string }[] }) => (s?.open ?? []).map(o => o.id);
         const said = [
-          (after.name ?? "") !== (before.name ?? "") && (after.name ? `named the chat “${after.name}”` : "removed the chat's name"),
-          ...(after.open ?? []).filter(o => !ids(before).includes(o.id)).map(o => (theirs(o.id) ? "let their other devices join" : `let ${o.name}'s devices join`)),
-          ...(before.open ?? []).filter(o => !ids(after).includes(o.id)).map(o => (theirs(o.id) ? "stopped letting their other devices join" : `stopped letting ${o.name}'s devices join`))
+          before && after.name !== before.name && (after.name ? `named it “${after.name}”` : "removed its name"),
+          ...(after.open ?? []).filter(o => !ids(before).includes(o.id)).map(o => `let ${o.name}'s devices join`),
+          ...(before?.open ?? []).filter(o => !ids(after).includes(o.id)).map(o => `stopped letting ${o.name}'s devices join`)
         ].filter(Boolean);
-        return said.length ? h("li", { className: "event" }, who(item.by), ` ${said.join(" and ")}`, at) : null;
+        return h("li", { className: "event" }, who(item.by), ` ${said.join(" and ") || "changed the settings"}`, at);
       }
-      case "warning":
-        return h("li", { className: "event warn" }, item.text, at);
+      case "introduced":
+        return h("li", { className: "event" }, who(item.by), ` introduced ${item.identity.name}`, at);
     }
   }
 
   /** An image shows in the chat; any other file downloads on a click. */
   private attachmentView(file: Attachment): HTMLElement {
-    if (/^image\/(png|jpeg|gif|webp)$/.test(file.type ?? "")) {
+    const hash = client.hashOf(file.link);
+    if (/^image\/(png|jpeg|gif|webp)$/.test(file.type) && (client.held.has(hash) || file.size <= FILE_LIMIT)) {
       const image = h("img", { className: "image", alt: file.name });
       image.onload = () => this.stuck && this.bottom();
-      client.image(this.gid, file.link).then(
-        src => (image.src = src),
+      client.file(lmk, this.gid, file.link).then(
+        bytes => (image.src = URL.createObjectURL(new Blob([bytes as BlobPart], { type: file.type }))),
         error => image.replaceWith(h("p", { className: "muted" }, `${file.name} could not be shown: ${error instanceof Error ? error.message : error}`))
       );
       return image;
     }
-    const button = h("button", { className: "download" }, `Download ${file.name} (${megabytes(file.size)})`);
-    button.onclick = () => busy(button, "Downloading…", async () => download(await client.file(this.gid, file.link), file.name));
+    const button = h("button", { className: "download" }, `${client.held.has(hash) ? "Download" : "Fetch"} ${file.name} (${megabytes(file.size)})`);
+    button.onclick = () => busy(button, "Fetching…", async () => download(await client.file(lmk, this.gid, file.link), file.name));
     return button;
   }
 
@@ -866,7 +947,7 @@ class ChatView extends View {
     const others = this.members.filter(m => !m.you);
     this.empty.hidden = others.length > 0;
     this.empty.replaceChildren(
-      h("p", {}, "Only you so far. Invite a person or an agent: they get a link and a code that work once, within 10 minutes."),
+      h("p", {}, "Only you so far. Invite a person or an agent: they get a link that works once, within 10 minutes."),
       h("button", { className: "primary", onclick: () => inviteDialog({ gid: this.gid }) }, "Invite someone")
     );
     for (const fp of this.to) if (!others.some(m => m.fp === fp)) this.to.delete(fp);
@@ -893,8 +974,20 @@ class ChatView extends View {
     const { replyTo, attachment } = this;
     this.context.replaceChildren(
       ...kids([
-        replyTo && h("div", {}, h("span", {}, "Replying to ", h("b", {}, label(replyTo.from)), ": ", (replyTo.content || replyTo.attachment?.name || "").slice(0, 80)), close(() => (this.replyTo = undefined))),
-        attachment && h("div", {}, h("span", {}, "Attached ", h("b", {}, attachment.name), ` · ${megabytes(attachment.size)}`), close(() => (this.attachment = undefined)))
+        replyTo &&
+          h(
+            "div",
+            {},
+            h("span", {}, "Replying to ", h("b", {}, label(replyTo.from)), ": ", (replyTo.content || replyTo.attachment?.name || "").slice(0, 80)),
+            close(() => (this.replyTo = undefined))
+          ),
+        attachment &&
+          h(
+            "div",
+            {},
+            h("span", {}, "Attached ", h("b", {}, attachment.name), ` · ${megabytes(attachment.size)}`),
+            close(() => (this.attachment = undefined))
+          )
       ])
     );
   }
@@ -911,7 +1004,6 @@ class ChatView extends View {
   }
 
   private attach(file: File) {
-    if (file.size > MAX_BLOB_BYTES) return toast(`${file.name} is too large: files go up to 10 MB.`);
     this.attachment = file;
     this.drawContext();
     this.input.focus();
@@ -919,9 +1011,10 @@ class ChatView extends View {
 
   private async submit() {
     const content = this.input.value.trim();
-    const { attachment } = this;
+    const { attachment, replyTo } = this;
     if (!content && !attachment) return;
-    const options = { to: this.to.size ? [...this.to] : undefined, reply_to: this.replyTo?.id, urgent: this.urgent.checked || undefined };
+    const to = [...this.to];
+    const urgent = this.urgent.checked;
     this.input.value = "";
     this.grow();
     this.to.clear();
@@ -932,7 +1025,11 @@ class ChatView extends View {
     this.drawContext();
     this.stuck = true;
     try {
-      await client.send(this.gid, content, options, attachment);
+      const bytes = attachment && new Uint8Array(await attachment.arrayBuffer());
+      const sent = lmk.send(this.gid, content, replyTo?.id, to, urgent, attachment?.name, attachment?.type, bytes);
+      setTimeout(render, 50);
+      const answer = JSON.parse(await sent);
+      if (answer.attachment && answer.attachment.held_by.length === 0) toast(`No other member holds ${attachment!.name} yet: it is available only while this browser is open.`);
     } catch (error) {
       toast(error);
       if (!this.input.value) this.input.value = content;
@@ -940,83 +1037,46 @@ class ChatView extends View {
       this.grow();
       this.drawContext();
     }
+    render();
   }
 }
 
-/** A doc: one text that everyone in it edits at once, and on wide screens, a chat picked to show beside it. */
+/** A doc: one text that everyone in it edits at once, in CodeMirror bound to the doc's Yjs text. */
 class DocView extends View {
   private host = h("div", { className: "editor" });
-  private side = h("div", { className: "beside" });
-  private picker: HTMLSelectElement;
-  private editor?: EditorView;
+  private bound?: { edited: () => void; measure: () => void; destroy: () => void };
 
   constructor(gid: string) {
-    const picker = h("select", { className: "beside-picker", title: "A chat to show beside the document", ariaLabel: "Chat beside" });
-    super(gid, picker);
-    this.picker = picker;
-    picker.onchange = () => {
-      localStorage.setItem(`beside ${gid}`, picker.value);
-      this.place();
-      render();
-    };
-    this.el.append(h("div", { className: "body" }, this.host, this.side));
-    import("./editor").then(({ editor }) => {
-      if (!client.groups.has(gid)) return;
-      const blobs = {
-        show: (link: string) => client.image(gid, link),
-        attach: (bytes: Uint8Array) => client.attach(gid, bytes),
-        open: (link: string, name: string) => client.file(gid, link).then(bytes => download(bytes, name), toast),
+    super(gid);
+    docs.set(gid, this);
+    this.el.append(h("div", { className: "body" }, this.host));
+    import("./editor").then(({ bind }) => {
+      if (!group(gid)) return;
+      const files = {
+        show: (link: string) => client.file(lmk, gid, link).then(bytes => URL.createObjectURL(new Blob([bytes as BlobPart]))),
+        attach: (bytes: Uint8Array) => lmk.add_file(gid, bytes),
+        open: (link: string, name: string) => client.file(lmk, gid, link).then(bytes => download(bytes, name), toast),
         fail: toast
       };
-      this.editor = editor(this.host, client.doc(gid).getText("text"), blobs);
+      this.bound = bind(this.host, lmk, gid, files);
     });
   }
 
-  async update() {
-    await super.update();
-    const chats = [...client.groups.keys()].filter(gid => client.groups.get(gid)!.settings.kind === "chat");
-    const chosen = beside(this.gid) ?? "";
-    update(this.picker, JSON.stringify([chats.map(title), chosen]), () => [
-      h("option", { value: "" }, "No chat beside"),
-      ...chats.map(gid => h("option", { value: gid }, `💬 ${title(gid)}`))
-    ]);
-    this.picker.value = chosen;
-    this.place();
-    const chat = this.side.firstElementChild && beside(this.gid);
-    if (chat) await views.get(chat)!.update();
-  }
-
-  /** Shows the chat picked for this doc beside it, on wide screens. */
-  private place() {
-    const chat = wide.matches ? beside(this.gid) : undefined;
-    const view = chat && viewOf(chat);
-    if (view && view.el.parentElement !== this.side) {
-      this.side.replaceChildren(view.el);
-      view.el.hidden = false;
-      view.show(false);
-    }
-    if (!view) this.side.replaceChildren();
+  edited() {
+    this.bound?.edited();
   }
 
   show() {
-    this.place();
-    this.editor?.requestMeasure();
+    this.bound?.measure();
   }
 
   destroy() {
-    this.editor?.destroy();
+    this.bound?.destroy();
   }
 }
 
 function timeOf(at: number): HTMLElement {
   return h("time", { dateTime: new Date(at).toISOString(), title: new Date(at).toLocaleString() }, new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
-}
-
-function dayName(at: number): string {
-  const day = new Date(at).toDateString();
-  if (day === new Date().toDateString()) return "Today";
-  if (day === new Date(Date.now() - 86_400_000).toDateString()) return "Yesterday";
-  return new Date(at).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
 }
 
 function download(bytes: Uint8Array, name: string) {

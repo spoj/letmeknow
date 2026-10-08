@@ -1,4 +1,5 @@
-// A doc's editor: markdown in CodeMirror, bound to the doc's Yjs text. "- [ ]" items show as checkboxes that tick with
+// A doc's editor: markdown in CodeMirror, bound to the doc's Yjs text, which edits here and the session's own copy
+// (lmk-node's) keep in step. "- [ ]" items show as checkboxes that tick with
 // a click; a toolbar (and Alt+↑/↓, Tab, Shift+Tab) moves and indents lines. Links show as their text, and open on a
 // click, except on the line being edited. Images the doc links show below their line; pasting or dropping a file
 // uploads it and inserts its link.
@@ -8,7 +9,8 @@ import { defaultHighlightStyle, syntaxHighlighting, syntaxTree } from "@codemirr
 import { EditorState, type Range, StateField } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, ViewPlugin, type ViewUpdate, WidgetType, keymap, placeholder, showPanel } from "@codemirror/view";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
-import type * as Y from "yjs";
+import * as Y from "yjs";
+import type { Lmk } from "./client";
 
 class Checkbox extends WidgetType {
   constructor(readonly checked: boolean) {
@@ -213,7 +215,7 @@ class Picture extends WidgetType {
 
 function pictures(state: EditorState, blobs: Blobs): DecorationSet {
   const found: Range<Decoration>[] = [];
-  for (const match of state.doc.toString().matchAll(/!\[[^\]\n]*\]\((lmk:[0-9a-f]{64}#[0-9a-f]{64})\)/g)) {
+  for (const match of state.doc.toString().matchAll(/!\[[^\]\n]*\]\((lmk:[0-9a-f]{64}\.[0-9]+#[0-9a-f]{64})\)/g)) {
     const end = state.doc.lineAt(match.index).to;
     found.push(Decoration.widget({ widget: new Picture(match[1], blobs), block: true, side: 1 }).range(end));
   }
@@ -252,7 +254,23 @@ function insertFiles(view: EditorView, blobs: Blobs, event: Event, files: FileLi
   return true;
 }
 
-export function editor(parent: HTMLElement, text: Y.Text, blobs: Blobs): EditorView {
+/** From the session: an edit made elsewhere. */
+const REMOTE = "lmk";
+
+/** An editor of the doc `gid`. `edited` takes in what the session's copy has that this one lacks. */
+export function bind(parent: HTMLElement, lmk: Lmk, gid: string, blobs: Blobs) {
+  const doc = new Y.Doc();
+  Y.applyUpdate(doc, lmk.doc(gid), REMOTE);
+  doc.on("update", (update: Uint8Array, origin: unknown) => origin !== REMOTE && lmk.edit(gid, update).catch(blobs.fail));
+  const view = editor(parent, doc.getText("text"), blobs);
+  return {
+    edited: () => Y.applyUpdate(doc, lmk.doc_diff(gid, Y.encodeStateVector(doc)), REMOTE),
+    measure: () => view.requestMeasure(),
+    destroy: () => (view.destroy(), doc.destroy())
+  };
+}
+
+function editor(parent: HTMLElement, text: Y.Text, blobs: Blobs): EditorView {
   const extensions = [
     keymap.of([...yUndoManagerKeymap, ...defaultKeymap, indentWithTab]),
     markdown({ base: markdownLanguage }),

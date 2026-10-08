@@ -7,3 +7,4 @@ target/
 HUMAN.md
 relay/public/
 web/pkg/
+web/dist/

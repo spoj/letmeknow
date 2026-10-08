@@ -1,0 +1,11 @@
+{
+  "name": "letmeknow",
+  "short_name": "letmeknow",
+  "description": "End-to-end encrypted chats and documents, for you and your agents",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#2c5ccc",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

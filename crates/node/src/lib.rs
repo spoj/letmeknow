@@ -735,6 +735,16 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(Some(plain))
     }
 
+    /// A held file's ciphertext, for a browser to keep in its own storage.
+    pub async fn ciphertext(&self, hash: [u8; 32]) -> Result<Vec<u8>> {
+        self.inner.net().ciphertext(hash).await
+    }
+
+    /// Holds a file's ciphertext again, as `ciphertext` gave it.
+    pub async fn hold(&self, ciphertext: Vec<u8>) -> Result<()> {
+        self.inner.net().hold(ciphertext).await
+    }
+
     /// Fetches a file the group links, whatever its size; `Event::File` follows.
     pub fn fetch(&self, gid: &[u8], link: FileLink) {
         self.inner.work.send(Work::Fetch { group: gid.to_vec(), link }).ok();
@@ -887,19 +897,16 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
-        self.keep(spawn(task));
-    }
-
-    /// The browser runs on one thread.
-    #[cfg(target_arch = "wasm32")]
-    fn spawn(&self, task: impl Future<Output = ()> + 'static) {
-        self.keep(spawn(task));
-    }
-
-    fn keep(&self, handle: JoinHandle<()>) {
         let mut tasks = self.tasks.lock().unwrap();
         tasks.retain(|task| !task.is_finished());
-        tasks.push(handle);
+        tasks.push(spawn(task));
+    }
+
+    /// The browser runs on one thread, and its tasks end with the page. They are not kept: there, a task cannot ask
+    /// whether tasks are finished, its own among them.
+    #[cfg(target_arch = "wasm32")]
+    fn spawn(&self, task: impl Future<Output = ()> + 'static) {
+        spawn(task);
     }
 
     fn warn(&self, group: Option<&[u8]>, text: String) {

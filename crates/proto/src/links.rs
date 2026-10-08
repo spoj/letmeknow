@@ -6,6 +6,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 pub const INVITE_PREFIX: &str = "https://letmeknow.dev/i#";
 /// letmeknow.dev's relay, which links leave out.
 pub const RELAY: &str = "https://letmeknow.dev";
+/// letmeknow.dev's membership service: its iroh key, hex. It is reached through `RELAY`.
+pub const MEMBERSHIP_KEY: &str = "50d422869a41e313ef48fa00284557a0c3d15374280b7f3d5d35a35c2393370f";
 
 /// `https://letmeknow.dev/i#1.<g|d>.<key>.<secret>[.<relay>]`, every field after the kind in unpadded base64url.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,16 +1,16 @@
-// Builds the browser client into relay/public/assets, where the relay serves it: the client's library compiled to
-// WebAssembly, and the app bundled. app.js and app.css keep their names; the WebAssembly file and the chunks loaded
-// later (the editor, the QR code) carry a hash.
+// Builds the browser client into dist/, which `letmeknow serve --web web/dist` serves: crates/web compiled to
+// WebAssembly with the workspace's `wasm` profile, the app bundled, and a service worker that caches exactly these files.
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { rmSync } from "node:fs";
+import { copyFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 
 const web = fileURLToPath(new URL(".", import.meta.url));
-const client = fileURLToPath(new URL("../client/", import.meta.url));
-const out = fileURLToPath(new URL("../relay/public/assets/", import.meta.url));
-execFileSync("cargo", ["rustc", "--lib", "--profile", "wasm", "--target", "wasm32-unknown-unknown", "--crate-type", "cdylib"], { cwd: client, stdio: "inherit" });
-execFileSync("wasm-bindgen", ["--target", "web", "--out-dir", "pkg", `${client}target/wasm32-unknown-unknown/wasm/letmeknow.wasm`], { cwd: web, stdio: "inherit" });
+const root = fileURLToPath(new URL("..", import.meta.url));
+const out = `${web}dist/`;
+execFileSync("cargo", ["build", "-p", "lmk-web", "--profile", "wasm", "--target", "wasm32-unknown-unknown"], { cwd: root, stdio: "inherit" });
+execFileSync("wasm-bindgen", ["--target", "web", "--out-dir", "pkg", `${root}target/wasm32-unknown-unknown/wasm/lmk_web.wasm`], { cwd: web, stdio: "inherit" });
 rmSync(out, { recursive: true, force: true });
 await build({
   entryPoints: { app: `${web}src/main.ts` },
@@ -18,10 +18,22 @@ await build({
   chunkNames: "[name]-[hash]",
   splitting: true,
   loader: { ".wasm": "file" },
-  publicPath: "/assets",
+  publicPath: "/",
   bundle: true,
   minify: true,
   format: "esm",
   target: "es2022",
   outdir: out
+});
+for (const file of ["index.html", "manifest.webmanifest", "icon.svg"]) copyFileSync(`${web}src/${file}`, out + file);
+const files = readdirSync(out).sort();
+const version = createHash("sha256");
+for (const file of files) version.update(file).update(readFileSync(out + file));
+await build({
+  entryPoints: [`${web}src/sw.ts`],
+  define: { FILES: JSON.stringify(files.map(file => `/${file}`)), VERSION: JSON.stringify(version.digest("hex").slice(0, 16)) },
+  bundle: true,
+  minify: true,
+  target: "es2022",
+  outfile: `${out}sw.js`
 });

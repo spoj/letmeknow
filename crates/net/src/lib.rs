@@ -257,6 +257,16 @@ impl Net {
         self.inner.files.held(&hash).await
     }
 
+    /// A held file's ciphertext, for a browser to keep in its own storage.
+    pub async fn ciphertext(&self, hash: [u8; 32]) -> Result<Vec<u8>> {
+        self.inner.files.ciphertext(&hash).await
+    }
+
+    /// Holds a file's ciphertext again, as `ciphertext` gave it.
+    pub async fn hold(&self, ciphertext: Vec<u8>) -> Result<()> {
+        self.inner.files.hold(ciphertext).await
+    }
+
     /// Decrypts a held file into `out`.
     pub async fn read_file(&self, link: &FileLink, out: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
         self.inner.files.read(link, out).await

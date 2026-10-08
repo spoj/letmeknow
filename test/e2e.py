@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""End-to-end test: a local `letmeknow serve` (membership service and relay, with a self-signed certificate) and several
-`letmeknow listen` processes, each its own device. --no-browser is the default: there is no browser client yet."""
-import json, os, queue, signal, socket, subprocess, sys, tempfile, threading, time
+"""End-to-end test: a local `letmeknow serve` (membership service, relay and web client, with a self-signed certificate)
+and several `letmeknow listen` processes, each its own device; then the browser client in Chromium (web/e2e.mjs) with
+native sessions of its own. --no-browser skips building and testing the browser client, which is the same on every OS."""
+import json, os, queue, shutil, signal, socket, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "target", "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
+WEB = os.path.join(ROOT, "web")
+BROWSER = "--no-browser" not in sys.argv
 TMP = tempfile.mkdtemp(prefix="lmk-e2e-")
 ENV = {**os.environ, "NO_PROXY": "localhost,127.0.0.1"}
 ENV.pop("LETMEKNOW_SESSION", None)
@@ -103,6 +106,8 @@ def serve():
     https = free_port()
     args = [BIN, "serve", "--domain", "localhost", "--https-port", str(https), "--http-port", str(free_port()), "--membership-port", str(free_port()),
             "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key]
+    if BROWSER:
+        args += ["--web", os.path.join(WEB, "dist")]
     proc = subprocess.Popen(args, env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
     membership = proc.stdout.readline().strip().removeprefix("membership: ")
     ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_RELAY=f"https://localhost:{https}", LETMEKNOW_MEMBERSHIP=membership)
@@ -111,6 +116,8 @@ def serve():
 
 def main():
     subprocess.run(["cargo", "build", "-q", "-p", "letmeknow"], cwd=ROOT, check=True)
+    if BROWSER:
+        subprocess.run([shutil.which("npm"), "run", "build"], cwd=WEB, check=True)
     server = serve()
     listeners = []
     try:
@@ -213,6 +220,8 @@ def main():
         check(got["group"] == group, "a restarted session catches up on what it missed")
         renamed = until(lambda: run("bob", "groups"), lambda gs: any(g.get("name") == "Release" for g in gs))
         check(any(g.get("name") == "Release" for g in renamed), "and on the commits it missed")
+        if BROWSER and subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=WEB, env={**ENV, "URL": ENV["LETMEKNOW_RELAY"], "BIN": BIN}).returncode:
+            sys.exit("FAIL: the browser test")
         print("all ok")
     finally:
         for listener in listeners:
