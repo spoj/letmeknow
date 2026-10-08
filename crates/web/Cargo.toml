@@ -1,0 +1,27 @@
+[package]
+name = "lmk-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Only the browser build has anything in it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+lmk-node.workspace = true
+lmk-proto.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+iroh = { workspace = true, features = ["tls-ring"] }
+js-sys = "0.3"
+n0-future = "0.3"
+openmls_memory_storage.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_traits.workspace = true
+rustc-hash = "2"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "0.4"

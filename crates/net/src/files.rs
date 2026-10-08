@@ -158,6 +158,17 @@ impl Files {
         Ok(self.store.remote().local(Hash::from_bytes(*hash)).await?.local_bytes())
     }
 
+    /// A held file's ciphertext, whole.
+    pub async fn ciphertext(&self, hash: &[u8; 32]) -> Result<Vec<u8>> {
+        Ok(self.store.get_bytes(Hash::from_bytes(*hash)).await?.to_vec())
+    }
+
+    /// Holds a file's ciphertext, as `ciphertext` gave it.
+    pub async fn hold(&self, ciphertext: Vec<u8>) -> Result<()> {
+        self.store.add_bytes(ciphertext).await?;
+        Ok(())
+    }
+
     pub async fn read(&self, link: &FileLink, out: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
         ensure!(self.complete(&link.hash).await?, "{} is not held", link.link());
         let mut reader = self.store.reader(Hash::from_bytes(link.hash));

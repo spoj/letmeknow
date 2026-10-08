@@ -735,6 +735,16 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(Some(plain))
     }
 
+    /// A held file's ciphertext, for a browser to keep in its own storage.
+    pub async fn ciphertext(&self, hash: [u8; 32]) -> Result<Vec<u8>> {
+        self.inner.net().ciphertext(hash).await
+    }
+
+    /// Holds a file's ciphertext again, as `ciphertext` gave it.
+    pub async fn hold(&self, ciphertext: Vec<u8>) -> Result<()> {
+        self.inner.net().hold(ciphertext).await
+    }
+
     /// Fetches a file the group links, whatever its size; `Event::File` follows.
     pub fn fetch(&self, gid: &[u8], link: FileLink) {
         self.inner.work.send(Work::Fetch { group: gid.to_vec(), link }).ok();
