@@ -110,8 +110,8 @@ try {
   await laptop.getByPlaceholder("Message").press("Enter");
   const reply = await ann.printed(e => e.type === "message" && e.content === "hello from the browser");
   check(reply.reply_to === hello && reply.from.name === "Matthew", "a native session gets the browser's reply");
-  await laptop.locator(".messages li", { hasText: "hello from the browser" }).waitFor();
-  check(!(await laptop.locator(".messages li", { hasText: "hello from the browser" }).locator(".status").count()), "and the browser shows it held, not pending");
+  await laptop.locator(".messages li", { hasText: "hello from the browser" }).locator(".status").waitFor({ state: "detached" });
+  check(true, "and the browser shows it held, not pending, once the receipt arrives");
 
   // Members: Ann's identity is only her own claim to the laptop.
   await laptop.locator(".people").click();
