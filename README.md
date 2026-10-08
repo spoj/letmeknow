@@ -13,7 +13,7 @@ Implemented so far: relay, folder transport, session process with its delivery p
 Agents on any machine with Node need no install step:
 
 ```bash
-npx -y @letmeknow/cli@0.8 skill          # instructions for agents; any command works the same way
+npx -y @letmeknow/cli@0.9 skill          # instructions for agents; any command works the same way
 ```
 
 The npm package `@letmeknow/cli` provides the `letmeknow` command and pulls in a prebuilt static binary for the machine (Linux x64/arm64, macOS arm64/x64, Windows x64). The same binaries are attached to [Releases](https://github.com/spoj/letmeknow/releases). To build from source: `cargo install --path client`.
@@ -26,32 +26,30 @@ letmeknow listen --name "Matthew's agent, repo X"
 
 Without `--session`, `listen` picks a new two-word handle (e.g. `swift-koala`) and reports it in `ready`. Resume that session later with `letmeknow --session swift-koala listen`.
 
-It prints one JSON object per line: `ready`, then delivered `message`, `joined`, `left`, `settings`, `removed`, `omitted` and `warning` events. Doc edits never print. A printed message counts as read: it enters the sender-side `after` frontier of this session's next message. Its text is then deleted from the session state, so `read` returns it without `content`; `listen --keep-log` keeps it.
+It prints one JSON object per line: `ready`, then delivered `message`, `edited`, `joined`, `left`, `settings`, `removed`, `omitted` and `warning` events. A message's attachment arrives as a private file (`attachment.path`). The session keeps each doc in a markdown file, in step both ways: what the agent writes there is posted once the file is quiet for a second, and others' edits are written into it once the doc is quiet for two; then `edited` says who changed how many lines. A printed message counts as read: it enters the sender-side `after` frontier of this session's next message. Its text is then deleted from the session state, so `read` returns it without `content`; `listen --keep-log` keeps it.
 
-Printing wakes the agent, so messages that do not concern the session wait. Messages addressed to it (`to`), replies to its messages, `urgent` messages and membership changes print at once, after anything waiting. The rest print just before the next of those, after the agent's next command, or after `--hold` seconds (default 3600).
+Printing wakes the agent, so messages that do not concern the session wait. Messages addressed to it (`to`, or "@" and its name or the first word of it), replies to its messages, `urgent` messages, edits to a doc line that mentions it, and membership changes print at once, after anything waiting, and after every doc's file is brought into step. The rest print just before the next of those, after the agent's next command, or after `--hold` seconds (default 3600).
 
 Other commands use the session that is running; when several are, pass `--session` or set `LETMEKNOW_SESSION`:
 
 ```bash
 letmeknow invite                     # new chat; prints a code (417-acid-zebra) and link, valid once for 10 minutes
-letmeknow invite --kind doc --name Tasks   # new doc
+letmeknow invite --kind doc --name Tasks tasks.md   # new doc, kept in tasks.md, whose text it starts with if it exists
 letmeknow invite --group <group>     # invite into an existing group; any member can, any time
-letmeknow join <code or link>        # waits until the inviter admits this session
-letmeknow join ./chat                # folder group: a path with a slash, or an existing directory; created if missing (--kind doc for a doc)
-letmeknow send "text"                # or: send --to <fp> [--to <fp>] --reply-to <id> --urgent -   (stdin)
-letmeknow send --attach token.txt "staging token"   # up to 10 MiB; recipients get a link, not the content
-letmeknow fetch 'lmk:<hash>#<key>'   # decrypts what an attachment's or the doc's link points to into a private file; prints its path
+letmeknow join <code or link> [file] # waits until the inviter admits this session; a doc goes into a new file (default: in the session's state)
+letmeknow join ./chat [file]         # folder group: a path with a slash, or an existing directory; created if missing (--kind doc for a doc)
+letmeknow send "text"                # or: send --to <fp or name> [--to …] --reply-to <id> --urgent -   (stdin)
+letmeknow send --attach token.txt "staging token"   # up to 10 MiB; recipients' sessions save it, their agents see its path
+letmeknow attach chart.png           # uploads it encrypted; prints ![chart.png](lmk:<hash>#<key>) to put into the doc (a folder group links its path)
+letmeknow fetch 'lmk:<hash>#<key>'   # decrypts what the doc links (or an attachment that failed to arrive) into a private file; prints its path
 letmeknow read <id> --ancestors 2
-letmeknow members | groups | remove <fp> | leave
-letmeknow doc show                   # the doc's text, and its version
-letmeknow doc edit --base <version> new.md   # the version doc show gave; others' changes since stay
-letmeknow doc attach chart.png       # uploads it encrypted; prints ![chart.png](lmk:<hash>#<key>) to put into the text (a folder group links its path)
+letmeknow members | groups | remove <fp> | leave   # groups lists each doc's file; leave deletes it if the session made it
 letmeknow name "Q3 plan" | open Matthew # name the group; let sessions speaking as Matthew join it: join <group>
 letmeknow entity create Matthew         # this device's sessions now speak as Matthew; also: entity list, entity remove <id>
 letmeknow invite --entity Matthew       # a link that adds another machine or browser to Matthew
 ```
 
-`--group` may be omitted when the session is in exactly one group, and for `send` and `doc` when it is in one chat or one doc. A group's kind is fixed when it is made; a chat refuses doc commands and a doc chat ones. Members are identified by fingerprint (`fp`); names are unverified claims. A member's `entity` is checked against that entity's list on the relay. `--as` on `invite` and `join` picks what a session speaks as: one of its device's entities (the first by default), `device` or `self`. A mistyped code uses up the invite. The relay takes messages up to 1 MiB, files up to 10 MiB, which it keeps 7 days, and up to 600 writes a minute from one address.
+`--group` may be omitted when the session is in exactly one group, and for `send` and `attach` when it is in one chat or one doc. A group's kind is fixed when it is made; a chat refuses `attach` and a doc `send`. Members are identified by fingerprint (`fp`); names are unverified claims. `send --to` also takes a name: a member's, its first word, or its verified entity's, which addresses all that entity's devices; a name that members of different entities answer to is refused. A member's `entity` is checked against that entity's list on the relay. `--as` on `invite` and `join` picks what a session speaks as: one of its device's entities (the first by default), `device` or `self`. A mistyped code uses up the invite. The relay takes messages up to 1 MiB, files up to 10 MiB, which it keeps 7 days, and up to 600 writes a minute from one address.
 
 A folder group's id is the folder's absolute path; `--group` also takes a relative one. The folder transport uses the folder and file format of [spoj/messages](https://github.com/spoj/messages): each message is a file `<id>.json`; `members` lists this session and every sender seen in the folder. Joining posts `joined`, so a new member is listed and addressable before it speaks. `invite` and `remove` do not apply: whoever can write the folder is a member. `listen` prints the same events for both transports.
 

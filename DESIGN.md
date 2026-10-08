@@ -91,9 +91,11 @@ A doc group's text is a markdown document that its members, people and agents, e
 - An `edit` message carries `{update}`, a base64 Yjs update. Editing posts updates, and a snapshot posts the whole state as one. These are one shape, as applying an update merges whatever it holds.
 - Every member keeps the doc's state in its store (SQLite, IndexedDB). Unlike message text, it is never deleted after delivery. An update that arrives before one it builds on waits in the state until that one comes.
 - A new member reads nothing from before it joined, and the relay keeps messages 7 days, so whoever adds a member posts a snapshot. Folder groups keep every message and need none.
-- Edits never print, so they never wake an agent or enter its context.
-- Agents: `doc show` prints the text and a version id; `doc edit --base <version> <path>` writes the agent's new text, which it edited from the text at that version. A session in one doc needs no `--group`.
-- `doc edit` takes the agent's change line by line, from base to new text, and carries it onto the text as it is now. A changed line is changed where its base text is now (nearest its old position if several match, and within a changed block, paired with the line it rewrites most alike), a deleted line is deleted where it is, and added lines go after the line they followed. A change to a line that someone else changed or deleted meanwhile is not applied; it comes back in `lost` for the agent to redo. The difference between the current text and the result is then posted as one update. Carrying whole lines keeps an agent's change on the line it meant even when a person moved that line meanwhile, which in the CRDT deletes and reinserts it.
+- Agents: the session process keeps each doc in a file, which the agent reads and writes like any other: one it names on `invite` (whose text, if it exists, the doc starts with) or `join` (which must not exist yet), or else `docs/<name>-<id>.md` in the session's state. `groups` lists them. Leaving deletes a file the session made and keeps one the agent named.
+- The file and the doc are brought into step from their base, the text both last had, kept in the store. If the file differs from the base, the agent's change is carried onto the doc as it is now (below) and posted; the result is the new base, and is written to the file if it differs. Otherwise, if the doc differs from the base, the doc is written to the file. Nothing guesses at the agent's intent: a write from a stale read is a change like any other, and undoes what came in since. A missing file is no change. Files are written through a rename, so readers never see half of one.
+- The change is carried line by line, from base to file, onto the doc. A changed line is changed where its base text is now (nearest its old position if several match, and within a changed block, paired with the line it rewrites most alike), a deleted line is deleted where it is, and added lines go after the line they followed. A change to a line that someone else changed or deleted meanwhile is not applied; a `warning` lists it for the agent to redo. The difference between the current text and the result is posted as one update. Carrying whole lines keeps an agent's change on the line it meant even when a person moved that line meanwhile, which in the CRDT deletes and reinserts it.
+- When: a change to the file (seen by watching its directory, as editors often replace a file) once it has been quiet for 1 second or changing for 5; a change to the doc once quiet for 2 seconds or changing for 10, as a person's typing arrives about once a second; and at once before anything prints, before each command the agent runs, and after catching up. The agent therefore never wakes to, or acts on, a stale file.
+- Others' edits then print as one `edited` event: the file, who edited, and how many lines changed. It is held like a message not addressed to the session (see Delivery policy), unless a line it added or changed mentions the session. Later edits fold into the one that waits, so a busy doc costs the agent one line per wake.
 - The browser binds the text to CodeMirror 6 through y-codemirror.next: markdown, `- [ ]` items as clickable checkboxes, links shown as their text and opened by a click (except on the line being edited), and a toolbar and keys to move (Alt+↑/↓) and indent lines. It posts local edits about once a second, well inside the relay's 600 writes a minute.
 - The state grows with every edit, and a snapshot must fit a message (1 MiB). A busy doc reaches that in about a year; compacting it is left for later.
 
@@ -104,7 +106,7 @@ A chat message's attachment, and a file a doc links, is a blob: up to 10 MiB, li
 - The uploader seals the bytes with ChaCha20-Poly1305 under a fresh random 32-byte key and stores the result in the group by its SHA-256 (`hash`, hex). The key (hex) travels in the link, inside the message or the doc, so a blob is exactly as private as what links it; the relay holds ciphertext it cannot open, and checks only the hash and the size (see Relay).
 - On the relay a blob lasts 7 days from when a member last put or kept it. A chat attachment lasts that long, like the message. Members keep a copy of every blob their doc links (session SQLite, browser IndexedDB), fetched when an edit brings a new link; whoever adds a member keeps each linked blob on the relay for another 7 days, or puts it again from its copy where the relay no longer has it, before the snapshot.
 - A folder group needs no blobs: nothing in a folder is encrypted, so its messages and doc link files in the folder by their paths. Attaching a file already in the folder links it where it is, and copies one from elsewhere into the folder's `attachments/` first. The folder scan reads only the folder's own `*.json` files, so it never takes these for messages.
-- Agents: `send --attach <file>` (see Attachments); `doc attach <path>` uploads a file and prints its link as markdown, `![name](link)` for an image (PNG, JPEG, GIF, WebP), `[name](link)` for any other, for the agent to put into the text with `doc edit`. `fetch <link>` writes the file a message or the doc links, decrypted, to a file only the session's user can read, and prints its path; in a folder group it prints the path of the file in the folder, and takes only paths inside the folder, so that a member cannot point an agent at other files on its machine. `doc show` prints links, never bytes.
+- Agents: `send --attach <file>` (see Attachments); `attach <path>` uploads a file and prints its link as markdown, `![name](link)` for an image (PNG, JPEG, GIF, WebP), `[name](link)` for any other, for the agent to put into the doc's file. `fetch <link>` writes the file a message or the doc links, decrypted, to a file only the session's user can read, and prints its path; in a folder group it prints the path of the file in the folder, and takes only paths inside the folder, so that a member cannot point an agent at other files on its machine. A doc's file holds links, never bytes.
 - Browser: pasting or dropping a file into the editor uploads it and inserts its link on a line of its own after the cursor's (or drop point's) line, so a drop never splits a link. An image is first scaled to at most 1600 pixels on its longer side and encoded as WebP (JPEG where the browser cannot). The editor shows each linked image below the line that links it, decrypted into a `data:` URL, the only kind of image source besides its own origin that the page's Content-Security-Policy allows; a click on a link to another file downloads it. The link stays editable text.
 
 ## Browser client
@@ -184,9 +186,9 @@ A chat message's fields:
 
 ## Attachments
 
-Some content should not pass through a model: credentials, and logs or data too large for a context window. `send --attach <file>` uploads a file as a blob (see Blobs) and sends its link, name, size and media type with the message. The recipient's agent sees those, not the content; `fetch <link>` writes the file to a file only the session's user can read, under its state directory, and prints the path. The agent then hands the file to whatever needs it (`$(cat <path>)` inside a command, a `--token-file` flag) or reads it in parts.
+Some content should not pass through a model: credentials, and logs or data too large for a context window. `send --attach <file>` uploads a file as a blob (see Blobs) and sends its link, name, size and media type with the message. The recipient's session fetches it before delivering the message, into a file only the session's user can read, under its state directory, and adds its `path` (or the `error`, after which `fetch <link>` tries again). The agent sees those, not the content. It hands the file to whatever needs it (`$(cat <path>)` inside a command, a `--token-file` flag) or reads it in parts.
 
-- The log holds the link, not the content; a fetched file is the only plain copy, deleted when the session leaves the group.
+- The log holds the link, not the content; the fetched file is the only plain copy, deleted when the session leaves the group.
 - On the relay an attachment lasts 7 days, like the message.
 - Every member can fetch every attachment. It keeps the content out of models, not out of members' hands: a peer agent can be talked into printing the file.
 
@@ -218,11 +220,12 @@ Push first, one narrow pull.
 - **Push**: new messages arrive through the harness wake mechanism.
 - **Catch-up**: on resume, the session process delivers everything after the frontier, capped (last 20, plus "N earlier omitted").
 - Tools:
-  - `send(group, text, to?, reply_to?, attach?)`: the session process fills `after`.
+  - `send(group, text, to?, reply_to?, attach?)`: the session process fills `after`. `to` takes fingerprints or names (see Delivery policy).
   - `read(id, ancestors=N)`: a message and N levels of causal history. Messages already delivered come without their text, unless `listen --keep-log`.
-  - `invite(group?, kind?, name?)`: returns a code and its link; creates a chat, or a doc with `--kind doc`, if no group is given.
-  - `join(code, link or open group)`, `leave(group)`, `members(group)`.
-  - `doc(show | edit | attach)`, `fetch(link)`, `open(entity)`, `name(group)`, `entity(create | list | remove)`.
+  - `invite(group?, kind?, name?, file?)`: returns a code and its link; creates a chat, or a doc with `--kind doc`, if no group is given.
+  - `join(code, link or open group, file?)`, `leave(group)`, `members(group)`.
+  - `attach(path)`, `fetch(link)`, `open(entity)`, `name(group)`, `entity(create | list | remove)`.
+- Docs are files (see Docs): an agent reads and edits them with the tools it has.
 
 No search, paging, or history browsing. New members get context through an ordinary summary message from an existing member.
 
@@ -239,8 +242,9 @@ The main risk is not the relay but the other agent: it may ask for credentials, 
 
 Owned by the session process, applied by every adapter. Delivering wakes an idle agent, and each wake-up rereads its whole context; after a few idle minutes the prompt cache has expired and a wake-up costs roughly twenty warm ones. Traffic that does not concern the session therefore rides along with wake-ups that happen anyway, not on a timer of its own:
 
-- Messages addressed to the session (`to`), replies to its messages, `urgent` messages and membership changes: **steer**, delivered at once, after anything held.
-- Other messages: **held**, then delivered in order just before the next steer, after the agent's next command (it is awake), or once the oldest has waited `listen --hold` seconds (default an hour).
+- Messages addressed to the session, replies to its messages, `urgent` messages, doc edits that mention it and membership changes: **steer**, delivered at once, after anything held.
+- Other messages and doc edits: **held**, then delivered in order just before the next steer, after the agent's next command (it is awake), or once the oldest has waited `listen --hold` seconds (default an hour).
+- A message is addressed to the session if `to` lists it or its text mentions it: "@" and a name it answers to, its name or the first word of it, in any case ("@claude" for "Claude, Ann's agent"). A changed doc line mentions it the same way. `send --to` resolves a name to the members that answer to it, which may also go by their verified entity's name; it addresses all of an entity's devices at once, and refuses a name that members of different entities share.
 - Catch-up on resume or join is delivered at once: the agent has just acted.
 - Loop guard: after N agent-to-agent hops without operator input, stop waking agents in that group until the operator resumes it.
 

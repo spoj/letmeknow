@@ -245,8 +245,10 @@ struct Binding {
     /// When the file, and the doc, first and last changed since they were last in step, if they did.
     file_changed: Option<(Instant, Instant)>,
     doc_changed: Option<(Instant, Instant)>,
-    /// Who edited the doc since the agent was last told.
+    /// Who edited the doc since it was last brought into step.
     editors: Vec<Value>,
+    /// The text the agent was last told of, while an `edited` event waits to be printed.
+    since: String,
 }
 
 /// A file is brought into step once it has been quiet for FILE_QUIET, or changing for FILE_MAX; the doc after DOC_QUIET
@@ -1016,14 +1018,17 @@ impl Session {
                 let _ = events.send(Event::FileChanged(changed.clone()));
             }
         })
-        .and_then(|mut watcher| watcher.watch(path.parent().expect("a file is in a directory"), RecursiveMode::NonRecursive).map(|()| watcher))
-        .ok();
-        self.bindings.insert(gid.to_owned(), Binding { path, _watcher: watcher, file_changed: None, doc_changed: None, editors: Vec::new() });
+        .and_then(|mut watcher| watcher.watch(path.parent().expect("a file is in a directory"), RecursiveMode::NonRecursive).map(|()| watcher));
+        if let Err(error) = &watcher {
+            self.warn(Some(gid), format!("cannot watch {}: {error}; what you write there is taken at your next command", path.display()));
+        }
+        let binding = Binding { path, _watcher: watcher.ok(), file_changed: None, doc_changed: None, editors: Vec::new(), since: String::new() };
+        self.bindings.insert(gid.to_owned(), binding);
     }
 
-    /// Brings a doc and its file into step. What changed in the file since they last were (its base) is replayed onto
-    /// the doc as it is now and posted, as `doc edit` did; the file then gets the doc's text. A line both changed keeps
-    /// the doc's version, with a warning. What others changed in the doc meanwhile is told as `edited`.
+    /// Brings a doc and its file into step. What changed in the file since they last were (its base) is carried line by
+    /// line onto the doc as it is now and posted; the file then gets the doc's text. A line both changed keeps the doc's
+    /// version, with a warning. What others changed in the doc meanwhile is told as `edited`.
     async fn sync(&mut self, gid: &str) -> Result<()> {
         let binding = self.bindings.get_mut(gid).expect("a doc group is bound");
         binding.file_changed = None;
@@ -1052,9 +1057,24 @@ impl Session {
             self.warn(Some(gid), format!("others changed these lines of {} meanwhile, so your changes to them were not kept: {}", path.display(), lost.join(" | ")));
         }
         if current != base {
-            let (lines, changed) = doc::changed(&base, &current);
-            let direct = changed.iter().any(|line| mentions(line, &self.person));
-            self.deliver(gid, json!({ "type": "edited", "group": gid, "file": path, "by": editors, "lines": lines, "direct": direct }));
+            // One `edited` event per doc waits, telling of every change since the agent was last told.
+            let waiting = self.held.iter().position(|item| item["type"] == "edited" && item["group"] == gid);
+            let binding = self.bindings.get_mut(gid).expect("a doc group is bound");
+            let mut by = editors;
+            match waiting {
+                Some(at) => {
+                    let waited = self.held.remove(at);
+                    for editor in waited["by"].as_array().expect("edited lists its editors") {
+                        if !by.iter().any(|e| e["fp"] == editor["fp"]) {
+                            by.push(editor.clone());
+                        }
+                    }
+                }
+                None => binding.since = base.clone(),
+            }
+            let lines = doc::changed(&binding.since, &current).0;
+            let direct = doc::changed(&base, &current).1.iter().any(|line| mentions(line, &self.person));
+            self.deliver(gid, json!({ "type": "edited", "group": gid, "file": path, "by": by, "lines": lines, "direct": direct }));
         }
         Ok(())
     }

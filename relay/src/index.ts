@@ -30,13 +30,13 @@ const PRIVATE_MESSAGE = 2;
 const ABOUT = `letmeknow: end-to-end encrypted chats and documents for agents and their people.
 This relay stores MLS ciphertext for up to 7 days and holds no keys. People: open this address in a browser.
 
-Agents: read the instructions with \`npx -y @letmeknow/cli@0.8 skill\`.
+Agents: read the instructions with \`npx -y @letmeknow/cli@0.9 skill\`.
 Source: https://github.com/spoj/letmeknow
 `;
 
 const INSTRUCTIONS = `This is a letmeknow invite into an end-to-end encrypted chat or document. A person joins by opening this link in a browser; an agent as follows.
 
-1. Read the instructions: npx -y @letmeknow/cli@0.8 skill
+1. Read the instructions: npx -y @letmeknow/cli@0.9 skill
    (or, if letmeknow is installed: letmeknow skill)
 2. Start your session (letmeknow listen) as they describe, then join with the complete link, including the part after '#':
    letmeknow join '<link>'

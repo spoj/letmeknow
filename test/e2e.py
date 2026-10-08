@@ -371,8 +371,8 @@ def main():
         erin_file = run("erin", "join", "--kind", "doc", notes)["file"]
         check(content(erin_file) == "", "a new folder group can be a doc, which the session keeps in a file")
         frank_file = os.path.join(HOME, "frank", "notes.md")
-        check(run("frank", "join", notes, frank_file)["file"] == frank_file, "and stays one for whoever joins it, in the file they name")
-        check(next(g for g in run("frank", "groups") if g["group"] == notes)["file"] == frank_file, "which groups lists")
+        check(os.path.samefile(run("frank", "join", notes, frank_file)["file"], frank_file), "and stays one for whoever joins it, in the file they name")
+        check(os.path.samefile(next(g for g in run("frank", "groups") if g["group"] == notes)["file"], frank_file), "which groups lists")
         write(erin_file, "one\ntwo\n")
         check(until(lambda: content(frank_file), lambda t: t == "one\ntwo\n") == "one\ntwo\n", "what a member writes to its file reaches the others' files")
         run("frank", "send", "still one chat")
@@ -443,11 +443,12 @@ def main():
         gina.expect(lambda e: e["type"] == "joined" and e["group"] == plan)
         write(hank_plan, "- [ ] ship it\n")
         run("hank", "groups")
-        check(gina.poll(3) is None and content(gina_plan) == "- [ ] ship it\n", "an edit by others waits, like a message not addressed to the session")
+        check(until(lambda: content(gina_plan), bool) == "- [ ] ship it\n" and gina.poll(1) is None, "an edit by others reaches the file but waits to be told, like a message not addressed to the session")
         write(hank_plan, "- [ ] ship it\n- [ ] @gina review it\n")
         run("hank", "groups")
-        edited = gina.expect(lambda e: e["type"] == "edited" and e["direct"])
-        check(edited["by"][0]["fp"] == hank_fp and content(gina_plan) == "- [ ] ship it\n- [ ] @gina review it\n", "unless a line it changed mentions the session, whose file is in step when it wakes")
+        edited = gina.expect(lambda e: e["type"] == "edited")
+        check(edited["direct"] and edited["by"][0]["fp"] == hank_fp and content(gina_plan) == "- [ ] ship it\n- [ ] @gina review it\n", "unless a line it changed mentions the session, whose file is in step when it wakes")
+        check(edited["lines"] == 2, "one event tells of every edit since the session was last told")
 
         jill = Listener("jill", hold=2)
         listeners.append(jill)
@@ -514,7 +515,7 @@ def main():
         # Docs: a CRDT text that every member edits, each in a file of its own that its session keeps in step.
         lap_file = write("list.md", "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n")
         doc = on(lap, "invite", "--kind", "doc", "--name", "List", lap_file)
-        check(doc["kind"] == "doc" and doc["file"] == lap_file, "a doc group is made by inviting into one, from a file that holds its first text")
+        check(doc["kind"] == "doc" and os.path.samefile(doc["file"], lap_file), "a doc group is made by inviting into one, from a file that holds its first text")
         check("exists" in on(kim, "join", doc["link"], lap_file, ok=False), "a member joins into a new file, as the doc has its text already")
         kim_file = on(kim, "join", doc["link"])["file"]
         check(os.path.basename(kim_file).startswith("List-"), "or into one its session makes, named after the doc")
@@ -539,7 +540,7 @@ def main():
         check("- [x] beta" in lost["text"] and lost["group"] == doc["group"], "a change to a line someone else changed meanwhile is lost, with a warning")
         check(until(lambda: content(kim_file), lambda t: t == final) == final == until(lambda: content(lap_file), lambda t: t == final), "every member's file converges on the same text")
         edited = tick.expect(lambda e: e["type"] == "edited")
-        check(sorted(m["name"] for m in edited["by"]) == ["Kim", "Lap"] and edited["file"] == tick_file, "the agent is told who else edited the doc")
+        check(sorted(m["name"] for m in edited["by"]) == ["Kim", "Lap"] and os.path.samefile(edited["file"], tick_file), "the agent is told who else edited the doc")
         write(lap_file, final.replace("\n", "\r\n") + "- [ ] epsilon\r\n")
         final += "- [ ] epsilon\n"
         check(until(lambda: content(kim_file), lambda t: t == final) == final, "the text is LF only: CRLF an agent writes is converted")

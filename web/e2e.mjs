@@ -140,7 +140,9 @@ try {
   // A doc: the agent makes one and invites the laptop, whose phone joins it as Matthew's device. The editor loads only
   // once a doc shows.
   check(editorLoads.length === 0, "the editor is not loaded before a doc shows");
-  const checklist = agent("invite", "--kind", "doc", "--name", "Checklist");
+  const path = join(home, "list.md");
+  writeFileSync(path, "- [ ] reply to Ann\n- [ ] review budget\n- [ ] book flights\n");
+  const checklist = agent("invite", "--kind", "doc", "--name", "Checklist", path);
   await laptop.goto(checklist.link);
   await laptop.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
   await laptop.locator(".cm-content").waitFor();
@@ -149,24 +151,24 @@ try {
   await phone.locator(".opening", { hasText: "Checklist" }).getByRole("button", { name: "Join" }).click();
   await phone.locator(".cm-content").waitFor();
   check(true, "the phone joins the doc as one of Matthew's devices");
-  const path = join(home, "list.md");
-  writeFileSync(path, "- [ ] reply to Ann\n- [ ] review budget\n- [ ] book flights\n");
-  agent("doc", "edit", "--base", agent("doc", "show").version, path);
-  const old = agent("doc", "show").version;
   const text = page => page.locator(".cm-content").evaluate(content => content.cmTile.view.state.doc.toString());
+  const file = () => readFileSync(path, "utf8");
   await laptop.locator(".cm-line", { hasText: "review budget" }).locator(".cm-task").click();
   await phone.locator(".cm-line", { hasText: "book flights" }).click();
   await phone.keyboard.press("End");
   await phone.keyboard.type(" (Tuesday)");
-  writeFileSync(path, "- [x] reply to Ann\n- [ ] review budget\n- [ ] book flights\n- [ ] renew passport\n");
-  const edit = agent("doc", "edit", "--base", old, path);
-  check(edit.lost.length === 0, "the agent's edit from an older version loses nothing");
+  writeFileSync(path, file().replace("- [ ] reply to Ann", "- [x] reply to Ann") + "- [ ] renew passport\n");
   const expected = "- [x] reply to Ann\n- [x] review budget\n- [ ] book flights (Tuesday)\n- [ ] renew passport\n";
   for (let i = 0; i < 50 && (await text(laptop)) !== expected; i++) await laptop.waitForTimeout(200);
   for (let i = 0; i < 50 && (await text(phone)) !== expected; i++) await phone.waitForTimeout(200);
-  check((await text(laptop)) === expected && (await text(phone)) === expected, "both browsers converge on every edit");
-  check(agent("doc", "show").text === expected, "and so does the agent");
-  check(events.filter(e => e.group === checklist.group).every(e => ["joined", "settings"].includes(e.type)), "edits never print, so they never wake the agent");
+  for (let i = 0; i < 50 && file() !== expected; i++) await laptop.waitForTimeout(200);
+  check((await text(laptop)) === expected && (await text(phone)) === expected, "both browsers converge on every edit, the agent's file among them");
+  check(file() === expected, "and so does the agent's file");
+  await phone.locator(".cm-line", { hasText: "renew passport" }).click();
+  await phone.keyboard.press("End");
+  await phone.keyboard.type(" @agent?");
+  const mentioned = await printed(e => e.type === "edited" && e.direct);
+  check(mentioned.by.some(m => m.name === "phone") && file().includes("- [ ] renew passport @agent?\n"), "a line that mentions the agent wakes it, its file already in step");
   await laptop.locator(".beside-picker").selectOption({ label: "💬 Acme" });
   await laptop.locator(".beside .messages").waitFor();
   check(await laptop.getByText("Thanks, on it").isVisible(), "on a wide screen, a chat picked for the doc shows beside it");
@@ -187,7 +189,7 @@ try {
   const fetches = [];
   laptop.on("request", request => request.method() === "GET" && request.url().includes(`/g/${group}/messages`) && fetches.push(request.url()));
   await laptop.reload();
-  const moved = "- [x] reply to Ann\n- [x] review budget\n- [ ] renew passport\n- [ ] book flights (Tuesday)\n";
+  const moved = "- [x] reply to Ann\n- [x] review budget\n- [ ] renew passport @agent?\n- [ ] book flights (Tuesday)\n";
   await laptop.locator(".cm-content").waitFor();
   for (let i = 0; i < 50 && (await text(laptop)) !== moved; i++) await laptop.waitForTimeout(200);
   check((await text(laptop)) === moved, "Alt+↑ moves a line, and a reloaded browser reopens the doc it showed, caught up");
@@ -217,7 +219,7 @@ try {
   await laptop.getByPlaceholder("Message").press("Enter");
   const image = await printed(e => e.type === "message" && e.content === "the diagram");
   check(image.attachment?.name === "dot.png" && image.attachment.type === "image/png", "a browser sends an image as an attachment, with its name and type");
-  check(readFileSync(agent("fetch", image.attachment.link).path).equals(png), "which the agent fetches");
+  check(readFileSync(image.attachment.path).equals(png), "which reaches the agent as a file");
   await phone.locator(".messages img.image").waitFor();
   check((await phone.locator(".messages img.image").getAttribute("src")).startsWith("data:image/png;base64,"), "and the other browser shows it inline");
   const notes = join(home, "notes.txt");
@@ -247,10 +249,8 @@ try {
     }, [width, height]);
   const chart = join(home, "chart.png");
   writeFileSync(chart, Buffer.from(await picture(laptop, 120, 80), "base64"));
-  const attached = agent("doc", "attach", chart);
-  const before = agent("doc", "show");
-  writeFileSync(path, before.text + attached.markdown + "\n");
-  agent("doc", "edit", "--base", before.version, path);
+  const attached = agent("attach", chart);
+  writeFileSync(path, file() + attached.markdown + "\n");
   await laptop.locator(".group-list button", { hasText: "Checklist" }).click();
   const shown = (page, count) =>
     page.waitForFunction(count => {
@@ -268,7 +268,7 @@ try {
   check((await (await shown(laptop, 2)).jsonValue())[1] === 1600, "a pasted image is scaled down, uploaded and shown");
   let pasted;
   for (let i = 0; i < 50 && !pasted; i++) {
-    pasted = /!\[screenshot\]\((lmk:[0-9a-f#]+)\)/.exec(agent("doc", "show").text)?.[1];
+    pasted = /!\[screenshot\]\((lmk:[0-9a-f#]+)\)/.exec(file())?.[1];
     if (!pasted) await laptop.waitForTimeout(200);
   }
   const fetched = agent("fetch", pasted);
@@ -293,9 +293,8 @@ try {
   }, await picture(late, 300, 200));
   await shown(laptop, 3);
   check(/\)\n!\[photo\]\(lmk:[0-9a-f#]+\)$/.test(await text(laptop)), "an image dropped onto a line goes on its own line after it, and reaches the others");
-  const current = agent("doc", "show");
-  writeFileSync(path, `${current.text}\n${agent("doc", "attach", notes).markdown}\n`);
-  agent("doc", "edit", "--base", current.version, path);
+  const notesLink = agent("attach", notes).markdown;
+  writeFileSync(path, `${file()}\n${notesLink}\n`);
   const linked = laptop.waitForEvent("download");
   await laptop.locator(".cm-link", { hasText: "notes.txt" }).click();
   check((await linked).suggestedFilename() === "notes.txt", "another file the doc links downloads on a click");
