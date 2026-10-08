@@ -1,5 +1,6 @@
 //! Groups, identities, contacts and invites, with no network: MLS state through openmls's storage.
 
+pub mod contacts;
 pub mod device;
 pub mod group;
 pub mod identity;
