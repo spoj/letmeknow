@@ -9,6 +9,13 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct Relay(reqwest::Client);
 
+/// Whether a page whose entries are `sizes` bytes holds everything after its cursor. The relay ends a page early only
+/// before an entry that would take it past 2 MiB, and entries are at most 1 MiB, so a page of at most 1 MiB is whole:
+/// there is no need to ask for the next, empty one.
+pub fn whole(sizes: impl Iterator<Item = usize>) -> bool {
+    sizes.sum::<usize>() <= 1024 * 1024
+}
+
 #[derive(Deserialize)]
 struct Frame {
     seq: u64,

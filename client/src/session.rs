@@ -1,6 +1,6 @@
 use crate::device::{Device, Membership};
 use crate::files;
-use crate::relay::{Notice, Relay, transient};
+use crate::relay::{Notice, Relay, transient, whole};
 use crate::store::{Provider, SCHEMA};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
@@ -855,14 +855,20 @@ impl Session {
 
     /// Takes in what the relay has for a group now, so a file is read, or a message built, from where the group stands.
     async fn catch_up_now(&mut self, gid: &str) -> Result<()> {
-        let Some(group) = self.groups.get(gid) else { return Ok(()) };
-        let (relay, cursor) = (group.relay.clone(), group.cursor);
-        for (seq, data) in self.relay.fetch(&relay, gid, cursor).await? {
-            if let Err(error) = self.receive(gid, seq, &data).await {
-                self.warn(Some(gid), format!("{error:#}"));
+        loop {
+            let Some(group) = self.groups.get(gid) else { return Ok(()) };
+            let (relay, cursor) = (group.relay.clone(), group.cursor);
+            let messages = self.relay.fetch(&relay, gid, cursor).await?;
+            let done = whole(messages.iter().map(|(_, data)| data.len()));
+            for (seq, data) in messages {
+                if let Err(error) = self.receive(gid, seq, &data).await {
+                    self.warn(Some(gid), format!("{error:#}"));
+                }
+            }
+            if done {
+                return Ok(());
             }
         }
-        Ok(())
     }
 
 
@@ -1370,9 +1376,14 @@ impl Session {
         let (mut entries, mut after) = (Vec::new(), 0);
         loop {
             let page = self.relay.entries(relay, address, after, 0).await?;
-            let Some(last) = page.last() else { return Ok(entries) };
-            after = last.0;
+            let done = whole(page.iter().map(|(_, _, data)| data.len()));
+            if let Some(last) = page.last() {
+                after = last.0;
+            }
             entries.extend(page.into_iter().map(|(_, _, data)| data));
+            if done {
+                return Ok(entries);
+            }
         }
     }
 
@@ -1670,7 +1681,7 @@ async fn catch_up(
 ) -> Result<()> {
     loop {
         let messages = http.fetch(relay, gid, *after).await?;
-        let was_synced = std::mem::replace(synced, messages.is_empty());
+        let was_synced = std::mem::replace(synced, whole(messages.iter().map(|(_, data)| data.len())));
         if let Some((seq, _)) = messages.last() {
             *after = *seq;
         }

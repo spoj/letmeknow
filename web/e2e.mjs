@@ -132,6 +132,8 @@ try {
     await route.fetch();
     await route.abort();
   });
+  const fetches = [];
+  laptop.on("request", request => request.method() === "GET" && request.url().includes("/messages") && fetches.push(request.url()));
   await laptop.reload();
   await laptop.getByRole("button", { name: /^Files/ }).click();
   await laptop.getByRole("button", { name: "checklist.md" }).click();
@@ -143,6 +145,7 @@ try {
   await laptop.getByText("after the reload").waitFor();
   check(await laptop.getByText("Thanks, on it").isVisible(), "a reloaded browser keeps its messages and can still read new ones");
   check(lost === 1, "even when the relay took its key update but the answer was lost");
+  check(fetches.length === 1, `and catching up after the reload took one fetch (${fetches.length})`);
   check(!(await laptop.locator(".messages li", { hasText: "after the reload" }).textContent()).includes(" new"), "and later messages from it are not new");
   await laptop.unrouteAll();
   const requests = [];

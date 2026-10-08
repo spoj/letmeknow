@@ -84,10 +84,21 @@ async function boxRead(address: string, after = 0, wait = 0): Promise<{ seq: num
   return entries.map(e => ({ ...e, data: atob(e.data) }));
 }
 
+/**
+ * Whether a page whose entries are `sizes` bytes holds everything after its cursor. The relay ends a page early only
+ * before an entry that would take it past 2 MiB, and entries are at most 1 MiB, so a page of at most 1 MiB is whole:
+ * there is no need to ask for the next, empty one.
+ */
+const whole = (sizes: number[]) => sizes.reduce((a, b) => a + b, 0) <= 1024 * 1024;
+
 async function boxAll(address: string): Promise<string[]> {
   const all: string[] = [];
-  for (let page = await boxRead(address); page.length; page = await boxRead(address, page[page.length - 1].seq)) all.push(...page.map(e => e.data));
-  return all;
+  for (let after = 0; ; ) {
+    const page = await boxRead(address, after);
+    all.push(...page.map(e => e.data));
+    if (whole(page.map(e => e.data.length))) return all;
+    after = page[page.length - 1].seq;
+  }
 }
 
 const boxAppend = (address: string, data: string) => http(`/b/${address}`, { method: "POST", body: data });
@@ -120,6 +131,8 @@ export class Client {
   /** Inbox entries by entity, kept while the inbox's socket announces nothing new; `inboxNotices` counts announcements. */
   private inboxes = new Map<string, string[]>();
   private inboxNotices = 0;
+  /** Groups loaded with the page whose keys are to be replaced once caught up. */
+  private loaded = new Set<string>();
   private writes = new Map<string, [string, string, unknown]>();
   private saved = new Map<string, string>();
   private dirtyFiles = new Set<string>();
@@ -214,12 +227,9 @@ export class Client {
    */
   connect() {
     for (const gid of this.groups.keys()) {
+      this.loaded.add(gid);
       this.followGroup(gid);
       this.followRequests(gid);
-      this.run(async () => {
-        await this.catchUp(gid);
-        await this.updateKey(gid);
-      });
     }
     setInterval(() => this.groups.forEach((_, gid) => this.followGroup(gid)), 15_000);
     setInterval(() => this.groups.forEach((_, gid) => this.followRequests(gid)), 60_000);
@@ -289,6 +299,8 @@ export class Client {
     if (!group || (notice && notice.seq <= group.cursor)) return;
     if (notice?.data !== undefined && notice.seq === group.cursor + 1) return this.take(gid, notice.seq, notice.data);
     await this.catchUp(gid);
+    // Caught up after loading: replace this member's keys, for post-compromise security.
+    if (this.loaded.delete(gid)) await this.updateKey(gid);
   }
 
   private async catchUp(gid: string) {
@@ -296,8 +308,9 @@ export class Client {
       const group = this.groups.get(gid);
       if (!group) return;
       const page: { seq: number; data: string }[] = await (await http(`/g/${gid}/messages?after=${group.cursor}`)).json();
-      if (!page.length) return;
       for (const { seq, data } of page) await this.take(gid, seq, data);
+      // Base64 is a third larger than what it encodes.
+      if (whole(page.map(m => (m.data.length * 3) / 4))) return;
     }
   }
 
