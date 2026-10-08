@@ -6,3 +6,21 @@ license.workspace = true
 
 [dependencies]
 lmk-proto.workspace = true
+anyhow.workspace = true
+async-trait = "0.1"
+ed25519-dalek.workspace = true
+hex.workspace = true
+iroh = { workspace = true, features = ["tls-ring"] }
+notify.workspace = true
+rand.workspace = true
+thiserror = "2"
+serde.workspace = true
+rusqlite = { workspace = true, features = ["bundled"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+iroh-relay = { workspace = true, features = ["server"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { workspace = true, features = ["full"] }
