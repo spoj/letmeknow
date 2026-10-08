@@ -1072,6 +1072,11 @@ impl Session {
         group.cursor = seq;
         self.db.execute("UPDATE groups SET cursor = ? WHERE gid = ?", params![seq, gid])?;
         let id = digest(data);
+        let pending: Option<String> = self.db.query_row("SELECT id FROM pending WHERE gid = ?", [gid], |r| r.get(0)).optional()?;
+        if pending.as_ref() == Some(&id) {
+            // This session's commit, which the relay took though its answer never came.
+            return self.merge_pending(gid).await;
+        }
         let posted: Option<String> = self.db.query_row("SELECT id FROM posted WHERE id = ?", [&id], |r| r.get(0)).optional()?;
         if posted.is_some() {
             return Ok(());
@@ -1104,7 +1109,9 @@ impl Session {
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 let changes = membership_changes(&group.mls, &staged, &sender);
                 let self_removed = staged.self_removed();
+                // Merging drops any commit of this session's own for the same epoch: the relay took this one instead.
                 group.mls.merge_staged_commit(&self.provider, *staged)?;
+                self.db.execute("DELETE FROM pending WHERE gid = ?", [gid])?;
                 if self_removed {
                     self.drop_group(gid)?;
                     let by = self.describe(gid, sender).await?;
@@ -1122,6 +1129,8 @@ impl Session {
 
     /// Posts the message `build` makes from the current epoch, and merges it if it is a commit. Returns its id and relay
     /// sequence number, or `None` if the relay has seen a commit this session has not: it only takes messages for its epoch.
+    /// A commit whose answer never came stays pending, recorded in `pending`: the relay may have taken it, and catching up
+    /// tells.
     async fn post(
         &mut self,
         gid: &str,
@@ -1131,20 +1140,29 @@ impl Session {
         let bytes = build(&mut group.mls, &self.provider, &self.signer)?.to_bytes()?;
         let (id, relay) = (digest(&bytes), group.relay.clone());
         self.db.execute("INSERT INTO posted (id) VALUES (?)", [&id])?;
-        let posted = self.relay.post(&relay, gid, &bytes).await;
-        let mls = &mut self.groups.get_mut(gid).expect("still tracked").mls;
-        let Ok(Some(seq)) = posted else {
-            mls.clear_pending_commit(self.provider.storage())?;
-            return posted.map(|_| None);
-        };
-        if let Some(staged) = mls.pending_commit() {
-            let changes = membership_changes(mls, staged, &self.person);
-            mls.merge_pending_commit(&self.provider)?;
-            for change in changes {
-                self.deliver_change(gid, change).await?;
-            }
+        if group.mls.pending_commit().is_some() {
+            self.db.execute("INSERT OR REPLACE INTO pending (gid, id) VALUES (?, ?)", [gid, &id])?;
         }
+        let Some(seq) = self.relay.post(&relay, gid, &bytes).await? else {
+            self.groups.get_mut(gid).expect("still tracked").mls.clear_pending_commit(self.provider.storage())?;
+            self.db.execute("DELETE FROM pending WHERE gid = ?", [gid])?;
+            return Ok(None);
+        };
+        self.merge_pending(gid).await?;
         Ok(Some((id, seq)))
+    }
+
+    /// Merges this session's commit once the relay took it, and delivers the membership changes it makes.
+    async fn merge_pending(&mut self, gid: &str) -> Result<()> {
+        self.db.execute("DELETE FROM pending WHERE gid = ?", [gid])?;
+        let mls = &mut self.groups.get_mut(gid).context("unknown group")?.mls;
+        let Some(staged) = mls.pending_commit() else { return Ok(()) };
+        let changes = membership_changes(mls, staged, &self.person);
+        mls.merge_pending_commit(&self.provider)?;
+        for change in changes {
+            self.deliver_change(gid, change).await?;
+        }
+        Ok(())
     }
 
     /// Like `post`, but on `None` catches up and builds the message again.
@@ -1153,6 +1171,14 @@ impl Session {
         gid: &str,
         mut build: impl FnMut(&mut MlsGroup, &Provider, &SignatureKeyPair) -> Result<MlsMessageOut>,
     ) -> Result<(String, u64)> {
+        if self.groups.get(gid).context("unknown group")?.mls.pending_commit().is_some() {
+            // A commit whose answer never came: if the relay has it, catching up merges it; if not, it never arrived.
+            self.catch_up_now(gid).await?;
+            if self.groups[gid].mls.pending_commit().is_some() {
+                self.groups.get_mut(gid).expect("checked").mls.clear_pending_commit(self.provider.storage())?;
+                self.db.execute("DELETE FROM pending WHERE gid = ?", [gid])?;
+            }
+        }
         for _ in 0..3 {
             if let Some(posted) = self.post(gid, &mut build).await? {
                 return Ok(posted);
@@ -1239,7 +1265,7 @@ impl Session {
         }
         self.folders.remove(gid);
         self.backlog.remove(gid);
-        for table in ["groups", "folders", "messages", "settings", "applied", "files", "versions"] {
+        for table in ["groups", "folders", "messages", "settings", "applied", "files", "versions", "pending"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [gid])?;
         }
         let attachments = self.attachments.join(&digest(gid.as_bytes())[..16]);
