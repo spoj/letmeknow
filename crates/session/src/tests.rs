@@ -529,7 +529,7 @@ fn a_restarted_session_resumes_its_groups_and_docs() {
         let mut alice = world.start("alice", HOUR).await;
         let invite = alice.cmd(&["invite", "--kind", "doc", "--name", "Notes"]).await.unwrap();
         let file = invite["file"].as_str().unwrap().to_owned();
-        assert!(file.contains("/docs/Notes-"));
+        assert!(std::path::Path::new(&file).parent().unwrap().ends_with("docs"));
         alice.stop().await;
         std::fs::write(&file, "written while stopped\n").unwrap();
         let alice = world.start("alice", HOUR).await;

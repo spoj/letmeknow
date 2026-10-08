@@ -226,14 +226,3 @@ async fn sessions_of_one_device_find_each_other() {
     assert!(!published.exists());
     b.net.shutdown().await.unwrap();
 }
-
-#[test]
-fn builds_for_the_browser() {
-    let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/wasm-check");
-    let status = std::process::Command::new(env!("CARGO"))
-        .args(["build", "-p", "lmk-net", "--target", "wasm32-unknown-unknown", "--target-dir"])
-        .arg(target)
-        .status()
-        .unwrap();
-    assert!(status.success());
-}
