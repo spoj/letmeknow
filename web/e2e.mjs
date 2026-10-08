@@ -227,13 +227,27 @@ try {
     n => n === 2
   );
   check(tablet.run("identity", "list").identities[0].name === "Matt", "a native device joins the browser's identity by its link");
+
+  // The laptop opens a new chat to its identity, and the tablet, a device of it, joins without an invite.
+  await laptop.getByRole("button", { name: "New chat" }).click();
+  await laptop.locator("dialog").getByLabel("Name").fill("Ideas");
+  await laptop.locator("dialog").getByRole("button", { name: "Start" }).click();
+  await laptop.locator(".group-list button.on", { hasText: "Ideas" }).waitFor();
+  await laptop.getByRole("button", { name: "Settings" }).click();
+  await laptop.getByText("Your other devices can join").click();
+  await laptop.locator("dialog input[type=checkbox]:checked:enabled").waitFor();
+  await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
+  const offered = await until(() => tablet.run("groups"), groups => groups.some(g => g.name === "Ideas" && g.joined === false));
+  check(offered.some(g => g.name === "Ideas"), "a chat the browser opens to its identity reaches that identity's other devices");
+  check(tablet.run("join", "Ideas").members.length === 2, "and the browser admits one that asks");
+  await laptop.locator(".people", { hasText: "Matt · " }).waitFor();
   tablet.proc.kill();
 
   // With Ann gone, what the laptop sends to her chat is pending.
   ann.proc.kill();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
-  await laptop.getByPlaceholder("Message").fill("anyone there?");
-  await laptop.getByPlaceholder("Message").press("Enter");
+  await laptop.locator("textarea:visible").fill("anyone there?");
+  await laptop.locator("textarea:visible").press("Enter");
   await laptop.locator(".messages li", { hasText: "anyone there?" }).locator(".status", { hasText: "Pending" }).waitFor();
   check(true, "a message no other member holds shows as pending");
 

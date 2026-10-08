@@ -602,10 +602,11 @@ async function inviteDialog(target: { gid: string } | { identity: string }) {
   const body = h("div", { className: "invite" });
   const dialog = modal(device ? "Add a device" : "Invite someone", body);
   const make = async (label?: string) => {
-    const link = device ? lmk.invite_device(target.identity) : lmk.invite(target.gid, label);
-    const local = location.origin + new URL(link).pathname + new URL(link).hash;
+    // The link opens this server's app, which is letmeknow.dev's unless the person runs their own.
+    const made = new URL(device ? lmk.invite_device(target.identity) : lmk.invite(target.gid, label));
+    const link = location.origin + made.pathname + made.hash;
     const { encode } = await import("uqr");
-    const { data, size } = encode(local, { border: 0 });
+    const { data, size } = encode(link, { border: 0 });
     const ns = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(ns, "svg");
     svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
@@ -636,7 +637,8 @@ async function inviteDialog(target: { gid: string } | { identity: string }) {
     client.listen(joined);
     dialog.addEventListener("close", () => client.unlisten(joined));
   };
-  if (device) return make().catch(toast);
+  // Contacts belong to an identity, so only a browser that is a device of one labels its invites.
+  if (device || !me.identities.length) return make().catch(toast);
   const label = h("input", { placeholder: "e.g. Bob (Acme)" });
   const go = h("button", { className: "primary" }, "Make a link");
   body.append(
