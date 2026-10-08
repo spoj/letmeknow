@@ -111,6 +111,8 @@ pub struct Config {
     pub files: Option<PathBuf>,
     /// The largest file fetched without being asked.
     pub file_limit: u64,
+    /// How often two connected sessions swap heads and sync their groups again.
+    pub resync: Duration,
 }
 
 /// An endpoint with our relays and no address lookup; relay connections honour the proxy

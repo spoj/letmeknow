@@ -226,3 +226,42 @@ async fn sessions_of_one_device_find_each_other() {
     assert!(!published.exists());
     b.net.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_longer_head_is_judged_once_the_log_reaches_it() {
+    let relay = relay().await;
+    let keys = keys(2);
+    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
+    let service = service();
+    let log = |entries: &[&[u8]], frozen| Group { members: members.clone(), log: entries.iter().map(|e| e.to_vec()).collect(), frozen, ..Group::default() };
+    let mut a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, log(&[b"e1", b"e2", b"x3", b"x4"], false)), Options::default()).await;
+    let mut b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, log(&[b"e1", b"e2"], true)), Options::default()).await;
+    a.net.dial(members[1], relay.url.clone()).await.unwrap();
+    // B cannot judge A's longer head yet, and takes its entries only from the service.
+    eventually("A offers B its entries", || b.fake.groups.lock().unwrap()[G].offered > 0).await;
+    b.fake.groups.lock().unwrap().get_mut(G).unwrap().log.extend([b"e3".to_vec(), b"e4".to_vec()]);
+    b.net.changed(G);
+    let event = b.until(|e| matches!(e, Event::Contradiction { .. })).await;
+    let Event::Contradiction { ours, theirs, .. } = event else { unreachable!() };
+    assert_eq!((ours.length, theirs.length), (4, 4));
+    assert_ne!(ours.hash, theirs.hash);
+    assert!(a.events.try_recv().into_iter().all(|e| !matches!(e, Event::Contradiction { .. })));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connected_peers_sync_again() {
+    let relay = relay().await;
+    let keys = keys(2);
+    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
+    let service = service();
+    let group = || Group { members: members.clone(), log: vec![b"e1".to_vec()], ..Group::default() };
+    let often = || Options { resync: std::time::Duration::from_millis(200), ..Options::default() };
+    let mut a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), often()).await;
+    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), often()).await;
+    a.net.dial(members[1], relay.url.clone()).await.unwrap();
+    a.synced(G, members[1]).await;
+    // A message that reached A but was never sent on, as when a live send was lost.
+    let missed = message(1, "missed");
+    a.fake.hold(G, missed.clone());
+    eventually("the next sync brings it", || b.fake.holds(G, &missed)).await;
+}

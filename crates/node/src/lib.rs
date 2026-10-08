@@ -42,6 +42,8 @@ const MAX_MESSAGE: usize = 1 << 20;
 const RECEIPT_WAIT: Duration = Duration::from_secs(5);
 /// How often members not connected are dialed again.
 const REDIAL: Duration = Duration::from_secs(10);
+/// How often connected members sync their groups again.
+const RESYNC: Duration = Duration::from_secs(5 * 60);
 /// How long a fetched device list counts as fresh, in milliseconds.
 const LIST_FRESH: u64 = 10 * 60 * 1000;
 /// How long a fetch keeps looking for a member that holds the file.
@@ -491,6 +493,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             home: config.home,
             files: config.files,
             file_limit: config.file_limit,
+            resync: RESYNC,
         };
         let (net, mut net_events) =
             Net::spawn(endpoint, net_config, inner.clone(), Arc::new(groups::Admitter(inner.clone()))).await?;

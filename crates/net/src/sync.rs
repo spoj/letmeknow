@@ -4,7 +4,7 @@ use lmk_proto::{Bytes, head::Head, peer::Hello};
 use negentropy::{Id, NegentropyStorageVector};
 
 /// Whether `theirs` proves the service showed us a different log: our chain at its length differs.
-/// A longer head cannot be judged until we reach its length.
+/// A longer head is judged once we reach its length.
 pub fn contradicts(theirs: &Head, ours: &Head, chain: impl FnOnce(u64) -> Option<[u8; 32]>) -> bool {
     theirs.length <= ours.length && chain(theirs.length).is_some_and(|hash| hash[..] != theirs.hash.0[..])
 }

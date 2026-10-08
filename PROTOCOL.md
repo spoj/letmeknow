@@ -58,7 +58,7 @@ A log is a directory, `<folder>/<log id, hex>/`, holding one file per entry, `<p
 
 ### Gossip
 
-Two connected members exchange the newest signed heads they hold for the logs they share (see Peer protocol). A head that a member's own chain contradicts (same length, other hash; or a shorter head that is not a prefix of its chain) is proof: the session reports both heads in a `warning`.
+Two connected members exchange the newest signed heads they hold for the logs they share (see Peer protocol). A head that a member's own chain contradicts (same length, other hash; or a shorter head that is not a prefix of its chain) is proof: the session reports both heads in a `warning`. A longer head is kept, the longest from each peer, and judged once the member's own chain reaches its length.
 
 ## Groups
 
@@ -153,7 +153,7 @@ A message's id is SHA-256 of its MLS ciphertext. A member holds `message` and `l
 
 ## Peer protocol
 
-A `peer` stream joins two sessions that share a group, one stream per pair, kept open while both are online. Either side may send a frame at any time; every frame names its group, and a side serves a group only to a peer whose iroh key is in a leaf of that group's current epoch.
+A `peer` stream joins two sessions that share a group, one stream per pair, kept open while both are online. Either side may send a frame at any time; every frame names its group, and a side serves a group only to a peer whose iroh key is in a leaf of that group's current epoch. Each side sends `hello` when the stream opens and when its state of a group changes; and every 5 minutes it sends `hello` again and syncs each group anew, even if nothing changed, so a message lost on its way is found within 5 minutes.
 
 | Frame | Meaning |
 |---|---|
