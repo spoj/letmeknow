@@ -103,7 +103,7 @@ def main():
     subprocess.run([shutil.which("node"), "build.mjs"], cwd=web, check=True)
     os.makedirs(os.path.join(ROOT, "relay", ".wrangler"), exist_ok=True)
     log = open(os.path.join(ROOT, "relay", ".wrangler", "e2e.log"), "w")
-    relay = subprocess.Popen([shutil.which("npx"), "wrangler", "dev", "--port", str(PORT)], cwd=os.path.join(ROOT, "relay"),
+    relay = subprocess.Popen([shutil.which("npx"), "wrangler", "dev", "--port", str(PORT), "--inspector-port", str(free_port())], cwd=os.path.join(ROOT, "relay"),
                              env=ENV, stdout=log, stderr=subprocess.STDOUT)
     listeners = []
     try:
