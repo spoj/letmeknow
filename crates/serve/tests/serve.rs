@@ -3,7 +3,7 @@ use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, endpoint::presets, tls::CaTlsConfig};
 use iroh_relay::RelayQuicConfig;
 use lmk_membership::{Membership, client::ServeClient};
-use lmk_serve::{Certificate, ServeConfig, membership_key, serve};
+use lmk_serve::{Certificate, ServeConfig, serve};
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -75,7 +75,7 @@ async fn serves_relay_membership_and_page() {
         config.membership_port,
     );
     let relay = config.relay_url();
-    let key = membership_key(&state).unwrap().public();
+    let service = config.service().unwrap();
     let server = tokio::spawn(serve(config));
 
     for _ in 0..50 {
@@ -121,7 +121,7 @@ async fn serves_relay_membership_and_page() {
         .bind()
         .await
         .unwrap();
-    let client = ServeClient::new(endpoint, key.as_bytes(), &relay, &[]).unwrap();
+    let client = ServeClient::for_service(endpoint, &service).unwrap();
     let appended = tokio::time::timeout(Duration::from_secs(10), client.append(b"g", b"commit"))
         .await
         .unwrap()
@@ -134,7 +134,10 @@ async fn serves_relay_membership_and_page() {
         .bind()
         .await
         .unwrap();
-    let direct = ServeClient::new(endpoint, key.as_bytes(), "", &[format!("127.0.0.1:{membership}")]).unwrap();
+    let lmk_proto::group::Service::Serve { key, .. } = service else {
+        unreachable!()
+    };
+    let direct = ServeClient::new(endpoint, &key.0, "", &[format!("127.0.0.1:{membership}")]).unwrap();
     let page = direct.read(b"g", 0).await.unwrap();
     assert_eq!(page.entries[0].0, b"commit");
     let head = direct.head(b"g").await.unwrap();

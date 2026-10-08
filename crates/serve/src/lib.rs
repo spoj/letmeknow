@@ -34,6 +34,7 @@ use lmk_membership::{
     service::{Policy, Service},
     store::Store,
 };
+use lmk_proto::group;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::{net::TcpListener, sync::Notify};
 use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
@@ -87,10 +88,20 @@ impl ServeConfig {
             port => format!("https://{}:{port}", self.domain),
         }
     }
+
+    /// The address members put in their settings: the service's key and relay.
+    pub fn service(&self) -> Result<group::Service> {
+        let key = membership_key(&self.state)?.public();
+        Ok(group::Service::Serve {
+            key: (*key.as_bytes()).into(),
+            relay: self.relay_url(),
+            addrs: vec![],
+        })
+    }
 }
 
 /// The membership service's iroh key, which also signs its heads; made on first use.
-pub fn membership_key(state: &Path) -> Result<SecretKey> {
+fn membership_key(state: &Path) -> Result<SecretKey> {
     let path = state.join("membership.key");
     if let Ok(bytes) = std::fs::read(&path) {
         let bytes: [u8; 32] = bytes

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 lmk-membership.workspace = true
+lmk-proto.workspace = true
 anyhow.workspace = true
 ed25519-dalek.workspace = true
 http = "1"
@@ -22,5 +23,4 @@ tokio-stream = "0.1"
 tracing = "0.1"
 
 [dev-dependencies]
-lmk-proto.workspace = true
 rcgen = "0.14"
