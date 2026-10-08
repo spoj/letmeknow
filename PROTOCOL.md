@@ -13,7 +13,8 @@ The exact formats behind REWRITE.md, settled by the wave-1 prototypes on the `sp
 
 - All of our protocols use one ALPN, `letmeknow/1`, so two endpoints keep one connection. Each exchange is a bidirectional stream whose first frame names it: `{"stream": "membership" | "peer" | "invite"}`. File transfers use iroh-blobs' own ALPN.
 - Endpoints use iroh's `presets::Minimal` with a relay map holding our relays, and dial `EndpointAddr::new(key).with_relay_url(url)`, from the addresses that leaves, settings and invite links carry. iroh 1.3.0; the browser build enables only `tls-ring`.
-- Sessions of one device write their current direct addresses to `LETMEKNOW_HOME/addresses/<iroh key>.json` and dial each other from there, with no relay needed.
+- Sessions of one device write their current direct addresses to `LETMEKNOW_HOME/addresses/<iroh key, hex>.json`, as `{"addrs": ["<ip:port>"]}`, and dial each other from there, with no relay needed.
+- An invite link that names no relay is reached through letmeknow.dev's.
 - The session process calls `proxy_from_env()`.
 
 ## Keys
@@ -100,6 +101,7 @@ A member checks `device_sig` and the identity's device list (see Identity) when 
 - Ended epochs are kept by `max_past_epochs(256)` and dropped by `delete_past_epoch_secrets(PastEpochDeletion::older_than_duration(7 days))`, which dates an epoch by when it began.
 - State is stored in SQLite with WAL and `synchronous = NORMAL`, encoded as CBOR (ciborium; openmls cannot be read back by bincode). The browser stores openmls state in IndexedDB, one record per key, not as one dump.
 - Every change is inline in its commit; standalone proposals are never sent, and a commit that refers to one is invalid. So is an update that changes a member's credential identity or device.
+- A commit that adds members carries, as its authenticated data, `{"how": "invite" | "open"}`: how they came in, as its committer vouches. It does not bear on the commit's validity.
 - A member reads its group's log in order. For the epoch it is in, the first entry that is a valid commit for that epoch is applied; every other entry is skipped.
 - A committer saves its commit's bytes, posts them, and merges (`merge_pending_commit`) only if its entry, found by those bytes, is the first valid commit for its epoch; otherwise it clears it (`clear_pending_commit`), applies the winner (`merge_staged_commit`), and redoes its change on the new epoch.
 - Once the log has taken a commit, its author sends it to the members online (see Peer protocol).
@@ -115,11 +117,11 @@ A member checks `device_sig` and the identity's device list (see Identity) when 
 
 ### Contacts
 
-An identity's contacts live in its devices group as a Yjs map from identity id to `{"name", "how": "verified" | "introduced", "by", "at"}` (`by`: the introducer's identity id). It is synced like a doc's text: edits live, catch-up by diff, and its state linked in the Welcome.
+An identity's contacts live in its devices group as a Yjs map, named `contacts`, from identity id (unpadded base64url) to `{"name", "how": "verified" | "introduced", "by", "at"}` (`by`: the introducer's identity id). It is synced like a doc's text: edits live, catch-up by diff, and its state linked in the Welcome. A device on several identities writes contacts to its first.
 
 ### Devices group
 
-An identity's devices group is a chat whose settings carry `devices_of`. Its members are devices, not sessions: on a machine, whichever session process is running acts for the device, holding a lock in `LETMEKNOW_HOME`, and records what it learns (openings) there for the device's other sessions. In a browser, the device is the session.
+An identity's devices group is a chat whose settings carry `devices_of`. Its members are devices, not sessions: on a machine, whichever session process holds the lock `LETMEKNOW_HOME/device.lock` acts for the device, as a member whose MLS key is the device key, with its own iroh key and its state in `LETMEKNOW_HOME/device.db`. The device's other session processes do without its contacts and openings. In a browser, the device is the session.
 
 An opening, in its settings: `{"group", "kind", "name", "membership", "members": ["<iroh key>"]}`. A member that is a device of the identity writes it, and refreshes `members` when the group's membership changes.
 
@@ -127,7 +129,7 @@ An opening, in its settings: `{"group", "kind", "name", "membership", "members":
 
 A link is `https://letmeknow.dev/i#<fragment>`, where the fragment is `1.<g|d>.<inviter's iroh key>.<secret>[.<relay>]`: version 1; `g` for a group, `d` for a device link; then the key, a 16-byte random secret and, only if it is not letmeknow.dev's, the relay URL, each in unpadded base64url.
 
-The joiner opens an `invite` stream to the inviter's key and sends `{"secret", "key_package"}`. For a device link, the KeyPackage's credential names the new device's key and name, and no identity: the devices group's `devices_of` names it. The inviter checks the secret (single use, 10 minutes), commits the Add (for a device link: appends to the device list and adds the device to the devices group), and answers `{"welcome", "position", "doc"}`: `position` is the log position the joiner reads from, and `doc`, for a doc, links the doc's state as a file (see Files). A wrong or used secret gets `{"refused"}`; with 128 bits there is nothing to guess, so it uses nothing up.
+The joiner opens an `invite` stream to the inviter's key and sends `{"secret", "key_package"}`. For a device link, the KeyPackage's credential names the new device's key and name, and no identity: the devices group's `devices_of` names it. The inviter checks the secret (single use, 10 minutes), commits the Add (for a device link: appends to the device list and adds the device to the devices group), and answers `{"welcome", "position", "doc"}`: `position` is the log position of the commit that added the joiner, which reads the entries after it and anchors its chain at the first head it reads, and `doc`, for a doc or a devices group, links its Yjs state as a file (see Files). A wrong or used secret gets `{"refused"}`; with 128 bits there is nothing to guess, so it uses nothing up. Neither does a joiner refused by a link made for another identity. For a device link, the new device's MLS key is its device key.
 
 ## Messages
 
@@ -153,11 +155,16 @@ A `peer` stream joins two sessions that share a group, one stream per pair, kept
 | `{"commits": {"group", "entries", "head"}}` | Log entries the other lacks, judged by its head; also sent by a commit's author once the service has taken it |
 | `{"reconcile": {"group", "msg"}}` | A negentropy message (see below) |
 | `{"messages": {"group", "items"}}` | MLS ciphertexts the other lacks; also every new message as it is sent |
+| `{"receipt": {"group", "held": ["<id>"], "refused": [{"id", "reason"}]}}` | The answer to `messages`: the ids of the items the receiver took (held, or applied for an edit or diff), and of those it refused; items that wait for a commit are answered once applied, in a later receipt or not at all |
 | `{"doc": {"group", "snapshot"}}` | SHA-256 of `txn.snapshot().encode_v1()` |
 | `{"doc_sv": {"group", "sv"}}` | A Yjs state vector, sent when the snapshots differ; answered by a `diff` message |
 | `{"want": {"group", "files"}}`, `{"have": {"group", "files"}}` | BLAKE3 hashes (see Files) |
 | `{"join": {"group", "key_package"}}` | A request to join an open group, answered by `admitted` or `refused` |
 | `{"admitted": {"group", "admitted": {"welcome", "position", "doc"}}}`, `{"refused": {"group", "refused"}}` | The answer to `join`, as an invite's |
+
+A side that holds no head for a group yet sends the empty log's: length 0, hash h₀, `time` 0 and no signature, which needs none.
+
+A sender learns from receipts who holds its message, and who refused it; it keeps its message as its own pending send until a receipt says a member holds it, and offers it in every sync meanwhile. A receiver that refuses or cannot open a message keeps its id among those it gave up, so a message naming it in `after` shows a known gap rather than waiting.
 
 Message sync, per group, starts once both sides have caught up on commits. It is negentropy (crate `negentropy` 0.5) over items whose timestamp is the epoch and whose id is the message id, from epoch max(the later `joined`, the lower `floor`). `reconcile` frames alternate until negentropy is done; then `messages` carries what each lacks, never older than the receiver's `floor`. Ids a member gave up on (beyond its key window) stay in its set, so they are not offered again.
 
