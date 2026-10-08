@@ -217,6 +217,9 @@ enum Into {
 #[derive(Serialize, Deserialize)]
 pub struct Record {
     from: Person,
+    /// When it was written, in milliseconds since the Unix epoch: members take records in this order (each after the
+    /// messages it comes `after`), and the same message written twice is two records.
+    at: u64,
     #[serde(flatten)]
     payload: Payload,
 }
@@ -706,8 +709,7 @@ impl Session {
         attach: Option<(String, String)>,
         text: String,
     ) -> Result<Value> {
-        let gid = self.resolve(group)?;
-        self.require(&gid, CHAT)?;
+        let gid = self.of_kind(group, CHAT)?;
         let members = self.members(&gid)?;
         if let Some(to) = to.iter().find(|to| !members.iter().any(|m| m["fp"] == to.as_str())) {
             bail!("{to} is not a member of {gid}");
@@ -731,12 +733,27 @@ impl Session {
         Ok(json!({ "id": id }))
     }
 
-    /// Refuses what belongs to another kind of group.
-    fn require(&self, gid: &str, kind: &str) -> Result<()> {
-        match self.settings(gid)?.kind {
-            have if have == kind => Ok(()),
-            have if KINDS.contains(&have.as_str()) => bail!("{gid} is a {have} group; this works in a {kind} group"),
-            have => bail!("{gid} is a group of a kind this letmeknow does not know ({have:?}); upgrade it"),
+    /// The group a chat or doc command acts on: the one --group names, which must be of `kind`, or else the session's
+    /// one group of that kind.
+    fn of_kind(&self, group: Option<String>, kind: &str) -> Result<String> {
+        if group.is_some() {
+            let gid = self.resolve(group)?;
+            return match self.settings(&gid)?.kind {
+                have if have == kind => Ok(gid),
+                have if KINDS.contains(&have.as_str()) => bail!("{gid} is a {have} group, and this works in a {kind} group"),
+                have => bail!("{gid} is a group of a kind this letmeknow does not know ({have:?}); upgrade it"),
+            };
+        }
+        let mut found = Vec::new();
+        for gid in self.groups.keys().chain(self.folders.keys()) {
+            if self.settings(gid)?.kind == kind {
+                found.push(gid.clone());
+            }
+        }
+        match &found[..] {
+            [gid] => Ok(gid.clone()),
+            [] => bail!("this session is in no {kind} group; create one with `invite --kind {kind}`, or join one with `join`"),
+            _ => bail!("this session is in several {kind} groups; pass --group"),
         }
     }
 
@@ -764,13 +781,14 @@ impl Session {
             let bytes = serde_json::to_vec(payload)?;
             return Ok(self.post_retrying(gid, |mls, provider, signer| Ok(mls.create_message(provider, signer, &bytes)?)).await?.0);
         }
-        let bytes = serde_json::to_vec(&Record { from: serde_json::from_value(self.person.clone())?, payload: payload.clone() })?;
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
+        let bytes = serde_json::to_vec(&Record { from: serde_json::from_value(self.person.clone())?, at, payload: payload.clone() })?;
         let (dir, id) = (Path::new(gid), digest(&bytes));
         let temp = dir.join(format!(".{id}.tmp"));
         std::fs::write(&temp, bytes)?;
         std::fs::rename(&temp, dir.join(format!("{id}.json")))?;
         // Taken in already, so the folder scan does not apply it again.
-        self.db.execute("INSERT INTO applied (id, gid) VALUES (?, ?)", params![id, gid])?;
+        self.db.execute("INSERT INTO applied (gid, id) VALUES (?, ?)", params![gid, id])?;
         Ok(id)
     }
 
@@ -860,15 +878,13 @@ impl Session {
     async fn doc(&mut self, op: DocOp) -> Result<Value> {
         match op {
             DocOp::Show { group } => {
-                let gid = self.resolve(group)?;
-                self.require(&gid, DOC)?;
+                let gid = self.of_kind(group, DOC)?;
                 self.catch_up_now(&gid).await?;
                 let state = self.text(&gid)?;
                 Ok(json!({ "group": gid, "version": self.keep_version(&gid, &state)?, "text": doc::text(&state)? }))
             }
             DocOp::Edit { group, base, text } => {
-                let gid = self.resolve(group)?;
-                self.require(&gid, DOC)?;
+                let gid = self.of_kind(group, DOC)?;
                 self.catch_up_now(&gid).await?;
                 let state = self.text(&gid)?;
                 let base_state: Vec<u8> = self
@@ -885,8 +901,7 @@ impl Session {
                 Ok(json!({ "group": gid, "version": version, "merged": base != doc::version(&state), "lost": lost, "text": doc::text(&merged)? }))
             }
             DocOp::Attach { group, path } => {
-                let gid = self.resolve(group)?;
-                self.require(&gid, DOC)?;
+                let gid = self.of_kind(group, DOC)?;
                 let bytes = std::fs::read(&path).with_context(|| format!("cannot read {path}"))?;
                 let name = Path::new(&path).file_name().map_or_else(String::new, |n| n.to_string_lossy().replace(['[', ']'], ""));
                 let attachment = self.upload(&gid, &bytes, &name, Path::new(&path)).await?;
@@ -1666,7 +1681,7 @@ impl Session {
             self.warn(Some(gid), format!("ignored a {belongs} message in this {kind} group"));
             return Ok(());
         }
-        if !matches!(payload, Payload::Message(_)) && self.db.execute("INSERT OR IGNORE INTO applied (id, gid) VALUES (?, ?)", params![id, gid])? == 0 {
+        if !matches!(payload, Payload::Message(_)) && self.db.execute("INSERT OR IGNORE INTO applied (gid, id) VALUES (?, ?)", params![gid, id])? == 0 {
             return Ok(());
         }
         match payload {
@@ -1874,7 +1889,7 @@ async fn notified(ws: &mut WebSocket) -> Option<Notice> {
 /// Messages in `dir` not yet in `seen`, in causal order, and the names of files not named by their content's hash.
 /// Temp files are skipped; files that fail to parse are retried next scan.
 fn scan(dir: &Path, seen: &mut HashSet<OsString>) -> (Vec<(String, Record)>, Vec<String>) {
-    let (mut found, mut ignored) = (Vec::new(), Vec::new());
+    let (mut records, mut ignored) = (Vec::new(), Vec::new());
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let (name, path) = (entry.file_name(), entry.path());
         if path.extension() != Some(OsStr::new("json")) || seen.contains(&name) {
@@ -1888,10 +1903,9 @@ fn scan(dir: &Path, seen: &mut HashSet<OsString>) -> (Vec<(String, Record)>, Vec
             ignored.push(name.to_string_lossy().into_owned());
             continue;
         }
-        found.push((entry.metadata().and_then(|m| m.modified()).ok(), id, record));
+        records.push((id, record));
     }
-    found.sort_by_key(|(modified, ..)| *modified);
-    let mut records: Vec<(String, Record)> = found.into_iter().map(|(_, id, record)| (id, record)).collect();
+    records.sort_by_key(|(_, record)| record.at);
     let mut pending: HashSet<String> = records.iter().map(|(id, _)| id.clone()).collect();
     let mut ordered = Vec::with_capacity(records.len());
     while !records.is_empty() {

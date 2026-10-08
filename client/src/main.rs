@@ -266,15 +266,18 @@ async fn serve(stream: TcpStream, token: String, events: mpsc::UnboundedSender<E
 async fn call(session: &str, mut request: Request) -> Result<()> {
     if let Request::Send { text, attach, attach_name, .. } = &mut request {
         if let Some(file) = attach {
-            let bytes = match file.as_str() {
+            let (bytes, name) = match file.as_str() {
                 "-" => {
                     let mut bytes = Vec::new();
                     std::io::stdin().read_to_end(&mut bytes)?;
-                    bytes
+                    (bytes, "attachment".into())
                 }
-                path => std::fs::read(path).with_context(|| format!("cannot read {path}"))?,
+                path => {
+                    let name = Path::new(path).file_name().context("--attach names no file")?.to_string_lossy().into_owned();
+                    (std::fs::read(path).with_context(|| format!("cannot read {path}"))?, name)
+                }
             };
-            *attach_name = Path::new(file.as_str()).file_name().map_or_else(|| "attachment".into(), |n| n.to_string_lossy().into_owned());
+            *attach_name = name;
             *file = B64.encode(bytes);
         }
         if text == "-" {

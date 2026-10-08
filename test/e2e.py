@@ -186,13 +186,15 @@ def main():
         alice, bob, carol = (Listener(s) for s in ("alice", "bob", "carol"))
         listeners += [alice, bob, carol]
 
-        invite = run("alice", "invite")
+        invite = run("alice", "invite", "--name", "Plans")
         link, code = invite["link"], invite["code"]
         slot, words = code.split("-", 1)
         check(link == f"{RELAY}/i/{slot}#{words}" and len(words.split("-")) == 2, f"invite gives a short code ({code}) and its link")
+        check(invite["kind"] == "chat", "a new group is a chat unless asked otherwise")
         joined = run("bob", "join", link)
         group = joined["group"]
         check(len(joined["members"]) == 2, "bob joins alice's group through the link")
+        check(joined["kind"] == "chat" and joined["name"] == "Plans", "and learns what it is from the invite's welcome")
         check("invite already used" in run("carol", "join", link, ok=False), "an invite link works once")
         alice.expect(lambda e: e["type"] == "joined" and e["member"]["name"] == "Bob")
         fp = {m["name"]: m["fp"] for m in joined["members"]}
@@ -214,11 +216,18 @@ def main():
             f.write("s3cret-token")
         run("alice", "send", "--attach", token, "the staging token")
         got = bob.expect(lambda e: e["type"] == "message")
-        attachment = got["attachment"]
+        check(got["attachment"]["name"] == "token.txt" and got["attachment"]["size"] == 12, "an attachment arrives as a link, with its name and size")
+        attachment = run("bob", "fetch", got["attachment"]["link"])["path"]
         with open(attachment) as f:
-            check(got["content"] == "the staging token" and f.read() == "s3cret-token", "an attachment arrives as a file, with the text")
+            check(f.read() == "s3cret-token" and attachment.endswith("token.txt"), "which fetch decrypts into a file named like it")
         check(os.name == "nt" or os.stat(attachment).st_mode & 0o777 == 0o600, "that only its owner can read")
         check(not in_state(alice, b"s3cret") and not in_state(bob, b"s3cret"), "and that is its only copy")
+        big = os.urandom(3 * 1024 * 1024)
+        run("alice", "send", "--attach", write("big.bin", big), "a large file")
+        with open(run("bob", "fetch", bob.expect(lambda e: e["type"] == "message")["attachment"]["link"])["path"], "rb") as f:
+            check(f.read() == big, "an attachment holds up to 10 MiB")
+        check("files go up to" in run("alice", "send", "--attach", write("huge.bin", os.urandom(10 * 1024 * 1024 + 1)), "too much", ok=False), "and no more")
+        check("is a chat group" in run("alice", "doc", "show", "--group", group, ok=False), "a chat refuses what is for docs")
 
         slot = run("bob", "invite", "--group", group)["code"].split("-")[0]
         check("wrong invite code" in run("carol", "join", f"{slot}-wrong-guess", ok=False), "a wrong code fails for the joiner")
@@ -302,9 +311,9 @@ def main():
         erin.expect(lambda e: e["type"] == "joined" and e["group"] == folder)
         check(os.path.samefile(run("frank", "join", "shared/chat", cwd=HOME)["group"], folder), "a relative path is resolved where the command runs")
         check(run("frank", "members", "--group", "shared/chat", cwd=HOME)["group"] == run("frank", "groups")[0]["group"], "and so is --group")
-        got = frank.expect(lambda e: e["type"] == "message")
-        check(got["from"]["fp"] == erin_fp and got["content"] == "joined", "joining a folder posts 'joined'")
-        erin.expect(lambda e: e["type"] == "message" and e["from"]["fp"] == frank_fp)
+        frank.expect(lambda e: e["type"] == "joined" and e["member"]["fp"] == erin_fp)
+        erin.expect(lambda e: e["type"] == "joined" and e["member"]["fp"] == frank_fp)
+        check(True, "joining a folder tells its members")
         check([m["fp"] for m in run("frank", "members")["members"]] == [frank_fp, erin_fp], "so a member who has not spoken yet is listed")
 
         hello = run("erin", "send", "--to", frank_fp, "hello frank")["id"]
@@ -320,13 +329,14 @@ def main():
         check([m["content"] for m in history] == ["hello frank", "hi erin"], "listen --keep-log keeps it")
         with open(os.path.join(folder, reply + ".json"), "rb") as f:
             data = f.read()
-        check(hashlib.sha256(data).hexdigest() == reply and json.loads(data) == {"from": {"name": "Frank", "fp": frank_fp},
-              "content": "hi erin", "after": [hello], "to": [erin_fp], "reply_to": hello}, "the file is the message plus from, named by its hash")
+        record = json.loads(data)
+        check(hashlib.sha256(data).hexdigest() == reply and abs(record.pop("at") / 1000 - time.time()) < 60 and record == {"from": {"name": "Frank", "fp": frank_fp},
+              "type": "message", "content": "hi erin", "after": [hello], "to": [erin_fp], "reply_to": hello}, "the file is the message plus from and when, named by its hash")
         run("frank", "send", "--attach", "-", "from stdin", input="piped")
-        with open(erin.expect(lambda e: e["type"] == "message")["attachment"]) as f:
-            check(f.read() == "piped", "--attach - reads stdin; folder groups carry attachments too")
+        with open(run("erin", "fetch", erin.expect(lambda e: e["type"] == "message")["attachment"]["link"])["path"]) as f:
+            check(f.read() == "piped", "--attach - reads stdin; folder groups carry attachments too, in the folder")
 
-        hand = {"from": {"name": "Hand", "fp": "00"}, "after": []}
+        hand = {"from": {"name": "Hand", "fp": "00"}, "at": 0, "type": "message", "after": []}
         partial, temp = (json.dumps({**hand, "content": text}).encode() for text in ("was partial", "was temp"))
         named = lambda data: os.path.join(folder, hashlib.sha256(data).hexdigest() + ".json")
         with open(named(partial), "wb") as f:
@@ -346,28 +356,33 @@ def main():
         warning = erin.expect(lambda e: e["type"] == "warning")
         check(os.path.basename(misnamed) in warning["text"], "a file not named by its hash is ignored with a warning")
         os.remove(misnamed)
-        old = json.dumps({**hand, "content": "from 0.4", "to": erin_fp}).encode()
-        with open(named(old), "wb") as f:
-            f.write(old)
-        got = erin.expect(lambda e: e["type"] == "message")
-        check(got["content"] == "from 0.4" and got["to"] == [erin_fp] and got["direct"], "a 0.4 file with a single fingerprint in to still reads")
 
-        notes = run("erin", "file", "create", "notes.md", write("notes.md", "one\ntwo\n"))
-        base = until(lambda: run("frank", "file", "show", "notes.md", ok=False), lambda r: isinstance(r, dict))
-        erin_base = run("erin", "file", "show", "notes.md")["version"]
-        run("frank", "file", "edit", "--base", base["version"], "notes.md", write("frank.md", "one\ntwo\nthree\n"))
-        until(lambda: run("erin", "file", "show", "notes.md")["text"], lambda t: "three" in t)
-        edited = run("erin", "file", "edit", "--base", erin_base, "notes.md", write("erin.md", "ONE\ntwo\n"))
-        text = until(lambda: run("frank", "file", "show", "notes.md")["text"], lambda t: "ONE" in t)
-        check(edited["text"] == text == "ONE\ntwo\nthree\n" and notes["name"] == "notes.md", "files work the same in folder groups")
-        attached = run("erin", "file", "attach", write("photo.png", png(8, 8)))
+        notes = os.path.join(HOME, "shared", "notes")
+        check(run("erin", "join", "--kind", "doc", notes)["kind"] == "doc", "a new folder group can be a doc")
+        check(run("frank", "join", notes)["kind"] == "doc", "and stays one for whoever joins it")
+        erin_base = run("erin", "doc", "show")["version"]
+        run("erin", "doc", "edit", "--base", erin_base, write("erin.md", "one\ntwo\n"))
+        until(lambda: run("frank", "doc", "show")["text"], lambda t: t == "one\ntwo\n")
+        frank_base = run("frank", "doc", "show")["version"]
+        erin_base = run("erin", "doc", "show")["version"]
+        run("frank", "doc", "edit", "--base", frank_base, write("frank.md", "one\ntwo\nthree\n"))
+        until(lambda: run("erin", "doc", "show")["text"], lambda t: "three" in t)
+        edited = run("erin", "doc", "edit", "--base", erin_base, write("erin.md", "ONE\ntwo\n"))
+        text = until(lambda: run("frank", "doc", "show")["text"], lambda t: "ONE" in t)
+        check(edited["text"] == text == "ONE\ntwo\nthree\n", "docs work the same in folder groups, where doc commands find the one doc")
+        run("frank", "send", "still one chat")
+        check(erin.expect(lambda e: e.get("content") == "still one chat"), "and chat commands the one chat")
+        attached = run("erin", "doc", "attach", write("photo.png", png(8, 8)))
         check(attached["markdown"] == "![photo.png](attachments/photo.png)", "in a folder group, an attached image from elsewhere is copied into the folder and linked by its path")
-        with open(run("frank", "file", "fetch", attached["markdown"])["path"], "rb") as f:
-            check(f.read() == png(8, 8), "which members find there, by the link or its markdown")
-        with open(os.path.join(folder, "chart.png"), "wb") as f:
+        shown = run("erin", "doc", "show")
+        run("erin", "doc", "edit", "--base", shown["version"], write("erin.md", shown["text"] + attached["markdown"] + "\n"))
+        until(lambda: run("frank", "doc", "show")["text"], lambda t: attached["link"] in t)
+        with open(run("frank", "fetch", attached["link"])["path"], "rb") as f:
+            check(f.read() == png(8, 8), "which members find there, by its link")
+        with open(os.path.join(notes, "chart.png"), "wb") as f:
             f.write(png(4, 4))
-        check(run("erin", "file", "attach", os.path.join(folder, "chart.png"))["link"] == "chart.png", "a file already in the folder is linked where it is")
-        check("not a path inside the folder" in run("frank", "file", "fetch", "../secret.txt", ok=False), "links reach no file outside the folder")
+        check(run("erin", "doc", "attach", os.path.join(notes, "chart.png"))["link"] == "chart.png", "a file already in the folder is linked where it is")
+        check("no message or doc here links that" in run("frank", "fetch", "../secret.txt", ok=False), "fetch reaches only what a message or doc links")
 
         erin.stop()
         for i in range(22):
@@ -377,7 +392,7 @@ def main():
         omitted = erin.expect(lambda e: e["type"] == "omitted")
         got = [erin.expect(lambda e: e["type"] == "message")["content"] for _ in range(20)]
         check(omitted["count"] == 2 and got == [f"folder {i}" for i in range(2, 22)], "restart catches up on the folder's last 20 messages, in order")
-        check(run("frank", "leave")["left"] and run("frank", "groups") == [], "leaving a folder group")
+        check(run("frank", "leave", "--group", folder)["left"] and run("frank", "leave", "--group", notes)["left"] and run("frank", "groups") == [], "leaving folder groups")
 
         board = os.path.join(HOME, "board")
         gina, hank = Listener("gina", hold=600), Listener("hank")
@@ -386,18 +401,17 @@ def main():
         run("gina", "join", board)
         gina.expect(lambda e: e["type"] == "joined")
         run("hank", "join", board)
-        check(gina.poll(2) is None, "a message not addressed to the session waits")
-        for _ in range(20):
-            if len(run("gina", "members")["members"]) == 2:
-                break
-            time.sleep(0.5)
-        check(gina.expect(lambda e: e["type"] == "message")["from"]["fp"] == hank_fp, "until the agent runs a command")
-
+        check(gina.expect(lambda e: e["type"] == "joined")["member"]["fp"] == hank_fp, "a member joining wakes the session")
         run("hank", "send", "for everyone")
-        check(gina.poll(2) is None, "a message to the group waits too")
+        check(gina.poll(2) is None, "a message not addressed to the session waits")
+        run("gina", "members")
+        check(gina.expect(lambda e: e["type"] == "message")["content"] == "for everyone", "until the agent runs a command")
+
+        run("hank", "send", "for the room")
+        check(gina.poll(2) is None, "and waits again")
         run("hank", "send", "--to", gina_fp, "for gina")
         got = [gina.expect(lambda e: e["type"] == "message")["content"] for _ in range(2)]
-        check(got == ["for everyone", "for gina"], "a message addressed to the session wakes it, after the held ones")
+        check(got == ["for the room", "for gina"], "a message addressed to the session wakes it, after the held ones")
         run("hank", "send", "--urgent", "all hands")
         check(gina.expect(lambda e: e["type"] == "message")["urgent"], "so does an urgent message")
         question = run("gina", "send", "any news?")["id"]
@@ -461,55 +475,65 @@ def main():
         check(len(on_tick("join", group["group"])["members"]) == 5, "and any of them joins it without an invite, once a member admits it")
         joined = kim.expect(lambda e: e["type"] == "joined" and e["member"]["name"] == "Tick")
         check(joined["member"]["entity"]["name"] == "Matthew", "the others see who it speaks for")
-        check(tick.expect(lambda e: e["type"] == "settings")["settings"]["name"] == "Priorities", "the member who admits it passes on the group's settings")
+        check(next(g for g in on_tick("groups") if g["group"] == group["group"])["name"] == "Priorities", "the member who admits it passes on the group's settings")
         check("not open to any entity" in run("later", "join", group["group"], env=homes["elsewhere"], ok=False), "the group is not open to other entities")
 
-        # Files: CRDT text documents in the group, edited from versions that others have changed since.
-        created = on(lap, "file", "create", "list.md", write("list.md", "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n"))
-        shown = on(kim, "file", "show", "list.md")
-        check(shown["file"] == created["file"] and shown["text"] == "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n", "a file one member creates reads the same for another")
-        old = on_tick("file", "show", "list.md")["version"]
-        on(kim, "file", "edit", "--base", shown["version"], "list.md", write("kim.md", "- [x] alpha\n- [ ] beta\n- [ ] gamma\n"))
-        moved = on(lap, "file", "show", "list.md")
-        on(lap, "file", "edit", "--base", moved["version"], "list.md", write("lap.md", "- [ ] gamma\n- [x] alpha\n- [ ] beta (asked Bob)\n"))
-        edited = on_tick("file", "edit", "--base", old, "list.md", write("tick.md", "- [ ] alpha\n- [x] beta\n- [x] gamma\n- [ ] delta\n"))
+        # Docs: a CRDT text that every member edits, from versions that others have changed since.
+        doc = on(lap, "invite", "--kind", "doc", "--name", "List")
+        check(on(kim, "join", doc["link"])["kind"] == "doc", "a doc group is made by inviting into one")
+        on_tick("join", on(lap, "invite", "--group", doc["group"])["link"])
+        check("is a doc group" in on(kim, "send", "--group", doc["group"], "hi", ok=False), "a doc refuses what is for chats")
+        on(kim, "send", "one chat, one doc")
+        check(lap.expect(lambda e: e.get("content") == "one chat, one doc"), "chat commands find the one chat of a session in a chat and a doc")
+        empty = on(lap, "doc", "show")
+        check(empty["text"] == "" and empty["group"] == doc["group"], "and doc commands its one doc, empty at first")
+        on(lap, "doc", "edit", "--base", empty["version"], write("list.md", "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n"))
+        shown = until(lambda: on(kim, "doc", "show"), lambda r: r["text"])
+        check(shown["text"] == "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n", "what one member writes reads the same for another")
+        old = until(lambda: on_tick("doc", "show"), lambda r: r["text"])["version"]
+        on(kim, "doc", "edit", "--base", shown["version"], write("kim.md", "- [x] alpha\n- [ ] beta\n- [ ] gamma\n"))
+        moved = until(lambda: on(lap, "doc", "show"), lambda r: r["text"].startswith("- [x]"))
+        on(lap, "doc", "edit", "--base", moved["version"], write("lap.md", "- [ ] gamma\n- [x] alpha\n- [ ] beta (asked Bob)\n"))
+        edited = on_tick("doc", "edit", "--base", old, write("tick.md", "- [ ] alpha\n- [x] beta\n- [x] gamma\n- [ ] delta\n"))
         final = "- [x] gamma\n- [ ] delta\n- [x] alpha\n- [ ] beta (asked Bob)\n"
         check(edited["merged"] and edited["text"] == final, "an edit from an old version lands on the lines where they are now; others' changes stay")
         check(edited["lost"] == ["- [x] beta"], "a change to a line someone else changed meanwhile is reported as lost")
-        check(on(kim, "file", "show", "list.md")["text"] == final == on(lap, "file", "show", "list.md")["text"], "every member converges on the same text")
+        check(until(lambda: on(kim, "doc", "show")["text"], lambda t: t == final) == final == until(lambda: on(lap, "doc", "show")["text"], lambda t: t == final), "every member converges on the same text")
         drained = [e for e in iter(lambda: kim.poll(1), None)]
-        check(not any(e["type"] == "message" for e in drained), "file updates never print, so they never wake an agent")
-        check([f["name"] for f in on(kim, "file", "ls")] == ["list.md"], "file ls lists the group's files")
+        check(not any(e["type"] == "message" for e in drained), "edits never print, so they never wake an agent")
         with open(os.path.join(HOME, "crlf.md"), "wb") as f:
-            f.write(b"one\r\ntwo\r\n")
-        on(lap, "file", "create", "crlf.md", os.path.join(HOME, "crlf.md"))
-        check(on(kim, "file", "show", "crlf.md")["text"] == "one\ntwo\n", "files are LF only: CRLF an agent writes is converted")
+            f.write(final.replace("\n", "\r\n").encode())
+        on(lap, "doc", "edit", "--base", on(lap, "doc", "show")["version"], os.path.join(HOME, "crlf.md"))
+        check(on(lap, "doc", "show")["text"] == final, "the text is LF only: CRLF an agent writes is converted")
 
-        # Images: an agent attaches one and links it from a file; the others fetch it from the relay, and keep it.
-        attached = on(lap, "file", "attach", write("chart.png", png(40, 30)))
-        check(attached["markdown"] == f"![chart.png]({attached['link']})", "file attach uploads an image and gives its markdown link")
-        shown = on(lap, "file", "show", "list.md")
-        on(lap, "file", "edit", "--base", shown["version"], "list.md", write("lap.md", shown["text"] + attached["markdown"] + "\n"))
-        check(attached["link"] in on(kim, "file", "show", "list.md")["text"], "file show gives the link, not the image")
-        url = f"{RELAY}/g/{group['group']}/blobs/{attached['link'][4:68]}"
+        # Files in a doc: an agent uploads one and links it; the others fetch it from the relay, and keep it.
+        attached = on(lap, "doc", "attach", write("chart.png", png(40, 30)))
+        check(attached["markdown"] == f"![chart.png]({attached['link']})", "doc attach uploads an image and gives its markdown link")
+        notes_link = on(lap, "doc", "attach", write("notes.txt", "plain notes"))["markdown"]
+        check(notes_link.startswith("[notes.txt](lmk:"), "and any other file, as a plain link")
+        shown = on(lap, "doc", "show")
+        on(lap, "doc", "edit", "--base", shown["version"], write("lap.md", shown["text"] + attached["markdown"] + "\n"))
+        check(attached["link"] in until(lambda: on(kim, "doc", "show")["text"], lambda t: attached["link"] in t), "doc show gives the link, not the image")
+        url = f"{RELAY}/g/{doc['group']}/blobs/{attached['link'][4:68]}"
         sealed = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url).read()
         check(png(40, 30) not in sealed, "the relay holds it encrypted")
-        check(until(lambda: in_state(kim, sealed), bool), "members keep the images their files link")
-        fetched = on(kim, "file", "fetch", attached["link"])
+        check(until(lambda: in_state(kim, sealed), bool), "members keep the files their doc links")
+        fetched = on(kim, "fetch", attached["link"])
         with open(fetched["path"], "rb") as f:
             check(f.read() == png(40, 30) and fetched["path"].endswith(".png"), "another member fetches the image into a file")
         check(os.name == "nt" or os.stat(fetched["path"]).st_mode & 0o777 == 0o600, "that only its owner can read")
-        check("files link at most" in on(lap, "file", "attach", write("big.bin", os.urandom(1024 * 1024)), ok=False), "a blob over the relay's 1 MiB cap is refused")
+        check("files go up to" in on(lap, "doc", "attach", write("huge.bin", os.urandom(10 * 1024 * 1024 + 1)), ok=False), "a file over 10 MiB is refused")
 
         listed = on(lap, "entity", "remove", srv_device)["members"]
         check([m["name"] for m in listed] == [devices["entities"][0]["members"][0]["name"]], "a member can be taken off an entity's list")
         run("later", "join", on(lap, "invite", "--group", group["group"])["link"], env=homes["elsewhere"])
         seen = {m["name"]: m.get("entity") for m in run("later", "members", env=homes["elsewhere"])["members"]}
         check(seen["Srv"]["error"] == "not on Matthew's list" and seen["Lap"]["name"] == "Matthew", "after which its sessions no longer count as the entity")
-        shown = until(lambda: run("later", "file", "ls", env=homes["elsewhere"]), lambda files: files)
-        check(run("later", "file", "show", "list.md", env=homes["elsewhere"])["text"] == final + attached["markdown"] + "\n", "a member added later gets the file from a snapshot, as it cannot read what came before")
-        with open(run("later", "file", "fetch", attached["link"], env=homes["elsewhere"])["path"], "rb") as f:
-            check(f.read() == png(40, 30), "and the images it links")
+        run("later", "join", on(lap, "invite", "--group", doc["group"])["link"], env=homes["elsewhere"])
+        text = until(lambda: run("later", "doc", "show", env=homes["elsewhere"])["text"], bool)
+        check(text == final + attached["markdown"] + "\n", "a member added later gets the text from a snapshot, as it cannot read what came before")
+        with open(run("later", "fetch", attached["link"], env=homes["elsewhere"])["path"], "rb") as f:
+            check(f.read() == png(40, 30), "and the files it links")
 
         check("several sessions are running" in run(None, "groups", ok=False), "without --session, several running sessions are ambiguous")
         solo_env = {**ENV, "LETMEKNOW_HOME": os.path.join(HOME, "solo")}
