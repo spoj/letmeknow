@@ -171,7 +171,7 @@ function standing(p: Person): string | undefined {
 function who(p: Person): HTMLElement {
   const i = p.identity;
   const warning = i?.error ?? i?.warning ?? i?.new_device;
-  const level = i && !i.error ? i.how : "unknown";
+  const level = p.you ? "self" : i && !i.error ? i.how : "unknown";
   return h(
     "span",
     { className: warning ? "who warn" : "who", title: [standing(p), warning, `key ${p.fp}`].filter(Boolean).join("\n") },
@@ -855,10 +855,10 @@ class ChatView extends View {
       keep.add(key);
       let line = this.lines.get(key);
       if (line?.json !== json) {
-        const el = this.line(item, items, follows);
-        if (line) line.el.replaceWith(el);
-        else added = true;
-        line = { json, el };
+        if (line && at === line.el) at = at.nextElementSibling;
+        line?.el.remove();
+        added ||= !line;
+        line = { json, el: this.line(item, items, follows) };
         this.lines.set(key, line);
       }
       if (line.el !== at) this.list.insertBefore(line.el, at);

@@ -57,6 +57,11 @@ async function open(name, options) {
     ([relay, membership]) => {
       localStorage.setItem("lmk relay", relay);
       localStorage.setItem("lmk membership", membership);
+      window.toasts = [];
+      new MutationObserver(records => records.forEach(r => r.addedNodes.forEach(node => node.className === "toast" && window.toasts.push(node.textContent)))).observe(document, {
+        childList: true,
+        subtree: true
+      });
     },
     [LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP]
   );
@@ -181,6 +186,8 @@ try {
   await phone.getByText("welcome, phone").waitFor();
   check(true, "and reads what is sent there");
 
+  check((await laptop.evaluate(() => window.toasts)).length === 0, "the laptop showed no error before its reload");
+
   // A reload keeps the laptop's groups, messages and doc, and it still talks.
   await laptop.reload();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
@@ -221,6 +228,8 @@ try {
   );
   check(tablet.run("identity", "list").identities[0].name === "Matt", "a native device joins the browser's identity by its link");
   tablet.proc.kill();
+
+  for (const [name, page] of Object.entries(pages)) check((await page.evaluate(() => window.toasts)).length === 0, `${name} showed no error`);
 
   // The service worker serves the app with the page server unreachable.
   check(await laptop.evaluate(() => !!navigator.serviceWorker.controller), "a service worker controls the page");
