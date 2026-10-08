@@ -265,3 +265,31 @@ async fn connected_peers_sync_again() {
     a.fake.hold(G, missed.clone());
     eventually("the next sync brings it", || b.fake.holds(G, &missed)).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_no_group_links_are_deleted() {
+    let relay = relay().await;
+    let keys = keys(1);
+    let fake = Fake::new(&service()).with(G, Group { members: vec![keys[0].public()], ..Group::default() });
+    let options = Options { collect: std::time::Duration::from_millis(100), ..Options::default() };
+    let a = node(&relay, keys[0].clone(), fake, options).await;
+    let linked = a.net.add_file(std::io::Cursor::new(b"linked".to_vec())).await.unwrap();
+    let unlinked = a.net.add_file(std::io::Cursor::new(b"unlinked".to_vec())).await.unwrap();
+    a.fake.groups.lock().unwrap().get_mut(G).unwrap().files.push(linked.clone());
+    tokio::time::timeout(WAIT, async {
+        while a.net.has(unlinked.hash).await.unwrap() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the file no group links is deleted");
+    assert!(a.net.has(linked.hash).await.unwrap());
+    a.fake.groups.lock().unwrap().get_mut(G).unwrap().files.clear();
+    tokio::time::timeout(WAIT, async {
+        while a.net.has(linked.hash).await.unwrap() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("and so is one no longer linked");
+}

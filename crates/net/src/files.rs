@@ -2,7 +2,7 @@
 //! ciphertext, so replacing iroh-blobs later keeps every link valid.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -15,9 +15,10 @@ use bao_tree::{ChunkNum, ChunkRanges};
 use iroh::{Endpoint, EndpointId};
 use iroh_blobs::{
     BlobsProtocol, Hash,
-    api::Store,
+    api::{Store, TempTag},
     protocol::GetRequest,
     provider::events::{AbortReason, ConnectMode, EventMask, EventSender, ObserveMode, ProviderMessage, RequestMode, ThrottleMode},
+    store::{GcConfig, ProtectCb, ProtectOutcome},
 };
 use lmk_proto::links::FileLink;
 use n0_future::{StreamExt, join_all, task::spawn, time::timeout};
@@ -39,7 +40,9 @@ const HOLDER_WAIT: Duration = Duration::from_secs(30);
 pub(crate) struct Files {
     store: Store,
     endpoint: Endpoint,
-    downloads: Mutex<HashMap<[u8; 32], Download>>,
+    downloads: Arc<Mutex<HashMap<[u8; 32], Download>>>,
+    /// Files just added, kept from deletion until the next collection has seen them.
+    added: Arc<Mutex<Vec<TempTag>>>,
 }
 
 struct Download {
@@ -48,15 +51,36 @@ struct Download {
 }
 
 impl Files {
-    pub async fn new(endpoint: Endpoint, dir: Option<std::path::PathBuf>) -> Result<Self> {
+    /// Every `collect`, the store deletes the files no group links, unless they are on their way in.
+    pub async fn new(
+        endpoint: Endpoint,
+        dir: Option<std::path::PathBuf>,
+        groups: Arc<dyn Groups>,
+        collect: Duration,
+    ) -> Result<Self> {
+        let downloads: Arc<Mutex<HashMap<[u8; 32], Download>>> = Arc::default();
+        let added: Arc<Mutex<Vec<TempTag>>> = Arc::default();
+        let (downloading, just_added) = (downloads.clone(), added.clone());
+        let protect: ProtectCb = Arc::new(move |live: &mut HashSet<Hash>| {
+            for group in groups.groups() {
+                live.extend(groups.files(&group).iter().map(|file| Hash::from_bytes(file.hash)));
+            }
+            live.extend(downloading.lock().unwrap().keys().map(|hash| Hash::from_bytes(*hash)));
+            live.extend(just_added.lock().unwrap().drain(..).map(|tag| tag.hash()));
+            Box::pin(std::future::ready(ProtectOutcome::Continue))
+        });
+        let gc = GcConfig { interval: collect, add_protected: Some(protect) };
         let store = match dir {
             #[cfg(not(target_family = "wasm"))]
-            Some(dir) => (*iroh_blobs::store::fs::FsStore::load(dir).await?).clone(),
+            Some(dir) => {
+                let options = iroh_blobs::store::fs::options::Options { gc: Some(gc), ..iroh_blobs::store::fs::options::Options::new(&dir) };
+                (*iroh_blobs::store::fs::FsStore::load_with_opts(dir.join("blobs.db"), options).await?).clone()
+            }
             #[cfg(target_family = "wasm")]
             Some(_) => bail!("a browser keeps files in memory"),
-            None => (*iroh_blobs::store::mem::MemStore::new()).clone(),
+            None => (*iroh_blobs::store::mem::MemStore::new_with_opts(iroh_blobs::store::mem::Options { gc_config: Some(gc) })).clone(),
         };
-        Ok(Files { store, endpoint, downloads: Mutex::default() })
+        Ok(Files { store, endpoint, downloads, added })
     }
 
     /// Serves complete files to current members only: checked per connection, per request, and
@@ -144,9 +168,10 @@ impl Files {
             sealed.send(Ok(sealer.finish().into())).await.ok();
         });
         let stream = n0_future::stream::poll_fn(move |cx| rx.poll_recv(cx));
-        let tag = self.store.add_stream(stream).await.await?;
-        let size = size.load(Ordering::Relaxed);
-        Ok(FileLink { hash: *tag.hash.as_bytes(), size, key })
+        let tag = self.store.add_stream(stream).await.temp_tag().await?;
+        let hash = *tag.hash().as_bytes();
+        self.added.lock().unwrap().push(tag);
+        Ok(FileLink { hash, size: size.load(Ordering::Relaxed), key })
     }
 
     pub async fn complete(&self, hash: &[u8; 32]) -> Result<bool> {

@@ -78,11 +78,13 @@ pub struct Options {
     pub home: Option<PathBuf>,
     pub file_limit: u64,
     pub resync: Duration,
+    pub collect: Duration,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { relay_only: false, home: None, file_limit: 100 << 20, resync: Duration::from_secs(300) }
+        let (resync, collect) = (Duration::from_secs(300), Duration::from_secs(3600));
+        Options { relay_only: false, home: None, file_limit: 100 << 20, resync, collect }
     }
 }
 
@@ -93,8 +95,8 @@ pub async fn node(relay: &Relay, key: SecretKey, fake: Arc<Fake>, options: Optio
     }
     let endpoint = builder.bind().await.unwrap();
     tokio::time::timeout(WAIT, endpoint.online()).await.expect("online");
-    let config =
-        Config { relay: relay.url.clone(), home: options.home, files: None, file_limit: options.file_limit, resync: options.resync };
+    let (relay_url, files, file_limit) = (relay.url.clone(), None, options.file_limit);
+    let config = Config { relay: relay_url, home: options.home, files, file_limit, resync: options.resync, collect: options.collect };
     let (net, events) = Net::spawn(endpoint, config, fake.clone(), Arc::new(Inviter)).await.unwrap();
     Node { net, events, fake }
 }

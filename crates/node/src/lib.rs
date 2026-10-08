@@ -44,6 +44,8 @@ const RECEIPT_WAIT: Duration = Duration::from_secs(5);
 const REDIAL: Duration = Duration::from_secs(10);
 /// How often connected members sync their groups again.
 const RESYNC: Duration = Duration::from_secs(5 * 60);
+/// How often files no group holds any longer are deleted.
+const COLLECT: Duration = Duration::from_secs(60 * 60);
 /// How long a fetched device list counts as fresh, in milliseconds.
 const LIST_FRESH: u64 = 10 * 60 * 1000;
 /// How long a fetch keeps looking for a member that holds the file.
@@ -190,8 +192,27 @@ struct Rec {
     /// Messages this session could not open, so that sync does not offer them again.
     given_up: Vec<(u64, Bytes)>,
     pending: Vec<Pending>,
-    /// File links: attachments, and doc states linked in Welcomes.
-    files: Vec<String>,
+    /// File links, with when they were linked: attachments, files added, and doc states linked beside Welcomes. Each is
+    /// held for the group's `keep`.
+    files: Vec<(String, u64)>,
+    /// The doc state linked beside the latest Welcome, held however old.
+    state: Option<String>,
+}
+
+impl Rec {
+    fn link(&mut self, link: String) {
+        self.files.push((link, now()));
+    }
+
+    /// The files this session holds for the group: those linked within `keep`, its doc state, and the doc's current
+    /// links, given its text.
+    fn held(&self, keep: u32, text: Option<&str>) -> Vec<FileLink> {
+        let since = now().saturating_sub(keep as u64 * 24 * 3600 * 1000);
+        let linked = self.files.iter().filter(|(_, at)| *at >= since).map(|(link, _)| link).chain(&self.state);
+        let mut held: Vec<FileLink> = linked.filter_map(|link| FileLink::parse(link).ok()).collect();
+        held.extend(text.map(doc::links).unwrap_or_default());
+        held
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -494,6 +515,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             files: config.files,
             file_limit: config.file_limit,
             resync: RESYNC,
+            collect: COLLECT,
         };
         let (net, mut net_events) =
             Net::spawn(endpoint, net_config, inner.clone(), Arc::new(groups::Admitter(inner.clone()))).await?;
@@ -669,7 +691,7 @@ impl<P: Provider + Send + 'static> Node<P> {
                 g.rec.items.push(Item { epoch, id: Bytes(id.to_vec()), at: now() });
                 g.rec.pending.push(Pending { id: Bytes(id.to_vec()), what: "message".into() });
                 if let Payload::Message { attachment: Some(attachment), .. } = payload {
-                    g.rec.files.push(attachment.link.clone());
+                    g.rec.link(attachment.link.clone());
                 }
                 st.provider.put(&ciphertext_key(&id), &ciphertext)?;
                 let sender = me.and_then(|me| st.member(gid, &me)).context("this session is not in the group")?;
@@ -744,7 +766,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub async fn add_file(&self, gid: &[u8], bytes: Vec<u8>) -> Result<FileLink> {
         let link = self.inner.net().add_file(std::io::Cursor::new(bytes)).await?;
         let mut st = self.inner.state.lock().unwrap();
-        st.group_mut(gid)?.rec.files.push(link.link());
+        st.group_mut(gid)?.rec.link(link.link());
         st.save(gid)?;
         Ok(link)
     }
@@ -951,7 +973,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Drops held messages older than each group's `keep`.
+    /// Drops held messages and file links older than each group's `keep`; the files go at the next collection.
     fn expire(&self, st: &mut State<P>) {
         let now = now();
         let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
@@ -960,6 +982,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let before = now.saturating_sub(g.mls.settings().keep as u64 * 24 * 3600 * 1000);
             let (old, kept): (Vec<Item>, Vec<Item>) = g.rec.items.drain(..).partition(|item| item.at < before);
             g.rec.items = kept;
+            g.rec.files.retain(|(_, at)| *at >= before);
             for item in old {
                 st.provider.delete(&message_key(&item.id.0)).ok();
                 st.provider.delete(&ciphertext_key(&item.id.0)).ok();
@@ -1200,7 +1223,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
     async fn doc_from(&self, gid: &[u8], link: &FileLink, by: [u8; 32]) -> Result<()> {
         {
             let mut st = self.state.lock().unwrap();
-            st.group_mut(gid)?.rec.files.push(link.link());
+            let rec = &mut st.group_mut(gid)?.rec;
+            rec.link(link.link());
+            rec.state = Some(link.link());
             st.save(gid)?;
         }
         self.fetched(gid, link).await?;
@@ -1564,4 +1589,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_group_holds_files_linked_within_keep_its_doc_state_and_its_doc_links() {
+        let link = |n: u8| FileLink { hash: [n; 32], size: 1, key: [0; 32] }.link();
+        let old = now() - 3 * 24 * 3600 * 1000;
+        let files = vec![(link(1), old), (link(2), now()), (link(3), old)];
+        let rec = Rec { files, state: Some(link(3)), ..Rec::default() };
+        let text = format!("see [the plan]({})", link(4));
+        let held: Vec<u8> = rec.held(2, Some(&text)).iter().map(|file| file.hash[0]).collect();
+        assert_eq!(held, [2, 3, 4]);
+    }
 }
