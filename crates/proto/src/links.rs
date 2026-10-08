@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 pub const INVITE_PREFIX: &str = "https://letmeknow.dev/i#";
+/// letmeknow.dev's relay, which links leave out.
+pub const RELAY: &str = "https://letmeknow.dev";
 
 /// `https://letmeknow.dev/i#1.<g|d>.<key>.<secret>[.<relay>]`, every field after the kind in unpadded base64url.
 #[derive(Clone, Debug, PartialEq, Eq)]

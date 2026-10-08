@@ -25,7 +25,7 @@ pub struct Contradiction {
 
 /// The hashes h_start..=h_len of a log, and the newest head covering h_len. A client starts a chain when it reads a
 /// log from the beginning; a reader that starts later, such as a joiner, anchors one at a head it trusts.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Chain {
     pub start: u64,
     pub hashes: Vec<[u8; 32]>,

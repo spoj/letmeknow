@@ -18,13 +18,14 @@ use iroh::{
 use lmk_proto::{
     Answer, Bytes, frame,
     head::Head,
-    peer::{Admitted, Frame, Hello},
+    peer::{Admitted, Frame, Hello, Refusal},
 };
+use sha2::{Digest, Sha256};
 use n0_future::task::spawn;
 use negentropy::{Negentropy, NegentropyStorageVector};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{Event, Inner, sync};
+use crate::{Event, Inner, Taken, sync};
 
 /// Raw ciphertext bytes per `messages` frame, well under a frame's limit once in base64.
 const BATCH: usize = 8 << 20;
@@ -146,11 +147,24 @@ impl Session {
             Frame::Commits { group, entries, head } if self.member(&group.0) => self.on_commits(group, entries, head).await?,
             Frame::Reconcile { group, msg } if self.member(&group.0) => self.on_reconcile(group, msg).await?,
             Frame::Messages { group, items } if self.member(&group.0) => {
+                let (mut held, mut refused) = (Vec::new(), Vec::new());
                 for item in items {
-                    if let Err(e) = self.inner.groups.receive(&group.0, &item.0) {
-                        tracing::debug!("message from {} not taken: {e:#}", self.peer.fmt_short());
+                    let id = Bytes::from(<[u8; 32]>::from(Sha256::digest(&item.0)));
+                    match self.inner.groups.receive(&group.0, &item.0) {
+                        Taken::Held => held.push(id),
+                        Taken::Refused(reason) => refused.push(Refusal { id, reason }),
+                        Taken::Waiting => {}
                     }
                 }
+                if !held.is_empty() || !refused.is_empty() {
+                    self.write(&Frame::Receipt { group, held, refused }).await?;
+                }
+            }
+            Frame::Receipt { group, held, refused } => {
+                let id = |id: &Bytes| <[u8; 32]>::try_from(&id.0[..]).ok();
+                let held = held.iter().filter_map(id).collect();
+                let refused = refused.iter().filter_map(|r| Some((id(&r.id)?, r.reason.clone()))).collect();
+                self.inner.events.send(Event::Receipt { group: group.0, peer: self.peer, held, refused }).ok();
             }
             Frame::Doc { group, snapshot } if self.member(&group.0) => {
                 if self.inner.groups.doc(&group.0).is_some_and(|ours| ours[..] != snapshot.0[..]) {

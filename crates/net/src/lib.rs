@@ -61,7 +61,7 @@ pub trait Groups: Send + Sync + 'static {
     /// A held message's MLS ciphertext.
     fn message(&self, group: &[u8], id: &[u8; 32]) -> Option<Vec<u8>>;
     /// An MLS ciphertext from a peer: decrypt, verify, and hold or apply it, or give it up.
-    fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Result<()>;
+    fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Taken;
     /// For a doc, SHA-256 of its snapshot.
     fn doc(&self, group: &[u8]) -> Option<[u8; 32]>;
     /// For a doc, its Yjs state vector.
@@ -70,6 +70,15 @@ pub trait Groups: Send + Sync + 'static {
     fn diff(&self, group: &[u8], sv: &[u8]) -> Result<Vec<u8>>;
     /// The files the group links now.
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
+}
+
+/// What became of a ciphertext a peer sent; the peer hears which unless it waits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Taken {
+    Held,
+    Refused(String),
+    /// Kept until a commit it follows is applied.
+    Waiting,
 }
 
 /// The inviter's decisions; each may commit an Add before it answers.
@@ -85,6 +94,8 @@ pub enum Event {
     Disconnected(EndpointId),
     /// Two incompatible signed heads: the membership service showed members different logs.
     Contradiction { group: Vec<u8>, peer: EndpointId, ours: Head, theirs: Head },
+    /// What `peer` did with messages this session sent it.
+    Receipt { group: Vec<u8>, peer: EndpointId, held: Vec<[u8; 32]>, refused: Vec<([u8; 32], String)> },
     /// Message sync with `peer` finished.
     Synced { group: Vec<u8>, peer: EndpointId },
     /// A file is now held whole.
@@ -234,6 +245,11 @@ impl Net {
             bail!("could not fetch {}", link.link());
         }
         Ok(())
+    }
+
+    /// Whether a file is held whole.
+    pub async fn has(&self, hash: [u8; 32]) -> Result<bool> {
+        self.inner.files.complete(&hash).await
     }
 
     /// Verified ciphertext bytes held of a file.

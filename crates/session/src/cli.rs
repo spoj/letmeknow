@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::node::Inbound;
+use crate::session::Inbound;
 
 /// End-to-end encrypted chats and documents for agents and their people.
 #[derive(Parser)]
@@ -41,7 +41,7 @@ pub enum Command {
         /// Keep the text of messages once delivered, for audit; by default only ids, senders and references are kept
         #[arg(long)]
         keep_log: bool,
-        /// The membership service for groups and identities this session creates: letmeknow.dev, <key>@<relay URL>, or a folder
+        /// The membership service for groups and identities this session creates: letmeknow.dev, <key, hex>@<relay URL>, or a folder
         #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = "letmeknow.dev")]
         membership: String,
         /// The relay this session is reached through
@@ -68,6 +68,9 @@ pub struct Serve {
     /// The membership service's UDP port
     #[arg(long, default_value_t = 7843)]
     pub membership_port: u16,
+    /// QUIC address discovery's UDP port
+    #[arg(long, default_value_t = 7842)]
+    pub qad_port: u16,
     /// Logs, keys and certificates
     #[arg(long)]
     pub state: PathBuf,
@@ -350,7 +353,7 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
     let response = match serde_json::from_str::<Call>(&line) {
         Ok(call) if call.token == token => {
             let (reply, answer) = oneshot::channel();
-            let _ = inbound.send(Inbound::Request(call.request, reply));
+            let _ = inbound.send(Inbound::Request(Box::new(call.request), reply));
             answer.await.unwrap_or_else(|_| json!({ "error": "session process stopped" }))
         }
         Ok(_) => json!({ "error": "bad token" }),
@@ -418,9 +421,9 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     Ok(response)
 }
 
-/// A membership address names a folder when it is a path.
+/// A membership address names a folder when it is a path, not a service at a relay.
 pub fn is_folder(address: &str) -> bool {
-    address.contains(['/', '\\']) || address.starts_with('.')
+    !address.contains("@https://") && (address.contains(['/', '\\']) || address.starts_with('.'))
 }
 
 fn absolute(path: &str) -> Result<String> {
@@ -469,6 +472,6 @@ mod tests {
     #[test]
     fn folders_are_paths() {
         assert!(super::is_folder("./chat") && super::is_folder("/tmp/x"));
-        assert!(!super::is_folder("letmeknow.dev"));
+        assert!(!super::is_folder("letmeknow.dev") && !super::is_folder("50d4@https://next.letmeknow.dev"));
     }
 }

@@ -173,7 +173,7 @@ fn commit_race() {
     let pos = w.post(b2.commit);
     let applied = w.read(&[0, 1, 2]);
     let Applied::Commit { added, by, .. } = &applied[0][0] else { panic!() };
-    assert_eq!((added[0].name.as_str(), *by), ("D", w.m[1].g().own_index()));
+    assert_eq!((added[0].credential.as_ref().unwrap().name.as_str(), *by), ("D", w.m[1].g().own_index()));
     w.m[3].join(&b2.welcome.unwrap(), pos);
     w.agree(&[0, 1, 2, 3]);
     let added = w.m[0].g().added().last().unwrap().clone();
@@ -482,7 +482,7 @@ fn leave_and_removed_senders() {
     w.post(commit.commit);
     let applied = w.read_at(&[0, 1, 2], 1_000);
     let Applied::Commit { removed, .. } = &applied[0][0] else { panic!() };
-    assert_eq!(removed[0].name, "C");
+    assert_eq!(removed[0].credential.as_ref().unwrap().name, "C");
     assert!(!w.m[2].g().active());
     w.agree(&[0, 1]);
     let opened = w.m[0].open(&early, 1_000 + REMOVED_GRACE).unwrap();
