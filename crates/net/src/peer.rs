@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Result, bail, ensure};
 use iroh::{
     EndpointId,
-    endpoint::{RecvStream, SendStream},
+    endpoint::{Connection, RecvStream, SendStream},
 };
 use lmk_proto::{
     Answer, Bytes, frame,
@@ -29,7 +29,7 @@ use crate::{Event, Inner, sync};
 /// Raw ciphertext bytes per `messages` frame, well under a frame's limit once in base64.
 const BATCH: usize = 8 << 20;
 
-/// Answers a `want` with the hashes the peer holds; `None` for our own wants, whose answers start downloads.
+/// Takes the answer to a `want`; `None` for wants sent on catching up, whose answers start downloads.
 type HaveReply = Option<oneshot::Sender<Vec<[u8; 32]>>>;
 
 pub(crate) enum Input {
@@ -70,15 +70,17 @@ struct Round {
     epochs: HashMap<[u8; 32], u64>,
 }
 
+/// Runs the connection's one peer stream; the connection closes with it.
 pub(crate) async fn run(
     inner: Arc<Inner>,
-    peer: EndpointId,
+    conn: Connection,
     dialer: bool,
     send: SendStream,
     mut recv: RecvStream,
     input: mpsc::UnboundedSender<Input>,
     mut rx: mpsc::UnboundedReceiver<Input>,
 ) {
+    let peer = conn.remote_id();
     let reader = input.clone();
     spawn(async move {
         while let Ok(frame) = frame::read(&mut recv).await {
@@ -115,6 +117,7 @@ pub(crate) async fn run(
     if let Err(e) = result {
         tracing::debug!("peer stream with {} ended: {e:#}", peer.fmt_short());
     }
+    conn.close(0u32.into(), b"peer stream ended");
 }
 
 impl Session {
@@ -155,10 +158,10 @@ impl Session {
                     self.write(&Frame::DocSv { group, sv }).await?;
                 }
             }
-            Frame::DocSv { group, sv } if self.member(&group.0) => {
-                let diff = self.inner.groups.diff(&group.0, &sv.0)?;
-                self.write(&Frame::Messages { group, items: vec![Bytes(diff)] }).await?;
-            }
+            Frame::DocSv { group, sv } if self.member(&group.0) => match self.inner.groups.diff(&group.0, &sv.0) {
+                Ok(diff) => self.write(&Frame::Messages { group, items: vec![Bytes(diff)] }).await?,
+                Err(e) => tracing::warn!("no diff for {}: {e:#}", self.peer.fmt_short()),
+            },
             Frame::Want { group, files } => {
                 let mut have = Vec::new();
                 if self.member(&group.0) {
@@ -298,8 +301,10 @@ impl Session {
             return Ok(());
         }
         let new = entries[(mine.length - start) as usize..].to_vec();
-        self.inner.groups.apply(&group.0, new, head)?;
-        self.inner.changed(&group.0);
+        match self.inner.groups.apply(&group.0, new, head) {
+            Ok(()) => self.inner.changed(&group.0),
+            Err(e) => tracing::warn!("commits from {} not applied: {e:#}", self.peer.fmt_short()),
+        }
         Ok(())
     }
 

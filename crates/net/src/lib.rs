@@ -320,7 +320,7 @@ impl Inner {
         if dialed {
             match open_peer(&conn).await {
                 Ok((send, recv)) => {
-                    spawn(peer::run(self.clone(), peer, true, send, recv, input.clone(), rx.take().unwrap()));
+                    spawn(peer::run(self.clone(), conn.clone(), true, send, recv, input.clone(), rx.take().unwrap()));
                 }
                 Err(e) => tracing::debug!("no peer stream to {}: {e:#}", peer.fmt_short()),
             }
@@ -330,7 +330,7 @@ impl Inner {
             match open.stream {
                 Stream::Peer => {
                     if let Some(rx) = rx.take() {
-                        spawn(peer::run(self.clone(), peer, false, send, recv, input.clone(), rx));
+                        spawn(peer::run(self.clone(), conn.clone(), false, send, recv, input.clone(), rx));
                     }
                 }
                 Stream::Invite => {

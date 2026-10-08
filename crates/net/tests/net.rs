@@ -138,8 +138,8 @@ async fn file_from_two_holders_one_cut_off() {
     let (fake_a, fake_b, fake_c) = (Fake::new(&service).with(G, group()), Fake::new(&service).with(G, group()), Fake::new(&service).with(G, group()));
     let a = node(&relay, keys[0].clone(), fake_a.clone(), Options::default()).await;
     let b = node(&relay, keys[1].clone(), fake_b.clone(), Options::default()).await;
-    // C would fetch only files up to 1 MiB unasked.
-    let c = node(&relay, keys[2].clone(), fake_c.clone(), Options { file_limit: 1 << 20, ..Options::default() }).await;
+    // C, like a browser, goes through the relay, and would fetch only files up to 1 MiB unasked.
+    let c = node(&relay, keys[2].clone(), fake_c.clone(), Options { file_limit: 1 << 20, relay_only: true, ..Options::default() }).await;
 
     let plain: Vec<u8> = (0..16 << 20).map(|i: u32| (i % 251) as u8).collect();
     let link = a.net.add_file(std::io::Cursor::new(plain.clone())).await.unwrap();
