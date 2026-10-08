@@ -13,6 +13,7 @@ lmk-proto = { path = "crates/proto" }
 lmk-core = { path = "crates/core" }
 lmk-membership = { path = "crates/membership" }
 lmk-net = { path = "crates/net" }
+lmk-node = { path = "crates/node" }
 lmk-serve = { path = "crates/serve" }
 anyhow = "1"
 base64 = "0.23"

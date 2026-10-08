@@ -247,6 +247,11 @@ impl Net {
         Ok(())
     }
 
+    /// Whether a file is held whole.
+    pub async fn has(&self, hash: [u8; 32]) -> Result<bool> {
+        self.inner.files.complete(&hash).await
+    }
+
     /// Verified ciphertext bytes held of a file.
     pub async fn held(&self, hash: [u8; 32]) -> Result<u64> {
         self.inner.files.held(&hash).await

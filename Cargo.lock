@@ -2897,6 +2897,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "lmk-node"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek 3.0.0",
+ "iroh",
+ "iroh-relay",
+ "lmk-core",
+ "lmk-membership",
+ "lmk-net",
+ "lmk-proto",
+ "n0-future",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "similar",
+ "tokio",
+ "tracing",
+ "yrs",
+]
+
+[[package]]
 name = "lmk-proto"
 version = "0.10.0"
 dependencies = [
