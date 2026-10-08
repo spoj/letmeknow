@@ -1,6 +1,6 @@
 use crate::device::{Device, Membership};
 use crate::files;
-use crate::relay::Relay;
+use crate::relay::{Notice, Relay};
 use crate::store::{Provider, SCHEMA};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
@@ -1137,17 +1137,25 @@ impl Session {
 
     fn track(&mut self, gid: String, relay: String, cursor: u64, mls: MlsGroup) {
         let (http, events, poll_gid, poll_relay) = (self.relay.clone(), self.events.clone(), gid.clone(), relay.clone());
+        // Fetches on connecting, then takes messages from the socket's notices, fetching only after a gap or for a large
+        // message; polls only while it has no socket.
         let poller = tokio::spawn(async move {
             let (mut after, mut synced) = (cursor, false);
             loop {
-                let mut socket = http.subscribe(&poll_relay, &poll_gid).await.ok();
-                loop {
-                    if catch_up(&http, &events, &poll_relay, &poll_gid, &mut after, &mut synced).await.is_err() {
-                        break;
-                    }
+                let mut socket = http.subscribe(&poll_relay, &format!("g/{poll_gid}")).await.ok();
+                'fetch: while catch_up(&http, &events, &poll_relay, &poll_gid, &mut after, &mut synced).await.is_ok() {
                     let Some(ws) = &mut socket else { break };
-                    if !notified(ws).await {
-                        break;
+                    loop {
+                        match notified(ws).await {
+                            None => break 'fetch,
+                            Some(Notice { seq, .. }) if seq <= after => {}
+                            Some(Notice { seq, data: Some(data) }) if seq == after + 1 => {
+                                let Ok(data) = B64.decode(data) else { continue 'fetch };
+                                after = seq;
+                                let _ = events.send(Event::Batch { gid: poll_gid.clone(), messages: vec![(seq, data)], synced: true });
+                            }
+                            Some(_) => continue 'fetch,
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(POLL_S)).await;
@@ -1566,21 +1574,20 @@ async fn catch_up(
     }
 }
 
-/// Waits for the relay to announce a new message; false once the socket is gone.
-async fn notified(ws: &mut WebSocket) -> bool {
+/// Waits for the relay to announce something new; `None` once the socket is gone, or when a ping goes unanswered.
+/// A notice that does not parse counts as one without data, so the caller fetches.
+async fn notified(ws: &mut WebSocket) -> Option<Notice> {
     let mut unanswered = false;
     loop {
         match tokio::time::timeout(Duration::from_secs(PING_S), ws.next()).await {
             Ok(Some(Ok(Message::Text(text)))) if text == "pong" => unanswered = false,
-            Ok(Some(Ok(Message::Text(_)))) => return true,
+            Ok(Some(Ok(Message::Text(text)))) => return Some(serde_json::from_str(&text).unwrap_or(Notice { seq: u64::MAX, data: None })),
             Ok(Some(Ok(_))) => {}
-            Ok(_) => return false,
-            Err(_) if unanswered => return false,
+            Ok(_) => return None,
+            Err(_) if unanswered => return None,
             Err(_) => {
                 unanswered = true;
-                if ws.send(Message::Text("ping".into())).await.is_err() {
-                    return false;
-                }
+                ws.send(Message::Text("ping".into())).await.ok()?;
             }
         }
     }

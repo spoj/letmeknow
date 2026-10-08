@@ -17,6 +17,13 @@ struct Frame {
     data: String,
 }
 
+/// What a socket announces: a new entry's seq, and the entry itself unless it is large.
+#[derive(Deserialize)]
+pub struct Notice {
+    pub seq: u64,
+    pub data: Option<String>,
+}
+
 impl Relay {
     pub fn new() -> Result<Self> {
         Ok(Self(reqwest::Client::builder().timeout(Duration::from_secs(45)).build()?))
@@ -38,9 +45,10 @@ impl Relay {
         frames.into_iter().map(|f| Ok((f.seq, B64.decode(f.data)?))).collect()
     }
 
-    /// Opens a socket on which the relay sends each new message's seq.
-    pub async fn subscribe(&self, relay: &str, gid: &str) -> Result<WebSocket> {
-        Ok(self.0.get(format!("{relay}/g/{gid}/ws")).upgrade().send().await?.into_websocket().await?)
+    /// Opens a socket on which the relay announces each new message of a group (`g/<gid>`) or entry of a box
+    /// (`b/<address>`), as a `Notice`.
+    pub async fn subscribe(&self, relay: &str, path: &str) -> Result<WebSocket> {
+        Ok(self.0.get(format!("{relay}/{path}/ws?messages")).upgrade().send().await?.into_websocket().await?)
     }
 
     /// Appends to a box: an append-only log the relay keeps in the order it takes entries.
