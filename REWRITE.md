@@ -108,6 +108,18 @@ A receiver that refuses a message records it as missing, so a reference to it sh
 - **Provenance**: every member records who added whom and how (invite or open group), and who first introduced each identity to it. It shows these where they change a decision: an identity in a group that its introducer is not in, and another identity's new device ("Bob's tablet, added by Bob's laptop").
 - **Open groups**: the group context lists the identities a group is open to. A member that is a device of such an identity puts an opening (group id, kind, name, membership service, members' iroh keys) into its devices group's context, so every device of that identity knows it, including devices added later. A device that wants in asks members online, its own identity's devices first; any of them admits it if it speaks as an identity the group is open to.
 
+## Contacts
+
+Trust is local and travels one hop at most.
+
+- An identity keeps contacts: its own name for another identity, and how it knows them. They are private to it, shared by its devices through the devices group, so its agents see people as its person does.
+- How an identity knows another, with no scores: **verified** (it invited them, or scanned their code in person), **introduced** by a named contact, or **unknown** (only their own claim).
+- `invite --for "Bob (Acme)"` labels a link with whom it is meant for; whoever redeems it becomes the contact "Bob (Acme)", verified. `invite --to Bob` makes a link that only Bob's identity can redeem, so a leaked link is useless.
+- A member that adds someone tells the group who they are to it ("invited by Alice as Bob (Acme)"); `introduce` does the same on purpose. An introduction is the introducer's word: it becomes a contact only if accepted, and is otherwise shown with the introducer's name wherever that identity appears.
+- Self-chosen names stay, as claims. An identity's own name is a suggestion, filled in when it becomes a contact and shown, marked as its claim, only where there is no contact name. Device names are an identity's labels for its own devices ("Bob (Acme) · tablet"). Session names are handles within groups, which mentions use, since a session knows itself only by its own name. A contact name always wins for display and for `--to`, and a new identity using a contact's name gets a warning ("not your Bob").
+- Events carry, for each member, its contact name and how the identity knows it; the skill tells agents to treat unknown identities as strangers.
+- Left out: chains of trust, trust scores, public records of who vouched for whom, and global names.
+
 ## Invites
 
 - An invite is a link, `https://letmeknow.dev/i#…`, whose fragment holds the inviter's iroh key, its relay if not ours, and a random 128-bit secret. The fragment never reaches the page server.
@@ -118,9 +130,10 @@ A receiver that refuses a message records it as missing, so a reference to it sh
 ## Transport
 
 - Everything runs over iroh (QUIC). Native sessions connect directly when they can and through a relay otherwise; browsers always use a relay.
-- We run our own relays and no address lookup service. Addresses travel in our own data: members' leaves, the group context, and invite links. iroh's local network discovery connects sessions on one machine or LAN without the internet.
+- We run our own relays and no address lookup service. Addresses travel in our own data: members' leaves, the group context, and invite links. Sessions on one machine also find each other through the device's state directory, where each writes its current addresses. Across a LAN without the internet, mDNS (the separate crate iroh-mdns-address-lookup) connects sessions by key; it announces session keys to the whole LAN, so it is a setting, off by default.
+- Our own protocols share one ALPN, one stream per exchange, so two members keep one connection; file transfers add iroh-blobs' own while they run. An idle connection costs about 30 B/s, through the relay too, which keeps its path open beside a direct one.
 - Direct connections show a native session's IP address to the members it talks to. Accepted.
-- iroh honours `HTTPS_PROXY` for relay connections and falls back to HTTPS where UDP is blocked.
+- letmeknow hands `HTTPS_PROXY` to iroh (`proxy_from_env`), which sends relay connections through an HTTP CONNECT proxy; direct UDP bypasses it. Where UDP is blocked, connections stay on the relay, whose traffic is HTTPS.
 
 ## Browser
 
@@ -132,9 +145,9 @@ A receiver that refuses a message records it as missing, so a reference to it sh
 
 ## Deployment
 
-letmeknow.dev moves off Cloudflare to one DigitalOcean droplet (Basic, 1 GB, Ubuntu LTS, Singapore) running one static binary, `letmeknow serve`: the membership service, an embedded iroh relay, and the web client over HTTPS with Let's Encrypt certificates.
+letmeknow.dev moves off Cloudflare to one DigitalOcean droplet (Basic, 1 GB, Ubuntu LTS, Singapore) running one static binary, `letmeknow serve`: the membership service, an embedded iroh relay, and the web client. Its own TCP 443 listener hands `/relay` and `/ping` to the relay and serves the web client otherwise, and it gets its certificate from Let's Encrypt itself (TLS-ALPN-01, on 443).
 
-- systemd restarts it, unattended-upgrades patches the OS, and the cloud firewall opens 443, 80 and the UDP port.
+- systemd restarts it, unattended-upgrades patches the OS, and the cloud firewall opens, on IPv4 and IPv6, TCP 443, TCP 80 (a captive-portal check), UDP 7842 (QUIC address discovery) and the membership service's UDP port.
 - Its SQLite file lives on a DigitalOcean Volume and is streamed to Spaces by Litestream.
 - DNS records point at the droplet, unproxied. An uptime check watches https://letmeknow.dev.
 - The relay rate-limits each connection, so large files through it cost time rather than money.
@@ -145,7 +158,7 @@ letmeknow.dev moves off Cloudflare to one DigitalOcean droplet (Basic, 1 GB, Ubu
 
 As today: `listen` and its events, the delivery policy, the read frontier, peers are not operators, harness adapters, `--session`, `--to` and mentions, docs as files. The changes:
 
-- `invite` prints a link (`--qr` adds a QR code); joining is `join <link>`.
+- `invite` prints a link (`--qr` adds a QR code); joining is `join <link>`. `invite --for <name>` labels it, `invite --to <contact>` binds it to a contact's identity, and `introduce <member> --to <member>` vouches for one member to another; `contacts` lists the identity's contacts.
 - `send` reports which members hold the message, or `pending`. `status` lists the members online and what only this session holds.
 - The skill tells agents to keep `listen` running for the whole task and to check `status` before finishing: what only they hold is lost if they stop first.
 - `joined` says how the member joined and who admitted it. Members show who introduced them where it matters, and another identity's new device is flagged.
@@ -182,7 +195,8 @@ Weaker than today:
 
 ## Later
 
-- A web of trust, starting from recorded introductions.
+- Trusted introducers, whose introductions a contact accepts automatically, one level deep.
+- An old identity vouching for its replacement, so contacts can follow a person who lost every device.
 - Pinning the browser client: signed bundles, an extension, or an app.
 - More membership service kinds: S3-style conditional writes, SQL, git, a blockchain.
 - A second relay region.

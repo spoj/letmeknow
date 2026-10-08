@@ -9,6 +9,14 @@ The exact formats behind REWRITE.md. Sections marked **pending** wait on the wav
 - Hashes are SHA-256, keys and signatures Ed25519, except files, which hash with BLAKE3 (see Files).
 - On a QUIC stream, every frame is a 4-byte big-endian length, then that many bytes of JSON.
 
+## Connections
+
+- All of our protocols use one ALPN, `letmeknow/1`, so two endpoints keep one connection. Each exchange is a bidirectional stream whose first frame names it: `{"stream": "membership" | "peer" | "invite"}`. File transfers use iroh-blobs' own ALPN.
+- Endpoints use iroh's `presets::Minimal` with a relay map holding our relays, and dial `EndpointAddr::new(key).with_relay_url(url)`, from the addresses that leaves, settings and invite links carry. iroh 1.3.0; the browser build enables only `tls-ring`.
+- Sessions of one device write their current direct addresses to `LETMEKNOW_HOME/addresses/<iroh key>.json` and dial each other from there, with no relay needed.
+- mDNS (iroh-mdns-address-lookup 0.6) is a device setting, off by default, since it announces session keys to the whole LAN.
+- The session process calls `proxy_from_env()`.
+
 ## Keys
 
 - **Device key**: Ed25519, in `device.json` (CLI) or IndexedDB (browser). It signs its sessions' keys and its identity's device list entries.
@@ -27,7 +35,7 @@ A log is named by an id: a group's MLS group id, or a device list's address (see
 
 ### `letmeknow serve`
 
-ALPN `letmeknow/membership/1`. A client opens one bidirectional stream per request and gets one answer, except `subscribe`, which stays open.
+A client opens one `membership` stream per request and gets one answer, except `subscribe`, which stays open.
 
 | Request | Answer |
 |---|---|
@@ -103,6 +111,10 @@ A member checks `device_sig` and the identity's device list (see Identity) when 
 - The identity's id is SHA-256 of the first entry's body. A credential names the id and its service; the first entry proves both.
 - Valid entries: `create` first, signed by the device it names; then each `prev` names the latest valid entry, and `by` is on the list at that point. A removal is final. Members apply the first valid entry per `prev`, in log order, and skip the rest.
 
+### Contacts
+
+An identity's contacts live in its devices group as a Yjs map from identity id to `{"name", "how": "verified" | "introduced", "by", "at"}` (`by`: the introducer's identity id). It is synced like a doc's text: edits live, catch-up by diff, and its state linked in the Welcome.
+
 ### Devices group
 
 An identity's devices group is a chat whose settings carry `devices_of`. Its members are devices, not sessions: on a machine, whichever session process is running acts for the device, holding a lock in `LETMEKNOW_HOME`, and records what it learns (openings) there for the device's other sessions. In a browser, the device is the session.
@@ -113,7 +125,7 @@ An opening, in its settings: `{"group", "kind", "name", "membership", "members":
 
 A link is `https://letmeknow.dev/i#<fragment>`, where the fragment is `1.<g|d>.<inviter's iroh key>.<secret>[.<relay>]`: version 1; `g` for a group, `d` for a device link; the key and a 16-byte random secret in unpadded base64url; the relay URL, percent-encoded, only if it is not letmeknow.dev's.
 
-ALPN `letmeknow/invite/1`. The joiner opens a stream to the inviter's key and sends `{"secret", "key_package"}`, or `{"secret", "device": "<device key>", "device_name"}` for a device link. The inviter checks the secret (single use, 10 minutes), commits the Add (for a device link: appends to the device list and adds the device to the devices group), and answers `{"welcome", "position", "doc"}`: `position` is the log position the joiner reads from, and `doc`, for a doc, links the doc's state as a file (see Files). A wrong or used secret gets `{"refused"}`; with 128 bits there is nothing to guess, so it uses nothing up.
+The joiner opens an `invite` stream to the inviter's key and sends `{"secret", "key_package"}`, or `{"secret", "device": "<device key>", "device_name"}` for a device link. The inviter checks the secret (single use, 10 minutes), commits the Add (for a device link: appends to the device list and adds the device to the devices group), and answers `{"welcome", "position", "doc"}`: `position` is the log position the joiner reads from, and `doc`, for a doc, links the doc's state as a file (see Files). A wrong or used secret gets `{"refused"}`; with 128 bits there is nothing to guess, so it uses nothing up.
 
 ## Messages
 
@@ -125,12 +137,13 @@ The plaintext of an MLS application message is JSON with a `type`:
 | `edit` | doc | `update`: a Yjs v1 update, sent live to the members online and not held |
 | `diff` | doc | `update`: a Yjs v1 update answering `doc_sv` (see Peer protocol), not held |
 | `leave` | every | none: the sender asks to be removed; the first member to see it commits the Remove |
+| `introduce` | every | `identity` (`id`, `membership`), `name`, `how` (`invite`, `open`, `introduce`): who a member is to the sender; sent after the sender adds someone, and by `introduce` |
 
 A message's id is SHA-256 of its MLS ciphertext. A member holds `message` and `leave` for `keep` days, and only once it has decrypted and verified them. It takes no message from a removed sender that first reaches it more than 5 minutes after it applied the removal.
 
 ## Peer protocol
 
-**Pending: iroh** (framing and connection handling). ALPN `letmeknow/peer/1`, between two sessions that share a group. Either side may send a frame at any time; every frame names its group, and a side serves a group only to a peer whose iroh key is in a leaf of that group's current epoch.
+A `peer` stream joins two sessions that share a group, one stream per pair, kept open while both are online. Either side may send a frame at any time; every frame names its group, and a side serves a group only to a peer whose iroh key is in a leaf of that group's current epoch.
 
 | Frame | Meaning |
 |---|---|
