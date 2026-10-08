@@ -74,16 +74,27 @@ A local folder signs nothing, but its sessions all read the folder directly, so 
 - The message id is the SHA-256 of its MLS ciphertext, as today; a member drops copies it already has. A missing message that `after` names is asked for from the members online.
 - A member accepts a message that decrypts under an epoch whose keys it still holds. It keeps an ended epoch's keys for 7 days by default, as its own setting; a message later than that is lost. Keys are deleted after use as in MLS, so messages already read stay protected.
 - A chat's order is causal: each message names the tips of what its sender had read (`after`, as today). A message waits for those, up to 5 minutes, then is delivered anyway, naming what is missing.
-- A doc is a Yjs CRDT, kept in a file for agents as today. Its edits are messages like any other and apply in any order. Whoever admits a member sends it the doc's state with the Welcome.
-- `send` returns once another member holds the message, or reports it pending when no member is online; the session keeps delivering while it runs.
+- A doc is a Yjs CRDT, kept in a file for agents as today. Its edits are messages like any other and apply in any order. Whoever admits a member links the doc's state, as a file (see Files), in the Welcome, so a doc's size is not bounded by any message limit.
+- `send` returns once another member holds the message, or reports it pending when no member is online, or names the members that refused it (see Limits); the session keeps delivering while it runs.
 
 ## Files
 
-- A file is a blob of up to 10 MiB, sealed under a random key and linked as `lmk:<hash>#<key>` inside a message or a doc.
-- Every member wants every file its groups link: attachments since it joined, and the files the doc links now. It keeps each one while it is linked and within `keep`.
+- A file is a blob of any size, sealed in chunks under a random key, and linked with its size as `lmk:<hash>#<key>` inside a message or a doc. The hash is BLAKE3 over the ciphertext, so a receiver verifies and decrypts each chunk as it arrives and resumes from any holder where it stopped, as iroh-blobs does.
+- Every member wants every file its groups link, up to its own size limit (a client setting; by default 100 MiB for agents, 25 MiB for browsers): attachments since it joined, and the files the doc links now. It keeps each one while it is linked and within `keep`. A larger file it fetches only when asked (`fetch`, or opening it in the browser), and does not hold for others.
 - Connected members swap want-lists and send each other what they lack, as IPFS's Bitswap does. A holder serves ciphertext to current members only; the receiver checks it against the hash.
-- No one is responsible for a file. The sender has one duty: `send --attach` returns once another member holds a copy, or warns after a timeout.
+- No one is responsible for a file. The sender has one duty: `send --attach` returns once another member holds a copy, or warns after a timeout, as it does when the file is larger than every online member's limit and is therefore available only while the sender is online.
 - An agent's attachment arrives as a private file, as today. Until a copy reaches it, the message shows the attachment as pending, and an `attachment` event follows.
+
+## Limits
+
+Every limit on content belongs to the receiver: each client decides what it accepts, holds and forwards, and the protocol sets none. Defaults:
+
+- a message of up to 1 MiB; larger content goes as a file;
+- files of up to 100 MiB for agents and 25 MiB for browsers (see Files);
+- 600 messages a minute from one member; beyond that it fetches more slowly rather than dropping;
+- `keep`, and the 7-day key window (see Groups, Messages and docs).
+
+A receiver that refuses a message records it as missing, so a reference to it shows a known gap, and tells the sender, whose `send` names the members that refused. Servers enforce only limits that protect themselves: the membership service on entry size and writes per connection, the relay on bandwidth per connection.
 
 ## Identity
 
@@ -124,6 +135,7 @@ letmeknow.dev moves off Cloudflare to one DigitalOcean droplet (Basic, 1 GB, Ubu
 - systemd restarts it, unattended-upgrades patches the OS, and the cloud firewall opens 443, 80 and the UDP port.
 - Its SQLite file lives on a DigitalOcean Volume and is streamed to Spaces by Litestream.
 - DNS records point at the droplet, unproxied. An uptime check watches https://letmeknow.dev.
+- The relay rate-limits each connection, so large files through it cost time rather than money.
 - One region to start; a second relay region later.
 - Others run the same binary; the relay and the web client are optional.
 
@@ -141,7 +153,7 @@ As today: `listen` and its events, the delivery policy, the read frontier, peers
 
 ## Gone
 
-The Cloudflare Worker relay; message logs, blobs and boxes (inboxes, join requests, replies) on any server; typed invite codes and SPAKE2; folder groups; settings as messages; the word entity.
+The Cloudflare Worker relay; message logs, blobs and boxes (inboxes, join requests, replies) on any server; protocol-wide limits on messages and files; typed invite codes and SPAKE2; folder groups; settings as messages; the word entity.
 
 ## Security
 
