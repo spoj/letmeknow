@@ -457,3 +457,18 @@ pub fn qr(link: &str) -> Result<String> {
     let code = qrcode::QrCode::new(link)?;
     Ok(code.render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build())
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_link_shows_as_a_qr_code() {
+        let code = super::qr("https://letmeknow.dev/i#1.g.AAAA.BBBB").unwrap();
+        assert!(code.lines().count() > 10);
+    }
+
+    #[test]
+    fn folders_are_paths() {
+        assert!(super::is_folder("./chat") && super::is_folder("/tmp/x"));
+        assert!(!super::is_folder("letmeknow.dev"));
+    }
+}
