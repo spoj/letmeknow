@@ -510,9 +510,6 @@ impl Session {
             }
             Into::Entity(membership) => {
                 let member: Member = serde_json::from_slice(&bytes)?;
-                if member.key.as_deref().map(hex::decode).transpose()?.map(|key| fingerprint(&key)) != Some(member.id.clone()) {
-                    bail!("the joining device's id does not match its key");
-                }
                 let device = Device::load(&self.home)?;
                 let by = device.id();
                 self.append(&membership.relay, &membership.id, |list| list.add(device.signer(), &by, member.clone()), |list| {
@@ -1041,7 +1038,8 @@ impl Session {
                 group.mls.merge_staged_commit(&self.provider, *staged)?;
                 if self_removed {
                     self.drop_group(gid)?;
-                    self.print(json!({ "type": "removed", "group": gid, "by": sender }));
+                    let by = self.describe(gid, sender).await?;
+                    self.print(json!({ "type": "removed", "group": gid, "by": by }));
                     return Ok(());
                 }
                 for change in changes {
@@ -1198,6 +1196,7 @@ impl Session {
     /// Delivers a "joined" or "left" line once the member's entity is checked.
     async fn deliver_change(&mut self, gid: &str, mut change: Value) -> Result<()> {
         change["member"] = self.describe(gid, change["member"].take()).await?;
+        change["by"] = self.describe(gid, change["by"].take()).await?;
         self.deliver(gid, change);
         Ok(())
     }

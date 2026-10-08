@@ -135,6 +135,11 @@ impl List {
     }
 
     pub fn add(&self, signer: &impl Signer, by: &str, member: Member) -> Result<Vec<u8>> {
+        if let Some(key) = &member.key
+            && fingerprint(&hex::decode(key)?) != member.id
+        {
+            bail!("the new member's id does not match its key");
+        }
         sign(signer, &Body::Add { prev: self.last.clone(), by: by.into(), member })
     }
 

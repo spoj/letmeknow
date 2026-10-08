@@ -112,7 +112,8 @@ pub fn rebase(base: &str, new: &str, current: &str) -> (String, Vec<String>) {
         }
     }
     let mut text = out.join("\n");
-    if new.ends_with('\n') {
+    let changed = base.ends_with('\n') != new.ends_with('\n');
+    if if changed { new.ends_with('\n') } else { current.ends_with('\n') } {
         text.push('\n');
     }
     (text, lost)
