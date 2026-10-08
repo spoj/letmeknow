@@ -91,7 +91,9 @@ def check(condition, message):
 def main():
     subprocess.run(["cargo", "build", "-q"], cwd=os.path.join(ROOT, "client"), check=True)
     subprocess.run([shutil.which("npm"), "install", "--silent"], cwd=os.path.join(ROOT, "relay"), check=True)
-    os.makedirs(os.path.join(ROOT, "relay", "public"), exist_ok=True)
+    web = os.path.join(ROOT, "web")
+    subprocess.run([shutil.which("npm"), "install", "--silent"], cwd=web, check=True)
+    subprocess.run([shutil.which("node"), "build.mjs"], cwd=web, check=True)
     relay = subprocess.Popen([shutil.which("npx"), "wrangler", "dev", "--port", str(PORT)], cwd=os.path.join(ROOT, "relay"),
                              env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     listeners = []
@@ -381,6 +383,8 @@ def main():
         handle = solo.ready["session"]
         check(len(handle.split("-")) == 2, f"listen without --session picks a handle ({handle})")
         check(run(None, "groups", env=solo_env) == [], "commands use the one running session")
+        if subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=web, env={**ENV, "RELAY": RELAY, "BIN": BIN}).returncode:
+            sys.exit("browser test failed")
         print("all passed")
     finally:
         for listener in listeners:

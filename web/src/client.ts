@@ -308,7 +308,7 @@ export class Client {
     let name = "";
     for (const id of path) {
       try {
-        const list = await this.list(id);
+        const list = await this.list(id, holder);
         if (!list.members.some(m => m.id === holder)) return { ...described, entity: { id, error: `not on ${list.name}'s list` } };
         name = list.name;
       } catch (error) {
@@ -321,10 +321,13 @@ export class Client {
     return { ...described, entity: { id: holder, name, new: fresh, yours: this.me.entities.some(e => e.id === holder) } };
   }
 
-  /** An entity's list as the relay has it, fetched at most once a minute. */
-  async list(id: string, fresh = false): Promise<List> {
+  /**
+   * An entity's list as the relay has it. A list fetched in the last minute answers for `member` if it is on it; anyone
+   * else is checked with the relay, so a device added a moment ago counts at once. Without `member`, always fetched.
+   */
+  async list(id: string, member?: string): Promise<List> {
     const cached = this.lists.get(id);
-    if (cached && !fresh && Date.now() - cached.at < 60_000) return cached.list;
+    if (cached && Date.now() - cached.at < 60_000 && cached.list.members.some(m => m.id === member)) return cached.list;
     const list: List = JSON.parse(entity_list(id, JSON.stringify(await boxAll(place("list", utf8(id)).address))));
     this.lists.set(id, { at: Date.now(), list });
     return list;
@@ -335,7 +338,7 @@ export class Client {
     const { address } = place("list", utf8(id));
     for (let attempt = 0; attempt < 3; attempt++) {
       await boxAppend(address, build(JSON.stringify(await boxAll(address))));
-      if (done(await this.list(id, true))) return;
+      if (done(await this.list(id))) return;
     }
     throw new Error("the entity's list kept changing; try again");
   }
@@ -434,7 +437,8 @@ export class Client {
   private async welcome(envelope: { entity?: Membership; group: string; seq: number; welcome: string }): Promise<string> {
     if (envelope.entity) {
       const { id, name, secret } = envelope.entity;
-      this.me.entities = [...this.me.entities.filter(e => e.id !== id), { id, name, secret }];
+      // First, so that this browser speaks as it from now on.
+      this.me.entities = [{ id, name, secret }, ...this.me.entities.filter(e => e.id !== id)];
       return "";
     }
     const gid = envelope.group;

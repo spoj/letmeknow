@@ -29,6 +29,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.129
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -37,7 +41,12 @@ jobs:
           python-version: "3.12"
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: client
+      - run: cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings
+        working-directory: client
       - run: cargo test
         working-directory: client
+      - run: npm ci && npx playwright install --with-deps chromium-headless-shell && npm run check
+        working-directory: web
+        shell: bash
       - run: python -u test/e2e.py
-        timeout-minutes: 5
+        timeout-minutes: 10

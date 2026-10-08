@@ -44,3 +44,11 @@ getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] 
 openmls = { version = "0.9", features = ["js"] }
 openmls_memory_storage = "0.6"
 wasm-bindgen = "=0.2.129"
+
+# The browser client's WebAssembly (web/build.mjs): small over fast.
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

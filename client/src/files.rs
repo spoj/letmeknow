@@ -88,20 +88,22 @@ pub fn rebase(base: &str, new: &str, current: &str) -> (String, Vec<String>) {
         if tag == DiffTag::Equal {
             continue;
         }
-        let mut after = old.start.checked_sub(1).and_then(|i| find(&out, base_lines[i], i));
+        // Added lines go after the line they followed, else before the line that followed them, else where they were.
+        let mut at = (old.start.checked_sub(1).and_then(|i| find(&out, base_lines[i], i)).map(|i| i + 1))
+            .or_else(|| base_lines.get(old.end).and_then(|next| find(&out, next, old.end)))
+            .unwrap_or(old.start.min(out.len()));
         for (i, line) in new_lines[added.clone()].iter().enumerate() {
             match base_lines.get(old.start + i).filter(|_| i < old.len()) {
                 Some(original) => match find(&out, original, old.start + i) {
-                    Some(at) => {
-                        out[at] = line;
-                        after = Some(at);
+                    Some(found) => {
+                        out[found] = line;
+                        at = found + 1;
                     }
                     None => lost.push((*line).to_owned()),
                 },
                 None => {
-                    let at = after.map_or(0, |a| a + 1);
                     out.insert(at, line);
-                    after = Some(at);
+                    at += 1;
                 }
             }
         }
@@ -137,6 +139,15 @@ mod tests {
         let current = "- [ ] alpha\n- [x] beta\n- [ ] gamma\n- [ ] delta\n";
         let (text, _) = rebase(BASE, "- [ ] alpha\n- [ ] new\n- [ ] beta\n- [ ] gamma\n", current);
         assert_eq!(text, "- [ ] alpha\n- [ ] new\n- [x] beta\n- [ ] gamma\n- [ ] delta\n");
+    }
+
+    #[test]
+    fn an_added_line_stays_in_place_when_the_line_it_followed_changed() {
+        let current = "- [ ] alpha\n- [ ] beta\n- [ ] gamma (Tuesday)\n";
+        let (text, _) = rebase(BASE, "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n- [ ] delta\n", current);
+        assert_eq!(text, "- [ ] alpha\n- [ ] beta\n- [ ] gamma (Tuesday)\n- [ ] delta\n");
+        let (text, _) = rebase(BASE, "- [ ] alpha\n- [ ] new\n- [ ] beta\n- [ ] gamma\n", "- [x] alpha\n- [ ] beta\n- [ ] gamma\n");
+        assert_eq!(text, "- [x] alpha\n- [ ] new\n- [ ] beta\n- [ ] gamma\n");
     }
 
     #[test]

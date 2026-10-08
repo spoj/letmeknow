@@ -2,15 +2,17 @@
 // WebAssembly, and the app bundled. app.js and app.css keep their names; the WebAssembly file carries a hash.
 import { execFileSync } from "node:child_process";
 import { rmSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 
-const client = new URL("../client/", import.meta.url).pathname;
-const out = new URL("../relay/public/assets/", import.meta.url).pathname;
-execFileSync("cargo", ["rustc", "--lib", "--release", "--target", "wasm32-unknown-unknown", "--crate-type", "cdylib"], { cwd: client, stdio: "inherit" });
-execFileSync("wasm-bindgen", ["--target", "web", "--out-dir", "pkg", `${client}target/wasm32-unknown-unknown/release/letmeknow.wasm`], { cwd: new URL(".", import.meta.url).pathname, stdio: "inherit" });
+const web = fileURLToPath(new URL(".", import.meta.url));
+const client = fileURLToPath(new URL("../client/", import.meta.url));
+const out = fileURLToPath(new URL("../relay/public/assets/", import.meta.url));
+execFileSync("cargo", ["rustc", "--lib", "--profile", "wasm", "--target", "wasm32-unknown-unknown", "--crate-type", "cdylib"], { cwd: client, stdio: "inherit" });
+execFileSync("wasm-bindgen", ["--target", "web", "--out-dir", "pkg", `${client}target/wasm32-unknown-unknown/wasm/letmeknow.wasm`], { cwd: web, stdio: "inherit" });
 rmSync(out, { recursive: true, force: true });
 await build({
-  entryPoints: { app: "src/main.ts" },
+  entryPoints: { app: `${web}src/main.ts` },
   assetNames: "[name]-[hash]",
   loader: { ".wasm": "file" },
   publicPath: "/assets",

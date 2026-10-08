@@ -1225,7 +1225,7 @@ impl Session {
         let mut holder = person.get("device").or(person.get("fp")).and_then(Value::as_str).unwrap_or_default().to_owned();
         let mut name = String::new();
         for id in path {
-            let error = match self.list(&relay, &id).await {
+            let error = match self.list(&relay, &id, &holder).await {
                 Ok(list) if list.get(&holder).is_some() => {
                     name = list.name;
                     holder = id;
@@ -1243,10 +1243,12 @@ impl Session {
         Ok(person)
     }
 
-    /// An entity's list as the relay has it, fetched at most once a minute.
-    async fn list(&mut self, relay: &str, id: &str) -> Result<List> {
+    /// An entity's list as the relay has it. A list fetched in the last minute answers for those on it; anyone else is
+    /// checked with the relay, so a device added a moment ago counts at once.
+    async fn list(&mut self, relay: &str, id: &str, member: &str) -> Result<List> {
         if let Some((at, list)) = self.lists.get(id)
             && at.elapsed() < LIST_TTL
+            && list.get(member).is_some()
         {
             return Ok(list.clone());
         }

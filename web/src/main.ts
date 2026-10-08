@@ -288,7 +288,7 @@ function devices() {
   select(undefined);
   const list = h("div");
   const draw = async () => {
-    const entities = await Promise.all(client.me.entities.map(async entity => ({ entity, list: await client.list(entity.id, true) })));
+    const entities = await Promise.all(client.me.entities.map(async entity => ({ entity, list: await client.list(entity.id) })));
     list.replaceChildren(
       ...entities.map(({ entity, list: { members } }) => {
         const box = h("div", { className: "entity" });
