@@ -1,6 +1,6 @@
-# letmeknow protocol (draft)
+# letmeknow protocol
 
-The exact formats behind REWRITE.md, settled by the wave-1 prototypes on the `spike/*` branches (each has a FINDINGS.md). The crate `lmk-proto` (`crates/proto`) implements the shared shapes; where the two differ, fix one of them.
+The exact formats behind DESIGN.md. The crate `lmk-proto` (`crates/proto`) implements the shared shapes; where the two differ, fix one of them.
 
 ## Conventions
 
@@ -143,11 +143,13 @@ The plaintext of an MLS application message is JSON with a `type`:
 
 | `type` | Kind | Fields |
 |---|---|---|
-| `message` | chat | `content`, `after`, and optional `to`, `reply_to`, `urgent`, `attachment`, as today |
+| `message` | chat | `content`, `after`, and optional `to`, `reply_to`, `urgent`, `attachment` (below) |
 | `edit` | doc | `update`: a Yjs v1 update, sent live to the members online and not held |
 | `diff` | doc | `update`: a Yjs v1 update answering `doc_sv` (see Peer protocol), not held |
 | `leave` | every | none: the sender asks to be removed; the first member to see it commits the Remove |
 | `introduce` | every | `identity` (`id`, `membership`), `name`, `how` (`invite`, `open`, `introduce`): who a member is to the sender; sent after the sender adds someone, and by `introduce` |
+
+A `message`'s fields: `content`, its text, which may be empty with an attachment; `after`, the ids of the messages the sender had read that no other message it read lists in `after`; `to`, the members it addresses, each as the first 8 bytes of SHA-256 of its session key, or none for the group; `reply_to`, the id of the message it answers; `urgent`, `true` to wake every member; `attachment`, `{"link", "name", "size", "type"}`: a file link (see Files), its name, its size in bytes, and its media type, which may be empty.
 
 A message's id is SHA-256 of its MLS ciphertext. A member holds `message` and `leave` for `keep` days, and only once it has decrypted and verified them. It takes no message from a removed sender that first reaches it more than 5 minutes after it applied the removal.
 
@@ -192,4 +194,4 @@ Message sync, per group, starts once both sides have caught up on commits. It is
 - A service worker caches exactly the files of one build, under a name derived from their contents, and serves navigations with its `index.html`. A new build installs beside it and waits; the page offers it, and on acceptance tells it `"skip"`, and every tab the old one served reloads.
 - One tab at a time runs the session, holding the Web Lock `letmeknow`; the others wait for it.
 
-Push notifications are deferred; the push prototype's design is on `spike/push` (see REWRITE.md, Later).
+Push notifications are deferred (see DESIGN.md, Later).

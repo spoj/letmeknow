@@ -1,6 +1,0 @@
-[target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-C", "target-feature=+crt-static"]
-
-# getrandom 0.3, pulled in by rand, picks its WebAssembly backend from this flag.
-[target.wasm32-unknown-unknown]
-rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]
