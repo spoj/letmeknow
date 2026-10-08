@@ -112,6 +112,7 @@ export class Group extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const [, , gid, action] = url.pathname.split("/");
+    const data = await body(request);
     if (action === "ws") {
       if (request.headers.get("Upgrade") !== "websocket") return text("expected websocket", 426);
       // Sockets that ask for messages get each one in its notice; 0.7 clients get the bare seq.
@@ -123,8 +124,6 @@ export class Group extends DurableObject<Env> {
       return Response.json(page(this.sql, Number(url.searchParams.get("after") ?? 0)));
     }
     if (request.method !== "POST") return text("method not allowed", 405);
-
-    const data = new Uint8Array(await request.arrayBuffer());
     if (data.length > MAX_MESSAGE_BYTES) return text("message too large (limit 1 MiB)", 413);
     let header: Header;
     try {
@@ -202,6 +201,7 @@ export class Box extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const data = await body(request);
     if (url.pathname.split("/")[3] === "ws") {
       if (request.headers.get("Upgrade") !== "websocket") return text("expected websocket", 426);
       return accept(this.ctx, ["messages"]);
@@ -212,7 +212,6 @@ export class Box extends DurableObject<Env> {
       return Response.json(page(this.sql, after));
     }
     if (request.method !== "POST") return text("method not allowed", 405);
-    const data = new Uint8Array(await request.arrayBuffer());
     if (data.length > MAX_MESSAGE_BYTES) return text("entry too large (limit 1 MiB)", 413);
     const at = Date.now();
     const seq = this.sql.exec<{ seq: number }>("INSERT INTO messages (at, data) VALUES (?, ?) RETURNING seq", at, data).one().seq;
@@ -232,13 +231,12 @@ export class Invite extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const action = url.pathname.split("/")[3];
-    // Read the body before any answer: workerd faults when a body forwarded from the Worker is still streaming in after the response.
-    const body = request.method === "GET" ? "" : await request.text();
+    const json = new TextDecoder().decode(await body(request));
     let invite = await this.ctx.storage.get<InviteState>("invite");
 
     if (request.method === "PUT" && action === undefined) {
       if (invite && invite.expires > Date.now()) return text("invite exists", 409);
-      const { ttl, owner, pake } = parse(body);
+      const { ttl, owner, pake } = parse(json);
       if (!Number.isInteger(ttl) || (ttl as number) < 1 || (ttl as number) > MAX_INVITE_TTL_S) return text("bad ttl", 400);
       if (typeof owner !== "string" || !OWNER.test(owner)) return text("bad owner", 400);
       if (typeof pake !== "string" || pake.length > MAX_PAKE_CHARS) return text("bad pake", 400);
@@ -258,7 +256,7 @@ export class Invite extends DurableObject<Env> {
       return data ? Response.json({ data }) : new Response(null, { status: 204 });
     }
     if (request.method !== "POST") return text("not found", 404);
-    const { data } = parse(body);
+    const { data } = parse(json);
     if (typeof data !== "string" || data.length > MAX_MESSAGE_BYTES) return text("bad data", 400);
 
     if (action === "join") {
@@ -281,6 +279,12 @@ export class Invite extends DurableObject<Env> {
     await this.ctx.storage.deleteAll();
     wake(this.waiters);
   }
+}
+
+// Durable Objects read the body before any answer: workerd faults ("Can't read from request stream after response has
+// been sent") when a body forwarded from the Worker is still streaming in after the response.
+async function body(request: Request): Promise<Uint8Array> {
+  return request.method === "GET" ? new Uint8Array() : new Uint8Array(await request.arrayBuffer());
 }
 
 // Long-poll: hold the request until wake() or `wait` seconds (max 30) pass.
