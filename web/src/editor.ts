@@ -128,7 +128,10 @@ async function shrink(file: Blob): Promise<Uint8Array> {
   }
 }
 
-/** Uploads the images among `files` and inserts their links at `at`; false if there are none, so the editor handles the event. */
+/**
+ * Uploads the images among `files` and inserts their links on lines of their own, after the line at `at`, so that a
+ * drop never splits a link; false if there are none, so the editor handles the event.
+ */
 function insertImages(view: EditorView, images: Images, event: Event, files: FileList | undefined, at: number): boolean {
   const chosen = [...(files ?? [])].filter(f => f.type.startsWith("image/"));
   if (!chosen.length) return false;
@@ -137,7 +140,10 @@ function insertImages(view: EditorView, images: Images, event: Event, files: Fil
     const alt = file.name.replace(/\.[^.]*$/, "").replace(/[[\]]/g, "");
     shrink(file)
       .then(images.attach)
-      .then(link => view.dispatch({ changes: { from: Math.min(at, view.state.doc.length), insert: `![${alt}](${link})` } }))
+      .then(link => {
+        const line = view.state.doc.lineAt(Math.min(at, view.state.doc.length));
+        view.dispatch({ changes: { from: line.to, insert: `${line.length ? "\n" : ""}![${alt}](${link})` } });
+      })
       .catch(images.fail);
   }
   return true;

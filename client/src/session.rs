@@ -377,8 +377,8 @@ impl Session {
                     self.flush(&gid);
                     self.update_key(&gid).await;
                 }
-                if synced {
-                    self.keep_blobs(&gid).await;
+                if synced && let Err(error) = self.keep_blobs(&gid).await {
+                    self.warn(Some(&gid), format!("blobs: {error:#}"));
                 }
             }
             Event::Files { gid, records, ignored } => {
@@ -895,13 +895,10 @@ impl Session {
 
     /// Fetches the blobs that a relay group's files link and this member lacks: the relay keeps them only for its message
     /// TTL, so members keep them, and pass them on to the members they add.
-    async fn keep_blobs(&mut self, gid: &str) {
-        let links = match self.links(gid) {
-            Ok(links) => links,
-            Err(error) => return self.warn(Some(gid), format!("blobs: {error:#}")),
-        };
-        for hash in links {
-            if self.missing.contains(&hash) {
+    async fn keep_blobs(&mut self, gid: &str) -> Result<()> {
+        for hash in self.links(gid)? {
+            let kept = self.db.query_row("SELECT 1 FROM blobs WHERE gid = ? AND hash = ?", params![gid, hash], |_| Ok(())).optional()?;
+            if kept.is_some() || self.missing.contains(&hash) {
                 continue;
             }
             if let Err(error) = self.blob(gid, &hash).await {
@@ -909,6 +906,7 @@ impl Session {
                 self.missing.insert(hash);
             }
         }
+        Ok(())
     }
 
     /// Puts every blob the group's files link, that this member keeps, on the relay again, so a member just added can

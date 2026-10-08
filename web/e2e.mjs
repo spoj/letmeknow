@@ -186,6 +186,14 @@ try {
   await late.getByRole("button", { name: /^Files/ }).click();
   await late.getByRole("button", { name: "checklist.md" }).click();
   check((await (await shown(late, 2)).jsonValue()).join() === "120,1600", "a member added later sees both images");
+  await late.locator(".cm-content").evaluate(async (content, png) => {
+    const data = new DataTransfer();
+    data.items.add(new File([Uint8Array.from(atob(png), c => c.charCodeAt(0))], "photo.png", { type: "image/png" }));
+    const { left, bottom } = [...content.querySelectorAll(".cm-line")].at(-1).getBoundingClientRect();
+    content.dispatchEvent(new DragEvent("drop", { dataTransfer: data, clientX: left + 2, clientY: bottom - 2, bubbles: true, cancelable: true }));
+  }, await picture(late, 300, 200));
+  await shown(laptop, 3);
+  check(/\)\n!\[photo\]\(lmk:[0-9a-f#]+\)$/.test(await text(laptop)), "an image dropped onto a line goes on its own line after it, and reaches the others");
   await laptop.getByRole("button", { name: "Chat" }).click();
 
   // An open group: the laptop starts a group open to Matthew; the phone joins it without an invite.
