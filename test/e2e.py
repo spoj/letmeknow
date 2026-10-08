@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end test: a local `letmeknow serve` (membership service and relay, with a self-signed certificate) and several
 `letmeknow listen` processes, each its own device. --no-browser is the default: there is no browser client yet."""
-import json, os, queue, signal, socket, subprocess, sys, tempfile, threading, time
+import json, os, queue, socket, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "target", "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
@@ -28,7 +28,7 @@ def home(name):
 
 def run(session, *args, ok=True, input=None, device=None):
     env = {**ENV, "LETMEKNOW_HOME": home(device or session)}
-    result = subprocess.run([BIN, "--session", session, *args], env=env, input=input, capture_output=True, text=True, timeout=120)
+    result = subprocess.run([BIN, "--session", session, *args], env=env, input=input, capture_output=True, text=True, encoding="utf-8", timeout=120)
     if ok and result.returncode:
         sys.exit(f"{session} {args}: {result.stderr}")
     return json.loads(result.stdout) if result.returncode == 0 else result.stderr
@@ -65,12 +65,13 @@ class Listener:
         sys.exit(f"{self.session}: no {kind} event, only {seen}")
 
     def stop(self):
-        self.proc.send_signal(signal.SIGTERM)
+        # SIGTERM where there are signals; on Windows, the process ends at once.
+        self.proc.terminate()
         try:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.proc.kill()
-            sys.exit(f"{self.session}: listen ignored SIGTERM")
+            sys.exit(f"{self.session}: listen did not stop")
 
 
 def write(name, text):
@@ -81,7 +82,7 @@ def write(name, text):
 
 
 def content(path):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return f.read()
 
 
@@ -97,9 +98,7 @@ def until(produce, accept, timeout=20):
 def serve():
     """A local `letmeknow serve` with a self-signed certificate; returns it and its membership address."""
     cert, key = os.path.join(TMP, "cert.pem"), os.path.join(TMP, "key.pem")
-    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", key, "-out", cert,
-                    "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-addext", "basicConstraints=critical,CA:FALSE"],
-                   check=True, capture_output=True)
+    subprocess.run(["cargo", "run", "-q", "-p", "letmeknow", "--example", "self_signed", "--", cert, key], cwd=ROOT, check=True)
     https = free_port()
     args = [BIN, "serve", "--domain", "localhost", "--https-port", str(https), "--http-port", str(free_port()), "--membership-port", str(free_port()),
             "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key]
@@ -160,8 +159,8 @@ def main():
         bob_notes = os.path.join(TMP, "bob-notes.md")
         check(run("bob", "join", doc["link"], bob_notes)["kind"] == "doc", "bob joins the doc into a file of his")
         check(until(lambda: content(bob_notes), lambda text: text == "- [ ] alpha\n- [ ] beta\n"), "the doc's text reaches the joiner")
-        with open(bob_notes, "a") as f:
-            f.write("- [ ] gamma @alice\n")
+        with open(bob_notes, "ab") as f:
+            f.write(b"- [ ] gamma @alice\n")
         edited = alice.expect("edited", lambda e: e["group"] == doc["group"])
         check(edited["by"][0]["name"] == "Bob" and edited["direct"], "alice is told bob edited, mentioning her")
         check(content(notes) == "- [ ] alpha\n- [ ] beta\n- [ ] gamma @alice\n", "and her file has his line")
@@ -169,7 +168,7 @@ def main():
         check(until(lambda: content(bob_notes), lambda text: text.startswith("- [x] alpha")) == "- [x] alpha\n- [ ] beta\n- [ ] gamma @alice\n", "her edit reaches his file")
 
         # Carol joins through bob, who means the link for her; the chat is then opened to bob's identity.
-        joined = run("carol", "join", run("bob", "invite", "--group", group, "--for", "Carol")["link"])
+        joined = run("carol", "join", run("bob", "invite", f"--group={group}", "--for", "Carol")["link"])
         check(len(joined["members"]) == 3, "a member invites another")
         alice.expect("joined", lambda e: e["member"]["name"] == "Carol" and e["by"]["name"] == "Bob")
         check(any(c["name"] == "Carol" for c in run("bob", "contacts")["contacts"]), "carol is bob's contact")
@@ -188,18 +187,18 @@ def main():
         check(any(c["name"] == "Carol" and c["how"] == "verified" for c in contacts), "bob's contacts reach his tablet")
 
         # An open group: the chat is opened to bob's identity, and his tablet joins it without an invite.
-        opened = run("alice", "open", "--group", group, "Bob (Acme)")
+        opened = run("alice", "open", f"--group={group}", "Bob (Acme)")
         check(opened["settings"]["open"][0]["name"] == "Bob (Acme)", "alice opens the chat to bob's identity")
         listed = until(lambda: run("tablet", "groups"), lambda groups: any(g["group"] == group for g in groups))
         check(any(g["group"] == group and g.get("joined") is False for g in listed), "the tablet sees the chat open to it")
-        joined = run("tablet", "join", group)
+        joined = run("tablet", "join", "--", group)
         check(len(joined["members"]) == 4, "the tablet joins the open chat")
         event = alice.expect("joined", lambda e: e["member"]["name"] == "Tablet")
         check(event["how"] == "open" and event["member"]["identity"]["name"] == "Bob (Acme)", "as a device of the identity it is open to")
 
         # A removal.
-        carol_fp = next(m["fp"] for m in run("alice", "members", "--group", group)["members"] if m["name"] == "Carol")
-        run("alice", "remove", "--group", group, carol_fp)
+        carol_fp = next(m["fp"] for m in run("alice", "members", f"--group={group}")["members"] if m["name"] == "Carol")
+        run("alice", "remove", f"--group={group}", carol_fp)
         check(carol.expect("removed")["by"]["name"] == "Alice", "carol is told alice removed her")
         alice.expect("left", lambda e: e["member"]["name"] == "Carol")
         check(run("carol", "groups") == [], "and is in no group")
@@ -207,8 +206,8 @@ def main():
         # A restart: bob misses a message and a commit, and catches up when he is back.
         bob.stop()
         listeners.remove(bob)
-        run("alice", "name", "--group", group, "Release")
-        missed = run("alice", "send", "--group", group, "while you were away")
+        run("alice", "name", f"--group={group}", "Release")
+        missed = run("alice", "send", f"--group={group}", "while you were away")
         check("held_by" in missed, "the tablet holds what bob misses")
         bob = Listener("bob")
         listeners.append(bob)
@@ -218,7 +217,7 @@ def main():
         check(any(g.get("name") == "Release" for g in renamed), "and on the commits it missed")
 
         # Bob takes his tablet off his identity: its sessions leave his groups.
-        run("bob", "identity", "remove", tablet.ready["member"]["device"]["key"])
+        run("bob", "identity", "remove", "--", tablet.ready["member"]["device"]["key"])
         check(tablet.expect("removed", timeout=60)["group"] == group, "a device taken off its identity leaves its groups")
         print("all ok")
     finally:
