@@ -2,7 +2,7 @@
 
 use std::{
     future::Future,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU32,
     path::{Path, PathBuf},
     pin::Pin,
@@ -35,6 +35,7 @@ use lmk_membership::{
 };
 use lmk_proto::{frame::ALPN, group};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use socket2::{Domain, Socket, Type};
 use tokio::{net::TcpListener, sync::Notify};
 use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
 use tokio_stream::StreamExt;
@@ -181,9 +182,9 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         Arc::new(AllowAll),
         Arc::new(Metrics::default()),
     );
-    let https = TcpListener::bind((Ipv6Addr::UNSPECIFIED, config.https_port)).await?;
+    let https = listen_all(config.https_port)?;
     if let Some(port) = config.http_port {
-        let http = TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).await?;
+        let http = listen_all(port)?;
         tokio::spawn(redirect(http, config.relay_url()));
     }
 
@@ -227,6 +228,18 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
                 .await;
         });
     }
+}
+
+/// A TCP listener on every address, IPv4 and IPv6: a bare `[::]` takes IPv4 too on Linux, but not on Windows.
+fn listen_all(port: u16) -> Result<TcpListener> {
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, None)?;
+    socket.set_only_v6(false)?;
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    Ok(TcpListener::from_std(socket.into())?)
 }
 
 fn respond(status: StatusCode) -> http::response::Builder {

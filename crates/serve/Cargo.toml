@@ -16,6 +16,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 iroh = { workspace = true, features = ["tls-ring"] }
 iroh-relay = { workspace = true, features = ["server"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+socket2 = "0.6"
 tokio = { workspace = true, features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-rustls-acme.workspace = true

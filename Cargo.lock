@@ -2969,6 +2969,7 @@ dependencies = [
  "lmk-proto",
  "rcgen",
  "rustls",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tokio-rustls-acme",
