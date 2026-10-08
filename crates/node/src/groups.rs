@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
 use lmk_core::group::{self as core, Change, key_package_credential};
@@ -41,9 +41,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if g.rec.items.iter().any(|item| item.id.0 == id) {
             return Ok(Taken::Held);
         }
-        ensure!(!g.rec.given_up.iter().any(|(_, given)| given.0 == id), "beyond the key window");
-        ensure!(ciphertext.len() <= MAX_MESSAGE, "larger than 1 MiB");
+        ensure!(!g.rec.given_up.iter().any(|(_, given)| given.0 == id), "given up");
         let epoch = core::epoch_of(ciphertext)?;
+        if ciphertext.len() > MAX_MESSAGE {
+            g.rec.given_up.push((epoch, Bytes(id.to_vec())));
+            st.save(gid)?;
+            bail!("larger than 1 MiB");
+        }
         if epoch > g.mls.epoch() {
             if !g.future.iter().any(|waiting| waiting == ciphertext) {
                 g.future.push(ciphertext.to_vec());

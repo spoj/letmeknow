@@ -447,6 +447,10 @@ impl Session {
             bail!("{file} already holds another doc");
         }
         let to = to.map(|to| self.contact(&to)).transpose()?;
+        ensure!(
+            for_.is_none() || !self.identities().is_empty(),
+            "contacts belong to an identity: create one with `identity create`"
+        );
         let mut answer = json!({ "expires_in": INVITE_TTL });
         let link = match identity {
             Some(identity) => {
@@ -768,7 +772,8 @@ impl Session {
         }
         let sender = self.describe(&message.group, &message.sender)?;
         let payload = serde_json::to_value(&message.payload)?;
-        if self.missing(&payload)?.is_empty() {
+        // A message waits for those it comes after, unless this session gave them up: then it shows the gap.
+        if self.missing(&payload)?.iter().all(|missing| self.node.given_up(&message.group.0, missing)) {
             self.take_message(&message.group, id, sender, payload).await
         } else {
             self.waiting.push(Waiting { deadline: Instant::now() + CAUSAL_WAIT, gid: message.group, id, sender, payload });

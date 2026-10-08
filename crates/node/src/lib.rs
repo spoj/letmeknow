@@ -676,6 +676,12 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok((Bytes(id.to_vec()), delivery))
     }
 
+    /// Whether this session gave a message up: it refused it, or could not open it.
+    pub fn given_up(&self, gid: &[u8], id: &[u8]) -> bool {
+        let st = self.inner.state.lock().unwrap();
+        st.group(gid).is_ok_and(|g| g.rec.given_up.iter().any(|(_, given)| given.0 == id))
+    }
+
     /// A held message.
     pub fn message(&self, id: &[u8]) -> Result<Option<Message>> {
         get(&self.inner.state.lock().unwrap().provider, &message_key(id))
