@@ -88,13 +88,16 @@ pub fn rebase(base: &str, new: &str, current: &str) -> (String, Vec<String>) {
         if tag == DiffTag::Equal {
             continue;
         }
-        // Added lines go after the line they followed, else before the line that followed them, else where they were.
+        let pairs = pair(&base_lines[old.clone()], &new_lines[added.clone()]);
+        // Added lines go after the line they followed, else before the first changed line of the block, else before the
+        // line that followed the block, else where they were.
         let mut at = (old.start.checked_sub(1).and_then(|i| find(&out, base_lines[i], i)).map(|i| i + 1))
+            .or_else(|| pairs.iter().flatten().find_map(|&j| find(&out, base_lines[old.start + j], old.start + j)))
             .or_else(|| base_lines.get(old.end).and_then(|next| find(&out, next, old.end)))
             .unwrap_or(old.start.min(out.len()));
-        for (i, line) in new_lines[added.clone()].iter().enumerate() {
-            match base_lines.get(old.start + i).filter(|_| i < old.len()) {
-                Some(original) => match find(&out, original, old.start + i) {
+        for (line, paired) in new_lines[added.clone()].iter().zip(&pairs) {
+            match paired {
+                Some(j) => match find(&out, base_lines[old.start + j], old.start + j) {
                     Some(found) => {
                         out[found] = line;
                         at = found + 1;
@@ -107,8 +110,10 @@ pub fn rebase(base: &str, new: &str, current: &str) -> (String, Vec<String>) {
                 }
             }
         }
-        for (i, original) in base_lines[old.clone()].iter().enumerate().skip(added.len()) {
-            if let Some(at) = find(&out, original, old.start + i) {
+        for (j, original) in base_lines[old.clone()].iter().enumerate() {
+            if !pairs.contains(&Some(j))
+                && let Some(at) = find(&out, original, old.start + j)
+            {
                 out.remove(at);
             }
         }
@@ -119,6 +124,33 @@ pub fn rebase(base: &str, new: &str, current: &str) -> (String, Vec<String>) {
         text.push('\n');
     }
     (text, lost)
+}
+
+/// Pairs each line of a changed block's new text with the old line it rewrites: the pairing, in order, of lines at least
+/// half alike that is most alike in total. An unpaired new line was added; an unpaired old line was removed.
+fn pair(old: &[&str], new: &[&str]) -> Vec<Option<usize>> {
+    let alike = |i: usize, j: usize| Some(TextDiff::from_chars(new[i], old[j]).ratio()).filter(|r| *r >= 0.5);
+    // best[i][j]: the most likeness pairing new[i..] with old[j..] can reach.
+    let mut best = vec![vec![0.0f32; old.len() + 1]; new.len() + 1];
+    for i in (0..new.len()).rev() {
+        for j in (0..old.len()).rev() {
+            let paired = alike(i, j).map_or(0.0, |r| r + best[i + 1][j + 1]);
+            best[i][j] = paired.max(best[i + 1][j]).max(best[i][j + 1]);
+        }
+    }
+    let mut pairs = vec![None; new.len()];
+    let (mut i, mut j) = (0, 0);
+    while i < new.len() && j < old.len() {
+        if alike(i, j).is_some_and(|r| best[i][j] == r + best[i + 1][j + 1]) {
+            pairs[i] = Some(j);
+            (i, j) = (i + 1, j + 1);
+        } else if best[i][j] == best[i + 1][j] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    pairs
 }
 
 #[cfg(test)]
@@ -148,6 +180,15 @@ mod tests {
         assert_eq!(text, "- [ ] alpha\n- [ ] beta\n- [ ] gamma (Tuesday)\n- [ ] delta\n");
         let (text, _) = rebase(BASE, "- [ ] alpha\n- [ ] new\n- [ ] beta\n- [ ] gamma\n", "- [x] alpha\n- [ ] beta\n- [ ] gamma\n");
         assert_eq!(text, "- [x] alpha\n- [ ] new\n- [ ] beta\n- [ ] gamma\n");
+    }
+
+    #[test]
+    fn a_changed_block_pairs_each_line_with_the_line_it_rewrites() {
+        let current = "- [ ] alpha (call Ann)\n- [ ] beta\n- [ ] gamma\n";
+        let (text, lost) = rebase(BASE, "- [ ] new\n- [x] alpha\n- [x] beta\n- [ ] gamma\n", current);
+        assert_eq!((text.as_str(), lost), ("- [ ] alpha (call Ann)\n- [ ] new\n- [x] beta\n- [ ] gamma\n", vec!["- [x] alpha".to_owned()]));
+        let (text, lost) = rebase(BASE, "- [x] beta\n- [ ] gamma\n", "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n- [ ] delta\n");
+        assert_eq!((text.as_str(), lost.len()), ("- [x] beta\n- [ ] gamma\n- [ ] delta\n", 0));
     }
 
     #[test]
