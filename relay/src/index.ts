@@ -214,7 +214,7 @@ export class Invite extends DurableObject<Env> {
 
     if (request.method === "PUT" && action === undefined) {
       if (invite && invite.expires > Date.now()) return text("invite exists", 409);
-      const { ttl, owner, pake }: { ttl: unknown; owner: unknown; pake: unknown } = JSON.parse(body);
+      const { ttl, owner, pake } = parse(body);
       if (!Number.isInteger(ttl) || (ttl as number) < 1 || (ttl as number) > MAX_INVITE_TTL_S) return text("bad ttl", 400);
       if (typeof owner !== "string" || !OWNER.test(owner)) return text("bad owner", 400);
       if (typeof pake !== "string" || pake.length > MAX_PAKE_CHARS) return text("bad pake", 400);
@@ -234,7 +234,7 @@ export class Invite extends DurableObject<Env> {
       return data ? Response.json({ data }) : new Response(null, { status: 204 });
     }
     if (request.method !== "POST") return text("not found", 404);
-    const { data }: { data: unknown } = JSON.parse(body);
+    const { data } = parse(body);
     if (typeof data !== "string" || data.length > MAX_MESSAGE_BYTES) return text("bad data", 400);
 
     if (action === "join") {
@@ -276,6 +276,16 @@ function wait(waiters: Set<() => void>, url: URL): Promise<void> {
 
 function wake(waiters: Set<() => void>) {
   for (const done of [...waiters]) done();
+}
+
+// A JSON object's fields, none if the body is not one, so a bad body is refused like a bad field.
+function parse(body: string): Record<string, unknown> {
+  try {
+    const value = JSON.parse(body);
+    return typeof value === "object" && value ? value : {};
+  } catch {
+    return {};
+  }
 }
 
 type Header = { groupId: string; epoch: number; contentType: number };

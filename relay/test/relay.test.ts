@@ -140,6 +140,13 @@ describe("invite", () => {
     expect(await receive("welcome")).toEqual({ data: "w" });
   });
 
+  it("refuses bodies that are not the JSON it expects", async () => {
+    const id = "2";
+    for (const body of ["{", "null"]) expect((await SELF.fetch(`${origin}/i/${id}`, { method: "PUT", body })).status).toBe(400);
+    await create(id);
+    for (const body of ["{", "null"]) expect((await SELF.fetch(`${origin}/i/${id}/join`, { method: "POST", body })).status).toBe(400);
+  });
+
   it("disappears at expiry, freeing the slot", async () => {
     const id = "999";
     await create(id);
