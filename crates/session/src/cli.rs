@@ -353,7 +353,7 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
     let response = match serde_json::from_str::<Call>(&line) {
         Ok(call) if call.token == token => {
             let (reply, answer) = oneshot::channel();
-            let _ = inbound.send(Inbound::Request(call.request, reply));
+            let _ = inbound.send(Inbound::Request(Box::new(call.request), reply));
             answer.await.unwrap_or_else(|_| json!({ "error": "session process stopped" }))
         }
         Ok(_) => json!({ "error": "bad token" }),

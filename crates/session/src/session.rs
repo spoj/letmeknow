@@ -46,7 +46,7 @@ pub struct Config {
 
 /// What reaches the session process besides its nodes' events.
 pub enum Inbound {
-    Request(Request, oneshot::Sender<Value>),
+    Request(Box<Request>, oneshot::Sender<Value>),
     /// A doc's file changed.
     FileChanged(Bytes),
 }
@@ -242,6 +242,7 @@ impl Session {
     pub async fn handle(&mut self, inbound: Inbound) {
         match inbound {
             Inbound::Request(request, reply) => {
+                let request = *request;
                 // The agent may have just changed a file.
                 self.sync_all().await;
                 if let Request::Fetch { link } = request {

@@ -1,7 +1,7 @@
 //! Sessions over a local relay with a self-signed certificate, their logs in a folder.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,7 +92,7 @@ fn folder(test: &str) -> PathBuf {
     dir
 }
 
-fn settings(kind: Kind, folder: &PathBuf) -> Settings {
+fn settings(kind: Kind, folder: &Path) -> Settings {
     Settings {
         protocol: PROTOCOL,
         kind,
