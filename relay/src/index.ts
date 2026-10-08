@@ -13,6 +13,7 @@ type InviteState = { expires: number; owner: string; pake: string; join?: string
 const ID = /^[0-9a-f]{32}$/;
 const SLOT = /^[1-9][0-9]{0,2}$/;
 const OWNER = /^[0-9a-f]{64}$/;
+const HASH = /^[0-9a-f]{64}$/;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_MESSAGE_BYTES = 1024 * 1024;
 const PAGE_BYTES = 2 * MAX_MESSAGE_BYTES;
@@ -106,17 +107,19 @@ export class Group extends DurableObject<Env> {
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.sql.exec("CREATE TABLE IF NOT EXISTS messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, data BLOB NOT NULL)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS state (epoch INTEGER NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, at INTEGER NOT NULL, data BLOB NOT NULL)");
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const [, , gid, action] = url.pathname.split("/");
+    const [, , gid, action, hash] = url.pathname.split("/");
     if (action === "ws") {
       if (request.headers.get("Upgrade") !== "websocket") return text("expected websocket", 426);
       const { 0: client, 1: server } = new WebSocketPair();
       this.ctx.acceptWebSocket(server);
       return new Response(null, { status: 101, webSocket: client });
     }
+    if (action === "blobs" && HASH.test(hash ?? "")) return this.blob(request, hash);
     if (action !== "messages") return text("not found", 404);
     if (request.method === "GET") {
       if (url.searchParams.has("wait")) return text("long-polling was removed; upgrade letmeknow", 410);
@@ -143,8 +146,29 @@ export class Group extends DurableObject<Env> {
       "INSERT INTO messages (at, data) VALUES (?, ?) RETURNING seq", Date.now(), data
     ).one().seq;
     for (const socket of this.ctx.getWebSockets()) socket.send(String(seq));
-    if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + RETENTION_MS);
+    await this.retain();
     return Response.json({ seq });
+  }
+
+  // A blob: an encrypted image or other file that the group's files link, addressed by the SHA-256 of its bytes. Putting
+  // one again refreshes it, so it lives on while members keep linking it.
+  private async blob(request: Request, hash: string): Promise<Response> {
+    if (request.method === "GET") {
+      const row = this.sql.exec<{ data: ArrayBuffer }>("SELECT data FROM blobs WHERE hash = ?", hash).toArray()[0];
+      return row ? new Response(row.data) : text("blob not found", 404);
+    }
+    if (request.method !== "PUT") return text("method not allowed", 405);
+    const data = new Uint8Array(await request.arrayBuffer());
+    if (data.length > MAX_MESSAGE_BYTES) return text("blob too large (limit 1 MiB)", 413);
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+    if (Array.from(digest, b => b.toString(16).padStart(2, "0")).join("") !== hash) return text("blob does not match its hash", 400);
+    this.sql.exec("INSERT INTO blobs (hash, at, data) VALUES (?, ?, ?) ON CONFLICT (hash) DO UPDATE SET at = excluded.at", hash, Date.now(), data);
+    await this.retain();
+    return new Response(null, { status: 204 });
+  }
+
+  private async retain() {
+    if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now() + RETENTION_MS);
   }
 
   webSocketClose(socket: WebSocket) {
@@ -153,8 +177,12 @@ export class Group extends DurableObject<Env> {
 
   async alarm() {
     this.sql.exec("DELETE FROM messages WHERE at <= ?", Date.now() - RETENTION_MS);
-    const oldest = this.sql.exec<{ at: number }>("SELECT at FROM messages ORDER BY seq LIMIT 1").toArray()[0];
-    if (oldest) await this.ctx.storage.setAlarm(oldest.at + RETENTION_MS);
+    this.sql.exec("DELETE FROM blobs WHERE at <= ?", Date.now() - RETENTION_MS);
+    const oldest = [
+      ...this.sql.exec<{ at: number }>("SELECT at FROM messages ORDER BY seq LIMIT 1"),
+      ...this.sql.exec<{ at: number }>("SELECT at FROM blobs ORDER BY at LIMIT 1")
+    ];
+    if (oldest.length) await this.ctx.storage.setAlarm(Math.min(...oldest.map(row => row.at)) + RETENTION_MS);
   }
 
   private epoch(): number {

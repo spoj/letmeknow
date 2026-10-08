@@ -107,7 +107,8 @@ A member commits a Remove. The group moves to a new epoch that the removed membe
 Per group, the relay stores:
 
 - the current MLS epoch;
-- a ciphertext log with a delivery cursor and a TTL (default 7 days).
+- a ciphertext log with a delivery cursor and a TTL (default 7 days);
+- blobs (see Images and blobs): encrypted files of up to 1 MiB, each addressed by the SHA-256 of its bytes, which the relay checks. They expire on the messages' TTL, counted from the last time a member put them; putting one again refreshes it.
 
 Per invite: the two SPAKE2 messages and the encrypted KeyPackage and Welcome until expiry.
 
