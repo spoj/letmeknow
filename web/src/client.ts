@@ -9,18 +9,21 @@ export type Entity = { id: string; name?: string; error?: string; new?: boolean;
 export type Person = { name: string; fp: string; device?: string; as?: string[]; you?: boolean; entity?: Entity };
 /** The person a member is, by its verified entity, or else the member itself. */
 export const whose = (p: Person) => (!p.entity?.error && p.entity?.name) || p.name;
-export type Settings = { name?: string; open?: { id: string; name: string }[]; requests?: string };
+/** `kind` says what the group shares, fixed when it is made: a chat or a doc. */
+export type Settings = { kind: string; name?: string; open?: { id: string; name: string }[]; requests?: string };
+/** A file sent with a message: the link to its blob, its name, size in bytes and media type. */
+export type Attachment = { link: string; name: string; size: number; type?: string };
+/** What a chat shows. Other kinds of group show no items: a warning in one goes to `onerror`. */
 export type Item =
-  | { type: "message"; id: string; from: Person; content: string; to?: string[]; reply_to?: string; urgent?: boolean; attachment?: string; after: string[]; at: number }
+  | { type: "message"; id: string; from: Person; content: string; to?: string[]; reply_to?: string; urgent?: boolean; attachment?: Attachment; after: string[]; at: number }
   | { type: "joined" | "left"; member: Person; by: Person; at: number }
-  | { type: "settings"; settings: Settings; by: Person; at: number }
+  | { type: "settings"; settings: Settings; before: Settings; by: Person; at: number }
   | { type: "warning"; text: string; at: number };
 /** An entity this browser is in. Its secret locates and seals the entity's inbox. */
 export type Membership = { id: string; name: string; secret: string };
-export type Opening = { group: string; relay: string; name: string; requests: string; closed?: boolean };
+export type Opening = { group: string; relay: string; kind: string; name: string; requests: string; closed?: boolean };
 export type Invite = { code: string; link: string };
 export type List = { id: string; name: string; members: { id: string; key?: string; name: string }[] };
-export type FileDoc = { gid: string; id: string; name: string; doc: Y.Doc };
 /**
  * `read` counts the items a person has seen. `pending` is the id of a commit this browser posted without hearing the
  * relay's answer: catching up tells whether the relay took it.
@@ -28,8 +31,14 @@ export type FileDoc = { gid: string; id: string; name: string; doc: Y.Doc };
 export type Group = { gid: string; cursor: number; settings: Settings; posted: string[]; requests: number; read: number; pending?: string };
 /** What a socket announces: a page row, without `data` when the entry is large. */
 type Notice = { seq: number; at: number; data?: string };
-type FileUpdate = { id: string; name?: string; update: string };
-type Payload = { content?: string; after: string[]; to?: string[]; reply_to?: string; urgent?: boolean; attachment?: string; settings?: Settings; file?: FileUpdate };
+type Payload =
+  | ({ type: "settings" } & Settings)
+  | { type: "message"; content?: string; after: string[]; to?: string[]; reply_to?: string; urgent?: boolean; attachment?: Attachment }
+  | { type: "edit"; update: string };
+/** The kind of group each type of message belongs to; settings belong to every kind. */
+const BELONGS: Record<string, string> = { message: "chat", edit: "doc" };
+/** The most a blob holds. */
+export const MAX_BLOB_BYTES = 10 * 1024 * 1024;
 
 const INVITE_TTL_MS = 600_000;
 const origin = location.origin;
@@ -41,7 +50,7 @@ const utf8 = (s: string) => new TextEncoder().encode(s);
 const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 const same = (a: Settings, b: Settings) =>
   a.name === b.name && a.requests === b.requests && JSON.stringify(a.open ?? []) === JSON.stringify(b.open ?? []);
-/** A link to a blob in a file: `lmk:<hash>#<key>`. */
+/** A link to a blob: `lmk:<hash>#<key>`. */
 const LINK = /lmk:([0-9a-f]{64})#([0-9a-f]{64})/g;
 const sha256 = async (bytes: Uint8Array) => hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource)));
 
@@ -127,7 +136,8 @@ export class Client {
   items = new Map<string, Item[]>();
   /** Each group's members as `members` last checked them. */
   people = new Map<string, Person[]>();
-  files = new Map<string, FileDoc>();
+  /** Each doc group's text, as a Yjs document. */
+  docs = new Map<string, Y.Doc>();
   onchange = () => {};
   onerror = (_error: unknown) => {};
   private seen = new Set<string>();
@@ -143,7 +153,7 @@ export class Client {
   private loaded = new Set<string>();
   private writes = new Map<string, [string, string, unknown]>();
   private saved = new Map<string, string>();
-  private dirtyFiles = new Set<string>();
+  private dirtyDocs = new Set<string>();
   private queue: Promise<unknown> = Promise.resolve();
   /** Blobs kept in IndexedDB, and those fetched or being fetched since the page loaded, as "<gid> <hash>". */
   private blobs = new Set<string>();
@@ -163,10 +173,15 @@ export class Client {
       for (const group of (await state("groups")) as Group[]) {
         client.groups.set(group.gid, group);
         client.items.set(group.gid, await store.all<Item>("items", `${group.gid} `));
+        // Made before groups had kinds, and unreadable now: left here, though not in the group.
+        if (!group.settings.kind) {
+          client.member.leave(group.gid);
+          await client.forget(group.gid);
+        }
       }
-      for (const file of await store.all<{ gid: string; id: string; name: string; state: Uint8Array; unsent?: Uint8Array }>("files", "")) {
-        client.track(file.gid, file.id, file.name, file.state);
-        if (file.unsent) client.queueUpdate(file.gid, file.id, file.unsent);
+      for (const { gid, state, unsent } of await store.all<{ gid: string; state: Uint8Array; unsent?: Uint8Array }>("docs", "")) {
+        client.track(gid, state);
+        if (unsent) client.queueUpdate(gid, unsent);
       }
     }
     return client;
@@ -184,12 +199,12 @@ export class Client {
 
   private async save() {
     if (!this.member) return;
-    for (const key of this.dirtyFiles) {
-      const file = this.files.get(key);
-      const unsent = this.outbox.get(key)?.updates ?? [];
-      if (file) this.write("files", key, { gid: file.gid, id: file.id, name: file.name, state: Y.encodeStateAsUpdate(file.doc), unsent: unsent.length ? Y.mergeUpdates(unsent) : undefined });
+    for (const gid of this.dirtyDocs) {
+      const doc = this.docs.get(gid);
+      const unsent = this.outbox.get(gid)?.updates ?? [];
+      if (doc) this.write("docs", gid, { gid, state: Y.encodeStateAsUpdate(doc), unsent: unsent.length ? Y.mergeUpdates(unsent) : undefined });
     }
-    this.dirtyFiles.clear();
+    this.dirtyDocs.clear();
     const state = { member: this.member.save(), me: JSON.stringify(this.me), groups: JSON.stringify([...this.groups.values()]), seen: JSON.stringify([...this.seen]) };
     const changed = Object.entries(state).filter(([key, value]) => this.saved.get(key) !== value);
     for (const [key, value] of changed) this.write("state", key, value);
@@ -263,7 +278,7 @@ export class Client {
   private follow(key: string, path: string, update: (notice?: Notice) => void) {
     const existing = this.sockets.get(key)?.socket;
     if (existing && existing.readyState <= WebSocket.OPEN) return;
-    const socket = new WebSocket(`${origin.replace(/^http/, "ws")}${path}/ws?messages`);
+    const socket = new WebSocket(`${origin.replace(/^http/, "ws")}${path}/ws`);
     let opened = false;
     let unanswered: ReturnType<typeof setTimeout> | undefined;
     const check = () => {
@@ -361,21 +376,32 @@ export class Client {
       this.groups.get(gid)!.pending = undefined;
       for (const change of result.changes) this.show(gid, { type: change.type, member: await this.describe(change.member), by: await this.describe(change.by), at: Date.now() });
       if (result.removed) {
-        const name = this.groups.get(gid)!.settings.name;
+        const { name, kind } = this.groups.get(gid)!.settings;
         const by = whose(await this.describe(result.sender));
         await this.forget(gid);
-        this.onerror(`${by} removed you from ${name ? `“${name}”` : "a group"}`);
+        this.onerror(`${by} removed you from ${name ? `“${name}”` : ({ chat: "a chat", doc: "a document" }[kind] ?? "a group")}`);
         return;
       }
       await this.members(gid);
       return;
     }
     const payload: Payload = result.payload;
-    if (payload.file) return this.applyFile(gid, payload.file);
+    const kind = this.groups.get(gid)!.settings.kind;
+    if (payload.type !== "settings" && BELONGS[payload.type] !== kind) {
+      // A type that belongs to no kind this browser knows (a folder's "joined", or a newer version's) says nothing here.
+      if (BELONGS[payload.type]) this.show(gid, { type: "warning", text: `Ignored a ${BELONGS[payload.type]} message in this ${kind}`, at: Date.now() });
+      return;
+    }
+    // An edit is never shown, so it does not meet the sender's entity.
+    if (payload.type === "edit") return this.applyEdit(gid, payload.update);
     const from = await this.describe(result.sender);
-    if (payload.settings) return this.settle(gid, payload.settings, from);
-    const { content = "", to, reply_to, urgent, attachment, after } = payload;
-    this.show(gid, { type: "message", id, from, content, to, reply_to, urgent, attachment, after, at: Date.now() });
+    if (payload.type === "message") {
+      const { content = "", to, reply_to, urgent, attachment, after } = payload;
+      return this.show(gid, { type: "message", id, from, content, to, reply_to, urgent, attachment, after, at: Date.now() });
+    }
+    const { type, ...settings } = payload;
+    if (settings.kind !== kind) return this.show(gid, { type: "warning", text: `Ignored settings that would make this ${kind} a ${settings.kind}`, at: Date.now() });
+    await this.settle(gid, settings, from);
   }
 
   /**
@@ -426,6 +452,7 @@ export class Client {
   private show(gid: string, item: Item) {
     const items = this.items.get(gid);
     if (!items) return;
+    if (this.groups.get(gid)!.settings.kind !== "chat") return item.type === "warning" && this.onerror(item.text);
     this.write("items", `${gid} ${String(items.length).padStart(10, "0")}`, item);
     items.push(item);
   }
@@ -437,11 +464,13 @@ export class Client {
     return messages.map(m => m.id).filter(id => !covered.has(id));
   }
 
-  send(gid: string, content: string, options: { to?: string[]; reply_to?: string; urgent?: boolean; attachment?: string }) {
+  /** Sends a message, with `file` uploaded first, outside the queue, as it may take a while. */
+  async send(gid: string, content: string, options: { to?: string[]; reply_to?: string; urgent?: boolean }, file?: File) {
+    const attachment = file && { link: await this.attach(gid, new Uint8Array(await file.arrayBuffer())), name: file.name, size: file.size, type: file.type || undefined };
     return this.run(async () => {
-      const payload: Payload = { content, after: this.tips(gid), ...options };
-      const { id } = await this.post(gid, () => this.member!.encrypt(gid, utf8(JSON.stringify(payload))));
-      this.show(gid, { type: "message", id, from: await this.self(gid), content, ...options, after: payload.after, at: Date.now() });
+      const message = { type: "message" as const, content, after: this.tips(gid), ...options, attachment };
+      const { id } = await this.post(gid, () => this.member!.encrypt(gid, utf8(JSON.stringify(message))));
+      this.show(gid, { ...message, id, from: await this.self(gid), at: Date.now() });
     });
   }
 
@@ -525,31 +554,18 @@ export class Client {
     });
   }
 
-  /** A new group named `name`, which this browser's other devices may join. */
-  newGroup(name: string): Promise<string> {
+  /** A new group of `kind` named `name`, which this browser's other devices may join. */
+  newGroup(kind: string, name: string): Promise<string> {
     return this.run(async () => {
       const gid = this.member!.create_group(this.path());
-      this.groups.set(gid, { gid, cursor: 0, settings: {}, posted: [], requests: 0, read: 0 });
+      this.groups.set(gid, { gid, cursor: 0, settings: { kind }, posted: [], requests: 0, read: 0 });
       this.items.set(gid, []);
       this.followGroup(gid);
+      const settings = { kind, ...(name ? { name } : {}) };
       const entity = this.me.entities[0];
-      if (entity) await this.openTo(gid, entity, name ? { name } : {});
-      else if (name) await this.setSettings(gid, { name });
+      if (entity) await this.openTo(gid, entity, settings);
+      else await this.setSettings(gid, settings);
       return gid;
-    });
-  }
-
-  /**
-   * After joining `gid` by invite, lets this browser's other devices join it too. Waits a moment for the settings the
-   * inviter posts after adding a member, as settings are posted whole and older ones would undo the inviter's.
-   */
-  async openToOwn(gid: string) {
-    const entity = this.me.entities[0];
-    for (let i = 0; i < 10 && this.groups.has(gid) && !Object.keys(this.groups.get(gid)!.settings).length; i++) await new Promise(r => setTimeout(r, 500));
-    if (!entity || !this.groups.has(gid)) return;
-    await this.run(async () => {
-      await this.catchUp(gid);
-      if (this.groups.has(gid)) await this.openTo(gid, entity);
     });
   }
 
@@ -618,10 +634,13 @@ export class Client {
       welcome = added.welcome;
       return unb64(added.commit);
     });
-    return { group: gid, seq, welcome };
+    return { group: gid, seq, welcome, settings: this.groups.get(gid)!.settings };
   }
 
-  /** Redeems an invite link: joins its group, or for a device link, adds this browser to the entity. */
+  /**
+   * Redeems an invite link: joins its group, which this browser's other devices may then join too, or for a device
+   * link, adds this browser to the entity.
+   */
   async redeem(slot: string, words: string): Promise<string> {
     const theirs: string = (await (await http(`/i/${slot}/pake?wait=0`)).json()).data;
     const pake = new Pake(words);
@@ -632,10 +651,15 @@ export class Client {
     await http(`/i/${slot}/join`, { method: "POST", body: JSON.stringify({ data: JSON.stringify(join) }) });
     const data = await wait(() => inviteData(`/i/${slot}/welcome?wait=25`), "the inviter did not answer within 10 minutes");
     const envelope = JSON.parse(text(open(key, "welcome", data)));
-    return this.run(() => this.welcome(envelope));
+    return this.run(async () => {
+      const gid = await this.welcome(envelope);
+      const entity = this.me.entities[0];
+      if (gid && entity && this.groups.has(gid)) await this.openTo(gid, entity);
+      return gid;
+    });
   }
 
-  private async welcome(envelope: { error?: string; entity?: Membership; group: string; seq: number; welcome: string }): Promise<string> {
+  private async welcome(envelope: { error?: string; entity?: Membership; group: string; seq: number; welcome: string; settings: Settings }): Promise<string> {
     if (envelope.error) throw new Error(`the inviter could not add this browser: ${envelope.error}`);
     if (envelope.entity) {
       const { id, name, secret } = envelope.entity;
@@ -645,10 +669,11 @@ export class Client {
     }
     const gid = envelope.group;
     this.member!.join(gid, unb64(envelope.welcome));
-    this.groups.set(gid, { gid, cursor: envelope.seq, settings: {}, posted: [], requests: 0, read: 0 });
+    this.groups.set(gid, { gid, cursor: envelope.seq, settings: envelope.settings, posted: [], requests: 0, read: 0 });
     this.items.set(gid, []);
     this.followGroup(gid);
     await this.catchUp(gid);
+    await this.members(gid);
     return gid;
   }
 
@@ -665,29 +690,30 @@ export class Client {
     if (current.open?.some(o => o.id === entity.id)) return;
     const settings = { ...current, open: [...(current.open ?? []), { id: entity.id, name: entity.name }], requests: current.requests || hex(random(32)) };
     const inbox = place("inbox", unhex(entity.secret));
-    const opening: Opening = { group: gid, relay: origin, name: settings.name ?? "", requests: settings.requests };
+    const opening: Opening = { group: gid, relay: origin, kind: settings.kind, name: settings.name ?? "", requests: settings.requests };
     await boxAppend(inbox.address, seal(inbox.key, "inbox", utf8(JSON.stringify(opening))));
     await this.setSettings(gid, settings);
   }
 
   private async setSettings(gid: string, settings: Settings) {
-    await this.post(gid, () => this.member!.encrypt(gid, utf8(JSON.stringify({ after: [], settings }))));
+    await this.post(gid, () => this.member!.encrypt(gid, utf8(JSON.stringify({ type: "settings", ...settings }))));
     await this.settle(gid, settings, await this.self(gid));
   }
 
   private async settle(gid: string, settings: Settings, by: Person) {
     const group = this.groups.get(gid)!;
-    if (same(group.settings, settings)) return;
+    const before = group.settings;
+    if (same(before, settings)) return;
     group.settings = settings;
     this.followRequests(gid);
-    this.show(gid, { type: "settings", settings, by, at: Date.now() });
+    this.show(gid, { type: "settings", settings, before, by, at: Date.now() });
   }
 
   close(gid: string, entity: Membership) {
     return this.run(async () => {
       const current = this.groups.get(gid)!.settings;
       const inbox = place("inbox", unhex(entity.secret));
-      const closing: Opening = { group: gid, relay: origin, name: current.name ?? "", requests: current.requests!, closed: true };
+      const closing: Opening = { group: gid, relay: origin, kind: current.kind, name: current.name ?? "", requests: current.requests!, closed: true };
       await boxAppend(inbox.address, seal(inbox.key, "inbox", utf8(JSON.stringify(closing))));
       await this.setSettings(gid, { ...current, open: (current.open ?? []).filter(o => o.id !== entity.id) });
     });
@@ -724,7 +750,8 @@ export class Client {
         found.splice(0, found.length, ...others, ...(opening.closed ? [] : [{ opening, entity }]));
       }
     }
-    return found.filter(f => !this.groups.has(f.opening.group) && !this.me.left.includes(f.opening.group));
+    // An opening without a kind is for a group made before groups had kinds, which this browser cannot read.
+    return found.filter(f => f.opening.kind && !this.groups.has(f.opening.group) && !this.me.left.includes(f.opening.group));
   }
 
   /** Asks to join an open group; whichever member is online checks the request and adds this browser. */
@@ -795,14 +822,14 @@ export class Client {
     await this.postState(gid);
   }
 
-  /** What a member who was just added needs from the others, who keep it: the settings, and a snapshot of every file. */
+  /**
+   * What a member just added needs from the others, who keep it: in a doc group, the text, as one edit, and the blobs
+   * it links, kept on the relay. It cannot read what was sent before it joined; its welcome brought the settings.
+   */
   private async postState(gid: string) {
+    if (this.groups.get(gid)!.settings.kind !== "doc") return;
     await this.refreshBlobs(gid);
-    const settings = this.groups.get(gid)!.settings;
-    if (Object.keys(settings).length) await this.post(gid, () => this.member!.encrypt(gid, utf8(JSON.stringify({ after: [], settings }))));
-    for (const file of this.files.values()) {
-      if (file.gid === gid) await this.postFile(gid, file.id, file.name, Y.encodeStateAsUpdate(file.doc));
-    }
+    await this.postEdit(gid, Y.encodeStateAsUpdate(this.doc(gid)));
   }
 
   private async updateKey(gid: string) {
@@ -817,103 +844,93 @@ export class Client {
       socket?.close();
     }
     this.items.delete(gid);
-    for (const [key, file] of this.files) if (file.gid === gid) this.files.delete(key);
-    for (const key of this.writes.keys()) if (key.startsWith(`items ${gid} `) || key.startsWith(`files ${gid} `)) this.writes.delete(key);
+    this.docs.delete(gid);
+    for (const key of this.writes.keys()) if (key.startsWith(`items ${gid} `) || key === `docs ${gid}`) this.writes.delete(key);
     await store.remove("items", `${gid} `);
-    await store.remove("files", `${gid} `);
+    await store.remove("docs", gid);
     await store.remove("blobs", `${gid} `);
     for (const key of this.blobs) if (key.startsWith(`${gid} `)) this.blobs.delete(key);
   }
 
-  // Files: one Yjs document each, bound to the editor. Local edits go out at most about once a second.
+  // A doc group's text: a Yjs document, bound to the editor. Local edits go out at most about once a second.
 
-  filesOf(gid: string): FileDoc[] {
-    return [...this.files.values()].filter(f => f.gid === gid);
+  doc(gid: string): Y.Doc {
+    return this.docs.get(gid) ?? this.track(gid);
   }
 
-  createFile(gid: string, name: string) {
-    return this.run(async () => {
-      const id = hex(random(8));
-      const doc = this.track(gid, id, name);
-      await this.postFile(gid, id, name, Y.encodeStateAsUpdate(doc));
-      return id;
-    });
-  }
-
-  private track(gid: string, id: string, name: string, state?: Uint8Array): Y.Doc {
+  private track(gid: string, state?: Uint8Array): Y.Doc {
     const doc = new Y.Doc();
     if (state) Y.applyUpdate(doc, state, "remote");
-    doc.on("update", (update: Uint8Array, source: unknown) => source !== "remote" && this.queueUpdate(gid, id, update));
-    this.files.set(`${gid} ${id}`, { gid, id, name, doc });
-    this.dirtyFiles.add(`${gid} ${id}`);
+    doc.on("update", (update: Uint8Array, source: unknown) => source !== "remote" && this.queueUpdate(gid, update));
+    this.docs.set(gid, doc);
+    this.dirtyDocs.add(gid);
     return doc;
   }
 
-  private applyFile(gid: string, update: FileUpdate) {
-    const key = `${gid} ${update.id}`;
-    if (!this.files.has(key)) this.track(gid, update.id, "");
-    const file = this.files.get(key)!;
-    if (update.name) file.name = update.name;
-    Y.applyUpdate(file.doc, unb64(update.update), "remote");
-    this.dirtyFiles.add(key);
+  private applyEdit(gid: string, update: string) {
+    Y.applyUpdate(this.doc(gid), unb64(update), "remote");
+    this.dirtyDocs.add(gid);
     this.keepBlobs(gid);
   }
 
-  private queueUpdate(gid: string, id: string, update: Uint8Array) {
-    const key = `${gid} ${id}`;
-    const out = this.outbox.get(key) ?? { updates: [] };
+  private queueUpdate(gid: string, update: Uint8Array) {
+    const out = this.outbox.get(gid) ?? { updates: [] };
     out.updates.push(update);
-    this.outbox.set(key, out);
-    this.dirtyFiles.add(key);
-    this.flush(gid, id, 1_000);
+    this.outbox.set(gid, out);
+    this.dirtyDocs.add(gid);
+    this.flush(gid, 1_000);
   }
 
-  /** Sends a file's local edits as one update; if that fails, tries again later. */
-  private flush(gid: string, id: string, delay: number) {
-    const key = `${gid} ${id}`;
-    const out = this.outbox.get(key)!;
+  /** Sends the text's local edits as one update; if that fails, tries again later. */
+  private flush(gid: string, delay: number) {
+    const out = this.outbox.get(gid)!;
     out.timer ??= setTimeout(() => {
       out.timer = undefined;
       this.run(async () => {
         if (!out.updates.length || !this.groups.has(gid)) return;
         const sending = out.updates.length;
-        await this.postFile(gid, id, "", Y.mergeUpdates(out.updates.slice(0, sending)));
+        await this.postEdit(gid, Y.mergeUpdates(out.updates.slice(0, sending)));
         out.updates.splice(0, sending);
-        this.dirtyFiles.add(key);
-      }).catch(() => this.flush(gid, id, 5_000));
+        this.dirtyDocs.add(gid);
+      }).catch(() => this.flush(gid, 5_000));
     }, delay);
   }
 
-  private async postFile(gid: string, id: string, name: string, update: Uint8Array) {
-    const file: FileUpdate = { id, update: b64(update), ...(name ? { name } : {}) };
-    await this.post(gid, () => this.member!.encrypt(gid, utf8(JSON.stringify({ after: [], file }))));
+  private async postEdit(gid: string, update: Uint8Array) {
+    await this.post(gid, () => this.member!.encrypt(gid, utf8(JSON.stringify({ type: "edit", update: b64(update) }))));
   }
 
-  // Blobs: images that files link, each sealed under its own key, which the link carries. The relay keeps them only as
-  // long as messages, so members keep every blob their files link, and put them again for each member they add.
+  // Blobs: files that messages and docs link, each sealed under its own key, which the link carries. The relay keeps a
+  // blob for 7 days after it was last put or kept, so members keep every blob their doc links, and keep them on the
+  // relay for each member they add.
 
   /** Uploads `bytes` to the group sealed under a fresh key; returns the link to it. */
   async attach(gid: string, bytes: Uint8Array): Promise<string> {
+    if (bytes.length > MAX_BLOB_BYTES) throw new Error(`files go up to ${MAX_BLOB_BYTES / 1024 / 1024} MB`);
     const key = random(32);
     const sealed = blob_seal(key, bytes);
     const hash = await sha256(sealed);
-    await http(`/g/${gid}/blobs/${hash}`, { method: "PUT", body: sealed as BodyInit });
+    await (await http(`/g/${gid}/blobs/${hash}`, { method: "PUT", body: sealed as BodyInit })).text();
     await this.keep(gid, hash, sealed);
     return `lmk:${hash}#${hex(key)}`;
   }
 
   /** A linked image as a data: URL, the one kind of image source besides this origin that the page's policy allows. */
   image(gid: string, link: string): Promise<string> {
-    if (!this.images.has(link)) {
-      const [, hash, key] = new RegExp(LINK.source).exec(link)!;
-      this.images.set(link, this.blob(gid, hash).then(sealed => dataUrl(blob_open(unhex(key), sealed))));
-    }
+    if (!this.images.has(link)) this.images.set(link, this.file(gid, link).then(dataUrl));
     return this.images.get(link)!;
   }
 
-  /** Every blob the group's files link. */
+  /** The bytes of the file a link points to. */
+  async file(gid: string, link: string): Promise<Uint8Array> {
+    const [, hash, key] = new RegExp(LINK.source).exec(link)!;
+    return blob_open(unhex(key), await this.blob(gid, hash));
+  }
+
+  /** Every blob a doc group's text links. */
   private linked(gid: string): Set<string> {
-    return new Set(this.filesOf(gid).flatMap(f => [...f.doc.getText("text").toString().matchAll(LINK)].map(m => m[1])));
+    if (this.groups.get(gid)?.settings.kind !== "doc") return new Set();
+    return new Set([...this.doc(gid).getText("text").toString().matchAll(LINK)].map(m => m[1]));
   }
 
   /** A blob's sealed bytes, as kept here, or else from the relay, and then kept. */
@@ -931,21 +948,29 @@ export class Client {
     this.blobs.add(`${gid} ${hash}`);
   }
 
-  /** Fetches the blobs the group's files link that this browser lacks, once per page load. */
+  /** Fetches the blobs the doc links that this browser lacks, once per page load. */
   private keepBlobs(gid: string) {
     for (const hash of this.linked(gid)) {
       const key = `${gid} ${hash}`;
       if (this.blobs.has(key) || this.fetched.has(key)) continue;
       this.fetched.add(key);
-      this.blob(gid, hash).catch(error => this.onerror(`An image in a file could not be fetched: ${error}`));
+      this.blob(gid, hash).catch(error => this.onerror(`A file the document links could not be fetched: ${error}`));
     }
   }
 
-  /** Puts every blob the group's files link, that this browser keeps, on the relay again, for the member just added. */
+  /**
+   * Keeps every blob the doc links on the relay, for the member just added: for another 7 days where the relay has it,
+   * put again from this browser's copy where it no longer does.
+   */
   private async refreshBlobs(gid: string) {
     for (const hash of this.linked(gid)) {
-      const sealed = await store.get<Uint8Array>("blobs", `${gid} ${hash}`);
-      if (sealed) await http(`/g/${gid}/blobs/${hash}`, { method: "PUT", body: sealed as BodyInit });
+      try {
+        await (await http(`/g/${gid}/blobs/${hash}`, { method: "POST" })).text();
+      } catch (error) {
+        if (!(error instanceof Refused && error.status === 404)) throw error;
+        const sealed = await store.get<Uint8Array>("blobs", `${gid} ${hash}`);
+        if (sealed) await (await http(`/g/${gid}/blobs/${hash}`, { method: "PUT", body: sealed as BodyInit })).text();
+      }
     }
   }
 }

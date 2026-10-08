@@ -64,7 +64,6 @@ describe("group", () => {
     expect(all.map(m => m.seq)).toEqual([1, 2]);
     expect(Buffer.from(all[0].data, "base64")).toEqual(Buffer.from(first));
     expect(await poll(gid, 2)).toEqual([]);
-    expect((await SELF.fetch(`${origin}/g/${gid}/messages?after=2&wait=30`)).status).toBe(410);
   });
 
   it("caps messages at 1 MiB and pages at 2 MiB", async () => {
@@ -75,36 +74,23 @@ describe("group", () => {
     expect((await poll(gid, 2)).map(m => m.seq)).toEqual([3]);
   });
 
-  it("notifies websockets of new messages and answers pings", async () => {
+  it("puts each new message, unless large, in a notice to websockets, and answers pings", async () => {
     const gid = hex(16);
     const { socket, next } = await subscribe(`/g/${gid}/ws`);
-    let message = next();
-    await post(gid, mls(gid, 0, COMMIT));
-    expect(await message).toBe("1");
-    message = next();
-    socket.send("ping");
-    expect(await message).toBe("pong");
-    socket.close();
-  });
-
-  it("puts a small message in the notice of sockets that ask for messages", async () => {
-    const gid = hex(16);
-    const bare = await subscribe(`/g/${gid}/ws`);
-    const full = await subscribe(`/g/${gid}/ws?messages`);
-    let [seq, notice] = [bare.next(), full.next()];
+    let notice = next();
     const small = mls(gid, 0, APPLICATION);
     await post(gid, small);
-    expect(await seq).toBe("1");
     const frame = JSON.parse(await notice);
     expect(frame.seq).toBe(1);
     expect(frame.at).toBeGreaterThan(0);
     expect(Buffer.from(frame.data, "base64")).toEqual(Buffer.from(small));
-    [seq, notice] = [bare.next(), full.next()];
+    notice = next();
     await post(gid, mls(gid, 0, APPLICATION, 64 * 1024));
-    expect(await seq).toBe("2");
     expect(JSON.parse(await notice)).toEqual({ seq: 2, at: expect.any(Number) });
-    bare.socket.close();
-    full.socket.close();
+    notice = next();
+    socket.send("ping");
+    expect(await notice).toBe("pong");
+    socket.close();
   });
 
 
@@ -281,6 +267,6 @@ describe("page", () => {
   it("still carries the agent instructions, for tools that read the page", async () => {
     const page = await (await SELF.fetch(`${origin}/i/417`, html)).text();
     expect(page).toContain("letmeknow join '&lt;link&gt;'");
-    expect(await (await SELF.fetch(`${origin}/`)).text()).toContain("end-to-end encrypted group chat for agents");
+    expect(await (await SELF.fetch(`${origin}/`)).text()).toContain("end-to-end encrypted chats and documents for agents");
   });
 });

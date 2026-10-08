@@ -27,16 +27,16 @@ const NOTICE_BYTES = 64 * 1024;
 const COMMIT = 3;
 const PRIVATE_MESSAGE = 2;
 
-const ABOUT = `letmeknow: end-to-end encrypted group chat for agents and their people.
+const ABOUT = `letmeknow: end-to-end encrypted chats and documents for agents and their people.
 This relay stores MLS ciphertext for up to 7 days and holds no keys. People: open this address in a browser.
 
-Agents: read the instructions with \`npx -y @letmeknow/cli@0.7 skill\`.
+Agents: read the instructions with \`npx -y @letmeknow/cli@0.8 skill\`.
 Source: https://github.com/spoj/letmeknow
 `;
 
-const INSTRUCTIONS = `This is a letmeknow invite into an end-to-end encrypted group chat. A person joins by opening this link in a browser; an agent as follows.
+const INSTRUCTIONS = `This is a letmeknow invite into an end-to-end encrypted chat or document. A person joins by opening this link in a browser; an agent as follows.
 
-1. Read the instructions: npx -y @letmeknow/cli@0.7 skill
+1. Read the instructions: npx -y @letmeknow/cli@0.8 skill
    (or, if letmeknow is installed: letmeknow skill)
 2. Start your session (letmeknow listen) as they describe, then join with the complete link, including the part after '#':
    letmeknow join '<link>'
@@ -121,15 +121,11 @@ export class Group extends DurableObject<Env> {
     const data = await body(request);
     if (action === "ws") {
       if (request.headers.get("Upgrade") !== "websocket") return text("expected websocket", 426);
-      // Sockets that ask for messages get each one in its notice; 0.7 clients get the bare seq.
-      return accept(this.ctx, url.searchParams.has("messages") ? ["messages"] : []);
+      return accept(this.ctx);
     }
     if (action === "blobs" && HASH.test(hash ?? "")) return this.blob(request.method, hash, data);
     if (action !== "messages") return text("not found", 404);
-    if (request.method === "GET") {
-      if (url.searchParams.has("wait")) return text("long-polling was removed; upgrade letmeknow", 410);
-      return Response.json(page(this.sql, Number(url.searchParams.get("after") ?? 0)));
-    }
+    if (request.method === "GET") return Response.json(page(this.sql, Number(url.searchParams.get("after") ?? 0)));
     if (request.method !== "POST") return text("method not allowed", 405);
     if (data.length > MAX_MESSAGE_BYTES) return text("message too large (limit 1 MiB)", 413);
     let header: Header;
@@ -217,17 +213,16 @@ function page(sql: SqlStorage, after: number) {
 }
 
 // Accepts a hibernatable socket for notices; the relay answers "ping" with "pong" without waking the object.
-function accept(ctx: DurableObjectState, tags: string[]): Response {
+function accept(ctx: DurableObjectState): Response {
   const { 0: client, 1: server } = new WebSocketPair();
-  ctx.acceptWebSocket(server, tags);
+  ctx.acceptWebSocket(server);
   return new Response(null, { status: 101, webSocket: client });
 }
 
-// Tells each socket about a new entry: sockets tagged "messages" get it as a page row ({seq, at, data}, data left out
-// above NOTICE_BYTES, so those fetch it), others its seq alone.
+// Tells each socket about a new entry, as a page row ({seq, at, data}, data left out above NOTICE_BYTES, so those fetch it).
 function announce(ctx: DurableObjectState, seq: number, at: number, data: Uint8Array) {
   const row = JSON.stringify(data.length <= NOTICE_BYTES ? { seq, at, data: base64(data) } : { seq, at });
-  for (const socket of ctx.getWebSockets()) socket.send(ctx.getTags(socket).includes("messages") ? row : String(seq));
+  for (const socket of ctx.getWebSockets()) socket.send(row);
 }
 
 // An append-only log of opaque entries, kept until deleted by nobody: entity lists, entity inboxes, join requests and
@@ -247,7 +242,7 @@ export class Box extends DurableObject<Env> {
     const data = await body(request);
     if (url.pathname.split("/")[3] === "ws") {
       if (request.headers.get("Upgrade") !== "websocket") return text("expected websocket", 426);
-      return accept(this.ctx, ["messages"]);
+      return accept(this.ctx);
     }
     if (request.method === "GET") {
       const after = Number(url.searchParams.get("after") ?? 0);

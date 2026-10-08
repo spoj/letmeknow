@@ -1,10 +1,12 @@
-// IndexedDB, as four key-value stores: "state" (the member, this browser's entities, groups), "items" (what each
-// group showed, kept so a person can scroll back), "files" (each file's Yjs state) and "blobs" (the sealed images files link).
+// IndexedDB, as four key-value stores: "state" (the member, this browser's entities, groups), "items" (what each chat
+// showed, kept so a person can scroll back), "docs" (each doc's Yjs state) and "blobs" (the sealed files they link).
 const db: Promise<IDBDatabase> = new Promise((resolve, reject) => {
-  const request = indexedDB.open("letmeknow", 2);
+  const request = indexedDB.open("letmeknow", 3);
   request.onupgradeneeded = () => {
-    for (const name of ["state", "items", "files", "blobs"]) {
-      if (!request.result.objectStoreNames.contains(name)) request.result.createObjectStore(name);
+    const names = request.result.objectStoreNames;
+    if (names.contains("files")) request.result.deleteObjectStore("files");
+    for (const name of ["state", "items", "docs", "blobs"]) {
+      if (!names.contains(name)) request.result.createObjectStore(name);
     }
   };
   request.onsuccess = () => resolve(request.result);

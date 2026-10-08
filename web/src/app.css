@@ -97,7 +97,8 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 .group-list button, .me { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); text-align: left; border: 0; background: none; padding: var(--s2) var(--s3); min-height: 36px; }
 .group-list button:hover, .me:hover { background: var(--hover); }
 .group-list button.on { background: var(--accent-soft); color: var(--accent); font-weight: 500; }
-.group-list button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group-list button span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group-list .mark { flex: none; font-style: normal; font-size: var(--t-sm); }
 .group-list b:not(:empty) { background: var(--accent); color: var(--on-accent); border-radius: 10px; padding: 0 7px; font-size: 12px; line-height: 20px; }
 .open-list:not(:empty) { display: flex; flex-direction: column; gap: var(--s1); padding-top: var(--s2); border-top: 1px solid var(--line); }
 .open-list h3 { padding: var(--s1) var(--s3); }
@@ -118,22 +119,16 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 .people:hover { background: none; text-decoration: underline; }
 .people.warn { color: var(--warn); }
 .head-actions { display: flex; gap: var(--s2); }
-.tabs { display: none; }
+.group > .empty { position: static; flex: 1; }
+/* A doc takes the stage; on wide screens the chat picked for it runs beside it. */
 .body { flex: 1; min-height: 0; display: flex; }
-.chat, .files { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.group:not(.files-open) .files { display: none; }
-.files { padding: var(--s3) var(--s4) var(--s4); gap: var(--s3); }
-/* An open file takes the stage; the chat runs beside it, or is hidden. */
-.group.files-open .files { order: -1; }
-.group.files-open .chat { flex: 0 0 clamp(300px, 32%, 420px); border-left: 1px solid var(--line); }
-.group.files-open.chat-hidden .chat { display: none; }
-.chat-toggle { display: none; }
-.group.files-open .chat-toggle { display: inline-flex; }
-.file-list { display: flex; flex-wrap: wrap; gap: var(--s1); align-items: center; }
-.file-list button { min-height: 28px; font-size: var(--t-sm); }
-.file-list p { flex-basis: 100%; font-size: var(--t-sm); padding: var(--s2) var(--s1); max-width: 28rem; }
-.editor { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: var(--radius); }
-.editor:empty { display: none; }
+.editor { flex: 1; min-width: 0; overflow: auto; }
+.beside { flex: 0 0 clamp(300px, 32%, 420px); display: flex; border-left: 1px solid var(--line); }
+.beside:empty { display: none; }
+.beside > .group { flex: 1; min-width: 0; }
+.beside .group-head { padding: var(--s2) var(--s4); min-height: 56px; }
+.beside .composer { padding: var(--s3) var(--s4) var(--s4); }
+.beside-picker { font: inherit; font-size: var(--t-sm); min-height: 32px; max-width: 12rem; padding: 0 var(--s2); border: 1px solid var(--line); border-radius: var(--radius); background: var(--raise); color: inherit; }
 .editor .cm-editor { min-height: 100%; }
 .editor .cm-editor.cm-focused { outline: none; }
 .editor .cm-content { padding: var(--s3) 0; }
@@ -211,13 +206,9 @@ dialog > header { display: flex; align-items: center; justify-content: space-bet
 .toasts { position: fixed; z-index: 10; bottom: var(--s5); left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: var(--s2); width: min(28rem, calc(100vw - var(--s5))); pointer-events: none; }
 .toast { pointer-events: auto; cursor: pointer; padding: var(--s3) var(--s4); border-radius: var(--radius); background: var(--text); color: var(--bg); box-shadow: 0 6px 20px #0003; font-size: var(--t-sm); }
 
-/* Narrow screens: files are a tab beside the chat */
+/* Narrower screens: a doc has the stage to itself */
 @media (max-width: 999px) {
-  .files-toggle { display: none; }
-  .tabs { display: flex; gap: var(--s1); padding: var(--s2) var(--s5) 0; border-bottom: 1px solid var(--line); }
-  .tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--muted); }
-  .tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
-  .group.files-open .chat, .group.files-open .chat-toggle { display: none; }
+  .beside, .beside-picker { display: none; }
 }
 
 /* Phones: the group list, or one group */
@@ -228,11 +219,8 @@ dialog > header { display: flex; align-items: center; justify-content: space-bet
   .group-list button { min-height: 44px; }
   .back { display: block; margin-left: calc(var(--s2) * -1); }
   .group-head { padding: var(--s2) var(--s4); gap: var(--s2); min-height: 56px; }
-  .head-actions .files-toggle { display: none; }
-  .tabs { padding: var(--s1) var(--s4) 0; }
   .messages { padding: var(--s3) var(--s3); }
   .composer { padding: var(--s2) var(--s3) var(--s3); }
-  .files { padding: var(--s2) var(--s3) var(--s3); }
   .page { padding: var(--s4); }
   .welcome { padding: 0 var(--s4); margin-top: var(--s6); }
 }

@@ -1,6 +1,6 @@
 # letmeknow: encrypted group chat for agents and their people
 
-A person asks their agent to talk to a coworker's agent, or to an agent that sets up access. One of them shares a short-lived invite code; the other agent joins. People join the same groups from a browser, and members, people and agents, edit the group's text files together. Groups are small (2–5 members), task-scoped, and last hours to days.
+A person asks their agent to talk to a coworker's agent, or to an agent that sets up access. One of them shares a short-lived invite code; the other agent joins. People join the same groups from a browser. A group is a chat, where members talk back and forth, or a doc, one text that people and agents edit at once, such as a task list an agent keeps in order while its person ticks items off. Groups are small (2–5 members), task-scoped, and last hours to days.
 
 Messages are end-to-end encrypted with MLS (RFC 9420). The relay at letmeknow.dev moves and briefly stores ciphertext; it holds no keys, names, or member lists.
 
@@ -22,6 +22,15 @@ agent session ── adapter ── session process ──files──┘
 - **Relay**: Cloudflare Worker with one Durable Object per group, per pending invite and per box (see Relay). HTTPS plus a WebSocket for new-message notices; clients fall back to polling where a proxy blocks WebSockets. It also serves the browser client.
 - **Folder**: the other transport. A directory on one machine, or synced between machines, carries a group in plain files (see Folder groups).
 
+## Kinds of group
+
+A group shares one thing, fixed when it is made: its kind, in its settings.
+
+- **chat**: messages in order (see Message format). Members send text and files, to everyone or to some.
+- **doc**: one markdown text that every member edits at once (see Docs), and the files it links.
+
+A member who needs both joins two groups; a session or browser is in as many as it likes. The kind is a string, so later versions can add kinds: a member keeps its membership in a group of a kind it does not know, and shows that it cannot show it. Each message type belongs to one kind, except `settings`, which every kind has (see Message format); a member ignores, with a warning, a message of another kind's type, and settings that would change the kind. Agents' commands belong to a kind too (`send` to chats, `doc` to docs) and are refused, with the reason, in a group of another.
+
 ## Identity
 
 Members are sessions; devices run them; entities say whose they are.
@@ -30,7 +39,7 @@ Members are sessions; devices run them; entities say whose they are.
 - **Device**: a `LETMEKNOW_HOME` (its key in `device.json`, named after the host) or a browser profile. A device signs each of its sessions' keys, and the signature sits in the session's credential, so members see which device a session runs on with no relay write per session. A browser's one key is both its device and its session.
 - **Entity**: a person, team or agent, as a named list of devices kept on the relay ("Matthew": laptop, server, phone). A session speaks as one entity per group, named in its credential: `--as <entity>`, by default its device's first entity; `--as device` speaks as the device alone, `--as self` as the session alone. A session cannot be in one group as two entities; that takes another session.
 
-Members see each other as name, fingerprint and entity. A claimed entity is checked against its list, which must hold the session's device (for a browser, its key): a verified one shows as `entity: {id, name}`, with `new` the first time this member shows it to its agent or person (in a message, a membership change, settings, or a session's `join` and `members` output; not in a file update, an admission check or the browser's member list, which is redrawn), unless it is `yours`: its own device is on the list; a failed one as `entity: {id, error}`, e.g. "not on Matthew's list".
+Members see each other as name, fingerprint and entity. A claimed entity is checked against its list, which must hold the session's device (for a browser, its key): a verified one shows as `entity: {id, name}`, with `new` the first time this member shows it to its agent or person (in a message, a membership change, settings, or a session's `join` and `members` output; not in a doc edit, an admission check or the browser's member list, which is redrawn), unless it is `yours`: its own device is on the list; a failed one as `entity: {id, error}`, e.g. "not on Matthew's list".
 
 Trust comes from the invite path at first meeting: the inviter shares invites over a channel that already authenticates people (Slack DM, email), so "whoever redeemed the code I sent Bob" is Bob's agent. An entity carries that trust forward: a later member speaking as "Matthew" runs on a device that Matthew's devices put on his list.
 
@@ -54,7 +63,7 @@ The words are too short to serve as a key: anyone holding the encrypted exchange
 
 1. Inviter A's session process picks the words and a free slot, and creates an invite Durable Object holding A's SPAKE2 message, an expiry of 10 minutes, and a private owner token. It long-polls for a join request.
 2. Joiner B fetches A's SPAKE2 message, derives the key, and posts its own SPAKE2 message with an MLS KeyPackage encrypted under the key. The relay accepts one join per invite.
-3. A derives the key, decrypts the KeyPackage, commits an Add, and posts the Welcome, encrypted under the same key. Only the owner token may post the Welcome. If A cannot add B, it posts, in place of the Welcome, the reason, sealed under the same key: B learns why at once, and a B with a wrong code, which cannot open it, fails at once too (A warns of the wrong code). Either way the invite is used up.
+3. A derives the key, decrypts the KeyPackage, commits an Add, and posts the Welcome with the group's settings, encrypted under the same key. Only the owner token may post the Welcome. If A cannot add B, it posts, in place of the Welcome, the reason, sealed under the same key: B learns why at once, and a B with a wrong code, which cannot open it, fails at once too (A warns of the wrong code). Either way the invite is used up.
 4. B joins at the epoch A's commit created. Every member sees "A added B (name, fingerprint)". The invite object deletes itself at expiry, freeing the slot.
 
 Any member may invite. Only the inviter's session admits against its invite, so no other member needs to know about it. Both sides are normally online when an invite is shared; an invite whose inviter is offline simply expires.
@@ -63,39 +72,40 @@ Any member may invite. Only the inviter's session admits against its invite, so 
 
 A member can open a group to an entity its device is in (`open <entity>`). Any session speaking as that entity may then join without an invite, so a person's devices and agents reach the group by themselves.
 
-1. The group's settings list the entity and carry a requests key, made when the group is first opened. The opener also writes an opening (group id, relay, name, requests key) to the entity's inbox: a box whose address and key derive from a secret that only the entity's devices hold.
+1. The group's settings list the entity and carry a requests key, made when the group is first opened. The opener also writes an opening (group id, relay, kind, name, requests key) to the entity's inbox: a box whose address and key derive from a secret that only the entity's devices hold.
 2. Devices list the groups open to their entities: `groups` shows them with `joined: false`, the browser under "You can join".
 3. A session joins with `join <group id>`: it appends a request, its KeyPackage and a fresh reply secret sealed under the requests key, to the group's requests box, then waits up to 10 minutes on the reply box that secret derives.
-4. Every member online follows the requests box on a socket, which announces each request (without one, it checks the box every minute). It admits a request whose credential speaks as an entity the group is open to, checked against the entity's list: it commits the Add, writes the Welcome to the reply box, and posts the group's state (see Group settings). When several race, the relay's epoch check lets one commit win, and the others find the joiner already in the group. Requests older than 10 minutes are skipped, so a request posted again later cannot bring back a session that left. A member moves its place in the box past a request only once it has admitted or refused it; one that failed midway (the relay, a list it could not fetch) is tried again shortly, and a Welcome already committed is kept until it is written.
+4. Every member online follows the requests box on a socket, which announces each request (without one, it checks the box every minute). It admits a request whose credential speaks as an entity the group is open to, checked against the entity's list: it commits the Add, writes the Welcome with the group's settings to the reply box, and in a doc posts the text (see Docs). When several race, the relay's epoch check lets one commit win, and the others find the joiner already in the group. Requests older than 10 minutes are skipped, so a request posted again later cannot bring back a session that left. A member moves its place in the box past a request only once it has admitted or refused it; one that failed midway (the relay, a list it could not fetch) is tried again shortly, and a Welcome already committed is kept until it is written.
 5. `open --close <entity>` takes the entity out of the settings and writes a closing to its inbox.
 
 A request needs some member online; with none, it expires.
 
 ## Group settings
 
-`name <name>` and `open` post the group's settings (name, open entities, requests key) whole, in a message's `settings` field. The latest a member has received wins. Whoever adds a member posts them again, along with a snapshot of every file (see Files), because MLS gives a new member nothing from before it joined.
+The settings are the kind, a name, the entities the group is open to and its requests key. A new group's first message holds them; `name <name>` and `open` post them again, whole, as a `settings` message. The latest a member has received wins, except that the kind never changes. MLS gives a new member nothing from before it joined, so whoever adds one sends them with the Welcome: a joiner knows at once what it joined and what it is called.
 
-## Files
+## Docs
 
-A file is a markdown text document that the group's members, people and agents, edit at once. It is a CRDT: Yjs in the browser, yrs in the session process, which share one update format (Yjs v1). Lines end in LF; the session process converts CRLF in what agents write.
+A doc group's text is a markdown document that its members, people and agents, edit at once. It is a CRDT: Yjs in the browser, yrs in the session process, which share one update format (Yjs v1). Lines end in LF; the session process converts CRLF in what agents write.
 
-- A message's `file` field carries `{id, name?, update}`, a base64 Yjs update. Creating a file posts its whole state with its name, editing posts updates, and a snapshot posts the whole state again. These are one shape, as applying an update merges whatever it holds.
-- Every member keeps each file's state in its store (SQLite, IndexedDB). Unlike message text, it is never deleted after delivery. An update that arrives before one it builds on waits in the state until that one comes.
-- A new member reads nothing from before it joined, and the relay keeps messages 7 days, so whoever adds a member posts a snapshot of every file. Folder groups keep every message and need none.
-- File messages never print, so they never wake an agent or enter its context, and they stay out of `after`.
-- Agents: `file ls`; `file show <file>` prints the text and a version id; `file create <name> <path>`; `file edit <file> --base <version> <path>` writes the agent's new text, which it edited from the text at that version.
-- `file edit` takes the agent's change line by line, from base to new text, and carries it onto the text as it is now. A changed line is changed where its base text is now (nearest its old position if several match), a deleted line is deleted where it is, and added lines go after the line they followed. A change to a line that someone else changed or deleted meanwhile is not applied; it comes back in `lost` for the agent to redo. The difference between the current text and the result is then posted as one update. Carrying whole lines keeps an agent's change on the line it meant even when a person moved that line meanwhile, which in the CRDT deletes and reinserts it.
-- The browser binds a file to CodeMirror 6 through y-codemirror.next: markdown, `- [ ]` items as clickable checkboxes, Alt+↑/↓ to move lines. It posts local edits about once a second, well inside the relay's 600 writes a minute.
+- An `edit` message carries `{update}`, a base64 Yjs update. Editing posts updates, and a snapshot posts the whole state as one. These are one shape, as applying an update merges whatever it holds.
+- Every member keeps the doc's state in its store (SQLite, IndexedDB). Unlike message text, it is never deleted after delivery. An update that arrives before one it builds on waits in the state until that one comes.
+- A new member reads nothing from before it joined, and the relay keeps messages 7 days, so whoever adds a member posts a snapshot. Folder groups keep every message and need none.
+- Edits never print, so they never wake an agent or enter its context.
+- Agents: `doc show` prints the text and a version id; `doc edit --base <version> <path>` writes the agent's new text, which it edited from the text at that version. A session in one doc needs no `--group`.
+- `doc edit` takes the agent's change line by line, from base to new text, and carries it onto the text as it is now. A changed line is changed where its base text is now (nearest its old position if several match, and within a changed block, paired with the line it rewrites most alike), a deleted line is deleted where it is, and added lines go after the line they followed. A change to a line that someone else changed or deleted meanwhile is not applied; it comes back in `lost` for the agent to redo. The difference between the current text and the result is then posted as one update. Carrying whole lines keeps an agent's change on the line it meant even when a person moved that line meanwhile, which in the CRDT deletes and reinserts it.
+- The browser binds the text to CodeMirror 6 through y-codemirror.next: markdown, `- [ ]` items as clickable checkboxes, links shown as their text and opened by a click (except on the line being edited), and a toolbar and keys to move (Alt+↑/↓) and indent lines. It posts local edits about once a second, well inside the relay's 600 writes a minute.
+- The state grows with every edit, and a snapshot must fit a message (1 MiB). A busy doc reaches that in about a year; compacting it is left for later.
 
-### Images and blobs
+## Blobs
 
-A file links an image, or any other file, as a blob: `![alt](lmk:<hash>#<key>)`.
+A chat message's attachment, and a file a doc links, is a blob: up to 10 MiB, linked as `lmk:<hash>#<key>`.
 
-- The uploader seals the bytes with ChaCha20-Poly1305 under a fresh random 32-byte key and stores the result in the group by its SHA-256 (`hash`, hex). The key (hex) travels in the link, inside the file, so a blob is exactly as private as the files that link it; the relay holds ciphertext it cannot open, and checks only the hash and the 1 MiB cap (see Relay).
-- On the relay a blob expires like a message, so members keep a copy of every blob their files link (session SQLite, browser IndexedDB), fetched when a file update brings a new link. Whoever adds a member puts every linked blob it keeps again, before the file snapshots: the new member can fetch them, and the relay's copy lives on as long as a file links it.
-- A folder group needs no blobs: nothing in a folder is encrypted, so its files link files in the folder by their paths. `file attach` links a file already in the folder where it is, and copies one from elsewhere into the folder's `attachments/` first. `file fetch` prints where a link's file is, and takes only paths inside the folder, so that a member cannot point an agent at other files on its machine. The folder scan reads only the folder's own `*.json` files, so it never takes these for messages.
-- Agents: `file attach <path>` uploads a file and prints its link as markdown, with `!` when it is an image (PNG, JPEG, GIF, WebP), for the agent to put into a file with `file edit`. `file fetch <link>` writes the blob, decrypted, to a file only the session's user can read, as attachments are (see Attachments), and prints its path. `file show` prints links, never bytes.
-- Browser: pasting or dropping an image into a file's editor scales it to at most 1600 pixels on its longer side, encodes it as WebP (JPEG where the browser cannot) small enough for the cap, uploads it, and inserts its link on a line of its own after the cursor's (or drop point's) line, so a drop never splits a link. The editor shows each linked image below the line that links it, decrypted into a `data:` URL, the only kind of image source besides its own origin that the page's Content-Security-Policy allows. The link stays editable text.
+- The uploader seals the bytes with ChaCha20-Poly1305 under a fresh random 32-byte key and stores the result in the group by its SHA-256 (`hash`, hex). The key (hex) travels in the link, inside the message or the doc, so a blob is exactly as private as what links it; the relay holds ciphertext it cannot open, and checks only the hash and the size (see Relay).
+- On the relay a blob lasts 7 days from when a member last put or kept it. A chat attachment lasts that long, like the message. Members keep a copy of every blob their doc links (session SQLite, browser IndexedDB), fetched when an edit brings a new link; whoever adds a member keeps each linked blob on the relay for another 7 days, or puts it again from its copy where the relay no longer has it, before the snapshot.
+- A folder group needs no blobs: nothing in a folder is encrypted, so its messages and doc link files in the folder by their paths. Attaching a file already in the folder links it where it is, and copies one from elsewhere into the folder's `attachments/` first. The folder scan reads only the folder's own `*.json` files, so it never takes these for messages.
+- Agents: `send --attach <file>` (see Attachments); `doc attach <path>` uploads a file and prints its link as markdown, `![name](link)` for an image (PNG, JPEG, GIF, WebP), `[name](link)` for any other, for the agent to put into the text with `doc edit`. `fetch <link>` writes the file a message or the doc links, decrypted, to a file only the session's user can read, and prints its path; in a folder group it prints the path of the file in the folder, and takes only paths inside the folder, so that a member cannot point an agent at other files on its machine. `doc show` prints links, never bytes.
+- Browser: pasting or dropping a file into the editor uploads it and inserts its link on a line of its own after the cursor's (or drop point's) line, so a drop never splits a link. An image is first scaled to at most 1600 pixels on its longer side and encoded as WebP (JPEG where the browser cannot). The editor shows each linked image below the line that links it, decrypted into a `data:` URL, the only kind of image source besides its own origin that the page's Content-Security-Policy allows; a click on a link to another file downloads it. The link stays editable text.
 
 ## Browser client
 
@@ -105,14 +115,15 @@ A person joins a group by opening its invite link.
 - The member is the Rust client's protocol code with OpenMLS, compiled to WebAssembly (`client/src/web.rs`); the page (`web/`) does networking, storage and display. ts-mls stays rejected (see Crypto).
 - A browser is a member like a session, with its own key and display name. On first use it starts an entity in the name given, unless it opens a device link, which makes it a device of that entity. One person joins from a laptop and a phone as two members of one entity.
 - The page speaks of people and their devices, not entities: a member shows as "Matthew · phone" (entity, then its own name), a failed entity check as a plain warning, and a key's fingerprint only in a tooltip. Opening a device link is "adding a device"; the page shows the link, its code and a QR code of the link.
-- Every group a browser starts or joins is open to its entity, shown as "Your other devices can join" and switched off in the group's settings. A browser opens a group it joined by invite only once the settings the inviter posts after adding it had a few seconds to arrive, as settings are posted whole. A newly added device asks to join every group open to its entity, without a click per group; some member must be online to admit it. Groups it left are not offered again.
-- A person starts a group, or joins with the link or its code typed (`417-acid-zebra`), which are the same invite. A browser leaves a group as a session does: it proposes its own removal, which another member commits, and forgets the group at once.
-- Background work (catching up, admitting requests, key updates) never redraws what a person is using: the page appends new items, follows the bottom of the list only if it was there, and keeps each group's draft, scroll position and open file.
-- Attachments: images (PNG, JPEG, GIF, WebP, by their first bytes) show inline from `data:` URLs, other files as downloads, named by the message text when that is a file name. A browser sends one with the file's name as text unless a person typed some.
+- Every group a browser starts or joins is open to its entity, shown as "Your other devices can join" and switched off in the group's settings. A browser opens a group it joined by invite as soon as it joined, as the Welcome brought the settings. A newly added device asks to join every group open to its entity, without a click per group; some member must be online to admit it. Groups it left are not offered again.
+- A person starts a chat or a doc, or joins with the link or its code typed (`417-acid-zebra`), which are the same invite. The list of groups marks each one's kind. A browser leaves a group as a session does: it proposes its own removal, which another member commits, and forgets the group at once.
+- A doc takes the whole view; on a wide screen a person can pick one of their chats to show beside it, which the browser remembers for that doc. A chat counts as read while it shows, beside a doc or alone.
+- Background work (catching up, admitting requests, key updates) never redraws what a person is using: the page appends new items, follows the bottom of the list only if it was there, and keeps each chat's draft and scroll position and each doc's editor.
+- Attachments: a browser sends any file up to 10 MiB, uploading it before the message. Images (PNG, JPEG, GIF, WebP, by their media type) show inline from `data:` URLs, fetched when the message shows; other files show their name and size, and are fetched and saved on a click.
 - The editor (CodeMirror, the markdown grammars) and the QR code generator load on first use, as separate chunks, so a first visit loads the page, Yjs and the WebAssembly member.
-- MLS state, message history, files and the images they link persist in IndexedDB; one tab at a time holds them (Web Locks). The state is saved before each post, so a reload never forgets a message as its own nor reuses its keys. Messages show at once; nothing is held. Unlike a session the browser keeps message text, because a person scrolls back.
+- MLS state, message history, docs and the blobs they link persist in IndexedDB; one tab at a time holds them (Web Locks). The state is saved before each post, so a reload never forgets a message as its own nor reuses its keys. Messages show at once; nothing is held. Unlike a session the browser keeps message text, because a person scrolls back.
 - Joining from a link waits for a click, so a link preview or scanner opening it does not use up the invite. The page drops the words from the address bar once joined.
-- While open, the page does what a running session does: key updates on load and hourly, admitting join requests to open groups, snapshots after adding a member.
+- While open, the page does what a running session does: key updates on load and hourly, admitting join requests to open groups, doc snapshots after adding a member.
 
 ## Removal
 
@@ -124,7 +135,7 @@ Per group, the relay stores:
 
 - the current MLS epoch;
 - a ciphertext log with a delivery cursor and a TTL (default 7 days);
-- blobs (see Images and blobs): encrypted files of up to 1 MiB, each addressed by the SHA-256 of its bytes, which the relay checks. They expire on the messages' TTL, counted from the last time a member put them; putting one again refreshes it.
+- blobs (see Blobs): encrypted files of up to 10 MiB (sealed: 28 bytes more), each addressed by the SHA-256 of its bytes, which the relay checks, and stored in rows of 1 MiB, as a Durable Object's row holds at most 2 MB. They expire on the messages' TTL, counted from the last time a member put or kept one: `PUT` stores a blob, `POST` keeps one the relay has (404 if it has none, for the member to put it again), `GET` reads it.
 
 Per invite: the two SPAKE2 messages and the encrypted KeyPackage and Welcome until expiry.
 
@@ -134,7 +145,7 @@ Behavior:
 
 - Accepts a message only if it targets the current epoch (compare-and-set on the plaintext epoch header of the MLS PrivateMessage); a commit moves the group to the next. This is the single source of membership order. It also means every message is encrypted under the epoch its readers are at: a sender that missed a commit is refused, catches up, and encrypts again. A sender that hears no answer to a commit keeps it pending until the log shows whether the relay took it: its own commit there is merged, another member's replaces it, and one missing from an up-to-date log never arrived.
 - Serves "everything after cursor N" in pages of up to 2 MiB. A page ends early only before an entry that would take it past 2 MiB, so one holding at most 1 MiB holds everything; clients fetch the next page only after a fuller one. The same call serves live delivery and resume.
-- Announces each new message on a WebSocket (hibernatable, so idle listeners cost nothing; the relay answers `ping` with `pong` without waking the object). A socket opened with `?messages` gets the message itself in the notice, as a page row `{seq, at, data}`, with `data` left out above 64 KiB; others (0.7 clients) get the bare seq. Members fetch when they (re)connect, after a gap in the notices, and for messages too large to come in one; they poll every 15 seconds only while they have no socket, and close a socket whose ping goes unanswered. Each fetch costs a request, a notice nothing, so a group's members fetch only what they missed. Invites, which live minutes, use a 30-second long-poll instead.
+- Announces each new message on a WebSocket (hibernatable, so idle listeners cost nothing; the relay answers `ping` with `pong` without waking the object). A notice holds the message itself, as a page row `{seq, at, data}`, with `data` left out above 64 KiB. Members fetch when they (re)connect, after a gap in the notices, and for messages too large to come in one; they poll every 15 seconds only while they have no socket, and close a socket whose ping goes unanswered. Each fetch costs a request, a notice nothing, so a group's members fetch only what they missed. Invites, which live minutes, use a 30-second long-poll instead.
 - The group id is random and only shared inside Welcomes; writing requires knowing it. Messages are capped at 1 MiB, and each client address at 600 writes a minute.
 
 A session offline longer than the TTL cannot process missed commits and must be re-invited.
@@ -147,18 +158,25 @@ A session offline longer than the TTL cannot process missed commits and must be 
 
 ## Message format
 
-Both transports carry the same JSON message. On the relay it is the plaintext inside the MLS application message; in a folder it is the file body, with `from` added (see Folder groups).
+Both transports carry the same JSON message. On the relay it is the plaintext inside the MLS application message; in a folder it is the file body, with `from` and `at` added (see Folder groups). `type` says what it is:
+
+| `type` | Kind | Fields |
+|---|---|---|
+| `settings` | every | `kind`, and optional `name`, `open`, `requests` (see Group settings) |
+| `message` | chat | `content`, `after`, and optional `to`, `reply_to`, `urgent`, `attachment` (below) |
+| `edit` | doc | `update`: a base64 Yjs update (see Docs) |
+| `joined` | folder only | none: a session joined the folder (see Folder groups) |
+
+A chat message's fields:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `content` | Yes, except with `settings` or `file` | Message text |
+| `content` | Yes | Message text, which may be empty with an attachment |
 | `after` | Yes | Tips of the sender's read frontier (may be empty) |
 | `to` | No | Recipient fingerprints; omit to address the group |
 | `reply_to` | No | Message id being answered; must be covered by `after` |
 | `urgent` | No | `true` to deliver at once to every member |
-| `attachment` | No | File content, base64; recipients get it as a file, not as text (see Attachments) |
-| `settings` | No | The group's settings, whole (see Group settings) |
-| `file` | No | A change to one of the group's files (see Files); never delivered as a message |
+| `attachment` | No | `{link, name, size, type}`: a file's link (see Blobs), name, size in bytes and media type (see Attachments) |
 
 - On the relay, the sender is the MLS-authenticated leaf; there is no `from` field.
 - Message id = SHA-256 of the stored bytes: the MLS ciphertext on the relay, the file in a folder. A reference names exactly one content.
@@ -166,26 +184,26 @@ Both transports carry the same JSON message. On the relay it is the plaintext in
 
 ## Attachments
 
-Some content should not pass through a model: credentials, and logs or data too large for a context window. `send --attach <file>` carries a file's content in the message. The recipient's session process writes it to a file only the session's user can read, under its state directory, and delivers the path with the text. The agent then hands the file to whatever needs it (`$(cat <path>)` inside a command, a `--token-file` flag) or reads it in parts.
+Some content should not pass through a model: credentials, and logs or data too large for a context window. `send --attach <file>` uploads a file as a blob (see Blobs) and sends its link, name, size and media type with the message. The recipient's agent sees those, not the content; `fetch <link>` writes the file to a file only the session's user can read, under its state directory, and prints the path. The agent then hands the file to whatever needs it (`$(cat <path>)` inside a command, a `--token-file` flag) or reads it in parts.
 
-- The log never holds attachments; the file is the only copy, deleted when the session leaves the group.
-- On the relay an attachment counts toward the 1 MiB message cap, a third larger in base64.
-- Every member receives every attachment. It keeps the content out of models, not out of members' hands: a peer agent can be talked into printing the file.
+- The log holds the link, not the content; a fetched file is the only plain copy, deleted when the session leaves the group.
+- On the relay an attachment lasts 7 days, like the message.
+- Every member can fetch every attachment. It keeps the content out of models, not out of members' hands: a peer agent can be talked into printing the file.
 
 ## Folder groups
 
-Several agent loops working in one repository, or on machines that sync a folder, should not need invites or a network. `letmeknow join <path>` joins the directory as a group, creating it if needed. The group id is the absolute path.
+Several agent loops working in one repository, or on machines that sync a folder, should not need invites or a network. `letmeknow join <path>` joins the directory as a group, creating it if needed, as a chat unless `--kind doc`; a folder that holds a group keeps its kind. The group id is the absolute path.
 
-- **No MLS.** Folder permissions are the trust boundary: whoever can read the folder reads the chat, and whoever can write it is a member. MLS would add nothing against that reader, and it needs one ordering authority for commits, which the relay provides and a folder does not. There is no invite, admit, or removal.
-- **Format**: the folder and file format of [spoj/messages](https://github.com/spoj/messages). One file per message, `<id>.json`: the message (see Message format) plus the sender as `from`. The id is the SHA-256 of the file's bytes.
+- **No MLS.** Folder permissions are the trust boundary: whoever can read the folder reads the group, and whoever can write it is a member. MLS would add nothing against that reader, and it needs one ordering authority for commits, which the relay provides and a folder does not. There is no invite, admit, or removal.
+- **Format**: the folder and file format of [spoj/messages](https://github.com/spoj/messages). One file per message, `<id>.json`: the message (see Message format) plus the sender as `from` and the time it was written as `at` (milliseconds since the Unix epoch), so the same message written twice is two files. The id is the SHA-256 of the file's bytes.
 - **Identity**: `from` is the session's name and fingerprint (first 8 bytes of the SHA-256 of its Ed25519 signing key), unauthenticated. Anyone who can write the folder can claim any `from`.
-- **Members**: this session plus every sender seen in the folder. Joining posts `joined`, so a member is listed and addressable before it speaks. `to` must name members; `reply_to` must be a known message.
+- **Members**: this session plus every sender seen in the folder. Joining posts a `joined` message, which tells the others, so a member is listed and addressable before it speaks. `to` must name members; `reply_to` must be a known message.
 - **Writing**: the complete record goes to `.<id>.tmp` in the folder, then is renamed to `<id>.json`. Files are never modified or deleted.
 - **Checking**: a file whose name is not the SHA-256 of its bytes is ignored with a warning. This catches edited and misnamed files; it does not authenticate the sender.
 - **Reading**: only `*.json` files are taken, each once, tracked by filename. Files that fail to parse are retried on later scans, so a file still being written or synced is delivered once complete.
 - **Delivery**: the session process scans the folder on each OS file notification, and every 15 seconds for filesystems that send none (network and some synced folders). New files go through the same path as relay messages: local log, read frontier, catch-up.
 - **Resume**: the session process records every message it has taken in. On `listen` it delivers every file it has not, capped like relay catch-up. Existing files are never silently marked as seen.
-- **Ordering**: causal only, through `after`. Catch-up orders a batch by `after`, then by file modification time. There is no cursor.
+- **Ordering**: causal only, through `after`. Catch-up orders a batch by `after`, then by `at`. There is no cursor.
 
 ## Read frontier
 
@@ -202,9 +220,9 @@ Push first, one narrow pull.
 - Tools:
   - `send(group, text, to?, reply_to?, attach?)`: the session process fills `after`.
   - `read(id, ancestors=N)`: a message and N levels of causal history. Messages already delivered come without their text, unless `listen --keep-log`.
-  - `invite(group?)`: returns a code and its link; creates the group if none is given.
+  - `invite(group?, kind?, name?)`: returns a code and its link; creates a chat, or a doc with `--kind doc`, if no group is given.
   - `join(code, link or open group)`, `leave(group)`, `members(group)`.
-  - `file(ls | show | create | edit | attach | fetch)`, `open(entity)`, `name(group)`, `entity(create | list | remove)`.
+  - `doc(show | edit | attach)`, `fetch(link)`, `open(entity)`, `name(group)`, `entity(create | list | remove)`.
 
 No search, paging, or history browsing. New members get context through an ordinary summary message from an existing member.
 
@@ -254,8 +272,8 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 - **Peer agent**: reads everything while a member; removal restores confidentiality going forward. Its frontier claims are signed and attributable. Its requests carry no operator authority (see Peers are not operators).
 - **Leaked invite code**: short expiry, single use, joiner name and fingerprint shown to all. The words are hidden from the relay only; anything else that sees the whole link (the chat it was shared in, a hosted web-fetch tool) sees them.
 - **Guessed invite code**: one guess per invite, about 1 in 1.7 million. A wrong guess uses up the invite and warns the inviter. With few slots anyone can find live invites and use them up; that is denial of service.
-- **Local state**: MLS secrets, attachments, files and the blobs they link, undelivered messages and, with `--keep-log`, delivered ones sit on disk; file permissions are the protection.
-- **Blobs**: the relay learns each blob's size, and when members put it, which they do again whenever one adds a member. A link's key opens its blob for anyone who saw the file, including members removed since, who already had what it linked; a member who deletes a link cannot take it back from those who saw it.
+- **Local state**: MLS secrets, fetched files, docs and the blobs they link, undelivered messages and, with `--keep-log`, delivered ones sit on disk; file permissions are the protection.
+- **Blobs**: the relay learns each blob's size, and when members put or keep it, which they do again whenever one adds a member to a doc. A link's key opens its blob for anyone who saw the message or the doc, including members removed since, who already had what it linked; a member who deletes a link cannot take it back from those who saw it.
 - **Browser member**: trusts whoever serves the page, because that code holds its keys. The relay's operator, or whoever takes over its domain, could serve code that leaks them. The Content-Security-Policy keeps out other origins' code, not the origin's own.
 - **Entities**: any device on a list can add any other, so an entity is as strong as its weakest device. Taking a device off a list stops its sessions counting as the entity from the next check on; sessions already in groups stay members until removed from each. Group members can read an entity's list (device names and keys) through the id in a credential.
 - **Open groups**: while a group is open to an entity, any device on its list can join, with no one asked.
@@ -267,7 +285,7 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 - Encrypting folder groups.
 - Server-side telemetry or OpenTelemetry export; operators can ship the local log.
 - Accounts, or names on the relay in the clear.
-- History from before a member joined, other than files.
+- History from before a member joined, other than a doc's text.
 - Entities listing entities, majority rules for lists, recovery keys.
 
 ## Open questions

@@ -78,7 +78,7 @@ impl Relay {
     /// Opens a socket on which the relay announces each new message of a group (`g/<gid>`) or entry of a box
     /// (`b/<address>`), as a `Notice`.
     pub async fn subscribe(&self, relay: &str, path: &str) -> Result<WebSocket> {
-        Ok(self.0.get(format!("{relay}/{path}/ws?messages")).upgrade().send().await?.into_websocket().await?)
+        Ok(self.0.get(format!("{relay}/{path}/ws")).upgrade().send().await?.into_websocket().await?)
     }
 
     /// Appends to a box: an append-only log the relay keeps in the order it takes entries.

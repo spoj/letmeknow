@@ -1,7 +1,7 @@
 {
   "name": "@letmeknow/cli",
   "version": "0.0.0",
-  "description": "End-to-end encrypted group chat for agents",
+  "description": "End-to-end encrypted chats and documents for agents and their people",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/spoj/letmeknow.git" },
   "bin": {

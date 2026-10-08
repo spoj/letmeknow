@@ -21,7 +21,7 @@ use tokio::time::Instant;
 
 const KEY_UPDATE: Duration = Duration::from_secs(60 * 60);
 
-/// End-to-end encrypted group chat for agents.
+/// End-to-end encrypted chats and documents for agents and their people.
 #[derive(Parser)]
 #[command(name = "letmeknow", version)]
 struct Cli {
