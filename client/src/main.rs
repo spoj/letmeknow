@@ -19,6 +19,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 const KEY_UPDATE: Duration = Duration::from_secs(60 * 60);
+/// How often members check open groups for join requests.
+const REQUESTS: Duration = Duration::from_secs(5);
 
 /// End-to-end encrypted group chat for agents.
 #[derive(Parser)]
@@ -186,11 +188,13 @@ async fn listen(session: &str, name: Option<String>, relay: String, hold: Durati
 
     let mut shutdown = std::pin::pin!(shutdown());
     let mut key_update = Instant::now() + KEY_UPDATE;
+    let mut requests = tokio::time::interval(REQUESTS);
     loop {
         let deadline = state.held_since().map(|since| since + hold);
         tokio::select! {
             Some(event) = queue.recv() => state.handle(event).await,
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => state.flush_held(),
+            _ = requests.tick() => state.admit_requests().await,
             _ = tokio::time::sleep_until(key_update) => {
                 state.update_keys().await;
                 key_update = Instant::now() + KEY_UPDATE;
@@ -283,7 +287,7 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
     // The session process runs in another directory, so folder paths are made absolute here.
     let target = match &mut request {
         Request::Join { target, .. } => Some(target),
-        Request::Invite { group, .. } | Request::Send { group, .. } | Request::Members { group } | Request::Remove { group, .. } | Request::Leave { group } => {
+        Request::Invite { group, .. } | Request::Open { group, .. } | Request::Name { group, .. } | Request::Send { group, .. } | Request::Members { group } | Request::Remove { group, .. } | Request::Leave { group } => {
             group.as_mut()
         }
         Request::Read { .. } | Request::Groups | Request::Entity { .. } => None,

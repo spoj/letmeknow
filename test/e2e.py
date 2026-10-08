@@ -306,10 +306,24 @@ def main():
         joined = kim.expect(lambda e: e["type"] == "joined" and e["member"]["name"] == "Alone")
         check("entity" not in joined["member"] and "device" not in joined["member"], "--as self speaks as the session alone")
 
-        listed = on(lap, "entity", "remove", srv_device)["members"]
-        check([m["name"] for m in listed] == [devices["entities"][0]["members"][0]["name"]], "a member can be taken off an entity's list")
         later = Listener("later", env=homes["elsewhere"])
         listeners.append(later)
+        on(lap, "name", "Priorities")
+        check(kim.expect(lambda e: e["type"] == "settings")["settings"]["name"] == "Priorities", "a group can be named, for everyone in it")
+        on(lap, "open", "Matthew")
+        tick = Listener("tick", env=homes["server"])
+        listeners.append(tick)
+        on_tick = lambda *args, **kw: run("tick", *args, env=homes["server"], **kw)
+        listed = [g for g in on_tick("groups") if g.get("joined") is False]
+        check([(g["group"], g["name"], g["open_to"]) for g in listed] == [(group["group"], "Priorities", "Matthew")], "a group opened to an entity is listed for its sessions")
+        check(len(on_tick("join", group["group"])["members"]) == 5, "and any of them joins it without an invite, once a member admits it")
+        joined = kim.expect(lambda e: e["type"] == "joined" and e["member"]["name"] == "Tick")
+        check(joined["member"]["entity"]["name"] == "Matthew", "the others see who it speaks for")
+        check(tick.expect(lambda e: e["type"] == "settings")["settings"]["name"] == "Priorities", "the member who admits it passes on the group's settings")
+        check("not open to any entity" in run("later", "join", group["group"], env=homes["elsewhere"], ok=False), "the group is not open to other entities")
+
+        listed = on(lap, "entity", "remove", srv_device)["members"]
+        check([m["name"] for m in listed] == [devices["entities"][0]["members"][0]["name"]], "a member can be taken off an entity's list")
         run("later", "join", on(lap, "invite", "--group", group["group"])["link"], env=homes["elsewhere"])
         seen = {m["name"]: m.get("entity") for m in run("later", "members", env=homes["elsewhere"])["members"]}
         check(seen["Srv"]["error"] == "not on Matthew's list" and seen["Lap"]["name"] == "Matthew", "after which its sessions no longer count as the entity")

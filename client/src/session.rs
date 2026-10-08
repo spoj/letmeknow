@@ -5,10 +5,10 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::Subcommand;
 use letmeknow::proto::{
-    CIPHERSUITE, INVITE_SLOTS, INVITE_TTL_S, PAKE_ID, Payload, create_config, digest, fingerprint, invite_key, invite_words, join_config,
+    CIPHERSUITE, INVITE_SLOTS, INVITE_TTL_S, Opened, PAKE_ID, Payload, Settings, create_config, digest, fingerprint, invite_key, invite_words, join_config,
     membership_changes, open, person, random_below, seal,
 };
-use letmeknow::entity::{self, List, Member, place};
+use letmeknow::entity::{self, JoinRequest, List, Member, Opening, place};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::{OpenMlsProvider, random::OpenMlsRand};
@@ -99,6 +99,20 @@ pub enum Request {
     Leave {
         #[arg(long)]
         group: Option<String>,
+    },
+    /// Let sessions of an entity this device is in join the group without an invite (they run `join <group>`), or with --close, no longer
+    Open {
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(long)]
+        close: bool,
+        entity: String,
+    },
+    /// Name the group, for everyone in it
+    Name {
+        #[arg(long)]
+        group: Option<String>,
+        name: String,
     },
     /// Entities this device is in: create one, list them, or take a member off one
     Entity {
@@ -278,7 +292,12 @@ impl Session {
     pub async fn handle(&mut self, event: Event) {
         match event {
             Event::Request(Request::Join { target, as_ }, reply) if !Path::new(&target).is_absolute() => {
-                if let Err(error) = self.join(target, as_, reply).await {
+                let joined = if target.len() == 32 && target.chars().all(|c| c.is_ascii_hexdigit()) {
+                    self.join_open(target, as_, reply).await
+                } else {
+                    self.join(target, as_, reply).await
+                };
+                if let Err(error) = joined {
                     self.warn(None, format!("join: {error:#}"));
                 }
                 self.flush_held();
@@ -340,18 +359,36 @@ impl Session {
                 Ok(json!({ "group": gid, "members": self.described_members(&gid).await? }))
             }
             Request::Groups => {
-                let mut groups: Vec<Value> = self
-                    .groups
-                    .iter()
-                    .map(|(gid, g)| json!({ "group": gid, "members": g.mls.members().count(), "relay": g.relay, "epoch": g.mls.epoch().as_u64() }))
-                    .collect();
+                let mut groups = Vec::new();
+                for (gid, g) in &self.groups {
+                    let mut group = json!({ "group": gid, "members": g.mls.members().count(), "relay": g.relay, "epoch": g.mls.epoch().as_u64() });
+                    let settings = self.settings(gid)?;
+                    if !settings.name.is_empty() {
+                        group["name"] = json!(settings.name);
+                    }
+                    if !settings.open.is_empty() {
+                        group["open"] = json!(settings.open);
+                    }
+                    groups.push(group);
+                }
                 for gid in self.folders.keys() {
                     groups.push(json!({ "group": gid, "members": self.members(gid)?.len(), "folder": gid }));
+                }
+                for (opening, membership) in self.openings().await? {
+                    if !self.groups.contains_key(&opening.group) {
+                        groups.push(json!({ "group": opening.group, "name": opening.name, "open_to": membership.name, "joined": false }));
+                    }
                 }
                 Ok(Value::Array(groups))
             }
             Request::Remove { group, member } => self.remove(group, &member).await,
             Request::Leave { group } => self.leave(group).await,
+            Request::Open { group, close, entity } => self.open_to(group, entity, close).await,
+            Request::Name { group, name } => {
+                let gid = self.resolve(group)?;
+                let settings = Settings { name, ..self.settings(&gid)? };
+                self.set(&gid, settings).await
+            }
             Request::Entity { op: EntityOp::Create { name } } => self.entity_create(name).await,
             Request::Entity { op: EntityOp::List } => self.entities().await,
             Request::Entity { op: EntityOp::Remove { entity, member } } => self.entity_remove(entity, member).await,
@@ -426,7 +463,10 @@ impl Session {
             }
         };
         let envelope = match &invite.into {
-            Into::Group(gid) => self.add(gid, &bytes).await?,
+            Into::Group(gid) => {
+                let key_package = self.key_package(&bytes)?;
+                self.add(gid, key_package).await?
+            }
             Into::Entity(membership) => {
                 let member: Member = serde_json::from_slice(&bytes)?;
                 if member.key.as_deref().map(hex::decode).transpose()?.map(|key| fingerprint(&key)) != Some(member.id.clone()) {
@@ -443,15 +483,21 @@ impl Session {
         };
         let sealed = seal(self.provider.rand(), &key, b"welcome", &serde_json::to_vec(&envelope)?)?;
         self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
+        if let Into::Group(gid) = &invite.into {
+            self.post_state(gid).await?;
+        }
         Ok(())
     }
 
-    /// Adds the session whose key package is `bytes` to a group; returns the welcome envelope that lets it join.
-    async fn add(&mut self, gid: &str, bytes: &[u8]) -> Result<Value> {
+    fn key_package(&self, bytes: &[u8]) -> Result<KeyPackage> {
         let MlsMessageBodyIn::KeyPackage(key_package) = MlsMessageIn::tls_deserialize_exact_bytes(bytes)?.extract() else {
             bail!("join request is not a key package");
         };
-        let key_package = key_package.validate(self.provider.crypto(), ProtocolVersion::Mls10)?;
+        Ok(key_package.validate(self.provider.crypto(), ProtocolVersion::Mls10)?)
+    }
+
+    /// Adds the session with `key_package` to a group; returns the welcome envelope that lets it join.
+    async fn add(&mut self, gid: &str, key_package: KeyPackage) -> Result<Value> {
         let mut welcome = None;
         let (_, seq) = self
             .post_retrying(gid, |mls, provider, signer| {
@@ -569,18 +615,8 @@ impl Session {
         {
             bail!("unknown message {reply_to}");
         }
-        let mut payload = Payload { to, reply_to, urgent, attachment, after: self.tips(&gid)?, content: Some(text) };
-        let id = if self.groups.contains_key(&gid) {
-            let bytes = serde_json::to_vec(&payload)?;
-            self.post_retrying(&gid, |mls, provider, signer| Ok(mls.create_message(provider, signer, &bytes)?)).await?.0
-        } else {
-            let bytes = serde_json::to_vec(&Record { from: serde_json::from_value(self.person.clone())?, payload: payload.clone() })?;
-            let (dir, id) = (Path::new(&gid), digest(&bytes));
-            let temp = dir.join(format!(".{id}.tmp"));
-            std::fs::write(&temp, bytes)?;
-            std::fs::rename(&temp, dir.join(format!("{id}.json")))?;
-            id
-        };
+        let mut payload = Payload { to, reply_to, urgent, attachment, after: self.tips(&gid)?, content: Some(text), ..Payload::default() };
+        let id = self.post_payload(&gid, &payload).await?;
         payload.attachment = None;
         self.db.execute(
             "INSERT INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
@@ -588,6 +624,185 @@ impl Session {
         )?;
         self.mark_seen(&gid, &id)?;
         Ok(json!({ "id": id }))
+    }
+
+    /// Posts a message to the relay or writes it to the folder; returns its id.
+    async fn post_payload(&mut self, gid: &str, payload: &Payload) -> Result<String> {
+        if self.groups.contains_key(gid) {
+            let bytes = serde_json::to_vec(payload)?;
+            return Ok(self.post_retrying(gid, |mls, provider, signer| Ok(mls.create_message(provider, signer, &bytes)?)).await?.0);
+        }
+        let bytes = serde_json::to_vec(&Record { from: serde_json::from_value(self.person.clone())?, payload: payload.clone() })?;
+        let (dir, id) = (Path::new(gid), digest(&bytes));
+        let temp = dir.join(format!(".{id}.tmp"));
+        std::fs::write(&temp, bytes)?;
+        std::fs::rename(&temp, dir.join(format!("{id}.json")))?;
+        // Taken in already, so the folder scan does not apply it again.
+        self.db.execute("INSERT INTO applied (id, gid) VALUES (?, ?)", params![id, gid])?;
+        Ok(id)
+    }
+
+    fn settings(&self, gid: &str) -> Result<Settings> {
+        let stored: Option<String> = self.db.query_row("SELECT settings FROM settings WHERE gid = ?", [gid], |r| r.get(0)).optional()?;
+        Ok(stored.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default())
+    }
+
+    fn store_settings(&self, gid: &str, settings: &Settings) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO settings (gid, settings) VALUES (?, ?) ON CONFLICT (gid) DO UPDATE SET settings = excluded.settings",
+            params![gid, serde_json::to_string(settings)?],
+        )?;
+        Ok(())
+    }
+
+    /// Changes the group's settings for everyone in it.
+    async fn set(&mut self, gid: &str, settings: Settings) -> Result<Value> {
+        self.post_payload(gid, &Payload { settings: Some(settings.clone()), ..Payload::default() }).await?;
+        self.store_settings(gid, &settings)?;
+        Ok(json!({ "group": gid, "settings": settings }))
+    }
+
+    /// What a member who was just added needs from the others: the settings.
+    async fn post_state(&mut self, gid: &str) -> Result<()> {
+        let settings = self.settings(gid)?;
+        if settings != Settings::default() {
+            self.post_payload(gid, &Payload { settings: Some(settings), ..Payload::default() }).await?;
+        }
+        Ok(())
+    }
+
+    /// Opens the group to an entity: records it in the settings, and tells the entity's devices through its inbox.
+    async fn open_to(&mut self, group: Option<String>, entity: String, close: bool) -> Result<Value> {
+        let gid = self.resolve(group)?;
+        let relay = self.groups.get(&gid).context("only relay groups can be opened; anyone who can write a folder is in it")?.relay.clone();
+        let membership = Device::load(&self.home)?.entity(&entity)?.clone();
+        let mut settings = self.settings(&gid)?;
+        settings.open.retain(|o| o.id != membership.id);
+        if !close {
+            settings.open.push(Opened { id: membership.id.clone(), name: membership.name.clone() });
+        }
+        if settings.requests.is_empty() {
+            settings.requests = hex::encode(self.provider.rand().random_array::<32>()?);
+        }
+        let opening = Opening { group: gid.clone(), relay, name: settings.name.clone(), requests: settings.requests.clone(), closed: close };
+        let (address, key) = place("inbox", &hex::decode(&membership.secret)?);
+        let sealed = seal(self.provider.rand(), &key, b"inbox", &serde_json::to_vec(&opening)?)?;
+        self.relay.append(&membership.relay, &address, &sealed).await?;
+        self.set(&gid, settings).await
+    }
+
+    /// Groups open to this device's entities, from their inboxes: the latest entry for each group, unless it closed it.
+    async fn openings(&self) -> Result<Vec<(Opening, Membership)>> {
+        let mut openings: Vec<(Opening, Membership)> = Vec::new();
+        for membership in Device::load(&self.home)?.entities {
+            let (address, key) = place("inbox", &hex::decode(&membership.secret)?);
+            for entry in self.read_box(&membership.relay, &address).await? {
+                let Ok(opening) = open(&key, b"inbox", &entry).and_then(|bytes| Ok(serde_json::from_slice::<Opening>(&bytes)?)) else {
+                    continue;
+                };
+                openings.retain(|(o, m)| o.group != opening.group || m.id != membership.id);
+                if !opening.closed {
+                    openings.push((opening, membership.clone()));
+                }
+            }
+        }
+        Ok(openings)
+    }
+
+    /// Asks to join a group open to one of this device's entities; whichever member is online checks the request and
+    /// adds this session.
+    async fn join_open(&mut self, gid: String, as_: Option<String>, reply: oneshot::Sender<Value>) -> Result<()> {
+        let prepared = async {
+            let (opening, membership) =
+                self.openings().await?.into_iter().find(|(o, _)| o.group == gid).context("that group is not open to any entity of this device")?;
+            let as_ = as_.unwrap_or(membership.id);
+            let bundle = KeyPackage::builder().build(CIPHERSUITE, &self.provider, &self.signer, self.credential(Some(&as_))?)?;
+            let key_package = B64.encode(MlsMessageOut::from(bundle.key_package().clone()).to_bytes()?);
+            let reply_secret: [u8; 32] = self.provider.rand().random_array()?;
+            let request = JoinRequest { key_package, reply: hex::encode(reply_secret) };
+            let (address, key) = place("requests", &hex::decode(&opening.requests)?);
+            let sealed = seal(self.provider.rand(), &key, b"request", &serde_json::to_vec(&request)?)?;
+            self.relay.append(&opening.relay, &address, &sealed).await?;
+            anyhow::Ok((opening.relay, place("reply", &reply_secret)))
+        };
+        let (relay, (address, key)) = match prepared.await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = reply.send(json!({ "error": format!("{error:#}") }));
+                return Ok(());
+            }
+        };
+        let (http, events) = (self.relay.clone(), self.events.clone());
+        tokio::spawn(async move {
+            let deadline = Instant::now() + Duration::from_secs(INVITE_TTL_S);
+            while Instant::now() < deadline {
+                match http.entries(&relay, &address, 0, POLL_WAIT_S).await {
+                    Ok(entries) if entries.is_empty() => {}
+                    Ok(mut entries) => return drop(events.send(Event::Welcome { relay, key, data: entries.remove(0).2, reply })),
+                    Err(error) => return drop(reply.send(json!({ "error": format!("waiting to be admitted: {error:#}") }))),
+                }
+            }
+            drop(reply.send(json!({ "error": "no member admitted the request; one must be online" })));
+        });
+        Ok(())
+    }
+
+    /// Checks open groups for join requests, every REQUESTS seconds while `listen` runs. A request from a session that
+    /// speaks as an entity the group is open to is admitted, unless another member admitted it first.
+    pub async fn admit_requests(&mut self) {
+        let opened = match self.opened() {
+            Ok(opened) => opened,
+            Err(error) => return self.warn(None, format!("join requests: {error:#}")),
+        };
+        for (gid, settings, cursor) in opened {
+            if settings.open.is_empty() || !self.groups.contains_key(&gid) {
+                continue;
+            }
+            if let Err(error) = self.admit_open(&gid, &settings, cursor).await {
+                self.warn(Some(&gid), format!("join requests: {error:#}"));
+            }
+        }
+    }
+
+    fn opened(&self) -> Result<Vec<(String, Settings, u64)>> {
+        let rows: Vec<(String, String, u64)> =
+            self.db.prepare("SELECT gid, settings, cursor FROM settings")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+        rows.into_iter().map(|(gid, settings, cursor)| Ok((gid, serde_json::from_str(&settings)?, cursor))).collect()
+    }
+
+    async fn admit_open(&mut self, gid: &str, settings: &Settings, cursor: u64) -> Result<()> {
+        let relay = self.groups[gid].relay.clone();
+        let (address, key) = place("requests", &hex::decode(&settings.requests)?);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
+        for (seq, at, data) in self.relay.entries(&relay, &address, cursor, 0).await? {
+            self.db.execute("UPDATE settings SET cursor = ? WHERE gid = ?", params![seq, gid])?;
+            // Expired requests are skipped, so an old one posted again cannot bring back a session that left.
+            if at + INVITE_TTL_S * 1000 < now {
+                continue;
+            }
+            let request: JoinRequest = serde_json::from_slice(&open(&key, b"request", &data)?)?;
+            let key_package = self.key_package(&B64.decode(&request.key_package)?)?;
+            let leaf = key_package.leaf_node();
+            let joiner = self.describe(gid, person(leaf.credential(), leaf.signature_key().as_slice())).await?;
+            if self.members(gid)?.iter().any(|m| m["fp"] == joiner["fp"]) {
+                continue;
+            }
+            let entity = joiner["entity"]["id"].as_str().filter(|_| joiner["entity"].get("error").is_none());
+            if !entity.is_some_and(|id| settings.open.iter().any(|o| o.id == id)) {
+                self.warn(Some(gid), format!("refused a join request from {joiner}: it speaks as no entity the group is open to"));
+                continue;
+            }
+            let envelope = match self.add(gid, key_package).await {
+                Ok(envelope) => envelope,
+                Err(_) if self.members(gid)?.iter().any(|m| m["fp"] == joiner["fp"]) => continue, // another member was first
+                Err(error) => return Err(error),
+            };
+            let (reply_address, reply_key) = place("reply", &hex::decode(&request.reply)?);
+            let sealed = seal(self.provider.rand(), &reply_key, b"welcome", &serde_json::to_vec(&envelope)?)?;
+            self.relay.append(&relay, &reply_address, &sealed).await?;
+            self.post_state(gid).await?;
+        }
+        Ok(())
     }
 
     fn read(&mut self, id: &str, ancestors: usize) -> Result<Value> {
@@ -811,7 +1026,7 @@ impl Session {
         }
         self.folders.remove(gid);
         self.backlog.remove(gid);
-        for table in ["groups", "folders", "messages"] {
+        for table in ["groups", "folders", "messages", "settings", "applied"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [gid])?;
         }
         let attachments = self.attachments.join(&digest(gid.as_bytes())[..16]);
@@ -1039,6 +1254,16 @@ impl Session {
 
     /// Logs a received message and delivers it, with its attachment written to a file only this user can read.
     fn ingest(&mut self, gid: &str, id: &str, sender: Value, mut payload: Payload) -> Result<()> {
+        if let Some(settings) = payload.settings.take() {
+            if self.db.execute("INSERT OR IGNORE INTO applied (id, gid) VALUES (?, ?)", params![id, gid])? == 0 {
+                return Ok(());
+            }
+            if settings != self.settings(gid)? {
+                self.store_settings(gid, &settings)?;
+                self.deliver(gid, json!({ "type": "settings", "group": gid, "settings": settings, "by": sender }));
+            }
+            return Ok(());
+        }
         let attachment = payload.attachment.take().map(|data| B64.decode(data)).transpose()?;
         let inserted = self.db.execute(
             "INSERT OR IGNORE INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",

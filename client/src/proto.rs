@@ -19,7 +19,9 @@ const MAX_PAST_EPOCHS: usize = 5;
 const WORDS: &str = include_str!("words.txt");
 
 /// A message as both transports carry it: MLS plaintext on the relay, the body of a folder file.
-#[derive(Clone, Serialize, Deserialize)]
+/// A message with `settings` (or, later, a file) carries no text and stays out of the conversation: it is never
+/// delivered as a message, and never listed in `after`.
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Payload {
     /// `None` in a session's log once delivered, unless `listen --keep-log`.
     pub content: Option<String>,
@@ -33,6 +35,28 @@ pub struct Payload {
     /// Base64 file content. Recipients get it as a private file; the session's log never holds it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Settings>,
+}
+
+/// A group's settings, posted whole whenever one changes; the latest a member has seen wins. Whoever adds a member
+/// posts them again, so the new member has them too.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Settings {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Entities whose sessions may join without an invite.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open: Vec<Opened>,
+    /// Hex key that seals join requests to the members; set when the group is first opened.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requests: String,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct Opened {
+    pub id: String,
+    pub name: String,
 }
 
 /// Reads `to` as a list, or as the single fingerprint that 0.4 wrote, so older folder files and stored messages still parse.
