@@ -162,11 +162,25 @@ async fn a_doc_reaches_a_joiner_and_edits_go_live() {
     bob.until(|e| matches!(e, Event::Edited { .. }).then_some(())).await;
     assert_eq!(lmk_node::doc::text(&bob.node.doc(&gid.0).unwrap()).unwrap(), "first line\n");
     let update = lmk_node::doc::edit(&bob.node.doc(&gid.0).unwrap(), "first line\nsecond\n").unwrap();
+    alice.node.doc_edits(&gid.0).unwrap();
     bob.node.edit(&gid.0, update).await.unwrap();
+    // Whoever reads the doc before the event is handled still learns who changed it.
+    let editors = tokio::time::timeout(WAIT, async {
+        loop {
+            let (state, editors) = alice.node.doc_edits(&gid.0).unwrap();
+            if lmk_node::doc::text(&state).unwrap() == "first line\nsecond\n" {
+                return editors;
+            }
+            assert!(editors.is_empty());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(editors.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["Bob"]);
     let by = alice.until(|e| match e {
         Event::Edited { by, .. } => Some(by),
         _ => None,
     }).await;
     assert_eq!(by.name, "Bob");
-    assert_eq!(lmk_node::doc::text(&alice.node.doc(&gid.0).unwrap()).unwrap(), "first line\nsecond\n");
 }

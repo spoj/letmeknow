@@ -57,8 +57,6 @@ struct Binding {
     /// Watches the file's directory, as editors often replace a file rather than write into it.
     _watcher: Option<RecommendedWatcher>,
     quiet: Quiet,
-    /// The members whose changes came in since the doc was last brought into step.
-    editors: Vec<Value>,
     /// The text the agent was last told of, while an `edited` event waits to be printed.
     since: String,
 }
@@ -315,13 +313,9 @@ impl Session {
                 self.refresh_opening(&group).await?;
             }
             Event::Message(message) => self.received(message).await?,
-            Event::Edited { group, by } => {
-                let by = self.describe(&group, &by)?;
+            Event::Edited { group, .. } => {
                 if let Some(binding) = self.bindings.get_mut(&group) {
                     binding.quiet.doc_changed(Instant::now());
-                    if !binding.editors.iter().any(|e| e["fp"] == by["fp"]) {
-                        binding.editors.push(by);
-                    }
                 }
             }
             Event::Introduced { group, by, identity, name, how } => self.introduced(&group, &by, identity, name, how)?,
@@ -655,7 +649,8 @@ impl Session {
         let settings = self.node.settings(&gid.0)?;
         let mut answer = json!({ "group": b64(&gid.0), "kind": settings.kind, "name": settings.name, "members": self.described_members(&gid)? });
         if settings.kind == Kind::Doc {
-            let text = ydoc::text(&self.node.doc(&gid.0)?)?;
+            // The file starts with the doc's text, so the changes in it are not told as edits.
+            let text = ydoc::text(&self.node.doc_edits(&gid.0)?.0)?;
             answer["file"] = json!(self.bind(&gid, file, &text)?);
         }
         Ok(answer)
@@ -1051,7 +1046,7 @@ impl Session {
         if let Err(error) = &watcher {
             self.warn(Some(gid), format!("cannot watch {}: {error}; what you write there is taken at your next command", path.display()));
         }
-        let binding = Binding { path, _watcher: watcher.ok(), quiet: Quiet::default(), editors: Vec::new(), since: String::new() };
+        let binding = Binding { path, _watcher: watcher.ok(), quiet: Quiet::default(), since: String::new() };
         self.bindings.insert(gid.clone(), binding);
     }
 
@@ -1061,7 +1056,6 @@ impl Session {
     async fn sync(&mut self, gid: &Bytes) -> Result<()> {
         let binding = self.bindings.get_mut(gid).expect("a doc is bound");
         binding.quiet = Quiet::default();
-        let editors = std::mem::take(&mut binding.editors);
         let path = binding.path.clone();
         let base: String = self.db.query_row("SELECT base FROM bindings WHERE gid = ?", [&gid.0], |r| r.get(0))?;
         let file = match std::fs::read_to_string(&path) {
@@ -1069,7 +1063,7 @@ impl Session {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => base.clone(),
             Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
         };
-        let state = self.node.doc(&gid.0)?;
+        let (state, editors) = self.node.doc_edits(&gid.0)?;
         let current = ydoc::text(&state)?;
         let (text, lost) = if file == base { (current.clone(), Vec::new()) } else { doc::rebase(&base, &file, &current) };
         if text != current {
@@ -1086,7 +1080,7 @@ impl Session {
         if current != base {
             // One `edited` event per doc waits, telling of every change since the agent was last told.
             let group = b64(&gid.0);
-            let mut by = editors;
+            let mut by: Vec<Value> = editors.iter().map(|e| self.describe(gid, e)).collect::<Result<_>>()?;
             match self.outbox.take_edited(&group) {
                 Some(waited) => {
                     for editor in waited["by"].as_array().expect("edited lists its editors") {

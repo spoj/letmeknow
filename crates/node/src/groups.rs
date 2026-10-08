@@ -100,7 +100,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 ensure!(doc_like(&settings), "an edit outside a doc");
                 let old = st.doc_state(gid)?;
                 let new = doc::apply(&old, &update.0)?;
-                st.provider.put(&crate::doc_key(gid), &new)?;
+                st.edited(gid, &new, &sender)?;
                 if settings.kind == Kind::Doc {
                     let before = doc::links(&doc::text(&old)?);
                     for link in doc::links(&doc::text(&new)?) {

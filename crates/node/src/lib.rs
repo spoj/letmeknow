@@ -221,6 +221,8 @@ pub(crate) struct State<P> {
     lists: HashMap<Vec<u8>, (DeviceList, u64)>,
     /// `send`s waiting for receipts.
     waiters: HashMap<[u8; 32], mpsc::UnboundedSender<(EndpointId, Option<String>)>>,
+    /// For each doc, the members whose edits or diffs came in since `doc_edits` last handed them out.
+    editors: HashMap<Vec<u8>, Vec<Member>>,
 }
 
 pub(crate) enum Work {
@@ -331,6 +333,16 @@ impl<P: Provider> State<P> {
 
     fn doc_state(&self, gid: &[u8]) -> Result<Vec<u8>> {
         self.provider.get(&doc_key(gid))?.context("the group has no doc")
+    }
+
+    /// Stores a doc's new state, which `by` changed.
+    fn edited(&mut self, gid: &[u8], state: &[u8], by: &Member) -> Result<()> {
+        self.provider.put(&doc_key(gid), state)?;
+        let editors = self.editors.entry(gid.to_vec()).or_default();
+        if !editors.iter().any(|e| e.key == by.key && e.iroh == by.iroh) {
+            editors.push(by.clone());
+        }
+        Ok(())
     }
 
     /// A member as events show it, if it has a letmeknow credential.
@@ -458,6 +470,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             labels: HashMap::new(),
             lists: HashMap::new(),
             waiters: HashMap::new(),
+            editors: HashMap::new(),
         };
         let inner = Arc::new(Inner {
             state: Mutex::new(state),
@@ -709,6 +722,14 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// A doc's Yjs state.
     pub fn doc(&self, gid: &[u8]) -> Result<Vec<u8>> {
         self.inner.state.lock().unwrap().doc_state(gid)
+    }
+
+    /// A doc's Yjs state, with the members whose changes came in since this was last asked: the two are read together,
+    /// so a change is never in the state while its editor waits for the next call.
+    pub fn doc_edits(&self, gid: &[u8]) -> Result<(Vec<u8>, Vec<Member>)> {
+        let mut st = self.inner.state.lock().unwrap();
+        let state = st.doc_state(gid)?;
+        Ok((state, st.editors.remove(gid).unwrap_or_default()))
     }
 
     /// Applies an edit to a doc and sends it to the members online.
@@ -1189,10 +1210,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.fetched(gid, link).await?;
         let mut state = Vec::new();
         self.net().read_file(link, &mut state).await?;
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
         let merged = doc::apply(&st.doc_state(gid)?, &state)?;
-        st.provider.put(&doc_key(gid), &merged)?;
         let by = st.by_iroh(gid, &EndpointId::from_bytes(&by)?);
+        st.edited(gid, &merged, &by)?;
         self.events.send(Event::Edited { group: Bytes(gid.to_vec()), by }).ok();
         Ok(())
     }
@@ -1323,6 +1344,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         st.provider.delete(&rec_key(gid))?;
         st.provider.delete(&doc_key(gid))?;
+        st.editors.remove(gid);
         g.mls.delete(&st.provider)?;
         st.save_groups()?;
         if let Some(net) = self.net.get() {
