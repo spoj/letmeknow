@@ -54,7 +54,7 @@ The words are too short to serve as a key: anyone holding the encrypted exchange
 
 1. Inviter A's session process picks the words and a free slot, and creates an invite Durable Object holding A's SPAKE2 message, an expiry of 10 minutes, and a private owner token. It long-polls for a join request.
 2. Joiner B fetches A's SPAKE2 message, derives the key, and posts its own SPAKE2 message with an MLS KeyPackage encrypted under the key. The relay accepts one join per invite.
-3. A derives the key, decrypts the KeyPackage, commits an Add, and posts the Welcome, encrypted under the same key. Only the owner token may post the Welcome. If the KeyPackage does not decrypt (wrong code), A warns and posts a Welcome that B cannot open either, so B fails at once. Either way the invite is used up.
+3. A derives the key, decrypts the KeyPackage, commits an Add, and posts the Welcome, encrypted under the same key. Only the owner token may post the Welcome. If A cannot add B, it posts, in place of the Welcome, the reason, sealed under the same key: B learns why at once, and a B with a wrong code, which cannot open it, fails at once too (A warns of the wrong code). Either way the invite is used up.
 4. B joins at the epoch A's commit created. Every member sees "A added B (name, fingerprint)". The invite object deletes itself at expiry, freeing the slot.
 
 Any member may invite. Only the inviter's session admits against its invite, so no other member needs to know about it. Both sides are normally online when an invite is shared; an invite whose inviter is offline simply expires.

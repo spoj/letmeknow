@@ -462,14 +462,15 @@ export class Client {
       const key = pake.finish(unb64(join.pake), slot);
       const welcome = (data: Uint8Array) =>
         http(`/i/${slot}/welcome`, { method: "POST", headers: { Authorization: `Bearer ${owner}` }, body: JSON.stringify({ data: seal(key, "welcome", data) }) });
+      let envelope: object;
       try {
-        const envelope = await this.run(() => this.admit(target, key, join));
-        await welcome(utf8(JSON.stringify(envelope)));
+        envelope = await this.run(() => this.admit(target, key, join));
       } catch (error) {
-        // Sealed under our key, so a joiner with a wrong code cannot open it and stops waiting.
-        await welcome(new Uint8Array());
+        // Sealed under our key: a joiner with a wrong code cannot open it either, and stops waiting.
+        await welcome(utf8(JSON.stringify({ error: String(error) })));
         throw error;
       }
+      await welcome(utf8(JSON.stringify(envelope)));
       if ("gid" in target) await this.run(() => this.postState(target.gid));
       return;
     }
@@ -513,7 +514,8 @@ export class Client {
     }
   }
 
-  private async welcome(envelope: { entity?: Membership; group: string; seq: number; welcome: string }): Promise<string> {
+  private async welcome(envelope: { error?: string; entity?: Membership; group: string; seq: number; welcome: string }): Promise<string> {
+    if (envelope.error) throw new Error(`the inviter could not add this browser: ${envelope.error}`);
     if (envelope.entity) {
       const { id, name, secret } = envelope.entity;
       // First, so that this browser speaks as it from now on.

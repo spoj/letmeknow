@@ -272,6 +272,10 @@ def main():
         run("lost", "send", "after the lost answer", env=lossy_env)
         check(kate.expect(lambda e: e["type"] == "message")["content"] == "after the lost answer", "a commit the relay took though its answer was lost still counts for its sender")
         lost.expect(lambda e: e["type"] == "left" and e["member"]["name"] == "Liam")
+        gone = run("kate", "invite")
+        run("kate", "leave", "--group", gone["group"])
+        refused = run("liam", "join", gone["link"], ok=False)
+        check("could not admit" in refused and "unknown group" in refused, "a joiner the inviter could not add is told why at once")
 
         folder = os.path.join(HOME, "shared", "chat")
         erin, frank = Listener("erin", extra=["--keep-log"]), Listener("frank")

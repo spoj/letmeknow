@@ -514,23 +514,29 @@ impl Session {
         let join: Value = serde_json::from_str(data)?;
         let pake = B64.decode(join["pake"].as_str().context("join request lacks pake")?)?;
         let key = invite_key(&spake.finish(&pake)?, &invite.id);
+        let admitted = self.admitted(invite, &key, &join).await;
+        // Sealed under our key: a joiner with a wrong code cannot open it either, and stops waiting.
+        let envelope = admitted.as_ref().map(Value::clone).unwrap_or_else(|error| json!({ "error": format!("{error:#}") }));
+        let sealed = seal(self.provider.rand(), &key, b"welcome", &serde_json::to_vec(&envelope)?)?;
+        self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
+        admitted?;
+        if let Into::Group(gid) = &invite.into {
+            self.post_state(gid).await?;
+        }
+        Ok(())
+    }
+
+    /// Adds whoever redeemed an invite, as `join` describes it; returns the envelope that lets it join.
+    async fn admitted(&mut self, invite: &Invite, key: &[u8; 32], join: &Value) -> Result<Value> {
         let field = match invite.into {
             Into::Group(_) => "key_package",
             Into::Entity(_) => "device",
         };
-        let bytes = match open(&key, b"join", join[field].as_str().with_context(|| format!("join request lacks {field}"))?) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                // Sealed under our key, so a joiner with a wrong code cannot open it and stops waiting.
-                let sealed = seal(self.provider.rand(), &key, b"welcome", b"")?;
-                self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
-                return Err(error);
-            }
-        };
-        let envelope = match &invite.into {
+        let bytes = open(key, b"join", join[field].as_str().with_context(|| format!("join request lacks {field}"))?)?;
+        match &invite.into {
             Into::Group(gid) => {
                 let key_package = self.key_package(&bytes)?;
-                self.add(gid, key_package).await?
+                self.add(gid, key_package).await
             }
             Into::Entity(membership) => {
                 let member: Member = serde_json::from_slice(&bytes)?;
@@ -540,15 +546,9 @@ impl Session {
                     list.get(&member.id).is_some()
                 })
                 .await?;
-                json!({ "entity": membership })
+                Ok(json!({ "entity": membership }))
             }
-        };
-        let sealed = seal(self.provider.rand(), &key, b"welcome", &serde_json::to_vec(&envelope)?)?;
-        self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
-        if let Into::Group(gid) = &invite.into {
-            self.post_state(gid).await?;
         }
-        Ok(())
     }
 
     fn key_package(&self, bytes: &[u8]) -> Result<KeyPackage> {
@@ -635,6 +635,9 @@ impl Session {
 
     async fn welcome(&mut self, relay: &str, key: &[u8; 32], data: &str) -> Result<Value> {
         let envelope: Value = serde_json::from_slice(&open(key, b"welcome", data)?)?;
+        if let Some(error) = envelope.get("error").and_then(Value::as_str) {
+            bail!("the inviter could not admit this session: {error}");
+        }
         if let Some(entity) = envelope.get("entity") {
             let membership: Membership = serde_json::from_value(entity.clone())?;
             let mut device = Device::load(&self.home)?;
