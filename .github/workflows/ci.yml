@@ -32,5 +32,24 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -u test/e2e.py
-        timeout-minutes: 10
+      # The browser client is the same on every OS, so only Linux builds and tests it.
+      - if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.129
+      - if: runner.os == 'Linux'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('web/package-lock.json') }}
+      - if: runner.os == 'Linux'
+        run: npm ci && npx playwright install --with-deps chromium-headless-shell && npm run check
+        working-directory: web
+      - run: python -u test/e2e.py ${{ runner.os != 'Linux' && '--no-browser' || '' }}
+        timeout-minutes: 15
