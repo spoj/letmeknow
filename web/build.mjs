@@ -1,5 +1,6 @@
 // Builds the browser client into relay/public/assets, where the relay serves it: the client's library compiled to
-// WebAssembly, and the app bundled. app.js and app.css keep their names; the WebAssembly file carries a hash.
+// WebAssembly, and the app bundled. app.js and app.css keep their names; the WebAssembly file and the chunks loaded
+// later (the editor, the QR code) carry a hash.
 import { execFileSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -14,6 +15,8 @@ rmSync(out, { recursive: true, force: true });
 await build({
   entryPoints: { app: `${web}src/main.ts` },
   assetNames: "[name]-[hash]",
+  chunkNames: "[name]-[hash]",
+  splitting: true,
   loader: { ".wasm": "file" },
   publicPath: "/assets",
   bundle: true,

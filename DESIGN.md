@@ -64,7 +64,7 @@ Any member may invite. Only the inviter's session admits against its invite, so 
 A member can open a group to an entity its device is in (`open <entity>`). Any session speaking as that entity may then join without an invite, so a person's devices and agents reach the group by themselves.
 
 1. The group's settings list the entity and carry a requests key, made when the group is first opened. The opener also writes an opening (group id, relay, name, requests key) to the entity's inbox: a box whose address and key derive from a secret that only the entity's devices hold.
-2. Devices list the groups open to their entities: `groups` shows them with `joined: false`, the browser under "Open to you".
+2. Devices list the groups open to their entities: `groups` shows them with `joined: false`, the browser under "You can join".
 3. A session joins with `join <group id>`: it appends a request, its KeyPackage and a fresh reply secret sealed under the requests key, to the group's requests box, then waits up to 10 minutes on the reply box that secret derives.
 4. Every member online checks the requests box every 5 seconds. It admits a request whose credential speaks as an entity the group is open to, checked against the entity's list: it commits the Add, writes the Welcome to the reply box, and posts the group's state (see Group settings). When several race, the relay's epoch check lets one commit win, and the others find the joiner already in the group. Requests older than 10 minutes are skipped, so a request posted again later cannot bring back a session that left.
 5. `open --close <entity>` takes the entity out of the settings and writes a closing to its inbox.
@@ -104,13 +104,19 @@ A person joins a group by opening its invite link.
 - The relay serves the page for `/` and `/i/<slot>` to requests that accept `text/html`. The page's code comes from the relay's own origin, as static assets (`relay/public`, built by `web/build.mjs`), under a Content-Security-Policy that allows scripts and connections from that origin only, and with `no-transform`, so the CDN injects nothing (analytics, email obfuscation) into the page.
 - The member is the Rust client's protocol code with OpenMLS, compiled to WebAssembly (`client/src/web.rs`); the page (`web/`) does networking, storage and display. ts-mls stays rejected (see Crypto).
 - A browser is a member like a session, with its own key and display name. On first use it starts an entity in the name given, unless it opens a device link, which makes it a device of that entity. One person joins from a laptop and a phone as two members of one entity.
+- The page speaks of people and their devices, not entities: a member shows as "Matthew · phone" (entity, then its own name), a failed entity check as a plain warning, and a key's fingerprint only in a tooltip. Opening a device link is "adding a device"; the page shows the link, its code and a QR code of the link.
+- Every group a browser starts or joins is open to its entity, shown as "Your other devices can join" and switched off in the group's settings. A browser opens a group it joined by invite only once the settings the inviter posts after adding it had a few seconds to arrive, as settings are posted whole. A newly added device asks to join every group open to its entity, without a click per group; some member must be online to admit it. Groups it left are not offered again.
+- A person starts a group, or joins with the link or its code typed (`417-acid-zebra`), which are the same invite. A browser leaves a group as a session does: it proposes its own removal, which another member commits, and forgets the group at once.
+- Background work (catching up, admitting requests, key updates) never redraws what a person is using: the page appends new items, follows the bottom of the list only if it was there, and keeps each group's draft, scroll position and open file.
+- Attachments: images (PNG, JPEG, GIF, WebP, by their first bytes) show inline from `data:` URLs, other files as downloads, named by the message text when that is a file name. A browser sends one with the file's name as text unless a person typed some.
+- The editor (CodeMirror, the markdown grammars) and the QR code generator load on first use, as separate chunks, so a first visit loads the page, Yjs and the WebAssembly member.
 - MLS state, message history, files and the images they link persist in IndexedDB; one tab at a time holds them (Web Locks). Messages show at once; nothing is held. Unlike a session the browser keeps message text, because a person scrolls back.
 - Joining from a link waits for a click, so a link preview or scanner opening it does not use up the invite. The page drops the words from the address bar once joined.
 - While open, the page does what a running session does: key updates on load and hourly, admitting join requests to open groups, snapshots after adding a member.
 
 ## Removal
 
-A member commits a Remove. The group moves to a new epoch that the removed member cannot decrypt. A leaving member asks another member to commit its removal; groups that are done are abandoned and expire.
+A member commits a Remove. The group moves to a new epoch that the removed member cannot decrypt. A leaving member asks another member to commit its removal (MLS lets no member commit its own), and members see it as having left, not as removed by whoever committed it; groups that are done are abandoned and expire.
 
 ## Relay
 

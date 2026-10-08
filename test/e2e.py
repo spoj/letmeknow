@@ -184,7 +184,8 @@ def main():
         check(True, "removed member is told; others see it")
 
         run("bob", "leave")
-        alice.expect(lambda e: e["type"] == "left" and e["member"]["name"] == "Bob")
+        left = alice.expect(lambda e: e["type"] == "left" and e["member"]["name"] == "Bob")
+        check(left["by"]["name"] == "Bob", "a member that leaves is shown leaving, not removed by whoever committed it")
         bob.expect(lambda e: e["type"] == "removed")
         check([m["name"] for m in run("alice", "members")["members"]] == ["Alice"], "leaving is committed by a remaining member")
         check(not os.path.exists(attachment), "attachments are deleted when the session leaves the group")

@@ -71,7 +71,8 @@ export async function inviteKind(slot: string): Promise<"group" | "entity" | nul
 
 export class Client {
   member?: Member;
-  me = { name: "", entities: [] as Membership[] };
+  /** `left`: groups this browser left, which it no longer lists as open to it. */
+  me = { name: "", entities: [] as Membership[], left: [] as string[] };
   groups = new Map<string, Group>();
   items = new Map<string, Item[]>();
   files = new Map<string, FileDoc>();
@@ -98,7 +99,7 @@ export class Client {
     if (saved) {
       client.member = Member.load(saved);
       client.blobs = new Set(await store.keys("blobs", ""));
-      client.me = await state("me");
+      client.me = { left: [], ...(await state("me")) };
       client.seen = new Set(await state("seen"));
       for (const group of (await state("groups")) as Group[]) {
         client.groups.set(group.gid, group);
@@ -146,7 +147,7 @@ export class Client {
   /** First use: this browser becomes a member named `label`, and starts the entity `entity`, unless a device link will add it to one. */
   async create(label: string, entity?: string) {
     this.member = new Member(label);
-    this.me = { name: label, entities: [] };
+    this.me = { name: label, entities: [], left: [] };
     await this.run(async () => {
       if (entity) await this.createEntity(entity);
     });
@@ -225,7 +226,7 @@ export class Client {
         try {
           await this.receive(gid, id, bytes);
         } catch (error) {
-          this.show(gid, { type: "warning", text: `message ${id.slice(0, 8)}: ${error}`, at: Date.now() });
+          this.show(gid, { type: "warning", text: `A message could not be read: ${error}`, at: Date.now() });
         }
       }
     }
@@ -240,9 +241,9 @@ export class Client {
     if (result.changes) {
       for (const change of result.changes) this.show(gid, { type: change.type, member: await this.describe(change.member), by: await this.describe(change.by), at: Date.now() });
       if (result.removed) {
-        const name = this.groups.get(gid)!.settings.name || `group ${gid.slice(0, 6)}`;
+        const name = this.groups.get(gid)!.settings.name;
         await this.forget(gid);
-        this.onerror(`${result.sender.name} removed you from ${name}`);
+        this.onerror(`${result.sender.name} removed you from ${name ? `“${name}”` : "a group"}`);
       }
       return;
     }
@@ -295,7 +296,7 @@ export class Client {
     return messages.map(m => m.id).filter(id => !covered.has(id));
   }
 
-  send(gid: string, content: string, options: { to?: string[]; reply_to?: string; urgent?: boolean }) {
+  send(gid: string, content: string, options: { to?: string[]; reply_to?: string; urgent?: boolean; attachment?: string }) {
     return this.run(async () => {
       const payload: Payload = { content, after: this.tips(gid), ...options };
       const { id } = await this.post(gid, () => this.member!.encrypt(gid, utf8(JSON.stringify(payload))));
@@ -366,13 +367,47 @@ export class Client {
     });
   }
 
-  newGroup(): Promise<string> {
+  /** A new group named `name`, which this browser's other devices may join. */
+  newGroup(name: string): Promise<string> {
     return this.run(async () => {
       const gid = this.member!.create_group(this.path());
       this.groups.set(gid, { gid, cursor: 0, settings: {}, posted: [], requests: 0, read: 0 });
       this.items.set(gid, []);
       this.follow(gid);
+      const entity = this.me.entities[0];
+      if (entity) await this.openTo(gid, entity, name ? { name } : {});
+      else if (name) await this.setSettings(gid, { name });
       return gid;
+    });
+  }
+
+  /**
+   * After joining `gid` by invite, lets this browser's other devices join it too. Waits a moment for the settings the
+   * inviter posts after adding a member, as settings are posted whole and older ones would undo the inviter's.
+   */
+  async openToOwn(gid: string) {
+    const entity = this.me.entities[0];
+    for (let i = 0; i < 10 && this.groups.has(gid) && !Object.keys(this.groups.get(gid)!.settings).length; i++) await new Promise(r => setTimeout(r, 500));
+    if (!entity || !this.groups.has(gid)) return;
+    await this.run(async () => {
+      await this.catchUp(gid);
+      if (this.groups.has(gid)) await this.openTo(gid, entity);
+    });
+  }
+
+  removeMember(gid: string, fp: string) {
+    return this.run(async () => {
+      await this.post(gid, () => this.member!.remove(gid, fp));
+    });
+  }
+
+  /** Leaves a group: asks the others to commit this member's removal, as no member can commit its own, and forgets it. */
+  leave(gid: string) {
+    return this.run(async () => {
+      if (JSON.parse(this.member!.members(gid)).length > 1) await this.post(gid, () => this.member!.leave_proposal(gid));
+      this.member!.leave(gid);
+      this.me.left.push(gid);
+      await this.forget(gid);
     });
   }
 
@@ -469,14 +504,16 @@ export class Client {
 
   /** Lets sessions of `entity` join the group without an invite, and tells the entity's devices through its inbox. */
   open(gid: string, entity: Membership) {
-    return this.run(async () => {
-      const current = this.groups.get(gid)!.settings;
-      const settings = { ...current, open: [...(current.open ?? []).filter(o => o.id !== entity.id), { id: entity.id, name: entity.name }], requests: current.requests || hex(random(32)) };
-      const inbox = place("inbox", unhex(entity.secret));
-      const opening: Opening = { group: gid, relay: origin, name: settings.name ?? "", requests: settings.requests };
-      await boxAppend(inbox.address, seal(inbox.key, "inbox", utf8(JSON.stringify(opening))));
-      await this.setSettings(gid, settings);
-    });
+    return this.run(() => this.openTo(gid, entity));
+  }
+
+  private async openTo(gid: string, entity: Membership, current = this.groups.get(gid)!.settings) {
+    if (current.open?.some(o => o.id === entity.id)) return;
+    const settings = { ...current, open: [...(current.open ?? []), { id: entity.id, name: entity.name }], requests: current.requests || hex(random(32)) };
+    const inbox = place("inbox", unhex(entity.secret));
+    const opening: Opening = { group: gid, relay: origin, name: settings.name ?? "", requests: settings.requests };
+    await boxAppend(inbox.address, seal(inbox.key, "inbox", utf8(JSON.stringify(opening))));
+    await this.setSettings(gid, settings);
   }
 
   private async setSettings(gid: string, settings: Settings) {
@@ -517,7 +554,7 @@ export class Client {
         found.splice(0, found.length, ...others, ...(opening.closed ? [] : [{ opening, entity }]));
       }
     }
-    return found.filter(f => !this.groups.has(f.opening.group));
+    return found.filter(f => !this.groups.has(f.opening.group) && !this.me.left.includes(f.opening.group));
   }
 
   /** Asks to join an open group; whichever member is online checks the request and adds this browser. */
@@ -550,7 +587,7 @@ export class Client {
         const present = () => JSON.parse(this.member!.members(group.gid)).some((m: Person) => m.fp === applicant.fp);
         if (present()) continue;
         if (!applicant.entity || applicant.entity.error || !opened.some(o => o.id === applicant.entity!.id)) {
-          this.show(group.gid, { type: "warning", text: `refused a join request from ${applicant.name}: it speaks as no entity the group is open to`, at: Date.now() });
+          this.show(group.gid, { type: "warning", text: `Turned away ${applicant.name}, who asked to join: not a device of anyone this group lets join without an invite`, at: Date.now() });
           continue;
         }
         let envelope: object;

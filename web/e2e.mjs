@@ -1,5 +1,6 @@
 // Browser end-to-end test, run by test/e2e.py against its local relay (RELAY) with the session binary (BIN): Matthew
-// joins an agent's group from his laptop and his phone, they chat, and all three edit one checklist at once.
+// joins an agent's group from his laptop, adds his phone, which joins his groups on its own, they chat, and all three
+// edit one checklist at once, with images in it. Ann starts on the page with a typed code, and leaves or is removed.
 import { execFileSync, spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,7 +25,7 @@ createInterface({ input: listener.stdout }).on("line", line => {
   waiters.forEach(wake => wake());
 });
 /** The first event the agent printed that `predicate` accepts. */
-function printed(predicate, ms = 15_000) {
+function printed(predicate, ms = 30_000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("FAIL: the agent printed no such event")), ms);
     const look = () => {
@@ -41,67 +42,109 @@ function printed(predicate, ms = 15_000) {
 
 const browser = await chromium.launch();
 const pages = {};
+const open = async (name, options) => {
+  const page = await (await browser.newContext({ permissions: ["clipboard-read", "clipboard-write"], ...options })).newPage();
+  page.on("console", message => message.type() === "error" && console.log(`${name}: ${message.text()}`));
+  page.on("pageerror", error => console.log(`${name}: ${error}`));
+  pages[name] = page;
+  return page;
+};
 try {
   await printed(e => e.type === "ready");
   const { link, group } = agent("invite");
-  const laptop = await (await browser.newContext()).newPage();
-  const phone = await (await browser.newContext()).newPage();
-  Object.assign(pages, { laptop, phone });
-  for (const [name, page] of Object.entries(pages)) {
-    page.on("console", message => message.type() === "error" && console.log(`${name}: ${message.text()}`));
-    page.on("pageerror", error => console.log(`${name}: ${error}`));
-  }
+  const laptop = await open("laptop", { viewport: { width: 1280, height: 800 } });
+  const phone = await open("phone", { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  const editorLoads = [];
+  laptop.on("request", request => request.url().includes("/assets/editor-") && editorLoads.push(request.url()));
 
+  // Invited by link: what it is, a name, Join, and the group.
   await laptop.goto(link);
-  await laptop.getByPlaceholder("Your name").fill("Matthew");
-  await laptop.getByRole("button", { name: "Join" }).click();
-  await laptop.locator("header .members", { hasText: "Agent" }).waitFor();
+  await laptop.getByRole("heading", { name: "You're invited to a group chat" }).waitFor();
+  await laptop.getByLabel("Your name").fill("Matthew");
+  await laptop.getByRole("button", { name: "Join group" }).click();
+  await laptop.locator(".people", { hasText: "Agent" }).waitFor();
   check(new URL(laptop.url()).pathname === "/", "a browser joins from an invite link, with a click");
   const joined = await printed(e => e.type === "joined" && e.member.name === "Matthew");
-  check(joined.member.entity?.name === "Matthew", "the agent sees the browser member speak as the entity it started");
+  check(joined.member.entity?.name === "Matthew", "the agent sees the browser member speak as the person it started");
+  await laptop.getByText("Matthew let their other devices join").waitFor();
+  check(true, "a group the browser joins lets its person's other devices join");
 
-  // The phone becomes one of Matthew's devices, then joins from its own link and speaks as Matthew too.
-  await laptop.getByRole("button", { name: "Matthew · devices" }).click();
-  await laptop.getByRole("button", { name: "Link a device" }).click();
-  const deviceLink = await laptop.locator(".invite code").nth(1).textContent();
+  // Adding a device: a link, a code and a QR code; the phone then joins Matthew's groups by itself.
+  await laptop.getByRole("button", { name: /Your devices/ }).click();
+  await laptop.getByRole("button", { name: "Add a device" }).click();
+  const deviceLink = await laptop.locator("dialog .copy code").first().textContent();
+  check(/^\d+-[a-z]+-[a-z]+$/.test(await laptop.locator("dialog .code").textContent()), "adding a device shows the link and its code");
+  check((await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "and a QR code of the link");
   await phone.goto(deviceLink);
-  await phone.getByPlaceholder("Your name").fill("Matthew's phone");
+  await phone.getByRole("heading", { name: "Add this browser to your devices" }).waitFor();
+  check((await phone.getByLabel("Name this device").inputValue()) === "phone", "a phone suggests its own device name");
   await phone.getByRole("button", { name: "Add this browser" }).click();
-  await laptop.getByText("Matthew's phone").waitFor();
-  await phone.goto(agent("invite", "--group", group).link);
-  await phone.getByRole("button", { name: "Join" }).click();
-  await phone.locator("header .members", { hasText: "Agent" }).waitFor();
-  const second = await printed(e => e.type === "joined" && e.member.name === "Matthew's phone");
-  check(second.member.entity?.name === "Matthew", "a linked phone joins from another invite link as a second member speaking as Matthew");
+  await laptop.getByText("Added. The device now joins your groups.").waitFor();
+  await laptop.locator(".devices li", { hasText: "phone" }).waitFor();
+  check(true, "the laptop lists the phone among Matthew's devices");
+  const second = await printed(e => e.type === "joined" && e.member.name === "phone");
+  check(second.member.entity?.name === "Matthew", "the added phone joins Matthew's group on its own, as a second member speaking as Matthew");
+  await phone.locator(".back:visible").click();
+  await phone.locator(".group-list button", { hasText: "Agent" }).click();
+  await phone.locator(".people", { hasText: "Matthew" }).waitFor();
+  check((await phone.locator(".people").textContent()).includes("Agent"), "and lists who is who, by whose they are");
 
-  await laptop.getByRole("button", { name: /^group / }).click();
+  await laptop.locator(".group-list button").first().click();
   const morning = agent("send", "Morning. Your priority list is ready.").id;
   for (const page of [laptop, phone]) await page.getByText("Morning. Your priority list is ready.").waitFor();
   console.log("ok - both browsers show the agent's message");
   await laptop.locator(".chips button", { hasText: "Agent" }).click();
-  await laptop.getByPlaceholder(/^Message/).fill("Thanks, on it");
-  await laptop.getByPlaceholder(/^Message/).press("Enter");
+  await laptop.getByPlaceholder("Message").fill("Thanks, on it");
+  await laptop.getByPlaceholder("Message").press("Enter");
   const direct = await printed(e => e.type === "message" && e.content === "Thanks, on it");
   check(direct.direct && direct.from.entity.name === "Matthew", "a browser sends a direct message to the agent");
-  await phone.locator(".messages li", { hasText: "Morning." }).hover();
+  await phone.locator(".messages li", { hasText: "Morning." }).click();
   await phone.locator(".messages li", { hasText: "Morning." }).getByRole("button", { name: "Reply" }).click();
-  await phone.getByText("urgent", { exact: true }).click();
-  await phone.getByPlaceholder(/^Message/).fill("Call me");
-  await phone.getByPlaceholder(/^Message/).press("Enter");
+  await phone.getByText("Urgent", { exact: true }).click();
+  await phone.getByPlaceholder("Message").fill("Call me");
+  await phone.getByRole("button", { name: "Send" }).click();
   const reply = await printed(e => e.type === "message" && e.content === "Call me");
   check(reply.urgent && reply.reply_to === morning, "a browser sends an urgent reply");
-  await laptop.getByText("Call me").waitFor();
+  await laptop.locator(".messages li.urgent", { hasText: "Call me" }).waitFor();
   console.log("ok - the other browser shows it too");
 
-  // The checklist: the agent rewrites it from an older version while Matthew ticks and adds items in both browsers.
+  // Background activity moves nothing a person is using: the draft, its focus and selection, and the scroll position.
+  for (let i = 0; i < 20; i++) agent("send", `status line ${i}`);
+  await laptop.getByText("status line 19").waitFor();
+  const input = laptop.getByPlaceholder("Message");
+  await input.fill("half a thought");
+  await input.evaluate(element => ((element.marker = true), element.setSelectionRange(2, 6)));
+  const list = laptop.locator(".group:visible .messages");
+  await list.evaluate(element => (element.scrollTop = 100));
+  agent("send", "while you scroll");
+  await laptop.getByRole("button", { name: "New messages ↓" }).waitFor();
+  await laptop.waitForTimeout(6_000); // a few background rounds: polling, join requests
+  const kept = await input.evaluate(element => [element.marker, document.activeElement === element, element.value, element.selectionStart, element.selectionEnd]);
+  check(JSON.stringify(kept) === JSON.stringify([true, true, "half a thought", 2, 6]), "background activity keeps the composer, its focus, text and selection");
+  check((await list.evaluate(element => element.scrollTop)) === 100, "a new message appends without moving a list scrolled up");
+  await laptop.getByRole("button", { name: "New messages ↓" }).click();
+  const atBottom = () => list.evaluate(element => element.scrollHeight - element.scrollTop - element.clientHeight < 2);
+  check(await atBottom(), "and New messages goes to the bottom");
+  agent("send", "at the bottom");
+  await laptop.getByText("at the bottom").waitFor();
+  await laptop.waitForTimeout(300);
+  check(await atBottom(), "a list at the bottom follows new messages");
+  await input.fill("");
+
+  // Files: beside the chat on the laptop, a tab on the phone, and loaded only when first shown.
   const path = join(home, "list.md");
   writeFileSync(path, "- [ ] reply to Ann\n- [ ] review budget\n- [ ] book flights\n");
+  check(editorLoads.length === 0, "the editor is not loaded before files are shown");
   agent("file", "create", "checklist.md", path);
   const old = agent("file", "show", "checklist.md").version;
   for (const page of [laptop, phone]) {
-    await page.getByRole("button", { name: /^Files/ }).click();
+    await page.getByRole("button", { name: /^Files · 1/ }).click();
     await page.getByRole("button", { name: "checklist.md" }).click();
+    await page.locator(".cm-content").waitFor();
   }
+  check(editorLoads.length === 1, "and is loaded once they are");
+  check(await laptop.locator(".group:visible .chat").isVisible(), "files show beside the chat on a wide screen");
+  check(!(await phone.locator(".group:visible .chat").isVisible()), "and instead of it on a phone");
   const text = page => page.locator(".cm-content").evaluate(content => content.cmTile.view.state.doc.toString());
   await laptop.locator(".cm-line", { hasText: "review budget" }).locator(".cm-task").click();
   await phone.locator(".cm-line", { hasText: "book flights" }).click();
@@ -121,17 +164,36 @@ try {
   await phone.keyboard.press("Alt+ArrowUp");
   await phone.waitForTimeout(1500);
   await laptop.reload();
-  await laptop.getByRole("button", { name: /^Files/ }).click();
   await laptop.getByRole("button", { name: "checklist.md" }).click();
   const moved = "- [x] reply to Ann\n- [x] review budget\n- [ ] renew passport\n- [ ] book flights (Tuesday)\n";
   for (let i = 0; i < 50 && (await text(laptop)) !== moved; i++) await laptop.waitForTimeout(200);
   check((await text(laptop)) === moved, "Alt+↑ moves a line, and a reloaded browser keeps its files and catches up");
-  await laptop.getByRole("button", { name: "Chat" }).click();
   agent("send", "after the reload");
   await laptop.getByText("after the reload").waitFor();
   check(await laptop.getByText("Thanks, on it").isVisible(), "a reloaded browser keeps its messages and can still read new ones");
+  await phone.getByRole("button", { name: "Chat" }).click();
+  const phoneList = phone.locator(".group:visible .messages");
+  check(await phoneList.evaluate(e => e.scrollHeight - e.scrollTop - e.clientHeight < 2), "back from the files tab, the chat is still at the bottom");
 
-  // Images: the agent links one into the checklist, the laptop pastes another, and a browser added later sees both.
+  // Files and images in chat.
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
+  await laptop.locator(".group:visible input[type=file]").setInputFiles({ name: "dot.png", mimeType: "image/png", buffer: png });
+  await laptop.locator(".chips button", { hasText: "Agent" }).click();
+  await laptop.getByPlaceholder("Message").fill("the diagram");
+  await laptop.getByPlaceholder("Message").press("Enter");
+  const image = await printed(e => e.type === "message" && e.content === "the diagram");
+  check(image.attachment, "a browser sends an image as an attachment");
+  await phone.locator(".messages img.image").waitFor();
+  check((await phone.locator(".messages img.image").getAttribute("src")).startsWith("data:image/png;base64,"), "and the other browser shows it inline");
+  const notes = join(home, "notes.txt");
+  writeFileSync(notes, "plain notes");
+  agent("send", "--attach", notes, "notes.txt");
+  const download = phone.waitForEvent("download");
+  await phone.getByRole("button", { name: "Download notes.txt" }).click();
+  check((await download).suggestedFilename() === "notes.txt", "another file shows as a download");
+
+  // Images in a file: the agent links one into the checklist, the laptop pastes another, and a member added later sees
+  // both, as whoever adds a member puts its images on the relay again.
   const picture = (page, width, height) =>
     page.evaluate(async ([width, height]) => {
       const canvas = Object.assign(document.createElement("canvas"), { width, height });
@@ -148,8 +210,6 @@ try {
   const before = agent("file", "show", "checklist.md");
   writeFileSync(path, before.text + attached.markdown + "\n");
   agent("file", "edit", "--base", before.version, "checklist.md", path);
-  await laptop.getByRole("button", { name: /^Files/ }).click();
-  await laptop.getByRole("button", { name: "checklist.md" }).click();
   const shown = (page, count) =>
     page.waitForFunction(count => {
       const images = [...document.querySelectorAll(".cm-image img")];
@@ -157,7 +217,6 @@ try {
     }, count);
   check((await (await shown(laptop, 1)).jsonValue())[0] === 120, "a browser shows the image an agent linked, inline, decrypted");
   check((await text(laptop)).includes(attached.markdown), "and keeps the link as editable text");
-
   await laptop.locator(".cm-line").last().click();
   await laptop.locator(".cm-content").evaluate(async (content, png) => {
     const data = new DataTransfer();
@@ -171,19 +230,17 @@ try {
     if (!pasted) await laptop.waitForTimeout(200);
   }
   const fetched = agent("file", "fetch", pasted);
-  const webp = readFileSync(fetched.path);
-  check(fetched.path.endsWith(".webp") && webp.subarray(8, 12).toString() === "WEBP", "the agent fetches the pasted image, as WebP, from its link");
-
-  // The laptop adds a member, so it puts both images again; the new member fetches them.
-  await laptop.getByRole("button", { name: "Invite" }).click();
-  const lateLink = await laptop.locator(".invite code").nth(1).textContent();
-  const late = await (await browser.newContext()).newPage();
-  pages.late = late;
-  await late.goto(lateLink);
-  await late.getByPlaceholder("Your name").fill("Ann");
-  await late.getByRole("button", { name: "Join" }).click();
-  await late.locator("header .members", { hasText: "Agent" }).waitFor();
-  await late.getByRole("button", { name: /^Files/ }).click();
+  check(fetched.path.endsWith(".webp") && readFileSync(fetched.path).subarray(8, 12).toString() === "WEBP", "the agent fetches the pasted image, as WebP, from its link");
+  await laptop.getByRole("button", { name: "Invite", exact: true }).click();
+  const lateCode = await laptop.locator("dialog .code").textContent();
+  const late = await open("bea", { viewport: { width: 1280, height: 800 } });
+  await late.goto(RELAY);
+  await late.getByLabel("Your name").fill("Bea");
+  await late.getByLabel("Invite code or link").fill(lateCode);
+  await late.getByRole("button", { name: "Join", exact: true }).click();
+  await laptop.getByText("They joined the group.").waitFor();
+  await laptop.keyboard.press("Escape");
+  await late.getByRole("button", { name: /^Files · 1/ }).click();
   await late.getByRole("button", { name: "checklist.md" }).click();
   check((await (await shown(late, 2)).jsonValue()).join() === "120,1600", "a member added later sees both images");
   await late.locator(".cm-content").evaluate(async (content, png) => {
@@ -194,21 +251,73 @@ try {
   }, await picture(late, 300, 200));
   await shown(laptop, 3);
   check(/\)\n!\[photo\]\(lmk:[0-9a-f#]+\)$/.test(await text(laptop)), "an image dropped onto a line goes on its own line after it, and reaches the others");
-  await laptop.getByRole("button", { name: "Chat" }).click();
 
-  // An open group: the laptop starts a group open to Matthew; the phone joins it without an invite.
-  await laptop.getByRole("button", { name: "+ New group" }).click();
-  await laptop.getByRole("button", { name: "Open to Matthew" }).click();
-  await laptop.getByText("opened it to Matthew").waitFor();
+  // A new group, named; the phone joins it from the list of groups open to Matthew's devices.
+  await laptop.getByRole("button", { name: "New group" }).click();
+  await laptop.getByLabel("Group name").fill("Trip");
+  await laptop.getByRole("button", { name: "Start group" }).click();
+  await laptop.getByText("Matthew named the group “Trip” and let their other devices join").waitFor();
   await phone.reload();
-  await phone.locator(".opening").getByRole("button", { name: "Join" }).click();
-  await phone.getByText("opened it to Matthew").waitFor();
-  check((await phone.locator("header .members").textContent()).includes("(you)"), "a device of Matthew joins a group open to Matthew, admitted by a member online");
+  await phone.locator(".opening", { hasText: "Trip" }).getByRole("button", { name: "Join" }).click();
+  await phone.locator(".group:visible h2", { hasText: "Trip" }).waitFor();
+  await phone.locator(".group:visible .people", { hasText: "Matthew and you" }).waitFor();
+  check(true, "a device of Matthew joins a group open to his devices, admitted by a member online");
 
-  const { fp } = agent("members", "--group", group).members.find(m => m.name === "Matthew's phone");
+  await laptop.locator(".group-list button", { hasText: "Agent" }).click();
+  await list.evaluate(element => (element.scrollTop = 100));
+  await laptop.waitForTimeout(100);
+  await laptop.locator(".group-list button", { hasText: "Trip" }).click();
+  await laptop.locator(".group-list button", { hasText: "Agent" }).click();
+  check((await list.evaluate(element => element.scrollTop)) === 100, "switching groups restores where each list was");
+  await laptop.locator(".group-list button", { hasText: "Trip" }).click();
+
+  // Ann starts on the page with a code, typed; she is then removed, and the phone leaves.
+  await laptop.getByRole("button", { name: "Invite", exact: true }).click();
+  const code = await laptop.locator("dialog .code").textContent();
+  const ann = await open("ann", { viewport: { width: 1280, height: 800 } });
+  await ann.goto(RELAY);
+  await ann.getByLabel("Your name").fill("Ann");
+  await ann.getByLabel("Invite code or link").fill(code);
+  await ann.getByRole("button", { name: "Join", exact: true }).click();
+  await ann.locator(".group:visible h2", { hasText: "Trip" }).waitFor();
+  await laptop.getByText("They joined the group.").waitFor();
+  check(true, "a first visit joins a group by its typed code");
+  await laptop.getByRole("button", { name: "Group settings" }).click();
+  await laptop.getByLabel("Group name").fill("Trip to Lisbon");
+  await laptop.getByRole("button", { name: "Rename" }).click();
+  await ann.locator(".group:visible h2", { hasText: "Trip to Lisbon" }).waitFor();
+  check(true, "a group is renamed for everyone");
+  await laptop.locator("dialog li", { hasText: "Ann" }).getByRole("button", { name: "Remove" }).click();
+  await laptop.locator("dialog li", { hasText: "Ann" }).getByRole("button", { name: "Remove Ann?" }).click();
+  await ann.getByText("Matthew removed you from “Trip to Lisbon”").waitFor();
+  check((await ann.locator(".group-list button").count()) === 0, "a member is removed, and the removed browser drops the group");
+  await laptop.keyboard.press("Escape");
+  await phone.getByRole("button", { name: "Group settings" }).click();
+  await phone.getByRole("button", { name: "Leave group" }).click();
+  await phone.getByRole("button", { name: "Leave for good?" }).click();
+  await laptop.getByText("Matthew · phone left").waitFor();
+  check(!(await phone.locator(".group-list button", { hasText: "Trip" }).count()), "a browser leaves a group: it asks, and another member commits its removal");
+  await phone.reload();
+  await phone.locator(".group-list button", { hasText: "Agent" }).waitFor();
+  check(!(await phone.locator(".opening", { hasText: "Trip" }).count()), "and the group it left is not offered again");
+
+  // Taken off Matthew's devices, the phone still says it is his: the others see a plain warning.
+  await laptop.getByRole("button", { name: /Your devices/ }).click();
+  await laptop.locator(".devices li", { hasText: "phone" }).getByRole("button", { name: "Remove" }).click();
+  await laptop.locator(".devices li", { hasText: "phone" }).getByRole("button", { name: "Remove phone?" }).click();
+  await laptop.locator(".devices li", { hasText: "phone" }).waitFor({ state: "detached" });
+  await laptop.locator(".group-list button", { hasText: "Agent" }).click();
+  await phone.locator(".group-list button", { hasText: "Agent" }).click();
+  await phone.getByPlaceholder("Message").fill("still me");
+  await phone.getByRole("button", { name: "Send" }).click();
+  const claim = laptop.locator(".messages li", { hasText: "still me" }).locator(".who");
+  await claim.waitFor();
+  check((await claim.getAttribute("class")).includes("warn") && (await claim.getAttribute("title")).startsWith("Says it is Matthew's, but is not on Matthew's list of devices."), "a member that claims to be someone's device but is not on their list shows a plain warning");
+
+  const { fp } = agent("members", "--group", group).members.find(m => m.name === "phone");
   agent("remove", fp, "--group", group);
-  await phone.getByText(`Agent removed you from group ${group.slice(0, 6)}`).waitFor();
-  check((await phone.locator("nav button", { hasText: `group ${group.slice(0, 6)}` }).count()) === 0, "a browser removed from a group drops it");
+  await phone.getByText("Agent removed you from a group").waitFor();
+  check((await phone.locator(".group-list button").count()) === 0, "a browser removed from a group drops it");
 } catch (error) {
   for (const [name, page] of Object.entries(pages)) {
     console.log(`${name} shows:`, JSON.stringify(await page.locator("#app").innerText()));
