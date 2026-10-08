@@ -190,7 +190,8 @@ impl Files {
 
     /// Holds a file's ciphertext, as `ciphertext` gave it.
     pub async fn hold(&self, ciphertext: Vec<u8>) -> Result<()> {
-        self.store.add_bytes(ciphertext).await?;
+        let tag = self.store.add_bytes(ciphertext).temp_tag().await?;
+        self.added.lock().unwrap().push(tag);
         Ok(())
     }
 
