@@ -344,24 +344,45 @@ fn rules_bind_everyone() {
     let mut w = World::new(&["A", "B", "C", "E"]);
     w.found(0, &[1, 2]);
 
-    // A kind change.
+    // Our own API refuses to build a commit that breaks them.
     let mut bad = w.m[1].g().settings();
     bad.kind = Kind::Doc;
-    let commit = w.m[1].commit(Change { settings: Some(bad), ..Change::default() });
-    w.post(commit.commit);
-    let applied = w.read(&[0, 1, 2]);
-    assert!(matches!(&applied[1][0], Applied::Skipped { lost: true, reason } if reason.contains("kind")));
-    assert!(!is_commit(&applied[0][0]) && !is_commit(&applied[2][0]));
-    w.agree(&[0, 1, 2]);
+    let b = &mut w.m[1];
+    let error = b.group.as_mut().unwrap().commit(
+        &b.provider,
+        &b.session,
+        Change { settings: Some(bad.clone()), ..Change::default() },
+    );
+    assert!(error.err().unwrap().to_string().contains("kind"));
+    assert!(!w.m[1].g().pending());
 
-    // A protocol change.
-    let mut bad = w.m[1].g().settings();
-    bad.protocol = 2;
-    let commit = w.m[1].commit(Change { settings: Some(bad), ..Change::default() });
-    w.post(commit.commit);
-    let applied = w.read(&[0, 1, 2]);
-    assert!(applied.iter().all(|reader| !is_commit(&reader[0])));
-    w.agree(&[0, 1, 2]);
+    // A kind change, built around it, and then a protocol change.
+    for change in [|s: &mut Settings| s.kind = Kind::Doc, |s: &mut Settings| s.protocol = 2] {
+        let mut bad = w.m[1].g().settings();
+        change(&mut bad);
+        let b = &mut w.m[1];
+        let group = b.group.as_mut().unwrap();
+        let bundle = group
+            .mls
+            .commit_builder()
+            .consume_proposal_store(false)
+            .force_self_update(true)
+            .propose_group_context_extensions(context_extensions(&bad).unwrap())
+            .unwrap()
+            .load_psks(b.provider.storage())
+            .unwrap()
+            .build(b.provider.rand(), b.provider.crypto(), &b.session.signer, |_| true)
+            .unwrap()
+            .stage_commit(&b.provider)
+            .unwrap();
+        let bytes = bundle.into_messages().0.to_bytes().unwrap();
+        group.state.posted = Some(Bytes(bytes.clone()));
+        w.post(bytes);
+        let applied = w.read(&[0, 1, 2]);
+        assert!(matches!(&applied[1][0], Applied::Skipped { lost: true, .. }));
+        assert!(applied.iter().all(|reader| !is_commit(&reader[0])));
+        w.agree(&[0, 1, 2]);
+    }
 
     // An update that changes the committer's device: C claims another device.
     let other = Device::new("someone else's");

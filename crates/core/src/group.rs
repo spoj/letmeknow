@@ -373,6 +373,8 @@ impl Group {
     /// Builds a commit and keeps it pending, with its bytes saved: post them next, then read the log.
     pub fn commit<P: Provider>(&mut self, provider: &P, session: &Session, change: Change) -> Result<Commit> {
         ensure!(self.state.posted.is_none(), "a commit is already pending");
+        // One staged but never saved, so never posted.
+        self.mls.clear_pending_commit(provider.storage())?;
         let adds = change.add.iter().map(|bytes| key_package_in(provider, bytes)).collect::<Result<Vec<_>>>()?;
         let mut builder = self
             .mls
@@ -392,6 +394,10 @@ impl Group {
             .load_psks(provider.storage())?
             .build(provider.rand(), provider.crypto(), &session.signer, |_| true)?
             .stage_commit(provider)?;
+        if let Err(error) = rules(&self.mls, self.mls.pending_commit().unwrap(), self.mls.own_leaf_index()) {
+            self.mls.clear_pending_commit(provider.storage())?;
+            return Err(error);
+        }
         let (commit, welcome, _) = bundle.into_messages();
         let commit = commit.to_bytes()?;
         self.state.posted = Some(Bytes(commit.clone()));
@@ -430,9 +436,7 @@ impl Group {
             Err(error) => return Ok(Applied::Skipped { reason: format!("{error:#}"), lost: false }),
         };
         let lost = self.state.posted.take().is_some();
-        if lost {
-            self.mls.clear_pending_commit(provider.storage())?;
-        }
+        self.mls.clear_pending_commit(provider.storage())?;
         let applied = observe(&self.mls, &mut self.state, &staged, by, false, lost, now);
         self.mls.merge_staged_commit(provider, staged)?;
         self.merged(provider, applied)
