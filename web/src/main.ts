@@ -130,8 +130,10 @@ function who(p: Person): HTMLElement {
   return h("span", { className: warning ? "who warn" : "who", title: [warning, `key ${p.fp}`].filter(Boolean).join("\n") }, warning && "⚠ ", label(p));
 }
 
+/** The group's name, or else who else is in it, leaving out this person's other devices. */
 function title(gid: string): string {
-  const others = (JSON.parse(client.member!.members(gid)) as Person[]).filter(m => !m.you).map(m => m.name);
+  const mine = client.me.entities.map(e => e.id);
+  const others = (JSON.parse(client.member!.members(gid)) as Person[]).filter(m => !m.you && !mine.includes(m.as?.[0] ?? "")).map(m => m.name);
   return client.groups.get(gid)!.settings.name || others.join(", ") || "New group";
 }
 
@@ -561,6 +563,7 @@ class GroupView {
   private editor?: EditorView;
   /** The settings the next settings item changes, the sender and time of the last message, and its day. */
   private settings: Settings = {};
+  private seenSettings = false;
   private last?: { fp: string; at: number };
   private day = "";
 
@@ -707,6 +710,14 @@ class GroupView {
         const before = this.settings;
         const after = item.settings;
         this.settings = after;
+        // The first settings a member gets after it joined are the group's as they were, not a change.
+        const state = !this.seenSettings && item.by.fp !== client.member!.fp();
+        this.seenSettings = true;
+        if (state) {
+          const open = (after.open ?? []).map(o => (client.me.entities.some(e => e.id === o.id) ? "your other devices" : `${o.name}'s devices`));
+          const said = [after.name && `is named “${after.name}”`, open.length && `lets ${open.join(" and ")} join`].filter(Boolean);
+          return said.length ? h("li", { className: "event" }, `The group ${said.join(" and ")}`, at) : null;
+        }
         const ids = (s: Settings) => (s.open ?? []).map(o => o.id);
         const theirs = (id: string) => id === item.by.entity?.id;
         const said = [
@@ -866,7 +877,7 @@ class GroupView {
   private settingsDialog() {
     const gid = this.gid;
     const settings = client.groups.get(gid)!.settings;
-    const name = h("input", { value: settings.name ?? "", placeholder: title(gid) });
+    const name = h("input", { value: settings.name ?? "", placeholder: title(gid), ariaLabel: "Group name" });
     const save = h("button", {}, "Rename");
     const entity = client.me.entities[0];
     const open = h("input", { type: "checkbox", checked: !!entity && !!settings.open?.some(o => o.id === entity.id) });
@@ -919,5 +930,5 @@ function dayName(at: number): string {
 function download(data: string, name: string) {
   const url = URL.createObjectURL(new Blob([Uint8Array.from(atob(data), c => c.charCodeAt(0))]));
   h("a", { href: url, download: name }).click();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
