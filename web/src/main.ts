@@ -641,10 +641,15 @@ class GroupView {
   }
 
   show() {
-    if (this.stuck) this.bottom();
-    else this.list.scrollTop = this.top;
+    this.restore();
     this.editor?.requestMeasure();
     if (!touch.matches && !this.el.contains(document.activeElement)) this.input.focus();
+  }
+
+  /** Back where the list was when it was hidden: the bottom if it was there. Its scroll position is lost while hidden. */
+  private restore() {
+    if (this.stuck) this.bottom();
+    else this.list.scrollTop = this.top;
   }
 
   private bottom() {
@@ -825,7 +830,9 @@ class GroupView {
   }
 
   private setFiles(open: boolean) {
+    if (this.list.clientHeight) this.top = this.list.scrollTop;
     this.el.classList.toggle("files-open", open);
+    if (this.list.clientHeight) this.restore();
     this.filesButton.setAttribute("aria-pressed", String(open));
     this.chatTab.classList.toggle("on", !open);
     this.filesTab.classList.toggle("on", open);

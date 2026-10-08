@@ -172,6 +172,8 @@ try {
   await laptop.getByText("after the reload").waitFor();
   check(await laptop.getByText("Thanks, on it").isVisible(), "a reloaded browser keeps its messages and can still read new ones");
   await phone.getByRole("button", { name: "Chat" }).click();
+  const phoneList = phone.locator(".group:visible .messages");
+  check(await phoneList.evaluate(e => e.scrollHeight - e.scrollTop - e.clientHeight < 2), "back from the files tab, the chat is still at the bottom");
 
   // Files and images in chat.
   const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
@@ -200,6 +202,14 @@ try {
   await phone.locator(".group:visible h2", { hasText: "Trip" }).waitFor();
   await phone.locator(".group:visible .people", { hasText: "Matthew and you" }).waitFor();
   check(true, "a device of Matthew joins a group open to his devices, admitted by a member online");
+
+  await laptop.locator(".group-list button", { hasText: "Agent" }).click();
+  await list.evaluate(element => (element.scrollTop = 100));
+  await laptop.waitForTimeout(100);
+  await laptop.locator(".group-list button", { hasText: "Trip" }).click();
+  await laptop.locator(".group-list button", { hasText: "Agent" }).click();
+  check((await list.evaluate(element => element.scrollTop)) === 100, "switching groups restores where each list was");
+  await laptop.locator(".group-list button", { hasText: "Trip" }).click();
 
   // Ann starts on the page with a code, typed; she is then removed, and the phone leaves.
   await laptop.getByRole("button", { name: "Invite", exact: true }).click();
