@@ -130,7 +130,7 @@ Trust is local and travels one hop at most.
 ## Transport
 
 - Everything runs over iroh (QUIC). Native sessions connect directly when they can and through a relay otherwise; browsers always use a relay.
-- We run our own relays and no address lookup service. Addresses travel in our own data: members' leaves, the group context, and invite links. Sessions on one machine also find each other through the device's state directory, where each writes its current addresses. Across a LAN without the internet, mDNS (the separate crate iroh-mdns-address-lookup) connects sessions by key; it announces session keys to the whole LAN, so it is a setting, off by default.
+- We run our own relays and no address lookup service. Addresses travel in our own data: members' leaves, the group context, and invite links. Sessions on one machine also find each other through the device's state directory, where each writes its current addresses. Machines on a LAN with the internet start through the relay and go direct within seconds; a LAN without the internet is not served.
 - Our own protocols share one ALPN, one stream per exchange, so two members keep one connection; file transfers add iroh-blobs' own while they run. An idle connection costs about 30 B/s, through the relay too, which keeps its path open beside a direct one.
 - Direct connections show a native session's IP address to the members it talks to. Accepted.
 - letmeknow hands `HTTPS_PROXY` to iroh (`proxy_from_env`), which sends relay connections through an HTTP CONNECT proxy; direct UDP bypasses it. Where UDP is blocked, connections stay on the relay, whose traffic is HTTPS.
@@ -197,6 +197,7 @@ Weaker than today:
 
 - Trusted introducers, whose introductions a contact accepts automatically, one level deep.
 - An old identity vouching for its replacement, so contacts can follow a person who lost every device.
+- LAN discovery without the internet (mDNS, the crate iroh-mdns-address-lookup: about 0.7 MB, constant LAN chatter, and it announces session keys to the whole LAN).
 - Pinning the browser client: signed bundles, an extension, or an app.
 - More membership service kinds: S3-style conditional writes, SQL, git, a blockchain.
 - A second relay region.

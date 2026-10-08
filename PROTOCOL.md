@@ -14,7 +14,6 @@ The exact formats behind REWRITE.md. Sections marked **pending** wait on the wav
 - All of our protocols use one ALPN, `letmeknow/1`, so two endpoints keep one connection. Each exchange is a bidirectional stream whose first frame names it: `{"stream": "membership" | "peer" | "invite"}`. File transfers use iroh-blobs' own ALPN.
 - Endpoints use iroh's `presets::Minimal` with a relay map holding our relays, and dial `EndpointAddr::new(key).with_relay_url(url)`, from the addresses that leaves, settings and invite links carry. iroh 1.3.0; the browser build enables only `tls-ring`.
 - Sessions of one device write their current direct addresses to `LETMEKNOW_HOME/addresses/<iroh key>.json` and dial each other from there, with no relay needed.
-- mDNS (iroh-mdns-address-lookup 0.6) is a device setting, off by default, since it announces session keys to the whole LAN.
 - The session process calls `proxy_from_env()`.
 
 ## Keys
