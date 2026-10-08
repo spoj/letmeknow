@@ -286,7 +286,7 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
         }
     }
     if let Request::File { op: FileOp::Edit { text, .. } | FileOp::Create { text, .. } } = &mut request {
-        *text = match text.as_str() {
+        let read = match text.as_str() {
             "-" => {
                 let mut text = String::new();
                 std::io::stdin().read_to_string(&mut text)?;
@@ -294,6 +294,8 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
             }
             path => std::fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?,
         };
+        // Files are LF only: the browser's editor counts "\r\n" as one character, the CRDT as two.
+        *text = read.replace("\r\n", "\n");
     }
     // The session process runs in another directory, so folder paths are made absolute here.
     let target = match &mut request {

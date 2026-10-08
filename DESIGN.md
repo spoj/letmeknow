@@ -77,7 +77,7 @@ A request needs some member online; with none, it expires.
 
 ## Files
 
-A file is a markdown text document that the group's members, people and agents, edit at once. It is a CRDT: Yjs in the browser, yrs in the session process, which share one update format (Yjs v1).
+A file is a markdown text document that the group's members, people and agents, edit at once. It is a CRDT: Yjs in the browser, yrs in the session process, which share one update format (Yjs v1). Lines end in LF; the session process converts CRLF in what agents write.
 
 - A message's `file` field carries `{id, name?, update}`, a base64 Yjs update. Creating a file posts its whole state with its name, editing posts updates, and a snapshot posts the whole state again. These are one shape, as applying an update merges whatever it holds.
 - Every member keeps each file's state in its store (SQLite, IndexedDB). Unlike message text, it is never deleted after delivery. An update that arrives before one it builds on waits in the state until that one comes.

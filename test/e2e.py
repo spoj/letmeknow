@@ -368,6 +368,10 @@ def main():
         drained = [e for e in iter(lambda: kim.poll(1), None)]
         check(not any(e["type"] == "message" for e in drained), "file updates never print, so they never wake an agent")
         check([f["name"] for f in on(kim, "file", "ls")] == ["list.md"], "file ls lists the group's files")
+        with open(os.path.join(HOME, "crlf.md"), "wb") as f:
+            f.write(b"one\r\ntwo\r\n")
+        on(lap, "file", "create", "crlf.md", os.path.join(HOME, "crlf.md"))
+        check(on(kim, "file", "show", "crlf.md")["text"] == "one\ntwo\n", "files are LF only: CRLF an agent writes is converted")
 
         listed = on(lap, "entity", "remove", srv_device)["members"]
         check([m["name"] for m in listed] == [devices["entities"][0]["members"][0]["name"]], "a member can be taken off an entity's list")
