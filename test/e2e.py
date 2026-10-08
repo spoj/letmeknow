@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """End-to-end test: local relay (wrangler dev) plus several session processes."""
-import hashlib, json, os, queue, shutil, subprocess, sys, tempfile, threading, time, urllib.request
+import hashlib, json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "client", "target", "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
-PORT = 8798
+def free_port():
+    with socket.socket() as s:
+        s.bind(("localhost", 0))
+        return s.getsockname()[1]
+
+
+# A free port, so that several checkouts can run this test at once.
+PORT = free_port()
 RELAY = f"http://localhost:{PORT}"
 HOME = tempfile.mkdtemp(prefix="lmk-e2e-")
 ENV = {**os.environ, "LETMEKNOW_HOME": HOME, "LETMEKNOW_RELAY": RELAY, "NO_PROXY": "localhost,127.0.0.1"}
