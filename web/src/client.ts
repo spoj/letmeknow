@@ -1,6 +1,6 @@
 // The browser member: the session process's protocol, with keys and MLS in WebAssembly (client/src/web.rs) and the
 // relay reached from this page's own origin. Unlike an agent session it keeps message text, and nothing is held back.
-import init, { Member, Pake, entity_list, invite_words, locate, open, random, seal } from "../pkg/letmeknow.js";
+import init, { Member, Pake, blob_open, blob_seal, entity_list, invite_words, locate, open, random, seal } from "../pkg/letmeknow.js";
 import wasm from "../pkg/letmeknow_bg.wasm";
 import * as Y from "yjs";
 import * as store from "./store";
@@ -34,6 +34,8 @@ const utf8 = (s: string) => new TextEncoder().encode(s);
 const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 const same = (a: Settings, b: Settings) =>
   a.name === b.name && a.requests === b.requests && JSON.stringify(a.open ?? []) === JSON.stringify(b.open ?? []);
+/** A link to a blob in a file: `lmk:<hash>#<key>`. */
+const LINK = /lmk:([0-9a-f]{64})#([0-9a-f]{64})/g;
 const sha256 = async (bytes: Uint8Array) => hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource)));
 
 async function http(path: string, init?: RequestInit): Promise<Response> {
@@ -83,6 +85,10 @@ export class Client {
   private saved = new Map<string, string>();
   private dirtyFiles = new Set<string>();
   private queue: Promise<unknown> = Promise.resolve();
+  /** Blobs kept in IndexedDB, and those fetched or being fetched since the page loaded, as "<gid> <hash>". */
+  private blobs = new Set<string>();
+  private fetched = new Set<string>();
+  private images = new Map<string, Promise<string>>();
 
   static async start(): Promise<Client> {
     await init({ module_or_path: wasm });
@@ -91,6 +97,7 @@ export class Client {
     const saved = await store.get<string>("state", "member");
     if (saved) {
       client.member = Member.load(saved);
+      client.blobs = new Set(await store.keys("blobs", ""));
       client.me = await state("me");
       client.seen = new Set(await state("seen"));
       for (const group of (await state("groups")) as Group[]) {
@@ -562,6 +569,7 @@ export class Client {
 
   /** What a member who was just added needs from the others, who keep it: the settings, and a snapshot of every file. */
   private async postState(gid: string) {
+    await this.refreshBlobs(gid);
     const settings = this.groups.get(gid)!.settings;
     if (Object.keys(settings).length) await this.post(gid, () => this.member!.encrypt(gid, utf8(JSON.stringify({ after: [], settings }))));
     for (const file of this.files.values()) {
@@ -581,6 +589,8 @@ export class Client {
     for (const key of this.writes.keys()) if (key.startsWith(`items ${gid} `) || key.startsWith(`files ${gid} `)) this.writes.delete(key);
     await store.remove("items", `${gid} `);
     await store.remove("files", `${gid} `);
+    await store.remove("blobs", `${gid} `);
+    for (const key of this.blobs) if (key.startsWith(`${gid} `)) this.blobs.delete(key);
   }
 
   // Files: one Yjs document each, bound to the editor. Local edits go out at most about once a second.
@@ -614,6 +624,7 @@ export class Client {
     if (update.name) file.name = update.name;
     Y.applyUpdate(file.doc, unb64(update.update), "remote");
     this.dirtyFiles.add(key);
+    this.keepBlobs(gid);
   }
 
   private queueUpdate(gid: string, id: string, update: Uint8Array) {
@@ -645,4 +656,71 @@ export class Client {
     const file: FileUpdate = { id, update: b64(update), ...(name ? { name } : {}) };
     await this.post(gid, () => this.member!.encrypt(gid, utf8(JSON.stringify({ after: [], file }))));
   }
+
+  // Blobs: images that files link, each sealed under its own key, which the link carries. The relay keeps them only as
+  // long as messages, so members keep every blob their files link, and put them again for each member they add.
+
+  /** Uploads `bytes` to the group sealed under a fresh key; returns the link to it. */
+  async attach(gid: string, bytes: Uint8Array): Promise<string> {
+    const key = random(32);
+    const sealed = blob_seal(key, bytes);
+    const hash = await sha256(sealed);
+    await http(`/g/${gid}/blobs/${hash}`, { method: "PUT", body: sealed as BodyInit });
+    await this.keep(gid, hash, sealed);
+    return `lmk:${hash}#${hex(key)}`;
+  }
+
+  /** A linked image as a data: URL, the one kind of image source besides this origin that the page's policy allows. */
+  image(gid: string, link: string): Promise<string> {
+    if (!this.images.has(link)) {
+      const [, hash, key] = new RegExp(LINK.source).exec(link)!;
+      this.images.set(link, this.blob(gid, hash).then(sealed => dataUrl(blob_open(unhex(key), sealed))));
+    }
+    return this.images.get(link)!;
+  }
+
+  /** Every blob the group's files link. */
+  private linked(gid: string): Set<string> {
+    return new Set(this.filesOf(gid).flatMap(f => [...f.doc.getText("text").toString().matchAll(LINK)].map(m => m[1])));
+  }
+
+  /** A blob's sealed bytes, as kept here, or else from the relay, and then kept. */
+  private async blob(gid: string, hash: string): Promise<Uint8Array> {
+    const kept = await store.get<Uint8Array>("blobs", `${gid} ${hash}`);
+    if (kept) return kept;
+    const sealed = new Uint8Array(await (await http(`/g/${gid}/blobs/${hash}`)).arrayBuffer());
+    if ((await sha256(sealed)) !== hash) throw new Error(`the relay altered blob ${hash}`);
+    await this.keep(gid, hash, sealed);
+    return sealed;
+  }
+
+  private async keep(gid: string, hash: string, sealed: Uint8Array) {
+    await store.put([["blobs", `${gid} ${hash}`, sealed]]);
+    this.blobs.add(`${gid} ${hash}`);
+  }
+
+  /** Fetches the blobs the group's files link that this browser lacks, once per page load. */
+  private keepBlobs(gid: string) {
+    for (const hash of this.linked(gid)) {
+      const key = `${gid} ${hash}`;
+      if (this.blobs.has(key) || this.fetched.has(key)) continue;
+      this.fetched.add(key);
+      this.blob(gid, hash).catch(error => this.onerror(`a file links image ${hash.slice(0, 8)}, which cannot be fetched: ${error}`));
+    }
+  }
+
+  /** Puts every blob the group's files link, that this browser keeps, on the relay again, for the member just added. */
+  private async refreshBlobs(gid: string) {
+    for (const hash of this.linked(gid)) {
+      const sealed = await store.get<Uint8Array>("blobs", `${gid} ${hash}`);
+      if (sealed) await http(`/g/${gid}/blobs/${hash}`, { method: "PUT", body: sealed as BodyInit });
+    }
+  }
+}
+
+function dataUrl(bytes: Uint8Array): string {
+  const head = String.fromCharCode(...bytes.subarray(0, 12));
+  const type = head.startsWith("\x89PNG") ? "png" : head.startsWith("\xff\xd8\xff") ? "jpeg" : head.startsWith("GIF8") ? "gif" : head.startsWith("RIFF") && head.endsWith("WEBP") ? "webp" : "";
+  if (!type) throw new Error("not an image");
+  return `data:image/${type};base64,${b64(bytes)}`;
 }

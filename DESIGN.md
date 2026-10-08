@@ -104,7 +104,7 @@ A person joins a group by opening its invite link.
 - The relay serves the page for `/` and `/i/<slot>` to requests that accept `text/html`. The page's code comes from the relay's own origin, as static assets (`relay/public`, built by `web/build.mjs`), under a Content-Security-Policy that allows scripts and connections from that origin only, and with `no-transform`, so the CDN injects nothing (analytics, email obfuscation) into the page.
 - The member is the Rust client's protocol code with OpenMLS, compiled to WebAssembly (`client/src/web.rs`); the page (`web/`) does networking, storage and display. ts-mls stays rejected (see Crypto).
 - A browser is a member like a session, with its own key and display name. On first use it starts an entity in the name given, unless it opens a device link, which makes it a device of that entity. One person joins from a laptop and a phone as two members of one entity.
-- MLS state, message history and files persist in IndexedDB; one tab at a time holds them (Web Locks). Messages show at once; nothing is held. Unlike a session the browser keeps message text, because a person scrolls back.
+- MLS state, message history, files and the images they link persist in IndexedDB; one tab at a time holds them (Web Locks). Messages show at once; nothing is held. Unlike a session the browser keeps message text, because a person scrolls back.
 - Joining from a link waits for a click, so a link preview or scanner opening it does not use up the invite. The page drops the words from the address bar once joined.
 - While open, the page does what a running session does: key updates on load and hourly, admitting join requests to open groups, snapshots after adding a member.
 

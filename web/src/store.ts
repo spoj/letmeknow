@@ -1,9 +1,11 @@
-// IndexedDB, as three key-value stores: "state" (the member, this browser's entities, groups), "items" (what each
-// group showed, kept so a person can scroll back) and "files" (each file's Yjs state).
+// IndexedDB, as four key-value stores: "state" (the member, this browser's entities, groups), "items" (what each
+// group showed, kept so a person can scroll back), "files" (each file's Yjs state) and "blobs" (the sealed images files link).
 const db: Promise<IDBDatabase> = new Promise((resolve, reject) => {
-  const request = indexedDB.open("letmeknow", 1);
+  const request = indexedDB.open("letmeknow", 2);
   request.onupgradeneeded = () => {
-    for (const name of ["state", "items", "files"]) request.result.createObjectStore(name);
+    for (const name of ["state", "items", "files", "blobs"]) {
+      if (!request.result.objectStoreNames.contains(name)) request.result.createObjectStore(name);
+    }
   };
   request.onsuccess = () => resolve(request.result);
   request.onerror = () => reject(request.error);
@@ -29,6 +31,11 @@ export async function get<T>(store: string, key: string): Promise<T | undefined>
 export async function all<T>(store: string, prefix: string): Promise<T[]> {
   const range = IDBKeyRange.bound(prefix, prefix + "\uffff");
   return done((await db).transaction(store).objectStore(store).getAll(range));
+}
+
+export async function keys(store: string, prefix: string): Promise<string[]> {
+  const range = IDBKeyRange.bound(prefix, prefix + "\uffff");
+  return done((await db).transaction(store).objectStore(store).getAllKeys(range));
 }
 
 /// Writes several values at once: either all are stored or none.

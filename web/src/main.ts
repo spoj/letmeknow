@@ -353,7 +353,8 @@ function openFile(gid: string, id: string) {
   closeFile();
   file = id;
   render();
-  view = editor(editorHost, client.files.get(`${gid} ${id}`)!.doc.getText("text"));
+  const images = { show: (link: string) => client.image(gid, link), attach: (bytes: Uint8Array) => client.attach(gid, bytes), fail };
+  view = editor(editorHost, client.files.get(`${gid} ${id}`)!.doc.getText("text"), images);
 }
 
 async function newFile(gid: string) {
