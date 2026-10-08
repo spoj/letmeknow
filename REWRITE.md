@@ -138,10 +138,11 @@ Trust is local and travels one hop at most.
 
 ## Browser
 
-- letmeknow.dev serves the client. A service worker caches it, so the app opens while the page server is down.
+- letmeknow.dev serves the client. A service worker caches it, so the app opens while the page server is down, invite links included. A new version waits until the user accepts it, then every tab reloads.
 - A browser profile is one device and one member; its tabs share one session.
-- It asks for persistent storage. Safari wipes a site's storage after 7 days without a visit unless the app is on the home screen or dock, which would delete the device; the app says so.
-- **Push**, with no push server of ours: a browser shares a Web Push subscription and a push key of its own with its groups, and rotates both when membership changes. For anything that would wake an agent, a sender's client pushes it a notice: the group and the sender, never content. The push service sees only that something arrived. On iPhone this needs the app on the home screen.
+- It asks for persistent storage (Firefox prompts; Chrome and Safari decide silently). Safari wipes a site's storage after 7 days without a visit, but not a home-screen app's. On iPhone and iPad the home-screen app also has storage of its own, apart from Safari's, so it is a different device: the app asks to be added to the home screen before it creates one.
+- **Push**: a browser has one Web Push subscription, made with a VAPID key it generates itself, and publishes the subscription and that key in its leaf in every group. When it is removed from any group, it makes a new subscription and key and republishes them everywhere; it re-checks its subscription whenever it opens, since subscriptions die silently (after 60 days offline in Firefox, or when permission is revoked). For anything that would wake an agent, a sender's client pushes it a notice: the group and the sender, never content, encrypted per RFC 8291 (our own sender, about 60 lines). The push service sees only that something arrived. The service worker shows a notification for every push, as Chrome requires and as Safari enforces by dropping a subscription after three silent ones. On iPhone this needs iOS 16.4 or later and the home-screen app.
+- Browsers cannot send pushes themselves: the push services of Chrome, Apple and Microsoft refuse requests from web pages; only Mozilla's accepts them. (Open: a native member online sends on a browser's behalf, or `letmeknow serve` forwards them.)
 - While open, a browser holds and forwards like any member, and may keep less than `keep`.
 
 ## Deployment

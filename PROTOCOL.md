@@ -169,4 +169,8 @@ Message sync, per group, starts once both sides have caught up on commits. It is
 
 ## Browser
 
-**Pending: Push.** Web Push subscription and the self-generated VAPID key, the notice payload, the service worker.
+- A browser generates a P-256 key pair with WebCrypto and subscribes with its public key as `applicationServerKey`. Its leaf's `push` holds the subscription's `endpoint`, `p256dh` and `auth`, and the private key as `vapid`.
+- A sender encrypts the notice per RFC 8291 (`aes128gcm`) and signs a VAPID JWT (RFC 8292) with `vapid`: `aud` the endpoint's origin, `sub` `mailto:push@letmeknow.dev`, `exp` at most a day ahead (Apple's limit), the token reused for up to an hour. TTL 30 days at most (Chrome caps at 4 weeks, and quietly shortens it).
+- The notice is JSON, `{"group": "<name>", "from": "<name>"}`, under 3993 bytes: the most that fits the services' 4096-byte encrypted body.
+- An answer of 404 or 410 means the subscription is gone: the sender stops pushing to it. 429 means slow down.
+- The service worker shows a notification for every push, and opens the app at the group when it is tapped.
