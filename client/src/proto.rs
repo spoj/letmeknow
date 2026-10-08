@@ -18,6 +18,26 @@ pub const PAKE_ID: &[u8] = b"letmeknow invite v2";
 const MAX_PAST_EPOCHS: usize = 5;
 const WORDS: &str = include_str!("words.txt");
 
+/// A described member's entity, if its claim checked out.
+pub fn verified(member: &Value) -> Option<&Value> {
+    Some(&member["entity"]).filter(|entity| entity.is_object() && entity["error"].is_null())
+}
+
+/// Whether a member answers to `name`, in any case: its name, the first word of its name, or its entity's name.
+pub fn answers(member: &Value, name: &str) -> bool {
+    let (name, own) = (name.to_lowercase(), member["name"].as_str().unwrap_or_default().to_lowercase());
+    let first: String = own.chars().take_while(|c| c.is_alphanumeric()).collect();
+    own == name || first == name || verified(member).and_then(|e| e["name"].as_str()).is_some_and(|entity| entity.to_lowercase() == name)
+}
+
+/// Whether `text` mentions `member`: "@" and a name it answers to, as "@claude" does "Claude, Matthew's coding agent".
+pub fn mentions(text: &str, member: &Value) -> bool {
+    text.match_indices('@').any(|(at, _)| {
+        let name: String = text[at + 1..].chars().take_while(|c| c.is_alphanumeric() || "-_".contains(*c)).collect();
+        !text[..at].ends_with(char::is_alphanumeric) && !name.is_empty() && answers(member, &name)
+    })
+}
+
 /// The kinds of group: the one thing a group shares, fixed when it is made. A chat shares messages in order; a document
 /// (`doc`) shares one text that its members edit at once.
 pub const CHAT: &str = "chat";
@@ -259,6 +279,21 @@ pub fn digest(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_member_answers_to_its_name_the_first_word_of_it_and_its_entitys_name() {
+        let member = serde_json::json!({ "name": "Claude, Matthew's coding agent", "entity": { "id": "e", "name": "Matthew" } });
+        assert!(["claude, matthew's coding agent", "Claude", "MATTHEW"].iter().all(|name| super::answers(&member, name)));
+        assert!(!super::answers(&member, "Matt"));
+        let unverified = serde_json::json!({ "name": "Claude", "entity": { "id": "e", "error": "not on Matthew's list" } });
+        assert!(!super::answers(&unverified, "Matthew"));
+        assert!(super::mentions("@Claude please check", &member));
+        assert!(super::mentions("ok, @claude.", &member));
+        assert!(!super::mentions("@Claudette, look", &member));
+        assert!(!super::mentions("Claude, look", &member));
+        assert!(!super::mentions("mail claude@example.com", &member));
+        assert!(!super::mentions("@ (", &serde_json::json!({ "name": "(bot)" })));
+    }
+
     use super::*;
 
     #[test]

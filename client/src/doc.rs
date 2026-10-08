@@ -41,8 +41,12 @@ pub fn text(state: &[u8]) -> Result<String> {
     Ok(body.get_string(&doc.transact()))
 }
 
-pub fn version(state: &[u8]) -> String {
-    letmeknow::proto::digest(state)[..16].to_owned()
+/// How many lines `new` changed from `old`, and the lines it added or changed.
+pub fn changed(old: &str, new: &str) -> (usize, Vec<String>) {
+    let diff = TextDiff::from_lines(old, new);
+    let count = diff.ops().iter().map(|op| op.old_range().len().max(op.new_range().len()) * usize::from(op.tag() != DiffTag::Equal)).sum();
+    let added = diff.iter_all_changes().filter(|c| c.tag() == ChangeTag::Insert).map(|c| c.value().trim_end_matches('\n').to_owned()).collect();
+    (count, added)
 }
 
 /// The update that makes the text of `state` read `new`, as edits on `state`.
@@ -195,6 +199,12 @@ mod tests {
         let current = "- [ ] alpha\n- [ ] beta (asked Bob)\n- [ ] gamma\n";
         let (text, lost) = rebase(BASE, "- [ ] alpha\n- [x] beta\n- [ ] gamma\n", current);
         assert_eq!((text.as_str(), lost), (current, vec!["- [x] beta".to_owned()]));
+    }
+
+    #[test]
+    fn changed_counts_the_lines_a_text_changed_and_gives_the_new_ones() {
+        let (count, added) = changed(BASE, "- [x] alpha\n- [ ] gamma\n- [ ] delta @Claude\n");
+        assert_eq!((count, added), (3, vec!["- [x] alpha".to_owned(), "- [ ] delta @Claude".to_owned()]));
     }
 
     #[test]

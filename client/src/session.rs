@@ -7,7 +7,8 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::Subcommand;
 use letmeknow::proto::{
     Attachment, CHAT, CIPHERSUITE, DOC, Edit, INVITE_SLOTS, INVITE_TTL_S, KINDS, MAX_BLOB_BYTES, Message, Opened, PAKE_ID, Payload, Settings, blob_link, blob_links,
-    create_config, digest, fingerprint, image_type, invite_key, invite_words, join_config, membership_changes, open, open_blob, person, random_below, seal, seal_blob,
+    answers, create_config, digest, fingerprint, image_type, invite_key, invite_words, join_config, membership_changes, mentions, open, open_blob, person,
+    random_below, seal, seal_blob, verified,
 };
 use letmeknow::entity::{self, JoinRequest, List, Member, Opening, place};
 use openmls::prelude::*;
@@ -53,6 +54,9 @@ pub enum Request {
         /// The new group's name
         #[arg(long, conflicts_with = "group")]
         name: Option<String>,
+        /// A new doc's file: kept in step with the doc, and its first text if it exists [default: a new file in the session's state]
+        #[arg(conflicts_with_all = ["group", "entity"])]
+        file: Option<String>,
         /// What this session speaks as in a new group: one of its device's entities, "device" or "self" [default: the device's first entity]
         #[arg(long = "as", value_name = "ENTITY")]
         #[serde(rename = "as")]
@@ -67,6 +71,8 @@ pub enum Request {
         /// What a new folder group shares: a chat or a doc; a folder that holds a group keeps its kind
         #[arg(long, value_parser = KINDS, default_value = CHAT)]
         kind: String,
+        /// For a doc: a new file to keep in step with it [default: a new file in the session's state]
+        file: Option<String>,
         /// What this session speaks as in the group: one of its device's entities, "device" or "self" [default: the device's first entity]
         #[arg(long = "as", value_name = "ENTITY")]
         #[serde(rename = "as")]
@@ -76,7 +82,8 @@ pub enum Request {
     Send {
         #[arg(long)]
         group: Option<String>,
-        /// Fingerprint of a member this message is addressed to; repeat for several
+        /// A member to address: its fingerprint, or a name it answers to (its name, the first word of it, or its entity's
+        /// name, which all that entity's devices answer to); repeat for several. "@name" in the text addresses too
         #[arg(long)]
         to: Vec<String>,
         /// Id of the message this answers
@@ -85,7 +92,7 @@ pub enum Request {
         /// Deliver at once to every member, not only those addressed
         #[arg(long)]
         urgent: bool,
-        /// File to attach, up to 10 MiB ("-" reads stdin); recipients get its link, which `fetch` turns into a private copy
+        /// File to attach, up to 10 MiB ("-" reads stdin); each recipient's session saves it into a private file
         #[arg(long, value_name = "FILE")]
         attach: Option<String>,
         /// The attached file's name, set from its path
@@ -132,46 +139,20 @@ pub enum Request {
         group: Option<String>,
         name: String,
     },
-    /// A doc group's text, which every member edits at once
-    Doc {
-        #[command(subcommand)]
-        op: DocOp,
+    /// Upload a file (up to 10 MiB) for a doc; prints the markdown link to put into the doc's file. A folder group links
+    /// its path in the folder, copying it into attachments/ if it is elsewhere
+    Attach {
+        #[arg(long)]
+        group: Option<String>,
+        path: String,
     },
-    /// The file an attachment's or the doc's link points to, decrypted into a file only you can read (in a folder group,
-    /// the file in the folder). Prints its path
+    /// The file a doc links (or an attachment that failed to arrive), decrypted into a file only you can read (in a
+    /// folder group, the file in the folder). Prints its path
     Fetch { link: String },
     /// Entities this device is in: create one, list them, or take a member off one
     Entity {
         #[command(subcommand)]
         op: EntityOp,
-    },
-}
-
-#[derive(Subcommand, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DocOp {
-    /// The text, and its version for `doc edit --base`
-    Show {
-        #[arg(long)]
-        group: Option<String>,
-    },
-    /// Make the text that of PATH ("-" reads stdin), read at version --base: lines you changed are changed where they are
-    /// now, so what others changed since stays
-    Edit {
-        #[arg(long)]
-        group: Option<String>,
-        #[arg(long)]
-        base: String,
-        #[arg(value_name = "PATH")]
-        text: String,
-    },
-    /// Make an image or other file (up to 10 MiB) linkable from the text: on the relay, uploaded encrypted; in a folder
-    /// group, linked by its path in the folder (copied into attachments/ if it is elsewhere). Prints the markdown link to
-    /// put into the text with `doc edit`
-    Attach {
-        #[arg(long)]
-        group: Option<String>,
-        path: String,
     },
 }
 
@@ -195,7 +176,9 @@ pub enum Event {
     Batch { gid: String, messages: Vec<(u64, Vec<u8>)>, synced: bool },
     Files { gid: String, records: Vec<(String, Record)>, ignored: Vec<String> },
     JoinRequest { invite: Box<Invite>, spake: Spake2<Ed25519Group>, data: String },
-    Welcome { relay: String, key: [u8; 32], data: String, reply: oneshot::Sender<Value> },
+    Welcome { relay: String, key: [u8; 32], data: String, file: Option<String>, reply: oneshot::Sender<Value> },
+    /// The file of this doc group changed, or may have.
+    FileChanged(String),
     /// The requests box of this open group has new entries, or may have.
     Requests(String),
 }
@@ -254,6 +237,38 @@ struct Folder {
     _wake: std_mpsc::Sender<()>,
 }
 
+/// A doc group's file, which the session keeps in step with the doc. Its base, the text both last had, is in the store.
+struct Binding {
+    path: PathBuf,
+    /// Watches the file's directory, as editors often replace a file rather than write into it.
+    _watcher: Option<RecommendedWatcher>,
+    /// When the file, and the doc, first and last changed since they were last in step, if they did.
+    file_changed: Option<(Instant, Instant)>,
+    doc_changed: Option<(Instant, Instant)>,
+    /// Who edited the doc since the agent was last told.
+    editors: Vec<Value>,
+}
+
+/// A file is brought into step once it has been quiet for FILE_QUIET, or changing for FILE_MAX; the doc after DOC_QUIET
+/// or DOC_MAX. Editors write a file in bursts; a person's typing reaches the doc about once a second.
+const FILE_QUIET: Duration = Duration::from_secs(1);
+const FILE_MAX: Duration = Duration::from_secs(5);
+const DOC_QUIET: Duration = Duration::from_secs(2);
+const DOC_MAX: Duration = Duration::from_secs(10);
+
+impl Binding {
+    fn due(&self) -> Option<Instant> {
+        let file = self.file_changed.map(|(first, last)| (last + FILE_QUIET).min(first + FILE_MAX));
+        let doc = self.doc_changed.map(|(first, last)| (last + DOC_QUIET).min(first + DOC_MAX));
+        file.into_iter().chain(doc).min()
+    }
+}
+
+fn mark(changed: &mut Option<(Instant, Instant)>) {
+    let now = Instant::now();
+    *changed = Some((changed.map_or(now, |(first, _)| first), now));
+}
+
 pub struct Session {
     db: Connection,
     provider: Provider,
@@ -270,6 +285,11 @@ pub struct Session {
     held_since: Option<Instant>,
     keep_log: bool,
     attachments: PathBuf,
+    /// Where docs' files go unless the agent names one.
+    docs: PathBuf,
+    bindings: HashMap<String, Binding>,
+    /// Lines to print once the docs' files are in step, so the agent never wakes to a stale file.
+    out: Vec<String>,
     events: mpsc::UnboundedSender<Event>,
     /// The letmeknow home, which holds the device.
     home: PathBuf,
@@ -343,6 +363,9 @@ impl Session {
             held_since: None,
             keep_log,
             attachments: dir.join("attachments"),
+            docs: dir.join("docs"),
+            bindings: HashMap::new(),
+            out: Vec::new(),
             events,
             home: home.to_owned(),
             lists: HashMap::new(),
@@ -365,6 +388,20 @@ impl Session {
             session.backlog.insert(gid.clone(), Vec::new());
             session.watch(gid);
         }
+        let gids: Vec<String> = session.groups.keys().chain(session.folders.keys()).cloned().collect();
+        for gid in gids {
+            if session.settings(&gid)?.kind != DOC {
+                continue;
+            }
+            let path: Option<String> = session.db.query_row("SELECT path FROM bindings WHERE gid = ?", [&gid], |r| r.get(0)).optional()?;
+            match path {
+                Some(path) => session.follow(&gid, PathBuf::from(path)),
+                None => {
+                    let text = doc::text(&session.text(&gid)?)?;
+                    session.bind(&gid, None, &text)?;
+                }
+            }
+        }
         Ok(session)
     }
 
@@ -374,11 +411,11 @@ impl Session {
 
     pub async fn handle(&mut self, event: Event) {
         match event {
-            Event::Request(Request::Join { target, as_, .. }, reply) if !Path::new(&target).is_absolute() => {
+            Event::Request(Request::Join { target, as_, file, .. }, reply) if !Path::new(&target).is_absolute() => {
                 let joined = if target.len() == 32 && target.chars().all(|c| c.is_ascii_hexdigit()) {
-                    self.join_open(target, as_, reply).await
+                    self.join_open(target, as_, file, reply).await
                 } else {
-                    self.join(target, as_, reply).await
+                    self.join(target, as_, file, reply).await
                 };
                 if let Err(error) = joined {
                     self.warn(None, format!("join: {error:#}"));
@@ -386,6 +423,8 @@ impl Session {
                 self.flush_held();
             }
             Event::Request(request, reply) => {
+                // The agent may have just changed a file.
+                self.sync_all().await;
                 let result = self.request(request).await;
                 let _ = reply.send(result.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
                 self.flush_held();
@@ -399,6 +438,11 @@ impl Session {
                 if synced && self.backlog.contains_key(&gid) {
                     self.flush(&gid);
                     self.update_key(&gid).await;
+                    if self.bindings.contains_key(&gid)
+                        && let Err(error) = self.sync(&gid).await
+                    {
+                        self.warn(Some(&gid), format!("{error:#}"));
+                    }
                 }
                 if synced && let Err(error) = self.keep_blobs(&gid).await {
                     self.warn(Some(&gid), format!("blobs: {error:#}"));
@@ -412,11 +456,16 @@ impl Session {
                     self.warn(Some(&gid), format!("ignored files not named by the SHA-256 of their content: {}", ignored.join(", ")));
                 }
                 for (id, record) in records {
-                    if let Err(error) = self.ingest(&gid, &id, json!(record.from), record.payload) {
+                    if let Err(error) = self.ingest(&gid, &id, json!(record.from), record.payload).await {
                         self.warn(Some(&gid), format!("{error:#}"));
                     }
                 }
                 self.flush(&gid);
+                if self.bindings.contains_key(&gid)
+                    && let Err(error) = self.sync(&gid).await
+                {
+                    self.warn(Some(&gid), format!("{error:#}"));
+                }
             }
             Event::JoinRequest { invite, spake, data } => {
                 if let Err(error) = self.admit(&invite, spake, &data).await {
@@ -427,9 +476,14 @@ impl Session {
                     self.warn(gid, format!("invite {}: {error:#}", invite.id));
                 }
             }
-            Event::Welcome { relay, key, data, reply } => {
-                let result = self.welcome(&relay, &key, &data).await;
+            Event::Welcome { relay, key, data, file, reply } => {
+                let result = self.welcome(&relay, &key, &data, file).await;
                 let _ = reply.send(result.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
+            }
+            Event::FileChanged(gid) => {
+                if let Some(binding) = self.bindings.get_mut(&gid) {
+                    mark(&mut binding.file_changed);
+                }
             }
             Event::Requests(gid) => {
                 if let Err(error) = self.admit_open(&gid).await {
@@ -446,8 +500,8 @@ impl Session {
 
     async fn request(&mut self, request: Request) -> Result<Value> {
         match request {
-            Request::Invite { group, kind, name, as_, entity } => self.invite(group, kind, name, as_, entity).await,
-            Request::Join { target, kind, .. } => self.join_folder(target, kind).await,
+            Request::Invite { group, kind, name, file, as_, entity } => self.invite(group, kind, name, file, as_, entity).await,
+            Request::Join { target, kind, file, .. } => self.join_folder(target, kind, file).await,
             Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
                 self.send(group, to, reply_to, urgent, attach.map(|data| (data, attach_name)), text).await
             }
@@ -467,10 +521,17 @@ impl Session {
                     if !settings.open.is_empty() {
                         group["open"] = json!(settings.open);
                     }
+                    if let Some(binding) = self.bindings.get(gid) {
+                        group["file"] = json!(binding.path);
+                    }
                     groups.push(group);
                 }
                 for gid in self.folders.keys() {
-                    groups.push(json!({ "group": gid, "kind": self.settings(gid)?.kind, "members": self.members(gid)?.len(), "folder": gid }));
+                    let mut group = json!({ "group": gid, "kind": self.settings(gid)?.kind, "members": self.members(gid)?.len(), "folder": gid });
+                    if let Some(binding) = self.bindings.get(gid) {
+                        group["file"] = json!(binding.path);
+                    }
+                    groups.push(group);
                 }
                 for (opening, membership) in self.openings().await? {
                     if !self.groups.contains_key(&opening.group) {
@@ -487,7 +548,14 @@ impl Session {
                 let settings = Settings { name, ..self.settings(&gid)? };
                 self.set(&gid, settings).await
             }
-            Request::Doc { op } => self.doc(op).await,
+            Request::Attach { group, path } => {
+                let gid = self.of_kind(group, DOC)?;
+                let bytes = std::fs::read(&path).with_context(|| format!("cannot read {path}"))?;
+                let name = Path::new(&path).file_name().map_or_else(String::new, |n| n.to_string_lossy().replace(['[', ']'], ""));
+                let attachment = self.upload(&gid, &bytes, &name, Path::new(&path)).await?;
+                let markdown = format!("{}[{name}]({})", if attachment.media.is_empty() { "" } else { "!" }, attachment.link);
+                Ok(json!({ "link": attachment.link, "markdown": markdown }))
+            }
             Request::Fetch { link } => self.fetch(link).await,
             Request::Entity { op: EntityOp::Create { name } } => self.entity_create(name).await,
             Request::Entity { op: EntityOp::List } => self.entities().await,
@@ -495,7 +563,18 @@ impl Session {
         }
     }
 
-    async fn invite(&mut self, group: Option<String>, kind: String, name: Option<String>, as_: Option<String>, entity: Option<String>) -> Result<Value> {
+    async fn invite(
+        &mut self,
+        group: Option<String>,
+        kind: String,
+        name: Option<String>,
+        file: Option<String>,
+        as_: Option<String>,
+        entity: Option<String>,
+    ) -> Result<Value> {
+        if file.is_some() && kind != DOC {
+            bail!("only a doc has a file: invite --kind doc <file>");
+        }
         // A device link announces itself in the pake message, so the joiner knows to send its device, not a key package.
         let (into, relay, kind) = match entity {
             Some(entity) => {
@@ -506,7 +585,7 @@ impl Session {
             None => {
                 let gid = match group {
                     Some(_) => self.resolve(group)?,
-                    None => self.create_group(as_.as_deref(), kind, name.unwrap_or_default()).await?,
+                    None => self.create_group(as_.as_deref(), kind, name.unwrap_or_default(), file).await?,
                 };
                 let relay = self.groups.get(&gid).context("folder groups need no invite; share the folder path")?.relay.clone();
                 (Into::Group(gid), relay, "")
@@ -525,7 +604,13 @@ impl Session {
         }
         let id = slot.context("no free invite slot on the relay; try again")?;
         let target = match &into {
-            Into::Group(gid) => json!({ "group": gid, "kind": self.settings(gid)?.kind }),
+            Into::Group(gid) => {
+                let mut target = json!({ "group": gid, "kind": self.settings(gid)?.kind });
+                if let Some(binding) = self.bindings.get(gid) {
+                    target["file"] = json!(binding.path);
+                }
+                target
+            }
             Into::Entity(membership) => json!({ "entity": membership.id, "name": membership.name }),
         };
         let invite = Box::new(Invite { relay: relay.clone(), id: id.clone(), owner, into });
@@ -605,7 +690,7 @@ impl Session {
 
     /// A folder has no membership record, so joining posts `joined`: whoever wrote to the folder is a member, and this
     /// makes the new one visible and addressable before it speaks. A folder that holds no group yet gets one of `kind`.
-    async fn join_folder(&mut self, gid: String, kind: String) -> Result<Value> {
+    async fn join_folder(&mut self, gid: String, kind: String, file: Option<String>) -> Result<Value> {
         if !self.folders.contains_key(&gid) {
             std::fs::create_dir_all(&gid)?;
             self.db.execute("INSERT INTO folders (gid) VALUES (?)", [&gid])?;
@@ -618,14 +703,22 @@ impl Session {
                 Some(settings) => self.store_settings(&gid, &settings)?,
                 None => _ = self.set(&gid, Settings { kind, ..Settings::default() }).await?,
             }
+            // Bound before the folder is scanned, so its text comes into the file.
+            if self.settings(&gid)?.kind == DOC {
+                self.bind(&gid, file, "")?;
+            }
             self.post_payload(&gid, &Payload::Joined).await?;
             self.watch(gid.clone());
             self.print(json!({ "type": "joined", "group": gid, "member": self.person }));
         }
-        Ok(json!({ "group": gid, "kind": self.settings(&gid)?.kind, "members": self.members(&gid)? }))
+        let mut answer = json!({ "group": gid, "kind": self.settings(&gid)?.kind, "members": self.members(&gid)? });
+        if let Some(binding) = self.bindings.get(&gid) {
+            answer["file"] = json!(binding.path);
+        }
+        Ok(answer)
     }
 
-    async fn join(&mut self, code: String, as_: Option<String>, reply: oneshot::Sender<Value>) -> Result<()> {
+    async fn join(&mut self, code: String, as_: Option<String>, file: Option<String>, reply: oneshot::Sender<Value>) -> Result<()> {
         let prepared = async {
             let (target, words) = code
                 .trim()
@@ -663,14 +756,14 @@ impl Session {
         let (http, events) = (self.relay.clone(), self.events.clone());
         tokio::spawn(async move {
             match wait(|| http.invite_get(&relay, &id, "welcome", POLL_WAIT_S), "the inviter did not answer within 10 minutes").await {
-                Ok(data) => drop(events.send(Event::Welcome { relay, key, data, reply })),
+                Ok(data) => drop(events.send(Event::Welcome { relay, key, data, file, reply })),
                 Err(error) => drop(reply.send(json!({ "error": format!("waiting for welcome: {error:#}") }))),
             }
         });
         Ok(())
     }
 
-    async fn welcome(&mut self, relay: &str, key: &[u8; 32], data: &str) -> Result<Value> {
+    async fn welcome(&mut self, relay: &str, key: &[u8; 32], data: &str, file: Option<String>) -> Result<Value> {
         let envelope: Value = serde_json::from_slice(&open(key, b"welcome", data)?)?;
         if let Some(error) = envelope.get("error").and_then(Value::as_str) {
             bail!("the inviter could not admit this session: {error}");
@@ -696,8 +789,13 @@ impl Session {
         self.add_group(&gid, relay, seq, mls)?;
         let settings: Settings = serde_json::from_value(envelope["settings"].clone())?;
         self.store_settings(&gid, &settings)?;
+        let mut answer = json!({ "group": gid, "kind": settings.kind, "name": settings.name, "members": self.described_members(&gid).await? });
+        // The text comes a moment later, from whoever added this session.
+        if settings.kind == DOC {
+            answer["file"] = json!(self.bind(&gid, file, "")?);
+        }
         self.print(json!({ "type": "joined", "group": gid, "member": self.person }));
-        Ok(json!({ "group": gid, "kind": settings.kind, "name": settings.name, "members": self.described_members(&gid).await? }))
+        Ok(answer)
     }
 
     async fn send(
@@ -711,9 +809,25 @@ impl Session {
     ) -> Result<Value> {
         let gid = self.of_kind(group, CHAT)?;
         let members = self.members(&gid)?;
-        if let Some(to) = to.iter().find(|to| !members.iter().any(|m| m["fp"] == to.as_str())) {
-            bail!("{to} is not a member of {gid}");
+        let mut addressed = Vec::new();
+        for to in to {
+            if members.iter().any(|m| m["fp"] == to.as_str()) {
+                addressed.push(to);
+                continue;
+            }
+            let described = self.described_members(&gid).await?;
+            let named: Vec<&Value> = described.iter().filter(|m| m["you"] != true && answers(m, &to)).collect();
+            // A name may address several devices, as long as they speak for one entity.
+            let people: HashSet<&str> = named.iter().filter_map(|m| verified(m).map_or(&m["fp"], |e| &e["id"]).as_str()).collect();
+            match people.len() {
+                0 => bail!("no member of {gid} has the fingerprint or name {to}"),
+                1 => addressed.extend(named.iter().filter_map(|m| m["fp"].as_str()).map(str::to_owned)),
+                _ => bail!("{to} could be any of {}; pass fingerprints", named.iter().map(|m| format!("{} ({})", m["name"], m["fp"])).collect::<Vec<_>>().join(", ")),
+            }
         }
+        addressed.sort();
+        addressed.dedup();
+        let to = addressed;
         if let Some(reply_to) = &reply_to
             && !self.mark_seen(&gid, reply_to)?
         {
@@ -730,7 +844,11 @@ impl Session {
             params![id, gid, self.person.to_string(), serde_json::to_string(&message)?],
         )?;
         self.mark_seen(&gid, &id)?;
-        Ok(json!({ "id": id }))
+        let mut sent = json!({ "id": id });
+        if !message.to.is_empty() {
+            sent["to"] = json!(message.to);
+        }
+        Ok(sent)
     }
 
     /// The group a chat or doc command acts on: the one --group names, which must be of `kind`, or else the session's
@@ -868,45 +986,99 @@ impl Session {
         Ok(())
     }
 
-    /// Records a version shown to the agent, which a later `doc edit --base` may build on.
-    fn keep_version(&self, gid: &str, state: &[u8]) -> Result<String> {
-        let version = doc::version(state);
-        self.db.execute("INSERT OR IGNORE INTO versions (gid, version, state) VALUES (?, ?, ?)", params![gid, version, state])?;
-        Ok(version)
+    /// Keeps `file` (or a new one in the session's state) in step with the doc group `gid`, from `base`, the text both
+    /// have now. The file is created holding it unless it exists; one that exists brings its text in at the next sync.
+    fn bind(&mut self, gid: &str, file: Option<String>, base: &str) -> Result<PathBuf> {
+        let path = match file {
+            Some(file) => PathBuf::from(file),
+            None => {
+                let name: String = self.settings(gid)?.name.chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+                let name = Some(name.trim_matches('-')).filter(|name| !name.is_empty()).unwrap_or("doc");
+                self.docs.join(format!("{name}-{}.md", &digest(gid.as_bytes())[..8]))
+            }
+        };
+        if !path.exists() {
+            write_file(&path, base)?;
+        }
+        self.db.execute("INSERT INTO bindings (gid, path, base) VALUES (?, ?, ?)", params![gid, path.to_str().context("path is not UTF-8")?, base])?;
+        self.follow(gid, path.clone());
+        Ok(path)
     }
 
-    async fn doc(&mut self, op: DocOp) -> Result<Value> {
-        match op {
-            DocOp::Show { group } => {
-                let gid = self.of_kind(group, DOC)?;
-                self.catch_up_now(&gid).await?;
-                let state = self.text(&gid)?;
-                Ok(json!({ "group": gid, "version": self.keep_version(&gid, &state)?, "text": doc::text(&state)? }))
+    /// Watches a doc's file, which is brought into step once it has been quiet for a moment.
+    fn follow(&mut self, gid: &str, path: PathBuf) {
+        let (events, changed, name) = (self.events.clone(), gid.to_owned(), path.file_name().map(OsStr::to_owned));
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            if let Ok(event) = event
+                && !event.kind.is_access()
+                && event.paths.iter().any(|p| p.file_name() == name.as_deref())
+            {
+                let _ = events.send(Event::FileChanged(changed.clone()));
             }
-            DocOp::Edit { group, base, text } => {
-                let gid = self.of_kind(group, DOC)?;
-                self.catch_up_now(&gid).await?;
-                let state = self.text(&gid)?;
-                let base_state: Vec<u8> = self
-                    .db
-                    .query_row("SELECT state FROM versions WHERE gid = ? AND version = ?", params![gid, base], |r| r.get(0))
-                    .optional()?
-                    .with_context(|| format!("unknown version {base}; run `doc show` for the current one"))?;
-                let (target, lost) = doc::rebase(&doc::text(&base_state)?, &text, &doc::text(&state)?);
-                let update = doc::edit(&state, &target)?;
-                let merged = doc::apply(&state, &update)?;
-                self.post_payload(&gid, &Payload::Edit(Edit { update: B64.encode(&update) })).await?;
-                self.store_text(&gid, &merged)?;
-                let version = self.keep_version(&gid, &merged)?;
-                Ok(json!({ "group": gid, "version": version, "merged": base != doc::version(&state), "lost": lost, "text": doc::text(&merged)? }))
+        })
+        .and_then(|mut watcher| watcher.watch(path.parent().expect("a file is in a directory"), RecursiveMode::NonRecursive).map(|()| watcher))
+        .ok();
+        self.bindings.insert(gid.to_owned(), Binding { path, _watcher: watcher, file_changed: None, doc_changed: None, editors: Vec::new() });
+    }
+
+    /// Brings a doc and its file into step. What changed in the file since they last were (its base) is replayed onto
+    /// the doc as it is now and posted, as `doc edit` did; the file then gets the doc's text. A line both changed keeps
+    /// the doc's version, with a warning. What others changed in the doc meanwhile is told as `edited`.
+    async fn sync(&mut self, gid: &str) -> Result<()> {
+        let binding = self.bindings.get_mut(gid).expect("a doc group is bound");
+        binding.file_changed = None;
+        binding.doc_changed = None;
+        let editors = std::mem::take(&mut binding.editors);
+        let path = binding.path.clone();
+        let base: String = self.db.query_row("SELECT base FROM bindings WHERE gid = ?", [gid], |r| r.get(0))?;
+        let file = match std::fs::read_to_string(&path) {
+            Ok(text) => text.replace("\r\n", "\n"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => base.clone(),
+            Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+        };
+        let state = self.text(gid)?;
+        let current = doc::text(&state)?;
+        let (text, lost) = if file == base { (current.clone(), Vec::new()) } else { doc::rebase(&base, &file, &current) };
+        if text != current {
+            let update = doc::edit(&state, &text)?;
+            self.post_payload(gid, &Payload::Edit(Edit { update: B64.encode(&update) })).await?;
+            self.store_text(gid, &doc::apply(&state, &update)?)?;
+        }
+        if text != file {
+            write_file(&path, &text)?;
+        }
+        self.db.execute("UPDATE bindings SET base = ? WHERE gid = ?", params![text, gid])?;
+        if !lost.is_empty() {
+            self.warn(Some(gid), format!("others changed these lines of {} meanwhile, so your changes to them were not kept: {}", path.display(), lost.join(" | ")));
+        }
+        if current != base {
+            let (lines, changed) = doc::changed(&base, &current);
+            let direct = changed.iter().any(|line| mentions(line, &self.person));
+            self.deliver(gid, json!({ "type": "edited", "group": gid, "file": path, "by": editors, "lines": lines, "direct": direct }));
+        }
+        Ok(())
+    }
+
+    async fn sync_all(&mut self) {
+        let gids: Vec<String> = self.bindings.keys().cloned().collect();
+        for gid in gids {
+            if let Err(error) = self.sync(&gid).await {
+                self.warn(Some(&gid), format!("{error:#}"));
             }
-            DocOp::Attach { group, path } => {
-                let gid = self.of_kind(group, DOC)?;
-                let bytes = std::fs::read(&path).with_context(|| format!("cannot read {path}"))?;
-                let name = Path::new(&path).file_name().map_or_else(String::new, |n| n.to_string_lossy().replace(['[', ']'], ""));
-                let attachment = self.upload(&gid, &bytes, &name, Path::new(&path)).await?;
-                let markdown = format!("{}[{name}]({})", if attachment.media.is_empty() { "" } else { "!" }, attachment.link);
-                Ok(json!({ "link": attachment.link, "markdown": markdown }))
+        }
+    }
+
+    /// When the next doc and its file are due to be brought into step.
+    pub fn next_sync(&self) -> Option<Instant> {
+        self.bindings.values().filter_map(Binding::due).min()
+    }
+
+    pub async fn sync_due(&mut self) {
+        let now = Instant::now();
+        let due: Vec<String> = self.bindings.iter().filter(|(_, b)| b.due().is_some_and(|at| at <= now)).map(|(gid, _)| gid.clone()).collect();
+        for gid in due {
+            if let Err(error) = self.sync(&gid).await {
+                self.warn(Some(&gid), format!("{error:#}"));
             }
         }
     }
@@ -1076,7 +1248,7 @@ impl Session {
 
     /// Asks to join a group open to one of this device's entities; whichever member is online checks the request and
     /// adds this session.
-    async fn join_open(&mut self, gid: String, as_: Option<String>, reply: oneshot::Sender<Value>) -> Result<()> {
+    async fn join_open(&mut self, gid: String, as_: Option<String>, file: Option<String>, reply: oneshot::Sender<Value>) -> Result<()> {
         let prepared = async {
             let (opening, membership) =
                 self.openings().await?.into_iter().find(|(o, _)| o.group == gid).context("that group is not open to any entity of this device")?;
@@ -1101,7 +1273,7 @@ impl Session {
         tokio::spawn(async move {
             let entry = wait(|| async { Ok(http.entries(&relay, &address, 0, POLL_WAIT_S).await?.into_iter().next().map(|(_, _, data)| data)) }, "no member admitted the request; one must be online").await;
             match entry {
-                Ok(data) => drop(events.send(Event::Welcome { relay, key, data, reply })),
+                Ok(data) => drop(events.send(Event::Welcome { relay, key, data, file, reply })),
                 Err(error) => drop(reply.send(json!({ "error": format!("waiting to be admitted: {error:#}") }))),
             }
         });
@@ -1262,7 +1434,7 @@ impl Session {
                 let payload: Payload = serde_json::from_slice(&message.into_bytes())?;
                 // An edit is never shown, so it does not meet the sender's entity.
                 let sender = self.describe(gid, sender, !matches!(payload, Payload::Edit(_))).await?;
-                self.ingest(gid, id, sender, payload)?;
+                self.ingest(gid, id, sender, payload).await?;
             }
             ProcessedMessageContent::ProposalMessage(proposal) => {
                 if !matches!(proposal.proposal(), Proposal::Remove(_)) {
@@ -1380,14 +1552,19 @@ impl Session {
         }
     }
 
-    /// A new group of `kind`: its settings are its first message.
-    async fn create_group(&mut self, as_: Option<&str>, kind: String, name: String) -> Result<String> {
+    /// A new group of `kind`: its settings are its first message. A doc's file, if it exists, holds its first text.
+    async fn create_group(&mut self, as_: Option<&str>, kind: String, name: String, file: Option<String>) -> Result<String> {
         let gid = hex::encode(self.provider.rand().random_array::<16>()?);
         let me = self.credential(as_)?;
         let mls = MlsGroup::new_with_group_id(&self.provider, &self.signer, &create_config(), GroupId::from_slice(gid.as_bytes()), me)?;
         let relay = self.default_relay.clone();
         self.add_group(&gid, &relay, 0, mls)?;
+        let doc = kind == DOC;
         self.set(&gid, Settings { kind, name, ..Settings::default() }).await?;
+        if doc {
+            self.bind(&gid, file, "")?;
+            self.sync(&gid).await?;
+        }
         Ok(gid)
     }
 
@@ -1432,7 +1609,14 @@ impl Session {
         }
         self.folders.remove(gid);
         self.backlog.remove(gid);
-        for table in ["groups", "folders", "senders", "messages", "settings", "applied", "docs", "versions", "blobs", "pending"] {
+        // A file the agent named stays; one in the session's state goes with the group.
+        if let Some(binding) = self.bindings.remove(gid)
+            && binding.path.starts_with(&self.docs)
+            && binding.path.exists()
+        {
+            std::fs::remove_file(&binding.path)?;
+        }
+        for table in ["groups", "folders", "senders", "messages", "settings", "applied", "docs", "bindings", "blobs", "pending"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [gid])?;
         }
         let attachments = self.attachments.join(&digest(gid.as_bytes())[..16]);
@@ -1669,7 +1853,7 @@ impl Session {
 
     /// Takes in a message: settings and edits change the group's state, chat messages are logged and delivered. A type
     /// that belongs to another kind of group is ignored, and so is a change of kind.
-    fn ingest(&mut self, gid: &str, id: &str, sender: Value, payload: Payload) -> Result<()> {
+    async fn ingest(&mut self, gid: &str, id: &str, sender: Value, payload: Payload) -> Result<()> {
         if self.folders.contains_key(gid) {
             self.db.execute("INSERT OR IGNORE INTO senders (gid, fp, person) VALUES (?, ?, ?)", params![gid, sender["fp"].as_str(), sender.to_string()])?;
         }
@@ -1695,18 +1879,30 @@ impl Session {
                 }
             }
             Payload::Joined => self.deliver(gid, json!({ "type": "joined", "group": gid, "member": sender })),
-            // An edit changes the text and nothing else: it never wakes the agent.
+            // An edit changes the text; the file follows once the doc is quiet, and then the agent is told.
             Payload::Edit(edit) => {
                 let state = doc::apply(&self.text(gid)?, &B64.decode(&edit.update)?)?;
                 self.store_text(gid, &state)?;
+                let binding = self.bindings.get_mut(gid).expect("a doc group is bound");
+                mark(&mut binding.doc_changed);
+                if !binding.editors.iter().any(|e| e["fp"] == sender["fp"]) {
+                    binding.editors.push(sender);
+                }
             }
+            // An attachment is fetched before its message is delivered, so the agent gets a file.
             Payload::Message(message) => {
                 let inserted = self.db.execute(
                     "INSERT OR IGNORE INTO messages (id, gid, sender, payload) VALUES (?, ?, ?, ?)",
                     params![id, gid, sender.to_string(), serde_json::to_string(&message)?],
                 )?;
                 if inserted > 0 {
-                    let item = self.message_json(gid, id, sender, &message);
+                    let mut item = self.message_json(gid, id, sender, &message);
+                    if let Some(attachment) = &message.attachment {
+                        match self.fetch(attachment.link.clone()).await {
+                            Ok(fetched) => item["attachment"]["path"] = fetched["path"].clone(),
+                            Err(error) => item["attachment"]["error"] = json!(format!("{error:#}")),
+                        }
+                    }
                     self.deliver(gid, item);
                 }
             }
@@ -1755,7 +1951,7 @@ impl Session {
             "group": gid,
             "id": id,
             "from": from,
-            "direct": message.to.contains(&self.fp),
+            "direct": message.to.contains(&self.fp) || message.content.as_deref().is_some_and(|content| mentions(content, &self.person)),
             "content": message.content,
         });
         if !message.to.is_empty() {
@@ -1787,14 +1983,20 @@ impl Session {
         }
     }
 
-    /// Membership changes, and messages addressed to this session, answering one of its messages, or urgent.
+    /// Membership changes; messages addressed to this session (by `to` or by mention), answering one of its messages, or
+    /// urgent; and doc edits that mention it.
     fn wakes(&self, item: &Value) -> bool {
-        item["type"] != "message"
-            || item["direct"] == true
-            || item["urgent"] == true
-            || item["reply_to"]
-                .as_str()
-                .is_some_and(|id| matches!(self.message(id), Ok(Some((_, from, _))) if from["fp"] == self.fp.as_str()))
+        match item["type"].as_str() {
+            Some("message") => {
+                item["direct"] == true
+                    || item["urgent"] == true
+                    || item["reply_to"]
+                        .as_str()
+                        .is_some_and(|id| matches!(self.message(id), Ok(Some((_, from, _))) if from["fp"] == self.fp.as_str()))
+            }
+            Some("edited") => item["direct"] == true,
+            _ => true,
+        }
     }
 
     pub fn held_since(&self) -> Option<Instant> {
@@ -1808,13 +2010,24 @@ impl Session {
         }
     }
 
-    fn print(&self, item: Value) {
+    fn print(&mut self, item: Value) {
         if item["type"] == "message"
             && let (Some(gid), Some(id)) = (item["group"].as_str(), item["id"].as_str())
         {
             let _ = self.mark_seen(gid, id);
         }
-        println!("{item}");
+        self.out.push(item.to_string());
+    }
+
+    /// Prints what is waiting, once the docs' files are in step: whatever wakes the agent, it reads current files.
+    pub async fn emit(&mut self) {
+        if self.out.is_empty() {
+            return;
+        }
+        self.sync_all().await;
+        for line in std::mem::take(&mut self.out) {
+            println!("{line}");
+        }
     }
 
     /// Records that a message entered the agent's context. Its text is then deleted, unless `listen --keep-log`.
@@ -1823,8 +2036,8 @@ impl Session {
         Ok(self.db.execute(&format!("UPDATE messages SET seen = 1{forget} WHERE id = ? AND gid = ?"), [id, gid])? > 0)
     }
 
-    fn warn(&self, gid: Option<&str>, text: String) {
-        println!("{}", json!({ "type": "warning", "group": gid, "text": text }));
+    fn warn(&mut self, gid: Option<&str>, text: String) {
+        self.out.push(json!({ "type": "warning", "group": gid, "text": text }).to_string());
     }
 
 }
@@ -1915,6 +2128,18 @@ fn scan(dir: &Path, seen: &mut HashSet<OsString>) -> (Vec<(String, Record)>, Vec
         ordered.push((id, record));
     }
     (ordered, ignored)
+}
+
+/// Writes a doc's file whole, through a rename, so that its readers never see half of it. The file keeps its permissions.
+fn write_file(path: &Path, text: &str) -> Result<()> {
+    let temp = path.with_file_name(format!(".{}.letmeknow", path.file_name().context("not a file")?.to_string_lossy()));
+    std::fs::create_dir_all(path.parent().context("not a file")?)?;
+    std::fs::write(&temp, text)?;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        std::fs::set_permissions(&temp, metadata.permissions())?;
+    }
+    std::fs::rename(&temp, path)?;
+    Ok(())
 }
 
 /// A folder group links a file by its path in the folder; one from elsewhere is copied into the folder's attachments/

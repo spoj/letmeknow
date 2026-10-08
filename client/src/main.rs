@@ -9,7 +9,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use session::{DocOp, Event, Request, Session};
+use session::{Event, Request, Session};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -34,7 +34,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the session process and print delivered messages as NDJSON
+    /// Run the session process, which keeps each doc's file in step, and print what arrives as NDJSON
     Listen {
         /// Display name, fixed when the session is created [default: <user>/<session>]
         #[arg(long, env = "LETMEKNOW_NAME")]
@@ -42,7 +42,7 @@ enum Command {
         /// Relay for groups this session creates
         #[arg(long, env = "LETMEKNOW_RELAY", default_value = "https://letmeknow.dev")]
         relay: String,
-        /// Seconds a message not addressed to this session may wait for something that wakes the agent anyway
+        /// Seconds a message or doc edit not addressed to this session may wait for something that wakes the agent anyway
         #[arg(long, env = "LETMEKNOW_HOLD", default_value_t = 3600)]
         hold: u64,
         /// Keep the text of messages once delivered, for audit; by default only ids, senders and references are kept
@@ -188,10 +188,13 @@ async fn listen(session: &str, name: Option<String>, relay: String, hold: Durati
     let mut shutdown = std::pin::pin!(shutdown());
     let mut key_update = Instant::now() + KEY_UPDATE;
     loop {
+        state.emit().await;
         let deadline = state.held_since().map(|since| since + hold);
+        let sync = state.next_sync();
         tokio::select! {
             Some(event) = queue.recv() => state.handle(event).await,
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => state.flush_held(),
+            _ = tokio::time::sleep_until(sync.unwrap_or_else(Instant::now)), if sync.is_some() => state.sync_due().await,
             _ = tokio::time::sleep_until(key_update) => {
                 state.update_keys().await;
                 key_update = Instant::now() + KEY_UPDATE;
@@ -285,30 +288,33 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
             std::io::stdin().read_to_string(text)?;
         }
     }
-    // The session process reads the file itself, from another directory.
-    if let Request::Doc { op: DocOp::Attach { path, .. } } = &mut request {
-        let absolute: PathBuf = std::path::absolute(&*path)?.components().collect();
-        *path = absolute.to_str().context("path is not UTF-8")?.to_owned();
+    // The session process reads and writes files itself, from another directory.
+    let file = match &mut request {
+        Request::Attach { path, .. } => Some(path),
+        Request::Invite { file, .. } | Request::Join { file, .. } => file.as_mut(),
+        _ => None,
+    };
+    if let Some(file) = file {
+        let absolute: PathBuf = std::path::absolute(&*file)?.components().collect();
+        *file = absolute.to_str().context("path is not UTF-8")?.to_owned();
     }
-    if let Request::Doc { op: DocOp::Edit { text, .. } } = &mut request {
-        let read = match text.as_str() {
-            "-" => {
-                let mut text = String::new();
-                std::io::stdin().read_to_string(&mut text)?;
-                text
-            }
-            path => std::fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?,
-        };
-        // The text is LF only: the browser's editor counts "\r\n" as one character, the CRDT as two.
-        *text = read.replace("\r\n", "\n");
+    // A doc a member joins already has its text, which would be merged with the file's.
+    if let Request::Join { file: Some(file), .. } = &request
+        && Path::new(file).exists()
+    {
+        bail!("{file} exists; name a new file for the doc");
     }
     // The session process runs in another directory, so folder paths are made absolute here.
     let target = match &mut request {
         Request::Join { target, .. } => Some(target),
-        Request::Invite { group, .. } | Request::Open { group, .. } | Request::Name { group, .. } | Request::Send { group, .. } | Request::Members { group } | Request::Remove { group, .. } | Request::Leave { group } => {
-            group.as_mut()
-        }
-        Request::Doc { op: DocOp::Show { group } | DocOp::Edit { group, .. } | DocOp::Attach { group, .. } } => group.as_mut(),
+        Request::Invite { group, .. }
+        | Request::Open { group, .. }
+        | Request::Name { group, .. }
+        | Request::Send { group, .. }
+        | Request::Members { group }
+        | Request::Remove { group, .. }
+        | Request::Leave { group }
+        | Request::Attach { group, .. } => group.as_mut(),
         Request::Read { .. } | Request::Groups | Request::Fetch { .. } | Request::Entity { .. } => None,
     };
     if let Some(target) = target
