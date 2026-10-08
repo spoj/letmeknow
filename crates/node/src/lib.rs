@@ -897,19 +897,16 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
-        self.keep(spawn(task));
-    }
-
-    /// The browser runs on one thread.
-    #[cfg(target_arch = "wasm32")]
-    fn spawn(&self, task: impl Future<Output = ()> + 'static) {
-        self.keep(spawn(task));
-    }
-
-    fn keep(&self, handle: JoinHandle<()>) {
         let mut tasks = self.tasks.lock().unwrap();
         tasks.retain(|task| !task.is_finished());
-        tasks.push(handle);
+        tasks.push(spawn(task));
+    }
+
+    /// The browser runs on one thread, and its tasks end with the page. They are not kept: there, a task cannot ask
+    /// whether tasks are finished, its own among them.
+    #[cfg(target_arch = "wasm32")]
+    fn spawn(&self, task: impl Future<Output = ()> + 'static) {
+        spawn(task);
     }
 
     fn warn(&self, group: Option<&[u8]>, text: String) {

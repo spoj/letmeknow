@@ -120,15 +120,8 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 .people.warn { color: var(--warn); }
 .head-actions { display: flex; gap: var(--s2); }
 .group > .empty { position: static; flex: 1; }
-/* A doc takes the stage; on wide screens the chat picked for it runs beside it. */
 .body { flex: 1; min-height: 0; display: flex; }
 .editor { flex: 1; min-width: 0; overflow: auto; }
-.beside { flex: 0 0 clamp(300px, 32%, 420px); display: flex; border-left: 1px solid var(--line); }
-.beside:empty { display: none; }
-.beside > .group { flex: 1; min-width: 0; }
-.beside .group-head { padding: var(--s2) var(--s4); min-height: 56px; }
-.beside .composer { padding: var(--s3) var(--s4) var(--s4); }
-.beside-picker { font: inherit; font-size: var(--t-sm); min-height: 32px; max-width: 12rem; padding: 0 var(--s2); border: 1px solid var(--line); border-radius: var(--radius); background: var(--raise); color: inherit; }
 .editor .cm-editor { min-height: 100%; }
 .editor .cm-editor.cm-focused { outline: none; }
 .editor .cm-content { padding: var(--s3) 0; }
@@ -149,6 +142,9 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 .who { font-weight: 600; }
 .meta .who { font-size: var(--t-md); }
 .tag { color: var(--warn); font-weight: 600; }
+.level { font-weight: 400; }
+.level.verified { color: var(--accent); }
+.status { font-size: var(--t-sm); }
 time { font-size: 12px; color: var(--muted); }
 .text { white-space: pre-wrap; overflow-wrap: anywhere; }
 blockquote { margin: 2px 0; padding: 0 var(--s2); border-left: 2px solid var(--line); color: var(--muted); font-size: var(--t-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -203,13 +199,9 @@ dialog > header { display: flex; align-items: center; justify-content: space-bet
 .expiry { font-size: var(--t-sm); color: var(--muted); }
 .done { font-weight: 500; }
 
+.banner { position: fixed; z-index: 10; top: var(--s3); left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s2) var(--s2) var(--s4); border-radius: var(--radius); background: var(--raise); border: 1px solid var(--line); box-shadow: 0 6px 20px #0003; font-size: var(--t-sm); }
 .toasts { position: fixed; z-index: 10; bottom: var(--s5); left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: var(--s2); width: min(28rem, calc(100vw - var(--s5))); pointer-events: none; }
 .toast { pointer-events: auto; cursor: pointer; padding: var(--s3) var(--s4); border-radius: var(--radius); background: var(--text); color: var(--bg); box-shadow: 0 6px 20px #0003; font-size: var(--t-sm); }
-
-/* Narrower screens: a doc has the stage to itself */
-@media (max-width: 999px) {
-  .beside, .beside-picker { display: none; }
-}
 
 /* Phones: the group list, or one group */
 @media (max-width: 699px) {
