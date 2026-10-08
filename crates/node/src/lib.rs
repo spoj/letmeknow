@@ -606,6 +606,9 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// An invite link into a group, or with `Target::Device`, to this device's identity.
     pub fn invite(&self, target: Target, label: Option<String>, to: Option<Vec<u8>>) -> Result<String> {
+        if let Target::Group(gid) = &target {
+            ensure!(self.settings(gid)?.devices_of.is_none(), "a devices group takes devices by a device link, not an invite");
+        }
         let device = matches!(target, Target::Device(_));
         let secret = self.inner.state.lock().unwrap().invites.make(target, label, to, now()).secret;
         let (key, relay) = self.address();

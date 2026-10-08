@@ -669,6 +669,7 @@ class View {
   private people = h("button", { className: "people quiet" });
 
   constructor(readonly gid: string) {
+    const devicesOf = group(gid)?.settings.devices_of;
     this.el = h(
       "section",
       { className: "group" },
@@ -680,7 +681,9 @@ class View {
         h(
           "div",
           { className: "head-actions" },
-          h("button", { onclick: () => inviteDialog({ gid }) }, "Invite"),
+          devicesOf
+            ? h("button", { onclick: () => inviteDialog({ identity: devicesOf }) }, "Add a device")
+            : h("button", { onclick: () => inviteDialog({ gid }) }, "Invite"),
           h("button", { className: "icon quiet", title: "Settings", ariaLabel: "Settings", onclick: () => this.settingsDialog() }, "⋯")
         )
       )

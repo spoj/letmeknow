@@ -175,13 +175,13 @@ try {
   const devices = desk.run("identity", "list").identities[0].devices;
   check(devices.length === 2 && devices.some(d => d.name === "phone"), "a device link adds the browser to the identity's device list");
   const team = desk.run("invite", "--name", "Team");
-  desk.run("open", "--group", team.group, "Matthew");
+  desk.run("open", `--group=${team.group}`, "Matthew");
   const opened = await desk.printed(e => e.type === "joined" && e.member.device === "phone", 60_000);
   check(opened.how === "open" && opened.member.identity.name === "Matthew", "the phone joins a chat open to its identity by itself");
   await phone.locator(".back:visible").click();
   await phone.locator(".group-list button", { hasText: "Team" }).waitFor();
   check(true, "and lists it");
-  desk.run("send", "--group", team.group, "welcome, phone");
+  desk.run("send", `--group=${team.group}`, "welcome, phone");
   await phone.locator(".group-list button", { hasText: "Team" }).click();
   await phone.getByText("welcome, phone").waitFor();
   check(true, "and reads what is sent there");
@@ -193,7 +193,7 @@ try {
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.getByText("hello from the terminal", { exact: true }).waitFor();
   check((await laptop.locator(".group-list button").count()) === 2, "a reloaded browser keeps its groups and their messages");
-  ann.run("send", "--group", invite.group, "after the reload");
+  ann.run("send", `--group=${invite.group}`, "after the reload");
   await laptop.getByText("after the reload").waitFor();
   await laptop.getByPlaceholder("Message").fill("still here");
   await laptop.getByPlaceholder("Message").press("Enter");
