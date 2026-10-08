@@ -65,7 +65,7 @@ A local folder signs nothing, but its sessions all read the folder directly, so 
 - Settings live in the MLS group context and change only by commit: kind (fixed), name, the identities the group is open to, `keep`, the membership service's address, and the protocol version.
 - Each member's leaf names its iroh key and relay, so every member can dial every other. A changed relay is a commit, like a key update.
 - `keep` (days, default 90) is how long members hold the group's messages, doc edits and files for one another. Each client may hold less.
-- Post-compromise security as today: a session replaces its keys with an empty commit when it resumes a group, once caught up, and hourly while it runs.
+- Post-compromise security: a session replaces its keys with an empty commit when it resumes a group, once caught up, and then daily while it runs, so a stolen key stops working within a day. (Today it is hourly; with the key window, every epoch is kept for a week and openmls rewrites all of them on each send and receive, so a group must make few: about 7 per member a week.)
 - Removal as today: a member commits a Remove. A leaving session asks the others, in a message, to commit its removal (MLS lets no member commit its own), and is shown as having left.
 - Every change (add, remove, key update, settings) is written inside the commit that applies it. MLS also lets a member send a change on its own, as a proposal that a later commit points to; we never do, because proposals are not in the membership log, and a member that missed one could not apply the commit.
 
@@ -175,7 +175,7 @@ The Cloudflare Worker relay; message logs, blobs and boxes (inboxes, join reques
 
 ## Security
 
-Intact: one agreed membership sequence; post-compromise security; sender signatures; forward secrecy for messages already read; nothing readable by the membership service or relays.
+Intact: one agreed membership sequence; post-compromise security, healing within a day instead of an hour; sender signatures; forward secrecy for messages already read; nothing readable by the membership service or relays.
 
 Stronger than today:
 
