@@ -994,7 +994,7 @@ impl Session {
                 let list = self.fetch_list(relay, id).await?;
                 self.lists.insert(id.to_owned(), (Instant::now(), list));
             }
-            let described = self.describe(gid, joiner.clone()).await?;
+            let described = self.describe(gid, joiner.clone(), false).await?;
             let entity = described["entity"]["id"].as_str().filter(|_| described["entity"].get("error").is_none());
             if !entity.is_some_and(|id| settings.open.iter().any(|o| o.id == id)) {
                 self.warn(Some(gid), format!("refused a join request from {described}: it speaks as no entity the group is open to"));
@@ -1096,8 +1096,10 @@ impl Session {
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(message) => {
-                let sender = self.describe(gid, sender).await?;
-                self.ingest(gid, id, sender, serde_json::from_slice(&message.into_bytes())?)?;
+                let payload: Payload = serde_json::from_slice(&message.into_bytes())?;
+                // A file update is never shown, so it does not meet the sender's entity.
+                let sender = self.describe(gid, sender, payload.file.is_none()).await?;
+                self.ingest(gid, id, sender, payload)?;
             }
             ProcessedMessageContent::ProposalMessage(proposal) => {
                 if !matches!(proposal.proposal(), Proposal::Remove(_)) {
@@ -1114,7 +1116,7 @@ impl Session {
                 self.db.execute("DELETE FROM pending WHERE gid = ?", [gid])?;
                 if self_removed {
                     self.drop_group(gid)?;
-                    let by = self.describe(gid, sender).await?;
+                    let by = self.describe(gid, sender, true).await?;
                     self.print(json!({ "type": "removed", "group": gid, "by": by }));
                     return Ok(());
                 }
@@ -1291,15 +1293,15 @@ impl Session {
     async fn described_members(&mut self, gid: &str) -> Result<Vec<Value>> {
         let mut members = Vec::new();
         for member in self.members(gid)? {
-            members.push(self.describe(gid, member).await?);
+            members.push(self.describe(gid, member, true).await?);
         }
         Ok(members)
     }
 
     /// Delivers a "joined" or "left" line once the member's entity is checked.
     async fn deliver_change(&mut self, gid: &str, mut change: Value) -> Result<()> {
-        change["member"] = self.describe(gid, change["member"].take()).await?;
-        change["by"] = self.describe(gid, change["by"].take()).await?;
+        change["member"] = self.describe(gid, change["member"].take(), true).await?;
+        change["by"] = self.describe(gid, change["by"].take(), true).await?;
         self.deliver(gid, change);
         Ok(())
     }
@@ -1320,8 +1322,9 @@ impl Session {
     }
 
     /// Checks the entities a member says it speaks as against their lists: the first must list its device (or the
-    /// member itself), each later one the one before. Records entities this session meets for the first time.
-    async fn describe(&mut self, gid: &str, mut person: Value) -> Result<Value> {
+    /// member itself), each later one the one before. An entity is `new` until this session meets it: until it shows the
+    /// agent something from or about it (`meet`), which an admission check or a file update does not.
+    async fn describe(&mut self, gid: &str, mut person: Value, meet: bool) -> Result<Value> {
         let Some(path) = person.as_object_mut().and_then(|p| p.remove("as")) else { return Ok(person) };
         let path: Vec<String> = serde_json::from_value(path)?;
         let relay = self.groups.get(gid).map_or_else(|| self.default_relay.clone(), |g| g.relay.clone());
@@ -1340,9 +1343,12 @@ impl Session {
             person["entity"] = json!({ "id": id, "error": error });
             return Ok(person);
         }
-        let new = self.db.execute("INSERT OR IGNORE INTO seen (id, name, gid) VALUES (?, ?, ?)", params![holder, name, gid])? > 0;
+        let new = match meet {
+            true => self.db.execute("INSERT OR IGNORE INTO seen (id, name, gid) VALUES (?, ?, ?)", params![holder, name, gid])? > 0,
+            false => self.db.query_row("SELECT 1 FROM seen WHERE id = ?", [&holder], |_| Ok(())).optional()?.is_none(),
+        };
         let yours = Device::load(&self.home)?.entities.iter().any(|e| e.id == holder);
-        person["entity"] = json!({ "id": holder, "name": name, "new": new, "yours": yours });
+        person["entity"] = json!({ "id": holder, "name": name, "new": new && !yours, "yours": yours });
         Ok(person)
     }
 

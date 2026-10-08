@@ -43,6 +43,7 @@ const browser = await chromium.launch();
 const pages = {};
 try {
   await printed(e => e.type === "ready");
+  agent("entity", "create", "Acme");
   const { link, group } = agent("invite");
   const laptop = await (await browser.newContext()).newPage();
   const phone = await (await browser.newContext()).newPage();
@@ -78,6 +79,8 @@ try {
   const morning = agent("send", "Morning. Your priority list is ready.").id;
   for (const page of [laptop, phone]) await page.getByText("Morning. Your priority list is ready.").waitFor();
   console.log("ok - both browsers show the agent's message");
+  const met = await phone.locator(".messages li", { hasText: "Morning." }).textContent();
+  check(met.includes("Acme · Agent new"), "marked as from an entity the phone had not met, though it had listed its members");
   await laptop.locator(".chips button", { hasText: "Agent" }).click();
   await laptop.getByPlaceholder(/^Message/).fill("Thanks, on it");
   await laptop.getByPlaceholder(/^Message/).press("Enter");
@@ -140,6 +143,7 @@ try {
   await laptop.getByText("after the reload").waitFor();
   check(await laptop.getByText("Thanks, on it").isVisible(), "a reloaded browser keeps its messages and can still read new ones");
   check(lost === 1, "even when the relay took its key update but the answer was lost");
+  check(!(await laptop.locator(".messages li", { hasText: "after the reload" }).textContent()).includes(" new"), "and later messages from it are not new");
   await laptop.unrouteAll();
   const requests = [];
   for (const page of [laptop, phone]) page.on("request", request => requests.push(request.url()));

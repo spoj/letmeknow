@@ -369,7 +369,7 @@ export class Client {
 
   async members(gid: string): Promise<Person[]> {
     const members: Person[] = [];
-    for (const member of JSON.parse(this.member!.members(gid))) members.push(await this.describe(member));
+    for (const member of JSON.parse(this.member!.members(gid))) members.push(await this.describe(member, false));
     return members;
   }
 
@@ -379,9 +379,10 @@ export class Client {
 
   /**
    * Checks the entities a member says it speaks as against their lists: the first must list its device (or the member
-   * itself), each later one the one before. Notes entities this browser meets for the first time.
+   * itself), each later one the one before. An entity is `new` until this browser meets it: until it shows the person an
+   * item (message, membership change, settings) from or about it. Listing members, which is redrawn, is no meeting.
    */
-  private async describe(person: Person): Promise<Person> {
+  private async describe(person: Person, meet = true): Promise<Person> {
     const { as: path, ...described } = person;
     if (!path) return described;
     let holder = person.device ?? person.fp;
@@ -397,8 +398,9 @@ export class Client {
       holder = id;
     }
     const fresh = !this.seen.has(holder);
-    this.seen.add(holder);
-    return { ...described, entity: { id: holder, name, new: fresh, yours: this.me.entities.some(e => e.id === holder) } };
+    if (meet) this.seen.add(holder);
+    const yours = this.me.entities.some(e => e.id === holder);
+    return { ...described, entity: { id: holder, name, new: fresh && !yours, yours } };
   }
 
   /**
@@ -637,7 +639,7 @@ export class Client {
       if (present()) return;
       // Fetched first, so a list the relay failed to give fails this try instead of refusing the request.
       for (const id of applicant.as ?? []) await this.list(id);
-      const described = await this.describe(applicant);
+      const described = await this.describe(applicant, false);
       if (!described.entity || described.entity.error || !opened.some(o => o.id === described.entity!.id)) {
         this.show(gid, { type: "warning", text: `refused a join request from ${applicant.name}: it speaks as no entity the group is open to`, at: Date.now() });
         return;
