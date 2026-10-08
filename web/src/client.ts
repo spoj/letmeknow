@@ -298,7 +298,13 @@ export class Client {
     const group = this.groups.get(gid);
     if (!group || (notice && notice.seq <= group.cursor)) return;
     if (notice?.data !== undefined && notice.seq === group.cursor + 1) return this.take(gid, notice.seq, notice.data);
-    await this.catchUp(gid);
+    try {
+      await this.catchUp(gid);
+    } catch (error) {
+      // Reopened, and so tried again, within 15 seconds: an open socket would announce only what comes next.
+      this.sockets.get(gid)?.socket.close();
+      throw error;
+    }
     // Caught up after loading: replace this member's keys, for post-compromise security.
     if (this.loaded.delete(gid)) await this.updateKey(gid);
   }
