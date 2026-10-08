@@ -1,10 +1,7 @@
 node_modules/
-.wrangler/
-.dev.vars
 .DS_Store
 target/
 
 HUMAN.md
-relay/public/
 web/pkg/
 web/dist/
