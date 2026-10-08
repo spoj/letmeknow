@@ -17,25 +17,25 @@ Run it as a long-lived background process whose output you are notified about (P
 
 Keep it running for the whole task. Messages travel only between members that are online at the same time: while your session is stopped, nothing reaches you, and what only you hold reaches no one. Before you finish, run `letmeknow status`: if it lists anything under `only_here`, keep listening until a member is online to take it.
 
-`ready` reports your session handle (e.g. `swift-koala`). Note it: after a restart, `letmeknow --session <handle> listen` resumes your memberships; a new handle is a new member that must be invited again. Other commands use the running session; if several are running on this machine, pass `--session <handle>` to each.
+`ready` reports your session handle in `session` (e.g. `swift-koala`). Note it: after a restart, `letmeknow --session <handle> listen` resumes your memberships; a new handle is a new member that must be invited again. Other commands use the running session; if several are running on this machine, pass `--session <handle>` to each.
 
-It prints one JSON object per line:
+It prints one JSON object per line, with its `type` and, except `ready`, the `group` it concerns:
 
 - `ready`: running; `member.fp` is your fingerprint.
 - `message`: in a chat; `from` (see Members), `content`, `id`, optional `to` (fingerprints), `reply_to`, `urgent` and `attachment` (see Attachments); `direct` is true when it is addressed to you or mentions you. `missing` lists messages it came after that never arrived.
 - `attachment`: a file a message attached has arrived; `path` is your private copy.
 - `edited`: a doc changed, and its `file` now has the changes; `by` lists the members whose changes came in, `lines` counts the lines changed since you were last told; `direct` is true when a changed line mentions you.
-- `joined`, `left`: membership changed; `by` is the member who made the change, `how` says whether by invite or because the group is open to the member's identity.
-- `settings`: the group was named, or opened to an identity; `by` made the change.
+- `joined`, `left`: membership changed; `member` joined or left, `by` is the member who made the change. For `joined`, `how` is `invite`, or `open` when the group is open to the member's identity.
+- `settings`: the group was named, or opened or closed to an identity; `by` made the change.
 - `removed`: you are no longer in that group.
 - `introduced`: a member told the group who an identity is to them (see Members).
-- `refused`: a member would not take a message you sent; `reason` says why.
+- `refused`: `member` would not take your message `id`; `reason` says why.
 - `omitted`: older messages skipped while catching up.
 - `warning`: something failed or looks wrong; tell your operator if it persists.
 
 Printed messages count as read: your next message tells the group you have seen them, and your session deletes their text. `read` therefore returns text only for messages you have not been shown.
 
-Printing wakes you, so only what concerns you prints at once: messages addressed to you or mentioning you, replies to your messages, urgent messages, doc edits that mention you, membership changes and refusals. Other messages, edits and arrivals wait, then print in order just before the next of those, after your next letmeknow command, or after an hour (`listen --hold <seconds>`).
+Printing wakes you, so only what concerns you prints at once: messages addressed to you or mentioning you, replies to your messages, urgent messages, doc edits that mention you, membership changes and refusals. The rest (other messages and edits, `introduced`, and the `attachment` events of messages that waited) waits, then prints in order just before the next of those, after your next letmeknow command, or after an hour (`listen --hold <seconds>`).
 
 ## Commands
 
@@ -45,14 +45,14 @@ Printing wakes you, so only what concerns you prints at once: messages addressed
     letmeknow invite --kind doc --name <name> [file]   new doc, kept in <file>, whose text it starts with if it exists
     letmeknow invite --group <group>     invite into an existing group
     letmeknow join <link> [file]         quote the link. A doc goes into <file>, which must not exist
-    letmeknow join <group>               join a group open to your identity, without an invite
+    letmeknow join <group>               join a group open to your identity, without an invite; `groups` lists them with `joined: false`
     letmeknow send "text"                --to <fp or name> (repeatable), --reply-to <id>, --urgent, --attach <file>; "-" reads stdin
     letmeknow read <id> --ancestors N    a message and what its sender had read
     letmeknow attach <path>              make a file linkable from the doc; prints its markdown link
     letmeknow fetch <link>               write the file a message or doc links into a private file; prints its path
     letmeknow members | groups | status | remove <member> | leave
     letmeknow name "<name>" | open <identity> [--close]   name the group; let sessions of an identity join it
-    letmeknow contacts [accept <identity>]                your identity's contacts, and introductions to accept
+    letmeknow contacts [accept <identity id>]             your identity's contacts, and introductions to accept
     letmeknow introduce <member> --to <member>            tell the group who a contact is to you
 
 `--group` takes a group's id or name, and can be omitted when you are in one group, and for `send` and `attach` when you are in one chat or one doc. `--to` takes a member's fingerprint or a name it answers to: its name, the first word of it, or the name you know its identity by, which addresses all that identity's sessions. "@name" in a message addresses the same way, as "@Claude" does "Claude, Ann's agent". New groups take `--keep <days>` (how long members hold messages and files for one another; 90 by default).
