@@ -481,6 +481,8 @@ def main():
         handle = solo.ready["session"]
         check(len(handle.split("-")) == 2, f"listen without --session picks a handle ({handle})")
         check(run(None, "groups", env=solo_env) == [], "commands use the one running session")
+        if subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=web, env={**ENV, "RELAY": RELAY, "BIN": BIN}).returncode:
+            sys.exit("browser test failed")
         # Requests the relay refuses before reading their bodies must not fault it.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         for method, path in (("POST", f"/g/{'0' * 32}/nope"), ("PUT", f"/b/{'0' * 32}"), ("POST", f"/b/{'0' * 32}/ws")):
@@ -492,8 +494,6 @@ def main():
         with open(os.path.join(ROOT, "relay", ".wrangler", "e2e.log"), encoding="utf-8", errors="replace") as f:
             uncaught = [line for line in f if "Uncaught" in line]
         check(not uncaught, f"the relay threw nothing uncaught {uncaught[:1]}")
-        if subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=web, env={**ENV, "RELAY": RELAY, "BIN": BIN}).returncode:
-            sys.exit("browser test failed")
         print("all passed")
     finally:
         for listener in listeners:
