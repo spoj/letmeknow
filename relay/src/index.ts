@@ -22,16 +22,16 @@ const MAX_WAIT_S = 30;
 const COMMIT = 3;
 const PRIVATE_MESSAGE = 2;
 
-const ABOUT = `letmeknow: end-to-end encrypted group chat for agents.
-This relay stores MLS ciphertext for up to 7 days and holds no keys.
+const ABOUT = `letmeknow: end-to-end encrypted group chat for agents and their people.
+This relay stores MLS ciphertext for up to 7 days and holds no keys. People: open this address in a browser.
 
-Agents: read the instructions with \`npx -y @letmeknow/cli@0.6 skill\`.
+Agents: read the instructions with \`npx -y @letmeknow/cli@0.7 skill\`.
 Source: https://github.com/spoj/letmeknow
 `;
 
-const INSTRUCTIONS = `This is a letmeknow invite: another agent is inviting yours into an end-to-end encrypted group chat.
+const INSTRUCTIONS = `This is a letmeknow invite into an end-to-end encrypted group chat. A person joins by opening this link in a browser; an agent as follows.
 
-1. Read the instructions: npx -y @letmeknow/cli@0.6 skill
+1. Read the instructions: npx -y @letmeknow/cli@0.7 skill
    (or, if letmeknow is installed: letmeknow skill)
 2. Start your session (letmeknow listen) as they describe, then join with the complete link, including the part after '#':
    letmeknow join '<link>'
@@ -207,11 +207,13 @@ export class Invite extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const action = url.pathname.split("/")[3];
+    // Read the body before any answer: workerd faults when a body forwarded from the Worker is still streaming in after the response.
+    const body = request.method === "GET" ? "" : await request.text();
     let invite = await this.ctx.storage.get<InviteState>("invite");
 
     if (request.method === "PUT" && action === undefined) {
       if (invite && invite.expires > Date.now()) return text("invite exists", 409);
-      const { ttl, owner, pake } = await request.json<{ ttl: unknown; owner: unknown; pake: unknown }>();
+      const { ttl, owner, pake }: { ttl: unknown; owner: unknown; pake: unknown } = JSON.parse(body);
       if (!Number.isInteger(ttl) || (ttl as number) < 1 || (ttl as number) > MAX_INVITE_TTL_S) return text("bad ttl", 400);
       if (typeof owner !== "string" || !OWNER.test(owner)) return text("bad owner", 400);
       if (typeof pake !== "string" || pake.length > MAX_PAKE_CHARS) return text("bad pake", 400);
@@ -231,7 +233,7 @@ export class Invite extends DurableObject<Env> {
       return data ? Response.json({ data }) : new Response(null, { status: 204 });
     }
     if (request.method !== "POST") return text("not found", 404);
-    const { data } = await request.json<{ data: unknown }>();
+    const { data }: { data: unknown } = JSON.parse(body);
     if (typeof data !== "string" || data.length > MAX_MESSAGE_BYTES) return text("bad data", 400);
 
     if (action === "join") {

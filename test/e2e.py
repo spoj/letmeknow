@@ -94,8 +94,10 @@ def main():
     web = os.path.join(ROOT, "web")
     subprocess.run([shutil.which("npm"), "install", "--silent"], cwd=web, check=True)
     subprocess.run([shutil.which("node"), "build.mjs"], cwd=web, check=True)
+    os.makedirs(os.path.join(ROOT, "relay", ".wrangler"), exist_ok=True)
+    log = open(os.path.join(ROOT, "relay", ".wrangler", "e2e.log"), "w")
     relay = subprocess.Popen([shutil.which("npx"), "wrangler", "dev", "--port", str(PORT)], cwd=os.path.join(ROOT, "relay"),
-                             env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                             env=ENV, stdout=log, stderr=subprocess.STDOUT)
     listeners = []
     try:
         for _ in range(60):
