@@ -241,6 +241,19 @@ try {
   await phone.locator(".group-list button", { hasText: "Agent" }).waitFor();
   check(!(await phone.locator(".opening", { hasText: "Trip" }).count()), "and the group it left is not offered again");
 
+  // Taken off Matthew's devices, the phone still says it is his: the others see a plain warning.
+  await laptop.getByRole("button", { name: /Your devices/ }).click();
+  await laptop.locator(".devices li", { hasText: "phone" }).getByRole("button", { name: "Remove" }).click();
+  await laptop.locator(".devices li", { hasText: "phone" }).getByRole("button", { name: "Remove phone?" }).click();
+  await laptop.locator(".devices li", { hasText: "phone" }).waitFor({ state: "detached" });
+  await laptop.locator(".group-list button", { hasText: "Agent" }).click();
+  await phone.locator(".group-list button", { hasText: "Agent" }).click();
+  await phone.getByPlaceholder("Message").fill("still me");
+  await phone.getByRole("button", { name: "Send" }).click();
+  const claim = laptop.locator(".messages li", { hasText: "still me" }).locator(".who");
+  await claim.waitFor();
+  check((await claim.getAttribute("class")).includes("warn") && (await claim.getAttribute("title")).startsWith("Says it is Matthew's, but is not on Matthew's list of devices."), "a member that claims to be someone's device but is not on their list shows a plain warning");
+
   const { fp } = agent("members", "--group", group).members.find(m => m.name === "phone");
   agent("remove", fp, "--group", group);
   await phone.getByText("Agent removed you from a group").waitFor();

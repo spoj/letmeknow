@@ -331,6 +331,7 @@ function select(gid: string) {
   let view = views.get(gid);
   if (!view) views.set(gid, (view = new GroupView(gid)));
   if (page !== "group" || selected !== gid) show(view.el);
+  layout.classList.add("in-main");
   page = "group";
   selected = gid;
   view.show();
@@ -560,6 +561,7 @@ class GroupView {
   private attachment?: { name: string; size: number; data: string };
   private members: Person[] = [];
   private raw = "";
+  private described = 0;
   private file?: string;
   private editor?: EditorView;
   /** The settings the next settings item changes, the sender and time of the last message, and its day. */
@@ -661,9 +663,11 @@ class GroupView {
 
   async update() {
     set(this.heading, title(this.gid));
+    // Checked again each minute too, as a member's device may have been taken off its person's list.
     const raw = client.member!.members(this.gid);
-    if (raw !== this.raw) {
+    if (raw !== this.raw || Date.now() - this.described > 60_000) {
       this.raw = raw;
+      this.described = Date.now();
       this.members = await client.members(this.gid);
       this.drawPeople();
     }
