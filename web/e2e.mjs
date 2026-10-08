@@ -120,6 +120,15 @@ try {
   await phone.locator(".cm-line", { hasText: "renew passport" }).click();
   await phone.keyboard.press("Alt+ArrowUp");
   await phone.waitForTimeout(1500);
+  // The laptop's key update on reload is a commit the relay takes, but its answer is lost on the way back.
+  let lost = 0;
+  await laptop.route(`**/g/${group}/messages`, async route => {
+    const body = route.request().postDataBuffer();
+    if (lost || route.request().method() !== "POST" || body[45] !== 3) return route.continue();
+    lost++;
+    await route.fetch();
+    await route.abort();
+  });
   await laptop.reload();
   await laptop.getByRole("button", { name: /^Files/ }).click();
   await laptop.getByRole("button", { name: "checklist.md" }).click();
@@ -130,6 +139,8 @@ try {
   agent("send", "after the reload");
   await laptop.getByText("after the reload").waitFor();
   check(await laptop.getByText("Thanks, on it").isVisible(), "a reloaded browser keeps its messages and can still read new ones");
+  check(lost === 1, "even when the relay took its key update but the answer was lost");
+  await laptop.unrouteAll();
 
   // An open group: the laptop starts a group open to Matthew; the phone joins it without an invite.
   await laptop.getByRole("button", { name: "+ New group" }).click();
