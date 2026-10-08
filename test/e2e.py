@@ -392,7 +392,7 @@ def main():
         omitted = erin.expect(lambda e: e["type"] == "omitted")
         got = [erin.expect(lambda e: e["type"] == "message")["content"] for _ in range(20)]
         check(omitted["count"] == 2 and got == [f"folder {i}" for i in range(2, 22)], "restart catches up on the folder's last 20 messages, in order")
-        check(run("frank", "leave", "--group", folder)["left"] and run("frank", "leave", "--group", notes)["left"] and run("frank", "groups") == [], "leaving folder groups")
+        check(run("frank", "leave", "--group", "shared/chat", cwd=HOME)["left"] and run("frank", "leave", "--group", notes)["left"] and run("frank", "groups") == [], "leaving folder groups")
 
         board = os.path.join(HOME, "board")
         gina, hank = Listener("gina", hold=600), Listener("hank")
