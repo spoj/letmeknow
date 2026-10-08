@@ -24,6 +24,8 @@ struct World {
     _relay: Server,
     network: crate::Network,
     root: PathBuf,
+    /// For the sessions started from now on.
+    causal_wait: Duration,
 }
 
 async fn world(test: &str) -> World {
@@ -48,7 +50,8 @@ async fn world(test: &str) -> World {
     let relay = format!("https://localhost:{}", server.https_addr().unwrap().port()).parse().unwrap();
     let root = std::env::temp_dir().join(format!("lmk-session-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    World { _relay: server, network: crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) }, root }
+    let network = crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) };
+    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT }
 }
 
 struct Agent {
@@ -77,6 +80,7 @@ impl World {
             dir: session_dir(&home, handle).unwrap(),
             name: handle[..1].to_uppercase() + &handle[1..],
             hold,
+            causal_wait: self.causal_wait,
             keep_log: false,
             membership: self.membership(),
         };
@@ -582,5 +586,25 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
         }
         assert_eq!(listed.unwrap()["identities"][0]["name"], "Alice");
         assert!(second.printed().await.iter().all(|e| e["type"] != "warning"));
+    });
+}
+
+#[test]
+fn a_message_waits_for_those_it_comes_after_then_shows_them_missing() {
+    local(async {
+        let mut world = world("wait").await;
+        let (alice, mut bob, group) = pair(&world, HOUR).await;
+        let before = alice.cmd(&["send", "@bob before carol"]).await.unwrap();
+        bob.expect("message").await;
+        world.causal_wait = Duration::from_secs(2);
+        let mut carol = world.start("carol", HOUR).await;
+        carol.cmd(&["join", alice.cmd(&["invite", "--group", &group]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        // Bob's message comes after one from before Carol joined, which can never reach her.
+        let sent = std::time::Instant::now();
+        bob.cmd(&["send", "@carol see above"]).await.unwrap();
+        let got = carol.expect("message").await;
+        assert!(sent.elapsed() >= Duration::from_millis(1500), "{:?}", sent.elapsed());
+        assert_eq!(got["content"], "@carol see above");
+        assert_eq!(got["missing"], json!([before["id"]]));
     });
 }

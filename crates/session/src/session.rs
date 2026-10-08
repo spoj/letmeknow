@@ -31,7 +31,7 @@ use crate::doc::{self, Quiet};
 use crate::policy::{Outbox, mentions, wakes};
 
 /// How long a message waits for those it comes after.
-const CAUSAL_WAIT: Duration = Duration::from_secs(300);
+pub const CAUSAL_WAIT: Duration = Duration::from_secs(300);
 /// How long after starting what arrives counts as catching up.
 const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
 const FETCH_WAIT: Duration = Duration::from_secs(60);
@@ -46,6 +46,8 @@ pub struct Config {
     pub dir: PathBuf,
     pub name: String,
     pub hold: Duration,
+    /// How long a message waits for those it comes after: `CAUSAL_WAIT`, but in tests.
+    pub causal_wait: Duration,
     pub keep_log: bool,
     /// For groups and identities this session creates.
     pub membership: Service,
@@ -892,7 +894,7 @@ impl Session {
         if self.missing(&payload)?.iter().all(|missing| self.node.given_up(&message.group.0, missing)) {
             self.take_message(&message.group, id, sender, payload).await
         } else {
-            self.waiting.push(Waiting { deadline: Instant::now() + CAUSAL_WAIT, gid: message.group, id, sender, payload });
+            self.waiting.push(Waiting { deadline: Instant::now() + self.config.causal_wait, gid: message.group, id, sender, payload });
             Ok(())
         }
     }
