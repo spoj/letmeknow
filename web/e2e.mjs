@@ -141,6 +141,11 @@ try {
   check(await laptop.getByText("Thanks, on it").isVisible(), "a reloaded browser keeps its messages and can still read new ones");
   check(lost === 1, "even when the relay took its key update but the answer was lost");
   await laptop.unrouteAll();
+  const requests = [];
+  for (const page of [laptop, phone]) page.on("request", request => requests.push(request.url()));
+  agent("send", "no fetch needed");
+  await laptop.getByText("no fetch needed").waitFor();
+  check(!requests.some(url => url.includes("/messages")), "a new message comes in its socket's notice, with no fetch");
 
   // An open group: the laptop starts a group open to Matthew; the phone joins it without an invite.
   await laptop.getByRole("button", { name: "+ New group" }).click();
@@ -150,6 +155,10 @@ try {
   await phone.locator(".opening").getByRole("button", { name: "Join" }).click();
   await phone.getByText("opened it to Matthew").waitFor();
   check((await phone.locator("header .members").textContent()).includes("(you)"), "a device of Matthew joins a group open to Matthew, admitted by a member online");
+  await laptop.waitForTimeout(2_000);
+  requests.length = 0;
+  await laptop.waitForTimeout(16_000);
+  check(requests.length === 0, `idle browsers with working sockets send no requests, even in a group open to them (${requests})`);
 
   const { fp } = agent("members", "--group", group).members.find(m => m.name === "Matthew's phone");
   agent("remove", fp, "--group", group);
