@@ -1,3 +1,4 @@
+use crate::device::{Device, Membership};
 use crate::relay::Relay;
 use crate::store::{Provider, SCHEMA};
 use anyhow::{Context, Result, bail};
@@ -7,6 +8,7 @@ use letmeknow::proto::{
     CIPHERSUITE, INVITE_SLOTS, INVITE_TTL_S, PAKE_ID, Payload, create_config, digest, fingerprint, invite_key, invite_words, join_config,
     membership_changes, open, person, random_below, seal,
 };
+use letmeknow::entity::{self, List, Member, place};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::{OpenMlsProvider, random::OpenMlsRand};
@@ -30,18 +32,32 @@ const POLL_WAIT_S: u64 = 25;
 const POLL_S: u64 = 15;
 const PING_S: u64 = 30;
 const CATCH_UP: usize = 20;
+const LIST_TTL: Duration = Duration::from_secs(60);
 
 /// Requests an agent sends to its session process.
 #[derive(Subcommand, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    /// Create a one-time invite code and link; creates a new group unless --group is given
+    /// Create a one-time invite code and link: into a group (a new one unless --group is given), or with --entity, for another device to join an entity
     Invite {
         #[arg(long)]
         group: Option<String>,
+        /// What this session speaks as in a new group: one of its device's entities, "device" or "self" [default: the device's first entity]
+        #[arg(long = "as", value_name = "ENTITY")]
+        #[serde(rename = "as")]
+        as_: Option<String>,
+        /// Invite another device (a machine or a browser) into this entity, instead of a session into a group
+        #[arg(long, conflicts_with_all = ["group", "as_"])]
+        entity: Option<String>,
     },
-    /// Join a group through an invite code or link, or a shared folder (a path with a slash, or an existing directory)
-    Join { target: String },
+    /// Join a group through an invite code or link, or a shared folder (a path with a slash, or an existing directory); a device link adds this device to an entity
+    Join {
+        target: String,
+        /// What this session speaks as in the group: one of its device's entities, "device" or "self" [default: the device's first entity]
+        #[arg(long = "as", value_name = "ENTITY")]
+        #[serde(rename = "as")]
+        as_: Option<String>,
+    },
     /// Send a message ("-" reads the text from stdin)
     Send {
         #[arg(long)]
@@ -84,13 +100,33 @@ pub enum Request {
         #[arg(long)]
         group: Option<String>,
     },
+    /// Entities this device is in: create one, list them, or take a member off one
+    Entity {
+        #[command(subcommand)]
+        op: EntityOp,
+    },
+}
+
+#[derive(Subcommand, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityOp {
+    /// Start an entity with this device as its first member
+    Create { name: String },
+    /// The entities this device is in, and who is on their lists
+    List,
+    /// Take a member, by id, off an entity's list
+    Remove {
+        #[arg(long)]
+        entity: Option<String>,
+        member: String,
+    },
 }
 
 pub enum Event {
     Request(Request, oneshot::Sender<Value>),
     Batch { gid: String, messages: Vec<(u64, Vec<u8>)>, synced: bool },
     Files { gid: String, records: Vec<(String, Record)>, ignored: Vec<String> },
-    JoinRequest { invite: Invite, spake: Spake2<Ed25519Group>, data: String },
+    JoinRequest { invite: Box<Invite>, spake: Spake2<Ed25519Group>, data: String },
     Welcome { relay: String, key: [u8; 32], data: String, reply: oneshot::Sender<Value> },
 }
 
@@ -98,7 +134,13 @@ pub struct Invite {
     relay: String,
     id: String,
     owner: String,
-    gid: String,
+    into: Into,
+}
+
+/// What an invite admits: a session into a group, or a device into an entity.
+enum Into {
+    Group(String),
+    Entity(Membership),
 }
 
 /// A folder group message: the file `<id>.json`, whose id is the SHA-256 of the file. It holds the payload plus the `from` that MLS supplies on the relay.
@@ -138,7 +180,7 @@ pub struct Session {
     db: Connection,
     provider: Provider,
     signer: SignatureKeyPair,
-    me: CredentialWithKey,
+    name: String,
     person: Value,
     fp: String,
     relay: Relay,
@@ -151,10 +193,15 @@ pub struct Session {
     keep_log: bool,
     attachments: PathBuf,
     events: mpsc::UnboundedSender<Event>,
+    /// The letmeknow home, which holds the device.
+    home: PathBuf,
+    /// Entity lists fetched lately, by entity id.
+    lists: HashMap<String, (Instant, List)>,
 }
 
 impl Session {
     pub fn open(
+        home: &Path,
         dir: &Path,
         name: String,
         rename: bool,
@@ -186,13 +233,12 @@ impl Session {
             }
         };
         let fp = fingerprint(signer.public());
-        let me = CredentialWithKey { credential: BasicCredential::new(name.clone().into_bytes()).into(), signature_key: signer.public().into() };
         let mut session = Self {
             db,
             provider,
             signer,
-            me,
             person: json!({ "name": name, "fp": fp }),
+            name,
             fp,
             relay: Relay::new()?,
             default_relay,
@@ -204,6 +250,8 @@ impl Session {
             keep_log,
             attachments: dir.join("attachments"),
             events,
+            home: home.to_owned(),
+            lists: HashMap::new(),
         };
         let rows: Vec<(String, String, u64)> = session
             .db
@@ -229,8 +277,8 @@ impl Session {
 
     pub async fn handle(&mut self, event: Event) {
         match event {
-            Event::Request(Request::Join { target }, reply) if !Path::new(&target).is_absolute() => {
-                if let Err(error) = self.join(target, reply).await {
+            Event::Request(Request::Join { target, as_ }, reply) if !Path::new(&target).is_absolute() => {
+                if let Err(error) = self.join(target, as_, reply).await {
                     self.warn(None, format!("join: {error:#}"));
                 }
                 self.flush_held();
@@ -267,11 +315,15 @@ impl Session {
             }
             Event::JoinRequest { invite, spake, data } => {
                 if let Err(error) = self.admit(&invite, spake, &data).await {
-                    self.warn(Some(&invite.gid), format!("invite {}: {error:#}", invite.id));
+                    let gid = match &invite.into {
+                        Into::Group(gid) => Some(gid.as_str()),
+                        Into::Entity(_) => None,
+                    };
+                    self.warn(gid, format!("invite {}: {error:#}", invite.id));
                 }
             }
             Event::Welcome { relay, key, data, reply } => {
-                let result = self.welcome(&relay, &key, &data);
+                let result = self.welcome(&relay, &key, &data).await;
                 let _ = reply.send(result.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
             }
         }
@@ -279,13 +331,13 @@ impl Session {
 
     async fn request(&mut self, request: Request) -> Result<Value> {
         match request {
-            Request::Invite { group } => self.invite(group).await,
-            Request::Join { target } => self.join_folder(target).await,
+            Request::Invite { group, as_, entity } => self.invite(group, as_, entity).await,
+            Request::Join { target, .. } => self.join_folder(target).await,
             Request::Send { group, to, reply_to, urgent, attach, text } => self.send(group, to, reply_to, urgent, attach, text).await,
             Request::Read { id, ancestors } => self.read(&id, ancestors),
             Request::Members { group } => {
                 let gid = self.resolve(group)?;
-                Ok(json!({ "group": gid, "members": self.members(&gid)? }))
+                Ok(json!({ "group": gid, "members": self.described_members(&gid).await? }))
             }
             Request::Groups => {
                 let mut groups: Vec<Value> = self
@@ -300,28 +352,46 @@ impl Session {
             }
             Request::Remove { group, member } => self.remove(group, &member).await,
             Request::Leave { group } => self.leave(group).await,
+            Request::Entity { op: EntityOp::Create { name } } => self.entity_create(name).await,
+            Request::Entity { op: EntityOp::List } => self.entities().await,
+            Request::Entity { op: EntityOp::Remove { entity, member } } => self.entity_remove(entity, member).await,
         }
     }
 
-    async fn invite(&mut self, group: Option<String>) -> Result<Value> {
-        let gid = match group {
-            Some(_) => self.resolve(group)?,
-            None => self.create_group()?,
+    async fn invite(&mut self, group: Option<String>, as_: Option<String>, entity: Option<String>) -> Result<Value> {
+        // A device link announces itself in the pake message, so the joiner knows to send its device, not a key package.
+        let (into, relay, kind) = match entity {
+            Some(entity) => {
+                let membership = Device::load(&self.home)?.entity(&entity)?.clone();
+                let relay = membership.relay.clone();
+                (Into::Entity(membership), relay, "entity ")
+            }
+            None => {
+                let gid = match group {
+                    Some(_) => self.resolve(group)?,
+                    None => self.create_group(as_.as_deref())?,
+                };
+                let relay = self.groups.get(&gid).context("folder groups need no invite; share the folder path")?.relay.clone();
+                (Into::Group(gid), relay, "")
+            }
         };
-        let relay = self.groups.get(&gid).context("folder groups need no invite; share the folder path")?.relay.clone();
         let words = invite_words(self.provider.rand())?;
         let (spake, pake) = Spake2::<Ed25519Group>::start_symmetric(&Password::new(&words), &Identity::new(PAKE_ID));
         let owner = hex::encode(self.provider.rand().random_array::<32>()?);
         let mut slot = None;
         for _ in 0..10 {
             let id = (random_below(self.provider.rand(), INVITE_SLOTS)? + 1).to_string();
-            if self.relay.create_invite(&relay, &id, INVITE_TTL_S, &owner, &B64.encode(&pake)).await? {
+            if self.relay.create_invite(&relay, &id, INVITE_TTL_S, &owner, &format!("{kind}{}", B64.encode(&pake))).await? {
                 slot = Some(id);
                 break;
             }
         }
         let id = slot.context("no free invite slot on the relay; try again")?;
-        let invite = Invite { relay: relay.clone(), id: id.clone(), owner, gid: gid.clone() };
+        let target = match &into {
+            Into::Group(gid) => json!({ "group": gid }),
+            Into::Entity(membership) => json!({ "entity": membership.id, "name": membership.name }),
+        };
+        let invite = Box::new(Invite { relay: relay.clone(), id: id.clone(), owner, into });
 
         let (http, events) = (self.relay.clone(), self.events.clone());
         tokio::spawn(async move {
@@ -333,19 +403,20 @@ impl Session {
                 }
             }
         });
-        Ok(json!({
-            "group": gid,
-            "code": format!("{id}-{words}"),
-            "link": format!("{relay}/i/{id}#{words}"),
-            "expires_in": INVITE_TTL_S,
-        }))
+        let mut answer = json!({ "code": format!("{id}-{words}"), "link": format!("{relay}/i/{id}#{words}"), "expires_in": INVITE_TTL_S });
+        answer.as_object_mut().expect("object").extend(target.as_object().expect("object").clone());
+        Ok(answer)
     }
 
     async fn admit(&mut self, invite: &Invite, spake: Spake2<Ed25519Group>, data: &str) -> Result<()> {
         let join: Value = serde_json::from_str(data)?;
         let pake = B64.decode(join["pake"].as_str().context("join request lacks pake")?)?;
         let key = invite_key(&spake.finish(&pake)?, &invite.id);
-        let bytes = match open(&key, b"join", join["key_package"].as_str().context("join request lacks key package")?) {
+        let field = match invite.into {
+            Into::Group(_) => "key_package",
+            Into::Entity(_) => "device",
+        };
+        let bytes = match open(&key, b"join", join[field].as_str().with_context(|| format!("join request lacks {field}"))?) {
             Ok(bytes) => bytes,
             Err(error) => {
                 // Sealed under our key, so a joiner with a wrong code cannot open it and stops waiting.
@@ -354,24 +425,43 @@ impl Session {
                 return Err(error);
             }
         };
-        let MlsMessageBodyIn::KeyPackage(key_package) = MlsMessageIn::tls_deserialize_exact_bytes(&bytes)?.extract() else {
+        let envelope = match &invite.into {
+            Into::Group(gid) => self.add(gid, &bytes).await?,
+            Into::Entity(membership) => {
+                let member: Member = serde_json::from_slice(&bytes)?;
+                if member.key.as_deref().map(hex::decode).transpose()?.map(|key| fingerprint(&key)) != Some(member.id.clone()) {
+                    bail!("the joining device's id does not match its key");
+                }
+                let device = Device::load(&self.home)?;
+                let by = device.id();
+                self.append(&membership.relay, &membership.id, |list| list.add(device.signer(), &by, member.clone()), |list| {
+                    list.get(&member.id).is_some()
+                })
+                .await?;
+                json!({ "entity": membership })
+            }
+        };
+        let sealed = seal(self.provider.rand(), &key, b"welcome", &serde_json::to_vec(&envelope)?)?;
+        self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
+        Ok(())
+    }
+
+    /// Adds the session whose key package is `bytes` to a group; returns the welcome envelope that lets it join.
+    async fn add(&mut self, gid: &str, bytes: &[u8]) -> Result<Value> {
+        let MlsMessageBodyIn::KeyPackage(key_package) = MlsMessageIn::tls_deserialize_exact_bytes(bytes)?.extract() else {
             bail!("join request is not a key package");
         };
         let key_package = key_package.validate(self.provider.crypto(), ProtocolVersion::Mls10)?;
-
         let mut welcome = None;
         let (_, seq) = self
-            .post_retrying(&invite.gid, |mls, provider, signer| {
+            .post_retrying(gid, |mls, provider, signer| {
                 let (commit, message, _) = mls.add_members(provider, signer, std::slice::from_ref(&key_package))?;
                 welcome = Some(message);
                 Ok(commit)
             })
             .await?;
         let welcome = welcome.context("no welcome")?.to_bytes()?;
-        let envelope = json!({ "group": invite.gid, "seq": seq, "welcome": B64.encode(welcome) });
-        let sealed = seal(self.provider.rand(), &key, b"welcome", &serde_json::to_vec(&envelope)?)?;
-        self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
-        Ok(())
+        Ok(json!({ "group": gid, "seq": seq, "welcome": B64.encode(welcome) }))
     }
 
     /// A folder has no membership record, so joining posts a message: senders are members, and this makes the new one visible and addressable before it speaks.
@@ -387,7 +477,7 @@ impl Session {
         Ok(json!({ "group": gid, "members": self.members(&gid)? }))
     }
 
-    async fn join(&mut self, code: String, reply: oneshot::Sender<Value>) -> Result<()> {
+    async fn join(&mut self, code: String, as_: Option<String>, reply: oneshot::Sender<Value>) -> Result<()> {
         let prepared = async {
             let (target, words) = code
                 .trim()
@@ -396,11 +486,22 @@ impl Session {
                 .context("expected an invite code like 417-acid-zebra, its link, or a folder path like ./chat")?;
             let (relay, id) = target.rsplit_once("/i/").unwrap_or((self.default_relay.as_str(), target));
             let pake = self.relay.invite_get(relay, id, "pake", 0).await?.context("invite lacks the inviter's pake message")?;
+            let (device_link, pake) = match pake.strip_prefix("entity ") {
+                Some(pake) => (true, pake.to_owned()),
+                None => (false, pake),
+            };
             let (spake, message) = Spake2::<Ed25519Group>::start_symmetric(&Password::new(words.to_lowercase()), &Identity::new(PAKE_ID));
             let key = invite_key(&spake.finish(&B64.decode(pake)?)?, id);
-            let bundle = KeyPackage::builder().build(CIPHERSUITE, &self.provider, &self.signer, self.me.clone())?;
-            let bytes = MlsMessageOut::from(bundle.key_package().clone()).to_bytes()?;
-            let join = json!({ "pake": B64.encode(message), "key_package": seal(self.provider.rand(), &key, b"join", &bytes)? });
+            let (field, bytes) = if device_link {
+                let device = Device::load(&self.home)?;
+                let member = Member { id: device.id(), key: Some(hex::encode(device.key())), name: device.name.clone() };
+                ("device", serde_json::to_vec(&member)?)
+            } else {
+                let bundle = KeyPackage::builder().build(CIPHERSUITE, &self.provider, &self.signer, self.credential(as_.as_deref())?)?;
+                ("key_package", MlsMessageOut::from(bundle.key_package().clone()).to_bytes()?)
+            };
+            let mut join = json!({ "pake": B64.encode(message) });
+            join[field] = json!(seal(self.provider.rand(), &key, b"join", &bytes)?);
             self.relay.invite_post(relay, id, "join", &join.to_string(), None).await?;
             anyhow::Ok((relay.to_owned(), id.to_owned(), key))
         };
@@ -424,8 +525,16 @@ impl Session {
         Ok(())
     }
 
-    fn welcome(&mut self, relay: &str, key: &[u8; 32], data: &str) -> Result<Value> {
+    async fn welcome(&mut self, relay: &str, key: &[u8; 32], data: &str) -> Result<Value> {
         let envelope: Value = serde_json::from_slice(&open(key, b"welcome", data)?)?;
+        if let Some(entity) = envelope.get("entity") {
+            let membership: Membership = serde_json::from_value(entity.clone())?;
+            let mut device = Device::load(&self.home)?;
+            device.entities.retain(|e| e.id != membership.id);
+            device.entities.push(membership.clone());
+            device.save(&self.home)?;
+            return Ok(json!({ "entity": membership.id, "name": membership.name }));
+        }
         let gid = envelope["group"].as_str().context("welcome lacks group")?.to_owned();
         let seq = envelope["seq"].as_u64().context("welcome lacks seq")?;
         let bytes = B64.decode(envelope["welcome"].as_str().context("welcome lacks message")?)?;
@@ -438,7 +547,7 @@ impl Session {
         }
         self.add_group(&gid, relay, seq, mls)?;
         self.print(json!({ "type": "joined", "group": gid, "member": self.person }));
-        Ok(json!({ "group": gid, "members": self.members(&gid)? }))
+        Ok(json!({ "group": gid, "members": self.described_members(&gid).await? }))
     }
 
     async fn send(
@@ -557,6 +666,7 @@ impl Session {
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(message) => {
+                let sender = self.describe(gid, sender).await?;
                 self.ingest(gid, id, sender, serde_json::from_slice(&message.into_bytes())?)?;
             }
             ProcessedMessageContent::ProposalMessage(proposal) => {
@@ -576,7 +686,7 @@ impl Session {
                     return Ok(());
                 }
                 for change in changes {
-                    self.deliver(gid, change);
+                    self.deliver_change(gid, change).await?;
                 }
             }
             _ => bail!("unsupported message"),
@@ -605,7 +715,7 @@ impl Session {
             let changes = membership_changes(mls, staged, &self.person);
             mls.merge_pending_commit(&self.provider)?;
             for change in changes {
-                self.deliver(gid, change);
+                self.deliver_change(gid, change).await?;
             }
         }
         Ok(Some((id, seq)))
@@ -659,9 +769,10 @@ impl Session {
         }
     }
 
-    fn create_group(&mut self) -> Result<String> {
+    fn create_group(&mut self, as_: Option<&str>) -> Result<String> {
         let gid = hex::encode(self.provider.rand().random_array::<16>()?);
-        let mls = MlsGroup::new_with_group_id(&self.provider, &self.signer, &create_config(), GroupId::from_slice(gid.as_bytes()), self.me.clone())?;
+        let me = self.credential(as_)?;
+        let mls = MlsGroup::new_with_group_id(&self.provider, &self.signer, &create_config(), GroupId::from_slice(gid.as_bytes()), me)?;
         let relay = self.default_relay.clone();
         self.add_group(&gid, &relay, 0, mls)?;
         Ok(gid)
@@ -721,6 +832,151 @@ impl Session {
                 _ => bail!("this session is in several groups; pass --group"),
             },
         }
+    }
+
+    async fn described_members(&mut self, gid: &str) -> Result<Vec<Value>> {
+        let mut members = Vec::new();
+        for member in self.members(gid)? {
+            members.push(self.describe(gid, member).await?);
+        }
+        Ok(members)
+    }
+
+    /// Delivers a "joined" or "left" line once the member's entity is checked.
+    async fn deliver_change(&mut self, gid: &str, mut change: Value) -> Result<()> {
+        change["member"] = self.describe(gid, change["member"].take()).await?;
+        self.deliver(gid, change);
+        Ok(())
+    }
+
+    /// This session's credential for a group: its name, its device's note, and the entity it speaks as.
+    fn credential(&self, as_: Option<&str>) -> Result<CredentialWithKey> {
+        let device = Device::load(&self.home)?;
+        let mut identity = entity::Identity { name: self.name.clone(), ..Default::default() };
+        if as_ != Some("self") {
+            identity.device = Some(entity::note(device.signer(), device.key(), self.signer.public())?);
+            identity.path = match as_ {
+                Some("device") => Vec::new(),
+                Some(name) => vec![device.entity(name)?.id.clone()],
+                None => device.entities.first().map(|e| e.id.clone()).into_iter().collect(),
+            };
+        }
+        Ok(CredentialWithKey { credential: BasicCredential::new(identity.to_bytes()).into(), signature_key: self.signer.public().into() })
+    }
+
+    /// Checks the entities a member says it speaks as against their lists: the first must list its device (or the
+    /// member itself), each later one the one before. Records entities this session meets for the first time.
+    async fn describe(&mut self, gid: &str, mut person: Value) -> Result<Value> {
+        let Some(path) = person.as_object_mut().and_then(|p| p.remove("as")) else { return Ok(person) };
+        let path: Vec<String> = serde_json::from_value(path)?;
+        let relay = self.groups.get(gid).map_or_else(|| self.default_relay.clone(), |g| g.relay.clone());
+        let mut holder = person.get("device").or(person.get("fp")).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let mut name = String::new();
+        for id in path {
+            let error = match self.list(&relay, &id).await {
+                Ok(list) if list.get(&holder).is_some() => {
+                    name = list.name;
+                    holder = id;
+                    continue;
+                }
+                Ok(list) => format!("not on {}'s list", list.name),
+                Err(error) => format!("{error:#}"),
+            };
+            person["entity"] = json!({ "id": id, "error": error });
+            return Ok(person);
+        }
+        let new = self.db.execute("INSERT OR IGNORE INTO seen (id, name, gid) VALUES (?, ?, ?)", params![holder, name, gid])? > 0;
+        let yours = Device::load(&self.home)?.entities.iter().any(|e| e.id == holder);
+        person["entity"] = json!({ "id": holder, "name": name, "new": new, "yours": yours });
+        Ok(person)
+    }
+
+    /// An entity's list as the relay has it, fetched at most once a minute.
+    async fn list(&mut self, relay: &str, id: &str) -> Result<List> {
+        if let Some((at, list)) = self.lists.get(id)
+            && at.elapsed() < LIST_TTL
+        {
+            return Ok(list.clone());
+        }
+        let list = self.fetch_list(relay, id).await?;
+        self.lists.insert(id.to_owned(), (Instant::now(), list.clone()));
+        Ok(list)
+    }
+
+    async fn fetch_list(&self, relay: &str, id: &str) -> Result<List> {
+        let (address, key) = place("list", id.as_bytes());
+        let entries: Vec<Vec<u8>> = self.read_box(relay, &address).await?.iter().filter_map(|e| open(&key, b"list", e).ok()).collect();
+        List::replay(id, &entries)
+    }
+
+    /// Every entry in a box on the relay, in the order it took them.
+    async fn read_box(&self, relay: &str, address: &str) -> Result<Vec<String>> {
+        let (mut entries, mut after) = (Vec::new(), 0);
+        loop {
+            let page = self.relay.entries(relay, address, after, 0).await?;
+            let Some(last) = page.last() else { return Ok(entries) };
+            after = last.0;
+            entries.extend(page.into_iter().map(|(_, _, data)| data));
+        }
+    }
+
+    /// Appends the entry `build` makes to an entity's list, then checks with `done` that it took effect. An entry posted
+    /// by someone else in between makes ours invalid (it no longer follows the last one), so it is built again.
+    async fn append(&mut self, relay: &str, id: &str, build: impl Fn(&List) -> Result<Vec<u8>>, done: impl Fn(&List) -> bool) -> Result<List> {
+        let (address, key) = place("list", id.as_bytes());
+        for _ in 0..3 {
+            let entry = build(&self.fetch_list(relay, id).await?)?;
+            self.relay.append(relay, &address, &seal(self.provider.rand(), &key, b"list", &entry)?).await?;
+            let list = self.fetch_list(relay, id).await?;
+            if done(&list) {
+                self.lists.insert(id.to_owned(), (Instant::now(), list.clone()));
+                return Ok(list);
+            }
+        }
+        bail!("the entity's list kept changing; try again")
+    }
+
+    async fn entity_create(&mut self, name: String) -> Result<Value> {
+        let mut device = Device::load(&self.home)?;
+        let member = Member { id: device.id(), key: Some(hex::encode(device.key())), name: device.name.clone() };
+        let (id, entry) = entity::create(device.signer(), member, &name, &self.provider.rand().random_array::<16>()?)?;
+        let relay = self.default_relay.clone();
+        let (address, key) = place("list", id.as_bytes());
+        self.relay.append(&relay, &address, &seal(self.provider.rand(), &key, b"list", &entry)?).await?;
+        let secret = hex::encode(self.provider.rand().random_array::<32>()?);
+        device.entities.push(Membership { id: id.clone(), name: name.clone(), secret, relay });
+        device.save(&self.home)?;
+        Ok(json!({ "entity": id, "name": name }))
+    }
+
+    async fn entities(&mut self) -> Result<Value> {
+        let device = Device::load(&self.home)?;
+        let mut entities = Vec::new();
+        for membership in &device.entities {
+            let list = self.fetch_list(&membership.relay, &membership.id).await?;
+            let members: Vec<Value> = list.members.iter().map(|m| json!({ "id": m.id, "name": m.name, "you": m.id == device.id() })).collect();
+            entities.push(json!({ "entity": list.id, "name": list.name, "members": members }));
+        }
+        Ok(json!({ "device": { "id": device.id(), "name": device.name }, "entities": entities }))
+    }
+
+    async fn entity_remove(&mut self, entity: Option<String>, member: String) -> Result<Value> {
+        let mut device = Device::load(&self.home)?;
+        let membership = match (entity, device.entities.as_slice()) {
+            (Some(entity), _) => device.entity(&entity)?.clone(),
+            (None, [only]) => only.clone(),
+            (None, _) => bail!("pass --entity: this device is in {} entities", device.entities.len()),
+        };
+        let by = device.id();
+        let list = self
+            .append(&membership.relay, &membership.id, |list| list.remove(device.signer(), &by, &member), |list| list.get(&member).is_none())
+            .await?;
+        if member == by {
+            device.entities.retain(|e| e.id != membership.id);
+            device.save(&self.home)?;
+        }
+        let members: Vec<Value> = list.members.iter().map(|m| json!({ "id": m.id, "name": m.name })).collect();
+        Ok(json!({ "entity": list.id, "name": list.name, "members": members }))
     }
 
     /// Relay groups: the MLS members. Folder groups: this session and every sender seen in the folder.

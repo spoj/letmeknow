@@ -1,3 +1,4 @@
+mod device;
 mod relay;
 mod session;
 mod store;
@@ -101,12 +102,15 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn sessions_dir() -> Result<PathBuf> {
-    let home = match std::env::var_os("LETMEKNOW_HOME") {
+fn home_dir() -> Result<PathBuf> {
+    Ok(match std::env::var_os("LETMEKNOW_HOME") {
         Some(home) => PathBuf::from(home),
         None => dirs::data_local_dir().context("no local data directory")?.join("letmeknow"),
-    };
-    Ok(home.join("sessions"))
+    })
+}
+
+fn sessions_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join("sessions"))
 }
 
 fn session_dir(session: &str) -> Result<PathBuf> {
@@ -165,7 +169,7 @@ async fn listen(session: &str, name: Option<String>, relay: String, hold: Durati
     let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "agent".into());
     let rename = name.is_some();
     let name = name.unwrap_or_else(|| format!("{user}/{session}"));
-    let mut state = Session::open(&dir, name, rename, relay.trim_end_matches('/').to_owned(), keep_log, events.clone())?;
+    let mut state = Session::open(&home_dir()?, &dir, name, rename, relay.trim_end_matches('/').to_owned(), keep_log, events.clone())?;
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let mut token = [0u8; 32];
@@ -278,11 +282,11 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
     }
     // The session process runs in another directory, so folder paths are made absolute here.
     let target = match &mut request {
-        Request::Join { target } => Some(target),
-        Request::Invite { group } | Request::Send { group, .. } | Request::Members { group } | Request::Remove { group, .. } | Request::Leave { group } => {
+        Request::Join { target, .. } => Some(target),
+        Request::Invite { group, .. } | Request::Send { group, .. } | Request::Members { group } | Request::Remove { group, .. } | Request::Leave { group } => {
             group.as_mut()
         }
-        Request::Read { .. } | Request::Groups => None,
+        Request::Read { .. } | Request::Groups | Request::Entity { .. } => None,
     };
     if let Some(target) = target
         && !target.contains("://")

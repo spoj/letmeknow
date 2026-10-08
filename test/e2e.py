@@ -74,6 +74,7 @@ def check(condition, message):
 def main():
     subprocess.run(["cargo", "build", "-q"], cwd=os.path.join(ROOT, "client"), check=True)
     subprocess.run([shutil.which("npm"), "install", "--silent"], cwd=os.path.join(ROOT, "relay"), check=True)
+    os.makedirs(os.path.join(ROOT, "relay", "public"), exist_ok=True)
     relay = subprocess.Popen([shutil.which("npx"), "wrangler", "dev", "--port", str(PORT)], cwd=os.path.join(ROOT, "relay"),
                              env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     listeners = []
@@ -271,6 +272,47 @@ def main():
         run("hank", "send", "later")
         jill.expect(lambda e: e.get("content") == "later")
         check(time.time() - start >= 2, "a held message is printed once --hold runs out")
+
+        # Each letmeknow home is a device; an entity lists devices, and every session on them speaks as it.
+        homes = {d: {**ENV, "LETMEKNOW_HOME": os.path.join(HOME, d)} for d in ("laptop", "server", "elsewhere")}
+        lap, srv, kim = Listener("lap", env=homes["laptop"]), Listener("srv", env=homes["server"]), Listener("kim", env=homes["elsewhere"])
+        listeners += [lap, srv, kim]
+        on = lambda listener, *args, **kw: run(listener.session, *args, env=homes[{"lap": "laptop", "srv": "server", "kim": "elsewhere"}[listener.session]], **kw)
+        matthew = on(lap, "entity", "create", "Matthew")["entity"]
+        link = on(lap, "invite", "--entity", "Matthew")
+        check(link["entity"] == matthew and on(srv, "join", link["link"])["entity"] == matthew, "a device link adds another device to an entity")
+        devices = on(srv, "entity", "list")
+        listed = devices["entities"][0]["members"]
+        check([m["you"] for m in listed] == [False, True] and devices["device"]["id"] == listed[1]["id"], "both devices are on its list")
+        srv_device = devices["device"]["id"]
+
+        group = on(lap, "invite")
+        seen = {m["name"]: m.get("entity") for m in on(kim, "join", group["link"])["members"]}
+        check(seen["Lap"]["name"] == "Matthew" and seen["Lap"]["new"] and seen["Kim"] is None, "others see which entity a session speaks as, and that they have not met it")
+        on(srv, "join", on(lap, "invite", "--group", group["group"])["link"])
+        joined = kim.expect(lambda e: e["type"] == "joined" and e["member"]["name"] == "Srv")
+        check(joined["member"]["entity"]["id"] == matthew and not joined["member"]["entity"]["new"], "a session on another of its devices is the same entity, met before")
+        on(kim, "send", "hello Matthew")
+        on(srv, "send", "--to", kim.ready["member"]["fp"], "from the server")
+        got = kim.expect(lambda e: e["type"] == "message" and e["content"] == "from the server")
+        check(got["from"]["entity"]["name"] == "Matthew" and not got["from"]["entity"]["yours"], "a message shows its sender's entity")
+        got = lap.expect(lambda e: e["type"] == "message" and e["content"] == "from the server")
+        check(got["from"]["entity"]["yours"], "and whether that entity is yours")
+
+        alone = Listener("alone", env=homes["server"])
+        listeners.append(alone)
+        on_alone = lambda *args, **kw: run("alone", *args, env=homes["server"], **kw)
+        on_alone("join", "--as", "self", on(lap, "invite", "--group", group["group"])["link"])
+        joined = kim.expect(lambda e: e["type"] == "joined" and e["member"]["name"] == "Alone")
+        check("entity" not in joined["member"] and "device" not in joined["member"], "--as self speaks as the session alone")
+
+        listed = on(lap, "entity", "remove", srv_device)["members"]
+        check([m["name"] for m in listed] == [devices["entities"][0]["members"][0]["name"]], "a member can be taken off an entity's list")
+        later = Listener("later", env=homes["elsewhere"])
+        listeners.append(later)
+        run("later", "join", on(lap, "invite", "--group", group["group"])["link"], env=homes["elsewhere"])
+        seen = {m["name"]: m.get("entity") for m in run("later", "members", env=homes["elsewhere"])["members"]}
+        check(seen["Srv"]["error"] == "not on Matthew's list" and seen["Lap"]["name"] == "Matthew", "after which its sessions no longer count as the entity")
 
         check("several sessions are running" in run(None, "groups", ok=False), "without --session, several running sessions are ambiguous")
         solo_env = {**ENV, "LETMEKNOW_HOME": os.path.join(HOME, "solo")}

@@ -12,6 +12,8 @@ pub struct Relay(reqwest::Client);
 #[derive(Deserialize)]
 struct Frame {
     seq: u64,
+    #[serde(default)]
+    at: u64,
     data: String,
 }
 
@@ -39,6 +41,20 @@ impl Relay {
     /// Opens a socket on which the relay sends each new message's seq.
     pub async fn subscribe(&self, relay: &str, gid: &str) -> Result<WebSocket> {
         Ok(self.0.get(format!("{relay}/g/{gid}/ws")).upgrade().send().await?.into_websocket().await?)
+    }
+
+    /// Appends to a box: an append-only log the relay keeps in the order it takes entries.
+    pub async fn append(&self, relay: &str, address: &str, data: &str) -> Result<u64> {
+        let body: Value = ok(self.0.post(format!("{relay}/b/{address}")).body(data.to_owned()).send().await?).await?.json().await?;
+        body["seq"].as_u64().context("relay response lacks seq")
+    }
+
+    /// A page of a box's entries after `after`, waiting up to `wait` seconds for one: (seq, when the relay took it in
+    /// milliseconds since the epoch, data).
+    pub async fn entries(&self, relay: &str, address: &str, after: u64, wait: u64) -> Result<Vec<(u64, u64, String)>> {
+        let url = format!("{relay}/b/{address}?after={after}&wait={wait}");
+        let frames: Vec<Frame> = ok(self.0.get(url).send().await?).await?.json().await?;
+        frames.into_iter().map(|f| Ok((f.seq, f.at, String::from_utf8(B64.decode(f.data)?)?))).collect()
     }
 
     /// `false` means the slot is taken.

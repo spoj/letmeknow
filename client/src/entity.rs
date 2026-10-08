@@ -89,6 +89,7 @@ enum Body {
 
 /// An entity's list, replayed from its entries in relay order. Entries that do not follow the last valid one, or
 /// whose signer is not a keyed member at that point, are ignored: this is what makes a removal final.
+#[derive(Clone)]
 pub struct List {
     pub id: String,
     pub name: String,
