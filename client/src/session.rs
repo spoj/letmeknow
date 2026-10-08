@@ -396,12 +396,16 @@ impl Session {
                 continue;
             }
             let path: Option<String> = session.db.query_row("SELECT path FROM bindings WHERE gid = ?", [&gid], |r| r.get(0)).optional()?;
+            let text = doc::text(&session.text(&gid)?)?;
             match path {
-                Some(path) => session.follow(&gid, PathBuf::from(path)),
-                None => {
-                    let text = doc::text(&session.text(&gid)?)?;
-                    session.bind(&gid, None, &text)?;
+                Some(path) => {
+                    // A session stopped after writing the file but before storing its base: the file holds the doc's text.
+                    if std::fs::read_to_string(&path).is_ok_and(|file| file.replace("\r\n", "\n") == text) {
+                        session.db.execute("UPDATE bindings SET base = ? WHERE gid = ?", params![text, gid])?;
+                    }
+                    session.follow(&gid, PathBuf::from(path));
                 }
+                None => _ = session.bind(&gid, None, &text)?,
             }
         }
         Ok(session)

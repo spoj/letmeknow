@@ -1,5 +1,5 @@
 //! A document group's text: a Yjs document holding one text, so the browser (Yjs) and the session process (yrs) edit the
-//! same document. Its state is a Yjs update holding everything; the version shown to agents is a hash of it.
+//! same document. Its state is a Yjs update holding everything.
 use anyhow::Result;
 use similar::{ChangeTag, DiffTag, TextDiff};
 use yrs::updates::decoder::Decode;

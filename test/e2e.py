@@ -40,7 +40,7 @@ class Listener:
             self.lines.put(json.loads(line))
 
     def expect(self, predicate, timeout=15):
-        deadline = time.time() + timeout
+        deadline, seen = time.time() + timeout, []
         while time.time() < deadline:
             try:
                 event = self.lines.get(timeout=deadline - time.time())
@@ -50,7 +50,8 @@ class Listener:
                 return event
             if event["type"] == "warning":
                 sys.exit(f"{self.session} warning: {event}")
-        sys.exit(f"{self.session}: expected event not seen")
+            seen.append(event)
+        sys.exit(f"{self.session}: expected event not seen, only {seen}")
 
     def poll(self, timeout):
         try:
@@ -527,6 +528,7 @@ def main():
         on(kim, "send", "one chat, one doc")
         check(lap.expect(lambda e: e.get("content") == "one chat, one doc"), "chat commands find the one chat of a session in a chat and a doc")
         until(lambda: content(tick_file), bool)
+        on_tick("groups")  # waits for the session to store what it wrote, as stop kills it at once on Windows
         tick.stop()
         write(kim_file, "- [x] alpha\n- [ ] beta\n- [ ] gamma\n")
         until(lambda: content(lap_file), lambda t: t.startswith("- [x]"))
