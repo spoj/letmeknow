@@ -1793,7 +1793,23 @@ dependencies = [
 name = "lmk-serve"
 version = "0.10.0"
 dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "iroh",
+ "iroh-relay",
+ "lmk-membership",
  "lmk-proto",
+ "rcgen",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "tokio-rustls-acme",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
