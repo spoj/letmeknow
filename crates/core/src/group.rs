@@ -73,6 +73,11 @@ pub fn credential_of(credential: &openmls::prelude::Credential) -> Option<Creden
     serde_json::from_slice(basic.identity()).ok()
 }
 
+/// The epoch an MLS message was sent in, which its header shows.
+pub fn epoch_of(bytes: &[u8]) -> Result<u64> {
+    Ok(parse::<MlsMessageIn>(bytes)?.try_into_protocol_message()?.epoch().as_u64())
+}
+
 fn parse<T: tls_codec::DeserializeBytes>(bytes: &[u8]) -> Result<T> {
     Ok(T::tls_deserialize_exact_bytes(bytes)?)
 }
@@ -182,10 +187,18 @@ fn key_package_in<P: Provider>(provider: &P, bytes: &[u8]) -> Result<KeyPackage>
 #[derive(Clone, Debug, Default)]
 pub struct Change {
     pub add: Vec<Vec<u8>>,
+    /// How the added members came in, carried in the commit's authenticated data.
+    pub how: Option<How>,
     /// Leaf indices.
     pub remove: Vec<u32>,
     pub settings: Option<Settings>,
     pub leaf: Option<Leaf>,
+}
+
+/// A commit's authenticated data: how the members it adds came in.
+#[derive(Serialize, Deserialize)]
+struct Aad {
+    how: How,
 }
 
 /// A commit to post, and for an add, the Welcome to send once the log has taken it.
@@ -203,6 +216,23 @@ pub struct Member {
     pub leaf: Option<Leaf>,
 }
 
+impl Member {
+    fn of(group: &MlsGroup, index: LeafNodeIndex) -> Option<Self> {
+        let member = group.member_at(index)?;
+        let leaf = group.public_group().leaf(index)?;
+        Some(Member {
+            index: index.u32(),
+            key: member.signature_key,
+            credential: credential_of(&member.credential),
+            leaf: leaf_of(leaf.extensions()),
+        })
+    }
+}
+
+fn leaf_of(extensions: &Extensions<LeafNode>) -> Option<Leaf> {
+    serde_json::from_slice(&extensions.unknown(LEAF_EXTENSION)?.0).ok()
+}
+
 /// What a log entry did.
 #[derive(Clone, Debug)]
 pub enum Applied {
@@ -214,8 +244,10 @@ pub enum Applied {
         own: bool,
         /// This session's pending commit lost the race and was cleared: redo its change.
         lost: bool,
-        added: Vec<Credential>,
-        removed: Vec<Credential>,
+        /// As their KeyPackages show them; `index` is their new leaf.
+        added: Vec<Member>,
+        how: Option<How>,
+        removed: Vec<Member>,
         settings: bool,
         /// This session was removed.
         gone: bool,
@@ -237,6 +269,8 @@ pub struct Opened {
     pub index: u32,
     /// The sender's leaf index now, if it is still a member.
     pub current: Option<u32>,
+    /// The sender's signature key.
+    pub key: Vec<u8>,
     pub sender: Credential,
     pub payload: Payload,
 }
@@ -246,6 +280,7 @@ pub struct Opened {
 pub struct Added {
     pub member: Credential,
     pub by: Credential,
+    pub how: Option<How>,
     /// The epoch the add started.
     pub epoch: u64,
 }
@@ -254,10 +289,12 @@ pub struct Added {
 struct State {
     /// The bytes of this session's pending commit, as posted.
     posted: Option<Bytes>,
+    /// How the members it adds came in.
+    how: Option<How>,
     window: Window,
     joined: u64,
-    /// Removed members, by `device_sig` (one per session key), with when their removal was applied.
-    removed: Vec<(Bytes, u64)>,
+    /// Removed members, by `device_sig` (one per session key), with their key and when their removal was applied.
+    removed: Vec<(Bytes, Bytes, u64)>,
     added: Vec<Added>,
 }
 
@@ -316,6 +353,12 @@ impl Group {
         provider.put(&state_key(self.id()), &serde_json::to_vec(&self.state)?)
     }
 
+    /// Deletes the group's state, once this session has left it.
+    pub fn delete<P: Provider>(mut self, provider: &P) -> Result<()> {
+        self.mls.delete(provider.storage())?;
+        provider.delete(&state_key(self.id()))
+    }
+
     pub fn id(&self) -> &[u8] {
         self.mls.group_id().as_slice()
     }
@@ -345,24 +388,17 @@ impl Group {
         self.state.posted.is_some()
     }
 
+    /// The bytes of the pending commit, to post again when it is not known whether the log took them.
+    pub fn posted(&self) -> Option<&[u8]> {
+        self.state.posted.as_ref().map(|posted| posted.0.as_slice())
+    }
+
     pub fn epoch_authenticator(&self) -> &[u8] {
         self.mls.epoch_authenticator().as_slice()
     }
 
     pub fn members(&self) -> Vec<Member> {
-        self.mls
-            .members()
-            .map(|member| Member {
-                index: member.index.u32(),
-                credential: credential_of(&member.credential),
-                leaf: self
-                    .mls
-                    .public_group()
-                    .leaf(member.index)
-                    .and_then(|leaf| serde_json::from_slice(&leaf.extensions().unknown(LEAF_EXTENSION)?.0).ok()),
-                key: member.signature_key,
-            })
-            .collect()
+        self.mls.members().filter_map(|member| Member::of(&self.mls, member.index)).collect()
     }
 
     /// Who added whom, as the log showed it since this session joined.
@@ -376,6 +412,9 @@ impl Group {
         // One staged but never saved, so never posted.
         self.mls.clear_pending_commit(provider.storage())?;
         let adds = change.add.iter().map(|bytes| key_package_in(provider, bytes)).collect::<Result<Vec<_>>>()?;
+        if let Some(how) = change.how {
+            self.mls.set_aad(serde_json::to_vec(&Aad { how })?);
+        }
         let mut builder = self
             .mls
             .commit_builder()
@@ -401,6 +440,7 @@ impl Group {
         let (commit, welcome, _) = bundle.into_messages();
         let commit = commit.to_bytes()?;
         self.state.posted = Some(Bytes(commit.clone()));
+        self.state.how = change.how;
         self.save(provider)?;
         Ok(Commit { commit, welcome: welcome.map(|welcome| welcome.to_bytes()).transpose()? })
     }
@@ -427,34 +467,46 @@ impl Group {
                 self.save(provider)?;
                 return Ok(Applied::Skipped { reason: error.to_string(), lost: true });
             }
-            let applied = observe(&self.mls, &mut self.state, staged, by, true, false, now);
+            let how = self.state.how;
+            let applied = observe(&self.mls, &mut self.state, staged, by, how, true, false, now);
             self.mls.merge_pending_commit(provider)?;
             return self.merged(provider, applied);
         }
-        let (staged, by) = match self.stage(provider, entry) {
+        let (staged, by, how) = match self.stage(provider, entry) {
             Ok(staged) => staged,
             Err(error) => return Ok(Applied::Skipped { reason: format!("{error:#}"), lost: false }),
         };
         let lost = self.state.posted.take().is_some();
         self.mls.clear_pending_commit(provider.storage())?;
-        let applied = observe(&self.mls, &mut self.state, &staged, by, false, lost, now);
+        let applied = observe(&self.mls, &mut self.state, &staged, by, how, false, lost, now);
         self.mls.merge_staged_commit(provider, staged)?;
         self.merged(provider, applied)
     }
 
-    fn stage<P: Provider>(&mut self, provider: &P, entry: &[u8]) -> Result<(StagedCommit, LeafNodeIndex)> {
+    fn stage<P: Provider>(
+        &mut self,
+        provider: &P,
+        entry: &[u8],
+    ) -> Result<(StagedCommit, LeafNodeIndex, Option<How>)> {
         let message = parse::<MlsMessageIn>(entry)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Commit, "not a commit");
         let processed = self.mls.process_message(provider, message)?;
+        let how = serde_json::from_slice::<Aad>(processed.aad()).ok().map(|aad| aad.how);
         let Sender::Member(by) = *processed.sender() else { bail!("not from a member") };
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             bail!("not a commit from another member")
         };
         rules(&self.mls, &staged, by)?;
-        Ok((*staged, by))
+        Ok((*staged, by, how))
     }
 
-    fn merged<P: Provider>(&mut self, provider: &P, applied: Applied) -> Result<Applied> {
+    fn merged<P: Provider>(&mut self, provider: &P, mut applied: Applied) -> Result<Applied> {
+        if let Applied::Commit { added, .. } = &mut applied {
+            let members = self.members();
+            for member in added {
+                member.index = members.iter().find(|m| m.key == member.key).map_or(0, |m| m.index);
+            }
+        }
         self.expire(provider)?;
         self.save(provider)?;
         Ok(applied)
@@ -506,10 +558,12 @@ impl Group {
             bail!("not an application message")
         };
         let current = self.members().into_iter().find(|member| member.credential.as_ref() == Some(&sender));
+        let mut key = current.as_ref().map(|member| member.key.clone()).unwrap_or_default();
         if current.is_none() {
-            let removed = self.state.removed.iter().rev().find(|(sig, _)| *sig == sender.device_sig);
-            if let Some((_, at)) = removed {
+            let removed = self.state.removed.iter().rev().find(|(sig, _, _)| *sig == sender.device_sig);
+            if let Some((_, removed, at)) = removed {
                 ensure!(now <= at + REMOVED_GRACE, "from a member removed more than 5 minutes before");
+                key = removed.0.clone();
             }
         }
         let payload: Payload = serde_json::from_slice(&message.into_bytes())?;
@@ -526,6 +580,7 @@ impl Group {
             epoch,
             index: index.u32(),
             current: current.map(|member| member.index),
+            key,
             sender,
             payload,
         })
@@ -568,35 +623,46 @@ pub fn with_opening(mut settings: Settings, opening: Opening) -> Settings {
 }
 
 /// Records what a commit does, before it is merged.
+#[allow(clippy::too_many_arguments)]
 fn observe(
     group: &MlsGroup,
     state: &mut State,
     staged: &StagedCommit,
     by: LeafNodeIndex,
+    how: Option<How>,
     own: bool,
     lost: bool,
     now: u64,
 ) -> Applied {
     let committer = group.member_at(by).and_then(|member| credential_of(&member.credential));
-    let added: Vec<Credential> = staged
+    let removed: Vec<Member> =
+        staged.remove_proposals().filter_map(|remove| Member::of(group, remove.remove_proposal().removed())).collect();
+    let added: Vec<Member> = staged
         .add_proposals()
-        .filter_map(|add| credential_of(add.add_proposal().key_package().leaf_node().credential()))
-        .collect();
-    let removed: Vec<Credential> = staged
-        .remove_proposals()
-        .filter_map(|remove| group.member_at(remove.remove_proposal().removed()))
-        .filter_map(|member| credential_of(&member.credential))
+        .map(|add| {
+            let leaf = add.add_proposal().key_package().leaf_node();
+            Member {
+                // Set once merged.
+                index: 0,
+                key: leaf.signature_key().as_slice().to_vec(),
+                credential: credential_of(leaf.credential()),
+                leaf: leaf_of(leaf.extensions()),
+            }
+        })
         .collect();
     let epoch = staged.epoch().as_u64();
     if let Some(committer) = &committer {
-        state.added.extend(added.iter().map(|member| Added { member: member.clone(), by: committer.clone(), epoch }));
+        let credentials = added.iter().filter_map(|member| member.credential.clone());
+        state.added.extend(credentials.map(|member| Added { member, by: committer.clone(), how, epoch }));
     }
-    state.removed.extend(removed.iter().map(|member| (member.device_sig.clone(), now)));
+    let gone = removed.iter().filter_map(|member| Some((member.credential.as_ref()?.device_sig.clone(), member)));
+    state.removed.extend(gone.map(|(sig, member)| (sig, Bytes(member.key.clone()), now)));
     Applied::Commit {
         by: by.u32(),
         own,
         lost,
         added,
+        how,
         removed,
         settings: staged.queued_proposals().any(|p| matches!(p.proposal(), Proposal::GroupContextExtensions(_))),
         gone: staged.self_removed(),

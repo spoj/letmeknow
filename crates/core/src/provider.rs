@@ -10,6 +10,7 @@ use openmls_traits::storage::StorageProvider;
 pub trait Provider: OpenMlsProvider<StorageProvider: StorageProvider<1, Error: Send + Sync + 'static>> {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
+    fn delete(&self, key: &[u8]) -> Result<()>;
 }
 
 /// The browser's provider: everything in one `MemoryStorage`, whose `values` the browser persists, one record per key.
@@ -49,6 +50,11 @@ impl Provider for MemoryProvider {
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.storage.values.write().unwrap().insert(memory_key(key), value.to_vec());
+        Ok(())
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<()> {
+        self.storage.values.write().unwrap().remove(&memory_key(key));
         Ok(())
     }
 }
@@ -142,6 +148,11 @@ mod native {
 
         fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
             self.ours.execute("INSERT OR REPLACE INTO lmk (key, value) VALUES (?1, ?2)", (key, value))?;
+            Ok(())
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<()> {
+            self.ours.execute("DELETE FROM lmk WHERE key = ?1", [key])?;
             Ok(())
         }
     }

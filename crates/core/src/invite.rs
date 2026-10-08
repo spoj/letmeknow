@@ -1,12 +1,10 @@
-//! The inviter's side of an invite: its secret, and admitting whoever presents it.
+//! The inviter's side of an invite: its secret, and checking whoever presents it.
 
-use anyhow::{Context, Result, bail, ensure};
-use lmk_proto::Bytes;
+use anyhow::{Context, Result, ensure};
 use lmk_proto::group::Credential;
-use lmk_proto::peer::Admitted;
 
-use crate::device::{Device, signed_by_device};
-use crate::group::{Change, Group, Session, key_package_credential};
+use crate::device::signed_by_device;
+use crate::group::key_package_credential;
 use crate::identity::{DeviceList, Verdict, check};
 use crate::provider::Provider;
 
@@ -17,8 +15,8 @@ pub const VALID_FOR: u64 = 10 * 60 * 1000;
 pub enum Target {
     /// A group, by id.
     Group(Vec<u8>),
-    /// A device link to this device's identity.
-    Device,
+    /// A device link to one of this device's identities, by id.
+    Device(Vec<u8>),
 }
 
 #[derive(Clone, Debug)]
@@ -37,22 +35,13 @@ pub struct Invite {
 #[derive(Default)]
 pub struct Invites(Vec<Invite>);
 
-/// An admission under way: append `entry` (a device link's) to the device list, post `commit`, and once the log has
-/// taken the commit, answer with `admitted`.
-pub struct Admitting {
-    pub entry: Option<Vec<u8>>,
-    pub commit: Vec<u8>,
-    welcome: Vec<u8>,
+/// A redeemed invite: commit the Add of `key_package` (for a device link, after appending the device to the list),
+/// and once the log has taken it, answer with the Welcome.
+pub struct Redeemed {
+    pub target: Target,
     /// The joiner, as its KeyPackage names it.
     pub joiner: Credential,
     pub label: Option<String>,
-}
-
-impl Admitting {
-    /// `position`: where the joiner starts reading the log; `doc`: for a doc, a file link to its state.
-    pub fn admitted(self, position: u64, doc: Option<String>) -> Admitted {
-        Admitted { welcome: Bytes(self.welcome), position, doc }
-    }
 }
 
 impl Invites {
@@ -61,93 +50,53 @@ impl Invites {
         self.0.last().unwrap()
     }
 
-    /// The invite a secret opens, if it is valid; `accept` decides whether this joiner may use it. Only a
-    /// successful redemption uses the invite up.
-    fn redeem(&mut self, secret: &[u8], now: u64, accept: impl Fn(&Invite) -> Result<()>) -> Result<Invite> {
-        self.0.retain(|invite| now < invite.made + VALID_FOR);
-        let at = self.0.iter().position(|invite| invite.secret == secret).context("no such invite")?;
-        accept(&self.0[at])?;
-        Ok(self.0.remove(at))
+    /// The identity an invite's secret is bound to, if it is valid and bound: fetch its device list for `redeem`.
+    pub fn bound(&self, secret: &[u8], now: u64) -> Option<&[u8]> {
+        let invite = self.0.iter().find(|invite| invite.secret == secret && now < invite.made + VALID_FOR)?;
+        invite.to.as_deref()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    /// A joiner presents the secret of a group invite with its KeyPackage. `list` is the device list of the identity
-    /// its credential names, needed only for an invite made `--to` an identity.
-    pub fn admit_member<P: Provider>(
+    /// A joiner presents a secret with its KeyPackage. `list` is the device list of the identity its credential names,
+    /// needed only for an invite made `--to` an identity. For a device link, the KeyPackage's credential names the
+    /// device and must be its own. Only a successful redemption uses the invite up.
+    pub fn redeem<P: Provider>(
         &mut self,
         provider: &P,
-        session: &Session,
-        group: &mut Group,
         secret: &[u8],
         key_package: &[u8],
         list: Option<&DeviceList>,
         now: u64,
-    ) -> Result<Admitting> {
+    ) -> Result<Redeemed> {
         let (joiner, key) = key_package_credential(provider, key_package)?;
-        let invite = self.redeem(secret, now, |invite| {
-            ensure!(invite.target == Target::Group(group.id().to_vec()), "an invite to another group");
-            if let Some(to) = &invite.to {
-                let named = joiner.identity.as_ref().is_some_and(|identity| identity.id.0 == *to);
-                ensure!(named && check(&joiner, &key, list) == Verdict::Verified, "an invite for another identity");
+        self.0.retain(|invite| now < invite.made + VALID_FOR);
+        let at = self.0.iter().position(|invite| invite.secret == secret).context("unknown, used or expired invite")?;
+        let invite = &self.0[at];
+        match &invite.target {
+            Target::Group(_) => {
+                if let Some(to) = &invite.to {
+                    let named = joiner.identity.as_ref().is_some_and(|identity| identity.id.0 == *to);
+                    ensure!(named && check(&joiner, &key, list) == Verdict::Verified, "this link is for another identity");
+                }
             }
-            Ok(())
-        })?;
-        let commit =
-            group.commit(provider, session, Change { add: vec![key_package.to_vec()], ..Change::default() })?;
-        Ok(Admitting {
-            entry: None,
-            commit: commit.commit,
-            welcome: commit.welcome.unwrap(),
-            joiner,
-            label: invite.label,
-        })
-    }
-
-    /// A new device presents the secret of a device link with its KeyPackage for the devices group, whose credential
-    /// names the device: it goes on `list` (by this device, `by`) and into `devices`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn admit_device<P: Provider>(
-        &mut self,
-        provider: &P,
-        session: &Session,
-        by: &Device,
-        list: &DeviceList,
-        devices: &mut Group,
-        secret: &[u8],
-        key_package: &[u8],
-        now: u64,
-    ) -> Result<Admitting> {
-        let (joiner, key) = key_package_credential(provider, key_package)?;
-        if !signed_by_device(&joiner, &key) {
-            bail!("the KeyPackage is not the device's");
+            Target::Device(_) => ensure!(signed_by_device(&joiner, &key), "the KeyPackage is not the device's"),
         }
-        self.redeem(secret, now, |invite| {
-            ensure!(invite.target == Target::Device, "not a device link");
-            Ok(())
-        })?;
-        let entry = list.add(by, &joiner.device.0, &joiner.device_name);
-        let commit =
-            devices.commit(provider, session, Change { add: vec![key_package.to_vec()], ..Change::default() })?;
-        Ok(Admitting {
-            entry: Some(entry),
-            commit: commit.commit,
-            welcome: commit.welcome.unwrap(),
-            joiner,
-            label: None,
-        })
+        let invite = self.0.remove(at);
+        Ok(Redeemed { target: invite.target, joiner, label: invite.label })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use lmk_proto::group::{IdentityRef, Kind, Opening, Payload, Service};
+    use lmk_proto::Bytes;
+    use lmk_proto::group::{How, IdentityRef, Kind, Opening, Payload, Service};
     use lmk_proto::links;
-    use lmk_proto::peer::InviteRequest;
+    use lmk_proto::peer::{Admitted, InviteRequest};
 
     use super::*;
-    use crate::contacts::{Contact, Contacts, How};
+    use crate::contacts::{self, Contact, Contacts};
+    use crate::device::Device;
     use crate::group::tests::{Member, leaf, settings};
-    use crate::group::{Window, introduction, with_opening};
+    use crate::group::{Change, Group, Session, Window, introduction, with_opening};
     use crate::identity::create;
     use crate::provider::MemoryProvider;
 
@@ -176,32 +125,18 @@ mod tests {
         let request: InviteRequest = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
         let key_package = &request.key_package;
 
-        let group = alice.group.as_mut().unwrap();
-        assert!(
-            invites
-                .admit_member(&alice.provider, &alice.session, group, &[0; 16], &key_package.0, None, 2_000)
-                .is_err()
-        );
-        let admitting = invites
-            .admit_member(&alice.provider, &alice.session, group, &request.secret.0, &key_package.0, None, 2_000)
-            .unwrap();
-        assert_eq!((admitting.joiner.name.as_str(), admitting.label.as_deref()), ("Bob", Some("Bob (Acme)")));
-        log.push(admitting.commit.clone());
-        assert!(matches!(alice.read(&log, 2_000)[0], crate::group::Applied::Commit { own: true, .. }));
-        let admitted = admitting.admitted(log.len() as u64, None);
+        assert!(invites.redeem(&alice.provider, &[0; 16], &key_package.0, None, 2_000).is_err());
+        let redeemed = invites.redeem(&alice.provider, &request.secret.0, &key_package.0, None, 2_000).unwrap();
+        assert_eq!((redeemed.joiner.name.as_str(), redeemed.label.as_deref()), ("Bob", Some("Bob (Acme)")));
+        let commit = alice.commit(Change { add: vec![key_package.0.clone()], how: Some(How::Invite), ..Change::default() });
+        log.push(commit.commit);
+        let applied = alice.read(&log, 2_000);
+        let crate::group::Applied::Commit { own: true, how, added, .. } = &applied[0] else { panic!() };
+        assert_eq!((*how, added[0].index), (Some(How::Invite), 1));
+        let admitted = Admitted { welcome: Bytes(commit.welcome.unwrap()), position: log.len() as u64, doc: None };
 
         // A used secret is refused.
-        let group = alice.group.as_mut().unwrap();
-        let again = invites.admit_member(
-            &alice.provider,
-            &alice.session,
-            group,
-            &request.secret.0,
-            &key_package.0,
-            None,
-            2_000,
-        );
-        assert!(again.is_err());
+        assert!(invites.redeem(&alice.provider, &request.secret.0, &key_package.0, None, 2_000).is_err());
 
         let admitted: Admitted = serde_json::from_str(&serde_json::to_string(&admitted).unwrap()).unwrap();
         bob.join(&admitted.welcome.0, admitted.position as usize);
@@ -236,22 +171,20 @@ mod tests {
         let kp = carol.session.key_package(&carol.provider).unwrap();
 
         let secret = invites.make(Target::Group(id.clone()), None, None, 0).secret;
-        let group = alice.group.as_mut().unwrap();
-        assert!(invites.admit_member(&alice.provider, &alice.session, group, &secret, &kp, None, VALID_FOR).is_err());
+        assert!(invites.redeem(&alice.provider, &secret, &kp, None, VALID_FOR).is_err());
 
         // `--to Bob`: Carol cannot redeem it, and her try does not use it up.
         let bob_device = Device::new("bob's laptop");
         let (bob_id, first) = create(&bob_device, "Bob", Service::Folder("/tmp/lmk".into()));
         let bob_list = DeviceList::replay(&bob_id, [first.as_slice()]).unwrap();
         let secret = invites.make(Target::Group(id), None, Some(bob_id.to_vec()), 0).secret;
-        assert!(
-            invites.admit_member(&alice.provider, &alice.session, group, &secret, &kp, Some(&bob_list), 1).is_err()
-        );
+        assert_eq!(invites.bound(&secret, 1), Some(bob_id.as_slice()));
+        assert!(invites.redeem(&alice.provider, &secret, &kp, Some(&bob_list), 1).is_err());
         let bob_provider = MemoryProvider::default();
         let identity = IdentityRef { id: bob_id.into(), membership: Service::Folder("/tmp/lmk".into()) };
         let bob = Session::create(&bob_provider, &bob_device, "Bob", Some(identity), leaf("Bob")).unwrap();
         let kp = bob.key_package(&bob_provider).unwrap();
-        assert!(invites.admit_member(&alice.provider, &alice.session, group, &secret, &kp, Some(&bob_list), 2).is_ok());
+        assert!(invites.redeem(&alice.provider, &secret, &kp, Some(&bob_list), 2).is_ok());
     }
 
     #[test]
@@ -265,10 +198,10 @@ mod tests {
         laptop.group = Some(Group::create(&laptop.provider, &laptop.session, &settings, Window::default()).unwrap());
         let mut log: Vec<Vec<u8>> = Vec::new();
         let contacts = Contacts::default();
-        contacts.set(&[9; 32], &Contact { name: "Bob (Acme)".into(), how: How::Verified, by: None, at: 1 });
+        contacts.set(&[9; 32], &Contact { name: "Bob (Acme)".into(), how: contacts::How::Verified, by: None, at: 1 });
 
         let mut invites = Invites::default();
-        let secret = invites.make(Target::Device, None, None, 0).secret;
+        let secret = invites.make(Target::Device(id.to_vec()), None, None, 0).secret;
 
         // The new device, which does not know the identity yet: its credential names only the device.
         let phone_provider = MemoryProvider::default();
@@ -279,23 +212,14 @@ mod tests {
             key_package: Bytes(phone_session.key_package(&phone_provider).unwrap()),
         };
 
-        let group = laptop.group.as_mut().unwrap();
-        let admitting = invites
-            .admit_device(
-                &laptop.provider,
-                &laptop.session,
-                &laptop.device,
-                &list,
-                group,
-                &request.secret.0,
-                &request.key_package.0,
-                5,
-            )
-            .unwrap();
-        list_log.push(admitting.entry.clone().unwrap());
-        log.push(admitting.commit.clone());
+        let redeemed =
+            invites.redeem(&laptop.provider, &request.secret.0, &request.key_package.0, None, 5).unwrap();
+        assert_eq!(redeemed.target, Target::Device(id.to_vec()));
+        list_log.push(list.add(&laptop.device, &redeemed.joiner.device.0, &redeemed.joiner.device_name));
+        let commit = laptop.commit(Change { add: vec![request.key_package.0.clone()], ..Change::default() });
+        log.push(commit.commit);
         laptop.read(&log, 5);
-        let admitted = admitting.admitted(log.len() as u64, None);
+        let admitted = Admitted { welcome: Bytes(commit.welcome.unwrap()), position: log.len() as u64, doc: None };
 
         let list = DeviceList::replay(&id, list_log.iter().map(Vec::as_slice)).unwrap();
         assert!(list.has(&phone_device.public()));
@@ -312,7 +236,7 @@ mod tests {
         let phone_contacts = Contacts::load(&contacts.state()).unwrap();
         let edit = contacts.set(
             &[8; 32],
-            &Contact { name: "Carol".into(), how: How::Introduced, by: Some(Bytes(vec![9; 32])), at: 2 },
+            &Contact { name: "Carol".into(), how: contacts::How::Introduced, by: Some(Bytes(vec![9; 32])), at: 2 },
         );
         let group = laptop.group.as_mut().unwrap();
         let (_, sealed) =
@@ -320,7 +244,7 @@ mod tests {
         let Payload::Edit { update } = phone.open(&sealed, 6).unwrap().payload else { panic!() };
         phone_contacts.apply(&update.0).unwrap();
         assert_eq!(phone_contacts.get(&[9; 32]).unwrap().name, "Bob (Acme)");
-        assert_eq!(phone_contacts.get(&[8; 32]).unwrap().how, How::Introduced);
+        assert_eq!(phone_contacts.get(&[8; 32]).unwrap().how, contacts::How::Introduced);
         let hi = phone.send("from the phone");
         assert_eq!(laptop.open(&hi, 7).unwrap().sender.device_name, "phone");
 
