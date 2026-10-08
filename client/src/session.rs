@@ -32,6 +32,9 @@ use tokio::time::Instant;
 const POLL_WAIT_S: u64 = 25;
 const POLL_S: u64 = 15;
 const PING_S: u64 = 30;
+/// How often a request box is checked while its socket is down, and how soon a request that failed is tried again.
+const REQUESTS_POLL_S: u64 = 60;
+const REQUESTS_RETRY_S: u64 = 15;
 const CATCH_UP: usize = 20;
 const LIST_TTL: Duration = Duration::from_secs(60);
 
@@ -182,6 +185,8 @@ pub enum Event {
     Files { gid: String, records: Vec<(String, Record)>, ignored: Vec<String> },
     JoinRequest { invite: Box<Invite>, spake: Spake2<Ed25519Group>, data: String },
     Welcome { relay: String, key: [u8; 32], data: String, reply: oneshot::Sender<Value> },
+    /// The requests box of this open group has new entries, or may have.
+    Requests(String),
 }
 
 pub struct Invite {
@@ -216,11 +221,16 @@ struct Group {
     relay: String,
     cursor: u64,
     poller: JoinHandle<()>,
+    /// The requests box this group is open on, and the task following it.
+    requests: Option<(String, JoinHandle<()>)>,
 }
 
 impl Drop for Group {
     fn drop(&mut self) {
         self.poller.abort();
+        if let Some((_, task)) = &self.requests {
+            task.abort();
+        }
     }
 }
 
@@ -251,6 +261,8 @@ pub struct Session {
     home: PathBuf,
     /// Entity lists fetched lately, by entity id.
     lists: HashMap<String, (Instant, List)>,
+    /// Welcomes for admitted join requests not yet written to their reply box, by its address.
+    replies: HashMap<String, String>,
 }
 
 impl Session {
@@ -306,6 +318,7 @@ impl Session {
             events,
             home: home.to_owned(),
             lists: HashMap::new(),
+            replies: HashMap::new(),
         };
         let rows: Vec<(String, String, u64)> = session
             .db
@@ -315,7 +328,8 @@ impl Session {
         for (gid, relay, cursor) in rows {
             let mls = MlsGroup::load(session.provider.storage(), &GroupId::from_slice(gid.as_bytes()))?.context("missing MLS state")?;
             session.backlog.insert(gid.clone(), Vec::new());
-            session.track(gid, relay, cursor, mls);
+            session.track(gid.clone(), relay, cursor, mls);
+            session.follow_requests(&gid)?;
         }
         let folders: Vec<String> = session.db.prepare("SELECT gid FROM folders")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
         for gid in folders {
@@ -384,6 +398,16 @@ impl Session {
             Event::Welcome { relay, key, data, reply } => {
                 let result = self.welcome(&relay, &key, &data).await;
                 let _ = reply.send(result.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
+            }
+            Event::Requests(gid) => {
+                if let Err(error) = self.admit_open(&gid).await {
+                    self.warn(Some(&gid), format!("join requests: {error:#}"));
+                    let events = self.events.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(REQUESTS_RETRY_S)).await;
+                        let _ = events.send(Event::Requests(gid));
+                    });
+                }
             }
         }
     }
@@ -685,11 +709,44 @@ impl Session {
         Ok(stored.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default())
     }
 
-    fn store_settings(&self, gid: &str, settings: &Settings) -> Result<()> {
+    fn store_settings(&mut self, gid: &str, settings: &Settings) -> Result<()> {
         self.db.execute(
             "INSERT INTO settings (gid, settings) VALUES (?, ?) ON CONFLICT (gid) DO UPDATE SET settings = excluded.settings",
             params![gid, serde_json::to_string(settings)?],
         )?;
+        self.follow_requests(gid)
+    }
+
+    /// Follows the requests box of a group open to an entity: its socket announces each join request, and while it has
+    /// none the box is checked every REQUESTS_POLL_S seconds.
+    fn follow_requests(&mut self, gid: &str) -> Result<()> {
+        let settings = self.settings(gid)?;
+        let Some(group) = self.groups.get_mut(gid) else { return Ok(()) };
+        let address = match settings.open.is_empty() {
+            true => None,
+            false => Some(place("requests", &hex::decode(&settings.requests)?).0),
+        };
+        if group.requests.as_ref().map(|(followed, _)| followed) == address.as_ref() {
+            return Ok(());
+        }
+        if let Some((_, task)) = group.requests.take() {
+            task.abort();
+        }
+        let Some(address) = address else { return Ok(()) };
+        let (http, events, relay, gid, path) = (self.relay.clone(), self.events.clone(), group.relay.clone(), gid.to_owned(), format!("b/{address}"));
+        let task = tokio::spawn(async move {
+            loop {
+                let socket = http.subscribe(&relay, &path).await.ok();
+                let _ = events.send(Event::Requests(gid.clone()));
+                if let Some(mut ws) = socket {
+                    while notified(&mut ws).await.is_some() {
+                        let _ = events.send(Event::Requests(gid.clone()));
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(REQUESTS_POLL_S)).await;
+            }
+        });
+        group.requests = Some((address, task));
         Ok(())
     }
 
@@ -888,60 +945,72 @@ impl Session {
         Ok(())
     }
 
-    /// Checks open groups for join requests, every REQUESTS seconds while `listen` runs. A request from a session that
-    /// speaks as an entity the group is open to is admitted, unless another member admitted it first.
-    pub async fn admit_requests(&mut self) {
-        let opened = match self.opened() {
-            Ok(opened) => opened,
-            Err(error) => return self.warn(None, format!("join requests: {error:#}")),
-        };
-        for (gid, settings, cursor) in opened {
-            if settings.open.is_empty() || !self.groups.contains_key(&gid) {
-                continue;
-            }
-            if let Err(error) = self.admit_open(&gid, &settings, cursor).await {
-                self.warn(Some(&gid), format!("join requests: {error:#}"));
-            }
+    /// Admits the join requests in an open group's requests box from sessions that speak as an entity the group is open
+    /// to, unless another member admitted them first. The cursor moves past a request once it is handled, so one that
+    /// failed is tried again.
+    async fn admit_open(&mut self, gid: &str) -> Result<()> {
+        let Some(group) = self.groups.get(gid) else { return Ok(()) };
+        let relay = group.relay.clone();
+        let (settings, cursor): (String, u64) = self.db.query_row("SELECT settings, cursor FROM settings WHERE gid = ?", [gid], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let settings: Settings = serde_json::from_str(&settings)?;
+        if settings.open.is_empty() {
+            return Ok(());
         }
-    }
-
-    fn opened(&self) -> Result<Vec<(String, Settings, u64)>> {
-        let rows: Vec<(String, String, u64)> =
-            self.db.prepare("SELECT gid, settings, cursor FROM settings")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
-        rows.into_iter().map(|(gid, settings, cursor)| Ok((gid, serde_json::from_str(&settings)?, cursor))).collect()
-    }
-
-    async fn admit_open(&mut self, gid: &str, settings: &Settings, cursor: u64) -> Result<()> {
-        let relay = self.groups[gid].relay.clone();
         let (address, key) = place("requests", &hex::decode(&settings.requests)?);
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
         for (seq, at, data) in self.relay.entries(&relay, &address, cursor, 0).await? {
-            self.db.execute("UPDATE settings SET cursor = ? WHERE gid = ?", params![seq, gid])?;
             // Expired requests are skipped, so an old one posted again cannot bring back a session that left.
-            if at + INVITE_TTL_S * 1000 < now {
-                continue;
+            if at + INVITE_TTL_S * 1000 >= now {
+                self.admit_request(gid, &relay, &settings, &key, &data).await?;
             }
-            let request: JoinRequest = serde_json::from_slice(&open(&key, b"request", &data)?)?;
-            let key_package = self.key_package(&B64.decode(&request.key_package)?)?;
+            self.db.execute("UPDATE settings SET cursor = ? WHERE gid = ?", params![seq, gid])?;
+        }
+        Ok(())
+    }
+
+    /// Admits one join request. A request that cannot be admitted is refused with a warning; an error means it may be
+    /// admitted on a later try.
+    async fn admit_request(&mut self, gid: &str, relay: &str, settings: &Settings, key: &[u8; 32], data: &str) -> Result<()> {
+        let read = || -> Result<(KeyPackage, (String, [u8; 32]))> {
+            let request: JoinRequest = serde_json::from_slice(&open(key, b"request", data)?)?;
+            Ok((self.key_package(&B64.decode(&request.key_package)?)?, place("reply", &hex::decode(&request.reply)?)))
+        };
+        let (key_package, (reply_address, reply_key)) = match read() {
+            Ok(read) => read,
+            Err(error) => {
+                self.warn(Some(gid), format!("ignored a join request that does not read: {error:#}"));
+                return Ok(());
+            }
+        };
+        if !self.replies.contains_key(&reply_address) {
             let leaf = key_package.leaf_node();
-            let joiner = self.describe(gid, person(leaf.credential(), leaf.signature_key().as_slice())).await?;
-            if self.members(gid)?.iter().any(|m| m["fp"] == joiner["fp"]) {
-                continue;
+            let joiner = person(leaf.credential(), leaf.signature_key().as_slice());
+            let present = |session: &Self| session.members(gid).map(|members| members.iter().any(|m| m["fp"] == joiner["fp"]));
+            if present(self)? {
+                return Ok(());
             }
-            let entity = joiner["entity"]["id"].as_str().filter(|_| joiner["entity"].get("error").is_none());
+            // Fetched first, so a list the relay failed to give fails this try instead of refusing the request.
+            for id in joiner["as"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                let list = self.fetch_list(relay, id).await?;
+                self.lists.insert(id.to_owned(), (Instant::now(), list));
+            }
+            let described = self.describe(gid, joiner.clone()).await?;
+            let entity = described["entity"]["id"].as_str().filter(|_| described["entity"].get("error").is_none());
             if !entity.is_some_and(|id| settings.open.iter().any(|o| o.id == id)) {
-                self.warn(Some(gid), format!("refused a join request from {joiner}: it speaks as no entity the group is open to"));
-                continue;
+                self.warn(Some(gid), format!("refused a join request from {described}: it speaks as no entity the group is open to"));
+                return Ok(());
             }
             let envelope = match self.add(gid, key_package).await {
                 Ok(envelope) => envelope,
-                Err(_) if self.members(gid)?.iter().any(|m| m["fp"] == joiner["fp"]) => continue, // another member was first
+                Err(_) if present(self)? => return Ok(()), // another member was first
                 Err(error) => return Err(error),
             };
-            let (reply_address, reply_key) = place("reply", &hex::decode(&request.reply)?);
-            let sealed = seal(self.provider.rand(), &reply_key, b"welcome", &serde_json::to_vec(&envelope)?)?;
-            self.relay.append(&relay, &reply_address, &sealed).await?;
-            self.post_state(gid).await?;
+            self.replies.insert(reply_address.clone(), seal(self.provider.rand(), &reply_key, b"welcome", &serde_json::to_vec(&envelope)?)?);
+        }
+        self.relay.append(relay, &reply_address, &self.replies[&reply_address]).await?;
+        self.replies.remove(&reply_address);
+        if let Err(error) = self.post_state(gid).await {
+            self.warn(Some(gid), format!("posting the group's state for its new member: {error:#}"));
         }
         Ok(())
     }
@@ -1161,7 +1230,7 @@ impl Session {
                 tokio::time::sleep(Duration::from_secs(POLL_S)).await;
             }
         });
-        self.groups.insert(gid, Group { mls, relay, cursor, poller });
+        self.groups.insert(gid, Group { mls, relay, cursor, poller, requests: None });
     }
 
     fn drop_group(&mut self, gid: &str) -> Result<()> {
