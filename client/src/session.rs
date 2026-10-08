@@ -34,8 +34,6 @@ const POLL_S: u64 = 15;
 const PING_S: u64 = 30;
 const CATCH_UP: usize = 20;
 const LIST_TTL: Duration = Duration::from_secs(60);
-/// Where a folder group keeps its blobs; the folder scan reads only the folder's own `*.json` files.
-const BLOBS: &str = ".blobs";
 
 /// Requests an agent sends to its session process.
 #[derive(Subcommand, Serialize, Deserialize)]
@@ -161,16 +159,16 @@ pub enum FileOp {
         #[arg(value_name = "PATH")]
         text: String,
     },
-    /// Upload an image, or any file up to about 1 MiB, encrypted, for the group's files to link; prints the markdown link to put into a file with `file edit`
+    /// Make an image or other file linkable from the group's files: on the relay, uploaded encrypted (up to about 1 MiB);
+    /// in a folder group, linked by its path in the folder (copied into attachments/ if it is elsewhere). Prints the
+    /// markdown link to put into a file with `file edit`
     Attach {
         #[arg(long)]
         group: Option<String>,
         path: String,
-        /// PATH's content, base64, which the command reads.
-        #[arg(skip)]
-        data: String,
     },
-    /// Decrypt what a link (lmk:<hash>#<key>) in a file points to into a file only you can read; prints its path
+    /// The file a link in a file points to: a relay group's (lmk:<hash>#<key>) decrypted into a file only you can read,
+    /// a folder group's where it is in the folder; prints its path
     Fetch {
         #[arg(long)]
         group: Option<String>,
@@ -820,22 +818,31 @@ impl Session {
                 self.store_file(&gid, &id, &name, &state)?;
                 Ok(json!({ "file": id, "name": name, "version": self.keep_version(&gid, &id, &state)? }))
             }
-            FileOp::Attach { group, path, data } => {
+            FileOp::Attach { group, path } => {
                 let gid = self.resolve(group)?;
-                let bytes = B64.decode(data)?;
-                if bytes.len() + BLOB_OVERHEAD > MAX_BLOB_BYTES {
-                    bail!("{path} is {} bytes; files link at most {}", bytes.len(), MAX_BLOB_BYTES - BLOB_OVERHEAD);
-                }
-                let key = self.provider.rand().random_array()?;
-                let sealed = seal_blob(self.provider.rand(), &key, &bytes)?;
-                self.put_blob(&gid, &digest(&sealed), &sealed).await?;
-                let link = blob_link(&key, &sealed);
+                let bytes = std::fs::read(&path).with_context(|| format!("cannot read {path}"))?;
                 let name = Path::new(&path).file_name().map_or_else(String::new, |n| n.to_string_lossy().replace(['[', ']'], ""));
+                let link = if self.groups.contains_key(&gid) {
+                    if bytes.len() + BLOB_OVERHEAD > MAX_BLOB_BYTES {
+                        bail!("{path} is {} bytes; files link at most {}", bytes.len(), MAX_BLOB_BYTES - BLOB_OVERHEAD);
+                    }
+                    let key = self.provider.rand().random_array()?;
+                    let sealed = seal_blob(self.provider.rand(), &key, &bytes)?;
+                    self.put_blob(&gid, &digest(&sealed), &sealed).await?;
+                    blob_link(&key, &sealed)
+                } else {
+                    folder_link(&gid, Path::new(&path), &name, &bytes)?
+                };
                 let markdown = format!("{}[{name}]({link})", if image_type(&bytes).is_some() { "!" } else { "" });
                 Ok(json!({ "link": link, "markdown": markdown }))
             }
             FileOp::Fetch { group, link } => {
                 let gid = self.resolve(group)?;
+                if !self.groups.contains_key(&gid) {
+                    let path = folder_path(&gid, &link)?;
+                    let bytes = std::fs::metadata(&path).with_context(|| format!("no file {} in the folder", path.display()))?.len();
+                    return Ok(json!({ "path": path, "bytes": bytes }));
+                }
                 let (hash, key) = blob_links(&link).into_iter().next().context("expected a link like lmk:<hash>#<key>")?;
                 let bytes = open_blob(&key, &self.blob(&gid, &hash).await?)?;
                 let dir = self.attachments.join(&digest(gid.as_bytes())[..16]);
@@ -850,25 +857,16 @@ impl Session {
         }
     }
 
-    /// Stores a blob where the group's members find it: in the folder, or on the relay and kept here too.
+    /// Stores a blob on the relay, and keeps it here too.
     async fn put_blob(&self, gid: &str, hash: &str, sealed: &[u8]) -> Result<()> {
-        let Some(group) = self.groups.get(gid) else {
-            let dir = Path::new(gid).join(BLOBS);
-            std::fs::create_dir_all(&dir)?;
-            let temp = dir.join(format!(".{hash}.tmp"));
-            std::fs::write(&temp, sealed)?;
-            return Ok(std::fs::rename(&temp, dir.join(hash))?);
-        };
-        self.relay.put_blob(&group.relay, gid, hash, sealed).await?;
+        self.relay.put_blob(&self.groups[gid].relay, gid, hash, sealed).await?;
         self.db.execute("INSERT OR IGNORE INTO blobs (gid, hash, data) VALUES (?, ?, ?)", params![gid, hash, sealed])?;
         Ok(())
     }
 
-    /// A blob's sealed bytes: from the folder, as kept here, or else from the relay, and then kept.
+    /// A blob's sealed bytes: as kept here, or else from the relay, and then kept.
     async fn blob(&self, gid: &str, hash: &str) -> Result<Vec<u8>> {
-        let Some(group) = self.groups.get(gid) else {
-            return std::fs::read(Path::new(gid).join(BLOBS).join(hash)).with_context(|| format!("no blob {hash} in the folder"));
-        };
+        let group = &self.groups[gid];
         if let Some(sealed) = self.kept_blob(gid, hash)? {
             return Ok(sealed);
         }
@@ -1738,4 +1736,36 @@ fn scan(dir: &Path, seen: &mut HashSet<OsString>) -> (Vec<(String, Record)>, Vec
         ordered.push((id, record));
     }
     (ordered, ignored)
+}
+
+/// A folder group links a file by its path in the folder; one from elsewhere is copied into the folder's attachments/
+/// first. Nothing in a folder is encrypted, so neither is this.
+fn folder_link(folder: &str, source: &Path, name: &str, bytes: &[u8]) -> Result<String> {
+    let relative = match source.strip_prefix(folder) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => {
+            let dir = Path::new(folder).join("attachments");
+            std::fs::create_dir_all(&dir)?;
+            let mut name = name.replace(|c: char| !c.is_ascii_alphanumeric() && !"._-".contains(c), "-");
+            if dir.join(&name).exists() && std::fs::read(dir.join(&name))? != bytes {
+                name = format!("{}-{name}", &digest(bytes)[..8]);
+            }
+            std::fs::write(dir.join(&name), bytes)?;
+            Path::new("attachments").join(name)
+        }
+    };
+    let link = relative.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+    Ok(if link.contains([' ', '(', ')']) { format!("<{link}>") } else { link })
+}
+
+/// The file a folder group's link (or its markdown) names. Only paths inside the folder: a member could otherwise
+/// link an agent to any file on its machine.
+fn folder_path(folder: &str, link: &str) -> Result<PathBuf> {
+    let target = link.rsplit_once("](").map_or(link, |(_, rest)| rest.trim_end_matches(')'));
+    let target = target.trim_start_matches('<').trim_end_matches('>');
+    let relative = Path::new(target);
+    if !relative.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+        bail!("{target} is not a path inside the folder");
+    }
+    Ok(Path::new(folder).join(relative))
 }

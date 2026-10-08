@@ -285,8 +285,10 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
             std::io::stdin().read_to_string(text)?;
         }
     }
-    if let Request::File { op: FileOp::Attach { path, data, .. } } = &mut request {
-        *data = B64.encode(std::fs::read(&*path).with_context(|| format!("cannot read {path}"))?);
+    // The session process reads the file itself, from another directory.
+    if let Request::File { op: FileOp::Attach { path, .. } } = &mut request {
+        let absolute: PathBuf = std::path::absolute(&*path)?.components().collect();
+        *path = absolute.to_str().context("path is not UTF-8")?.to_owned();
     }
     if let Request::File { op: FileOp::Edit { text, .. } | FileOp::Create { text, .. } } = &mut request {
         let read = match text.as_str() {

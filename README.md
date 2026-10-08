@@ -43,8 +43,8 @@ letmeknow read <id> --ancestors 2
 letmeknow members | groups | remove <fp> | leave
 letmeknow file create plan.md plan.md   # a markdown file the group edits at once; also: file ls, file show <file>
 letmeknow file edit plan.md --base <version> new.md   # the version file show gave; others' changes since stay
-letmeknow file attach chart.png         # uploads it encrypted; prints ![chart.png](lmk:<hash>#<key>) to put into a file
-letmeknow file fetch 'lmk:<hash>#<key>' # decrypts what a link points to into a private file; prints its path
+letmeknow file attach chart.png         # uploads it encrypted; prints ![chart.png](lmk:<hash>#<key>) to put into a file (a folder group links its path)
+letmeknow file fetch 'lmk:<hash>#<key>' # decrypts what a link points to into a private file; prints its path (a folder group's, where it is)
 letmeknow name "Q3 plan" | open Matthew # name the group; let sessions speaking as Matthew join it: join <group>
 letmeknow entity create Matthew         # this device's sessions now speak as Matthew; also: entity list, entity remove <id>
 letmeknow invite --entity Matthew       # a link that adds another machine or browser to Matthew

@@ -275,11 +275,13 @@ def main():
         text = until(lambda: run("frank", "file", "show", "notes.md")["text"], lambda t: "ONE" in t)
         check(edited["text"] == text == "ONE\ntwo\nthree\n" and notes["name"] == "notes.md", "files work the same in folder groups")
         attached = run("erin", "file", "attach", write("photo.png", png(8, 8)))
-        blob = os.path.join(folder, ".blobs", attached["link"][4:68])
-        with open(blob, "rb") as f:
-            check(png(8, 8) not in f.read(), "in a folder group, an attached image is an encrypted file in .blobs")
+        check(attached["markdown"] == "![photo.png](attachments/photo.png)", "in a folder group, an attached image from elsewhere is copied into the folder and linked by its path")
         with open(run("frank", "file", "fetch", attached["markdown"])["path"], "rb") as f:
-            check(f.read() == png(8, 8), "which members fetch from there, by the link or its markdown")
+            check(f.read() == png(8, 8), "which members find there, by the link or its markdown")
+        with open(os.path.join(folder, "chart.png"), "wb") as f:
+            f.write(png(4, 4))
+        check(run("erin", "file", "attach", os.path.join(folder, "chart.png"))["link"] == "chart.png", "a file already in the folder is linked where it is")
+        check("not a path inside the folder" in run("frank", "file", "fetch", "../secret.txt", ok=False), "links reach no file outside the folder")
 
         erin.stop()
         for i in range(22):
