@@ -37,7 +37,7 @@ pub fn service(address: &str) -> Result<Service> {
 }
 
 /// The skill text for agents.
-pub const SKILL: &str = include_str!("../SKILL.md");
+pub const SKILL: &str = include_str!("../../../SKILL.md");
 
 pub async fn serve(serve: cli::Serve) -> Result<()> {
     let mut config = lmk_serve::ServeConfig::new(serve.domain, serve.state);
