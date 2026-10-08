@@ -151,6 +151,7 @@ mod tests {
         assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().head.length, 2);
         assert_eq!(store.append(b"g", b"three").unwrap().position, 3);
         assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().entries.len(), 1);
+        drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

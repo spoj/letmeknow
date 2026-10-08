@@ -147,5 +147,4 @@ async fn serves_relay_membership_and_page() {
     assert_eq!((head.length, head.hash), (page.head.length, page.head.hash));
 
     server.abort();
-    std::fs::remove_dir_all(&state).unwrap();
 }
