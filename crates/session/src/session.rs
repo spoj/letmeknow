@@ -1127,6 +1127,7 @@ impl<C: Core, P: Peers, L: Log> Session<C, P, L> {
     }
 
     /// A file arrived: for the attachments and fetches waiting for it, and a joined doc's state.
+    #[allow(clippy::type_complexity)]
     fn arrived(&mut self, hash: [u8; 32]) -> Result<()> {
         self.db.execute("DELETE FROM pending WHERE id = ?", [hash])?;
         let waiting: Vec<(Vec<u8>, Vec<u8>, String, String, bool)> = self
