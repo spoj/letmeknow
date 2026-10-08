@@ -78,10 +78,10 @@ A group context extension, of the private-use type `0xff01`, whose data is JSON:
 A leaf node extension, of type `0xff02`, whose data is JSON:
 
 ```json
-{"key": "<iroh key>", "relay": "<url>", "push": {"endpoint", "p256dh", "auth", "vapid": "<private key>"}}
+{"key": "<iroh key>", "relay": "<url>"}
 ```
 
-`push` is present only for browsers (see Browser). A changed relay or push key is an update commit.
+A changed relay is an update commit.
 
 ### Credential
 
@@ -169,8 +169,4 @@ Message sync, per group, starts once both sides have caught up on commits. It is
 
 ## Browser
 
-- A browser generates a P-256 key pair with WebCrypto and subscribes with its public key as `applicationServerKey`. Its leaf's `push` holds the subscription's `endpoint`, `p256dh` and `auth`, and the private key as `vapid`.
-- A sender encrypts the notice per RFC 8291 (`aes128gcm`) and signs a VAPID JWT (RFC 8292) with `vapid`: `aud` the endpoint's origin, `sub` `mailto:push@letmeknow.dev`, `exp` at most a day ahead (Apple's limit), the token reused for up to an hour. TTL 30 days at most (Chrome caps at 4 weeks, and quietly shortens it).
-- The notice is JSON, `{"group": "<name>", "from": "<name>"}`, under 3993 bytes: the most that fits the services' 4096-byte encrypted body.
-- An answer of 404 or 410 means the subscription is gone: the sender stops pushing to it. 429 means slow down.
-- The service worker shows a notification for every push, and opens the app at the group when it is tapped.
+Push notifications are deferred; the push prototype's design is on `spike/push` (see REWRITE.md, Later).

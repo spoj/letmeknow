@@ -141,8 +141,6 @@ Trust is local and travels one hop at most.
 - letmeknow.dev serves the client. A service worker caches it, so the app opens while the page server is down, invite links included. A new version waits until the user accepts it, then every tab reloads.
 - A browser profile is one device and one member; its tabs share one session.
 - It asks for persistent storage (Firefox prompts; Chrome and Safari decide silently). Safari wipes a site's storage after 7 days without a visit, but not a home-screen app's. On iPhone and iPad the home-screen app also has storage of its own, apart from Safari's, so it is a different device: the app asks to be added to the home screen before it creates one.
-- **Push**: a browser has one Web Push subscription, made with a VAPID key it generates itself, and publishes the subscription and that key in its leaf in every group. When it is removed from any group, it makes a new subscription and key and republishes them everywhere; it re-checks its subscription whenever it opens, since subscriptions die silently (after 60 days offline in Firefox, or when permission is revoked). For anything that would wake an agent, a sender's client pushes it a notice: the group and the sender, never content, encrypted per RFC 8291 (our own sender, about 60 lines). The push service sees only that something arrived. The service worker shows a notification for every push, as Chrome requires and as Safari enforces by dropping a subscription after three silent ones. On iPhone this needs iOS 16.4 or later and the home-screen app.
-- Browsers cannot send pushes themselves: the push services of Chrome, Apple and Microsoft refuse requests from web pages; only Mozilla's accepts them. (Open: a native member online sends on a browser's behalf, or `letmeknow serve` forwards them.)
 - While open, a browser holds and forwards like any member, and may keep less than `keep`.
 
 ## Deployment
@@ -192,13 +190,13 @@ Weaker than today:
 - **No shared transcript**: members can end up holding different sets of messages, when one expired before reaching them or arrived after their key window. Docs always converge.
 - **Removed members' old epochs**: a removed member can write new messages into the epochs it was in; members take them for only 5 minutes after applying its removal.
 - **Doc edits relayed in a diff** are vouched for by the member that sent the diff, not their authors; since any member can edit anything, this loses attribution, not access.
-- **Push notices**: a notice's group and sender are encrypted under a key that does not change, so they lack forward secrecy.
 - **Availability**: a message reaches a member only while that member and some holder are online together. Agents that are never online at the same time need a third member to bridge them.
 
 ## Later
 
 - Trusted introducers, whose introductions a contact accepts automatically, one level deep.
 - An old identity vouching for its replacement, so contacts can follow a person who lost every device.
+- Push notifications for browsers, designed from the push prototype (spike/push): one Web Push subscription per browser, made with a VAPID key the browser generates and publishes in its leaf, rotated on any removal; notices name only the group and sender; our own RFC 8291 sender. Browsers cannot send to the push services of Chrome, Apple or Microsoft, so a native member online, or a stateless forwarder in `letmeknow serve`, must send for them.
 - LAN discovery without the internet (mDNS, the crate iroh-mdns-address-lookup: about 0.7 MB, constant LAN chatter, and it announces session keys to the whole LAN).
 - Pinning the browser client: signed bundles, an extension, or an app.
 - More membership service kinds: S3-style conditional writes, SQL, git, a blockchain.
