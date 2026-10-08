@@ -548,5 +548,7 @@ fn state_survives_a_restart() {
     assert_eq!(a.g().epoch_authenticator(), b.g().epoch_authenticator());
     let hi = b.send("after a restart");
     assert_eq!(text(&a.open(&hi, 0).unwrap()), "after a restart");
+    // Windows cannot delete a database that is still open.
+    drop((a, b));
     std::fs::remove_dir_all(dir).unwrap();
 }
