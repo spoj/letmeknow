@@ -86,7 +86,15 @@ impl World {
             contacts: Vec::new(),
             openings: Vec::new(),
         };
-        world.lock().unwrap().nodes.insert(iroh.clone(), node);
+        let mut locked = world.lock().unwrap();
+        match locked.nodes.get_mut(&iroh) {
+            Some(restarted) => {
+                restarted.inbound = inbound.clone();
+                restarted.online = true;
+            }
+            None => _ = locked.nodes.insert(iroh.clone(), node),
+        }
+        drop(locked);
         (FakeCore(world.clone(), iroh.clone()), FakePeers(world.clone(), iroh), FakeLog(world.clone(), inbound))
     }
 
@@ -113,7 +121,7 @@ fn nonce() -> u64 {
     rand::random()
 }
 
-pub struct FakeCore(Shared, Bytes);
+pub struct FakeCore(pub Shared, pub Bytes);
 
 impl FakeCore {
     fn with<T>(&self, f: impl FnOnce(&mut Node) -> T) -> T {

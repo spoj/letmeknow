@@ -49,7 +49,9 @@ async fn start(world: &Shared, home: &Path, handle: &str, me: Member, hold: Dura
             let parts = World::join(&world, joining.clone(), inbound);
             let mut node = world.lock().unwrap();
             let node = node.nodes.get_mut(&joining.iroh).unwrap();
-            node.identities.extend(joining.identity.map(|c| (c.identity, c.name)));
+            if node.identities.is_empty() {
+                node.identities.extend(joining.identity.map(|c| (c.identity, c.name)));
+            }
             Ok(parts)
         };
         let print = move |line: String| drop(out.send(line));
@@ -341,5 +343,126 @@ fn the_command_channel_needs_its_token_and_a_running_session() {
         let missing = Agent { handle: "nobody".into(), ..alice };
         let error = cmd(&home, &missing, &["groups"]).await.unwrap_err().to_string();
         assert!(error.contains("not running"), "{error}");
+    });
+}
+
+#[test]
+fn a_message_waits_for_those_it_comes_after() {
+    local(async {
+        let (world, home, mut alice, bob, group) = pair("causal", Duration::from_secs(3600)).await;
+        let gid = Bytes(base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &group).unwrap());
+        let mut core = crate::fake::FakeCore(world.clone(), bob.member.iroh.clone());
+        let message = |content: &str, after: Vec<Bytes>| lmk_proto::group::Payload::Message {
+            content: content.into(),
+            after,
+            to: Vec::new(),
+            reply_to: None,
+            urgent: true,
+            attachment: None,
+        };
+        use crate::node::Core;
+        let first = core.seal(&gid.0, &message("first", Vec::new())).unwrap();
+        let first_id = Bytes(<sha2::Sha256 as sha2::Digest>::digest(&first).to_vec());
+        let second = core.seal(&gid.0, &message("second", vec![first_id])).unwrap();
+        let inbound = world.lock().unwrap().nodes[&alice.member.iroh].inbound.clone();
+        let send = |ciphertext: Vec<u8>| inbound.send(crate::node::Inbound::Message { group: gid.clone(), ciphertext }).unwrap();
+        send(second);
+        assert!(alice.printed().await.is_empty());
+        send(first);
+        assert_eq!(alice.expect("message").await["content"], "first");
+        let second = alice.expect("message").await;
+        assert_eq!(second["content"], "second");
+        assert!(second.get("missing").is_none());
+        drop(home);
+    });
+}
+
+#[test]
+fn a_session_of_an_identity_joins_a_group_open_to_it() {
+    local(async {
+        let (world, home, mut alice, bob, group) = pair("open", Duration::from_secs(3600)).await;
+        let opened = cmd(&home, &alice, &["open", "Bob (Acme)"]).await.unwrap();
+        assert_eq!(opened["settings"]["open"][0]["name"], "Bob (Acme)");
+        let mut tablet = member("Bob's tablet agent", bob.member.identity.clone().map(|c| c.identity), "Robert");
+        tablet.device_name = "tablet".into();
+        let other = start(&world, &home, "tablet", tablet, Duration::from_secs(3600)).await;
+        let opening = lmk_proto::group::Opening {
+            group: Bytes(base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &group).unwrap()),
+            kind: lmk_proto::group::Kind::Chat,
+            name: String::new(),
+            membership: Service::Folder("/tmp/lmk-test".into()),
+            members: vec![alice.member.iroh.clone()],
+        };
+        world.lock().unwrap().nodes.get_mut(&other.member.iroh).unwrap().openings.push(opening);
+        let groups = cmd(&home, &other, &["groups"]).await.unwrap();
+        assert_eq!(groups[0]["joined"], false);
+        let joined = cmd(&home, &other, &["join", &group]).await.unwrap();
+        assert_eq!(joined["members"].as_array().unwrap().len(), 3);
+        let event = alice.expect("joined").await;
+        assert_eq!(event["member"]["identity"]["name"], "Bob (Acme)");
+        // A session that speaks for no identity the group is open to is refused.
+        let carol = start(&world, &home, "carol", member("Carol", None, ""), Duration::from_secs(3600)).await;
+        let opening = world.lock().unwrap().nodes[&other.member.iroh].openings[0].clone();
+        world.lock().unwrap().nodes.get_mut(&carol.member.iroh).unwrap().openings.push(opening);
+        let refused = cmd(&home, &carol, &["join", &group]).await.unwrap_err().to_string();
+        assert!(refused.contains("open to"), "{refused}");
+        assert_eq!(alice.expect("warning").await["group"], group.as_str());
+    });
+}
+
+#[test]
+fn a_link_for_one_identity_admits_no_other() {
+    local(async {
+        let (world, home, alice, _bob, group) = pair("to", Duration::from_secs(3600)).await;
+        let invite = cmd(&home, &alice, &["invite", "--group", &group, "--to", "Bob (Acme)"]).await.unwrap();
+        let carol = start(&world, &home, "carol", member("Carol", None, ""), Duration::from_secs(3600)).await;
+        let refused = cmd(&home, &carol, &["join", invite["link"].as_str().unwrap()]).await.unwrap_err().to_string();
+        assert!(refused.contains("another identity"), "{refused}");
+        // The link is used up.
+        let again = cmd(&home, &carol, &["join", invite["link"].as_str().unwrap()]).await.unwrap_err().to_string();
+        assert!(again.contains("unknown, used or expired"), "{again}");
+    });
+}
+
+#[test]
+fn identities_are_created_listed_and_lose_devices() {
+    local(async {
+        let (world, home) = (Shared::default(), home("identity"));
+        let alice = start(&world, &home, "alice", member("Alice", None, ""), Duration::from_secs(3600)).await;
+        let created = cmd(&home, &alice, &["identity", "create", "Alice Smith"]).await.unwrap();
+        assert_eq!(created["name"], "Alice Smith");
+        let listed = cmd(&home, &alice, &["identity", "list"]).await.unwrap();
+        assert_eq!(listed["identities"][0]["devices"][0]["you"], true);
+        assert_eq!(listed["identities"][0]["name"], "Alice Smith");
+        let invite = cmd(&home, &alice, &["invite", "--identity", "Alice Smith"]).await.unwrap();
+        assert!(invite["link"].as_str().unwrap().contains("#1.d."));
+        let phone = start(&world, &home, "phone", member("Phone", None, ""), Duration::from_secs(3600)).await;
+        let joined = cmd(&home, &phone, &["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        assert!(joined["device"].is_string());
+        let listed = cmd(&home, &alice, &["identity", "list"]).await.unwrap();
+        assert_eq!(listed["identities"][0]["devices"].as_array().unwrap().len(), 2);
+        cmd(&home, &alice, &["identity", "remove", "Phone's laptop"]).await.unwrap();
+        let listed = cmd(&home, &alice, &["identity", "list"]).await.unwrap();
+        assert_eq!(listed["identities"][0]["devices"].as_array().unwrap().len(), 1);
+    });
+}
+
+#[test]
+fn a_restarted_session_resumes_its_groups_and_docs() {
+    local(async {
+        let (world, home) = (Shared::default(), home("restart"));
+        let me = member("Alice", None, "");
+        let alice = start(&world, &home, "alice", me.clone(), Duration::from_secs(3600)).await;
+        let invite = cmd(&home, &alice, &["invite", "--kind", "doc", "--name", "Notes"]).await.unwrap();
+        let file = invite["file"].as_str().unwrap().to_owned();
+        assert!(file.contains("/docs/Notes-"));
+        drop(alice);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::write(&file, "written while stopped\n").unwrap();
+        let alice = start(&world, &home, "alice", me, Duration::from_secs(3600)).await;
+        let groups = cmd(&home, &alice, &["groups"]).await.unwrap();
+        assert_eq!((groups[0]["name"].as_str(), groups[0]["file"].as_str()), (Some("Notes"), Some(file.as_str())));
+        cmd(&home, &alice, &["leave"]).await.unwrap();
+        assert!(!Path::new(&file).exists());
     });
 }
