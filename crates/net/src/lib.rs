@@ -248,11 +248,11 @@ impl Net {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.router.shutdown().await?;
         #[cfg(not(target_family = "wasm"))]
         if let Some(home) = &self.inner.config.home {
-            std::fs::remove_file(addresses::path(home, &self.id())).ok();
+            std::fs::remove_file(addresses::path(home, &self.id()))?;
         }
-        self.router.shutdown().await?;
         Ok(())
     }
 }

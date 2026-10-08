@@ -29,12 +29,15 @@ use crate::{Event, Inner, sync};
 /// Raw ciphertext bytes per `messages` frame, well under a frame's limit once in base64.
 const BATCH: usize = 8 << 20;
 
+/// Answers a `want` with the hashes the peer holds; `None` for our own wants, whose answers start downloads.
+type HaveReply = Option<oneshot::Sender<Vec<[u8; 32]>>>;
+
 pub(crate) enum Input {
     Frame(Frame),
     Closed,
     Send(Frame),
     Changed(Bytes),
-    Want { group: Bytes, files: Vec<[u8; 32]>, reply: Option<oneshot::Sender<Vec<[u8; 32]>>> },
+    Want { group: Bytes, files: Vec<[u8; 32]>, reply: HaveReply },
     Join { group: Bytes, key_package: Bytes, reply: oneshot::Sender<Answer<Admitted>> },
 }
 
@@ -46,7 +49,7 @@ struct Session {
     input: mpsc::UnboundedSender<Input>,
     groups: HashMap<Bytes, Group>,
     /// Our `want`s awaiting their `have`, in order.
-    wants: HashMap<Bytes, VecDeque<Option<oneshot::Sender<Vec<[u8; 32]>>>>>,
+    wants: HashMap<Bytes, VecDeque<HaveReply>>,
     joins: HashMap<Bytes, oneshot::Sender<Answer<Admitted>>>,
 }
 

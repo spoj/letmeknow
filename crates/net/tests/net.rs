@@ -45,6 +45,12 @@ async fn hello_head_swap_and_contradiction() {
     }
     assert_eq!(c.fake.log(G)[2], b"x3", "nothing applied across a contradiction");
 
+    // A's next commit, once the service took it, goes to B at once.
+    a.fake.groups.lock().unwrap().get_mut(G).unwrap().log.push(b"e4".to_vec());
+    a.net.changed(G);
+    b.synced(G, members[0]).await;
+    assert_eq!(b.fake.log(G).len(), 4);
+
     b.net.dial(members[2], relay.url.clone()).await.unwrap();
     b.until(|e| matches!(e, Event::Contradiction { peer, .. } if *peer == members[2])).await;
     assert_eq!(a.net.connected().len(), 2);
