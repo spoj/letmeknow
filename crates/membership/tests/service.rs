@@ -14,9 +14,7 @@ use iroh::{
 };
 use iroh_relay::{
     RelayQuicConfig,
-    server::{
-        CertConfig, QuicConfig, RelayConfig as RelayServerConfig, Server, ServerConfig, TlsConfig,
-    },
+    server::{CertConfig, QuicConfig, RelayConfig as RelayServerConfig, Server, ServerConfig, TlsConfig},
 };
 use lmk_membership::{
     ALPN, Contradiction, Forged, Membership, Refused,
@@ -38,14 +36,12 @@ async fn net(name: &str) -> Net {
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert = ck.cert.der().clone();
     let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()));
-    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_no_client_auth()
-    .with_single_cert(vec![cert.clone()], key)
-    .unwrap();
+    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key)
+        .unwrap();
     let mut relay = RelayServerConfig::new((Ipv4Addr::LOCALHOST, 0));
     relay.tls = Some(TlsConfig::new(
         (Ipv4Addr::LOCALHOST, 0),
@@ -62,10 +58,7 @@ async fn net(name: &str) -> Net {
     let url = format!("https://localhost:{}", server.https_addr().unwrap().port())
         .parse()
         .unwrap();
-    let config = RelayConfig::new(
-        url,
-        Some(RelayQuicConfig::new(server.quic_addr().unwrap().port())),
-    );
+    let config = RelayConfig::new(url, Some(RelayQuicConfig::new(server.quic_addr().unwrap().port())));
     let dir = std::env::temp_dir().join(format!("lmk-membership-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -80,26 +73,13 @@ async fn net(name: &str) -> Net {
 impl Net {
     fn builder(&self) -> Builder {
         Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Custom(RelayMap::from_iter([self
-                .config
-                .clone()])))
+            .relay_mode(RelayMode::Custom(RelayMap::from_iter([self.config.clone()])))
             .ca_tls_config(CaTlsConfig::custom_roots([self.cert.clone()]))
     }
 
-    async fn service(
-        &self,
-        secret: &SecretKey,
-        signer: SigningKey,
-        db: &str,
-        policy: Policy,
-    ) -> Router {
+    async fn service(&self, secret: &SecretKey, signer: SigningKey, db: &str, policy: Policy) -> Router {
         let store = Store::open(&self.dir.join(db), signer).unwrap();
-        let endpoint = self
-            .builder()
-            .secret_key(secret.clone())
-            .bind()
-            .await
-            .unwrap();
+        let endpoint = self.builder().secret_key(secret.clone()).bind().await.unwrap();
         let router = Router::builder(endpoint)
             .accept(ALPN, Service::new(store, policy))
             .spawn();
@@ -173,10 +153,7 @@ async fn append_read_subscribe() {
     bob.append(b"g", b"three").await.unwrap();
     for (position, entry) in [(2, b"two".as_slice()), (3, b"three")] {
         let notice = catching_up.next().await.unwrap().unwrap();
-        assert_eq!(
-            (notice.position, notice.entry.0.as_slice()),
-            (position, entry)
-        );
+        assert_eq!((notice.position, notice.entry.0.as_slice()), (position, entry));
     }
     assert_eq!(behind.chain(b"g").unwrap().length(), 3);
     assert_eq!(read_all(&bob, b"g").await.len(), 3);
@@ -190,9 +167,7 @@ async fn racing_appends_get_one_order() {
         appends_per_minute: 1000,
         ..Policy::default()
     };
-    let _service = net
-        .service(&secret, signer(&secret), "store.db", policy)
-        .await;
+    let _service = net.service(&secret, signer(&secret), "store.db", policy).await;
     let clients = [net.client(&secret).await, net.client(&secret).await];
     let tasks = clients.iter().enumerate().map(|(c, client)| {
         let client = client.clone();
@@ -200,14 +175,7 @@ async fn racing_appends_get_one_order() {
             let mut positions = Vec::new();
             for i in 0..20 {
                 let entry = format!("{c}-{i}");
-                positions.push((
-                    client
-                        .append(b"g", entry.as_bytes())
-                        .await
-                        .unwrap()
-                        .position,
-                    entry,
-                ));
+                positions.push((client.append(b"g", entry.as_bytes()).await.unwrap().position, entry));
             }
             positions
         })
@@ -240,9 +208,7 @@ async fn refusals() {
         appends_per_minute: 1,
         ..Policy::default()
     };
-    let _service = net
-        .service(&secret, signer(&secret), "store.db", policy)
-        .await;
+    let _service = net.service(&secret, signer(&secret), "store.db", policy).await;
     let client = net.client(&secret).await;
     let refused = |r: anyhow::Result<_>| r.unwrap_err().downcast::<Refused>().unwrap().0;
     assert_eq!(refused(client.append(b"g", &[0; 11]).await), "size");
@@ -270,18 +236,14 @@ async fn forged_and_contradicting_heads() {
     impostor.shutdown().await.unwrap();
 
     // The service shows the client one log, then, after losing its database, another.
-    let honest = net
-        .service(&secret, signer(&secret), "one.db", Policy::default())
-        .await;
+    let honest = net.service(&secret, signer(&secret), "one.db", Policy::default()).await;
     let client = net.client(&secret).await;
     client.append(b"g", b"a").await.unwrap();
     client.append(b"g", b"b").await.unwrap();
     let ours = client.chain(b"g").unwrap().head;
     honest.shutdown().await.unwrap();
 
-    let split = net
-        .service(&secret, signer(&secret), "two.db", Policy::default())
-        .await;
+    let split = net.service(&secret, signer(&secret), "two.db", Policy::default()).await;
     let other = net.client(&secret).await;
     other.append(b"g", b"x").await.unwrap();
     other.append(b"g", b"y").await.unwrap();
@@ -292,12 +254,6 @@ async fn forged_and_contradicting_heads() {
         .downcast::<Contradiction>()
         .unwrap();
     assert_eq!((err.ours, err.theirs.length), (ours, 2));
-    assert!(
-        client
-            .read(b"g", 1)
-            .await
-            .unwrap_err()
-            .is::<Contradiction>()
-    );
+    assert!(client.read(b"g", 1).await.unwrap_err().is::<Contradiction>());
     split.shutdown().await.unwrap();
 }

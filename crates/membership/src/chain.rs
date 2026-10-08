@@ -134,10 +134,7 @@ impl Chains {
     }
 
     pub fn set(&self, chain: Chain) {
-        self.chains
-            .lock()
-            .unwrap()
-            .insert(chain.head.log.0.clone(), chain);
+        self.chains.lock().unwrap().insert(chain.head.log.0.clone(), chain);
     }
 
     fn signed(&self, log: &[u8], head: &Head) -> Result<()> {
@@ -161,14 +158,10 @@ impl Chains {
         self.signed(log, head)?;
         let mut chains = self.chains.lock().unwrap();
         if after == 0 {
-            chains
-                .entry(log.to_vec())
-                .or_insert_with(|| Chain::new(log));
+            chains.entry(log.to_vec()).or_insert_with(|| Chain::new(log));
         }
         match chains.get_mut(log) {
-            Some(chain)
-                if !entries.is_empty() && chain.start <= after && after <= chain.length() =>
-            {
+            Some(chain) if !entries.is_empty() && chain.start <= after && after <= chain.length() => {
                 chain.extend(after, entries, head)?
             }
             Some(chain) => chain.check(head)?,
@@ -201,13 +194,9 @@ mod tests {
         let chains = Chains::new(Some(key.verifying_key()));
         let hashes = chain_of(b"log", &[b"a", b"b", b"c"]);
         let head2 = Head::sign(&key, b"log", 2, hashes[2], 1);
-        chains
-            .page(b"log", 0, &bytes(&[b"a", b"b"]), &head2)
-            .unwrap();
+        chains.page(b"log", 0, &bytes(&[b"a", b"b"]), &head2).unwrap();
         let head3 = Head::sign(&key, b"log", 3, hashes[3], 2);
-        chains
-            .page(b"log", 1, &bytes(&[b"b", b"c"]), &head3)
-            .unwrap();
+        chains.page(b"log", 1, &bytes(&[b"b", b"c"]), &head3).unwrap();
         assert_eq!(chains.get(b"log").unwrap().length(), 3);
         chains.head(b"log", &head2).unwrap();
 
@@ -249,16 +238,9 @@ mod tests {
         assert!(chains.get(b"log").is_none());
         chains.set(Chain::anchored(head2));
         chains
-            .page(
-                b"log",
-                2,
-                &bytes(&[b"c"]),
-                &Head::sign(&key, b"log", 3, hashes[3], 2),
-            )
+            .page(b"log", 2, &bytes(&[b"c"]), &Head::sign(&key, b"log", 3, hashes[3], 2))
             .unwrap();
-        chains
-            .head(b"log", &Head::sign(&key, b"log", 1, hashes[1], 3))
-            .unwrap();
+        chains.head(b"log", &Head::sign(&key, b"log", 1, hashes[1], 3)).unwrap();
         let wrong = Head::sign(&key, b"log", 4, hashes[3], 4);
         assert!(
             chains
@@ -267,10 +249,7 @@ mod tests {
                 .is::<Contradiction>()
         );
         assert_eq!(
-            (
-                chains.get(b"log").unwrap().start,
-                chains.get(b"log").unwrap().length()
-            ),
+            (chains.get(b"log").unwrap().start, chains.get(b"log").unwrap().length()),
             (2, 3)
         );
     }

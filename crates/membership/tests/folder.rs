@@ -34,14 +34,7 @@ async fn concurrent_writers() {
                 let mut positions = Vec::new();
                 for i in 0..25 {
                     let entry = format!("{w}-{i}");
-                    positions.push((
-                        client
-                            .append(b"g", entry.as_bytes())
-                            .await
-                            .unwrap()
-                            .position,
-                        entry,
-                    ));
+                    positions.push((client.append(b"g", entry.as_bytes()).await.unwrap().position, entry));
                 }
                 positions
             })
@@ -60,10 +53,7 @@ async fn concurrent_writers() {
     let (a, b) = (FolderClient::new(&dir), FolderClient::new(&dir));
     assert_eq!(read_all(&a, b"g").await, order);
     assert_eq!(read_all(&b, b"g").await, order);
-    assert_eq!(
-        tip(a.head(b"g").await.unwrap()),
-        tip(b.chain(b"g").unwrap().head)
-    );
+    assert_eq!(tip(a.head(b"g").await.unwrap()), tip(b.chain(b"g").unwrap().head));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -86,10 +76,7 @@ async fn subscribe_and_tamper() {
             (position, entry.as_slice())
         );
     }
-    assert_eq!(
-        tip(alice.head(b"g").await.unwrap()),
-        tip(bob.head(b"g").await.unwrap())
-    );
+    assert_eq!(tip(alice.head(b"g").await.unwrap()), tip(bob.head(b"g").await.unwrap()));
 
     std::fs::write(dir.join(hex::encode(b"g")).join("2.entry"), b"rewritten").unwrap();
     assert!(alice.read(b"g", 1).await.unwrap_err().is::<Contradiction>());

@@ -21,10 +21,7 @@ pub struct Store {
 }
 
 pub fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
 impl Store {
@@ -91,8 +88,7 @@ impl Store {
         while bytes < max_bytes
             && let Some(row) = rows.next()?
         {
-            let (position, entry, hash): (u64, Vec<u8>, [u8; 32]) =
-                (row.get(0)?, row.get(1)?, row.get(2)?);
+            let (position, entry, hash): (u64, Vec<u8>, [u8; 32]) = (row.get(0)?, row.get(1)?, row.get(2)?);
             if position != after + 1 + entries.len() as u64 {
                 return Ok(None);
             }
@@ -144,29 +140,17 @@ mod tests {
         assert_eq!(two.head.hash.0, expected);
 
         let page = store.read(b"g", 0, 1).unwrap().unwrap();
-        assert_eq!(
-            (page.entries, page.head.length),
-            (vec![Bytes(b"one".to_vec())], 1)
-        );
+        assert_eq!((page.entries, page.head.length), (vec![Bytes(b"one".to_vec())], 1));
         let page = store.read(b"g", 1, 1 << 20).unwrap().unwrap();
         assert_eq!((page.entries.len(), page.head.length), (1, 2));
         let page = store.read(b"g", 2, 1 << 20).unwrap().unwrap();
-        assert_eq!(
-            (page.entries.len(), page.head.hash.0),
-            (0, expected.to_vec())
-        );
+        assert_eq!((page.entries.len(), page.head.hash.0), (0, expected.to_vec()));
 
         assert_eq!(store.expire(now() + 1).unwrap(), 2);
         assert!(store.read(b"g", 0, 1 << 20).unwrap().is_none());
-        assert_eq!(
-            store.read(b"g", 2, 1 << 20).unwrap().unwrap().head.length,
-            2
-        );
+        assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().head.length, 2);
         assert_eq!(store.append(b"g", b"three").unwrap().position, 3);
-        assert_eq!(
-            store.read(b"g", 2, 1 << 20).unwrap().unwrap().entries.len(),
-            1
-        );
+        assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().entries.len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

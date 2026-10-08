@@ -80,12 +80,7 @@ impl Service {
         service
     }
 
-    async fn stream(
-        &self,
-        mut send: SendStream,
-        mut recv: RecvStream,
-        appends: &Mutex<Window>,
-    ) -> Result<()> {
+    async fn stream(&self, mut send: SendStream, mut recv: RecvStream, appends: &Mutex<Window>) -> Result<()> {
         let open: Open = frame::read(&mut recv).await?;
         if open.stream != Stream::Membership {
             return Ok(());
@@ -134,12 +129,7 @@ impl Service {
         Ok(())
     }
 
-    async fn subscribe(
-        &self,
-        mut send: SendStream,
-        mut recv: RecvStream,
-        logs: Vec<Bytes>,
-    ) -> Result<()> {
+    async fn subscribe(&self, mut send: SendStream, mut recv: RecvStream, logs: Vec<Bytes>) -> Result<()> {
         let mut notices = self.0.notices.subscribe();
         let mut logs: HashSet<Bytes> = logs.into_iter().collect();
         let (requests, mut changes) = mpsc::channel(1);
@@ -167,9 +157,7 @@ impl Service {
 }
 
 fn refused<T>(reason: &str) -> Answer<T> {
-    Answer::Refused {
-        refused: reason.into(),
-    }
+    Answer::Refused { refused: reason.into() }
 }
 
 /// Appends counted per connection, in fixed one-minute windows.

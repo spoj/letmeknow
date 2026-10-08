@@ -87,20 +87,14 @@ impl ServeClient {
     /// Checks a notice and passes it on, first reading any entries it skips past.
     async fn deliver(&self, notice: Notice, out: &mpsc::Sender<Result<Notice>>) -> Result<()> {
         let log = notice.log.0.clone();
-        let after = notice
-            .position
-            .checked_sub(1)
-            .context("a notice at position 0")?;
+        let after = notice.position.checked_sub(1).context("a notice at position 0")?;
         let len = self.0.chains.get(&log).map(|c| c.length());
         if let Some(mut len) = len
             && after > len
         {
             while len < notice.position {
                 let page = self.read(&log, len).await?;
-                ensure!(
-                    !page.entries.is_empty(),
-                    "the service withholds entries it announced"
-                );
+                ensure!(!page.entries.is_empty(), "the service withholds entries it announced");
                 for entry in page.entries {
                     len += 1;
                     let head = page.head.clone();
@@ -115,12 +109,9 @@ impl ServeClient {
             }
             return self.0.chains.head(&log, &notice.head);
         }
-        self.0.chains.page(
-            &log,
-            after,
-            std::slice::from_ref(&notice.entry),
-            &notice.head,
-        )?;
+        self.0
+            .chains
+            .page(&log, after, std::slice::from_ref(&notice.entry), &notice.head)?;
         if len.is_none_or(|len| notice.position > len) {
             out.send(Ok(notice)).await?;
         }
@@ -137,23 +128,13 @@ impl Membership for ServeClient {
                 entry: entry.into(),
             })
             .await?;
-        let after = appended
-            .position
-            .checked_sub(1)
-            .context("appended at position 0")?;
-        self.0
-            .chains
-            .page(log, after, &[entry.into()], &appended.head)?;
+        let after = appended.position.checked_sub(1).context("appended at position 0")?;
+        self.0.chains.page(log, after, &[entry.into()], &appended.head)?;
         Ok(appended)
     }
 
     async fn read(&self, log: &[u8], after: u64) -> Result<Page> {
-        let page: Page = self
-            .request(Request::Read {
-                log: log.into(),
-                after,
-            })
-            .await?;
+        let page: Page = self.request(Request::Read { log: log.into(), after }).await?;
         self.0.chains.page(log, after, &page.entries, &page.head)?;
         Ok(page)
     }

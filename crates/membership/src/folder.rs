@@ -116,9 +116,7 @@ impl FolderClient {
             .chains
             .get(log)
             .map_or_else(|| head::start(log), |c| c.hash_at(after).expect("within"));
-        let hash = entries
-            .iter()
-            .fold(start, |hash, entry| head::next(&hash, &entry.0));
+        let hash = entries.iter().fold(start, |hash, entry| head::next(&hash, &entry.0));
         let head = unsigned(log, after + entries.len() as u64, hash);
         self.0.chains.page(log, after, &entries, &head)?;
         Ok(Page { entries, head })
