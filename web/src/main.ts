@@ -205,7 +205,11 @@ function welcome(kind: string | undefined) {
         "div",
         { className: "card welcome" },
         h("h1", {}, "Add letmeknow to your Home Screen first"),
-        h("p", {}, "Tap Share, then Add to Home Screen, and open letmeknow from there. The Home Screen app keeps its own storage, apart from Safari's, so it is a device of its own; and Safari forgets a site's storage after a week without a visit."),
+        h(
+          "p",
+          {},
+          "Tap Share, then Add to Home Screen, and open letmeknow from there. The Home Screen app keeps its own storage, apart from Safari's, so it is a device of its own; and Safari forgets a site's storage after a week without a visit."
+        ),
         invite && h("p", { className: "muted" }, "To use this invite there, copy the link now and paste it into the app's Join."),
         invite && copyable(invite),
         anyway
@@ -225,10 +229,12 @@ function welcome(kind: string | undefined) {
       h("h1", {}, "You're invited"),
       h("p", {}, "Someone sent you this link to share a chat or a document with you, and perhaps with their agents. It is end-to-end encrypted: only those in it can read it."),
       form(
-        () => ready() && busy(join, "Joining…", async () => {
-          await start(name.value.trim(), device.value.trim());
-          await redeem(invite!);
-        }),
+        () =>
+          ready() &&
+          busy(join, "Joining…", async () => {
+            await start(name.value.trim(), device.value.trim());
+            await redeem(invite!);
+          }),
         field("Your name", name, "Everyone you share with sees it."),
         deviceField,
         join
@@ -241,10 +247,12 @@ function welcome(kind: string | undefined) {
       h("h1", {}, "Add this browser to your devices"),
       h("p", {}, "This link comes from one of your other devices. Once added, this browser joins your groups and speaks for you there."),
       form(
-        () => device.reportValidity() && busy(add, "Adding…", async () => {
-          await start(device.value.trim(), device.value.trim());
-          await redeem(invite!);
-        }),
+        () =>
+          device.reportValidity() &&
+          busy(add, "Adding…", async () => {
+            await start(device.value.trim(), device.value.trim());
+            await redeem(invite!);
+          }),
         field("Name this device", device, "Shown next to your name, as in “Matthew · phone”."),
         add
       )
@@ -272,16 +280,16 @@ function starters(before: () => Promise<boolean> = async () => true): HTMLElemen
   const name = h("input", { placeholder: "e.g. Q3 plan" });
   const chat = h("button", { className: "primary" }, "New chat");
   const doc = h("button", { type: "button" }, "New document");
-  const create = (kind: string, button: HTMLButtonElement) =>
-    busy(button, "Starting…", async () => (await before()) && select(lmk.create(kind, name.value.trim())));
+  const create = (kind: string, button: HTMLButtonElement) => busy(button, "Starting…", async () => (await before()) && select(lmk.create(kind, name.value.trim())));
   doc.onclick = () => create("doc", doc);
   const link = h("input", { placeholder: "https://letmeknow.dev/i#…", autocomplete: "off", autocapitalize: "none", spellcheck: false });
   const joinButton = h("button", {}, "Join");
   const join = form(
-    () => busy(joinButton, "Joining…", async () => {
-      if (!client.kindOf(link.value.trim())) return toast("That is not a letmeknow invite link.");
-      if (await before()) await redeem(link.value.trim());
-    }),
+    () =>
+      busy(joinButton, "Joining…", async () => {
+        if (!client.kindOf(link.value.trim())) return toast("That is not a letmeknow invite link.");
+        if (await before()) await redeem(link.value.trim());
+      }),
     h("h2", {}, "Join with a link"),
     field("Invite link", link, "A link works once, within 10 minutes of being made."),
     joinButton
@@ -310,13 +318,20 @@ function offer(kind: string | undefined) {
   const go = h("button", { className: "primary", autofocus: true }, kind === "group" ? "Join" : "Add this browser");
   const dialog = modal(
     kind === "group" ? "You're invited" : "Add this browser to your devices",
-    h("p", {}, kind === "group" ? "Join to share a chat or a document with whoever sent you the link, and perhaps their agents." : "This browser becomes one of the devices of whoever made this link: it joins their chats and documents and speaks for them."),
+    h(
+      "p",
+      {},
+      kind === "group"
+        ? "Join to share a chat or a document with whoever sent you the link, and perhaps their agents."
+        : "This browser becomes one of the devices of whoever made this link: it joins their chats and documents and speaks for them."
+    ),
     h("div", { className: "buttons" }, go)
   );
-  go.onclick = () => busy(go, "Joining…", async () => {
-    await redeem(invite!);
-    dialog.close();
-  });
+  go.onclick = () =>
+    busy(go, "Joining…", async () => {
+      await redeem(invite!);
+      dialog.close();
+    });
 }
 
 /** Uses an invite link: lands in the group it joined, or, for a device link, on this browser's devices. */
@@ -452,7 +467,8 @@ function drawNav() {
   for (const g of groups.filter(g => g.joined)) {
     let entry = navButtons.get(g.group);
     if (!entry) {
-      const name = h("span"), badge = h("b");
+      const name = h("span"),
+        badge = h("b");
       const mark = h("i", { className: "mark", ariaHidden: "true" }, g.settings.devices_of ? "🔒" : KINDS[g.settings.kind].mark);
       entry = { button: h("button", { onclick: () => select(g.group) }, mark, name, badge), name, badge };
       navButtons.set(g.group, entry);
@@ -483,10 +499,15 @@ function newGroupDialog(kind: "chat" | "doc") {
   const dialog = modal(
     `New ${KINDS[kind].name}`,
     kind === "doc" && h("p", { className: "muted" }, "One page that everyone in it, people and agents, edits at once."),
-    form(() => busy(create, "Starting…", async () => {
-      select(lmk.create(kind, name.value.trim()));
-      dialog.close();
-    }), field("Name", name, "Optional. You can rename it later."), h("div", { className: "buttons" }, create))
+    form(
+      () =>
+        busy(create, "Starting…", async () => {
+          select(lmk.create(kind, name.value.trim()));
+          dialog.close();
+        }),
+      field("Name", name, "Optional. You can rename it later."),
+      h("div", { className: "buttons" }, create)
+    )
   );
 }
 
@@ -495,11 +516,16 @@ function joinDialog() {
   const join = h("button", { className: "primary" }, "Join");
   const dialog = modal(
     "Join with a link",
-    form(() => busy(join, "Joining…", async () => {
-      if (!client.kindOf(link.value.trim())) return toast("That is not a letmeknow invite link.");
-      await redeem(link.value.trim());
-      dialog.close();
-    }), field("Invite link", link, "An invite into a group, or a device link from one of your devices. It works once, within 10 minutes."), h("div", { className: "buttons" }, join))
+    form(
+      () =>
+        busy(join, "Joining…", async () => {
+          if (!client.kindOf(link.value.trim())) return toast("That is not a letmeknow invite link.");
+          await redeem(link.value.trim());
+          dialog.close();
+        }),
+      field("Invite link", link, "An invite into a group, or a device link from one of your devices. It works once, within 10 minutes."),
+      h("div", { className: "buttons" }, join)
+    )
   );
 }
 
@@ -551,11 +577,8 @@ async function drawDevices() {
     h("button", { className: "primary", onclick: () => inviteDialog({ identity: identity.id }) }, "Add a device"),
     h("h2", {}, "Contacts"),
     contacts.contacts.length === 0 && h("p", { className: "muted" }, "Whoever joins through an invite you made for them becomes your contact."),
-    h(
-      "ul",
-      { className: "devices" },
-      ...contacts.contacts.map(c => h("li", {}, h("span", {}, c.name), h("small", {}, c.how === "verified" ? "verified" : `introduced by ${c.by}`)))
-    ),
+    contacts.contacts.length > 0 &&
+      h("ul", { className: "devices" }, ...contacts.contacts.map(c => h("li", {}, h("span", {}, c.name), h("small", {}, c.how === "verified" ? "verified" : `introduced by ${c.by}`)))),
     contacts.introductions.length > 0 && h("h3", {}, "Introduced to you"),
     contacts.introductions.length > 0 &&
       h(
@@ -591,7 +614,13 @@ async function inviteDialog(target: { gid: string } | { identity: string }) {
     path.setAttribute("d", data.flatMap((row, y) => row.map((dark, x) => (dark ? `M${x} ${y}h1v1h-1z` : ""))).join(""));
     svg.append(path);
     body.replaceChildren(
-      h("p", {}, device ? "Open this link on your other device, or scan the QR code with its camera. Your chats and documents then reach it." : `Send this link to a person or an agent. Whoever opens it first joins the ${kind}${label ? ` as your contact “${label}”` : ""}.`),
+      h(
+        "p",
+        {},
+        device
+          ? "Open this link on your other device, or scan the QR code with its camera. Your chats and documents then reach it."
+          : `Send this link to a person or an agent. Whoever opens it first joins the ${kind}${label ? ` as your contact “${label}”` : ""}.`
+      ),
       h("div", { className: "qr" }, svg),
       copyable(link),
       h("p", {}, device ? "On a computer, an agent's session adds it with:" : "An agent joins with:"),
@@ -708,7 +737,14 @@ class View {
           return h(
             "li",
             {},
-            h("div", {}, who(m), m.you && h("small", { className: "muted" }, " you"), h("p", { className: m.identity?.error ? "warn" : "muted" }, standing(m)), m.added_by && h("p", { className: "muted" }, `added by ${m.added_by.name ?? "a former member"} (${m.added_by.how})`)),
+            h(
+              "div",
+              {},
+              who(m),
+              m.you && h("small", { className: "muted" }, " you"),
+              h("p", { className: m.identity?.error ? "warn" : "muted" }, standing(m)),
+              m.added_by && h("p", { className: "muted" }, `added by ${m.added_by.name ?? "a former member"} (${m.added_by.how})`)
+            ),
             accept,
             !m.you && !settings.devices_of && confirmed("Remove", `Remove ${label(m)}?`, () => lmk.remove(gid, m.key))
           );
@@ -716,11 +752,15 @@ class View {
       ),
       !settings.devices_of && openable.map(toggle),
       !settings.devices_of &&
-        h("div", { className: "buttons leave" }, confirmed(`Leave ${kind}`, "Leave for good?", async () => {
-          if (!(await lmk.leave(gid))) toast("Asked the others to remove you; you leave once one of them is online.");
-          render();
-          dialog.close();
-        }))
+        h(
+          "div",
+          { className: "buttons leave" },
+          confirmed(`Leave ${kind}`, "Leave for good?", async () => {
+            if (!(await lmk.leave(gid))) toast("Asked the others to remove you; you leave once one of them is online.");
+            render();
+            dialog.close();
+          })
+        )
     );
   }
 }
@@ -842,8 +882,17 @@ class ChatView extends View {
         return h(
           "li",
           { className: classes.filter(Boolean).join(" "), tabIndex: -1 },
-          !follows && h("div", { className: "meta" }, who(item.from), to?.length && h("span", { className: "muted" }, "to ", to.map(label).join(", ")), item.urgent && h("span", { className: "tag" }, "Urgent"), at),
-          item.reply_to && h("blockquote", {}, parent ? [h("b", {}, label(parent.from)), " ", (parent.content || parent.attachment?.name || "").slice(0, 160)] : "a message this browser does not hold"),
+          !follows &&
+            h(
+              "div",
+              { className: "meta" },
+              who(item.from),
+              to?.length && h("span", { className: "muted" }, "to ", to.map(label).join(", ")),
+              item.urgent && h("span", { className: "tag" }, "Urgent"),
+              at
+            ),
+          item.reply_to &&
+            h("blockquote", {}, parent ? [h("b", {}, label(parent.from)), " ", (parent.content || parent.attachment?.name || "").slice(0, 160)] : "a message this browser does not hold"),
           item.content && h("div", { className: "text" }, item.content),
           item.attachment && this.attachmentView(item.attachment),
           status,
@@ -856,11 +905,7 @@ class ChatView extends View {
       case "left": {
         const self = item.by.key === item.member.key;
         const said =
-          item.type === "joined"
-            ? [who(item.by), item.how === "open" ? " let in " : " added ", who(item.member)]
-            : self
-              ? [who(item.member), " left"]
-              : [who(item.by), " removed ", who(item.member)];
+          item.type === "joined" ? [who(item.by), item.how === "open" ? " let in " : " added ", who(item.member)] : self ? [who(item.member), " left"] : [who(item.by), " removed ", who(item.member)];
         return h("li", { className: "event" }, ...said, at);
       }
       case "settings": {
@@ -927,8 +972,20 @@ class ChatView extends View {
     const { replyTo, attachment } = this;
     this.context.replaceChildren(
       ...kids([
-        replyTo && h("div", {}, h("span", {}, "Replying to ", h("b", {}, label(replyTo.from)), ": ", (replyTo.content || replyTo.attachment?.name || "").slice(0, 80)), close(() => (this.replyTo = undefined))),
-        attachment && h("div", {}, h("span", {}, "Attached ", h("b", {}, attachment.name), ` · ${megabytes(attachment.size)}`), close(() => (this.attachment = undefined)))
+        replyTo &&
+          h(
+            "div",
+            {},
+            h("span", {}, "Replying to ", h("b", {}, label(replyTo.from)), ": ", (replyTo.content || replyTo.attachment?.name || "").slice(0, 80)),
+            close(() => (this.replyTo = undefined))
+          ),
+        attachment &&
+          h(
+            "div",
+            {},
+            h("span", {}, "Attached ", h("b", {}, attachment.name), ` · ${megabytes(attachment.size)}`),
+            close(() => (this.attachment = undefined))
+          )
       ])
     );
   }

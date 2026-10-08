@@ -21,12 +21,7 @@ export async function load(): Promise<{ records: [Uint8Array, Uint8Array][]; fil
   const tx = (await db).transaction(["records", "files"]);
   const records = tx.objectStore("records");
   const files = tx.objectStore("files");
-  const [keys, values, hashes, sealed] = await Promise.all([
-    done(records.getAllKeys()),
-    done(records.getAll()),
-    done(files.getAllKeys()),
-    done(files.getAll())
-  ]);
+  const [keys, values, hashes, sealed] = await Promise.all([done(records.getAllKeys()), done(records.getAll()), done(files.getAllKeys()), done(files.getAll())]);
   return {
     records: keys.map((key, i) => [new Uint8Array(key as ArrayBuffer), values[i]]),
     files: new Map(hashes.map((hash, i) => [hash as string, sealed[i]]))

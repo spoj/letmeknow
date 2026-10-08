@@ -23,5 +23,10 @@ sw.addEventListener("fetch", event => {
   if (event.request.method !== "GET" || url.origin !== location.origin) return;
   const path = event.request.mode === "navigate" ? "/index.html" : url.pathname;
   if (!FILES.includes(path)) return;
-  event.respondWith(caches.open(VERSION).then(cache => cache.match(path)).then(cached => cached ?? fetch(event.request)));
+  event.respondWith(
+    caches
+      .open(VERSION)
+      .then(cache => cache.match(path))
+      .then(cached => cached ?? fetch(event.request))
+  );
 });

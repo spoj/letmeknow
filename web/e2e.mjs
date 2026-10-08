@@ -53,10 +53,13 @@ const browser = await chromium.launch({ args: ["--ignore-certificate-errors"] })
 const pages = {};
 async function open(name, options) {
   const context = await browser.newContext({ ignoreHTTPSErrors: true, acceptDownloads: true, permissions: ["clipboard-read", "clipboard-write"], ...options });
-  await context.addInitScript(([relay, membership]) => {
-    localStorage.setItem("lmk relay", relay);
-    localStorage.setItem("lmk membership", membership);
-  }, [LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP]);
+  await context.addInitScript(
+    ([relay, membership]) => {
+      localStorage.setItem("lmk relay", relay);
+      localStorage.setItem("lmk membership", membership);
+    },
+    [LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP]
+  );
   const page = await context.newPage();
   pages[name] = page;
   page.on("console", message => message.type() === "error" && console.log(`${name}: ${message.text()}`));
@@ -134,14 +137,26 @@ try {
   await laptop.locator("dialog").getByLabel("Invite link").fill(doc.link);
   await laptop.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
   await laptop.locator(".cm-content").waitFor();
-  check((await until(() => text(laptop), t => t === "- [ ] alpha\n- [ ] beta\n")) === "- [ ] alpha\n- [ ] beta\n", "the browser gets a doc's text when it joins");
+  check(
+    (await until(
+      () => text(laptop),
+      t => t === "- [ ] alpha\n- [ ] beta\n"
+    )) === "- [ ] alpha\n- [ ] beta\n",
+    "the browser gets a doc's text when it joins"
+  );
   await laptop.locator(".cm-line", { hasText: "beta" }).click();
   await laptop.keyboard.press("End");
   await laptop.keyboard.type(" (browser)");
-  const edited = await until(() => readFileSync(notes, "utf8"), t => t.includes("beta (browser)"));
+  const edited = await until(
+    () => readFileSync(notes, "utf8"),
+    t => t.includes("beta (browser)")
+  );
   check(edited === "- [ ] alpha\n- [ ] beta (browser)\n", "an edit in the browser reaches the native session's file");
   writeFileSync(notes, "- [x] alpha\n- [ ] beta (browser)\n- [ ] gamma\n");
-  const both = await until(() => text(laptop), t => t === "- [x] alpha\n- [ ] beta (browser)\n- [ ] gamma\n");
+  const both = await until(
+    () => text(laptop),
+    t => t === "- [x] alpha\n- [ ] beta (browser)\n- [ ] gamma\n"
+  );
   check(both === "- [x] alpha\n- [ ] beta (browser)\n- [ ] gamma\n", "and the native session's edit reaches the browser");
 
   // A device link adds a phone to Matthew's identity, made on his desk; the phone then joins a chat open to it.
@@ -178,7 +193,41 @@ try {
   await ann.printed(e => e.type === "message" && e.content === "still here");
   check(true, "and still exchanges messages");
   await laptop.locator(".group-list button", { hasText: "Notes" }).click();
-  check((await until(() => text(laptop), t => t.includes("gamma"))).includes("gamma"), "and its doc");
+  check(
+    (
+      await until(
+        () => text(laptop),
+        t => t.includes("gamma")
+      )
+    ).includes("gamma"),
+    "and its doc"
+  );
+
+  // The laptop starts an identity of its own, and its device link adds a native session's device to it.
+  await laptop.locator(".me").click();
+  await laptop.getByLabel("Your name").fill("Matt");
+  await laptop.getByRole("button", { name: "Start" }).click();
+  await laptop.locator(".devices li", { hasText: "this browser" }).waitFor();
+  await laptop.getByRole("button", { name: "Add a device" }).click();
+  const link = await laptop.locator("dialog .copy code").first().textContent();
+  check(link.includes("#1.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
+  const tablet = native("tablet");
+  await tablet.printed(e => e.type === "ready");
+  tablet.run("join", link);
+  await laptop.getByText("Added. The device now joins your chats and documents.").waitFor();
+  await until(
+    () => laptop.locator(".devices li").count(),
+    n => n === 2
+  );
+  check(tablet.run("identity", "list").identities[0].name === "Matt", "a native device joins the browser's identity by its link");
+  tablet.proc.kill();
+
+  // The service worker serves the app with the page server unreachable.
+  check(await laptop.evaluate(() => !!navigator.serviceWorker.controller), "a service worker controls the page");
+  await laptop.context().setOffline(true);
+  await laptop.reload();
+  await laptop.locator(".group-list button", { hasText: "Plans" }).waitFor();
+  check(true, "and opens the app offline, groups and all");
   console.log("browser ok");
 } catch (error) {
   for (const [name, page] of Object.entries(pages)) await page.screenshot({ path: join(tmp, `${name}.png`) });

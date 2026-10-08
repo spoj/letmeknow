@@ -4,14 +4,35 @@ import init, { type Lmk, invite_kind, start } from "../pkg/lmk_web.js";
 import wasm from "../pkg/lmk_web_bg.wasm";
 import * as store from "./store";
 
-export type Identity = { id: string; name: string; how: "self" | "verified" | "introduced" | "unknown"; by?: string; warning?: string; error?: string; new_device?: string; introduced?: { by: string; name: string } };
+export type Identity = {
+  id: string;
+  name: string;
+  how: "self" | "verified" | "introduced" | "unknown";
+  by?: string;
+  warning?: string;
+  error?: string;
+  new_device?: string;
+  introduced?: { by: string; name: string };
+};
 export type Person = { key: string; fp: string; name: string; device: string; you?: boolean; identity?: Identity; added_by?: { name?: string; how: string } };
 export type Named = { id: string; name: string };
 export type Settings = { kind: "chat" | "doc"; name: string; open?: Named[]; keep?: number; devices_of?: string };
 export type Group = { group: string; settings: Settings; members: Person[]; joined: boolean };
 export type Attachment = { link: string; name: string; size: number; type: string };
 export type Item =
-  | { type: "message"; id: string; at: number; from: Person; content: string; to?: string[]; reply_to?: string; urgent?: boolean; attachment?: Attachment; pending?: boolean; refused?: { name: string; reason: string }[] }
+  | {
+      type: "message";
+      id: string;
+      at: number;
+      from: Person;
+      content: string;
+      to?: string[];
+      reply_to?: string;
+      urgent?: boolean;
+      attachment?: Attachment;
+      pending?: boolean;
+      refused?: { name: string; reason: string }[];
+    }
   | { type: "leave"; id: string; at: number; from: Person }
   | { type: "joined"; at: number; member: Person; by: Person; how: string }
   | { type: "left"; at: number; member: Person; by: Person }
