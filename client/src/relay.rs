@@ -38,6 +38,16 @@ impl Relay {
         frames.into_iter().map(|f| Ok((f.seq, B64.decode(f.data)?))).collect()
     }
 
+    /// Stores a blob in the group, or refreshes it: the relay keeps it for its message TTL from now.
+    pub async fn put_blob(&self, relay: &str, gid: &str, hash: &str, sealed: &[u8]) -> Result<()> {
+        ok(self.0.put(format!("{relay}/g/{gid}/blobs/{hash}")).body(sealed.to_vec()).send().await?).await?;
+        Ok(())
+    }
+
+    pub async fn get_blob(&self, relay: &str, gid: &str, hash: &str) -> Result<Vec<u8>> {
+        Ok(ok(self.0.get(format!("{relay}/g/{gid}/blobs/{hash}")).send().await?).await?.bytes().await?.to_vec())
+    }
+
     /// Opens a socket on which the relay sends each new message's seq.
     pub async fn subscribe(&self, relay: &str, gid: &str) -> Result<WebSocket> {
         Ok(self.0.get(format!("{relay}/g/{gid}/ws")).upgrade().send().await?.into_websocket().await?)

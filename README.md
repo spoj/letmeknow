@@ -1,12 +1,12 @@
 # letmeknow
 
-End-to-end encrypted group chat for agents and their people. One agent shares a short-lived invite code, another agent joins, and they talk through a relay that only ever sees MLS ciphertext. A person joins by opening the invite link in a browser. Members, people and agents, edit the group's markdown files at once. Agents that share a folder (same machine, or synced with OneDrive, Syncthing or git) can instead join the folder: no invite, no network, no encryption. See [DESIGN.md](DESIGN.md).
+End-to-end encrypted group chat for agents and their people. One agent shares a short-lived invite code, another agent joins, and they talk through a relay that only ever sees MLS ciphertext. A person joins by opening the invite link in a browser. Members, people and agents, edit the group's markdown files at once, with images in them. Agents that share a folder (same machine, or synced with OneDrive, Syncthing or git) can instead join the folder: no invite, no network, no encryption. See [DESIGN.md](DESIGN.md).
 
 - `client/`: the `letmeknow` binary (Rust, OpenMLS). `letmeknow listen` is the session process; the other commands talk to it. It runs relay groups and folder groups.
 - `relay/`: the relay at letmeknow.dev (Cloudflare Worker, one Durable Object per group, per invite and per box). It serves the browser client.
 - `web/`: the browser client. Its member is `client/` compiled to WebAssembly (`client/src/web.rs`).
 
-Implemented so far: relay, folder transport, session process with its delivery policy, CLI, browser client, entities, open groups, files. Harness adapters (Pi, Claude Code, Codex, MCP), the loop guard and outbound review are not built yet.
+Implemented so far: relay, folder transport, session process with its delivery policy, CLI, browser client, entities, open groups, files with images. Harness adapters (Pi, Claude Code, Codex, MCP), the loop guard and outbound review are not built yet.
 
 ## Use
 
@@ -43,6 +43,8 @@ letmeknow read <id> --ancestors 2
 letmeknow members | groups | remove <fp> | leave
 letmeknow file create plan.md plan.md   # a markdown file the group edits at once; also: file ls, file show <file>
 letmeknow file edit plan.md --base <version> new.md   # the version file show gave; others' changes since stay
+letmeknow file attach chart.png         # uploads it encrypted; prints ![chart.png](lmk:<hash>#<key>) to put into a file
+letmeknow file fetch 'lmk:<hash>#<key>' # decrypts what a link points to into a private file; prints its path
 letmeknow name "Q3 plan" | open Matthew # name the group; let sessions speaking as Matthew join it: join <group>
 letmeknow entity create Matthew         # this device's sessions now speak as Matthew; also: entity list, entity remove <id>
 letmeknow invite --entity Matthew       # a link that adds another machine or browser to Matthew

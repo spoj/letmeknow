@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end test: local relay (wrangler dev) plus several session processes."""
-import hashlib, json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request
+import hashlib, json, os, queue, shutil, socket, struct, subprocess, sys, tempfile, threading, time, urllib.request, zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "client", "target", "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
@@ -84,9 +84,15 @@ def until(produce, accept, timeout=10):
 
 def write(name, text):
     path = os.path.join(HOME, name)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+    with open(path, "wb") as f:
+        f.write(text if isinstance(text, bytes) else text.encode())
     return path
+
+
+def png(width, height):
+    chunk = lambda kind, data: struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    rows = b"".join(b"\0" + bytes([200, 40, 40]) * width for _ in range(height))
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
 
 
 def check(condition, message):
@@ -263,6 +269,12 @@ def main():
         edited = run("erin", "file", "edit", "--base", erin_base, "notes.md", write("erin.md", "ONE\ntwo\n"))
         text = until(lambda: run("frank", "file", "show", "notes.md")["text"], lambda t: "ONE" in t)
         check(edited["text"] == text == "ONE\ntwo\nthree\n" and notes["name"] == "notes.md", "files work the same in folder groups")
+        attached = run("erin", "file", "attach", write("photo.png", png(8, 8)))
+        blob = os.path.join(folder, ".blobs", attached["link"][4:68])
+        with open(blob, "rb") as f:
+            check(png(8, 8) not in f.read(), "in a folder group, an attached image is an encrypted file in .blobs")
+        with open(run("frank", "file", "fetch", attached["markdown"])["path"], "rb") as f:
+            check(f.read() == png(8, 8), "which members fetch from there, by the link or its markdown")
 
         erin.stop()
         for i in range(22):
@@ -380,13 +392,31 @@ def main():
         on(lap, "file", "create", "crlf.md", os.path.join(HOME, "crlf.md"))
         check(on(kim, "file", "show", "crlf.md")["text"] == "one\ntwo\n", "files are LF only: CRLF an agent writes is converted")
 
+        # Images: an agent attaches one and links it from a file; the others fetch it from the relay, and keep it.
+        attached = on(lap, "file", "attach", write("chart.png", png(40, 30)))
+        check(attached["markdown"] == f"![chart.png]({attached['link']})", "file attach uploads an image and gives its markdown link")
+        shown = on(lap, "file", "show", "list.md")
+        on(lap, "file", "edit", "--base", shown["version"], "list.md", write("lap.md", shown["text"] + attached["markdown"] + "\n"))
+        check(attached["link"] in on(kim, "file", "show", "list.md")["text"], "file show gives the link, not the image")
+        url = f"{RELAY}/g/{group['group']}/blobs/{attached['link'][4:68]}"
+        sealed = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url).read()
+        check(png(40, 30) not in sealed, "the relay holds it encrypted")
+        check(until(lambda: in_state(kim, sealed), bool), "members keep the images their files link")
+        fetched = on(kim, "file", "fetch", attached["link"])
+        with open(fetched["path"], "rb") as f:
+            check(f.read() == png(40, 30) and fetched["path"].endswith(".png"), "another member fetches the image into a file")
+        check(os.name == "nt" or os.stat(fetched["path"]).st_mode & 0o777 == 0o600, "that only its owner can read")
+        check("files link at most" in on(lap, "file", "attach", write("big.bin", os.urandom(1024 * 1024)), ok=False), "a blob over the relay's 1 MiB cap is refused")
+
         listed = on(lap, "entity", "remove", srv_device)["members"]
         check([m["name"] for m in listed] == [devices["entities"][0]["members"][0]["name"]], "a member can be taken off an entity's list")
         run("later", "join", on(lap, "invite", "--group", group["group"])["link"], env=homes["elsewhere"])
         seen = {m["name"]: m.get("entity") for m in run("later", "members", env=homes["elsewhere"])["members"]}
         check(seen["Srv"]["error"] == "not on Matthew's list" and seen["Lap"]["name"] == "Matthew", "after which its sessions no longer count as the entity")
         shown = until(lambda: run("later", "file", "ls", env=homes["elsewhere"]), lambda files: files)
-        check(run("later", "file", "show", "list.md", env=homes["elsewhere"])["text"] == final, "a member added later gets the file from a snapshot, as it cannot read what came before")
+        check(run("later", "file", "show", "list.md", env=homes["elsewhere"])["text"] == final + attached["markdown"] + "\n", "a member added later gets the file from a snapshot, as it cannot read what came before")
+        with open(run("later", "file", "fetch", attached["link"], env=homes["elsewhere"])["path"], "rb") as f:
+            check(f.read() == png(40, 30), "and the images it links")
 
         check("several sessions are running" in run(None, "groups", ok=False), "without --session, several running sessions are ambiguous")
         solo_env = {**ENV, "LETMEKNOW_HOME": os.path.join(HOME, "solo")}

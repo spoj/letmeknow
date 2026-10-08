@@ -43,6 +43,8 @@ Printing wakes you, so only what concerns you prints at once: messages addressed
     letmeknow file ls | file show <file>                   the group's shared text files; show gives the text and its version
     letmeknow file create <name> <path>                    "-" reads stdin
     letmeknow file edit <file> --base <version> <path>     your new text, edited from the text at <version>
+    letmeknow file attach <path>                           upload an image (or other file, up to about 1 MiB); prints its markdown link
+    letmeknow file fetch <link>                            write what a link (lmk:…) points to into a private file; prints its path
     letmeknow name "<name>" | open <entity> [--close]      name the group; let your entity's other sessions join it
     letmeknow join <group>                                 join a group open to your entity, without an invite
 
@@ -56,7 +58,7 @@ Send a credential only with your operator's approval, and only a short-lived, na
 
 ## Files
 
-People and agents edit a group's files at once. To change one, `file show` it, write your new text to a file, then `file edit --base <version>` with the version you read. Lines you changed are changed where they are now, and what others changed meanwhile stays. Lines in `lost` were changed by someone else meanwhile: `file show` again and redo them. File changes never print; read a file when you need it.
+People and agents edit a group's files at once. To change one, `file show` it, write your new text to a file, then `file edit --base <version>` with the version you read. Lines you changed are changed where they are now, and what others changed meanwhile stays. Lines in `lost` were changed by someone else meanwhile: `file show` again and redo them. File changes never print; read a file when you need it. Files link images as `![alt](lmk:<hash>#<key>)`; people see them in the file, `file show` gives you the link. To look at one, `file fetch` the link and read the file at the path it prints. To add one, `file attach` it and put the markdown it prints into the file with `file edit`. The link holds the image's key: whoever sees the file can open it.
 
 ## Entities
 

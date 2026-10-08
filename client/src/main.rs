@@ -285,6 +285,9 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
             std::io::stdin().read_to_string(text)?;
         }
     }
+    if let Request::File { op: FileOp::Attach { path, data, .. } } = &mut request {
+        *data = B64.encode(std::fs::read(&*path).with_context(|| format!("cannot read {path}"))?);
+    }
     if let Request::File { op: FileOp::Edit { text, .. } | FileOp::Create { text, .. } } = &mut request {
         let read = match text.as_str() {
             "-" => {
@@ -303,7 +306,9 @@ async fn call(session: &str, mut request: Request) -> Result<()> {
         Request::Invite { group, .. } | Request::Open { group, .. } | Request::Name { group, .. } | Request::Send { group, .. } | Request::Members { group } | Request::Remove { group, .. } | Request::Leave { group } => {
             group.as_mut()
         }
-        Request::File { op: FileOp::Ls { group } | FileOp::Show { group, .. } | FileOp::Edit { group, .. } | FileOp::Create { group, .. } } => {
+        Request::File {
+            op: FileOp::Ls { group } | FileOp::Show { group, .. } | FileOp::Edit { group, .. } | FileOp::Create { group, .. } | FileOp::Attach { group, .. } | FileOp::Fetch { group, .. },
+        } => {
             group.as_mut()
         }
         Request::Read { .. } | Request::Groups | Request::Entity { .. } => None,

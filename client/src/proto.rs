@@ -122,25 +122,77 @@ pub fn invite_key(secret: &[u8], id: &str) -> [u8; 32] {
 }
 
 pub fn seal(rand: &RustCrypto, key: &[u8; 32], label: &[u8], plaintext: &[u8]) -> Result<String> {
+    Ok(B64.encode(seal_bytes(rand, key, label, plaintext)?))
+}
+
+pub fn open(key: &[u8; 32], label: &[u8], data: &str) -> Result<Vec<u8>> {
+    open_bytes(key, label, &B64.decode(data)?).map_err(|_| anyhow::anyhow!("cannot decrypt: wrong invite code or tampered data"))
+}
+
+fn seal_bytes(rand: &RustCrypto, key: &[u8; 32], label: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     let nonce: [u8; 12] = rand.random_array()?;
     let cipher = ChaCha20Poly1305::new_from_slice(key).expect("32-byte key");
     let sealed = cipher
         .encrypt(&nonce.into(), Aad { msg: plaintext, aad: label })
         .map_err(|_| anyhow::anyhow!("encryption failed"))?;
-    Ok(B64.encode([nonce.as_slice(), &sealed].concat()))
+    Ok([nonce.as_slice(), &sealed].concat())
 }
 
-pub fn open(key: &[u8; 32], label: &[u8], data: &str) -> Result<Vec<u8>> {
-    let bytes = B64.decode(data)?;
+fn open_bytes(key: &[u8; 32], label: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.len() < 12 {
         bail!("sealed data too short");
     }
     let (nonce, sealed) = bytes.split_at(12);
     let nonce: [u8; 12] = nonce.try_into().expect("12 bytes");
     let cipher = ChaCha20Poly1305::new_from_slice(key).expect("32-byte key");
-    cipher
-        .decrypt(&nonce.into(), Aad { msg: sealed, aad: label })
-        .map_err(|_| anyhow::anyhow!("cannot decrypt: wrong invite code or tampered data"))
+    cipher.decrypt(&nonce.into(), Aad { msg: sealed, aad: label }).map_err(|_| anyhow::anyhow!("cannot decrypt: wrong key or tampered data"))
+}
+
+/// The relay's cap on a blob, sealed: its message cap.
+pub const MAX_BLOB_BYTES: usize = 1024 * 1024;
+/// What sealing adds to a blob: nonce and tag.
+pub const BLOB_OVERHEAD: usize = 12 + 16;
+
+/// A blob is an image or other file that a group's files link as `lmk:<hash>#<key>`: sealed under a fresh key, which
+/// travels in the link, and stored by the SHA-256 of the sealed bytes.
+pub fn seal_blob(rand: &RustCrypto, key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+    seal_bytes(rand, key, b"blob", plaintext)
+}
+
+pub fn blob_link(key: &[u8; 32], sealed: &[u8]) -> String {
+    format!("lmk:{}#{}", digest(sealed), hex::encode(key))
+}
+
+pub fn open_blob(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
+    open_bytes(key, b"blob", sealed)
+}
+
+/// Every blob `text` links, as (hash, key), in order and once each.
+pub fn blob_links(text: &str) -> Vec<(String, [u8; 32])> {
+    let mut links: Vec<(String, [u8; 32])> = Vec::new();
+    for (at, _) in text.match_indices("lmk:") {
+        let link = text[at + 4..].get(..129).filter(|l| l.as_bytes()[64] == b'#');
+        let Some((hash, key)) = link.map(|l| (&l[..64], &l[65..])) else { continue };
+        let key = hex::decode(key).ok().and_then(|k| <[u8; 32]>::try_from(k).ok());
+        if let Some(key) = key
+            && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && !links.iter().any(|(h, _)| h == hash)
+        {
+            links.push((hash.to_owned(), key));
+        }
+    }
+    links
+}
+
+/// The file extension of an image the browser shows inline: PNG, JPEG, GIF or WebP.
+pub fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => Some("png"),
+        [0xff, 0xd8, 0xff, ..] => Some("jpg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("gif"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("webp"),
+        _ => None,
+    }
 }
 
 /// "joined"/"left" lines for a commit, computed before it is merged.
@@ -175,4 +227,23 @@ pub fn fingerprint(signature_key: &[u8]) -> String {
 
 pub fn digest(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_blob_opens_with_the_key_in_its_link() {
+        let key = [7; 32];
+        let sealed = seal_blob(&RustCrypto::default(), &key, b"pixels").unwrap();
+        let link = blob_link(&key, &sealed);
+        let text = format!("# Plan\n![chart]({link}) and again [here]({link}), not lmk:{} or lmk:short", "0".repeat(64));
+        let links = blob_links(&text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].0, digest(&sealed));
+        assert_eq!(open_blob(&links[0].1, &sealed).unwrap(), b"pixels");
+        assert!(open_blob(&[0; 32], &sealed).is_err());
+        assert_eq!(sealed.len(), 6 + BLOB_OVERHEAD);
+    }
 }

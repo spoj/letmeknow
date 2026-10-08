@@ -326,6 +326,17 @@ pub fn open(key: &[u8], label: &str, data: &str) -> R<Vec<u8>> {
     crate::proto::open(&key32(key)?, label.as_bytes(), data).map_err(err)
 }
 
+/// A blob (an image a file links) sealed under its own fresh `key`; it is stored by the SHA-256 of the result.
+#[wasm_bindgen]
+pub fn blob_seal(key: &[u8], data: &[u8]) -> R<Vec<u8>> {
+    crate::proto::seal_blob(&RustCrypto::default(), &key32(key)?, data).map_err(err)
+}
+
+#[wasm_bindgen]
+pub fn blob_open(key: &[u8], sealed: &[u8]) -> R<Vec<u8>> {
+    crate::proto::open_blob(&key32(key)?, sealed).map_err(err)
+}
+
 /// Where something derived from `secret` lives on the relay: {"address", "key"} (hex).
 #[wasm_bindgen]
 pub fn locate(label: &str, secret: &[u8]) -> String {

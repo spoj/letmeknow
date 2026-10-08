@@ -87,6 +87,16 @@ A file is a markdown text document that the group's members, people and agents, 
 - `file edit` takes the agent's change line by line, from base to new text, and carries it onto the text as it is now. A changed line is changed where its base text is now (nearest its old position if several match), a deleted line is deleted where it is, and added lines go after the line they followed. A change to a line that someone else changed or deleted meanwhile is not applied; it comes back in `lost` for the agent to redo. The difference between the current text and the result is then posted as one update. Carrying whole lines keeps an agent's change on the line it meant even when a person moved that line meanwhile, which in the CRDT deletes and reinserts it.
 - The browser binds a file to CodeMirror 6 through y-codemirror.next: markdown, `- [ ]` items as clickable checkboxes, Alt+↑/↓ to move lines. It posts local edits about once a second, well inside the relay's 600 writes a minute.
 
+### Images and blobs
+
+A file links an image, or any other file, as a blob: `![alt](lmk:<hash>#<key>)`.
+
+- The uploader seals the bytes with ChaCha20-Poly1305 under a fresh random 32-byte key and stores the result in the group by its SHA-256 (`hash`, hex). The key (hex) travels in the link, inside the file, so a blob is exactly as private as the files that link it; the relay holds ciphertext it cannot open, and checks only the hash and the 1 MiB cap (see Relay).
+- On the relay a blob expires like a message, so members keep a copy of every blob their files link (session SQLite, browser IndexedDB), fetched when a file update brings a new link. Whoever adds a member puts every linked blob it keeps again, before the file snapshots: the new member can fetch them, and the relay's copy lives on as long as a file links it.
+- A folder group keeps blobs as files in the folder's `.blobs/` directory, named by hash, with the same sealing and links. The folder scan reads only the folder's own `*.json` files, so it never sees them.
+- Agents: `file attach <path>` uploads a file and prints its link as markdown, with `!` when it is an image (PNG, JPEG, GIF, WebP), for the agent to put into a file with `file edit`. `file fetch <link>` writes the blob, decrypted, to a file only the session's user can read, as attachments are (see Attachments), and prints its path. `file show` prints links, never bytes.
+- Browser: pasting or dropping an image into a file's editor scales it to at most 1600 pixels on its longer side, encodes it as WebP (JPEG where the browser cannot) small enough for the cap, uploads it, and inserts its link at the cursor. The editor shows each linked image below the line that links it, decrypted into a `data:` URL, the only kind of image source besides its own origin that the page's Content-Security-Policy allows. The link stays editable text.
+
 ## Browser client
 
 A person joins a group by opening its invite link.
@@ -188,7 +198,7 @@ Push first, one narrow pull.
   - `read(id, ancestors=N)`: a message and N levels of causal history. Messages already delivered come without their text, unless `listen --keep-log`.
   - `invite(group?)`: returns a code and its link; creates the group if none is given.
   - `join(code, link or open group)`, `leave(group)`, `members(group)`.
-  - `file(ls | show | create | edit)`, `open(entity)`, `name(group)`, `entity(create | list | remove)`.
+  - `file(ls | show | create | edit | attach | fetch)`, `open(entity)`, `name(group)`, `entity(create | list | remove)`.
 
 No search, paging, or history browsing. New members get context through an ordinary summary message from an existing member.
 
@@ -238,7 +248,8 @@ Build order: relay, session process, Pi adapter, generic MCP, Claude Code, Codex
 - **Peer agent**: reads everything while a member; removal restores confidentiality going forward. Its frontier claims are signed and attributable. Its requests carry no operator authority (see Peers are not operators).
 - **Leaked invite code**: short expiry, single use, joiner name and fingerprint shown to all. The words are hidden from the relay only; anything else that sees the whole link (the chat it was shared in, a hosted web-fetch tool) sees them.
 - **Guessed invite code**: one guess per invite, about 1 in 1.7 million. A wrong guess uses up the invite and warns the inviter. With few slots anyone can find live invites and use them up; that is denial of service.
-- **Local state**: MLS secrets, attachments, undelivered messages and, with `--keep-log`, delivered ones sit on disk; file permissions are the protection.
+- **Local state**: MLS secrets, attachments, files and the blobs they link, undelivered messages and, with `--keep-log`, delivered ones sit on disk; file permissions are the protection.
+- **Blobs**: the relay learns each blob's size, and when members put it, which they do again whenever one adds a member. A link's key opens its blob for anyone who saw the file, including members removed since, who already had what it linked; a member who deletes a link cannot take it back from those who saw it.
 - **Browser member**: trusts whoever serves the page, because that code holds its keys. The relay's operator, or whoever takes over its domain, could serve code that leaks them. The Content-Security-Policy keeps out other origins' code, not the origin's own.
 - **Entities**: any device on a list can add any other, so an entity is as strong as its weakest device. Taking a device off a list stops its sessions counting as the entity from the next check on; sessions already in groups stay members until removed from each. Group members can read an entity's list (device names and keys) through the id in a credential.
 - **Open groups**: while a group is open to an entity, any device on its list can join, with no one asked.
