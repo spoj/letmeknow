@@ -3,7 +3,7 @@
 // link waits for a click, so link scanners that open it join nothing.
 import "./app.css";
 import type { EditorView } from "@codemirror/view";
-import { Client, type Invite, type Item, type Membership, type Opening, type Person, type Settings, inviteKind } from "./client";
+import { Client, type Invite, type Item, type Membership, type Opening, type Person, type Settings, inviteKind, whose } from "./client";
 
 type Child = Node | string | false | undefined | null | 0;
 type Message = Extract<Item, { type: "message" }>;
@@ -134,21 +134,24 @@ function who(p: Person): HTMLElement {
 /** The group's name, or else who else is in it, leaving out this person's other devices. */
 function title(gid: string): string {
   const mine = client.me.entities.map(e => e.id);
-  const others = (JSON.parse(client.member!.members(gid)) as Person[]).filter(m => !m.you && !mine.includes(m.as?.[0] ?? "")).map(m => m.name);
-  return client.groups.get(gid)!.settings.name || others.join(", ") || "New group";
+  const members: Person[] = client.people.get(gid) ?? JSON.parse(client.member!.members(gid));
+  const others = members.filter(m => !m.you && !mine.includes(m.entity?.id ?? m.as?.[0] ?? "")).map(whose);
+  return client.groups.get(gid)!.settings.name || [...new Set(others)].join(", ") || "New group";
 }
 
 function unread(gid: string): number {
-  const seen = gid === selected && page === "group" && document.visibilityState === "visible";
+  const seen = gid === selected && page === "group" && document.visibilityState === "visible" && views.get(gid)!.chatShown;
   return seen ? 0 : client.items.get(gid)!.length - client.groups.get(gid)!.read;
 }
 
 // First visit, and invites.
 
 function welcome(kind: "group" | "entity" | null) {
-  const device = touch.matches ? "phone" : "laptop";
-  const name = h("input", { required: true, autocomplete: "name", autofocus: true, value: kind === "entity" ? device : "" });
-  const ready = () => name.reportValidity() && name.value.trim();
+  const guess = touch.matches ? "phone" : "laptop";
+  const name = h("input", { required: true, autocomplete: "name", autofocus: true, value: kind === "entity" ? guess : "" });
+  const device = h("input", { required: true, value: guess });
+  const deviceField = field("This device", device, "As in “Matthew · phone”, so you can tell your devices apart.");
+  const ready = () => name.reportValidity() && device.reportValidity() && name.value.trim();
   let body: Child[];
   if (kind === "group") {
     const join = h("button", { className: "primary" }, "Join group");
@@ -157,11 +160,12 @@ function welcome(kind: "group" | "entity" | null) {
       h("p", {}, "Someone sent you this link to talk with them, and perhaps with their agents. Messages are end-to-end encrypted: only the group's members can read them."),
       form(
         () => ready() && busy(join, "Joining…", async () => {
-          await client.create(name.value.trim(), name.value.trim());
+          await client.create(device.value.trim(), name.value.trim());
           enter();
           await redeem(invite!.slot, invite!.words);
         }),
         field("Your name", name, "Everyone in the group sees it."),
+        deviceField,
         join
       )
     ];
@@ -186,9 +190,10 @@ function welcome(kind: "group" | "entity" | null) {
         ? [h("h1", {}, "This invite has expired"), h("p", {}, "An invite works once, within 10 minutes. Ask whoever sent it for a new one, or start your own group.")]
         : [h("h1", {}, "letmeknow"), h("p", { className: "lede" }, "End-to-end encrypted group chat for you and your agents.")],
       field("Your name", name, "Shown to everyone in your groups."),
+      deviceField,
       ...starters(async kind => {
         if (!ready()) return false;
-        await client.create(name.value.trim(), kind === "entity" ? undefined : name.value.trim());
+        await client.create(device.value.trim(), kind === "entity" ? undefined : name.value.trim());
         enter();
         return true;
       }),
@@ -310,9 +315,10 @@ function enter() {
   root.replaceChildren(layout, toasts);
   refreshOpenings();
   setInterval(refreshOpenings, 60_000);
-  const newest = [...client.groups.keys()].at(-1);
-  if (!newest) return showStart();
-  select(newest);
+  const last = localStorage.getItem("group");
+  const shown = last && client.groups.has(last) ? last : [...client.groups.keys()].at(-1);
+  if (!shown) return showStart();
+  select(shown);
   if (narrow.matches) layout.classList.remove("in-main");
 }
 
@@ -338,6 +344,7 @@ function select(gid: string) {
   layout.classList.add("in-main");
   page = "group";
   selected = gid;
+  localStorage.setItem("group", gid);
   view.show();
   render();
 }
@@ -381,7 +388,7 @@ async function draw() {
   if (page !== "group" || !selected) return;
   await views.get(selected)!.update();
   const group = client.groups.get(selected);
-  if (group && document.visibilityState === "visible" && group.read !== client.items.get(selected)!.length) client.markRead(selected);
+  if (group && unread(selected) === 0 && group.read !== client.items.get(selected)!.length) client.markRead(selected);
 }
 document.addEventListener("visibilitychange", render);
 
@@ -473,6 +480,7 @@ async function showDevices() {
             "li",
             {},
             h("span", { title: `key ${m.id}` }, m.name, m.id === me && h("small", {}, " this browser")),
+            m.id === me && h("button", { className: "quiet", onclick: () => renameDialog().then(draw) }, "Rename"),
             confirmed("Remove", m.id === me ? "Remove this browser?" : `Remove ${m.name}?`, async () => {
               await client.removeFromEntity(entity, m.id);
               await draw();
@@ -485,6 +493,20 @@ async function showDevices() {
     );
   };
   await draw().catch(toast);
+}
+
+function renameDialog(): Promise<void> {
+  const name = h("input", { required: true, value: client.me.name });
+  const rename = h("button", { className: "primary" }, "Rename");
+  const dialog = modal("Rename this device", form(
+    () => name.reportValidity() && busy(rename, "Renaming…", async () => {
+      await client.renameDevice(name.value.trim());
+      dialog.close();
+    }),
+    field("Name this device", name, "Your groups see the new name from now on."),
+    h("div", { className: "buttons" }, rename)
+  ));
+  return new Promise(resolve => dialog.addEventListener("close", () => resolve()));
 }
 
 // Invites: a link, the code it holds, and a QR code of the link. Both work once, within 10 minutes.
@@ -555,6 +577,7 @@ class GroupView {
   private fileList = h("div", { className: "file-list" });
   private editorHost = h("div", { className: "editor" });
   private filesButton = h("button", { className: "files-toggle" }, "Files");
+  private chatButton = h("button", { className: "chat-toggle" }, "Chat");
   private chatTab = h("button", {}, "Chat");
   private filesTab = h("button", {}, "Files");
   private shown = 0;
@@ -567,6 +590,8 @@ class GroupView {
   private raw = "";
   private described = 0;
   private file?: string;
+  /** The file to open once the files show: the one open when this group was last shown. */
+  private wanted?: string;
   private editor?: EditorView;
   /** The settings the next settings item changes, the sender and time of the last message, and its day. */
   private settings: Settings = {};
@@ -585,7 +610,7 @@ class GroupView {
         { className: "group-head" },
         back(),
         h("div", { className: "title" }, this.heading, this.people),
-        h("div", { className: "head-actions" }, h("button", { onclick: () => inviteDialog({ gid }) }, "Invite"), this.filesButton, h("button", { className: "icon quiet", title: "Group settings", ariaLabel: "Group settings", onclick: () => this.settingsDialog() }, "⋯"))
+        h("div", { className: "head-actions" }, h("button", { onclick: () => inviteDialog({ gid }) }, "Invite"), this.filesButton, this.chatButton, h("button", { className: "icon quiet", title: "Group settings", ariaLabel: "Group settings", onclick: () => this.settingsDialog() }, "⋯"))
       ),
       h("div", { className: "tabs" }, this.chatTab, this.filesTab),
       h(
@@ -609,6 +634,11 @@ class GroupView {
     this.people.onclick = () => this.settingsDialog();
     this.newer.onclick = () => this.bottom();
     this.filesButton.onclick = () => this.setFiles(!this.el.classList.contains("files-open"));
+    this.chatButton.onclick = () => {
+      this.el.classList.toggle("chat-hidden");
+      this.remember();
+      render();
+    };
     this.chatTab.onclick = () => this.setFiles(false);
     this.filesTab.onclick = () => this.setFiles(true);
     this.list.onscroll = () => {
@@ -640,7 +670,21 @@ class GroupView {
       this.picker.value = "";
       if (file) this.attach(file);
     };
-    this.setFiles(wide.matches && client.filesOf(gid).length > 0);
+    // Shown as it was last time, in this browser: files or chat, and which file.
+    const saved: { files: boolean; chat: boolean; file?: string } | null = JSON.parse(localStorage.getItem(`view ${gid}`) ?? "null");
+    this.wanted = saved?.file;
+    this.el.classList.toggle("chat-hidden", saved?.chat === false);
+    this.setFiles(saved?.files ?? (wide.matches && client.filesOf(gid).length > 0));
+  }
+
+  /** Whether the chat is on screen: not hidden behind the files, nor beside them by choice. */
+  get chatShown(): boolean {
+    return !this.el.classList.contains("files-open") || (wide.matches && !this.el.classList.contains("chat-hidden"));
+  }
+
+  private remember() {
+    const view = { files: this.el.classList.contains("files-open"), chat: !this.el.classList.contains("chat-hidden"), file: this.file ?? this.wanted };
+    localStorage.setItem(`view ${this.gid}`, JSON.stringify(view));
   }
 
   hide() {
@@ -689,6 +733,10 @@ class GroupView {
     }
     if (added && this.stuck) this.bottom();
     else if (added) this.newer.hidden = false;
+    const waiting = unread(this.gid);
+    set(this.chatButton, waiting ? `Chat · ${waiting}` : "Chat");
+    set(this.chatTab, waiting ? `Chat · ${waiting}` : "Chat");
+    this.chatButton.setAttribute("aria-pressed", String(!this.el.classList.contains("chat-hidden")));
     this.drawFiles();
   }
 
@@ -761,7 +809,8 @@ class GroupView {
   private drawPeople() {
     const others = this.members.filter(m => !m.you);
     const warned = others.some(m => m.entity?.error);
-    this.people.replaceChildren(...(others.length ? [warned ? "⚠ " : "", others.map(label).join(", "), " and you"] : ["Only you so far"]));
+    const names = new Set(others.map(m => (m.entity?.yours && !m.entity.error ? `your ${m.name}` : label(m))));
+    this.people.replaceChildren(...(others.length ? [warned ? "⚠ " : "", [...names].join(", "), " and you"] : ["Only you so far"]));
     this.people.classList.toggle("warn", warned);
     this.empty.hidden = others.length > 0;
     this.empty.replaceChildren(
@@ -845,6 +894,7 @@ class GroupView {
     this.filesButton.setAttribute("aria-pressed", String(open));
     this.chatTab.classList.toggle("on", !open);
     this.filesTab.classList.toggle("on", open);
+    this.remember();
     this.drawFiles();
   }
 
@@ -857,12 +907,13 @@ class GroupView {
       h("button", { className: "quiet", onclick: () => this.newFile() }, "+ New file"),
       !files.length && h("p", { className: "muted" }, "Files are markdown documents that everyone in the group, people and agents, edits at once.")
     ]);
-    if (this.el.classList.contains("files-open") && !this.file && files.length) this.openFile(files[0].id);
+    if (this.el.classList.contains("files-open") && !this.file && files.length) this.openFile((files.find(f => f.id === this.wanted) ?? files[0]).id);
   }
 
   private async openFile(id: string) {
     this.closeFile();
     this.file = id;
+    this.remember();
     this.drawFiles();
     const { editor } = await import("./editor");
     if (this.file !== id || this.editor) return;

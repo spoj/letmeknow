@@ -1,11 +1,12 @@
 // A file's editor: markdown in CodeMirror, bound to the file's Yjs text. "- [ ]" items show as checkboxes that tick
-// with a click; Alt+↑/↓ moves lines. Images the file links show below their line; pasting or dropping one uploads it
-// and inserts its link.
-import { defaultKeymap } from "@codemirror/commands";
-import { markdown } from "@codemirror/lang-markdown";
-import { defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
+// with a click; a toolbar (and Alt+↑/↓, Tab, Shift+Tab) moves and indents lines. Links show as their text, and open on a
+// click, except on the line being edited. Images the file links show below their line; pasting or dropping one uploads
+// it and inserts its link.
+import { defaultKeymap, indentLess, indentMore, indentWithTab, moveLineDown, moveLineUp } from "@codemirror/commands";
+import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { defaultHighlightStyle, syntaxHighlighting, syntaxTree } from "@codemirror/language";
 import { EditorState, type Range, StateField } from "@codemirror/state";
-import { Decoration, type DecorationSet, EditorView, ViewPlugin, type ViewUpdate, WidgetType, keymap } from "@codemirror/view";
+import { Decoration, type DecorationSet, EditorView, ViewPlugin, type ViewUpdate, WidgetType, keymap, showPanel } from "@codemirror/view";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import type * as Y from "yjs";
 
@@ -68,6 +69,100 @@ const checkboxes = ViewPlugin.fromClass(
     }
   }
 );
+
+/**
+ * Links: `[text](url)` shows as its text, styled as a link, unless a cursor is on its line; bare URLs are links too. An
+ * image the file links (`![alt](lmk:…)`) shows only as the image below its line, unless a cursor is on that line.
+ */
+function links(view: EditorView): DecorationSet {
+  const { state } = view;
+  const editing = new Set(state.selection.ranges.map(r => state.doc.lineAt(r.head).number));
+  const found: Range<Decoration>[] = [];
+  const link = (from: number, to: number, href: string) =>
+    found.push(Decoration.mark({ class: "cm-link", attributes: { "data-href": href, title: href } }).range(from, to));
+  for (const { from, to } of view.visibleRanges) {
+    syntaxTree(state).iterate({
+      from,
+      to,
+      enter: node => {
+        if (node.name === "URL") return void link(node.from, node.to, state.sliceDoc(node.from, node.to));
+        if (node.name !== "Link" && node.name !== "Image") return;
+        const [open, close] = node.node.getChildren("LinkMark");
+        const url = node.node.getChild("URL");
+        if (!url || !close) return false;
+        const href = state.sliceDoc(url.from, url.to);
+        const shown = !editing.has(state.doc.lineAt(node.from).number);
+        if (node.name === "Image") {
+          if (shown && href.startsWith("lmk:")) found.push(Decoration.replace({}).range(node.from, node.to));
+        } else if (close.from > open.to) {
+          link(open.to, close.from, href);
+          if (shown) found.push(Decoration.replace({}).range(node.from, open.to), Decoration.replace({}).range(close.from, node.to));
+        }
+        return false;
+      }
+    });
+  }
+  return Decoration.set(found, true);
+}
+
+const linking = ViewPlugin.fromClass(
+  class {
+    decorations: DecorationSet;
+
+    constructor(view: EditorView) {
+      this.decorations = links(view);
+    }
+
+    update(update: ViewUpdate) {
+      if (update.docChanged || update.viewportChanged || update.selectionSet || syntaxTree(update.state) !== syntaxTree(update.startState)) {
+        this.decorations = links(update.view);
+      }
+    }
+  },
+  {
+    decorations: plugin => plugin.decorations,
+    eventHandlers: {
+      mousedown(event) {
+        const href = (event.target as HTMLElement).closest(".cm-link")?.getAttribute("data-href");
+        if (!href || !/^(https?|mailto):/i.test(href)) return false;
+        window.open(href, "_blank", "noopener");
+        return true;
+      }
+    }
+  }
+);
+
+/** Makes each selected line a task, or ticks or unticks it if it is one. */
+function task(view: EditorView): boolean {
+  const lines = new Map(view.state.selection.ranges.map(r => [view.state.doc.lineAt(r.head).number, view.state.doc.lineAt(r.head)]));
+  const changes = [...lines.values()].map(line => {
+    const box = /^\s*[-*+] \[([ xX])\]/.exec(line.text);
+    if (box) return { from: line.from + box[0].length - 2, to: line.from + box[0].length - 1, insert: box[1] === " " ? "x" : " " };
+    const bullet = /^\s*[-*+] /.exec(line.text);
+    return bullet ? { from: line.from + bullet[0].length, insert: "[ ] " } : { from: line.from + /^\s*/.exec(line.text)![0].length, insert: "- [ ] " };
+  });
+  view.dispatch({ changes });
+  return true;
+}
+
+/** Buttons for what the keyboard does with lines, as phones have no Alt or Tab; they keep the editor's focus. */
+function toolbar(view: EditorView): HTMLElement {
+  const bar = Object.assign(document.createElement("div"), { className: "cm-tools" });
+  const tools: [string, string, (view: EditorView) => boolean][] = [
+    ["↑", "Move the line up (Alt+↑)", moveLineUp],
+    ["↓", "Move the line down (Alt+↓)", moveLineDown],
+    ["⇤", "Outdent (Shift+Tab)", indentLess],
+    ["⇥", "Indent (Tab)", indentMore],
+    ["☑", "Make the line a task, or tick it", task]
+  ];
+  for (const [label, title, run] of tools) {
+    const button = Object.assign(document.createElement("button"), { type: "button", className: "quiet icon", textContent: label, title, ariaLabel: title });
+    button.onpointerdown = event => event.preventDefault();
+    button.onclick = () => run(view);
+    bar.append(button);
+  }
+  return bar;
+}
 
 /** How the editor reaches the group's images: a link's image as a data: URL, and uploading one, which gives its link. */
 export type Images = { show: (link: string) => Promise<string>; attach: (bytes: Uint8Array) => Promise<string>; fail: (error: unknown) => void };
@@ -151,8 +246,10 @@ function insertImages(view: EditorView, images: Images, event: Event, files: Fil
 
 export function editor(parent: HTMLElement, text: Y.Text, images: Images): EditorView {
   const extensions = [
-    keymap.of([...yUndoManagerKeymap, ...defaultKeymap]),
-    markdown(),
+    keymap.of([...yUndoManagerKeymap, ...defaultKeymap, indentWithTab]),
+    markdown({ base: markdownLanguage }),
+    linking,
+    showPanel.of(view => ({ dom: toolbar(view), top: true })),
     syntaxHighlighting(defaultHighlightStyle),
     EditorView.lineWrapping,
     checkboxes,

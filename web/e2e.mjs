@@ -65,9 +65,9 @@ try {
   await laptop.getByRole("button", { name: "Join group" }).click();
   await laptop.locator(".people", { hasText: "Agent" }).waitFor();
   check(new URL(laptop.url()).pathname === "/", "a browser joins from an invite link, with a click");
-  const joined = await printed(e => e.type === "joined" && e.member.name === "Matthew");
-  check(joined.member.entity?.name === "Matthew", "the agent sees the browser member speak as the person it started");
-  await laptop.getByText("Matthew let their other devices join").waitFor();
+  const joined = await printed(e => e.type === "joined" && e.member.entity?.name === "Matthew");
+  check(joined.member.name === "laptop", "the agent sees the browser member speak as the person it started, named as a device");
+  await laptop.getByText("Matthew · laptop let their other devices join").waitFor();
   check(true, "a group the browser joins lets its person's other devices join");
 
   // Adding a device: a link, a code and a QR code; the phone then joins Matthew's groups by itself.
@@ -86,9 +86,10 @@ try {
   const second = await printed(e => e.type === "joined" && e.member.name === "phone");
   check(second.member.entity?.name === "Matthew", "the added phone joins Matthew's group on its own, as a second member speaking as Matthew");
   await phone.locator(".back:visible").click();
-  await phone.locator(".group-list button", { hasText: "Agent" }).click();
-  await phone.locator(".people", { hasText: "Matthew" }).waitFor();
-  check((await phone.locator(".people").textContent()).includes("Agent"), "and lists who is who, by whose they are");
+  await phone.locator(".group-list button", { hasText: "Acme" }).click();
+  await phone.locator(".people", { hasText: "your laptop" }).waitFor();
+  check((await phone.locator(".people").textContent()).includes("Acme · Agent"), "and lists who is who, by whose they are");
+  check((await phone.locator(".group-list button").first().textContent()).startsWith("Acme"), "and titles the group by whose its other members are");
 
   await laptop.locator(".group-list button").first().click();
   const morning = agent("send", "Morning. Your priority list is ready.").id;
@@ -279,22 +280,22 @@ try {
   await laptop.getByRole("button", { name: "New group" }).click();
   await laptop.getByLabel("Group name").fill("Trip");
   await laptop.getByRole("button", { name: "Start group" }).click();
-  await laptop.getByText("Matthew named the group “Trip” and let their other devices join").waitFor();
+  await laptop.getByText("Matthew · laptop named the group “Trip” and let their other devices join").waitFor();
   await phone.reload();
   await phone.locator(".opening", { hasText: "Trip" }).getByRole("button", { name: "Join" }).click();
   await phone.locator(".group:visible h2", { hasText: "Trip" }).waitFor();
-  await phone.locator(".group:visible .people", { hasText: "Matthew and you" }).waitFor();
+  await phone.locator(".group:visible .people", { hasText: "your laptop and you" }).waitFor();
   check(true, "a device of Matthew joins a group open to his devices, admitted by a member online");
   await laptop.waitForTimeout(2_000);
   requests.length = 0;
   await laptop.waitForTimeout(16_000);
   check(requests.length === 0, `idle browsers with working sockets send no requests, even in a group open to them (${requests})`);
 
-  await laptop.locator(".group-list button", { hasText: "Agent" }).click();
+  await laptop.locator(".group-list button", { hasText: "Acme" }).click();
   await list.evaluate(element => (element.scrollTop = 100));
   await laptop.waitForTimeout(100);
   await laptop.locator(".group-list button", { hasText: "Trip" }).click();
-  await laptop.locator(".group-list button", { hasText: "Agent" }).click();
+  await laptop.locator(".group-list button", { hasText: "Acme" }).click();
   check((await list.evaluate(element => element.scrollTop)) === 100, "switching groups restores where each list was");
   await laptop.locator(".group-list button", { hasText: "Trip" }).click();
 
@@ -325,7 +326,7 @@ try {
   await laptop.getByText("Matthew · phone left").waitFor();
   check(!(await phone.locator(".group-list button", { hasText: "Trip" }).count()), "a browser leaves a group: it asks, and another member commits its removal");
   await phone.reload();
-  await phone.locator(".group-list button", { hasText: "Agent" }).waitFor();
+  await phone.locator(".group-list button", { hasText: "Acme" }).waitFor();
   check(!(await phone.locator(".opening", { hasText: "Trip" }).count()), "and the group it left is not offered again");
 
   // Taken off Matthew's devices, the phone still says it is his: the others see a plain warning.
@@ -333,8 +334,8 @@ try {
   await laptop.locator(".devices li", { hasText: "phone" }).getByRole("button", { name: "Remove" }).click();
   await laptop.locator(".devices li", { hasText: "phone" }).getByRole("button", { name: "Remove phone?" }).click();
   await laptop.locator(".devices li", { hasText: "phone" }).waitFor({ state: "detached" });
-  await laptop.locator(".group-list button", { hasText: "Agent" }).click();
-  await phone.locator(".group-list button", { hasText: "Agent" }).click();
+  await laptop.locator(".group-list button", { hasText: "Acme" }).click();
+  await phone.locator(".group-list button", { hasText: "Acme" }).click();
   await phone.getByPlaceholder("Message").fill("still me");
   await phone.getByRole("button", { name: "Send" }).click();
   const claim = laptop.locator(".messages li", { hasText: "still me" }).locator(".who");
@@ -343,11 +344,21 @@ try {
 
   const { fp } = agent("members", "--group", group).members.find(m => m.name === "phone");
   agent("remove", fp, "--group", group);
-  await phone.getByText("Agent removed you from a group").waitFor();
+  await phone.getByText("Acme removed you from a group").waitFor();
   check((await phone.locator(".group-list button").count()) === 0, "a browser removed from a group drops it");
+
+  // The laptop renames itself: each group learns the name from a key update, and Matthew's list holds it too.
+  await laptop.getByRole("button", { name: /Your devices/ }).click();
+  await laptop.locator(".devices li", { hasText: "this browser" }).getByRole("button", { name: "Rename" }).click();
+  await laptop.getByLabel("Name this device").fill("desk");
+  await laptop.locator("dialog").getByRole("button", { name: "Rename" }).click();
+  await laptop.locator(".devices li", { hasText: "desk" }).waitFor();
+  const renamed = () => agent("members", "--group", group).members.find(m => m.entity?.name === "Matthew")?.name;
+  for (let i = 0; i < 50 && renamed() !== "desk"; i++) await laptop.waitForTimeout(200);
+  check(renamed() === "desk", "a browser renames itself, in its groups and on its person's list of devices");
 } catch (error) {
   for (const [name, page] of Object.entries(pages)) {
-    console.log(`${name} shows:`, JSON.stringify(await page.locator("#app").innerText()));
+    console.log(`${name} shows:`, JSON.stringify(await page.locator("#app").innerText({ timeout: 1_000 }).catch(() => "")));
   }
   throw error;
 } finally {

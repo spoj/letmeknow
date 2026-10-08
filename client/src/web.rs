@@ -214,13 +214,24 @@ impl Member {
     }
 
     /// An empty commit that replaces this member's keys. Settle once the relay answers.
+    /// Renames this member; each group learns the new name from the member's next key update there.
+    pub fn rename(&mut self, name: &str) {
+        self.name = name.to_owned();
+    }
+
+    /// A commit that replaces this member's leaf in `gid`, under its current name.
     pub fn update_key(&mut self, gid: &str) -> R<Vec<u8>> {
         let provider = &self.provider;
         let mls = self.groups.get_mut(gid).ok_or_else(|| JsError::new("unknown group"))?;
+        let leaf = mls.own_leaf_node().ok_or_else(|| JsError::new("not in the group"))?;
+        let mut identity = Identity::parse(BasicCredential::try_from(leaf.credential().clone())?.identity());
+        identity.name = self.name.clone();
+        let credential = CredentialWithKey { credential: BasicCredential::new(identity.to_bytes()).into(), signature_key: self.signer.public().into() };
         let commit = mls
             .commit_builder()
             .consume_proposal_store(false)
             .force_self_update(true)
+            .leaf_node_parameters(LeafNodeParameters::builder().with_credential_with_key(credential).build())
             .load_psks(provider.storage())?
             .build(provider.rand(), provider.crypto(), &self.signer, |_| true)?
             .stage_commit(provider)?

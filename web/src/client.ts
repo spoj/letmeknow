@@ -7,6 +7,8 @@ import * as store from "./store";
 
 export type Entity = { id: string; name?: string; error?: string; new?: boolean; yours?: boolean };
 export type Person = { name: string; fp: string; device?: string; as?: string[]; you?: boolean; entity?: Entity };
+/** The person a member is, by its verified entity, or else the member itself. */
+export const whose = (p: Person) => (!p.entity?.error && p.entity?.name) || p.name;
 export type Settings = { name?: string; open?: { id: string; name: string }[]; requests?: string };
 export type Item =
   | { type: "message"; id: string; from: Person; content: string; to?: string[]; reply_to?: string; urgent?: boolean; attachment?: string; after: string[]; at: number }
@@ -103,7 +105,8 @@ async function boxAll(address: string): Promise<string[]> {
   }
 }
 
-const boxAppend = (address: string, data: string) => http(`/b/${address}`, { method: "POST", body: data });
+// Bodies are read even when unused: one left unread holds its connection open until the browser drops it.
+const boxAppend = async (address: string, data: string): Promise<number> => (await (await http(`/b/${address}`, { method: "POST", body: data })).json()).seq;
 const place = (label: string, secret: Uint8Array): { address: string; key: Uint8Array } => {
   const { address, key } = JSON.parse(locate(label, secret));
   return { address, key: unhex(key) };
@@ -122,6 +125,8 @@ export class Client {
   me = { name: "", entities: [] as Membership[], left: [] as string[] };
   groups = new Map<string, Group>();
   items = new Map<string, Item[]>();
+  /** Each group's members as `members` last checked them. */
+  people = new Map<string, Person[]>();
   files = new Map<string, FileDoc>();
   onchange = () => {};
   onerror = (_error: unknown) => {};
@@ -238,6 +243,7 @@ export class Client {
       this.loaded.add(gid);
       this.followGroup(gid);
       this.followRequests(gid);
+      this.run(() => this.members(gid));
     }
     setInterval(() => this.groups.forEach((_, gid) => this.followGroup(gid)), 15_000);
     setInterval(() => this.groups.forEach((_, gid) => this.followRequests(gid)), 60_000);
@@ -356,9 +362,12 @@ export class Client {
       for (const change of result.changes) this.show(gid, { type: change.type, member: await this.describe(change.member), by: await this.describe(change.by), at: Date.now() });
       if (result.removed) {
         const name = this.groups.get(gid)!.settings.name;
+        const by = whose(await this.describe(result.sender));
         await this.forget(gid);
-        this.onerror(`${result.sender.name} removed you from ${name ? `“${name}”` : "a group"}`);
+        this.onerror(`${by} removed you from ${name ? `“${name}”` : "a group"}`);
+        return;
       }
+      await this.members(gid);
       return;
     }
     const payload: Payload = result.payload;
@@ -391,6 +400,7 @@ export class Client {
       await this.save();
       const response = await http(`/g/${gid}/messages`, { method: "POST", body: bytes as BodyInit });
       if (response.status === 409) {
+        await response.text();
         this.member!.settle(gid, false);
         group.pending = undefined;
         await this.catchUp(gid);
@@ -404,10 +414,13 @@ export class Client {
 
   /** Merges this browser's commit once the relay took it, and shows the membership changes it makes. */
   private async merge(gid: string) {
-    this.groups.get(gid)!.pending = undefined;
+    const group = this.groups.get(gid)!;
+    const committed = group.pending !== undefined;
+    group.pending = undefined;
     for (const change of JSON.parse(this.member!.settle(gid, true))) {
       this.show(gid, { type: change.type, member: await this.describe(change.member), by: await this.describe(change.by), at: Date.now() });
     }
+    if (committed) await this.members(gid);
   }
 
   private show(gid: string, item: Item) {
@@ -432,9 +445,11 @@ export class Client {
     });
   }
 
+  /** The group's members, each checked against its entity's list; kept in `people` too. */
   async members(gid: string): Promise<Person[]> {
     const members: Person[] = [];
     for (const member of JSON.parse(this.member!.members(gid))) members.push(await this.describe(member, false));
+    this.people.set(gid, members);
     return members;
   }
 
@@ -488,6 +503,19 @@ export class Client {
       if (done(await this.list(id))) return;
     }
     throw new Error("the entity's list kept changing; try again");
+  }
+
+  /** Renames this browser: in each group by a key update that carries the name, and on its entities' lists. */
+  renameDevice(name: string) {
+    return this.run(async () => {
+      this.member!.rename(name);
+      this.me.name = name;
+      for (const gid of this.groups.keys()) await this.post(gid, () => this.member!.update_key(gid));
+      const me = this.member!.entry();
+      for (const { id } of this.me.entities) {
+        await this.appendEntity(id, entries => this.member!.entity_add(id, entries, me), list => list.members.some(m => m.id === this.member!.fp() && m.name === name));
+      }
+    });
   }
 
   removeFromEntity(entity: Membership, member: string) {
@@ -550,7 +578,9 @@ export class Client {
     for (let attempt = 0; attempt < 10 && !slot; attempt++) {
       const id = String(1 + (new DataView(random(4).buffer).getUint32(0) % 999));
       const body = JSON.stringify({ ttl: INVITE_TTL_MS / 1000, owner, pake: ("entity" in target ? "entity " : "") + b64(pake.message()) });
-      if ((await http(`/i/${id}`, { method: "PUT", body })).status === 201) slot = id;
+      const response = await http(`/i/${id}`, { method: "PUT", body });
+      await response.text();
+      if (response.status === 201) slot = id;
     }
     if (!slot) throw new Error("no free invite slot on the relay; try again");
     update({ code: `${slot}-${words}`, link: `${origin}/i/${slot}#${words}` });

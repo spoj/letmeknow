@@ -122,7 +122,13 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 .body { flex: 1; min-height: 0; display: flex; }
 .chat, .files { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .group:not(.files-open) .files { display: none; }
-.files { border-left: 1px solid var(--line); padding: var(--s3) var(--s4) var(--s4); gap: var(--s3); }
+.files { padding: var(--s3) var(--s4) var(--s4); gap: var(--s3); }
+/* An open file takes the stage; the chat runs beside it, or is hidden. */
+.group.files-open .files { order: -1; }
+.group.files-open .chat { flex: 0 0 clamp(300px, 32%, 420px); border-left: 1px solid var(--line); }
+.group.files-open.chat-hidden .chat { display: none; }
+.chat-toggle { display: none; }
+.group.files-open .chat-toggle { display: inline-flex; }
 .file-list { display: flex; flex-wrap: wrap; gap: var(--s1); align-items: center; }
 .file-list button { min-height: 28px; font-size: var(--t-sm); }
 .file-list p { flex-basis: 100%; font-size: var(--t-sm); padding: var(--s2) var(--s1); max-width: 28rem; }
@@ -211,8 +217,7 @@ dialog > header { display: flex; align-items: center; justify-content: space-bet
   .tabs { display: flex; gap: var(--s1); padding: var(--s2) var(--s5) 0; border-bottom: 1px solid var(--line); }
   .tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--muted); }
   .tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
-  .group.files-open .chat { display: none; }
-  .files { border-left: 0; }
+  .group.files-open .chat, .group.files-open .chat-toggle { display: none; }
 }
 
 /* Phones: the group list, or one group */
@@ -237,3 +242,9 @@ dialog > header { display: flex; align-items: center; justify-content: space-bet
   .messages li:focus-within .actions { display: flex; position: static; justify-content: flex-end; }
   .messages li:focus { outline: none; background: var(--hover); }
 }
+/* CodeMirror's own style draws the caret black unless told the editor is dark; follow the text color instead. */
+.editor .cm-editor .cm-content { caret-color: var(--text); }
+.editor .cm-link { color: var(--accent); text-decoration: underline; cursor: pointer; }
+.editor .cm-panels { background: var(--bg); border-color: var(--line); }
+.cm-tools { display: flex; gap: 2px; padding: 2px var(--s2); }
+.cm-tools button { min-height: 32px; min-width: 36px; }
