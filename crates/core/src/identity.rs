@@ -89,7 +89,10 @@ impl DeviceList {
     fn created(id: &[u8; 32], sealed: &[u8]) -> Option<Self> {
         let entry = open(id, sealed).ok()?;
         let body = signed_body(&entry)?;
-        let valid = body.op == Op::Create && body.prev.is_none() && body.by == body.device && Sha256::digest(&entry.body.0)[..] == id[..];
+        let valid = body.op == Op::Create
+            && body.prev.is_none()
+            && body.by == body.device
+            && Sha256::digest(&entry.body.0)[..] == id[..];
         if !valid {
             return None;
         }

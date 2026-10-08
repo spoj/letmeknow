@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Credential, IdentityRef, LEAF_EXTENSION, Leaf, PROTOCOL, Payload, SETTINGS_EXTENSION, Settings};
+use lmk_proto::group::{
+    Credential, How, IdentityRef, Kind, LEAF_EXTENSION, Leaf, Opening, PROTOCOL, Payload, SETTINGS_EXTENSION, Service,
+    Settings,
+};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use serde::{Deserialize, Serialize};
@@ -288,10 +291,15 @@ impl Group {
         let MlsMessageBodyIn::Welcome(welcome) = parse::<MlsMessageIn>(welcome)?.extract() else {
             bail!("not a Welcome")
         };
-        let staged =
-            StagedWelcome::build_from_welcome(provider, &join_config(window), welcome)?.skip_lifetime_validation().build()?;
+        let staged = StagedWelcome::build_from_welcome(provider, &join_config(window), welcome)?
+            .skip_lifetime_validation()
+            .build()?;
         let settings = settings_of(staged.group_context().extensions())?;
-        ensure!(settings.protocol == PROTOCOL, "this group runs protocol {}; this client runs {PROTOCOL}", settings.protocol);
+        ensure!(
+            settings.protocol == PROTOCOL,
+            "this group runs protocol {}; this client runs {PROTOCOL}",
+            settings.protocol
+        );
         let mls = staged.into_group(provider)?;
         let group = Group { state: State { window, joined: mls.epoch().as_u64(), ..State::default() }, mls };
         group.save(provider)?;
@@ -347,9 +355,11 @@ impl Group {
             .map(|member| Member {
                 index: member.index.u32(),
                 credential: credential_of(&member.credential),
-                leaf: self.mls.public_group().leaf(member.index).and_then(|leaf| {
-                    serde_json::from_slice(&leaf.extensions().unknown(LEAF_EXTENSION)?.0).ok()
-                }),
+                leaf: self
+                    .mls
+                    .public_group()
+                    .leaf(member.index)
+                    .and_then(|leaf| serde_json::from_slice(&leaf.extensions().unknown(LEAF_EXTENSION)?.0).ok()),
                 key: member.signature_key,
             })
             .collect()
@@ -375,8 +385,8 @@ impl Group {
             builder = builder.propose_group_context_extensions(context_extensions(settings)?)?;
         }
         if let Some(leaf) = &change.leaf {
-            builder =
-                builder.leaf_node_parameters(LeafNodeParameters::builder().with_extensions(leaf_extensions(leaf)?).build());
+            builder = builder
+                .leaf_node_parameters(LeafNodeParameters::builder().with_extensions(leaf_extensions(leaf)?).build());
         }
         let bundle = builder
             .load_psks(provider.storage())?
@@ -465,7 +475,12 @@ impl Group {
     }
 
     /// Seals a payload as an application message; returns its id and ciphertext.
-    pub fn seal<P: Provider>(&mut self, provider: &P, session: &Session, payload: &Payload) -> Result<([u8; 32], Vec<u8>)> {
+    pub fn seal<P: Provider>(
+        &mut self,
+        provider: &P,
+        session: &Session,
+        payload: &Payload,
+    ) -> Result<([u8; 32], Vec<u8>)> {
         let message = self.mls.create_message(provider, &session.signer, &serde_json::to_vec(payload)?)?.to_bytes()?;
         Ok((Sha256::digest(&message).into(), message))
     }
@@ -493,26 +508,70 @@ impl Group {
                 ensure!(now <= at + REMOVED_GRACE, "from a member removed more than 5 minutes before");
             }
         }
+        let payload: Payload = serde_json::from_slice(&message.into_bytes())?;
+        if let Payload::Introduce { identity, name, how } = &payload {
+            let key = [b"introduced/".as_slice(), &identity.id.0].concat();
+            if provider.get(&key)?.is_none() {
+                let introduction =
+                    Introduction { name: name.clone(), how: *how, by: sender.clone(), group: self.id().into() };
+                provider.put(&key, &serde_json::to_vec(&introduction)?)?;
+            }
+        }
         Ok(Opened {
             id: Sha256::digest(bytes).into(),
             epoch,
             index: index.u32(),
             current: current.map(|member| member.index),
             sender,
-            payload: serde_json::from_slice(&message.into_bytes())?,
+            payload,
         })
     }
 }
 
+/// Who first introduced an identity to this session, and as whom.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Introduction {
+    pub name: String,
+    pub how: How,
+    pub by: Credential,
+    pub group: Bytes,
+}
+
+pub fn introduction<P: Provider>(provider: &P, identity: &[u8]) -> Result<Option<Introduction>> {
+    let key = [b"introduced/".as_slice(), identity].concat();
+    Ok(provider.get(&key)?.map(|bytes| serde_json::from_slice(&bytes)).transpose()?)
+}
+
+/// The settings of an identity's devices group.
+pub fn devices_settings(identity: &[u8], name: &str, membership: Service) -> Settings {
+    Settings {
+        protocol: PROTOCOL,
+        kind: Kind::Chat,
+        name: name.into(),
+        open: vec![],
+        keep: 90,
+        membership,
+        devices_of: Some(identity.into()),
+        openings: vec![],
+    }
+}
+
+/// Settings with an opening recorded, replacing the one for the same group; commit them with `Change::settings`.
+pub fn with_opening(mut settings: Settings, opening: Opening) -> Settings {
+    settings.openings.retain(|old| old.group != opening.group);
+    settings.openings.push(opening);
+    settings
+}
+
 /// Records what a commit does, before it is merged.
 fn observe(
-group: &MlsGroup,
-state: &mut State,
-staged: &StagedCommit,
-by: LeafNodeIndex,
-own: bool,
-lost: bool,
-now: u64,
+    group: &MlsGroup,
+    state: &mut State,
+    staged: &StagedCommit,
+    by: LeafNodeIndex,
+    own: bool,
+    lost: bool,
+    now: u64,
 ) -> Applied {
     let committer = group.member_at(by).and_then(|member| credential_of(&member.credential));
     let added: Vec<Credential> = staged

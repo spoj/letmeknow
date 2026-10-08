@@ -4,6 +4,7 @@ pub mod contacts;
 pub mod device;
 pub mod group;
 pub mod identity;
+pub mod invite;
 pub mod provider;
 
 use openmls_rust_crypto::RustCrypto;

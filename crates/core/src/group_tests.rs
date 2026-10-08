@@ -82,7 +82,14 @@ impl<P: Provider> Member<P> {
 }
 
 pub(crate) fn message(text: &str) -> Payload {
-    Payload::Message { content: text.into(), after: vec![], to: vec![], reply_to: None, urgent: false, attachment: None }
+    Payload::Message {
+        content: text.into(),
+        after: vec![],
+        to: vec![],
+        reply_to: None,
+        urgent: false,
+        attachment: None,
+    }
 }
 
 fn text(opened: &Opened) -> &str {
@@ -394,7 +401,8 @@ fn rules_bind_everyone() {
     let c = &mut w.m[2];
     let group = c.group.as_mut().unwrap();
     let message = parse::<MlsMessageIn>(&proposal).unwrap().try_into_protocol_message().unwrap();
-    let ProcessedMessageContent::ProposalMessage(queued) = group.mls.process_message(&c.provider, message).unwrap().into_content()
+    let ProcessedMessageContent::ProposalMessage(queued) =
+        group.mls.process_message(&c.provider, message).unwrap().into_content()
     else {
         panic!()
     };
