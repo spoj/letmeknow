@@ -1756,6 +1756,7 @@ dependencies = [
  "iroh",
  "iroh-relay",
  "lmk-proto",
+ "n0-future",
  "notify",
  "rand 0.9.5",
  "rcgen",

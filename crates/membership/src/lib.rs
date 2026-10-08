@@ -2,8 +2,11 @@
 
 pub mod chain;
 pub mod client;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod folder;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod service;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod store;
 
 use anyhow::Result;

@@ -157,7 +157,7 @@ impl Membership for ServeClient {
         frame::write(&mut send, &Request::Subscribe { logs }).await?;
         let (out, notices) = mpsc::channel(64);
         let client = self.clone();
-        tokio::spawn(async move {
+        n0_future::task::spawn(async move {
             let _send = send;
             let result: Result<()> = async {
                 loop {
