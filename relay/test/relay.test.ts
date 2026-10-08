@@ -125,6 +125,7 @@ describe("blob", () => {
   const sha256 = (data: Uint8Array) => createHash("sha256").update(data).digest("hex");
   const put = (gid: string, hash: string, body: Uint8Array) => SELF.fetch(`${origin}/g/${gid}/blobs/${hash}`, { method: "PUT", body });
   const get = (gid: string, hash: string) => SELF.fetch(`${origin}/g/${gid}/blobs/${hash}`);
+  const keep = (gid: string, hash: string) => SELF.fetch(`${origin}/g/${gid}/blobs/${hash}`, { method: "POST" });
   const age = (gid: string) =>
     runInDurableObject(env.GROUPS.get(env.GROUPS.idFromName(gid)), async (_, state) => {
       state.storage.sql.exec("UPDATE blobs SET at = 0");
@@ -139,25 +140,31 @@ describe("blob", () => {
     expect((await get(gid, sha256(randomBytes(8)))).status).toBe(404);
   });
 
-  it("refuses a blob that does not match its hash, or is over 1 MiB", async () => {
+  it("refuses a blob that does not match its hash, or is over 10 MiB sealed", async () => {
     const gid = hex(16);
     expect((await put(gid, sha256(randomBytes(8)), randomBytes(8))).status).toBe(400);
-    const large = new Uint8Array(1024 * 1024 + 1);
+    const large = new Uint8Array(10 * 1024 * 1024 + 29);
     expect((await put(gid, sha256(large), large)).status).toBe(413);
-    const largest = new Uint8Array(1024 * 1024).fill(1);
+    const largest = Buffer.from(new Uint8Array(10 * 1024 * 1024 + 28).map((_, i) => i % 251));
     expect((await put(gid, sha256(largest), largest)).status).toBe(204);
+    expect(Buffer.from(await (await get(gid, sha256(largest))).arrayBuffer()).equals(largest)).toBe(true);
   });
 
-  it("expires blobs with the messages, unless put again since", async () => {
+  it("expires blobs with the messages, unless put again or kept since", async () => {
     const gid = hex(16);
-    const [kept, dropped] = [randomBytes(64), randomBytes(64)];
+    const [kept, put_again, dropped] = [randomBytes(64), randomBytes(64), randomBytes(64)];
     await put(gid, sha256(kept), kept);
+    await put(gid, sha256(put_again), put_again);
     await put(gid, sha256(dropped), dropped);
     await age(gid);
-    await put(gid, sha256(kept), kept);
+    expect((await keep(gid, sha256(kept))).status).toBe(204);
+    await put(gid, sha256(put_again), put_again);
+    expect((await keep(gid, sha256(randomBytes(64)))).status).toBe(404);
     await runDurableObjectAlarm(env.GROUPS.get(env.GROUPS.idFromName(gid)));
     expect((await get(gid, sha256(dropped))).status).toBe(404);
-    expect((await get(gid, sha256(kept))).status).toBe(200);
+    expect((await keep(gid, sha256(dropped))).status).toBe(404);
+    expect((await get(gid, sha256(put_again))).status).toBe(200);
+    expect(Buffer.from(await (await get(gid, sha256(kept))).arrayBuffer())).toEqual(kept);
     await age(gid);
     await runDurableObjectAlarm(env.GROUPS.get(env.GROUPS.idFromName(gid)));
     expect((await get(gid, sha256(kept))).status).toBe(404);

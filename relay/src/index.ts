@@ -16,6 +16,9 @@ const OWNER = /^[0-9a-f]{64}$/;
 const HASH = /^[0-9a-f]{64}$/;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_MESSAGE_BYTES = 1024 * 1024;
+// A blob holds up to 10 MiB, sealed (a 12-byte nonce and a 16-byte tag), in rows of at most CHUNK_BYTES: a row holds 2 MB.
+const MAX_BLOB_BYTES = 10 * 1024 * 1024 + 28;
+const CHUNK_BYTES = 1024 * 1024;
 const PAGE_BYTES = 2 * MAX_MESSAGE_BYTES;
 const MAX_INVITE_TTL_S = 24 * 60 * 60;
 const MAX_PAKE_CHARS = 1024;
@@ -108,7 +111,8 @@ export class Group extends DurableObject<Env> {
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.sql.exec("CREATE TABLE IF NOT EXISTS messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, data BLOB NOT NULL)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS state (epoch INTEGER NOT NULL)");
-    this.sql.exec("CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, at INTEGER NOT NULL, data BLOB NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, at INTEGER NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS chunks (hash TEXT NOT NULL, n INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (hash, n))");
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -148,18 +152,29 @@ export class Group extends DurableObject<Env> {
     return Response.json({ seq });
   }
 
-  // A blob: an encrypted image or other file that the group's files link, addressed by the SHA-256 of its bytes. Putting
-  // one again refreshes it, so it lives on while members keep linking it.
+  // A blob: an encrypted file that a message or the document links, addressed by the SHA-256 of its bytes. PUT stores
+  // it; POST keeps one the relay has for another RETENTION_MS, so a member need not upload it again; GET reads it.
   private async blob(method: string, hash: string, data: Uint8Array): Promise<Response> {
+    const kept = this.sql.exec("SELECT 1 FROM blobs WHERE hash = ?", hash).toArray().length > 0;
     if (method === "GET") {
-      const row = this.sql.exec<{ data: ArrayBuffer }>("SELECT data FROM blobs WHERE hash = ?", hash).toArray()[0];
-      return row ? new Response(row.data) : text("blob not found", 404);
+      if (!kept) return text("blob not found", 404);
+      const chunks = this.sql.exec<{ data: ArrayBuffer }>("SELECT data FROM chunks WHERE hash = ? ORDER BY n", hash).toArray();
+      return new Response(new Blob(chunks.map(c => c.data)));
+    }
+    if (method === "POST") {
+      if (!kept) return text("blob not found", 404);
+      this.sql.exec("UPDATE blobs SET at = ? WHERE hash = ?", Date.now(), hash);
+      await this.retain();
+      return new Response(null, { status: 204 });
     }
     if (method !== "PUT") return text("method not allowed", 405);
-    if (data.length > MAX_MESSAGE_BYTES) return text("blob too large (limit 1 MiB)", 413);
+    if (data.length > MAX_BLOB_BYTES) return text("blob too large (limit 10 MiB)", 413);
     const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
     if (Array.from(digest, b => b.toString(16).padStart(2, "0")).join("") !== hash) return text("blob does not match its hash", 400);
-    this.sql.exec("INSERT INTO blobs (hash, at, data) VALUES (?, ?, ?) ON CONFLICT (hash) DO UPDATE SET at = excluded.at", hash, Date.now(), data);
+    this.sql.exec("INSERT INTO blobs (hash, at) VALUES (?, ?) ON CONFLICT (hash) DO UPDATE SET at = excluded.at", hash, Date.now());
+    for (let n = 0; !kept && n * CHUNK_BYTES < data.length; n++) {
+      this.sql.exec("INSERT INTO chunks (hash, n, data) VALUES (?, ?, ?)", hash, n, data.subarray(n * CHUNK_BYTES, (n + 1) * CHUNK_BYTES));
+    }
     await this.retain();
     return new Response(null, { status: 204 });
   }
@@ -174,6 +189,7 @@ export class Group extends DurableObject<Env> {
 
   async alarm() {
     this.sql.exec("DELETE FROM messages WHERE at <= ?", Date.now() - RETENTION_MS);
+    this.sql.exec("DELETE FROM chunks WHERE hash IN (SELECT hash FROM blobs WHERE at <= ?)", Date.now() - RETENTION_MS);
     this.sql.exec("DELETE FROM blobs WHERE at <= ?", Date.now() - RETENTION_MS);
     const oldest = [
       ...this.sql.exec<{ at: number }>("SELECT at FROM messages ORDER BY seq LIMIT 1"),
