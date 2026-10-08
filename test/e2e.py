@@ -66,7 +66,8 @@ class Listener:
 
 
 class Proxy(http.server.BaseHTTPRequestHandler):
-    """A forward proxy to the relay that can lose the answer to one POST: the relay takes it, the client never hears."""
+    """A forward proxy to the relay that can lose one answer (`lose`: method and path prefix): the relay takes the request,
+    the client never hears."""
     protocol_version = "HTTP/1.1"
     lose = None
 
@@ -95,7 +96,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         relay.request(self.command, path, body, {k: v for k, v in self.headers.items() if k.lower() not in ("connection", "proxy-connection")})
         response = relay.getresponse()
         data = response.read()
-        if self.command == "POST" and Proxy.lose and url.path.startswith(Proxy.lose):
+        if Proxy.lose and f"{self.command} {url.path}".startswith(Proxy.lose):
             Proxy.lose = None
             self.close_connection = True
             return
@@ -264,7 +265,7 @@ def main():
         run("kate", "join", lossy["link"])
         run("liam", "join", run("lost", "invite", "--group", lossy["group"], env=lossy_env)["link"])
         kate.expect(lambda e: e["type"] == "joined" and e["member"]["name"] == "Liam")
-        Proxy.lose = f"/g/{lossy['group']}/messages"
+        Proxy.lose = f"POST /g/{lossy['group']}/messages"
         liam_fp = liam.ready["member"]["fp"]
         run("lost", "remove", liam_fp, ok=False, env=lossy_env)
         liam.expect(lambda e: e["type"] == "removed")
@@ -272,6 +273,10 @@ def main():
         run("lost", "send", "after the lost answer", env=lossy_env)
         check(kate.expect(lambda e: e["type"] == "message")["content"] == "after the lost answer", "a commit the relay took though its answer was lost still counts for its sender")
         lost.expect(lambda e: e["type"] == "left" and e["member"]["name"] == "Liam")
+        invite = run("lost", "invite", "--group", lossy["group"], env=lossy_env)
+        Proxy.lose = f"GET /i/{invite['code'].split('-')[0]}/join"
+        run("liam", "join", invite["link"])
+        check(Proxy.lose is None, "an inviter whose wait for the joiner fails once waits again")
         gone = run("kate", "invite")
         run("kate", "leave", "--group", gone["group"])
         refused = run("liam", "join", gone["link"], ok=False)

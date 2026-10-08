@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use reqwest::{Response, StatusCode};
 use reqwest_websocket::{Upgrade, WebSocket};
@@ -95,10 +95,28 @@ impl Relay {
     }
 }
 
+/// The relay's answer to a request it refused.
+#[derive(Debug)]
+pub struct Refused(StatusCode, String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "relay answered {}: {}", self.0, self.1)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Whether trying again may help: the relay was not reached, the connection dropped, or it failed (5xx) rather than
+/// refused (4xx).
+pub fn transient(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Refused>().is_none_or(|refused| refused.0.is_server_error())
+}
+
 async fn ok(response: Response) -> Result<Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
-    bail!("relay answered {status}: {}", response.text().await.unwrap_or_default().trim())
+    Err(Refused(status, response.text().await.unwrap_or_default().trim().to_owned()).into())
 }

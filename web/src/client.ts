@@ -41,10 +41,41 @@ const same = (a: Settings, b: Settings) =>
   a.name === b.name && a.requests === b.requests && JSON.stringify(a.open ?? []) === JSON.stringify(b.open ?? []);
 const sha256 = async (bytes: Uint8Array) => hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource)));
 
+/** The relay's answer to a request it refused. */
+class Refused extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
 async function http(path: string, init?: RequestInit): Promise<Response> {
   const response = await fetch(origin + path, init);
-  if (!response.ok && response.status !== 409) throw new Error(`relay answered ${response.status}: ${(await response.text()).trim()}`);
+  if (!response.ok && response.status !== 409) throw new Refused(response.status, `relay answered ${response.status}: ${(await response.text()).trim()}`);
   return response;
+}
+
+/**
+ * Long-polls with `poll` until it yields something, for as long as an invite or join request lives. A poll that failed
+ * on the way (no answer, or a relay failure) is tried again a few seconds later: a dropped connection says nothing about
+ * the invite.
+ */
+async function wait<T>(poll: () => Promise<T | undefined>, expired: string): Promise<T> {
+  for (const deadline = Date.now() + INVITE_TTL_MS; Date.now() < deadline; ) {
+    try {
+      const found = await poll();
+      if (found !== undefined) return found;
+    } catch (error) {
+      if (error instanceof Refused && error.status < 500) throw error;
+      await new Promise(resolve => setTimeout(resolve, 3_000));
+    }
+  }
+  throw new Error(expired);
+}
+
+/** The data a long-poll on an invite brought, if any. */
+async function inviteData(path: string): Promise<string | undefined> {
+  const response = await http(path);
+  return response.status === 204 ? undefined : (await response.json()).data;
 }
 
 // Boxes: append-only logs on the relay holding sealed text (entity lists, inboxes, join requests and replies).
@@ -455,25 +486,20 @@ export class Client {
     }
     if (!slot) throw new Error("no free invite slot on the relay; try again");
     update({ code: `${slot}-${words}`, link: `${origin}/i/${slot}#${words}` });
-    for (;;) {
-      const response = await http(`/i/${slot}/join?wait=25`);
-      if (response.status === 204) continue;
-      const join = JSON.parse((await response.json()).data);
-      const key = pake.finish(unb64(join.pake), slot);
-      const welcome = (data: Uint8Array) =>
-        http(`/i/${slot}/welcome`, { method: "POST", headers: { Authorization: `Bearer ${owner}` }, body: JSON.stringify({ data: seal(key, "welcome", data) }) });
-      let envelope: object;
-      try {
-        envelope = await this.run(() => this.admit(target, key, join));
-      } catch (error) {
-        // Sealed under our key: a joiner with a wrong code cannot open it either, and stops waiting.
-        await welcome(utf8(JSON.stringify({ error: String(error) })));
-        throw error;
-      }
-      await welcome(utf8(JSON.stringify(envelope)));
-      if ("gid" in target) await this.run(() => this.postState(target.gid));
-      return;
+    const join = JSON.parse(await wait(() => inviteData(`/i/${slot}/join?wait=25`), "nobody used the invite within 10 minutes"));
+    const key = pake.finish(unb64(join.pake), slot);
+    const welcome = (data: Uint8Array) =>
+      http(`/i/${slot}/welcome`, { method: "POST", headers: { Authorization: `Bearer ${owner}` }, body: JSON.stringify({ data: seal(key, "welcome", data) }) });
+    let envelope: object;
+    try {
+      envelope = await this.run(() => this.admit(target, key, join));
+    } catch (error) {
+      // Sealed under our key: a joiner with a wrong code cannot open it either, and stops waiting.
+      await welcome(utf8(JSON.stringify({ error: String(error) })));
+      throw error;
     }
+    await welcome(utf8(JSON.stringify(envelope)));
+    if ("gid" in target) await this.run(() => this.postState(target.gid));
   }
 
   private async admit(target: { gid: string } | { entity: Membership }, key: Uint8Array, join: { device?: string; key_package?: string }): Promise<object> {
@@ -506,12 +532,9 @@ export class Client {
     if (theirs.startsWith("entity ")) join.device = seal(key, "join", utf8(this.member!.entry()));
     else join.key_package = seal(key, "join", this.member!.key_package(this.path()));
     await http(`/i/${slot}/join`, { method: "POST", body: JSON.stringify({ data: JSON.stringify(join) }) });
-    for (;;) {
-      const response = await http(`/i/${slot}/welcome?wait=25`);
-      if (response.status === 204) continue;
-      const envelope = JSON.parse(text(open(key, "welcome", (await response.json()).data)));
-      return this.run(() => this.welcome(envelope));
-    }
+    const data = await wait(() => inviteData(`/i/${slot}/welcome?wait=25`), "the inviter did not answer within 10 minutes");
+    const envelope = JSON.parse(text(open(key, "welcome", data)));
+    return this.run(() => this.welcome(envelope));
   }
 
   private async welcome(envelope: { error?: string; entity?: Membership; group: string; seq: number; welcome: string }): Promise<string> {
@@ -596,11 +619,8 @@ export class Client {
     const requests = place("requests", unhex(opening.requests));
     await boxAppend(requests.address, seal(requests.key, "request", utf8(JSON.stringify({ key_package: b64(keyPackage), reply: hex(reply) }))));
     const back = place("reply", reply);
-    for (const deadline = Date.now() + INVITE_TTL_MS; Date.now() < deadline; ) {
-      const entries = await boxRead(back.address, 0, 25);
-      if (entries.length) return this.run(() => this.welcome(JSON.parse(text(open(back.key, "welcome", entries[0].data)))));
-    }
-    throw new Error("no member admitted the request; one must be online");
+    const data = await wait(async () => (await boxRead(back.address, 0, 25))[0]?.data, "no member admitted the request; one must be online");
+    return this.run(() => this.welcome(JSON.parse(text(open(back.key, "welcome", data)))));
   }
 
   /**

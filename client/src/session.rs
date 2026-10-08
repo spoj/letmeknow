@@ -1,6 +1,6 @@
 use crate::device::{Device, Membership};
 use crate::files;
-use crate::relay::{Notice, Relay};
+use crate::relay::{Notice, Relay, transient};
 use crate::store::{Provider, SCHEMA};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 const POLL_WAIT_S: u64 = 25;
+const RETRY_S: u64 = 3;
 const POLL_S: u64 = 15;
 const PING_S: u64 = 30;
 /// How often a request box is checked while its socket is down, and how soon a request that failed is tried again.
@@ -497,12 +498,8 @@ impl Session {
 
         let (http, events) = (self.relay.clone(), self.events.clone());
         tokio::spawn(async move {
-            loop {
-                match http.invite_get(&invite.relay, &invite.id, "join", POLL_WAIT_S).await {
-                    Ok(Some(data)) => return drop(events.send(Event::JoinRequest { invite, spake, data })),
-                    Ok(None) => {}
-                    Err(_) => return,
-                }
+            if let Ok(data) = wait(|| http.invite_get(&invite.relay, &invite.id, "join", POLL_WAIT_S), "nobody used the invite").await {
+                let _ = events.send(Event::JoinRequest { invite, spake, data });
             }
         });
         let mut answer = json!({ "code": format!("{id}-{words}"), "link": format!("{relay}/i/{id}#{words}"), "expires_in": INVITE_TTL_S });
@@ -622,12 +619,9 @@ impl Session {
         };
         let (http, events) = (self.relay.clone(), self.events.clone());
         tokio::spawn(async move {
-            loop {
-                match http.invite_get(&relay, &id, "welcome", POLL_WAIT_S).await {
-                    Ok(Some(data)) => return drop(events.send(Event::Welcome { relay, key, data, reply })),
-                    Ok(None) => {}
-                    Err(error) => return drop(reply.send(json!({ "error": format!("waiting for welcome: {error:#}") }))),
-                }
+            match wait(|| http.invite_get(&relay, &id, "welcome", POLL_WAIT_S), "the inviter did not answer within 10 minutes").await {
+                Ok(data) => drop(events.send(Event::Welcome { relay, key, data, reply })),
+                Err(error) => drop(reply.send(json!({ "error": format!("waiting for welcome: {error:#}") }))),
             }
         });
         Ok(())
@@ -935,15 +929,11 @@ impl Session {
         };
         let (http, events) = (self.relay.clone(), self.events.clone());
         tokio::spawn(async move {
-            let deadline = Instant::now() + Duration::from_secs(INVITE_TTL_S);
-            while Instant::now() < deadline {
-                match http.entries(&relay, &address, 0, POLL_WAIT_S).await {
-                    Ok(entries) if entries.is_empty() => {}
-                    Ok(mut entries) => return drop(events.send(Event::Welcome { relay, key, data: entries.remove(0).2, reply })),
-                    Err(error) => return drop(reply.send(json!({ "error": format!("waiting to be admitted: {error:#}") }))),
-                }
+            let entry = wait(|| async { Ok(http.entries(&relay, &address, 0, POLL_WAIT_S).await?.into_iter().next().map(|(_, _, data)| data)) }, "no member admitted the request; one must be online").await;
+            match entry {
+                Ok(data) => drop(events.send(Event::Welcome { relay, key, data, reply })),
+                Err(error) => drop(reply.send(json!({ "error": format!("waiting to be admitted: {error:#}") }))),
             }
-            drop(reply.send(json!({ "error": "no member admitted the request; one must be online" })));
         });
         Ok(())
     }
@@ -1653,6 +1643,21 @@ impl Session {
         println!("{}", json!({ "type": "warning", "group": gid, "text": text }));
     }
 
+}
+
+/// Long-polls with `poll` until it yields something, for as long as an invite or join request lives. A poll that failed
+/// on the way is tried again a few seconds later: a dropped connection says nothing about the invite.
+async fn wait<T, F: std::future::Future<Output = Result<Option<T>>>>(mut poll: impl FnMut() -> F, expired: &str) -> Result<T> {
+    let deadline = Instant::now() + Duration::from_secs(INVITE_TTL_S);
+    while Instant::now() < deadline {
+        match poll().await {
+            Ok(Some(found)) => return Ok(found),
+            Ok(None) => {}
+            Err(error) if transient(&error) => tokio::time::sleep(Duration::from_secs(RETRY_S)).await,
+            Err(error) => return Err(error),
+        }
+    }
+    bail!("{expired}")
 }
 
 async fn catch_up(
