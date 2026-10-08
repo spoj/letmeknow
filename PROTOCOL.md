@@ -114,6 +114,7 @@ A member checks `device_sig` and the identity's device list (see Identity) when 
 - An entry, before sealing, is `{"body": "<bytes>", "sig": "<sig>"}`. `body` is JSON, `{"prev": "<hash of the previous entry's body>" | null, "op": "create" | "add" | "remove", "device": "<key>", "device_name": "", "by": "<signing device key>"}`, plus `"name"` and `"membership"` on `create`. `sig` is by `by` over `"letmeknow device list v1\0"` ‖ body.
 - The identity's id is SHA-256 of the first entry's body. A credential names the id and its service; the first entry proves both.
 - Valid entries: `create` first, signed by the device it names; then each `prev` names the latest valid entry, and `by` is on the list at that point. A removal is final. Members apply the first valid entry per `prev`, in log order, and skip the rest.
+- A member reads the lists of the identities its groups' members speak as, and of each devices group's identity, when it joins or resumes, when members are added, and again once a list is 10 minutes old. Whenever a list it reads has removed a member's device, it commits that member's removal; a member that finds the removal already done drops its own.
 
 ### Contacts
 

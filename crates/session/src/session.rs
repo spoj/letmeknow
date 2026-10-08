@@ -1320,6 +1320,8 @@ impl Session {
                 let list = device.device_list(&identity).await?;
                 let listed = list.devices.iter().find(|d| b64(&d.key.0) == removed || d.name == removed).context("no such device")?;
                 device.remove_device(&identity, &listed.key.0).await?;
+                // This session's groups lose the device's sessions too.
+                self.node.device_list(&identity).await?;
                 Ok(json!({ "identity": identity.id, "removed": listed.key }))
             }
         }

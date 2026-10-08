@@ -136,6 +136,11 @@ impl DeviceList {
         self.devices.iter().any(|listed| listed.key.0 == device)
     }
 
+    /// Whether the device was on the list and was removed.
+    pub fn removed(&self, device: &[u8]) -> bool {
+        self.removed.iter().any(|removed| removed.0 == device)
+    }
+
     /// The sealed entry by which `by` adds a device.
     pub fn add(&self, by: &Device, device: &[u8], device_name: &str) -> Vec<u8> {
         self.entry(by, Op::Add, device, device_name)
@@ -232,6 +237,7 @@ mod tests {
         log.push(list.remove(&phone, &laptop.public()));
         let list = DeviceList::replay(&id, log.iter().map(Vec::as_slice)).unwrap();
         assert!(!list.has(&stranger.public()) && !list.has(&laptop.public()) && list.has(&phone.public()));
+        assert!(list.removed(&laptop.public()) && !list.removed(&stranger.public()));
         log.push(list.add(&laptop, &tablet.public(), "tablet"));
         log.push(list.add(&phone, &laptop.public(), "laptop"));
         let mut replayed = DeviceList::replay(&id, log.iter().map(Vec::as_slice)).unwrap();

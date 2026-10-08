@@ -54,9 +54,18 @@ struct Session {
 }
 
 async fn session(relay: &Relay, name: &str) -> Session {
+    node(relay, name, false).await
+}
+
+/// A device's own node: its key is the device key.
+async fn device(relay: &Relay, name: &str) -> Session {
+    node(relay, name, true).await
+}
+
+async fn node(relay: &Relay, name: &str, device_key: bool) -> Session {
     let config = Config {
         name: name.into(),
-        device_key: false,
+        device_key,
         relay: relay.url.clone(),
         ca: CaTlsConfig::custom_roots([relay.cert.clone()]),
         home: None,
@@ -183,4 +192,43 @@ async fn a_doc_reaches_a_joiner_and_edits_go_live() {
         _ => None,
     }).await;
     assert_eq!(by.name, "Bob");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_device_leaves_every_group() {
+    let relay = relay().await;
+    let dir = folder("revoke");
+    let membership = Service::Folder(dir.join("identities").to_str().unwrap().into());
+    let mut alice = session(&relay, "Alice").await;
+    let mut laptop = device(&relay, "laptop").await;
+    let mut tablet = device(&relay, "tablet").await;
+    let bob = laptop.node.identity_create("Bob", membership).await.unwrap();
+    let link = laptop.node.invite(Target::Device(bob.id.0.clone()), None, None).unwrap();
+    let devices = tablet.node.join(&Invite::parse(&link).unwrap(), None).await.unwrap();
+    laptop.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let chat = alice.node.create(settings(Kind::Chat, &dir), None).unwrap();
+    let link = alice.node.invite(Target::Group(chat.0.clone()), None, None).unwrap();
+    tablet.node.join(&Invite::parse(&link).unwrap(), Some(bob.clone())).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+
+    laptop.node.remove_device(&bob, &tablet.node.device().public()).await.unwrap();
+    // The laptop notices in the devices group; alice, once she reads the list.
+    laptop.until(|e| matches!(e, Event::Left { .. }).then_some(())).await;
+    alice.node.device_list(&bob).await.unwrap();
+    let left = alice.until(|e| match e {
+        Event::Left { member, .. } => Some(member),
+        _ => None,
+    }).await;
+    assert_eq!(left.device.0, tablet.node.device().public());
+    let mut gone = Vec::new();
+    while gone.len() < 2 {
+        gone.push(tablet.until(|e| match e {
+            Event::Removed { group, .. } => Some(group),
+            _ => None,
+        }).await);
+    }
+    gone.sort();
+    let mut expected = vec![devices, chat];
+    expected.sort();
+    assert_eq!(gone, expected);
 }

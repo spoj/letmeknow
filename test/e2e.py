@@ -213,6 +213,10 @@ def main():
         check(got["group"] == group, "a restarted session catches up on what it missed")
         renamed = until(lambda: run("bob", "groups"), lambda gs: any(g.get("name") == "Release" for g in gs))
         check(any(g.get("name") == "Release" for g in renamed), "and on the commits it missed")
+
+        # Bob takes his tablet off his identity: its sessions leave his groups.
+        run("bob", "identity", "remove", tablet.ready["member"]["device"]["key"])
+        check(tablet.expect("removed", timeout=60)["group"] == group, "a device taken off its identity leaves its groups")
         print("all ok")
     finally:
         for listener in listeners:

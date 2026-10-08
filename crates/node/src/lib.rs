@@ -822,7 +822,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.list(identity).await
     }
 
-    /// Takes a device off one of this device's identities, and out of its devices group.
+    /// Takes a device off one of this device's identities; its sessions then leave every group this session is in.
     pub async fn remove_device(&self, identity: &IdentityRef, device: &[u8]) -> Result<()> {
         let list = self.inner.list(identity).await?;
         ensure!(list.has(device), "that device is not on the list");
@@ -832,15 +832,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             .client(&identity.membership)?
             .append(&lmk_proto::identity::address(&identity.id.0), &entry)
             .await?;
-        self.inner.list(identity).await?;
-        let gid = self.inner.state.lock().unwrap().devices_group(&identity.id.0);
-        if let Some(gid) = gid {
-            let member = self.members(&gid)?.into_iter().find(|m| m.device.0 == device);
-            if let Some(member) = member {
-                self.remove(&gid, &member.key.0).await?;
-            }
-        }
-        Ok(())
+        self.inner.list(identity).await.map(drop)
     }
 
     /// The contacts of this device's identities.
@@ -977,6 +969,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         loop {
             sleep(REDIAL).await;
             self.dial_all();
+            self.refresh_all().await;
         }
     }
 
@@ -1290,12 +1283,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Fetches the device lists of the identities a group's members speak as, unless fresh.
+    /// Fetches the device lists of the identities a group's members speak as, or its devices are of, unless fresh.
     async fn refresh(&self, gid: &[u8]) {
         let stale: Vec<IdentityRef> = {
             let st = self.state.lock().unwrap();
             let Ok(g) = st.group(gid) else { return };
-            let identities = g.mls.members().into_iter().filter_map(|m| m.credential?.identity);
+            let settings = g.mls.settings();
+            let devices_of =
+                settings.devices_of.map(|id| IdentityRef { id, membership: settings.membership.clone() });
+            let identities = g.mls.members().into_iter().filter_map(|m| m.credential?.identity).chain(devices_of);
             identities
                 .filter(|identity| st.lists.get(&identity.id.0).is_none_or(|(_, at)| at + LIST_FRESH < now()))
                 .collect()
@@ -1305,6 +1301,25 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 timeout(RECEIPT_WAIT, self.list(&identity)).await.map_err(anyhow::Error::from).and_then(|r| r)
             {
                 tracing::debug!("the device list of {}: {error:#}", hex(&identity.id.0));
+            }
+        }
+        self.revoke(&self.state.lock().unwrap(), gid);
+    }
+
+    /// Has the members of a group removed whose device left the identity they speak as or, in a devices group, the
+    /// identity it is of.
+    fn revoke(&self, st: &State<P>, gid: &[u8]) {
+        let Ok(g) = st.group(gid) else { return };
+        let devices_of = g.mls.settings().devices_of;
+        for member in g.mls.members() {
+            let Some(credential) = &member.credential else { continue };
+            let Some(id) = credential.identity.as_ref().map(|identity| &identity.id).or(devices_of.as_ref()) else {
+                continue;
+            };
+            if member.key != st.session.key()
+                && st.lists.get(&id.0).is_some_and(|(list, _)| list.removed(&credential.device.0))
+            {
+                self.work.send(Work::Remove { group: gid.to_vec(), key: member.key }).ok();
             }
         }
     }
@@ -1323,7 +1338,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         let id: [u8; 32] = identity.id.0.as_slice().try_into().context("an identity id is 32 bytes")?;
         let list = DeviceList::replay(&id, entries.iter().map(|entry| entry.0.as_slice()))?;
-        self.state.lock().unwrap().lists.insert(identity.id.0.clone(), (list.clone(), now()));
+        let mut st = self.state.lock().unwrap();
+        st.lists.insert(identity.id.0.clone(), (list.clone(), now()));
+        for gid in st.groups.keys() {
+            self.revoke(&st, gid);
+        }
         Ok(list)
     }
 
@@ -1389,7 +1408,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                                 .group(&group)
                                 .is_ok_and(|g| g.mls.members().iter().any(|m| m.key == key))
                         {
-                            inner.warn(Some(&group), format!("removing a member that asked to leave: {error:#}"));
+                            inner.warn(Some(&group), format!("removing a member: {error:#}"));
                         }
                     });
                 }
