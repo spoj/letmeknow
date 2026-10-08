@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::Subcommand;
 use letmeknow::proto::{
-    CIPHERSUITE, FileUpdate, INVITE_SLOTS, INVITE_TTL_S, Opened, PAKE_ID, Payload, Settings, create_config, digest, fingerprint, invite_key, invite_words, join_config,
-    membership_changes, open, person, random_below, seal,
+    BLOB_OVERHEAD, CIPHERSUITE, FileUpdate, INVITE_SLOTS, INVITE_TTL_S, MAX_BLOB_BYTES, Opened, PAKE_ID, Payload, Settings, blob_link, blob_links, create_config, digest,
+    fingerprint, image_type, invite_key, invite_words, join_config, membership_changes, open, open_blob, person, random_below, seal, seal_blob,
 };
 use letmeknow::entity::{self, JoinRequest, List, Member, Opening, place};
 use openmls::prelude::*;
@@ -34,6 +34,8 @@ const POLL_S: u64 = 15;
 const PING_S: u64 = 30;
 const CATCH_UP: usize = 20;
 const LIST_TTL: Duration = Duration::from_secs(60);
+/// Where a folder group keeps its blobs; the folder scan reads only the folder's own `*.json` files.
+const BLOBS: &str = ".blobs";
 
 /// Requests an agent sends to its session process.
 #[derive(Subcommand, Serialize, Deserialize)]
@@ -159,6 +161,21 @@ pub enum FileOp {
         #[arg(value_name = "PATH")]
         text: String,
     },
+    /// Upload an image, or any file up to about 1 MiB, encrypted, for the group's files to link; prints the markdown link to put into a file with `file edit`
+    Attach {
+        #[arg(long)]
+        group: Option<String>,
+        path: String,
+        /// PATH's content, base64, which the command reads.
+        #[arg(skip)]
+        data: String,
+    },
+    /// Decrypt what a link (lmk:<hash>#<key>) in a file points to into a file only you can read; prints its path
+    Fetch {
+        #[arg(long)]
+        group: Option<String>,
+        link: String,
+    },
 }
 
 #[derive(Subcommand, Serialize, Deserialize)]
@@ -251,6 +268,8 @@ pub struct Session {
     home: PathBuf,
     /// Entity lists fetched lately, by entity id.
     lists: HashMap<String, (Instant, List)>,
+    /// Blobs linked from files that could not be fetched, warned about once.
+    missing: HashSet<String>,
 }
 
 impl Session {
@@ -306,6 +325,7 @@ impl Session {
             events,
             home: home.to_owned(),
             lists: HashMap::new(),
+            missing: HashSet::new(),
         };
         let rows: Vec<(String, String, u64)> = session
             .db
@@ -356,6 +376,9 @@ impl Session {
                 if synced && self.backlog.contains_key(&gid) {
                     self.flush(&gid);
                     self.update_key(&gid).await;
+                }
+                if synced && let Err(error) = self.keep_blobs(&gid).await {
+                    self.warn(Some(&gid), format!("blobs: {error:#}"));
                 }
             }
             Event::Files { gid, records, ignored } => {
@@ -703,6 +726,7 @@ impl Session {
     /// What a member who was just added needs from the others, who keep it: the settings, and a snapshot of every file.
     /// It cannot read anything sent before it joined.
     async fn post_state(&mut self, gid: &str) -> Result<()> {
+        self.refresh_blobs(gid).await?;
         let settings = self.settings(gid)?;
         if settings != Settings::default() {
             self.post_payload(gid, &Payload { settings: Some(settings), ..Payload::default() }).await?;
@@ -796,7 +820,105 @@ impl Session {
                 self.store_file(&gid, &id, &name, &state)?;
                 Ok(json!({ "file": id, "name": name, "version": self.keep_version(&gid, &id, &state)? }))
             }
+            FileOp::Attach { group, path, data } => {
+                let gid = self.resolve(group)?;
+                let bytes = B64.decode(data)?;
+                if bytes.len() + BLOB_OVERHEAD > MAX_BLOB_BYTES {
+                    bail!("{path} is {} bytes; files link at most {}", bytes.len(), MAX_BLOB_BYTES - BLOB_OVERHEAD);
+                }
+                let key = self.provider.rand().random_array()?;
+                let sealed = seal_blob(self.provider.rand(), &key, &bytes)?;
+                self.put_blob(&gid, &digest(&sealed), &sealed).await?;
+                let link = blob_link(&key, &sealed);
+                let name = Path::new(&path).file_name().map_or_else(String::new, |n| n.to_string_lossy().replace(['[', ']'], ""));
+                let markdown = format!("{}[{name}]({link})", if image_type(&bytes).is_some() { "!" } else { "" });
+                Ok(json!({ "link": link, "markdown": markdown }))
+            }
+            FileOp::Fetch { group, link } => {
+                let gid = self.resolve(group)?;
+                let (hash, key) = blob_links(&link).into_iter().next().context("expected a link like lmk:<hash>#<key>")?;
+                let bytes = open_blob(&key, &self.blob(&gid, &hash).await?)?;
+                let dir = self.attachments.join(&digest(gid.as_bytes())[..16]);
+                std::fs::create_dir_all(&dir)?;
+                let path = match image_type(&bytes) {
+                    Some(extension) => dir.join(format!("{}.{extension}", &hash[..16])),
+                    None => dir.join(&hash[..16]),
+                };
+                crate::private_file(&path, &bytes)?;
+                Ok(json!({ "path": path, "bytes": bytes.len() }))
+            }
         }
+    }
+
+    /// Stores a blob where the group's members find it: in the folder, or on the relay and kept here too.
+    async fn put_blob(&self, gid: &str, hash: &str, sealed: &[u8]) -> Result<()> {
+        let Some(group) = self.groups.get(gid) else {
+            let dir = Path::new(gid).join(BLOBS);
+            std::fs::create_dir_all(&dir)?;
+            let temp = dir.join(format!(".{hash}.tmp"));
+            std::fs::write(&temp, sealed)?;
+            return Ok(std::fs::rename(&temp, dir.join(hash))?);
+        };
+        self.relay.put_blob(&group.relay, gid, hash, sealed).await?;
+        self.db.execute("INSERT OR IGNORE INTO blobs (gid, hash, data) VALUES (?, ?, ?)", params![gid, hash, sealed])?;
+        Ok(())
+    }
+
+    /// A blob's sealed bytes: from the folder, as kept here, or else from the relay, and then kept.
+    async fn blob(&self, gid: &str, hash: &str) -> Result<Vec<u8>> {
+        let Some(group) = self.groups.get(gid) else {
+            return std::fs::read(Path::new(gid).join(BLOBS).join(hash)).with_context(|| format!("no blob {hash} in the folder"));
+        };
+        if let Some(sealed) = self.kept_blob(gid, hash)? {
+            return Ok(sealed);
+        }
+        let sealed = self.relay.get_blob(&group.relay, gid, hash).await?;
+        if digest(&sealed) != hash {
+            bail!("the relay altered blob {hash}");
+        }
+        self.db.execute("INSERT OR IGNORE INTO blobs (gid, hash, data) VALUES (?, ?, ?)", params![gid, hash, sealed])?;
+        Ok(sealed)
+    }
+
+    fn kept_blob(&self, gid: &str, hash: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.db.query_row("SELECT data FROM blobs WHERE gid = ? AND hash = ?", params![gid, hash], |r| r.get(0)).optional()?)
+    }
+
+    /// Every blob the group's files link.
+    fn links(&self, gid: &str) -> Result<Vec<String>> {
+        let mut links = Vec::new();
+        for (_, _, state) in self.files(gid)? {
+            links.extend(blob_links(&files::text(&state)?).into_iter().map(|(hash, _)| hash));
+        }
+        Ok(links)
+    }
+
+    /// Fetches the blobs that a relay group's files link and this member lacks: the relay keeps them only for its message
+    /// TTL, so members keep them, and pass them on to the members they add.
+    async fn keep_blobs(&mut self, gid: &str) -> Result<()> {
+        for hash in self.links(gid)? {
+            let kept = self.db.query_row("SELECT 1 FROM blobs WHERE gid = ? AND hash = ?", params![gid, hash], |_| Ok(())).optional()?;
+            if kept.is_some() || self.missing.contains(&hash) {
+                continue;
+            }
+            if let Err(error) = self.blob(gid, &hash).await {
+                self.warn(Some(gid), format!("a file links blob {hash}, which cannot be fetched: {error:#}"));
+                self.missing.insert(hash);
+            }
+        }
+        Ok(())
+    }
+
+    /// Puts every blob the group's files link, that this member keeps, on the relay again, so a member just added can
+    /// fetch it and it stays there as long as a file links it.
+    async fn refresh_blobs(&self, gid: &str) -> Result<()> {
+        let relay = &self.groups[gid].relay;
+        for hash in self.links(gid)? {
+            if let Some(sealed) = self.kept_blob(gid, &hash)? {
+                self.relay.put_blob(relay, gid, &hash, &sealed).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Takes in what the relay has for a group now, so a file is read, or a message built, from where the group stands.
@@ -1162,7 +1284,7 @@ impl Session {
         }
         self.folders.remove(gid);
         self.backlog.remove(gid);
-        for table in ["groups", "folders", "messages", "settings", "applied", "files", "versions"] {
+        for table in ["groups", "folders", "messages", "settings", "applied", "files", "versions", "blobs"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [gid])?;
         }
         let attachments = self.attachments.join(&digest(gid.as_bytes())[..16]);

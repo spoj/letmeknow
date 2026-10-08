@@ -1,6 +1,6 @@
 import { SELF, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 const origin = "https://letmeknow.dev";
@@ -97,6 +97,49 @@ describe("group", () => {
     await runDurableObjectAlarm(stub);
     expect(await poll(gid, 0)).toEqual([]);
     expect((await post(gid, mls(gid, 0, COMMIT))).status).toBe(409);
+  });
+});
+
+describe("blob", () => {
+  const sha256 = (data: Uint8Array) => createHash("sha256").update(data).digest("hex");
+  const put = (gid: string, hash: string, body: Uint8Array) => SELF.fetch(`${origin}/g/${gid}/blobs/${hash}`, { method: "PUT", body });
+  const get = (gid: string, hash: string) => SELF.fetch(`${origin}/g/${gid}/blobs/${hash}`);
+  const age = (gid: string) =>
+    runInDurableObject(env.GROUPS.get(env.GROUPS.idFromName(gid)), async (_, state) => {
+      state.storage.sql.exec("UPDATE blobs SET at = 0");
+    });
+
+  it("stores a blob under the SHA-256 of its bytes, in its group only", async () => {
+    const gid = hex(16);
+    const data = randomBytes(1000);
+    expect((await put(gid, sha256(data), data)).status).toBe(204);
+    expect(Buffer.from(await (await get(gid, sha256(data))).arrayBuffer())).toEqual(data);
+    expect((await get(hex(16), sha256(data))).status).toBe(404);
+    expect((await get(gid, sha256(randomBytes(8)))).status).toBe(404);
+  });
+
+  it("refuses a blob that does not match its hash, or is over 1 MiB", async () => {
+    const gid = hex(16);
+    expect((await put(gid, sha256(randomBytes(8)), randomBytes(8))).status).toBe(400);
+    const large = new Uint8Array(1024 * 1024 + 1);
+    expect((await put(gid, sha256(large), large)).status).toBe(413);
+    const largest = new Uint8Array(1024 * 1024).fill(1);
+    expect((await put(gid, sha256(largest), largest)).status).toBe(204);
+  });
+
+  it("expires blobs with the messages, unless put again since", async () => {
+    const gid = hex(16);
+    const [kept, dropped] = [randomBytes(64), randomBytes(64)];
+    await put(gid, sha256(kept), kept);
+    await put(gid, sha256(dropped), dropped);
+    await age(gid);
+    await put(gid, sha256(kept), kept);
+    await runDurableObjectAlarm(env.GROUPS.get(env.GROUPS.idFromName(gid)));
+    expect((await get(gid, sha256(dropped))).status).toBe(404);
+    expect((await get(gid, sha256(kept))).status).toBe(200);
+    await age(gid);
+    await runDurableObjectAlarm(env.GROUPS.get(env.GROUPS.idFromName(gid)));
+    expect((await get(gid, sha256(kept))).status).toBe(404);
   });
 });
 

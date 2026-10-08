@@ -1,7 +1,7 @@
 // Browser end-to-end test, run by test/e2e.py against its local relay (RELAY) with the session binary (BIN): Matthew
 // joins an agent's group from his laptop and his phone, they chat, and all three edit one checklist at once.
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -130,6 +130,71 @@ try {
   agent("send", "after the reload");
   await laptop.getByText("after the reload").waitFor();
   check(await laptop.getByText("Thanks, on it").isVisible(), "a reloaded browser keeps its messages and can still read new ones");
+
+  // Images: the agent links one into the checklist, the laptop pastes another, and a browser added later sees both.
+  const picture = (page, width, height) =>
+    page.evaluate(async ([width, height]) => {
+      const canvas = Object.assign(document.createElement("canvas"), { width, height });
+      const context = canvas.getContext("2d");
+      context.fillStyle = "#2563eb";
+      context.fillRect(0, 0, width, height);
+      context.fillStyle = "#f59e0b";
+      context.fillRect(width / 4, height / 4, width / 2, height / 2);
+      return canvas.toDataURL("image/png").split(",")[1];
+    }, [width, height]);
+  const chart = join(home, "chart.png");
+  writeFileSync(chart, Buffer.from(await picture(laptop, 120, 80), "base64"));
+  const attached = agent("file", "attach", chart);
+  const before = agent("file", "show", "checklist.md");
+  writeFileSync(path, before.text + attached.markdown + "\n");
+  agent("file", "edit", "--base", before.version, "checklist.md", path);
+  await laptop.getByRole("button", { name: /^Files/ }).click();
+  await laptop.getByRole("button", { name: "checklist.md" }).click();
+  const shown = (page, count) =>
+    page.waitForFunction(count => {
+      const images = [...document.querySelectorAll(".cm-image img")];
+      return images.length === count && images.every(image => image.complete && image.naturalWidth > 0 && image.src.startsWith("data:image/")) && images.map(image => image.naturalWidth);
+    }, count);
+  check((await (await shown(laptop, 1)).jsonValue())[0] === 120, "a browser shows the image an agent linked, inline, decrypted");
+  check((await text(laptop)).includes(attached.markdown), "and keeps the link as editable text");
+
+  await laptop.locator(".cm-line").last().click();
+  await laptop.locator(".cm-content").evaluate(async (content, png) => {
+    const data = new DataTransfer();
+    data.items.add(new File([Uint8Array.from(atob(png), c => c.charCodeAt(0))], "screenshot.png", { type: "image/png" }));
+    content.dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }));
+  }, await picture(laptop, 2400, 1200));
+  check((await (await shown(laptop, 2)).jsonValue())[1] === 1600, "a pasted image is scaled down, uploaded and shown");
+  let pasted;
+  for (let i = 0; i < 50 && !pasted; i++) {
+    pasted = /!\[screenshot\]\((lmk:[0-9a-f#]+)\)/.exec(agent("file", "show", "checklist.md").text)?.[1];
+    if (!pasted) await laptop.waitForTimeout(200);
+  }
+  const fetched = agent("file", "fetch", pasted);
+  const webp = readFileSync(fetched.path);
+  check(fetched.path.endsWith(".webp") && webp.subarray(8, 12).toString() === "WEBP", "the agent fetches the pasted image, as WebP, from its link");
+
+  // The laptop adds a member, so it puts both images again; the new member fetches them.
+  await laptop.getByRole("button", { name: "Invite" }).click();
+  const lateLink = await laptop.locator(".invite code").nth(1).textContent();
+  const late = await (await browser.newContext()).newPage();
+  pages.late = late;
+  await late.goto(lateLink);
+  await late.getByPlaceholder("Your name").fill("Ann");
+  await late.getByRole("button", { name: "Join" }).click();
+  await late.locator("header .members", { hasText: "Agent" }).waitFor();
+  await late.getByRole("button", { name: /^Files/ }).click();
+  await late.getByRole("button", { name: "checklist.md" }).click();
+  check((await (await shown(late, 2)).jsonValue()).join() === "120,1600", "a member added later sees both images");
+  await late.locator(".cm-content").evaluate(async (content, png) => {
+    const data = new DataTransfer();
+    data.items.add(new File([Uint8Array.from(atob(png), c => c.charCodeAt(0))], "photo.png", { type: "image/png" }));
+    const { left, bottom } = [...content.querySelectorAll(".cm-line")].at(-1).getBoundingClientRect();
+    content.dispatchEvent(new DragEvent("drop", { dataTransfer: data, clientX: left + 2, clientY: bottom - 2, bubbles: true, cancelable: true }));
+  }, await picture(late, 300, 200));
+  await shown(laptop, 3);
+  check(/\)\n!\[photo\]\(lmk:[0-9a-f#]+\)$/.test(await text(laptop)), "an image dropped onto a line goes on its own line after it, and reaches the others");
+  await laptop.getByRole("button", { name: "Chat" }).click();
 
   // An open group: the laptop starts a group open to Matthew; the phone joins it without an invite.
   await laptop.getByRole("button", { name: "+ New group" }).click();
