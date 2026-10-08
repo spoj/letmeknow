@@ -23,8 +23,8 @@ pub struct Contradiction {
     pub theirs: Head,
 }
 
-/// The hashes h_start..=h_len of a log, and the newest head covering h_len. A chain starts at 0, or, for a reader
-/// that joined later, at the first head it was given.
+/// The hashes h_start..=h_len of a log, and the newest head covering h_len. A client starts a chain when it reads a
+/// log from the beginning; a reader that starts later, such as a joiner, anchors one at a head it trusts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Chain {
     pub start: u64,
@@ -127,13 +127,15 @@ impl Chains {
     pub fn page(&self, log: &[u8], after: u64, entries: &[Bytes], head: &Head) -> Result<()> {
         self.signed(log, head)?;
         let mut chains = self.chains.lock().unwrap();
-        let chain = chains.entry(log.to_vec()).or_insert_with(|| {
-            if after == 0 { Chain::new(log) } else { Chain::anchored(head.clone()) }
-        });
-        if entries.is_empty() || after > chain.len() || after < chain.start {
-            chain.check(head)?;
-        } else {
-            chain.extend(after, entries, head)?;
+        if after == 0 {
+            chains.entry(log.to_vec()).or_insert_with(|| Chain::new(log));
+        }
+        match chains.get_mut(log) {
+            Some(chain) if !entries.is_empty() && chain.start <= after && after <= chain.len() => {
+                chain.extend(after, entries, head)?
+            }
+            Some(chain) => chain.check(head)?,
+            None => {}
         }
         Ok(())
     }
@@ -183,14 +185,18 @@ mod tests {
     }
 
     #[test]
-    fn anchors_a_late_reader() {
+    fn anchored() {
         let key = SigningKey::from_bytes(&[1; 32]);
         let chains = Chains::new(Some(key.verifying_key()));
-        let hashes = chain_of(b"log", &[b"a", b"b", b"c"]);
-        let head3 = Head::sign(&key, b"log", 3, hashes[3], 1);
-        chains.page(b"log", 2, &bytes(&[b"c"]), &head3).unwrap();
-        let chain = chains.get(b"log").unwrap();
-        assert_eq!((chain.start, chain.len()), (3, 3));
-        chains.head(b"log", &Head::sign(&key, b"log", 1, hashes[1], 2)).unwrap();
+        let hashes = chain_of(b"log", &[b"a", b"b", b"c", b"d"]);
+        let head2 = Head::sign(&key, b"log", 2, hashes[2], 1);
+        chains.page(b"log", 1, &bytes(&[b"b"]), &head2).unwrap();
+        assert!(chains.get(b"log").is_none());
+        chains.set(Chain::anchored(head2));
+        chains.page(b"log", 2, &bytes(&[b"c"]), &Head::sign(&key, b"log", 3, hashes[3], 2)).unwrap();
+        chains.head(b"log", &Head::sign(&key, b"log", 1, hashes[1], 3)).unwrap();
+        let wrong = Head::sign(&key, b"log", 4, hashes[3], 4);
+        assert!(chains.page(b"log", 3, &bytes(&[b"d"]), &wrong).unwrap_err().is::<Contradiction>());
+        assert_eq!((chains.get(b"log").unwrap().start, chains.get(b"log").unwrap().len()), (2, 3));
     }
 }
