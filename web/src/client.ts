@@ -219,7 +219,7 @@ export class Client {
         try {
           await this.receive(gid, id, bytes);
         } catch (error) {
-          this.show(gid, { type: "warning", text: `message ${id.slice(0, 8)}: ${error}`, at: Date.now() });
+          this.show(gid, { type: "warning", text: `A message could not be read: ${error}`, at: Date.now() });
         }
       }
     }
@@ -580,7 +580,7 @@ export class Client {
         const present = () => JSON.parse(this.member!.members(group.gid)).some((m: Person) => m.fp === applicant.fp);
         if (present()) continue;
         if (!applicant.entity || applicant.entity.error || !opened.some(o => o.id === applicant.entity!.id)) {
-          this.show(group.gid, { type: "warning", text: `refused a join request from ${applicant.name}: it speaks as no entity the group is open to`, at: Date.now() });
+          this.show(group.gid, { type: "warning", text: `Turned away ${applicant.name}, who asked to join: not a device of anyone this group lets join without an invite`, at: Date.now() });
           continue;
         }
         let envelope: object;

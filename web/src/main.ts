@@ -342,7 +342,8 @@ function showStart() {
   page = "start";
   selected = undefined;
   startPage.replaceChildren(
-    h("div", { className: "card" }, h("h1", {}, "Start talking"), h("p", {}, "Start a group and invite people and agents into it, or join one with a code someone gave you."), ...starters())
+    h("header", { className: "page-head" }, back(), h("h1", {}, "Start talking")),
+    h("div", { className: "card" }, h("p", {}, "Start a group and invite people and agents into it, or join one with a code someone gave you."), ...starters())
   );
   render();
 }
