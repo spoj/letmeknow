@@ -2,7 +2,8 @@
 // WebAssembly with the workspace's `wasm` profile, the app bundled, and a service worker that caches exactly these files.
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { copyFileSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { brotliCompressSync, gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 
@@ -25,7 +26,7 @@ await build({
   target: "es2022",
   outdir: out
 });
-for (const file of ["index.html", "manifest.webmanifest", "icon.svg"]) copyFileSync(`${web}src/${file}`, out + file);
+for (const file of ["index.html", "manifest.webmanifest", "icon.svg", "icon-180.png", "icon-192.png", "icon-512.png"]) copyFileSync(`${web}src/${file}`, out + file);
 const files = readdirSync(out).sort();
 const version = createHash("sha256");
 for (const file of files) version.update(file).update(readFileSync(out + file));
@@ -37,3 +38,9 @@ await build({
   target: "es2022",
   outfile: `${out}sw.js`
 });
+// `letmeknow serve` sends these instead when the browser takes them.
+for (const file of readdirSync(out).filter(file => !file.endsWith(".png"))) {
+  const bytes = readFileSync(out + file);
+  writeFileSync(`${out}${file}.br`, brotliCompressSync(bytes));
+  writeFileSync(`${out}${file}.gz`, gzipSync(bytes, { level: 9 }));
+}

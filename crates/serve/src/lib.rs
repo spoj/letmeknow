@@ -289,11 +289,13 @@ impl HyperService<Request<Incoming>> for Site {
         }
         let web = self.web.clone();
         let path = req.uri().path().to_owned();
-        Box::pin(async move { Ok(file(web.as_deref(), &path).await?) })
+        let accept = req.headers().get(header::ACCEPT_ENCODING).and_then(|a| a.to_str().ok()).unwrap_or_default().to_owned();
+        Box::pin(async move { Ok(file(web.as_deref(), &path, &accept).await?) })
     }
 }
 
-async fn file(web: Option<&PathBuf>, path: &str) -> http::Result<Response<BytesBody>> {
+/// A file of the web client, or its `.br` or `.gz` beside it when the client takes that encoding.
+async fn file(web: Option<&PathBuf>, path: &str, accept: &str) -> http::Result<Response<BytesBody>> {
     let not_found = || respond(StatusCode::NOT_FOUND).body(body("not found"));
     let Some(web) = web else { return not_found() };
     let name = path.trim_start_matches('/');
@@ -302,13 +304,21 @@ async fn file(web: Option<&PathBuf>, path: &str) -> http::Result<Response<BytesB
     }
     let last = name.rsplit('/').next().unwrap_or_default();
     let name = if last.contains('.') { name } else { "index.html" };
+    let ext = name.rsplit('.').next().unwrap_or_default();
+    let res = respond(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type(ext))
+        .header(header::VARY, "accept-encoding");
+    for (encoding, suffix) in [("br", "br"), ("gzip", "gz")] {
+        if accept.split(',').any(|a| a.split(';').next().map(str::trim) == Some(encoding))
+            && let Ok(bytes) = tokio::fs::read(web.join(format!("{name}.{suffix}"))).await
+        {
+            return res.header(header::CONTENT_ENCODING, encoding).body(body(bytes));
+        }
+    }
     let Ok(bytes) = tokio::fs::read(web.join(name)).await else {
         return not_found();
     };
-    let ext = name.rsplit('.').next().unwrap_or_default();
-    respond(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type(ext))
-        .body(body(bytes))
+    res.body(body(bytes))
 }
 
 fn content_type(ext: &str) -> &'static str {

@@ -18,7 +18,7 @@ fn free_port() -> u16 {
         .unwrap_or_else(|_| free_port())
 }
 
-async fn https_get(port: u16, cert: &CertificateDer<'static>, path: &str) -> String {
+async fn https_get(port: u16, cert: &CertificateDer<'static>, path: &str, headers: &str) -> String {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.clone()).unwrap();
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -32,7 +32,7 @@ async fn https_get(port: u16, cert: &CertificateDer<'static>, path: &str) -> Str
         .connect(ServerName::try_from("localhost").unwrap(), tcp)
         .await
         .unwrap();
-    tls.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
+    tls.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{headers}\r\n").as_bytes())
         .await
         .unwrap();
     let mut response = Vec::new();
@@ -55,6 +55,7 @@ async fn serves_relay_membership_and_page() {
     let web = state.join("web");
     std::fs::create_dir_all(&web).unwrap();
     std::fs::write(web.join("index.html"), "<h1>letmeknow</h1>").unwrap();
+    std::fs::write(web.join("index.html.br"), "brotli").unwrap();
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     std::fs::write(state.join("cert.pem"), ck.cert.pem()).unwrap();
     std::fs::write(state.join("key.pem"), ck.signing_key.serialize_pem()).unwrap();
@@ -84,13 +85,15 @@ async fn serves_relay_membership_and_page() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let page = https_get(https, &cert, "/i").await;
+    let page = https_get(https, &cert, "/i", "").await;
     assert!(
         page.starts_with("HTTP/1.1 200") && page.ends_with("<h1>letmeknow</h1>"),
         "{page}"
     );
-    assert!(https_get(https, &cert, "/missing.js").await.starts_with("HTTP/1.1 404"));
-    assert!(https_get(https, &cert, "/ping").await.starts_with("HTTP/1.1 200"));
+    let compressed = https_get(https, &cert, "/", "Accept-Encoding: gzip, br;q=1\r\n").await;
+    assert!(compressed.contains("content-encoding: br") && compressed.ends_with("brotli"), "{compressed}");
+    assert!(https_get(https, &cert, "/missing.js", "").await.starts_with("HTTP/1.1 404"));
+    assert!(https_get(https, &cert, "/ping", "").await.starts_with("HTTP/1.1 200"));
     let portal = http_get(
         http,
         "GET /generate_204 HTTP/1.1\r\nHost: localhost\r\nX-Iroh-Challenge: abc\r\nConnection: close\r\n\r\n",

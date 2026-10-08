@@ -1,6 +1,6 @@
 #!/bin/sh
-# deploy/deploy.sh <ssh host> <domain>: builds `letmeknow serve` and installs it with Litestream, which backs its
-# database up to Spaces. Needs ~/.config/letmeknow-deploy/spaces.json (the Spaces key) and membership.key (the
+# deploy/deploy.sh <ssh host> <domain>: builds `letmeknow serve` and the web client, and installs them with Litestream,
+# which backs the database up to Spaces. Needs ~/.config/letmeknow-deploy/spaces.json (the Spaces key) and membership.key (the
 # membership service's key, also kept in the bucket under keys/).
 set -eu
 host=$1 domain=$2
@@ -8,6 +8,8 @@ conf=$HOME/.config/letmeknow-deploy
 cd "$(dirname "$0")/.."
 cargo build --release --target x86_64-unknown-linux-musl -p letmeknow
 scp -q target/x86_64-unknown-linux-musl/release/letmeknow "$host:/usr/local/bin/letmeknow.new"
+(cd web && npm ci --no-audit --no-fund && npm run build)
+tar -C web/dist -czf - . | ssh "$host" 'set -e; w=/usr/local/share/letmeknow; rm -rf $w/web.new; mkdir -p $w/web.new; tar -C $w/web.new -xzf -; rm -rf $w/web; mv $w/web.new $w/web'
 scp -q deploy/letmeknow.service deploy/litestream.yml "$conf/membership.key" "$host:/tmp/"
 access=$(jq -r .key.access_key "$conf/spaces.json")
 secret=$(jq -r .key.secret_key "$conf/spaces.json")
