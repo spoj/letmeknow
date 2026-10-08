@@ -6,3 +6,24 @@ license.workspace = true
 
 [dependencies]
 lmk-proto.workspace = true
+anyhow.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+openmls.workspace = true
+openmls_basic_credential.workspace = true
+openmls_memory_storage.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_traits.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+yrs.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ciborium.workspace = true
+openmls_sqlite_storage.workspace = true
+rusqlite.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+openmls = { workspace = true, features = ["js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
