@@ -3,12 +3,14 @@ import { DurableObject } from "cloudflare:workers";
 interface Env {
   GROUPS: DurableObjectNamespace<Group>;
   INVITES: DurableObjectNamespace<Invite>;
+  BOXES: DurableObjectNamespace<Box>;
+  ASSETS: Fetcher;
   WRITES: RateLimit;
 }
 
 type InviteState = { expires: number; owner: string; pake: string; join?: string; welcome?: string };
 
-const GROUP = /^[0-9a-f]{32}$/;
+const ID = /^[0-9a-f]{32}$/;
 const SLOT = /^[1-9][0-9]{0,2}$/;
 const OWNER = /^[0-9a-f]{64}$/;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -40,18 +42,60 @@ The link works once and expires within 10 minutes; a mistyped code also uses it 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/") return new Response(ABOUT);
+    const [kind, id, action] = url.pathname.split("/").slice(1);
+    const page = request.method === "GET" && (url.pathname === "/" || (kind === "i" && SLOT.test(id ?? "") && action === undefined));
+    if (page) {
+      if (request.headers.get("Accept")?.includes("text/html")) return app(url);
+      return new Response(url.pathname === "/" ? ABOUT : INSTRUCTIONS);
+    }
+    if (kind === "assets") return env.ASSETS.fetch(request);
     if (request.method !== "GET") {
       const { success } = await env.WRITES.limit({ key: request.headers.get("CF-Connecting-IP") ?? "" });
       if (!success) return text("too many writes from this address; try again in a minute", 429);
     }
-    const [kind, id, action] = url.pathname.split("/").slice(1);
-    if (kind === "g" && GROUP.test(id ?? "")) return env.GROUPS.get(env.GROUPS.idFromName(id)).fetch(request);
+    if (kind === "g" && ID.test(id ?? "")) return env.GROUPS.get(env.GROUPS.idFromName(id)).fetch(request);
+    if (kind === "b" && ID.test(id ?? "")) return env.BOXES.get(env.BOXES.idFromName(id)).fetch(request);
     if (kind !== "i" || !SLOT.test(id ?? "")) return text("not found", 404);
-    if (request.method === "GET" && action === undefined) return new Response(INSTRUCTIONS);
     return env.INVITES.get(env.INVITES.idFromName(id)).fetch(request);
   }
 };
+
+// The browser client. Its code holds the member's keys, so it loads nothing but this origin's own scripts.
+function app(url: URL): Response {
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>letmeknow</title>
+<link rel="stylesheet" href="/assets/app.css">
+<script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+<main id="app"><pre id="agents">${escape(url.pathname === "/" ? ABOUT : INSTRUCTIONS)}</pre></main>
+</body>
+</html>
+`;
+  const host = url.host;
+  const csp = [
+    "default-src 'none'",
+    "script-src 'self' 'wasm-unsafe-eval'",
+    "style-src 'self' 'unsafe-inline'",
+    `connect-src 'self' wss://${host} ws://${host}`,
+    "img-src 'self' data:",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'"
+  ].join("; ");
+  return new Response(html, {
+    headers: { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": csp, "Cache-Control": "no-cache" }
+  });
+}
+
+function escape(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 
 export class Group extends DurableObject<Env> {
   sql = this.ctx.storage.sql;
@@ -75,7 +119,7 @@ export class Group extends DurableObject<Env> {
     if (action !== "messages") return text("not found", 404);
     if (request.method === "GET") {
       if (url.searchParams.has("wait")) return text("long-polling was removed; upgrade letmeknow", 410);
-      return Response.json(this.since(Number(url.searchParams.get("after") ?? 0)));
+      return Response.json(page(this.sql, Number(url.searchParams.get("after") ?? 0)));
     }
     if (request.method !== "POST") return text("method not allowed", 405);
 
@@ -116,16 +160,44 @@ export class Group extends DurableObject<Env> {
     return this.sql.exec<{ epoch: number }>("SELECT epoch FROM state").toArray()[0]?.epoch ?? 0;
   }
 
-  // A page stops before PAGE_BYTES, so a large backlog never has to fit in memory at once; clients fetch until a page is empty.
-  private since(after: number) {
-    const page: { seq: number; data: string }[] = [];
-    let bytes = 0;
-    for (const row of this.sql.exec<{ seq: number; data: ArrayBuffer }>("SELECT seq, data FROM messages WHERE seq > ? ORDER BY seq", after)) {
-      bytes += row.data.byteLength;
-      if (bytes > PAGE_BYTES) break;
-      page.push({ seq: row.seq, data: base64(new Uint8Array(row.data)) });
+}
+
+// A page stops before PAGE_BYTES, so a large backlog never has to fit in memory at once; clients fetch until a page is empty.
+function page(sql: SqlStorage, after: number) {
+  const rows: { seq: number; at: number; data: string }[] = [];
+  let bytes = 0;
+  for (const row of sql.exec<{ seq: number; at: number; data: ArrayBuffer }>("SELECT seq, at, data FROM messages WHERE seq > ? ORDER BY seq", after)) {
+    bytes += row.data.byteLength;
+    if (bytes > PAGE_BYTES) break;
+    rows.push({ seq: row.seq, at: row.at, data: base64(new Uint8Array(row.data)) });
+  }
+  return rows;
+}
+
+// An append-only log of opaque entries, kept until deleted by nobody: entity lists, entity inboxes, join requests and
+// their replies. Writers seal what they post; the order the relay gives is the order readers replay.
+export class Box extends DurableObject<Env> {
+  sql = this.ctx.storage.sql;
+  waiters = new Set<() => void>();
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.sql.exec("CREATE TABLE IF NOT EXISTS messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, data BLOB NOT NULL)");
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method === "GET") {
+      const after = Number(url.searchParams.get("after") ?? 0);
+      if (page(this.sql, after).length === 0) await wait(this.waiters, url);
+      return Response.json(page(this.sql, after));
     }
-    return page;
+    if (request.method !== "POST") return text("method not allowed", 405);
+    const data = new Uint8Array(await request.arrayBuffer());
+    if (data.length > MAX_MESSAGE_BYTES) return text("entry too large (limit 1 MiB)", 413);
+    const seq = this.sql.exec<{ seq: number }>("INSERT INTO messages (at, data) VALUES (?, ?) RETURNING seq", Date.now(), data).one().seq;
+    wake(this.waiters);
+    return Response.json({ seq });
   }
 }
 

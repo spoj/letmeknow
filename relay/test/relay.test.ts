@@ -148,3 +148,45 @@ describe("invite", () => {
     expect((await create(id)).status).toBe(201);
   });
 });
+
+describe("box", () => {
+  const append = (id: string, data: string) => SELF.fetch(`${origin}/b/${id}`, { method: "POST", body: data }).then(r => r.json());
+  const read = (id: string, after: number, wait = 0) =>
+    SELF.fetch(`${origin}/b/${id}?after=${after}&wait=${wait}`).then(r => r.json<any[]>());
+
+  it("keeps entries in the order it took them, with the time it took them", async () => {
+    const id = hex(16);
+    expect(await append(id, "a")).toEqual({ seq: 1 });
+    expect(await append(id, "b")).toEqual({ seq: 2 });
+    const entries = await read(id, 0);
+    expect(entries.map(e => Buffer.from(e.data, "base64").toString())).toEqual(["a", "b"]);
+    expect(entries[0].at).toBeGreaterThan(0);
+    expect(await read(id, 2)).toEqual([]);
+  });
+
+  it("holds a read until an entry arrives", async () => {
+    const id = hex(16);
+    const waiting = read(id, 0, 10);
+    await append(id, "late");
+    expect((await waiting).map(e => e.seq)).toEqual([1]);
+  });
+});
+
+describe("page", () => {
+  const html = { headers: { Accept: "text/html,application/xhtml+xml" } };
+
+  it("serves the browser client to browsers, under a policy that loads only this origin's scripts", async () => {
+    for (const path of ["/", "/i/417"]) {
+      const response = await SELF.fetch(`${origin}${path}`, html);
+      expect(response.headers.get("Content-Type")).toContain("text/html");
+      expect(response.headers.get("Content-Security-Policy")).toContain("script-src 'self' 'wasm-unsafe-eval'");
+      expect(await response.text()).toContain('src="/assets/app.js"');
+    }
+  });
+
+  it("still carries the agent instructions, for tools that read the page", async () => {
+    const page = await (await SELF.fetch(`${origin}/i/417`, html)).text();
+    expect(page).toContain("letmeknow join '&lt;link&gt;'");
+    expect(await (await SELF.fetch(`${origin}/`)).text()).toContain("end-to-end encrypted group chat for agents");
+  });
+});

@@ -6,10 +6,12 @@
   "compatibility_date": "2025-03-01",
   "workers_dev": true,
   "routes": ["letmeknow.dev/*"],
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
   "durable_objects": {
     "bindings": [
       { "name": "GROUPS", "class_name": "Group" },
-      { "name": "INVITES", "class_name": "Invite" }
+      { "name": "INVITES", "class_name": "Invite" },
+      { "name": "BOXES", "class_name": "Box" }
     ]
   },
   "ratelimits": [
@@ -19,6 +21,7 @@
     { "tag": "v1", "new_sqlite_classes": ["Question"] },
     { "tag": "v2", "deleted_classes": ["Question"] },
     { "tag": "v3", "new_sqlite_classes": ["Session"] },
-    { "tag": "v4", "deleted_classes": ["Session"], "new_sqlite_classes": ["Group", "Invite"] }
+    { "tag": "v4", "deleted_classes": ["Session"], "new_sqlite_classes": ["Group", "Invite"] },
+    { "tag": "v5", "new_sqlite_classes": ["Box"] }
   ]
 }
