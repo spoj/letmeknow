@@ -224,7 +224,10 @@ fn send_reports_who_holds_a_message_or_that_it_is_pending_or_refused() {
         assert!(status["warning"].is_string());
         // Once Bob is back, he takes it, and it is held here no more; what he refused still is.
         let mut bob = world.start("bob", HOUR).await;
-        assert_eq!(bob.expect("message").await["content"], "anyone?");
+        let message = bob.expect("message").await;
+        assert_eq!(message["content"], "anyone?");
+        // It comes after the message Bob refused, which shows as a known gap rather than keeping it waiting.
+        assert_eq!(message["missing"], json!([refused["id"]]));
         let only_here = || async { alice.cmd(&["status"]).await.unwrap()["groups"][0]["only_here"].clone() };
         for _ in 0..20 {
             if only_here().await.as_array().unwrap().len() == 1 {
