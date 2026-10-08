@@ -29,8 +29,8 @@ const post = (gid: string, body: Uint8Array) =>
 const poll = (gid: string, after: number) =>
   SELF.fetch(`${origin}/g/${gid}/messages?after=${after}`).then(r => r.json<any[]>());
 
-async function subscribe(gid: string) {
-  const socket = (await SELF.fetch(`${origin}/g/${gid}/ws`, { headers: { Upgrade: "websocket" } })).webSocket!;
+async function subscribe(path: string) {
+  const socket = (await SELF.fetch(`${origin}${path}`, { headers: { Upgrade: "websocket" } })).webSocket!;
   socket.accept();
   const next = () => new Promise<string>(resolve => socket.addEventListener("message", e => resolve(e.data as string), { once: true }));
   return { socket, next };
@@ -77,7 +77,7 @@ describe("group", () => {
 
   it("notifies websockets of new messages and answers pings", async () => {
     const gid = hex(16);
-    const { socket, next } = await subscribe(gid);
+    const { socket, next } = await subscribe(`/g/${gid}/ws`);
     let message = next();
     await post(gid, mls(gid, 0, COMMIT));
     expect(await message).toBe("1");
@@ -86,6 +86,27 @@ describe("group", () => {
     expect(await message).toBe("pong");
     socket.close();
   });
+
+  it("puts a small message in the notice of sockets that ask for messages", async () => {
+    const gid = hex(16);
+    const bare = await subscribe(`/g/${gid}/ws`);
+    const full = await subscribe(`/g/${gid}/ws?messages`);
+    let [seq, notice] = [bare.next(), full.next()];
+    const small = mls(gid, 0, APPLICATION);
+    await post(gid, small);
+    expect(await seq).toBe("1");
+    const frame = JSON.parse(await notice);
+    expect(frame.seq).toBe(1);
+    expect(frame.at).toBeGreaterThan(0);
+    expect(Buffer.from(frame.data, "base64")).toEqual(Buffer.from(small));
+    [seq, notice] = [bare.next(), full.next()];
+    await post(gid, mls(gid, 0, APPLICATION, 64 * 1024));
+    expect(await seq).toBe("2");
+    expect(JSON.parse(await notice)).toEqual({ seq: 2, at: expect.any(Number) });
+    bare.socket.close();
+    full.socket.close();
+  });
+
 
   it("expires old messages but keeps the epoch", async () => {
     const gid = hex(16);
@@ -183,6 +204,13 @@ describe("invite", () => {
     expect(await receive("welcome")).toEqual({ data: "w" });
   });
 
+  it("refuses bodies that are not the JSON it expects", async () => {
+    const id = "2";
+    for (const body of ["{", "null"]) expect((await SELF.fetch(`${origin}/i/${id}`, { method: "PUT", body })).status).toBe(400);
+    await create(id);
+    for (const body of ["{", "null"]) expect((await SELF.fetch(`${origin}/i/${id}/join`, { method: "POST", body })).status).toBe(400);
+  });
+
   it("disappears at expiry, freeing the slot", async () => {
     const id = "999";
     await create(id);
@@ -212,6 +240,21 @@ describe("box", () => {
     const waiting = read(id, 0, 10);
     await append(id, "late");
     expect((await waiting).map(e => e.seq)).toEqual([1]);
+  });
+
+  it("announces each new entry, with the entry, on its sockets", async () => {
+    const id = hex(16);
+    const { socket, next } = await subscribe(`/b/${id}/ws`);
+    let message = next();
+    await append(id, "a");
+    const frame = JSON.parse(await message);
+    expect([frame.seq, Buffer.from(frame.data, "base64").toString()]).toEqual([1, "a"]);
+    expect(frame.at).toBeGreaterThan(0);
+    message = next();
+    socket.send("ping");
+    expect(await message).toBe("pong");
+    expect((await SELF.fetch(`${origin}/b/${id}/ws`)).status).toBe(426);
+    socket.close();
   });
 });
 

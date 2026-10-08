@@ -19,8 +19,13 @@ export type Opening = { group: string; relay: string; name: string; requests: st
 export type Invite = { code: string; link: string };
 export type List = { id: string; name: string; members: { id: string; key?: string; name: string }[] };
 export type FileDoc = { gid: string; id: string; name: string; doc: Y.Doc };
-/** `read` counts the items a person has seen. */
-export type Group = { gid: string; cursor: number; settings: Settings; posted: string[]; requests: number; read: number };
+/**
+ * `read` counts the items a person has seen. `pending` is the id of a commit this browser posted without hearing the
+ * relay's answer: catching up tells whether the relay took it.
+ */
+export type Group = { gid: string; cursor: number; settings: Settings; posted: string[]; requests: number; read: number; pending?: string };
+/** What a socket announces: a page row, without `data` when the entry is large. */
+type Notice = { seq: number; at: number; data?: string };
 type FileUpdate = { id: string; name?: string; update: string };
 type Payload = { content?: string; after: string[]; to?: string[]; reply_to?: string; urgent?: boolean; attachment?: string; settings?: Settings; file?: FileUpdate };
 
@@ -38,10 +43,41 @@ const same = (a: Settings, b: Settings) =>
 const LINK = /lmk:([0-9a-f]{64})#([0-9a-f]{64})/g;
 const sha256 = async (bytes: Uint8Array) => hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource)));
 
+/** The relay's answer to a request it refused. */
+class Refused extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
 async function http(path: string, init?: RequestInit): Promise<Response> {
   const response = await fetch(origin + path, init);
-  if (!response.ok && response.status !== 409) throw new Error(`relay answered ${response.status}: ${(await response.text()).trim()}`);
+  if (!response.ok && response.status !== 409) throw new Refused(response.status, `relay answered ${response.status}: ${(await response.text()).trim()}`);
   return response;
+}
+
+/**
+ * Long-polls with `poll` until it yields something, for as long as an invite or join request lives. A poll that failed
+ * on the way (no answer, or a relay failure) is tried again a few seconds later: a dropped connection says nothing about
+ * the invite.
+ */
+async function wait<T>(poll: () => Promise<T | undefined>, expired: string): Promise<T> {
+  for (const deadline = Date.now() + INVITE_TTL_MS; Date.now() < deadline; ) {
+    try {
+      const found = await poll();
+      if (found !== undefined) return found;
+    } catch (error) {
+      if (error instanceof Refused && error.status < 500) throw error;
+      await new Promise(resolve => setTimeout(resolve, 3_000));
+    }
+  }
+  throw new Error(expired);
+}
+
+/** The data a long-poll on an invite brought, if any. */
+async function inviteData(path: string): Promise<string | undefined> {
+  const response = await http(path);
+  return response.status === 204 ? undefined : (await response.json()).data;
 }
 
 // Boxes: append-only logs on the relay holding sealed text (entity lists, inboxes, join requests and replies).
@@ -50,10 +86,21 @@ async function boxRead(address: string, after = 0, wait = 0): Promise<{ seq: num
   return entries.map(e => ({ ...e, data: atob(e.data) }));
 }
 
+/**
+ * Whether a page whose entries are `sizes` bytes holds everything after its cursor. The relay ends a page early only
+ * before an entry that would take it past 2 MiB, and entries are at most 1 MiB, so a page of at most 1 MiB is whole:
+ * there is no need to ask for the next, empty one.
+ */
+const whole = (sizes: number[]) => sizes.reduce((a, b) => a + b, 0) <= 1024 * 1024;
+
 async function boxAll(address: string): Promise<string[]> {
   const all: string[] = [];
-  for (let page = await boxRead(address); page.length; page = await boxRead(address, page[page.length - 1].seq)) all.push(...page.map(e => e.data));
-  return all;
+  for (let after = 0; ; ) {
+    const page = await boxRead(address, after);
+    all.push(...page.map(e => e.data));
+    if (whole(page.map(e => e.data.length))) return all;
+    after = page[page.length - 1].seq;
+  }
 }
 
 const boxAppend = (address: string, data: string) => http(`/b/${address}`, { method: "POST", body: data });
@@ -81,7 +128,14 @@ export class Client {
   private seen = new Set<string>();
   private lists = new Map<string, { at: number; list: List }>();
   private outbox = new Map<string, { updates: Uint8Array[]; timer?: ReturnType<typeof setTimeout> }>();
-  private sockets = new Map<string, WebSocket>();
+  private sockets = new Map<string, { socket: WebSocket; check: () => void }>();
+  /** Welcomes for admitted join requests not yet written to their reply box, by its address. */
+  private replies = new Map<string, string>();
+  /** Inbox entries by entity, kept while the inbox's socket announces nothing new; `inboxNotices` counts announcements. */
+  private inboxes = new Map<string, string[]>();
+  private inboxNotices = 0;
+  /** Groups loaded with the page whose keys are to be replaced once caught up. */
+  private loaded = new Set<string>();
   private writes = new Map<string, [string, string, unknown]>();
   private saved = new Map<string, string>();
   private dirtyFiles = new Set<string>();
@@ -175,40 +229,92 @@ export class Client {
     return JSON.stringify(this.me.entities.slice(0, 1).map(e => e.id));
   }
 
-  /** Follows every group: a socket announces new messages; a poll every 15 seconds covers a lost socket and reopens it. */
+  /**
+   * Follows every group, and the requests box of every open group, on sockets. A group's socket brings each new
+   * message; while a socket is down, it is reopened every 15 seconds (a box's every minute), and each failed try polls.
+   */
   connect() {
     for (const gid of this.groups.keys()) {
-      this.follow(gid);
-      this.run(async () => {
-        await this.catchUp(gid);
-        await this.updateKey(gid);
-      });
+      this.loaded.add(gid);
+      this.followGroup(gid);
+      this.followRequests(gid);
     }
-    setInterval(() => {
-      for (const gid of this.groups.keys()) {
-        this.follow(gid);
-        this.run(() => this.catchUp(gid));
-      }
-    }, 15_000);
-    setInterval(() => this.run(() => this.admitRequests()), 5_000);
+    setInterval(() => this.groups.forEach((_, gid) => this.followGroup(gid)), 15_000);
+    setInterval(() => this.groups.forEach((_, gid) => this.followRequests(gid)), 60_000);
     setInterval(() => this.groups.forEach((_, gid) => this.run(() => this.updateKey(gid))), 3_600_000);
+    // A device that slept may hold sockets that look open but are dead, and lost others.
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) return;
-      for (const gid of this.groups.keys()) {
-        this.follow(gid);
-        this.run(() => this.catchUp(gid));
-      }
+      this.sockets.forEach(s => s.check());
+      this.groups.forEach((_, gid) => this.followGroup(gid));
     });
   }
 
-  private follow(gid: string) {
-    const existing = this.sockets.get(gid);
+  /**
+   * Opens the socket `key` on `path` unless it is open: `update` gets each notice, and is called without one when the
+   * socket opens (to fetch what came before) or fails to (a poll). A ping unanswered for 10 seconds closes it.
+   */
+  private follow(key: string, path: string, update: (notice?: Notice) => void) {
+    const existing = this.sockets.get(key)?.socket;
     if (existing && existing.readyState <= WebSocket.OPEN) return;
-    const socket = new WebSocket(`${origin.replace(/^http/, "ws")}/g/${gid}/ws`);
-    const ping = setInterval(() => socket.readyState === WebSocket.OPEN && socket.send("ping"), 30_000);
-    socket.onmessage = event => event.data !== "pong" && this.run(() => this.catchUp(gid));
-    socket.onclose = () => clearInterval(ping);
-    this.sockets.set(gid, socket);
+    const socket = new WebSocket(`${origin.replace(/^http/, "ws")}${path}/ws?messages`);
+    let opened = false;
+    let unanswered: ReturnType<typeof setTimeout> | undefined;
+    const check = () => {
+      if (socket.readyState !== WebSocket.OPEN || unanswered) return;
+      socket.send("ping");
+      unanswered = setTimeout(() => socket.close(), 10_000);
+    };
+    const ping = setInterval(check, 30_000);
+    socket.onopen = () => {
+      opened = true;
+      update();
+    };
+    socket.onmessage = event => {
+      if (event.data === "pong") {
+        clearTimeout(unanswered);
+        unanswered = undefined;
+        return;
+      }
+      const notice = JSON.parse(event.data);
+      update(typeof notice === "object" ? notice : undefined);
+    };
+    socket.onclose = () => {
+      clearInterval(ping);
+      clearTimeout(unanswered);
+      if (!opened && this.sockets.get(key)?.socket === socket) update();
+    };
+    this.sockets.set(key, { socket, check });
+  }
+
+  private followGroup(gid: string) {
+    this.follow(gid, `/g/${gid}`, notice => this.run(() => this.noticed(gid, notice)));
+  }
+
+  /** Follows the requests box of a group open to an entity, or stops once it is closed. */
+  private followRequests(gid: string) {
+    const { open: opened, requests } = this.groups.get(gid)?.settings ?? {};
+    const key = `requests ${gid}`;
+    if (opened?.length && requests) return this.follow(key, `/b/${place("requests", unhex(requests)).address}`, () => this.run(() => this.admitRequests(gid)));
+    const socket = this.sockets.get(key)?.socket;
+    this.sockets.delete(key);
+    socket?.close();
+  }
+
+  /** Takes a message from its notice when it is the next one; otherwise fetches what this browser lacks. */
+  private async noticed(gid: string, notice?: Notice) {
+    const group = this.groups.get(gid);
+    if (!group || (notice && notice.seq <= group.cursor)) return;
+    if (notice?.data !== undefined && notice.seq === group.cursor + 1) return this.take(gid, notice.seq, notice.data);
+    try {
+      await this.catchUp(gid);
+    } catch (error) {
+      // Reopened, and so tried again, within 15 seconds: an open socket would announce only what comes next.
+      this.sockets.get(gid)?.socket.close();
+      throw error;
+    }
+    // Caught up after loading: replace this member's keys, for post-compromise security.
+    if (this.loaded.delete(gid)) await this.updateKey(gid);
   }
 
   private async catchUp(gid: string) {
@@ -216,19 +322,25 @@ export class Client {
       const group = this.groups.get(gid);
       if (!group) return;
       const page: { seq: number; data: string }[] = await (await http(`/g/${gid}/messages?after=${group.cursor}`)).json();
-      if (!page.length) return;
-      for (const { seq, data } of page) {
-        if (!this.groups.has(gid)) return;
-        group.cursor = seq;
-        const bytes = unb64(data);
-        const id = await sha256(bytes);
-        if (group.posted.includes(id)) continue;
-        try {
-          await this.receive(gid, id, bytes);
-        } catch (error) {
-          this.show(gid, { type: "warning", text: `A message could not be read: ${error}`, at: Date.now() });
-        }
-      }
+      for (const { seq, data } of page) await this.take(gid, seq, data);
+      // Base64 is a third larger than what it encodes.
+      if (whole(page.map(m => (m.data.length * 3) / 4))) return;
+    }
+  }
+
+  private async take(gid: string, seq: number, data: string) {
+    const group = this.groups.get(gid);
+    if (!group || seq <= group.cursor) return;
+    group.cursor = seq;
+    const bytes = unb64(data);
+    const id = await sha256(bytes);
+    // This browser's commit, which the relay took though its answer never came.
+    if (id === group.pending) return this.merge(gid);
+    if (group.posted.includes(id)) return;
+    try {
+      await this.receive(gid, id, bytes);
+    } catch (error) {
+      this.show(gid, { type: "warning", text: `A message could not be read: ${error}`, at: Date.now() });
     }
   }
 
@@ -239,6 +351,8 @@ export class Client {
       return;
     }
     if (result.changes) {
+      // Merging another member's commit drops this browser's own for the same epoch: the relay took that one instead.
+      this.groups.get(gid)!.pending = undefined;
       for (const change of result.changes) this.show(gid, { type: change.type, member: await this.describe(change.member), by: await this.describe(change.by), at: Date.now() });
       if (result.removed) {
         const name = this.groups.get(gid)!.settings.name;
@@ -255,31 +369,45 @@ export class Client {
     this.show(gid, { type: "message", id, from, content, to, reply_to, urgent, attachment, after, at: Date.now() });
   }
 
-  /** Posts what `build` makes at the group's current epoch; if the relay has moved on, catches up and builds again. */
+  /**
+   * Posts what `build` makes at the group's current epoch; if the relay has moved on, catches up and builds again. A
+   * commit whose answer never comes stays pending until catching up shows whether the relay took it.
+   */
   private async post(gid: string, build: () => Uint8Array): Promise<{ seq: number; id: string }> {
+    const group = this.groups.get(gid)!;
+    if (group.pending) {
+      await this.catchUp(gid);
+      if (group.pending) {
+        this.member!.settle(gid, false);
+        group.pending = undefined;
+      }
+    }
     for (let attempt = 0; attempt < 3; attempt++) {
       const bytes = build();
       const id = await sha256(bytes);
-      const group = this.groups.get(gid)!;
       group.posted = [...group.posted.slice(-50), id];
-      let response: Response;
-      try {
-        response = await http(`/g/${gid}/messages`, { method: "POST", body: bytes as BodyInit });
-      } catch (error) {
-        this.member!.settle(gid, false);
-        throw error;
-      }
+      if (this.member!.pending(gid)) group.pending = id;
+      // Saved first, so that after a reload this browser still knows the message as its own, and never reuses its keys.
+      await this.save();
+      const response = await http(`/g/${gid}/messages`, { method: "POST", body: bytes as BodyInit });
       if (response.status === 409) {
         this.member!.settle(gid, false);
+        group.pending = undefined;
         await this.catchUp(gid);
         continue;
       }
-      for (const change of JSON.parse(this.member!.settle(gid, true))) {
-        this.show(gid, { type: change.type, member: await this.describe(change.member), by: await this.describe(change.by), at: Date.now() });
-      }
+      await this.merge(gid);
       return { seq: (await response.json()).seq, id };
     }
     throw new Error("the group kept changing; try again");
+  }
+
+  /** Merges this browser's commit once the relay took it, and shows the membership changes it makes. */
+  private async merge(gid: string) {
+    this.groups.get(gid)!.pending = undefined;
+    for (const change of JSON.parse(this.member!.settle(gid, true))) {
+      this.show(gid, { type: change.type, member: await this.describe(change.member), by: await this.describe(change.by), at: Date.now() });
+    }
   }
 
   private show(gid: string, item: Item) {
@@ -306,7 +434,7 @@ export class Client {
 
   async members(gid: string): Promise<Person[]> {
     const members: Person[] = [];
-    for (const member of JSON.parse(this.member!.members(gid))) members.push(await this.describe(member));
+    for (const member of JSON.parse(this.member!.members(gid))) members.push(await this.describe(member, false));
     return members;
   }
 
@@ -316,9 +444,10 @@ export class Client {
 
   /**
    * Checks the entities a member says it speaks as against their lists: the first must list its device (or the member
-   * itself), each later one the one before. Notes entities this browser meets for the first time.
+   * itself), each later one the one before. An entity is `new` until this browser meets it: until it shows the person an
+   * item (message, membership change, settings) from or about it. Listing members, which is redrawn, is no meeting.
    */
-  private async describe(person: Person): Promise<Person> {
+  private async describe(person: Person, meet = true): Promise<Person> {
     const { as: path, ...described } = person;
     if (!path) return described;
     let holder = person.device ?? person.fp;
@@ -334,8 +463,9 @@ export class Client {
       holder = id;
     }
     const fresh = !this.seen.has(holder);
-    this.seen.add(holder);
-    return { ...described, entity: { id: holder, name, new: fresh, yours: this.me.entities.some(e => e.id === holder) } };
+    if (meet) this.seen.add(holder);
+    const yours = this.me.entities.some(e => e.id === holder);
+    return { ...described, entity: { id: holder, name, new: fresh && !yours, yours } };
   }
 
   /**
@@ -373,7 +503,7 @@ export class Client {
       const gid = this.member!.create_group(this.path());
       this.groups.set(gid, { gid, cursor: 0, settings: {}, posted: [], requests: 0, read: 0 });
       this.items.set(gid, []);
-      this.follow(gid);
+      this.followGroup(gid);
       const entity = this.me.entities[0];
       if (entity) await this.openTo(gid, entity, name ? { name } : {});
       else if (name) await this.setSettings(gid, { name });
@@ -424,24 +554,20 @@ export class Client {
     }
     if (!slot) throw new Error("no free invite slot on the relay; try again");
     update({ code: `${slot}-${words}`, link: `${origin}/i/${slot}#${words}` });
-    for (;;) {
-      const response = await http(`/i/${slot}/join?wait=25`);
-      if (response.status === 204) continue;
-      const join = JSON.parse((await response.json()).data);
-      const key = pake.finish(unb64(join.pake), slot);
-      const welcome = (data: Uint8Array) =>
-        http(`/i/${slot}/welcome`, { method: "POST", headers: { Authorization: `Bearer ${owner}` }, body: JSON.stringify({ data: seal(key, "welcome", data) }) });
-      try {
-        const envelope = await this.run(() => this.admit(target, key, join));
-        await welcome(utf8(JSON.stringify(envelope)));
-      } catch (error) {
-        // Sealed under our key, so a joiner with a wrong code cannot open it and stops waiting.
-        await welcome(new Uint8Array());
-        throw error;
-      }
-      if ("gid" in target) await this.run(() => this.postState(target.gid));
-      return;
+    const join = JSON.parse(await wait(() => inviteData(`/i/${slot}/join?wait=25`), "nobody used the invite within 10 minutes"));
+    const key = pake.finish(unb64(join.pake), slot);
+    const welcome = (data: Uint8Array) =>
+      http(`/i/${slot}/welcome`, { method: "POST", headers: { Authorization: `Bearer ${owner}` }, body: JSON.stringify({ data: seal(key, "welcome", data) }) });
+    let envelope: object;
+    try {
+      envelope = await this.run(() => this.admit(target, key, join));
+    } catch (error) {
+      // Sealed under our key: a joiner with a wrong code cannot open it either, and stops waiting.
+      await welcome(utf8(JSON.stringify({ error: String(error) })));
+      throw error;
     }
+    await welcome(utf8(JSON.stringify(envelope)));
+    if ("gid" in target) await this.run(() => this.postState(target.gid));
   }
 
   private async admit(target: { gid: string } | { entity: Membership }, key: Uint8Array, join: { device?: string; key_package?: string }): Promise<object> {
@@ -474,15 +600,13 @@ export class Client {
     if (theirs.startsWith("entity ")) join.device = seal(key, "join", utf8(this.member!.entry()));
     else join.key_package = seal(key, "join", this.member!.key_package(this.path()));
     await http(`/i/${slot}/join`, { method: "POST", body: JSON.stringify({ data: JSON.stringify(join) }) });
-    for (;;) {
-      const response = await http(`/i/${slot}/welcome?wait=25`);
-      if (response.status === 204) continue;
-      const envelope = JSON.parse(text(open(key, "welcome", (await response.json()).data)));
-      return this.run(() => this.welcome(envelope));
-    }
+    const data = await wait(() => inviteData(`/i/${slot}/welcome?wait=25`), "the inviter did not answer within 10 minutes");
+    const envelope = JSON.parse(text(open(key, "welcome", data)));
+    return this.run(() => this.welcome(envelope));
   }
 
-  private async welcome(envelope: { entity?: Membership; group: string; seq: number; welcome: string }): Promise<string> {
+  private async welcome(envelope: { error?: string; entity?: Membership; group: string; seq: number; welcome: string }): Promise<string> {
+    if (envelope.error) throw new Error(`the inviter could not add this browser: ${envelope.error}`);
     if (envelope.entity) {
       const { id, name, secret } = envelope.entity;
       // First, so that this browser speaks as it from now on.
@@ -493,7 +617,7 @@ export class Client {
     this.member!.join(gid, unb64(envelope.welcome));
     this.groups.set(gid, { gid, cursor: envelope.seq, settings: {}, posted: [], requests: 0, read: 0 });
     this.items.set(gid, []);
-    this.follow(gid);
+    this.followGroup(gid);
     await this.catchUp(gid);
     return gid;
   }
@@ -525,6 +649,7 @@ export class Client {
     const group = this.groups.get(gid)!;
     if (same(group.settings, settings)) return;
     group.settings = settings;
+    this.followRequests(gid);
     this.show(gid, { type: "settings", settings, by, at: Date.now() });
   }
 
@@ -538,12 +663,27 @@ export class Client {
     });
   }
 
-  /** Groups open to this browser's entities, from their inboxes: the latest entry for each group, unless it closed it. */
+  /**
+   * Groups open to this browser's entities, from their inboxes: the latest entry for each group, unless it closed it.
+   * An inbox is followed on a socket, and fetched again only once that announces something or is down.
+   */
   async openings(): Promise<{ opening: Opening; entity: Membership }[]> {
     const found: { opening: Opening; entity: Membership }[] = [];
     for (const entity of this.me.entities) {
       const inbox = place("inbox", unhex(entity.secret));
-      for (const entry of await boxAll(inbox.address)) {
+      const key = `inbox ${entity.id}`;
+      this.follow(key, `/b/${inbox.address}`, () => {
+        this.inboxNotices++;
+        this.inboxes.delete(entity.id);
+      });
+      const live = this.sockets.get(key)!.socket.readyState === WebSocket.OPEN;
+      let entries = live ? this.inboxes.get(entity.id) : undefined;
+      if (!entries) {
+        const notices = this.inboxNotices;
+        entries = await boxAll(inbox.address);
+        if (live && notices === this.inboxNotices) this.inboxes.set(entity.id, entries);
+      }
+      for (const entry of entries) {
         let opening: Opening;
         try {
           opening = JSON.parse(text(open(inbox.key, "inbox", entry)));
@@ -564,44 +704,65 @@ export class Client {
     const requests = place("requests", unhex(opening.requests));
     await boxAppend(requests.address, seal(requests.key, "request", utf8(JSON.stringify({ key_package: b64(keyPackage), reply: hex(reply) }))));
     const back = place("reply", reply);
-    for (const deadline = Date.now() + INVITE_TTL_MS; Date.now() < deadline; ) {
-      const entries = await boxRead(back.address, 0, 25);
-      if (entries.length) return this.run(() => this.welcome(JSON.parse(text(open(back.key, "welcome", entries[0].data)))));
-    }
-    throw new Error("no member admitted the request; one must be online");
+    const data = await wait(async () => (await boxRead(back.address, 0, 25))[0]?.data, "no member admitted the request; one must be online");
+    return this.run(() => this.welcome(JSON.parse(text(open(back.key, "welcome", data)))));
   }
 
-  /** Admits join requests to open groups from sessions that speak as an entity the group is open to. */
-  private async admitRequests() {
-    for (const group of [...this.groups.values()]) {
-      const { open: opened, requests } = group.settings;
-      if (!opened?.length || !requests) continue;
-      const box = place("requests", unhex(requests));
+  /**
+   * Admits the join requests in an open group's requests box from sessions that speak as an entity the group is open
+   * to. The cursor moves past a request once it is handled, so one that failed is tried again shortly.
+   */
+  private async admitRequests(gid: string) {
+    const group = this.groups.get(gid);
+    const { open: opened, requests } = group?.settings ?? {};
+    if (!group || !opened?.length || !requests) return;
+    const box = place("requests", unhex(requests));
+    try {
       for (const entry of await boxRead(box.address, group.requests)) {
-        group.requests = entry.seq;
         // Expired requests are skipped, so an old one posted again cannot bring back a session that left.
-        if (entry.at + INVITE_TTL_MS < Date.now()) continue;
-        const request = JSON.parse(text(open(box.key, "request", entry.data)));
-        const keyPackage = unb64(request.key_package);
-        const applicant = await this.describe(JSON.parse(this.member!.applicant(keyPackage)));
-        const present = () => JSON.parse(this.member!.members(group.gid)).some((m: Person) => m.fp === applicant.fp);
-        if (present()) continue;
-        if (!applicant.entity || applicant.entity.error || !opened.some(o => o.id === applicant.entity!.id)) {
-          this.show(group.gid, { type: "warning", text: `Turned away ${applicant.name}, who asked to join: not a device of anyone this group lets join without an invite`, at: Date.now() });
-          continue;
-        }
-        let envelope: object;
-        try {
-          envelope = await this.add(group.gid, keyPackage);
-        } catch (error) {
-          if (present()) continue; // another member was first
-          throw error;
-        }
-        const back = place("reply", unhex(request.reply));
-        await boxAppend(back.address, seal(back.key, "welcome", utf8(JSON.stringify(envelope))));
-        await this.postState(group.gid);
+        if (entry.at + INVITE_TTL_MS >= Date.now()) await this.admitRequest(gid, opened, box.key, entry.data);
+        group.requests = entry.seq;
       }
+    } catch (error) {
+      setTimeout(() => this.run(() => this.admitRequests(gid)), 15_000);
+      throw error;
     }
+  }
+
+  /** Admits one join request. A request that cannot be admitted is refused with a warning; a throw means it may be on a later try. */
+  private async admitRequest(gid: string, opened: { id: string }[], key: Uint8Array, data: string) {
+    let read: { keyPackage: Uint8Array; applicant: Person; back: { address: string; key: Uint8Array } };
+    try {
+      const request = JSON.parse(text(open(key, "request", data)));
+      const keyPackage = unb64(request.key_package);
+      read = { keyPackage, applicant: JSON.parse(this.member!.applicant(keyPackage)), back: place("reply", unhex(request.reply)) };
+    } catch (error) {
+      this.show(gid, { type: "warning", text: `A request to join could not be read: ${error}`, at: Date.now() });
+      return;
+    }
+    const { keyPackage, applicant, back } = read;
+    if (!this.replies.has(back.address)) {
+      const present = () => JSON.parse(this.member!.members(gid)).some((m: Person) => m.fp === applicant.fp);
+      if (present()) return;
+      // Fetched first, so a list the relay failed to give fails this try instead of refusing the request.
+      for (const id of applicant.as ?? []) await this.list(id);
+      const described = await this.describe(applicant, false);
+      if (!described.entity || described.entity.error || !opened.some(o => o.id === described.entity!.id)) {
+        this.show(gid, { type: "warning", text: `Turned away ${applicant.name}, who asked to join: not a device of anyone this group lets join without an invite`, at: Date.now() });
+        return;
+      }
+      let envelope: object;
+      try {
+        envelope = await this.add(gid, keyPackage);
+      } catch (error) {
+        if (present()) return; // another member was first
+        throw error;
+      }
+      this.replies.set(back.address, seal(back.key, "welcome", utf8(JSON.stringify(envelope))));
+    }
+    await boxAppend(back.address, this.replies.get(back.address)!);
+    this.replies.delete(back.address);
+    await this.postState(gid);
   }
 
   /** What a member who was just added needs from the others, who keep it: the settings, and a snapshot of every file. */
@@ -619,8 +780,12 @@ export class Client {
   }
 
   private async forget(gid: string) {
-    this.sockets.get(gid)?.close();
     this.groups.delete(gid);
+    for (const key of [gid, `requests ${gid}`]) {
+      const socket = this.sockets.get(key)?.socket;
+      this.sockets.delete(key);
+      socket?.close();
+    }
     this.items.delete(gid);
     for (const [key, file] of this.files) if (file.gid === gid) this.files.delete(key);
     for (const key of this.writes.keys()) if (key.startsWith(`items ${gid} `) || key.startsWith(`files ${gid} `)) this.writes.delete(key);
@@ -742,7 +907,7 @@ export class Client {
       const key = `${gid} ${hash}`;
       if (this.blobs.has(key) || this.fetched.has(key)) continue;
       this.fetched.add(key);
-      this.blob(gid, hash).catch(error => this.onerror(`a file links image ${hash.slice(0, 8)}, which cannot be fetched: ${error}`));
+      this.blob(gid, hash).catch(error => this.onerror(`An image in a file could not be fetched: ${error}`));
     }
   }
 

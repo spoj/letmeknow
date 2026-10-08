@@ -127,7 +127,8 @@ function unverified(p: Person): string | undefined {
 
 function who(p: Person): HTMLElement {
   const warning = unverified(p);
-  return h("span", { className: warning ? "who warn" : "who", title: [warning, `key ${p.fp}`].filter(Boolean).join("\n") }, warning && "⚠ ", label(p));
+  const first = p.entity?.new && `The first time you see anyone of ${p.entity.name}'s`;
+  return h("span", { className: warning ? "who warn" : "who", title: [warning, first, `key ${p.fp}`].filter(Boolean).join("\n") }, warning && "⚠ ", label(p), first && h("small", {}, " new"));
 }
 
 /** The group's name, or else who else is in it, leaving out this person's other devices. */
@@ -315,8 +316,11 @@ function enter() {
   if (narrow.matches) layout.classList.remove("in-main");
 }
 
+// Free while the inboxes' sockets are up; redrawing only on a change keeps an idle page from fetching anything.
 async function refreshOpenings() {
-  openings = await client.openings().catch(error => (toast(error), openings));
+  const found = await client.openings().catch(error => (toast(error), openings));
+  if (JSON.stringify(found) === JSON.stringify(openings)) return;
+  openings = found;
   render();
 }
 
@@ -663,7 +667,7 @@ class GroupView {
 
   async update() {
     set(this.heading, title(this.gid));
-    // Checked again each minute too, as a member's device may have been taken off its person's list.
+    // Checked again on an update a minute later too, as a member's device may have been taken off its person's list.
     const raw = client.member!.members(this.gid);
     if (raw !== this.raw || Date.now() - this.described > 60_000) {
       this.raw = raw;

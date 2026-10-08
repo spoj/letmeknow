@@ -51,6 +51,7 @@ const open = async (name, options) => {
 };
 try {
   await printed(e => e.type === "ready");
+  agent("entity", "create", "Acme");
   const { link, group } = agent("invite");
   const laptop = await open("laptop", { viewport: { width: 1280, height: 800 } });
   const phone = await open("phone", { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
@@ -93,6 +94,8 @@ try {
   const morning = agent("send", "Morning. Your priority list is ready.").id;
   for (const page of [laptop, phone]) await page.getByText("Morning. Your priority list is ready.").waitFor();
   console.log("ok - both browsers show the agent's message");
+  const met = await phone.locator(".messages li", { hasText: "Morning." }).textContent();
+  check(met.includes("Acme · Agent new"), "marked as from an entity the phone had not met, though it had listed its members");
   await laptop.locator(".chips button", { hasText: "Agent" }).click();
   await laptop.getByPlaceholder("Message").fill("Thanks, on it");
   await laptop.getByPlaceholder("Message").press("Enter");
@@ -163,6 +166,17 @@ try {
   await phone.locator(".cm-line", { hasText: "renew passport" }).click();
   await phone.keyboard.press("Alt+ArrowUp");
   await phone.waitForTimeout(1500);
+  // The laptop's key update on reload is a commit the relay takes, but its answer is lost on the way back.
+  let lost = 0;
+  await laptop.route(`**/g/${group}/messages`, async route => {
+    const body = route.request().postDataBuffer();
+    if (lost || route.request().method() !== "POST" || body[45] !== 3) return route.continue();
+    lost++;
+    await route.fetch();
+    await route.abort();
+  });
+  const fetches = [];
+  laptop.on("request", request => request.method() === "GET" && request.url().includes("/messages") && fetches.push(request.url()));
   await laptop.reload();
   await laptop.getByRole("button", { name: "checklist.md" }).click();
   const moved = "- [x] reply to Ann\n- [x] review budget\n- [ ] renew passport\n- [ ] book flights (Tuesday)\n";
@@ -174,6 +188,15 @@ try {
   await phone.getByRole("button", { name: "Chat" }).click();
   const phoneList = phone.locator(".group:visible .messages");
   check(await phoneList.evaluate(e => e.scrollHeight - e.scrollTop - e.clientHeight < 2), "back from the files tab, the chat is still at the bottom");
+  check(lost === 1, "even when the relay took its key update but the answer was lost");
+  check(fetches.length === 1, `and catching up after the reload took one fetch (${fetches.length})`);
+  check(!(await laptop.locator(".messages li", { hasText: "after the reload" }).textContent()).includes(" new"), "and later messages from it are not new");
+  await laptop.unrouteAll();
+  const requests = [];
+  for (const page of [laptop, phone]) page.on("request", request => requests.push(request.url()));
+  agent("send", "no fetch needed");
+  await laptop.getByText("no fetch needed").waitFor();
+  check(!requests.some(url => url.includes("/messages")), "a new message comes in its socket's notice, with no fetch");
 
   // Files and images in chat.
   const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
@@ -262,6 +285,10 @@ try {
   await phone.locator(".group:visible h2", { hasText: "Trip" }).waitFor();
   await phone.locator(".group:visible .people", { hasText: "Matthew and you" }).waitFor();
   check(true, "a device of Matthew joins a group open to his devices, admitted by a member online");
+  await laptop.waitForTimeout(2_000);
+  requests.length = 0;
+  await laptop.waitForTimeout(16_000);
+  check(requests.length === 0, `idle browsers with working sockets send no requests, even in a group open to them (${requests})`);
 
   await laptop.locator(".group-list button", { hasText: "Agent" }).click();
   await list.evaluate(element => (element.scrollTop = 100));

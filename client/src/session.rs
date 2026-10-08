@@ -1,6 +1,6 @@
 use crate::device::{Device, Membership};
 use crate::files;
-use crate::relay::Relay;
+use crate::relay::{Notice, Relay, transient, whole};
 use crate::store::{Provider, SCHEMA};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
@@ -30,8 +30,12 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 const POLL_WAIT_S: u64 = 25;
+const RETRY_S: u64 = 3;
 const POLL_S: u64 = 15;
 const PING_S: u64 = 30;
+/// How often a request box is checked while its socket is down, and how soon a request that failed is tried again.
+const REQUESTS_POLL_S: u64 = 60;
+const REQUESTS_RETRY_S: u64 = 15;
 const CATCH_UP: usize = 20;
 const LIST_TTL: Duration = Duration::from_secs(60);
 
@@ -197,6 +201,8 @@ pub enum Event {
     Files { gid: String, records: Vec<(String, Record)>, ignored: Vec<String> },
     JoinRequest { invite: Box<Invite>, spake: Spake2<Ed25519Group>, data: String },
     Welcome { relay: String, key: [u8; 32], data: String, reply: oneshot::Sender<Value> },
+    /// The requests box of this open group has new entries, or may have.
+    Requests(String),
 }
 
 pub struct Invite {
@@ -231,11 +237,16 @@ struct Group {
     relay: String,
     cursor: u64,
     poller: JoinHandle<()>,
+    /// The requests box this group is open on, and the task following it.
+    requests: Option<(String, JoinHandle<()>)>,
 }
 
 impl Drop for Group {
     fn drop(&mut self) {
         self.poller.abort();
+        if let Some((_, task)) = &self.requests {
+            task.abort();
+        }
     }
 }
 
@@ -268,6 +279,8 @@ pub struct Session {
     lists: HashMap<String, (Instant, List)>,
     /// Blobs linked from files that could not be fetched, warned about once.
     missing: HashSet<String>,
+    /// Welcomes for admitted join requests not yet written to their reply box, by its address.
+    replies: HashMap<String, String>,
 }
 
 impl Session {
@@ -324,6 +337,7 @@ impl Session {
             home: home.to_owned(),
             lists: HashMap::new(),
             missing: HashSet::new(),
+            replies: HashMap::new(),
         };
         let rows: Vec<(String, String, u64)> = session
             .db
@@ -333,7 +347,8 @@ impl Session {
         for (gid, relay, cursor) in rows {
             let mls = MlsGroup::load(session.provider.storage(), &GroupId::from_slice(gid.as_bytes()))?.context("missing MLS state")?;
             session.backlog.insert(gid.clone(), Vec::new());
-            session.track(gid, relay, cursor, mls);
+            session.track(gid.clone(), relay, cursor, mls);
+            session.follow_requests(&gid)?;
         }
         let folders: Vec<String> = session.db.prepare("SELECT gid FROM folders")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
         for gid in folders {
@@ -405,6 +420,16 @@ impl Session {
             Event::Welcome { relay, key, data, reply } => {
                 let result = self.welcome(&relay, &key, &data).await;
                 let _ = reply.send(result.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
+            }
+            Event::Requests(gid) => {
+                if let Err(error) = self.admit_open(&gid).await {
+                    self.warn(Some(&gid), format!("join requests: {error:#}"));
+                    let events = self.events.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(REQUESTS_RETRY_S)).await;
+                        let _ = events.send(Event::Requests(gid));
+                    });
+                }
             }
         }
     }
@@ -494,12 +519,8 @@ impl Session {
 
         let (http, events) = (self.relay.clone(), self.events.clone());
         tokio::spawn(async move {
-            loop {
-                match http.invite_get(&invite.relay, &invite.id, "join", POLL_WAIT_S).await {
-                    Ok(Some(data)) => return drop(events.send(Event::JoinRequest { invite, spake, data })),
-                    Ok(None) => {}
-                    Err(_) => return,
-                }
+            if let Ok(data) = wait(|| http.invite_get(&invite.relay, &invite.id, "join", POLL_WAIT_S), "nobody used the invite").await {
+                let _ = events.send(Event::JoinRequest { invite, spake, data });
             }
         });
         let mut answer = json!({ "code": format!("{id}-{words}"), "link": format!("{relay}/i/{id}#{words}"), "expires_in": INVITE_TTL_S });
@@ -511,23 +532,29 @@ impl Session {
         let join: Value = serde_json::from_str(data)?;
         let pake = B64.decode(join["pake"].as_str().context("join request lacks pake")?)?;
         let key = invite_key(&spake.finish(&pake)?, &invite.id);
+        let admitted = self.admitted(invite, &key, &join).await;
+        // Sealed under our key: a joiner with a wrong code cannot open it either, and stops waiting.
+        let envelope = admitted.as_ref().map(Value::clone).unwrap_or_else(|error| json!({ "error": format!("{error:#}") }));
+        let sealed = seal(self.provider.rand(), &key, b"welcome", &serde_json::to_vec(&envelope)?)?;
+        self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
+        admitted?;
+        if let Into::Group(gid) = &invite.into {
+            self.post_state(gid).await?;
+        }
+        Ok(())
+    }
+
+    /// Adds whoever redeemed an invite, as `join` describes it; returns the envelope that lets it join.
+    async fn admitted(&mut self, invite: &Invite, key: &[u8; 32], join: &Value) -> Result<Value> {
         let field = match invite.into {
             Into::Group(_) => "key_package",
             Into::Entity(_) => "device",
         };
-        let bytes = match open(&key, b"join", join[field].as_str().with_context(|| format!("join request lacks {field}"))?) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                // Sealed under our key, so a joiner with a wrong code cannot open it and stops waiting.
-                let sealed = seal(self.provider.rand(), &key, b"welcome", b"")?;
-                self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
-                return Err(error);
-            }
-        };
-        let envelope = match &invite.into {
+        let bytes = open(key, b"join", join[field].as_str().with_context(|| format!("join request lacks {field}"))?)?;
+        match &invite.into {
             Into::Group(gid) => {
                 let key_package = self.key_package(&bytes)?;
-                self.add(gid, key_package).await?
+                self.add(gid, key_package).await
             }
             Into::Entity(membership) => {
                 let member: Member = serde_json::from_slice(&bytes)?;
@@ -537,15 +564,9 @@ impl Session {
                     list.get(&member.id).is_some()
                 })
                 .await?;
-                json!({ "entity": membership })
+                Ok(json!({ "entity": membership }))
             }
-        };
-        let sealed = seal(self.provider.rand(), &key, b"welcome", &serde_json::to_vec(&envelope)?)?;
-        self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
-        if let Into::Group(gid) = &invite.into {
-            self.post_state(gid).await?;
         }
-        Ok(())
     }
 
     fn key_package(&self, bytes: &[u8]) -> Result<KeyPackage> {
@@ -619,12 +640,9 @@ impl Session {
         };
         let (http, events) = (self.relay.clone(), self.events.clone());
         tokio::spawn(async move {
-            loop {
-                match http.invite_get(&relay, &id, "welcome", POLL_WAIT_S).await {
-                    Ok(Some(data)) => return drop(events.send(Event::Welcome { relay, key, data, reply })),
-                    Ok(None) => {}
-                    Err(error) => return drop(reply.send(json!({ "error": format!("waiting for welcome: {error:#}") }))),
-                }
+            match wait(|| http.invite_get(&relay, &id, "welcome", POLL_WAIT_S), "the inviter did not answer within 10 minutes").await {
+                Ok(data) => drop(events.send(Event::Welcome { relay, key, data, reply })),
+                Err(error) => drop(reply.send(json!({ "error": format!("waiting for welcome: {error:#}") }))),
             }
         });
         Ok(())
@@ -632,6 +650,9 @@ impl Session {
 
     async fn welcome(&mut self, relay: &str, key: &[u8; 32], data: &str) -> Result<Value> {
         let envelope: Value = serde_json::from_slice(&open(key, b"welcome", data)?)?;
+        if let Some(error) = envelope.get("error").and_then(Value::as_str) {
+            bail!("the inviter could not admit this session: {error}");
+        }
         if let Some(entity) = envelope.get("entity") {
             let membership: Membership = serde_json::from_value(entity.clone())?;
             let mut device = Device::load(&self.home)?;
@@ -706,11 +727,44 @@ impl Session {
         Ok(stored.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default())
     }
 
-    fn store_settings(&self, gid: &str, settings: &Settings) -> Result<()> {
+    fn store_settings(&mut self, gid: &str, settings: &Settings) -> Result<()> {
         self.db.execute(
             "INSERT INTO settings (gid, settings) VALUES (?, ?) ON CONFLICT (gid) DO UPDATE SET settings = excluded.settings",
             params![gid, serde_json::to_string(settings)?],
         )?;
+        self.follow_requests(gid)
+    }
+
+    /// Follows the requests box of a group open to an entity: its socket announces each join request, and while it has
+    /// none the box is checked every REQUESTS_POLL_S seconds.
+    fn follow_requests(&mut self, gid: &str) -> Result<()> {
+        let settings = self.settings(gid)?;
+        let Some(group) = self.groups.get_mut(gid) else { return Ok(()) };
+        let address = match settings.open.is_empty() {
+            true => None,
+            false => Some(place("requests", &hex::decode(&settings.requests)?).0),
+        };
+        if group.requests.as_ref().map(|(followed, _)| followed) == address.as_ref() {
+            return Ok(());
+        }
+        if let Some((_, task)) = group.requests.take() {
+            task.abort();
+        }
+        let Some(address) = address else { return Ok(()) };
+        let (http, events, relay, gid, path) = (self.relay.clone(), self.events.clone(), group.relay.clone(), gid.to_owned(), format!("b/{address}"));
+        let task = tokio::spawn(async move {
+            loop {
+                let socket = http.subscribe(&relay, &path).await.ok();
+                let _ = events.send(Event::Requests(gid.clone()));
+                if let Some(mut ws) = socket {
+                    while notified(&mut ws).await.is_some() {
+                        let _ = events.send(Event::Requests(gid.clone()));
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(REQUESTS_POLL_S)).await;
+            }
+        });
+        group.requests = Some((address, task));
         Ok(())
     }
 
@@ -921,14 +975,20 @@ impl Session {
 
     /// Takes in what the relay has for a group now, so a file is read, or a message built, from where the group stands.
     async fn catch_up_now(&mut self, gid: &str) -> Result<()> {
-        let Some(group) = self.groups.get(gid) else { return Ok(()) };
-        let (relay, cursor) = (group.relay.clone(), group.cursor);
-        for (seq, data) in self.relay.fetch(&relay, gid, cursor).await? {
-            if let Err(error) = self.receive(gid, seq, &data).await {
-                self.warn(Some(gid), format!("{error:#}"));
+        loop {
+            let Some(group) = self.groups.get(gid) else { return Ok(()) };
+            let (relay, cursor) = (group.relay.clone(), group.cursor);
+            let messages = self.relay.fetch(&relay, gid, cursor).await?;
+            let done = whole(messages.iter().map(|(_, data)| data.len()));
+            for (seq, data) in messages {
+                if let Err(error) = self.receive(gid, seq, &data).await {
+                    self.warn(Some(gid), format!("{error:#}"));
+                }
+            }
+            if done {
+                return Ok(());
             }
         }
-        Ok(())
     }
 
 
@@ -995,73 +1055,81 @@ impl Session {
         };
         let (http, events) = (self.relay.clone(), self.events.clone());
         tokio::spawn(async move {
-            let deadline = Instant::now() + Duration::from_secs(INVITE_TTL_S);
-            while Instant::now() < deadline {
-                match http.entries(&relay, &address, 0, POLL_WAIT_S).await {
-                    Ok(entries) if entries.is_empty() => {}
-                    Ok(mut entries) => return drop(events.send(Event::Welcome { relay, key, data: entries.remove(0).2, reply })),
-                    Err(error) => return drop(reply.send(json!({ "error": format!("waiting to be admitted: {error:#}") }))),
-                }
+            let entry = wait(|| async { Ok(http.entries(&relay, &address, 0, POLL_WAIT_S).await?.into_iter().next().map(|(_, _, data)| data)) }, "no member admitted the request; one must be online").await;
+            match entry {
+                Ok(data) => drop(events.send(Event::Welcome { relay, key, data, reply })),
+                Err(error) => drop(reply.send(json!({ "error": format!("waiting to be admitted: {error:#}") }))),
             }
-            drop(reply.send(json!({ "error": "no member admitted the request; one must be online" })));
         });
         Ok(())
     }
 
-    /// Checks open groups for join requests, every REQUESTS seconds while `listen` runs. A request from a session that
-    /// speaks as an entity the group is open to is admitted, unless another member admitted it first.
-    pub async fn admit_requests(&mut self) {
-        let opened = match self.opened() {
-            Ok(opened) => opened,
-            Err(error) => return self.warn(None, format!("join requests: {error:#}")),
-        };
-        for (gid, settings, cursor) in opened {
-            if settings.open.is_empty() || !self.groups.contains_key(&gid) {
-                continue;
-            }
-            if let Err(error) = self.admit_open(&gid, &settings, cursor).await {
-                self.warn(Some(&gid), format!("join requests: {error:#}"));
-            }
+    /// Admits the join requests in an open group's requests box from sessions that speak as an entity the group is open
+    /// to, unless another member admitted them first. The cursor moves past a request once it is handled, so one that
+    /// failed is tried again.
+    async fn admit_open(&mut self, gid: &str) -> Result<()> {
+        let Some(group) = self.groups.get(gid) else { return Ok(()) };
+        let relay = group.relay.clone();
+        let (settings, cursor): (String, u64) = self.db.query_row("SELECT settings, cursor FROM settings WHERE gid = ?", [gid], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let settings: Settings = serde_json::from_str(&settings)?;
+        if settings.open.is_empty() {
+            return Ok(());
         }
-    }
-
-    fn opened(&self) -> Result<Vec<(String, Settings, u64)>> {
-        let rows: Vec<(String, String, u64)> =
-            self.db.prepare("SELECT gid, settings, cursor FROM settings")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
-        rows.into_iter().map(|(gid, settings, cursor)| Ok((gid, serde_json::from_str(&settings)?, cursor))).collect()
-    }
-
-    async fn admit_open(&mut self, gid: &str, settings: &Settings, cursor: u64) -> Result<()> {
-        let relay = self.groups[gid].relay.clone();
         let (address, key) = place("requests", &hex::decode(&settings.requests)?);
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
         for (seq, at, data) in self.relay.entries(&relay, &address, cursor, 0).await? {
-            self.db.execute("UPDATE settings SET cursor = ? WHERE gid = ?", params![seq, gid])?;
             // Expired requests are skipped, so an old one posted again cannot bring back a session that left.
-            if at + INVITE_TTL_S * 1000 < now {
-                continue;
+            if at + INVITE_TTL_S * 1000 >= now {
+                self.admit_request(gid, &relay, &settings, &key, &data).await?;
             }
-            let request: JoinRequest = serde_json::from_slice(&open(&key, b"request", &data)?)?;
-            let key_package = self.key_package(&B64.decode(&request.key_package)?)?;
+            self.db.execute("UPDATE settings SET cursor = ? WHERE gid = ?", params![seq, gid])?;
+        }
+        Ok(())
+    }
+
+    /// Admits one join request. A request that cannot be admitted is refused with a warning; an error means it may be
+    /// admitted on a later try.
+    async fn admit_request(&mut self, gid: &str, relay: &str, settings: &Settings, key: &[u8; 32], data: &str) -> Result<()> {
+        let read = || -> Result<(KeyPackage, (String, [u8; 32]))> {
+            let request: JoinRequest = serde_json::from_slice(&open(key, b"request", data)?)?;
+            Ok((self.key_package(&B64.decode(&request.key_package)?)?, place("reply", &hex::decode(&request.reply)?)))
+        };
+        let (key_package, (reply_address, reply_key)) = match read() {
+            Ok(read) => read,
+            Err(error) => {
+                self.warn(Some(gid), format!("ignored a join request that does not read: {error:#}"));
+                return Ok(());
+            }
+        };
+        if !self.replies.contains_key(&reply_address) {
             let leaf = key_package.leaf_node();
-            let joiner = self.describe(gid, person(leaf.credential(), leaf.signature_key().as_slice())).await?;
-            if self.members(gid)?.iter().any(|m| m["fp"] == joiner["fp"]) {
-                continue;
+            let joiner = person(leaf.credential(), leaf.signature_key().as_slice());
+            let present = |session: &Self| session.members(gid).map(|members| members.iter().any(|m| m["fp"] == joiner["fp"]));
+            if present(self)? {
+                return Ok(());
             }
-            let entity = joiner["entity"]["id"].as_str().filter(|_| joiner["entity"].get("error").is_none());
+            // Fetched first, so a list the relay failed to give fails this try instead of refusing the request.
+            for id in joiner["as"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                let list = self.fetch_list(relay, id).await?;
+                self.lists.insert(id.to_owned(), (Instant::now(), list));
+            }
+            let described = self.describe(gid, joiner.clone(), false).await?;
+            let entity = described["entity"]["id"].as_str().filter(|_| described["entity"].get("error").is_none());
             if !entity.is_some_and(|id| settings.open.iter().any(|o| o.id == id)) {
-                self.warn(Some(gid), format!("refused a join request from {joiner}: it speaks as no entity the group is open to"));
-                continue;
+                self.warn(Some(gid), format!("refused a join request from {described}: it speaks as no entity the group is open to"));
+                return Ok(());
             }
             let envelope = match self.add(gid, key_package).await {
                 Ok(envelope) => envelope,
-                Err(_) if self.members(gid)?.iter().any(|m| m["fp"] == joiner["fp"]) => continue, // another member was first
+                Err(_) if present(self)? => return Ok(()), // another member was first
                 Err(error) => return Err(error),
             };
-            let (reply_address, reply_key) = place("reply", &hex::decode(&request.reply)?);
-            let sealed = seal(self.provider.rand(), &reply_key, b"welcome", &serde_json::to_vec(&envelope)?)?;
-            self.relay.append(&relay, &reply_address, &sealed).await?;
-            self.post_state(gid).await?;
+            self.replies.insert(reply_address.clone(), seal(self.provider.rand(), &reply_key, b"welcome", &serde_json::to_vec(&envelope)?)?);
+        }
+        self.relay.append(relay, &reply_address, &self.replies[&reply_address]).await?;
+        self.replies.remove(&reply_address);
+        if let Err(error) = self.post_state(gid).await {
+            self.warn(Some(gid), format!("posting the group's state for its new member: {error:#}"));
         }
         Ok(())
     }
@@ -1123,6 +1191,11 @@ impl Session {
         group.cursor = seq;
         self.db.execute("UPDATE groups SET cursor = ? WHERE gid = ?", params![seq, gid])?;
         let id = digest(data);
+        let pending: Option<String> = self.db.query_row("SELECT id FROM pending WHERE gid = ?", [gid], |r| r.get(0)).optional()?;
+        if pending.as_ref() == Some(&id) {
+            // This session's commit, which the relay took though its answer never came.
+            return self.merge_pending(gid).await;
+        }
         let posted: Option<String> = self.db.query_row("SELECT id FROM posted WHERE id = ?", [&id], |r| r.get(0)).optional()?;
         if posted.is_some() {
             return Ok(());
@@ -1142,8 +1215,10 @@ impl Session {
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(message) => {
-                let sender = self.describe(gid, sender).await?;
-                self.ingest(gid, id, sender, serde_json::from_slice(&message.into_bytes())?)?;
+                let payload: Payload = serde_json::from_slice(&message.into_bytes())?;
+                // A file update is never shown, so it does not meet the sender's entity.
+                let sender = self.describe(gid, sender, payload.file.is_none()).await?;
+                self.ingest(gid, id, sender, payload)?;
             }
             ProcessedMessageContent::ProposalMessage(proposal) => {
                 if !matches!(proposal.proposal(), Proposal::Remove(_)) {
@@ -1155,10 +1230,12 @@ impl Session {
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 let changes = membership_changes(&group.mls, &staged, &sender);
                 let self_removed = staged.self_removed();
+                // Merging drops any commit of this session's own for the same epoch: the relay took this one instead.
                 group.mls.merge_staged_commit(&self.provider, *staged)?;
+                self.db.execute("DELETE FROM pending WHERE gid = ?", [gid])?;
                 if self_removed {
                     self.drop_group(gid)?;
-                    let by = self.describe(gid, sender).await?;
+                    let by = self.describe(gid, sender, true).await?;
                     self.print(json!({ "type": "removed", "group": gid, "by": by }));
                     return Ok(());
                 }
@@ -1173,6 +1250,8 @@ impl Session {
 
     /// Posts the message `build` makes from the current epoch, and merges it if it is a commit. Returns its id and relay
     /// sequence number, or `None` if the relay has seen a commit this session has not: it only takes messages for its epoch.
+    /// A commit whose answer never came stays pending, recorded in `pending`: the relay may have taken it, and catching up
+    /// tells.
     async fn post(
         &mut self,
         gid: &str,
@@ -1182,20 +1261,29 @@ impl Session {
         let bytes = build(&mut group.mls, &self.provider, &self.signer)?.to_bytes()?;
         let (id, relay) = (digest(&bytes), group.relay.clone());
         self.db.execute("INSERT INTO posted (id) VALUES (?)", [&id])?;
-        let posted = self.relay.post(&relay, gid, &bytes).await;
-        let mls = &mut self.groups.get_mut(gid).expect("still tracked").mls;
-        let Ok(Some(seq)) = posted else {
-            mls.clear_pending_commit(self.provider.storage())?;
-            return posted.map(|_| None);
-        };
-        if let Some(staged) = mls.pending_commit() {
-            let changes = membership_changes(mls, staged, &self.person);
-            mls.merge_pending_commit(&self.provider)?;
-            for change in changes {
-                self.deliver_change(gid, change).await?;
-            }
+        if group.mls.pending_commit().is_some() {
+            self.db.execute("INSERT OR REPLACE INTO pending (gid, id) VALUES (?, ?)", [gid, &id])?;
         }
+        let Some(seq) = self.relay.post(&relay, gid, &bytes).await? else {
+            self.groups.get_mut(gid).expect("still tracked").mls.clear_pending_commit(self.provider.storage())?;
+            self.db.execute("DELETE FROM pending WHERE gid = ?", [gid])?;
+            return Ok(None);
+        };
+        self.merge_pending(gid).await?;
         Ok(Some((id, seq)))
+    }
+
+    /// Merges this session's commit once the relay took it, and delivers the membership changes it makes.
+    async fn merge_pending(&mut self, gid: &str) -> Result<()> {
+        self.db.execute("DELETE FROM pending WHERE gid = ?", [gid])?;
+        let mls = &mut self.groups.get_mut(gid).context("unknown group")?.mls;
+        let Some(staged) = mls.pending_commit() else { return Ok(()) };
+        let changes = membership_changes(mls, staged, &self.person);
+        mls.merge_pending_commit(&self.provider)?;
+        for change in changes {
+            self.deliver_change(gid, change).await?;
+        }
+        Ok(())
     }
 
     /// Like `post`, but on `None` catches up and builds the message again.
@@ -1204,6 +1292,14 @@ impl Session {
         gid: &str,
         mut build: impl FnMut(&mut MlsGroup, &Provider, &SignatureKeyPair) -> Result<MlsMessageOut>,
     ) -> Result<(String, u64)> {
+        if self.groups.get(gid).context("unknown group")?.mls.pending_commit().is_some() {
+            // A commit whose answer never came: if the relay has it, catching up merges it; if not, it never arrived.
+            self.catch_up_now(gid).await?;
+            if self.groups[gid].mls.pending_commit().is_some() {
+                self.groups.get_mut(gid).expect("checked").mls.clear_pending_commit(self.provider.storage())?;
+                self.db.execute("DELETE FROM pending WHERE gid = ?", [gid])?;
+            }
+        }
         for _ in 0..3 {
             if let Some(posted) = self.post(gid, &mut build).await? {
                 return Ok(posted);
@@ -1257,23 +1353,31 @@ impl Session {
 
     fn track(&mut self, gid: String, relay: String, cursor: u64, mls: MlsGroup) {
         let (http, events, poll_gid, poll_relay) = (self.relay.clone(), self.events.clone(), gid.clone(), relay.clone());
+        // Fetches on connecting, then takes messages from the socket's notices, fetching only after a gap or for a large
+        // message; polls only while it has no socket.
         let poller = tokio::spawn(async move {
             let (mut after, mut synced) = (cursor, false);
             loop {
-                let mut socket = http.subscribe(&poll_relay, &poll_gid).await.ok();
-                loop {
-                    if catch_up(&http, &events, &poll_relay, &poll_gid, &mut after, &mut synced).await.is_err() {
-                        break;
-                    }
+                let mut socket = http.subscribe(&poll_relay, &format!("g/{poll_gid}")).await.ok();
+                'fetch: while catch_up(&http, &events, &poll_relay, &poll_gid, &mut after, &mut synced).await.is_ok() {
                     let Some(ws) = &mut socket else { break };
-                    if !notified(ws).await {
-                        break;
+                    loop {
+                        match notified(ws).await {
+                            None => break 'fetch,
+                            Some(Notice { seq, .. }) if seq <= after => {}
+                            Some(Notice { seq, data: Some(data) }) if seq == after + 1 => {
+                                let Ok(data) = B64.decode(data) else { continue 'fetch };
+                                after = seq;
+                                let _ = events.send(Event::Batch { gid: poll_gid.clone(), messages: vec![(seq, data)], synced: true });
+                            }
+                            Some(_) => continue 'fetch,
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(POLL_S)).await;
             }
         });
-        self.groups.insert(gid, Group { mls, relay, cursor, poller });
+        self.groups.insert(gid, Group { mls, relay, cursor, poller, requests: None });
     }
 
     fn drop_group(&mut self, gid: &str) -> Result<()> {
@@ -1282,7 +1386,7 @@ impl Session {
         }
         self.folders.remove(gid);
         self.backlog.remove(gid);
-        for table in ["groups", "folders", "messages", "settings", "applied", "files", "versions", "blobs"] {
+        for table in ["groups", "folders", "messages", "settings", "applied", "files", "versions", "blobs", "pending"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [gid])?;
         }
         let attachments = self.attachments.join(&digest(gid.as_bytes())[..16]);
@@ -1308,15 +1412,15 @@ impl Session {
     async fn described_members(&mut self, gid: &str) -> Result<Vec<Value>> {
         let mut members = Vec::new();
         for member in self.members(gid)? {
-            members.push(self.describe(gid, member).await?);
+            members.push(self.describe(gid, member, true).await?);
         }
         Ok(members)
     }
 
     /// Delivers a "joined" or "left" line once the member's entity is checked.
     async fn deliver_change(&mut self, gid: &str, mut change: Value) -> Result<()> {
-        change["member"] = self.describe(gid, change["member"].take()).await?;
-        change["by"] = self.describe(gid, change["by"].take()).await?;
+        change["member"] = self.describe(gid, change["member"].take(), true).await?;
+        change["by"] = self.describe(gid, change["by"].take(), true).await?;
         self.deliver(gid, change);
         Ok(())
     }
@@ -1337,8 +1441,9 @@ impl Session {
     }
 
     /// Checks the entities a member says it speaks as against their lists: the first must list its device (or the
-    /// member itself), each later one the one before. Records entities this session meets for the first time.
-    async fn describe(&mut self, gid: &str, mut person: Value) -> Result<Value> {
+    /// member itself), each later one the one before. An entity is `new` until this session meets it: until it shows the
+    /// agent something from or about it (`meet`), which an admission check or a file update does not.
+    async fn describe(&mut self, gid: &str, mut person: Value, meet: bool) -> Result<Value> {
         let Some(path) = person.as_object_mut().and_then(|p| p.remove("as")) else { return Ok(person) };
         let path: Vec<String> = serde_json::from_value(path)?;
         let relay = self.groups.get(gid).map_or_else(|| self.default_relay.clone(), |g| g.relay.clone());
@@ -1357,9 +1462,12 @@ impl Session {
             person["entity"] = json!({ "id": id, "error": error });
             return Ok(person);
         }
-        let new = self.db.execute("INSERT OR IGNORE INTO seen (id, name, gid) VALUES (?, ?, ?)", params![holder, name, gid])? > 0;
+        let new = match meet {
+            true => self.db.execute("INSERT OR IGNORE INTO seen (id, name, gid) VALUES (?, ?, ?)", params![holder, name, gid])? > 0,
+            false => self.db.query_row("SELECT 1 FROM seen WHERE id = ?", [&holder], |_| Ok(())).optional()?.is_none(),
+        };
         let yours = Device::load(&self.home)?.entities.iter().any(|e| e.id == holder);
-        person["entity"] = json!({ "id": holder, "name": name, "new": new, "yours": yours });
+        person["entity"] = json!({ "id": holder, "name": name, "new": new && !yours, "yours": yours });
         Ok(person)
     }
 
@@ -1388,9 +1496,14 @@ impl Session {
         let (mut entries, mut after) = (Vec::new(), 0);
         loop {
             let page = self.relay.entries(relay, address, after, 0).await?;
-            let Some(last) = page.last() else { return Ok(entries) };
-            after = last.0;
+            let done = whole(page.iter().map(|(_, _, data)| data.len()));
+            if let Some(last) = page.last() {
+                after = last.0;
+            }
             entries.extend(page.into_iter().map(|(_, _, data)| data));
+            if done {
+                return Ok(entries);
+            }
         }
     }
 
@@ -1663,6 +1776,21 @@ impl Session {
 
 }
 
+/// Long-polls with `poll` until it yields something, for as long as an invite or join request lives. A poll that failed
+/// on the way is tried again a few seconds later: a dropped connection says nothing about the invite.
+async fn wait<T, F: std::future::Future<Output = Result<Option<T>>>>(mut poll: impl FnMut() -> F, expired: &str) -> Result<T> {
+    let deadline = Instant::now() + Duration::from_secs(INVITE_TTL_S);
+    while Instant::now() < deadline {
+        match poll().await {
+            Ok(Some(found)) => return Ok(found),
+            Ok(None) => {}
+            Err(error) if transient(&error) => tokio::time::sleep(Duration::from_secs(RETRY_S)).await,
+            Err(error) => return Err(error),
+        }
+    }
+    bail!("{expired}")
+}
+
 async fn catch_up(
     http: &Relay,
     events: &mpsc::UnboundedSender<Event>,
@@ -1673,7 +1801,7 @@ async fn catch_up(
 ) -> Result<()> {
     loop {
         let messages = http.fetch(relay, gid, *after).await?;
-        let was_synced = std::mem::replace(synced, messages.is_empty());
+        let was_synced = std::mem::replace(synced, whole(messages.iter().map(|(_, data)| data.len())));
         if let Some((seq, _)) = messages.last() {
             *after = *seq;
         }
@@ -1686,21 +1814,20 @@ async fn catch_up(
     }
 }
 
-/// Waits for the relay to announce a new message; false once the socket is gone.
-async fn notified(ws: &mut WebSocket) -> bool {
+/// Waits for the relay to announce something new; `None` once the socket is gone, or when a ping goes unanswered.
+/// A notice that does not parse counts as one without data, so the caller fetches.
+async fn notified(ws: &mut WebSocket) -> Option<Notice> {
     let mut unanswered = false;
     loop {
         match tokio::time::timeout(Duration::from_secs(PING_S), ws.next()).await {
             Ok(Some(Ok(Message::Text(text)))) if text == "pong" => unanswered = false,
-            Ok(Some(Ok(Message::Text(_)))) => return true,
+            Ok(Some(Ok(Message::Text(text)))) => return Some(serde_json::from_str(&text).unwrap_or(Notice { seq: u64::MAX, data: None })),
             Ok(Some(Ok(_))) => {}
-            Ok(_) => return false,
-            Err(_) if unanswered => return false,
+            Ok(_) => return None,
+            Err(_) if unanswered => return None,
             Err(_) => {
                 unanswered = true;
-                if ws.send(Message::Text("ping".into())).await.is_err() {
-                    return false;
-                }
+                ws.send(Message::Text("ping".into())).await.ok()?;
             }
         }
     }

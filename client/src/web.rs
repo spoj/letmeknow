@@ -234,6 +234,11 @@ impl Member {
         Ok(mls.commit_to_pending_proposals(&self.provider, &self.signer)?.0.to_bytes()?)
     }
 
+    /// Whether a commit this member built waits for the relay's answer.
+    pub fn pending(&self, gid: &str) -> R<bool> {
+        Ok(self.group(gid)?.pending_commit().is_some())
+    }
+
     /// After the relay took (`accepted`) or refused what was just built: merges a pending commit and returns its
     /// "joined"/"left" lines, or drops it.
     pub fn settle(&mut self, gid: &str, accepted: bool) -> R<String> {

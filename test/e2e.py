@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end test: local relay (wrangler dev) plus several session processes, then the browser client in Chromium
 (web/e2e.mjs). --no-browser skips building and testing the browser client, which is the same on every OS."""
-import hashlib, json, os, queue, shutil, socket, struct, subprocess, sys, tempfile, threading, time, urllib.request, zlib
+import hashlib, http.client, http.server, json, os, queue, shutil, socket, struct, subprocess, sys, tempfile, threading, time, urllib.error, urllib.parse, urllib.request, zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "client", "target", "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
@@ -65,6 +65,65 @@ class Listener:
         except subprocess.TimeoutExpired:
             self.proc.kill()
             sys.exit(f"{self.session}: listen ignored SIGTERM")
+
+
+class Proxy(http.server.BaseHTTPRequestHandler):
+    """A forward proxy to the relay that can lose one answer (`lose`: method and path prefix): the relay takes the request,
+    the client never hears."""
+    protocol_version = "HTTP/1.1"
+    lose = None
+
+    @classmethod
+    def start(cls):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), cls)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return {**ENV, "HTTP_PROXY": f"http://127.0.0.1:{server.server_port}", "NO_PROXY": ""}
+
+    def log_message(self, *args):
+        pass
+
+    def forward(self):
+        url = urllib.parse.urlsplit(self.path)
+        path = url.path + (f"?{url.query}" if url.query else "")
+        if self.headers.get("Upgrade"):
+            upstream = socket.create_connection(("localhost", PORT))
+            head = "".join(f"{k}: {v}\r\n" for k, v in self.headers.items() if not k.lower().startswith("proxy-"))
+            upstream.sendall(f"{self.command} {path} HTTP/1.1\r\n{head}\r\n".encode())
+            threading.Thread(target=self.pipe, args=(self.connection, upstream), daemon=True).start()
+            self.pipe(upstream, self.connection)
+            self.close_connection = True
+            return
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        relay = http.client.HTTPConnection("localhost", PORT, timeout=60)
+        relay.request(self.command, path, body, {k: v for k, v in self.headers.items() if k.lower() not in ("connection", "proxy-connection")})
+        response = relay.getresponse()
+        data = response.read()
+        if Proxy.lose and f"{self.command} {url.path}".startswith(Proxy.lose):
+            Proxy.lose = None
+            self.close_connection = True
+            return
+        self.send_response(response.status)
+        for k, v in response.getheaders():
+            if k.lower() not in ("connection", "transfer-encoding", "content-length"):
+                self.send_header(k, v)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    do_GET = do_POST = do_PUT = forward
+
+    @staticmethod
+    def pipe(source, sink):
+        try:
+            while chunk := source.recv(65536):
+                sink.sendall(chunk)
+        except OSError:
+            pass
+        for end in (source, sink):
+            try:
+                end.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
 
 def in_state(listener, *texts):
@@ -208,6 +267,32 @@ def main():
         alice.expect(lambda e: e.get("content") == "after the update")
         run("alice", "send", "seen it")
         check(dave.expect(lambda e: e["type"] == "message")["content"] == "seen it", "and both sides still read each other")
+
+        # The relay takes a commit but its answer is lost: the session must still move to the epoch it made.
+        lossy_env = Proxy.start()
+        lost = Listener("lost", env=lossy_env)
+        kate, liam = Listener("kate"), Listener("liam")
+        listeners += [lost, kate, liam]
+        lossy = run("lost", "invite", env=lossy_env)
+        run("kate", "join", lossy["link"])
+        run("liam", "join", run("lost", "invite", "--group", lossy["group"], env=lossy_env)["link"])
+        kate.expect(lambda e: e["type"] == "joined" and e["member"]["name"] == "Liam")
+        Proxy.lose = f"POST /g/{lossy['group']}/messages"
+        liam_fp = liam.ready["member"]["fp"]
+        run("lost", "remove", liam_fp, ok=False, env=lossy_env)
+        liam.expect(lambda e: e["type"] == "removed")
+        until(lambda: run("lost", "members", env=lossy_env)["members"], lambda members: len(members) == 2)
+        run("lost", "send", "after the lost answer", env=lossy_env)
+        check(kate.expect(lambda e: e["type"] == "message")["content"] == "after the lost answer", "a commit the relay took though its answer was lost still counts for its sender")
+        lost.expect(lambda e: e["type"] == "left" and e["member"]["name"] == "Liam")
+        invite = run("lost", "invite", "--group", lossy["group"], env=lossy_env)
+        Proxy.lose = f"GET /i/{invite['code'].split('-')[0]}/join"
+        run("liam", "join", invite["link"])
+        check(Proxy.lose is None, "an inviter whose wait for the joiner fails once waits again")
+        gone = run("kate", "invite")
+        run("kate", "leave", "--group", gone["group"])
+        refused = run("liam", "join", gone["link"], ok=False)
+        check("could not admit" in refused and "unknown group" in refused, "a joiner the inviter could not add is told why at once")
 
         folder = os.path.join(HOME, "shared", "chat")
         erin, frank = Listener("erin", extra=["--keep-log"]), Listener("frank")
@@ -436,6 +521,17 @@ def main():
         check(run(None, "groups", env=solo_env) == [], "commands use the one running session")
         if BROWSER and subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=web, env={**ENV, "RELAY": RELAY, "BIN": BIN}).returncode:
             sys.exit("browser test failed")
+        # Requests the relay refuses before reading their bodies must not fault it.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for method, path in (("POST", f"/g/{'0' * 32}/nope"), ("PUT", f"/b/{'0' * 32}"), ("POST", f"/b/{'0' * 32}/ws")):
+            try:
+                opener.open(urllib.request.Request(RELAY + path, data=os.urandom(256 * 1024), method=method), timeout=10)
+            except urllib.error.HTTPError:
+                pass
+        time.sleep(1)
+        with open(os.path.join(ROOT, "relay", ".wrangler", "e2e.log"), encoding="utf-8", errors="replace") as f:
+            uncaught = [line for line in f if "Uncaught" in line]
+        check(not uncaught, f"the relay threw nothing uncaught {uncaught[:1]}")
         print("all passed")
     finally:
         for listener in listeners:

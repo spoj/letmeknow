@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use reqwest::{Response, StatusCode};
 use reqwest_websocket::{Upgrade, WebSocket};
@@ -9,12 +9,26 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct Relay(reqwest::Client);
 
+/// Whether a page whose entries are `sizes` bytes holds everything after its cursor. The relay ends a page early only
+/// before an entry that would take it past 2 MiB, and entries are at most 1 MiB, so a page of at most 1 MiB is whole:
+/// there is no need to ask for the next, empty one.
+pub fn whole(sizes: impl Iterator<Item = usize>) -> bool {
+    sizes.sum::<usize>() <= 1024 * 1024
+}
+
 #[derive(Deserialize)]
 struct Frame {
     seq: u64,
     #[serde(default)]
     at: u64,
     data: String,
+}
+
+/// What a socket announces: a new entry's seq, and the entry itself unless it is large.
+#[derive(Deserialize)]
+pub struct Notice {
+    pub seq: u64,
+    pub data: Option<String>,
 }
 
 impl Relay {
@@ -48,9 +62,10 @@ impl Relay {
         Ok(ok(self.0.get(format!("{relay}/g/{gid}/blobs/{hash}")).send().await?).await?.bytes().await?.to_vec())
     }
 
-    /// Opens a socket on which the relay sends each new message's seq.
-    pub async fn subscribe(&self, relay: &str, gid: &str) -> Result<WebSocket> {
-        Ok(self.0.get(format!("{relay}/g/{gid}/ws")).upgrade().send().await?.into_websocket().await?)
+    /// Opens a socket on which the relay announces each new message of a group (`g/<gid>`) or entry of a box
+    /// (`b/<address>`), as a `Notice`.
+    pub async fn subscribe(&self, relay: &str, path: &str) -> Result<WebSocket> {
+        Ok(self.0.get(format!("{relay}/{path}/ws?messages")).upgrade().send().await?.into_websocket().await?)
     }
 
     /// Appends to a box: an append-only log the relay keeps in the order it takes entries.
@@ -97,10 +112,28 @@ impl Relay {
     }
 }
 
+/// The relay's answer to a request it refused.
+#[derive(Debug)]
+pub struct Refused(StatusCode, String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "relay answered {}: {}", self.0, self.1)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Whether trying again may help: the relay was not reached, the connection dropped, or it failed (5xx) rather than
+/// refused (4xx).
+pub fn transient(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Refused>().is_none_or(|refused| refused.0.is_server_error())
+}
+
 async fn ok(response: Response) -> Result<Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
-    bail!("relay answered {status}: {}", response.text().await.unwrap_or_default().trim())
+    Err(Refused(status, response.text().await.unwrap_or_default().trim().to_owned()).into())
 }
