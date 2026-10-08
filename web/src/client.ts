@@ -221,8 +221,12 @@ export class Client {
     setInterval(() => this.groups.forEach((_, gid) => this.followGroup(gid)), 15_000);
     setInterval(() => this.groups.forEach((_, gid) => this.followRequests(gid)), 60_000);
     setInterval(() => this.groups.forEach((_, gid) => this.run(() => this.updateKey(gid))), 3_600_000);
-    // A device that slept may hold sockets that look open but are dead.
-    document.addEventListener("visibilitychange", () => document.hidden || this.sockets.forEach(s => s.check()));
+    // A device that slept may hold sockets that look open but are dead, and lost others.
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) return;
+      this.sockets.forEach(s => s.check());
+      this.groups.forEach((_, gid) => this.followGroup(gid));
+    });
   }
 
   /**
