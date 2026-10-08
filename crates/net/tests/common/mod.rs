@@ -1,0 +1,315 @@
+//! A local relay with a self-signed certificate, and a fake of the group logic: epochs are log
+//! lengths, and a "ciphertext" is `epoch ‖ kind ‖ body`, kind 0 a message, kind 1 a doc diff.
+
+#![allow(dead_code)]
+
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::{Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use anyhow::{Result, bail};
+use ed25519_dalek::SigningKey;
+use iroh::{EndpointId, RelayMap, RelayUrl, SecretKey, tls::CaTlsConfig};
+use iroh_relay::{
+    RelayQuicConfig,
+    server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig},
+};
+use lmk_net::{Admit, Config, Event, Groups, Net};
+use lmk_proto::{
+    Answer, Bytes,
+    head::{self, Head},
+    links::FileLink,
+    peer::{Admitted, Hello, InviteRequest},
+};
+use n0_future::boxed::BoxFuture;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+use yrs::{
+    Doc, ReadTxn, StateVector, Transact, Update,
+    updates::{decoder::Decode, encoder::Encode},
+};
+
+pub const WAIT: Duration = Duration::from_secs(30);
+
+pub struct Relay {
+    pub server: Server,
+    pub url: RelayUrl,
+    pub map: RelayMap,
+    pub cert: CertificateDer<'static>,
+}
+
+pub async fn relay() -> Relay {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = CertificateDer::from(certified.cert.der().to_vec());
+    let key = PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
+    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key)
+        .unwrap();
+    let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
+    relay.tls = Some(TlsConfig::new((Ipv6Addr::UNSPECIFIED, 0), CertConfig::Manual { server_config: tls.clone() }));
+    let mut quic = QuicConfig::new((Ipv6Addr::UNSPECIFIED, 0));
+    quic.server_config = Some(tls);
+    let mut config = ServerConfig::default();
+    config.relay = Some(relay);
+    config.quic = Some(quic);
+    let server = Server::spawn(config).await.unwrap();
+    let url: RelayUrl = format!("https://localhost:{}", server.https_addr().unwrap().port()).parse().unwrap();
+    let quic = RelayQuicConfig::new(server.quic_addr().unwrap().port());
+    let map = RelayMap::from(iroh::RelayConfig::new(url.clone(), Some(quic)));
+    Relay { server, url, map, cert }
+}
+
+pub struct Node {
+    pub net: Net,
+    pub events: mpsc::UnboundedReceiver<Event>,
+    pub fake: Arc<Fake>,
+}
+
+pub struct Options {
+    pub relay_only: bool,
+    pub home: Option<PathBuf>,
+    pub file_limit: u64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { relay_only: false, home: None, file_limit: 100 << 20 }
+    }
+}
+
+pub async fn node(relay: &Relay, key: SecretKey, fake: Arc<Fake>, options: Options) -> Node {
+    let mut builder = lmk_net::builder(relay.map.clone()).secret_key(key).ca_tls_config(CaTlsConfig::custom_roots([relay.cert.clone()]));
+    if options.relay_only {
+        builder = builder.clear_ip_transports();
+    }
+    let endpoint = builder.bind().await.unwrap();
+    tokio::time::timeout(WAIT, endpoint.online()).await.expect("online");
+    let config = Config { relay: relay.url.clone(), home: options.home, files: None, file_limit: options.file_limit };
+    let (net, events) = Net::spawn(endpoint, config, fake.clone(), Arc::new(Inviter)).await.unwrap();
+    Node { net, events, fake }
+}
+
+impl Node {
+    pub async fn until(&mut self, wanted: impl Fn(&Event) -> bool) -> Event {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let event = self.events.recv().await.unwrap();
+                if wanted(&event) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the event came")
+    }
+
+    pub async fn synced(&mut self, group: &[u8], peer: EndpointId) {
+        self.until(|e| *e == Event::Synced { group: group.to_vec(), peer }).await;
+    }
+}
+
+pub async fn eventually(what: &str, check: impl Fn() -> bool) {
+    tokio::time::timeout(WAIT, async {
+        while !check() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"));
+}
+
+pub fn keys(n: usize) -> Vec<SecretKey> {
+    (0..n).map(|_| SecretKey::generate()).collect()
+}
+
+pub fn message(epoch: u64, text: &str) -> Vec<u8> {
+    [&epoch.to_be_bytes()[..], &[0], text.as_bytes()].concat()
+}
+
+pub fn id(ciphertext: &[u8]) -> [u8; 32] {
+    Sha256::digest(ciphertext).into()
+}
+
+pub const SECRET: [u8; 16] = [5; 16];
+
+/// Admits whoever brings `SECRET`, and every join request.
+pub struct Inviter;
+
+impl Admit for Inviter {
+    fn invite(&self, _: EndpointId, request: InviteRequest) -> BoxFuture<Answer<Admitted>> {
+        Box::pin(async move {
+            if request.secret.0 == SECRET {
+                Answer::Ok(Admitted { welcome: Bytes(b"welcome".to_vec()), position: 3, doc: None })
+            } else {
+                Answer::Refused { refused: "unknown secret".into() }
+            }
+        })
+    }
+
+    fn join(&self, _: EndpointId, group: Vec<u8>, _: Vec<u8>) -> BoxFuture<Answer<Admitted>> {
+        Box::pin(async move { Answer::Ok(Admitted { welcome: Bytes(group), position: 1, doc: None }) })
+    }
+}
+
+#[derive(Default)]
+pub struct Group {
+    pub members: Vec<EndpointId>,
+    pub log: Vec<Vec<u8>>,
+    pub floor: u64,
+    pub joined: u64,
+    pub held: BTreeMap<[u8; 32], (u64, Vec<u8>)>,
+    pub given_up: BTreeMap<[u8; 32], u64>,
+    pub doc: Option<Doc>,
+    pub files: Vec<FileLink>,
+}
+
+pub struct Fake {
+    service: SigningKey,
+    pub groups: Mutex<HashMap<Vec<u8>, Group>>,
+    /// After this many more membership checks, the peer is no longer a member.
+    pub cut: Mutex<Option<(EndpointId, usize)>>,
+}
+
+impl Fake {
+    pub fn new(service: &SigningKey) -> Arc<Fake> {
+        Arc::new(Fake { service: service.clone(), groups: Mutex::default(), cut: Mutex::default() })
+    }
+
+    pub fn with(self: &Arc<Self>, group: &[u8], g: Group) -> Arc<Self> {
+        self.groups.lock().unwrap().insert(group.to_vec(), g);
+        self.clone()
+    }
+
+    pub fn hold(&self, group: &[u8], ciphertext: Vec<u8>) {
+        let epoch = u64::from_be_bytes(ciphertext[..8].try_into().unwrap());
+        self.groups.lock().unwrap().get_mut(group).unwrap().held.insert(id(&ciphertext), (epoch, ciphertext));
+    }
+
+    pub fn holds(&self, group: &[u8], ciphertext: &[u8]) -> bool {
+        self.groups.lock().unwrap()[group].held.contains_key(&id(ciphertext))
+    }
+
+    pub fn log(&self, group: &[u8]) -> Vec<Vec<u8>> {
+        self.groups.lock().unwrap()[group].log.clone()
+    }
+
+    pub fn text(&self, group: &[u8]) -> String {
+        let groups = self.groups.lock().unwrap();
+        let doc = groups[group].doc.as_ref().unwrap();
+        let text = doc.get_or_insert_text("text");
+        yrs::GetString::get_string(&text, &doc.transact())
+    }
+
+    fn chain_of(log: &[Vec<u8>], group: &[u8], n: usize) -> [u8; 32] {
+        log[..n].iter().fold(head::start(group), |hash, entry| head::next(&hash, entry))
+    }
+}
+
+impl Groups for Fake {
+    fn groups(&self) -> Vec<Vec<u8>> {
+        self.groups.lock().unwrap().keys().cloned().collect()
+    }
+
+    fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
+        let mut cut = self.cut.lock().unwrap();
+        if let Some((who, left)) = cut.as_mut()
+            && who == peer
+        {
+            if *left == 0 {
+                return false;
+            }
+            *left -= 1;
+        }
+        self.groups.lock().unwrap().get(group).is_some_and(|g| g.members.contains(peer))
+    }
+
+    fn hello(&self, group: &[u8]) -> Hello {
+        let groups = self.groups.lock().unwrap();
+        let g = &groups[group];
+        let length = g.log.len() as u64;
+        let head = Head::sign(&self.service, group, length, Self::chain_of(&g.log, group, g.log.len()), 0);
+        Hello { group: group.into(), epoch: length, head, floor: g.floor, joined: g.joined }
+    }
+
+    fn verify_head(&self, _: &[u8], head: &Head) -> bool {
+        head.verify(&self.service.verifying_key())
+    }
+
+    fn chain(&self, group: &[u8], position: u64) -> Option<[u8; 32]> {
+        let groups = self.groups.lock().unwrap();
+        let log = &groups[group].log;
+        (position as usize <= log.len()).then(|| Self::chain_of(log, group, position as usize))
+    }
+
+    fn entries(&self, group: &[u8], after: u64) -> Vec<Bytes> {
+        self.groups.lock().unwrap()[group].log[after as usize..].iter().map(|e| Bytes(e.clone())).collect()
+    }
+
+    fn apply(&self, group: &[u8], entries: Vec<Bytes>, _: Head) -> Result<()> {
+        self.groups.lock().unwrap().get_mut(group).unwrap().log.extend(entries.into_iter().map(|e| e.0));
+        Ok(())
+    }
+
+    fn items(&self, group: &[u8], from: u64) -> Vec<(u64, [u8; 32])> {
+        let groups = self.groups.lock().unwrap();
+        let g = &groups[group];
+        let held = g.held.iter().map(|(id, (epoch, _))| (*epoch, *id));
+        held.chain(g.given_up.iter().map(|(id, epoch)| (*epoch, *id))).filter(|(epoch, _)| *epoch >= from).collect()
+    }
+
+    fn message(&self, group: &[u8], id: &[u8; 32]) -> Option<Vec<u8>> {
+        self.groups.lock().unwrap()[group].held.get(id).map(|(_, ciphertext)| ciphertext.clone())
+    }
+
+    fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Result<()> {
+        let epoch = u64::from_be_bytes(ciphertext[..8].try_into()?);
+        let mut groups = self.groups.lock().unwrap();
+        let g = groups.get_mut(group).unwrap();
+        if epoch < g.floor {
+            g.given_up.insert(id(ciphertext), epoch);
+            bail!("below the floor");
+        }
+        if epoch > g.log.len() as u64 {
+            bail!("from a future epoch");
+        }
+        match ciphertext[8] {
+            0 => {
+                g.held.insert(id(ciphertext), (epoch, ciphertext.to_vec()));
+            }
+            _ => {
+                let update = Update::decode_v1(&ciphertext[9..])?;
+                g.doc.as_ref().unwrap().transact_mut().apply_update(update)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn doc(&self, group: &[u8]) -> Option<[u8; 32]> {
+        let groups = self.groups.lock().unwrap();
+        let doc = groups[group].doc.as_ref()?;
+        Some(Sha256::digest(doc.transact().snapshot().encode_v1()).into())
+    }
+
+    fn doc_sv(&self, group: &[u8]) -> Vec<u8> {
+        self.groups.lock().unwrap()[group].doc.as_ref().unwrap().transact().state_vector().encode_v1()
+    }
+
+    fn diff(&self, group: &[u8], sv: &[u8]) -> Result<Vec<u8>> {
+        let groups = self.groups.lock().unwrap();
+        let g = &groups[group];
+        let update = g.doc.as_ref().unwrap().transact().encode_state_as_update_v1(&StateVector::decode_v1(sv)?);
+        Ok([&(g.log.len() as u64).to_be_bytes()[..], &[1], &update].concat())
+    }
+
+    fn files(&self, group: &[u8]) -> Vec<FileLink> {
+        self.groups.lock().unwrap()[group].files.clone()
+    }
+}
