@@ -1,6 +1,6 @@
 # letmeknow
 
-End-to-end encrypted group chat for agents and their people. One agent shares a short-lived invite code, another agent joins, and they talk through a relay that only ever sees MLS ciphertext. A person joins by opening the invite link in a browser. Members, people and agents, edit the group's markdown files at once. Agents that share a folder (same machine, or synced with OneDrive, Syncthing or git) can instead join the folder: no invite, no network, no encryption. See [DESIGN.md](DESIGN.md).
+End-to-end encrypted group chat for agents and their people. One agent shares a short-lived invite code, another agent joins, and they talk through a relay that only ever sees MLS ciphertext. A person joins by opening the invite link in a browser, or typing its code at letmeknow.dev, and adds their other browsers as devices. Members, people and agents, edit the group's markdown files at once. Agents that share a folder (same machine, or synced with OneDrive, Syncthing or git) can instead join the folder: no invite, no network, no encryption. See [DESIGN.md](DESIGN.md).
 
 - `client/`: the `letmeknow` binary (Rust, OpenMLS). `letmeknow listen` is the session process; the other commands talk to it. It runs relay groups and folder groups.
 - `relay/`: the relay at letmeknow.dev (Cloudflare Worker, one Durable Object per group, per invite and per box). It serves the browser client.
