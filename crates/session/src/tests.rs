@@ -24,6 +24,8 @@ struct World {
     _relay: Server,
     network: crate::Network,
     root: PathBuf,
+    /// For the sessions started from now on.
+    causal_wait: Duration,
 }
 
 async fn world(test: &str) -> World {
@@ -48,7 +50,8 @@ async fn world(test: &str) -> World {
     let relay = format!("https://localhost:{}", server.https_addr().unwrap().port()).parse().unwrap();
     let root = std::env::temp_dir().join(format!("lmk-session-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    World { _relay: server, network: crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) }, root }
+    let network = crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) };
+    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT }
 }
 
 struct Agent {
@@ -66,12 +69,18 @@ impl World {
 
     /// A session process in its own home: its own device.
     async fn start(&self, handle: &str, hold: Duration) -> Agent {
-        let home = self.root.join(handle);
+        self.start_in(handle, handle, hold).await
+    }
+
+    /// A session process in the home `device`.
+    async fn start_in(&self, device: &str, handle: &str, hold: Duration) -> Agent {
+        let home = self.root.join(device);
         let config = Config {
             handle: handle.into(),
             dir: session_dir(&home, handle).unwrap(),
             name: handle[..1].to_uppercase() + &handle[1..],
             hold,
+            causal_wait: self.causal_wait,
             keep_log: false,
             membership: self.membership(),
         };
@@ -367,7 +376,7 @@ fn introductions_are_shown_until_accepted() {
         let mut carol = world.start("carol", HOUR).await;
         carol.cmd(&["identity", "create", "Carol"]).await.unwrap();
         assert!(alice.cmd(&["invite", "--group", "x"]).await.is_err());
-        let invite = alice.cmd(&["invite", "--group", &group]).await.unwrap();
+        let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
         carol.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         let introduced = alice.cmd(&["introduce", "Bob", "--to", "Carol"]).await.unwrap();
         assert_eq!(introduced["identity"]["name"], "Bob (Acme)");
@@ -394,7 +403,7 @@ fn introductions_are_shown_until_accepted() {
         assert_eq!(bob_seen["identity"]["introduced"][0]["name"], "Bob (Acme)");
         let contacts = carol.cmd(&["contacts"]).await.unwrap();
         let id = contacts["introductions"][0]["identity"].as_str().unwrap().to_owned();
-        carol.cmd(&["contacts", "accept", &id]).await.unwrap();
+        carol.cmd(&["contacts", "accept", "--", &id]).await.unwrap();
         let members = carol.cmd(&["members"]).await.unwrap();
         let bob_seen = members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Bob").unwrap().clone();
         assert_eq!((bob_seen["identity"]["how"].as_str(), bob_seen["identity"]["name"].as_str()), (Some("introduced"), Some("Bob (Acme)")));
@@ -468,14 +477,14 @@ fn a_session_of_an_identity_joins_a_group_open_to_it() {
             groups = tablet.cmd(&["groups"]).await.unwrap();
         }
         assert_eq!(groups[0]["joined"], false, "{groups}");
-        let joined = tablet.cmd(&["join", &group]).await.unwrap();
+        let joined = tablet.cmd(&["join", "--", &group]).await.unwrap();
         assert_eq!(joined["members"].as_array().unwrap().len(), 3);
         let event = alice.expect("joined").await;
         assert_eq!((event["member"]["identity"]["name"].as_str(), event["how"].as_str()), (Some("Bob (Acme)"), Some("open")));
         assert!(event["member"]["identity"]["new_device"].as_str().unwrap().starts_with("added by "));
         // A session of another identity cannot see the group, so it cannot join it.
         let carol = world.start("carol", HOUR).await;
-        let refused = carol.cmd(&["join", &group]).await.unwrap_err().to_string();
+        let refused = carol.cmd(&["join", "--", &group]).await.unwrap_err().to_string();
         assert!(refused.contains("open to your identity"), "{refused}");
     });
 }
@@ -516,7 +525,7 @@ fn identities_are_created_listed_and_lose_devices() {
         let devices = listed["identities"][0]["devices"].as_array().unwrap();
         assert_eq!(devices.len(), 2);
         let phone_key = devices.iter().find(|d| d["you"] == false).unwrap()["key"].as_str().unwrap().to_owned();
-        alice.cmd(&["identity", "remove", &phone_key]).await.unwrap();
+        alice.cmd(&["identity", "remove", "--", &phone_key]).await.unwrap();
         let listed = alice.cmd(&["identity", "list"]).await.unwrap();
         assert_eq!(listed["identities"][0]["devices"].as_array().unwrap().len(), 1);
     });
@@ -537,5 +546,65 @@ fn a_restarted_session_resumes_its_groups_and_docs() {
         assert_eq!((groups[0]["name"].as_str(), groups[0]["file"].as_str()), (Some("Notes"), Some(file.as_str())));
         alice.cmd(&["leave"]).await.unwrap();
         assert!(!Path::new(&file).exists());
+    });
+}
+
+#[test]
+fn every_session_of_a_device_sees_its_state_and_changes_it() {
+    local(async {
+        let world = world("device").await;
+        let mut first = world.start("alice", HOUR).await;
+        let mut second = world.start_in("alice", "second", HOUR).await;
+        // The second session process acts through the first, which holds the device's lock.
+        second.cmd(&["identity", "create", "Alice"]).await.unwrap();
+        assert_eq!(first.cmd(&["identity", "list"]).await.unwrap()["identities"][0]["name"], "Alice");
+        let bob = world.start("bob", HOUR).await;
+        bob.cmd(&["identity", "create", "Robert"]).await.unwrap();
+        let invite = second.cmd(&["invite", "--for", "Bob (Acme)"]).await.unwrap();
+        bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        second.expect("joined").await;
+        for agent in [&first, &second] {
+            let contacts = agent.cmd(&["contacts"]).await.unwrap();
+            assert_eq!(contacts["contacts"][0]["name"], "Bob (Acme)", "{contacts}");
+        }
+        let members = second.cmd(&["members"]).await.unwrap();
+        let bob_seen = members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Bob").unwrap().clone();
+        assert_eq!(bob_seen["identity"]["how"], "verified");
+        // An opening the second records reaches the first.
+        second.cmd(&["open", "Alice"]).await.unwrap();
+        let groups = first.cmd(&["groups"]).await.unwrap();
+        assert_eq!((groups[0]["group"].as_str(), groups[0]["joined"].as_bool()), (invite["group"].as_str(), Some(false)));
+        // Once the first stops, the second acts for the device.
+        first.stop().await;
+        let mut listed = second.cmd(&["identity", "list"]).await;
+        for _ in 0..60 {
+            if listed.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            listed = second.cmd(&["identity", "list"]).await;
+        }
+        assert_eq!(listed.unwrap()["identities"][0]["name"], "Alice");
+        assert!(second.printed().await.iter().all(|e| e["type"] != "warning"));
+    });
+}
+
+#[test]
+fn a_message_waits_for_those_it_comes_after_then_shows_them_missing() {
+    local(async {
+        let mut world = world("wait").await;
+        let (alice, mut bob, group) = pair(&world, HOUR).await;
+        let before = alice.cmd(&["send", "@bob before carol"]).await.unwrap();
+        bob.expect("message").await;
+        world.causal_wait = Duration::from_secs(2);
+        let mut carol = world.start("carol", HOUR).await;
+        carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        // Bob's message comes after one from before Carol joined, which can never reach her.
+        let sent = std::time::Instant::now();
+        bob.cmd(&["send", "@carol see above"]).await.unwrap();
+        let got = carol.expect("message").await;
+        assert!(sent.elapsed() >= Duration::from_millis(1500), "{:?}", sent.elapsed());
+        assert_eq!(got["content"], "@carol see above");
+        assert_eq!(got["missing"], json!([before["id"]]));
     });
 }

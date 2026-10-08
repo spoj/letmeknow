@@ -111,6 +111,10 @@ pub struct Config {
     pub files: Option<PathBuf>,
     /// The largest file fetched without being asked.
     pub file_limit: u64,
+    /// How often two connected sessions swap heads and sync their groups again.
+    pub resync: Duration,
+    /// How often the files no group links any longer are deleted.
+    pub collect: Duration,
 }
 
 /// An endpoint with our relays and no address lookup; relay connections honour the proxy
@@ -148,7 +152,7 @@ impl Net {
         groups: Arc<dyn Groups>,
         admit: Arc<dyn Admit>,
     ) -> Result<(Net, mpsc::UnboundedReceiver<Event>)> {
-        let files = Arc::new(Files::new(endpoint.clone(), config.files.clone()).await?);
+        let files = Arc::new(Files::new(endpoint.clone(), config.files.clone(), groups.clone(), config.collect).await?);
         #[cfg(not(target_family = "wasm"))]
         if let Some(home) = &config.home {
             addresses::publish(&endpoint, home)?;

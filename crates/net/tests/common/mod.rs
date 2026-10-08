@@ -77,11 +77,14 @@ pub struct Options {
     pub relay_only: bool,
     pub home: Option<PathBuf>,
     pub file_limit: u64,
+    pub resync: Duration,
+    pub collect: Duration,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { relay_only: false, home: None, file_limit: 100 << 20 }
+        let (resync, collect) = (Duration::from_secs(300), Duration::from_secs(3600));
+        Options { relay_only: false, home: None, file_limit: 100 << 20, resync, collect }
     }
 }
 
@@ -92,7 +95,8 @@ pub async fn node(relay: &Relay, key: SecretKey, fake: Arc<Fake>, options: Optio
     }
     let endpoint = builder.bind().await.unwrap();
     tokio::time::timeout(WAIT, endpoint.online()).await.expect("online");
-    let config = Config { relay: relay.url.clone(), home: options.home, files: None, file_limit: options.file_limit };
+    let (relay_url, files, file_limit) = (relay.url.clone(), None, options.file_limit);
+    let config = Config { relay: relay_url, home: options.home, files, file_limit, resync: options.resync, collect: options.collect };
     let (net, events) = Net::spawn(endpoint, config, fake.clone(), Arc::new(Inviter)).await.unwrap();
     Node { net, events, fake }
 }
@@ -169,6 +173,9 @@ pub struct Group {
     pub given_up: BTreeMap<[u8; 32], u64>,
     pub doc: Option<Doc>,
     pub files: Vec<FileLink>,
+    /// Takes no entries from peers, as when they reach it only from the service; counts those offered.
+    pub frozen: bool,
+    pub offered: usize,
 }
 
 pub struct Fake {
@@ -254,7 +261,13 @@ impl Groups for Fake {
     }
 
     fn apply(&self, group: &[u8], entries: Vec<Bytes>, _: Head) -> Result<()> {
-        self.groups.lock().unwrap().get_mut(group).unwrap().log.extend(entries.into_iter().map(|e| e.0));
+        let mut groups = self.groups.lock().unwrap();
+        let g = groups.get_mut(group).unwrap();
+        if g.frozen {
+            g.offered += entries.len();
+            anyhow::bail!("frozen");
+        }
+        g.log.extend(entries.into_iter().map(|e| e.0));
         Ok(())
     }
 

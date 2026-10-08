@@ -58,7 +58,7 @@ A log is a directory, `<folder>/<log id, hex>/`, holding one file per entry, `<p
 
 ### Gossip
 
-Two connected members exchange the newest signed heads they hold for the logs they share (see Peer protocol). A head that a member's own chain contradicts (same length, other hash; or a shorter head that is not a prefix of its chain) is proof: the session reports both heads in a `warning`.
+Two connected members exchange the newest signed heads they hold for the logs they share (see Peer protocol). A head that a member's own chain contradicts (same length, other hash; or a shorter head that is not a prefix of its chain) is proof: the session reports both heads in a `warning`. A longer head is kept, the longest from each peer, and judged once the member's own chain reaches its length.
 
 ## Groups
 
@@ -114,6 +114,7 @@ A member checks `device_sig` and the identity's device list (see Identity) when 
 - An entry, before sealing, is `{"body": "<bytes>", "sig": "<sig>"}`. `body` is JSON, `{"prev": "<hash of the previous entry's body>" | null, "op": "create" | "add" | "remove", "device": "<key>", "device_name": "", "by": "<signing device key>"}`, plus `"name"` and `"membership"` on `create`. `sig` is by `by` over `"letmeknow device list v1\0"` ‖ body.
 - The identity's id is SHA-256 of the first entry's body. A credential names the id and its service; the first entry proves both.
 - Valid entries: `create` first, signed by the device it names; then each `prev` names the latest valid entry, and `by` is on the list at that point. A removal is final. Members apply the first valid entry per `prev`, in log order, and skip the rest.
+- A member reads the lists of the identities its groups' members speak as, and of each devices group's identity, when it joins or resumes, when members are added, and again once a list is 10 minutes old. Whenever a list it reads has removed a member's device, it commits that member's removal; a member that finds the removal already done drops its own.
 
 ### Contacts
 
@@ -121,7 +122,12 @@ An identity's contacts live in its devices group as a Yjs map, named `contacts`,
 
 ### Devices group
 
-An identity's devices group is a chat whose settings carry `devices_of`. Its members are devices, not sessions: on a machine, whichever session process holds the lock `LETMEKNOW_HOME/device.lock` acts for the device, as a member whose MLS key is the device key, with its own iroh key and its state in `LETMEKNOW_HOME/device.db`. The device's other session processes do without its contacts and openings. In a browser, the device is the session.
+An identity's devices group is a chat whose settings carry `devices_of`. Its members are devices, not sessions: on a machine, whichever session process holds the lock `LETMEKNOW_HOME/device.lock` acts for the device, as a member whose MLS key is the device key, with its own iroh key and its state in `LETMEKNOW_HOME/device.db`. The device's other session processes try the lock every 10 seconds, so one takes over when the holder stops. In a browser, the device is the session.
+
+On a machine, the holder shares the device with its other session processes through two files in `LETMEKNOW_HOME`:
+
+- `device-state.json`: `{"identities": [[<identity ref>, "<name>"]], "contacts": [["<identity id>", <contact>]], "openings": [<opening>]}`, rewritten whenever it changes, by writing `device-state.new` and renaming it over the old. The others read it whenever they need contacts, identities or openings.
+- `device-endpoint`: the holder's second command channel (`{"port", "token"}`, a localhost TCP port taking one JSON line `{"token", "request"}` and answering one line, as each session's own `endpoint`). The others send it the requests only the device's node can answer: `identity`, `invite --identity`, `join` with a device link, and two of their own, `{"cmd": "set_contact", "identity", "contact"}` and `{"cmd": "set_opening", "identity", "opening"}`. The holder rewrites `device-state.json` before it answers.
 
 An opening, in its settings: `{"group", "kind", "name", "membership", "members": ["<iroh key>"]}`. A member that is a device of the identity writes it, and refreshes `members` when the group's membership changes.
 
@@ -147,7 +153,7 @@ A message's id is SHA-256 of its MLS ciphertext. A member holds `message` and `l
 
 ## Peer protocol
 
-A `peer` stream joins two sessions that share a group, one stream per pair, kept open while both are online. Either side may send a frame at any time; every frame names its group, and a side serves a group only to a peer whose iroh key is in a leaf of that group's current epoch.
+A `peer` stream joins two sessions that share a group, one stream per pair, kept open while both are online. Either side may send a frame at any time; every frame names its group, and a side serves a group only to a peer whose iroh key is in a leaf of that group's current epoch. Each side sends `hello` when the stream opens and when its state of a group changes; and every 5 minutes it sends `hello` again and syncs each group anew, even if nothing changed, so a message lost on its way is found within 5 minutes.
 
 | Frame | Meaning |
 |---|---|
@@ -173,6 +179,7 @@ Message sync, per group, starts once both sides have caught up on commits. It is
 - A file's key is 32 random bytes. Its ciphertext is the STREAM construction as in age: the plaintext in chunks of 65,520 bytes (the last shorter, and empty only for an empty file), each sealed with ChaCha20-Poly1305 under the key, with the nonce u88 big-endian chunk counter ‖ `0x01` for the last chunk, else `0x00`. Sealed chunks are 64 KiB.
 - Its hash is BLAKE3 over the whole ciphertext. A link is `lmk:<hash, hex>.<plaintext size>#<key, hex>`.
 - Transfer is iroh-blobs `=0.103.1` on its own ALPN, kept inside one module. A holder admits a connection only from the iroh key of a current member of a group the two share, a request only for a file one of those groups links, and checks again every 16 KiB it sends.
+- A member holds, for a group, the files linked within `keep` (attachments of messages, by when the message reached it; files it added; doc states beside Welcomes), the files its doc links now, and the doc state beside the latest Welcome it made or took. It serves and wants only those, and deletes every other file it holds once an hour.
 - A member asks connected peers with `want`; each answers `have` with those it holds, and the member fetches from several holders at once, resuming where a transfer stopped. A browser keeps the ciphertext in its own storage (IndexedDB), since iroh-blobs keeps only memory there.
 
 ## Browser

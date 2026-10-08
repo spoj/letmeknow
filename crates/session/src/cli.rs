@@ -13,6 +13,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::session::Inbound;
+use lmk_core::contacts::Contact;
+use lmk_proto::Bytes;
+use lmk_proto::group::Opening;
 
 /// End-to-end encrypted chats and documents for agents and their people.
 #[derive(Parser)]
@@ -224,6 +227,12 @@ pub enum Request {
         #[arg(long)]
         to: String,
     },
+    /// Sets a contact of the device's first identity; sent to the session process that acts for the device.
+    #[command(skip)]
+    SetContact { identity: Bytes, contact: Contact },
+    /// Records an opening in an identity's devices group; sent to the session process that acts for the device.
+    #[command(skip)]
+    SetOpening { identity: Bytes, opening: Opening },
 }
 
 #[derive(Subcommand, Serialize, Deserialize, Debug, Clone)]
@@ -321,21 +330,20 @@ pub async fn running_session(home: &Path) -> Result<String> {
     }
 }
 
-async fn connect(endpoint: &Path) -> Result<(TcpStream, String)> {
+pub async fn connect(endpoint: &Path) -> Result<(TcpStream, String)> {
     let endpoint: Endpoint = serde_json::from_slice(&std::fs::read(endpoint)?)?;
     Ok((TcpStream::connect(("127.0.0.1", endpoint.port)).await?, endpoint.token))
 }
 
-/// Opens the command channel of the session in `dir`: requests that come with its token go to `inbound`.
-pub async fn open_channel(dir: &Path, inbound: mpsc::UnboundedSender<Inbound>) -> Result<()> {
-    let endpoint_path = dir.join("endpoint");
-    if connect(&endpoint_path).await.is_ok() {
-        bail!("session {} is already running", dir.display());
+/// Opens a command channel, written to `endpoint_path`: requests that come with its token go to `inbound`.
+pub async fn open_channel(endpoint_path: &Path, inbound: mpsc::UnboundedSender<Inbound>) -> Result<()> {
+    if connect(endpoint_path).await.is_ok() {
+        bail!("{} is already answered by a running session", endpoint_path.display());
     }
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let token = hex::encode(rand::random::<[u8; 32]>());
     let endpoint = Endpoint { port: listener.local_addr()?.port(), token: token.clone() };
-    private_file(&endpoint_path, &serde_json::to_vec(&endpoint)?)?;
+    private_file(endpoint_path, &serde_json::to_vec(&endpoint)?)?;
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             tokio::spawn(answer(stream, token.clone(), inbound.clone()));
@@ -407,9 +415,14 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     {
         bail!("{file} exists; name a new file for the doc");
     }
-    let (stream, token) = connect(&session_dir(home, session)?.join("endpoint"))
+    let channel = connect(&session_dir(home, session)?.join("endpoint"))
         .await
         .with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen`"))?;
+    exchange(channel, request).await
+}
+
+/// Sends a request over a command channel and returns its answer.
+pub async fn exchange((stream, token): (TcpStream, String), request: Request) -> Result<Value> {
     let (read, mut write) = stream.into_split();
     write.write_all(format!("{}\n", serde_json::to_string(&Call { token, request })?).as_bytes()).await?;
     let mut line = String::new();

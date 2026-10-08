@@ -30,6 +30,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 name: name.unwrap_or_else(|| format!("{user}/{handle}")),
                 handle,
                 hold: Duration::from_secs(hold),
+                causal_wait: letmeknow::session::CAUSAL_WAIT,
                 keep_log,
                 membership: letmeknow::service(&membership)?,
             };

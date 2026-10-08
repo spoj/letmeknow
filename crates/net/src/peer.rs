@@ -21,7 +21,7 @@ use lmk_proto::{
     peer::{Admitted, Frame, Hello, Refusal},
 };
 use sha2::{Digest, Sha256};
-use n0_future::task::spawn;
+use n0_future::{task::spawn, time::sleep};
 use negentropy::{Negentropy, NegentropyStorageVector};
 use tokio::sync::{mpsc, oneshot};
 
@@ -38,6 +38,8 @@ pub(crate) enum Input {
     Closed,
     Send(Frame),
     Changed(Bytes),
+    /// Time to sync every group again.
+    Resync,
     Want { group: Bytes, files: Vec<[u8; 32]>, reply: HaveReply },
     Join { group: Bytes, key_package: Bytes, reply: oneshot::Sender<Answer<Admitted>> },
 }
@@ -57,6 +59,8 @@ struct Session {
 #[derive(Default)]
 struct Group {
     theirs: Option<Hello>,
+    /// The longest head the peer showed beyond our log, judged once our log reaches it.
+    longer: Option<Head>,
     /// The log length we last started a sync at.
     synced: Option<u64>,
     initiator: Option<Round>,
@@ -82,6 +86,15 @@ pub(crate) async fn run(
     mut rx: mpsc::UnboundedReceiver<Input>,
 ) {
     let peer = conn.remote_id();
+    let (ticker, resync) = (input.clone(), inner.config.resync);
+    spawn(async move {
+        loop {
+            sleep(resync).await;
+            if ticker.send(Input::Resync).is_err() {
+                return;
+            }
+        }
+    });
     let reader = input.clone();
     spawn(async move {
         while let Ok(frame) = frame::read(&mut recv).await {
@@ -101,6 +114,7 @@ pub(crate) async fn run(
                 Input::Closed => break,
                 Input::Send(frame) => session.write(&frame).await?,
                 Input::Changed(group) => session.changed(group).await?,
+                Input::Resync => session.resync().await?,
                 Input::Want { group, files, reply } => {
                     session.wants.entry(group.clone()).or_default().push_back(reply);
                     let files = files.into_iter().map(Bytes::from).collect();
@@ -215,9 +229,28 @@ impl Session {
         Ok(())
     }
 
-    /// Checks a signed head from the peer against our chain; reports a contradiction.
-    fn judge(&self, group: &Bytes, ours: &Head, theirs: &Head) -> Result<()> {
+    /// Checks a signed head from the peer against our chain, now or, if it is longer, once our chain reaches it;
+    /// reports a contradiction.
+    fn judge(&mut self, group: &Bytes, ours: &Head, theirs: &Head) -> Result<()> {
         ensure!(self.inner.groups.verify_head(&group.0, theirs), "a head the service did not sign");
+        let state = self.groups.entry(group.clone()).or_default();
+        if theirs.length > ours.length && state.longer.as_ref().is_none_or(|longer| longer.length < theirs.length) {
+            state.longer = Some(theirs.clone());
+        }
+        self.judge_longer(group, ours)?;
+        self.contradiction(group, ours, theirs)
+    }
+
+    /// Judges the longest head the peer showed, once our chain has reached it.
+    fn judge_longer(&mut self, group: &Bytes, ours: &Head) -> Result<()> {
+        let longer = self.groups.get_mut(group).and_then(|state| state.longer.take_if(|longer| longer.length <= ours.length));
+        match longer {
+            Some(longer) => self.contradiction(group, ours, &longer),
+            None => Ok(()),
+        }
+    }
+
+    fn contradiction(&self, group: &Bytes, ours: &Head, theirs: &Head) -> Result<()> {
         if sync::contradicts(theirs, ours, |n| self.inner.groups.chain(&group.0, n)) {
             self.inner
                 .events
@@ -328,8 +361,25 @@ impl Session {
             return Ok(());
         }
         let mine = self.inner.groups.hello(&group.0);
+        if let Err(e) = self.judge_longer(&group, &mine.head) {
+            tracing::warn!("a head from {}: {e:#}", self.peer.fmt_short());
+            return Ok(());
+        }
         self.write(&Frame::Hello { groups: vec![mine.clone()] }).await?;
         self.catch_up(&group, &mine).await
+    }
+
+    /// Swaps heads again and syncs every group anew, whatever it has synced already.
+    async fn resync(&mut self) -> Result<()> {
+        for state in self.groups.values_mut() {
+            state.synced = None;
+        }
+        for group in self.inner.groups.groups() {
+            if self.member(&group) {
+                self.changed(Bytes(group)).await?;
+            }
+        }
+        Ok(())
     }
 
     fn storage(&self, group: &Bytes) -> Option<(NegentropyStorageVector, HashMap<[u8; 32], u64>)> {

@@ -13,7 +13,7 @@ use lmk_core::provider::SqliteProvider;
 use lmk_node::Node;
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use lmk_proto::links::RELAY;
 
@@ -77,8 +77,8 @@ impl Network {
     }
 }
 
-/// Runs a session process until `shutdown`: opens its command channel and its node, and the device's node if no other
-/// session process of this device runs it.
+/// Runs a session process until `shutdown`: opens its command channel and its node; the session acts for the device
+/// too while no other session process of the device does.
 pub async fn listen(
     config: session::Config,
     home: &Path,
@@ -88,7 +88,7 @@ pub async fn listen(
 ) -> Result<()> {
     cli::private_dir(&config.dir)?;
     let (inbound, queue) = tokio::sync::mpsc::unbounded_channel();
-    cli::open_channel(&config.dir, inbound.clone()).await?;
+    cli::open_channel(&config.dir.join("endpoint"), inbound.clone()).await?;
     let device_file = home.join("device.json");
     let device = match device_file.exists() {
         true => Device::load(&device_file)?,
@@ -98,7 +98,15 @@ pub async fn listen(
             device
         }
     };
-    let node_config = |name: &str, device_key, files| lmk_node::Config {
+    let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
+    let node_config = node_config(&network, home, &config.name, false, config.dir.join("files"));
+    let (node, events) = Node::start(provider, device, node_config).await?;
+    let session = session::Session::open(config, node, home, network, inbound).await?;
+    session::run(session, queue, events, print, shutdown).await
+}
+
+fn node_config(network: &Network, home: &Path, name: &str, device_key: bool, files: PathBuf) -> lmk_node::Config {
+    lmk_node::Config {
         name: name.into(),
         device_key,
         relay: network.relay.clone(),
@@ -107,23 +115,7 @@ pub async fn listen(
         files: Some(files),
         file_limit: 100 << 20,
         window: Window::default(),
-    };
-    let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
-    let (node, events) = Node::start(provider, device.clone(), node_config(&config.name, false, config.dir.join("files"))).await?;
-    // Held while the process runs: whoever holds it acts for the device.
-    let lock = std::fs::File::create(home.join("device.lock"))?;
-    let (device_node, device_events) = match lock.try_lock() {
-        Ok(()) => {
-            let provider = SqliteProvider::open(&home.join("device.db"))?;
-            let (node, events) = Node::start(provider, device.clone(), node_config(&device.name, true, home.join("device-files"))).await?;
-            (Some(node), events)
-        }
-        Err(_) => (None, tokio::sync::mpsc::unbounded_channel().1),
-    };
-    let session = session::Session::open(config, node, device_node, inbound).await?;
-    let result = session::run(session, queue, events, device_events, print, shutdown).await;
-    drop(lock);
-    result
+    }
 }
 
 /// Resolves on Ctrl-C or, on Unix, SIGTERM.

@@ -77,7 +77,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 let g = st.groups.get_mut(gid).unwrap();
                 if let Payload::Message { attachment: Some(attachment), .. } = &payload {
                     let link = FileLink::parse(&attachment.link)?;
-                    g.rec.files.push(attachment.link.clone());
+                    g.rec.link(attachment.link.clone());
                     if link.size <= self.file_limit {
                         self.work.send(Work::Fetch { group: gid.to_vec(), link }).ok();
                     }
@@ -100,7 +100,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 ensure!(doc_like(&settings), "an edit outside a doc");
                 let old = st.doc_state(gid)?;
                 let new = doc::apply(&old, &update.0)?;
-                st.provider.put(&crate::doc_key(gid), &new)?;
+                st.edited(gid, &new, &sender)?;
                 if settings.kind == Kind::Doc {
                     let before = doc::links(&doc::text(&old)?);
                     for link in doc::links(&doc::text(&new)?) {
@@ -197,7 +197,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Some(state) => {
                 let link = self.net().add_file(std::io::Cursor::new(state)).await?.link();
                 let mut st = self.state.lock().unwrap();
-                st.group_mut(gid)?.rec.files.push(link.clone());
+                let rec = &mut st.group_mut(gid)?.rec;
+                rec.link(link.clone());
+                rec.state = Some(link.clone());
                 st.save(gid)?;
                 Some(link)
             }
@@ -333,13 +335,9 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         let Some(g) = st.groups.get(group) else {
             return Vec::new();
         };
-        let mut files: Vec<FileLink> = g.rec.files.iter().filter_map(|link| FileLink::parse(link).ok()).collect();
-        if g.mls.settings().kind == Kind::Doc
-            && let Ok(text) = st.doc_state(group).and_then(|state| doc::text(&state))
-        {
-            files.extend(doc::links(&text));
-        }
-        files
+        let settings = g.mls.settings();
+        let text = (settings.kind == Kind::Doc).then(|| st.doc_state(group).and_then(|state| doc::text(&state)).ok()).flatten();
+        g.rec.held(settings.keep, text.as_deref())
     }
 }
 
