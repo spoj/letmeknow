@@ -8,24 +8,36 @@ license = "MIT"
 anyhow = "1.0.104"
 base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
-clap = { version = "4.6.7", features = ["derive", "env"] }
-dirs = "7.0.0"
-futures-util = { version = "0.3", default-features = false }
-getrandom = "0.4.3"
+ed25519-dalek = "2.2"
 hex = "0.4.3"
 hkdf = "0.13.0"
-notify = "8.2.0"
 openmls = "0.9"
 openmls_basic_credential = "0.6"
 openmls_rust_crypto = "0.6"
-openmls_sqlite_storage = "0.3"
 openmls_traits = "0.6"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
-reqwest-websocket = { version = "0.6", default-features = false }
-rusqlite = "0.37"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 spake2 = { version = "0.4", features = ["std"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { version = "4.6.7", features = ["derive", "env"] }
+dirs = "7.0.0"
+futures-util = { version = "0.3", default-features = false }
+getrandom = "0.4.3"
+notify = "8.2.0"
+openmls_sqlite_storage = "0.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+reqwest-websocket = { version = "0.6", default-features = false }
+rusqlite = "0.37"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+
+# The browser client: `web/build.mjs` compiles the library to WebAssembly.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+openmls = { version = "0.9", features = ["js"] }
+openmls_memory_storage = "0.6"
+wasm-bindgen = "=0.2.129"

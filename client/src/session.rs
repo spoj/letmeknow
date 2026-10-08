@@ -2,16 +2,17 @@ use crate::relay::Relay;
 use crate::store::{Provider, SCHEMA};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::{Aead, Payload as Aad}};
 use clap::Subcommand;
-use hkdf::Hkdf;
+use letmeknow::proto::{
+    CIPHERSUITE, INVITE_SLOTS, INVITE_TTL_S, PAKE_ID, Payload, create_config, digest, fingerprint, invite_key, invite_words, join_config,
+    membership_changes, open, person, random_below, seal,
+};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::{OpenMlsProvider, random::OpenMlsRand};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -25,12 +26,6 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
-const MAX_PAST_EPOCHS: usize = 5;
-const INVITE_TTL_S: u64 = 600;
-const INVITE_SLOTS: usize = 999;
-const PAKE_ID: &[u8] = b"letmeknow invite v2";
-const WORDS: &str = include_str!("words.txt");
 const POLL_WAIT_S: u64 = 25;
 const POLL_S: u64 = 15;
 const PING_S: u64 = 30;
@@ -104,37 +99,6 @@ pub struct Invite {
     id: String,
     owner: String,
     gid: String,
-}
-
-/// A message as both transports carry it: MLS plaintext on the relay, the body of a folder file.
-#[derive(Clone, Serialize, Deserialize)]
-struct Payload {
-    /// `None` in the session's log once delivered, unless `listen --keep-log`.
-    content: Option<String>,
-    after: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "one_or_many")]
-    to: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_to: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    urgent: bool,
-    /// Base64 file content. Recipients get it as a private file; the session's log never holds it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    attachment: Option<String>,
-}
-
-/// Reads `to` as a list, or as the single fingerprint that 0.4 wrote, so older folder files and stored messages still parse.
-fn one_or_many<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum To {
-        One(String),
-        Many(Vec<String>),
-    }
-    Ok(match To::deserialize(deserializer)? {
-        To::One(fp) => vec![fp],
-        To::Many(fps) => fps,
-    })
 }
 
 /// A folder group message: the file `<id>.json`, whose id is the SHA-256 of the file. It holds the payload plus the `from` that MLS supplies on the relay.
@@ -345,13 +309,12 @@ impl Session {
             None => self.create_group()?,
         };
         let relay = self.groups.get(&gid).context("folder groups need no invite; share the folder path")?.relay.clone();
-        let words: Vec<&str> = WORDS.lines().collect();
-        let words = format!("{}-{}", words[self.random_below(words.len())?], words[self.random_below(words.len())?]);
+        let words = invite_words(self.provider.rand())?;
         let (spake, pake) = Spake2::<Ed25519Group>::start_symmetric(&Password::new(&words), &Identity::new(PAKE_ID));
         let owner = hex::encode(self.provider.rand().random_array::<32>()?);
         let mut slot = None;
         for _ in 0..10 {
-            let id = (self.random_below(INVITE_SLOTS)? + 1).to_string();
+            let id = (random_below(self.provider.rand(), INVITE_SLOTS)? + 1).to_string();
             if self.relay.create_invite(&relay, &id, INVITE_TTL_S, &owner, &B64.encode(&pake)).await? {
                 slot = Some(id);
                 break;
@@ -386,7 +349,7 @@ impl Session {
             Ok(bytes) => bytes,
             Err(error) => {
                 // Sealed under our key, so a joiner with a wrong code cannot open it and stops waiting.
-                let sealed = self.seal(&key, b"welcome", b"")?;
+                let sealed = seal(self.provider.rand(), &key, b"welcome", b"")?;
                 self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
                 return Err(error);
             }
@@ -406,7 +369,7 @@ impl Session {
             .await?;
         let welcome = welcome.context("no welcome")?.to_bytes()?;
         let envelope = json!({ "group": invite.gid, "seq": seq, "welcome": B64.encode(welcome) });
-        let sealed = self.seal(&key, b"welcome", &serde_json::to_vec(&envelope)?)?;
+        let sealed = seal(self.provider.rand(), &key, b"welcome", &serde_json::to_vec(&envelope)?)?;
         self.relay.invite_post(&invite.relay, &invite.id, "welcome", &sealed, Some(&invite.owner)).await?;
         Ok(())
     }
@@ -437,7 +400,7 @@ impl Session {
             let key = invite_key(&spake.finish(&B64.decode(pake)?)?, id);
             let bundle = KeyPackage::builder().build(CIPHERSUITE, &self.provider, &self.signer, self.me.clone())?;
             let bytes = MlsMessageOut::from(bundle.key_package().clone()).to_bytes()?;
-            let join = json!({ "pake": B64.encode(message), "key_package": self.seal(&key, b"join", &bytes)? });
+            let join = json!({ "pake": B64.encode(message), "key_package": seal(self.provider.rand(), &key, b"join", &bytes)? });
             self.relay.invite_post(relay, id, "join", &join.to_string(), None).await?;
             anyhow::Ok((relay.to_owned(), id.to_owned(), key))
         };
@@ -469,12 +432,7 @@ impl Session {
         let MlsMessageBodyIn::Welcome(welcome) = MlsMessageIn::tls_deserialize_exact_bytes(&bytes)?.extract() else {
             bail!("not a welcome message");
         };
-        let config = MlsGroupJoinConfig::builder()
-            .use_ratchet_tree_extension(true)
-            .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
-            .max_past_epochs(MAX_PAST_EPOCHS)
-            .build();
-        let mls = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)?.into_group(&self.provider)?;
+        let mls = StagedWelcome::new_from_welcome(&self.provider, &join_config(), welcome, None)?.into_group(&self.provider)?;
         if mls.group_id().as_slice() != gid.as_bytes() {
             bail!("welcome is for a different group");
         }
@@ -703,13 +661,7 @@ impl Session {
 
     fn create_group(&mut self) -> Result<String> {
         let gid = hex::encode(self.provider.rand().random_array::<16>()?);
-        let mls = MlsGroup::builder()
-            .with_group_id(GroupId::from_slice(gid.as_bytes()))
-            .ciphersuite(CIPHERSUITE)
-            .use_ratchet_tree_extension(true)
-            .with_wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
-            .max_past_epochs(MAX_PAST_EPOCHS)
-            .build(&self.provider, &self.signer, self.me.clone())?;
+        let mls = MlsGroup::new_with_group_id(&self.provider, &self.signer, &create_config(), GroupId::from_slice(gid.as_bytes()), self.me.clone())?;
         let relay = self.default_relay.clone();
         self.add_group(&gid, &relay, 0, mls)?;
         Ok(gid)
@@ -960,31 +912,6 @@ impl Session {
         println!("{}", json!({ "type": "warning", "group": gid, "text": text }));
     }
 
-    fn random_below(&self, n: usize) -> Result<usize> {
-        Ok(u32::from_le_bytes(self.provider.rand().random_array()?) as usize % n)
-    }
-
-    fn seal(&self, key: &[u8; 32], label: &[u8], plaintext: &[u8]) -> Result<String> {
-        let nonce: [u8; 12] = self.provider.rand().random_array()?;
-        let cipher = ChaCha20Poly1305::new_from_slice(key).expect("32-byte key");
-        let sealed = cipher
-            .encrypt(&nonce.into(), Aad { msg: plaintext, aad: label })
-            .map_err(|_| anyhow::anyhow!("encryption failed"))?;
-        Ok(B64.encode([nonce.as_slice(), &sealed].concat()))
-    }
-}
-
-fn open(key: &[u8; 32], label: &[u8], data: &str) -> Result<Vec<u8>> {
-    let bytes = B64.decode(data)?;
-    if bytes.len() < 12 {
-        bail!("sealed data too short");
-    }
-    let (nonce, sealed) = bytes.split_at(12);
-    let nonce: [u8; 12] = nonce.try_into().expect("12 bytes");
-    let cipher = ChaCha20Poly1305::new_from_slice(key).expect("32-byte key");
-    cipher
-        .decrypt(&nonce.into(), Aad { msg: sealed, aad: label })
-        .map_err(|_| anyhow::anyhow!("cannot decrypt: wrong invite code or tampered data"))
 }
 
 async fn catch_up(
@@ -1060,40 +987,4 @@ fn scan(dir: &Path, seen: &mut HashSet<OsString>) -> (Vec<(String, Record)>, Vec
         ordered.push((id, record));
     }
     (ordered, ignored)
-}
-
-fn invite_key(secret: &[u8], id: &str) -> [u8; 32] {
-    let mut key = [0; 32];
-    Hkdf::<Sha256>::new(None, secret)
-        .expand(format!("letmeknow invite v2 {id}").as_bytes(), &mut key)
-        .expect("32 bytes is a valid HKDF output length");
-    key
-}
-
-/// "joined"/"left" lines for a commit, computed before it is merged.
-fn membership_changes(mls: &MlsGroup, staged: &StagedCommit, by: &Value) -> Vec<Value> {
-    let gid = String::from_utf8_lossy(mls.group_id().as_slice());
-    let added = staged.add_proposals().map(|p| {
-        let leaf = p.add_proposal().key_package().leaf_node();
-        json!({ "type": "joined", "group": gid, "member": person(leaf.credential(), leaf.signature_key().as_slice()), "by": by })
-    });
-    let removed = staged.remove_proposals().filter_map(|p| mls.member_at(p.remove_proposal().removed())).map(|m| {
-        json!({ "type": "left", "group": gid, "member": person(&m.credential, &m.signature_key), "by": by })
-    });
-    added.chain(removed).collect()
-}
-
-fn person(credential: &Credential, signature_key: &[u8]) -> Value {
-    let name = BasicCredential::try_from(credential.clone())
-        .map(|c| String::from_utf8_lossy(c.identity()).into_owned())
-        .unwrap_or_else(|_| "?".into());
-    json!({ "name": name, "fp": fingerprint(signature_key) })
-}
-
-fn fingerprint(signature_key: &[u8]) -> String {
-    hex::encode(&Sha256::digest(signature_key)[..8])
-}
-
-fn digest(data: &[u8]) -> String {
-    hex::encode(Sha256::digest(data))
 }
