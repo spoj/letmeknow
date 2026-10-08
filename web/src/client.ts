@@ -117,6 +117,9 @@ export class Client {
   private sockets = new Map<string, { socket: WebSocket; check: () => void }>();
   /** Welcomes for admitted join requests not yet written to their reply box, by its address. */
   private replies = new Map<string, string>();
+  /** Inbox entries by entity, kept while the inbox's socket announces nothing new; `inboxNotices` counts announcements. */
+  private inboxes = new Map<string, string[]>();
+  private inboxNotices = 0;
   private writes = new Map<string, [string, string, unknown]>();
   private saved = new Map<string, string>();
   private dirtyFiles = new Set<string>();
@@ -597,12 +600,27 @@ export class Client {
     });
   }
 
-  /** Groups open to this browser's entities, from their inboxes: the latest entry for each group, unless it closed it. */
+  /**
+   * Groups open to this browser's entities, from their inboxes: the latest entry for each group, unless it closed it.
+   * An inbox is followed on a socket, and fetched again only once that announces something or is down.
+   */
   async openings(): Promise<{ opening: Opening; entity: Membership }[]> {
     const found: { opening: Opening; entity: Membership }[] = [];
     for (const entity of this.me.entities) {
       const inbox = place("inbox", unhex(entity.secret));
-      for (const entry of await boxAll(inbox.address)) {
+      const key = `inbox ${entity.id}`;
+      this.follow(key, `/b/${inbox.address}`, () => {
+        this.inboxNotices++;
+        this.inboxes.delete(entity.id);
+      });
+      const live = this.sockets.get(key)!.socket.readyState === WebSocket.OPEN;
+      let entries = live ? this.inboxes.get(entity.id) : undefined;
+      if (!entries) {
+        const notices = this.inboxNotices;
+        entries = await boxAll(inbox.address);
+        if (live && notices === this.inboxNotices) this.inboxes.set(entity.id, entries);
+      }
+      for (const entry of entries) {
         let opening: Opening;
         try {
           opening = JSON.parse(text(open(inbox.key, "inbox", entry)));
