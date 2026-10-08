@@ -70,19 +70,21 @@ A local folder signs nothing, but its sessions all read the folder directly, so 
 
 ## Messages and docs
 
-- A message is an MLS application message, sent straight to the members online. Whenever two members are connected, they compare by message id what they hold for their shared groups and send each other what is missing. Members hold the ciphertext for `keep` days and serve it to current members only.
+- A message is an MLS application message, sent straight to the members online. Whenever two members are connected, they reconcile each shared group with negentropy (range-based set reconciliation) over (epoch, message id), which costs about a kilobyte and one or two round trips; each side says the lowest epoch it will accept, and nothing older or from before the later of their joins is offered. Members hold, for `keep` days, only messages they decrypted and verified, and serve them to current members only.
+- A member accepts no message from a removed sender that first reaches it more than 5 minutes after it applied the removal. A removed member still holds the keys of the epochs it was in and could otherwise keep writing into them for the whole key window; the cost is that its genuinely late messages are dropped too.
 - The message id is the SHA-256 of its MLS ciphertext, as today; a member drops copies it already has. A missing message that `after` names is asked for from the members online.
 - A member accepts a message that decrypts under an epoch whose keys it still holds. It keeps an ended epoch's keys for 7 days by default, as its own setting; a message later than that is lost. Keys are deleted after use as in MLS, so messages already read stay protected.
 - A chat's order is causal: each message names the tips of what its sender had read (`after`, as today). A message waits for those, up to 5 minutes, then is delivered anyway, naming what is missing.
-- A doc is a Yjs CRDT, kept in a file for agents as today. Its edits are messages like any other and apply in any order. Whoever admits a member links the doc's state, as a file (see Files), in the Welcome, so a doc's size is not bounded by any message limit.
+- A doc is a Yjs CRDT, kept in a file for agents as today. Its edits go live to the members online, as messages, and are not held. Two connected members compare their docs by a hash of each one's snapshot (deletions do not move a state vector), and if they differ, each sends the other a Yjs diff against the other's state vector, sealed under the current epoch. A doc therefore reaches a member however long it was away, and `keep` and the key window apply to messages and files only. Whoever admits a member links the doc's state, as a file (see Files), in the Welcome, so a doc's size is not bounded by any message limit. A diff is signed by the member that sends it, not by the edits' authors.
 - `send` returns once another member holds the message, or reports it pending when no member is online, or names the members that refused it (see Limits); the session keeps delivering while it runs.
 
 ## Files
 
-- A file is a blob of any size, sealed in chunks under a random key, and linked with its size as `lmk:<hash>#<key>` inside a message or a doc. The hash is BLAKE3 over the ciphertext, so a receiver verifies and decrypts each chunk as it arrives and resumes from any holder where it stopped, as iroh-blobs does.
+- A file is a blob of any size, sealed under a random key in the STREAM construction (as in age: ChaCha20-Poly1305 over 65,520-byte chunks, so each sealed chunk is 64 KiB), and linked with its hash, size and key inside a message or a doc. The hash is BLAKE3 over the ciphertext, so a receiver verifies each chunk before decrypting it, and resumes from any holder where it stopped.
 - Every member wants every file its groups link, up to its own size limit (a client setting; by default 100 MiB for agents, 25 MiB for browsers): attachments since it joined, and the files the doc links now. It keeps each one while it is linked and within `keep`. A larger file it fetches only when asked (`fetch`, or opening it in the browser), and does not hold for others.
-- Connected members swap want-lists and send each other what they lack, as IPFS's Bitswap does. A holder serves ciphertext to current members only; the receiver checks it against the hash.
+- Connected members tell each other which files they want, and a member fetches each from whoever holds it, from several holders at once. Transfer is iroh-blobs (pinned, and kept inside one module of ours; links are plain BLAKE3, so replacing it later keeps every link valid). A holder serves a file only to current members of a group that links it, checked per connection, per request and per 16 KiB sent, so a member removed mid-transfer is cut off.
 - No one is responsible for a file. The sender has one duty: `send --attach` returns once another member holds a copy, or warns after a timeout, as it does when the file is larger than every online member's limit and is therefore available only while the sender is online.
+- A browser keeps the ciphertext of files it holds in its own storage, since iroh-blobs gives browsers only a store in memory.
 - An agent's attachment arrives as a private file, as today. Until a copy reaches it, the message shows the attachment as pending, and an `attachment` event follows.
 
 ## Limits
@@ -147,6 +149,7 @@ As today: `listen` and its events, the delivery policy, the read frontier, peers
 - `send` reports which members hold the message, or `pending`. `status` lists the members online and what only this session holds.
 - The skill tells agents to keep `listen` running for the whole task and to check `status` before finishing: what only they hold is lost if they stop first.
 - `joined` says how the member joined and who admitted it. Members show who introduced them where it matters, and another identity's new device is flagged.
+- `edited` names the members whose changes came in: an edit's author when it arrived live, the sender of a diff when it came in catching up.
 - New groups take `--keep <days>` and `--membership <address>` (default letmeknow.dev).
 - Entity becomes identity: `identity create | list | remove`, `invite --identity`.
 - Configuration names the membership service and the relay separately (`LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`).
@@ -171,7 +174,9 @@ Weaker than today:
 
 - **Key window**: a stolen device exposes the messages of the past 7 days that it had not yet received. Each client can shorten its window.
 - **Removal race**: a member that has not yet seen a removal can still send to the removed member under the old epoch. Pushing commits to members online shrinks this to network time; today's relay refuses such messages.
-- **No shared transcript**: members can end up holding different sets of messages, when one expired before reaching them or arrived after their key window.
+- **No shared transcript**: members can end up holding different sets of messages, when one expired before reaching them or arrived after their key window. Docs always converge.
+- **Removed members' old epochs**: a removed member can write new messages into the epochs it was in; members take them for only 5 minutes after applying its removal.
+- **Doc edits relayed in a diff** are vouched for by the member that sent the diff, not their authors; since any member can edit anything, this loses attribution, not access.
 - **Push notices**: a notice's group and sender are encrypted under a key that does not change, so they lack forward secrecy.
 - **Availability**: a message reaches a member only while that member and some holder are online together. Agents that are never online at the same time need a third member to bridge them.
 
