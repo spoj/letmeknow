@@ -63,10 +63,10 @@ Two connected members exchange the newest signed heads they hold for the logs th
 
 ### Settings
 
-A group context extension, of the private-use type `0xff01` (pending: the MLS prototype), whose data is JSON:
+A group context extension, of the private-use type `0xff01`, whose data is JSON:
 
 ```json
-{"kind": "chat" | "doc", "name": "", "open": [{"id": "<identity id>", "name": "Matthew"}], "keep": 90,
+{"protocol": 1, "kind": "chat" | "doc", "name": "", "open": [{"id": "<identity id>", "name": "Matthew"}], "keep": 90,
  "membership": {"serve": {"key": "<iroh key>", "relay": "<url>", "addrs": ["<ip:port>"]}} | {"folder": "<path>"},
  "devices_of": "<identity id>", "openings": [<opening>]}
 ```
@@ -96,9 +96,12 @@ A member checks `device_sig` and the identity's device list (see Identity) when 
 
 ### Commits
 
-- Every change is inline in its commit; standalone proposals are never sent.
+- Protocol version 1 fixes: openmls `=0.9.1`; ciphersuite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`; `PURE_CIPHERTEXT_WIRE_FORMAT_POLICY` (commits are PrivateMessages, so the membership service reads nothing); `SenderRatchetConfiguration::new(1000, 100_000)`; KeyPackages built with `Lifetime::init(0, u64::MAX)`, joins with lifetime validation skipped; `RequiredCapabilities` naming `0xff01` and `0xff02`, resent with every settings change, since a GroupContextExtensions proposal replaces the whole list. Settings carry `"protocol": 1`.
+- Ended epochs are kept by `max_past_epochs(256)` and dropped by `delete_past_epoch_secrets(PastEpochDeletion::older_than_duration(7 days))`, which dates an epoch by when it began.
+- State is stored in SQLite with WAL and `synchronous = NORMAL`, encoded as CBOR (ciborium; openmls cannot be read back by bincode). The browser stores openmls state in IndexedDB, one record per key, not as one dump.
+- Every change is inline in its commit; standalone proposals are never sent, and a commit that refers to one is invalid. So is an update that changes a member's credential identity or device.
 - A member reads its group's log in order. For the epoch it is in, the first entry that is a valid commit for that epoch is applied; every other entry is skipped.
-- A committer posts its commit and merges it only if the log's answer shows it first for its epoch; otherwise it clears it, applies the winner, and redoes its change on the new epoch.
+- A committer saves its commit's bytes, posts them, and merges (`merge_pending_commit`) only if its entry, found by those bytes, is the first valid commit for its epoch; otherwise it clears it (`clear_pending_commit`), applies the winner (`merge_staged_commit`), and redoes its change on the new epoch.
 - Once the log has taken a commit, its author sends it to the members online (see Peer protocol).
 
 ## Identity

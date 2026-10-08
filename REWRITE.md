@@ -39,7 +39,8 @@ It holds two kinds of log and nothing else:
 
 Members decide what entries mean, from the service's order:
 
-- In a group, the first valid commit for each epoch wins and every other entry is skipped, so junk, such as a removed member's fake commit, changes nothing. A commit's validity depends only on MLS state, never on fetched data such as device lists: members who fetched at different times would otherwise disagree about which commit won, and the group would fork.
+- In a group, the first valid commit for each epoch wins and every other entry is skipped, so junk, such as a removed member's fake commit, changes nothing. A commit's validity depends only on MLS state, never on fetched data such as device lists, the clock, or a client's own settings: members who judged differently would disagree about which commit won, and the group would fork. So every member runs the same protocol version, which the settings name and which fixes the openmls version and its configuration; KeyPackages never expire (the inviter checks freshness when it admits); and the app's own rules on commits read only MLS state and bind the committer too: no proposal by reference, and no update that changes a member's identity or device. A client that does not run a group's protocol version stops and says so.
+- A committer saves its commit's bytes before posting, since it cannot recognise its own encrypted commit otherwise, and finds its log entry by them.
 - In a device list, the first entry that extends the latest one wins. A removal is final.
 
 Each member hash-chains a log as it reads it: h₀ = SHA-256(log id), hₙ = SHA-256(hₙ₋₁ ‖ entryₙ). `letmeknow serve` signs each answer with its key: the log's id, length, latest hash, and the time. This is a signed head.
@@ -61,7 +62,7 @@ A local folder signs nothing, but its sessions all read the folder directly, so 
 
 ## Groups
 
-- Settings live in the MLS group context and change only by commit: kind (fixed), name, the identities the group is open to, `keep`, and the membership service's address.
+- Settings live in the MLS group context and change only by commit: kind (fixed), name, the identities the group is open to, `keep`, the membership service's address, and the protocol version.
 - Each member's leaf names its iroh key and relay, so every member can dial every other. A changed relay is a commit, like a key update.
 - `keep` (days, default 90) is how long members hold the group's messages, doc edits and files for one another. Each client may hold less.
 - Post-compromise security as today: a session replaces its keys with an empty commit when it resumes a group, once caught up, and hourly while it runs.
@@ -73,7 +74,7 @@ A local folder signs nothing, but its sessions all read the folder directly, so 
 - A message is an MLS application message, sent straight to the members online. Whenever two members are connected, they reconcile each shared group with negentropy (range-based set reconciliation) over (epoch, message id), which costs about a kilobyte and one or two round trips; each side says the lowest epoch it will accept, and nothing older or from before the later of their joins is offered. Members hold, for `keep` days, only messages they decrypted and verified, and serve them to current members only.
 - A member accepts no message from a removed sender that first reaches it more than 5 minutes after it applied the removal. A removed member still holds the keys of the epochs it was in and could otherwise keep writing into them for the whole key window; the cost is that its genuinely late messages are dropped too.
 - The message id is the SHA-256 of its MLS ciphertext, as today; a member drops copies it already has. A missing message that `after` names is asked for from the members online.
-- A member accepts a message that decrypts under an epoch whose keys it still holds. It keeps an ended epoch's keys for 7 days by default, as its own setting; a message later than that is lost. Keys are deleted after use as in MLS, so messages already read stay protected.
+- A member accepts a message that decrypts under an epoch whose keys it still holds. It keeps an ended epoch's keys for 7 days by default, as its own setting, judged from when the epoch began, and never more than 256 ended epochs; a message later than that is lost. Keys are deleted after use as in MLS, so messages already read stay protected. A sender's messages may arrive up to 1000 out of order.
 - A chat's order is causal: each message names the tips of what its sender had read (`after`, as today). A message waits for those, up to 5 minutes, then is delivered anyway, naming what is missing.
 - A doc is a Yjs CRDT, kept in a file for agents as today. Its edits go live to the members online, as messages, and are not held. Two connected members compare their docs by a hash of each one's snapshot (deletions do not move a state vector), and if they differ, each sends the other a Yjs diff against the other's state vector, sealed under the current epoch. A doc therefore reaches a member however long it was away, and `keep` and the key window apply to messages and files only. Whoever admits a member links the doc's state, as a file (see Files), in the Welcome, so a doc's size is not bounded by any message limit. A diff is signed by the member that sends it, not by the edits' authors.
 - `send` returns once another member holds the message, or reports it pending when no member is online, or names the members that refused it (see Limits); the session keeps delivering while it runs.
