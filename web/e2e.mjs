@@ -40,11 +40,17 @@ function printed(predicate, ms = 15_000) {
 }
 
 const browser = await chromium.launch();
+const pages = {};
 try {
   await printed(e => e.type === "ready");
   const { link, group } = agent("invite");
   const laptop = await (await browser.newContext()).newPage();
   const phone = await (await browser.newContext()).newPage();
+  Object.assign(pages, { laptop, phone });
+  for (const [name, page] of Object.entries(pages)) {
+    page.on("console", message => message.type() === "error" && console.log(`${name}: ${message.text()}`));
+    page.on("pageerror", error => console.log(`${name}: ${error}`));
+  }
 
   await laptop.goto(link);
   await laptop.getByPlaceholder("Your name").fill("Matthew");
@@ -133,6 +139,16 @@ try {
   await phone.locator(".opening").getByRole("button", { name: "Join" }).click();
   await phone.getByText("opened it to Matthew").waitFor();
   check((await phone.locator("header .members").textContent()).includes("(you)"), "a device of Matthew joins a group open to Matthew, admitted by a member online");
+
+  const { fp } = agent("members", "--group", group).members.find(m => m.name === "Matthew's phone");
+  agent("remove", fp, "--group", group);
+  await phone.getByText(`Agent removed you from group ${group.slice(0, 6)}`).waitFor();
+  check((await phone.locator("nav button", { hasText: `group ${group.slice(0, 6)}` }).count()) === 0, "a browser removed from a group drops it");
+} catch (error) {
+  for (const [name, page] of Object.entries(pages)) {
+    console.log(`${name} shows:`, JSON.stringify(await page.locator("#app").innerText()));
+  }
+  throw error;
 } finally {
   await browser.close();
   listener.kill();

@@ -287,12 +287,12 @@ function inviteInto(gid: string) {
 function devices() {
   select(undefined);
   const list = h("div");
-  const draw = async () => {
+  const drawDevices = async () => {
     const entities = await Promise.all(client.me.entities.map(async entity => ({ entity, list: await client.list(entity.id) })));
     list.replaceChildren(
       ...entities.map(({ entity, list: { members } }) => {
         const box = h("div", { className: "entity" });
-        const link = () => showInvite(`Open the link on the other device, or run letmeknow join CODE there; its sessions then speak as ${entity.name}.`, { entity }, box).then(draw);
+        const link = () => showInvite(`Open the link on the other device, or run letmeknow join CODE there; its sessions then speak as ${entity.name}.`, { entity }, box).then(drawDevices);
         box.append(
           h("h3", {}, entity.name),
           h("p", {}, `These devices speak as ${entity.name}:`),
@@ -304,20 +304,20 @@ function devices() {
     );
     if (!entities.length) {
       const name = h("input", { placeholder: "Your name", value: client.me.name });
-      list.append(h("p", {}, "This browser speaks as no entity. ", name, h("button", { onclick: () => client.startEntity(name.value.trim()).then(draw) }, "Start one")));
+      list.append(h("p", {}, "This browser speaks as no entity. ", name, h("button", { onclick: () => client.startEntity(name.value.trim()).then(drawDevices) }, "Start one")));
     }
   };
   const remove = async (entity: Membership, m: { id: string; name: string }) => {
     if (!confirm(`Remove ${m.name} from ${entity.name}? Its sessions will no longer count as ${entity.name}.`)) return;
     await client.removeFromEntity(entity, m.id);
-    await draw();
+    await drawDevices();
   };
   home.replaceChildren(
     h("h2", {}, "letmeknow"),
     h("p", {}, "End-to-end encrypted group chat for people and their agents. Start a group with + New group, then invite people and agents into it with a code."),
     list
   );
-  draw().catch(fail);
+  drawDevices().catch(fail);
 }
 
 /** Shows an invite until it is used; resolves then. */

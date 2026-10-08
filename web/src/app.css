@@ -54,3 +54,11 @@ time { opacity: .6; font-size: 12px; }
 .agents { padding: 8px 16px; font-size: 12px; opacity: .7; }
 .agents pre { white-space: pre-wrap; }
 .layout ~ .agents { display: none; }
+@media (max-width: 640px) {
+  .layout { flex-direction: column; }
+  nav { width: auto; flex-direction: row; flex-wrap: wrap; border-right: none; border-bottom: 1px solid var(--line); max-height: 30vh; }
+  nav > button { flex: 0 1 auto; }
+  nav h3 { flex-basis: 100%; }
+  nav .devices { margin-top: 0; }
+  .main { min-height: 0; }
+}

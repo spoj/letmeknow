@@ -13,7 +13,7 @@ function done(request: IDBRequest | IDBTransaction): Promise<any> {
   return new Promise((resolve, reject) => {
     if (request instanceof IDBTransaction) {
       request.oncomplete = () => resolve(undefined);
-      request.onerror = () => reject(request.error);
+      request.onabort = () => reject(request.error);
     } else {
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);

@@ -167,7 +167,7 @@ export class Client {
     return JSON.stringify(this.me.entities.slice(0, 1).map(e => e.id));
   }
 
-  /** Follows every group: a socket announces new messages, a poll every 15 seconds covers a missing socket. */
+  /** Follows every group: a socket announces new messages; a poll every 15 seconds covers a lost socket and reopens it. */
   connect() {
     for (const gid of this.groups.keys()) {
       this.follow(gid);
@@ -176,7 +176,12 @@ export class Client {
         await this.updateKey(gid);
       });
     }
-    setInterval(() => this.groups.forEach((_, gid) => this.run(() => this.catchUp(gid))), 15_000);
+    setInterval(() => {
+      for (const gid of this.groups.keys()) {
+        this.follow(gid);
+        this.run(() => this.catchUp(gid));
+      }
+    }, 15_000);
     setInterval(() => this.run(() => this.admitRequests()), 5_000);
     setInterval(() => this.groups.forEach((_, gid) => this.run(() => this.updateKey(gid))), 3_600_000);
     document.addEventListener("visibilitychange", () => {
@@ -227,7 +232,11 @@ export class Client {
     }
     if (result.changes) {
       for (const change of result.changes) this.show(gid, { type: change.type, member: await this.describe(change.member), by: await this.describe(change.by), at: Date.now() });
-      if (result.removed) await this.forget(gid);
+      if (result.removed) {
+        const name = this.groups.get(gid)!.settings.name || `group ${gid.slice(0, 6)}`;
+        await this.forget(gid);
+        this.onerror(`${result.sender.name} removed you from ${name}`);
+      }
       return;
     }
     const payload: Payload = result.payload;
