@@ -233,6 +233,6 @@ dialog > header { display: flex; align-items: center; justify-content: space-bet
 /* CodeMirror's own style draws the caret black unless told the editor is dark; follow the text color instead. */
 .editor .cm-editor .cm-content { caret-color: var(--text); }
 .editor .cm-link { color: var(--accent); text-decoration: underline; cursor: pointer; }
-.editor .cm-panels { background: var(--bg); border-color: var(--line); }
+.editor .cm-panels { background: var(--bg); border-color: var(--line); color: var(--text); }
 .cm-tools { display: flex; gap: 2px; padding: 2px var(--s2); }
 .cm-tools button { min-height: 32px; min-width: 36px; }
