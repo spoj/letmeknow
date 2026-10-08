@@ -29,9 +29,7 @@ impl Logs {
             return Ok(client.clone());
         }
         let client: Arc<dyn Membership> = match service {
-            Service::Serve { .. } => {
-                Arc::new(ServeClient::for_service(self.endpoint.clone(), service)?)
-            }
+            Service::Serve { .. } => Arc::new(ServeClient::for_service(self.endpoint.clone(), service)?),
             #[cfg(not(target_arch = "wasm32"))]
             Service::Folder(path) => Arc::new(lmk_membership::folder::FolderClient::new(path)),
             #[cfg(target_arch = "wasm32")]

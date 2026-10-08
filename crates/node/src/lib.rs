@@ -16,17 +16,13 @@ use iroh::tls::CaTlsConfig;
 use iroh::{EndpointId, RelayMap, RelayUrl, SecretKey};
 use lmk_core::contacts::{Contact, Contacts};
 use lmk_core::device::Device;
-use lmk_core::group::{
-    self as core, Change, Group, Session, Window, devices_settings, with_opening,
-};
+use lmk_core::group::{self as core, Change, Group, Session, Window, devices_settings, with_opening};
 use lmk_core::identity::{self, DeviceList, Verdict, check};
 use lmk_core::invite::{Invites, Target};
 use lmk_core::provider::Provider;
 use lmk_membership::{Chain, Refused};
 use lmk_net::Net;
-use lmk_proto::group::{
-    Credential, How, IdentityRef, Kind, Leaf, Opening, Payload, Service, Settings,
-};
+use lmk_proto::group::{Credential, How, IdentityRef, Kind, Leaf, Opening, Payload, Service, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use lmk_proto::peer::Admitted;
 use lmk_proto::{Answer, Bytes};
@@ -303,13 +299,7 @@ fn doc_key(gid: &[u8]) -> Vec<u8> {
 }
 
 fn entry_key(gid: &[u8], position: u64) -> Vec<u8> {
-    [
-        b"node/entry/".as_slice(),
-        gid,
-        b"/",
-        &position.to_be_bytes(),
-    ]
-    .concat()
+    [b"node/entry/".as_slice(), gid, b"/", &position.to_be_bytes()].concat()
 }
 
 fn message_key(id: &[u8]) -> Vec<u8> {
@@ -331,15 +321,11 @@ fn endpoint_id(key: &[u8]) -> Option<EndpointId> {
 
 impl<P: Provider> State<P> {
     fn group(&self, gid: &[u8]) -> Result<&G> {
-        self.groups
-            .get(gid)
-            .context("this session is not in that group")
+        self.groups.get(gid).context("this session is not in that group")
     }
 
     fn group_mut(&mut self, gid: &[u8]) -> Result<&mut G> {
-        self.groups
-            .get_mut(gid)
-            .context("this session is not in that group")
+        self.groups.get_mut(gid).context("this session is not in that group")
     }
 
     fn save(&self, gid: &[u8]) -> Result<()> {
@@ -352,9 +338,7 @@ impl<P: Provider> State<P> {
     }
 
     fn doc_state(&self, gid: &[u8]) -> Result<Vec<u8>> {
-        self.provider
-            .get(&doc_key(gid))?
-            .context("the group has no doc")
+        self.provider.get(&doc_key(gid))?.context("the group has no doc")
     }
 
     /// A member as events show it, if it has a letmeknow credential.
@@ -362,12 +346,7 @@ impl<P: Provider> State<P> {
         let credential = member.credential.clone()?;
         let g = self.groups.get(gid);
         let added = g.and_then(|g| {
-            let added = g
-                .mls
-                .added()
-                .iter()
-                .rev()
-                .find(|added| added.member == credential)?;
+            let added = g.mls.added().iter().rev().find(|added| added.member == credential)?;
             let by = g
                 .mls
                 .members()
@@ -384,11 +363,7 @@ impl<P: Provider> State<P> {
             .map(|identity| self.claim(&credential, &member.key, identity));
         Some(Member {
             key: Bytes(member.key.clone()),
-            iroh: member
-                .leaf
-                .as_ref()
-                .map(|leaf| leaf.key.clone())
-                .unwrap_or_default(),
+            iroh: member.leaf.as_ref().map(|leaf| leaf.key.clone()).unwrap_or_default(),
             name: credential.name,
             device: credential.device,
             device_name: credential.device_name,
@@ -441,11 +416,9 @@ impl<P: Provider> State<P> {
     fn by_iroh(&self, gid: &[u8], iroh: &EndpointId) -> Member {
         let found = self.groups.get(gid).and_then(|g| {
             let members = g.mls.members();
-            let member = members.iter().find(|m| {
-                m.leaf
-                    .as_ref()
-                    .is_some_and(|leaf| leaf.key.0 == iroh.as_bytes())
-            })?;
+            let member = members
+                .iter()
+                .find(|m| m.leaf.as_ref().is_some_and(|leaf| leaf.key.0 == iroh.as_bytes()))?;
             self.member(gid, member)
         });
         found.unwrap_or_else(|| Member {
@@ -462,12 +435,7 @@ impl<P: Provider> State<P> {
     fn devices_group(&self, identity: &[u8]) -> Option<Vec<u8>> {
         self.groups
             .iter()
-            .find(|(_, g)| {
-                g.mls
-                    .settings()
-                    .devices_of
-                    .is_some_and(|of| of.0 == identity)
-            })
+            .find(|(_, g)| g.mls.settings().devices_of.is_some_and(|of| of.0 == identity))
             .map(|(gid, _)| gid.clone())
     }
 
@@ -495,28 +463,16 @@ impl<P: Provider> State<P> {
 
 impl<P: Provider + Send + 'static> Node<P> {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
-    pub async fn start(
-        provider: P,
-        device: Device,
-        config: Config,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
+    pub async fn start(provider: P, device: Device, config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let secret = match provider.get(b"node/iroh")? {
-            Some(bytes) => SecretKey::from_bytes(
-                &bytes
-                    .as_slice()
-                    .try_into()
-                    .context("an iroh key is 32 bytes")?,
-            ),
+            Some(bytes) => SecretKey::from_bytes(&bytes.as_slice().try_into().context("an iroh key is 32 bytes")?),
             None => {
                 let key = SecretKey::from_bytes(&lmk_core::random());
                 provider.put(b"node/iroh", &key.to_bytes())?;
                 key
             }
         };
-        let relays = RelayMap::from(iroh::RelayConfig::new(
-            config.relay.clone(),
-            Some(Default::default()),
-        ));
+        let relays = RelayMap::from(iroh::RelayConfig::new(config.relay.clone(), Some(Default::default())));
         let endpoint = lmk_net::builder(relays)
             .secret_key(secret)
             .ca_tls_config(config.ca)
@@ -528,14 +484,9 @@ impl<P: Provider + Send + 'static> Node<P> {
         };
         let mut session = match provider.get(b"session")? {
             Some(_) => Session::load(&provider)?,
-            None if config.device_key => Session::create_with(
-                &provider,
-                device.signer(),
-                &device,
-                &config.name,
-                None,
-                leaf.clone(),
-            )?,
+            None if config.device_key => {
+                Session::create_with(&provider, device.signer(), &device, &config.name, None, leaf.clone())?
+            }
             None => Session::create(&provider, &device, &config.name, None, leaf.clone())?,
         };
         if session.leaf != leaf {
@@ -545,11 +496,9 @@ impl<P: Provider + Send + 'static> Node<P> {
         let mut groups = HashMap::new();
         for gid in get::<Vec<Bytes>>(&provider, b"node/groups")?.unwrap_or_default() {
             let mls = Group::load(&provider, &gid.0)?;
-            let rec: Rec =
-                get(&provider, &rec_key(&gid.0))?.context("a group without its record")?;
+            let rec: Rec = get(&provider, &rec_key(&gid.0))?.context("a group without its record")?;
             if let Some(chain) = &rec.chain {
-                logs.client(&mls.settings().membership)?
-                    .set_chain(chain.clone());
+                logs.client(&mls.settings().membership)?.set_chain(chain.clone());
             }
             groups.insert(
                 gid.0,
@@ -672,25 +621,13 @@ impl<P: Provider + Send + 'static> Node<P> {
         let members = self.members(gid)?;
         Ok(members
             .into_iter()
-            .filter(|m| {
-                connected
-                    .iter()
-                    .any(|peer| peer.as_bytes()[..] == m.iroh.0[..])
-            })
+            .filter(|m| connected.iter().any(|peer| peer.as_bytes()[..] == m.iroh.0[..]))
             .collect())
     }
 
     /// What this session sent to a group that no other member holds yet.
     pub fn only_here(&self, gid: &[u8]) -> Result<Vec<Pending>> {
-        Ok(self
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .group(gid)?
-            .rec
-            .pending
-            .clone())
+        Ok(self.inner.state.lock().unwrap().group(gid)?.rec.pending.clone())
     }
 
     /// A new group with this session its only member, speaking as `identity`.
@@ -708,12 +645,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 
     /// An invite link into a group, or with `Target::Device`, to this device's identity.
-    pub fn invite(
-        &self,
-        target: Target,
-        label: Option<String>,
-        to: Option<Vec<u8>>,
-    ) -> Result<String> {
+    pub fn invite(&self, target: Target, label: Option<String>, to: Option<Vec<u8>>) -> Result<String> {
         let device = matches!(target, Target::Device(_));
         let secret = self
             .inner
@@ -759,19 +691,15 @@ impl<P: Provider + Send + 'static> Node<P> {
             let Some(peer) = endpoint_id(&key.0) else {
                 continue;
             };
-            let asked = self.inner.net().join(
-                peer,
-                self.inner.relay.clone(),
-                &opening.group.0,
-                key_package.clone(),
-            );
+            let asked = self
+                .inner
+                .net()
+                .join(peer, self.inner.relay.clone(), &opening.group.0, key_package.clone());
             match timeout(RECEIPT_WAIT * 4, asked).await {
                 Ok(Ok(Answer::Ok(admitted))) => {
                     return self.inner.welcomed(admitted, *peer.as_bytes()).await;
                 }
-                Ok(Ok(Answer::Refused { refused })) => {
-                    refusal = anyhow::anyhow!("refused: {refused}")
-                }
+                Ok(Ok(Answer::Refused { refused })) => refusal = anyhow::anyhow!("refused: {refused}"),
                 Ok(Err(error)) => tracing::debug!("asking {} to join: {error:#}", peer.fmt_short()),
                 Err(_) => tracing::debug!("{} did not answer", peer.fmt_short()),
             }
@@ -782,11 +710,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub async fn remove(&self, gid: &[u8], key: &[u8]) -> Result<()> {
         self.inner
             .commit(gid, |g| {
-                let member = g
-                    .members()
-                    .into_iter()
-                    .find(|m| m.key == key)
-                    .context("not a member")?;
+                let member = g.members().into_iter().find(|m| m.key == key).context("not a member")?;
                 Ok(Change {
                     remove: vec![member.index],
                     ..Change::default()
@@ -797,11 +721,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 
     /// Changes the group's settings, from the current ones.
-    pub async fn change_settings(
-        &self,
-        gid: &[u8],
-        change: impl Fn(Settings) -> Settings,
-    ) -> Result<Settings> {
+    pub async fn change_settings(&self, gid: &[u8], change: impl Fn(Settings) -> Settings) -> Result<Settings> {
         self.inner
             .commit(gid, |g| {
                 Ok(Change {
@@ -827,18 +747,11 @@ impl<P: Provider + Send + 'static> Node<P> {
         let (id, ciphertext, receipts) = {
             let mut st = self.inner.state.lock().unwrap();
             let st = &mut *st;
-            let g = st
-                .groups
-                .get_mut(gid)
-                .context("this session is not in that group")?;
+            let g = st.groups.get_mut(gid).context("this session is not in that group")?;
             let (id, ciphertext) = g.mls.seal(&st.provider, &st.session, payload)?;
             if matches!(payload, Payload::Message { .. } | Payload::Leave) {
                 let epoch = g.mls.epoch();
-                let me = g
-                    .mls
-                    .members()
-                    .into_iter()
-                    .find(|m| m.key == st.session.key());
+                let me = g.mls.members().into_iter().find(|m| m.key == st.session.key());
                 let g = st.groups.get_mut(gid).unwrap();
                 g.rec.items.push(Item {
                     epoch,
@@ -918,11 +831,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// Seals a file and holds it for a group.
     pub async fn add_file(&self, gid: &[u8], bytes: Vec<u8>) -> Result<FileLink> {
-        let link = self
-            .inner
-            .net()
-            .add_file(std::io::Cursor::new(bytes))
-            .await?;
+        let link = self.inner.net().add_file(std::io::Cursor::new(bytes)).await?;
         let mut st = self.inner.state.lock().unwrap();
         st.group_mut(gid)?.rec.files.push(link.link());
         st.save(gid)?;
@@ -1041,17 +950,9 @@ impl<P: Provider + Send + 'static> Node<P> {
             .append(&lmk_proto::identity::address(&identity.id.0), &entry)
             .await?;
         self.inner.list(identity).await?;
-        let gid = self
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .devices_group(&identity.id.0);
+        let gid = self.inner.state.lock().unwrap().devices_group(&identity.id.0);
         if let Some(gid) = gid {
-            let member = self
-                .members(&gid)?
-                .into_iter()
-                .find(|m| m.device.0 == device);
+            let member = self.members(&gid)?.into_iter().find(|m| m.device.0 == device);
             if let Some(member) = member {
                 self.remove(&gid, &member.key.0).await?;
             }
@@ -1075,18 +976,11 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub async fn set_contact(&self, id: &[u8], contact: &Contact) -> Result<()> {
         let (gid, update) = {
             let st = self.inner.state.lock().unwrap();
-            let identity = st
-                .device
-                .identities
-                .first()
-                .context("this device is on no identity")?;
+            let identity = st.device.identities.first().context("this device is on no identity")?;
             let gid = st
                 .devices_group(&identity.id.0)
                 .context("this device is not in its identity's devices group")?;
-            (
-                gid.clone(),
-                Contacts::load(&st.doc_state(&gid)?)?.set(id, contact),
-            )
+            (gid.clone(), Contacts::load(&st.doc_state(&gid)?)?.set(id, contact))
         };
         self.inner.edit(&gid, update).await
     }
@@ -1106,12 +1000,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let st = self.inner.state.lock().unwrap();
         let g = st.group(gid)?;
         let settings = g.mls.settings();
-        let members = g
-            .mls
-            .members()
-            .into_iter()
-            .filter_map(|m| Some(m.leaf?.key))
-            .collect();
+        let members = g.mls.members().into_iter().filter_map(|m| Some(m.leaf?.key)).collect();
         Ok(Opening {
             group: Bytes(gid.to_vec()),
             kind: settings.kind,
@@ -1199,12 +1088,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let st = &mut *st;
             gids = st.groups.keys().cloned().collect();
             for gid in &gids {
-                st.groups
-                    .get_mut(gid)
-                    .unwrap()
-                    .mls
-                    .expire(&st.provider)
-                    .ok();
+                st.groups.get_mut(gid).unwrap().mls.expire(&st.provider).ok();
             }
             self.expire(st);
         }
@@ -1217,8 +1101,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for gid in gids {
             let g = st.groups.get_mut(&gid).unwrap();
             let before = now.saturating_sub(g.mls.settings().keep as u64 * 24 * 3600 * 1000);
-            let (old, kept): (Vec<Item>, Vec<Item>) =
-                g.rec.items.drain(..).partition(|item| item.at < before);
+            let (old, kept): (Vec<Item>, Vec<Item>) = g.rec.items.drain(..).partition(|item| item.at < before);
             g.rec.items = kept;
             for item in old {
                 st.provider.delete(&message_key(&item.id.0)).ok();
@@ -1275,12 +1158,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     inner.read(&gid).await?;
                     while let Some(notice) = subscription.next().await {
                         let notice = notice?;
-                        inner.logged(
-                            &gid,
-                            notice.position - 1,
-                            vec![notice.entry],
-                            client.chain(&gid),
-                        )?;
+                        inner.logged(&gid, notice.position - 1, vec![notice.entry], client.chain(&gid))?;
                     }
                     anyhow::Ok(())
                 };
@@ -1297,14 +1175,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Reads a group's log from the service, through its end.
     async fn read(&self, gid: &[u8]) -> Result<()> {
-        let service = self
-            .state
-            .lock()
-            .unwrap()
-            .group(gid)?
-            .mls
-            .settings()
-            .membership;
+        let service = self.state.lock().unwrap().group(gid)?.mls.settings().membership;
         let client = self.logs.client(&service)?;
         loop {
             let after = self.state.lock().unwrap().group(gid)?.rec.logged;
@@ -1322,13 +1193,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Stores log entries that follow position `after`, and applies what it can. `chain` is the client's, recorded
     /// when it covers just what is stored, so that a head this session shows its peers matches its entries.
-    pub(crate) fn logged(
-        &self,
-        gid: &[u8],
-        after: u64,
-        entries: Vec<Bytes>,
-        chain: Option<Chain>,
-    ) -> Result<()> {
+    pub(crate) fn logged(&self, gid: &[u8], after: u64, entries: Vec<Bytes>, chain: Option<Chain>) -> Result<()> {
         let mut st = self.state.lock().unwrap();
         let st = &mut *st;
         let g = st.group_mut(gid)?;
@@ -1416,21 +1281,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Commits a change built on the group's current epoch, posts it, and reads the log until it is known whether it
     /// won its epoch; if another commit won, builds it again. Returns the Welcome, if it adds, and the position.
-    async fn commit(
-        &self,
-        gid: &[u8],
-        change: impl Fn(&Group) -> Result<Change>,
-    ) -> Result<(Option<Vec<u8>>, u64)> {
+    async fn commit(&self, gid: &[u8], change: impl Fn(&Group) -> Result<Change>) -> Result<(Option<Vec<u8>>, u64)> {
         let _committing = self.committing.lock().await;
         for _ in 0..COMMIT_TRIES {
             self.read(gid).await?;
             let (service, bytes, welcome, ours) = {
                 let mut st = self.state.lock().unwrap();
                 let st = &mut *st;
-                let g = st
-                    .groups
-                    .get_mut(gid)
-                    .context("this session is not in that group")?;
+                let g = st.groups.get_mut(gid).context("this session is not in that group")?;
                 g.own_at = None;
                 let service = g.mls.settings().membership;
                 // A commit posted before, which the log may or may not have taken: post it again.
@@ -1460,10 +1318,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.read(gid).await?;
             let st = self.state.lock().unwrap();
             let g = st.group(gid)?;
-            ensure!(
-                g.rec.position >= position,
-                "the log did not show the commit it took"
-            );
+            ensure!(g.rec.position >= position, "the log did not show the commit it took");
             if ours && g.own_at == Some(position) {
                 return Ok((welcome, position));
             }
@@ -1483,11 +1338,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             );
             let settings = mls.settings();
             if let Some(identity) = &settings.devices_of
-                && !st
-                    .device
-                    .identities
-                    .iter()
-                    .any(|known| known.id == *identity)
+                && !st.device.identities.iter().any(|known| known.id == *identity)
             {
                 st.device.identities.push(IdentityRef {
                     id: identity.clone(),
@@ -1516,10 +1367,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let (inner, gid, link) = (self.clone(), gid.clone(), FileLink::parse(&link)?);
             self.spawn(async move {
                 if let Err(error) = inner.doc_from(&gid, &link, by).await {
-                    inner.warn(
-                        Some(&gid),
-                        format!("the doc's text did not arrive: {error:#}"),
-                    );
+                    inner.warn(Some(&gid), format!("the doc's text did not arrive: {error:#}"));
                 }
             });
         }
@@ -1570,13 +1418,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             st.provider.put(&doc_key(gid), &state)?;
             let g = st.groups.get_mut(gid).unwrap();
             g.mls
-                .seal(
-                    &st.provider,
-                    &st.session,
-                    &Payload::Edit {
-                        update: Bytes(update),
-                    },
-                )?
+                .seal(&st.provider, &st.session, &Payload::Edit { update: Bytes(update) })?
                 .1
         };
         self.net().send(gid, ciphertext);
@@ -1634,11 +1476,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let stale: Vec<IdentityRef> = {
             let st = self.state.lock().unwrap();
             let Ok(g) = st.group(gid) else { return };
-            let identities = g
-                .mls
-                .members()
-                .into_iter()
-                .filter_map(|m| m.credential?.identity);
+            let identities = g.mls.members().into_iter().filter_map(|m| m.credential?.identity);
             identities
                 .filter(|identity| {
                     st.lists
@@ -1689,10 +1527,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     fn forget(&self, gid: &[u8]) -> Result<()> {
         let mut st = self.state.lock().unwrap();
         let st = &mut *st;
-        let g = st
-            .groups
-            .remove(gid)
-            .context("this session is not in that group")?;
+        let g = st.groups.remove(gid).context("this session is not in that group")?;
         if let Some(follow) = g.follow {
             follow.abort();
         }
@@ -1725,10 +1560,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     removed,
                     settings,
                     gone,
-                } => {
-                    self.applied(&group, by, added, how, removed, settings, gone)
-                        .await
-                }
+                } => self.applied(&group, by, added, how, removed, settings, gone).await,
                 Work::Read(gid) => {
                     if self.reading.lock().unwrap().insert(gid.clone()) {
                         let inner = self.clone();
@@ -1750,11 +1582,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                             .group(&group)
                             .is_ok_and(|g| g.mls.members().iter().any(|m| m.key == key));
                         if still
-                            && let Err(error) = (Node {
-                                inner: inner.clone(),
-                            })
-                            .remove(&group, &key)
-                            .await
+                            && let Err(error) = (Node { inner: inner.clone() }).remove(&group, &key).await
                             && inner
                                 .state
                                 .lock()
@@ -1886,14 +1714,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                             changed = true;
                             self.events.send(Event::Held { group, id, by }).ok();
                         }
-                        Some(reason) => {
-                            _ = self.events.send(Event::Refused {
-                                group,
-                                id,
-                                by,
-                                reason,
-                            })
-                        }
+                        Some(reason) => _ = self.events.send(Event::Refused { group, id, by, reason }),
                     }
                 }
                 if changed {

@@ -20,8 +20,8 @@ use n0_future::boxed::BoxFuture;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Event, Inner, Item, MAX_MESSAGE, Message, State, Work, ciphertext_key, doc, doc_like,
-    entry_key, message_key, now, put,
+    Event, Inner, Item, MAX_MESSAGE, Message, State, Work, ciphertext_key, doc, doc_like, entry_key, message_key, now,
+    put,
 };
 
 /// A head that needs no signature: the empty log's.
@@ -154,11 +154,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
                 self.events.send(Event::Edited { group, by: sender }).ok();
             }
-            Payload::Introduce {
-                identity,
-                name,
-                how,
-            } => {
+            Payload::Introduce { identity, name, how } => {
                 self.events
                     .send(Event::Introduced {
                         group,
@@ -192,10 +188,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 .redeem(&st.provider, &secret, &key_package, list.as_ref(), now)?
         };
         match redeemed.target {
-            Target::Group(gid) => {
-                self.admit(&gid, key_package, How::Invite, redeemed.label)
-                    .await
-            }
+            Target::Group(gid) => self.admit(&gid, key_package, How::Invite, redeemed.label).await,
             Target::Device(id) => {
                 let identity = {
                     let st = self.state.lock().unwrap();
@@ -275,11 +268,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         };
         let doc = match state {
             Some(state) => {
-                let link = self
-                    .net()
-                    .add_file(std::io::Cursor::new(state))
-                    .await?
-                    .link();
+                let link = self.net().add_file(std::io::Cursor::new(state)).await?.link();
                 let mut st = self.state.lock().unwrap();
                 st.group_mut(gid)?.rec.files.push(link.clone());
                 st.save(gid)?;
@@ -315,11 +304,10 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
         let st = self.state.lock().unwrap();
         st.groups.get(group).is_some_and(|g| {
-            g.mls.members().iter().any(|m| {
-                m.leaf
-                    .as_ref()
-                    .is_some_and(|leaf| leaf.key.0 == peer.as_bytes())
-            })
+            g.mls
+                .members()
+                .iter()
+                .any(|m| m.leaf.as_ref().is_some_and(|leaf| leaf.key.0 == peer.as_bytes()))
         })
     }
 
@@ -379,12 +367,7 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
             return Vec::new();
         };
         (after + 1..=g.rec.logged)
-            .filter_map(|position| {
-                st.provider
-                    .get(&entry_key(group, position))
-                    .ok()?
-                    .map(Bytes)
-            })
+            .filter_map(|position| st.provider.get(&entry_key(group, position)).ok()?.map(Bytes))
             .collect()
     }
 
@@ -392,16 +375,10 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         let (after, chain) = {
             let st = self.state.lock().unwrap();
             let g = st.group(group)?;
-            let mut chain: Chain = g
-                .rec
-                .chain
-                .clone()
-                .context("no chain of the group's log yet")?;
+            let mut chain: Chain = g.rec.chain.clone().context("no chain of the group's log yet")?;
             let after = chain.length();
             chain.extend(after, &entries, &head)?;
-            self.logs
-                .client(&g.mls.settings().membership)?
-                .set_chain(chain.clone());
+            self.logs.client(&g.mls.settings().membership)?.set_chain(chain.clone());
             (after, chain)
         };
         self.logged(group, after, entries, Some(chain))
@@ -456,13 +433,7 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         let update = doc::diff(&st.doc_state(group)?, sv)?;
         let g = st.groups.get_mut(group).context("not in that group")?;
         Ok(g.mls
-            .seal(
-                &st.provider,
-                &st.session,
-                &Payload::Diff {
-                    update: Bytes(update),
-                },
-            )?
+            .seal(&st.provider, &st.session, &Payload::Diff { update: Bytes(update) })?
             .1)
     }
 
@@ -497,12 +468,7 @@ impl<P: Provider + Send + 'static> Admit for Admitter<P> {
         })
     }
 
-    fn join(
-        &self,
-        _: EndpointId,
-        group: Vec<u8>,
-        key_package: Vec<u8>,
-    ) -> BoxFuture<Answer<Admitted>> {
+    fn join(&self, _: EndpointId, group: Vec<u8>, key_package: Vec<u8>) -> BoxFuture<Answer<Admitted>> {
         let inner = self.0.clone();
         Box::pin(async move {
             let admitted = inner.open_join(&group, key_package).await;

@@ -17,8 +17,7 @@ pub fn new(text: &str) -> Vec<u8> {
     let doc = Doc::new();
     let body = doc.get_or_insert_text(TEXT);
     body.insert(&mut doc.transact_mut(), 0, text);
-    doc.transact()
-        .encode_state_as_update_v1(&StateVector::default())
+    doc.transact().encode_state_as_update_v1(&StateVector::default())
 }
 
 fn load(state: &[u8]) -> Result<Doc> {
@@ -32,8 +31,7 @@ fn load(state: &[u8]) -> Result<Doc> {
 /// it is kept as it came.
 pub fn apply(state: &[u8], update: &[u8]) -> Result<Vec<u8>> {
     let doc = load(state)?;
-    doc.transact_mut()
-        .apply_update(Update::decode_v1(update)?)?;
+    doc.transact_mut().apply_update(Update::decode_v1(update)?)?;
     let txn = doc.transact();
     if txn.store().pending_update().is_none() && txn.store().pending_ds().is_none() {
         return Ok(txn.encode_state_as_update_v1(&StateVector::default()));
