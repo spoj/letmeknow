@@ -70,6 +70,7 @@ impl Invites {
         Ok(self.0.remove(at))
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// A joiner presents the secret of a group invite with its KeyPackage. `list` is the device list of the identity
     /// its credential names, needed only for an invite made `--to` an identity.
     pub fn admit_member<P: Provider>(
@@ -141,14 +142,14 @@ impl Invites {
 
 #[cfg(test)]
 mod tests {
-    use lmk_proto::group::{IdentityRef, Payload, Service};
+    use lmk_proto::group::{IdentityRef, Kind, Opening, Payload, Service};
     use lmk_proto::links;
     use lmk_proto::peer::{InviteRequest, Joiner};
 
     use super::*;
     use crate::contacts::{Contact, Contacts, How};
-    use crate::group::Window;
     use crate::group::tests::{Member, leaf, settings};
+    use crate::group::{Window, introduction, with_opening};
     use crate::identity::create;
     use crate::provider::MemoryProvider;
 
@@ -212,6 +213,18 @@ mod tests {
         let reply = alice.send("welcome");
         assert!(matches!(bob.open(&reply, 3_000).unwrap().payload, Payload::Message { .. }));
         assert_eq!(alice.g().added()[0].member.name, "Bob");
+
+        // Alice tells the group who Bob is to her; Bob records who first introduced each identity.
+        let carol = IdentityRef { id: Bytes(vec![3; 32]), membership: Service::Folder("/tmp/lmk".into()) };
+        for (name, now) in [("Carol", 4_000), ("Not Carol", 5_000)] {
+            let introduce =
+                Payload::Introduce { identity: carol.clone(), name: name.into(), how: lmk_proto::group::How::Invite };
+            let group = alice.group.as_mut().unwrap();
+            let (_, sealed) = group.seal(&alice.provider, &alice.session, &introduce).unwrap();
+            bob.open(&sealed, now).unwrap();
+        }
+        let introduction = introduction(&bob.provider, &[3; 32]).unwrap().unwrap();
+        assert_eq!((introduction.name.as_str(), introduction.by.name.as_str()), ("Carol", "Alice"));
     }
 
     #[test]
@@ -318,5 +331,20 @@ mod tests {
         assert_eq!(phone_contacts.get(&[8; 32]).unwrap().how, How::Introduced);
         let hi = phone.send("from the phone");
         assert_eq!(laptop.open(&hi, 7).unwrap().sender.device_name, "phone");
+
+        // An opening, kept in the devices group's context, reaches every device.
+        let opening = Opening {
+            group: Bytes(vec![1; 16]),
+            kind: Kind::Doc,
+            name: "Spec".into(),
+            membership: Service::Folder("/tmp/lmk".into()),
+            members: vec![Bytes(b"someone".to_vec())],
+        };
+        let settings = with_opening(laptop.g().settings(), opening.clone());
+        let commit = laptop.commit(Change { settings: Some(settings), ..Change::default() });
+        log.push(commit.commit);
+        laptop.read(&log, 8);
+        phone.read(&log, 8);
+        assert_eq!(phone.g().settings().openings, [opening]);
     }
 }
