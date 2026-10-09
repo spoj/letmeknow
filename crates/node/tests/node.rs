@@ -175,6 +175,53 @@ async fn chat_and_removal() {
     assert!(bob.node.groups().is_empty());
 }
 
+/// An invite is a rule every member holds: any of them admits its joiner, once, within its 10 minutes.
+#[tokio::test(flavor = "multi_thread")]
+async fn any_member_admits_an_invite_once() {
+    use lmk_proto::links::Invite;
+    let relay = relay().await;
+    let dir = folder("invite");
+    let mut alice = session(&relay, "Alice").await;
+    let mut bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+
+    // Two joiners race with one secret, each asking another member: one gets in, and the other is refused.
+    let link = alice.node.invite(&gid.0, Some("Carol".into()), None).await.unwrap();
+    assert_eq!(link.members.len(), 2, "the link names the inviter and the member that took the invite");
+    let only = |n: usize| Invite { members: vec![link.members[n].clone()], ..link.clone() };
+    let (carol, dave) = (session(&relay, "Carol").await, session(&relay, "Dave").await);
+    let (to_alice, to_bob) = (only(0), only(1));
+    let (by_alice, by_bob) = tokio::join!(carol.node.join(&to_alice, None), dave.node.join(&to_bob, None));
+    assert!(by_alice.is_ok() != by_bob.is_ok(), "{by_alice:?} {by_bob:?}");
+    let refused = format!("{:#}", by_alice.err().or(by_bob.err()).unwrap());
+    assert!(refused.contains("unknown, used or expired"), "{refused}");
+    let erin = session(&relay, "Erin").await;
+    let used = erin.node.join(&link, None).await.unwrap_err();
+    assert!(format!("{used:#}").contains("unknown, used or expired"), "a used secret is refused");
+
+    // An expired one too.
+    let secret = [7u8; 16];
+    let expired = json!({ "type": "invite", "hash": Bytes(Sha256::digest(secret).to_vec()), "expires": lmk_node::now() - 1 });
+    let (_, delivery) = bob.node.send(&gid.0, &expired, true).await.unwrap();
+    assert!(delivery.held.iter().any(|m| m.name == "Alice"));
+    let expired = Invite { secret, members: vec![link.members[0].clone()], ..link.clone() };
+    assert!(format!("{:#}", erin.node.join(&expired, None).await.unwrap_err()).contains("unknown, used or expired"));
+
+    // With the inviter offline, the other member it named admits the joiner; the inviter, not it, introduces them.
+    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+    let (joined, by) = erin.node.join(&link, None).await.unwrap();
+    assert_eq!((joined, by), (gid.clone(), link.members[1].key));
+    let (member, how, introduces) = bob.until(|e| match e {
+        Event::Joined { member, how, introduces, .. } if member.name == "Erin" => Some((member, how, introduces)),
+        _ => None,
+    }).await;
+    assert_eq!((member.name.as_str(), how, introduces), ("Erin", lmk_proto::group::How::Invite, false));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() {
     let relay = relay().await;
