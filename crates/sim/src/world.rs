@@ -202,6 +202,8 @@ struct World {
 pub(crate) fn run(seed: u64, actions: &[Action], options: Options) -> Outcome {
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| {
+        // openmls encrypts path secrets on rayon's threads: on one, they draw randomness in order.
+        rayon::ThreadPoolBuilder::new().num_threads(1).build_global().unwrap();
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             PANICS.with_borrow_mut(|panics| panics.push(info.to_string()));

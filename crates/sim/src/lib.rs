@@ -159,7 +159,7 @@ pub struct Outcome {
     pub log: Vec<String>,
 }
 
-/// Runs these actions in a world the seed decides.
+/// Runs these actions in a world the seed decides; one at a time in a process, whose randomness it seeds.
 pub fn run(seed: u64, actions: &[Action], options: Options) -> Outcome {
     world::run(seed, actions, options)
 }

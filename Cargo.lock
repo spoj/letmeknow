@@ -3044,6 +3044,7 @@ dependencies = [
  "n0-future",
  "openmls_memory_storage",
  "openmls_traits",
+ "rayon",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
