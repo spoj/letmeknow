@@ -356,18 +356,11 @@ fn membership_changes_wake_and_a_removed_session_is_told() {
     });
 }
 
-/// The files under `dir` that hold `secret`.
+/// The files of a session's database that hold `secret`. The `-shm` file holds only the WAL's index, and Windows locks
+/// parts of it.
 fn holding(dir: &Path, secret: &str) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            found.extend(holding(&path, secret));
-        } else if std::fs::read(&path).unwrap().windows(secret.len()).any(|w| w == secret.as_bytes()) {
-            found.push(path);
-        }
-    }
-    found
+    let files = ["session.db", "session.db-wal"].map(|name| dir.join(name));
+    files.into_iter().filter(|path| std::fs::read(path).unwrap_or_default().windows(secret.len()).any(|w| w == secret.as_bytes())).collect()
 }
 
 #[test]

@@ -174,8 +174,10 @@ mod native {
 mod tests {
     use super::{Provider, SqliteProvider};
 
+    /// The database files that hold `secret`. The `-shm` file holds only the WAL's index, and Windows locks parts of it.
     fn in_files(dir: &std::path::Path, secret: &[u8]) -> Vec<String> {
         let files = std::fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().path());
+        let files = files.filter(|path| !path.to_string_lossy().ends_with("-shm"));
         let holding = files.filter(|path| std::fs::read(path).unwrap().windows(secret.len()).any(|w| w == secret));
         holding.map(|path| path.display().to_string()).collect()
     }
