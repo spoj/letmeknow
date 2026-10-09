@@ -1,6 +1,6 @@
-//! A `peer` stream: hello and head swap, commits, negentropy message sync, live messages, want and
-//! have, join requests, and kinds' frames and state links. Every group frame is served only to a
-//! member.
+//! A `peer` stream: hello and head swap, log entries, negentropy message sync, live messages, want
+//! and have, join requests, and kinds' state links. Every group frame is served only to a member,
+//! and every log's entries only to a member of a group that follows it.
 //!
 //! Negentropy tells only its initiator what each side lacks, so a sync runs two rounds: the
 //! dialer initiates and pushes what the acceptor lacks, then ends its round with an empty
@@ -19,7 +19,7 @@ use iroh::{
 use lmk_proto::{
     Answer, Bytes, frame,
     head::Head,
-    peer::{Admitted, Frame, Hello, List, Refusal},
+    peer::{Admitted, Frame, Hello, Refusal},
 };
 use sha2::{Digest, Sha256};
 use n0_future::{task::spawn, time::sleep};
@@ -55,16 +55,21 @@ struct Session {
     /// Our `want`s awaiting their `have`, in order.
     wants: HashMap<Bytes, VecDeque<HaveReply>>,
     joins: HashMap<Bytes, oneshot::Sender<Answer<Admitted>>>,
-    /// The newest head of each device list either side has shown the other.
-    lists: HashMap<Bytes, Head>,
+    logs: HashMap<Bytes, Log>,
+}
+
+#[derive(Default)]
+struct Log {
+    /// The newest head the peer showed.
+    theirs: Option<Head>,
+    /// The longest head the peer showed beyond our log, judged once our log reaches it.
+    longer: Option<Head>,
 }
 
 #[derive(Default)]
 struct Group {
     theirs: Option<Hello>,
-    /// The longest head the peer showed beyond our log, judged once our log reaches it.
-    longer: Option<Head>,
-    /// The log length we last started a sync at.
+    /// The length of the group's log we last started a sync at.
     synced: Option<u64>,
     initiator: Option<Round>,
     responder: Option<Negentropy<'static, NegentropyStorageVector>>,
@@ -119,7 +124,7 @@ pub(crate) async fn run(
         groups: HashMap::new(),
         wants: HashMap::new(),
         joins: HashMap::new(),
-        lists: HashMap::new(),
+        logs: HashMap::new(),
     };
     let result = async {
         session.hello().await?;
@@ -159,35 +164,51 @@ impl Session {
         self.inner.groups.is_member(group, &self.peer)
     }
 
-    async fn hello(&mut self) -> Result<()> {
-        let shared: Vec<Vec<u8>> = self.inner.groups.groups().into_iter().filter(|g| self.member(g)).collect();
-        let groups = shared.iter().map(|g| self.inner.groups.hello(g)).collect();
-        let lists = self.unshown(&shared);
-        self.write(&Frame::Hello { groups, lists }).await
+    /// The groups both are in.
+    fn shared(&self) -> Vec<Vec<u8>> {
+        self.inner.groups.groups().into_iter().filter(|g| self.member(g)).collect()
     }
 
-    /// The device lists of the identities in these groups whose newest head the peer has not seen.
-    fn unshown(&mut self, groups: &[Vec<u8>]) -> Vec<List> {
-        let lists = self.inner.groups.lists(groups);
-        lists.into_iter().filter(|list| self.lists.insert(list.identity.clone(), list.head.clone()).as_ref() != Some(&list.head)).collect()
+    /// The logs this session follows for groups both are in.
+    fn logs(&self, groups: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut logs: Vec<Vec<u8>> = groups.iter().flat_map(|g| self.inner.groups.logs(g)).collect();
+        logs.sort();
+        logs.dedup();
+        logs
+    }
+
+    async fn hello(&mut self) -> Result<()> {
+        let shared = self.shared();
+        self.send_hello(&shared).await
+    }
+
+    async fn send_hello(&mut self, groups: &[Vec<u8>]) -> Result<()> {
+        let hellos = groups.iter().map(|g| self.inner.groups.hello(g)).collect();
+        let heads = self.logs(groups).iter().map(|log| self.inner.groups.head(log)).collect();
+        self.write(&Frame::Hello { groups: hellos, heads }).await
     }
 
     async fn frame(&mut self, frame: Frame) -> Result<()> {
         match frame {
-            Frame::Hello { groups, lists } => {
-                if !lists.is_empty() && self.inner.groups.groups().iter().any(|g| self.member(g)) {
-                    for list in lists {
-                        self.lists.insert(list.identity.clone(), list.head.clone());
-                        self.inner.groups.list(self.peer, list);
+            Frame::Hello { groups, heads } => {
+                let shared = self.shared();
+                let logs = self.logs(&shared);
+                for theirs in heads.into_iter().filter(|head| logs.contains(&head.log.0)) {
+                    let log = theirs.log.clone();
+                    if let Err(e) = self.judge(&log, &theirs) {
+                        tracing::warn!("hello from {}: {e:#}", self.peer.fmt_short());
+                        continue;
                     }
+                    self.logs.entry(log.clone()).or_default().theirs = Some(theirs);
+                    self.forward(&log).await?;
                 }
-                for hello in groups {
-                    if self.member(&hello.group.0) {
-                        self.on_hello(hello).await?;
-                    }
+                for hello in groups.into_iter().filter(|hello| shared.contains(&hello.group.0)) {
+                    let group = hello.group.clone();
+                    self.groups.entry(group.clone()).or_default().theirs = Some(hello);
+                    self.sync(&group).await?;
                 }
             }
-            Frame::Commits { group, entries, head } if self.member(&group.0) => self.on_commits(group, entries, head).await?,
+            Frame::Entries { log, entries, head } => self.on_entries(log, entries, head).await?,
             Frame::Reconcile { group, msg } if self.member(&group.0) => self.on_reconcile(group, msg).await?,
             Frame::Messages { group, items } if self.member(&group.0) => {
                 let (mut held, mut refused) = (Vec::new(), Vec::new());
@@ -209,7 +230,6 @@ impl Session {
                 let refused = refused.iter().filter_map(|r| Some((id(&r.id)?, r.reason.clone()))).collect();
                 self.inner.events.send(Event::Receipt { group: group.0, peer: self.peer, held, refused }).ok();
             }
-            Frame::Kind(frame) if self.member(&frame.group.0) => self.inner.groups.frame(self.peer, frame),
             Frame::State { group, link } if self.member(&group.0) => self.inner.groups.state(&group.0, self.peer, link),
             Frame::Want { group, files } => {
                 let mut have = Vec::new();
@@ -250,65 +270,60 @@ impl Session {
         Ok(())
     }
 
-    /// Checks a signed head from the peer against our chain, now or, if it is longer, once our chain reaches it;
-    /// reports a contradiction.
-    fn judge(&mut self, group: &Bytes, ours: &Head, theirs: &Head) -> Result<()> {
-        ensure!(self.inner.groups.verify_head(&group.0, theirs), "a head the service did not sign");
-        let state = self.groups.entry(group.clone()).or_default();
+    /// Checks a signed head of a log from the peer against our chain, now or, if it is longer, once our chain reaches
+    /// it; reports a contradiction.
+    fn judge(&mut self, log: &Bytes, theirs: &Head) -> Result<()> {
+        ensure!(self.inner.groups.verify_head(&log.0, theirs), "a head the service did not sign");
+        let ours = self.inner.groups.head(&log.0);
+        let state = self.logs.entry(log.clone()).or_default();
         if theirs.length > ours.length && state.longer.as_ref().is_none_or(|longer| longer.length < theirs.length) {
             state.longer = Some(theirs.clone());
         }
-        self.judge_longer(group, ours)?;
-        self.contradiction(group, ours, theirs)
+        self.judge_longer(log)?;
+        self.contradiction(log, &ours, theirs)
     }
 
-    /// Judges the longest head the peer showed, once our chain has reached it.
-    fn judge_longer(&mut self, group: &Bytes, ours: &Head) -> Result<()> {
-        let longer = self.groups.get_mut(group).and_then(|state| state.longer.take_if(|longer| longer.length <= ours.length));
+    /// Judges the longest head the peer showed of a log, once our chain has reached it.
+    fn judge_longer(&mut self, log: &Bytes) -> Result<()> {
+        let ours = self.inner.groups.head(&log.0);
+        let longer = self.logs.get_mut(log).and_then(|state| state.longer.take_if(|longer| longer.length <= ours.length));
         match longer {
-            Some(longer) => self.contradiction(group, ours, &longer),
+            Some(longer) => self.contradiction(log, &ours, &longer),
             None => Ok(()),
         }
     }
 
-    fn contradiction(&self, group: &Bytes, ours: &Head, theirs: &Head) -> Result<()> {
-        if sync::contradicts(theirs, ours, |n| self.inner.groups.chain(&group.0, n)) {
-            self.inner
-                .events
-                .send(Event::Contradiction { group: group.0.clone(), peer: self.peer, ours: ours.clone(), theirs: theirs.clone() })
-                .ok();
+    fn contradiction(&self, log: &Bytes, ours: &Head, theirs: &Head) -> Result<()> {
+        if sync::contradicts(theirs, ours, |n| self.inner.groups.chain(&log.0, n)) {
+            let event = Event::Contradiction { log: log.0.clone(), peer: self.peer, ours: ours.clone(), theirs: theirs.clone() };
+            self.inner.events.send(event).ok();
             bail!("the service showed us different logs");
         }
         Ok(())
     }
 
-    async fn on_hello(&mut self, theirs: Hello) -> Result<()> {
-        let group = theirs.group.clone();
-        let mine = self.inner.groups.hello(&group.0);
-        if let Err(e) = self.judge(&group, &mine.head, &theirs.head) {
-            tracing::warn!("hello from {}: {e:#}", self.peer.fmt_short());
-            return Ok(());
+    /// Sends the entries of a log the peer lacks, judged by the head it showed.
+    async fn forward(&mut self, log: &Bytes) -> Result<()> {
+        let Some(theirs) = self.logs.get(log).and_then(|state| state.theirs.clone()) else { return Ok(()) };
+        let mine = self.inner.groups.head(&log.0);
+        if theirs.length < mine.length {
+            let entries = self.inner.groups.entries(&log.0, theirs.length);
+            if !entries.is_empty() {
+                self.write(&Frame::Entries { log: log.clone(), entries, head: mine }).await?;
+            }
         }
-        if let Some(log) = theirs.log.clone() {
-            self.inner.groups.log_head(self.peer, &group.0, log);
-        }
-        self.groups.entry(group.clone()).or_default().theirs = Some(theirs);
-        self.catch_up(&group, &mine).await
+        Ok(())
     }
 
-    /// Sends the entries the peer lacks, and starts syncing once both logs are alike.
-    async fn catch_up(&mut self, group: &Bytes, mine: &Hello) -> Result<()> {
-        let Some(theirs) = self.groups.get(group).and_then(|g| g.theirs.clone()) else { return Ok(()) };
-        if theirs.head.length < mine.head.length {
-            let entries = self.inner.groups.entries(&group.0, theirs.head.length);
-            self.write(&Frame::Commits { group: group.clone(), entries, head: mine.head.clone() }).await?;
-        }
-        let state = self.groups.get_mut(group).unwrap();
-        if (theirs.head.length, &theirs.head.hash) != (mine.head.length, &mine.head.hash) || state.synced == Some(mine.head.length)
-        {
+    /// Starts syncing a group's messages once both hold the same log of it.
+    async fn sync(&mut self, group: &Bytes) -> Result<()> {
+        let mine = self.inner.groups.head(&group.0);
+        let alike = self.logs.get(group).and_then(|state| state.theirs.as_ref()).is_some_and(|theirs| (theirs.length, &theirs.hash) == (mine.length, &mine.hash));
+        let state = self.groups.entry(group.clone()).or_default();
+        if !alike || state.theirs.is_none() || state.synced == Some(mine.length) {
             return Ok(());
         }
-        state.synced = Some(mine.head.length);
+        state.synced = Some(mine.length);
         self.inner.events.send(Event::InStep { group: group.0.clone(), peer: self.peer }).ok();
         self.want(group).await?;
         if self.dialer {
@@ -354,25 +369,34 @@ impl Session {
         }
     }
 
-    async fn on_commits(&mut self, group: Bytes, entries: Vec<Bytes>, head: Head) -> Result<()> {
-        let mine = self.inner.groups.hello(&group.0).head;
-        if let Err(e) = self.judge(&group, &mine, &head) {
-            tracing::warn!("commits from {}: {e:#}", self.peer.fmt_short());
+    async fn on_entries(&mut self, log: Bytes, entries: Vec<Bytes>, head: Head) -> Result<()> {
+        let shared = self.shared();
+        if !self.logs(&shared).contains(&log.0) {
+            tracing::debug!("{} sent entries of a log we share no group of", self.peer.fmt_short());
             return Ok(());
         }
+        if let Err(e) = self.judge(&log, &head) {
+            tracing::warn!("entries from {}: {e:#}", self.peer.fmt_short());
+            return Ok(());
+        }
+        let mine = self.inner.groups.head(&log.0);
         let Some(start) = head.length.checked_sub(entries.len() as u64) else { return Ok(()) };
         if head.length <= mine.length || start > mine.length {
             return Ok(());
         }
-        let Some(from) = self.inner.groups.chain(&group.0, start) else { return Ok(()) };
+        let Some(from) = self.inner.groups.chain(&log.0, start) else { return Ok(()) };
         if sync::extend(from, &entries)[..] != head.hash.0[..] {
-            tracing::warn!("commits from {} do not end at their head", self.peer.fmt_short());
+            tracing::warn!("entries from {} do not end at their head", self.peer.fmt_short());
             return Ok(());
         }
         let new = entries[(mine.length - start) as usize..].to_vec();
-        match self.inner.groups.apply(&group.0, new, head) {
-            Ok(()) => self.inner.changed(&group.0),
-            Err(e) => tracing::warn!("commits from {} not applied: {e:#}", self.peer.fmt_short()),
+        match self.inner.groups.apply(&log.0, new, head) {
+            Ok(()) => {
+                for group in shared.into_iter().filter(|g| self.inner.groups.logs(g).contains(&log.0)) {
+                    self.inner.changed(&group);
+                }
+            }
+            Err(e) => tracing::warn!("entries from {} not taken: {e:#}", self.peer.fmt_short()),
         }
         Ok(())
     }
@@ -382,14 +406,18 @@ impl Session {
             self.groups.remove(&group);
             return Ok(());
         }
-        let mine = self.inner.groups.hello(&group.0);
-        if let Err(e) = self.judge_longer(&group, &mine.head) {
-            tracing::warn!("a head from {}: {e:#}", self.peer.fmt_short());
-            return Ok(());
+        let logs = self.inner.groups.logs(&group.0);
+        for log in &logs {
+            if let Err(e) = self.judge_longer(&Bytes(log.clone())) {
+                tracing::warn!("a head from {}: {e:#}", self.peer.fmt_short());
+                return Ok(());
+            }
         }
-        let lists = self.unshown(std::slice::from_ref(&group.0));
-        self.write(&Frame::Hello { groups: vec![mine.clone()], lists }).await?;
-        self.catch_up(&group, &mine).await
+        self.send_hello(std::slice::from_ref(&group.0)).await?;
+        for log in logs {
+            self.forward(&Bytes(log)).await?;
+        }
+        self.sync(&group).await
     }
 
     /// Swaps heads again and syncs every group anew, whatever it has synced already.

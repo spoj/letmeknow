@@ -8,7 +8,6 @@ use lmk_proto::group::{
     CHAT, Control, Credential, How, IdentityRef, LEAF_EXTENSION, Leaf, Opening, PROTOCOL, SETTINGS_EXTENSION, Service,
     Settings, held_by_type,
 };
-use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use serde::{Deserialize, Serialize};
@@ -207,27 +206,12 @@ struct Aad {
     how: How,
 }
 
-/// An application message's authenticated data: a payload its sender marks as held, or an entry of the kind's log.
+/// An application message's authenticated data: a payload its sender marks as held.
 #[derive(Default, Serialize, Deserialize)]
 struct Marks {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     held: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    log: bool,
 }
-
-/// A message sealed under an epoch whose keys this session does not hold: one it never was in, or one past its key
-/// window.
-#[derive(Debug)]
-pub struct Unheld;
-
-impl std::fmt::Display for Unheld {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("sealed under an epoch whose keys this session does not hold")
-    }
-}
-
-impl std::error::Error for Unheld {}
 
 /// A commit to post, and for an add, the Welcome to send once the log has taken it.
 pub struct Commit {
@@ -303,8 +287,6 @@ pub struct Opened {
     pub payload: serde_json::Value,
     /// Whether members hold it (see `seal`).
     pub held: bool,
-    /// Whether it is an entry of the kind's log (see `seal_entry`).
-    pub log: bool,
 }
 
 /// Who added whom, as the log showed it.
@@ -572,20 +554,8 @@ impl Group {
         held: bool,
     ) -> Result<([u8; 32], Vec<u8>)> {
         if held && !held_by_type(payload) {
-            self.mls.set_aad(serde_json::to_vec(&Marks { held, log: false })?);
+            self.mls.set_aad(serde_json::to_vec(&Marks { held })?);
         }
-        let message = self.mls.create_message(provider, &session.signer, &serde_json::to_vec(payload)?)?.to_bytes()?;
-        Ok((Sha256::digest(&message).into(), message))
-    }
-
-    /// Seals a payload as an entry of the kind's log, marked so in its authenticated data.
-    pub fn seal_entry<P: Provider>(
-        &mut self,
-        provider: &P,
-        session: &Session,
-        payload: &serde_json::Value,
-    ) -> Result<([u8; 32], Vec<u8>)> {
-        self.mls.set_aad(serde_json::to_vec(&Marks { held: false, log: true })?);
         let message = self.mls.create_message(provider, &session.signer, &serde_json::to_vec(payload)?)?.to_bytes()?;
         Ok((Sha256::digest(&message).into(), message))
     }
@@ -596,18 +566,11 @@ impl Group {
     }
 
     /// Decrypts and verifies a member's message. `now` (milliseconds) is when it first reached this session; a removed
-    /// member's message that first reached it more than 5 minutes after the removal is refused. A message under an
-    /// epoch whose keys this session does not hold fails with `Unheld`.
+    /// member's message that first reached it more than 5 minutes after the removal is refused.
     pub fn open<P: Provider>(&mut self, provider: &P, bytes: &[u8], now: u64) -> Result<Opened> {
         let message = parse::<MlsMessageIn>(bytes)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Application, "not an application message");
-        let unheld = message.epoch() < self.mls.epoch();
-        let processed = match self.mls.process_message(provider, message) {
-            Err(ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(
-                MessageDecryptionError::SecretTreeError(SecretTreeError::TooDistantInThePast),
-            ))) if unheld => return Err(Unheld.into()),
-            processed => processed?,
-        };
+        let processed = self.mls.process_message(provider, message)?;
         let epoch = processed.epoch().as_u64();
         let marks = serde_json::from_slice::<Marks>(processed.aad()).unwrap_or_default();
         let sender = credential_of(processed.credential()).context("the sender has no letmeknow credential")?;
@@ -628,7 +591,6 @@ impl Group {
         ensure!(payload["type"].is_string(), "a payload without a type");
         Ok(Opened {
             held: marks.held || held_by_type(&payload),
-            log: marks.log,
             id: Sha256::digest(bytes).into(),
             epoch,
             index: index.u32(),

@@ -12,11 +12,6 @@ pub const LEAF_EXTENSION: u16 = 0xff02;
 /// The one kind every client supports, built in. Every other kind is a plugin's.
 pub const CHAT: &str = "chat";
 
-/// The kinds a leaf that lists none supports: those of 0.10.
-fn legacy_kinds() -> Vec<String> {
-    vec![CHAT.into(), "doc".into()]
-}
-
 /// Where a log lives.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,7 +36,7 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub openings: Vec<Opening>,
     /// The id of the kind's log at the membership service: random, so that only members can tie it to the group. In a
-    /// group of a plugin's kind made since 0.11.
+    /// group of a plugin's kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<Bytes>,
 }
@@ -71,7 +66,6 @@ pub struct Leaf {
     pub key: Bytes,
     pub relay: String,
     /// The kinds the session supports.
-    #[serde(default = "legacy_kinds")]
     pub kinds: Vec<String>,
 }
 
@@ -127,12 +121,15 @@ pub fn held_by_type(payload: &serde_json::Value) -> bool {
     matches!(type_of(payload), "message" | "leave")
 }
 
-/// The payloads of a devices group's contacts, a Yjs map synced as a doc's text was: live edits, and diffs answering a
-/// `doc_sv` frame. Both are Yjs v1 updates.
+/// The live payloads of a devices group's contacts, a Yjs map synced as a doc's text is: edits; to one member, the hash
+/// of a snapshot to compare, the state vector of a member whose snapshot differs, and the diff that answers it. Updates
+/// are Yjs v1.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContactsUpdate {
     Edit { update: Bytes },
+    Snapshot { snapshot: Bytes },
+    Sv { sv: Bytes },
     Diff { update: Bytes },
 }
 
@@ -191,11 +188,5 @@ mod tests {
         assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","after":[]}"#);
         let folder = serde_json::to_string(&Service::Folder("/tmp/x".into())).unwrap();
         assert_eq!(folder, r#"{"folder":"/tmp/x"}"#);
-    }
-
-    #[test]
-    fn a_leaf_without_kinds_is_a_0_10_one() {
-        let leaf: Leaf = serde_json::from_str(r#"{"key":"AA","relay":"https://letmeknow.dev"}"#).unwrap();
-        assert_eq!(leaf.kinds, ["chat", "doc"]);
     }
 }

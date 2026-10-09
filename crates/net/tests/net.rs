@@ -9,11 +9,9 @@ use iroh::RelayUrl;
 use lmk_net::Event;
 use lmk_proto::{
     Answer, Bytes,
-    head::Head,
     links::Invite,
-    peer::{Frame, KindFrame, List},
+    peer::Frame,
 };
-use serde_json::json;
 
 const G: &[u8] = b"group";
 
@@ -42,8 +40,8 @@ async fn hello_head_swap_and_contradiction() {
     c.net.dial(members[0], relay.url.clone()).await.unwrap();
     for (node, peer) in [(&mut a, members[2]), (&mut c, members[0])] {
         let event = node.until(|e| matches!(e, Event::Contradiction { .. })).await;
-        let Event::Contradiction { group, peer: from, ours, theirs } = event else { unreachable!() };
-        assert_eq!((group.as_slice(), from), (G, peer));
+        let Event::Contradiction { log, peer: from, ours, theirs } = event else { unreachable!() };
+        assert_eq!((log.as_slice(), from), (G, peer));
         assert_eq!((ours.length, theirs.length), (3, 3));
         assert_ne!(ours.hash, theirs.hash);
     }
@@ -64,31 +62,30 @@ async fn hello_head_swap_and_contradiction() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn device_lists_are_shown_once_per_head() {
+async fn every_log_of_a_group_is_caught_up_from_peers() {
+    const K: &[u8] = b"kind log";
+    const L: &[u8] = b"only A's";
     let relay = relay().await;
     let keys = keys(2);
     let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let group = || Group { members: members.clone(), ..Group::default() };
     let service = service();
-    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
-    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
-    let list = |time| List { identity: Bytes(vec![7; 32]), entries: vec![Bytes(b"e1".to_vec())], head: Head::sign(&service, b"list", 1, [0; 32], time) };
-    a.fake.lists.lock().unwrap().push(list(1));
-    b.fake.lists.lock().unwrap().push(list(1));
-    let presented = |node: &Node| node.fake.presented.lock().unwrap().iter().map(|(_, l)| l.head.time).collect::<Vec<_>>();
+    let group = |others: &[(&[u8], &[&[u8]])]| Group {
+        members: members.clone(),
+        log: vec![b"e1".to_vec()],
+        others: others.iter().map(|(id, entries)| (id.to_vec(), entries.iter().map(|e| e.to_vec()).collect())).collect(),
+        ..Group::default()
+    };
+    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group(&[(K, &[b"k1", b"k2"]), (L, &[b"l1"])])), Options::default()).await;
+    let mut b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group(&[(K, &[b"k1"])])), Options::default()).await;
     a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    eventually("each shows the other its list", || presented(&a) == [1] && presented(&b) == [1]).await;
+    b.synced(G, members[0]).await;
+    eventually("B catches up on the kind's log", || b.fake.log(K).len() == 2).await;
+    assert!(b.fake.log(L).is_empty(), "a log B does not follow is not B's");
+    a.fake.groups.lock().unwrap().get_mut(G).unwrap().others.get_mut(K).unwrap().push(b"k3".to_vec());
     a.net.changed(G);
-    *a.fake.lists.lock().unwrap() = vec![list(2)];
-    a.net.changed(G);
-    eventually("a newer head is shown", || presented(&b) == [1, 2]).await;
-    *b.fake.lists.lock().unwrap() = vec![list(2)];
-    b.net.changed(G);
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert_eq!((presented(&a), presented(&b)), (vec![1], vec![1, 2]), "nothing is shown twice, nor back");
-    for node in [&a, &b] {
-        node.net.shutdown().await.unwrap();
-    }
+    eventually("an entry A took goes to B at once", || b.fake.log(K).len() == 3).await;
+    a.net.shutdown().await.unwrap();
+    b.net.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -138,7 +135,7 @@ async fn messages_sync_after_both_were_offline() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn kind_frames_live_messages_and_state_links_reach_one_member() {
+async fn live_messages_and_state_links_reach_one_member() {
     let relay = relay().await;
     let keys = keys(3);
     let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
@@ -152,21 +149,18 @@ async fn kind_frames_live_messages_and_state_links_reach_one_member() {
     a.net.dial(members[2], relay.url.clone()).await.unwrap();
     let in_step = a.until(|e| matches!(e, Event::InStep { .. })).await;
     assert_eq!(in_step, Event::InStep { group: G.to_vec(), peer: members[1] });
-    let frame = KindFrame::new(Bytes(G.to_vec()), json!({ "doc": { "snapshot": "AA" } })).unwrap();
     let live = [&1u64.to_be_bytes()[..], &[1], b"edit"].concat();
     for peer in [members[1], members[2]] {
-        assert!(a.net.frame(peer, Frame::Kind(frame.clone())));
         assert!(a.net.frame(peer, Frame::State { group: Bytes(G.to_vec()), link: Some("lmk:state".into()) }));
         assert!(a.net.send_to(peer, G, live.clone()));
     }
-    eventually("the frame, state link and live message reach B", || {
-        !b.fake.frames.lock().unwrap().is_empty() && !b.fake.states.lock().unwrap().is_empty() && !b.fake.groups.lock().unwrap()[G].live.is_empty()
+    eventually("the state link and live message reach B", || {
+        !b.fake.states.lock().unwrap().is_empty() && !b.fake.groups.lock().unwrap()[G].live.is_empty()
     })
     .await;
-    assert_eq!(b.fake.frames.lock().unwrap()[0], (members[0], frame));
     assert_eq!(b.fake.states.lock().unwrap()[0], (G.to_vec(), members[0], Some("lmk:state".to_string())));
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert!(c.fake.frames.lock().unwrap().is_empty() && c.fake.states.lock().unwrap().is_empty(), "none reach a non-member");
+    assert!(c.fake.states.lock().unwrap().is_empty(), "none reach a non-member");
     assert!(c.fake.groups.lock().unwrap()[G].live.is_empty());
     a.net.shutdown().await.unwrap();
     b.net.shutdown().await.unwrap();
