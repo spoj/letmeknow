@@ -54,3 +54,7 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+
+# Dependencies optimized in tests: the simulator's members do real cryptography.
+[profile.dev.package."*"]
+opt-level = 2

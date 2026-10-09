@@ -80,6 +80,9 @@ impl std::fmt::Display for Failure {
     }
 }
 
+/// Members of a group, with their nodes.
+type Holders = Vec<(usize, Node<Store>)>;
+
 /// A member's storage, which outlives its crashes: a browser's records.
 #[derive(Clone, Default)]
 struct Store(Arc<MemoryProvider>);
@@ -416,6 +419,7 @@ impl World {
                 sleep(Duration::from_secs(10)).await;
             }
         });
+        self.note(format!("m{i} up as {}", id.fmt_short()));
         let mut members = self.members.lock().unwrap();
         members[i].client = Some(client);
         members[i].tasks = vec![events, told, renew];
@@ -496,6 +500,13 @@ impl World {
         self.members.lock().unwrap()[i].device.clone()
     }
 
+    /// Of the members running and in a group, the one `m` picks.
+    fn holder(&self, gid: &Bytes, m: usize) -> Result<usize> {
+        let holders: Vec<usize> = self.clients().into_iter().filter(|(_, c)| c.node().groups().contains(gid)).map(|(i, _)| i).collect();
+        ensure!(!holders.is_empty(), "no one running holds the group");
+        Ok(holders[m % holders.len()])
+    }
+
     async fn act(self: &Arc<Self>, act: &Act) -> Result<String> {
         match *act {
             Act::CreateIdentity { m } => {
@@ -511,10 +522,17 @@ impl World {
             }
             Act::Invite { m, group, n, label, to } => {
                 let mut invite = json!({ "cmd": "invite" });
-                match group {
-                    Some(g) => invite["group"] = json!(b64(&self.group(g)?.0)),
-                    None => invite["name"] = json!(format!("g{}", self.book.lock().unwrap().groups.len())),
-                }
+                let m = match group {
+                    Some(g) => {
+                        let gid = self.group(g)?;
+                        invite["group"] = json!(b64(&gid.0));
+                        self.holder(&gid, m)?
+                    }
+                    None => {
+                        invite["name"] = json!(format!("g{}", self.book.lock().unwrap().groups.len()));
+                        m
+                    }
+                };
                 if label {
                     invite["for"] = json!(format!("friend{}", self.index(n)));
                 }
@@ -537,44 +555,55 @@ impl World {
                 Ok(self.request(n, json!({ "cmd": "join", "target": b64(&gid.0) })).await?["group"].to_string())
             }
             Act::Send { m, group } => {
-                let (gid, client) = (self.group(group)?, self.client(m)?);
-                ensure!(client.node().groups().contains(&gid), "not in the group");
+                let gid = self.group(group)?;
+                let m = self.holder(&gid, m)?;
+                let client = self.client(m)?;
                 let after = client.tips(&gid, |_| true)?;
-                let chat = Chat { text: format!("from m{} at {}", self.index(m), elapsed()), to: Vec::new(), reply_to: None, urgent: false, attachment: None };
+                let chat = Chat { text: format!("from m{m} at {}", elapsed()), to: Vec::new(), reply_to: None, urgent: false, attachment: None };
                 let (id, answer) = client.send(&gid, chat, after).await?;
                 let epoch = client.node().message(&id.0)?.context("a sent message is held")?.epoch;
-                let by = self.index(m);
-                self.book.lock().unwrap().sent.push(Sent { by, group: gid, id, epoch });
+                self.book.lock().unwrap().sent.push(Sent { by: m, group: gid, id, epoch });
                 Ok(answer.to_string())
             }
             Act::Live { m, group } => {
-                let (gid, client) = (self.group(group)?, self.client(m)?);
-                client.node().send_live(&gid.0, &json!({ "type": "sim", "from": self.index(m) }), None)?;
+                let gid = self.group(group)?;
+                let m = self.holder(&gid, m)?;
+                self.client(m)?.node().send_live(&gid.0, &json!({ "type": "sim", "from": m }), None)?;
                 Ok(String::new())
             }
             Act::Rename { m, group } => {
                 let gid = self.group(group)?;
+                let m = self.holder(&gid, m)?;
                 Ok(self.request(m, json!({ "cmd": "name", "group": b64(&gid.0), "name": format!("named at {}", elapsed()) })).await?.to_string())
             }
             Act::Open { m, group, n, close } => {
                 let gid = self.group(group)?;
+                let m = self.holder(&gid, m)?;
                 let identity = self.identity(n)?;
                 Ok(self.request(m, json!({ "cmd": "open", "group": b64(&gid.0), "identity": b64(&identity.0), "close": close })).await?.to_string())
             }
             Act::Leave { m, group } => {
                 let gid = self.group(group)?;
+                let m = self.holder(&gid, m)?;
                 Ok(self.request(m, json!({ "cmd": "leave", "group": b64(&gid.0) })).await?.to_string())
             }
             Act::Remove { m, group, n } => {
                 let gid = self.group(group)?;
-                let member = fp(&self.device(n).public());
+                let m = self.holder(&gid, m)?;
+                let me = self.client(m)?.node().key();
+                let others: Vec<Bytes> = self.client(m)?.node().members(&gid.0)?.into_iter().map(|member| member.key).filter(|key| *key != me).collect();
+                ensure!(!others.is_empty(), "alone in the group");
+                let member = fp(&others[n % others.len()].0);
                 Ok(self.request(m, json!({ "cmd": "remove", "group": b64(&gid.0), "member": member })).await?.to_string())
             }
             Act::TakeOff { m, n } => {
                 let identity = self.identity(m)?;
+                let m = self.index(m);
+                let others: Vec<usize> = (0..self.size()).filter(|j| *j != m && self.identity(*j).is_ok_and(|id| id == identity)).collect();
+                ensure!(!others.is_empty(), "the only device of its identity");
+                let n = others[n % others.len()];
                 let device = b64(&self.device(n).public());
                 let answer = self.request(m, json!({ "cmd": "identity", "op": { "remove": { "identity": b64(&identity.0), "device": device } } })).await?;
-                let n = self.index(n);
                 self.book.lock().unwrap().revoked.push((identity, n, elapsed()));
                 Ok(answer.to_string())
             }
@@ -621,13 +650,18 @@ impl World {
     }
 
     /// Checks a frame on a `peer` stream against the serving rules, as its sender sees them as it sends it.
-    fn inspect(&self, from: EndpointId, to: EndpointId, frame: &[u8]) {
-        let Ok(frame) = serde_json::from_slice::<Frame>(frame) else { return };
+    fn inspect(&self, from: EndpointId, to: EndpointId, bytes: &[u8]) {
+        let Ok(frame) = serde_json::from_slice::<Frame>(bytes) else { return };
         let sender = {
             let members = self.members.lock().unwrap();
             members.iter().position(|m| m.iroh == from).and_then(|i| Some((i, members[i].client.clone()?)))
         };
         let Some((i, client)) = sender else { return };
+        let name = |id: EndpointId| self.members.lock().unwrap().iter().position(|m| m.iroh == id).map_or_else(|| id.fmt_short().to_string(), |j| format!("m{j}"));
+        if std::env::var_os("LMK_SIM_FRAMES").is_some() {
+            let text: String = String::from_utf8_lossy(bytes).chars().take(300).collect();
+            self.book.lock().unwrap().log.push(format!("{} m{i} -> {} {text}", clock(elapsed()), name(to)));
+        }
         let node = client.node();
         let groups: Vec<(&str, Bytes)> = match &frame {
             Frame::Hello { groups, .. } => groups.iter().map(|hello| ("hello", hello.group.clone())).collect(),
@@ -642,8 +676,7 @@ impl World {
         };
         for (what, gid) in groups {
             if !node.serves(&gid.0, &to) {
-                let to = self.members.lock().unwrap().iter().position(|m| m.iroh == to).map_or_else(|| to.fmt_short().to_string(), |j| format!("m{j}"));
-                self.fail("served", format!("m{i} sent {to} {what} of {}, which it does not serve it", b64(&gid.0)));
+                self.fail("served", format!("m{i} sent {} {what} of {}, which it does not serve it", name(to), b64(&gid.0)));
             }
         }
     }
@@ -692,7 +725,7 @@ impl World {
     }
 
     /// Each group's members, as its latest epoch shows them, checked to have converged; with each one's node.
-    fn converged(&self) -> Vec<(Bytes, Vec<(usize, Node<Store>)>)> {
+    fn converged(&self) -> Vec<(Bytes, Holders)> {
         let clients = self.clients();
         let gids: BTreeSet<Bytes> = clients.iter().flat_map(|(_, c)| c.node().groups()).collect();
         let mut groups = Vec::new();
@@ -779,7 +812,7 @@ impl World {
     }
 
     /// Each member of a group sends a live message; every other that both sides hold valid certificates of takes it.
-    async fn live(&self, groups: &[(Bytes, Vec<(usize, Node<Store>)>)]) {
+    async fn live(&self, groups: &[(Bytes, Holders)]) {
         let mut expected = Vec::new();
         for (gid, inside) in groups {
             for (s, sender) in inside {
@@ -789,7 +822,8 @@ impl World {
                 }
                 for (r, receiver) in inside {
                     if r != s && sender.serves(&gid.0, &receiver.net().id()) && receiver.serves(&gid.0, &sender.net().id()) {
-                        expected.push((*s, *r, nonce.clone()));
+                        let connected = sender.net().connected().contains(&receiver.net().id());
+                        expected.push((*s, *r, nonce.clone(), connected));
                     }
                 }
             }
@@ -798,8 +832,8 @@ impl World {
         let book = self.book.lock().unwrap();
         let lost: Vec<String> = expected
             .into_iter()
-            .filter(|(_, r, nonce)| !book.live.contains(&(*r, nonce.clone())))
-            .map(|(s, r, nonce)| format!("m{r} did not take m{s}'s live message {nonce}"))
+            .filter(|(_, r, nonce, _)| !book.live.contains(&(*r, nonce.clone())))
+            .map(|(s, r, nonce, connected)| format!("m{r} did not take m{s}'s live message {nonce}, sent {}connected", if connected { "" } else { "not " }))
             .collect();
         drop(book);
         for text in lost {

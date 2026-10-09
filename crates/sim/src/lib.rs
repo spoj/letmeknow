@@ -15,7 +15,7 @@ pub use world::Failure;
 pub struct Rng(pub u64);
 
 impl Rng {
-    pub fn next(&mut self) -> u64 {
+    pub fn draw(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -24,7 +24,7 @@ impl Rng {
     }
 
     pub fn below(&mut self, n: u64) -> u64 {
-        self.next() % n.max(1)
+        self.draw() % n.max(1)
     }
 
     fn index(&mut self, n: usize) -> usize {
@@ -147,7 +147,7 @@ pub fn generate(seed: u64, options: Options) -> Vec<Action> {
                 65..71 => Act::Offline { m },
                 71..78 => Act::Online { m },
                 78..82 => Act::Restart { m },
-                82..85 => Act::Partition { mask: rng.next() as u32 },
+                82..85 => Act::Partition { mask: rng.draw() as u32 },
                 85..89 => Act::Heal,
                 _ => Act::Drop { m, n: other },
             }
