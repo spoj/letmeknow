@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use lmk_core::provider::Provider;
 use lmk_membership::client::ServeClient;
-use lmk_membership::{Chain, Contradiction, Membership};
+use lmk_membership::{Chain, Contradiction, Membership, Refused};
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
@@ -218,6 +218,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 Err(error) => {
                     if let Some(contradiction) = error.downcast_ref::<Contradiction>() {
                         self.contradicted(&self.state.lock().unwrap(), id, contradiction, "this session");
+                    }
+                    // Past its retention, a member can no longer apply the commits it missed, and must be added again.
+                    if error.downcast_ref::<Refused>().is_some_and(|refused| refused.0 == "expired")
+                        && self.state.lock().unwrap().log(id).is_ok_and(|log| log.of == Of::Group)
+                    {
+                        self.work.send(Work::Gone(id.to_vec())).ok();
                     }
                     return Err(error);
                 }

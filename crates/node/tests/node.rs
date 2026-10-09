@@ -173,7 +173,7 @@ async fn chat_and_removal() {
     let bob_key = bob.node.key();
     alice.node.remove(&gid.0, &bob_key.0).await.unwrap();
     bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
-    assert!(bob.node.groups().is_empty());
+    eventually("Bob forgot the group", || bob.node.groups().is_empty()).await;
 }
 
 /// An invite is a rule every member holds: any of them admits its joiner, once, within its 10 minutes.
@@ -842,4 +842,204 @@ async fn a_member_refuses_what_it_cannot_take_and_send_names_it() {
     .await
     .expect("Bob refused it for its size");
     assert!(bob.node.given_up(&gid.0, &id.0));
+}
+
+/// Waits until `done` holds, polling.
+async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    tokio::time::timeout(WAIT, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"));
+}
+
+fn log_dir(logs: &Path, gid: &Bytes) -> PathBuf {
+    logs.join(gid.0.iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+/// Makes a folder's log unreachable, even to root, by a file in its place; or reachable again.
+fn reachable(dir: &Path, reachable: bool) {
+    let aside = dir.with_extension("aside");
+    if reachable {
+        std::fs::remove_file(dir).unwrap();
+        std::fs::rename(&aside, dir).unwrap();
+    } else {
+        std::fs::rename(dir, &aside).unwrap();
+        std::fs::write(dir, b"").unwrap();
+    }
+}
+
+/// A member holding a `leave` whose removal it could not commit as it took it commits it once it starts again, with the
+/// leaver offline, or, with `restart_holder` false, once it syncs with the leaver.
+async fn held_leave(test: &str, restart_holder: bool) {
+    use lmk_core::provider::SqliteProvider;
+    let relay = relay().await;
+    let dir = folder(test);
+    std::fs::create_dir_all(&dir).unwrap();
+    let logs = dir.join("logs");
+    let start = |name: &'static str| {
+        let (relay, db) = (&relay, dir.join(format!("{name}.db")));
+        async move {
+            let (node, events) = Node::start(SqliteProvider::open(&db).unwrap(), config(relay, name, None, &[CHAT])).await.unwrap();
+            Session { node, events }
+        }
+    };
+    let mut alice = start("Alice").await;
+    let bob = start("Bob").await;
+    let gid = alice.node.create(settings(CHAT, &logs), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+
+    reachable(&log_dir(&logs, &gid), false);
+    let delivery = bob.node.leave(&gid.0).await.unwrap().unwrap();
+    assert_eq!(delivery.held.len(), 1, "Alice holds the leave");
+    alice.until(|e| matches!(e, Event::Warning { text, .. } if text.contains("removing a member")).then_some(())).await;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+    if restart_holder {
+        alice.node.shutdown().await.unwrap();
+        drop(alice);
+        reachable(&log_dir(&logs, &gid), true);
+        alice = start("Alice").await;
+    } else {
+        reachable(&log_dir(&logs, &gid), true);
+        start("Bob").await;
+    }
+    alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "Bob").then_some(())).await;
+    assert_eq!(alice.node.members(&gid.0).unwrap().len(), 1);
+    alice.node.shutdown().await.unwrap();
+}
+
+/// A `leave` sealed before its sender was removed and added again removes it no more.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_leave_does_not_remove_a_member_added_again() {
+    use lmk_core::provider::SqliteProvider;
+    let relay = relay().await;
+    let dir = folder("leave-again");
+    std::fs::create_dir_all(&dir).unwrap();
+    let alice_db = dir.join("alice.db");
+    let start = || async {
+        let (node, events) = Node::start(SqliteProvider::open(&alice_db).unwrap(), config(&relay, "Alice", None, &[CHAT])).await.unwrap();
+        Session { node, events }
+    };
+    let mut alice = start().await;
+    let mut bob = session(&relay, "Bob").await;
+    let carol = session(&relay, "Carol").await;
+    let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("Carol has both Adds", || carol.node.members(&gid.0).unwrap().len() == 3).await;
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+
+    bob.node.leave(&gid.0).await.unwrap();
+    bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
+    bob.node.join(&carol.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    let alice = start().await;
+    let leaves = || alice.node.messages(&gid.0).unwrap().iter().filter(|m| m.payload["type"] == "leave").count();
+    eventually("Alice holds Bob's old leave", || leaves() == 1).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(alice.node.members(&gid.0).unwrap().len(), 3, "Bob is still in");
+    assert_eq!(carol.node.members(&gid.0).unwrap().len(), 3, "Bob is still in");
+    alice.node.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_leave_is_committed_on_start() {
+    held_leave("leave-start", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_leave_is_committed_after_a_sync() {
+    held_leave("leave-sync", false).await;
+}
+
+/// Two members that leave at once: one's removal of the other wins, and the one left alone forgets the group.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leaver_left_alone_forgets_the_group() {
+    let relay = relay().await;
+    let dir = folder("alone");
+    let mut alice = session(&relay, "Alice").await;
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let (a, b) = tokio::join!(alice.node.leave(&gid.0), bob.node.leave(&gid.0));
+    a.unwrap().unwrap();
+    b.unwrap().unwrap();
+    eventually("both forgot the group", || alice.node.groups().is_empty() && bob.node.groups().is_empty()).await;
+}
+
+/// Changes that another member's commit already made answer ok and commit nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_made_moot_commits_nothing() {
+    let relay = relay().await;
+    let dir = folder("moot");
+    let mut alice = session(&relay, "Alice").await;
+    let mut bob = session(&relay, "Bob").await;
+    let carol = session(&relay, "Carol").await;
+    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("Bob has both Adds", || bob.node.members(&gid.0).unwrap().len() == 3).await;
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+
+    let rename = |s: Settings| Settings { name: "Same".into(), ..s };
+    let (a, b) = tokio::join!(alice.node.change_settings(&gid.0, rename), bob.node.change_settings(&gid.0, rename));
+    a.unwrap();
+    b.unwrap();
+    let epochs = (alice.node.epoch(&gid.0).unwrap(), bob.node.epoch(&gid.0).unwrap());
+    assert!(epochs.0.max(epochs.1) == epoch + 1, "one rename committed: {epochs:?} after {epoch}");
+    eventually("Bob is at the rename", || bob.node.epoch(&gid.0).unwrap() == epoch + 1).await;
+
+    let carol_key = carol.node.key();
+    let remove = |node: &Node<MemoryProvider>| {
+        let (node, gid, key) = (node.clone(), gid.clone(), carol_key.clone());
+        tokio::spawn(async move { node.remove(&gid.0, &key.0).await.unwrap() })
+    };
+    let (a, b) = (remove(&alice.node), remove(&bob.node));
+    assert!(a.await.unwrap() != b.await.unwrap(), "one of them committed the removal");
+    let epochs = (alice.node.epoch(&gid.0).unwrap(), bob.node.epoch(&gid.0).unwrap());
+    assert!(epochs.0.max(epochs.1) == epoch + 2, "one removal committed: {epochs:?} after {}", epoch + 1);
+    bob.until(|e| matches!(e, Event::Left { .. }).then_some(())).await;
+    let again = alice.node.remove(&gid.0, &carol_key.0).await.unwrap_err();
+    assert!(format!("{again:#}").contains("not a member"), "removing a non-member fails at once: {again:#}");
+}
+
+/// A member away past its log's retention can apply none of the commits it missed: it is told it was removed, and
+/// forgets the group.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_away_past_the_retention_drops_the_group() {
+    use lmk_core::provider::SqliteProvider;
+    let relay = relay().await;
+    let dir = folder("retention");
+    let (membership, _service) = signing_service(&relay, &dir).await;
+    let bob_db = dir.join("bob.db");
+    let start = || async {
+        let (node, events) = Node::start(SqliteProvider::open(&bob_db).unwrap(), config(&relay, "Bob", None, &[CHAT])).await.unwrap();
+        Session { node, events }
+    };
+    let mut alice = session(&relay, "Alice").await;
+    let bob = start().await;
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+
+    alice.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
+    alice.node.shutdown().await.unwrap();
+    let store = Store::open(&dir.join("membership.db"), ed25519_dalek::SigningKey::from_bytes(&[0; 32])).unwrap();
+    store.expire(lmk_node::now() + 1).unwrap();
+
+    let mut bob = start().await;
+    bob.until(|e| matches!(e, Event::Removed { by: None, .. }).then_some(())).await;
+    eventually("Bob forgot the group", || bob.node.groups().is_empty()).await;
+    bob.node.shutdown().await.unwrap();
 }

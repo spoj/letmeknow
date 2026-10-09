@@ -366,6 +366,9 @@ impl<P: Provider + Send + 'static> Client<P> {
                     .inner
                     .node
                     .change_settings(&gid.0, |mut settings| {
+                        if !close && settings.open.iter().any(|o| o.id == id && o.name == name) {
+                            return settings;
+                        }
                         settings.open.retain(|o| o.id != id);
                         if !close {
                             settings.open.push(Named { id: id.clone(), name: name.clone(), rest: Default::default() });

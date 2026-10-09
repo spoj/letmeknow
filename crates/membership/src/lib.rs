@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 pub use chain::{Chain, Contradiction, Forged};
 
-/// The service refused an append: `size`, `rate` or `policy`.
+/// The service refused a request: an append as `size`, `rate` or `policy`, a read as `expired`.
 #[derive(Debug, thiserror::Error)]
 #[error("the membership service refused: {0}")]
 pub struct Refused(pub String);
