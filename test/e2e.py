@@ -32,9 +32,9 @@ def home(name):
     return os.path.join(TMP, name)
 
 
-def run(session, *args, ok=True, input=None, device=None):
+def run(session, *args, ok=True, input=None, device=None, bin=BIN):
     env = {**ENV, "LETMEKNOW_HOME": home(device or session)}
-    result = subprocess.run([BIN, "--session", session, *args], env=env, input=input, capture_output=True, text=True, encoding="utf-8", timeout=120)
+    result = subprocess.run([bin, "--session", session, *args], env=env, input=input, capture_output=True, text=True, encoding="utf-8", timeout=120)
     if ok and result.returncode:
         sys.exit(f"{session} {args}: {result.stderr}")
     return json.loads(result.stdout) if result.returncode == 0 else result.stderr
@@ -43,10 +43,10 @@ def run(session, *args, ok=True, input=None, device=None):
 class Listener:
     """A session process, in its own home (its own device) unless it shares `device`'s."""
 
-    def __init__(self, session, device=None):
+    def __init__(self, session, device=None, bin=BIN):
         self.session, self.lines = session, queue.Queue()
         env = {**ENV, "LETMEKNOW_HOME": home(device or session)}
-        args = [BIN, "--session", session, "listen", "--name", session.title(), "--hold", "0"]
+        args = [bin, "--session", session, "listen", "--name", session.title(), "--hold", "0"]
         self.log = open(os.path.join(TMP, f"{session}.log"), "a")
         self.proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8")
         threading.Thread(target=self.read, daemon=True).start()
@@ -101,14 +101,14 @@ def until(produce, accept, timeout=20):
         time.sleep(0.3)
 
 
-def git(session, *args, cwd=None, ok=True, alias=False):
-    """git, as an agent of `session` runs it: lmk:: remotes reach that session, through git-remote-lmk on PATH or, with
-    `alias`, through the git alias that npm installs need."""
-    env = {**ENV, "LETMEKNOW_HOME": home(session), "LETMEKNOW_SESSION": session}
+def git(session, *args, cwd=None, ok=True, alias=False, bin=BIN):
+    """git, as an agent of `session` runs it: lmk:: remotes reach that session, through the git-remote-lmk beside `bin`
+    or, with `alias`, through the git alias that npm installs need."""
+    env = {**ENV, "LETMEKNOW_HOME": home(session), "LETMEKNOW_SESSION": session, "PATH": os.path.dirname(bin) + os.pathsep + os.environ["PATH"]}
     config = ["-c", "init.defaultBranch=main"]
     if alias:
         env["PATH"] = os.environ["PATH"]
-        config += ["-c", f"alias.remote-lmk=!'{BIN}' git-remote-lmk"]
+        config += ["-c", f"alias.remote-lmk=!'{bin}' git-remote-lmk"]
     result = subprocess.run(["git", *config, *args], cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", timeout=120)
     if ok and result.returncode:
         sys.exit(f"{session} git {args}: {result.stderr}")

@@ -68,3 +68,17 @@ jobs:
       - if: runner.os == 'Linux'
         run: npm run check
         working-directory: web
+
+  # Sessions of the last release beside this build's.
+  compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: gh release download --repo "$GITHUB_REPOSITORY" --pattern '*-x86_64-unknown-linux-musl.tar.gz' --dir old && tar xzf old/*.tar.gz -C old
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: LETMEKNOW_OLD="$(echo "$PWD"/old/letmeknow-*/)" python3 -u test/compat.py
+        timeout-minutes: 15
