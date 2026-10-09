@@ -1,9 +1,10 @@
 // Browser end-to-end test, run by test/e2e.py against its local `letmeknow serve` (URL, serving dist/) with the native
-// binary (BIN): Matthew's laptop, which takes its relay and membership service from the server that served it, joins
-// Ann's chat from a link and they talk and pass files both ways; it joins her doc and they edit it both ways; his desk's
-// identity adds his phone by a device link, and the phone joins a chat open to that identity by itself; the laptop keeps
-// everything across a reload, a second tab works through the first and takes over when it closes; introductions,
-// refusals, files kept and deleted, a git group's pushes and chat, and the service worker's updates.
+// binary (BIN): Matt's laptop, which takes its relay and membership service from the server that served it, joins Ann's
+// chat from a link, becoming his identity's first device as it does, and they talk and pass files both ways; it joins
+// her doc and they edit it both ways; Matthew's desk adds his phone by a device link, the phone joins a chat open to that
+// identity by itself and is renamed, and a kiosk on an identity of its own moves to his; the laptop keeps everything
+// across a reload, a second tab works through the first and takes over when it closes; introductions, refusals, files
+// kept and deleted, a git group's pushes and chat, and the service worker's updates.
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -129,16 +130,21 @@ try {
         request.onerror = () => reject(request.error);
       })
   );
-  const invite = ann.run("invite", "--name", "Plans");
+  const invite = ann.run("invite", "--name", "Plans", "--for", "Matt");
   await laptop.goto(local(invite.link));
   await laptop.getByRole("heading", { name: "You're invited" }).waitFor();
-  await laptop.getByLabel("Your name").fill("Matthew");
+  await laptop.getByLabel("Your name").fill("Matt");
   await laptop.getByRole("button", { name: "Join", exact: true }).click();
   await laptop.locator(".people", { hasText: "Ann" }).waitFor();
   check(new URL(laptop.url()).pathname === "/", "a browser joins from an invite link, with a click");
   check(!(await kept(laptop)).includes("00"), "a profile that a letmeknow before 0.12 used starts afresh");
-  await ann.printed(e => e.type === "joined" && e.member.name === "Matthew");
+  await ann.printed(e => e.type === "joined" && e.member.name === "Matt");
   check(true, "the native session sees the browser join");
+  const matt = await until(
+    () => ann.run("members", `--group=${invite.group}`).members.find(m => m.name === "Matt"),
+    m => m?.identity?.how === "verified"
+  );
+  check(matt.identity.name === "Matt" && matt.device === "laptop", "the welcome screen makes the browser its identity's first device, which the inviter records as the contact the link was for");
 
   // Messages both ways, with a reply.
   const hello = ann.run("send", "hello from the terminal").id;
@@ -149,7 +155,7 @@ try {
   await laptop.getByPlaceholder("Message").fill("hello from the browser");
   await laptop.getByPlaceholder("Message").press("Enter");
   const reply = await ann.printed(e => e.type === "message" && e.content === "hello from the browser");
-  check(reply.reply_to === hello && reply.from.name === "Matthew", "a native session gets the browser's reply");
+  check(reply.reply_to === hello && reply.from.name === "Matt", "a native session gets the browser's reply");
   await laptop.locator(".messages li", { hasText: "hello from the browser" }).locator(".status").waitFor({ state: "detached" });
   check(true, "and the browser shows it held, not pending, once the receipt arrives");
 
@@ -238,10 +244,30 @@ try {
   await phone.locator(".messages li", { hasText: "the report" }).getByRole("button", { name: "Download report.txt" }).waitFor();
   const [reportHash, ...others] = (await kept(phone)).filter(hash => !before.includes(hash));
   check(reportHash && !others.length, "the phone keeps a file a message attached");
+
+  // The phone is renamed: Matthew's desk lists it so, and its session shows the new name in the chat at once.
+  await phone.locator(".back:visible").click();
+  await phone.locator(".me").click();
+  await phone.locator(".devices li", { hasText: "this browser" }).getByRole("button", { name: "Rename" }).click();
+  await phone.locator("dialog").getByLabel("This device").fill("pocket");
+  await phone.locator("dialog").getByRole("button", { name: "Rename" }).click();
+  await phone.locator(".devices li", { hasText: "pocket" }).waitFor();
+  const listed = await until(
+    () => desk.run("identity", "list").identities[0].devices.map(d => d.name),
+    names => names.includes("pocket")
+  );
+  check(listed.includes("pocket") && !listed.includes("phone"), "a renamed browser shows under its new name in another device's list");
+  const renamed = await until(
+    () => desk.run("members", `--group=${team.group}`).members.map(m => m.device),
+    devices => devices.includes("pocket")
+  );
+  check(renamed.includes("pocket"), "and in a group's members");
+  await phone.locator(".back:visible").click();
+  await phone.locator(".group-list button", { hasText: "Team" }).click();
   await phone.getByRole("button", { name: "Settings" }).click();
   await phone.getByRole("button", { name: "Leave chat" }).click();
   await phone.getByRole("button", { name: "Leave for good?" }).click();
-  await desk.printed(e => e.type === "left" && e.member.device === "phone");
+  await desk.printed(e => e.type === "left" && e.member.device === "pocket");
   await phone.locator(".group-list button", { hasText: "Team" }).waitFor({ state: "detached" });
   const told = await phone.evaluate(() => window.toasts.splice(0));
   check(told.every(t => t.startsWith("Asked the others to remove you") || t.startsWith("You were removed from Team")), `the phone leaves the chat (${told.length} notices)`);
@@ -252,6 +278,27 @@ try {
     hashes => !hashes.includes(reportHash)
   );
   check(!left.includes(reportHash) && before.every(hash => left.includes(hash)), "and deletes the file no group links any longer");
+
+  // A kiosk starts a chat as Kim, its own identity, then opens a device link of Matthew's: it moves to his identity,
+  // leaving Kim, which ends, and the chat.
+  const kiosk = await open("kiosk", { viewport: { width: 1280, height: 800 } });
+  await kiosk.goto(SITE);
+  await kiosk.getByLabel("Your name").fill("Kim");
+  await kiosk.getByLabel("This device").fill("kiosk");
+  await kiosk.getByLabel("Name", { exact: true }).fill("Kiosk notes");
+  await kiosk.getByRole("button", { name: "New chat" }).click();
+  await kiosk.locator(".group-list button", { hasText: "Kiosk notes" }).waitFor();
+  check((await kiosk.locator(".me").textContent()).includes("Kim"), "a chat started from the welcome screen makes the browser its identity's first device");
+  await kiosk.goto(local(desk.run("invite", "--identity", "Matthew").link));
+  const moving = kiosk.locator("dialog", { hasText: "Move this browser to another identity" });
+  await moving.waitFor();
+  const said = await moving.textContent();
+  check(said.includes("It leaves Kim, which ends") && said.includes("as Kim: Kiosk notes"), "a device link opened in a browser on an identity says what moving does");
+  await moving.getByRole("button", { name: "Move this browser" }).click();
+  await kiosk.locator(".devices li", { hasText: "this browser" }).waitFor();
+  check((await kiosk.locator(".me").textContent()).includes("Matthew"), "and moves the browser to the identity of the link");
+  const moved = desk.run("identity", "list").identities[0].devices.map(d => d.name);
+  check(moved.includes("kiosk") && (await kiosk.locator(".group-list button", { hasText: "Kiosk notes" }).count()) === 0, "which lists it, and it left Kim's chat");
 
   check((await laptop.evaluate(() => window.toasts)).length === 0, "the laptop showed no error before its reload");
 
@@ -317,10 +364,8 @@ try {
   await ann.printed(e => e.type === "message" && e.content === "the second tab runs it");
   check(true, "when the first tab closes, the second runs the session");
 
-  // The laptop starts an identity of its own, and its device link adds a native session's device to it.
+  // The laptop's device link adds a native session's device to its identity.
   await laptop.locator(".me").click();
-  await laptop.getByLabel("Your name").fill("Matt");
-  await laptop.getByRole("button", { name: "Start" }).click();
   await laptop.locator(".devices li", { hasText: "this browser" }).waitFor();
   await laptop.getByRole("button", { name: "Add a device" }).click();
   const link = await laptop.locator("dialog .copy code").first().textContent();
