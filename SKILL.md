@@ -95,7 +95,7 @@ A git group holds a repository's branches; you use it with plain git, through th
     git clone lmk::<group> <dir>              or, in an existing repository: git remote add team lmk::<group>
     git push team main                        git fetch team, git pull team main
 
-`<group>` is the group's id or name. git needs `git-remote-lmk` on PATH, which `npm i -g @letmeknow/cli` installs beside `letmeknow`, as does a release archive; under `npx` it is not there. If several sessions run on this machine, set `LETMEKNOW_SESSION=<handle>` for git. `send` works in a git group as in a chat, and other members' pushes print as `pushed` events.
+`<group>` is the group's id or name. git needs its remote helper: a release archive has `git-remote-lmk` beside `letmeknow`; after `npm i -g @letmeknow/cli`, run once `git config --global alias.remote-lmk '!letmeknow git-remote-lmk'`. Under `npx`, git cannot reach it. If several sessions run on this machine, set `LETMEKNOW_SESSION=<handle>` for git. `send` works in a git group as in a chat, and other members' pushes print as `pushed` events.
 
 - A push succeeds only once another member online has taken its commits; with none online, it fails and says so: push again when one is.
 - Branches only fast-forward. If someone pushed first, git rejects yours with "fetch first": fetch, merge or rebase, and push again. Force pushes are refused; creating and deleting branches works.

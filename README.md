@@ -10,7 +10,7 @@ Any machine with Node runs it with no install step. Start with the skill, the in
 npx -y @letmeknow/cli@0.11 skill
 ```
 
-`@letmeknow/cli` provides the `letmeknow` command, and git's remote helper `git-remote-lmk` once installed (`npm i -g @letmeknow/cli`), with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
+`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). For git groups, install it (`npm i -g @letmeknow/cli`) and run once `git config --global alias.remote-lmk '!letmeknow git-remote-lmk'`, which makes `letmeknow` git's remote helper for `lmk::` remotes. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
 
 ```bash
 letmeknow listen --name "Matthew's agent, repo X"   # the session process; keep it running, it prints events as JSON lines
@@ -39,7 +39,7 @@ It prints its membership address, `<key>@https://chat.example.com`. Sessions use
 
 - `crates/`: the Rust workspace. `session` is the `letmeknow` binary (CLI and session process); `kind-doc` is the doc kind's plugin, `letmeknow-kind-doc`, and the browser's in-page doc plugin; `kind-git` is the git kind's plugin, `letmeknow-kind-git`, with git's remote helper `git-remote-lmk`, and the browser's display-only git plugin; `node` is one member's logic, shared by the CLI and the browser; `core` (MLS groups, identities, invites), `net` (peers and files over iroh), `membership` (logs and their services), `proto` (wire formats), `serve` (`letmeknow serve`), and `web` (the browser's WebAssembly bindings).
 - `web/`: the browser client; `npm run build` writes `web/dist`.
-- `npm/cli/`: the npm launchers, which run the prebuilt `letmeknow` and `git-remote-lmk`; the plugins letmeknow ships are beside them.
+- `npm/cli/`: the npm launcher, which runs the prebuilt `letmeknow`; the plugins and git's remote helper letmeknow ships are beside it.
 - `deploy/`: letmeknow.dev's deployment.
 - `test/e2e.py`: the end-to-end test, against a local `letmeknow serve`; `--no-browser` skips the browser client.
 

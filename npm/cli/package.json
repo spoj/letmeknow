@@ -5,8 +5,7 @@
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/spoj/letmeknow.git" },
   "bin": {
-    "letmeknow": "bin/letmeknow.js",
-    "git-remote-lmk": "bin/git-remote-lmk.js"
+    "letmeknow": "bin/letmeknow.js"
   },
   "files": [
     "bin"
