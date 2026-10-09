@@ -190,7 +190,7 @@ The plaintext of an MLS application message is JSON with a `type`. `leave`, `int
 
 | `type` | Fields |
 |---|---|
-| `leave` | none: the sender asks to be removed; the first member to see it commits the Remove |
+| `leave` | none: the sender asks to be removed; the first member to see it commits the Remove, and in a devices group then replaces the identity's key (see Devices group) |
 | `introduce` | `identity` (`id`, `membership`), `name`, `how` (`invite`, `open`, `introduce`), and optional `to`: who a member is to the sender; sent once someone joins by the sender's invite or the sender admits someone to an open group, and by `introduce` |
 | `refused` | `messages`: `[{"id", "reason"}]`, the messages the sender gave up since its last `refused`; `reason` is `size` (larger than it takes), `old` (under an epoch whose keys it no longer holds, or below its floor), `removed` (from a member removed more than 5 minutes before it arrived) or `unreadable` (it did not open) |
 | `invite` | `hash`, SHA-256 of an invite's secret, `expires` (ms), and optional `label` (`--for`) and `to` (`--to`, an identity id): a rule any member admits a joiner by, once (see Invites) |
