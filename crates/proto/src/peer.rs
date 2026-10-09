@@ -31,8 +31,13 @@ pub enum Frame {
     Join { group: Bytes, key_package: Bytes },
     Admitted { group: Bytes, admitted: Admitted },
     Refused { group: Bytes, refused: String },
-    /// A file link to the state of the group's kind, which the sender's kind hands this member.
-    State { group: Bytes, link: String },
+    /// A file link to the state of the group's kind, which the sender's kind hands this member; without one, a request
+    /// for one.
+    State {
+        group: Bytes,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
+    },
     /// A frame of the group's kind.
     #[serde(untagged)]
     Kind(KindFrame),
@@ -103,6 +108,9 @@ pub struct Hello {
     pub floor: u64,
     /// The epoch the sender joined.
     pub joined: u64,
+    /// The newest signed head the sender holds of the kind's log, if it follows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<Head>,
 }
 
 /// An identity's device list as its membership service showed it: every entry, and the service's signed head over

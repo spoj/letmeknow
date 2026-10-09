@@ -64,8 +64,11 @@ pub trait Groups: Send + Sync + 'static {
     fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Taken;
     /// A frame of the group's kind from `peer`, a member.
     fn frame(&self, peer: EndpointId, frame: KindFrame);
-    /// A link to the state of the group's kind, which `peer`, a member, hands this session.
-    fn state(&self, group: &[u8], peer: EndpointId, link: String);
+    /// A link to the state of the group's kind, which `peer`, a member, hands this session; without one, `peer` asks
+    /// for the kind's state.
+    fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>);
+    /// The newest signed head `peer`, a member, holds of the group's kind log.
+    fn log_head(&self, peer: EndpointId, group: &[u8], head: Head);
     /// The files the group links now.
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
     /// The device lists this session holds, with signed heads, of the identities in these groups.

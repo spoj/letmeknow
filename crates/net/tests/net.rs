@@ -156,7 +156,7 @@ async fn kind_frames_live_messages_and_state_links_reach_one_member() {
     let live = [&1u64.to_be_bytes()[..], &[1], b"edit"].concat();
     for peer in [members[1], members[2]] {
         assert!(a.net.frame(peer, Frame::Kind(frame.clone())));
-        assert!(a.net.frame(peer, Frame::State { group: Bytes(G.to_vec()), link: "lmk:state".into() }));
+        assert!(a.net.frame(peer, Frame::State { group: Bytes(G.to_vec()), link: Some("lmk:state".into()) }));
         assert!(a.net.send_to(peer, G, live.clone()));
     }
     eventually("the frame, state link and live message reach B", || {
@@ -164,7 +164,7 @@ async fn kind_frames_live_messages_and_state_links_reach_one_member() {
     })
     .await;
     assert_eq!(b.fake.frames.lock().unwrap()[0], (members[0], frame));
-    assert_eq!(b.fake.states.lock().unwrap()[0], (G.to_vec(), members[0], "lmk:state".to_string()));
+    assert_eq!(b.fake.states.lock().unwrap()[0], (G.to_vec(), members[0], Some("lmk:state".to_string())));
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(c.fake.frames.lock().unwrap().is_empty() && c.fake.states.lock().unwrap().is_empty(), "none reach a non-member");
     assert!(c.fake.groups.lock().unwrap()[G].live.is_empty());

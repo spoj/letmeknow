@@ -36,6 +36,8 @@ const FETCH_WAIT: Duration = Duration::from_secs(60);
 const INVITE_TTL: u64 = 600;
 /// How long the session waits for a plugin's answer.
 const ASK_WAIT: Duration = Duration::from_secs(60);
+/// How long a plugin's `spread` waits for a member online to hold its file.
+const SPREAD_WAIT: Duration = Duration::from_secs(30);
 /// How often a session process that does not act for the device tries its lock.
 const DEVICE_RETRY: Duration = Duration::from_secs(10);
 
@@ -60,6 +62,14 @@ pub enum Inbound {
     Request(Box<Request>, oneshot::Sender<Value>),
     /// A warning of the device's node: of its events, only these concern the agent.
     DeviceWarning(String),
+    /// A plugin's request that the session carried out in the background, to answer now.
+    Done { kind: String, group: Bytes, id: Value, done: Result<Done> },
+}
+
+/// What a plugin's request carried out in the background came to.
+pub enum Done {
+    Appended(u64),
+    Holders(Vec<Member>),
 }
 
 /// What the session process acting for the device publishes of it.
@@ -128,9 +138,15 @@ pub struct Session {
     asked: u64,
     /// Inviters' requests for a kind's state, by plugin and request id.
     snapshots: HashMap<(String, u64), oneshot::Sender<Option<Vec<u8>>>>,
+    /// Commands a plugin is carrying out, by plugin and request id.
+    commands: HashMap<(String, u64), oneshot::Sender<Value>>,
     kind_fetches: Vec<KindFetch>,
     /// What plugins show of their groups in `groups`.
     infos: HashMap<Bytes, Value>,
+    /// The kinds whose groups carry chat too, as their plugins said when they started.
+    chat_kinds: HashSet<String>,
+    /// The last position of each group's kind log handed to its plugin, once the plugin follows the log.
+    handed: HashMap<Bytes, u64>,
 }
 
 pub fn fp(key: &[u8]) -> String {
@@ -202,16 +218,21 @@ impl Session {
             kind_of: HashMap::new(),
             asked: 0,
             snapshots: HashMap::new(),
+            commands: HashMap::new(),
             kind_fetches: Vec::new(),
             infos: HashMap::new(),
+            chat_kinds: HashSet::new(),
+            handed: HashMap::new(),
         };
         session.take_device().await?;
         for gid in session.node.groups() {
             session.outbox.catch_up(&b64(&gid.0));
-            if session.node.settings(&gid.0)?.kind != CHAT {
-                if let Err(error) = session.open_kind(&gid, None).await {
-                    session.warn(Some(&gid), format!("{error:#}"));
-                }
+            if session.node.settings(&gid.0)?.kind != CHAT
+                && let Err(error) = session.open_kind(&gid, None).await
+            {
+                session.warn(Some(&gid), format!("{error:#}"));
+            }
+            if !session.chats(&gid) {
                 continue;
             }
             // Messages that arrived but were never taken in, as when the session stopped while they waited.
@@ -376,6 +397,12 @@ impl Session {
                     if let Err(error) = self.fetch(link, reply).await {
                         self.warn(None, format!("{error:#}"));
                     }
+                } else if let Request::Kind { kind, args, cwd } = request {
+                    // A plugin's command may take a while, and may need this session meanwhile: it is answered when the
+                    // plugin answers.
+                    if let Err(error) = self.command(kind, args, cwd, reply).await {
+                        self.warn(None, format!("{error:#}"));
+                    }
                 } else {
                     let result = self.request(request).await;
                     // Before the answer, so that the device's other session processes read what the request changed.
@@ -385,6 +412,22 @@ impl Session {
                 self.outbox.flush_held();
             }
             Inbound::DeviceWarning(text) => self.warn(None, format!("this device: {text}")),
+            Inbound::Done { kind, group, id, done } => {
+                let answer = match done {
+                    Ok(Done::Appended(position)) => self.hand_entries(&group).await.map(|()| json!({ "position": position })),
+                    Ok(Done::Holders(holders)) => {
+                        holders.iter().map(|m| self.describe(&group, m)).collect::<Result<Vec<_>>>().map(|held_by| json!({ "held_by": held_by }))
+                    }
+                    Err(error) => Err(error),
+                };
+                let answer = match answer {
+                    Ok(answer) => json!({ "type": "answer", "id": id, "answer": answer }),
+                    Err(error) => json!({ "type": "answer", "id": id, "error": format!("{error:#}") }),
+                };
+                if let Err(error) = self.plugins.send(&kind, &answer).await {
+                    self.warn(Some(&group), format!("{error:#}"));
+                }
+            }
         }
     }
 
@@ -400,6 +443,7 @@ impl Session {
             | Event::Synced { group }
             | Event::InStep { group, .. }
             | Event::State { group, .. }
+            | Event::Logged { group }
             | Event::Snapshot { group, .. }
             | Event::Introduced { group, .. }
             | Event::Held { group, .. }
@@ -437,7 +481,7 @@ impl Session {
                 self.outbox.deliver(item, true);
                 self.refresh_opening(&group).await?;
             }
-            Event::Message(message) if self.node.settings(&message.group.0)?.kind == CHAT => self.received(message).await?,
+            Event::Message(message) if message.payload["type"] == "message" && self.chats(&message.group) => self.received(message).await?,
             Event::Message(message) => {
                 let from = self.describe(&message.group, &message.sender)?;
                 let item = json!({ "type": "message", "id": hex::encode(&message.id.0), "from": from, "payload": message.payload, "held": true });
@@ -467,6 +511,7 @@ impl Session {
                 let item = json!({ "type": "state", "from": self.describe(&group, &from)?, "data": Bytes(data) });
                 self.tell_plugin(&group, item).await?;
             }
+            Event::Logged { group } => self.hand_entries(&group).await?,
             Event::Snapshot { group, reply } => {
                 if let Some(kind) = self.kind_of.get(&group).cloned() {
                     self.asked += 1;
@@ -540,13 +585,7 @@ impl Session {
                 let gid = self.resolve(group)?;
                 Ok(json!({ "group": b64(&gid.0), "kind": self.node.settings(&gid.0)?.kind, "members": self.described_members(&gid)? }))
             }
-            Request::Kind { kind, args, cwd } => {
-                if !self.plugins.is_running(&kind) {
-                    let dir = self.kind_dir(&kind);
-                    self.plugins.start(&kind, &dir).await?;
-                }
-                self.ask(&kind, json!({ "type": "command", "args": args, "cwd": cwd })).await
-            }
+            Request::Kind { .. } => unreachable!("answered by command"),
             Request::Groups => self.groups(),
             Request::Remove { group, member } => {
                 let gid = self.resolve(group)?;
@@ -639,6 +678,7 @@ impl Session {
                             membership,
                             devices_of: None,
                             openings: Vec::new(),
+                            log: None,
                         };
                         let gid = self.node.create(settings, as_)?;
                         if kind != CHAT {
@@ -775,15 +815,19 @@ impl Session {
         }
     }
 
-    /// The chat a command acts on: the one --group names, or else the session's one chat.
+    /// Whether a group carries chat: a chat, or a group of a kind whose plugin says its groups do.
+    fn chats(&self, gid: &Bytes) -> bool {
+        self.node.settings(&gid.0).is_ok_and(|s| s.kind == CHAT || self.chat_kinds.contains(&s.kind))
+    }
+
+    /// The group carrying chat a command acts on: the one --group names, or else the session's one such group.
     fn chat(&self, group: Option<String>) -> Result<Bytes> {
         if group.is_some() {
             let gid = self.resolve(group)?;
-            ensure!(self.node.settings(&gid.0)?.kind == CHAT, "{} is not a chat", b64(&gid.0));
+            ensure!(self.chats(&gid), "{} carries no chat", b64(&gid.0));
             return Ok(gid);
         }
-        let found: Vec<Bytes> =
-            self.node.groups().into_iter().filter(|gid| self.node.settings(&gid.0).is_ok_and(|s| s.kind == CHAT)).collect();
+        let found: Vec<Bytes> = self.node.groups().into_iter().filter(|gid| self.chats(gid)).collect();
         match &found[..] {
             [gid] => Ok(gid.clone()),
             [] => bail!("this session is in no chat; create one with `invite`, or join one with `join`"),
@@ -1194,7 +1238,7 @@ impl Session {
         let settings = self.node.settings(&gid.0)?;
         let kind = settings.kind.clone();
         if !self.plugins.is_running(&kind) {
-            self.plugins.start(&kind, &self.kind_dir(&kind)).await?;
+            self.start_plugin(&kind).await?;
         }
         self.kind_of.insert(gid.clone(), kind.clone());
         let me = self.describe_key(gid, &self.node.key());
@@ -1218,6 +1262,42 @@ impl Session {
             self.forget_legacy(gid)?;
         }
         Ok(answer)
+    }
+
+    /// Starts a kind's plugin, which answers `start` with what its groups carry besides its own content.
+    async fn start_plugin(&mut self, kind: &str) -> Result<()> {
+        self.plugins.start(kind).await?;
+        let started = self.ask(kind, json!({ "type": "start", "kind": kind, "dir": self.kind_dir(kind) })).await?;
+        if started["chat"] == true {
+            self.chat_kinds.insert(kind.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Hands a group's plugin the entries of its kind's log it has not had.
+    async fn hand_entries(&mut self, gid: &Bytes) -> Result<()> {
+        let Some(&after) = self.handed.get(gid) else { return Ok(()) };
+        for entry in self.node.entries(&gid.0, after)? {
+            let item = json!({ "type": "entry", "position": entry.position, "epoch": entry.epoch, "from": self.describe(gid, &entry.from)?, "payload": entry.payload });
+            self.tell_plugin(gid, item).await?;
+            self.handed.insert(gid.clone(), entry.position);
+        }
+        Ok(())
+    }
+
+    /// Passes `letmeknow <kind> <args>...` to the kind's plugin; `reply` gets its answer.
+    async fn command(&mut self, kind: String, args: Vec<String>, cwd: String, reply: oneshot::Sender<Value>) -> Result<()> {
+        let started = match self.plugins.is_running(&kind) {
+            true => Ok(()),
+            false => self.start_plugin(&kind).await,
+        };
+        if let Err(error) = started {
+            let _ = reply.send(json!({ "error": format!("{error:#}") }));
+            return Ok(());
+        }
+        self.asked += 1;
+        self.commands.insert((kind.clone(), self.asked), reply);
+        self.plugins.send(&kind, &json!({ "type": "command", "id": self.asked, "args": args, "cwd": cwd })).await
     }
 
     /// Whether a table 0.10 kept docs in is still here: `bindings`, or `carrying`, which 0.10.0 lacks.
@@ -1309,13 +1389,15 @@ impl Session {
     /// A line a plugin wrote, or `None` once it stopped, when it is started again.
     pub async fn plugin_line(&mut self, kind: String, line: Option<Value>) {
         let Some(message) = line else {
+            // Its commands' callers hear that the session could not answer.
+            self.commands.retain(|(of, _), _| *of != kind);
             if !self.plugins.stopped(&kind) {
                 self.warn(None, format!("the {kind} plugin stopped; it runs again once this session restarts"));
                 return;
             }
             self.warn(None, format!("the {kind} plugin stopped; starting it again"));
             let restarted = async {
-                self.plugins.start(&kind, &self.kind_dir(&kind)).await?;
+                self.start_plugin(&kind).await?;
                 let gids: Vec<Bytes> = self.kind_of.iter().filter(|(_, k)| **k == kind).map(|(gid, _)| gid.clone()).collect();
                 for gid in gids {
                     self.open_kind(&gid, None).await?;
@@ -1365,6 +1447,25 @@ impl Session {
                 }
             }
             "send" => self.node.send_live(&group()?.0, &message["payload"], to)?,
+            "log" => {
+                let gid = group()?;
+                let from = message["after"].as_u64().map(|after| (after, message["epoch"].as_u64().unwrap_or_default()));
+                self.node.follow_log(&gid.0, from)?;
+                if let Some((after, _)) = from {
+                    self.handed.insert(gid.clone(), after);
+                    self.hand_entries(&gid).await?;
+                }
+            }
+            "append" => {
+                let (node, group, payload) = (self.node.clone(), group()?, message["payload"].clone());
+                self.background(kind, group.clone(), message["id"].clone(), async move { Ok(Done::Appended(node.append(&group.0, &payload).await?)) });
+            }
+            "spread" => {
+                let (node, gid) = (self.node.clone(), group()?);
+                let link = FileLink::parse(message["link"].as_str().context("no link")?)?;
+                let holders = async move { Ok(Done::Holders(node.holders(&gid.0, &link, SPREAD_WAIT).await)) };
+                self.background(kind, group()?, message["id"].clone(), holders);
+            }
             "frame" => self.node.frame(&group()?.0, to.context("a frame goes to a member")?, message["frame"].clone())?,
             "add" => {
                 let data = serde_json::from_value::<Bytes>(message["data"].clone())?.0;
@@ -1408,6 +1509,12 @@ impl Session {
             "info" => _ = self.infos.insert(group()?, message["info"].clone()),
             "answer" => {
                 let id = message["id"].as_u64().unwrap_or_default();
+                if let Some(reply) = self.commands.remove(&(kind.to_owned(), id)) {
+                    let _ = reply.send(match &message["error"] {
+                        Value::Null => message["answer"].clone(),
+                        error => json!({ "error": error }),
+                    });
+                }
                 if let Some(reply) = self.snapshots.remove(&(kind.to_owned(), id)) {
                     let data = message["answer"]["data"].as_str().and_then(|data| URL_SAFE_NO_PAD.decode(data).ok());
                     let _ = reply.send(data);
@@ -1416,6 +1523,14 @@ impl Session {
             other => bail!("unknown message {other:?}"),
         }
         Ok(())
+    }
+
+    /// Carries out a plugin's request without holding up the session; its answer follows as `Inbound::Done`.
+    fn background(&self, kind: &str, group: Bytes, id: Value, done: impl Future<Output = Result<Done>> + Send + 'static) {
+        let (inbound, kind) = (self.inbound.clone(), kind.to_owned());
+        tokio::spawn(async move {
+            let _ = inbound.send(Inbound::Done { kind, group, id, done: done.await });
+        });
     }
 
     // Members, identities and contacts.

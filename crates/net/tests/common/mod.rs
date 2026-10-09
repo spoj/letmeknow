@@ -204,8 +204,11 @@ pub struct Fake {
     pub presented: Mutex<Vec<(EndpointId, List)>>,
     /// Kinds' frames and state links from peers.
     pub frames: Mutex<Vec<(EndpointId, KindFrame)>>,
-    pub states: Mutex<Vec<(Vec<u8>, EndpointId, String)>>,
+    pub states: Mutex<Vec<StateLink>>,
 }
+
+/// A group, the peer, and the link it handed, or none when it asked for a state.
+pub type StateLink = (Vec<u8>, EndpointId, Option<String>);
 
 impl Fake {
     pub fn new(service: &SigningKey) -> Arc<Fake> {
@@ -266,7 +269,7 @@ impl Groups for Fake {
         let g = &groups[group];
         let length = g.log.len() as u64;
         let head = Head::sign(&self.service, group, length, Self::chain_of(&g.log, group, g.log.len()), 0);
-        Hello { group: group.into(), epoch: length, head, floor: g.floor, joined: g.joined }
+        Hello { group: group.into(), epoch: length, head, floor: g.floor, joined: g.joined, log: None }
     }
 
     fn verify_head(&self, _: &[u8], head: &Head) -> bool {
@@ -329,9 +332,11 @@ impl Groups for Fake {
         self.frames.lock().unwrap().push((peer, frame));
     }
 
-    fn state(&self, group: &[u8], peer: EndpointId, link: String) {
+    fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>) {
         self.states.lock().unwrap().push((group.to_vec(), peer, link));
     }
+
+    fn log_head(&self, _: EndpointId, _: &[u8], _: Head) {}
 
     fn files(&self, group: &[u8]) -> Vec<FileLink> {
         self.groups.lock().unwrap()[group].files.clone()

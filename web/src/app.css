@@ -156,6 +156,7 @@ blockquote { margin: 2px 0; padding: 0 var(--s2); border-left: 2px solid var(--l
 .messages li.event { margin-top: var(--s2); font-size: var(--t-sm); color: var(--muted); }
 .messages li.event .who { font-weight: 500; color: var(--text); }
 .messages li.event time { margin-left: var(--s2); }
+.messages li.pushed ul { margin: var(--s1) 0 0; padding-left: var(--s4); color: var(--text); }
 .messages li.day { align-self: center; margin: var(--s4) 0 0; font-size: 12px; font-weight: 600; color: var(--muted); }
 .empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--s3); padding: var(--s5); text-align: center; pointer-events: none; }
 .empty > * { pointer-events: auto; max-width: 24rem; }
