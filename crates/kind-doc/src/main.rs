@@ -170,7 +170,10 @@ impl Plugin {
                     self.out.push(answer(id, Ok(json!({ "file": file }))));
                 }
             }
-            "gone" => self.gone(&group)?,
+            "gone" => {
+                self.gone(&group)?;
+                self.out.push(answer(&message["id"], Ok(json!({}))));
+            }
             "command" => self.command(message)?,
             "sync" => {
                 let groups: Vec<String> = self.bindings.keys().cloned().collect();

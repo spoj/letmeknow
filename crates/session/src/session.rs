@@ -730,7 +730,8 @@ impl Session {
     async fn drop_group(&mut self, gid: &Bytes) -> Result<()> {
         self.infos.remove(gid);
         if let Some(kind) = self.kind_of.remove(gid) {
-            self.plugins.send(&kind, &json!({ "type": "gone", "group": b64(&gid.0) })).await?;
+            // Answered once the plugin let go of the group, so that a doc file it made is gone when `leave` returns.
+            self.ask(&kind, json!({ "type": "gone", "group": b64(&gid.0) })).await?;
         }
         for table in ["taken", "attachments"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [&gid.0])?;

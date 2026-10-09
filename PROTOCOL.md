@@ -222,7 +222,7 @@ The session sends:
 |---|---|
 | `{"type": "start", "id", "kind", "dir"}` | The first line, a request. `dir` is the plugin's own state directory, `sessions/<handle>/kinds/<kind>/`. Answered `{}`, or `{"chat": true}` if the kind's groups carry chat too: then their `message` payloads are the session's chat, which `send` sends there, and do not reach the plugin |
 | `{"type": "group", "group", "settings", "me"}`, and optionally `id`, `command`, `args`, `cwd`, `import` | The session is in a group of the kind: for each when the plugin starts, and when the session makes one (`command`: `invite`) or joins one (`join`), with the command's arguments for the kind and the directory they are relative to, as a request. `me` is this session as the group's members see it. `import`: a doc 0.10 kept (see Doc). A session whose plugin refuses a group it makes or joins leaves it |
-| `{"type": "gone", "group"}` | The session left the group, or was removed |
+| `{"type": "gone", "id", "group"}` | The session left the group, or was removed: answered once the plugin let go of what it kept for the group, such as a doc file it made. The browser sends no `id` and waits for no answer |
 | `{"type": "message", "group", "from", "payload", "held"}`, and `id` if held | A payload of the kind from a member |
 | `{"type": "frame", "group", "from", "frame"}` | A frame from a member, `{"<name>": {...}}` |
 | `{"type": "synced", "group", "member"}` | The session and a connected member hold the same log of the group: a time to compare state |

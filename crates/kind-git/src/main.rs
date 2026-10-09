@@ -165,6 +165,7 @@ impl Plugin {
                         false => {}
                     }
                 }
+                self.out.push(answer(&message["id"], Ok(json!({}))));
             }
             "entry" => self.entry(&group, message)?,
             "message" if message["payload"]["type"] == "bundle" => {
