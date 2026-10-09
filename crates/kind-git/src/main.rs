@@ -23,9 +23,12 @@ struct Group {
 
 /// A request of ours waiting for the session's answer.
 enum Waiting {
-    /// A push's bundle being added; then it is announced and spread, and the push appended.
+    /// A push's bundle being added; then the push is sent as a held message, its bundle spread, and its message's id
+    /// appended.
     Add { command: Value, group: String, push: Push },
-    Spread { command: Value, group: String, push: Push },
+    Send { command: Value, group: String, push: Push },
+    /// The bundle spreading, and the members that hold the push's message.
+    Spread { command: Value, group: String, message: String, held_by: Vec<Value> },
     Append { command: Value },
     /// A pushed bundle, to check.
     Check { group: String, position: u64 },
@@ -168,9 +171,9 @@ impl Plugin {
                 self.out.push(answer(&message["id"], Ok(json!({}))));
             }
             "entry" => self.entry(&group, message)?,
-            "message" if message["payload"]["type"] == "bundle" => {
+            "message" if message["payload"]["type"] == "push" && message["payload"]["bundle"].is_string() => {
                 // A push's bundle, ahead of its entry: held, and so fetched, within this session's limit.
-                self.out.push(json!({ "type": "hold", "group": group, "links": [message["payload"]["link"]] }));
+                self.out.push(json!({ "type": "hold", "group": group, "links": [message["payload"]["bundle"]] }));
             }
             "state" => self.state(&group, serde_json::from_slice(&bytes(&message["data"])?)?)?,
             "snapshot" => self.snapshot(&group, &message["id"])?,
@@ -197,7 +200,7 @@ impl Plugin {
             Err(_) => None,
         };
         let follow = match &kept {
-            Some(branches) => json!({ "type": "log", "group": group, "after": branches.position, "epoch": branches.epoch }),
+            Some(branches) => json!({ "type": "log", "group": group, "after": branches.position }),
             None => json!({ "type": "log", "group": group }),
         };
         let name = message["settings"]["name"].as_str().unwrap_or_default().to_owned();
@@ -212,8 +215,8 @@ impl Plugin {
 
     fn entry(&mut self, group: &str, message: &Value) -> Result<()> {
         let branches = self.groups.get_mut(group).and_then(|g| g.branches.as_mut()).context("an entry before the group's state")?;
-        let (position, epoch) = (message["position"].as_u64().context("no position")?, message["epoch"].as_u64().unwrap_or_default());
-        if let Some(taken) = branches.take(position, epoch, message["from"].clone(), &message["payload"]) {
+        let position = message["position"].as_u64().context("no position")?;
+        if let Some(taken) = branches.take(position, message["from"].clone(), &message["payload"]) {
             let (push, from) = (taken.push.clone(), taken.from.clone());
             let counts = branches.counts(position);
             if let Some(link) = &push.bundle {
@@ -294,7 +297,7 @@ impl Plugin {
         g.branches = Some(Branches::from_state(&state));
         g.checking = false;
         self.save(group)?;
-        self.out.push(json!({ "type": "log", "group": group, "after": state.position, "epoch": state.epoch }));
+        self.out.push(json!({ "type": "log", "group": group, "after": state.position }));
         Ok(())
     }
 
@@ -304,8 +307,7 @@ impl Plugin {
             self.out.push(answer(asked, Ok(json!({}))));
             return Ok(());
         };
-        let (position, epoch) = branches.settled;
-        let state = State { position, epoch, refs: branches.refs.clone(), bundle: None };
+        let state = State { position: branches.settled, refs: branches.refs.clone(), bundle: None };
         if state.refs.is_empty() {
             self.out.push(answer(asked, Ok(json!({ "data": Bytes(serde_json::to_vec(&state)?) }))));
             return Ok(());
@@ -348,7 +350,7 @@ impl Plugin {
                         let add = json!({ "type": "add", "group": group, "data": Bytes(data) });
                         self.request(add, Waiting::Add { command, group, push });
                     }
-                    None => self.append(command, &group, push),
+                    None => self.send(command, &group, push),
                 }
             }
             _ => bail!("the git kind's commands are for git-remote-lmk: use `git remote add <name> lmk::<group>`, then git push and git fetch"),
@@ -356,10 +358,21 @@ impl Plugin {
         Ok(())
     }
 
-    fn append(&mut self, command: Value, group: &str, push: Push) {
-        let mut payload = serde_json::to_value(push).expect("JSON");
+    /// Sends a push as a held message, which members hold, and fetch its bundle, ahead of its entry.
+    fn send(&mut self, command: Value, group: &str, push: Push) {
+        let mut payload = serde_json::to_value(&push).expect("JSON");
         payload["type"] = json!("push");
-        self.request(json!({ "type": "append", "group": group, "payload": payload }), Waiting::Append { command });
+        let send = json!({ "type": "send", "group": group, "payload": payload, "held": true });
+        self.request(send, Waiting::Send { command, group: group.to_owned(), push });
+    }
+
+    /// Appends a push's message to the log, once another member holds it and its bundle.
+    fn append(&mut self, command: Value, group: &str, message: &str, held: bool) {
+        if !held {
+            let error = anyhow::anyhow!("no other member is online to take the push, so it was not made; push again once one is");
+            return self.out.push(answer(&command, Err(error)));
+        }
+        self.request(json!({ "type": "append", "group": group, "message": message }), Waiting::Append { command });
     }
 
     fn answered(&mut self, message: &Value) -> Result<()> {
@@ -370,30 +383,38 @@ impl Plugin {
         };
         match (waiting, answered) {
             (Waiting::Add { command, group, mut push }, Ok(added)) => {
-                let link = added["link"].as_str().context("no link")?.to_owned();
-                // The members online fetch the bundle before the push is in the log.
-                self.out.push(json!({ "type": "send", "group": group, "payload": { "type": "bundle", "link": link } }));
-                push.bundle = Some(link.clone());
-                self.request(json!({ "type": "spread", "group": group, "link": link }), Waiting::Spread { command, group, push });
+                push.bundle = Some(added["link"].as_str().context("no link")?.to_owned());
+                self.send(command, &group, push);
             }
-            (Waiting::Spread { command, group, push }, Ok(spread)) => {
-                if spread["held_by"].as_array().is_none_or(Vec::is_empty) {
-                    let error = anyhow::anyhow!("no other member is online to take the push, so it was not made; push again once one is");
-                    self.out.push(answer(&command, Err(error)));
-                } else {
-                    self.append(command, &group, push);
+            (Waiting::Send { command, group, push }, Ok(sent)) => {
+                let message = sent["id"].as_str().context("no id")?.to_owned();
+                let held_by = sent["held_by"].as_array().cloned().unwrap_or_default();
+                match push.bundle {
+                    Some(link) => {
+                        let spread = json!({ "type": "spread", "group": group, "link": link });
+                        self.request(spread, Waiting::Spread { command, group, message, held_by });
+                    }
+                    None => self.append(command, &group, &message, !held_by.is_empty()),
                 }
+            }
+            (Waiting::Spread { command, group, message, held_by }, Ok(spread)) => {
+                let holds_both = |member: &Value| held_by.iter().any(|held| held["fp"] == member["fp"]);
+                let both = spread["held_by"].as_array().is_some_and(|holders| holders.iter().any(holds_both));
+                self.append(command, &group, &message, both);
             }
             (Waiting::Append { command }, Ok(appended)) => {
                 let position = appended["position"].as_u64().context("no position")?;
                 let answered = match self.won.remove(&position) {
                     Some(true) => Ok(json!({ "position": position })),
                     Some(false) => Err(anyhow::anyhow!("fetch first")),
-                    None => Err(anyhow::anyhow!("the group's keys changed as it pushed; push again")),
+                    None => Err(anyhow::anyhow!("the log did not take the push; push again")),
                 };
                 self.out.push(answer(&command, answered));
             }
-            (Waiting::Add { command, .. } | Waiting::Spread { command, .. } | Waiting::Append { command }, Err(error)) => {
+            (
+                Waiting::Add { command, .. } | Waiting::Send { command, .. } | Waiting::Spread { command, .. } | Waiting::Append { command },
+                Err(error),
+            ) => {
                 self.out.push(answer(&command, Err(error)));
             }
             (Waiting::Check { group, position }, fetched) => {

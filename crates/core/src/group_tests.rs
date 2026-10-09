@@ -560,31 +560,3 @@ fn a_kind_payload_is_held_when_its_sender_marks_it() {
     let held: Vec<bool> = [held, live, chat].iter().map(|c| w.m[1].open(c, 0).unwrap().held).collect();
     assert_eq!(held, [true, false, true]);
 }
-
-#[test]
-fn log_entries_are_marked_and_those_under_epochs_not_held_are_told_apart() {
-    let mut w = World::new(&["A", "B", "C"]);
-    w.found(0, &[1]);
-    let a = &mut w.m[0];
-    let entry = a.group.as_mut().unwrap().seal_entry(&a.provider, &a.session, &serde_json::json!({ "type": "push" })).unwrap().1;
-    let opened = w.m[1].open(&entry, 0).unwrap();
-    assert!(opened.log && !opened.held && opened.payload["type"] == "push");
-    let hi = w.m[0].send("hi");
-    assert!(!w.m[1].open(&hi, 0).unwrap().log);
-
-    let early = {
-        let a = &mut w.m[0];
-        a.group.as_mut().unwrap().seal_entry(&a.provider, &a.session, &serde_json::json!({ "type": "push" })).unwrap().1
-    };
-    let add = w.key_package(2);
-    let commit = w.m[0].commit(Change { add: vec![add], ..Change::default() });
-    let pos = w.post(commit.commit);
-    w.read(&[0, 1]);
-    w.m[2].join(commit.welcome.as_ref().unwrap(), pos);
-    assert!(w.m[2].open(&early, 0).unwrap_err().is::<Unheld>(), "a joiner holds no keys from before it joined");
-    assert!(!w.m[1].open(b"junk", 0).unwrap_err().is::<Unheld>());
-
-    let b = &mut w.m[1];
-    b.group.as_mut().unwrap().set_window(&b.provider, Window { epochs: 0, ..Window::default() }).unwrap();
-    assert!(w.m[1].open(&early, 0).unwrap_err().is::<Unheld>(), "nor keys past its window");
-}

@@ -45,7 +45,7 @@ impl Plugin {
 }
 
 #[test]
-fn a_doc_in_a_file_its_commands_and_frames() {
+fn a_doc_in_a_file_its_commands_and_its_comparisons() {
     let dir = std::env::temp_dir().join(format!("lmk-kind-doc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -67,10 +67,11 @@ fn a_doc_in_a_file_its_commands_and_frames() {
     assert_eq!((&attached["id"], &attached["answer"]["markdown"]), (&json!(2), &json!("![chart.png](lmk:x)")));
 
     // A member whose doc differs gets this doc's state vector; one that sends its own gets a diff, to it alone.
-    plugin.send(json!({ "type": "frame", "group": "g1", "from": { "fp": "bb" }, "frame": { "doc": { "snapshot": "AA" } } }));
-    let frame = plugin.next("frame");
-    assert_eq!((&frame["to"], frame["frame"]["doc_sv"]["sv"].is_string()), (&json!("bb"), true));
-    plugin.send(json!({ "type": "frame", "group": "g1", "from": { "fp": "bb" }, "frame": { "doc_sv": { "sv": "AA" } } }));
+    let from = |payload| json!({ "type": "message", "group": "g1", "from": { "fp": "bb" }, "payload": payload, "held": false });
+    plugin.send(from(json!({ "type": "snapshot", "snapshot": "AA" })));
+    let sv = plugin.next("send");
+    assert_eq!((&sv["to"], &sv["payload"]["type"]), (&json!("bb"), &json!("sv")));
+    plugin.send(from(json!({ "type": "sv", "sv": "AA" })));
     let diff = plugin.next("send");
     assert_eq!((&diff["to"], &diff["payload"]["type"]), (&json!("bb"), &json!("diff")));
 

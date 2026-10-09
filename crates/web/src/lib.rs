@@ -418,24 +418,16 @@ impl App {
         self.on_event.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string())).ok();
     }
 
-    /// Tells a group's in-page plugin of the group, made or joined by `command`; a doc with the state 0.10 kept of it
-    /// if it has none of its own yet.
+    /// Tells a group's in-page plugin of the group, made or joined by `command`.
     fn open_kind(self: &Rc<Self>, gid: &[u8], command: Option<&str>) -> Result<()> {
         let settings = self.node.settings(gid)?;
         if ![DOC, GIT].contains(&settings.kind.as_str()) {
             return Ok(());
         }
-        let mut message = json!({ "type": "group", "group": b64(gid), "settings": settings, "id": 0, "command": command });
-        let legacy = self.node.legacy_doc(gid)?.filter(|_| settings.kind == DOC);
-        if let Some(state) = &legacy {
-            message["import"] = json!({ "state": Bytes(state.clone()) });
-        }
+        let message = json!({ "type": "group", "group": b64(gid), "settings": settings, "id": 0, "command": command });
         let answers = self.to_kind(&settings.kind, message);
         if let Some(error) = answers.iter().find_map(|answer| answer["error"].as_str()) {
             return Err(anyhow!("{error}"));
-        }
-        if legacy.is_some() {
-            self.node.forget_legacy_doc(gid)?;
         }
         Ok(())
     }
@@ -461,12 +453,11 @@ impl App {
                         }
                     }
                     "send" => self.node.send_live(&gid, &message["payload"], message["to"].as_str())?,
-                    "frame" => self.node.frame(&gid, message["to"].as_str().context("no member")?, message["frame"].clone())?,
                     "links" => self.node.set_links(&gid, serde_json::from_value(message["links"].clone())?)?,
                     "log" => {
-                        let from = message["after"].as_u64().map(|after| (after, message["epoch"].as_u64().unwrap_or_default()));
-                        self.node.follow_log(&gid, from)?;
-                        if let Some((after, _)) = from {
+                        let after = message["after"].as_u64();
+                        self.node.follow_log(&gid, after)?;
+                        if let Some(after) = after {
                             self.handed.borrow_mut().insert(gid.clone(), after);
                             self.hand_entries(&gid)?;
                         }
@@ -509,7 +500,7 @@ impl App {
         for entry in self.node.entries(gid, after)? {
             self.handed.borrow_mut().insert(gid.to_vec(), entry.position);
             let from = self.describe(&known, &entry.from);
-            let message = json!({ "type": "entry", "group": b64(gid), "position": entry.position, "epoch": entry.epoch, "from": from, "payload": entry.payload });
+            let message = json!({ "type": "entry", "group": b64(gid), "position": entry.position, "id": hex::encode(&entry.id.0), "from": from, "payload": entry.payload });
             self.to_kind(GIT, message);
         }
         Ok(())
@@ -563,10 +554,6 @@ impl App {
             Event::Live { group, sender, payload } => {
                 let from = self.describe(&self.known(&group.0)?, &sender);
                 self.tell_kind(&group.0, json!({ "type": "message", "from": from, "payload": payload, "held": false }))?;
-            }
-            Event::Frame { group, from, frame } => {
-                let from = self.describe(&self.known(&group.0)?, &from);
-                self.tell_kind(&group.0, json!({ "type": "frame", "from": from, "frame": frame }))?;
             }
             // The page shows messages as they come, waiting for none.
             Event::Synced { .. } => {}

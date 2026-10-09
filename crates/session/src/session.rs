@@ -242,10 +242,6 @@ impl Session {
                 }
             }
         }
-        // Once every doc 0.10 kept is the doc plugin's, the tables it kept them in go.
-        if session.legacy("bindings")? && session.db.query_row("SELECT count(*) FROM bindings", [], |r| r.get::<_, i64>(0))? == 0 {
-            session.db.execute_batch("DROP TABLE bindings; DROP TABLE IF EXISTS carrying;")?;
-        }
         Ok(session)
     }
 
@@ -439,7 +435,6 @@ impl Session {
             | Event::Removed { group, .. }
             | Event::Settings { group, .. }
             | Event::Live { group, .. }
-            | Event::Frame { group, .. }
             | Event::Synced { group }
             | Event::InStep { group, .. }
             | Event::State { group, .. }
@@ -489,10 +484,6 @@ impl Session {
             }
             Event::Live { group, sender, payload } => {
                 let item = json!({ "type": "message", "from": self.describe(&group, &sender)?, "payload": payload, "held": false });
-                self.tell_plugin(&group, item).await?;
-            }
-            Event::Frame { group, from, frame } => {
-                let item = json!({ "type": "frame", "from": self.describe(&group, &from)?, "frame": frame });
                 self.tell_plugin(&group, item).await?;
             }
             // What a sync did not bring will not come from that member: a message waiting only for such shows the gap.
@@ -1233,8 +1224,8 @@ impl Session {
         self.config.dir.join("kinds").join(kind)
     }
 
-    /// Tells a group's kind's plugin of the group, starting the plugin if need be: with `args` from `invite` or `join`,
-    /// or with a doc 0.10 kept. Returns the plugin's answer, when it is asked one.
+    /// Tells a group's kind's plugin of the group, starting the plugin if need be, with `args` from `invite` or `join`.
+    /// Returns the plugin's answer, when it is asked one.
     async fn open_kind(&mut self, gid: &Bytes, args: Option<(&str, Vec<String>, String)>) -> Result<Value> {
         let settings = self.node.settings(&gid.0)?;
         let kind = settings.kind.clone();
@@ -1244,25 +1235,14 @@ impl Session {
         self.kind_of.insert(gid.clone(), kind.clone());
         let me = self.describe_key(gid, &self.node.key());
         let mut message = json!({ "type": "group", "group": b64(&gid.0), "settings": settings, "me": me });
-        let legacy = self.legacy_doc(gid)?;
-        if let Some(import) = &legacy {
-            message["import"] = import.clone();
-        }
-        let asked = args.is_some() || legacy.is_some();
-        if let Some((command, args, cwd)) = args {
-            message["command"] = json!(command);
-            message["args"] = json!(args);
-            message["cwd"] = json!(cwd);
-        }
-        if !asked {
+        let Some((command, args, cwd)) = args else {
             self.plugins.send(&kind, &message).await?;
             return Ok(json!({}));
-        }
-        let answer = self.ask(&kind, message).await?;
-        if legacy.is_some() {
-            self.forget_legacy(gid)?;
-        }
-        Ok(answer)
+        };
+        message["command"] = json!(command);
+        message["args"] = json!(args);
+        message["cwd"] = json!(cwd);
+        self.ask(&kind, message).await
     }
 
     /// Starts a kind's plugin, which answers `start` with what its groups carry besides its own content.
@@ -1279,7 +1259,7 @@ impl Session {
     async fn hand_entries(&mut self, gid: &Bytes) -> Result<()> {
         let Some(&after) = self.handed.get(gid) else { return Ok(()) };
         for entry in self.node.entries(&gid.0, after)? {
-            let item = json!({ "type": "entry", "position": entry.position, "epoch": entry.epoch, "from": self.describe(gid, &entry.from)?, "payload": entry.payload });
+            let item = json!({ "type": "entry", "position": entry.position, "id": hex::encode(&entry.id.0), "from": self.describe(gid, &entry.from)?, "payload": entry.payload });
             self.tell_plugin(gid, item).await?;
             self.handed.insert(gid.clone(), entry.position);
         }
@@ -1299,50 +1279,6 @@ impl Session {
         self.asked += 1;
         self.commands.insert((kind.clone(), self.asked), reply);
         self.plugins.send(&kind, &json!({ "type": "command", "id": self.asked, "args": args, "cwd": cwd })).await
-    }
-
-    /// Whether a table 0.10 kept docs in is still here: `bindings`, or `carrying`, which 0.10.0 lacks.
-    fn legacy(&self, table: &str) -> Result<bool> {
-        Ok(self.db.query_row("SELECT count(*) FROM sqlite_master WHERE name = ?", [table], |r| r.get::<_, i64>(0))? > 0)
-    }
-
-    /// A doc as 0.10 kept it, before the doc plugin did: its state, and its file's binding, which the plugin imports.
-    fn legacy_doc(&self, gid: &Bytes) -> Result<Option<Value>> {
-        if self.node.settings(&gid.0)?.kind != "doc" {
-            return Ok(None);
-        }
-        let state = self.node.legacy_doc(&gid.0)?;
-        let binding: Option<(String, String)> = match self.legacy("bindings")? {
-            true => self.db.query_row("SELECT path, base FROM bindings WHERE gid = ?", [&gid.0], |r| Ok((r.get(0)?, r.get(1)?))).optional()?,
-            false => None,
-        };
-        if state.is_none() && binding.is_none() {
-            return Ok(None);
-        }
-        let mut import = json!({});
-        if let Some(state) = state {
-            import["state"] = json!(Bytes(state));
-        }
-        if let Some((path, base)) = binding {
-            let carrying: Option<(String, Vec<u8>)> = match self.legacy("carrying")? {
-                true => self.db.query_row("SELECT file, edit FROM carrying WHERE gid = ?", [&gid.0], |r| Ok((r.get(0)?, r.get(1)?))).optional()?,
-                false => None,
-            };
-            let made = Path::new(&path).starts_with(self.config.dir.join("docs"));
-            let carrying = carrying.map(|(file, edit)| json!({ "file": file, "edit": Bytes(edit) }));
-            import = json!({ "state": import["state"], "path": path, "base": base, "made": made, "carrying": carrying });
-        }
-        Ok(Some(import))
-    }
-
-    fn forget_legacy(&self, gid: &Bytes) -> Result<()> {
-        self.node.forget_legacy_doc(&gid.0)?;
-        for table in ["bindings", "carrying"] {
-            if self.legacy(table)? {
-                self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [&gid.0])?;
-            }
-        }
-        Ok(())
     }
 
     /// Sends a plugin a message about one of its groups, if it runs.
@@ -1450,16 +1386,17 @@ impl Session {
             "send" => self.node.send_live(&group()?.0, &message["payload"], to)?,
             "log" => {
                 let gid = group()?;
-                let from = message["after"].as_u64().map(|after| (after, message["epoch"].as_u64().unwrap_or_default()));
-                self.node.follow_log(&gid.0, from)?;
-                if let Some((after, _)) = from {
+                let after = message["after"].as_u64();
+                self.node.follow_log(&gid.0, after)?;
+                if let Some(after) = after {
                     self.handed.insert(gid.clone(), after);
                     self.hand_entries(&gid).await?;
                 }
             }
             "append" => {
-                let (node, group, payload) = (self.node.clone(), group()?, message["payload"].clone());
-                self.background(kind, group.clone(), message["id"].clone(), async move { Ok(Done::Appended(node.append(&group.0, &payload).await?)) });
+                let (node, group) = (self.node.clone(), group()?);
+                let id = message_id(message["message"].as_str().context("no message")?)?;
+                self.background(kind, group.clone(), message["id"].clone(), async move { Ok(Done::Appended(node.append(&group.0, &id).await?)) });
             }
             "spread" => {
                 let (node, gid) = (self.node.clone(), group()?);
@@ -1467,7 +1404,6 @@ impl Session {
                 let holders = async move { Ok(Done::Holders(node.holders(&gid.0, &link, SPREAD_WAIT).await)) };
                 self.background(kind, group()?, message["id"].clone(), holders);
             }
-            "frame" => self.node.frame(&group()?.0, to.context("a frame goes to a member")?, message["frame"].clone())?,
             "add" => {
                 let data = serde_json::from_value::<Bytes>(message["data"].clone())?.0;
                 let link = self.node.add_file(&group()?.0, data).await?;

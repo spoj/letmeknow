@@ -221,21 +221,15 @@ impl Plugin {
     }
 
     /// A group of this session: its doc, and its file. With `args`, from `invite` or `join`, the file is `args[0]` (or a
-    /// new one in this plugin's directory); a doc 0.10 kept comes with `import`. Returns the file's path.
+    /// new one in this plugin's directory). Returns the file's path.
     fn open(&mut self, group: &str, message: &Value) -> Result<PathBuf> {
-        let import = &message["import"];
-        let state = match std::fs::read(self.state_path(group)) {
-            Ok(state) => state,
-            Err(_) if import["state"].is_string() => bytes(&import["state"])?,
-            Err(_) => ydoc::new(""),
-        };
+        let state = std::fs::read(self.state_path(group)).unwrap_or_else(|_| ydoc::new(""));
         self.docs.open(group, state, &mut self.out)?;
         self.save_state(group)?;
         self.names.insert(group.to_owned(), message["settings"]["name"].as_str().unwrap_or_default().to_owned());
         let me = message["me"].clone();
         let saved = match std::fs::read(self.saved_path(group)) {
             Ok(saved) => Some(Saved::from_json(&serde_json::from_slice(&saved)?)?),
-            Err(_) if import["path"].is_string() => Some(Saved::from_json(import)?),
             Err(_) => None,
         };
         if let Some(saved) = saved {

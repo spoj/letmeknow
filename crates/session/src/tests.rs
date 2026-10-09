@@ -590,7 +590,7 @@ async fn until_file(agent: &Agent, file: &Path, check: impl Fn(&str) -> bool) ->
 }
 
 #[test]
-fn docs_that_drift_apart_meet_again_through_their_plugins_frames() {
+fn docs_that_drift_apart_meet_again() {
     local(async {
         let world = world("frames").await;
         let mut alice = world.start("alice", HOUR).await;
@@ -602,7 +602,7 @@ fn docs_that_drift_apart_meet_again_through_their_plugins_frames() {
         bob.cmd(&["join", invite["link"].as_str().unwrap(), theirs.to_str().unwrap()]).await.unwrap();
         alice.expect("joined").await;
         assert_eq!(until_file(&bob, &theirs, |t| t.contains("alpha")).await, "- [ ] alpha\n");
-        // Bob is away while Alice edits: her live edit never reaches him, but the docs' frames bring it once he is back.
+        // Bob is away while Alice edits: her live edit never reaches him, but the docs compare once he is back.
         bob.stop().await;
         std::fs::write(&plan, "- [x] alpha\n").unwrap();
         alice.cmd(&["status"]).await.unwrap();
@@ -657,7 +657,7 @@ fn a_restarted_session_resumes_its_groups_and_docs() {
 }
 
 #[test]
-fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_twice_nor_one_0_10_left() {
+fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_twice() {
     local(async {
         use lmk_kind_doc::ydoc;
         let world = world("carrying").await;
@@ -671,9 +671,8 @@ fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_t
         let dir = session_dir(&alice.home, "alice").unwrap();
         let (state_file, saved_file) = (dir.join(format!("kinds/doc/{gid}.yjs")), dir.join(format!("kinds/doc/{gid}.json")));
         // Another member's line came in; then the plugin stopped after recording that it carried its own new line onto
-        // the doc, with the doc changed (`applied`) or not, before the file was rewritten and the base stored. The third
-        // time, 0.10 did so, and kept it all in its own tables.
-        for (i, applied) in [true, false, true].into_iter().enumerate() {
+        // the doc, with the doc changed (`applied`) or not, before the file was rewritten and the base stored.
+        for (i, applied) in [true, false].into_iter().enumerate() {
             let base = std::fs::read_to_string(&file).unwrap();
             let carried = format!("{base}mine {i}\n");
             let expected = format!("others {i}\n{carried}");
@@ -683,33 +682,13 @@ fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_t
             let edit = ydoc::edit(&theirs, &expected).unwrap();
             let state = if applied { ydoc::apply(&theirs, &edit).unwrap() } else { theirs };
             let carrying = json!({ "file": carried, "edit": lmk_proto::Bytes(edit.clone()) });
-            if i < 2 {
-                std::fs::write(&state_file, &state).unwrap();
-                std::fs::write(&saved_file, json!({ "path": file, "base": base, "made": true, "carrying": carrying }).to_string()).unwrap();
-            } else {
-                std::fs::remove_file(&state_file).unwrap();
-                std::fs::remove_file(&saved_file).unwrap();
-                let db = rusqlite::Connection::open(dir.join("session.db")).unwrap();
-                db.execute_batch(
-                    "CREATE TABLE bindings (gid BLOB PRIMARY KEY, path TEXT NOT NULL, base TEXT NOT NULL);
-                     CREATE TABLE carrying (gid BLOB PRIMARY KEY, file TEXT NOT NULL, edit BLOB NOT NULL);",
-                )
-                .unwrap();
-                let id = lmk_kind_doc::bytes(&json!(gid)).unwrap();
-                let key = [b"node/doc/".as_slice(), &id].concat();
-                db.execute("INSERT INTO lmk (key, value) VALUES (?, ?)", rusqlite::params![key, state]).unwrap();
-                db.execute("INSERT INTO bindings VALUES (?, ?, ?)", rusqlite::params![id, file, base]).unwrap();
-                db.execute("INSERT INTO carrying VALUES (?, ?, ?)", rusqlite::params![id, carried, edit]).unwrap();
-            }
+            std::fs::write(&state_file, &state).unwrap();
+            std::fs::write(&saved_file, json!({ "path": file, "base": base, "made": true, "carrying": carrying }).to_string()).unwrap();
             alice = world.start("alice", HOUR).await;
             alice.cmd(&["status"]).await.unwrap();
             assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
             alice.stop().await;
         }
-        let db = rusqlite::Connection::open(dir.join("session.db")).unwrap();
-        let left: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('bindings', 'carrying')", [], |r| r.get(0)).unwrap();
-        let legacy: i64 = db.query_row("SELECT count(*) FROM lmk WHERE key >= ? AND key < ?", [b"node/doc/".to_vec(), b"node/doc0".to_vec()], |r| r.get(0)).unwrap();
-        assert_eq!((left, legacy), (0, 0), "0.10's records of the doc are gone once the plugin has it");
     });
 }
 
