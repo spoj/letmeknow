@@ -41,6 +41,7 @@ Explorations for after 0.10, kept loose on purpose: ideas, questions and the tra
 - Ordering through the service is like a blockchain: the append is the confirmation, the signed head the receipt, the rate limit the fee. One sequencer cannot be stopped from lying, only caught.
 - Members' own consensus is safe without timing guarantees, but makes progress only while a majority is online. Members that may lie need four to tolerate one liar. The `after` references already make a group's messages a graph of what each had seen.
 - A leader per group, chosen through the log, could sequence messages, do one-off chores, and keep clocks. There is at most one per claim, but someone leads only while someone online can take over.
+- With leaders, the service could order only claims and device lists: a leader would sequence its group's commits and anchor its head at the service now and then, so the service would see far less, and a group could change members while the service is unreachable. The cost is failover: a commit the old leader took that the new one never saw forks the group's keys, and the members that applied it must be added again. Who leads must still come from one place.
 
 ## Transactions
 
