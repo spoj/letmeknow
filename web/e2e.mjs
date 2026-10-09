@@ -479,7 +479,10 @@ try {
   );
   check(readFileSync(fetched.path, "utf8") === "the spec", "a tab serves a kept file, loading it from IndexedDB when a member wants it");
 
-  for (const [name, page] of Object.entries(pages)) check((await page.evaluate(() => window.toasts)).length === 0, `${name} showed no error`);
+  for (const [name, page] of Object.entries(pages)) {
+    const toasts = await page.evaluate(() => window.toasts);
+    check(toasts.length === 0, `${name} showed no error${toasts.length ? `: ${toasts.join("; ")}` : ""}`);
+  }
 
   // A new version waits until the person accepts it, then the tab reloads into it.
   const sw = join("dist", "sw.js");

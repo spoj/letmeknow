@@ -576,7 +576,7 @@ async function drawDevices() {
           {},
           h("span", { title: `key ${d.key}` }, d.name, d.you && h("small", {}, " this browser")),
           d.you
-            ? h("div", { className: "row" }, h("button", { onclick: renameDialog }, "Rename"), h("button", { className: "danger", onclick: () => leaveDialog() }, "Leave"))
+            ? h("span", {}, h("button", { onclick: renameDialog }, "Rename"), h("button", { className: "danger", onclick: () => leaveDialog() }, "Leave"))
             : confirmed("Remove", `Remove ${d.name}?`, async () => {
                 await request({ cmd: "identity", op: { remove: { identity: identity.id, device: d.key } } });
                 shown.delete(devicesBody);

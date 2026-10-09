@@ -1247,18 +1247,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let mut gids = gids;
         loop {
             for gid in &gids {
-                if let Err(error) = self.read(gid).await {
-                    self.warn(Some(gid), format!("catching up: {error:#}"));
-                    continue;
-                }
                 let (leaf, device) = {
                     let st = self.state.lock().unwrap();
                     (st.session.leaf.clone(), st.device.clone())
                 };
                 let change = |g: &Group| Ok(Change { leaf: Some(leaf.clone()), name: renaming(g, device.as_deref()), ..Change::default() });
-                if let Err(error) = self.commit(gid, change).await
+                let updated = async {
+                    self.read(gid).await.context("catching up")?;
+                    self.commit(gid, change).await.context("key update")
+                };
+                // Unless the group was left meanwhile, as when a device leaves its identity as it starts.
+                if let Err(error) = updated.await
+                    && self.state.lock().unwrap().groups.contains_key(gid)
                 {
-                    self.warn(Some(gid), format!("key update: {error:#}"));
+                    self.warn(Some(gid), format!("{error:#}"));
                 }
             }
             sleep(KEY_UPDATE).await;
