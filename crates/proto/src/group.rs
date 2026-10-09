@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Bytes;
 
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 /// The private-use extension types: settings in the group context, and leaf data.
 pub const SETTINGS_EXTENSION: u16 = 0xff01;
 pub const LEAF_EXTENSION: u16 = 0xff02;

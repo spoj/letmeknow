@@ -222,7 +222,7 @@ def main():
 
         # An invite, and chat.
         invite = run("alice", "invite", "--name", "Plans", "--for", "Bob (Acme)")
-        check(invite["link"].startswith("https://letmeknow.dev/i#1.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
+        check(invite["link"].startswith("https://letmeknow.dev/i#2.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
         group = invite["group"]
         check("serve" in run("alice", "groups")[0]["membership"], "its log is on the local letmeknow serve")
         joined = run("bob", "join", invite["link"])
@@ -289,7 +289,7 @@ def main():
 
         # A device link: bob's tablet joins his identity, and his contacts reach it.
         link = run("bob", "invite", "--identity", "Bob")["link"]
-        check("#1.d." in link, "invite --identity gives a device link")
+        check("#2.d." in link, "invite --identity gives a device link")
         tablet = Listener("tablet")
         listeners.append(tablet)
         check("device" in run("tablet", "join", link), "the tablet joins bob's identity")

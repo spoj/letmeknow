@@ -16,6 +16,7 @@ The exact formats behind DESIGN.md. The crate `lmk-proto` (`crates/proto`) imple
 - Sessions of one device write their current direct addresses to `LETMEKNOW_HOME/addresses/<iroh key, hex>.json`, as `{"addrs": ["<ip:port>"]}`, and dial each other from there, with no relay needed.
 - A member an invite link names without a relay is reached through letmeknow.dev's.
 - The session process calls `proxy_from_env()`.
+- `LETMEKNOW_HOME/format` holds `2`, the layout of the state kept there; a session refuses a home that holds state without it. The browser keeps its state in IndexedDB `lmk`, version 2.
 
 ## Keys
 
@@ -69,7 +70,7 @@ Two connected members exchange the newest signed heads they hold of the logs the
 A group context extension, of the private-use type `0xff01`, whose data is JSON:
 
 ```json
-{"protocol": 1, "kind": "<kind>", "name": "", "open": [{"id": "<identity id>", "name": "Matthew"}], "keep": 90,
+{"protocol": 2, "kind": "<kind>", "name": "", "open": [{"id": "<identity id>", "name": "Matthew"}], "keep": 90,
  "membership": {"serve": {"key": "<iroh key>", "relay": "<url>", "addrs": ["<ip:port>"]}} | {"folder": "<path>"}}
 ```
 
@@ -98,7 +99,7 @@ An MLS basic credential whose identity bytes are JSON:
 
 ### Commits
 
-- Protocol version 1 fixes: openmls `=0.9.1`; ciphersuite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`; `PURE_CIPHERTEXT_WIRE_FORMAT_POLICY` (commits are PrivateMessages, so the membership service reads nothing); `SenderRatchetConfiguration::new(1000, 100_000)`; KeyPackages built with `Lifetime::init(0, u64::MAX)`, joins with lifetime validation skipped; `RequiredCapabilities` naming `0xff01` and `0xff02`, resent with every settings change, since a GroupContextExtensions proposal replaces the whole list. Settings carry `"protocol": 1`.
+- Protocol version 2 fixes: openmls `=0.9.1`; ciphersuite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`; `PURE_CIPHERTEXT_WIRE_FORMAT_POLICY` (commits are PrivateMessages, so the membership service reads nothing); `SenderRatchetConfiguration::new(1000, 100_000)`; KeyPackages built with `Lifetime::init(0, u64::MAX)`, joins with lifetime validation skipped; `RequiredCapabilities` naming `0xff01` and `0xff02`, resent with every settings change, since a GroupContextExtensions proposal replaces the whole list. Settings carry `"protocol": 2`.
 - Ended epochs are kept by `max_past_epochs(256)` and dropped by `delete_past_epoch_secrets(PastEpochDeletion::older_than_duration(7 days))`, which dates an epoch by when it began.
 - State is stored in SQLite with WAL, `synchronous = NORMAL` and `secure_delete`, encoded as CBOR (ciborium; openmls cannot be read back by bincode). After it deletes secrets or text (a message's text once shown, messages past `keep`, a group it leaves, epochs dropped when it applies a commit or daily), a session checkpoints with `wal_checkpoint(TRUNCATE)`, so that no copy stays in the WAL. The browser stores openmls state in IndexedDB, one record per key, not as one dump.
 - Every change is inline in its commit; standalone proposals are never sent, and a commit that refers to one is invalid. So is an update that changes a member's credential.
@@ -155,7 +156,7 @@ On a machine, the holder shares the device with its other session processes thro
 
 A member admits a joiner that meets a rule of the group: an invite, or an opening (see Devices group).
 
-- **An invite** is a 16-byte random secret. Its inviter sends the group the held payload `invite` (see Messages), with the secret's SHA-256, and keeps the same record; every member that takes it holds it, until `keep` days after it expires. Its link is `https://letmeknow.dev/i#<fragment>`, where the fragment is `1.<g|d>.<secret>.<member>[.<member>...]`: version 1; `g` for a group, `d` for a device link; the secret; then the members to ask, the inviter first, then up to three members whose receipts for the `invite` came within `send`'s wait. Each member is its iroh key, then `~` and its relay URL only if that is not letmeknow.dev's; every field in unpadded base64url.
+- **An invite** is a 16-byte random secret. Its inviter sends the group the held payload `invite` (see Messages), with the secret's SHA-256, and keeps the same record; every member that takes it holds it, until `keep` days after it expires. Its link is `https://letmeknow.dev/i#<fragment>`, where the fragment is `2.<g|d>.<secret>.<member>[.<member>...]`: version 2; `g` for a group, `d` for a device link; the secret; then the members to ask, the inviter first, then up to three members whose receipts for the `invite` came within `send`'s wait. Each member is its iroh key, then `~` and its relay URL only if that is not letmeknow.dev's; every field in unpadded base64url.
 - **An opening**: the group's settings name the identity the joiner speaks as (see Identity).
 
 The joiner dials the members the link or the opening names in turn, giving each 10 seconds to connect and 30 to answer, and sends on the peer stream `join` (see Peer protocol): `{"id", "secret", "key_package", "certificate"}`, or for an opening `{"id", "group", "key_package", "certificate"}`, the certificate (see Identity) of the identity its credential names, if any. A member admits by an invite it holds whose `expires` is ahead and that no commit it applied names; one made `--to` an identity, only a joiner whose certificate of it checks out against the identity's key log, read anew. It admits by an opening a joiner whose certificate of an identity the group is open to checks out likewise. It refuses a joiner whose KeyPackage's leaf does not list the group's kind. It commits the Add with the invite's hash in the commit's authenticated data, and checks again that no commit names it each time it builds the commit, so of two members racing to admit by one invite, the one that loses the epoch refuses. It answers `admitted`, `{"welcome", "position", "doc", "before", "certificates", "logs"}`: `position` is the log position of the commit that added the joiner, which reads the entries after it and anchors its chain at the first head it reads; `doc` links, as a file (see Files), the state of the group's kind, if its kind gives one (see Kinds); `before` lists the ids of the messages it holds from epochs before the joiner's, which the joiner can never get, so that no message waits for them (see Messages); `certificates`, those it holds of the group's members, the joiner's own among them; and `logs`, the logs of the kind's order it reads from where it is, `[{"id", "after"}]`, the current one last (see Kinds). Otherwise it answers `refused`: an unknown, used or expired secret gets the same reason, and with 128 bits there is nothing to guess, so a refusal uses nothing up.

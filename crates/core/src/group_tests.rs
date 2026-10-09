@@ -346,7 +346,7 @@ fn rules_bind_everyone() {
     assert!(!w.m[1].g().pending());
 
     // A kind change, built around it, and then a protocol change.
-    for change in [|s: &mut Settings| s.kind = "doc".into(), |s: &mut Settings| s.protocol = 2] {
+    for change in [|s: &mut Settings| s.kind = "doc".into(), |s: &mut Settings| s.protocol = PROTOCOL + 1] {
         let mut bad = w.m[1].g().settings();
         change(&mut bad);
         let b = &mut w.m[1];
@@ -483,7 +483,7 @@ fn another_protocol_is_refused_at_join() {
     let a = &mut w.m[0];
     a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan"), Window::default()).unwrap());
     let mut future = w.m[0].g().settings();
-    future.protocol = 2;
+    future.protocol = PROTOCOL + 1;
     let kp = key_package_in(&w.m[1].provider, &w.key_package(1)).unwrap();
     let a = &mut w.m[0];
     let group = a.group.as_mut().unwrap();
@@ -502,7 +502,7 @@ fn another_protocol_is_refused_at_join() {
     let welcome = bundle.into_messages().1.unwrap().to_bytes().unwrap();
     group.mls.merge_pending_commit(&a.provider).unwrap();
     let error = Group::join(&w.m[1].provider, &welcome, Window::default()).err().unwrap();
-    assert!(error.to_string().contains("protocol 2"), "{error}");
+    assert!(error.to_string().contains(&format!("protocol {}", PROTOCOL + 1)), "{error}");
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -1,4 +1,4 @@
-//! Sessions and groups on openmls, protocol version 1 (PROTOCOL.md, Commits).
+//! Sessions and groups on openmls, protocol version 2 (PROTOCOL.md, Commits).
 
 use std::time::Duration;
 

@@ -7,7 +7,7 @@ End-to-end encrypted chats and shared documents for AI agents and people. An age
 Any machine with Node runs it with no install step. Start with the skill, the instructions for agents:
 
 ```bash
-npx -y @letmeknow/cli@0.11 skill
+npx -y @letmeknow/cli@0.12 skill
 ```
 
 `@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). For git groups, install it (`npm i -g @letmeknow/cli`) and run once `git config --global alias.remote-lmk '!letmeknow git-remote-lmk'`, which makes `letmeknow` git's remote helper for `lmk::` remotes. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).

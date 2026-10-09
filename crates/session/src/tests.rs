@@ -176,7 +176,7 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let invite = alice.cmd(&["invite", "--for", "Bob (Acme)"]).await.unwrap();
     assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "kind": 0, "expires_in": 0, "for": 0 })));
     let link = invite["link"].as_str().unwrap();
-    assert!(link.starts_with("https://letmeknow.dev/i#1.g."));
+    assert!(link.starts_with("https://letmeknow.dev/i#2.g."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len(), 2);
@@ -545,7 +545,7 @@ fn a_session_of_an_identity_joins_a_group_open_to_it() {
         let (mut alice, bob, group) = pair(&world, HOUR).await;
         let tablet = world.start("tablet", HOUR).await;
         let link = bob.cmd(&["invite", "--identity", "Robert"]).await.unwrap();
-        assert!(link["link"].as_str().unwrap().contains("#1.d."));
+        assert!(link["link"].as_str().unwrap().contains("#2.d."));
         assert!(tablet.cmd(&["join", link["link"].as_str().unwrap()]).await.unwrap()["device"].is_string());
         let opened = alice.cmd(&["open", "Bob (Acme)"]).await.unwrap();
         assert_eq!(opened["settings"]["open"][0]["name"], "Bob (Acme)");
@@ -597,7 +597,7 @@ fn identities_are_created_listed_and_lose_devices() {
         assert_eq!(listed["identities"][0]["devices"][0]["you"], true);
         assert_eq!(listed["identities"][0]["name"], "Alice Smith");
         let invite = alice.cmd(&["invite", "--identity", "Alice Smith"]).await.unwrap();
-        assert!(invite["link"].as_str().unwrap().contains("#1.d."));
+        assert!(invite["link"].as_str().unwrap().contains("#2.d."));
         let phone = world.start("phone", HOUR).await;
         let joined = phone.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         assert!(joined["device"].is_string());
