@@ -2995,6 +2995,7 @@ dependencies = [
  "hex",
  "iroh",
  "js-sys",
+ "letmeknow-kind-doc",
  "lmk-node",
  "lmk-proto",
  "n0-future",

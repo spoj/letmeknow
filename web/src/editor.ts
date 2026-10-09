@@ -1,5 +1,5 @@
-// A doc's editor: markdown in CodeMirror, bound to the doc's Yjs text, which edits here and the session's own copy
-// (lmk-node's) keep in step. "- [ ]" items show as checkboxes that tick with
+// A doc's editor: markdown in CodeMirror, bound to the doc's Yjs text, which edits here and the copy the doc kind's
+// in-page plugin keeps (lmk_kind_doc::Page, through its commands) keep in step. "- [ ]" items show as checkboxes that tick with
 // a click; a toolbar (and Alt+↑/↓, Tab, Shift+Tab) moves and indents lines. Links show as their text, and open on a
 // click, except on the line being edited. Images the doc links show below their line; pasting or dropping a file
 // uploads it and inserts its link.
@@ -257,14 +257,27 @@ function insertFiles(view: EditorView, blobs: Blobs, event: Event, files: FileLi
 /** From the session: an edit made elsewhere. */
 const REMOTE = "lmk";
 
-/** An editor of the doc `gid`. `edited` takes in what the session's copy has that this one lacks. */
+function b64(bytes: Uint8Array): string {
+  let text = "";
+  for (const byte of bytes) text += String.fromCharCode(byte);
+  return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function unb64(text: string): Uint8Array {
+  return Uint8Array.from(atob(text.replace(/-/g, "+").replace(/_/g, "/")), char => char.charCodeAt(0));
+}
+
+/** A command of the doc kind's in-page plugin. */
+const command = async (lmk: Session, ...args: string[]) => JSON.parse(await lmk.command("doc", JSON.stringify(args)));
+
+/** An editor of the doc `gid`. `edited` takes in what the plugin's copy has that this one lacks. */
 export async function bind(parent: HTMLElement, lmk: Session, gid: string, blobs: Blobs) {
   const doc = new Y.Doc();
-  Y.applyUpdate(doc, await lmk.doc(gid), REMOTE);
-  doc.on("update", (update: Uint8Array, origin: unknown) => origin !== REMOTE && lmk.edit(gid, update).catch(blobs.fail));
+  Y.applyUpdate(doc, unb64((await command(lmk, "state", gid)).state), REMOTE);
+  doc.on("update", (update: Uint8Array, origin: unknown) => origin !== REMOTE && command(lmk, "edit", gid, b64(update)).catch(blobs.fail));
   const view = editor(parent, doc.getText("text"), blobs);
   return {
-    edited: () => lmk.doc_diff(gid, Y.encodeStateVector(doc)).then(diff => Y.applyUpdate(doc, diff, REMOTE), blobs.fail),
+    edited: () => command(lmk, "diff", gid, b64(Y.encodeStateVector(doc))).then(({ diff }) => Y.applyUpdate(doc, unb64(diff), REMOTE), blobs.fail),
     measure: () => view.requestMeasure(),
     destroy: () => (view.destroy(), doc.destroy())
   };
