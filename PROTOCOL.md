@@ -28,7 +28,7 @@ The exact formats behind DESIGN.md. The crate `lmk-proto` (`crates/proto`) imple
 
 ### Logs
 
-A log is named by an id: a group's MLS group id, or a device list's address (see Identity). Positions start at 1. Each member chains a log as it reads it:
+A log is named by an id: a group's MLS group id, a kind's log id (see Kinds), or a device list's address (see Identity). Positions start at 1. Each member chains a log as it reads it:
 
 - h₀ = SHA-256(`"letmeknow log v1\0"` ‖ log id)
 - hₙ = SHA-256(hₙ₋₁ ‖ SHA-256(entryₙ))
@@ -69,10 +69,10 @@ A group context extension, of the private-use type `0xff01`, whose data is JSON:
 ```json
 {"protocol": 1, "kind": "<kind>", "name": "", "open": [{"id": "<identity id>", "name": "Matthew"}], "keep": 90,
  "membership": {"serve": {"key": "<iroh key>", "relay": "<url>", "addrs": ["<ip:port>"]}} | {"folder": "<path>"},
- "devices_of": "<identity id>", "openings": [<opening>]}
+ "devices_of": "<identity id>", "openings": [<opening>], "log": "<16 random bytes>"}
 ```
 
-`kind` is a kind id (see Kinds): `chat`, `doc`, or another plugin's. `devices_of` marks an identity's devices group, a chat, and `openings` appear only there (see Identity). Members list `0xff01` and `0xff02` in their capabilities.
+`kind` is a kind id (see Kinds): `chat`, `doc`, `git`, or another plugin's. `devices_of` marks an identity's devices group, a chat, and `openings` appear only there (see Identity). `log` is the id of the kind's log (see Kinds), which its creator draws for a group of a plugin's kind; groups made before 0.11 have none, and a 0.10 member that changes the settings drops it. Members list `0xff01` and `0xff02` in their capabilities.
 
 ### Leaf data
 
@@ -152,7 +152,7 @@ An `introduce`'s `to` lists the members it is for, as a message's `to` does; onl
 
 A chat `message`'s fields: `content`, its text, which may be empty with an attachment; `after`, the ids of the messages the sender had read that no other message it read lists in `after`; `to`, the members it addresses, each as the first 8 bytes of SHA-256 of its session key, or none for the group; `reply_to`, the id of the message it answers; `urgent`, `true` to wake every member; `attachment`, `{"link", "name", "size", "type"}`: a file link (see Files), its name, its size in bytes, and its media type, which may be empty. A chat holds the file an attachment links.
 
-A message's id is SHA-256 of its MLS ciphertext. A payload is held or live. Held are `message` and `leave`, and any payload whose sender marks it so with the MLS message's authenticated data `{"held": true}`; every other payload is live. A member holds a held payload for `keep` days, and only once it has decrypted and verified it; a live one it takes and holds not. It takes no message from a removed sender that first reaches it more than 5 minutes after it applied the removal.
+A message's id is SHA-256 of its MLS ciphertext. A payload is held or live. Held are `message` and `leave`, and any payload whose sender marks it so with the MLS message's authenticated data `{"held": true}`; every other payload is live. An entry of a kind's log is marked `{"log": true}` instead (see Kinds); a member refuses a message so marked, and skips an entry not marked. A member holds a held payload for `keep` days, and only once it has decrypted and verified it; a live one it takes and holds not. It takes no message from a removed sender that first reaches it more than 5 minutes after it applied the removal.
 
 ## Peer protocol
 
@@ -160,18 +160,18 @@ A `peer` stream joins two sessions that share a group, one stream per pair, kept
 
 | Frame | Meaning |
 |---|---|
-| `{"hello": {"groups": [{"group", "epoch", "head", "floor", "joined"}], "lists": [{"identity", "entries", "head"}]}}` | For each group both are in: the epoch the sender is at, the newest signed head it holds, the lowest epoch it accepts, and the epoch it joined. `lists`, if any: the device lists of the identities in those groups, each with all its entries and the service's head over them, that the other side has not yet shown or been shown with that head (see Identity) |
+| `{"hello": {"groups": [{"group", "epoch", "head", "floor", "joined", "log"}], "lists": [{"identity", "entries", "head"}]}}` | For each group both are in: the epoch the sender is at, the newest signed head it holds, the lowest epoch it accepts, the epoch it joined, and if it follows the kind's log, the newest signed head it holds of that. `lists`, if any: the device lists of the identities in those groups, each with all its entries and the service's head over them, that the other side has not yet shown or been shown with that head (see Identity) |
 | `{"commits": {"group", "entries", "head"}}` | Log entries the other lacks, judged by its head; also sent by a commit's author once the service has taken it |
 | `{"reconcile": {"group", "msg"}}` | A negentropy message (see below) |
 | `{"messages": {"group", "items"}}` | MLS ciphertexts the other lacks; also every new message as it is sent, to the members online or to one |
 | `{"receipt": {"group", "held": ["<id>"], "refused": [{"id", "reason"}]}}` | The answer to `messages`: the ids of the items the receiver took (held, or taken in if live), and of those it refused; items that wait for a commit are not answered |
 | `{"<name>": {"group", ...}}` | A frame of the group's kind, to this member: any name but the core's frames here (see Kinds) |
-| `{"state": {"group", "link"}}` | A link to a state of the group's kind (see Files) that the sender's kind hands this member, as an inviter does in `admitted` |
+| `{"state": {"group", "link"}}` | A link to a state of the group's kind (see Files) that the sender's kind hands this member, as an inviter does in `admitted`; without `link`, a request for one |
 | `{"want": {"group", "files"}}`, `{"have": {"group", "files"}}` | BLAKE3 hashes (see Files) |
 | `{"join": {"group", "key_package"}}` | A request to join an open group, answered by `admitted` or `refused` |
 | `{"admitted": {"group", "admitted": {"welcome", "position", "doc", "before"}}}`, `{"refused": {"group", "refused"}}` | The answer to `join`, as an invite's |
 
-Clients before 0.10.1 send no `lists` and ignore them. A side that holds no head for a group yet sends the empty log's: length 0, hash h₀, `time` 0 and no signature, which needs none.
+Clients before 0.10.1 send no `lists` and ignore them, and clients before 0.11 send no `log` and ignore it. A head of a kind's log is judged as a group's is (see Gossip): one that contradicts the member's chain is reported, and a longer one has the member read the log. A side that holds no head for a group yet sends the empty log's: length 0, hash h₀, `time` 0 and no signature, which needs none.
 
 A sender learns from receipts who holds its message, and who refused it; it keeps its message as its own pending send until a receipt says a member holds it, and offers it in every sync meanwhile. A receiver that refuses or cannot open a message keeps its id among those it gave up, so a message naming it in `after` shows a known gap rather than waiting.
 
@@ -187,7 +187,7 @@ Message sync, per group, starts once both sides have caught up on commits. It is
 
 ## Kinds
 
-A kind id is a plain string: `chat`, built in, or a plugin's, such as `doc`. The core reads none of a kind's content.
+A kind id is a plain string: `chat`, built in, or a plugin's, such as `doc` or `git`. The core reads none of a kind's content.
 
 ### Channels
 
@@ -197,7 +197,18 @@ What a kind may do in its groups, and nothing else:
 - **Live messages**: payloads to the members online, or to one, not held.
 - **Frames to one member**: `{"<name>": {...}}`, sent as the peer frame `{"<name>": {"group", ...}}` to a current member online. A name of the core's frames is refused. Clients before 0.11 close the stream on a frame they do not know, so a kind sends frames only in its own groups, whose members all support it; 0.10 knows the doc's frames, but not `state`.
 - **Files**: files it adds, held `keep` days; files it holds `keep` days from when it says, as those a held message links; and the files it links now, held while it does. A member fetches those within its limit.
-- **A state link**: when a member is admitted, the inviter asks its kind for a state and links it in `admitted`'s `doc`; a kind can also hand a member that fell behind a state, which goes as a `state` frame. The member fetches the file and gives it to its kind.
+- **A log**: the group's kind log (below).
+- **A state link**: when a member is admitted, the inviter asks its kind for a state and links it in `admitted`'s `doc`; a kind can also hand a member that fell behind a state, which goes as a `state` frame. A member behind its kind's log asks a member online for one with a `state` frame without `link`, at most once a minute, and whenever it syncs with a member while still behind, unless it was handed one in that minute; the member asked hands one if its kind gives one. The member fetches the file and gives it to its kind.
+
+### Logs
+
+A group of a plugin's kind has a log of its own at the group's membership service, named by the settings' `log`, and chained, signed and gossiped as a group's log is (see Membership service).
+
+- An entry is an MLS application message whose plaintext is a payload of the kind, sealed under the epoch current when it is appended, with the authenticated data `{"log": true}`. Before sealing, the appender reads its group's log to its end.
+- A member reads the log in order, from where its kind asks, and for each entry: one whose header names an epoch older than that of the last entry taken is skipped; one that is this session's own (it keeps each payload it appends, by SHA-256 of the ciphertext, until its entry is read) is taken; one whose epoch this session has not reached is skipped once the group's log is read to its end; one that opens and is marked is taken; one under an epoch whose keys this session does not hold leaves it behind; any other is skipped. Entries are opened once; the session keeps those taken until its kind asks to read past them.
+- A read the service refuses as `expired` leaves the member behind too. A member behind reads no further until its kind asks to read from a later position, as from a state it was handed.
+
+### Plugins
 
 ### Plugins
 
@@ -209,15 +220,16 @@ The session sends:
 
 | Message | Meaning |
 |---|---|
-| `{"type": "start", "kind", "dir"}` | The first line. `dir` is the plugin's own state directory, `sessions/<handle>/kinds/<kind>/` |
+| `{"type": "start", "id", "kind", "dir"}` | The first line, a request. `dir` is the plugin's own state directory, `sessions/<handle>/kinds/<kind>/`. Answered `{}`, or `{"chat": true}` if the kind's groups carry chat too: then their `message` payloads are the session's chat, which `send` sends there, and do not reach the plugin |
 | `{"type": "group", "group", "settings", "me"}`, and optionally `id`, `command`, `args`, `cwd`, `import` | The session is in a group of the kind: for each when the plugin starts, and when the session makes one (`command`: `invite`) or joins one (`join`), with the command's arguments for the kind and the directory they are relative to, as a request. `me` is this session as the group's members see it. `import`: a doc 0.10 kept (see Doc). A session whose plugin refuses a group it makes or joins leaves it |
 | `{"type": "gone", "group"}` | The session left the group, or was removed |
 | `{"type": "message", "group", "from", "payload", "held"}`, and `id` if held | A payload of the kind from a member |
 | `{"type": "frame", "group", "from", "frame"}` | A frame from a member, `{"<name>": {...}}` |
 | `{"type": "synced", "group", "member"}` | The session and a connected member hold the same log of the group: a time to compare state |
 | `{"type": "state", "group", "from", "data"}` | A state `from` handed this session, beside the Welcome that admitted it or in a `state` frame |
-| `{"type": "snapshot", "id", "group"}` | A member is being admitted: answered `{"data"}` to hand it a state, or `{}`. The inviter waits 10 seconds |
-| `{"type": "command", "id", "args", "cwd"}` | `letmeknow <kind> <args>...`, run in `cwd`: the answer is what the command prints |
+| `{"type": "snapshot", "id", "group"}` | A member is being admitted, or asks for a state: answered `{"data"}` to hand it one, or `{}`. The session waits 10 seconds |
+| `{"type": "entry", "group", "position", "epoch", "from", "payload"}` | An entry of the kind's log taken, in log order, with the epoch it was sealed under |
+| `{"type": "command", "id", "args", "cwd"}` | `letmeknow <kind> <args>...`, run in `cwd`: the answer is what the command prints. The session goes on meanwhile |
 | `{"type": "sync", "id"}` | Bring into step what the plugin keeps outside letmeknow, such as a doc's file: asked before the session prints anything and before each command, which wait for the answer |
 | `{"type": "printed", "group", "key"}` | The plugin's event with this `key` was printed |
 
@@ -232,10 +244,25 @@ The plugin sends:
 | `{"type": "links", "group", "links"}` | The files the kind links now, which replace those it linked before |
 | `{"type": "fetch", "id", "group", "link"}` | A file the group holds: answered `{"data"}` once it is here, fetched from the members online, or with an error after a minute |
 | `{"type": "state", "group", "to", "data"}` | Hands a member a state |
+| `{"type": "log", "group"}`, and optionally `after`, `epoch` | Follows the kind's log after position `after`, whose last entry taken was sealed under `epoch`, as the kind's own state stands: entries come as `entry`, the ones the session keeps after `after` first, and those up to `after` go. Without `after`, the kind has no state yet, and the session asks a member for one. A position before one the kind named earlier leaves the session behind |
+| `{"type": "append", "id", "group", "payload"}` | Appends to the kind's log: answered `{"position"}` once every entry up to it was handed as `entry`, its own among them unless it was skipped. Refused while the session is behind, and as the service refuses (`size`, `rate`) |
+| `{"type": "spread", "id", "group", "link"}` | Waits until a member online holds a file whole, up to 30 seconds: answered `{"held_by"}`, at once with none if no member is online |
 | `{"type": "event", "group", "event"}`, and optionally `wake`, `key` | For `listen`, which prints `event` with the group's id in `group`: by the delivery policy at once with `wake: true`, held otherwise. An event of type `warning` prints at once, as the session's own. With `key`, it replaces a held event of the plugin's for the group with the same key, and is told as `printed` |
 | `{"type": "info", "group", "info"}` | Fields `groups` shows for the group |
 
-The browser's in-page plugins speak the same messages, as JSON values, without `start`, `me` and `cwd`; the page sends their commands (`Lmk.command(kind, args)`), and gets their events as `{...event, "group", "kind"}`.
+The browser's in-page plugins speak the same messages, as JSON values, without `start`, `me` and `cwd`, and with no `spread`; the page sends their commands (`Lmk.command(kind, args)`), and gets their events as `{...event, "group", "kind"}`.
+
+### Git
+
+The git kind's plugin is `letmeknow-kind-git`, with git's remote helper `git-remote-lmk` beside it; in the browser, `lmk_kind_git::Page` runs in the page, display-only. Its groups carry chat (`start` answers `{"chat": true}`).
+
+- A push is the log entry `{"type": "push", "ref", "old", "new", "bundle", "subjects"}`: the full ref name, the old and new commit ids (hex), each null for a branch created or deleted, the file link of a git bundle of the new commits, or null if they need none, and their subjects, newest first, at most 50. Ahead of it, the pusher adds the bundle as a file and sends the members online the live payload `{"type": "bundle", "link"}`, which they hold; it appends only once `spread` names a member that holds it.
+- A member replays the pushes in log order over its branches: a push counts if `old` is its ref's tip (none, for one created), and then moves the ref to `new` or deletes it. A member checks each push in log order: it unbundles the bundle into its repository (`git bundle unbundle`, which needs the bundle's prerequisites), and the push is void if that fails, or `new` is not a commit there, or `old` is not its ancestor (`git merge-base --is-ancestor`). Void pushes are left out of the replay. The repository's refs are the branches replayed as far as every push is checked; a push must build on the branches replayed counting those not checked yet. A pusher's push won if it counted when its entry was taken.
+- Its state, given on `snapshot` and taken on `state`, is JSON, `{"position", "epoch", "refs", "bundle"}`: the log position and epoch as far as every push is checked, the branches there (`{"<ref>": "<commit>"}`), and the file link of a bundle of all their commits (`git bundle create` of every ref), or null if there are none. A member takes a state no older than the last entry it took, fetches its bundle and unbundles it, and follows the log after `position`.
+- Its event is `pushed` (`by`, `ref`, `old`, `new`, `subjects`), for a push of another member that counted when its entry was taken, not waking. `info` gives `remote`, `lmk::<group>`, as `group`'s answer does on `invite` and `join`.
+- Its commands are git-remote-lmk's: `git list <group> [--push]`, answered `{"refs", "head", "repo"}` (the branches as checked, or with `--push` counting those not checked yet; the ref `HEAD` names, `refs/heads/main` if there is one; the repository's path), and `git push <group> <ref> <old> <new> <bundle> [<subject>...]`, with `-` for none and a bundle's path, answered `{"position"}`, or the error `fetch first` if `old` is not the tip or its entry did not count. `<group>` is a group's id or name.
+- `git-remote-lmk` (gitremote-helpers(7)) is git's helper for `lmk::<group>`. It finds `letmeknow` beside its own executable, then on PATH, and runs `letmeknow git list` and `letmeknow git push` against the session `LETMEKNOW_SESSION` names, or the one running. It has the capabilities `fetch`, `push` and `option` (only `force-if-includes`, which git requires and which matters only for force pushes). It fetches from the plugin's repository (`git fetch --no-write-fetch-head`), refuses a force push, and bundles a push as `<src> --not` the group's branches it has.
+- The plugin keeps, in `dir`, each group's bare repository, `repos/<group>.git`, and its branches and the pushes not yet checked, `<group>.json`. In the browser, it keeps them in the record `kind/git/<group>`, takes every push as checked, holds no file, answers `snapshot` with `{}`, and has no commands.
 
 ### Doc
 
@@ -251,7 +278,7 @@ The doc kind's plugin is `letmeknow-kind-doc`; in the browser, the same Rust (`l
 ## Browser
 
 - The client is lmk-node compiled to WebAssembly (`crates/web`), with a device key that is also its MLS key, so its credential's `device` is its own key. Its iroh key is separate, as natively, and it reaches every peer and membership service through relays.
-- Its records live in an IndexedDB database `lmk`. The store `records` holds the `Provider`'s, one record per key: openmls's own keys, and ours under `lmk/` (lmk-node's `node/…` and `session`, the client's `web/…`: its device, name, and each group's timeline, refusals and settings as last seen, and the in-page doc plugin's `kind/doc/<group id, base64url>`: each doc's Yjs state). The page writes the records that changed every second and after each action. The store `files` holds the ciphertext of each file it holds, by BLAKE3 hash (hex): the files it adds, and those it fetches up to 25 MiB, which it takes without being asked. The page reads only their hashes when it opens; the session loads a file into iroh-blobs' memory store when it reads it, or when a member's `want` names it. It answers `have` only for files in this store, so a larger file fetched when asked, which stays in memory only, is served to no one. When the page opens and once an hour, it deletes the files no group links, by the rule in Files.
+- Its records live in an IndexedDB database `lmk`. The store `records` holds the `Provider`'s, one record per key: openmls's own keys, and ours under `lmk/` (lmk-node's `node/…` and `session`, the client's `web/…`: its device, name, and each group's timeline, refusals and settings as last seen, and the in-page plugins' `kind/doc/<group id, base64url>`, each doc's Yjs state, and `kind/git/<group id, base64url>`, each git group's branches). A git group's timeline holds its pushes beside its changes. The page writes the records that changed every second and after each action. The store `files` holds the ciphertext of each file it holds, by BLAKE3 hash (hex): the files it adds, and those it fetches up to 25 MiB, which it takes without being asked. The page reads only their hashes when it opens; the session loads a file into iroh-blobs' memory store when it reads it, or when a member's `want` names it. It answers `have` only for files in this store, so a larger file fetched when asked, which stays in memory only, is served to no one. When the page opens and once an hour, it deletes the files no group links, by the rule in Files.
 - Its membership service is the one `letmeknow serve` names at `GET /membership`, as text, `<iroh key, hex>@<relay URL>`, on the server the page came from; its relay is that address's relay URL. `localStorage` can name others, as tests do: `lmk relay` (a URL) and `lmk membership` (the same form). The service worker caches `/membership` with the build's files.
 - The page serves `/i` as the app, which reads the invite from the fragment.
 - A service worker caches exactly the files of one build, under a name derived from their contents, and serves navigations with its `index.html`. A new build installs beside it and waits; the page offers it, and on acceptance tells it `"skip"`, and every tab the old one served reloads.
