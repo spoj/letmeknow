@@ -172,6 +172,9 @@ pub enum Event {
         from: Member,
         frame: Value,
     },
+    /// A sync of the group's held messages with a member finished: this session holds every message that member held
+    /// for it and could open.
+    Synced { group: Bytes },
     /// This session and a connected member hold the same log of the group: a time to compare the kind's state.
     InStep {
         group: Bytes,
@@ -1783,6 +1786,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 self.events.send(Event::File(hash)).ok();
             }
             lmk_net::Event::Synced { group, peer } => {
+                self.events.send(Event::Synced { group: Bytes(group.clone()) }).ok();
                 // A file only this session held may have reached the peer since.
                 let pending: Vec<[u8; 32]> = {
                     let st = self.state.lock().unwrap();

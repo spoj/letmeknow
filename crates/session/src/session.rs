@@ -397,6 +397,7 @@ impl Session {
             | Event::Settings { group, .. }
             | Event::Live { group, .. }
             | Event::Frame { group, .. }
+            | Event::Synced { group }
             | Event::InStep { group, .. }
             | Event::State { group, .. }
             | Event::Snapshot { group, .. }
@@ -450,6 +451,14 @@ impl Session {
                 let item = json!({ "type": "frame", "from": self.describe(&group, &from)?, "frame": frame });
                 self.tell_plugin(&group, item).await?;
             }
+            // What a sync did not bring will not come from that member: a message waiting only for such shows the gap.
+            Event::Synced { group } => loop {
+                let waiting: Vec<[u8; 32]> = self.waiting.iter().map(|w| w.id).collect();
+                let unblocked = |w: &Waiting| self.missing(&w.payload).is_ok_and(|missing| missing.iter().all(|id| !waiting.contains(id)));
+                let Some(i) = self.waiting.iter().position(|w| w.gid == group && unblocked(w)) else { break };
+                let w = self.waiting.remove(i);
+                self.take_message(&w.gid, w.id, w.sender, w.payload).await?;
+            },
             Event::InStep { group, member } => {
                 let item = json!({ "type": "synced", "member": self.describe(&group, &member)? });
                 self.tell_plugin(&group, item).await?;

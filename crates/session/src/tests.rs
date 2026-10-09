@@ -784,10 +784,41 @@ fn a_message_waits_for_those_it_comes_after_then_shows_them_missing() {
         let mut carol = world.start("carol", HOUR).await;
         carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
         let bob = world.start("bob", HOUR).await;
+        // Once Bob and Carol have synced, no sync ends before the wait does.
+        for _ in 0..40 {
+            let online = bob.cmd(&["status"]).await.unwrap()["groups"][0]["online"].clone();
+            if online.as_array().unwrap().iter().any(|member| member["name"] == "Carol") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
         let sent = std::time::Instant::now();
         bob.cmd(&["send", "@carol see above"]).await.unwrap();
         let got = carol.expect("message").await;
         assert!(sent.elapsed() >= Duration::from_millis(1500), "{:?}", sent.elapsed());
+        assert_eq!(got["content"], "@carol see above");
+        assert_eq!(got["missing"], json!([unseen["id"]]));
+    });
+}
+
+#[test]
+fn a_message_after_one_that_cannot_come_shows_the_gap_once_a_sync_ends() {
+    local(async {
+        let world = world("gap").await;
+        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
+        alice.stop().await;
+        let unseen = bob.cmd(&["send", "while alice is away"]).await.unwrap();
+        bob.stop().await;
+        let alice = world.start("alice", HOUR).await;
+        let mut carol = world.start("carol", HOUR).await;
+        carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        carol.stop().await;
+        let bob = world.start("bob", HOUR).await;
+        bob.cmd(&["send", "@carol see above"]).await.unwrap();
+        // Back, Carol syncs; that cannot bring Bob's first message, from before she joined, so she does not wait 5 minutes.
+        let mut carol = world.start("carol", HOUR).await;
+        let got = carol.expect("message").await;
         assert_eq!(got["content"], "@carol see above");
         assert_eq!(got["missing"], json!([unseen["id"]]));
     });

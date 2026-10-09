@@ -515,6 +515,8 @@ impl App {
                 let from = self.describe(&self.known(&group.0)?, &from);
                 self.tell_doc(&group.0, json!({ "type": "frame", "from": from, "frame": frame }))?;
             }
+            // The page shows messages as they come, waiting for none.
+            Event::Synced { .. } => {}
             Event::InStep { group, member } => {
                 let member = self.describe(&self.known(&group.0)?, &member);
                 self.tell_doc(&group.0, json!({ "type": "synced", "member": member }))?;
