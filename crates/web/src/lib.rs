@@ -674,7 +674,7 @@ impl Lmk {
     /// A new chat, doc or git repository, speaking as this browser's first identity; returns its id.
     pub async fn create(&self, kind: String, name: String) -> R<String> {
         let app = &self.app;
-        let settings = Settings { protocol: PROTOCOL, kind, name, open: Vec::new(), keep: 90, membership: app.membership.clone() };
+        let settings = Settings { protocol: PROTOCOL, kind, name, open: Vec::new(), keep: 90, membership: app.membership.clone(), rest: Default::default() };
         let (gid, _) = app.client.create(settings, None, (Vec::new(), String::new())).await.map_err(js)?;
         app.remember_settings(&gid.0).map_err(js)?;
         app.flush();

@@ -64,7 +64,7 @@ A local folder signs nothing, but its sessions all read the folder directly, so 
 ## Groups
 
 - Settings live in the MLS group context and change only by commit: kind (fixed; see Kinds), name, the identities the group is open to, `keep`, the membership service's address, and the protocol version.
-- Each member's leaf names its iroh key and relay, so every member can dial every other, and the kinds its session supports. A changed relay or list of kinds is a commit, like a key update.
+- Each member's leaf names its iroh key and relay, so every member can dial every other, the kinds its session supports, and its protocol revision (see Compatibility). A session's leaf changes by a commit: the key update it makes for each group as it starts carries its leaf as it would write it now.
 - `keep` (days, default 90) is how long members hold the group's messages and files for one another. Each client may hold less.
 - Post-compromise security: a session replaces its keys with an empty commit when it resumes a group, once caught up, and then daily while it runs, so a stolen key stops working within a day. Not more often: every epoch is kept for the key window, and openmls rewrites all of them on each send and receive, so a group must make few, about 7 per member a week.
 - Removal: a member commits a Remove. A leaving session asks the others, in a message, to commit its removal (MLS lets no member commit its own); the first member to see it does, and the session is shown as having left. A session alone in a group just forgets it.
@@ -175,6 +175,15 @@ A member admits a joiner that meets a rule of the group, and every member knows 
 - Our own protocols share one ALPN, one stream per exchange, so two members keep one connection; file transfers add iroh-blobs' own while they run. An idle connection costs about 30 B/s, through the relay too, which keeps its path open beside a direct one.
 - Direct connections show a native session's IP address to the members it talks to. Accepted.
 - letmeknow hands `HTTPS_PROXY` to iroh (`proxy_from_env`), which sends relay connections through an HTTP CONNECT proxy; direct UDP bypasses it. Where UDP is blocked, connections stay on the relay, whose traffic is HTTPS.
+
+## Compatibility
+
+Agents pin a minor version (`@letmeknow/cli@0.12`), so the releases of one minor version run side by side, and a group's members may run any of them. They stay compatible by rules, not by luck (PROTOCOL.md, Compatibility):
+
+- Readers ignore what they do not know and skip what they cannot parse, without dropping a connection over it. An advisory value they do not know, such as a new reason for a refusal, reads as some other one; one that is not, such as a new kind of membership service, fails, saying a newer letmeknow made it. The membership service answers a request it does not know with a refusal.
+- Whoever rewrites a shared record, such as a group's settings or a devices group's state, keeps the fields it does not know, so an older member renaming a group does not undo what a newer one added.
+- Each compatible addition raises the protocol revision, which every member's leaf names. A session uses an addition only toward members whose leaves name its revision or a later one; leaves are in the group's state, so this holds for members offline too, and a session updates its leaf as it starts.
+- Anything else breaks compatibility, and waits for a new minor version: it goes only through a switch an older client checks, which are the ALPN, a group's protocol version, the invite link version, the home's format and the browser's database version.
 
 ## Clients
 
