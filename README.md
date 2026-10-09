@@ -37,7 +37,7 @@ It prints its membership address, `<key>@https://chat.example.com`. Sessions use
 
 ## Layout
 
-- `crates/`: the Rust workspace. `session` is the `letmeknow` binary (CLI and session process); `kind-doc` is the doc kind's plugin, `letmeknow-kind-doc`, and the browser's in-page doc plugin; `kind-git` is the git kind's plugin, `letmeknow-kind-git`, with git's remote helper `git-remote-lmk`, and the browser's display-only git plugin; `node` is one member's session, and `client` the client core on it (requests, events, described members, plugin hosting), both shared by the CLI and the browser; `core` (MLS groups, identities, invites), `net` (peers and files over iroh), `membership` (logs and their services), `proto` (wire formats), `serve` (`letmeknow serve`), and `web` (the browser's WebAssembly bindings).
+- `crates/`: the Rust workspace. `session` is the `letmeknow` binary (CLI and session process); `kind-doc` is the doc kind's plugin, `letmeknow-kind-doc`, and the browser's in-page doc plugin; `kind-git` is the git kind's plugin, `letmeknow-kind-git`, with git's remote helper `git-remote-lmk`, and the browser's display-only git plugin; `node` is one member's session, and `client` the client core on it (requests, events, described members, plugin hosting), both shared by the CLI and the browser; `core` (MLS groups, identities, invites), `net` (peers and files over iroh), `membership` (logs and their services), `proto` (wire formats), `transport` (connections and streams, iroh's or the simulator's), `serve` (`letmeknow serve`), `web` (the browser's WebAssembly bindings), and `sim`, the deterministic simulation (see DESIGN.md, Testing).
 - `web/`: the browser client; `npm run build` writes `web/dist`.
 - `npm/cli/`: the npm launcher, which runs the prebuilt `letmeknow`; the plugins and git's remote helper letmeknow ships are beside it.
 - `deploy/`: letmeknow.dev's deployment.
@@ -48,6 +48,7 @@ It prints its membership address, `<key>@https://chat.example.com`. Sessions use
 cargo test --workspace
 python3 test/e2e.py   # the browser part needs wasm-bindgen-cli 0.2.129, and `npm ci && npx playwright install chromium-headless-shell` in web/
 LETMEKNOW_OLD=<directory of the last release's binaries> python3 test/compat.py
+cargo run -p lmk-sim --release -- --seeds 0..300   # each failing seed prints the command that replays it
 ```
 
 ## Docs
