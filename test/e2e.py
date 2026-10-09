@@ -158,13 +158,22 @@ def compat(old, listeners):
     check(got[0]["content"] == "@cleo from 0.10.1", "a 0.10.0 peer and this build exchange messages")
     run("ann", "introduce", f"--group={chat['group']}", "Ben", "--to", "Cleo")
     check(cleo.expect("introduced", lambda e: e["how"] == "introduce")["identity"]["name"] == "Ben", "and introductions, which it takes as for everyone")
+    cleo_notes = os.path.join(TMP, "cleo-notes.md")
+    run("cleo", "join", run("ann", "invite", f"--group={doc['group']}")["link"], cleo_notes, bin=old)
+    check(until(lambda: content(cleo_notes), lambda text: "new line" in text) == "- old line\n- new line\n", "a 0.10.0 peer joins a doc through this build's doc plugin")
+    with open(cleo_notes, "ab") as f:
+        f.write(b"- cleo's line\n")
+    check("cleo's line" in until(lambda: content(ann_notes), lambda text: "cleo's line" in text), "and its edits reach this build's")
+    with open(ann_notes, "ab") as f:
+        f.write(b"- ann's line\n")
+    check("ann's line" in until(lambda: content(cleo_notes), lambda text: "ann's line" in text), "and this build's reach it")
     for listener in (ann, ben, phone, cleo):
         listener.stop()
         listeners.remove(listener)
 
 
 def main():
-    subprocess.run(["cargo", "build", "-q", "-p", "letmeknow"], cwd=ROOT, check=True)
+    subprocess.run(["cargo", "build", "-q", "-p", "letmeknow", "-p", "letmeknow-kind-doc"], cwd=ROOT, check=True)
     if BROWSER:
         subprocess.run([shutil.which("npm"), "run", "build"], cwd=WEB, check=True)
     server = serve()
@@ -223,6 +232,12 @@ def main():
         check(content(notes) == "- [ ] alpha\n- [ ] beta\n- [ ] gamma @alice\n", "and her file has his line")
         write("notes.md", "- [x] alpha\n- [ ] beta\n- [ ] gamma @alice\n")
         check(until(lambda: content(bob_notes), lambda text: text.startswith("- [x] alpha")) == "- [x] alpha\n- [ ] beta\n- [ ] gamma @alice\n", "her edit reaches his file")
+        attached = run("alice", "doc", "attach", f"--group={doc['group']}", token)
+        check(attached["markdown"].startswith("[token.txt](lmk:"), "the doc plugin answers `letmeknow doc attach`")
+        with open(notes, "a") as f:
+            f.write(attached["markdown"] + "\n")
+        until(lambda: content(bob_notes), lambda text: attached["link"] in text)
+        check(content(run("bob", "fetch", attached["link"])["path"]) == "s3cret", "and a member fetches the file the doc links")
 
         # Carol joins through bob, who means the link for her; the chat is then opened to bob's identity.
         joined = run("carol", "join", run("bob", "invite", f"--group={group}", "--for", "Carol")["link"])

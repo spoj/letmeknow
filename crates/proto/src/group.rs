@@ -9,11 +9,12 @@ pub const PROTOCOL: u32 = 1;
 pub const SETTINGS_EXTENSION: u16 = 0xff01;
 pub const LEAF_EXTENSION: u16 = 0xff02;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Kind {
-    Chat,
-    Doc,
+/// The one kind every client supports, built in. Every other kind is a plugin's.
+pub const CHAT: &str = "chat";
+
+/// The kinds a leaf that lists none supports: those of 0.10.
+fn legacy_kinds() -> Vec<String> {
+    vec![CHAT.into(), "doc".into()]
 }
 
 /// Where a log lives.
@@ -28,7 +29,7 @@ pub enum Service {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub protocol: u32,
-    pub kind: Kind,
+    pub kind: String,
     pub name: String,
     pub open: Vec<Named>,
     pub keep: u32,
@@ -52,7 +53,7 @@ pub struct Named {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Opening {
     pub group: Bytes,
-    pub kind: Kind,
+    pub kind: String,
     pub name: String,
     pub membership: Service,
     /// The iroh keys of its members when last refreshed.
@@ -65,6 +66,9 @@ pub struct Leaf {
     /// The session's iroh key.
     pub key: Bytes,
     pub relay: String,
+    /// The kinds the session supports.
+    #[serde(default = "legacy_kinds")]
+    pub kinds: Vec<String>,
 }
 
 /// The identity bytes of a session's basic credential.
@@ -87,28 +91,11 @@ pub struct IdentityRef {
     pub membership: Service,
 }
 
-/// The plaintext of an MLS application message.
+/// The core's own payloads. The plaintext of an MLS application message is JSON with a `type`; every type but these
+/// belongs to the group's kind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Payload {
-    Message {
-        content: String,
-        /// Tips of what the sender had read: message ids.
-        after: Vec<Bytes>,
-        /// Fingerprints; empty addresses the group.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        to: Vec<Bytes>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reply_to: Option<Bytes>,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        urgent: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        attachment: Option<Attachment>,
-    },
-    /// A live doc edit: a Yjs v1 update.
-    Edit { update: Bytes },
-    /// A doc catch-up: a Yjs v1 update answering a state vector.
-    Diff { update: Bytes },
+pub enum Control {
     /// The sender asks to be removed.
     Leave,
     /// Who an identity is to the sender.
@@ -120,6 +107,47 @@ pub enum Payload {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         to: Vec<Bytes>,
     },
+}
+
+impl Control {
+    pub const TYPES: [&str; 2] = ["leave", "introduce"];
+}
+
+/// A payload's `type`.
+pub fn type_of(payload: &serde_json::Value) -> &str {
+    payload["type"].as_str().unwrap_or_default()
+}
+
+/// Whether members hold a payload: those of these types always, and others when their sender marks them so.
+pub fn held_by_type(payload: &serde_json::Value) -> bool {
+    matches!(type_of(payload), "message" | "leave")
+}
+
+/// The payloads of a devices group's contacts, a Yjs map synced as a doc's text was: live edits, and diffs answering a
+/// `doc_sv` frame. Both are Yjs v1 updates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContactsUpdate {
+    Edit { update: Bytes },
+    Diff { update: Bytes },
+}
+
+/// A chat message, the payload of the built-in kind.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "message")]
+pub struct ChatMessage {
+    pub content: String,
+    /// Tips of what the sender had read: message ids.
+    pub after: Vec<Bytes>,
+    /// Fingerprints; empty addresses the group.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub to: Vec<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub urgent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<Attachment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,9 +174,9 @@ mod tests {
 
     #[test]
     fn payload_shapes() {
-        let leave = serde_json::to_string(&Payload::Leave).unwrap();
+        let leave = serde_json::to_string(&Control::Leave).unwrap();
         assert_eq!(leave, r#"{"type":"leave"}"#);
-        let message = Payload::Message {
+        let message = ChatMessage {
             content: "hi".into(),
             after: vec![],
             to: vec![],
@@ -159,5 +187,11 @@ mod tests {
         assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","after":[]}"#);
         let folder = serde_json::to_string(&Service::Folder("/tmp/x".into())).unwrap();
         assert_eq!(folder, r#"{"folder":"/tmp/x"}"#);
+    }
+
+    #[test]
+    fn a_leaf_without_kinds_is_a_0_10_one() {
+        let leaf: Leaf = serde_json::from_str(r#"{"key":"AA","relay":"https://letmeknow.dev"}"#).unwrap();
+        assert_eq!(leaf.kinds, ["chat", "doc"]);
     }
 }

@@ -31,15 +31,17 @@ jobs:
           targets: ${{ matrix.target }}
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --target ${{ matrix.target }} -p letmeknow
+      # The plugins of the kinds letmeknow ships go beside it, where a session looks for them first.
+      - run: cargo build --release --target ${{ matrix.target }} -p letmeknow -p letmeknow-kind-doc
       - name: Package
         run: |
-          exe=letmeknow; [[ "${{ matrix.target }}" == *windows* ]] && exe=letmeknow.exe
+          suffix=; [[ "${{ matrix.target }}" == *windows* ]] && suffix=.exe
+          exes=("target/${{ matrix.target }}/release/letmeknow$suffix" "target/${{ matrix.target }}/release/letmeknow-kind-doc$suffix")
           name=letmeknow-${{ github.ref_name }}-${{ matrix.target }}
           mkdir -p "$name" "npm/${{ matrix.npm }}/bin"
-          cp README.md SKILL.md LICENSE "target/${{ matrix.target }}/release/$exe" "$name/"
-          cp "target/${{ matrix.target }}/release/$exe" "npm/${{ matrix.npm }}/bin/"
-          if [[ "$exe" == *.exe ]]; then 7z a "$name.zip" "$name"; else tar czf "$name.tar.gz" "$name"; fi
+          cp README.md SKILL.md LICENSE "${exes[@]}" "$name/"
+          cp "${exes[@]}" "npm/${{ matrix.npm }}/bin/"
+          if [[ -n "$suffix" ]]; then 7z a "$name.zip" "$name"; else tar czf "$name.tar.gz" "$name"; fi
       - uses: actions/upload-artifact@v4
         with:
           name: archive-${{ matrix.target }}

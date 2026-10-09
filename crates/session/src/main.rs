@@ -1,5 +1,6 @@
 use clap::Parser;
 use letmeknow::cli::{Cli, Command, Request, call, home_dir, new_handle, running_session, session_dir};
+use letmeknow::kinds;
 use letmeknow::session::Config;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -33,6 +34,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 causal_wait: letmeknow::session::CAUSAL_WAIT,
                 keep_log,
                 membership: letmeknow::service(&membership)?,
+                plugins: kinds::dirs(),
             };
             let print = |line: String| println!("{line}");
             letmeknow::listen(config, &home, letmeknow::Network::new(&relay)?, print, letmeknow::shutdown()).await
@@ -42,6 +44,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Serve(serve) => letmeknow::serve(serve).await,
+        Command::Kind(mut args) => {
+            let kind = args.remove(0);
+            let session = match cli.session {
+                Some(session) => session,
+                None => running_session(&home).await?,
+            };
+            println!("{}", call(&home, &session, Request::Kind { kind, args, cwd: String::new() }).await?);
+            Ok(())
+        }
         Command::Request(request) => {
             let session = match cli.session {
                 Some(session) => session,

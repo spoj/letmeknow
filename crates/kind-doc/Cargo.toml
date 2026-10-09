@@ -1,0 +1,24 @@
+[package]
+name = "letmeknow-kind-doc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "lmk_kind_doc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "letmeknow-kind-doc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+lmk-proto.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+similar = "3"
+yrs.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+notify.workspace = true

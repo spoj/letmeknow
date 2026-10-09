@@ -1,5 +1,5 @@
-//! A doc group's text: a Yjs document holding one text, so the browser (Yjs) and the session process (yrs) edit the
-//! same document. Its state is a Yjs update holding everything.
+//! A doc's text: a Yjs document holding one text, so the browser's editor (Yjs) and the doc plugin (yrs) edit the same
+//! document. Its state is a Yjs update holding everything.
 
 use anyhow::Result;
 use lmk_proto::links::FileLink;
@@ -85,14 +85,18 @@ pub fn edit(state: &[u8], new: &str) -> Result<Vec<u8>> {
 }
 
 /// The file links in a text.
-pub fn links(text: &str) -> Vec<FileLink> {
-    text.match_indices("lmk:")
+pub fn links(text: &str) -> Vec<String> {
+    let mut links: Vec<String> = text
+        .match_indices("lmk:")
         .filter_map(|(at, _)| {
             let link: String =
                 text[at..].chars().take_while(|c| c.is_ascii_alphanumeric() || ":.#".contains(*c)).collect();
-            FileLink::parse(&link).ok()
+            Some(FileLink::parse(&link).ok()?.link())
         })
-        .collect()
+        .collect();
+    links.sort();
+    links.dedup();
+    links
 }
 
 #[cfg(test)]

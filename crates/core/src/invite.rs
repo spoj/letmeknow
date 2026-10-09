@@ -88,7 +88,7 @@ impl Invites {
 #[cfg(test)]
 mod tests {
     use lmk_proto::Bytes;
-    use lmk_proto::group::{How, IdentityRef, Kind, Opening, Payload, Service};
+    use lmk_proto::group::{Control, ContactsUpdate, How, IdentityRef, Opening, Service};
     use lmk_proto::links;
     use lmk_proto::peer::{Admitted, InviteRequest};
 
@@ -144,14 +144,16 @@ mod tests {
         let hi = bob.send("hello");
         assert_eq!(alice.open(&hi, 3_000).unwrap().sender.name, "Bob");
         let reply = alice.send("welcome");
-        assert!(matches!(bob.open(&reply, 3_000).unwrap().payload, Payload::Message { .. }));
+        assert_eq!(bob.open(&reply, 3_000).unwrap().payload["type"], "message");
         assert_eq!(alice.g().added()[0].member.name, "Bob");
 
         // Alice tells the group who Bob is to her.
         let carol = IdentityRef { id: Bytes(vec![3; 32]), membership: Service::Folder("/tmp/lmk".into()) };
-        let introduce = Payload::Introduce { identity: carol, name: "Carol".into(), how: How::Invite, to: Vec::new() };
-        let (_, sealed) = alice.group.as_mut().unwrap().seal(&alice.provider, &alice.session, &introduce).unwrap();
-        assert_eq!(bob.open(&sealed, 4_000).unwrap().payload, introduce);
+        let introduce = Control::Introduce { identity: carol, name: "Carol".into(), how: How::Invite, to: Vec::new() };
+        let introduce = serde_json::to_value(introduce).unwrap();
+        let (_, sealed) = alice.group.as_mut().unwrap().seal(&alice.provider, &alice.session, &introduce, false).unwrap();
+        let opened = bob.open(&sealed, 4_000).unwrap();
+        assert_eq!((opened.payload, opened.held), (introduce, false));
     }
 
     #[test]
@@ -233,9 +235,9 @@ mod tests {
             &Contact { name: "Carol".into(), how: contacts::How::Introduced, by: Some(Bytes(vec![9; 32])), at: 2 },
         );
         let group = laptop.group.as_mut().unwrap();
-        let (_, sealed) =
-            group.seal(&laptop.provider, &laptop.session, &Payload::Edit { update: Bytes(edit) }).unwrap();
-        let Payload::Edit { update } = phone.open(&sealed, 6).unwrap().payload else { panic!() };
+        let edit = serde_json::to_value(ContactsUpdate::Edit { update: Bytes(edit) }).unwrap();
+        let (_, sealed) = group.seal(&laptop.provider, &laptop.session, &edit, false).unwrap();
+        let ContactsUpdate::Edit { update } = serde_json::from_value(phone.open(&sealed, 6).unwrap().payload).unwrap() else { panic!() };
         phone_contacts.apply(&update.0).unwrap();
         assert_eq!(phone_contacts.get(&[9; 32]).unwrap().name, "Bob (Acme)");
         assert_eq!(phone_contacts.get(&[8; 32]).unwrap().how, contacts::How::Introduced);
@@ -245,7 +247,7 @@ mod tests {
         // An opening, kept in the devices group's context, reaches every device.
         let opening = Opening {
             group: Bytes(vec![1; 16]),
-            kind: Kind::Doc,
+            kind: "doc".into(),
             name: "Spec".into(),
             membership: Service::Folder("/tmp/lmk".into()),
             members: vec![Bytes(b"someone".to_vec())],

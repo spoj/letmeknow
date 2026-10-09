@@ -25,7 +25,7 @@ use lmk_proto::{
     frame::{self, ALPN, Open, Stream},
     head::Head,
     links::{FileLink, Invite},
-    peer::{Admitted, Frame, Hello, InviteRequest, List},
+    peer::{Admitted, Frame, Hello, InviteRequest, KindFrame, List},
 };
 use n0_future::{boxed::BoxFuture, join_all, task::spawn, time::timeout};
 use tokio::{
@@ -62,12 +62,10 @@ pub trait Groups: Send + Sync + 'static {
     fn message(&self, group: &[u8], id: &[u8; 32]) -> Option<Vec<u8>>;
     /// An MLS ciphertext from a peer: decrypt, verify, and hold or apply it, or give it up.
     fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Taken;
-    /// For a doc, SHA-256 of its snapshot.
-    fn doc(&self, group: &[u8]) -> Option<[u8; 32]>;
-    /// For a doc, its Yjs state vector.
-    fn doc_sv(&self, group: &[u8]) -> Vec<u8>;
-    /// For a doc, a `diff` message answering `sv`, sealed under the current epoch.
-    fn diff(&self, group: &[u8], sv: &[u8]) -> Result<Vec<u8>>;
+    /// A frame of the group's kind from `peer`, a member.
+    fn frame(&self, peer: EndpointId, frame: KindFrame);
+    /// A link to the state of the group's kind, which `peer`, a member, hands this session.
+    fn state(&self, group: &[u8], peer: EndpointId, link: String);
     /// The files the group links now.
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
     /// The device lists this session holds, with signed heads, of the identities in these groups.
@@ -110,6 +108,8 @@ pub enum Event {
     Contradiction { group: Vec<u8>, peer: EndpointId, ours: Head, theirs: Head },
     /// What `peer` did with messages this session sent it.
     Receipt { group: Vec<u8>, peer: EndpointId, held: Vec<[u8; 32]>, refused: Vec<([u8; 32], String)> },
+    /// This session and `peer` hold the same log of the group: a time to compare the state of its kind.
+    InStep { group: Vec<u8>, peer: EndpointId },
     /// Message sync with `peer` finished.
     Synced { group: Vec<u8>, peer: EndpointId },
     /// A file is now held whole.
@@ -201,6 +201,17 @@ impl Net {
     pub fn send(&self, group: &[u8], ciphertext: Vec<u8>) -> Vec<EndpointId> {
         let frame = Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)] };
         self.inner.members(group).into_iter().filter(|(_, input)| input.send(Input::Send(frame.clone())).is_ok()).map(|(peer, _)| peer).collect()
+    }
+
+    /// Sends a new MLS message to one member online, if it is connected.
+    pub fn send_to(&self, peer: EndpointId, group: &[u8], ciphertext: Vec<u8>) -> bool {
+        self.frame(peer, Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)] })
+    }
+
+    /// Sends a frame to one member online, if it is connected.
+    pub fn frame(&self, peer: EndpointId, frame: Frame) -> bool {
+        let input = self.inner.links.lock().unwrap().get(&peer).map(|link| link.input.clone());
+        input.is_some_and(|input| input.send(Input::Send(frame)).is_ok())
     }
 
     /// Tells peers this session's state of a group changed (a commit applied, a member added):

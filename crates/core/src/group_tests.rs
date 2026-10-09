@@ -2,12 +2,12 @@
 
 use super::*;
 use crate::provider::MemoryProvider;
-use lmk_proto::group::{Kind, Named, Service};
+use lmk_proto::group::{CHAT, ChatMessage, Control, Named, Service};
 
 pub(crate) fn settings(name: &str) -> Settings {
     Settings {
         protocol: PROTOCOL,
-        kind: Kind::Chat,
+        kind: CHAT.into(),
         name: name.into(),
         open: vec![],
         keep: 90,
@@ -18,7 +18,7 @@ pub(crate) fn settings(name: &str) -> Settings {
 }
 
 pub(crate) fn leaf(name: &str) -> Leaf {
-    Leaf { key: Bytes(name.as_bytes().to_vec()), relay: "https://relay.example/".into() }
+    Leaf { key: Bytes(name.as_bytes().to_vec()), relay: "https://relay.example/".into(), kinds: vec![CHAT.into()] }
 }
 
 pub(crate) struct Member<P: Provider = MemoryProvider> {
@@ -62,7 +62,7 @@ impl<P: Provider> Member<P> {
 
     pub fn send(&mut self, text: &str) -> Vec<u8> {
         let group = self.group.as_mut().unwrap();
-        group.seal(&self.provider, &self.session, &message(text)).unwrap().1
+        group.seal(&self.provider, &self.session, &message(text), true).unwrap().1
     }
 
     pub fn open(&mut self, bytes: &[u8], now: u64) -> Result<Opened> {
@@ -81,20 +81,13 @@ impl<P: Provider> Member<P> {
     }
 }
 
-pub(crate) fn message(text: &str) -> Payload {
-    Payload::Message {
-        content: text.into(),
-        after: vec![],
-        to: vec![],
-        reply_to: None,
-        urgent: false,
-        attachment: None,
-    }
+pub(crate) fn message(text: &str) -> serde_json::Value {
+    let message = ChatMessage { content: text.into(), after: vec![], to: vec![], reply_to: None, urgent: false, attachment: None };
+    serde_json::to_value(message).unwrap()
 }
 
 fn text(opened: &Opened) -> &str {
-    let Payload::Message { content, .. } = &opened.payload else { panic!("not a message") };
-    content
+    opened.payload["content"].as_str().expect("a message")
 }
 
 struct World {
@@ -315,7 +308,7 @@ fn leaf_data() {
     w.found(0, &[1, 2]);
     let leaves: Vec<_> = w.m[0].g().members().into_iter().map(|m| m.leaf.unwrap()).collect();
     assert_eq!(leaves, [leaf("A"), leaf("B"), leaf("C")]);
-    let moved = Leaf { key: Bytes(b"B".to_vec()), relay: "https://relay2.example/".into() };
+    let moved = Leaf { relay: "https://relay2.example/".into(), ..leaf("B") };
     let commit = w.m[1].commit(Change { leaf: Some(moved.clone()), ..Change::default() });
     w.post(commit.commit);
     w.read(&[0, 1, 2]);
@@ -346,7 +339,7 @@ fn rules_bind_everyone() {
 
     // Our own API refuses to build a commit that breaks them.
     let mut bad = w.m[1].g().settings();
-    bad.kind = Kind::Doc;
+    bad.kind = "doc".into();
     let b = &mut w.m[1];
     let error = b.group.as_mut().unwrap().commit(
         &b.provider,
@@ -357,7 +350,7 @@ fn rules_bind_everyone() {
     assert!(!w.m[1].g().pending());
 
     // A kind change, built around it, and then a protocol change.
-    for change in [|s: &mut Settings| s.kind = Kind::Doc, |s: &mut Settings| s.protocol = 2] {
+    for change in [|s: &mut Settings| s.kind = "doc".into(), |s: &mut Settings| s.protocol = 2] {
         let mut bad = w.m[1].g().settings();
         change(&mut bad);
         let b = &mut w.m[1];
@@ -477,7 +470,7 @@ fn leave_and_removed_senders() {
     let c = &mut w.m[2];
     let (_, leave) = c.group.as_mut().unwrap().leave(&c.provider, &c.session).unwrap();
     let opened = w.m[1].open(&leave, 0).unwrap();
-    assert_eq!(opened.payload, Payload::Leave);
+    assert_eq!((opened.payload.clone(), opened.held), (serde_json::to_value(Control::Leave).unwrap(), true));
     let commit = w.m[1].commit(Change { remove: vec![opened.current.unwrap()], ..Change::default() });
     w.post(commit.commit);
     let applied = w.read_at(&[0, 1, 2], 1_000);
@@ -551,4 +544,18 @@ fn state_survives_a_restart() {
     // Windows cannot delete a database that is still open.
     drop((a, b));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_kind_payload_is_held_when_its_sender_marks_it() {
+    let mut w = World::new(&["A", "B"]);
+    w.found(0, &[1]);
+    let a = &mut w.m[0];
+    let push = serde_json::json!({ "type": "push", "refs": [] });
+    let group = a.group.as_mut().unwrap();
+    let (_, held) = group.seal(&a.provider, &a.session, &push, true).unwrap();
+    let (_, live) = group.seal(&a.provider, &a.session, &push, false).unwrap();
+    let (_, chat) = group.seal(&a.provider, &a.session, &message("hi"), false).unwrap();
+    let held: Vec<bool> = [held, live, chat].iter().map(|c| w.m[1].open(c, 0).unwrap().held).collect();
+    assert_eq!(held, [true, false, true]);
 }

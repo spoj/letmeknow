@@ -16,7 +16,6 @@ n0-future = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-similar = "3"
 tokio = { workspace = true, features = ["sync"] }
 tracing = "0.1"
 yrs.workspace = true

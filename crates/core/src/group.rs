@@ -5,8 +5,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use lmk_proto::Bytes;
 use lmk_proto::group::{
-    Credential, How, IdentityRef, Kind, LEAF_EXTENSION, Leaf, Opening, PROTOCOL, Payload, SETTINGS_EXTENSION, Service,
-    Settings,
+    CHAT, Control, Credential, How, IdentityRef, LEAF_EXTENSION, Leaf, Opening, PROTOCOL, SETTINGS_EXTENSION, Service,
+    Settings, held_by_type,
 };
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -176,6 +176,11 @@ pub fn key_package_credential<P: Provider>(provider: &P, key_package: &[u8]) -> 
     Ok((credential, leaf.signature_key().as_slice().to_vec()))
 }
 
+/// The leaf data a KeyPackage carries.
+pub fn key_package_leaf<P: Provider>(provider: &P, key_package: &[u8]) -> Result<Leaf> {
+    leaf_of(key_package_in(provider, key_package)?.leaf_node().extensions()).context("a KeyPackage without our leaf data")
+}
+
 fn key_package_in<P: Provider>(provider: &P, bytes: &[u8]) -> Result<KeyPackage> {
     let MlsMessageBodyIn::KeyPackage(key_package) = parse::<MlsMessageIn>(bytes)?.extract() else {
         bail!("not a KeyPackage")
@@ -199,6 +204,12 @@ pub struct Change {
 #[derive(Serialize, Deserialize)]
 struct Aad {
     how: How,
+}
+
+/// An application message's authenticated data, for a payload its sender marks as held.
+#[derive(Serialize, Deserialize)]
+struct Held {
+    held: bool,
 }
 
 /// A commit to post, and for an add, the Welcome to send once the log has taken it.
@@ -272,7 +283,9 @@ pub struct Opened {
     /// The sender's signature key.
     pub key: Vec<u8>,
     pub sender: Credential,
-    pub payload: Payload,
+    pub payload: serde_json::Value,
+    /// Whether members hold it (see `seal`).
+    pub held: bool,
 }
 
 /// Who added whom, as the log showed it.
@@ -530,20 +543,25 @@ impl Group {
         self.save(provider)
     }
 
-    /// Seals a payload as an application message; returns its id and ciphertext.
+    /// Seals a payload as an application message; returns its id and ciphertext. A payload members hold that is not
+    /// held by its type is marked so in the message's authenticated data.
     pub fn seal<P: Provider>(
         &mut self,
         provider: &P,
         session: &Session,
-        payload: &Payload,
+        payload: &serde_json::Value,
+        held: bool,
     ) -> Result<([u8; 32], Vec<u8>)> {
+        if held && !held_by_type(payload) {
+            self.mls.set_aad(serde_json::to_vec(&Held { held })?);
+        }
         let message = self.mls.create_message(provider, &session.signer, &serde_json::to_vec(payload)?)?.to_bytes()?;
         Ok((Sha256::digest(&message).into(), message))
     }
 
     /// Asks the others to commit this session's removal.
     pub fn leave<P: Provider>(&mut self, provider: &P, session: &Session) -> Result<([u8; 32], Vec<u8>)> {
-        self.seal(provider, session, &Payload::Leave)
+        self.seal(provider, session, &serde_json::to_value(Control::Leave)?, true)
     }
 
     /// Decrypts and verifies a member's message. `now` (milliseconds) is when it first reached this session.
@@ -552,6 +570,7 @@ impl Group {
         ensure!(message.content_type() == ContentType::Application, "not an application message");
         let processed = self.mls.process_message(provider, message)?;
         let epoch = processed.epoch().as_u64();
+        let marked = serde_json::from_slice::<Held>(processed.aad()).is_ok_and(|aad| aad.held);
         let sender = credential_of(processed.credential()).context("the sender has no letmeknow credential")?;
         let Sender::Member(index) = *processed.sender() else { bail!("not from a member") };
         let ProcessedMessageContent::ApplicationMessage(message) = processed.into_content() else {
@@ -566,8 +585,10 @@ impl Group {
                 key = removed.0.clone();
             }
         }
-        let payload: Payload = serde_json::from_slice(&message.into_bytes())?;
+        let payload: serde_json::Value = serde_json::from_slice(&message.into_bytes())?;
+        ensure!(payload["type"].is_string(), "a payload without a type");
         Ok(Opened {
+            held: marked || held_by_type(&payload),
             id: Sha256::digest(bytes).into(),
             epoch,
             index: index.u32(),
@@ -583,7 +604,7 @@ impl Group {
 pub fn devices_settings(identity: &[u8], name: &str, membership: Service) -> Settings {
     Settings {
         protocol: PROTOCOL,
-        kind: Kind::Chat,
+        kind: CHAT.into(),
         name: name.into(),
         open: vec![],
         keep: 90,

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::cli::{Cli, Command, session_dir};
+use crate::cli::{Cli, Command, Request, session_dir};
 use crate::session::Config;
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -26,6 +26,15 @@ struct World {
     root: PathBuf,
     /// For the sessions started from now on.
     causal_wait: Duration,
+    plugins: Vec<PathBuf>,
+}
+
+/// Where cargo builds the workspace's binaries, the doc plugin among them: beside this test's own directory.
+fn built() -> PathBuf {
+    let dir = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
+    let plugin = dir.join(format!("letmeknow-kind-doc{}", std::env::consts::EXE_SUFFIX));
+    assert!(plugin.exists(), "build the doc plugin first: cargo build -p letmeknow-kind-doc");
+    dir
 }
 
 async fn world(test: &str) -> World {
@@ -51,7 +60,7 @@ async fn world(test: &str) -> World {
     let root = std::env::temp_dir().join(format!("lmk-session-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let network = crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) };
-    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT }
+    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT, plugins: vec![built()] }
 }
 
 struct Agent {
@@ -83,6 +92,7 @@ impl World {
             causal_wait: self.causal_wait,
             keep_log: false,
             membership: self.membership(),
+            plugins: self.plugins.clone(),
         };
         let (out, events) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel::<()>();
@@ -103,7 +113,11 @@ impl Agent {
         let home = self.home.to_str().unwrap();
         let base = ["letmeknow", "--home", home, "--session", self.handle.as_str()];
         let cli = Cli::try_parse_from(base.iter().chain(args))?;
-        let Command::Request(request) = cli.command else { panic!("not a request") };
+        let request = match cli.command {
+            Command::Request(request) => request,
+            Command::Kind(mut args) => Request::Kind { kind: args.remove(0), args, cwd: String::new() },
+            _ => panic!("not a request"),
+        };
         crate::cli::call(&self.home, &self.handle, request).await
     }
 
@@ -328,7 +342,7 @@ fn a_doc_is_a_file_that_others_edit_too() {
         assert!(bob.printed().await.iter().all(|e| e["type"] != "warning"));
         let attached = world.root.join("chart.png");
         std::fs::write(&attached, b"\x89PNG....").unwrap();
-        let link = alice.cmd(&["attach", attached.to_str().unwrap()]).await.unwrap();
+        let link = alice.cmd(&["doc", "attach", attached.to_str().unwrap()]).await.unwrap();
         assert!(link["markdown"].as_str().unwrap().starts_with("![chart.png](lmk:"));
     });
 }
@@ -562,6 +576,68 @@ fn identities_are_created_listed_and_lose_devices() {
     });
 }
 
+/// Waits, running commands so that what waits prints, until `file` reads as `check` wants.
+async fn until_file(agent: &Agent, file: &Path, check: impl Fn(&str) -> bool) -> String {
+    for _ in 0..80 {
+        agent.cmd(&["groups"]).await.unwrap();
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        if check(&text) {
+            return text;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    std::fs::read_to_string(file).unwrap()
+}
+
+#[test]
+fn docs_that_drift_apart_meet_again_through_their_plugins_frames() {
+    local(async {
+        let world = world("frames").await;
+        let mut alice = world.start("alice", HOUR).await;
+        let mut bob = world.start("bob", HOUR).await;
+        std::fs::create_dir_all(&world.root).unwrap();
+        let (plan, theirs) = (world.root.join("plan.md"), world.root.join("bob-plan.md"));
+        std::fs::write(&plan, "- [ ] alpha\n").unwrap();
+        let invite = alice.cmd(&["invite", "--kind", "doc", plan.to_str().unwrap()]).await.unwrap();
+        bob.cmd(&["join", invite["link"].as_str().unwrap(), theirs.to_str().unwrap()]).await.unwrap();
+        alice.expect("joined").await;
+        assert_eq!(until_file(&bob, &theirs, |t| t.contains("alpha")).await, "- [ ] alpha\n");
+        // Bob is away while Alice edits: her live edit never reaches him, but the docs' frames bring it once he is back.
+        bob.stop().await;
+        std::fs::write(&plan, "- [x] alpha\n").unwrap();
+        alice.cmd(&["status"]).await.unwrap();
+        let bob = world.start("bob", HOUR).await;
+        assert_eq!(until_file(&bob, &theirs, |t| t.contains("[x]")).await, "- [x] alpha\n");
+        alice.stop().await;
+    });
+}
+
+#[test]
+fn a_kinds_commands_pass_through_and_a_session_without_its_plugin_is_refused() {
+    local(async {
+        let mut world = world("plugins").await;
+        let alice = world.start("alice", HOUR).await;
+        world.plugins = Vec::new();
+        let bob = world.start("bob", HOUR).await;
+        let invite = alice.cmd(&["invite", "--kind", "doc"]).await.unwrap();
+        let error = bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap_err();
+        assert!(format!("{error:#}").contains("does not support doc groups"), "{error:#}");
+        let error = bob.cmd(&["invite", "--kind", "doc"]).await.unwrap_err();
+        assert!(format!("{error:#}").contains("no plugin for doc groups"), "{error:#}");
+        let error = bob.cmd(&["doc", "attach", "x"]).await.unwrap_err();
+        assert!(format!("{error:#}").contains("no plugin for doc groups"), "{error:#}");
+        // Alice's plugin answers her doc's commands, and refuses those it does not know.
+        let error = alice.cmd(&["doc", "frobnicate"]).await.unwrap_err();
+        assert!(format!("{error:#}").contains("usage: letmeknow doc attach"), "{error:#}");
+        let readme = world.root.join("readme.txt");
+        std::fs::write(&readme, "read me").unwrap();
+        let attached = alice.cmd(&["doc", "attach", readme.to_str().unwrap()]).await.unwrap();
+        assert!(attached["markdown"].as_str().unwrap().starts_with("[readme.txt](lmk:"));
+        let fetched = alice.cmd(&["fetch", attached["link"].as_str().unwrap()]).await.unwrap();
+        assert_eq!(fetched["bytes"], 7);
+    });
+}
+
 #[test]
 fn a_restarted_session_resumes_its_groups_and_docs() {
     local(async {
@@ -581,38 +657,59 @@ fn a_restarted_session_resumes_its_groups_and_docs() {
 }
 
 #[test]
-fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_twice() {
+fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_twice_nor_one_0_10_left() {
     local(async {
-        use base64::Engine;
+        use lmk_kind_doc::ydoc;
         let world = world("carrying").await;
         let mut alice = world.start("alice", HOUR).await;
         let invite = alice.cmd(&["invite", "--kind", "doc", "--name", "Notes"]).await.unwrap();
-        let gid = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(invite["group"].as_str().unwrap()).unwrap();
+        let gid = invite["group"].as_str().unwrap().to_owned();
         let file = invite["file"].as_str().unwrap().to_owned();
         std::fs::write(&file, "one\n").unwrap();
         alice.cmd(&["status"]).await.unwrap();
         alice.stop().await;
-        // Another member's line came in; then it stopped after recording that it carried its own new line onto the doc,
-        // with the doc changed (`applied`) or not, before the file was rewritten and the base stored.
-        for (i, applied) in [true, false].into_iter().enumerate() {
+        let dir = session_dir(&alice.home, "alice").unwrap();
+        let (state_file, saved_file) = (dir.join(format!("kinds/doc/{gid}.yjs")), dir.join(format!("kinds/doc/{gid}.json")));
+        // Another member's line came in; then the plugin stopped after recording that it carried its own new line onto
+        // the doc, with the doc changed (`applied`) or not, before the file was rewritten and the base stored. The third
+        // time, 0.10 did so, and kept it all in its own tables.
+        for (i, applied) in [true, false, true].into_iter().enumerate() {
             let base = std::fs::read_to_string(&file).unwrap();
             let carried = format!("{base}mine {i}\n");
             let expected = format!("others {i}\n{carried}");
             std::fs::write(&file, &carried).unwrap();
-            let db = rusqlite::Connection::open(session_dir(&alice.home, "alice").unwrap().join("session.db")).unwrap();
-            let key = [b"node/doc/".as_slice(), &gid].concat();
-            let state: Vec<u8> = db.query_row("SELECT value FROM lmk WHERE key = ?", [&key], |r| r.get(0)).unwrap();
-            let theirs = lmk_node::doc::apply(&state, &lmk_node::doc::edit(&state, &format!("others {i}\n{base}")).unwrap()).unwrap();
-            let edit = lmk_node::doc::edit(&theirs, &expected).unwrap();
-            let state = if applied { lmk_node::doc::apply(&theirs, &edit).unwrap() } else { theirs };
-            db.execute("UPDATE lmk SET value = ? WHERE key = ?", rusqlite::params![state, key]).unwrap();
-            db.execute("INSERT INTO carrying (gid, file, edit) VALUES (?, ?, ?)", rusqlite::params![gid, carried, edit]).unwrap();
-            drop(db);
+            let state = std::fs::read(&state_file).unwrap();
+            let theirs = ydoc::apply(&state, &ydoc::edit(&state, &format!("others {i}\n{base}")).unwrap()).unwrap();
+            let edit = ydoc::edit(&theirs, &expected).unwrap();
+            let state = if applied { ydoc::apply(&theirs, &edit).unwrap() } else { theirs };
+            let carrying = json!({ "file": carried, "edit": lmk_proto::Bytes(edit.clone()) });
+            if i < 2 {
+                std::fs::write(&state_file, &state).unwrap();
+                std::fs::write(&saved_file, json!({ "path": file, "base": base, "made": true, "carrying": carrying }).to_string()).unwrap();
+            } else {
+                std::fs::remove_file(&state_file).unwrap();
+                std::fs::remove_file(&saved_file).unwrap();
+                let db = rusqlite::Connection::open(dir.join("session.db")).unwrap();
+                db.execute_batch(
+                    "CREATE TABLE bindings (gid BLOB PRIMARY KEY, path TEXT NOT NULL, base TEXT NOT NULL);
+                     CREATE TABLE carrying (gid BLOB PRIMARY KEY, file TEXT NOT NULL, edit BLOB NOT NULL);",
+                )
+                .unwrap();
+                let id = lmk_kind_doc::bytes(&json!(gid)).unwrap();
+                let key = [b"node/doc/".as_slice(), &id].concat();
+                db.execute("INSERT INTO lmk (key, value) VALUES (?, ?)", rusqlite::params![key, state]).unwrap();
+                db.execute("INSERT INTO bindings VALUES (?, ?, ?)", rusqlite::params![id, file, base]).unwrap();
+                db.execute("INSERT INTO carrying VALUES (?, ?, ?)", rusqlite::params![id, carried, edit]).unwrap();
+            }
             alice = world.start("alice", HOUR).await;
             alice.cmd(&["status"]).await.unwrap();
             assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
             alice.stop().await;
         }
+        let db = rusqlite::Connection::open(dir.join("session.db")).unwrap();
+        let left: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('bindings', 'carrying')", [], |r| r.get(0)).unwrap();
+        let legacy: i64 = db.query_row("SELECT count(*) FROM lmk WHERE key >= ? AND key < ?", [b"node/doc/".to_vec(), b"node/doc0".to_vec()], |r| r.get(0)).unwrap();
+        assert_eq!((left, legacy), (0, 0), "0.10's records of the doc are gone once the plugin has it");
     });
 }
 

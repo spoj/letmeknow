@@ -5,23 +5,26 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
-use lmk_core::group::{self as core, Change, key_package_credential};
+use lmk_core::group::{self as core, Change, key_package_credential, key_package_leaf};
 use lmk_core::identity::{DeviceList, Verdict, check};
 use lmk_core::invite::Target;
 use lmk_core::provider::Provider;
 use lmk_membership::Chain;
 use lmk_net::{Admit, Groups, Taken};
-use lmk_proto::group::{How, Kind, Payload, Service};
+use lmk_proto::group::{CHAT, ContactsUpdate, Control, How, Service, type_of};
 use lmk_proto::head::{self, Head};
 use lmk_proto::links::FileLink;
-use lmk_proto::peer::{Admitted, Hello, InviteRequest, List};
+use lmk_proto::peer::{Admitted, Frame, Hello, InviteRequest, KindFrame, List};
 use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
+use n0_future::time::timeout;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 
 use crate::{
-    Event, Inner, Item, MAX_MESSAGE, Message, State, Work, ciphertext_key, doc, doc_like, entry_key, message_key, now,
-    put,
+    Event, Inner, Item, MAX_MESSAGE, Message, SNAPSHOT_WAIT, State, Work, ciphertext_key, doc_key, entry_key, message_key,
+    now, put, yjs,
 };
 
 /// A head that needs no signature: the empty log's.
@@ -72,51 +75,32 @@ impl<P: Provider + Send + 'static> Inner<P> {
         });
         let sender = st.member(gid, &sender).context("the sender has no letmeknow credential")?;
         let group = Bytes(gid.to_vec());
-        match opened.payload {
-            payload @ (Payload::Message { .. } | Payload::Leave) => {
-                let g = st.groups.get_mut(gid).unwrap();
-                if let Payload::Message { attachment: Some(attachment), .. } = &payload {
-                    let link = FileLink::parse(&attachment.link)?;
-                    g.rec.link(attachment.link.clone());
-                    if link.size <= self.file_limit {
-                        self.work.send(Work::Fetch { group: gid.to_vec(), link }).ok();
+        let payload = opened.payload;
+        if Control::TYPES.contains(&type_of(&payload)) {
+            match serde_json::from_value(payload.clone())? {
+                Control::Leave => {
+                    if opened.current.is_some() {
+                        self.work.send(Work::Remove { group: gid.to_vec(), key: opened.key.clone() }).ok();
+                    }
+                    hold(st, gid, Message { id: Bytes(id.to_vec()), group, epoch, at: now(), sender, payload }, ciphertext)?;
+                }
+                Control::Introduce { identity, name, how, to } => {
+                    let me = Bytes(Sha256::digest(st.session.key())[..8].to_vec());
+                    if to.is_empty() || to.contains(&me) {
+                        self.events.send(Event::Introduced { group, by: sender, identity, name, how }).ok();
                     }
                 }
-                if payload == Payload::Leave && opened.current.is_some() {
-                    self.work.send(Work::Remove { group: gid.to_vec(), key: opened.key.clone() }).ok();
-                }
-                let at = now();
-                g.rec.items.push(Item { epoch, id: Bytes(id.to_vec()), at });
-                st.provider.put(&ciphertext_key(&id), ciphertext)?;
-                let message = Message { id: Bytes(id.to_vec()), group, epoch, at, sender, payload };
-                put(&st.provider, &message_key(&id), &message)?;
-                st.save(gid)?;
-                if matches!(message.payload, Payload::Message { .. }) {
-                    self.events.send(Event::Message(message)).ok();
-                }
             }
-            Payload::Edit { update } | Payload::Diff { update } => {
-                let settings = st.group(gid)?.mls.settings();
-                ensure!(doc_like(&settings), "an edit outside a doc");
-                let old = st.doc_state(gid)?;
-                let new = doc::apply(&old, &update.0)?;
-                st.edited(gid, &new, &sender)?;
-                if settings.kind == Kind::Doc {
-                    let before = doc::links(&doc::text(&old)?);
-                    for link in doc::links(&doc::text(&new)?) {
-                        if !before.contains(&link) && link.size <= self.file_limit {
-                            self.work.send(Work::Fetch { group: gid.to_vec(), link }).ok();
-                        }
-                    }
-                }
-                self.events.send(Event::Edited { group, by: sender }).ok();
-            }
-            Payload::Introduce { identity, name, how, to } => {
-                let me = Bytes(Sha256::digest(st.session.key())[..8].to_vec());
-                if to.is_empty() || to.contains(&me) {
-                    self.events.send(Event::Introduced { group, by: sender, identity, name, how }).ok();
-                }
-            }
+        } else if st.devices(gid) {
+            let (ContactsUpdate::Edit { update } | ContactsUpdate::Diff { update }) = serde_json::from_value(payload)?;
+            let state = yjs::apply(&st.contacts_state(gid)?, &update.0)?;
+            st.provider.put(&doc_key(gid), &state)?;
+        } else if opened.held {
+            let message = Message { id: Bytes(id.to_vec()), group, epoch, at: now(), sender, payload };
+            hold(st, gid, message.clone(), ciphertext)?;
+            self.events.send(Event::Message(message)).ok();
+        } else {
+            self.events.send(Event::Live { group, sender, payload }).ok();
         }
         Ok(Taken::Held)
     }
@@ -177,7 +161,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.admit(gid, key_package, How::Open, None).await
     }
 
-    /// Commits the Add, and answers with the Welcome and, for a doc, its state as a file.
+    /// Commits the Add, and answers with the Welcome and the state of the group's kind, or of its contacts, as a file.
+    /// A joiner whose session does not support the group's kind is refused.
     async fn admit(
         self: &Arc<Self>,
         gid: &[u8],
@@ -185,10 +170,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
         how: How,
         label: Option<String>,
     ) -> Result<Admitted> {
-        if let Some(label) = label {
+        {
             let mut st = self.state.lock().unwrap();
-            let (_, key) = key_package_credential(&st.provider, &key_package)?;
-            st.labels.insert(key, label);
+            let kind = st.group(gid)?.mls.settings().kind;
+            let leaf = key_package_leaf(&st.provider, &key_package)?;
+            ensure!(leaf.kinds.contains(&kind), "its session does not support {kind} groups");
+            if let Some(label) = label {
+                let (_, key) = key_package_credential(&st.provider, &key_package)?;
+                st.labels.insert(key, label);
+            }
         }
         let add = Change { add: vec![key_package], how: Some(how), ..Change::default() };
         let (welcome, position) = self.commit(gid, |_| Ok(add.clone())).await?;
@@ -196,18 +186,24 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let st = self.state.lock().unwrap();
             let g = st.group(gid)?;
             let before = g.rec.items.iter().filter(|item| item.epoch < g.mls.epoch()).map(|item| item.id.clone()).collect();
-            (doc_like(&g.mls.settings()).then(|| st.doc_state(gid)).transpose()?, before)
+            let state = match (st.devices(gid), g.mls.settings().kind == CHAT) {
+                (true, _) => Ok(st.contacts_state(gid)?),
+                (false, true) => Err(None),
+                (false, false) => {
+                    let (reply, state) = oneshot::channel();
+                    self.events.send(Event::Snapshot { group: Bytes(gid.to_vec()), reply }).ok();
+                    Err(Some(state))
+                }
+            };
+            (state, before)
+        };
+        let state = match state {
+            Ok(state) => Some(state),
+            Err(None) => None,
+            Err(Some(asked)) => timeout(SNAPSHOT_WAIT, asked).await.ok().and_then(Result::ok).flatten(),
         };
         let doc = match state {
-            Some(state) => {
-                let link = self.net().add_file(std::io::Cursor::new(state)).await?.link();
-                let mut st = self.state.lock().unwrap();
-                let rec = &mut st.group_mut(gid)?.rec;
-                rec.link(link.clone());
-                rec.state = Some(link.clone());
-                st.save(gid)?;
-                Some(link)
-            }
+            Some(state) => Some(self.state_file(gid, state).await?),
             None => None,
         };
         Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc, before })
@@ -316,23 +312,21 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         self.take(&mut st, group, ciphertext)
     }
 
-    fn doc(&self, group: &[u8]) -> Option<[u8; 32]> {
-        let st = self.state.lock().unwrap();
-        doc_like(&st.groups.get(group)?.mls.settings()).then_some(())?;
-        doc::snapshot(&st.doc_state(group).ok()?).ok()
-    }
-
-    fn doc_sv(&self, group: &[u8]) -> Vec<u8> {
-        let st = self.state.lock().unwrap();
-        st.doc_state(group).and_then(|state| doc::state_vector(&state)).unwrap_or_default()
-    }
-
-    fn diff(&self, group: &[u8], sv: &[u8]) -> Result<Vec<u8>> {
+    fn frame(&self, peer: EndpointId, frame: KindFrame) {
+        let gid = frame.group.0.clone();
         let mut st = self.state.lock().unwrap();
-        let st = &mut *st;
-        let update = doc::diff(&st.doc_state(group)?, sv)?;
-        let g = st.groups.get_mut(group).context("not in that group")?;
-        Ok(g.mls.seal(&st.provider, &st.session, &Payload::Diff { update: Bytes(update) })?.1)
+        if !st.devices(&gid) {
+            let from = st.by_iroh(&gid, &peer);
+            self.events.send(Event::Frame { group: frame.group.clone(), from, frame: frame.value() }).ok();
+            return;
+        }
+        if let Err(error) = self.contacts_frame(&mut st, peer, frame) {
+            tracing::debug!("a contacts frame from {}: {error:#}", peer.fmt_short());
+        }
+    }
+
+    fn state(&self, group: &[u8], peer: EndpointId, link: String) {
+        self.work.send(Work::State { group: group.to_vec(), link, by: peer }).ok();
     }
 
     fn files(&self, group: &[u8]) -> Vec<FileLink> {
@@ -340,9 +334,7 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         let Some(g) = st.groups.get(group) else {
             return Vec::new();
         };
-        let settings = g.mls.settings();
-        let text = (settings.kind == Kind::Doc).then(|| st.doc_state(group).and_then(|state| doc::text(&state)).ok()).flatten();
-        g.rec.held(settings.keep, text.as_deref())
+        g.rec.held(g.mls.settings().keep)
     }
 
     fn lists(&self, groups: &[Vec<u8>]) -> Vec<List> {
@@ -362,7 +354,37 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
     }
 }
 
+/// Stores a held message and its ciphertext.
+fn hold<P: Provider>(st: &mut State<P>, gid: &[u8], message: Message, ciphertext: &[u8]) -> Result<()> {
+    let id = message.id.0.clone();
+    st.group_mut(gid)?.rec.items.push(Item { epoch: message.epoch, id: message.id.clone(), at: message.at });
+    st.provider.put(&ciphertext_key(&id), ciphertext)?;
+    put(&st.provider, &message_key(&id), &message)?;
+    st.save(gid)
+}
+
 impl<P: Provider + Send + 'static> Inner<P> {
+    /// A devices group's contacts, compared as a doc's text was: a member whose snapshot differs gets this session's
+    /// state vector (`doc_sv`), and answers it with a `diff` of what this session lacks.
+    fn contacts_frame(&self, st: &mut State<P>, peer: EndpointId, frame: KindFrame) -> Result<()> {
+        let (gid, state) = (frame.group.0.clone(), st.contacts_state(&frame.group.0)?);
+        let field = |name: &str| serde_json::from_value::<Bytes>(frame.body.get(name).cloned().unwrap_or(Value::Null));
+        match frame.name.as_str() {
+            "doc" if field("snapshot")?.0 != yjs::snapshot(&state)? => {
+                let reply = json!({ "doc_sv": { "sv": Bytes(yjs::state_vector(&state)?) } });
+                self.net().frame(peer, Frame::Kind(KindFrame::new(frame.group, reply)?));
+            }
+            "doc_sv" => {
+                let diff = serde_json::to_value(ContactsUpdate::Diff { update: Bytes(yjs::diff(&state, &field("sv")?.0)?) })?;
+                let g = st.groups.get_mut(&gid).context("not in that group")?;
+                let ciphertext = g.mls.seal(&st.provider, &st.session, &diff, false)?.1;
+                self.net().send_to(peer, &gid, ciphertext);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Checks a device list a peer presented, and holds it if it is newer than the one held.
     fn presented(&self, peer: EndpointId, presented: List) -> Result<()> {
         let id: [u8; 32] = presented.identity.0.as_slice().try_into().context("an identity id is 32 bytes")?;

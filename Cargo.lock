@@ -2553,11 +2553,11 @@ dependencies = [
  "hex",
  "iroh",
  "iroh-relay",
+ "letmeknow-kind-doc",
  "lmk-core",
  "lmk-node",
  "lmk-proto",
  "lmk-serve",
- "notify",
  "qrcode",
  "rand 0.9.5",
  "rcgen",
@@ -2567,9 +2567,21 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "similar",
  "tokio",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "letmeknow-kind-doc"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "lmk-proto",
+ "notify",
+ "serde_json",
+ "sha2 0.11.0",
+ "similar",
+ "yrs",
 ]
 
 [[package]]
@@ -2911,7 +2923,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "yrs",
 ]
 
 [[package]]
@@ -2932,7 +2943,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "similar",
  "tokio",
  "tracing",
  "yrs",
@@ -2985,6 +2995,7 @@ dependencies = [
  "hex",
  "iroh",
  "js-sys",
+ "letmeknow-kind-doc",
  "lmk-node",
  "lmk-proto",
  "n0-future",

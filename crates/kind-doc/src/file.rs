@@ -1,9 +1,8 @@
-//! A doc as an agent sees it: a file, kept in step with the doc's text (`lmk_node::doc`).
+//! A doc as an agent sees it: a file, kept in step with the doc's text.
 use anyhow::{Context, Result};
 use similar::{ChangeTag, DiffTag, TextDiff};
 use std::path::Path;
-use std::time::Duration;
-use tokio::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How many lines `new` changed from `old`, and the lines it added or changed.
 pub fn changed(old: &str, new: &str) -> (usize, Vec<String>) {

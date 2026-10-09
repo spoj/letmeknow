@@ -33,7 +33,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Run the session process, which keeps each doc's file in step, and print what arrives as NDJSON
+    /// Run the session process, which runs the plugins of its groups' kinds, and print what arrives as NDJSON
     Listen {
         /// Display name, fixed when the session is created [default: <user>/<session>]
         #[arg(long, env = "LETMEKNOW_NAME")]
@@ -57,6 +57,9 @@ pub enum Command {
     Serve(Serve),
     #[command(flatten)]
     Request(Request),
+    /// A command of a kind's plugin: `letmeknow <kind> <args>...`, such as `letmeknow doc attach <path>`
+    #[command(external_subcommand)]
+    Kind(Vec<String>),
 }
 
 #[derive(clap::Args, Debug)]
@@ -95,15 +98,20 @@ pub enum Request {
     Invite {
         #[arg(long)]
         group: Option<String>,
-        /// What a new group shares: a chat (messages in order) or a doc (one text everyone edits at once)
-        #[arg(long, value_parser = ["chat", "doc"], default_value = "chat", conflicts_with = "group")]
+        /// What a new group shares: a chat (messages in order), or a kind a plugin of this session supports, such as a doc (one text everyone edits at once)
+        #[arg(long, default_value = "chat", conflicts_with = "group")]
         kind: String,
         /// The new group's name
         #[arg(long, conflicts_with = "group")]
         name: Option<String>,
-        /// A new doc's file: kept in step with the doc, and its first text if it exists [default: a new file in the session's state]
+        /// For the new group's kind: a doc's file, kept in step with the doc, and its first text if it exists [default: a new file in the session's state]
         #[arg(conflicts_with_all = ["group", "identity"])]
-        file: Option<String>,
+        #[serde(default)]
+        args: Vec<String>,
+        /// The command's directory, which the arguments are relative to
+        #[arg(skip)]
+        #[serde(default)]
+        cwd: String,
         /// Days members hold a new group's messages and files for one another
         #[arg(long, default_value_t = 90, conflicts_with = "group")]
         keep: u32,
@@ -131,8 +139,12 @@ pub enum Request {
     /// Join a group through an invite link, or a group open to your identity by its id; a device link adds this device to an identity
     Join {
         target: String,
-        /// For a doc: a new file to keep in step with it [default: a new file in the session's state]
-        file: Option<String>,
+        /// For the group's kind: a doc's new file to keep in step with it [default: a new file in the session's state]
+        #[serde(default)]
+        args: Vec<String>,
+        #[arg(skip)]
+        #[serde(default)]
+        cwd: String,
         /// What this session speaks as in the group: one of its device's identities [default: the device's first]
         #[arg(long = "as", value_name = "IDENTITY")]
         #[serde(rename = "as")]
@@ -199,13 +211,7 @@ pub enum Request {
         close: bool,
         identity: String,
     },
-    /// Make a file linkable from a doc; prints the markdown link to put into the doc's file
-    Attach {
-        #[arg(long)]
-        group: Option<String>,
-        path: String,
-    },
-    /// The file a doc or message links, decrypted into a file only you can read; prints its path
+    /// The file a message or a group's kind (a doc) links, decrypted into a file only you can read; prints its path
     Fetch { link: String },
     /// The members online in each group, and what only this session holds
     Status,
@@ -233,6 +239,9 @@ pub enum Request {
     /// Records an opening in an identity's devices group; sent to the session process that acts for the device.
     #[command(skip)]
     SetOpening { identity: Bytes, opening: Opening },
+    /// A command of a kind's plugin, from `letmeknow <kind> <args>...`.
+    #[command(skip)]
+    Kind { kind: String, args: Vec<String>, cwd: String },
 }
 
 #[derive(Subcommand, Serialize, Deserialize, Debug, Clone)]
@@ -371,7 +380,7 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
 }
 
 /// Sends a request to the running session and returns its answer. Files the request names are read, or made absolute,
-/// here: the session process runs elsewhere.
+/// here, and a kind's arguments go with this directory: the session process runs elsewhere.
 pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Value> {
     if let Request::Send { text, attach, attach_name, .. } = &mut request {
         if let Some(file) = attach {
@@ -394,13 +403,8 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
             std::io::stdin().read_to_string(text)?;
         }
     }
-    let file = match &mut request {
-        Request::Attach { path, .. } => Some(path),
-        Request::Invite { file, .. } | Request::Join { file, .. } => file.as_mut(),
-        _ => None,
-    };
-    if let Some(file) = file {
-        *file = absolute(file)?;
+    if let Request::Invite { cwd, .. } | Request::Join { cwd, .. } | Request::Kind { cwd, .. } = &mut request {
+        *cwd = absolute(".")?;
     }
     let membership = match &mut request {
         Request::Invite { membership, .. } | Request::Identity { op: IdentityOp::Create { membership, .. } } => membership.as_mut(),
@@ -408,12 +412,6 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     };
     if let Some(membership) = membership.filter(|m| is_folder(m)) {
         *membership = absolute(membership)?;
-    }
-    // A doc a member joins already has its text, which would be merged with the file's.
-    if let Request::Join { file: Some(file), .. } = &request
-        && Path::new(file).exists()
-    {
-        bail!("{file} exists; name a new file for the doc");
     }
     let channel = connect(&session_dir(home, session)?.join("endpoint"))
         .await

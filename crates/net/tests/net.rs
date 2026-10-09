@@ -11,9 +11,9 @@ use lmk_proto::{
     Answer, Bytes,
     head::Head,
     links::Invite,
-    peer::List,
+    peer::{Frame, KindFrame, List},
 };
-use yrs::{ReadTxn, Text, Transact, updates::decoder::Decode};
+use serde_json::json;
 
 const G: &[u8] = b"group";
 
@@ -138,26 +138,39 @@ async fn messages_sync_after_both_were_offline() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn doc_converges_by_diff() {
+async fn kind_frames_live_messages_and_state_links_reach_one_member() {
     let relay = relay().await;
-    let keys = keys(2);
+    let keys = keys(3);
     let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
     let service = service();
-    let docs = [yrs::Doc::with_client_id(1), yrs::Doc::with_client_id(2)];
-    docs[0].get_or_insert_text("text").insert(&mut docs[0].transact_mut(), 0, "hello world");
-    let base = docs[0].transact().encode_state_as_update_v1(&Default::default());
-    docs[1].transact_mut().apply_update(yrs::Update::decode_v1(&base).unwrap()).unwrap();
-    // Apart: A only deletes, which leaves its state vector as it was; B only inserts.
-    docs[0].get_or_insert_text("text").remove_range(&mut docs[0].transact_mut(), 0, 6);
-    docs[1].get_or_insert_text("text").push(&mut docs[1].transact_mut(), "!");
-    let [doc_a, doc_b] = docs;
-    let group = |doc| Group { members: members.clone(), log: vec![b"e1".to_vec()], doc: Some(doc), ..Group::default() };
-    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group(doc_a)), Options::default()).await;
-    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group(doc_b)), Options::default()).await;
+    let group = |members: &[_]| Group { members: members.to_vec(), log: vec![b"e1".to_vec()], ..Group::default() };
+    let mut a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group(&members)), Options::default()).await;
+    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group(&members)), Options::default()).await;
+    // C is no member, as far as A knows.
+    let c = node(&relay, keys[2].clone(), Fake::new(&service).with(G, group(&members[1..])), Options::default()).await;
     a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    eventually("the docs converge", || a.fake.text(G) == "world!" && b.fake.text(G) == "world!").await;
+    a.net.dial(members[2], relay.url.clone()).await.unwrap();
+    let in_step = a.until(|e| matches!(e, Event::InStep { .. })).await;
+    assert_eq!(in_step, Event::InStep { group: G.to_vec(), peer: members[1] });
+    let frame = KindFrame::new(Bytes(G.to_vec()), json!({ "doc": { "snapshot": "AA" } })).unwrap();
+    let live = [&1u64.to_be_bytes()[..], &[1], b"edit"].concat();
+    for peer in [members[1], members[2]] {
+        assert!(a.net.frame(peer, Frame::Kind(frame.clone())));
+        assert!(a.net.frame(peer, Frame::State { group: Bytes(G.to_vec()), link: "lmk:state".into() }));
+        assert!(a.net.send_to(peer, G, live.clone()));
+    }
+    eventually("the frame, state link and live message reach B", || {
+        !b.fake.frames.lock().unwrap().is_empty() && !b.fake.states.lock().unwrap().is_empty() && !b.fake.groups.lock().unwrap()[G].live.is_empty()
+    })
+    .await;
+    assert_eq!(b.fake.frames.lock().unwrap()[0], (members[0], frame));
+    assert_eq!(b.fake.states.lock().unwrap()[0], (G.to_vec(), members[0], "lmk:state".to_string()));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(c.fake.frames.lock().unwrap().is_empty() && c.fake.states.lock().unwrap().is_empty(), "none reach a non-member");
+    assert!(c.fake.groups.lock().unwrap()[G].live.is_empty());
     a.net.shutdown().await.unwrap();
     b.net.shutdown().await.unwrap();
+    c.net.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -28,7 +28,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --no-fail-fast
       - if: runner.os == 'Linux'
-        run: cargo build -p lmk-node -p lmk-core -p lmk-net -p lmk-membership --target wasm32-unknown-unknown
+        run: cargo build -p lmk-node -p lmk-core -p lmk-net -p lmk-membership -p lmk-web --target wasm32-unknown-unknown
+      - if: runner.os == 'Linux'
+        run: cargo clippy -p lmk-web --target wasm32-unknown-unknown --all-targets -- -D warnings
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

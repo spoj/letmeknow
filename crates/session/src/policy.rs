@@ -95,10 +95,9 @@ impl Outbox {
         self.held_since.map(|since| since + hold)
     }
 
-    /// Takes the held `edited` event of a doc, so a newer one can tell of both.
-    pub fn take_edited(&mut self, group: &str) -> Option<Value> {
-        let at = self.held.iter().position(|item| item["type"] == "edited" && item["group"] == group)?;
-        Some(self.held.remove(at))
+    /// Drops a held event of a group that a plugin's newer one with the same key (`printed`) replaces.
+    pub fn take_keyed(&mut self, group: &Value, printed: &Value) {
+        self.held.retain(|item| item["group"] != *group || item["printed"] != *printed);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -185,11 +184,15 @@ mod tests {
     }
 
     #[test]
-    fn a_held_edit_is_taken_back_to_be_merged() {
+    fn a_plugins_held_event_is_replaced_by_its_newer_one() {
         let mut outbox = Outbox::default();
-        outbox.deliver(json!({ "type": "edited", "group": "g", "by": [] }), false);
-        assert!(outbox.take_edited("h").is_none());
-        assert!(outbox.take_edited("g").is_some());
-        assert!(outbox.take_edited("g").is_none());
+        let printed = json!({ "kind": "doc", "key": "edited" });
+        outbox.deliver(json!({ "type": "edited", "group": "g", "lines": 1, "printed": printed }), false);
+        outbox.deliver(json!({ "type": "edited", "group": "h", "lines": 2, "printed": printed }), false);
+        outbox.take_keyed(&json!("g"), &printed);
+        outbox.deliver(json!({ "type": "edited", "group": "g", "lines": 3, "printed": printed }), false);
+        outbox.flush_held();
+        let lines: Vec<Value> = outbox.take().iter().map(|item| item["lines"].clone()).collect();
+        assert_eq!(lines, [json!(2), json!(3)]);
     }
 }

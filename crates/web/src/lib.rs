@@ -1,7 +1,8 @@
 //! The browser client: one lmk-node session whose MLS key is the browser's device key, reaching its peers only through
-//! the relay. The page persists the session's records in IndexedDB, one record per key, and the ciphertext of the files
-//! it holds, which the session loads when it needs one. Results that are not bytes are JSON strings; message ids and
-//! fingerprints are hex, other bytes base64url.
+//! the relay. Chat is built in; the doc kind is an in-page plugin (`lmk_kind_doc::Page`), which this hosts in the
+//! plugin protocol. The page persists the session's records in IndexedDB, one record per key, and the ciphertext of the
+//! files it holds, which the session loads when it needs one. Results that are not bytes are JSON strings; message ids
+//! and fingerprints are hex, other bytes base64url.
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::RefCell;
@@ -17,9 +18,10 @@ use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::group::Window;
 use lmk_node::lmk_core::invite::Target;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
-use lmk_node::{Claim, Disk, Event, Member, Node, doc, now};
+use lmk_kind_doc::Page;
+use lmk_node::{Claim, Disk, Event, Member, Node, now};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, How, IdentityRef, Kind, Named, PROTOCOL, Payload, Service, Settings};
+use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, How, IdentityRef, Named, PROTOCOL, Service, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::{Duration, sleep};
@@ -35,6 +37,8 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 /// Others' files larger than this are fetched only when asked, and kept only in memory, until the page closes.
 const FILE_LIMIT: u64 = 25 << 20;
+/// The kinds the browser supports: chat, and those of its in-page plugins.
+const DOC: &str = "doc";
 /// How often the files no group links any longer are deleted.
 const COLLECT: Duration = Duration::from_secs(60 * 60);
 
@@ -127,6 +131,23 @@ impl Provider for Store {
     }
 }
 
+/// The in-page doc plugin's records, among the session's.
+struct PageStore(Store);
+
+impl lmk_kind_doc::Store for PageStore {
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        self.0.get(key.as_bytes()).ok().flatten()
+    }
+
+    fn put(&self, key: &str, value: &[u8]) {
+        self.0.put(key.as_bytes(), value).ok();
+    }
+
+    fn delete(&self, key: &str) {
+        self.0.delete(key.as_bytes()).ok();
+    }
+}
+
 fn get<T: for<'de> Deserialize<'de>>(store: &Store, key: &[u8]) -> Result<Option<T>> {
     Ok(store.get(key)?.map(|bytes| serde_json::from_slice(&bytes)).transpose()?)
 }
@@ -203,6 +224,11 @@ struct App {
     /// Open groups this session tried to join by itself, and those it failed to join.
     tried: RefCell<HashSet<Bytes>>,
     failed: RefCell<HashSet<Bytes>>,
+    /// The doc kind's in-page plugin.
+    docs: RefCell<Page<PageStore>>,
+    /// Inviters' requests for a doc's state, by request id.
+    snapshots: RefCell<HashMap<u64, oneshot::Sender<Option<Vec<u8>>>>>,
+    asked: std::cell::Cell<u64>,
 }
 
 /// The browser's session.
@@ -258,11 +284,18 @@ impl App {
             disk: Some(kept.clone()),
             file_limit: FILE_LIMIT,
             window: Window::default(),
+            kinds: vec![CHAT.into(), DOC.into()],
         };
         let (node, mut events) = Node::start(store.clone(), device, node_config).await?;
         let membership = service(&config.membership)?;
-        let (tried, failed) = Default::default();
-        let app = Rc::new(App { node, store, membership, shadow: RefCell::new(shadow), idb, kept, on_event, tried, failed });
+        let (tried, failed, snapshots, asked) = Default::default();
+        let docs = RefCell::new(Page::new(PageStore(store.clone())));
+        let app = Rc::new(App { node, store, membership, shadow: RefCell::new(shadow), idb, kept, on_event, tried, failed, docs, snapshots, asked });
+        for gid in app.node.groups() {
+            if app.node.settings(&gid.0)?.kind == DOC {
+                app.open_doc(&gid.0)?;
+            }
+        }
         app.flush();
         app.join_openings();
         let io_app = app.clone();
@@ -368,6 +401,69 @@ impl App {
         self.on_event.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string())).ok();
     }
 
+    /// Tells the in-page doc plugin of a doc, with the state 0.10 kept of it if it has none of its own yet.
+    fn open_doc(self: &Rc<Self>, gid: &[u8]) -> Result<()> {
+        let mut message = json!({ "type": "group", "group": b64(gid), "settings": self.node.settings(gid)?, "id": 0 });
+        let legacy = self.node.legacy_doc(gid)?;
+        if let Some(state) = &legacy {
+            message["import"] = json!({ "state": Bytes(state.clone()) });
+        }
+        let answers = self.to_doc(message);
+        if let Some(error) = answers.iter().find_map(|answer| answer["error"].as_str()) {
+            return Err(anyhow!("{error}"));
+        }
+        if legacy.is_some() {
+            self.node.forget_legacy_doc(gid)?;
+        }
+        Ok(())
+    }
+
+    /// Gives the in-page doc plugin a message, and carries out what it asks through the group's channels; returns its
+    /// answers.
+    fn to_doc(self: &Rc<Self>, message: Value) -> Vec<Value> {
+        let out = self.docs.borrow_mut().input(&message);
+        let mut answers = Vec::new();
+        for message in out {
+            let gid = message["group"].as_str().map(unb64).transpose();
+            let done = gid.and_then(|gid| {
+                let gid = gid.unwrap_or_default();
+                match message["type"].as_str().unwrap_or_default() {
+                    "answer" => {
+                        let asked = message["id"].as_u64().and_then(|id| self.snapshots.borrow_mut().remove(&id));
+                        match asked {
+                            Some(reply) => drop(reply.send(message["answer"]["data"].as_str().map(unb64).transpose()?)),
+                            None => answers.push(message.clone()),
+                        }
+                    }
+                    "send" => self.node.send_live(&gid, &message["payload"], message["to"].as_str())?,
+                    "frame" => self.node.frame(&gid, message["to"].as_str().context("no member")?, message["frame"].clone())?,
+                    "links" => self.node.set_links(&gid, serde_json::from_value(message["links"].clone())?)?,
+                    "event" => {
+                        let mut event = message["event"].clone();
+                        event["group"] = message["group"].clone();
+                        event["kind"] = json!(DOC);
+                        self.emit(event);
+                    }
+                    other => anyhow::bail!("the doc plugin asked for {other}"),
+                }
+                Ok(())
+            });
+            if let Err(error) = done {
+                self.emit(json!({ "type": "warning", "group": message["group"], "text": format!("{error:#}") }));
+            }
+        }
+        answers
+    }
+
+    /// Hands a node event about a doc to the in-page doc plugin.
+    fn tell_doc(self: &Rc<Self>, gid: &[u8], mut message: Value) -> Result<()> {
+        if self.node.settings(gid)?.kind == DOC {
+            message["group"] = json!(b64(gid));
+            self.to_doc(message);
+        }
+        Ok(())
+    }
+
     async fn on(self: &Rc<Self>, event: Event) -> Result<()> {
         match event {
             Event::Joined { group, member, by, how, label } => {
@@ -392,6 +488,7 @@ impl App {
                 for kind in ["timeline", "settings", "refused"] {
                     self.store.delete(&key(kind, &group.0))?;
                 }
+                self.to_doc(json!({ "type": "gone", "group": group }));
                 self.emit(json!({ "type": "removed", "group": group, "by": by }));
             }
             Event::Settings { group, settings, by } => {
@@ -404,9 +501,34 @@ impl App {
                 self.refresh_opening(&group.0).await?;
             }
             Event::Message(message) => {
+                // Chat holds the file a message attaches.
+                if let Some(link) = message.payload["attachment"]["link"].as_str() {
+                    self.node.hold(&message.group.0, &[link.to_owned()])?;
+                }
                 self.emit(json!({ "type": "message", "group": message.group, "id": hex::encode(&message.id.0) }));
             }
-            Event::Edited { group, by } => self.emit(json!({ "type": "edited", "group": group, "by": by.name })),
+            Event::Live { group, sender, payload } => {
+                let from = self.describe(&self.known(&group.0)?, &sender);
+                self.tell_doc(&group.0, json!({ "type": "message", "from": from, "payload": payload, "held": false }))?;
+            }
+            Event::Frame { group, from, frame } => {
+                let from = self.describe(&self.known(&group.0)?, &from);
+                self.tell_doc(&group.0, json!({ "type": "frame", "from": from, "frame": frame }))?;
+            }
+            Event::InStep { group, member } => {
+                let member = self.describe(&self.known(&group.0)?, &member);
+                self.tell_doc(&group.0, json!({ "type": "synced", "member": member }))?;
+            }
+            Event::State { group, from, data } => {
+                let from = self.describe(&self.known(&group.0)?, &from);
+                self.tell_doc(&group.0, json!({ "type": "state", "from": from, "data": Bytes(data) }))?;
+            }
+            Event::Snapshot { group, reply } => {
+                let id = self.asked.get() + 1;
+                self.asked.set(id);
+                self.snapshots.borrow_mut().insert(id, reply);
+                self.tell_doc(&group.0, json!({ "type": "snapshot", "id": id }))?;
+            }
             Event::Introduced { group, by, identity, name, how } => {
                 let known = self.known(&group.0)?;
                 let described = self.describe(&known, &by);
@@ -456,7 +578,8 @@ impl App {
         }
         let contact = self.node.contacts()?.into_iter().find(|(id, _)| *id == claim.identity.id);
         let name = label.or(contact.map(|(_, c)| c.name)).unwrap_or(claim.name);
-        self.node.send(gid, &Payload::Introduce { identity: claim.identity, name, how, to: Vec::new() }).await?;
+        let introduce = Control::Introduce { identity: claim.identity, name, how, to: Vec::new() };
+        self.node.send(gid, &serde_json::to_value(introduce)?, false).await?;
         Ok(())
     }
 
@@ -573,7 +696,7 @@ impl App {
         for message in self.node.messages(gid)? {
             let from = self.describe(&known, &message.sender);
             let id = hex::encode(&message.id.0);
-            let Payload::Message { content, to, reply_to, urgent, attachment, .. } = message.payload else {
+            let Ok(ChatMessage { content, to, reply_to, urgent, attachment, .. }) = serde_json::from_value(message.payload) else {
                 items.push(json!({ "type": "leave", "id": id, "at": message.at, "from": from }));
                 continue;
             };
@@ -606,15 +729,10 @@ impl App {
 
     /// The messages no other held message comes after: what a new message names in `after`.
     fn tips(&self, gid: &[u8]) -> Result<Vec<Bytes>> {
-        let messages = self.node.messages(gid)?;
-        let covered: HashSet<&Bytes> = messages
-            .iter()
-            .flat_map(|m| match &m.payload {
-                Payload::Message { after, .. } => after.iter().collect(),
-                _ => Vec::new(),
-            })
-            .collect();
-        Ok(messages.iter().filter(|m| matches!(m.payload, Payload::Message { .. }) && !covered.contains(&m.id)).map(|m| m.id.clone()).collect())
+        let messages: Vec<(Bytes, ChatMessage)> =
+            self.node.messages(gid)?.into_iter().filter_map(|m| Some((m.id, serde_json::from_value(m.payload).ok()?))).collect();
+        let covered: HashSet<&Bytes> = messages.iter().flat_map(|(_, chat)| &chat.after).collect();
+        Ok(messages.iter().filter(|(id, _)| !covered.contains(id)).map(|(id, _)| id.clone()).collect())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -627,7 +745,7 @@ impl App {
             }
             None => None,
         };
-        let payload = Payload::Message {
+        let payload = ChatMessage {
             content,
             after: self.tips(gid)?,
             to: to.iter().map(|fp| Ok(Bytes(hex::decode(fp)?))).collect::<Result<_>>()?,
@@ -635,7 +753,7 @@ impl App {
             urgent,
             attachment: attachment.as_ref().map(|(_, a)| a.clone()),
         };
-        let (id, delivery) = self.node.send(gid, &payload).await?;
+        let (id, delivery) = self.node.send(gid, &serde_json::to_value(payload)?, true).await?;
         for (member, reason) in &delivery.refused {
             self.refused(gid, &id.0, member, reason)?;
         }
@@ -647,7 +765,7 @@ impl App {
         Ok(answer)
     }
 
-    async fn join(&self, link: &str) -> Result<Value> {
+    async fn join(self: &Rc<Self>, link: &str) -> Result<Value> {
         let invite = Invite::parse(link.trim())?;
         if invite.device {
             self.node.join(&invite, None).await?;
@@ -655,16 +773,25 @@ impl App {
         }
         let identity = self.node.identities().into_iter().next().map(|(identity, _)| identity);
         let gid = self.node.join(&invite, identity).await?;
-        self.remember_settings(&gid.0)?;
+        self.joined(&gid.0)?;
         Ok(json!({ "group": gid }))
     }
 
-    async fn join_open(&self, gid: &[u8]) -> Result<Value> {
+    async fn join_open(self: &Rc<Self>, gid: &[u8]) -> Result<Value> {
         let opening = self.node.openings().into_iter().find(|o| o.group.0 == gid).context("no such open group")?;
         let identity = self.node.identities().into_iter().next().context("this browser is on no identity")?.0;
         let gid = self.node.join_open(&opening, identity).await?;
-        self.remember_settings(&gid.0)?;
+        self.joined(&gid.0)?;
         Ok(json!({ "group": gid }))
+    }
+
+    /// A group this browser made or joined.
+    fn joined(self: &Rc<Self>, gid: &[u8]) -> Result<()> {
+        self.remember_settings(gid)?;
+        if self.node.settings(gid)?.kind == DOC {
+            self.open_doc(gid)?;
+        }
+        Ok(())
     }
 
     async fn devices(&self, id: &str) -> Result<Value> {
@@ -763,10 +890,9 @@ impl Lmk {
     /// A new chat or doc, speaking as this browser's first identity; returns its id.
     pub fn create(&self, kind: &str, name: &str) -> R<String> {
         let app = &self.app;
-        let kind = if kind == "doc" { Kind::Doc } else { Kind::Chat };
         let settings = Settings {
             protocol: PROTOCOL,
-            kind,
+            kind: kind.into(),
             name: name.into(),
             open: Vec::new(),
             keep: 90,
@@ -776,7 +902,7 @@ impl Lmk {
         };
         let identity = app.node.identities().into_iter().next().map(|(identity, _)| identity);
         let gid = app.node.create(settings, identity).map_err(js)?;
-        app.remember_settings(&gid.0).map_err(js)?;
+        app.joined(&gid.0).map_err(js)?;
         app.flush();
         Ok(b64(&gid.0))
     }
@@ -854,22 +980,20 @@ impl Lmk {
         Ok(())
     }
 
-    /// A doc's Yjs state.
-    pub fn doc(&self, gid: &str) -> R<Vec<u8>> {
-        self.app.node.doc(&unb64(gid).map_err(js)?).map_err(js)
-    }
-
-    /// What a Yjs doc with state vector `sv` lacks of a doc.
-    pub fn doc_diff(&self, gid: &str, sv: &[u8]) -> R<Vec<u8>> {
-        let state = self.app.node.doc(&unb64(gid).map_err(js)?).map_err(js)?;
-        doc::diff(&state, sv).map_err(js)
-    }
-
-    /// Applies a Yjs update made here to a doc and sends it to the members online.
-    pub async fn edit(&self, gid: String, update: Vec<u8>) -> R<()> {
-        self.app.node.edit(&unb64(&gid).map_err(js)?, update).await.map_err(js)?;
+    /// A command of a kind's in-page plugin, `args` a JSON array; answers its answer, as JSON. The doc kind's bind an
+    /// editor to a doc: `["state", group]`, `["diff", group, state vector]` and `["edit", group, update]`.
+    pub fn command(&self, kind: &str, args: &str) -> R<String> {
+        if kind != DOC {
+            return Err(JsError::new(&format!("this browser has no plugin for {kind} groups")));
+        }
+        let args: Value = serde_json::from_str(args).map_err(|e| js(e.into()))?;
+        let answers = self.app.to_doc(json!({ "type": "command", "id": 0, "args": args }));
         self.app.flush();
-        Ok(())
+        let answer = answers.into_iter().next().ok_or_else(|| JsError::new("the doc plugin did not answer"))?;
+        match answer["error"].as_str() {
+            Some(error) => Err(JsError::new(error)),
+            None => Ok(answer["answer"].to_string()),
+        }
     }
 
     /// Seals a file for a group and holds it; returns its link.
