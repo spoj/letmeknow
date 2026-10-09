@@ -783,8 +783,11 @@ impl<P: Provider + Send + 'static> Node<P> {
             st.group(gid)?.mls.settings().kind == DEVICES
         };
         let rule = serde_json::to_value(Control::Invite { hash, expires, label, to })?;
-        let (_, delivery) = self.send(gid, &rule, true).await?;
-        let st = self.inner.state.lock().unwrap();
+        let (id, delivery) = self.send(gid, &rule, true).await?;
+        // Members that take it later can admit by it too, but nothing waits for them: it is not pending here.
+        let mut st = self.inner.state.lock().unwrap();
+        st.group_mut(gid)?.rec.pending.retain(|pending| pending.id != id);
+        st.save(gid)?;
         let mut members = vec![address(*self.inner.net().id().as_bytes(), self.inner.relay.as_str())];
         for member in delivery.held.iter().take(LINK_MEMBERS) {
             let Some(leaf) = endpoint_id(&member.iroh.0).and_then(|peer| st.in_leaf(gid, &peer)?.leaf) else { continue };

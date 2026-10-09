@@ -31,11 +31,13 @@ struct World {
     plugins: Vec<PathBuf>,
 }
 
-/// Where cargo builds the workspace's binaries, the doc plugin among them: beside this test's own directory.
+/// Where cargo builds the workspace's binaries, the doc and git plugins among them: beside this test's own directory.
 fn built() -> PathBuf {
     let dir = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
-    let plugin = dir.join(format!("letmeknow-kind-doc{}", std::env::consts::EXE_SUFFIX));
-    assert!(plugin.exists(), "build the doc plugin first: cargo build -p letmeknow-kind-doc");
+    for kind in ["doc", "git"] {
+        let plugin = dir.join(format!("letmeknow-kind-{kind}{}", std::env::consts::EXE_SUFFIX));
+        assert!(plugin.exists(), "build the plugins first: cargo build -p letmeknow-kind-{kind}");
+    }
     dir
 }
 
@@ -834,5 +836,64 @@ fn a_message_after_one_that_cannot_come_shows_the_gap_once_a_sync_ends() {
         let got = carol.expect("message").await;
         assert_eq!(got["content"], "@carol see above");
         assert_eq!(got["missing"], json!([unseen["id"]]));
+    });
+}
+
+/// git, as the git plugin's caller runs it, in `repo`.
+fn git(repo: &Path, args: &[&str]) -> String {
+    let config = ["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "init.defaultBranch=main"];
+    let out = std::process::Command::new("git").arg("-C").arg(repo).args(config).args(args).output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn a_removed_member_cannot_stall_a_git_groups_log() {
+    local(async {
+        let world = world("git").await;
+        let mut alice = world.start("alice", HOUR).await;
+        let bob = world.start("bob", HOUR).await;
+        let mut carol = world.start("carol", HOUR).await;
+        let group = alice.cmd(&["invite", "--kind", "git", "--name", "Repo"]).await.unwrap()["group"].as_str().unwrap().to_owned();
+        for joiner in [&bob, &carol] {
+            joiner.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+            alice.expect("joined").await;
+        }
+        let repo = world.root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        let push = async |old: &str, n: u32| {
+            std::fs::write(repo.join("file.txt"), n.to_string()).unwrap();
+            git(&repo, &["add", "file.txt"]);
+            git(&repo, &["commit", "-qm", &format!("change {n}")]);
+            let (new, bundle) = (git(&repo, &["rev-parse", "HEAD"]), world.root.join(format!("{n}.bundle")));
+            let range = if old == "-" { "main".to_owned() } else { format!("{old}..main") };
+            git(&repo, &["bundle", "create", bundle.to_str().unwrap(), &range]);
+            let pushed = alice.cmd(&["git", "push", &group, "refs/heads/main", old, &new, bundle.to_str().unwrap()]).await.unwrap();
+            for _ in 0..80 {
+                if bob.cmd(&["git", "list", &group]).await.is_ok_and(|list| list["refs"]["refs/heads/main"] == new.as_str()) {
+                    return (new, pushed["position"].clone());
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            panic!("bob did not take push {n}");
+        };
+        let (first, position) = push("-", 1).await;
+        assert_eq!(position, 1);
+
+        // Alice removes Carol, who still knows the id of the log the group's pushes were ordered in, and appends to it an
+        // id of a message no member holds. The order went on in a new log, after the last push.
+        let members = alice.cmd(&["members"]).await.unwrap();
+        let fp = members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Carol").unwrap()["fp"].as_str().unwrap().to_owned();
+        alice.cmd(&["remove", &fp]).await.unwrap();
+        carol.expect("removed").await;
+        let entries = |dir: &Path| std::fs::read_dir(dir).unwrap().flatten().map(|entry| std::fs::read(entry.path()).unwrap()).collect::<Vec<_>>();
+        let logs = std::fs::read_dir(world.root.join("logs")).unwrap().flatten().map(|dir| dir.path());
+        let old = logs.filter(|dir| entries(dir).iter().any(|entry| entry == b"end")).collect::<Vec<_>>();
+        assert_eq!(old.len(), 1, "the removal ended the old log");
+        let next = entries(&old[0]).len() + 1;
+        std::fs::write(old[0].join(format!("{next}.entry")), [9; 32]).unwrap();
+        let (_, position) = push(&first, 2).await;
+        assert_eq!(position, 2, "the order goes on where the old log ended");
     });
 }
