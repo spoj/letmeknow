@@ -66,7 +66,10 @@ impl Helper {
             }
             let answer = match line.split(' ').next().unwrap_or_default() {
                 "" => return Ok(()),
-                "capabilities" => "fetch\npush\n\n".to_owned(),
+                "capabilities" => "fetch\npush\noption\n\n".to_owned(),
+                // Only force pushes would need it, and they are refused; git refuses to push with a helper that lacks it.
+                "option" if line == "option force-if-includes true" => "ok\n".to_owned(),
+                "option" => "unsupported\n".to_owned(),
                 "list" => self.list(line == "list for-push")?,
                 "fetch" => self.fetch(&batch)?,
                 "push" => batch.iter().map(|push| self.push(push.trim_start_matches("push "))).collect::<String>() + "\n",

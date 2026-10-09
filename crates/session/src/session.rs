@@ -62,6 +62,14 @@ pub enum Inbound {
     Request(Box<Request>, oneshot::Sender<Value>),
     /// A warning of the device's node: of its events, only these concern the agent.
     DeviceWarning(String),
+    /// A plugin's request that the session carried out in the background, to answer now.
+    Done { kind: String, group: Bytes, id: Value, done: Result<Done> },
+}
+
+/// What a plugin's request carried out in the background came to.
+pub enum Done {
+    Appended(u64),
+    Holders(Vec<Member>),
 }
 
 /// What the session process acting for the device publishes of it.
@@ -130,6 +138,8 @@ pub struct Session {
     asked: u64,
     /// Inviters' requests for a kind's state, by plugin and request id.
     snapshots: HashMap<(String, u64), oneshot::Sender<Option<Vec<u8>>>>,
+    /// Commands a plugin is carrying out, by plugin and request id.
+    commands: HashMap<(String, u64), oneshot::Sender<Value>>,
     kind_fetches: Vec<KindFetch>,
     /// What plugins show of their groups in `groups`.
     infos: HashMap<Bytes, Value>,
@@ -208,6 +218,7 @@ impl Session {
             kind_of: HashMap::new(),
             asked: 0,
             snapshots: HashMap::new(),
+            commands: HashMap::new(),
             kind_fetches: Vec::new(),
             infos: HashMap::new(),
             chat_kinds: HashSet::new(),
@@ -386,6 +397,12 @@ impl Session {
                     if let Err(error) = self.fetch(link, reply).await {
                         self.warn(None, format!("{error:#}"));
                     }
+                } else if let Request::Kind { kind, args, cwd } = request {
+                    // A plugin's command may take a while, and may need this session meanwhile: it is answered when the
+                    // plugin answers.
+                    if let Err(error) = self.command(kind, args, cwd, reply).await {
+                        self.warn(None, format!("{error:#}"));
+                    }
                 } else {
                     let result = self.request(request).await;
                     // Before the answer, so that the device's other session processes read what the request changed.
@@ -395,6 +412,22 @@ impl Session {
                 self.outbox.flush_held();
             }
             Inbound::DeviceWarning(text) => self.warn(None, format!("this device: {text}")),
+            Inbound::Done { kind, group, id, done } => {
+                let answer = match done {
+                    Ok(Done::Appended(position)) => self.hand_entries(&group).await.map(|()| json!({ "position": position })),
+                    Ok(Done::Holders(holders)) => {
+                        holders.iter().map(|m| self.describe(&group, m)).collect::<Result<Vec<_>>>().map(|held_by| json!({ "held_by": held_by }))
+                    }
+                    Err(error) => Err(error),
+                };
+                let answer = match answer {
+                    Ok(answer) => json!({ "type": "answer", "id": id, "answer": answer }),
+                    Err(error) => json!({ "type": "answer", "id": id, "error": format!("{error:#}") }),
+                };
+                if let Err(error) = self.plugins.send(&kind, &answer).await {
+                    self.warn(Some(&group), format!("{error:#}"));
+                }
+            }
         }
     }
 
@@ -543,12 +576,7 @@ impl Session {
                 let gid = self.resolve(group)?;
                 Ok(json!({ "group": b64(&gid.0), "kind": self.node.settings(&gid.0)?.kind, "members": self.described_members(&gid)? }))
             }
-            Request::Kind { kind, args, cwd } => {
-                if !self.plugins.is_running(&kind) {
-                    self.start_plugin(&kind).await?;
-                }
-                self.ask(&kind, json!({ "type": "command", "args": args, "cwd": cwd })).await
-            }
+            Request::Kind { .. } => unreachable!("answered by command"),
             Request::Groups => self.groups(),
             Request::Remove { group, member } => {
                 let gid = self.resolve(group)?;
@@ -1248,6 +1276,21 @@ impl Session {
         Ok(())
     }
 
+    /// Passes `letmeknow <kind> <args>...` to the kind's plugin; `reply` gets its answer.
+    async fn command(&mut self, kind: String, args: Vec<String>, cwd: String, reply: oneshot::Sender<Value>) -> Result<()> {
+        let started = match self.plugins.is_running(&kind) {
+            true => Ok(()),
+            false => self.start_plugin(&kind).await,
+        };
+        if let Err(error) = started {
+            let _ = reply.send(json!({ "error": format!("{error:#}") }));
+            return Ok(());
+        }
+        self.asked += 1;
+        self.commands.insert((kind.clone(), self.asked), reply);
+        self.plugins.send(&kind, &json!({ "type": "command", "id": self.asked, "args": args, "cwd": cwd })).await
+    }
+
     /// Whether a table 0.10 kept docs in is still here: `bindings`, or `carrying`, which 0.10.0 lacks.
     fn legacy(&self, table: &str) -> Result<bool> {
         Ok(self.db.query_row("SELECT count(*) FROM sqlite_master WHERE name = ?", [table], |r| r.get::<_, i64>(0))? > 0)
@@ -1403,17 +1446,14 @@ impl Session {
                 }
             }
             "append" => {
-                let gid = group()?;
-                let position = self.node.append(&gid.0, &message["payload"]).await?;
-                self.hand_entries(&gid).await?;
-                self.plugins.send(kind, &reply(json!({ "position": position }))).await?;
+                let (node, group, payload) = (self.node.clone(), group()?, message["payload"].clone());
+                self.background(kind, group.clone(), message["id"].clone(), async move { Ok(Done::Appended(node.append(&group.0, &payload).await?)) });
             }
             "spread" => {
-                let gid = group()?;
+                let (node, gid) = (self.node.clone(), group()?);
                 let link = FileLink::parse(message["link"].as_str().context("no link")?)?;
-                let holders = self.node.holders(&gid.0, &link, SPREAD_WAIT).await;
-                let held_by: Vec<Value> = holders.iter().map(|m| self.describe(&gid, m)).collect::<Result<_>>()?;
-                self.plugins.send(kind, &reply(json!({ "held_by": held_by }))).await?;
+                let holders = async move { Ok(Done::Holders(node.holders(&gid.0, &link, SPREAD_WAIT).await)) };
+                self.background(kind, group()?, message["id"].clone(), holders);
             }
             "frame" => self.node.frame(&group()?.0, to.context("a frame goes to a member")?, message["frame"].clone())?,
             "add" => {
@@ -1458,6 +1498,12 @@ impl Session {
             "info" => _ = self.infos.insert(group()?, message["info"].clone()),
             "answer" => {
                 let id = message["id"].as_u64().unwrap_or_default();
+                if let Some(reply) = self.commands.remove(&(kind.to_owned(), id)) {
+                    let _ = reply.send(match &message["error"] {
+                        Value::Null => message["answer"].clone(),
+                        error => json!({ "error": error }),
+                    });
+                }
                 if let Some(reply) = self.snapshots.remove(&(kind.to_owned(), id)) {
                     let data = message["answer"]["data"].as_str().and_then(|data| URL_SAFE_NO_PAD.decode(data).ok());
                     let _ = reply.send(data);
@@ -1466,6 +1512,14 @@ impl Session {
             other => bail!("unknown message {other:?}"),
         }
         Ok(())
+    }
+
+    /// Carries out a plugin's request without holding up the session; its answer follows as `Inbound::Done`.
+    fn background(&self, kind: &str, group: Bytes, id: Value, done: impl Future<Output = Result<Done>> + Send + 'static) {
+        let (inbound, kind) = (self.inbound.clone(), kind.to_owned());
+        tokio::spawn(async move {
+            let _ = inbound.send(Inbound::Done { kind, group, id, done: done.await });
+        });
     }
 
     // Members, identities and contacts.

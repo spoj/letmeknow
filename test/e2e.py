@@ -8,10 +8,13 @@ import json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, ti
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "target", "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
+# git finds git-remote-lmk on PATH.
+ENV_PATH = os.path.dirname(BIN) + os.pathsep + os.environ["PATH"]
 WEB = os.path.join(ROOT, "web")
 BROWSER = "--no-browser" not in sys.argv
 TMP = tempfile.mkdtemp(prefix="lmk-e2e-")
-ENV = {**os.environ, "NO_PROXY": "localhost,127.0.0.1"}
+ENV = {**os.environ, "NO_PROXY": "localhost,127.0.0.1", "PATH": ENV_PATH, "GIT_AUTHOR_NAME": "e2e", "GIT_AUTHOR_EMAIL": "e2e@example.com",
+       "GIT_COMMITTER_NAME": "e2e", "GIT_COMMITTER_EMAIL": "e2e@example.com"}
 ENV.pop("LETMEKNOW_SESSION", None)
 
 
@@ -100,6 +103,89 @@ def until(produce, accept, timeout=20):
         time.sleep(0.3)
 
 
+def git(session, *args, cwd=None, ok=True):
+    """git, as an agent of `session` runs it: lmk:: remotes reach that session."""
+    env = {**ENV, "LETMEKNOW_HOME": home(session), "LETMEKNOW_SESSION": session}
+    result = subprocess.run(["git", "-c", "init.defaultBranch=main", *args], cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", timeout=120)
+    if ok and result.returncode:
+        sys.exit(f"{session} git {args}: {result.stderr}")
+    return result
+
+
+def git_kind(alice, bob, dave, listeners):
+    """A git group: clone, push and fetch between two sessions, a race on one branch, a push with no other member online,
+    chat beside the pushes, and a joiner that gets the whole history. Returns bob's session, which it restarts."""
+    made = run("alice", "invite", "--kind", "git", "--name", "Repo")
+    check(made["kind"] == "git" and made["remote"] == f"lmk::{made['group']}", "invite --kind git makes a git group and names its remote")
+    run("bob", "join", made["link"])
+    alice.expect("joined", lambda e: e["group"] == made["group"])
+    ours, theirs = os.path.join(TMP, "alice-repo"), os.path.join(TMP, "bob-repo")
+    git("alice", "init", "-q", ours)
+    write("alice-repo/README.md", "hello\n")
+    git("alice", "add", "README.md", cwd=ours)
+    git("alice", "commit", "-qm", "first commit", cwd=ours)
+    git("alice", "remote", "add", "team", "lmk::Repo", cwd=ours)
+    git("alice", "push", "-q", "team", "main", cwd=ours)
+    pushed = bob.expect("pushed", lambda e: e["group"] == made["group"])
+    check(pushed["ref"] == "refs/heads/main" and pushed["subjects"] == ["first commit"] and pushed["by"]["name"] == "Alice", "a push reaches the other member as a pushed event")
+    git("bob", "clone", "-q", "lmk::Repo", theirs)
+    check(content(os.path.join(theirs, "README.md")) == "hello\n", "the other member clones it with git")
+    write("bob-repo/NOTES.md", "notes\n")
+    git("bob", "add", "NOTES.md", cwd=theirs)
+    git("bob", "commit", "-qm", "bob's notes", cwd=theirs)
+    git("bob", "push", "-q", "origin", "main", cwd=theirs)
+    alice.expect("pushed", lambda e: e["subjects"] == ["bob's notes"])
+    git("alice", "pull", "-q", "--ff-only", "team", "main", cwd=ours)
+    check(os.path.exists(os.path.join(ours, "NOTES.md")), "and pushes back, which the first fetches")
+
+    # Both push onto the same tip at once: the log takes one first, and the other is told to fetch first.
+    for who, repo in (("alice", ours), ("bob", theirs)):
+        write(os.path.join(repo, f"{who}.txt"), who)
+        git(who, "add", f"{who}.txt", cwd=repo)
+        git(who, "commit", "-qm", f"{who}'s change", cwd=repo)
+    results = {}
+    racers = [threading.Thread(target=lambda who, repo: results.update({who: git(who, "push", "team" if who == "alice" else "origin", "main", cwd=repo, ok=False)}), args=a)
+              for a in (("alice", ours), ("bob", theirs))]
+    for racer in racers:
+        racer.start()
+    for racer in racers:
+        racer.join()
+    won = [who for who, result in results.items() if result.returncode == 0]
+    lost = [who for who, result in results.items() if result.returncode != 0]
+    check(len(won) == 1 and "fetch first" in results[lost[0]].stderr, "of two pushes onto one tip, one wins and the other is told to fetch first")
+    loser, repo = lost[0], ours if lost[0] == "alice" else theirs
+    remote = "team" if loser == "alice" else "origin"
+    git(loser, "pull", "-q", "--rebase", remote, "main", cwd=repo)
+    git(loser, "push", "-q", remote, "main", cwd=repo)
+    check(git(loser, "log", "--format=%s", "-n", "2", cwd=repo).stdout.split("\n")[1] == f"{won[0]}'s change", "the other fetches, rebases and pushes")
+    check(git(loser, "push", "-f", remote, "HEAD~1:main", cwd=repo, ok=False).returncode != 0, "a force push is refused")
+
+    # Chat in the same group.
+    run("alice", "send", f"--group={made['group']}", "@bob the build is green")
+    check(bob.expect("message", lambda e: e["content"] == "@bob the build is green")["group"] == made["group"], "a git group carries chat")
+
+    # With no other member online, a push fails and says so.
+    bob.stop()
+    listeners.remove(bob)
+    write("alice-repo/late.txt", "late")
+    git("alice", "add", "late.txt", cwd=ours)
+    git("alice", "commit", "-qm", "while bob is away", cwd=ours)
+    failed = git("alice", "push", "team", "main", cwd=ours, ok=False)
+    check(failed.returncode != 0 and "no other member is online" in failed.stderr, "a push with no other member online fails and says so")
+    bob = Listener("bob")
+    listeners.append(bob)
+    until(lambda: git("alice", "push", "-q", "team", "main", cwd=ours, ok=False).returncode, lambda code: code == 0, timeout=60)
+    bob.expect("pushed", lambda e: e["subjects"] == ["while bob is away"], timeout=60)
+
+    # A joiner gets the whole history as the group's state.
+    run("dave", "join", run("alice", "invite", f"--group={made['group']}")["link"])
+    cloned = os.path.join(TMP, "dave-repo")
+    until(lambda: git("dave", "clone", "-q", "lmk::Repo", cloned, ok=False).returncode, lambda code: code == 0)
+    history = git("dave", "log", "--format=%s", cwd=cloned).stdout.strip().split("\n")
+    check(len(history) == 5 and history[0] == "while bob is away" and history[-1] == "first commit", "a joiner gets the whole history")
+    return bob
+
+
 def serve():
     """A local `letmeknow serve` with a self-signed certificate; returns it and its membership address."""
     cert, key = os.path.join(TMP, "cert.pem"), os.path.join(TMP, "key.pem")
@@ -173,7 +259,7 @@ def compat(old, listeners):
 
 
 def main():
-    subprocess.run(["cargo", "build", "-q", "-p", "letmeknow", "-p", "letmeknow-kind-doc"], cwd=ROOT, check=True)
+    subprocess.run(["cargo", "build", "-q", "-p", "letmeknow", "-p", "letmeknow-kind-doc", "-p", "letmeknow-kind-git"], cwd=ROOT, check=True)
     if BROWSER:
         subprocess.run([shutil.which("npm"), "run", "build"], cwd=WEB, check=True)
     server = serve()
@@ -238,6 +324,10 @@ def main():
             f.write(attached["markdown"] + "\n")
         until(lambda: content(bob_notes), lambda text: attached["link"] in text)
         check(content(run("bob", "fetch", attached["link"])["path"]) == "s3cret", "and a member fetches the file the doc links")
+
+        dave = Listener("dave")
+        listeners.append(dave)
+        bob = git_kind(alice, bob, dave, listeners)
 
         # Carol joins through bob, who means the link for her; the chat is then opened to bob's identity.
         joined = run("carol", "join", run("bob", "invite", f"--group={group}", "--for", "Carol")["link"])

@@ -3,9 +3,9 @@
 // Ann's chat from a link and they talk and pass files both ways; it joins her doc and they edit it both ways; his desk's
 // identity adds his phone by a device link, and the phone joins a chat open to that identity by itself; the laptop keeps
 // everything across a reload, a second tab works through the first and takes over when it closes; introductions,
-// refusals, files kept and deleted, and the service worker's updates.
+// refusals, files kept and deleted, a git group's pushes and chat, and the service worker's updates.
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -369,6 +369,33 @@ try {
   await laptop.locator(".me").click();
   await laptop.locator(".devices li", { hasText: "Carl (Acme)" }).waitFor();
   check(true, "the browser accepts an introduction, and the introduced identity becomes a contact");
+
+  // A git group: Ann pushes with git, Carl takes the bundle, and the browser shows the push beside the group's chat.
+  const repo = join(tmp, "ann-repo");
+  const annGit = (...args) =>
+    execFileSync("git", ["-c", "init.defaultBranch=main", ...args], { cwd: repo, env: { ...process.env, LETMEKNOW_HOME: join(tmp, "ann"), LETMEKNOW_SESSION: "ann" }, stdio: "pipe" });
+  mkdirSync(repo);
+  annGit("init", "-q");
+  writeFileSync(join(repo, "README.md"), "hello\n");
+  annGit("add", "README.md");
+  annGit("commit", "-qm", "first commit");
+  const code = ann.run("invite", "--kind", "git", "--name", "Code");
+  carl.run("join", code.link);
+  annGit("remote", "add", "team", code.remote);
+  await laptop.getByRole("button", { name: "Join", exact: true }).first().click();
+  await laptop.locator("dialog").getByLabel("Invite link").fill(ann.run("invite", `--group=${code.group}`).link);
+  await laptop.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
+  await laptop.locator(".group-list button.on", { hasText: "Code" }).waitFor();
+  check(true, "the browser joins a git group");
+  annGit("push", "-q", "team", "main");
+  await laptop.locator(".messages li.pushed", { hasText: "first commit" }).waitFor();
+  check((await laptop.locator(".messages li.pushed").textContent()).includes("pushed to main"), "and shows a push to it, with its commits' subjects");
+  ann.run("send", `--group=${code.group}`, "the build is green");
+  await laptop.getByText("the build is green").waitFor();
+  await laptop.locator("textarea:visible").fill("thanks");
+  await laptop.locator("textarea:visible").press("Enter");
+  await ann.printed(e => e.type === "message" && e.group === code.group && e.content === "thanks");
+  check(true, "and its chat, both ways");
 
   // A message larger than members take is refused, and shows who refused it.
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
