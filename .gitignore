@@ -5,3 +5,4 @@ target/
 HUMAN.md
 web/pkg/
 web/dist/
+__pycache__/
