@@ -29,15 +29,13 @@ jobs:
       - run: cargo test --workspace --no-fail-fast
       - if: runner.os == 'Linux'
         run: cargo build -p lmk-node -p lmk-core -p lmk-net -p lmk-membership -p lmk-client -p lmk-web --target wasm32-unknown-unknown
-      # The client core builds for phones: Android with the runner's NDK, iOS on macOS.
+      # The client core builds for Android, with the runner's NDK.
       - if: runner.os == 'Linux'
         run: |
           rustup target add aarch64-linux-android
           ndk=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
           CC_aarch64_linux_android=$ndk/aarch64-linux-android24-clang AR_aarch64_linux_android=$ndk/llvm-ar \
             cargo check -p lmk-client --target aarch64-linux-android
-      - if: runner.os == 'macOS'
-        run: rustup target add aarch64-apple-ios && cargo check -p lmk-client --target aarch64-apple-ios
       - if: runner.os == 'Linux'
         run: cargo clippy -p lmk-web --target wasm32-unknown-unknown --all-targets -- -D warnings
       - uses: actions/setup-python@v5

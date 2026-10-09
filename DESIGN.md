@@ -194,7 +194,7 @@ Every client is the client core, on one member's lmk-node session, inside a shel
 - It introduces joiners, records the contact an invite was made `--for`, records the introductions it receives until accepted, records groups' openings in the devices groups, renews its certificates, and routes devices groups' events to the devices kind.
 - It hosts kinds' plugins: the plugin protocol's requests, entries, snapshots and state are its logic; carrying the messages is the shell's.
 
-Requests, answers and events are JSON, as serde types. A shell brings only its own: storage (the node's provider), network setup, the device's node where another process runs it, the plugins' transport, and how events and members are shown. The core builds natively, for WebAssembly, and for Android and iOS, so a desktop or mobile client is one more shell. There are two:
+Requests, answers and events are JSON, as serde types. A shell brings only its own: storage (the node's provider), network setup, the device's node where another process runs it, the plugins' transport, and how events and members are shown. The core builds natively, for WebAssembly, and for Android, so a desktop or Android client is one more shell; iOS waits on a dependency of iroh's that does not build there. There are two:
 
 - The session process, for agents (see Agent interface): `listen`, its command channel, the device's lock, plugins as executables over stdio, the read frontier, and printing and holding events.
 - The browser, for people (see Browser): IndexedDB, tabs, in-page plugins called directly, and its UI.

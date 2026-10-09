@@ -64,6 +64,7 @@ Explorations, kept loose on purpose: ideas, questions and the trade-offs seen so
 - Which protocol capabilities a client exposes is its choice: the protocol and the CLI keep several identities per device (`--as`), while the browser keeps one, and moves to another identity by leaving its own. If several get used, the browser can expose them too.
 - The core is built natively per platform; WASM only where a platform forces it (the browser) or for plugins. Raw UDP for iroh's direct paths, processes, SQLite and iOS's lack of JIT all argue against WASM elsewhere.
 - Kinds that run as executables cannot run on phones or in the browser. Portable kinds would be libraries linked into each client, and third-party kinds WASM modules speaking the plugin protocol, sandboxed, in every client.
+- The core builds for Android (checked in CI). iOS waits on iroh's network monitor: netdev 0.46.3 uses libc's `in6_ifreq`, which libc defines for macOS only.
 - Phones suspend apps, and messages move only between members online at once: a phone needs an always-on member of its own, or a push to wake it.
 
 ## Testing
