@@ -42,8 +42,6 @@ struct Book {
     identity: IdentityRef,
     name: String,
     position: u64,
-    /// The epoch of the last entry taken.
-    epoch: u64,
     /// The identity's private keys, with when each was made, in milliseconds.
     keys: Vec<(Bytes, u64)>,
     contacts: Vec<(Bytes, Contact)>,
@@ -181,18 +179,16 @@ impl<P: Provider + Send + 'static> Devices<P> {
         self.node.append_identity(&identity, &entry).await?;
         let settings = Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), open: Vec::new(), keep: 90, membership, log: None };
         let gid = self.node.create(settings, None)?;
-        let epoch = self.node.epoch(&gid.0)?;
         let book = Book {
             identity: identity.clone(),
             name: name.into(),
             position: 0,
-            epoch,
             keys: vec![(Bytes(seed.to_vec()), now())],
             contacts: Vec::new(),
             openings: Vec::new(),
         };
         self.save(&gid.0, &Record { book: Some(book), added_by: None, since: now() })?;
-        self.node.follow_log(&gid.0, Some((0, epoch)))?;
+        self.node.follow_log(&gid.0, Some(0))?;
         Ok(identity)
     }
 
@@ -228,8 +224,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
     /// Sets a contact of this device's first identity.
     pub async fn set_contact(&self, id: &[u8], contact: Contact) -> Result<()> {
         let (gid, _) = self.books().into_iter().next().context("this device is on no identity")?;
-        let entry = Entry::Contact { identity: Bytes(id.to_vec()), contact };
-        self.node.append(&gid.0, &serde_json::to_value(entry)?).await.map(drop)
+        self.enter(&gid.0, Entry::Contact { identity: Bytes(id.to_vec()), contact }).await
     }
 
     /// Records a group open to an identity, unless it is recorded so already.
@@ -238,7 +233,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
         if book.openings.contains(&opening) {
             return Ok(());
         }
-        self.node.append(&gid.0, &serde_json::to_value(Entry::Opening { opening })?).await.map(drop)
+        self.enter(&gid.0, Entry::Opening { opening }).await
     }
 
     /// Takes a device off an identity, and replaces the identity's key, which it held.
@@ -247,6 +242,12 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let (gid, _) = self.book(identity)?;
         self.node.remove(&gid.0, device).await?;
         self.rotate(&gid.0).await
+    }
+
+    /// Holds an entry as a message of the group, and appends it to the group's log.
+    async fn enter(&self, gid: &[u8], entry: Entry) -> Result<()> {
+        let (id, _) = self.node.send(gid, &serde_json::to_value(entry)?, true).await?;
+        self.node.append(gid, &id.0).await.map(drop)
     }
 
     async fn rotate_if_due(&self, gid: &[u8]) -> Result<()> {
@@ -264,7 +265,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let log = self.node.read_key_log(&book.identity).await?;
         let (current, _) = book.seed(log.current()).context("this device does not hold the identity's current key")?;
         let next = lmk_core::random::<32>();
-        self.node.append(gid, &serde_json::to_value(Entry::Key { key: Bytes(next.to_vec()), at: now() })?).await?;
+        self.enter(gid, Entry::Key { key: Bytes(next.to_vec()), at: now() }).await?;
         self.node.append_identity(&book.identity, &log.rotate(&current, &public(&next))).await.map(drop)
     }
 
@@ -315,10 +316,10 @@ impl<P: Provider + Send + 'static> Devices<P> {
         if record.book.as_ref().is_some_and(|held| held.position > book.position) {
             return Ok(());
         }
-        let (position, epoch) = (book.position, book.epoch);
+        let position = book.position;
         record.book = Some(book);
         self.save(gid, &record)?;
-        self.node.follow_log(gid, Some((position, epoch)))
+        self.node.follow_log(gid, Some(position))
     }
 
     /// Applies the entries of the log taken since the state.
@@ -328,7 +329,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let Some(book) = &mut record.book else { return Ok(()) };
         let mut rotated = None;
         for entry in self.node.entries(gid, book.position)? {
-            (book.position, book.epoch) = (entry.position, entry.epoch);
+            book.position = entry.position;
             match serde_json::from_value(entry.payload) {
                 Ok(Entry::Key { key, at }) => {
                     if !book.keys.iter().any(|(held, _)| *held == key) {
@@ -347,9 +348,9 @@ impl<P: Provider + Send + 'static> Devices<P> {
                 Err(error) => tracing::debug!("skipped an entry of a devices group: {error:#}"),
             }
         }
-        let (identity, position, epoch) = (book.identity.clone(), book.position, book.epoch);
+        let (identity, position) = (book.identity.clone(), book.position);
         self.save(gid, &record)?;
-        self.node.follow_log(gid, Some((position, epoch)))?;
+        self.node.follow_log(gid, Some(position))?;
         // The device that made a key enters it in the key log once its devices have it: read the log until it shows.
         if let Some(key) = rotated {
             let node = self.node.clone();

@@ -101,10 +101,15 @@ def until(produce, accept, timeout=20):
         time.sleep(0.3)
 
 
-def git(session, *args, cwd=None, ok=True):
-    """git, as an agent of `session` runs it: lmk:: remotes reach that session."""
+def git(session, *args, cwd=None, ok=True, alias=False):
+    """git, as an agent of `session` runs it: lmk:: remotes reach that session, through git-remote-lmk on PATH or, with
+    `alias`, through the git alias that npm installs need."""
     env = {**ENV, "LETMEKNOW_HOME": home(session), "LETMEKNOW_SESSION": session}
-    result = subprocess.run(["git", "-c", "init.defaultBranch=main", *args], cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", timeout=120)
+    config = ["-c", "init.defaultBranch=main"]
+    if alias:
+        env["PATH"] = os.environ["PATH"]
+        config += ["-c", f"alias.remote-lmk=!'{BIN}' git-remote-lmk"]
+    result = subprocess.run(["git", *config, *args], cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", timeout=120)
     if ok and result.returncode:
         sys.exit(f"{session} git {args}: {result.stderr}")
     return result
@@ -126,8 +131,8 @@ def git_kind(alice, bob, dave, listeners):
     git("alice", "push", "-q", "team", "main", cwd=ours)
     pushed = bob.expect("pushed", lambda e: e["group"] == made["group"])
     check(pushed["ref"] == "refs/heads/main" and pushed["subjects"] == ["first commit"] and pushed["by"]["name"] == "Alice", "a push reaches the other member as a pushed event")
-    git("bob", "clone", "-q", "lmk::Repo", theirs)
-    check(content(os.path.join(theirs, "README.md")) == "hello\n", "the other member clones it with git")
+    git("bob", "clone", "-q", "lmk::Repo", theirs, alias=True)
+    check(content(os.path.join(theirs, "README.md")) == "hello\n", "the other member clones it with git, through the git alias")
     write("bob-repo/NOTES.md", "notes\n")
     git("bob", "add", "NOTES.md", cwd=theirs)
     git("bob", "commit", "-qm", "bob's notes", cwd=theirs)
@@ -163,6 +168,9 @@ def git_kind(alice, bob, dave, listeners):
     check(bob.expect("message", lambda e: e["content"] == "@bob the build is green")["group"] == made["group"], "a git group carries chat")
 
     # With no other member online, a push fails and says so.
+    tip = git(loser, "rev-parse", "HEAD", cwd=repo).stdout.strip()
+    head = lambda: (git("alice", "pull", "-q", "--ff-only", "team", "main", cwd=ours, ok=False), git("alice", "rev-parse", "HEAD", cwd=ours).stdout.strip())[1]
+    check(until(head, lambda h: h == tip) == tip, "both members end at the same tip")
     bob.stop()
     listeners.remove(bob)
     write("alice-repo/late.txt", "late")

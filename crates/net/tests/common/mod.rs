@@ -24,7 +24,7 @@ use lmk_proto::{
     head::{self, Head},
     identity::Envelope,
     links::FileLink,
-    peer::{Admitted, Hello, InviteRequest, Keys, KindFrame},
+    peer::{Admitted, Hello, InviteRequest},
 };
 use n0_future::boxed::BoxFuture;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -174,6 +174,8 @@ pub struct Group {
     /// Takes no entries from peers, as when they reach it only from the service; counts those offered.
     pub frozen: bool,
     pub offered: usize,
+    /// Other logs it follows for the group, such as its kind's, by id.
+    pub others: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
 }
 
 /// A browser's storage of files.
@@ -200,13 +202,12 @@ pub struct Fake {
     pub groups: Mutex<HashMap<Vec<u8>, Group>>,
     /// After this many more membership checks, the peer is no longer a member.
     pub cut: Mutex<Option<(EndpointId, usize)>>,
-    /// The key logs and certificates it presents, and those peers presented to it.
-    pub keys: Mutex<Vec<Keys>>,
-    pub presented: Mutex<Vec<(EndpointId, Keys)>>,
+    /// Members in a leaf it does not serve, for want of a valid certificate.
+    pub uncertified: Mutex<Vec<EndpointId>>,
+    /// The certificates it presents, and those peers presented to it.
     pub certificates: Mutex<Vec<Envelope>>,
     pub certified: Mutex<Vec<Envelope>>,
-    /// Kinds' frames and state links from peers.
-    pub frames: Mutex<Vec<(EndpointId, KindFrame)>>,
+    /// State links from peers.
     pub states: Mutex<Vec<StateLink>>,
 }
 
@@ -219,11 +220,9 @@ impl Fake {
             service: service.clone(),
             groups: Mutex::default(),
             cut: Mutex::default(),
-            keys: Mutex::default(),
-            presented: Mutex::default(),
+            uncertified: Mutex::default(),
             certificates: Mutex::default(),
             certified: Mutex::default(),
-            frames: Mutex::default(),
             states: Mutex::default(),
         })
     }
@@ -242,12 +241,17 @@ impl Fake {
         self.groups.lock().unwrap()[group].held.contains_key(&id(ciphertext))
     }
 
-    pub fn log(&self, group: &[u8]) -> Vec<Vec<u8>> {
-        self.groups.lock().unwrap()[group].log.clone()
+    /// The entries of a log: a group's own, or another it follows.
+    pub fn log(&self, log: &[u8]) -> Vec<Vec<u8>> {
+        let groups = self.groups.lock().unwrap();
+        match groups.get(log) {
+            Some(g) => g.log.clone(),
+            None => groups.values().find_map(|g| g.others.get(log)).cloned().unwrap_or_default(),
+        }
     }
 
-    fn chain_of(log: &[Vec<u8>], group: &[u8], n: usize) -> [u8; 32] {
-        log[..n].iter().fold(head::start(group), |hash, entry| head::next(&hash, entry))
+    fn chain_of(entries: &[Vec<u8>], log: &[u8], n: usize) -> [u8; 32] {
+        entries[..n].iter().fold(head::start(log), |hash, entry| head::next(&hash, entry))
     }
 }
 
@@ -256,7 +260,14 @@ impl Groups for Fake {
         self.groups.lock().unwrap().keys().cloned().collect()
     }
 
+    fn in_leaf(&self, group: &[u8], peer: &EndpointId) -> bool {
+        self.groups.lock().unwrap().get(group).is_some_and(|g| g.members.contains(peer))
+    }
+
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
+        if self.uncertified.lock().unwrap().contains(peer) {
+            return false;
+        }
         let mut cut = self.cut.lock().unwrap();
         if let Some((who, left)) = cut.as_mut()
             && who == peer
@@ -272,33 +283,45 @@ impl Groups for Fake {
     fn hello(&self, group: &[u8]) -> Hello {
         let groups = self.groups.lock().unwrap();
         let g = &groups[group];
-        let length = g.log.len() as u64;
-        let head = Head::sign(&self.service, group, length, Self::chain_of(&g.log, group, g.log.len()), 0);
-        Hello { group: group.into(), epoch: length, head, floor: g.floor, joined: g.joined, log: None }
+        Hello { group: group.into(), epoch: g.log.len() as u64, floor: g.floor, joined: g.joined }
+    }
+
+    fn logs(&self, group: &[u8]) -> Vec<Vec<u8>> {
+        let groups = self.groups.lock().unwrap();
+        [group.to_vec()].into_iter().chain(groups[group].others.keys().cloned()).collect()
+    }
+
+    fn head(&self, log: &[u8]) -> Head {
+        let entries = self.log(log);
+        Head::sign(&self.service, log, entries.len() as u64, Self::chain_of(&entries, log, entries.len()), 0)
     }
 
     fn verify_head(&self, _: &[u8], head: &Head) -> bool {
         head.verify(&self.service.verifying_key())
     }
 
-    fn chain(&self, group: &[u8], position: u64) -> Option<[u8; 32]> {
-        let groups = self.groups.lock().unwrap();
-        let log = &groups[group].log;
-        (position as usize <= log.len()).then(|| Self::chain_of(log, group, position as usize))
+    fn chain(&self, log: &[u8], position: u64) -> Option<[u8; 32]> {
+        let entries = self.log(log);
+        (position as usize <= entries.len()).then(|| Self::chain_of(&entries, log, position as usize))
     }
 
-    fn entries(&self, group: &[u8], after: u64) -> Vec<Bytes> {
-        self.groups.lock().unwrap()[group].log[after as usize..].iter().map(|e| Bytes(e.clone())).collect()
+    fn entries(&self, log: &[u8], after: u64) -> Vec<Bytes> {
+        self.log(log)[after as usize..].iter().map(|e| Bytes(e.clone())).collect()
     }
 
-    fn apply(&self, group: &[u8], entries: Vec<Bytes>, _: Head) -> Result<()> {
+    fn apply(&self, log: &[u8], entries: Vec<Bytes>, _: Head) -> Result<()> {
         let mut groups = self.groups.lock().unwrap();
-        let g = groups.get_mut(group).unwrap();
-        if g.frozen {
-            g.offered += entries.len();
-            anyhow::bail!("frozen");
+        let entries = entries.into_iter().map(|e| e.0);
+        if let Some(g) = groups.get_mut(log) {
+            if g.frozen {
+                g.offered += entries.len();
+                anyhow::bail!("frozen");
+            }
+            g.log.extend(entries);
+            return Ok(());
         }
-        g.log.extend(entries.into_iter().map(|e| e.0));
+        let other = groups.values_mut().find_map(|g| g.others.get_mut(log)).unwrap();
+        other.extend(entries);
         Ok(())
     }
 
@@ -319,7 +342,7 @@ impl Groups for Fake {
         let g = groups.get_mut(group).unwrap();
         if epoch < g.floor {
             g.given_up.insert(id(ciphertext), epoch);
-            return Taken::Refused("below the floor".into());
+            return Taken::Refused;
         }
         if epoch > g.log.len() as u64 {
             return Taken::Waiting;
@@ -333,26 +356,18 @@ impl Groups for Fake {
         Taken::Held
     }
 
-    fn frame(&self, peer: EndpointId, frame: KindFrame) {
-        self.frames.lock().unwrap().push((peer, frame));
+    fn below(&self, group: &[u8], items: Vec<(u64, [u8; 32])>) {
+        let mut groups = self.groups.lock().unwrap();
+        let g = groups.get_mut(group).unwrap();
+        g.given_up.extend(items.into_iter().map(|(epoch, id)| (id, epoch)));
     }
 
     fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>) {
         self.states.lock().unwrap().push((group.to_vec(), peer, link));
     }
 
-    fn log_head(&self, _: EndpointId, _: &[u8], _: Head) {}
-
     fn files(&self, group: &[u8]) -> Vec<FileLink> {
         self.groups.lock().unwrap()[group].files.clone()
-    }
-
-    fn keys(&self, _: &[Vec<u8>]) -> Vec<Keys> {
-        self.keys.lock().unwrap().clone()
-    }
-
-    fn key_log(&self, peer: EndpointId, keys: Keys) {
-        self.presented.lock().unwrap().push((peer, keys));
     }
 
     fn certificates(&self, _: &[Vec<u8>]) -> Vec<Envelope> {

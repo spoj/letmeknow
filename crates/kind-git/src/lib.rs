@@ -1,6 +1,7 @@
-//! The git kind: a repository's branches, which members push to through the group's kind log. A push's entry names the
-//! branch, its old and new commit, the bundle that brings the commits (a file), and their subjects. Every member applies
-//! the log in order: an update counts only if `old` is the branch's tip at that point. A member checks each bundle once
+//! The git kind: a repository's branches, which members push to through the group's kind log. A push is a held message
+//! naming the branch, its old and new commit, the bundle that brings the commits (a file), and their subjects; the log
+//! orders the pushes by their messages' ids. Every member applies the log in order: an update counts only if `old` is
+//! the branch's tip at that point. A member checks each bundle once
 //! it has it; one whose `new` does not follow `old` voids its update for every member, since a file's content is fixed
 //! by its hash. The group's state is its branches as of a log position, with a full bundle.
 //!
@@ -28,7 +29,7 @@ pub fn answer(id: &Value, answer: Result<Value>) -> Value {
     }
 }
 
-/// A push, as its log entry names it.
+/// A push, as its message names it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Push {
     #[serde(rename = "ref")]
@@ -54,9 +55,8 @@ pub enum Verdict {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Taken {
     pub position: u64,
-    pub epoch: u64,
-    /// The position and epoch of the entry taken before it.
-    pub before: (u64, u64),
+    /// The position of the entry taken before it.
+    pub before: u64,
     pub from: Value,
     pub push: Push,
     pub verdict: Verdict,
@@ -66,7 +66,6 @@ pub struct Taken {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct State {
     pub position: u64,
-    pub epoch: u64,
     pub refs: BTreeMap<String, String>,
     pub bundle: Option<String>,
 }
@@ -74,32 +73,29 @@ pub struct State {
 /// A group's branches as its log leaves them.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Branches {
-    /// The log position and epoch of the last entry taken.
+    /// The log position of the last entry taken.
     pub position: u64,
-    pub epoch: u64,
     /// The branches as of `settled`: every push up to it is checked and applied.
     pub refs: BTreeMap<String, String>,
-    pub settled: (u64, u64),
+    pub settled: u64,
     /// The pushes after `settled`, in log order.
     pub pushes: Vec<Taken>,
 }
 
 impl Branches {
     pub fn from_state(state: &State) -> Self {
-        let at = (state.position, state.epoch);
-        Branches { position: at.0, epoch: at.1, refs: state.refs.clone(), settled: at, pushes: Vec::new() }
+        Branches { position: state.position, refs: state.refs.clone(), settled: state.position, pushes: Vec::new() }
     }
 
     /// Takes an entry of the log. Returns its push, if it is one.
-    pub fn take(&mut self, position: u64, epoch: u64, from: Value, payload: &Value) -> Option<&Taken> {
-        let before = (self.position, self.epoch);
-        (self.position, self.epoch) = (position, epoch);
+    pub fn take(&mut self, position: u64, from: Value, payload: &Value) -> Option<&Taken> {
+        let before = std::mem::replace(&mut self.position, position);
         let push = (payload["type"] == "push").then(|| serde_json::from_value::<Push>(payload.clone()).ok()).flatten();
         let Some(push) = push else {
             self.settle();
             return None;
         };
-        self.pushes.push(Taken { position, epoch, before, from, push, verdict: Verdict::Pending });
+        self.pushes.push(Taken { position, before, from, push, verdict: Verdict::Pending });
         self.pushes.last()
     }
 
@@ -158,7 +154,7 @@ impl Branches {
         let checked = self.pushes.iter().take_while(|taken| taken.verdict != Verdict::Pending).count();
         self.refs = self.checked();
         self.pushes.drain(..checked);
-        self.settled = self.pushes.first().map_or((self.position, self.epoch), |first| first.before);
+        self.settled = self.pushes.first().map_or(self.position, |first| first.before);
     }
 }
 
@@ -206,7 +202,7 @@ impl<S: Store> Page<S> {
                 let kept = self.store.get(&format!("kind/git/{group}")).map(|kept| serde_json::from_slice::<Branches>(&kept)).transpose()?;
                 match kept {
                     Some(branches) => {
-                        out.push(json!({ "type": "log", "group": group, "after": branches.position, "epoch": branches.epoch }));
+                        out.push(json!({ "type": "log", "group": group, "after": branches.position }));
                         self.groups.insert(group, branches);
                     }
                     None => out.push(json!({ "type": "log", "group": group })),
@@ -222,15 +218,15 @@ impl<S: Store> Page<S> {
             "state" => {
                 let state: State = serde_json::from_slice(&bytes(&message["data"])?)?;
                 if self.groups.get(&group).is_none_or(|branches| state.position >= branches.position) {
-                    out.push(json!({ "type": "log", "group": group, "after": state.position, "epoch": state.epoch }));
+                    out.push(json!({ "type": "log", "group": group, "after": state.position }));
                     self.groups.insert(group.clone(), Branches::from_state(&state));
                     self.save(&group)?;
                 }
             }
             "entry" => {
                 let branches = self.groups.get_mut(&group).context("an entry of a log not followed")?;
-                let (position, epoch) = (message["position"].as_u64().unwrap_or_default(), message["epoch"].as_u64().unwrap_or_default());
-                if let Some(taken) = branches.take(position, epoch, message["from"].clone(), &message["payload"]) {
+                let position = message["position"].as_u64().unwrap_or_default();
+                if let Some(taken) = branches.take(position, message["from"].clone(), &message["payload"]) {
                     let push = taken.push.clone();
                     let counted = branches.counts(position);
                     branches.judge(position, Verdict::Good);
@@ -261,28 +257,28 @@ mod tests {
     #[test]
     fn an_update_counts_only_from_the_tip_and_a_void_bundle_voids_what_built_on_it() {
         let mut branches = Branches::default();
-        branches.take(1, 0, json!(null), &push("main", None, Some("a")));
-        branches.take(2, 0, json!(null), &push("main", Some("a"), Some("b")));
-        branches.take(3, 0, json!(null), &push("main", Some("a"), Some("c")));
-        branches.take(4, 1, json!(null), &push("main", Some("b"), Some("d")));
+        branches.take(1, json!(null), &push("main", None, Some("a")));
+        branches.take(2, json!(null), &push("main", Some("a"), Some("b")));
+        branches.take(3, json!(null), &push("main", Some("a"), Some("c")));
+        branches.take(4, json!(null), &push("main", Some("b"), Some("d")));
         assert!(branches.counts(2) && !branches.counts(3) && branches.counts(4));
         assert_eq!(branches.tips()["main"], "d");
         assert!(branches.checked().is_empty(), "nothing is checked yet");
 
         branches.judge(1, Verdict::Good);
-        assert_eq!((branches.refs["main"].as_str(), branches.settled), ("a", (1, 0)));
+        assert_eq!((branches.refs["main"].as_str(), branches.settled), ("a", 1));
         branches.judge(2, Verdict::Bad);
         assert!(branches.counts(3) && !branches.counts(4), "b is void, so c follows a and d does not");
         assert_eq!(branches.tips()["main"], "c");
         branches.judge(3, Verdict::Good);
         branches.judge(4, Verdict::Good);
-        assert_eq!((branches.refs["main"].as_str(), branches.settled, branches.pushes.len()), ("c", (4, 1), 0));
+        assert_eq!((branches.refs["main"].as_str(), branches.settled, branches.pushes.len()), ("c", 4, 0));
 
-        branches.take(5, 1, json!(null), &push("main", Some("c"), None));
+        branches.take(5, json!(null), &push("main", Some("c"), None));
         branches.judge(5, Verdict::Good);
         assert!(branches.refs.is_empty(), "a branch is deleted");
-        branches.take(6, 1, json!(null), &json!({ "type": "other" }));
-        assert_eq!(branches.settled, (6, 1));
+        branches.take(6, json!(null), &json!({ "type": "other" }));
+        assert_eq!(branches.settled, 6);
     }
 
     struct Memory(std::cell::RefCell<HashMap<String, Vec<u8>>>);
@@ -305,15 +301,15 @@ mod tests {
         let mut page = Page::new(&memory);
         let out = page.input(&json!({ "type": "group", "group": "g", "id": 1 }));
         assert_eq!(out[0], json!({ "type": "log", "group": "g" }), "a joiner without state asks for one");
-        let state = State { position: 3, epoch: 2, refs: [("refs/heads/main".into(), "a".into())].into(), bundle: None };
+        let state = State { position: 3, refs: [("refs/heads/main".into(), "a".into())].into(), bundle: None };
         let out = page.input(&json!({ "type": "state", "group": "g", "data": Bytes(serde_json::to_vec(&state).unwrap()) }));
-        assert_eq!(out[0], json!({ "type": "log", "group": "g", "after": 3, "epoch": 2 }));
-        let entry = |position, payload| json!({ "type": "entry", "group": "g", "position": position, "epoch": 2, "from": { "name": "Ann" }, "payload": payload });
+        assert_eq!(out[0], json!({ "type": "log", "group": "g", "after": 3 }));
+        let entry = |position, payload| json!({ "type": "entry", "group": "g", "position": position, "id": "00", "from": { "name": "Ann" }, "payload": payload });
         let out = page.input(&entry(4, push("refs/heads/main", Some("a"), Some("b"))));
         assert_eq!(out[0]["event"]["type"], "pushed");
         assert!(page.input(&entry(5, push("refs/heads/main", Some("a"), Some("c")))).is_empty(), "a push that lost is not told");
         let mut page = Page::new(&memory);
         let out = page.input(&json!({ "type": "group", "group": "g" }));
-        assert_eq!(out[0], json!({ "type": "log", "group": "g", "after": 5, "epoch": 2 }), "it resumes where it was");
+        assert_eq!(out[0], json!({ "type": "log", "group": "g", "after": 5 }), "it resumes where it was");
     }
 }

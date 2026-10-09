@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use iroh::tls::CaTlsConfig;
 use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
+use lmk_core::group::Window;
 use lmk_proto::group::Service;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
@@ -26,6 +27,7 @@ struct World {
     root: PathBuf,
     /// For the sessions started from now on.
     causal_wait: Duration,
+    window: Window,
     plugins: Vec<PathBuf>,
 }
 
@@ -60,7 +62,7 @@ async fn world(test: &str) -> World {
     let root = std::env::temp_dir().join(format!("lmk-session-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let network = crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) };
-    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT, plugins: vec![built()] }
+    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT, window: Window::default(), plugins: vec![built()] }
 }
 
 struct Agent {
@@ -90,6 +92,7 @@ impl World {
             name: handle[..1].to_uppercase() + &handle[1..],
             hold,
             causal_wait: self.causal_wait,
+            window: self.window,
             keep_log: false,
             membership: self.membership(),
             plugins: self.plugins.clone(),
@@ -235,7 +238,7 @@ fn send_reports_who_holds_a_message_or_that_it_is_pending_or_refused() {
         let (mut alice, mut bob, _) = pair(&world, HOUR).await;
         let big = "x".repeat(1 << 20);
         let refused = alice.cmd(&["send", "--to", "Bob", &big]).await.unwrap();
-        assert!(refused["refused"][0]["reason"].as_str().unwrap().contains("1 MiB"), "{refused}");
+        assert_eq!(refused["refused"][0]["reason"], "size", "{refused}");
         assert_eq!(refused["refused"][0]["member"]["name"], "Bob");
         assert_eq!(refused["to"].as_array().unwrap().len(), 1);
         bob.stop().await;
@@ -259,7 +262,7 @@ fn send_reports_who_holds_a_message_or_that_it_is_pending_or_refused() {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         assert_eq!(only_here().await[0]["id"], refused["id"]);
-        assert!(alice.printed().await.iter().all(|e| e["type"] != "warning"));
+        assert!(alice.printed().await.iter().all(|e| e["type"] != "warning" && e["type"] != "refused"), "send told of the refusal");
     });
 }
 
@@ -503,6 +506,37 @@ fn a_restarted_session_takes_in_what_it_missed_in_causal_order() {
 }
 
 #[test]
+fn a_member_back_past_its_key_window_reports_what_it_missed_and_the_sender_resends_it() {
+    local(async {
+        let mut world = world("old").await;
+        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
+        bob.stop().await;
+        let file = world.root.join("notes.txt");
+        std::fs::write(&file, "the notes").unwrap();
+        let sent = alice.cmd(&["send", "--attach", file.to_str().unwrap(), "while you were away"]).await.unwrap();
+        assert_eq!(sent["pending"], true);
+        for name in ["one", "two", "three"] {
+            alice.cmd(&["name", name]).await.unwrap();
+        }
+        // Bob keeps the keys of one ended epoch: Alice's message is below his floor when he is back.
+        world.window = Window { epochs: 1, ..Window::default() };
+        let mut bob = world.start("bob", HOUR).await;
+        let refused = alice.expect("refused").await;
+        assert_eq!(refused["member"]["name"], "Bob");
+        let id = sent["id"].as_str().unwrap();
+        let message = &refused["messages"][0];
+        assert_eq!((message["id"].as_str(), message["reason"].as_str(), message["content"].as_str()), (Some(id), Some("old"), Some("while you were away")));
+        let path = message["attachment"]["path"].as_str().unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "the notes");
+        let resent = alice.cmd(&["send", "--reply-to", id, "--attach", path, "while you were away"]).await.unwrap();
+        assert_eq!(resent["held_by"][0]["name"], "Bob");
+        let message = bob.expect("message").await;
+        assert_eq!((message["reply_to"].as_str(), message["content"].as_str()), (Some(id), Some("while you were away")));
+        assert_eq!(message["missing"], json!([id]), "a known gap, not a wait");
+    });
+}
+
+#[test]
 fn a_session_of_an_identity_joins_a_group_open_to_it() {
     local(async {
         let world = world("open").await;
@@ -590,7 +624,7 @@ async fn until_file(agent: &Agent, file: &Path, check: impl Fn(&str) -> bool) ->
 }
 
 #[test]
-fn docs_that_drift_apart_meet_again_through_their_plugins_frames() {
+fn docs_that_drift_apart_meet_again() {
     local(async {
         let world = world("frames").await;
         let mut alice = world.start("alice", HOUR).await;
@@ -602,7 +636,7 @@ fn docs_that_drift_apart_meet_again_through_their_plugins_frames() {
         bob.cmd(&["join", invite["link"].as_str().unwrap(), theirs.to_str().unwrap()]).await.unwrap();
         alice.expect("joined").await;
         assert_eq!(until_file(&bob, &theirs, |t| t.contains("alpha")).await, "- [ ] alpha\n");
-        // Bob is away while Alice edits: her live edit never reaches him, but the docs' frames bring it once he is back.
+        // Bob is away while Alice edits: her live edit never reaches him, but the docs compare once he is back.
         bob.stop().await;
         std::fs::write(&plan, "- [x] alpha\n").unwrap();
         alice.cmd(&["status"]).await.unwrap();
@@ -657,7 +691,7 @@ fn a_restarted_session_resumes_its_groups_and_docs() {
 }
 
 #[test]
-fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_twice_nor_one_0_10_left() {
+fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_twice() {
     local(async {
         use lmk_kind_doc::ydoc;
         let world = world("carrying").await;
@@ -671,9 +705,8 @@ fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_t
         let dir = session_dir(&alice.home, "alice").unwrap();
         let (state_file, saved_file) = (dir.join(format!("kinds/doc/{gid}.yjs")), dir.join(format!("kinds/doc/{gid}.json")));
         // Another member's line came in; then the plugin stopped after recording that it carried its own new line onto
-        // the doc, with the doc changed (`applied`) or not, before the file was rewritten and the base stored. The third
-        // time, 0.10 did so, and kept it all in its own tables.
-        for (i, applied) in [true, false, true].into_iter().enumerate() {
+        // the doc, with the doc changed (`applied`) or not, before the file was rewritten and the base stored.
+        for (i, applied) in [true, false].into_iter().enumerate() {
             let base = std::fs::read_to_string(&file).unwrap();
             let carried = format!("{base}mine {i}\n");
             let expected = format!("others {i}\n{carried}");
@@ -683,33 +716,13 @@ fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_t
             let edit = ydoc::edit(&theirs, &expected).unwrap();
             let state = if applied { ydoc::apply(&theirs, &edit).unwrap() } else { theirs };
             let carrying = json!({ "file": carried, "edit": lmk_proto::Bytes(edit.clone()) });
-            if i < 2 {
-                std::fs::write(&state_file, &state).unwrap();
-                std::fs::write(&saved_file, json!({ "path": file, "base": base, "made": true, "carrying": carrying }).to_string()).unwrap();
-            } else {
-                std::fs::remove_file(&state_file).unwrap();
-                std::fs::remove_file(&saved_file).unwrap();
-                let db = rusqlite::Connection::open(dir.join("session.db")).unwrap();
-                db.execute_batch(
-                    "CREATE TABLE bindings (gid BLOB PRIMARY KEY, path TEXT NOT NULL, base TEXT NOT NULL);
-                     CREATE TABLE carrying (gid BLOB PRIMARY KEY, file TEXT NOT NULL, edit BLOB NOT NULL);",
-                )
-                .unwrap();
-                let id = lmk_kind_doc::bytes(&json!(gid)).unwrap();
-                let key = [b"node/doc/".as_slice(), &id].concat();
-                db.execute("INSERT INTO lmk (key, value) VALUES (?, ?)", rusqlite::params![key, state]).unwrap();
-                db.execute("INSERT INTO bindings VALUES (?, ?, ?)", rusqlite::params![id, file, base]).unwrap();
-                db.execute("INSERT INTO carrying VALUES (?, ?, ?)", rusqlite::params![id, carried, edit]).unwrap();
-            }
+            std::fs::write(&state_file, &state).unwrap();
+            std::fs::write(&saved_file, json!({ "path": file, "base": base, "made": true, "carrying": carrying }).to_string()).unwrap();
             alice = world.start("alice", HOUR).await;
             alice.cmd(&["status"]).await.unwrap();
             assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
             alice.stop().await;
         }
-        let db = rusqlite::Connection::open(dir.join("session.db")).unwrap();
-        let left: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('bindings', 'carrying')", [], |r| r.get(0)).unwrap();
-        let legacy: i64 = db.query_row("SELECT count(*) FROM lmk WHERE key >= ? AND key < ?", [b"node/doc/".to_vec(), b"node/doc0".to_vec()], |r| r.get(0)).unwrap();
-        assert_eq!((left, legacy), (0, 0), "0.10's records of the doc are gone once the plugin has it");
     });
 }
 

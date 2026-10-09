@@ -1,6 +1,4 @@
-//! What the session process keeps beside its node's state, in the same SQLite file. 0.10 kept docs' files here too,
-//! in the tables `bindings` (`gid`, `path`, `base`) and `carrying` (`gid`, `file`, `edit`), which the doc plugin takes
-//! over.
+//! What the session process keeps beside its node's state, in the same SQLite file.
 
 use anyhow::Result;
 use rusqlite::Connection;

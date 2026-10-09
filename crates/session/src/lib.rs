@@ -96,6 +96,7 @@ pub async fn listen(
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
     let kinds = [lmk_proto::group::CHAT.to_owned()].into_iter().chain(kinds::discover(&config.plugins).into_keys()).collect();
     let node_config = node_config(&network, home, &config.name, None, config.dir.join("files"), kinds);
+    let node_config = lmk_node::Config { window: config.window, ..node_config };
     let (node, events) = Node::start(provider, node_config).await?;
     let session = session::Session::open(config, node, home, network, inbound).await?;
     session::run(session, queue, events, print, shutdown).await

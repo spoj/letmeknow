@@ -1,7 +1,8 @@
-//! The doc kind: one markdown text that every member edits at once, a Yjs document. Edits go live to the members online
-//! and are not held; two members that meet compare their docs by a hash of each one's snapshot (`doc` frames), and if
-//! they differ, each sends the other a `diff` against the other's state vector (`doc_sv`). An inviter hands a joiner
-//! the doc's state. The doc links files as `lmk:` links, which members hold while it does.
+//! The doc kind: one markdown text that every member edits at once, a Yjs document. Its payloads are live, none held:
+//! edits go to the members online; two members that meet compare their docs by a hash of each one's snapshot
+//! (`snapshot`), and if they differ, each sends the other a `diff` against the other's state vector (`sv`), all to that
+//! member alone. An inviter hands a joiner the doc's state. The doc links files as `lmk:` links, which members hold
+//! while it does.
 //!
 //! `Docs` is what every host of the kind does alike, in the plugin protocol (PROTOCOL.md): the session's plugin
 //! `letmeknow-kind-doc` (src/main.rs), which keeps each doc in a file, and the browser's in-page plugin (`Page`),
@@ -47,41 +48,40 @@ impl Docs {
         ydoc::text(self.state(group)?)
     }
 
-    /// Takes in what every host takes in alike: `message` (`edit`, `diff`), `frame` (`doc`, `doc_sv`), `synced`,
-    /// `state` and `snapshot`; what it sends goes to `out`. Returns the group whose doc changed and the member who
-    /// changed it, if any. Other messages are the host's.
+    /// Takes in what every host takes in alike: `message` (`edit`, `diff`, `snapshot`, `sv`), `synced`, `state` and
+    /// `snapshot`; what it sends goes to `out`. Returns the group whose doc changed and the member who changed it, if
+    /// any. Other messages are the host's.
     pub fn handle(&mut self, message: &Value, out: &mut Vec<Value>) -> Result<Option<(String, Value)>> {
         let group = message["group"].as_str().unwrap_or_default().to_owned();
-        match str(&message["type"])? {
-            "message" if matches!(message["payload"]["type"].as_str(), Some("edit" | "diff")) => {
-                self.apply(&group, &bytes(&message["payload"]["update"])?, out)?;
+        let (payload, to) = (&message["payload"], &message["from"]["fp"]);
+        match (str(&message["type"])?, payload["type"].as_str()) {
+            ("message", Some("edit" | "diff")) => {
+                self.apply(&group, &bytes(&payload["update"])?, out)?;
                 Ok(Some((group, message["from"].clone())))
             }
-            "state" => {
-                self.apply(&group, &bytes(&message["data"])?, out)?;
-                Ok(Some((group, message["from"].clone())))
-            }
-            "frame" => {
-                let to = &message["from"]["fp"];
+            ("message", Some("snapshot")) => {
                 let state = self.state(&group)?;
-                if let Some(snapshot) = message["frame"]["doc"].get("snapshot") {
-                    if bytes(snapshot)? != ydoc::snapshot(state)? {
-                        let sv = Bytes(ydoc::state_vector(state)?);
-                        out.push(json!({ "type": "frame", "group": group, "to": to, "frame": { "doc_sv": { "sv": sv } } }));
-                    }
-                } else if let Some(sv) = message["frame"]["doc_sv"].get("sv") {
-                    let diff = json!({ "type": "diff", "update": Bytes(ydoc::diff(state, &bytes(sv)?)?) });
-                    out.push(json!({ "type": "send", "group": group, "to": to, "payload": diff }));
+                if bytes(&payload["snapshot"])? != ydoc::snapshot(state)? {
+                    let sv = json!({ "type": "sv", "sv": Bytes(ydoc::state_vector(state)?) });
+                    out.push(json!({ "type": "send", "group": group, "to": to, "payload": sv }));
                 }
                 Ok(None)
             }
-            "synced" => {
-                let snapshot = Bytes(ydoc::snapshot(self.state(&group)?)?.to_vec());
-                let to = &message["member"]["fp"];
-                out.push(json!({ "type": "frame", "group": group, "to": to, "frame": { "doc": { "snapshot": snapshot } } }));
+            ("message", Some("sv")) => {
+                let diff = json!({ "type": "diff", "update": Bytes(ydoc::diff(self.state(&group)?, &bytes(&payload["sv"])?)?) });
+                out.push(json!({ "type": "send", "group": group, "to": to, "payload": diff }));
                 Ok(None)
             }
-            "snapshot" => {
+            ("state", _) => {
+                self.apply(&group, &bytes(&message["data"])?, out)?;
+                Ok(Some((group, message["from"].clone())))
+            }
+            ("synced", _) => {
+                let snapshot = json!({ "type": "snapshot", "snapshot": Bytes(ydoc::snapshot(self.state(&group)?)?.to_vec()) });
+                out.push(json!({ "type": "send", "group": group, "to": message["member"]["fp"], "payload": snapshot }));
+                Ok(None)
+            }
+            ("snapshot", _) => {
                 out.push(answer(&message["id"], Ok(json!({ "data": Bytes(self.state(&group)?.to_vec()) }))));
                 Ok(None)
             }
@@ -154,8 +154,7 @@ impl<S: Store> Page<S> {
         let key = format!("kind/doc/{group}");
         match str(&message["type"])? {
             "group" => {
-                let imported = message["import"].get("state").map(bytes).transpose()?;
-                let state = self.store.get(&key).or(imported).unwrap_or_else(|| ydoc::new(""));
+                let state = self.store.get(&key).unwrap_or_else(|| ydoc::new(""));
                 self.store.put(&key, &state);
                 self.docs.open(group, state, out)?;
                 if let Some(id) = message.get("id") {
@@ -205,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn two_docs_that_differ_converge_through_frames_and_a_diff() {
+    fn two_docs_that_differ_converge_through_a_diff() {
         let (mut a, mut b, mut out) = (Docs::default(), Docs::default(), Vec::new());
         let base = ydoc::new("- [ ] alpha\n");
         a.open("g", base.clone(), &mut out).unwrap();
@@ -220,14 +219,14 @@ mod tests {
 
         out.clear();
         a.handle(&json!({ "type": "synced", "group": "g", "member": ben }), &mut out).unwrap();
-        let frame = sent(&out, "frame");
-        assert_eq!(frame["to"], "bb");
+        let snapshot = sent(&out, "send");
+        assert_eq!((&snapshot["to"], &snapshot["payload"]["type"]), (&json!("bb"), &json!("snapshot")));
         out.clear();
-        b.handle(&json!({ "type": "frame", "group": "g", "from": ann, "frame": frame["frame"] }), &mut out).unwrap();
-        let frame = sent(&out, "frame");
-        assert!(frame["frame"]["doc_sv"]["sv"].is_string());
+        b.handle(&json!({ "type": "message", "group": "g", "from": ann, "payload": snapshot["payload"], "held": false }), &mut out).unwrap();
+        let sv = sent(&out, "send");
+        assert_eq!((&sv["to"], &sv["payload"]["type"]), (&json!("aa"), &json!("sv")));
         out.clear();
-        a.handle(&json!({ "type": "frame", "group": "g", "from": ben, "frame": frame["frame"] }), &mut out).unwrap();
+        a.handle(&json!({ "type": "message", "group": "g", "from": ben, "payload": sv["payload"], "held": false }), &mut out).unwrap();
         let diff = sent(&out, "send");
         assert_eq!((&diff["to"], &diff["payload"]["type"]), (&json!("bb"), &json!("diff")));
         let changed = b.handle(&json!({ "type": "message", "group": "g", "from": ann, "payload": diff["payload"], "held": false }), &mut out).unwrap();
@@ -250,18 +249,17 @@ mod tests {
     }
 
     #[test]
-    fn the_page_keeps_a_doc_imported_from_0_10_and_its_editors_edit_it() {
+    fn the_page_keeps_a_doc_and_its_editors_edit_it() {
         let memory = Memory(Default::default());
         let mut page = Page::new(&memory);
-        let old = Bytes(ydoc::new("from 0.10\n"));
-        page.input(&json!({ "type": "group", "group": "g", "id": 1, "import": { "state": old } }));
+        page.input(&json!({ "type": "group", "group": "g", "id": 1 }));
         let out = page.input(&json!({ "type": "command", "id": 2, "args": ["state", "g"] }));
         let state = bytes(&sent(&out, "answer")["answer"]["state"]).unwrap();
-        assert_eq!(ydoc::text(&state).unwrap(), "from 0.10\n");
-        let update = Bytes(ydoc::edit(&state, "from 0.10\nand now\n").unwrap());
+        assert_eq!(ydoc::text(&state).unwrap(), "");
+        let update = Bytes(ydoc::edit(&state, "and now\n").unwrap());
         let out = page.input(&json!({ "type": "command", "id": 3, "args": ["edit", "g", update] }));
         assert_eq!(sent(&out, "send")["payload"]["type"], "edit");
-        assert_eq!(ydoc::text(&(&memory).get("kind/doc/g").unwrap()).unwrap(), "from 0.10\nand now\n");
+        assert_eq!(ydoc::text(&(&memory).get("kind/doc/g").unwrap()).unwrap(), "and now\n");
         page.input(&json!({ "type": "gone", "group": "g" }));
         assert!((&memory).get("kind/doc/g").is_none());
     }

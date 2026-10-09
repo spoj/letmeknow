@@ -26,7 +26,7 @@ use lmk_proto::{
     head::Head,
     identity::Envelope,
     links::{FileLink, Invite},
-    peer::{Admitted, Frame, Hello, InviteRequest, Keys, KindFrame},
+    peer::{Admitted, Frame, Hello, InviteRequest},
 };
 use n0_future::{boxed::BoxFuture, join_all, task::spawn, time::timeout};
 use tokio::{
@@ -45,37 +45,39 @@ pub trait Groups: Send + Sync + 'static {
     /// The groups this session is in.
     fn groups(&self) -> Vec<Vec<u8>>;
     /// Whether `peer` is in a leaf of the group's current epoch.
+    fn in_leaf(&self, group: &[u8], peer: &EndpointId) -> bool;
+    /// Whether this session serves `peer` the group: it is in a leaf and, speaking as an identity, has shown a valid
+    /// certificate of it.
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool;
     /// This session's state of the group, as `hello` carries it.
     fn hello(&self, group: &[u8]) -> Hello;
-    /// Whether the group's membership service signed `head`; a folder's heads are unsigned.
-    fn verify_head(&self, group: &[u8], head: &Head) -> bool;
-    /// This session's chain hash after `position` entries, if it knows it.
-    fn chain(&self, group: &[u8], position: u64) -> Option<[u8; 32]>;
-    /// This session's log entries after `position`.
-    fn entries(&self, group: &[u8], after: u64) -> Vec<Bytes>;
-    /// Applies entries that directly follow this session's log and end at `head`, already
-    /// checked against its chain.
-    fn apply(&self, group: &[u8], entries: Vec<Bytes>, head: Head) -> Result<()>;
+    /// The logs this session follows for a group: the group's own, whose id is the group's, and others, such as its
+    /// kind's.
+    fn logs(&self, group: &[u8]) -> Vec<Vec<u8>>;
+    /// The newest signed head this session holds of a log it follows.
+    fn head(&self, log: &[u8]) -> Head;
+    /// Whether the log's membership service signed `head`; a folder's heads are unsigned.
+    fn verify_head(&self, log: &[u8], head: &Head) -> bool;
+    /// This session's chain hash of a log after `position` entries, if it knows it.
+    fn chain(&self, log: &[u8], position: u64) -> Option<[u8; 32]>;
+    /// This session's entries of a log after `position`, if it holds them.
+    fn entries(&self, log: &[u8], after: u64) -> Vec<Bytes>;
+    /// Takes entries that directly follow this session's copy of a log and end at `head`, already checked against its
+    /// chain.
+    fn apply(&self, log: &[u8], entries: Vec<Bytes>, head: Head) -> Result<()>;
     /// (epoch, message id) of every message held or given up on, from epoch `from`, in the order this session took them.
     fn items(&self, group: &[u8], from: u64) -> Vec<(u64, [u8; 32])>;
     /// A held message's MLS ciphertext.
     fn message(&self, group: &[u8], id: &[u8; 32]) -> Option<Vec<u8>>;
     /// An MLS ciphertext from a peer: decrypt, verify, and hold or apply it, or give it up.
     fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Taken;
-    /// A frame of the group's kind from `peer`, a member.
-    fn frame(&self, peer: EndpointId, frame: KindFrame);
+    /// (epoch, message id) of messages a peer holds that this session lacks, below its floor: given up.
+    fn below(&self, group: &[u8], items: Vec<(u64, [u8; 32])>);
     /// A link to the state of the group's kind, which `peer`, a member, hands this session; without one, `peer` asks
     /// for the kind's state.
     fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>);
-    /// The newest signed head `peer`, a member, holds of the group's kind log.
-    fn log_head(&self, peer: EndpointId, group: &[u8], head: Head);
     /// The files the group links now.
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
-    /// The key logs this session holds, with signed heads, of the identities in these groups.
-    fn keys(&self, groups: &[Vec<u8>]) -> Vec<Keys>;
-    /// A key log `peer` presented.
-    fn key_log(&self, peer: EndpointId, keys: Keys);
     /// The certificates this session holds of these groups' members.
     fn certificates(&self, groups: &[Vec<u8>]) -> Vec<Envelope>;
     /// A certificate `peer` presented.
@@ -92,11 +94,12 @@ pub trait Disk: Send + Sync + 'static {
     fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>);
 }
 
-/// What became of a ciphertext a peer sent; the peer hears which unless it waits.
+/// What became of a ciphertext a peer sent; a receipt tells the peer what was held.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Taken {
     Held,
-    Refused(String),
+    /// Given up.
+    Refused,
     /// Kept until a commit it follows is applied.
     Waiting,
 }
@@ -112,10 +115,10 @@ pub trait Admit: Send + Sync + 'static {
 pub enum Event {
     Connected(EndpointId),
     Disconnected(EndpointId),
-    /// Two incompatible signed heads: the membership service showed members different logs.
-    Contradiction { group: Vec<u8>, peer: EndpointId, ours: Head, theirs: Head },
-    /// What `peer` did with messages this session sent it.
-    Receipt { group: Vec<u8>, peer: EndpointId, held: Vec<[u8; 32]>, refused: Vec<([u8; 32], String)> },
+    /// Two incompatible signed heads of a log: its membership service showed members different logs.
+    Contradiction { log: Vec<u8>, peer: EndpointId, ours: Head, theirs: Head },
+    /// Messages this session sent that `peer` holds.
+    Receipt { group: Vec<u8>, peer: EndpointId, held: Vec<[u8; 32]> },
     /// This session and `peer` hold the same log of the group: a time to compare the state of its kind.
     InStep { group: Vec<u8>, peer: EndpointId },
     /// Message sync with `peer` finished.
@@ -207,13 +210,13 @@ impl Net {
 
     /// Sends a new MLS message to the members online; returns whom it went to.
     pub fn send(&self, group: &[u8], ciphertext: Vec<u8>) -> Vec<EndpointId> {
-        let frame = Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)] };
+        let frame = Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)], below: Vec::new() };
         self.inner.members(group).into_iter().filter(|(_, input)| input.send(Input::Send(frame.clone())).is_ok()).map(|(peer, _)| peer).collect()
     }
 
     /// Sends a new MLS message to one member online, if it is connected.
     pub fn send_to(&self, peer: EndpointId, group: &[u8], ciphertext: Vec<u8>) -> bool {
-        self.frame(peer, Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)] })
+        self.frame(peer, Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)], below: Vec::new() })
     }
 
     /// Sends a frame to one member online, if it is connected.
@@ -222,8 +225,8 @@ impl Net {
         input.is_some_and(|input| input.send(Input::Send(frame)).is_ok())
     }
 
-    /// Tells peers this session's state of a group changed (a commit applied, a member added):
-    /// each gets a new `hello`, and the entries it lacks.
+    /// Tells peers this session's state of a group changed (a log grew, a member added): each
+    /// gets a new `hello`, and the entries it lacks.
     pub fn changed(&self, group: &[u8]) {
         self.inner.changed(group);
     }

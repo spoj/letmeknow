@@ -92,11 +92,6 @@ const kept = page =>
       })
   );
 const text = page => page.locator(".cm-content").evaluate(content => content.cmTile.view.state.doc.toString());
-/** A doc's state as 0.10 kept it, in lmk-node's records: `lmk/node/doc/` and the group id's bytes. */
-const legacyKey = gid => {
-  const raw = Uint8Array.from(atob(gid.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
-  return [...new TextEncoder().encode("lmk/node/doc/"), ...raw];
-};
 async function until(produce, accept, ms = 20_000) {
   const deadline = Date.now() + ms;
   let value = await produce();
@@ -204,7 +199,7 @@ try {
   await phone.getByRole("button", { name: "Add this browser" }).click();
   await phone.locator(".devices li", { hasText: "phone" }).waitFor();
   const devices = desk.run("identity", "list").identities[0].devices;
-  check(devices.length === 2 && devices.some(d => d.name === "phone"), "a device link adds the browser to the identity's device list");
+  check(devices.length === 2 && devices.some(d => d.name === "phone"), "a device link adds the browser to the identity's devices");
   const team = desk.run("invite", "--name", "Team");
   desk.run("open", `--group=${team.group}`, "Matthew");
   const opened = await desk.printed(e => e.type === "joined" && e.member.device === "phone", 60_000);
@@ -240,27 +235,21 @@ try {
 
   check((await laptop.evaluate(() => window.toasts)).length === 0, "the laptop showed no error before its reload");
 
-  // A reload keeps the laptop's groups, messages and doc, and it still talks. Its doc's state goes back where 0.10 kept
-  // it, in lmk-node's records, and the doc plugin takes it from there.
-  const moved = await laptop.evaluate(
-    ([gid, legacy]) =>
+  // A reload keeps the laptop's groups, messages and doc, and it still talks.
+  const recorded = await laptop.evaluate(
+    gid =>
       new Promise((resolve, reject) => {
         const open = indexedDB.open("lmk");
         open.onsuccess = () => {
-          const records = open.result.transaction("records", "readwrite").objectStore("records");
-          const [ours, old] = [new TextEncoder().encode(`lmk/kind/doc/${gid}`), new Uint8Array(legacy)];
-          const read = records.get(ours);
-          read.onsuccess = () => {
-            if (!read.result) return resolve(false);
-            records.put(read.result, old);
-            records.delete(ours).onsuccess = () => resolve(true);
-          };
-          read.onerror = () => reject(read.error);
+          const records = open.result.transaction("records").objectStore("records");
+          const count = records.count(new TextEncoder().encode(`lmk/kind/doc/${gid}`));
+          count.onsuccess = () => resolve(count.result === 1);
+          count.onerror = () => reject(count.error);
         };
       }),
-    [doc.group, legacyKey(doc.group)]
+    doc.group
   );
-  check(moved, "the browser keeps its doc as the doc plugin's record");
+  check(recorded, "the browser keeps its doc as the doc plugin's record");
   await laptop.reload();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.getByText("hello from the terminal", { exact: true }).waitFor();
@@ -279,21 +268,8 @@ try {
         t => t.includes("gamma")
       )
     ).includes("gamma"),
-    "and its doc, also as 0.10 kept it"
+    "and its doc"
   );
-  const legacy = () =>
-    laptop.evaluate(
-      legacy =>
-        new Promise(resolve => {
-          const open = indexedDB.open("lmk");
-          open.onsuccess = () => {
-            const count = open.result.transaction("records").objectStore("records").count(new Uint8Array(legacy));
-            count.onsuccess = () => resolve(count.result);
-          };
-        }),
-      legacyKey(doc.group)
-    );
-  check((await until(legacy, n => n === 0)) === 0, "which it no longer keeps once the plugin has it");
 
   // A second tab works through the session the first one runs, and runs it once the first closes.
   const second = watch("second tab", await laptop.context().newPage());
@@ -401,9 +377,11 @@ try {
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.locator("textarea:visible").fill(`too long ${"x".repeat(1_100_000)}`);
   await laptop.locator("textarea:visible").press("Enter");
-  const refused = laptop.locator(".messages li", { hasText: "too long" }).locator(".status", { hasText: "Refused by" });
+  const refused = laptop.locator(".messages li", { hasText: "too long" }).locator(".status", { hasText: "Not taken by" });
   await refused.waitFor();
-  check((await refused.textContent()).includes("Ann (larger than 1 MiB)"), "a message the members refuse shows who refused it, and why");
+  const said = await refused.textContent();
+  check(said.includes("Ann") && said.includes("(too large for them)"), "a message the members refuse shows who refused it, and why");
+  check((await refused.getByRole("button", { name: "Resend" }).count()) === 0, "with no Resend, which cannot help");
   carl.proc.kill();
 
   // With Ann gone, what the laptop sends to her chat is pending.

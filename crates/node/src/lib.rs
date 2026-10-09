@@ -1,6 +1,6 @@
 //! One member's session over lmk-core, lmk-net and lmk-membership: its groups and their logs, its held messages and
 //! files, its invites and joins, and its members' identities: their key logs and certificates. A group's kind sees its
-//! content through the channels here (held and live messages, frames to one member, files, a log, and a state link for
+//! content through the channels here (held and live messages, files, its log, and a state link for
 //! joiners), and nothing of the rest; the core reads only its own payloads (`Control`). The devices kind (`devices`) is
 //! built on those channels. It stores everything through the core's `Provider`, so the same code runs natively (SQLite)
 //! and in the browser (memory the web client persists).
@@ -22,14 +22,14 @@ use lmk_core::device::Device;
 use lmk_core::group::{self as core, Change, Group, Session, Window};
 use lmk_core::identity::{KeyLog, certified, check};
 use lmk_core::invite::Invites;
+use lmk_membership::Contradiction;
 use lmk_core::provider::Provider;
-use lmk_membership::{Chain, Refused};
+use lmk_membership::Refused;
 use lmk_net::Net;
-use lmk_proto::group::{CHAT, Credential, How, IdentityRef, Leaf, Opening, Settings, held_by_type};
-use lmk_proto::head::Head;
+use lmk_proto::group::{CHAT, Control, Credential, How, IdentityRef, Leaf, Opening, Reason, Refusal, Settings, held_by_type};
 use lmk_proto::identity::Envelope;
 use lmk_proto::links::{FileLink, Invite, RELAY};
-use lmk_proto::peer::{Admitted, Frame, KindFrame};
+use lmk_proto::peer::{Admitted, Frame};
 use lmk_proto::{Answer, Bytes};
 use n0_future::task::{JoinHandle, spawn};
 use n0_future::time::{Duration, SystemTime, sleep, timeout};
@@ -48,6 +48,8 @@ const KEY_UPDATE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_MESSAGE: usize = 1 << 20;
 /// How long `send` waits for the members it wrote to.
 const RECEIPT_WAIT: Duration = Duration::from_secs(5);
+/// How long a member gathers the messages it gives up before it reports them.
+const REPORT_WAIT: Duration = Duration::from_secs(1);
 /// How often members not connected are dialed again.
 const REDIAL: Duration = Duration::from_secs(10);
 /// How often connected members sync their groups again.
@@ -126,20 +128,20 @@ pub struct Message {
     pub payload: Value,
 }
 
-/// An entry of the kind's log, opened: its position, the epoch it was sealed under, its sender and its payload.
+/// An entry of the kind's log, taken: its position, and the held message it names.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
     pub position: u64,
-    pub epoch: u64,
+    pub id: Bytes,
     pub from: Member,
     pub payload: Value,
 }
 
-/// Who took a message as `send` waited.
+/// Who held a message, and who refused it, as `send` waited.
 #[derive(Clone, Debug, Default)]
 pub struct Delivery {
     pub held: Vec<Member>,
-    pub refused: Vec<(Member, String)>,
+    pub refused: Vec<(Member, Reason)>,
 }
 
 /// What this session sent that no other member holds yet.
@@ -183,12 +185,6 @@ pub enum Event {
         sender: Member,
         payload: Value,
     },
-    /// A frame of the group's kind from one member: `{"<name>": {...}}`.
-    Frame {
-        group: Bytes,
-        from: Member,
-        frame: Value,
-    },
     /// A sync of the group's held messages with a member finished: this session holds every message that member held
     /// for it and could open.
     Synced { group: Bytes },
@@ -203,7 +199,7 @@ pub enum Event {
         from: Member,
         data: Vec<u8>,
     },
-    /// Entries of the kind's log were opened (see `Node::entries`).
+    /// Entries of the kind's log were taken (see `Node::entries`).
     Logged {
         group: Bytes,
     },
@@ -225,11 +221,11 @@ pub enum Event {
         id: Bytes,
         by: Member,
     },
+    /// A member reports that it gave up messages this session sent, after `send` stopped waiting.
     Refused {
         group: Bytes,
-        id: Bytes,
         by: Member,
-        reason: String,
+        messages: Vec<Refusal>,
     },
     /// A file is held whole.
     File([u8; 32]),
@@ -248,7 +244,6 @@ impl Event {
             | Event::Removed { group, .. }
             | Event::Settings { group, .. }
             | Event::Live { group, .. }
-            | Event::Frame { group, .. }
             | Event::Synced { group }
             | Event::InStep { group, .. }
             | Event::State { group, .. }
@@ -264,18 +259,20 @@ impl Event {
     }
 }
 
-/// A group's own record, beside its MLS state.
+/// A group's own record, beside its MLS state and its logs.
 #[derive(Default, Serialize, Deserialize)]
 struct Rec {
-    /// The last log position applied.
+    /// The last position of its log applied.
     position: u64,
-    /// The last log position stored.
-    logged: u64,
-    chain: Option<Chain>,
     items: Vec<Item>,
     /// Messages this session could not open, so that sync does not offer them again, and those from before it joined
     /// that its inviter held, as of epoch 0.
     given_up: Vec<(u64, Bytes)>,
+    /// Those it gave up and has not reported to the group yet.
+    unreported: Vec<Refusal>,
+    /// The newest epoch of the messages it dropped after `keep`: what it lacks up to there, it may have had, and does
+    /// not report.
+    expired: u64,
     pending: Vec<Pending>,
     /// File links, with when they were linked: those the kind holds (its files added, and those its held messages
     /// link) and states handed to or by this session. Each is held for the group's `keep`.
@@ -283,29 +280,9 @@ struct Rec {
     /// The state handed to or by this session last, held however old.
     state: Option<String>,
     /// The files the kind links now, held while it does.
-    #[serde(default)]
     links: Vec<String>,
     /// The kind's log, once the kind follows it.
-    #[serde(default)]
-    log: Option<KindLog>,
-}
-
-/// What this session holds of the kind's log.
-#[derive(Default, Serialize, Deserialize)]
-struct KindLog {
-    /// The last position read: every entry up to it was opened or skipped.
-    read: u64,
-    /// The epoch of the last entry taken; an entry sealed under an older one is skipped.
-    epoch: u64,
-    /// Where the kind last asked to read from: it holds what came before.
-    acked: u64,
-    chain: Option<Chain>,
-    /// The positions of entries opened, kept until the kind asks to read past them.
-    kept: Vec<u64>,
-    /// Entries this session appended, by SHA-256 of their ciphertext, until read back, since it cannot open its own.
-    own: Vec<(Bytes, Value)>,
-    /// The log cannot be followed from `read`: the kind has no state yet, or the keys or entries after it are gone.
-    behind: bool,
+    log: Option<kindlog::KindLog>,
 }
 
 impl Rec {
@@ -327,6 +304,8 @@ struct Item {
     epoch: u64,
     id: Bytes,
     at: u64,
+    /// Its place in the kind's log, once an entry there named it.
+    position: Option<u64>,
 }
 
 pub(crate) struct G {
@@ -336,46 +315,8 @@ pub(crate) struct G {
     future: Vec<Vec<u8>>,
     /// The position at which this session's own commit was last applied.
     own_at: Option<u64>,
-    follow: Option<JoinHandle<()>>,
-    follow_log: Option<JoinHandle<()>>,
     /// When this session last asked a member for the kind's state, or was handed one, in milliseconds.
     asked: u64,
-}
-
-/// A key log, the entries and signed head it was read from, and since when it counts as fresh: when it was read from
-/// its service or, for a copy a peer presented, its head's time.
-pub(crate) struct Known {
-    log: KeyLog,
-    entries: Vec<Bytes>,
-    head: Head,
-    at: u64,
-}
-
-/// How a copy of a key log compares with the one held.
-#[derive(Debug, PartialEq, Eq)]
-enum Compared {
-    /// They differ in an entry both have: the service showed two logs.
-    Contradicts,
-    Shorter,
-    /// As long, with a head no later.
-    AsLong,
-    /// Longer, or as long with a later head.
-    Newer,
-}
-
-impl Known {
-    fn compare(&self, entries: &[Bytes], head: &Head) -> Compared {
-        let common = self.entries.len().min(entries.len());
-        if self.entries[..common] != entries[..common] {
-            Compared::Contradicts
-        } else if head.length < self.head.length {
-            Compared::Shorter
-        } else if (head.length, head.time) <= (self.head.length, self.head.time) {
-            Compared::AsLong
-        } else {
-            Compared::Newer
-        }
-    }
 }
 
 pub(crate) struct State<P> {
@@ -385,14 +326,16 @@ pub(crate) struct State<P> {
     invites: Invites,
     /// Joiners' session keys, and the `--for` of the invites they redeemed.
     labels: HashMap<Vec<u8>, String>,
+    /// The logs this session follows, by id.
+    logs: HashMap<Vec<u8>, logs::Log>,
     /// Key logs, by identity id.
-    keys: HashMap<Vec<u8>, Known>,
+    keys: HashMap<Vec<u8>, KeyLog>,
     /// Members' certificates, this session's own among them, by session key and identity id.
     certificates: HashMap<(Vec<u8>, Vec<u8>), Envelope>,
     /// Members connected to this session without a valid certificate, by session key: since when.
     uncertified: HashMap<Vec<u8>, u64>,
     /// `send`s waiting for receipts.
-    waiters: HashMap<[u8; 32], mpsc::UnboundedSender<(EndpointId, Option<String>)>>,
+    waiters: HashMap<[u8; 32], mpsc::UnboundedSender<(EndpointId, Option<Reason>)>>,
 }
 
 pub(crate) enum Work {
@@ -405,6 +348,7 @@ pub(crate) enum Work {
         settings: bool,
         gone: bool,
     },
+    /// A log to read from its service.
     Read(Vec<u8>),
     Remove {
         group: Vec<u8>,
@@ -425,14 +369,17 @@ pub(crate) enum Work {
         group: Vec<u8>,
         by: EndpointId,
     },
-    ReadLog(Vec<u8>),
+    /// Messages were given up: report them in a moment.
+    Report(Vec<u8>),
     Net(lmk_net::Event),
 }
 
 pub(crate) struct Inner<P> {
     state: Mutex<State<P>>,
     net: OnceLock<Net>,
-    logs: logs::Logs,
+    clients: logs::Clients,
+    /// The tasks that follow logs at their services, by log id.
+    follows: Mutex<HashMap<Vec<u8>, JoinHandle<()>>>,
     relay: RelayUrl,
     file_limit: u64,
     window: Window,
@@ -441,8 +388,6 @@ pub(crate) struct Inner<P> {
     work: mpsc::UnboundedSender<Work>,
     committing: tokio::sync::Mutex<()>,
     reading: Mutex<HashSet<Vec<u8>>>,
-    /// Held while a kind's log is read, so that each entry is opened once.
-    reading_log: tokio::sync::Mutex<()>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -473,17 +418,8 @@ fn rec_key(gid: &[u8]) -> Vec<u8> {
     [b"node/group/".as_slice(), gid].concat()
 }
 
-/// A doc's state, as 0.10 kept it.
-fn doc_key(gid: &[u8]) -> Vec<u8> {
-    [b"node/doc/".as_slice(), gid].concat()
-}
-
 fn kind_key(key: &str) -> Vec<u8> {
     [b"kind/", key.as_bytes()].concat()
-}
-
-fn entry_key(gid: &[u8], position: u64) -> Vec<u8> {
-    [b"node/entry/".as_slice(), gid, b"/", &position.to_be_bytes()].concat()
 }
 
 fn message_key(id: &[u8]) -> Vec<u8> {
@@ -552,7 +488,7 @@ impl<P: Provider> State<P> {
     /// The identity a member speaks as, checked; and its device's name, if its certificate checks out.
     fn claim(&self, credential: &Credential, identity: &IdentityRef) -> (Claim, Option<String>) {
         let identity = identity.clone();
-        let Some(Known { log, .. }) = self.keys.get(&identity.id.0) else {
+        let Some(log) = self.keys.get(&identity.id.0) else {
             let error = Some("its identity's key could not be read yet".into());
             return (Claim { identity, name: String::new(), error, added_by_device: None }, None);
         };
@@ -585,6 +521,23 @@ impl<P: Provider> State<P> {
         })
     }
 
+    /// The member of a group whose leaf names an iroh key.
+    fn in_leaf(&self, gid: &[u8], peer: &EndpointId) -> Option<core::Member> {
+        let members = self.groups.get(gid)?.mls.members();
+        members.into_iter().find(|m| m.leaf.as_ref().is_some_and(|leaf| leaf.key.0 == peer.as_bytes()))
+    }
+
+    /// Whether this session serves a peer a group: it is a member and, speaking as an identity, has shown a valid
+    /// certificate of it.
+    fn serves(&self, gid: &[u8], peer: &EndpointId) -> bool {
+        let Some(member) = self.in_leaf(gid, peer) else { return false };
+        let Some((credential, identity)) = member.credential.as_ref().and_then(|c| Some((c, c.identity.as_ref()?))) else {
+            return true;
+        };
+        let log = self.keys.get(&identity.id.0);
+        log.is_some_and(|log| check(self.certificate(credential, &identity.id.0), credential, log, now()).is_ok())
+    }
+
     /// The identities a group's members speak as.
     fn identities(&self, gid: &[u8]) -> Vec<IdentityRef> {
         let Some(g) = self.groups.get(gid) else { return Vec::new() };
@@ -598,10 +551,11 @@ impl<P: Provider> State<P> {
         put(&self.provider, b"node/certificates", &own)
     }
 
-    /// A new group's records, and its MLS state.
+    /// A new group's records, its MLS state, and its log, read after `rec.position`.
     fn add_group(&mut self, mls: Group, rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
-        self.groups.insert(gid.clone(), G { mls, rec, future: Vec::new(), own_at: None, follow: None, follow_log: None, asked: 0 });
+        self.add_log(&gid, logs::Log::new(logs::Of::Group, mls.settings().membership, rec.position))?;
+        self.groups.insert(gid.clone(), G { mls, rec, future: Vec::new(), own_at: None, asked: 0 });
         self.save(&gid)?;
         self.save_groups()?;
         Ok(gid)
@@ -630,18 +584,18 @@ impl<P: Provider + Send + 'static> Node<P> {
         if session.leaf != leaf {
             session.set_leaf(&provider, leaf)?;
         }
-        let logs = logs::Logs::new(endpoint.clone());
+        let clients = logs::Clients::new(endpoint.clone());
+        let logs = State::load_logs(&provider)?;
+        for log in logs.values() {
+            if let Some(chain) = &log.chain {
+                clients.client(&log.service)?.set_chain(chain.clone());
+            }
+        }
         let mut groups = HashMap::new();
         for gid in get::<Vec<Bytes>>(&provider, b"node/groups")?.unwrap_or_default() {
             let mls = Group::load(&provider, &gid.0)?;
             let rec: Rec = get(&provider, &rec_key(&gid.0))?.context("a group without its record")?;
-            if let Some(chain) = &rec.chain {
-                logs.client(&mls.settings().membership)?.set_chain(chain.clone());
-            }
-            if let Some(chain) = rec.log.as_ref().and_then(|log| log.chain.clone()) {
-                logs.client(&mls.settings().membership)?.set_chain(chain);
-            }
-            groups.insert(gid.0, G { mls, rec, future: Vec::new(), own_at: None, follow: None, follow_log: None, asked: 0 });
+            groups.insert(gid.0, G { mls, rec, future: Vec::new(), own_at: None, asked: 0 });
         }
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
@@ -654,6 +608,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             groups,
             invites: Invites::default(),
             labels: HashMap::new(),
+            logs,
             keys: HashMap::new(),
             certificates,
             uncertified: HashMap::new(),
@@ -662,7 +617,8 @@ impl<P: Provider + Send + 'static> Node<P> {
         let inner = Arc::new(Inner {
             state: Mutex::new(state),
             net: OnceLock::new(),
-            logs,
+            clients,
+            follows: Mutex::default(),
             relay: config.relay.clone(),
             file_limit: config.file_limit,
             window: config.window,
@@ -671,7 +627,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             work: work.clone(),
             committing: tokio::sync::Mutex::new(()),
             reading: Mutex::default(),
-            reading_log: tokio::sync::Mutex::new(()),
             tasks: Mutex::default(),
         });
         // An invite link that names no relay is reached through letmeknow.dev's.
@@ -693,11 +648,24 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
         });
         inner.spawn(inner.clone().drive(work_rx));
-        let gids: Vec<Vec<u8>> = inner.state.lock().unwrap().groups.keys().cloned().collect();
-        for gid in &gids {
-            inner.follow(gid);
-            if inner.state.lock().unwrap().groups[gid].rec.log.is_some() {
-                inner.subscribe_log(gid);
+        let (gids, followed): (Vec<Vec<u8>>, Vec<Vec<u8>>) = {
+            let st = inner.state.lock().unwrap();
+            let followed = st.logs.iter().filter(|(_, log)| !matches!(log.of, logs::Of::Identity(_))).map(|(id, _)| id.clone());
+            (st.groups.keys().cloned().collect(), followed.collect())
+        };
+        for log in &followed {
+            inner.follow(log);
+        }
+        {
+            let mut st = inner.state.lock().unwrap();
+            let identities: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
+                logs::Of::Identity(id) => Some(id.clone()),
+                _ => None,
+            }).collect();
+            for id in identities {
+                if let Err(error) = inner.keyed(&mut st, &id.0) {
+                    inner.warn(None, format!("the key log of {}: {error:#}", hex(&id.0)));
+                }
             }
         }
         inner.spawn(inner.clone().resume(gids));
@@ -710,10 +678,8 @@ impl<P: Provider + Send + 'static> Node<P> {
         for task in self.inner.tasks.lock().unwrap().drain(..) {
             task.abort();
         }
-        for g in self.inner.state.lock().unwrap().groups.values_mut() {
-            for follow in [g.follow.take(), g.follow_log.take()].into_iter().flatten() {
-                follow.abort();
-            }
+        for (_, follow) in self.inner.follows.lock().unwrap().drain() {
+            follow.abort();
         }
         self.inner.net().shutdown().await
     }
@@ -869,7 +835,7 @@ impl<P: Provider + Send + 'static> Node<P> {
                 let epoch = g.mls.epoch();
                 let me = g.mls.members().into_iter().find(|m| m.key == st.session.key());
                 let g = st.groups.get_mut(gid).unwrap();
-                g.rec.items.push(Item { epoch, id: Bytes(id.to_vec()), at: now() });
+                g.rec.items.push(Item { epoch, id: Bytes(id.to_vec()), at: now(), position: None });
                 g.rec.pending.push(Pending { id: Bytes(id.to_vec()), what: "message".into() });
                 st.provider.put(&ciphertext_key(&id), &ciphertext)?;
                 let sender = me.and_then(|me| st.member(gid, &me)).context("this session is not in the group")?;
@@ -906,13 +872,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             Some(peer) => _ = self.inner.net().send_to(peer, gid, ciphertext),
             None => _ = self.inner.net().send(gid, ciphertext),
         }
-        Ok(())
-    }
-
-    /// Sends a frame of the group's kind, `{"<name>": {...}}`, to the member with fingerprint `to`, if it is online.
-    pub fn frame(&self, gid: &[u8], to: &str, frame: Value) -> Result<()> {
-        let peer = self.inner.state.lock().unwrap().by_fp(gid, to)?;
-        self.inner.net().frame(peer, Frame::Kind(KindFrame::new(Bytes(gid.to_vec()), frame)?));
         Ok(())
     }
 
@@ -954,18 +913,6 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// The files a group holds.
     pub fn linked(&self, gid: &[u8]) -> Vec<FileLink> {
         lmk_net::Groups::files(&*self.inner, gid)
-    }
-
-    /// A doc's state as 0.10 kept it, before the doc kind kept its own.
-    pub fn legacy_doc(&self, gid: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.state.lock().unwrap().provider.get(&doc_key(gid))
-    }
-
-    /// Deletes a doc's state as 0.10 kept it, once the doc kind keeps it.
-    pub fn forget_legacy_doc(&self, gid: &[u8]) -> Result<()> {
-        let st = self.inner.state.lock().unwrap();
-        st.provider.delete(&doc_key(gid))?;
-        st.provider.scrub()
     }
 
     /// Whether this session gave a message up: it refused it, or could not open it.
@@ -1076,7 +1023,11 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// The newest copy of an identity's key log, read from its service unless a copy is fresh.
     pub async fn key_log(&self, identity: &IdentityRef) -> Result<KeyLog> {
-        let fresh = self.inner.state.lock().unwrap().keys.get(&identity.id.0).filter(|known| known.at + KEYS_FRESH >= now()).map(|known| known.log.clone());
+        let fresh = {
+            let st = self.inner.state.lock().unwrap();
+            let read = st.logs.get(&lmk_proto::identity::address(&identity.id.0)[..]).is_some_and(|log| log.at + KEYS_FRESH >= now());
+            st.keys.get(&identity.id.0).filter(|_| read).cloned()
+        };
         match fresh {
             Some(log) => Ok(log),
             None => self.inner.read_keys(identity).await,
@@ -1090,13 +1041,13 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// The key log held of an identity, however old.
     pub fn held_key_log(&self, identity: &[u8]) -> Option<KeyLog> {
-        self.inner.state.lock().unwrap().keys.get(identity).map(|known| known.log.clone())
+        self.inner.state.lock().unwrap().keys.get(identity).cloned()
     }
 
     /// Appends a sealed entry to an identity's key log, and reads the log.
     pub async fn append_identity(&self, identity: &IdentityRef, entry: &[u8]) -> Result<KeyLog> {
         let log = lmk_proto::identity::address(&identity.id.0);
-        self.inner.logs.client(&identity.membership)?.append(&log, entry).await?;
+        self.inner.clients.client(&identity.membership)?.append(&log, entry).await?;
         self.inner.read_keys(identity).await
     }
 
@@ -1215,6 +1166,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let before = now.saturating_sub(g.mls.settings().keep as u64 * 24 * 3600 * 1000);
             let (old, kept): (Vec<Item>, Vec<Item>) = g.rec.items.drain(..).partition(|item| item.at < before);
             g.rec.items = kept;
+            g.rec.expired = old.iter().map(|item| item.epoch).fold(g.rec.expired, u64::max);
             g.rec.files.retain(|(_, at)| *at >= before);
             for item in old {
                 st.provider.delete(&message_key(&item.id.0)).ok();
@@ -1256,87 +1208,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Follows a group's log: new entries as they come, catching up whenever the subscription restarts.
-    fn follow(self: &Arc<Self>, gid: &[u8]) {
-        let (inner, key) = (self.clone(), gid.to_vec());
-        let handle = spawn(async move {
-            let gid = key;
-            loop {
-                let service = match inner.state.lock().unwrap().group(&gid) {
-                    Ok(g) => g.mls.settings().membership,
-                    Err(_) => return,
-                };
-                let followed = async {
-                    let client = inner.logs.client(&service)?;
-                    let mut subscription = client.subscribe(vec![Bytes(gid.clone())]).await?;
-                    inner.read(&gid).await?;
-                    while let Some(notice) = subscription.next().await {
-                        let notice = notice?;
-                        inner.logged(&gid, notice.position - 1, vec![notice.entry], client.chain(&gid))?;
-                    }
-                    anyhow::Ok(())
-                };
-                if let Err(error) = followed.await {
-                    tracing::debug!("following {}: {error:#}", hex(&gid));
-                }
-                sleep(Duration::from_secs(2)).await;
-            }
-        });
-        if let Some(g) = self.state.lock().unwrap().groups.get_mut(gid) {
-            g.follow = Some(handle);
-        }
-    }
-
-    /// Reads a group's log from the service, through its end.
-    async fn read(&self, gid: &[u8]) -> Result<()> {
-        let service = self.state.lock().unwrap().group(gid)?.mls.settings().membership;
-        let client = self.logs.client(&service)?;
-        loop {
-            let after = self.state.lock().unwrap().group(gid)?.rec.logged;
-            let page = client.read(gid, after).await?;
-            if client.chain(gid).is_none() {
-                client.set_chain(Chain::anchored(page.head.clone()));
-            }
-            let more = !page.entries.is_empty();
-            self.logged(gid, after, page.entries, client.chain(gid))?;
-            if !more {
-                return Ok(());
-            }
-        }
-    }
-
-    /// Stores log entries that follow position `after`, and applies what it can. `chain` is the client's, recorded
-    /// when it covers just what is stored, so that a head this session shows its peers matches its entries.
-    pub(crate) fn logged(&self, gid: &[u8], after: u64, entries: Vec<Bytes>, chain: Option<Chain>) -> Result<()> {
-        let mut st = self.state.lock().unwrap();
-        let st = &mut *st;
-        let g = st.group_mut(gid)?;
-        let logged = g.rec.logged;
-        if after > logged {
-            self.work.send(Work::Read(gid.to_vec())).ok();
-            return Ok(());
-        }
-        for (position, entry) in (after + 1..).zip(entries).skip((logged - after) as usize) {
-            st.provider.put(&entry_key(gid, position), &entry.0)?;
-            st.groups.get_mut(gid).unwrap().rec.logged = position;
-        }
-        let g = st.groups.get_mut(gid).unwrap();
-        if let Some(chain) = chain.filter(|chain| chain.length() == g.rec.logged) {
-            g.rec.chain = Some(chain);
-        }
-        self.advance(st, gid)
-    }
-
     /// Applies the stored entries this session has not applied yet, then the messages that waited for them.
     fn advance(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
         let mut changed = false;
+        let logged = st.log(gid)?.logged;
         loop {
             let g = st.groups.get_mut(gid).unwrap();
-            if g.rec.position >= g.rec.logged {
+            if g.rec.position >= logged {
                 break;
             }
             let position = g.rec.position + 1;
-            let entry = st.provider.get(&entry_key(gid, position))?.context("a stored entry is missing")?;
+            let entry = st.provider.get(&logs::entry_key(gid, position))?.context("a stored entry is missing")?;
             let applied = g.mls.apply(&st.provider, &entry, now())?;
             g.rec.position = position;
             let core::Applied::Commit { by, own, added, how, removed, settings, gone, .. } = applied else {
@@ -1357,9 +1239,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
             // Applying a commit deletes the secrets of epochs beyond the key window.
             if let Err(error) = st.provider.scrub() {
                 self.warn(Some(gid), format!("{error:#}"));
-            }
-            if let Some(net) = self.net.get() {
-                net.changed(gid);
             }
             let g = st.groups.get_mut(gid).unwrap();
             let epoch = g.mls.epoch();
@@ -1394,7 +1273,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     }
                 }
             };
-            let client = self.logs.client(&service)?;
+            let client = self.clients.client(&service)?;
             let position = match client.append(gid, &bytes).await {
                 Ok(appended) => appended.position,
                 Err(error) if error.is::<Refused>() => {
@@ -1424,7 +1303,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let mls = Group::join(&st.provider, &admitted.welcome.0, self.window)?;
             ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
             let given_up = admitted.before.iter().map(|id| (0, id.clone())).collect();
-            let rec = Rec { position: admitted.position, logged: admitted.position, given_up, ..Rec::default() };
+            let rec = Rec { position: admitted.position, given_up, ..Rec::default() };
             let gid = st.add_group(mls, rec)?;
             for certificate in admitted.certificates {
                 groups::take_certificate(st, certificate);
@@ -1509,7 +1388,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         gid: &[u8],
         id: [u8; 32],
         ciphertext: Vec<u8>,
-        mut receipts: mpsc::UnboundedReceiver<(EndpointId, Option<String>)>,
+        mut receipts: mpsc::UnboundedReceiver<(EndpointId, Option<Reason>)>,
     ) -> Delivery {
         let mut waiting = self.net().send(gid, ciphertext);
         let mut answers = Vec::new();
@@ -1556,8 +1435,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
             identities
                 .into_iter()
                 .filter(|identity| {
-                    let known = st.keys.get(&identity.id.0);
-                    known.is_none_or(|known| known.at + KEYS_FRESH < now() || since(&identity.id.0).is_some_and(|since| known.at < since))
+                    let read = st.logs.get(&lmk_proto::identity::address(&identity.id.0)[..]).map(|log| log.at);
+                    read.is_none_or(|at| at + KEYS_FRESH < now() || since(&identity.id.0).is_some_and(|since| at < since))
                 })
                 .collect()
         };
@@ -1597,16 +1476,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
             for member in g.mls.members() {
                 let (Some(credential), Some(leaf)) = (&member.credential, &member.leaf) else { continue };
                 let Some(identity) = &credential.identity else { continue };
-                let Some(known) = st.keys.get(&identity.id.0) else { continue };
+                let Some(log) = st.keys.get(&identity.id.0) else { continue };
                 if member.key == st.session.key()
-                    || check(st.certificates.get(&(member.key.clone(), identity.id.0.clone())), credential, &known.log, now).is_ok()
+                    || check(st.certificates.get(&(member.key.clone(), identity.id.0.clone())), credential, log, now).is_ok()
                     || !endpoint_id(&leaf.key.0).is_some_and(|peer| connected.contains(&peer))
                 {
                     continue;
                 }
                 seen.insert(member.key.clone());
                 let since = *st.uncertified.entry(member.key.clone()).or_insert(now);
-                if known.at >= since && now >= since + CERTIFICATE_GRACE {
+                let read = st.logs.get(&lmk_proto::identity::address(&identity.id.0)[..]).map_or(0, |log| log.at);
+                if read >= since && now >= since + CERTIFICATE_GRACE {
                     self.work.send(Work::Remove { group: gid.clone(), key: member.key.clone() }).ok();
                 }
             }
@@ -1614,55 +1494,29 @@ impl<P: Provider + Send + 'static> Inner<P> {
         st.uncertified.retain(|key, _| seen.contains(key));
     }
 
-    /// Reads an identity's key log from its service; returns the newest copy held.
+    /// Reads an identity's key log from its service.
     async fn read_keys(&self, identity: &IdentityRef) -> Result<KeyLog> {
-        let client = self.logs.client(&identity.membership)?;
-        let log = lmk_proto::identity::address(&identity.id.0);
-        let mut entries = Vec::new();
-        let head = loop {
-            let page = client.read(&log, entries.len() as u64).await?;
-            if page.entries.is_empty() {
-                break page.head;
+        let address = lmk_proto::identity::address(&identity.id.0);
+        {
+            let mut st = self.state.lock().unwrap();
+            if !st.logs.contains_key(&address[..]) {
+                let of = logs::Of::Identity(identity.id.clone());
+                st.add_log(&address, logs::Log::new(of, identity.membership.clone(), 0))?;
             }
-            entries.extend(page.entries);
-        };
-        let id: [u8; 32] = identity.id.0.as_slice().try_into().context("an identity id is 32 bytes")?;
-        let keys = KeyLog::replay(&id, entries.iter().map(|entry| entry.0.as_slice()))?;
-        let mut st = self.state.lock().unwrap();
-        self.take_keys(&mut st, keys, entries, head, now(), "its service");
-        Ok(st.keys[&id[..]].log.clone())
+        }
+        self.read(&address).await?;
+        self.state.lock().unwrap().keys.get(&identity.id.0).cloned().context("the key log has no valid first entry")
     }
 
-    /// Holds a copy of a key log unless the one held is as new, and then shows it to the peers of the groups it concerns.
-    /// A copy that contradicts the one held is reported.
-    pub(crate) fn take_keys(&self, st: &mut State<P>, log: KeyLog, entries: Vec<Bytes>, head: Head, at: u64, from: &str) {
-        let mut at = at;
-        if let Some(held) = st.keys.get_mut(&log.id[..]) {
-            match held.compare(&entries, &head) {
-                Compared::Contradicts => {
-                    let (here, there) = (held.entries.len(), entries.len());
-                    let text = format!(
-                        "the membership service showed different key logs of {}: {here} entries here, {there} from {from}",
-                        held.log.name
-                    );
-                    self.warn(None, text);
-                    return;
-                }
-                Compared::Shorter => return,
-                Compared::AsLong => {
-                    held.at = held.at.max(at);
-                    return;
-                }
-                Compared::Newer => at = at.max(held.at),
-            }
+    /// Replays an identity's key log, against which its members' certificates are checked.
+    pub(crate) fn keyed(&self, st: &mut State<P>, id: &[u8]) -> Result<()> {
+        let entries = st.entries(&lmk_proto::identity::address(id), 0);
+        if entries.is_empty() {
+            return Ok(());
         }
-        let id = log.id;
-        st.keys.insert(id.to_vec(), Known { log, entries, head, at });
-        if let Some(net) = self.net.get() {
-            for gid in st.groups.keys().filter(|gid| st.identities(gid).iter().any(|identity| identity.id.0 == id)) {
-                net.changed(gid);
-            }
-        }
+        let log = KeyLog::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
+        st.keys.insert(id.to_vec(), log);
+        Ok(())
     }
 
     /// Leaves a group behind: its state and records go.
@@ -1670,21 +1524,18 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let mut st = self.state.lock().unwrap();
         let st = &mut *st;
         let g = st.groups.remove(gid).context("this session is not in that group")?;
-        for follow in [g.follow, g.follow_log].into_iter().flatten() {
-            follow.abort();
+        for log in [Some(Bytes(gid.to_vec())), g.mls.settings().log].into_iter().flatten() {
+            self.unfollow(&log.0);
+            st.drop_log(&log.0)?;
         }
         for position in g.rec.log.iter().flat_map(|log| &log.kept) {
-            st.provider.delete(&kindlog::entry_key(gid, *position))?;
+            st.provider.delete(&kindlog::kept_key(gid, *position))?;
         }
         for item in &g.rec.items {
             st.provider.delete(&message_key(&item.id.0))?;
             st.provider.delete(&ciphertext_key(&item.id.0))?;
         }
-        for position in 1..=g.rec.logged {
-            st.provider.delete(&entry_key(gid, position))?;
-        }
         st.provider.delete(&rec_key(gid))?;
-        st.provider.delete(&doc_key(gid))?;
         g.mls.delete(&st.provider)?;
         st.save_groups()?;
         st.provider.scrub()?;
@@ -1701,14 +1552,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 Work::Applied { group, by, added, how, removed, settings, gone } => {
                     self.applied(&group, by, added, how, removed, settings, gone).await
                 }
-                Work::Read(gid) => {
-                    if self.reading.lock().unwrap().insert(gid.clone()) {
+                Work::Read(log) => {
+                    if self.reading.lock().unwrap().insert(log.clone()) {
                         let inner = self.clone();
                         self.spawn(async move {
-                            if let Err(error) = inner.read(&gid).await {
-                                tracing::debug!("reading {}: {error:#}", hex(&gid));
+                            if let Err(error) = inner.read(&log).await {
+                                tracing::debug!("reading {}: {error:#}", hex(&log));
                             }
-                            inner.reading.lock().unwrap().remove(&gid);
+                            inner.reading.lock().unwrap().remove(&log);
                         });
                     }
                 }
@@ -1748,12 +1599,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
                 Work::State { group, link, by } => self.state_from(&group, link, by),
                 Work::StateWanted { group, by } => self.hand_snapshot(&group, by),
-                Work::ReadLog(gid) => {
+                Work::Report(gid) => {
                     let inner = self.clone();
                     self.spawn(async move {
-                        if let Err(error) = inner.read_log(&gid).await {
-                            tracing::debug!("reading the log of {}: {error:#}", hex(&gid));
-                        }
+                        sleep(REPORT_WAIT).await;
+                        inner.report(&gid);
                     });
                 }
                 Work::Net(event) => self.net_event(event),
@@ -1807,16 +1657,37 @@ impl<P: Provider + Send + 'static> Inner<P> {
         drop(st);
     }
 
+    /// Tells the group, in one held notice, the messages this session gave up since it last did.
+    fn report(self: &Arc<Self>, gid: &[u8]) {
+        let messages = {
+            let mut st = self.state.lock().unwrap();
+            let Ok(g) = st.group_mut(gid) else { return };
+            let messages = std::mem::take(&mut g.rec.unreported);
+            if messages.is_empty() {
+                return;
+            }
+            if let Err(error) = st.save(gid) {
+                self.warn(Some(gid), format!("{error:#}"));
+            }
+            messages
+        };
+        let (node, gid) = (Node { inner: self.clone() }, gid.to_vec());
+        self.spawn(async move {
+            let payload = serde_json::to_value(Control::Refused { messages }).expect("JSON");
+            if let Err(error) = node.send(&gid, &payload, true).await {
+                node.inner.warn(Some(&gid), format!("reporting the messages this session refused: {error:#}"));
+            }
+        });
+    }
+
     fn net_event(self: &Arc<Self>, event: lmk_net::Event) {
         match event {
-            lmk_net::Event::Receipt { group, peer, held, refused } => {
+            lmk_net::Event::Receipt { group, peer, held } => {
                 let mut st = self.state.lock().unwrap();
-                let answers =
-                    held.into_iter().map(|id| (id, None)).chain(refused.into_iter().map(|(id, r)| (id, Some(r))));
                 let mut changed = false;
-                for (id, refused) in answers {
+                for id in held {
                     if let Some(waiter) = st.waiters.get(&id) {
-                        waiter.send((peer, refused)).ok();
+                        waiter.send((peer, None)).ok();
                         continue;
                     }
                     let Ok(g) = st.group_mut(&group) else { return };
@@ -1825,29 +1696,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     }
                     let by = st.by_iroh(&group, &peer);
                     let (group, id) = (Bytes(group.clone()), Bytes(id.to_vec()));
-                    match refused {
-                        None => {
-                            st.group_mut(&group.0).unwrap().rec.pending.retain(|pending| pending.id != id);
-                            changed = true;
-                            self.events.send(Event::Held { group, id, by }).ok();
-                        }
-                        Some(reason) => _ = self.events.send(Event::Refused { group, id, by, reason }),
-                    }
+                    st.group_mut(&group.0).unwrap().rec.pending.retain(|pending| pending.id != id);
+                    changed = true;
+                    self.events.send(Event::Held { group, id, by }).ok();
                 }
                 if changed {
                     st.save(&group).ok();
                 }
             }
-            lmk_net::Event::Contradiction { group, peer, ours, theirs } => {
-                let text = format!(
-                    "the membership service showed {} a different log: length {} with hash {} here, length {} with hash {} there",
-                    peer.fmt_short(),
-                    ours.length,
-                    hex(&ours.hash.0),
-                    theirs.length,
-                    hex(&theirs.hash.0)
-                );
-                self.warn(Some(&group), text);
+            lmk_net::Event::Contradiction { log, peer, ours, theirs } => {
+                let st = self.state.lock().unwrap();
+                self.contradicted(&st, &log, &Contradiction { ours, theirs }, &peer.fmt_short().to_string());
             }
             lmk_net::Event::Fetched(hash) => {
                 let mut st = self.state.lock().unwrap();
@@ -1864,6 +1723,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             lmk_net::Event::Synced { group, peer } => {
                 self.events.send(Event::Synced { group: Bytes(group.clone()) }).ok();
+                // A message the kind's log names that this sync did not bring will not come from this peer.
+                let mut st = self.state.lock().unwrap();
+                if self.waits(&st, &group) {
+                    self.ask_state(&mut st, &group, Some(peer));
+                }
+                drop(st);
+                self.report(&group);
                 // A file only this session held may have reached the peer since.
                 let pending: Vec<[u8; 32]> = {
                     let st = self.state.lock().unwrap();
@@ -1901,6 +1767,32 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 }
 
+impl<P: Provider + Send + 'static> Inner<P> {
+    /// Reports a log that its service showed differently, here and at `there`.
+    pub(crate) fn contradicted(&self, st: &State<P>, log: &[u8], contradiction: &Contradiction, there: &str) {
+        let what = match st.logs.get(log).map(|l| &l.of) {
+            Some(logs::Of::Kind(_)) => "the log of the group's kind",
+            Some(logs::Of::Identity(_)) => "a key log",
+            _ => "the group's log",
+        };
+        let Contradiction { ours, theirs } = contradiction;
+        let text = format!(
+            "the membership service showed {there} another version of {what}: length {} with hash {} here, length {} with hash {} there",
+            ours.length,
+            hex(&ours.hash.0),
+            theirs.length,
+            hex(&theirs.hash.0)
+        );
+        let groups = st.groups_of(log);
+        if groups.is_empty() {
+            self.warn(None, text.clone());
+        }
+        for gid in groups {
+            self.warn(Some(&gid), text.clone());
+        }
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1910,25 +1802,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_longer_or_later_key_log_wins_and_one_that_disagrees_contradicts() {
-        use lmk_core::identity::{create, public};
-        let seed = lmk_core::random();
-        let (id, first) = create(&seed, "Bob", lmk_proto::group::Service::Folder("/tmp".into()));
-        let log = KeyLog::replay(&id, [first.as_slice()]).unwrap();
-        let second = log.rotate(&seed, &public(&lmk_core::random()));
-        let other = log.rotate(&seed, &public(&lmk_core::random()));
-        let head = |length, time| Head { log: Bytes::default(), length, hash: Bytes::default(), time, sig: Bytes::default() };
-        let entries = |e: &[&Vec<u8>]| e.iter().map(|e| Bytes(e.to_vec())).collect::<Vec<_>>();
-        let held = Known { log, entries: entries(&[&first, &second]), head: head(2, 10), at: 10 };
-        assert_eq!(held.compare(&entries(&[&first]), &head(1, 20)), Compared::Shorter);
-        assert_eq!(held.compare(&entries(&[&first, &second]), &head(2, 10)), Compared::AsLong);
-        assert_eq!(held.compare(&entries(&[&first, &second]), &head(2, 11)), Compared::Newer);
-        assert_eq!(held.compare(&entries(&[&first, &second, &other]), &head(3, 5)), Compared::Newer);
-        assert_eq!(held.compare(&entries(&[&first, &other]), &head(2, 11)), Compared::Contradicts);
-        assert_eq!(held.compare(&entries(&[&other]), &head(1, 11)), Compared::Contradicts);
-    }
-
-    #[test]
     fn a_group_holds_files_linked_within_keep_its_state_and_its_kinds_links() {
         let link = |n: u8| FileLink { hash: [n; 32], size: 1, key: [0; 32] }.link();
         let old = now() - 3 * 24 * 3600 * 1000;
@@ -1936,11 +1809,5 @@ mod tests {
         let rec = Rec { files, state: Some(link(3)), links: vec![link(4)], ..Rec::default() };
         let held: Vec<u8> = rec.held(2).iter().map(|file| file.hash[0]).collect();
         assert_eq!(held, [2, 3, 4]);
-    }
-
-    #[test]
-    fn a_0_10_record_has_no_links() {
-        let rec: Rec = serde_json::from_str(r#"{"position":1,"logged":1,"chain":null,"items":[],"given_up":[],"pending":[],"files":[],"state":null}"#).unwrap();
-        assert!(rec.links.is_empty());
     }
 }

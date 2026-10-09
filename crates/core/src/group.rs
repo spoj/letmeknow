@@ -196,13 +196,11 @@ struct Aad {
     how: How,
 }
 
-/// An application message's authenticated data: a payload its sender marks as held, or an entry of the kind's log.
+/// An application message's authenticated data: a payload its sender marks as held.
 #[derive(Default, Serialize, Deserialize)]
 struct Marks {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     held: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    log: bool,
 }
 
 /// A message sealed under an epoch whose keys this session does not hold: one it never was in, or one past its key
@@ -217,6 +215,18 @@ impl std::fmt::Display for Unheld {
 }
 
 impl std::error::Error for Unheld {}
+
+/// A message from a member removed more than 5 minutes before it first reached this session.
+#[derive(Debug)]
+pub struct Removed;
+
+impl std::fmt::Display for Removed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("from a member removed more than 5 minutes before")
+    }
+}
+
+impl std::error::Error for Removed {}
 
 /// A commit to post, and for an add, the Welcome to send once the log has taken it.
 pub struct Commit {
@@ -292,8 +302,6 @@ pub struct Opened {
     pub payload: serde_json::Value,
     /// Whether members hold it (see `seal`).
     pub held: bool,
-    /// Whether it is an entry of the kind's log (see `seal_entry`).
-    pub log: bool,
 }
 
 /// Who added whom, as the log showed it.
@@ -561,20 +569,8 @@ impl Group {
         held: bool,
     ) -> Result<([u8; 32], Vec<u8>)> {
         if held && !held_by_type(payload) {
-            self.mls.set_aad(serde_json::to_vec(&Marks { held, log: false })?);
+            self.mls.set_aad(serde_json::to_vec(&Marks { held })?);
         }
-        let message = self.mls.create_message(provider, &session.signer, &serde_json::to_vec(payload)?)?.to_bytes()?;
-        Ok((Sha256::digest(&message).into(), message))
-    }
-
-    /// Seals a payload as an entry of the kind's log, marked so in its authenticated data.
-    pub fn seal_entry<P: Provider>(
-        &mut self,
-        provider: &P,
-        session: &Session,
-        payload: &serde_json::Value,
-    ) -> Result<([u8; 32], Vec<u8>)> {
-        self.mls.set_aad(serde_json::to_vec(&Marks { held: false, log: true })?);
         let message = self.mls.create_message(provider, &session.signer, &serde_json::to_vec(payload)?)?.to_bytes()?;
         Ok((Sha256::digest(&message).into(), message))
     }
@@ -585,8 +581,8 @@ impl Group {
     }
 
     /// Decrypts and verifies a member's message. `now` (milliseconds) is when it first reached this session; a removed
-    /// member's message that first reached it more than 5 minutes after the removal is refused. A message under an
-    /// epoch whose keys this session does not hold fails with `Unheld`.
+    /// member's message that first reached it more than 5 minutes after the removal fails with `Removed`. A message
+    /// under an epoch whose keys this session does not hold fails with `Unheld`.
     pub fn open<P: Provider>(&mut self, provider: &P, bytes: &[u8], now: u64) -> Result<Opened> {
         let message = parse::<MlsMessageIn>(bytes)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Application, "not an application message");
@@ -609,14 +605,15 @@ impl Group {
         if current.is_none()
             && let Some((removed, at)) = self.state.removed.iter().rev().find(|(key, _)| *key == sender.key)
         {
-            ensure!(now <= at + REMOVED_GRACE, "from a member removed more than 5 minutes before");
+            if now > at + REMOVED_GRACE {
+                return Err(Removed.into());
+            }
             key = removed.0.clone();
         }
         let payload: serde_json::Value = serde_json::from_slice(&message.into_bytes())?;
         ensure!(payload["type"].is_string(), "a payload without a type");
         Ok(Opened {
             held: marks.held || held_by_type(&payload),
-            log: marks.log,
             id: Sha256::digest(bytes).into(),
             epoch,
             index: index.u32(),

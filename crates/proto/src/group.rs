@@ -14,11 +14,6 @@ pub const CHAT: &str = "chat";
 /// The built-in kind of an identity's devices group, which devices join and sessions do not.
 pub const DEVICES: &str = "devices";
 
-/// The kinds a leaf that lists none supports: those of 0.10.
-fn legacy_kinds() -> Vec<String> {
-    vec![CHAT.into(), "doc".into()]
-}
-
 /// Where a log lives.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,7 +32,7 @@ pub struct Settings {
     pub keep: u32,
     pub membership: Service,
     /// The id of the kind's log at the membership service: random, so that only members can tie it to the group. In a
-    /// group of a plugin's kind made since 0.11.
+    /// group of a plugin's kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<Bytes>,
 }
@@ -67,7 +62,6 @@ pub struct Leaf {
     pub key: Bytes,
     pub relay: String,
     /// The kinds the session supports.
-    #[serde(default = "legacy_kinds")]
     pub kinds: Vec<String>,
 }
 
@@ -103,10 +97,32 @@ pub enum Control {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         to: Vec<Bytes>,
     },
+    /// The messages the sender gave up since it last said so.
+    Refused { messages: Vec<Refusal> },
 }
 
 impl Control {
-    pub const TYPES: [&str; 2] = ["leave", "introduce"];
+    pub const TYPES: [&str; 3] = ["leave", "introduce", "refused"];
+}
+
+/// A message a member gave up, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub id: Bytes,
+    pub reason: Reason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reason {
+    /// Larger than the member takes.
+    Size,
+    /// Sealed under an epoch whose keys the member no longer holds, or below its floor.
+    Old,
+    /// From a member removed more than 5 minutes before it arrived.
+    Removed,
+    /// It did not open.
+    Unreadable,
 }
 
 /// A payload's `type`.
@@ -116,7 +132,7 @@ pub fn type_of(payload: &serde_json::Value) -> &str {
 
 /// Whether members hold a payload: those of these types always, and others when their sender marks them so.
 pub fn held_by_type(payload: &serde_json::Value) -> bool {
-    matches!(type_of(payload), "message" | "leave")
+    matches!(type_of(payload), "message" | "leave" | "refused")
 }
 
 /// A chat message, the payload of the built-in kind.
@@ -174,11 +190,5 @@ mod tests {
         assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","after":[]}"#);
         let folder = serde_json::to_string(&Service::Folder("/tmp/x".into())).unwrap();
         assert_eq!(folder, r#"{"folder":"/tmp/x"}"#);
-    }
-
-    #[test]
-    fn a_leaf_without_kinds_is_a_0_10_one() {
-        let leaf: Leaf = serde_json::from_str(r#"{"key":"AA","relay":"https://letmeknow.dev"}"#).unwrap();
-        assert_eq!(leaf.kinds, ["chat", "doc"]);
     }
 }

@@ -55,6 +55,13 @@ pub enum Command {
     Skill,
     /// Run a membership service, an iroh relay and the web client (letmeknow.dev)
     Serve(Serve),
+    /// git's remote helper for lmk:: remotes, where `git-remote-lmk` is not on PATH:
+    /// `git config --global alias.remote-lmk '!letmeknow git-remote-lmk'`
+    #[command(name = "git-remote-lmk")]
+    GitRemoteLmk {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     #[command(flatten)]
     Request(Request),
     /// A command of a kind's plugin: `letmeknow <kind> <args>...`, such as `letmeknow doc attach <path>`

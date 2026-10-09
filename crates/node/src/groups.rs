@@ -2,69 +2,95 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
-use lmk_core::group::{self as core, Change, key_package_credential, key_package_leaf};
-use lmk_core::identity::{KeyLog, certified, check};
+use lmk_core::group::{self as core, Change, Removed, Unheld, key_package_credential, key_package_leaf};
+use lmk_core::identity::{certified, check};
 use lmk_core::provider::Provider;
-use lmk_membership::Chain;
 use lmk_net::{Admit, Groups, Taken};
-use lmk_proto::group::{CHAT, Control, Credential, How, Service, type_of};
-use lmk_proto::head::{self, Head};
+use lmk_proto::group::{CHAT, Control, Credential, How, Reason, Refusal, Service, type_of};
+use lmk_proto::head::Head;
 use lmk_proto::identity::Envelope;
 use lmk_proto::links::FileLink;
-use lmk_proto::peer::{Admitted, Hello, InviteRequest, Keys, KindFrame};
+use lmk_proto::peer::{Admitted, Hello, InviteRequest};
 use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::timeout;
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
+use crate::logs::empty;
 use crate::{
-    Event, Inner, Item, MAX_MESSAGE, Message, SNAPSHOT_WAIT, State, Work, ciphertext_key, entry_key, message_key, now, put,
+    Event, Inner, Item, MAX_MESSAGE, Message, SNAPSHOT_WAIT, State, Work, ciphertext_key, endpoint_id, get, message_key,
+    now, put,
 };
 
-/// A head that needs no signature: the empty log's.
-fn empty(log: &[u8]) -> Head {
-    Head { log: log.into(), length: 0, hash: head::start(log).into(), time: 0, sig: Bytes::default() }
-}
-
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Takes in a ciphertext from a peer: what became of it is told to the peer.
+    /// Takes in a ciphertext from a peer: held, waiting for a commit, or given up.
     pub(crate) fn take(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8]) -> Taken {
-        self.open(st, gid, ciphertext).unwrap_or_else(|error| Taken::Refused(format!("{error:#}")))
-    }
-
-    fn open(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8]) -> Result<Taken> {
         let id: [u8; 32] = Sha256::digest(ciphertext).into();
-        let g = st.group_mut(gid)?;
+        let Ok(g) = st.group_mut(gid) else { return Taken::Refused };
         if g.rec.items.iter().any(|item| item.id.0 == id) {
-            return Ok(Taken::Held);
+            return Taken::Held;
         }
-        ensure!(!g.rec.given_up.iter().any(|(_, given)| given.0 == id), "given up");
-        let epoch = core::epoch_of(ciphertext)?;
-        if ciphertext.len() > MAX_MESSAGE {
-            g.rec.given_up.push((epoch, Bytes(id.to_vec())));
-            st.save(gid)?;
-            bail!("larger than 1 MiB");
+        if g.rec.given_up.iter().any(|(_, given)| given.0 == id) {
+            return Taken::Refused;
         }
-        if epoch > g.mls.epoch() {
+        let Ok(epoch) = core::epoch_of(ciphertext) else { return Taken::Refused };
+        let opened = if ciphertext.len() > MAX_MESSAGE {
+            Err(Reason::Size)
+        } else if epoch > g.mls.epoch() {
             if !g.future.iter().any(|waiting| waiting == ciphertext) {
                 g.future.push(ciphertext.to_vec());
             }
             self.work.send(Work::Read(gid.to_vec())).ok();
-            return Ok(Taken::Waiting);
-        }
-        let g = st.groups.get_mut(gid).unwrap();
-        let opened = match g.mls.open(&st.provider, ciphertext, now()) {
-            Ok(opened) => opened,
-            Err(error) => {
-                g.rec.given_up.push((epoch, Bytes(id.to_vec())));
-                st.save(gid)?;
-                return Err(error);
-            }
+            return Taken::Waiting;
+        } else {
+            self.open(st, gid, ciphertext, id, epoch).map_err(|error| {
+                tracing::debug!("a message did not open: {error:#}");
+                if error.is::<Unheld>() {
+                    Reason::Old
+                } else if error.is::<Removed>() {
+                    Reason::Removed
+                } else {
+                    Reason::Unreadable
+                }
+            })
         };
+        match opened {
+            Ok(()) => Taken::Held,
+            Err(reason) => {
+                self.give_up(st, gid, epoch, id, reason);
+                self.given_up(st, gid);
+                Taken::Refused
+            }
+        }
+    }
+
+    /// Saves what was given up, which may leave the kind's log behind.
+    fn given_up(&self, st: &mut State<P>, gid: &[u8]) {
+        if let Err(error) = st.save(gid).and_then(|()| self.kind_advance(st, gid)) {
+            self.warn(Some(gid), format!("{error:#}"));
+        }
+    }
+
+    /// Records a message as given up, and reports it unless it is from before this session joined or as old as one
+    /// it held and dropped after `keep`. The first given up since the last report has the next one sent in a moment.
+    fn give_up(&self, st: &mut State<P>, gid: &[u8], epoch: u64, id: [u8; 32], reason: Reason) {
+        let g = st.groups.get_mut(gid).unwrap();
+        g.rec.given_up.push((epoch, Bytes(id.to_vec())));
+        if epoch >= g.mls.joined() && epoch > g.rec.expired {
+            if g.rec.unreported.is_empty() {
+                self.work.send(Work::Report(gid.to_vec())).ok();
+            }
+            g.rec.unreported.push(Refusal { id: Bytes(id.to_vec()), reason });
+        }
+    }
+
+    fn open(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8], id: [u8; 32], epoch: u64) -> Result<()> {
+        let g = st.groups.get_mut(gid).unwrap();
+        let opened = g.mls.open(&st.provider, ciphertext, now())?;
         let sender = g.mls.members().into_iter().find(|m| m.key == opened.key).unwrap_or(core::Member {
             index: opened.index,
             key: opened.key.clone(),
@@ -88,15 +114,33 @@ impl<P: Provider + Send + 'static> Inner<P> {
                         self.events.send(Event::Introduced { group, by: sender, identity, name, how }).ok();
                     }
                 }
+                Control::Refused { messages } => {
+                    let held = Message { id: Bytes(id.to_vec()), group: group.clone(), epoch, at: now(), sender: sender.clone(), payload };
+                    hold(st, gid, held, ciphertext)?;
+                    let peer = endpoint_id(&sender.iroh.0);
+                    let mut own = Vec::new();
+                    for refusal in messages {
+                        let Ok(sent) = <[u8; 32]>::try_from(&refusal.id.0[..]) else { continue };
+                        if let (Some(waiter), Some(peer)) = (st.waiters.get(&sent), peer) {
+                            waiter.send((peer, Some(refusal.reason))).ok();
+                        } else if get::<Message>(&st.provider, &message_key(&sent))?.is_some_and(|m| m.sender.key.0 == st.session.key()) {
+                            own.push(refusal);
+                        }
+                    }
+                    if !own.is_empty() {
+                        self.events.send(Event::Refused { group, by: sender, messages: own }).ok();
+                    }
+                }
             }
         } else if opened.held {
             let message = Message { id: Bytes(id.to_vec()), group, epoch, at: now(), sender, payload };
             hold(st, gid, message.clone(), ciphertext)?;
             self.events.send(Event::Message(message)).ok();
+            self.kind_advance(st, gid)?;
         } else {
             self.events.send(Event::Live { group, sender, payload }).ok();
         }
-        Ok(Taken::Held)
+        Ok(())
     }
 
     /// Answers an invite stream's request.
@@ -204,68 +248,64 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         self.state.lock().unwrap().groups.keys().cloned().collect()
     }
 
+    fn in_leaf(&self, group: &[u8], peer: &EndpointId) -> bool {
+        self.state.lock().unwrap().in_leaf(group, peer).is_some()
+    }
+
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
-        let st = self.state.lock().unwrap();
-        st.groups.get(group).is_some_and(|g| {
-            g.mls.members().iter().any(|m| m.leaf.as_ref().is_some_and(|leaf| leaf.key.0 == peer.as_bytes()))
-        })
+        self.state.lock().unwrap().serves(group, peer)
     }
 
     fn hello(&self, group: &[u8]) -> Hello {
         let st = self.state.lock().unwrap();
         let Some(g) = st.groups.get(group) else {
-            return Hello { group: group.into(), epoch: 0, head: empty(group), floor: 0, joined: 0, log: None };
+            return Hello { group: group.into(), epoch: 0, floor: 0, joined: 0 };
         };
         let (epoch, joined) = (g.mls.epoch(), g.mls.joined());
-        let head = g.rec.chain.as_ref().map_or_else(|| empty(group), |chain| chain.head.clone());
         let floor = joined.max(epoch.saturating_sub(self.window.epochs as u64));
-        let log = g.rec.log.as_ref().and_then(|log| Some(log.chain.as_ref()?.head.clone()));
-        Hello { group: group.into(), epoch, head, floor, joined, log }
+        Hello { group: group.into(), epoch, floor, joined }
     }
 
-    fn verify_head(&self, group: &[u8], head: &Head) -> bool {
-        if *head == empty(group) || head.length == 0 && head.hash.0 == head::start(group) {
+    fn logs(&self, group: &[u8]) -> Vec<Vec<u8>> {
+        let st = self.state.lock().unwrap();
+        let Some(g) = st.groups.get(group) else { return Vec::new() };
+        let kind = g.mls.settings().log.map(|id| id.0);
+        let identities = st.identities(group).into_iter().map(|identity| lmk_proto::identity::address(&identity.id.0).to_vec());
+        let mut logs: Vec<Vec<u8>> = [group.to_vec()].into_iter().chain(kind).chain(identities).filter(|id| st.logs.contains_key(id)).collect();
+        logs.sort();
+        logs.dedup();
+        logs
+    }
+
+    fn head(&self, log: &[u8]) -> Head {
+        self.state.lock().unwrap().logs.get(log).map_or_else(|| empty(log), |l| l.head(log))
+    }
+
+    fn verify_head(&self, log: &[u8], head: &Head) -> bool {
+        if head.length == 0 && head.hash == empty(log).hash {
             return true;
         }
         let st = self.state.lock().unwrap();
-        let Some(g) = st.groups.get(group) else {
-            return false;
-        };
-        match g.mls.settings().membership {
-            Service::Serve { key, .. } => {
-                let key: Option<[u8; 32]> = key.0.try_into().ok();
+        match st.logs.get(log).map(|l| &l.service) {
+            Some(Service::Serve { key, .. }) => {
+                let key: Option<[u8; 32]> = key.0.clone().try_into().ok();
                 key.and_then(|key| VerifyingKey::from_bytes(&key).ok()).is_some_and(|key| head.verify(&key))
             }
-            Service::Folder(_) => true,
+            Some(Service::Folder(_)) => true,
+            None => false,
         }
     }
 
-    fn chain(&self, group: &[u8], position: u64) -> Option<[u8; 32]> {
-        let st = self.state.lock().unwrap();
-        st.groups.get(group)?.rec.chain.as_ref()?.hash_at(position)
+    fn chain(&self, log: &[u8], position: u64) -> Option<[u8; 32]> {
+        self.state.lock().unwrap().logs.get(log)?.chain.as_ref()?.hash_at(position)
     }
 
-    fn entries(&self, group: &[u8], after: u64) -> Vec<Bytes> {
-        let st = self.state.lock().unwrap();
-        let Some(g) = st.groups.get(group) else {
-            return Vec::new();
-        };
-        (after + 1..=g.rec.logged)
-            .filter_map(|position| st.provider.get(&entry_key(group, position)).ok()?.map(Bytes))
-            .collect()
+    fn entries(&self, log: &[u8], after: u64) -> Vec<Bytes> {
+        self.state.lock().unwrap().entries(log, after)
     }
 
-    fn apply(&self, group: &[u8], entries: Vec<Bytes>, head: Head) -> Result<()> {
-        let (after, chain) = {
-            let st = self.state.lock().unwrap();
-            let g = st.group(group)?;
-            let mut chain: Chain = g.rec.chain.clone().context("no chain of the group's log yet")?;
-            let after = chain.length();
-            chain.extend(after, &entries, &head)?;
-            self.logs.client(&g.mls.settings().membership)?.set_chain(chain.clone());
-            (after, chain)
-        };
-        self.logged(group, after, entries, Some(chain))
+    fn apply(&self, log: &[u8], entries: Vec<Bytes>, head: Head) -> Result<()> {
+        self.take_entries(log, entries, head)
     }
 
     fn items(&self, group: &[u8], from: u64) -> Vec<(u64, [u8; 32])> {
@@ -292,9 +332,16 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         self.take(&mut st, group, ciphertext)
     }
 
-    fn frame(&self, peer: EndpointId, frame: KindFrame) {
-        let from = self.state.lock().unwrap().by_iroh(&frame.group.0, &peer);
-        self.events.send(Event::Frame { group: frame.group.clone(), from, frame: frame.value() }).ok();
+    fn below(&self, group: &[u8], items: Vec<(u64, [u8; 32])>) {
+        let floor = self.hello(group).floor;
+        let mut st = self.state.lock().unwrap();
+        let Ok(g) = st.group(group) else { return };
+        let known = |id: &[u8; 32]| g.rec.items.iter().any(|item| item.id.0 == id) || g.rec.given_up.iter().any(|(_, given)| given.0 == id);
+        let lacked: Vec<_> = items.into_iter().filter(|(epoch, id)| *epoch < floor && !known(id)).collect();
+        for (epoch, id) in lacked {
+            self.give_up(&mut st, group, epoch, id, Reason::Old);
+        }
+        self.given_up(&mut st, group);
     }
 
     fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>) {
@@ -304,32 +351,12 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         };
     }
 
-    fn log_head(&self, peer: EndpointId, group: &[u8], head: Head) {
-        self.judge_log_head(peer, group, head);
-    }
-
     fn files(&self, group: &[u8]) -> Vec<FileLink> {
         let st = self.state.lock().unwrap();
         let Some(g) = st.groups.get(group) else {
             return Vec::new();
         };
         g.rec.held(g.mls.settings().keep)
-    }
-
-    fn keys(&self, groups: &[Vec<u8>]) -> Vec<Keys> {
-        let st = self.state.lock().unwrap();
-        let mut ids: Vec<Bytes> = groups.iter().flat_map(|gid| st.identities(gid)).map(|identity| identity.id).collect();
-        ids.sort();
-        ids.dedup();
-        // A folder signs no heads; its sessions read it directly.
-        let signed = ids.iter().filter_map(|id| st.keys.get(&id.0)).filter(|known| matches!(known.log.membership, Service::Serve { .. }));
-        signed.map(|known| Keys { identity: Bytes(known.log.id.to_vec()), entries: known.entries.clone(), head: known.head.clone() }).collect()
-    }
-
-    fn key_log(&self, peer: EndpointId, keys: Keys) {
-        if let Err(error) = self.presented(peer, keys) {
-            tracing::debug!("a key log from {}: {error:#}", peer.fmt_short());
-        }
     }
 
     fn certificates(&self, groups: &[Vec<u8>]) -> Vec<Envelope> {
@@ -347,8 +374,15 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         certificates
     }
 
-    fn certificate(&self, _: EndpointId, certificate: Envelope) {
-        take_certificate(&mut self.state.lock().unwrap(), certificate);
+    fn certificate(&self, peer: EndpointId, certificate: Envelope) {
+        let mut st = self.state.lock().unwrap();
+        let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
+        let served = |st: &State<P>| gids.iter().filter(|gid| st.serves(gid, &peer)).cloned().collect::<Vec<_>>();
+        let before = served(&st);
+        take_certificate(&mut st, certificate);
+        for gid in served(&st).into_iter().filter(|gid| !before.contains(gid)) {
+            self.net().changed(&gid);
+        }
     }
 }
 
@@ -358,7 +392,7 @@ pub(crate) fn take_certificate<P: Provider>(st: &mut State<P>, certificate: Enve
     let Some(certified) = certified(&certificate) else { return };
     let members = st.groups.values().flat_map(|g| g.mls.members());
     let credential = members.filter_map(|m| m.credential).find(|c| c.key == certified.key && c.identity.as_ref().is_some_and(|i| i.id == certified.identity));
-    let log = st.keys.get(&certified.identity.0).map(|known| &known.log);
+    let log = st.keys.get(&certified.identity.0);
     let valid = |c: &Envelope| matches!((&credential, log), (Some(credential), Some(log)) if check(Some(c), credential, log, now()).is_ok());
     let key = (certified.key.0.clone(), certified.identity.0.clone());
     let newer = st.certificates.get(&key).is_none_or(|held| match (valid(&certificate), valid(held)) {
@@ -374,31 +408,10 @@ pub(crate) fn take_certificate<P: Provider>(st: &mut State<P>, certificate: Enve
 /// Stores a held message and its ciphertext.
 fn hold<P: Provider>(st: &mut State<P>, gid: &[u8], message: Message, ciphertext: &[u8]) -> Result<()> {
     let id = message.id.0.clone();
-    st.group_mut(gid)?.rec.items.push(Item { epoch: message.epoch, id: message.id.clone(), at: message.at });
+    st.group_mut(gid)?.rec.items.push(Item { epoch: message.epoch, id: message.id.clone(), at: message.at, position: None });
     st.provider.put(&ciphertext_key(&id), ciphertext)?;
     put(&st.provider, &message_key(&id), &message)?;
     st.save(gid)
-}
-
-impl<P: Provider + Send + 'static> Inner<P> {
-    /// Checks a key log a peer presented, and holds it if it is newer than the one held.
-    fn presented(&self, peer: EndpointId, presented: Keys) -> Result<()> {
-        let id: [u8; 32] = presented.identity.0.as_slice().try_into().context("an identity id is 32 bytes")?;
-        let mut st = self.state.lock().unwrap();
-        let ours = st.groups.keys().any(|gid| st.identities(gid).iter().any(|identity| identity.id.0 == id));
-        ensure!(ours, "an identity none of our groups' members speaks as");
-        let log = lmk_proto::identity::address(&id);
-        let Keys { entries, head, .. } = presented;
-        let hash = entries.iter().fold(head::start(&log), |hash, entry| head::next(&hash, &entry.0));
-        ensure!(head.log.0 == log && head.length == entries.len() as u64 && head.hash.0 == hash, "its head does not cover its entries");
-        let log = KeyLog::replay(&id, entries.iter().map(|entry| entry.0.as_slice()))?;
-        let Service::Serve { key, .. } = &log.membership else { bail!("a key log in a folder") };
-        let key = VerifyingKey::from_bytes(key.0.as_slice().try_into().context("a service key is 32 bytes")?)?;
-        ensure!(head.verify(&key), "a head its service did not sign");
-        let at = head.time;
-        self.take_keys(&mut st, log, entries, head, at, &peer.fmt_short().to_string());
-        Ok(())
-    }
 }
 
 pub(crate) struct Admitter<P>(pub Arc<Inner<P>>);

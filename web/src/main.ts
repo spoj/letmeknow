@@ -3,7 +3,7 @@
 // click, so link scanners that open it join nothing.
 import "./app.css";
 import * as client from "./client";
-import type { Attachment, Group, Item, Me, Person } from "./client";
+import type { Attachment, Group, Item, Me, Person, Reason } from "./client";
 
 const { lmk } = client;
 
@@ -858,7 +858,7 @@ class ChatView extends View {
         const to = item.to?.map(fp => this.members.find(m => m.fp === fp)).filter(m => m != null);
         const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent"];
         const status = item.refused
-          ? h("p", { className: "status warn" }, `Refused by ${item.refused.map(r => `${r.name} (${r.reason})`).join(", ")}`)
+          ? this.refusedView(item, item.refused)
           : item.pending && h("p", { className: "status warn" }, "Pending: no other member holds it yet. It goes out when one is online while this browser is open.");
         return h(
           "li",
@@ -977,6 +977,22 @@ class ChatView extends View {
           )
       ])
     );
+  }
+
+  /** Who refused a message of this browser's and why, and, where sending it again can help, a button that does, as a new message replying to it. */
+  private refusedView(item: Message, refused: { name: string; reason: Reason }[]): HTMLElement {
+    const why = { size: "too large for them", old: "too old for them to open", removed: "from a removed member", unreadable: "it did not open" };
+    const said = `Not taken by ${refused.map(r => `${r.name} (${why[r.reason]})`).join(", ")} `;
+    if (!refused.some(r => r.reason === "old" || r.reason === "unreadable")) return h("p", { className: "status warn" }, said);
+    const resend = h("button", { className: "quiet" }, "Resend");
+    resend.onclick = () =>
+      busy(resend, "Sending…", async () => {
+        const { attachment } = item;
+        const bytes = attachment && (await client.file(this.gid, attachment.link));
+        await lmk.send(this.gid, item.content, item.id, item.to ?? [], !!item.urgent, attachment?.name, attachment?.type, bytes);
+        render();
+      });
+    return h("p", { className: "status warn" }, said, resend);
   }
 
   private reply(item: Message) {
