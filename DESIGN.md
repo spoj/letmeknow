@@ -15,8 +15,8 @@ Everything in a group is end-to-end encrypted with MLS (RFC 9420). Members send 
 ## Roles
 
 - **Session**: an MLS member, either an agent's session process or a browser profile. Each agent session is its own member, with its own key. Its name is an unverified claim. It sees the IP address of members it connects to directly.
-- **Device**: a machine's `LETMEKNOW_HOME`, or a browser profile. It signs its sessions' keys and sits on an identity's device list. A browser's one key is both its device and its session.
-- **Identity**: a person, team or agent, as a tightly controlled list of devices ("Matthew": laptop, phone). It makes a member's "Matthew" verifiable and is as strong as its weakest device. No nesting, no admins.
+- **Device**: a machine's `LETMEKNOW_HOME`, or a browser profile. It is a member of its identities' devices groups, holds their keys, and certifies its sessions with them. A browser's one key is both its device and its session.
+- **Identity**: a person, team or agent, as a key its devices share ("Matthew": laptop, phone). It makes a member's "Matthew" verifiable and is as strong as its weakest device. No nesting, no admins.
 - **Membership service**: keeps membership logs and kinds' logs, and is a member of nothing. It sees log ids, entry sizes and timing, and which endpoints connect. It can stall, withhold or split a log, all detectably; it cannot read, forge, or add anyone.
 - **Relay**: an iroh relay. It forwards packets when no direct path exists; browsers always use one. It sees who connects to whom and when, and cannot read.
 - **Page server**: letmeknow.dev, or one's own `letmeknow serve`, serves the browser client, so it could take over every browser member it serves. Accepted for now.
@@ -38,13 +38,13 @@ It holds three kinds of log and nothing else:
 
 - **A group's log**: its MLS commits, under the group id.
 - **A kind's log**: a group's own order for its kind, under a random id in the group's settings, so that the service cannot tie it to the group (see Kinds).
-- **An identity's device list** (see Identity).
+- **An identity's key log** (see Identity).
 
 Members decide what entries mean, from the service's order:
 
-- In a group, the first valid commit for each epoch wins and every other entry is skipped, so junk, such as a removed member's fake commit, changes nothing. A commit's validity depends only on MLS state, never on fetched data such as device lists, the clock, or a client's own settings: members who judged differently would disagree about which commit won, and the group would fork. So every member runs the same protocol version, which the settings name and which fixes the openmls version and its configuration; KeyPackages never expire (the inviter checks freshness when it admits); and the app's own rules on commits read only MLS state and bind the committer too: no proposal by reference, and no update that changes a member's identity or device. A client that does not run a group's protocol version refuses it and says so.
+- In a group, the first valid commit for each epoch wins and every other entry is skipped, so junk, such as a removed member's fake commit, changes nothing. A commit's validity depends only on MLS state, never on fetched data such as key logs and certificates, the clock, or a client's own settings: members who judged differently would disagree about which commit won, and the group would fork. So every member runs the same protocol version, which the settings name and which fixes the openmls version and its configuration; KeyPackages never expire (the inviter checks freshness when it admits); and the app's own rules on commits read only MLS state and bind the committer too: no proposal by reference, no member whose credential names another key, and no update that changes a member's credential. A client that does not run a group's protocol version refuses it and says so.
 - A committer saves its commit's bytes before posting, since it cannot recognise its own encrypted commit otherwise, and finds its log entry by them. If another commit won the epoch, it applies that one and makes its change again.
-- In a device list, the first entry that extends the latest one wins. A removal is final.
+- In a key log, the first entry that extends the latest one, signed by its key, wins.
 - In a kind's log, every entry a member can open counts, in log order, unless it was sealed under an older epoch than the entry taken before it; what an entry means is the kind's.
 
 Each member hash-chains a log as it reads it, so that two readers can compare what they saw by one hash. `letmeknow serve` signs each answer with its key: the log's id, length, latest hash, and the time. This is a signed head.
@@ -56,14 +56,14 @@ Policy belongs to each service: who may create logs, how long it keeps entries, 
 Writes go only to the membership service, which alone assigns positions. Reads come from it or from any member:
 
 - A member's copy of entries counts only with a signed head that covers them, checked against the reader's own chain. Members mirror the record; they cannot change it.
-- Whenever two members connect, they swap the latest signed heads they hold for their shared groups, and the device lists of the identities in them (see Identity). Two incompatible heads prove that the service showed different members different logs; the session reports both in a `warning`. A member that finds itself behind gets the missing entries from that peer.
+- Whenever two members connect, they swap the latest signed heads they hold for their shared groups, and the key logs and certificates of the identities and members in them (see Identity). Two incompatible heads prove that the service showed different members different logs; the session reports both in a `warning`. A member that finds itself behind gets the missing entries from that peer.
 - Once the service has taken a commit, its author pushes it to the members online, so a removal spreads in network time.
 
 A local folder signs nothing, but its sessions all read the folder directly, so nothing needs forwarding.
 
 ## Groups
 
-- Settings live in the MLS group context and change only by commit: kind (fixed; see Kinds), name, the identities the group is open to, `keep`, the membership service's address, the protocol version, and in a group of a plugin's kind, the id of its kind's log.
+- Settings live in the MLS group context and change only by commit: kind (fixed; see Kinds), name, the identities the group is open to, `keep`, the membership service's address, the protocol version, and in a group of any kind but chat, the id of its kind's log.
 - Each member's leaf names its iroh key and relay, so every member can dial every other, and the kinds its session supports. A changed relay or list of kinds is a commit, like a key update.
 - `keep` (days, default 90) is how long members hold the group's messages and files for one another. Each client may hold less.
 - Post-compromise security: a session replaces its keys with an empty commit when it resumes a group, once caught up, and then daily while it runs, so a stolen key stops working within a day. Not more often: every epoch is kept for the key window, and openmls rewrites all of them on each send and receive, so a group must make few, about 7 per member a week.
@@ -72,18 +72,17 @@ A local folder signs nothing, but its sessions all read the folder directly, so 
 
 ## Kinds
 
-The core is a stable substrate, and kinds are extensions that compete: they need not share one model. The core is MLS groups, membership logs, identities and contacts, invites, peers, message sync, files, and a few control messages of its own (`leave`, `introduce`, receipts). It never reads a kind's content: every payload but its own control messages belongs to the group's kind.
+The core is a stable substrate, and kinds are extensions that compete: they need not share one model. The core is MLS groups, membership logs, identities' key logs and certificates, invites, peers, message sync, files, and a few control messages of its own (`leave`, `introduce`, receipts). It never reads a kind's content: every payload but its own control messages belongs to the group's kind.
 
-- A kind is a plain string, the group's `kind`. Chat is the one kind built in; every other kind is a plugin's, and each client supports the kinds it chooses. letmeknow ships the doc and git kinds as plugins, `letmeknow-kind-doc` and `letmeknow-kind-git`.
+- A kind is a plain string, the group's `kind`. Chat and devices (an identity's devices group, see Identity) are built in; every other kind is a plugin's, and each client supports the kinds it chooses. letmeknow ships the doc and git kinds as plugins, `letmeknow-kind-doc` and `letmeknow-kind-git`.
 - A kind gets generic channels and nothing else: held messages (synced, kept `keep` days, with receipts); live messages, to the members online and not held; frames to one member; files; a log of its own at the membership service, which orders its entries for every member (below); and a state link, which an inviter hands each joiner beside the Welcome, and a member can hand another that fell behind or asks for one.
 - A session lists the kinds it supports in its leaf; a leaf without the list, from 0.10, supports chat and doc. An inviter refuses a joiner that lacks the group's kind, and a session is not offered the open groups of kinds it lacks.
 - A native session finds a kind's plugin as an executable named `letmeknow-kind-<kind>`: beside its own executable first, where the release and the npm package put the plugins letmeknow ships (so they work under `npx` too), then on PATH, as git finds its subcommands. There is no registry. It starts a plugin while it has a group of its kind, and they speak JSON lines over stdio. A plugin sees its own groups' plaintext and nothing else; its output reaches `listen` as events, and `letmeknow <kind> <args…>` passes it a command. A plugin says when it starts whether its groups carry chat too, as git's do: then chat messages in them are the session's own, and `send` works there.
 - The browser loads no plugins from anywhere, since the page is the root of trust: it bundles the kinds it supports as in-page plugins speaking the same protocol, the doc and, display-only, git.
-- Contacts are not a kind: they stay a Yjs map in the core, in each identity's devices group.
 
 ### A kind's log
 
-Some kinds need an order every member agrees on: two pushes to one branch must not both win. The membership service already orders commits without reading them, so a group of a plugin's kind has a log of its own there, beside its membership log, under a random id in the group's settings. Only members know the id, so the service cannot tie the log to the group.
+Some kinds need an order every member agrees on: two pushes to one branch must not both win. The membership service already orders commits without reading them, so a group of any kind but chat has a log of its own there, beside its membership log, under a random id in the group's settings. Only members know the id, so the service cannot tie the log to the group.
 
 - An entry is sealed as a message is, under the epoch current when it is appended, and marked as an entry, so that it cannot pass for a message, nor a message for it. The service's limits apply: letmeknow.dev takes entries up to 1 MiB and 60 appends a minute per connection, and keeps them a year.
 - Members open the entries in log order and hand them to the kind with their positions. An entry that does not open is skipped, as is one sealed under an older epoch than the entry taken before it, so every member decides alike, and a removed member's entries under its old epochs stop counting once a member appends under a newer one. The session keeps what it opened until the kind says it holds it.
@@ -135,15 +134,15 @@ A receiver that refuses a message records it as given up, so a reference to it s
 
 ## Identity
 
-- **Device list**: a membership log on the service named in its first entry. The identity's id is the SHA-256 of that entry, so the id says where to look. The log's address and key derive from the id, so the service sees only ciphertext, and whoever knows the id can read the list. Each entry adds or removes a device key, names the entry before it, and is signed by a device on the list at that point.
-- **Reading lists**: a member needs the device lists of the identities its groups' members speak as when it joins or resumes, when members are added, and again once its copy is 10 minutes old; it reads them from their service only when no fresh copy came from a peer.
-- **Lists from peers**: whenever two members connect, they show each other the device lists of the identities in their shared groups, each with every entry and the service's signed head over them, and again whenever one holds a newer copy. A copy counts as fresh while its head is under 10 minutes old. A newer head wins, from whichever source; a copy that disagrees with the one held, on an entry both have, proves that the service showed members different lists, and the session reports both in a `warning`, as for group logs. So a device's removal spreads through peers in network time, and a member that has a fresh copy checks an identity without asking its service.
-- **Devices group**: each identity has a private MLS group of its devices, kept in step with the list by the device that adds or removes one. It carries the identity's openings in its group context and its contacts as a Yjs map. Its members are devices: on a machine, the session process holding the device's lock acts for it, and shares its identities, contacts and openings with the device's other session processes through files in `LETMEKNOW_HOME`; in a browser, the device is the session.
-- **Device links**: an invite link marked as one. The new device sends its device key; the inviter adds it to the list and to the devices group.
-- **Credentials**: a session's credential names its device, with the device's signature on the session key, and the identity it speaks as (`--as`, by default the device's first). A session speaks as one identity per group. Members check it against the device list. A failed check marks the member; it never invalidates a commit.
-- **Revocation**: when a device leaves its identity's list, whichever member of each group notices first removes that device's sessions from the group.
-- **Provenance**: every member records who added whom and how (invite or open group), and who introduced each identity to it. It shows these where they change a decision: an identity whose introducer is not in the group, and another identity's new device ("added by laptop").
-- **Open groups**: the group context lists the identities a group is open to. A member that is a device of such an identity puts an opening (group id, kind, name, membership service, members' iroh keys) into its devices group's context, so every device of that identity knows it, including devices added later. A device that wants in asks the members the opening names, in turn; any of them admits it if it speaks as an identity the group is open to, on that identity's current list. Browsers join the groups open to them by themselves; agents run `join <group>`.
+- **Key log**: an identity's public record is a membership log, on the service named in its first entry, of its keys: each new key, signed by the one before. The identity's id is the SHA-256 of that entry, so the id says where to look. The log's address and sealing key derive from the id, so the service sees only ciphertext, and whoever knows the id sees the identity's keys and when they change, but not its devices: not their keys, names or number.
+- **Devices group**: each identity has a private MLS group of its devices, of the built-in kind `devices`: its only membership. Its state is the identity's private keys, its contacts and its openings, kept in step through the group's kind log and handed to a new device as any kind's state. Its members are devices: on a machine, the session process holding the device's lock acts for it, and shares its identities, contacts and openings with the device's other session processes through files in `LETMEKNOW_HOME`, and certifies them; in a browser, the device is the session.
+- **Device links**: an invite link marked as one, into the devices group. The new device joins with its device key, and gets the identity's key with the group's state. Nothing public changes.
+- **Credentials and certificates**: a session's credential names its key and the identity it speaks as (`--as`, by default the device's first); a session speaks as one identity per group. Sessions never hold the identity's key: their device signs certificates for them with it, each naming the session's key and name and the device's name, valid for a day. Sessions show them to peers in `hello`, their own and those they hold of their groups' members, and renew them before they run out and whenever the key changes.
+- **Checking**: members check a certificate against the identity's current key, the newest in its key log. A copy of the log counts as fresh for 10 minutes, whether read from the service or shown by a peer with the service's signed head; a newer copy wins, from whichever source, and one that disagrees with the one held, on an entry both have, proves that the service showed members different logs, reported in a `warning` as for group logs. A failed check marks the member; it never invalidates a commit.
+- **Rotation**: removing a device removes it from the devices group, then replaces the identity's key: the new key goes to the remaining devices first, sealed under the epoch after the removal, then into the key log. A device also replaces a key once it is a month old, which bounds a leaked one.
+- **Revocation**: a member connected to a session that speaks as an identity removes it from the group once it has gone a minute without a valid certificate, judged by a key log read since. A device that still holds the identity's key renews its sessions within seconds of a new key, so it is the sessions of a removed device that go, as soon as members see the newer key and those sessions are online. Lapsed certificates of sessions that are offline mark them only, until they are back.
+- **Provenance**: every member records who added whom and how (invite or open group), and who introduced each identity to it. It shows these where they change a decision: an identity whose introducer is not in the group, and another identity's new device ("added by laptop", which its certificate claims).
+- **Open groups**: the group context lists the identities a group is open to. A session that speaks as such an identity has its device put an opening (group id, kind, name, membership service, members' iroh keys) into its devices group's state, so every device of that identity knows it, including devices added later. A session that wants in asks the members the opening names, in turn, showing its certificate; any of them admits it if it speaks as an identity the group is open to, with a valid certificate. Browsers join the groups open to them by themselves; agents run `join <group>`.
 
 ## Contacts
 
@@ -160,7 +159,7 @@ Trust is local and travels one hop at most.
 ## Invites
 
 - An invite is a link, `https://letmeknow.dev/i#…`, whose fragment holds the inviter's iroh key, its relay if not ours, and a random 128-bit secret. The fragment never reaches the page server.
-- The joiner dials the inviter's key, which iroh authenticates, and presents the secret. It then sends a KeyPackage (from a new device: its device key). The inviter commits the Add and returns the Welcome, which carries the settings, with the log position to read from and a link to the state of the group's kind, if it has one.
+- The joiner dials the inviter's key, which iroh authenticates, and presents the secret. It then sends a KeyPackage (from a new device: its device key), and the certificate of the identity it speaks as, if any. The inviter commits the Add and returns the Welcome, which carries the settings, with the log position to read from and a link to the state of the group's kind, if it has one.
 - Single use, valid for 10 minutes, and the inviter must be online. Any member may invite. To open one on another device, scan its QR code (`invite --qr`, or the browser's).
 - The key in the link authenticates the inviter, and the secret authenticates the joiner. A leaked link lets one stranger in, shown to every member as joined; `--to` binds a link to an identity.
 
@@ -207,7 +206,7 @@ letmeknow.dev is one DigitalOcean droplet (Basic, 1 GB, Ubuntu LTS, Singapore) r
 
 ## Security
 
-Properties: one agreed membership sequence; settings agreed by commit; post-compromise security, healing within a day; sender signatures; forward secrecy for messages already read; nothing readable by the membership service or relays. The membership service sees commits only, no message traffic, and invites and joins never touch it, so it does not learn who joins. Files go to current members only. A revoked device's sessions are removed from every group.
+Properties: one agreed membership sequence; settings agreed by commit; post-compromise security, healing within a day; sender signatures; forward secrecy for messages already read; nothing readable by the membership service or relays. The membership service sees commits only, no message traffic, and invites and joins never touch it, so it does not learn who joins. Files go to current members only. A removed device's sessions are removed from every group once they are online with members that saw the newer key.
 
 Limits:
 
@@ -221,7 +220,8 @@ Limits:
 - **Kinds' logs**: the service sees each log's entry sizes and timing, and which endpoint appends. A removed member can append under the epochs it was in, and its entries count until a member appends under a newer epoch.
 - **Plugins** run as the user, with the session process's rights, and see their groups' plaintext. Install only those you trust, as with git's subcommands; the plugins letmeknow ships sit beside its binary.
 - **Local state**: MLS secrets, held messages, files, docs and, with `--keep-log`, delivered text sit on disk; file permissions protect them. What a session deletes leaves no copy in its database files. Copies a harness keeps (transcripts, monitor logs) are outside every guarantee here.
-- **Open groups**: while a group is open to an identity, any device on its list can join, with no one asked.
+- **Open groups**: while a group is open to an identity, any session its devices certify can join, with no one asked.
+- **Identity keys**: every device of an identity holds its key, so a stolen device can certify sessions until it is removed, and a device about to be removed can replace the key first, as it can remove the other devices first. Sessions of a removed device that stay offline remain members, marked, until they are next online.
 
 ## Later
 
