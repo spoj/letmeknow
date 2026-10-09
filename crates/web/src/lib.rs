@@ -20,7 +20,7 @@ use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
 use lmk_node::{Claim, Disk, Event, Member, Node, doc, now};
 use lmk_proto::Bytes;
 use lmk_proto::group::{Attachment, How, IdentityRef, Kind, Named, PROTOCOL, Payload, Service, Settings};
-use lmk_proto::links::{FileLink, Invite, MEMBERSHIP_KEY, RELAY};
+use lmk_proto::links::{FileLink, Invite};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::{Duration, sleep};
 use openmls_memory_storage::MemoryStorage;
@@ -148,12 +148,9 @@ fn digest(value: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// A membership service: `letmeknow.dev`, or `<iroh key, hex>@<relay URL>`.
+/// A membership service: `<iroh key, hex>@<relay URL>`.
 fn service(address: &str) -> Result<Service> {
-    let (key, relay) = match address {
-        "letmeknow.dev" => (MEMBERSHIP_KEY, RELAY),
-        _ => address.split_once('@').context("a membership service is letmeknow.dev or <key>@<relay URL>")?,
-    };
+    let (key, relay) = address.split_once('@').context("a membership service is <key>@<relay URL>")?;
     Ok(Service::Serve { key: Bytes(hex::decode(key)?), relay: relay.into(), addrs: Vec::new() })
 }
 
@@ -162,8 +159,8 @@ struct Config {
     /// The person's name and this device's: used only when the browser has no session yet.
     name: String,
     device: String,
-    relay: Option<String>,
-    membership: Option<String>,
+    relay: String,
+    membership: String,
 }
 
 /// An introduction of an identity that is neither this one nor a contact: someone's word, until accepted.
@@ -244,7 +241,7 @@ impl App {
         let node_config = lmk_node::Config {
             name: get(&store, b"web/name")?.context("no name")?,
             device_key: true,
-            relay: config.relay.as_deref().unwrap_or(RELAY).parse()?,
+            relay: config.relay.parse()?,
             ca: Default::default(),
             home: None,
             files: None,
@@ -253,7 +250,7 @@ impl App {
             window: Window::default(),
         };
         let (node, mut events) = Node::start(store.clone(), device, node_config).await?;
-        let membership = service(config.membership.as_deref().unwrap_or("letmeknow.dev"))?;
+        let membership = service(&config.membership)?;
         let (tried, failed) = Default::default();
         let app = Rc::new(App { node, store, membership, shadow: RefCell::new(shadow), idb, kept, on_event, tried, failed });
         app.flush();

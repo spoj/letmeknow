@@ -1,8 +1,8 @@
 // The browser's session: lmk-node in WebAssembly (crates/web), its records and files kept in IndexedDB. One tab at a
 // time runs it, holding the Web Lock "letmeknow"; the other tabs call it over the BroadcastChannel "letmeknow", and hear
-// its events there. When that tab closes, a waiting tab takes the lock and runs the session from IndexedDB. Its relay and
-// membership service are those of the server the page came from, unless localStorage names others ("lmk relay",
-// "lmk membership"), as tests do.
+// its events there. When that tab closes, a waiting tab takes the lock and runs the session from IndexedDB. Its
+// membership service is the one the page's server names at /membership, `<key>@<relay URL>`, and its relay that one's,
+// unless localStorage names others ("lmk membership", "lmk relay"), as tests do.
 import init, { type Lmk, invite_kind, start } from "../pkg/lmk_web.js";
 import wasm from "../pkg/lmk_web_bg.wasm";
 import * as store from "./store";
@@ -126,7 +126,9 @@ let running: Promise<void> | undefined;
 function run(name = "", device = ""): Promise<void> {
   running ??= (async () => {
     const { records, kept } = await store.load();
-    const config = { name, device, relay: localStorage.getItem("lmk relay") ?? undefined, membership: localStorage.getItem("lmk membership") ?? undefined };
+    const membership = localStorage.getItem("lmk membership") ?? (await (await fetch("/membership")).text());
+    const relay = localStorage.getItem("lmk relay") ?? membership.slice(membership.indexOf("@") + 1);
+    const config = { name, device, relay, membership };
     local = await start(records, kept, JSON.stringify(config), store, (json: string) => {
       const event = JSON.parse(json) as Event;
       dispatch(event);
