@@ -307,11 +307,11 @@ async fn a_disk_holds_and_serves_only_what_it_keeps() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn invite_and_join() {
+async fn requests_to_be_admitted_are_answered_by_id() {
     let relay = relay().await;
     let keys = keys(2);
     let service = service();
-    let inviter = node(&relay, keys[0].clone(), Fake::new(&service), Options::default()).await;
+    let member = node(&relay, keys[0].clone(), Fake::new(&service), Options::default()).await;
     let joiner = node(&relay, keys[1].clone(), Fake::new(&service), Options { relay_only: true, ..Options::default() }).await;
     let join = |secret: Option<[u8; 16]>, group: Option<&[u8]>| Join {
         secret: secret.map(Bytes::from),
@@ -327,7 +327,7 @@ async fn invite_and_join() {
     assert!(matches!(invited.unwrap(), Answer::Ok(admitted) if admitted.welcome.0 == b"invited"));
     assert_eq!(refused.unwrap(), Answer::Refused { refused: "unknown secret".into() });
     assert!(matches!(opened.unwrap(), Answer::Ok(admitted) if admitted.welcome.0 == b"open"));
-    inviter.net.shutdown().await.unwrap();
+    member.net.shutdown().await.unwrap();
     joiner.net.shutdown().await.unwrap();
 }
 
