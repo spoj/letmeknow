@@ -197,12 +197,19 @@ impl Session {
             }
             let path: Option<String> =
                 session.db.query_row("SELECT path FROM bindings WHERE gid = ?", [&gid.0], |r| r.get(0)).optional()?;
+            let carrying: Option<(String, Vec<u8>)> =
+                session.db.query_row("SELECT file, edit FROM carrying WHERE gid = ?", [&gid.0], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            // A session stopped while carrying a file's changes onto the doc: the doc has them now, and the file had them.
+            if let Some((file, edit)) = carrying {
+                session.node.edit(&gid.0, edit).await?;
+                session.set_base(&gid, &file)?;
+            }
             let text = ydoc::text(&session.node.doc(&gid.0)?)?;
             match path {
                 Some(path) => {
                     // A session stopped after writing the file but before storing its base: the file holds the doc's text.
                     if std::fs::read_to_string(&path).is_ok_and(|file| file.replace("\r\n", "\n") == text) {
-                        session.db.execute("UPDATE bindings SET base = ? WHERE gid = ?", params![text, gid.0])?;
+                        session.set_base(&gid, &text)?;
                     }
                     session.follow(&gid, PathBuf::from(path));
                 }
@@ -232,7 +239,10 @@ impl Session {
         let device = lmk_core::device::Device::load(&self.device_file())?;
         let provider = SqliteProvider::open(&self.home.join("device.db"))?;
         let config = crate::node_config(&self.network, &self.home, &device.name, true, self.home.join("device-files"));
-        let (node, mut events) = Node::start(provider, device, config).await?;
+        let (node, mut events) = Node::start(provider, device.clone(), config).await?;
+        if node.device().identities != device.identities {
+            node.device().save(&self.device_file())?;
+        }
         let inbound = self.inbound.clone();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
@@ -648,7 +658,7 @@ impl Session {
         {
             std::fs::remove_file(&binding.path)?;
         }
-        for table in ["taken", "bindings", "attachments"] {
+        for table in ["taken", "bindings", "carrying", "attachments"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [&gid.0])?;
         }
         let attachments = self.attachments_dir(gid);
@@ -1189,12 +1199,14 @@ impl Session {
         let current = ydoc::text(&state)?;
         let (text, lost) = if file == base { (current.clone(), Vec::new()) } else { doc::rebase(&base, &file, &current) };
         if text != current {
-            self.node.edit(&gid.0, ydoc::edit(&state, &text)?).await?;
+            let edit = ydoc::edit(&state, &text)?;
+            self.db.execute("INSERT OR REPLACE INTO carrying (gid, file, edit) VALUES (?, ?, ?)", params![gid.0, file, edit])?;
+            self.node.edit(&gid.0, edit).await?;
         }
         if text != file {
             doc::write_file(&path, &text)?;
         }
-        self.db.execute("UPDATE bindings SET base = ? WHERE gid = ?", params![text, gid.0])?;
+        self.set_base(gid, &text)?;
         if !lost.is_empty() {
             let text = format!("others changed these lines of {} meanwhile, so your changes to them were not kept: {}", path.display(), lost.join(" | "));
             self.warn(Some(gid), text);
@@ -1221,6 +1233,14 @@ impl Session {
             self.outbox.deliver(item, wakes);
         }
         Ok(())
+    }
+
+    /// Records the text a doc and its file have in common, once the file's changes are on the doc.
+    fn set_base(&self, gid: &Bytes, base: &str) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("UPDATE bindings SET base = ? WHERE gid = ?", params![base, gid.0])?;
+        tx.execute("DELETE FROM carrying WHERE gid = ?", [&gid.0])?;
+        Ok(tx.commit()?)
     }
 
     async fn sync_all(&mut self) {

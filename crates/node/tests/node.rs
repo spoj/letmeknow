@@ -277,3 +277,31 @@ async fn a_removal_spreads_through_peers() {
     }).await;
     assert_eq!(left.device.0, tablet.node.device().public());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_that_stopped_before_it_was_saved_is_still_on_its_identity() {
+    use lmk_core::provider::SqliteProvider;
+    let relay = relay().await;
+    let dir = folder("unsaved");
+    std::fs::create_dir_all(&dir).unwrap();
+    let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
+    let config = || Config {
+        name: "laptop".into(),
+        device_key: true,
+        relay: relay.url.clone(),
+        ca: CaTlsConfig::custom_roots([relay.cert.clone()]),
+        home: None,
+        files: None,
+        file_limit: 100 << 20,
+        window: Window::default(),
+    };
+    let saved = Device::new("laptop");
+    let (node, _events) = Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), saved.clone(), config()).await.unwrap();
+    let bob = node.identity_create("Bob", membership).await.unwrap();
+    node.shutdown().await.unwrap();
+    drop(node);
+    let (node, _events) = Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), saved, config()).await.unwrap();
+    assert_eq!(node.device().identities, [bob.clone()]);
+    assert_eq!(node.identities(), [(bob, "Bob".to_owned())]);
+    node.shutdown().await.unwrap();
+}

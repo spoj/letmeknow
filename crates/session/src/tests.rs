@@ -588,6 +588,42 @@ fn a_restarted_session_resumes_its_groups_and_docs() {
 }
 
 #[test]
+fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_twice() {
+    local(async {
+        use base64::Engine;
+        let world = world("carrying").await;
+        let mut alice = world.start("alice", HOUR).await;
+        let invite = alice.cmd(&["invite", "--kind", "doc", "--name", "Notes"]).await.unwrap();
+        let gid = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(invite["group"].as_str().unwrap()).unwrap();
+        let file = invite["file"].as_str().unwrap().to_owned();
+        std::fs::write(&file, "one\n").unwrap();
+        alice.cmd(&["status"]).await.unwrap();
+        alice.stop().await;
+        // Another member's line came in; then it stopped after recording that it carried its own new line onto the doc,
+        // with the doc changed (`applied`) or not, before the file was rewritten and the base stored.
+        for (i, applied) in [true, false].into_iter().enumerate() {
+            let base = std::fs::read_to_string(&file).unwrap();
+            let carried = format!("{base}mine {i}\n");
+            let expected = format!("others {i}\n{carried}");
+            std::fs::write(&file, &carried).unwrap();
+            let db = rusqlite::Connection::open(session_dir(&alice.home, "alice").unwrap().join("session.db")).unwrap();
+            let key = [b"node/doc/".as_slice(), &gid].concat();
+            let state: Vec<u8> = db.query_row("SELECT value FROM lmk WHERE key = ?", [&key], |r| r.get(0)).unwrap();
+            let theirs = lmk_node::doc::apply(&state, &lmk_node::doc::edit(&state, &format!("others {i}\n{base}")).unwrap()).unwrap();
+            let edit = lmk_node::doc::edit(&theirs, &expected).unwrap();
+            let state = if applied { lmk_node::doc::apply(&theirs, &edit).unwrap() } else { theirs };
+            db.execute("UPDATE lmk SET value = ? WHERE key = ?", rusqlite::params![state, key]).unwrap();
+            db.execute("INSERT INTO carrying (gid, file, edit) VALUES (?, ?, ?)", rusqlite::params![gid, carried, edit]).unwrap();
+            drop(db);
+            alice = world.start("alice", HOUR).await;
+            alice.cmd(&["status"]).await.unwrap();
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+            alice.stop().await;
+        }
+    });
+}
+
+#[test]
 fn every_session_of_a_device_sees_its_state_and_changes_it() {
     local(async {
         let world = world("device").await;

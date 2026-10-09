@@ -63,7 +63,10 @@ impl Device {
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        options.open(path)?.write_all(&serde_json::to_vec_pretty(self)?)?;
+        // Through a rename, so that a crash never leaves half a file and loses the key.
+        let new = path.with_extension("new");
+        options.open(&new)?.write_all(&serde_json::to_vec_pretty(self)?)?;
+        std::fs::rename(new, path)?;
         Ok(())
     }
 }

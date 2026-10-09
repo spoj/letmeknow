@@ -495,7 +495,7 @@ impl<P: Provider> State<P> {
 
 impl<P: Provider + Send + 'static> Node<P> {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
-    pub async fn start(provider: P, device: Device, config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
+    pub async fn start(provider: P, mut device: Device, config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let secret = match provider.get(b"node/iroh")? {
             Some(bytes) => SecretKey::from_bytes(&bytes.as_slice().try_into().context("an iroh key is 32 bytes")?),
             None => {
@@ -524,6 +524,13 @@ impl<P: Provider + Send + 'static> Node<P> {
             let rec: Rec = get(&provider, &rec_key(&gid.0))?.context("a group without its record")?;
             if let Some(chain) = &rec.chain {
                 logs.client(&mls.settings().membership)?.set_chain(chain.clone());
+            }
+            // A device that stopped after joining an identity's devices group, before it was saved, is on the identity.
+            let settings = mls.settings();
+            if let Some(id) = settings.devices_of
+                && !device.identities.iter().any(|identity| identity.id == id)
+            {
+                device.identities.push(IdentityRef { id, membership: settings.membership });
             }
             groups.insert(gid.0, G { mls, rec, future: Vec::new(), own_at: None, follow: None });
         }
