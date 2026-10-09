@@ -285,7 +285,7 @@ try {
   await kiosk.goto(SITE);
   await kiosk.getByLabel("Your name").fill("Kim");
   await kiosk.getByLabel("This device").fill("kiosk");
-  await kiosk.getByLabel("Name", { exact: true }).fill("Kiosk notes");
+  await kiosk.getByPlaceholder("e.g. Q3 plan").fill("Kiosk notes");
   await kiosk.getByRole("button", { name: "New chat" }).click();
   await kiosk.locator(".group-list button", { hasText: "Kiosk notes" }).waitFor();
   check((await kiosk.locator(".me").textContent()).includes("Kim"), "a chat started from the welcome screen makes the browser its identity's first device");

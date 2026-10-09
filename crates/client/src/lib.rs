@@ -981,7 +981,9 @@ impl<P: Provider + Send + 'static> Client<P> {
         let Ok(state) = self.device_state() else { return Vec::new() };
         let mut failed = Vec::new();
         for identity in self.inner.node.spoken() {
-            if !state.identities.iter().any(|(own, _)| own.id == identity.id) {
+            // A state that names the device was published by a device that leaves identities so; none is published
+            // before a device's node first runs, or by 0.12.1.
+            if state.device.is_some() && !state.identities.iter().any(|(own, _)| own.id == identity.id) {
                 if let Err(error) = self.leave_as(&identity.id).await {
                     failed.push(error);
                 }
