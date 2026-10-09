@@ -12,8 +12,6 @@ pub(crate) fn settings(name: &str) -> Settings {
         open: vec![],
         keep: 90,
         membership: Service::Folder("/tmp/lmk".into()),
-        devices_of: None,
-        openings: vec![],
         log: None,
     }
 }
@@ -24,7 +22,6 @@ pub(crate) fn leaf(name: &str) -> Leaf {
 
 pub(crate) struct Member<P: Provider = MemoryProvider> {
     pub provider: P,
-    pub device: Device,
     pub session: Session,
     pub group: Option<Group>,
     /// Next log position to read (0-based here).
@@ -33,9 +30,8 @@ pub(crate) struct Member<P: Provider = MemoryProvider> {
 
 impl<P: Provider> Member<P> {
     pub fn new(provider: P, name: &str) -> Self {
-        let device = Device::new(&format!("{name}'s laptop"));
-        let session = Session::create(&provider, &device, name, None, leaf(name)).unwrap();
-        Member { provider, device, session, group: None, pos: 0 }
+        let session = Session::create(&provider, name, leaf(name)).unwrap();
+        Member { provider, session, group: None, pos: 0 }
     }
 
     pub fn g(&mut self) -> &mut Group {
@@ -378,9 +374,8 @@ fn rules_bind_everyone() {
         w.agree(&[0, 1, 2]);
     }
 
-    // An update that changes the committer's device: C claims another device.
-    let other = Device::new("someone else's");
-    w.m[2].session.credential = other.credential("C", w.m[2].session.key(), None);
+    // An update that changes the committer's credential: C claims another name.
+    w.m[2].session.credential.name = "Mallory".into();
     let c = &mut w.m[2];
     let group = c.group.as_mut().unwrap();
     let mut leaf = LeafNodeParameters::builder().with_credential_with_key(c.session.with_key()).build();
@@ -404,7 +399,7 @@ fn rules_bind_everyone() {
     group.state.posted = Some(Bytes(bytes.clone()));
     w.post(bytes);
     let applied = w.read(&[0, 1, 2]);
-    assert!(matches!(&applied[2][0], Applied::Skipped { lost: true, reason } if reason.contains("device")));
+    assert!(matches!(&applied[2][0], Applied::Skipped { lost: true, reason } if reason.contains("credential")));
     assert!(!is_commit(&applied[0][0]) && !is_commit(&applied[1][0]));
     w.agree(&[0, 1, 2]);
 
@@ -435,31 +430,30 @@ fn rules_bind_everyone() {
 
 #[test]
 fn credentials_are_checked_not_enforced() {
-    use crate::identity::{DeviceList, Verdict, check, create};
+    use crate::identity::{DAY, KeyLog, certify, check, create};
+    use lmk_proto::group::IdentityRef;
+    use lmk_proto::identity::Certified;
     let mut w = World::new(&["A", "M"]);
-    let (id, first) = create(&w.m[0].device, "Alice", Service::Folder("/tmp/lmk".into()));
-    let list = DeviceList::replay(&id, [first.as_slice()]).unwrap();
+    let seed = crate::random();
+    let (id, first) = create(&seed, "Alice", Service::Folder("/tmp/lmk".into()));
+    let log = KeyLog::replay(&id, [first.as_slice()]).unwrap();
     let identity = IdentityRef { id: id.into(), membership: Service::Folder("/tmp/lmk".into()) };
-    let a = &mut w.m[0];
-    a.session = Session::create(&a.provider, &a.device, "A", Some(identity.clone()), leaf("A")).unwrap();
-    // M claims Alice's identity from a device not on her list.
-    let m = &mut w.m[1];
-    m.session = Session::create(&m.provider, &m.device, "M", Some(identity), leaf("M")).unwrap();
-    let (credential, key) = key_package_credential(&w.m[0].provider, &w.key_package(1)).unwrap();
-    assert_eq!(check(&credential, &key, Some(&list)), Verdict::NotListed);
+    // A speaks as Alice, with a certificate; M claims her identity without one.
+    w.m[0].session.credential.identity = Some(identity.clone());
+    w.m[1].session.credential.identity = Some(identity);
+    let a = &w.m[0].session.credential;
+    let certified = Certified { identity: id.into(), key: a.key.clone(), name: a.name.clone(), device: "laptop".into(), added_by: None, expires: DAY };
+    let certificate = certify(&seed, &certified);
+    let m = key_package_credential(&w.m[0].provider, &w.key_package(1)).unwrap();
+    assert!(check(Some(&certificate), &m, &log, 0).is_err());
     w.found(0, &[1]);
     w.agree(&[0, 1]);
-    let verdicts: Vec<_> = w.m[1]
-        .g()
-        .members()
-        .iter()
-        .map(|member| check(member.credential.as_ref().unwrap(), &member.key, Some(&list)))
-        .collect();
-    assert_eq!(verdicts, [Verdict::Verified, Verdict::NotListed]);
+    let checked: Vec<bool> =
+        w.m[1].g().members().iter().map(|member| check(Some(&certificate), member.credential.as_ref().unwrap(), &log, 0).is_ok()).collect();
+    assert_eq!(checked, [true, false]);
     let hi = w.m[1].send("hi from M");
     let opened = w.m[0].open(&hi, 0).unwrap();
-    let sender = &w.m[0].g().members()[opened.current.unwrap() as usize];
-    assert_eq!(check(&opened.sender, &sender.key, Some(&list)), Verdict::NotListed);
+    assert_eq!((opened.key, opened.sender.name), (w.m[1].session.key().to_vec(), "M".to_owned()));
 }
 
 #[test]
@@ -536,7 +530,7 @@ fn state_survives_a_restart() {
     let session = Session::load(&provider).unwrap();
     let group = Group::load(&provider, &id).unwrap();
     assert!(group.pending());
-    let mut b = Member { device: Device::new("unused"), provider, session, group: Some(group), pos: 1 };
+    let mut b = Member { provider, session, group: Some(group), pos: 1 };
     assert!(matches!(b.read(&log, 0)[0], Applied::Commit { own: true, .. }));
     a.read(&log, 0);
     assert_eq!(a.g().epoch_authenticator(), b.g().epoch_authenticator());

@@ -5,16 +5,19 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 
-use crate::{Bytes, head::Head};
+use crate::{Bytes, head::Head, identity::Envelope};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Frame {
     Hello {
         groups: Vec<Hello>,
-        /// Device lists of the identities in those groups.
+        /// Key logs of the identities in those groups.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        lists: Vec<List>,
+        keys: Vec<Keys>,
+        /// Certificates of those groups' members.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        certificates: Vec<Envelope>,
     },
     /// Log entries the other lacks, ending at `head`.
     Commits { group: Bytes, entries: Vec<Bytes>, head: Head },
@@ -27,8 +30,8 @@ pub enum Frame {
     /// BLAKE3 hashes of files.
     Want { group: Bytes, files: Vec<Bytes> },
     Have { group: Bytes, files: Vec<Bytes> },
-    /// A request to join an open group.
-    Join { group: Bytes, key_package: Bytes },
+    /// A request to join an open group, with the joiner's certificate of the identity it speaks as.
+    Join { group: Bytes, key_package: Bytes, certificate: Envelope },
     Admitted { group: Bytes, admitted: Admitted },
     Refused { group: Bytes, refused: String },
     /// A file link to the state of the group's kind, which the sender's kind hands this member; without one, a request
@@ -113,20 +116,21 @@ pub struct Hello {
     pub log: Option<Head>,
 }
 
-/// An identity's device list as its membership service showed it: every entry, and the service's signed head over
-/// them.
+/// An identity's key log as its membership service showed it: every entry, and the service's signed head over them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct List {
+pub struct Keys {
     pub identity: Bytes,
     pub entries: Vec<Bytes>,
     pub head: Head,
 }
 
-/// The joiner's request on an `invite` stream. For a device link, the KeyPackage's credential names the new device.
+/// The joiner's request on an `invite` stream, with its certificate if it speaks as an identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteRequest {
     pub secret: Bytes,
     pub key_package: Bytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<Envelope>,
 }
 
 /// The answer to an invite or a join: answered as `Answer<Admitted>` on an `invite` stream.
@@ -135,7 +139,7 @@ pub struct Admitted {
     pub welcome: Bytes,
     /// The log position the joiner reads from.
     pub position: u64,
-    /// A file link to the state of the group's kind, or of a devices group's contacts.
+    /// A file link to the state of the group's kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     /// The ids of the messages from before the joiner's epoch that the inviter holds, which the joiner never gets.
@@ -148,11 +152,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_hello_without_lists_is_as_before() {
-        let old = r#"{"hello":{"groups":[]}}"#;
-        let hello: Frame = serde_json::from_str(old).unwrap();
-        assert_eq!(hello, Frame::Hello { groups: vec![], lists: vec![] });
-        assert_eq!(serde_json::to_string(&hello).unwrap(), old);
+    fn a_hello_leaves_out_what_it_lacks() {
+        let empty = r#"{"hello":{"groups":[]}}"#;
+        let hello: Frame = serde_json::from_str(empty).unwrap();
+        assert_eq!(hello, Frame::Hello { groups: vec![], keys: vec![], certificates: vec![] });
+        assert_eq!(serde_json::to_string(&hello).unwrap(), empty);
     }
 
     #[test]
