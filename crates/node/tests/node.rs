@@ -293,6 +293,7 @@ async fn a_device_that_stopped_before_it_was_saved_is_still_on_its_identity() {
         ca: CaTlsConfig::custom_roots([relay.cert.clone()]),
         home: None,
         files: None,
+        disk: None,
         file_limit: 100 << 20,
         window: Window::default(),
     };
