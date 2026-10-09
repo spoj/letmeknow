@@ -1,25 +1,23 @@
-//! The session process: it runs this session's node (and, holding the device's lock, the device's), keeps docs in step
-//! with their files, and prints what concerns the agent. The session process that holds the lock publishes the device's
-//! identities, contacts and openings to `device-state.json`, and answers the requests only the device's node can on the
-//! command channel `device-endpoint`, both in `LETMEKNOW_HOME`; the device's other session processes read the one and
-//! send such requests to the other.
+//! The session process: it runs this session's node (and, holding the device's lock, the device's), hosts the plugins
+//! of its groups' kinds, and prints what concerns the agent. Chat is its built-in kind. The session process that holds
+//! the lock publishes the device's identities, contacts and openings to `device-state.json`, and answers the requests
+//! only the device's node can on the command channel `device-endpoint`, both in `LETMEKNOW_HOME`; the device's other
+//! session processes read the one and send such requests to the other.
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64, engine::general_purpose::URL_SAFE_NO_PAD};
 use lmk_core::contacts::{self, Contact};
 use lmk_core::invite::Target;
 use lmk_core::provider::SqliteProvider;
-use lmk_node::{Claim, Event, Member, Node, doc as ydoc};
+use lmk_node::{Claim, Event, Member, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, How, IdentityRef, Kind, Named, Opening, PROTOCOL, Payload, Service, Settings};
+use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings};
 use lmk_proto::links::{FileLink, Invite};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -27,7 +25,7 @@ use tokio::time::Instant;
 
 use crate::cli::{ContactsOp, IdentityOp, Request, private_file};
 use crate::Network;
-use crate::doc::{self, Quiet};
+use crate::kinds::Plugins;
 use crate::policy::{Outbox, mentions, wakes};
 
 /// How long a message waits for those it comes after.
@@ -36,6 +34,8 @@ pub const CAUSAL_WAIT: Duration = Duration::from_secs(300);
 const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
 const FETCH_WAIT: Duration = Duration::from_secs(60);
 const INVITE_TTL: u64 = 600;
+/// How long the session waits for a plugin's answer.
+const ASK_WAIT: Duration = Duration::from_secs(60);
 /// How often a session process that does not act for the device tries its lock.
 const DEVICE_RETRY: Duration = Duration::from_secs(10);
 
@@ -51,13 +51,13 @@ pub struct Config {
     pub keep_log: bool,
     /// For groups and identities this session creates.
     pub membership: Service,
+    /// Where it looks for kinds' plugins, in order.
+    pub plugins: Vec<PathBuf>,
 }
 
 /// What reaches the session process besides its nodes' events.
 pub enum Inbound {
     Request(Box<Request>, oneshot::Sender<Value>),
-    /// A doc's file changed.
-    FileChanged(Bytes),
     /// A warning of the device's node: of its events, only these concern the agent.
     DeviceWarning(String),
 }
@@ -74,16 +74,6 @@ impl DeviceState {
     fn of(device: &SessionNode) -> Result<Self> {
         Ok(DeviceState { identities: device.identities(), contacts: device.contacts()?, openings: device.openings() })
     }
-}
-
-/// A doc group's file, which the session keeps in step with the doc. Its base, the text both last had, is in the store.
-struct Binding {
-    path: PathBuf,
-    /// Watches the file's directory, as editors often replace a file rather than write into it.
-    _watcher: Option<RecommendedWatcher>,
-    quiet: Quiet,
-    /// The text the agent was last told of, while an `edited` event waits to be printed.
-    since: String,
 }
 
 /// A message waiting for the messages it comes after.
@@ -105,6 +95,14 @@ struct Fetch {
     reply: oneshot::Sender<Value>,
 }
 
+/// A plugin's `fetch` waiting for its file.
+struct KindFetch {
+    kind: String,
+    id: Value,
+    link: FileLink,
+    deadline: Instant,
+}
+
 pub struct Session {
     db: Connection,
     node: SessionNode,
@@ -118,11 +116,21 @@ pub struct Session {
     network: Network,
     config: Config,
     outbox: Outbox,
-    bindings: HashMap<Bytes, Binding>,
     waiting: Vec<Waiting>,
     fetches: Vec<Fetch>,
     catching_up: Option<Instant>,
     inbound: mpsc::UnboundedSender<Inbound>,
+    plugins: Plugins,
+    plugin_lines: mpsc::UnboundedReceiver<(String, Option<Value>)>,
+    /// The kind of each group a plugin was told of.
+    kind_of: HashMap<Bytes, String>,
+    /// The last id this session gave a request to a plugin.
+    asked: u64,
+    /// Inviters' requests for a kind's state, by plugin and request id.
+    snapshots: HashMap<(String, u64), oneshot::Sender<Option<Vec<u8>>>>,
+    kind_fetches: Vec<KindFetch>,
+    /// What plugins show of their groups in `groups`.
+    infos: HashMap<Bytes, Value>,
 }
 
 pub fn fp(key: &[u8]) -> String {
@@ -131,6 +139,13 @@ pub fn fp(key: &[u8]) -> String {
 
 fn b64(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Adds an object's fields to another.
+fn merge(into: &mut Value, from: Value) {
+    if let (Some(into), Value::Object(from)) = (into.as_object_mut(), from) {
+        into.extend(from);
+    }
 }
 
 fn message_id(hex_id: &str) -> Result<[u8; 32]> {
@@ -165,6 +180,7 @@ impl Session {
             Some(_) => {}
             None => _ = db.execute("INSERT INTO session (name) VALUES (?)", [&config.name])?,
         }
+        let (plugins, plugin_lines) = Plugins::new(crate::kinds::discover(&config.plugins));
         let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("device.lock"))?;
         let mut session = Self {
             db,
@@ -177,44 +193,37 @@ impl Session {
             network,
             config,
             outbox: Outbox::default(),
-            bindings: HashMap::new(),
             waiting: Vec::new(),
             fetches: Vec::new(),
             catching_up: Some(Instant::now() + CATCH_UP_WINDOW),
             inbound,
+            plugins,
+            plugin_lines,
+            kind_of: HashMap::new(),
+            asked: 0,
+            snapshots: HashMap::new(),
+            kind_fetches: Vec::new(),
+            infos: HashMap::new(),
         };
         session.take_device().await?;
         for gid in session.node.groups() {
             session.outbox.catch_up(&b64(&gid.0));
+            if session.node.settings(&gid.0)?.kind != CHAT {
+                if let Err(error) = session.open_kind(&gid, None).await {
+                    session.warn(Some(&gid), format!("{error:#}"));
+                }
+                continue;
+            }
             // Messages that arrived but were never taken in, as when the session stopped while they waited.
             for message in session.node.messages(&gid.0)? {
-                if !session.taken(&message.id.0)? && message.sender.key != session.node.key() {
+                if message.payload["type"] == "message" && !session.taken(&message.id.0)? && message.sender.key != session.node.key() {
                     session.received(message).await?;
                 }
             }
-            if session.node.settings(&gid.0)?.kind != Kind::Doc {
-                continue;
-            }
-            let path: Option<String> =
-                session.db.query_row("SELECT path FROM bindings WHERE gid = ?", [&gid.0], |r| r.get(0)).optional()?;
-            let carrying: Option<(String, Vec<u8>)> =
-                session.db.query_row("SELECT file, edit FROM carrying WHERE gid = ?", [&gid.0], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-            // A session stopped while carrying a file's changes onto the doc: the doc has them now, and the file had them.
-            if let Some((file, edit)) = carrying {
-                session.node.edit(&gid.0, edit).await?;
-                session.set_base(&gid, &file)?;
-            }
-            let text = ydoc::text(&session.node.doc(&gid.0)?)?;
-            match path {
-                Some(path) => {
-                    // A session stopped after writing the file but before storing its base: the file holds the doc's text.
-                    if std::fs::read_to_string(&path).is_ok_and(|file| file.replace("\r\n", "\n") == text) {
-                        session.set_base(&gid, &text)?;
-                    }
-                    session.follow(&gid, PathBuf::from(path));
-                }
-                None => _ = session.bind(&gid, None, &text)?,
-            }
+        }
+        // Once every doc 0.10 kept is the doc plugin's, the tables it kept them in go.
+        if session.legacy_tables()? && session.db.query_row("SELECT count(*) FROM bindings", [], |r| r.get::<_, i64>(0))? == 0 {
+            session.db.execute_batch("DROP TABLE bindings; DROP TABLE carrying;")?;
         }
         Ok(session)
     }
@@ -238,7 +247,8 @@ impl Session {
         // Another session process may have acted for the device before, and changed it.
         let device = lmk_core::device::Device::load(&self.device_file())?;
         let provider = SqliteProvider::open(&self.home.join("device.db"))?;
-        let config = crate::node_config(&self.network, &self.home, &device.name, true, self.home.join("device-files"));
+        let kinds = self.node.kinds().to_vec();
+        let config = crate::node_config(&self.network, &self.home, &device.name, true, self.home.join("device-files"), kinds);
         let (node, mut events) = Node::start(provider, device.clone(), config).await?;
         if node.device().identities != device.identities {
             node.device().save(&self.device_file())?;
@@ -291,12 +301,11 @@ impl Session {
     /// When something is next due without anything arriving.
     pub fn next_due(&self) -> Instant {
         let held = self.outbox.deadline(self.config.hold);
-        let docs = self.bindings.values().filter_map(|b| b.quiet.due());
         let waiting = self.waiting.iter().map(|w| w.deadline);
-        let fetches = self.fetches.iter().map(|f| f.deadline);
+        let fetches = self.fetches.iter().map(|f| f.deadline).chain(self.kind_fetches.iter().map(|f| f.deadline));
         let device = self.device.is_none().then_some(self.device_retry);
         let later = Instant::now() + Duration::from_secs(3600);
-        let due = held.into_iter().chain(docs).chain(waiting).chain(fetches).chain(device);
+        let due = held.into_iter().chain(waiting).chain(fetches).chain(device);
         due.chain(self.catching_up).fold(later, Instant::min)
     }
 
@@ -315,13 +324,6 @@ impl Session {
             self.catching_up = None;
             self.outbox.caught_up();
         }
-        let due: Vec<Bytes> =
-            self.bindings.iter().filter(|(_, b)| b.quiet.due().is_some_and(|at| at <= now)).map(|(gid, _)| gid.clone()).collect();
-        for gid in due {
-            if let Err(error) = self.sync(&gid).await {
-                self.warn(Some(&gid), format!("{error:#}"));
-            }
-        }
         let (late, waiting) = std::mem::take(&mut self.waiting).into_iter().partition(|w| w.deadline <= now);
         self.waiting = waiting;
         for w in late {
@@ -334,21 +336,33 @@ impl Session {
         for fetch in late {
             let _ = fetch.reply.send(json!({ "error": "no member online holds that file; try again when one is" }));
         }
+        let (late, fetches): (Vec<KindFetch>, _) = std::mem::take(&mut self.kind_fetches).into_iter().partition(|f| f.deadline <= now);
+        self.kind_fetches = fetches;
+        for fetch in late {
+            let answer = json!({ "type": "answer", "id": fetch.id, "error": "no member online holds that file" });
+            let _ = self.plugins.send(&fetch.kind, &answer).await;
+        }
     }
 
-    /// Prints what is waiting, once the docs' files are in step: whatever wakes the agent, it reads current files.
+    /// Prints what is waiting, once the plugins are in step (a doc's file with its doc): whatever wakes the agent, it
+    /// acts on current state.
     pub async fn emit(&mut self, print: &mut impl FnMut(String)) {
         if self.outbox.is_empty() {
             return;
         }
-        self.sync_all().await;
-        for item in self.outbox.take() {
+        self.sync_kinds().await;
+        for mut item in self.outbox.take() {
             if item["type"] == "message"
                 && let Some(id) = item["id"].as_str().and_then(|id| message_id(id).ok())
             {
                 let _ = self.mark_seen(&id);
             }
+            let printed = item.as_object_mut().and_then(|item| item.remove("printed"));
             print(item.to_string());
+            if let Some(printed) = printed {
+                let told = json!({ "type": "printed", "group": item["group"], "key": printed["key"] });
+                let _ = self.plugins.send(printed["kind"].as_str().unwrap_or_default(), &told).await;
+            }
         }
     }
 
@@ -357,7 +371,7 @@ impl Session {
             Inbound::Request(request, reply) => {
                 let request = *request;
                 // The agent may have just changed a file.
-                self.sync_all().await;
+                self.sync_kinds().await;
                 if let Request::Fetch { link } = request {
                     if let Err(error) = self.fetch(link, reply).await {
                         self.warn(None, format!("{error:#}"));
@@ -370,11 +384,6 @@ impl Session {
                 }
                 self.outbox.flush_held();
             }
-            Inbound::FileChanged(gid) => {
-                if let Some(binding) = self.bindings.get_mut(&gid) {
-                    binding.quiet.file_changed(Instant::now());
-                }
-            }
             Inbound::DeviceWarning(text) => self.warn(None, format!("this device: {text}")),
         }
     }
@@ -386,7 +395,11 @@ impl Session {
             | Event::Left { group, .. }
             | Event::Removed { group, .. }
             | Event::Settings { group, .. }
-            | Event::Edited { group, .. }
+            | Event::Live { group, .. }
+            | Event::Frame { group, .. }
+            | Event::InStep { group, .. }
+            | Event::State { group, .. }
+            | Event::Snapshot { group, .. }
             | Event::Introduced { group, .. }
             | Event::Held { group, .. }
             | Event::Refused { group, .. } => Some(group.clone()),
@@ -415,7 +428,7 @@ impl Session {
             }
             Event::Removed { group, by } => {
                 let by = by.map(|by| self.describe(&group, &by)).transpose()?;
-                self.drop_group(&group)?;
+                self.drop_group(&group).await?;
                 self.outbox.deliver(json!({ "type": "removed", "group": b64(&group.0), "by": by }), true);
             }
             Event::Settings { group, settings, by } => {
@@ -423,10 +436,34 @@ impl Session {
                 self.outbox.deliver(item, true);
                 self.refresh_opening(&group).await?;
             }
-            Event::Message(message) => self.received(message).await?,
-            Event::Edited { group, .. } => {
-                if let Some(binding) = self.bindings.get_mut(&group) {
-                    binding.quiet.doc_changed(Instant::now());
+            Event::Message(message) if self.node.settings(&message.group.0)?.kind == CHAT => self.received(message).await?,
+            Event::Message(message) => {
+                let from = self.describe(&message.group, &message.sender)?;
+                let item = json!({ "type": "message", "id": hex::encode(&message.id.0), "from": from, "payload": message.payload, "held": true });
+                self.tell_plugin(&message.group, item).await?;
+            }
+            Event::Live { group, sender, payload } => {
+                let item = json!({ "type": "message", "from": self.describe(&group, &sender)?, "payload": payload, "held": false });
+                self.tell_plugin(&group, item).await?;
+            }
+            Event::Frame { group, from, frame } => {
+                let item = json!({ "type": "frame", "from": self.describe(&group, &from)?, "frame": frame });
+                self.tell_plugin(&group, item).await?;
+            }
+            Event::InStep { group, member } => {
+                let item = json!({ "type": "synced", "member": self.describe(&group, &member)? });
+                self.tell_plugin(&group, item).await?;
+            }
+            Event::State { group, from, data } => {
+                let item = json!({ "type": "state", "from": self.describe(&group, &from)?, "data": Bytes(data) });
+                self.tell_plugin(&group, item).await?;
+            }
+            Event::Snapshot { group, reply } => {
+                if let Some(kind) = self.kind_of.get(&group).cloned() {
+                    self.asked += 1;
+                    self.snapshots.insert((kind.clone(), self.asked), reply);
+                    let asked = json!({ "type": "snapshot", "id": self.asked, "group": b64(&group.0) });
+                    self.plugins.send(&kind, &asked).await?;
                 }
             }
             Event::Introduced { group, by, identity, name, how } => self.introduced(&group, &by, identity, name, how)?,
@@ -453,7 +490,8 @@ impl Session {
             Some(label) => label,
             None => self.display_name(&claim)?,
         };
-        self.node.send(&gid.0, &Payload::Introduce { identity: claim.identity, name, how, to: Vec::new() }).await?;
+        let introduce = Control::Introduce { identity: claim.identity, name, how, to: Vec::new() };
+        self.node.send(&gid.0, &serde_json::to_value(introduce)?, false).await?;
         Ok(())
     }
 
@@ -481,10 +519,10 @@ impl Session {
             return crate::cli::exchange(channel.context("no session process acts for this device")?, request).await;
         }
         match request {
-            Request::Invite { group, kind, name, file, keep, membership, as_, for_, to, qr: _, identity } => {
-                self.invite(group, kind, name, file, keep, membership, as_, for_, to, identity).await
+            Request::Invite { group, kind, name, args, cwd, keep, membership, as_, for_, to, qr: _, identity } => {
+                self.invite(group, kind, name, (args, cwd), keep, membership, as_, for_, to, identity).await
             }
-            Request::Join { target, file, as_ } => self.join(target, file, as_).await,
+            Request::Join { target, args, cwd, as_ } => self.join(target, (args, cwd), as_).await,
             Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
                 self.send(group, to, reply_to, urgent, attach.map(|data| (data, attach_name)), text).await
             }
@@ -492,6 +530,13 @@ impl Session {
             Request::Members { group } => {
                 let gid = self.resolve(group)?;
                 Ok(json!({ "group": b64(&gid.0), "kind": self.node.settings(&gid.0)?.kind, "members": self.described_members(&gid)? }))
+            }
+            Request::Kind { kind, args, cwd } => {
+                if !self.plugins.is_running(&kind) {
+                    let dir = self.kind_dir(&kind);
+                    self.plugins.start(&kind, &dir).await?;
+                }
+                self.ask(&kind, json!({ "type": "command", "args": args, "cwd": cwd })).await
             }
             Request::Groups => self.groups(),
             Request::Remove { group, member } => {
@@ -523,15 +568,6 @@ impl Session {
                 self.refresh_opening(&gid).await?;
                 Ok(json!({ "group": b64(&gid.0), "settings": settings }))
             }
-            Request::Attach { group, path } => {
-                let gid = self.of_kind(group, Kind::Doc)?;
-                let bytes = std::fs::read(&path).with_context(|| format!("cannot read {path}"))?;
-                let name = Path::new(&path).file_name().map_or_else(String::new, |n| n.to_string_lossy().replace(['[', ']'], ""));
-                let image = image_type(&bytes).is_some();
-                let link = self.node.add_file(&gid.0, bytes).await?.link();
-                let markdown = format!("{}[{name}]({link})", if image { "!" } else { "" });
-                Ok(json!({ "link": link, "markdown": markdown }))
-            }
             Request::Fetch { .. } => unreachable!("answered by fetch"),
             Request::Status => self.status(),
             Request::Identity { op } => self.identity(op).await,
@@ -557,7 +593,7 @@ impl Session {
         group: Option<String>,
         kind: String,
         name: Option<String>,
-        file: Option<String>,
+        (args, cwd): (Vec<String>, String),
         keep: u32,
         membership: Option<String>,
         as_: Option<String>,
@@ -565,14 +601,8 @@ impl Session {
         to: Option<String>,
         identity: Option<String>,
     ) -> Result<Value> {
-        let kind = if kind == "doc" { Kind::Doc } else { Kind::Chat };
-        ensure!(file.is_none() || kind == Kind::Doc, "only a doc has a file: invite --kind doc <file>");
-        // Two docs in one file would pass each one's text to the other's members.
-        if let Some(file) = &file
-            && self.bindings.values().any(|b| b.path == Path::new(file))
-        {
-            bail!("{file} already holds another doc");
-        }
+        ensure!(kind == CHAT || self.plugins.found.contains_key(&kind), "this session has no plugin for {kind} groups (letmeknow-kind-{kind})");
+        ensure!(args.is_empty() || kind != CHAT || group.is_some(), "a chat takes no arguments");
         let to = to.map(|to| self.contact(&to)).transpose()?;
         ensure!(
             for_.is_none() || !self.identities()?.is_empty(),
@@ -593,7 +623,7 @@ impl Session {
                         let as_ = self.speaking_as(as_)?;
                         let settings = Settings {
                             protocol: PROTOCOL,
-                            kind,
+                            kind: kind.clone(),
                             name: name.unwrap_or_default(),
                             open: Vec::new(),
                             keep,
@@ -601,7 +631,18 @@ impl Session {
                             devices_of: None,
                             openings: Vec::new(),
                         };
-                        self.create(settings, as_, file).await?
+                        let gid = self.node.create(settings, as_)?;
+                        if kind != CHAT {
+                            match self.open_kind(&gid, Some(("invite", args, cwd))).await {
+                                Ok(opened) => merge(&mut answer, opened),
+                                Err(error) => {
+                                    self.node.leave(&gid.0).await?;
+                                    self.drop_group(&gid).await?;
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        gid
                     }
                 };
                 let settings = self.node.settings(&gid.0)?;
@@ -609,9 +650,6 @@ impl Session {
                 answer["kind"] = json!(settings.kind);
                 if !settings.name.is_empty() {
                     answer["name"] = json!(settings.name);
-                }
-                if let Some(binding) = self.bindings.get(&gid) {
-                    answer["file"] = json!(binding.path);
                 }
                 self.node.invite(Target::Group(gid.0), for_.clone(), to.as_ref().map(|to| to.0.clone()))?
             }
@@ -626,20 +664,10 @@ impl Session {
         Ok(answer)
     }
 
-    async fn create(&mut self, settings: Settings, as_: Option<IdentityRef>, file: Option<String>) -> Result<Bytes> {
-        let doc = settings.kind == Kind::Doc;
-        let gid = self.node.create(settings, as_)?;
-        if doc {
-            self.bind(&gid, file, "")?;
-            self.sync(&gid).await?;
-        }
-        Ok(gid)
-    }
-
     async fn leave(&mut self, group: Option<String>) -> Result<Value> {
         let gid = self.resolve(group)?;
         let Some(delivery) = self.node.leave(&gid.0).await? else {
-            self.drop_group(&gid)?;
+            self.drop_group(&gid).await?;
             return Ok(json!({ "group": b64(&gid.0), "left": true }));
         };
         let mut answer = json!({ "group": b64(&gid.0), "left": true, "status": "another member commits the removal" });
@@ -649,16 +677,13 @@ impl Session {
         Ok(answer)
     }
 
-    /// Clears what the session kept of a group the node has left.
-    fn drop_group(&mut self, gid: &Bytes) -> Result<()> {
-        // A file the agent named stays; one in the session's state goes with the group.
-        if let Some(binding) = self.bindings.remove(gid)
-            && binding.path.starts_with(self.config.dir.join("docs"))
-            && binding.path.exists()
-        {
-            std::fs::remove_file(&binding.path)?;
+    /// Clears what the session kept of a group the node has left, and tells its kind's plugin.
+    async fn drop_group(&mut self, gid: &Bytes) -> Result<()> {
+        self.infos.remove(gid);
+        if let Some(kind) = self.kind_of.remove(gid) {
+            self.plugins.send(&kind, &json!({ "type": "gone", "group": b64(&gid.0) })).await?;
         }
-        for table in ["taken", "bindings", "carrying", "attachments"] {
+        for table in ["taken", "attachments"] {
             self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [&gid.0])?;
         }
         let attachments = self.attachments_dir(gid);
@@ -682,8 +707,8 @@ impl Session {
             if !settings.open.is_empty() {
                 group["open"] = json!(settings.open);
             }
-            if let Some(binding) = self.bindings.get(&gid) {
-                group["file"] = json!(binding.path);
+            if let Some(info) = self.infos.get(&gid) {
+                merge(&mut group, info.clone());
             }
             groups.push(group);
         }
@@ -741,27 +766,25 @@ impl Session {
         }
     }
 
-    /// The group a chat or doc command acts on: the one --group names, which must be of `kind`, or else the session's
-    /// one group of that kind.
-    fn of_kind(&self, group: Option<String>, kind: Kind) -> Result<Bytes> {
-        let name = if kind == Kind::Doc { "doc" } else { "chat" };
+    /// The chat a command acts on: the one --group names, or else the session's one chat.
+    fn chat(&self, group: Option<String>) -> Result<Bytes> {
         if group.is_some() {
             let gid = self.resolve(group)?;
-            ensure!(self.node.settings(&gid.0)?.kind == kind, "{} is not a {name}", b64(&gid.0));
+            ensure!(self.node.settings(&gid.0)?.kind == CHAT, "{} is not a chat", b64(&gid.0));
             return Ok(gid);
         }
         let found: Vec<Bytes> =
-            self.node.groups().into_iter().filter(|gid| self.node.settings(&gid.0).is_ok_and(|s| s.kind == kind)).collect();
+            self.node.groups().into_iter().filter(|gid| self.node.settings(&gid.0).is_ok_and(|s| s.kind == CHAT)).collect();
         match &found[..] {
             [gid] => Ok(gid.clone()),
-            [] => bail!("this session is in no {name}; create one with `invite --kind {name}`, or join one with `join`"),
-            _ => bail!("this session is in several {name}s; pass --group"),
+            [] => bail!("this session is in no chat; create one with `invite`, or join one with `join`"),
+            _ => bail!("this session is in several chats; pass --group"),
         }
     }
 
     // Joins.
 
-    async fn join(&mut self, target: String, file: Option<String>, as_: Option<String>) -> Result<Value> {
+    async fn join(&mut self, target: String, (args, cwd): (Vec<String>, String), as_: Option<String>) -> Result<Value> {
         let as_ = self.speaking_as(as_)?;
         let gid = if target.contains('#') {
             let invite = Invite::parse(target.trim())?;
@@ -780,10 +803,14 @@ impl Session {
         };
         let settings = self.node.settings(&gid.0)?;
         let mut answer = json!({ "group": b64(&gid.0), "kind": settings.kind, "name": settings.name, "members": self.described_members(&gid)? });
-        if settings.kind == Kind::Doc {
-            // The file starts with the doc's text, so the changes in it are not told as edits.
-            let text = ydoc::text(&self.node.doc_edits(&gid.0)?.0)?;
-            answer["file"] = json!(self.bind(&gid, file, &text)?);
+        if settings.kind != CHAT {
+            match self.open_kind(&gid, Some(("join", args, cwd))).await {
+                Ok(opened) => merge(&mut answer, opened),
+                Err(error) => {
+                    self.node.leave(&gid.0).await?;
+                    return Err(error);
+                }
+            }
         }
         Ok(answer)
     }
@@ -799,7 +826,7 @@ impl Session {
         attach: Option<(String, String)>,
         text: String,
     ) -> Result<Value> {
-        let gid = self.of_kind(group, Kind::Chat)?;
+        let gid = self.chat(group)?;
         let mut addressed: Vec<Member> = Vec::new();
         for to in to {
             for member in self.addressed(&gid, &to)? {
@@ -823,7 +850,7 @@ impl Session {
             }
             None => None,
         };
-        let payload = Payload::Message {
+        let payload = ChatMessage {
             content: text,
             after: self.tips(&gid)?.into_iter().map(|id| Bytes(id.to_vec())).collect(),
             to: addressed.iter().map(|m| Bytes(Sha256::digest(&m.key.0)[..8].to_vec())).collect(),
@@ -831,7 +858,7 @@ impl Session {
             urgent,
             attachment: attachment.as_ref().map(|(_, a)| a.clone()),
         };
-        let (id, delivery) = self.node.send(&gid.0, &payload).await?;
+        let (id, delivery) = self.node.send(&gid.0, &serde_json::to_value(payload)?, true).await?;
         self.db.execute("INSERT OR IGNORE INTO taken (id, gid, seen) VALUES (?, ?, 1)", params![id.0, gid.0])?;
         let mut answer = json!({ "id": hex::encode(&id.0) });
         if !addressed.is_empty() {
@@ -892,14 +919,17 @@ impl Session {
         Ok(found.remove(0))
     }
 
-    /// A chat message the node took in: it waits for those it comes after.
+    /// A chat message the node took in: the file it attaches is held, and it waits for those it comes after.
     async fn received(&mut self, message: lmk_node::Message) -> Result<()> {
         let id: [u8; 32] = message.id.0.as_slice().try_into()?;
         if self.taken(&id)? || self.waiting.iter().any(|w| w.id == id) {
             return Ok(());
         }
         let sender = self.describe(&message.group, &message.sender)?;
-        let payload = serde_json::to_value(&message.payload)?;
+        let payload = message.payload;
+        if let Some(link) = payload["attachment"]["link"].as_str() {
+            self.node.hold(&message.group.0, &[link.to_owned()])?;
+        }
         // A message waits for those it comes after, unless this session gave them up: then it shows the gap.
         if self.missing(&payload)?.iter().all(|missing| self.node.given_up(&message.group.0, missing)) {
             self.take_message(&message.group, id, sender, payload).await
@@ -998,8 +1028,8 @@ impl Session {
             self.node.messages(&gid.0)?.into_iter().filter(|m| self.seen(&m.id.0).unwrap_or(false)).collect();
         let mut covered = HashSet::new();
         for message in &seen {
-            if let Payload::Message { after, .. } = &message.payload {
-                covered.extend(after.iter().map(|id| id.0.clone()));
+            if let Ok(chat) = serde_json::from_value::<ChatMessage>(message.payload.clone()) {
+                covered.extend(chat.after.into_iter().map(|id| id.0));
             }
         }
         Ok(seen.into_iter().filter(|m| !covered.contains(&m.id.0)).filter_map(|m| m.id.0.try_into().ok()).collect())
@@ -1010,8 +1040,10 @@ impl Session {
         let Some(message) = self.node.message(id)? else { return Ok(()) };
         self.db.execute("INSERT OR IGNORE INTO taken (id, gid) VALUES (?, ?)", params![id, message.group.0])?;
         self.db.execute("UPDATE taken SET seen = 1 WHERE id = ?", [id])?;
-        if !self.config.keep_log {
-            self.node.redact(id)?;
+        if !self.config.keep_log && message.payload["type"] == "message" {
+            let mut payload = message.payload;
+            payload["content"] = json!("");
+            self.node.redact(id, payload)?;
         }
         Ok(())
     }
@@ -1030,14 +1062,12 @@ impl Session {
                     ensure!(depth > 0, "unknown message {}", hex::encode(id));
                     continue;
                 };
-                let payload = serde_json::to_value(&message.payload)?;
+                let Ok(chat) = serde_json::from_value::<ChatMessage>(message.payload.clone()) else { continue };
                 let from = self.describe(&message.group, &message.sender)?;
-                found.push(self.message_json(&message.group, id, from, &payload, false)?);
+                found.push(self.message_json(&message.group, id, from, &message.payload, false)?);
                 self.mark_seen(&id)?;
-                if let Payload::Message { after, .. } = &message.payload {
-                    for after in after {
-                        next.push(after.0.as_slice().try_into().ok().context("a message id is 32 bytes")?);
-                    }
+                for after in chat.after {
+                    next.push(after.0.as_slice().try_into().ok().context("a message id is 32 bytes")?);
                 }
             }
             level = next;
@@ -1083,6 +1113,12 @@ impl Session {
             let item = json!({ "type": "attachment", "group": b64(&gid.0), "message": hex::encode(&message), "name": name, "path": path });
             self.outbox.deliver(item, wakes);
         }
+        let (done, fetches): (Vec<KindFetch>, _) = std::mem::take(&mut self.kind_fetches).into_iter().partition(|f| f.link.hash == hash);
+        self.kind_fetches = fetches;
+        for fetch in done {
+            let data = self.node.file(&fetch.link).await?.context("an arrived file is held")?;
+            self.plugins.send(&fetch.kind, &json!({ "type": "answer", "id": fetch.id, "answer": { "data": Bytes(data) } })).await?;
+        }
         let (done, fetches): (Vec<Fetch>, _) = std::mem::take(&mut self.fetches).into_iter().partition(|f| f.hash == hash);
         self.fetches = fetches;
         for fetch in done {
@@ -1121,135 +1157,251 @@ impl Session {
         Ok(())
     }
 
-    /// The group whose messages or doc link `link`, and the file's name if a message attached it.
+    /// The group whose chat messages or kind link `link`, and the file's name if a message attached it.
     fn linking(&self, link: &str) -> Result<Option<(Bytes, Option<String>)>> {
         for gid in self.node.groups() {
             for message in self.node.messages(&gid.0)? {
-                if let Payload::Message { attachment: Some(attachment), .. } = &message.payload
-                    && attachment.link == link
-                {
-                    return Ok(Some((gid, Some(attachment.name.clone()))));
+                if message.payload["attachment"]["link"] == link {
+                    return Ok(Some((gid, message.payload["attachment"]["name"].as_str().map(str::to_owned))));
                 }
             }
-            if self.node.settings(&gid.0)?.kind == Kind::Doc && ydoc::text(&self.node.doc(&gid.0)?)?.contains(link) {
+            if self.node.linked(&gid.0).iter().any(|linked| linked.link() == link) {
                 return Ok(Some((gid, None)));
             }
         }
         Ok(None)
     }
 
-    // Docs.
+    // Kinds' plugins.
 
-    /// Keeps `file` (or a new one in the session's state) in step with the doc `gid`, from `base`, the text both have
-    /// now. The file is created holding it unless it exists; one that exists brings its text in at the next sync.
-    fn bind(&mut self, gid: &Bytes, file: Option<String>, base: &str) -> Result<PathBuf> {
-        let path = match file {
-            Some(file) => PathBuf::from(file),
-            None => {
-                let name: String =
-                    self.node.settings(&gid.0)?.name.chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
-                let name = Some(name.trim_matches('-')).filter(|name| !name.is_empty()).unwrap_or("doc");
-                self.config.dir.join("docs").join(format!("{name}-{}.md", &hex::encode(&gid.0)[..8]))
-            }
-        };
-        if !path.exists() {
-            doc::write_file(&path, base)?;
-        }
-        self.db.execute(
-            "INSERT INTO bindings (gid, path, base) VALUES (?, ?, ?)",
-            params![gid.0, path.to_str().context("path is not UTF-8")?, base],
-        )?;
-        self.follow(gid, path.clone());
-        Ok(path)
+    /// Where a kind's plugin keeps its state.
+    fn kind_dir(&self, kind: &str) -> PathBuf {
+        self.config.dir.join("kinds").join(kind)
     }
 
-    /// Watches a doc's file, which is brought into step once it has been quiet for a moment.
-    fn follow(&mut self, gid: &Bytes, path: PathBuf) {
-        let (inbound, changed, name) = (self.inbound.clone(), gid.clone(), path.file_name().map(OsStr::to_owned));
-        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            if let Ok(event) = event
-                && !event.kind.is_access()
-                && event.paths.iter().any(|p| p.file_name() == name.as_deref())
-            {
-                let _ = inbound.send(Inbound::FileChanged(changed.clone()));
-            }
-        })
-        .and_then(|mut watcher| watcher.watch(path.parent().expect("a file is in a directory"), RecursiveMode::NonRecursive).map(|()| watcher));
-        if let Err(error) = &watcher {
-            self.warn(Some(gid), format!("cannot watch {}: {error}; what you write there is taken at your next command", path.display()));
+    /// Tells a group's kind's plugin of the group, starting the plugin if need be: with `args` from `invite` or `join`,
+    /// or with a doc 0.10 kept. Returns the plugin's answer, when it is asked one.
+    async fn open_kind(&mut self, gid: &Bytes, args: Option<(&str, Vec<String>, String)>) -> Result<Value> {
+        let settings = self.node.settings(&gid.0)?;
+        let kind = settings.kind.clone();
+        if !self.plugins.is_running(&kind) {
+            self.plugins.start(&kind, &self.kind_dir(&kind)).await?;
         }
-        let binding = Binding { path, _watcher: watcher.ok(), quiet: Quiet::default(), since: String::new() };
-        self.bindings.insert(gid.clone(), binding);
+        self.kind_of.insert(gid.clone(), kind.clone());
+        let me = self.describe_key(gid, &self.node.key());
+        let mut message = json!({ "type": "group", "group": b64(&gid.0), "settings": settings, "me": me });
+        let legacy = self.legacy(gid)?;
+        if let Some(import) = &legacy {
+            message["import"] = import.clone();
+        }
+        let asked = args.is_some() || legacy.is_some();
+        if let Some((command, args, cwd)) = args {
+            message["command"] = json!(command);
+            message["args"] = json!(args);
+            message["cwd"] = json!(cwd);
+        }
+        if !asked {
+            self.plugins.send(&kind, &message).await?;
+            return Ok(json!({}));
+        }
+        let answer = self.ask(&kind, message).await?;
+        if legacy.is_some() {
+            self.forget_legacy(gid)?;
+        }
+        Ok(answer)
     }
 
-    /// Brings a doc and its file into step. What changed in the file since they last were (its base) is carried line by
-    /// line onto the doc as it is now and sent; the file then gets the doc's text. A line both changed keeps the doc's
-    /// version, with a warning. What others changed in the doc meanwhile is told as `edited`.
-    async fn sync(&mut self, gid: &Bytes) -> Result<()> {
-        let binding = self.bindings.get_mut(gid).expect("a doc is bound");
-        binding.quiet = Quiet::default();
-        let path = binding.path.clone();
-        let base: String = self.db.query_row("SELECT base FROM bindings WHERE gid = ?", [&gid.0], |r| r.get(0))?;
-        let file = match std::fs::read_to_string(&path) {
-            Ok(text) => text.replace("\r\n", "\n"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => base.clone(),
-            Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    fn legacy_tables(&self) -> Result<bool> {
+        Ok(self.db.query_row("SELECT count(*) FROM sqlite_master WHERE name = 'bindings'", [], |r| r.get::<_, i64>(0))? > 0)
+    }
+
+    /// A doc as 0.10 kept it, before the doc plugin did: its state, and its file's binding, which the plugin imports.
+    fn legacy(&self, gid: &Bytes) -> Result<Option<Value>> {
+        if self.node.settings(&gid.0)?.kind != "doc" {
+            return Ok(None);
+        }
+        let state = self.node.legacy_doc(&gid.0)?;
+        let tables = self.legacy_tables()?;
+        let binding: Option<(String, String)> = match tables {
+            true => self.db.query_row("SELECT path, base FROM bindings WHERE gid = ?", [&gid.0], |r| Ok((r.get(0)?, r.get(1)?))).optional()?,
+            false => None,
         };
-        let (state, editors) = self.node.doc_edits(&gid.0)?;
-        let current = ydoc::text(&state)?;
-        let (text, lost) = if file == base { (current.clone(), Vec::new()) } else { doc::rebase(&base, &file, &current) };
-        if text != current {
-            let edit = ydoc::edit(&state, &text)?;
-            self.db.execute("INSERT OR REPLACE INTO carrying (gid, file, edit) VALUES (?, ?, ?)", params![gid.0, file, edit])?;
-            self.node.edit(&gid.0, edit).await?;
+        if state.is_none() && binding.is_none() {
+            return Ok(None);
         }
-        if text != file {
-            doc::write_file(&path, &text)?;
+        let mut import = json!({});
+        if let Some(state) = state {
+            import["state"] = json!(Bytes(state));
         }
-        self.set_base(gid, &text)?;
-        if !lost.is_empty() {
-            let text = format!("others changed these lines of {} meanwhile, so your changes to them were not kept: {}", path.display(), lost.join(" | "));
-            self.warn(Some(gid), text);
+        if let Some((path, base)) = binding {
+            let carrying: Option<(String, Vec<u8>)> =
+                self.db.query_row("SELECT file, edit FROM carrying WHERE gid = ?", [&gid.0], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            let made = Path::new(&path).starts_with(self.config.dir.join("docs"));
+            let carrying = carrying.map(|(file, edit)| json!({ "file": file, "edit": Bytes(edit) }));
+            import = json!({ "state": import["state"], "path": path, "base": base, "made": made, "carrying": carrying });
         }
-        if current != base {
-            // One `edited` event per doc waits, telling of every change since the agent was last told.
-            let group = b64(&gid.0);
-            let mut by: Vec<Value> = editors.iter().map(|e| self.describe(gid, e)).collect::<Result<_>>()?;
-            match self.outbox.take_edited(&group) {
-                Some(waited) => {
-                    for editor in waited["by"].as_array().expect("edited lists its editors") {
-                        if !by.iter().any(|e| e["fp"] == editor["fp"]) {
-                            by.push(editor.clone());
-                        }
-                    }
-                }
-                None => self.bindings.get_mut(gid).expect("a doc is bound").since = base.clone(),
+        Ok(Some(import))
+    }
+
+    fn forget_legacy(&self, gid: &Bytes) -> Result<()> {
+        self.node.forget_legacy_doc(&gid.0)?;
+        if self.legacy_tables()? {
+            for table in ["bindings", "carrying"] {
+                self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [&gid.0])?;
             }
-            let me = self.describe_key(gid, &self.node.key());
-            let lines = doc::changed(&self.bindings[gid].since, &current).0;
-            let direct = doc::changed(&base, &current).1.iter().any(|line| mentions(line, &me));
-            let item = json!({ "type": "edited", "group": group, "file": path, "by": by, "lines": lines, "direct": direct });
-            let wakes = wakes(&item, |_| false);
-            self.outbox.deliver(item, wakes);
         }
         Ok(())
     }
 
-    /// Records the text a doc and its file have in common, once the file's changes are on the doc.
-    fn set_base(&self, gid: &Bytes, base: &str) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
-        tx.execute("UPDATE bindings SET base = ? WHERE gid = ?", params![base, gid.0])?;
-        tx.execute("DELETE FROM carrying WHERE gid = ?", [&gid.0])?;
-        Ok(tx.commit()?)
+    /// Sends a plugin a message about one of its groups, if it runs.
+    async fn tell_plugin(&mut self, gid: &Bytes, mut message: Value) -> Result<()> {
+        let Some(kind) = self.kind_of.get(gid).cloned() else { return Ok(()) };
+        message["group"] = json!(b64(&gid.0));
+        self.plugins.send(&kind, &message).await
     }
 
-    async fn sync_all(&mut self) {
-        let gids: Vec<Bytes> = self.bindings.keys().cloned().collect();
-        for gid in gids {
-            if let Err(error) = self.sync(&gid).await {
-                self.warn(Some(&gid), format!("{error:#}"));
+    /// Asks a plugin, and takes in what it and the others send meanwhile, until it answers.
+    async fn ask(&mut self, kind: &str, mut message: Value) -> Result<Value> {
+        self.asked += 1;
+        let id = self.asked;
+        message["id"] = json!(id);
+        self.plugins.send(kind, &message).await?;
+        let deadline = Instant::now() + ASK_WAIT;
+        loop {
+            let next = tokio::time::timeout_at(deadline, self.plugin_lines.recv()).await;
+            let (from, line) = next.ok().flatten().with_context(|| format!("the {kind} plugin did not answer"))?;
+            match &line {
+                Some(line) if from == kind && line["type"] == "answer" && line["id"] == id => {
+                    return match &line["error"] {
+                        Value::Null => Ok(line["answer"].clone()),
+                        error => bail!("{}", error.as_str().unwrap_or_default()),
+                    };
+                }
+                None if from == kind => {
+                    Box::pin(self.plugin_line(from, line)).await;
+                    bail!("the {kind} plugin stopped");
+                }
+                _ => Box::pin(self.plugin_line(from, line)).await,
             }
         }
+    }
+
+    /// Brings every plugin into step, as before the session prints or runs a command.
+    async fn sync_kinds(&mut self) {
+        for kind in self.plugins.running() {
+            if let Err(error) = self.ask(&kind, json!({ "type": "sync" })).await {
+                self.warn(None, format!("{error:#}"));
+            }
+        }
+    }
+
+    /// A line a plugin wrote, or `None` once it stopped, when it is started again.
+    pub async fn plugin_line(&mut self, kind: String, line: Option<Value>) {
+        let Some(message) = line else {
+            self.plugins.stopped(&kind);
+            self.warn(None, format!("the {kind} plugin stopped; starting it again"));
+            let restarted = async {
+                self.plugins.start(&kind, &self.kind_dir(&kind)).await?;
+                let gids: Vec<Bytes> = self.kind_of.iter().filter(|(_, k)| **k == kind).map(|(gid, _)| gid.clone()).collect();
+                for gid in gids {
+                    self.open_kind(&gid, None).await?;
+                }
+                anyhow::Ok(())
+            };
+            if let Err(error) = restarted.await {
+                self.warn(None, format!("{error:#}"));
+            }
+            return;
+        };
+        if let Err(error) = self.carry_out(&kind, &message).await {
+            match message.get("id") {
+                Some(id) if message["type"] != "answer" => {
+                    let _ = self.plugins.send(&kind, &json!({ "type": "answer", "id": id, "error": format!("{error:#}") })).await;
+                }
+                _ => {
+                    let gid = message["group"].as_str().and_then(|g| URL_SAFE_NO_PAD.decode(g).ok()).map(Bytes);
+                    self.warn(gid.as_ref(), format!("the {kind} plugin: {error:#}"));
+                }
+            }
+        }
+    }
+
+    /// Carries out what a plugin asks, through its groups' channels.
+    async fn carry_out(&mut self, kind: &str, message: &Value) -> Result<()> {
+        let group = || -> Result<Bytes> {
+            let gid = Bytes(URL_SAFE_NO_PAD.decode(message["group"].as_str().context("no group")?)?);
+            ensure!(self.kind_of.get(&gid).is_some_and(|k| k == kind), "not a {kind} group of this session");
+            Ok(gid)
+        };
+        let to = message["to"].as_str();
+        let reply = |answer: Value| json!({ "type": "answer", "id": message["id"], "answer": answer });
+        match message["type"].as_str().unwrap_or_default() {
+            "send" if message["held"] == true => {
+                let gid = group()?;
+                let (id, delivery) = self.node.send(&gid.0, &message["payload"], true).await?;
+                if message.get("id").is_some() {
+                    let held_by: Vec<Value> = delivery.held.iter().map(|m| self.describe(&gid, m)).collect::<Result<_>>()?;
+                    let refused: Vec<Value> = delivery
+                        .refused
+                        .iter()
+                        .map(|(member, reason)| Ok(json!({ "member": self.describe(&gid, member)?, "reason": reason })))
+                        .collect::<Result<_>>()?;
+                    let answer = json!({ "id": hex::encode(&id.0), "held_by": held_by, "refused": refused, "pending": delivery.held.is_empty() });
+                    self.plugins.send(kind, &reply(answer)).await?;
+                }
+            }
+            "send" => self.node.send_live(&group()?.0, &message["payload"], to)?,
+            "frame" => self.node.frame(&group()?.0, to.context("a frame goes to a member")?, message["frame"].clone())?,
+            "add" => {
+                let data = serde_json::from_value::<Bytes>(message["data"].clone())?.0;
+                let link = self.node.add_file(&group()?.0, data).await?;
+                self.plugins.send(kind, &reply(json!({ "link": link.link() }))).await?;
+            }
+            "hold" => self.node.hold(&group()?.0, &serde_json::from_value::<Vec<String>>(message["links"].clone())?)?,
+            "links" => self.node.set_links(&group()?.0, serde_json::from_value(message["links"].clone())?)?,
+            "fetch" => {
+                let gid = group()?;
+                let link = FileLink::parse(message["link"].as_str().context("no link")?)?;
+                ensure!(self.node.linked(&gid.0).contains(&link), "the group does not link that file");
+                match self.node.file(&link).await? {
+                    Some(data) => self.plugins.send(kind, &reply(json!({ "data": Bytes(data) }))).await?,
+                    None => {
+                        self.node.fetch(&gid.0, link.clone());
+                        let deadline = Instant::now() + FETCH_WAIT;
+                        self.kind_fetches.push(KindFetch { kind: kind.to_owned(), id: message["id"].clone(), link, deadline });
+                    }
+                }
+            }
+            "state" => {
+                let data = serde_json::from_value::<Bytes>(message["data"].clone())?.0;
+                self.node.hand_state(&group()?.0, to.context("a state goes to a member")?, data).await?;
+            }
+            "event" => {
+                let gid = group()?;
+                let event = message["event"].as_object().context("no event")?;
+                if event.get("type") == Some(&json!("warning")) {
+                    self.warn(Some(&gid), event.get("text").and_then(Value::as_str).unwrap_or_default().to_owned());
+                    return Ok(());
+                }
+                let mut item = json!({ "group": b64(&gid.0) });
+                merge(&mut item, Value::Object(event.clone()));
+                if let Some(key) = message["key"].as_str() {
+                    item["printed"] = json!({ "kind": kind, "key": key });
+                    self.outbox.take_keyed(&item["group"], &item["printed"]);
+                }
+                self.outbox.deliver(item, message["wake"] == true);
+            }
+            "info" => _ = self.infos.insert(group()?, message["info"].clone()),
+            "answer" => {
+                let id = message["id"].as_u64().unwrap_or_default();
+                if let Some(reply) = self.snapshots.remove(&(kind.to_owned(), id)) {
+                    let data = message["answer"]["data"].as_str().and_then(|data| URL_SAFE_NO_PAD.decode(data).ok());
+                    let _ = reply.send(data);
+                }
+            }
+            other => bail!("unknown message {other:?}"),
+        }
+        Ok(())
     }
 
     // Members, identities and contacts.
@@ -1371,8 +1523,8 @@ impl Session {
         ensure!(known["how"] != "unknown", "you can introduce only your contacts and your own identities");
         let name = known["name"].as_str().unwrap_or_default().to_owned();
         let to_fp = Bytes(Sha256::digest(&to.key.0)[..8].to_vec());
-        let payload = Payload::Introduce { identity: claim.identity.clone(), name: name.clone(), how: How::Introduce, to: vec![to_fp] };
-        let (id, _) = self.node.send(&gid.0, &payload).await?;
+        let payload = Control::Introduce { identity: claim.identity.clone(), name: name.clone(), how: How::Introduce, to: vec![to_fp] };
+        let (id, _) = self.node.send(&gid.0, &serde_json::to_value(payload)?, false).await?;
         Ok(json!({ "id": hex::encode(&id.0), "group": b64(&gid.0), "identity": { "id": claim.identity.id, "name": name }, "to": self.describe(&gid, &to)? }))
     }
 
@@ -1504,6 +1656,7 @@ impl Session {
     }
 
     pub async fn shutdown(&self) {
+        // Plugins stop with the session: their stdin closes when it ends.
         let _ = self.node.shutdown().await;
         if let Some(device) = &self.device {
             let _ = device.shutdown().await;
@@ -1528,10 +1681,12 @@ pub async fn run(
     loop {
         session.publish();
         session.emit(&mut print).await;
+        let due = session.next_due();
         tokio::select! {
             Some(item) = inbound.recv() => session.handle(item).await,
             Some(event) = events.recv() => session.event(event).await,
-            _ = tokio::time::sleep_until(session.next_due()) => session.tick().await,
+            Some((kind, line)) = session.plugin_lines.recv() => session.plugin_line(kind, line).await,
+            _ = tokio::time::sleep_until(due) => session.tick().await,
             _ = &mut shutdown => break,
         }
     }

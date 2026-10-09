@@ -1,5 +1,5 @@
 pub mod cli;
-pub mod doc;
+pub mod kinds;
 pub mod policy;
 pub mod session;
 mod store;
@@ -99,13 +99,14 @@ pub async fn listen(
         }
     };
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
-    let node_config = node_config(&network, home, &config.name, false, config.dir.join("files"));
+    let kinds = [lmk_proto::group::CHAT.to_owned()].into_iter().chain(kinds::discover(&config.plugins).into_keys()).collect();
+    let node_config = node_config(&network, home, &config.name, false, config.dir.join("files"), kinds);
     let (node, events) = Node::start(provider, device, node_config).await?;
     let session = session::Session::open(config, node, home, network, inbound).await?;
     session::run(session, queue, events, print, shutdown).await
 }
 
-fn node_config(network: &Network, home: &Path, name: &str, device_key: bool, files: PathBuf) -> lmk_node::Config {
+fn node_config(network: &Network, home: &Path, name: &str, device_key: bool, files: PathBuf, kinds: Vec<String>) -> lmk_node::Config {
     lmk_node::Config {
         name: name.into(),
         device_key,
@@ -116,6 +117,7 @@ fn node_config(network: &Network, home: &Path, name: &str, device_key: bool, fil
         disk: None,
         file_limit: 100 << 20,
         window: Window::default(),
+        kinds,
     }
 }
 
