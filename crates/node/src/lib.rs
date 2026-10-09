@@ -62,7 +62,7 @@ const KEYS_FRESH: u64 = 10 * 60 * 1000;
 const CERTIFICATE_GRACE: u64 = 60 * 1000;
 /// How long a fetch keeps looking for a member that holds the file.
 const FETCH_TRIES: u32 = 12;
-/// How long an inviter waits for the state of a group's kind.
+/// How long a member admitting a joiner waits for the state of the group's kind.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 /// How long a session behind its group's kind log waits before it asks a member for the kind's state again, in
 /// milliseconds.
@@ -274,7 +274,7 @@ struct Rec {
     position: u64,
     items: Vec<Item>,
     /// Messages this session could not open, so that sync does not offer them again, and those from before it joined
-    /// that its inviter held, as of epoch 0.
+    /// that the member that admitted it held, as of epoch 0.
     given_up: Vec<(u64, Bytes)>,
     /// Those it gave up and has not reported to the group yet.
     unreported: Vec<Refusal>,
@@ -1520,7 +1520,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.revoke();
     }
 
-    /// Waits a while for the certificates of added members that speak as identities, which their inviter and they show.
+    /// Waits a while for the certificates of added members that speak as identities, which the member that admitted them and they show.
     async fn await_certificates(&self, gid: &[u8], added: &[core::Member]) {
         let deadline = now() + RECEIPT_WAIT.as_millis() as u64;
         let missing = || {

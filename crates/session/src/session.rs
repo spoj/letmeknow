@@ -147,7 +147,7 @@ pub struct Session {
     kind_of: HashMap<Bytes, String>,
     /// The last id this session gave a request to a plugin.
     asked: u64,
-    /// Inviters' requests for a kind's state, by plugin and request id.
+    /// Admitting members' requests for a kind's state, by plugin and request id.
     snapshots: HashMap<(String, u64), oneshot::Sender<Option<Vec<u8>>>>,
     /// Commands a plugin is carrying out, by plugin and request id.
     commands: HashMap<(String, u64), oneshot::Sender<Value>>,

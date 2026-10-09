@@ -142,7 +142,7 @@ impl Session {
         }
     }
 
-    /// A KeyPackage, as it travels to an inviter. It never expires: the inviter judges freshness.
+    /// A KeyPackage, as it travels to a member that admits it. It never expires: that member judges freshness.
     pub fn key_package<P: Provider>(&self, provider: &P) -> Result<Vec<u8>> {
         let bundle = KeyPackage::builder()
             .leaf_node_capabilities(capabilities())
@@ -153,7 +153,7 @@ impl Session {
     }
 }
 
-/// Validates a KeyPackage as it arrives at an inviter, and returns its credential.
+/// Validates a KeyPackage as it arrives at a member that admits it, and returns its credential.
 pub fn key_package_credential<P: Provider>(provider: &P, key_package: &[u8]) -> Result<Credential> {
     let key_package = key_package_in(provider, key_package)?;
     leaf_credential(key_package.leaf_node())

@@ -1,7 +1,7 @@
 //! The doc kind: one markdown text that every member edits at once, a Yjs document. Its payloads are live, none held:
 //! edits go to the members online; two members that meet compare their docs by a hash of each one's snapshot
 //! (`snapshot`), and if they differ, each sends the other a `diff` against the other's state vector (`sv`), all to that
-//! member alone. An inviter hands a joiner the doc's state. The doc links files as `lmk:` links, which members hold
+//! member alone. Whoever admits a joiner hands it the doc's state. The doc links files as `lmk:` links, which members hold
 //! while it does.
 //!
 //! `Docs` is what every host of the kind does alike, in the plugin protocol (PROTOCOL.md): the session's plugin
