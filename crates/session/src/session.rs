@@ -545,12 +545,19 @@ impl Session {
             if message.sender.key != self.node.key() || message.payload["type"] != "message" {
                 continue;
             }
-            let mut item = json!({ "id": hex::encode(&id.0), "content": message.payload["content"] });
-            if let Some(attachment) = message.payload.get("attachment") {
-                item["attachment"] = attachment.clone();
-                let link = FileLink::parse(attachment["link"].as_str().context("an attachment has a link")?)?;
+            let chat: ChatMessage = serde_json::from_value(message.payload)?;
+            let mut item = json!({ "id": hex::encode(&id.0), "content": chat.content });
+            if !chat.to.is_empty() {
+                item["to"] = json!(chat.to.iter().map(|fp| hex::encode(&fp.0)).collect::<Vec<_>>());
+            }
+            if chat.urgent {
+                item["urgent"] = json!(true);
+            }
+            if let Some(attachment) = chat.attachment {
+                let link = FileLink::parse(&attachment.link)?;
+                item["attachment"] = json!(attachment);
                 if let Some(bytes) = self.node.file(&link).await? {
-                    item["attachment"]["path"] = json!(self.save(gid, &link, attachment["name"].as_str(), &bytes)?);
+                    item["attachment"]["path"] = json!(self.save(gid, &link, Some(&attachment.name), &bytes)?);
                 }
             }
             messages.push(item);
