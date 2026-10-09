@@ -252,14 +252,18 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         let log = st.logs.get_mut(id).unwrap();
         log.logged += fresh.len() as u64;
+        // A joiner's first read anchors its chain: the head it shows its peers is no longer empty, though it took
+        // nothing new, and they sync with it only once it shows the head they do.
+        let anchored = log.chain.is_none() && chain.as_ref().is_some_and(|chain| chain.length() == log.logged);
         if let Some(chain) = chain.filter(|chain| chain.length() == log.logged) {
             log.chain = Some(chain);
         }
         st.save_log(id)?;
-        if fresh.is_empty() {
+        if !fresh.is_empty() {
+            self.check(st, id)?;
+        } else if !anchored {
             return Ok(());
         }
-        self.check(st, id)?;
         if let Some(net) = self.net.get() {
             for gid in st.groups_of(id) {
                 net.changed(&gid);

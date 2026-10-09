@@ -49,3 +49,10 @@ fn a_read_that_overtakes_its_subscription() {
 fn a_replaced_connection_hands_on_what_it_kept() {
     passes_with(140, Options { members: 8, actions: 150 }, &[0, 1, 2, 3, 4, 5, 6, 7, 9, 10]);
 }
+
+/// A joiner offline from its join on showed peers an empty head of the group's log until its first read anchored its
+/// chain, and then, having taken no new entry, told no peer of its head, so no sync started until the resync.
+#[test]
+fn a_first_read_that_takes_no_entry() {
+    passes(4901, &[0, 1, 2, 4, 5, 6, 7, 12, 14, 17, 19, 24, 25, 56]);
+}
