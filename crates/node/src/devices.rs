@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use lmk_core::contacts::Contact;
 use lmk_core::device::{Device, verify};
 use lmk_core::identity::{self, DAY, public};
@@ -22,7 +22,8 @@ use crate::{Event, Node, hex, now};
 
 /// How long an identity keeps a key before a device replaces it, in milliseconds.
 const ROTATE: u64 = 30 * DAY;
-/// How many half seconds a new device waits for its identity's state.
+/// How many half seconds a new device waits for its identity's state, and a device that took another off for the
+/// identity's new key.
 const STATE_WAIT: u32 = 60;
 /// How often a device checks whether a key is due to be replaced.
 const ROTATE_CHECK: Duration = Duration::from_secs(60 * 60);
@@ -236,12 +237,19 @@ impl<P: Provider + Send + 'static> Devices<P> {
         self.enter(&gid.0, Entry::Opening { opening }).await
     }
 
-    /// Takes a device off an identity, and replaces the identity's key, which it held.
+    /// Takes a device off an identity, and replaces the identity's key, which it held, by a key log entry that names
+    /// it: again, once it holds the new key, if another device replaced the key at the same time.
     pub async fn remove(&self, identity: &[u8], device: &[u8]) -> Result<()> {
         ensure!(device != self.device.public(), "a device is taken off its identity by another of its devices");
         let (gid, _) = self.book(identity)?;
         self.node.remove(&gid.0, device).await?;
-        self.rotate(&gid.0).await
+        for _ in 0..STATE_WAIT {
+            if self.rotate(&gid.0, Some(Bytes(device.to_vec()))).await? {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+        bail!("this device does not hold its identity's current key")
     }
 
     /// Holds an entry as a message of the group, and appends it to the group's log.
@@ -254,19 +262,23 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let Some(book) = self.record(gid).book else { return Ok(()) };
         let log = self.node.key_log(&book.identity).await?;
         match book.seed(log.current()) {
-            Some((_, at)) if at + ROTATE <= now() => self.rotate(gid).await,
+            Some((_, at)) if at + ROTATE <= now() => self.rotate(gid, None).await.map(drop),
             _ => Ok(()),
         }
     }
 
-    /// Replaces the identity's key: the new one goes to its devices first, then into its key log, by the current one.
-    async fn rotate(&self, gid: &[u8]) -> Result<()> {
+    /// Replaces the identity's key, because the device with key `revoked` was taken off, if any: the new one goes to
+    /// its devices first, then into its key log, by the current one. Returns whether the key log took it, which it does
+    /// not if this device does not hold the current key yet, or another device replaced it first.
+    async fn rotate(&self, gid: &[u8], revoked: Option<Bytes>) -> Result<bool> {
         let book = self.record(gid).book.context("this device has no state of the identity yet")?;
         let log = self.node.read_key_log(&book.identity).await?;
-        let (current, _) = book.seed(log.current()).context("this device does not hold the identity's current key")?;
-        let next = lmk_core::random::<32>();
-        self.enter(gid, Entry::Key { key: Bytes(next.to_vec()), at: now() }).await?;
-        self.node.append_identity(&book.identity, &log.rotate(&current, &public(&next))).await.map(drop)
+        let Some((current, _)) = book.seed(log.current()) else { return Ok(false) };
+        let seed = lmk_core::random::<32>();
+        let next = public(&seed);
+        self.enter(gid, Entry::Key { key: Bytes(seed.to_vec()), at: now() }).await?;
+        let log = self.node.append_identity(&book.identity, &log.rotate(&current, &next, revoked)).await?;
+        Ok(log.keys.contains(&next))
     }
 
     /// A certificate, for a day, by the identity's newest key, that the session with MLS key `key` and name `name` is
@@ -276,7 +288,8 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let log = self.node.key_log(&book.identity).await?;
         let (seed, _) = book.seed(log.current()).context("this device does not hold its identity's current key yet")?;
         let added_by = self.record(&gid.0).added_by;
-        let certified = Certified { identity: book.identity.id, key, name, device: self.device.name.clone(), added_by, expires: now() + DAY };
+        let device_key = Some(Bytes(self.device.public().to_vec()));
+        let certified = Certified { identity: book.identity.id, key, name, device: self.device.name.clone(), device_key, added_by, expires: now() + DAY };
         Ok(identity::certify(&seed, &certified))
     }
 

@@ -441,7 +441,7 @@ fn credentials_are_checked_not_enforced() {
     w.m[0].session.credential.identity = Some(identity.clone());
     w.m[1].session.credential.identity = Some(identity);
     let a = &w.m[0].session.credential;
-    let certified = Certified { identity: id.into(), key: a.key.clone(), name: a.name.clone(), device: "laptop".into(), added_by: None, expires: DAY };
+    let certified = Certified { identity: id.into(), key: a.key.clone(), name: a.name.clone(), device: "laptop".into(), device_key: None, added_by: None, expires: DAY };
     let certificate = certify(&seed, &certified);
     let m = key_package_credential(&w.m[0].provider, &w.key_package(1)).unwrap();
     assert!(check(Some(&certificate), &m, &log, 0).is_err());

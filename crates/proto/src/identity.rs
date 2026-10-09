@@ -30,6 +30,9 @@ pub struct Body {
     /// In the first entry only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub membership: Option<Service>,
+    /// The key of the device taken off the identity, in an entry that replaces the key because of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked: Option<Bytes>,
 }
 
 /// A certificate's body: an identity's key vouches that a session of one of its devices speaks for it.
@@ -41,6 +44,9 @@ pub struct Certified {
     pub name: String,
     /// The name of the device that certified it.
     pub device: String,
+    /// That device's key in the identity's devices group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_key: Option<Bytes>,
     /// The name of the device that added that device to the identity; none for its first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_by: Option<String>,
