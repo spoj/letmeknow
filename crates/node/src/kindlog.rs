@@ -193,11 +193,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for (position, entry) in (after + 1..).zip(entries) {
             let g = st.groups.get_mut(gid).context("left the group")?;
             let log = g.rec.log.as_mut().unwrap();
-            let (hash, sealed) = (Sha256::digest(&entry.0).to_vec(), core::epoch_of(&entry.0));
-            let taken = match sealed {
-                Ok(epoch) if epoch >= log.epoch => match log.own.iter().position(|(own, _)| own.0 == hash) {
-                    Some(own) => {
-                        let payload = log.own.remove(own).1;
+            let hash = Sha256::digest(&entry.0).to_vec();
+            let own = log.own.iter().position(|(own, _)| own.0 == hash).map(|own| log.own.remove(own).1);
+            let taken = match core::epoch_of(&entry.0) {
+                Ok(epoch) if epoch >= log.epoch => match own {
+                    Some(payload) => {
                         let me = g.mls.members().into_iter().find(|m| m.key == st.session.key());
                         me.and_then(|me| st.member(gid, &me)).map(|from| Entry { position, epoch, from, payload })
                     }
