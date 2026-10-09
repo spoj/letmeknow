@@ -193,19 +193,29 @@ impl Session {
             Frame::Hello { groups, heads } => {
                 let shared = self.shared();
                 let logs = self.logs(&shared);
+                // A session ignores what a hello shows of a group it is not in yet or a log it does not follow yet,
+                // so a hello that shows us a group we had none for, or a log we are behind on, gets ours in return:
+                // the peer forwards and syncs by it.
+                let mut answer = false;
                 for theirs in heads.into_iter().filter(|head| logs.contains(&head.log.0)) {
                     let log = theirs.log.clone();
                     if let Err(e) = self.judge(&log, &theirs) {
                         tracing::warn!("hello from {}: {e:#}", self.peer.fmt_short());
                         continue;
                     }
+                    answer |= theirs.length > self.inner.groups.head(&log.0).length;
                     self.logs.entry(log.clone()).or_default().theirs = Some(theirs);
                     self.forward(&log).await?;
                 }
                 for hello in groups.into_iter().filter(|hello| shared.contains(&hello.group.0)) {
                     let group = hello.group.clone();
-                    self.groups.entry(group.clone()).or_default().theirs = Some(hello);
+                    let state = self.groups.entry(group.clone()).or_default();
+                    answer |= state.theirs.is_none();
+                    state.theirs = Some(hello);
                     self.sync(&group).await?;
+                }
+                if answer {
+                    self.send_hello(&shared).await?;
                 }
             }
             Frame::Entries { log, entries, head } => self.on_entries(log, entries, head).await?,
@@ -412,10 +422,10 @@ impl Session {
                 return Ok(());
             }
         }
-        self.send_hello(std::slice::from_ref(&group.0)).await?;
         for log in logs {
             self.forward(&Bytes(log)).await?;
         }
+        self.send_hello(std::slice::from_ref(&group.0)).await?;
         self.sync(&group).await
     }
 
