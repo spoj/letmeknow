@@ -136,7 +136,7 @@ An opening, in its settings: `{"group", "kind", "name", "membership", "members":
 
 A link is `https://letmeknow.dev/i#<fragment>`, where the fragment is `1.<g|d>.<inviter's iroh key>.<secret>[.<relay>]`: version 1; `g` for a group, `d` for a device link; then the key, a 16-byte random secret and, only if it is not letmeknow.dev's, the relay URL, each in unpadded base64url.
 
-The joiner opens an `invite` stream to the inviter's key and sends `{"secret", "key_package"}`. For a device link, the KeyPackage's credential names the new device's key and name, and no identity: the devices group's `devices_of` names it. The inviter checks the secret (single use, 10 minutes), commits the Add (for a device link: appends to the device list and adds the device to the devices group), and answers `{"welcome", "position", "doc"}`: `position` is the log position of the commit that added the joiner, which reads the entries after it and anchors its chain at the first head it reads, and `doc`, for a doc or a devices group, links its Yjs state as a file (see Files). A wrong or used secret gets `{"refused"}`; with 128 bits there is nothing to guess, so it uses nothing up. Neither does a joiner refused by a link made for another identity. For a device link, the new device's MLS key is its device key.
+The joiner opens an `invite` stream to the inviter's key and sends `{"secret", "key_package"}`. For a device link, the KeyPackage's credential names the new device's key and name, and no identity: the devices group's `devices_of` names it. The inviter checks the secret (single use, 10 minutes), commits the Add (for a device link: appends to the device list and adds the device to the devices group), and answers `{"welcome", "position", "doc", "before"}`: `position` is the log position of the commit that added the joiner, which reads the entries after it and anchors its chain at the first head it reads; `doc`, for a doc or a devices group, links its Yjs state as a file (see Files); and `before` lists the ids of the messages the inviter holds from epochs before the joiner's, which the joiner can never get, so that no message waits for them (see Messages). A wrong or used secret gets `{"refused"}`; with 128 bits there is nothing to guess, so it uses nothing up. Neither does a joiner refused by a link made for another identity. For a device link, the new device's MLS key is its device key.
 
 ## Messages
 
@@ -171,7 +171,7 @@ A `peer` stream joins two sessions that share a group, one stream per pair, kept
 | `{"doc_sv": {"group", "sv"}}` | A Yjs state vector, sent when the snapshots differ; answered by a `diff` message |
 | `{"want": {"group", "files"}}`, `{"have": {"group", "files"}}` | BLAKE3 hashes (see Files) |
 | `{"join": {"group", "key_package"}}` | A request to join an open group, answered by `admitted` or `refused` |
-| `{"admitted": {"group", "admitted": {"welcome", "position", "doc"}}}`, `{"refused": {"group", "refused"}}` | The answer to `join`, as an invite's |
+| `{"admitted": {"group", "admitted": {"welcome", "position", "doc", "before"}}}`, `{"refused": {"group", "refused"}}` | The answer to `join`, as an invite's |
 
 Clients before 0.10.1 send no `lists` and ignore them. A side that holds no head for a group yet sends the empty log's: length 0, hash h₀, `time` 0 and no signature, which needs none.
 

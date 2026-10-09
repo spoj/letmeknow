@@ -192,9 +192,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         let add = Change { add: vec![key_package], how: Some(how), ..Change::default() };
         let (welcome, position) = self.commit(gid, |_| Ok(add.clone())).await?;
-        let state = {
+        let (state, before) = {
             let st = self.state.lock().unwrap();
-            doc_like(&st.group(gid)?.mls.settings()).then(|| st.doc_state(gid)).transpose()?
+            let g = st.group(gid)?;
+            let before = g.rec.items.iter().filter(|item| item.epoch < g.mls.epoch()).map(|item| item.id.clone()).collect();
+            (doc_like(&g.mls.settings()).then(|| st.doc_state(gid)).transpose()?, before)
         };
         let doc = match state {
             Some(state) => {
@@ -208,7 +210,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             None => None,
         };
-        Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc })
+        Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc, before })
     }
 
     fn answer(&self, group: Option<&[u8]>, admitted: Result<Admitted>) -> Answer<Admitted> {

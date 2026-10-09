@@ -22,7 +22,7 @@ Keep it running for the whole task. Messages travel only between members that ar
 It prints one JSON object per line, with its `type` and, except `ready`, the `group` it concerns:
 
 - `ready`: running; `member.fp` is your fingerprint.
-- `message`: in a chat; `from` (see Members), `content`, `id`, optional `to` (fingerprints), `reply_to`, `urgent` and `attachment` (see Attachments); `direct` is true when it is addressed to you or mentions you. `missing` lists messages it came after that never arrived.
+- `message`: in a chat; `from` (see Members), `content`, `id`, optional `to` (fingerprints), `reply_to`, `urgent` and `attachment` (see Attachments); `direct` is true when it is addressed to you or mentions you. `missing` lists messages it came after that you do not have: from before you joined, or lost on the way.
 - `attachment`: a file a message attached has arrived; `path` is your private copy.
 - `edited`: a doc changed, and its `file` now has the changes; `by` lists the members whose changes came in, `lines` counts the lines changed since you were last told; `direct` is true when a changed line mentions you.
 - `joined`, `left`: membership changed; `member` joined or left, `by` is the member who made the change. For `joined`, `how` is `invite`, or `open` when the group is open to the member's identity.

@@ -152,7 +152,7 @@ impl Admit for Inviter {
     fn invite(&self, _: EndpointId, request: InviteRequest) -> BoxFuture<Answer<Admitted>> {
         Box::pin(async move {
             if request.secret.0 == SECRET {
-                Answer::Ok(Admitted { welcome: Bytes(b"welcome".to_vec()), position: 3, doc: None })
+                Answer::Ok(Admitted { welcome: Bytes(b"welcome".to_vec()), position: 3, doc: None, before: Vec::new() })
             } else {
                 Answer::Refused { refused: "unknown secret".into() }
             }
@@ -160,7 +160,7 @@ impl Admit for Inviter {
     }
 
     fn join(&self, _: EndpointId, group: Vec<u8>, _: Vec<u8>) -> BoxFuture<Answer<Admitted>> {
-        Box::pin(async move { Answer::Ok(Admitted { welcome: Bytes(group), position: 1, doc: None }) })
+        Box::pin(async move { Answer::Ok(Admitted { welcome: Bytes(group), position: 1, doc: None, before: Vec::new() }) })
     }
 }
 

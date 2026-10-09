@@ -133,7 +133,7 @@ mod tests {
         let applied = alice.read(&log, 2_000);
         let crate::group::Applied::Commit { own: true, how, added, .. } = &applied[0] else { panic!() };
         assert_eq!((*how, added[0].index), (Some(How::Invite), 1));
-        let admitted = Admitted { welcome: Bytes(commit.welcome.unwrap()), position: log.len() as u64, doc: None };
+        let admitted = Admitted { welcome: Bytes(commit.welcome.unwrap()), position: log.len() as u64, doc: None, before: Vec::new() };
 
         // A used secret is refused.
         assert!(invites.redeem(&alice.provider, &request.secret.0, &key_package.0, None, 2_000).is_err());
@@ -213,7 +213,7 @@ mod tests {
         let commit = laptop.commit(Change { add: vec![request.key_package.0.clone()], ..Change::default() });
         log.push(commit.commit);
         laptop.read(&log, 5);
-        let admitted = Admitted { welcome: Bytes(commit.welcome.unwrap()), position: log.len() as u64, doc: None };
+        let admitted = Admitted { welcome: Bytes(commit.welcome.unwrap()), position: log.len() as u64, doc: None, before: Vec::new() };
 
         let list = DeviceList::replay(&id, list_log.iter().map(Vec::as_slice)).unwrap();
         assert!(list.has(&phone_device.public()));

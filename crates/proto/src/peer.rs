@@ -77,6 +77,9 @@ pub struct Admitted {
     /// For a doc: a file link to its state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// The ids of the messages from before the joiner's epoch that the inviter holds, which the joiner never gets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before: Vec<Bytes>,
 }
 
 #[cfg(test)]

@@ -192,7 +192,8 @@ struct Rec {
     logged: u64,
     chain: Option<Chain>,
     items: Vec<Item>,
-    /// Messages this session could not open, so that sync does not offer them again.
+    /// Messages this session could not open, so that sync does not offer them again, and those from before it joined
+    /// that its inviter held, as of epoch 0.
     given_up: Vec<(u64, Bytes)>,
     pending: Vec<Pending>,
     /// File links, with when they were linked: attachments, files added, and doc states linked beside Welcomes. Each is
@@ -1272,7 +1273,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
             } else {
                 doc_like(&settings).then(|| doc::new(""))
             };
-            let rec = Rec { position: admitted.position, logged: admitted.position, ..Rec::default() };
+            let given_up = admitted.before.iter().map(|id| (0, id.clone())).collect();
+            let rec = Rec { position: admitted.position, logged: admitted.position, given_up, ..Rec::default() };
             st.add_group(mls, rec, doc)?
         };
         if let Err(error) = self.read(&gid).await {

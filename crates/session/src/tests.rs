@@ -657,21 +657,41 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
 }
 
 #[test]
-fn a_message_waits_for_those_it_comes_after_then_shows_them_missing() {
+fn a_message_after_some_from_before_its_reader_joined_shows_them_missing_at_once() {
     local(async {
-        let mut world = world("wait").await;
+        let world = world("before").await;
         let (alice, mut bob, group) = pair(&world, HOUR).await;
         let before = alice.cmd(&["send", "@bob before carol"]).await.unwrap();
         bob.expect("message").await;
+        let mut carol = world.start("carol", HOUR).await;
+        carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        // Alice's Welcome named her message, so Bob's, which comes after it, does not wait for it.
+        bob.cmd(&["send", "@carol see above"]).await.unwrap();
+        let got = carol.expect("message").await;
+        assert_eq!(got["content"], "@carol see above");
+        assert_eq!(got["missing"], json!([before["id"]]));
+    });
+}
+
+#[test]
+fn a_message_waits_for_those_it_comes_after_then_shows_them_missing() {
+    local(async {
+        let mut world = world("wait").await;
+        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
+        // Bob writes while Alice is away, and leaves before she is back, so her Welcome to Carol cannot name it.
+        alice.stop().await;
+        let unseen = bob.cmd(&["send", "while alice is away"]).await.unwrap();
+        bob.stop().await;
+        let alice = world.start("alice", HOUR).await;
         world.causal_wait = Duration::from_secs(2);
         let mut carol = world.start("carol", HOUR).await;
         carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
-        // Bob's message comes after one from before Carol joined, which can never reach her.
+        let bob = world.start("bob", HOUR).await;
         let sent = std::time::Instant::now();
         bob.cmd(&["send", "@carol see above"]).await.unwrap();
         let got = carol.expect("message").await;
         assert!(sent.elapsed() >= Duration::from_millis(1500), "{:?}", sent.elapsed());
         assert_eq!(got["content"], "@carol see above");
-        assert_eq!(got["missing"], json!([before["id"]]));
+        assert_eq!(got["missing"], json!([unseen["id"]]));
     });
 }
