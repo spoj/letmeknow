@@ -143,6 +143,29 @@ async fn a_peer_served_again_syncs_at_once() {
     b.net.shutdown().await.unwrap();
 }
 
+/// A message sent to a peer that does not serve this session the group yet, as a joiner checking the inviter's
+/// certificate, waits for the peer's hello of the group, which it would otherwise drop, live ones for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_waits_until_the_peer_shows_the_group() {
+    let relay = relay().await;
+    let keys = keys(2);
+    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
+    let group = || Group { members: members.clone(), log: vec![b"e1".to_vec()], ..Group::default() };
+    let service = service();
+    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
+    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
+    b.fake.uncertified.lock().unwrap().push(members[0]);
+    a.net.dial(members[1], relay.url.clone()).await.unwrap();
+    let live = [&1u64.to_be_bytes()[..], &[1], b"introduce"].concat();
+    assert!(a.net.send_to(members[1], G, live.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    b.fake.uncertified.lock().unwrap().clear();
+    b.net.served(members[0], G);
+    eventually("the live message reaches B once B serves A", || !b.fake.groups.lock().unwrap()[G].live.is_empty()).await;
+    a.net.shutdown().await.unwrap();
+    b.net.shutdown().await.unwrap();
+}
+
 /// A frame this session does not know, as a newer letmeknow may send, is skipped, and the stream stays up.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_frame_is_skipped() {

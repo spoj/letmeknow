@@ -32,6 +32,8 @@ use crate::{Event, Inner, Taken, sync};
 
 /// Raw ciphertext bytes per `messages` frame, well under a frame's limit once in base64.
 const BATCH: usize = 8 << 20;
+/// The messages of a group kept for a peer that has not shown it yet.
+const WAITING: usize = 256;
 
 /// Takes the answer to a `want`; `None` for wants sent on catching up, whose answers start downloads.
 type HaveReply = Option<oneshot::Sender<Vec<[u8; 32]>>>;
@@ -63,6 +65,8 @@ struct Session {
     logs: HashMap<Bytes, Log>,
     /// The certificates shown the peer since the last resync, by signature.
     shown: HashSet<Bytes>,
+    /// Messages of groups the peer has not shown in a `hello` yet, so would drop: sent once it does.
+    waiting: HashMap<Bytes, VecDeque<Frame>>,
 }
 
 #[derive(Default)]
@@ -136,6 +140,7 @@ pub(crate) async fn run(
         joins: HashMap::new(),
         logs: HashMap::new(),
         shown: HashSet::new(),
+        waiting: HashMap::new(),
     };
     let result = async {
         session.hello().await?;
@@ -143,7 +148,7 @@ pub(crate) async fn run(
             match input {
                 Input::Frame(frame) => session.frame(frame).await?,
                 Input::Closed => break,
-                Input::Send(frame) => session.write(&frame).await?,
+                Input::Send(frame) => session.send(frame).await?,
                 Input::Changed(group) => session.changed(group).await?,
                 Input::Served(group) => {
                     session.groups.remove(&group);
@@ -174,6 +179,21 @@ pub(crate) async fn run(
 impl Session {
     async fn write(&mut self, frame: &Frame) -> Result<()> {
         frame::write(&mut self.send, frame).await
+    }
+
+    /// Writes a frame, but keeps messages of a group the peer has not shown in a `hello` yet, the latest `WAITING`.
+    async fn send(&mut self, frame: Frame) -> Result<()> {
+        if let Frame::Messages { group, .. } = &frame
+            && self.groups.get(group).is_none_or(|state| state.theirs.is_none())
+        {
+            let waiting = self.waiting.entry(group.clone()).or_default();
+            if waiting.len() == WAITING {
+                waiting.pop_front();
+            }
+            waiting.push_back(frame);
+            return Ok(());
+        }
+        self.write(&frame).await
     }
 
     fn member(&self, group: &[u8]) -> bool {
@@ -258,6 +278,11 @@ impl Session {
                 }
                 if answer {
                     self.send_hello(&shared).await?;
+                }
+                for hello in &groups {
+                    for frame in self.waiting.remove(&hello.group).unwrap_or_default() {
+                        self.write(&frame).await?;
+                    }
                 }
                 for hello in groups {
                     self.sync(&hello.group).await?;
