@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
 use lmk_core::contacts::Contact;
-use lmk_core::device::Device;
+use lmk_core::device::{Device, verify};
 use lmk_core::identity::{self, DAY, public};
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
 use lmk_proto::group::{DEVICES, IdentityRef, Opening, PROTOCOL, Service, Settings};
-use lmk_proto::identity::{Certified, Envelope};
+use lmk_proto::identity::{CERTIFICATE_CONTEXT, Certified, Envelope};
 use lmk_proto::links::Invite;
 use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep};
@@ -26,6 +26,15 @@ const ROTATE: u64 = 30 * DAY;
 const STATE_WAIT: u32 = 60;
 /// How often a device checks whether a key is due to be replaced.
 const ROTATE_CHECK: Duration = Duration::from_secs(60 * 60);
+
+/// Whether a session's certificate is due for renewal: it holds none, it lasts less than another half day, or the
+/// identity's current key, `current`, did not sign it.
+pub fn renewal_due(certificate: Option<&Envelope>, current: Option<&Bytes>) -> bool {
+    certificate.is_none_or(|certificate| {
+        let lasts = identity::certified(certificate).is_some_and(|c| c.expires > now() + DAY / 2);
+        !lasts || current.is_some_and(|key| !verify(&key.0, CERTIFICATE_CONTEXT, &certificate.body.0, &certificate.sig.0))
+    })
+}
 
 /// A devices group's state, as the kind's log stands at `position`.
 #[derive(Clone, Serialize, Deserialize)]
@@ -270,7 +279,13 @@ impl<P: Provider + Send + 'static> Devices<P> {
         Ok(identity::certify(&seed, &certified))
     }
 
-    /// Takes the events of devices groups; returns every other event.
+    /// The identity a devices group is of, once this device has its state.
+    pub fn identity(&self, gid: &[u8]) -> Option<IdentityRef> {
+        Some(self.record(gid).book?.identity)
+    }
+
+    /// Takes the events of devices groups, but for their members joining and leaving and warnings; returns every other
+    /// event.
     pub fn on(&self, event: Event) -> Option<Event> {
         let gid = event.group()?.clone();
         let ours = self.node.settings(&gid.0).is_ok_and(|s| s.kind == DEVICES) || self.node.record(&record_key(&gid.0)).ok().flatten().is_some();
@@ -286,7 +301,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
                 Ok(())
             }
             Event::Removed { .. } => self.node.delete_record(&record_key(&gid.0)),
-            Event::Warning { .. } => return Some(event),
+            Event::Joined { .. } | Event::Left { .. } | Event::Warning { .. } => return Some(event),
             _ => Ok(()),
         };
         taken.err().map(|error| Event::Warning { group: Some(gid), text: format!("{error:#}") })

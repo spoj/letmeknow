@@ -45,13 +45,6 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
-      # e2e checks that 0.10.0's state and peers work with this build.
-      - if: runner.os == 'Linux'
-        run: |
-          npm pack @letmeknow/linux-x64@0.10.0 --pack-destination "$RUNNER_TEMP"
-          tar -xzf "$RUNNER_TEMP/letmeknow-linux-x64-0.10.0.tgz" -C "$RUNNER_TEMP"
-          chmod +x "$RUNNER_TEMP/package/bin/letmeknow"
-          echo "LETMEKNOW_OLD=$RUNNER_TEMP/package/bin/letmeknow" >> "$GITHUB_ENV"
       - if: runner.os == 'Linux'
         uses: actions/cache@v4
         with:

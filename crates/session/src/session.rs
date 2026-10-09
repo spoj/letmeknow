@@ -8,14 +8,13 @@
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64, engine::general_purpose::URL_SAFE_NO_PAD};
 use lmk_core::contacts::{self, Contact};
-use lmk_core::device::{Device, verify};
-use lmk_core::identity::{DAY, certified};
+use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
-use lmk_node::devices::Devices;
+use lmk_node::devices::{Devices, renewal_due};
 use lmk_node::{Claim, Event, Member, Node};
 use lmk_proto::Bytes;
 use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, DEVICES, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings};
-use lmk_proto::identity::{CERTIFICATE_CONTEXT, Envelope};
+use lmk_proto::identity::Envelope;
 use lmk_proto::links::{FileLink, Invite};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -1661,13 +1660,8 @@ impl Session {
         self.renew_at = Instant::now() + RENEW_CHECK;
         let Ok(state) = self.device_state() else { return };
         for identity in self.node.spoken() {
-            let certificate = self.node.certificate(&identity.id.0);
             let current = state.keys.iter().find(|(id, _)| *id == identity.id).map(|(_, key)| key);
-            let fresh = certificate.as_ref().is_some_and(|c| {
-                let lasts = certified(c).is_some_and(|c| c.expires > lmk_node::now() + DAY / 2);
-                lasts && current.is_none_or(|key| verify(&key.0, CERTIFICATE_CONTEXT, &c.body.0, &c.sig.0))
-            });
-            if !fresh && let Err(error) = self.certify(&identity).await {
+            if renewal_due(self.node.certificate(&identity.id.0).as_ref(), current) && let Err(error) = self.certify(&identity).await {
                 eprintln!("letmeknow: renewing this session's certificate: {error:#}");
             }
         }

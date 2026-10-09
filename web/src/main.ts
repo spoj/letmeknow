@@ -176,7 +176,6 @@ function who(p: Person): HTMLElement {
 function title(gid: string): string {
   const g = group(gid) ?? groups.find(g => g.group === gid);
   if (!g) return "a group";
-  if (g.settings.devices_of) return `${g.settings.name}'s devices`;
   const others = (g.members ?? []).filter(m => !m.you).map(label);
   return g.settings.name || [...new Set(others)].join(", ") || `New ${KINDS[g.settings.kind].name}`;
 }
@@ -450,7 +449,7 @@ function drawNav() {
     if (!entry) {
       const name = h("span"),
         badge = h("b");
-      const mark = h("i", { className: "mark", ariaHidden: "true" }, g.settings.devices_of ? "🔒" : KINDS[g.settings.kind].mark);
+      const mark = h("i", { className: "mark", ariaHidden: "true" }, KINDS[g.settings.kind].mark);
       entry = { button: h("button", { onclick: () => select(g.group) }, mark, name, badge), name, badge };
       navButtons.set(g.group, entry);
       groupList.prepend(entry.button);
@@ -609,9 +608,9 @@ async function inviteDialog(target: { gid: string } | { identity: string }) {
       copyable(`letmeknow join '${link}'`),
       h("p", { className: "expiry" }, "It works once, within 10 minutes, while this browser is open.")
     );
-    const gid = device ? groups.find(g => g.settings.devices_of === target.identity)?.group : target.gid;
     const joined = (event: client.Event) => {
-      if (event.type !== "joined" || event.group !== gid || !dialog.open) return;
+      const added = device ? event.type === "devices" && event.identity === target.identity : event.type === "joined" && event.group === target.gid;
+      if (!added || !dialog.open) return;
       body.replaceChildren(h("p", { className: "done" }, device ? "Added. The device now joins your chats and documents." : `They joined the ${kind}.`));
       setTimeout(() => dialog.close(), 1_500);
     };
@@ -650,7 +649,6 @@ class View {
   private people = h("button", { className: "people quiet" });
 
   constructor(readonly gid: string) {
-    const devicesOf = group(gid)?.settings.devices_of;
     this.el = h(
       "section",
       { className: "group" },
@@ -662,9 +660,7 @@ class View {
         h(
           "div",
           { className: "head-actions" },
-          devicesOf
-            ? h("button", { onclick: () => inviteDialog({ identity: devicesOf }) }, "Add a device")
-            : h("button", { onclick: () => inviteDialog({ gid }) }, "Invite"),
+          h("button", { onclick: () => inviteDialog({ gid }) }, "Invite"),
           h("button", { className: "icon quiet", title: "Settings", ariaLabel: "Settings", onclick: () => this.settingsDialog() }, "⋯")
         )
       )
@@ -710,8 +706,8 @@ class View {
       return h("label", { className: "switch" }, box, h("span", {}, h("b", {}, text), h("small", {}, `Their devices join this ${kind} on their own, without an invite.`)));
     };
     const dialog = modal(
-      settings.devices_of ? title(gid) : kind[0].toUpperCase() + kind.slice(1),
-      !settings.devices_of && form(() => busy(save, "Renaming…", () => lmk.rename(gid, name.value.trim())), field("Name", h("div", { className: "row" }, name, save))),
+      kind[0].toUpperCase() + kind.slice(1),
+      form(() => busy(save, "Renaming…", () => lmk.rename(gid, name.value.trim())), field("Name", h("div", { className: "row" }, name, save))),
       h("h3", {}, "People"),
       h(
         "ul",
@@ -732,21 +728,20 @@ class View {
               m.added_by && h("p", { className: "muted" }, `added by ${m.added_by.name ?? "a former member"} (${m.added_by.how})`)
             ),
             accept,
-            !m.you && !settings.devices_of && confirmed("Remove", `Remove ${label(m)}?`, () => lmk.remove(gid, m.key))
+            !m.you && confirmed("Remove", `Remove ${label(m)}?`, () => lmk.remove(gid, m.key))
           );
         })
       ),
-      !settings.devices_of && openable.map(toggle),
-      !settings.devices_of &&
-        h(
-          "div",
-          { className: "buttons leave" },
-          confirmed(`Leave ${kind}`, "Leave for good?", async () => {
-            if (!(await lmk.leave(gid))) toast("Asked the others to remove you; you leave once one of them is online.");
-            render();
-            dialog.close();
-          })
-        )
+      openable.map(toggle),
+      h(
+        "div",
+        { className: "buttons leave" },
+        confirmed(`Leave ${kind}`, "Leave for good?", async () => {
+          if (!(await lmk.leave(gid))) toast("Asked the others to remove you; you leave once one of them is online.");
+          render();
+          dialog.close();
+        })
+      )
     );
   }
 }
