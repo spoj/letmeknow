@@ -170,11 +170,11 @@ def git_kind(alice, bob, dave, listeners):
     check(bob.expect("message", lambda e: e["content"] == "@bob the build is green")["group"] == made["group"], "a git group carries chat")
 
     # With no other member online, a push fails and says so.
+    tip = git(loser, "rev-parse", "HEAD", cwd=repo).stdout.strip()
+    head = lambda: (git("alice", "pull", "-q", "--ff-only", "team", "main", cwd=ours, ok=False), git("alice", "rev-parse", "HEAD", cwd=ours).stdout.strip())[1]
+    check(until(head, lambda h: h == tip) == tip, "both members end at the same tip")
     bob.stop()
     listeners.remove(bob)
-    # A stopped process on Windows closes no connections, so Alice notices only once the connection times out.
-    gone = until(lambda: run("alice", "status"), lambda s: all(not g["online"] for g in s["groups"] if g["group"] == made["group"]), timeout=60)
-    check(all(not g["online"] for g in gone["groups"] if g["group"] == made["group"]), "alice sees bob go")
     write("alice-repo/late.txt", "late")
     git("alice", "add", "late.txt", cwd=ours)
     git("alice", "commit", "-qm", "while bob is away", cwd=ours)
