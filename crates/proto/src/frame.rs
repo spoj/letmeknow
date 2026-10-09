@@ -35,11 +35,24 @@ pub async fn write<T: Serialize, W: AsyncWrite + Unpin>(w: &mut W, value: &T) ->
 }
 
 pub async fn read<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R) -> Result<T> {
+    Ok(serde_json::from_slice(&read_body(r).await?)?)
+}
+
+/// Reads frames until one parses as `T`, skipping those that do not, such as a newer letmeknow's.
+pub async fn read_known<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R) -> Result<T> {
+    loop {
+        if let Ok(value) = serde_json::from_slice(&read_body(r).await?) {
+            return Ok(value);
+        }
+    }
+}
+
+pub async fn read_body<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     let len = r.read_u32().await?;
     ensure!(len <= MAX_FRAME, "a frame of {len} bytes exceeds {MAX_FRAME}");
     let mut body = vec![0; len as usize];
     r.read_exact(&mut body).await?;
-    Ok(serde_json::from_slice(&body)?)
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -53,5 +66,13 @@ mod tests {
         assert_eq!(&buf[4..], br#"{"stream":"peer"}"#);
         let open: Open = read(&mut buf.as_slice()).await.unwrap();
         assert_eq!(open.stream, Stream::Peer);
+    }
+
+    #[tokio::test]
+    async fn read_known_skips_what_does_not_parse() {
+        let mut buf = encode(&serde_json::json!({"stream": "newer"}));
+        buf.extend(encode(&Open { stream: Stream::Membership }));
+        let open: Open = read_known(&mut buf.as_slice()).await.unwrap();
+        assert_eq!(open.stream, Stream::Membership);
     }
 }

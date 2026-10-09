@@ -96,6 +96,7 @@ impl ServeConfig {
             key: (*key.as_bytes()).into(),
             relay: self.relay_url(),
             addrs: vec![],
+            rest: Default::default(),
         })
     }
 }

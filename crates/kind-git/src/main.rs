@@ -175,12 +175,14 @@ impl Plugin {
                 // A push's bundle, ahead of its entry: held, and so fetched, within this session's limit.
                 self.out.push(json!({ "type": "hold", "group": group, "links": [message["payload"]["bundle"]] }));
             }
+            "message" => {}
             "state" => self.state(&group, serde_json::from_slice(&bytes(&message["data"])?)?)?,
             "snapshot" => self.snapshot(&group, &message["id"])?,
             "synced" => self.check_next(&group)?,
             "command" => self.command(message)?,
             "sync" => self.out.push(answer(&message["id"], Ok(json!({})))),
             "answer" => self.answered(message)?,
+            other if message.get("id").is_some() => bail!("unknown request {other:?}"),
             _ => {}
         }
         Ok(())

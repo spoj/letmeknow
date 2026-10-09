@@ -125,6 +125,7 @@ fn settings(kind: &str, folder: &Path) -> Settings {
         open: vec![],
         keep: 90,
         membership: Service::Folder(folder.to_str().unwrap().into()),
+        rest: Default::default(),
     }
 }
 
@@ -292,7 +293,7 @@ async fn signing_service(relay: &Relay, dir: &Path) -> (Service, iroh::protocol:
     std::fs::create_dir_all(dir).unwrap();
     let store = Store::open(&dir.join("membership.db"), ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes())).unwrap();
     let router = iroh::protocol::Router::builder(endpoint.clone()).accept(ALPN, Membership::new(store, Policy::default())).spawn();
-    let service = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: relay.url.to_string(), addrs: vec![] };
+    let service = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: relay.url.to_string(), addrs: vec![], rest: Default::default() };
     (service, router)
 }
 
@@ -431,7 +432,7 @@ async fn devices_share_an_identity_and_certify_their_sessions_with_its_key() {
     routed(&mut laptop, laptop_devices.clone());
     routed(&mut tablet, tablet_devices.clone());
     let bob = laptop_devices.create("Bob", membership.clone()).await.unwrap();
-    laptop_devices.set_contact(&[9; 32], lmk_core::contacts::Contact { name: "Carol".into(), how: lmk_core::contacts::How::Verified, by: None, at: 1 }).await.unwrap();
+    laptop_devices.set_contact(&[9; 32], lmk_core::contacts::Contact { name: "Carol".into(), how: lmk_core::contacts::How::Verified, by: None, at: 1, rest: Default::default() }).await.unwrap();
 
     // A device link: the tablet gets the identity's state, its key and contacts among it.
     let link = lmk_proto::links::Invite::parse(&laptop_devices.invite(&bob.id.0).await.unwrap()).unwrap();
@@ -449,7 +450,7 @@ async fn devices_share_an_identity_and_certify_their_sessions_with_its_key() {
     }
     let chat = alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &dir) }, None).unwrap();
     alice.node.change_settings(&chat.0, |mut s| {
-        s.open.push(Named { id: bob.id.clone(), name: "Bob".into() });
+        s.open.push(Named { id: bob.id.clone(), name: "Bob".into(), rest: Default::default() });
         s
     }).await.unwrap();
     let opening = alice.node.opening(&chat.0).unwrap();

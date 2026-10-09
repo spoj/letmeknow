@@ -1,10 +1,13 @@
 //! What a group's MLS state carries for us, and the plaintext of its application messages.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::Bytes;
 
 pub const PROTOCOL: u32 = 2;
+/// This release's protocol revision, which grows with each compatible addition; a leaf without one is revision 0.
+pub const REVISION: u32 = 1;
 /// The private-use extension types: settings in the group context, and leaf data.
 pub const SETTINGS_EXTENSION: u16 = 0xff01;
 pub const LEAF_EXTENSION: u16 = 0xff02;
@@ -18,8 +21,17 @@ pub const DEVICES: &str = "devices";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Service {
-    Serve { key: Bytes, relay: String, addrs: Vec<String> },
+    Serve {
+        key: Bytes,
+        relay: String,
+        addrs: Vec<String>,
+        #[serde(flatten)]
+        rest: Map<String, Value>,
+    },
     Folder(String),
+    /// A kind of service a newer letmeknow made, kept as it is.
+    #[serde(untagged)]
+    Newer(Value),
 }
 
 /// The group context extension `SETTINGS_EXTENSION`.
@@ -31,6 +43,9 @@ pub struct Settings {
     pub open: Vec<Named>,
     pub keep: u32,
     pub membership: Service,
+    /// Fields a newer letmeknow added, kept when this one rewrites the settings.
+    #[serde(flatten)]
+    pub rest: Map<String, Value>,
 }
 
 /// An identity, by id, with the name its group knows it by.
@@ -38,6 +53,8 @@ pub struct Settings {
 pub struct Named {
     pub id: Bytes,
     pub name: String,
+    #[serde(flatten)]
+    pub rest: Map<String, Value>,
 }
 
 /// A group open to an identity, as its devices group keeps it.
@@ -49,6 +66,8 @@ pub struct Opening {
     pub membership: Service,
     /// The iroh keys of its members when last refreshed.
     pub members: Vec<Bytes>,
+    #[serde(flatten)]
+    pub rest: Map<String, Value>,
 }
 
 /// The leaf node extension `LEAF_EXTENSION`.
@@ -59,6 +78,9 @@ pub struct Leaf {
     pub relay: String,
     /// The kinds the session supports.
     pub kinds: Vec<String>,
+    /// The session's protocol revision.
+    #[serde(default)]
+    pub revision: u32,
 }
 
 /// The identity bytes of a member's basic credential: its name, its MLS signature key, and the identity it speaks as,
@@ -120,7 +142,7 @@ pub struct Refusal {
     pub reason: Reason,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
     /// Larger than the member takes.
@@ -131,6 +153,9 @@ pub enum Reason {
     Removed,
     /// It did not open.
     Unreadable,
+    /// A reason a newer letmeknow gave.
+    #[serde(untagged)]
+    Other(String),
 }
 
 /// A payload's `type`.
@@ -171,12 +196,15 @@ pub struct Attachment {
     pub media_type: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum How {
     Invite,
     Open,
     Introduce,
+    /// A way a newer letmeknow named.
+    #[serde(untagged)]
+    Other(String),
 }
 
 #[cfg(test)]
@@ -198,5 +226,28 @@ mod tests {
         assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","after":[]}"#);
         let folder = serde_json::to_string(&Service::Folder("/tmp/x".into())).unwrap();
         assert_eq!(folder, r#"{"folder":"/tmp/x"}"#);
+    }
+
+    #[test]
+    fn unknown_values_parse_to_the_catch_all() {
+        let refused: Control = serde_json::from_str(r#"{"type":"refused","messages":[{"id":"AQ","reason":"quota"},{"id":"Ag","reason":"old"}]}"#).unwrap();
+        let Control::Refused { messages } = refused else { panic!() };
+        assert_eq!(messages.iter().map(|m| m.reason.clone()).collect::<Vec<_>>(), [Reason::Other("quota".into()), Reason::Old]);
+        let introduce = r#"{"type":"introduce","identity":{"id":"AQ","membership":{"folder":"/x"}},"name":"Bob","how":"met"}"#;
+        let Control::Introduce { how, .. } = serde_json::from_str(introduce).unwrap() else { panic!() };
+        assert_eq!(how, How::Other("met".into()));
+        let service: Service = serde_json::from_str(r#"{"s3":{"bucket":"b"}}"#).unwrap();
+        assert!(matches!(service, Service::Newer(_)));
+        assert_eq!(serde_json::to_string(&service).unwrap(), r#"{"s3":{"bucket":"b"}}"#);
+    }
+
+    #[test]
+    fn records_keep_fields_this_version_does_not_know() {
+        let text = r#"{"protocol":2,"kind":"chat","name":"Plan","open":[{"id":"AQ","name":"Bob","since":1}],"keep":90,"membership":{"serve":{"key":"Ag","relay":"r","addrs":[],"ticket":"t"}},"color":"red"}"#;
+        let settings: Settings = serde_json::from_str(text).unwrap();
+        let renamed = Settings { name: "Release".into(), ..settings };
+        assert_eq!(serde_json::to_string(&renamed).unwrap(), text.replace("Plan", "Release"));
+        let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ","relay":"r","kinds":["chat"]}"#).unwrap();
+        assert_eq!(leaf.revision, 0, "a leaf without a revision is 0.12.1's");
     }
 }

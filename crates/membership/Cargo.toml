@@ -13,6 +13,7 @@ hex.workspace = true
 iroh = { workspace = true, features = ["tls-ring"] }
 n0-future = "0.3"
 serde.workspace = true
+serde_json.workspace = true
 thiserror = "2"
 tokio = { workspace = true, features = ["sync"] }
 tracing = "0.1"

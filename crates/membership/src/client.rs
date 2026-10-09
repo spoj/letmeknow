@@ -49,7 +49,7 @@ impl ServeClient {
     }
 
     pub fn for_service(endpoint: Endpoint, service: &Service) -> Result<Self> {
-        let Service::Serve { key, relay, addrs } = service else {
+        let Service::Serve { key, relay, addrs, .. } = service else {
             anyhow::bail!("not a serve service")
         };
         Self::new(endpoint, &key.0, relay, addrs)
@@ -161,7 +161,7 @@ impl Membership for ServeClient {
             let _send = send;
             let result: Result<()> = async {
                 loop {
-                    let notice = frame::read(&mut recv).await?;
+                    let notice = frame::read_known(&mut recv).await?;
                     client.deliver(notice, &out).await?;
                 }
             }

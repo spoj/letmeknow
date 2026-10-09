@@ -276,10 +276,14 @@ impl Groups for Fake {
         self.groups.lock().unwrap().get(group).is_some_and(|g| g.members.contains(peer))
     }
 
+    fn revision(&self, _: &[u8], _: &EndpointId) -> u32 {
+        lmk_proto::group::REVISION
+    }
+
     fn hello(&self, group: &[u8]) -> Hello {
         let groups = self.groups.lock().unwrap();
         let g = &groups[group];
-        Hello { group: group.into(), epoch: g.log.len() as u64, floor: g.floor, joined: g.joined }
+        Hello { group: group.into(), epoch: g.log.len() as u64, floor: g.floor, joined: g.joined, anew: false }
     }
 
     fn logs(&self, group: &[u8]) -> Vec<Vec<u8>> {

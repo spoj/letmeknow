@@ -188,7 +188,7 @@ impl Plugin {
                 }
             }
             "answer" => self.answered(message)?,
-            _ => {
+            "message" | "state" | "synced" | "snapshot" => {
                 if let Some((group, from)) = self.docs.handle(message, &mut self.out)? {
                     self.save_state(&group)?;
                     if let Some(binding) = self.bindings.get_mut(&group) {
@@ -199,6 +199,8 @@ impl Plugin {
                     }
                 }
             }
+            other if message.get("id").is_some() => bail!("unknown request {other:?}"),
+            _ => {}
         }
         Ok(())
     }

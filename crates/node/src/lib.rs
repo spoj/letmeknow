@@ -25,7 +25,7 @@ use lmk_membership::Contradiction;
 use lmk_core::provider::Provider;
 use lmk_membership::Refused;
 use lmk_net::Net;
-use lmk_proto::group::{CHAT, Control, Credential, DEVICES, How, IdentityRef, Leaf, Opening, Reason, Refusal, Settings, held_by_type};
+use lmk_proto::group::{CHAT, Control, Credential, DEVICES, How, IdentityRef, Leaf, Opening, REVISION, Reason, Refusal, Settings, held_by_type};
 use lmk_proto::identity::Envelope;
 use lmk_proto::links::{Address, FileLink, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Frame, Join, KindLog as LogRef};
@@ -495,7 +495,7 @@ impl<P: Provider> State<P> {
         let added = g.and_then(|g| {
             let added = g.mls.added().iter().rev().find(|added| added.member == credential)?;
             let by = g.mls.members().into_iter().find(|m| m.credential.as_ref() == Some(&added.by));
-            Some((Bytes(by.map(|by| by.key).unwrap_or_default()), added.how.unwrap_or(How::Invite)))
+            Some((Bytes(by.map(|by| by.key).unwrap_or_default()), added.how.clone().unwrap_or(How::Invite)))
         });
         let claim = credential.identity.as_ref().map(|identity| self.claim(&credential, identity));
         let device_name = claim.as_ref().and_then(|(_, device)| device.clone()).unwrap_or_default();
@@ -608,7 +608,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         };
         let relays = RelayMap::from(iroh::RelayConfig::new(config.relay.clone(), Some(Default::default())));
         let endpoint = lmk_net::builder(relays).secret_key(secret).ca_tls_config(config.ca).bind().await?;
-        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone() };
+        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone(), revision: REVISION };
         let mut session = match (provider.get(b"session")?, &config.device) {
             (Some(_), _) => Session::load(&provider)?,
             (None, Some(device)) => Session::create_with(&provider, device.signer(), &config.name, leaf.clone())?,
@@ -1166,6 +1166,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             name: settings.name,
             membership: settings.membership,
             members,
+            rest: Default::default(),
         })
     }
 }
@@ -1766,7 +1767,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let label = rule.and_then(|rule| rule.label).filter(|_| introduces);
         for member in &added {
             if let Some(member) = st.member(gid, member) {
-                let event = Event::Joined { group: group.clone(), member, by: by.clone(), how, introduces, label: label.clone() };
+                let event = Event::Joined { group: group.clone(), member, by: by.clone(), how: how.clone(), introduces, label: label.clone() };
                 self.events.send(event).ok();
             }
         }

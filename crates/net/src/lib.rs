@@ -49,6 +49,8 @@ pub trait Groups: Send + Sync + 'static {
     /// Whether this session serves `peer` the group: it is in a leaf and, speaking as an identity, has shown a valid
     /// certificate of it.
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool;
+    /// The protocol revision `peer`'s leaf in the group names; 0 if it names none.
+    fn revision(&self, group: &[u8], peer: &EndpointId) -> u32;
     /// This session's state of the group, as `hello` carries it.
     fn hello(&self, group: &[u8]) -> Hello;
     /// The logs this session follows for a group: the group's own, whose id is the group's, and others, such as its

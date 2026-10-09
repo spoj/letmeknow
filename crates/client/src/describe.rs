@@ -113,7 +113,7 @@ impl Describer {
         }
         let added_by = member.added.as_ref().map(|(by, how)| AddedBy {
             fp: fp(&by.0),
-            how: *how,
+            how: how.clone(),
             name: self.members.iter().find(|m| &m.key == by).map(|adder| adder.name.clone()),
         });
         Described {
@@ -160,7 +160,8 @@ impl Describer {
             known.name = contact.name.clone();
             known.how = match contact.how {
                 contacts::How::Verified => Standing::Verified,
-                contacts::How::Introduced => Standing::Introduced,
+                // A way a newer letmeknow named counts for no more than an introduction.
+                contacts::How::Introduced | contacts::How::Other(_) => Standing::Introduced,
             };
             if let Some(by) = &contact.by {
                 known.by = Some(self.contacts.iter().find(|(cid, _)| cid == by).map_or_else(|| b64(&by.0), |(_, c)| c.name.clone()));
@@ -221,7 +222,7 @@ mod tests {
     fn a_stranger_shows_its_claim_who_vouched_for_it_and_whose_name_it_takes() {
         let ann = member("Ann", 1, Some((10, "Ann")));
         let bob = member("Bob", 2, Some((20, "Bob")));
-        let contact = Contact { name: "Bob".into(), how: contacts::How::Verified, by: None, at: 0 };
+        let contact = Contact { name: "Bob".into(), how: contacts::How::Verified, by: None, at: 0, rest: Default::default() };
         let vouched = Introduction { identity: Bytes(vec![20]), name: "Robert (Acme)".into(), by: Described { name: Some("Ann".into()), ..Described::default() }, by_id: Bytes(vec![10]) };
         let describer = Describer {
             me: Bytes(vec![1]),
