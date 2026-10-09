@@ -239,6 +239,10 @@ pub enum Request {
     /// Records an opening in an identity's devices group; sent to the session process that acts for the device.
     #[command(skip)]
     SetOpening { identity: Bytes, opening: Opening },
+    /// A certificate of a session of this device, by an identity's key; sent to the session process that acts for the
+    /// device.
+    #[command(skip)]
+    Certify { identity: Bytes, key: Bytes, name: String },
     /// A command of a kind's plugin, from `letmeknow <kind> <args>...`.
     #[command(skip)]
     Kind { kind: String, args: Vec<String>, cwd: String },
@@ -250,13 +254,13 @@ pub enum IdentityOp {
     /// Start an identity with this device as its first device
     Create {
         name: String,
-        /// The membership service that keeps its device list [default: listen's]
+        /// The membership service that keeps its key log [default: listen's]
         #[arg(long)]
         membership: Option<String>,
     },
     /// The identities this device is on, and their devices
     List,
-    /// Take a device, by key, off an identity's list
+    /// Take a device, by key or name, off an identity, whose key is then replaced
     Remove {
         #[arg(long)]
         identity: Option<String>,

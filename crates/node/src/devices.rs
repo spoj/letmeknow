@@ -22,6 +22,8 @@ use crate::{Event, Node, hex, now};
 
 /// How long an identity keeps a key before a device replaces it, in milliseconds.
 const ROTATE: u64 = 30 * DAY;
+/// How many half seconds a new device waits for its identity's state.
+const STATE_WAIT: u32 = 60;
 /// How often a device checks whether a key is due to be replaced.
 const ROTATE_CHECK: Duration = Duration::from_secs(60 * 60);
 
@@ -191,18 +193,25 @@ impl<P: Provider + Send + 'static> Devices<P> {
         Ok(Invite { device: true, ..self.node.invite(&gid.0, None, None)? }.link())
     }
 
-    /// Joins an identity through a device link; its state follows.
+    /// Joins an identity through a device link, and waits a while for its state.
     pub async fn join(&self, link: &Invite) -> Result<()> {
         ensure!(link.device, "not a device link");
         let gid = self.node.join(link, None).await?;
         ensure!(self.node.settings(&gid.0)?.kind == DEVICES, "the link led to a group, not an identity");
         let added_by = self.node.members(&gid.0)?.into_iter().find(|m| m.iroh.0 == link.key).map(|m| m.name);
-        let _lock = self.lock.lock().unwrap();
+        let lock = self.lock.lock().unwrap();
         let mut record = self.record(&gid.0);
         (record.added_by, record.since) = (added_by, now());
         self.save(&gid.0, &record)?;
         if record.book.is_none() {
             self.node.follow_log(&gid.0, None)?;
+        }
+        drop(lock);
+        for _ in 0..STATE_WAIT {
+            if self.record(&gid.0).book.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(500)).await;
         }
         Ok(())
     }

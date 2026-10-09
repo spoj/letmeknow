@@ -1,17 +1,21 @@
-//! The session process: it runs this session's node (and, holding the device's lock, the device's), hosts the plugins
-//! of its groups' kinds, and prints what concerns the agent. Chat is its built-in kind. The session process that holds
-//! the lock publishes the device's identities, contacts and openings to `device-state.json`, and answers the requests
-//! only the device's node can on the command channel `device-endpoint`, both in `LETMEKNOW_HOME`; the device's other
-//! session processes read the one and send such requests to the other.
+//! The session process: it runs this session's node (and, holding the device's lock, the device's, with the devices
+//! kind), hosts the plugins of its groups' kinds, and prints what concerns the agent. Chat is its built-in kind. The
+//! session process that holds the lock publishes the device's identities, their current keys, contacts and openings to
+//! `device-state.json`, and answers the requests only the device's node can on the command channel `device-endpoint`,
+//! both in `LETMEKNOW_HOME`; the device's other session processes read the one and send such requests to the other,
+//! among them for the certificates they show of their identities.
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64, engine::general_purpose::URL_SAFE_NO_PAD};
 use lmk_core::contacts::{self, Contact};
-use lmk_core::invite::Target;
+use lmk_core::device::{Device, verify};
+use lmk_core::identity::{DAY, certified};
 use lmk_core::provider::SqliteProvider;
+use lmk_node::devices::Devices;
 use lmk_node::{Claim, Event, Member, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings};
+use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, DEVICES, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings};
+use lmk_proto::identity::{CERTIFICATE_CONTEXT, Envelope};
 use lmk_proto::links::{FileLink, Invite};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -40,6 +44,8 @@ const ASK_WAIT: Duration = Duration::from_secs(60);
 const SPREAD_WAIT: Duration = Duration::from_secs(30);
 /// How often a session process that does not act for the device tries its lock.
 const DEVICE_RETRY: Duration = Duration::from_secs(10);
+/// How often a session checks that its certificates are by its identities' current keys and last another half day.
+const RENEW_CHECK: Duration = Duration::from_secs(10);
 
 pub type SessionNode = Node<SqliteProvider>;
 
@@ -76,13 +82,15 @@ pub enum Done {
 #[derive(Default, Serialize, Deserialize)]
 struct DeviceState {
     identities: Vec<(IdentityRef, String)>,
+    /// Each identity's current public key, by identity id.
+    keys: Vec<(Bytes, Bytes)>,
     contacts: Vec<(Bytes, Contact)>,
     openings: Vec<Opening>,
 }
 
 impl DeviceState {
-    fn of(device: &SessionNode) -> Result<Self> {
-        Ok(DeviceState { identities: device.identities(), contacts: device.contacts()?, openings: device.openings() })
+    fn of(devices: &Devices<SqliteProvider>) -> Self {
+        DeviceState { identities: devices.identities(), keys: devices.keys(), contacts: devices.contacts(), openings: devices.openings() }
     }
 }
 
@@ -116,10 +124,12 @@ struct KindFetch {
 pub struct Session {
     db: Connection,
     node: SessionNode,
-    /// The device's node, when this process holds the device's lock.
-    device: Option<SessionNode>,
+    /// The device's node and its devices kind, when this process holds the device's lock.
+    device: Option<(SessionNode, Devices<SqliteProvider>)>,
     lock: std::fs::File,
     device_retry: Instant,
+    /// When this session next checks its certificates.
+    renew_at: Instant,
     /// The device's state as last published.
     published: String,
     home: PathBuf,
@@ -204,6 +214,7 @@ impl Session {
             device: None,
             lock,
             device_retry: Instant::now(),
+            renew_at: Instant::now(),
             published: String::new(),
             home: home.to_path_buf(),
             network,
@@ -251,7 +262,7 @@ impl Session {
 
     /// This session as the agent sees it in `ready`.
     pub fn me(&self) -> Result<Value> {
-        let device = self.node.device();
+        let device = Device::load(&self.device_file())?;
         let identities: Vec<Value> =
             self.identities()?.into_iter().map(|(identity, name)| json!({ "id": identity.id, "name": name })).collect();
         Ok(json!({ "name": self.config.name, "fp": fp(&self.node.key().0), "device": { "key": Bytes(device.public().to_vec()), "name": device.name }, "identities": identities }))
@@ -265,34 +276,31 @@ impl Session {
             Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
-        // Another session process may have acted for the device before, and changed it.
-        let device = lmk_core::device::Device::load(&self.device_file())?;
+        let device = Device::load(&self.device_file())?;
         let provider = SqliteProvider::open(&self.home.join("device.db"))?;
-        let kinds = self.node.kinds().to_vec();
-        let config = crate::node_config(&self.network, &self.home, &device.name, true, self.home.join("device-files"), kinds);
-        let (node, mut events) = Node::start(provider, device.clone(), config).await?;
-        if node.device().identities != device.identities {
-            node.device().save(&self.device_file())?;
-        }
-        let inbound = self.inbound.clone();
+        let kinds = vec![CHAT.into(), DEVICES.into()];
+        let config = crate::node_config(&self.network, &self.home, &device.name, Some(device.clone()), self.home.join("device-files"), kinds);
+        let (node, mut events) = Node::start(provider, config).await?;
+        let devices = Devices::new(node.clone(), device);
+        let (inbound, taking) = (self.inbound.clone(), devices.clone());
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                if let Event::Warning { text, .. } = event {
+                if let Some(Event::Warning { text, .. }) = taking.on(event) {
                     let _ = inbound.send(Inbound::DeviceWarning(text));
                 }
             }
         });
         crate::cli::open_channel(&self.home.join("device-endpoint"), self.inbound.clone()).await?;
-        self.device = Some(node);
+        self.device = Some((node, devices));
         Ok(())
     }
 
     /// Writes the device's state where its other session processes read it, if this process acts for the device and
     /// the state changed.
     fn publish(&mut self) {
-        let Some(device) = &self.device else { return };
-        let published = DeviceState::of(device).map(|state| serde_json::to_string(&state).expect("JSON"));
-        let written = published.and_then(|state| {
+        let Some((_, devices)) = &self.device else { return };
+        let state = serde_json::to_string(&DeviceState::of(devices)).expect("JSON");
+        let written = (|| {
             if state != self.published {
                 let path = self.home.join("device-state.json");
                 let new = path.with_extension("new");
@@ -300,8 +308,8 @@ impl Session {
                 std::fs::rename(&new, &path)?;
                 self.published = state;
             }
-            Ok(())
-        });
+            anyhow::Ok(())
+        })();
         if let Err(error) = written {
             self.warn(None, format!("publishing this device's state: {error:#}"));
         }
@@ -309,8 +317,8 @@ impl Session {
 
     /// The device's state: from its node if this process acts for the device, else as published.
     fn device_state(&self) -> Result<DeviceState> {
-        if let Some(device) = &self.device {
-            return DeviceState::of(device);
+        if let Some((_, devices)) = &self.device {
+            return Ok(DeviceState::of(devices));
         }
         match std::fs::read(self.home.join("device-state.json")) {
             Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
@@ -326,7 +334,7 @@ impl Session {
         let fetches = self.fetches.iter().map(|f| f.deadline).chain(self.kind_fetches.iter().map(|f| f.deadline));
         let device = self.device.is_none().then_some(self.device_retry);
         let later = Instant::now() + Duration::from_secs(3600);
-        let due = held.into_iter().chain(waiting).chain(fetches).chain(device);
+        let due = held.into_iter().chain(waiting).chain(fetches).chain(device).chain([self.renew_at]);
         due.chain(self.catching_up).fold(later, Instant::min)
     }
 
@@ -337,6 +345,9 @@ impl Session {
             && let Err(error) = self.take_device().await
         {
             self.warn(None, format!("acting for this device: {error:#}"));
+        }
+        if self.renew_at <= now {
+            self.renew().await;
         }
         if self.outbox.deadline(self.config.hold).is_some_and(|at| at <= now) {
             self.outbox.flush_held();
@@ -433,24 +444,7 @@ impl Session {
 
     /// What this session's node tells.
     pub async fn event(&mut self, event: Event) {
-        let group = match &event {
-            Event::Joined { group, .. }
-            | Event::Left { group, .. }
-            | Event::Removed { group, .. }
-            | Event::Settings { group, .. }
-            | Event::Live { group, .. }
-            | Event::Frame { group, .. }
-            | Event::Synced { group }
-            | Event::InStep { group, .. }
-            | Event::State { group, .. }
-            | Event::Logged { group }
-            | Event::Snapshot { group, .. }
-            | Event::Introduced { group, .. }
-            | Event::Held { group, .. }
-            | Event::Refused { group, .. } => Some(group.clone()),
-            Event::Message(message) => Some(message.group.clone()),
-            Event::File(_) | Event::Warning { .. } => None,
-        };
+        let group = event.group().filter(|_| !matches!(event, Event::Warning { .. })).cloned();
         if let Err(error) = self.on(event).await {
             self.warn(group.as_ref(), format!("{error:#}"));
         }
@@ -563,7 +557,7 @@ impl Session {
 
     async fn request(&mut self, request: Request) -> Result<Value> {
         let for_device = match &request {
-            Request::Identity { .. } | Request::SetContact { .. } | Request::SetOpening { .. } => true,
+            Request::Identity { .. } | Request::SetContact { .. } | Request::SetOpening { .. } | Request::Certify { .. } => true,
             Request::Invite { identity, .. } => identity.is_some(),
             Request::Join { target, .. } => Invite::parse(target.trim()).is_ok_and(|invite| invite.device),
             _ => false,
@@ -623,13 +617,14 @@ impl Session {
             Request::Contacts { op: Some(ContactsOp::Accept { identity, name }) } => self.accept(&identity, name).await,
             Request::Introduce { group, member, to } => self.introduce(group, &member, &to).await,
             Request::SetContact { identity, contact } => {
-                self.device()?.set_contact(&identity.0, &contact).await?;
+                self.devices()?.set_contact(&identity.0, contact).await?;
                 Ok(json!({}))
             }
             Request::SetOpening { identity, opening } => {
-                self.device()?.set_opening(&identity.0, opening).await?;
+                self.devices()?.set_opening(&identity.0, opening).await?;
                 Ok(json!({}))
             }
+            Request::Certify { identity, key, name } => Ok(json!(self.devices()?.certify(&identity.0, key, name).await?)),
         }
     }
 
@@ -661,14 +656,14 @@ impl Session {
             Some(identity) => {
                 let (identity, name) = self.own_identity(&identity)?;
                 answer["identity"] = json!({ "id": identity.id, "name": name });
-                self.device()?.invite(Target::Device(identity.id.0), None, None)?
+                self.devices()?.invite(&identity.id.0)?
             }
             None => {
                 let gid = match group {
                     Some(group) => self.resolve(Some(group))?,
                     None => {
                         let membership = membership.map(|m| crate::service(&m)).transpose()?.unwrap_or(self.config.membership.clone());
-                        let as_ = self.speaking_as(as_)?;
+                        let as_ = self.speaking_as(as_).await?;
                         let settings = Settings {
                             protocol: PROTOCOL,
                             kind: kind.clone(),
@@ -676,8 +671,6 @@ impl Session {
                             open: Vec::new(),
                             keep,
                             membership,
-                            devices_of: None,
-                            openings: Vec::new(),
                             log: None,
                         };
                         let gid = self.node.create(settings, as_)?;
@@ -700,7 +693,7 @@ impl Session {
                 if !settings.name.is_empty() {
                     answer["name"] = json!(settings.name);
                 }
-                self.node.invite(Target::Group(gid.0), for_.clone(), to.as_ref().map(|to| to.0.clone()))?
+                self.node.invite(&gid.0, for_.clone(), to.as_ref().map(|to| to.0.clone()))?.link()
             }
         };
         if let Some(for_) = &for_ {
@@ -839,16 +832,15 @@ impl Session {
     // Joins.
 
     async fn join(&mut self, target: String, (args, cwd): (Vec<String>, String), as_: Option<String>) -> Result<Value> {
-        let as_ = self.speaking_as(as_)?;
+        if let Ok(invite) = Invite::parse(target.trim())
+            && invite.device
+        {
+            self.devices()?.join(&invite).await?;
+            return Ok(json!({ "device": "this device joined the identity" }));
+        }
+        let as_ = self.speaking_as(as_).await?;
         let gid = if target.contains('#') {
-            let invite = Invite::parse(target.trim())?;
-            if invite.device {
-                let device = self.device()?;
-                device.join(&invite, None).await?;
-                device.device().save(&self.device_file())?;
-                return Ok(json!({ "device": "added to the identity's device list" }));
-            }
-            self.node.join(&invite, as_).await?
+            self.node.join(&Invite::parse(target.trim())?, as_).await?
         } else {
             let opening = self.device_state()?.openings.into_iter().find(|o| b64(&o.group.0) == target || o.name == target);
             let opening = opening.context("expected an invite link, or the id or name of a group open to your identity")?;
@@ -1658,9 +1650,36 @@ impl Session {
         Ok(json!({ "id": hex::encode(&id.0), "group": b64(&gid.0), "identity": { "id": claim.identity.id, "name": name }, "to": self.describe(&gid, &to)? }))
     }
 
-    /// The device's node, which this process runs when it holds the device's lock.
-    fn device(&self) -> Result<&SessionNode> {
-        self.device.as_ref().context("this session process does not act for the device")
+    /// The devices kind on the device's node, which this process runs when it holds the device's lock.
+    fn devices(&self) -> Result<&Devices<SqliteProvider>> {
+        self.device.as_ref().map(|(_, devices)| devices).context("this session process does not act for the device")
+    }
+
+    /// Renews this session's certificate of each identity it speaks as that is not by the identity's current key, or
+    /// that lasts less than another half day.
+    async fn renew(&mut self) {
+        self.renew_at = Instant::now() + RENEW_CHECK;
+        let Ok(state) = self.device_state() else { return };
+        for identity in self.node.spoken() {
+            let certificate = self.node.certificate(&identity.id.0);
+            let current = state.keys.iter().find(|(id, _)| *id == identity.id).map(|(_, key)| key);
+            let fresh = certificate.as_ref().is_some_and(|c| {
+                let lasts = certified(c).is_some_and(|c| c.expires > lmk_node::now() + DAY / 2);
+                lasts && current.is_none_or(|key| verify(&key.0, CERTIFICATE_CONTEXT, &c.body.0, &c.sig.0))
+            });
+            if !fresh && let Err(error) = self.certify(&identity).await {
+                eprintln!("letmeknow: renewing this session's certificate: {error:#}");
+            }
+        }
+    }
+
+    /// Has the device certify this session as speaking for an identity.
+    async fn certify(&mut self, identity: &IdentityRef) -> Result<()> {
+        let request = Request::Certify { identity: identity.id.clone(), key: self.node.key(), name: self.config.name.clone() };
+        let certificate: Envelope = serde_json::from_value(Box::pin(self.request(request)).await?)?;
+        // So that it shows its peers the key log its certificate needs.
+        self.node.read_key_log(identity).await?;
+        self.node.set_certificate(certificate)
     }
 
     fn device_file(&self) -> PathBuf {
@@ -1676,12 +1695,19 @@ impl Session {
         Ok(self.device_state()?.contacts)
     }
 
-    /// The identity a new membership speaks as: the one named, or else the device's first.
-    fn speaking_as(&self, as_: Option<String>) -> Result<Option<IdentityRef>> {
-        match as_ {
-            Some(as_) => Ok(Some(self.own_identity(&as_)?.0)),
-            None => Ok(self.identities()?.into_iter().next().map(|(identity, _)| identity)),
+    /// The identity a new membership speaks as, the one named or else the device's first, with this session's
+    /// certificate of it.
+    async fn speaking_as(&mut self, as_: Option<String>) -> Result<Option<IdentityRef>> {
+        let identity = match as_ {
+            Some(as_) => Some(self.own_identity(&as_)?.0),
+            None => self.identities()?.into_iter().next().map(|(identity, _)| identity),
+        };
+        if let Some(identity) = &identity
+            && self.node.certificate(&identity.id.0).is_none()
+        {
+            self.certify(identity).await?;
         }
+        Ok(identity)
     }
 
     /// An identity this device is on, by id or name.
@@ -1710,38 +1736,36 @@ impl Session {
     }
 
     async fn identity(&mut self, op: IdentityOp) -> Result<Value> {
-        let device = self.device()?.clone();
+        let devices = self.devices()?.clone();
         match op {
             IdentityOp::Create { name, membership } => {
                 let membership = membership.map(|m| crate::service(&m)).transpose()?.unwrap_or(self.config.membership.clone());
-                let identity = device.identity_create(&name, membership).await?;
-                device.device().save(&self.device_file())?;
+                let identity = devices.create(&name, membership).await?;
                 Ok(json!({ "identity": identity.id, "name": name }))
             }
             IdentityOp::List => {
+                let me = Device::load(&self.device_file())?.public();
                 let mut identities = Vec::new();
-                let me = device.device().public();
-                for (identity, _) in device.identities() {
-                    let list = device.device_list(&identity).await?;
-                    let devices: Vec<Value> =
-                        list.devices.iter().map(|d| json!({ "key": d.key, "name": d.name, "you": d.key.0 == me })).collect();
-                    identities.push(json!({ "identity": identity.id, "name": list.name, "devices": devices }));
+                for (identity, name) in devices.identities() {
+                    let listed = devices.devices(&identity.id.0)?;
+                    let listed: Vec<Value> = listed.iter().map(|(key, name)| json!({ "key": key, "name": name, "you": key.0 == me })).collect();
+                    identities.push(json!({ "identity": identity.id, "name": name, "devices": listed }));
                 }
                 Ok(json!({ "identities": identities }))
             }
             IdentityOp::Remove { identity, device: removed } => {
-                let identities = device.identities();
+                let identities = devices.identities();
                 let identity = match (identity, &identities[..]) {
                     (Some(identity), _) => self.own_identity(&identity)?.0,
                     (None, [(only, _)]) => only.clone(),
                     (None, _) => bail!("pass --identity: this device is on {} identities", identities.len()),
                 };
-                let list = device.device_list(&identity).await?;
-                let listed = list.devices.iter().find(|d| b64(&d.key.0) == removed || d.name == removed).context("no such device")?;
-                device.remove_device(&identity, &listed.key.0).await?;
-                // This session's groups lose the device's sessions too.
-                self.node.device_list(&identity).await?;
-                Ok(json!({ "identity": identity.id, "removed": listed.key }))
+                let listed = devices.devices(&identity.id.0)?;
+                let (key, _) = listed.iter().find(|(key, name)| b64(&key.0) == removed || *name == removed).context("no such device")?;
+                devices.remove(&identity.id.0, &key.0).await?;
+                // This session's groups lose the device's sessions too, once it shows them the new key.
+                self.node.read_key_log(&identity).await?;
+                Ok(json!({ "identity": identity.id, "removed": key }))
             }
         }
     }
@@ -1788,7 +1812,7 @@ impl Session {
     pub async fn shutdown(&self) {
         // Plugins stop with the session: their stdin closes when it ends.
         let _ = self.node.shutdown().await;
-        if let Some(device) = &self.device {
+        if let Some((device, _)) = &self.device {
             let _ = device.shutdown().await;
             let _ = std::fs::remove_file(self.home.join("device-endpoint"));
         }
