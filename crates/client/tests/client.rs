@@ -77,7 +77,7 @@ impl Member {
             kinds: vec![CHAT.into(), DEVICES.into(), KIND.into()],
         };
         let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-        let devices = Devices::new(node.clone(), device.clone());
+        let devices = Devices::new(node.clone(), device.clone(), Arc::new(|_: &Device| Ok(())));
         let (lines, written) = mpsc::unbounded_channel();
         let plugin = Arc::new(Recorder { started: Mutex::default(), sent: Mutex::default(), lines });
         let membership = Service::Folder(logs.to_str().unwrap().into());

@@ -75,7 +75,7 @@ async fn node(relay: &Relay, name: &str, kinds: &[&str]) -> Session {
 async fn device(relay: &Relay, name: &str) -> (Session, Devices<MemoryProvider>) {
     let device = Device::new(name);
     let (node, events) = Node::start(MemoryProvider::default(), config(relay, name, Some(device.clone()), &[CHAT, DEVICES])).await.unwrap();
-    (Session { node: node.clone(), events }, Devices::new(node, device))
+    (Session { node: node.clone(), events }, Devices::new(node, device, Arc::new(|_: &Device| Ok(()))))
 }
 
 fn config(relay: &Relay, name: &str, device: Option<Device>, kinds: &[&str]) -> Config {
@@ -599,7 +599,7 @@ async fn a_device_keeps_its_identities_across_restarts() {
     let start = || async {
         let (node, _events) =
             Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), config(&relay, "laptop", Some(device.clone()), &[CHAT, DEVICES])).await.unwrap();
-        (node.clone(), Devices::new(node, device.clone()))
+        (node.clone(), Devices::new(node, device.clone(), Arc::new(|_: &Device| Ok(()))))
     };
     let (node, devices) = start().await;
     let bob = devices.create("Bob", membership).await.unwrap();

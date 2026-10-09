@@ -1,8 +1,9 @@
 //! The devices kind, built in: an identity's devices group, whose members are its devices. Its state is the identity,
 //! its private keys, its contacts and the groups open to it, kept in step through the group's kind log and handed to a
 //! new device as any kind's state. A device certifies its sessions with the identity's newest key, and replaces the key
-//! when a device leaves and monthly.
+//! when it commits the removal of a device, and monthly.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -84,17 +85,23 @@ enum Entry {
     Opening { opening: Opening },
 }
 
+/// Keeps the device, as when it is renamed: its `device.json`, or a browser's record.
+pub type Save = Arc<dyn Fn(&Device) -> Result<()> + Send + Sync>;
+
 /// The devices kind, on a device's node.
 pub struct Devices<P> {
     node: Node<P>,
     device: Device,
+    save: Save,
     /// Held while a record is read and written back.
     lock: Arc<Mutex<()>>,
+    /// The devices `remove` takes off, which replaces the key itself.
+    removing: Arc<Mutex<HashSet<Bytes>>>,
 }
 
 impl<P> Clone for Devices<P> {
     fn clone(&self) -> Self {
-        Devices { node: self.node.clone(), device: self.device.clone(), lock: self.lock.clone() }
+        Devices { node: self.node.clone(), device: self.device.clone(), save: self.save.clone(), lock: self.lock.clone(), removing: self.removing.clone() }
     }
 }
 
@@ -103,9 +110,10 @@ fn record_key(gid: &[u8]) -> String {
 }
 
 impl<P: Provider + Send + 'static> Devices<P> {
-    /// The devices kind on `node`, whose key is `device`'s; it replaces each identity's key once it is a month old.
-    pub fn new(node: Node<P>, device: Device) -> Self {
-        let devices = Devices { node, device, lock: Arc::default() };
+    /// The devices kind on `node`, whose key is `device`'s, kept by `save`; it replaces each identity's key once it is a
+    /// month old.
+    pub fn new(node: Node<P>, device: Device, save: Save) -> Self {
+        let devices = Devices { node, device, save, lock: Arc::default(), removing: Arc::default() };
         let rotating = devices.clone();
         spawn(async move {
             loop {
@@ -147,6 +155,11 @@ impl<P: Provider + Send + 'static> Devices<P> {
 
     fn book(&self, identity: &[u8]) -> Result<(Bytes, Book)> {
         self.books().into_iter().find(|(_, book)| book.identity.id.0 == identity).context("this device is not on that identity")
+    }
+
+    /// This device's name.
+    pub fn name(&self) -> Option<String> {
+        self.node.device_name()
     }
 
     /// This device's identities, with their names.
@@ -248,19 +261,49 @@ impl<P: Provider + Send + 'static> Devices<P> {
         self.enter(&gid.0, Entry::Opening { opening }).await
     }
 
-    /// Takes a device off an identity, and replaces the identity's key, which it held, by a key log entry that names
-    /// it: again, once it holds the new key, if another device replaced the key at the same time.
+    /// Takes a device off an identity, and replaces the identity's key, which it held.
     pub async fn remove(&self, identity: &[u8], device: &[u8]) -> Result<()> {
-        ensure!(device != self.device.public(), "a device is taken off its identity by another of its devices");
+        ensure!(device != self.device.public(), "to take this device off its identity, leave it");
         let (gid, _) = self.book(identity)?;
-        self.node.remove(&gid.0, device).await?;
+        let device = Bytes(device.to_vec());
+        self.removing.lock().unwrap().insert(device.clone());
+        let removed = async {
+            self.node.remove(&gid.0, &device.0).await?;
+            self.revoke(&gid.0, device.clone()).await
+        };
+        let removed = removed.await;
+        self.removing.lock().unwrap().remove(&device);
+        removed
+    }
+
+    /// Replaces the identity's key by a key log entry that names a device taken off it: again, once this device holds
+    /// the new key, if another device replaced the key at the same time.
+    async fn revoke(&self, gid: &[u8], device: Bytes) -> Result<()> {
         for _ in 0..STATE_WAIT {
-            if self.rotate(&gid.0, Some(Bytes(device.to_vec()))).await? {
+            if self.rotate(gid, Some(device.clone())).await? {
                 return Ok(());
             }
             sleep(Duration::from_millis(500)).await;
         }
         bail!("this device does not hold its identity's current key")
+    }
+
+    /// Takes this device off an identity: it asks the other devices to remove it, or, the identity's only device, ends
+    /// the identity. Returns whether it ended.
+    pub async fn leave(&self, identity: &[u8]) -> Result<bool> {
+        let (gid, _) = self.book(identity)?;
+        let ended = self.node.leave(&gid.0).await?.is_none();
+        let _lock = self.lock.lock().unwrap();
+        self.node.delete_record(&record_key(&gid.0))?;
+        Ok(ended)
+    }
+
+    /// Renames this device: its record, the certificates it signs from now on, and its credential in its devices groups.
+    pub async fn rename(&self, name: &str) -> Result<()> {
+        let mut device = self.device.clone();
+        device.name = name.into();
+        (self.save)(&device)?;
+        self.node.rename_device(name).await
     }
 
     /// Holds an entry as a message of the group, and appends it to the group's log.
@@ -300,7 +343,8 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let (seed, _) = book.seed(log.current()).context("this device does not hold its identity's current key yet")?;
         let added_by = self.record(&gid.0).added_by;
         let device_key = Some(Bytes(self.device.public().to_vec()));
-        let certified = Certified { identity: book.identity.id, key, name, device: self.device.name.clone(), device_key, added_by, expires: now() + DAY };
+        let device = self.node.device_name().unwrap_or_default();
+        let certified = Certified { identity: book.identity.id, key, name, device, device_key, added_by, expires: now() + DAY };
         Ok(identity::certify(&seed, &certified))
     }
 
@@ -310,12 +354,23 @@ impl<P: Provider + Send + 'static> Devices<P> {
     }
 
     /// Takes the events of devices groups, but for their members joining and leaving and warnings; returns every other
-    /// event.
+    /// event. A device that committed another's removal replaces the identity's key.
     pub fn on(&self, event: Event) -> Option<Event> {
         let Some(gid) = event.group().cloned() else { return Some(event) };
         let ours = self.node.settings(&gid.0).is_ok_and(|s| s.kind == DEVICES) || self.node.record(&record_key(&gid.0)).ok().flatten().is_some();
         if !ours {
             return Some(event);
+        }
+        if let Event::Left { member, by, .. } = &event
+            && by.key == self.node.key()
+            && !self.removing.lock().unwrap().contains(&member.key)
+        {
+            let (devices, gid, device) = (self.clone(), gid.0.clone(), member.key.clone());
+            spawn(async move {
+                if let Err(error) = devices.revoke(&gid, device).await {
+                    tracing::warn!("replacing an identity's key: {error:#}");
+                }
+            });
         }
         let taken = match event {
             Event::State { data, .. } => self.take_state(&gid.0, &data),

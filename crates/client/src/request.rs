@@ -112,7 +112,7 @@ pub enum Request {
     /// The members online in each group, and what only this session holds
     #[cfg_attr(feature = "clap", command(display_order = 21))]
     Status,
-    /// Identities this device is on: create one, list them, or take a device off one
+    /// Identities this device is on: create one, list them, take a device off one, leave one, or rename this device
     #[cfg_attr(feature = "clap", command(display_order = 22))]
     Identity {
         #[cfg_attr(feature = "clap", command(subcommand))]
@@ -157,12 +157,16 @@ pub enum IdentityOp {
     },
     /// The identities this device is on, and their devices
     List,
-    /// Take a device, by key or name, off an identity, whose key is then replaced
+    /// Take another device, by key or name, off an identity, whose key is then replaced
     Remove {
         #[cfg_attr(feature = "clap", arg(long))]
         identity: Option<String>,
         device: String,
     },
+    /// Take this device off an identity: its sessions leave the groups they are in as it first; the identity ends if this is its only device
+    Leave { identity: String },
+    /// Rename this device, as its identities' devices and members of its sessions' groups see it
+    Rename { name: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -190,6 +194,8 @@ impl Request {
     /// Whether only the device's node answers it.
     pub fn for_device(&self) -> bool {
         match self {
+            // A session leaves its own groups first.
+            Request::Identity { op: IdentityOp::Leave { .. } } => false,
             Request::Identity { .. } | Request::SetContact { .. } | Request::SetOpening { .. } | Request::Certify { .. } => true,
             Request::Invite { identity, .. } => identity.is_some(),
             Request::Join { target, .. } => lmk_proto::links::Invite::parse(target.trim()).is_ok_and(|invite| invite.device),

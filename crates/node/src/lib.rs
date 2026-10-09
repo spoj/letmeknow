@@ -349,6 +349,10 @@ pub(crate) struct G {
 pub(crate) struct State<P> {
     provider: P,
     session: Session,
+    /// The session's own name, which its credential names in its groups.
+    name: String,
+    /// The device's name, which its credential names in its devices groups, where this is a device's node.
+    device: Option<String>,
     groups: HashMap<Vec<u8>, G>,
     /// The logs this session follows, by id.
     logs: HashMap<Vec<u8>, logs::Log>,
@@ -467,6 +471,16 @@ fn endpoint_id(key: &[u8]) -> Option<EndpointId> {
 }
 
 impl<P: Provider> State<P> {
+    /// What the credential of the group this session makes or joins next names: its identity, and in a devices group
+    /// the device's name, else its own.
+    fn speak(&mut self, identity: Option<IdentityRef>, devices: bool) {
+        self.session.credential.identity = identity;
+        self.session.credential.name = match &self.device {
+            Some(device) if devices => device.clone(),
+            _ => self.name.clone(),
+        };
+    }
+
     fn group(&self, gid: &[u8]) -> Result<&G> {
         self.groups.get(gid).context("this session is not in that group")
     }
@@ -496,8 +510,8 @@ impl<P: Provider> State<P> {
         let credential = member.credential.clone()?;
         let g = self.groups.get(gid);
         let added = g.and_then(|g| {
-            let added = g.mls.added().iter().rev().find(|added| added.member == credential)?;
-            let by = g.mls.members().into_iter().find(|m| m.credential.as_ref() == Some(&added.by));
+            let added = g.mls.added().iter().rev().find(|added| added.member.key == credential.key)?;
+            let by = g.mls.members().into_iter().find(|m| m.key == added.by.key.0);
             Some((Bytes(by.map(|by| by.key).unwrap_or_default()), added.how.clone().unwrap_or(How::Invite)))
         });
         let claim = credential.identity.as_ref().map(|identity| self.claim(&credential, identity));
@@ -654,6 +668,8 @@ impl<P: Provider + Send + 'static> Node<P> {
             .collect();
         let state = State {
             provider,
+            name: session.credential.name.clone(),
+            device: config.device.as_ref().map(|device| device.name.clone()),
             session,
             groups,
             logs,
@@ -782,7 +798,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let gid = {
             let mut st = self.inner.state.lock().unwrap();
             let st = &mut *st;
-            st.session.credential.identity = identity;
+            st.speak(identity, settings.kind == DEVICES);
             let mls = Group::create(&st.provider, &st.session, &settings, self.inner.window)?;
             let id = Bytes(mls.exported(&st.provider, kindlog::LOG_LABEL)?.to_vec());
             let kind_logs = if settings.kind == CHAT { Vec::new() } else { vec![LogRef { id, after: 0 }] };
@@ -829,7 +845,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             .iter()
             .map(|member| Ok((EndpointId::from_bytes(&member.key)?, member.relay.as_ref().map_or(Ok(ours.clone()), |relay| relay.parse())?)))
             .collect::<Result<Vec<_>>>()?;
-        self.ask(members, Some(Bytes(link.secret.to_vec())), None, identity).await
+        self.ask(members, Some(Bytes(link.secret.to_vec())), None, identity, link.device).await
     }
 
     /// Asks the members of an open group to admit this session in turn, speaking as `identity`, with its certificate.
@@ -837,7 +853,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         ensure!(self.inner.kinds.contains(&opening.kind), "this session does not support {} groups", opening.kind);
         self.certificate(&identity.id.0).context("this session has no certificate of that identity yet")?;
         let members = opening.members.iter().filter_map(|key| endpoint_id(&key.0)).map(|peer| (peer, self.inner.relay.clone())).collect();
-        Ok(self.ask(members, None, Some(opening.group.clone()), Some(identity)).await?.0)
+        Ok(self.ask(members, None, Some(opening.group.clone()), Some(identity), false).await?.0)
     }
 
     /// Asks members in turn to admit this session, by an invite's secret or a group open to `identity`.
@@ -847,11 +863,12 @@ impl<P: Provider + Send + 'static> Node<P> {
         secret: Option<Bytes>,
         group: Option<Bytes>,
         identity: Option<IdentityRef>,
+        devices: bool,
     ) -> Result<(Bytes, [u8; 32])> {
         let join = {
             let mut st = self.inner.state.lock().unwrap();
             let certificate = identity.as_ref().and_then(|identity| st.certificate(&st.session.credential, &identity.id.0).cloned());
-            st.session.credential.identity = identity;
+            st.speak(identity, devices);
             Join { secret, group, key_package: Bytes(st.session.key_package(&st.provider)?), certificate }
         };
         let dialed = n0_future::join_all(members.iter().map(|(peer, relay)| timeout(DIAL_WAIT, self.inner.net().dial(*peer, relay.clone())))).await;
@@ -1165,6 +1182,24 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(())
     }
 
+    /// The device's name, where this is a device's node.
+    pub fn device_name(&self) -> Option<String> {
+        self.inner.state.lock().unwrap().device.clone()
+    }
+
+    /// Renames the device, in its credential in each devices group whose members' leaves take a rename; the others
+    /// take it once they do, at this node's next key update.
+    pub async fn rename_device(&self, name: &str) -> Result<()> {
+        self.inner.state.lock().unwrap().device = Some(name.into());
+        for gid in self.groups() {
+            let due = self.inner.state.lock().unwrap().group(&gid.0).is_ok_and(|g| renaming(&g.mls, Some(name)).is_some());
+            if due {
+                self.inner.commit(&gid.0, |g| Ok(Change { name: renaming(g, Some(name)), ..Change::default() })).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// What a group this session is in looks like as an opening.
     pub fn opening(&self, gid: &[u8]) -> Result<Opening> {
         let st = self.inner.state.lock().unwrap();
@@ -1216,9 +1251,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     self.warn(Some(gid), format!("catching up: {error:#}"));
                     continue;
                 }
-                let leaf = self.state.lock().unwrap().session.leaf.clone();
-                if let Err(error) =
-                    self.commit(gid, |_| Ok(Change { leaf: Some(leaf.clone()), ..Change::default() })).await
+                let (leaf, device) = {
+                    let st = self.state.lock().unwrap();
+                    (st.session.leaf.clone(), st.device.clone())
+                };
+                let change = |g: &Group| Ok(Change { leaf: Some(leaf.clone()), name: renaming(g, device.as_deref()), ..Change::default() });
+                if let Err(error) = self.commit(gid, change).await
                 {
                     self.warn(Some(gid), format!("key update: {error:#}"));
                 }
@@ -1933,6 +1971,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.warn(Some(&gid), text.clone());
         }
     }
+}
+
+/// The name this session takes in a group: in a devices group, the device's, where its credential names another and
+/// every member's leaf takes a rename.
+fn renaming(g: &Group, device: Option<&str>) -> Option<String> {
+    let own = g.members().into_iter().find(|m| m.index == g.own_index())?.credential?;
+    let device = device.filter(|device| g.settings().kind == DEVICES && own.name != *device && g.renames())?;
+    Some(device.to_owned())
 }
 
 /// A member to dial, as an invite link names it.
