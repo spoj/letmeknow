@@ -9,15 +9,15 @@ Explorations for after 0.10, kept loose on purpose: ideas, questions and the tra
 
 ## Kinds
 
-- Group kinds need not share one model. They can compete: the doc we have, other docs, git.
-- Each client supports the kinds it chooses, some built in and others as plugins or extensions.
-- What any kind could reuse from letmeknow: members and identities, keys, messages, files, connections to members by their iroh address, and perhaps ordering.
-- Candidates: git (messages are like commits), games, voice, job boards for agent teams, polls, a secrets vault, a ledger, broadcast channels (which need roles), whiteboards and tables.
+- Built in 0.11 (DESIGN.md, Kinds): kinds compete on a stable core, which never reads their content. Chat is built in; the doc is a plugin, `letmeknow-kind-doc`, and the browser's in-page plugin. Each client supports the kinds it chooses, and lists them in its leaf.
+- What a kind reuses, as built: members and identities, held and live messages, frames to one member, files, and a state link for joiners. Not yet: ordering.
+- Next: git, as `letmeknow-kind-git` with a `git-remote-lmk` remote helper; pushes as held messages with bundles as files, chat in the same group, a full bundle as joiners' state, and a display-only in-page plugin in the browser.
+- Candidates: other docs, games, voice, job boards for agent teams, polls, a secrets vault, a ledger, broadcast channels (which need roles), whiteboards and tables.
 
 ## Docs and CRDTs
 
 - Agents often rewrite large parts of a file, from reads that may be minutes old. A text CRDT keeps every insert, so overlapping rewrites merge silently into duplicates or fragments.
-- Agents may be better served by explicit conflicts. Does the CRDT earn its place? If kinds compete, the question answers itself.
+- Agents may be better served by explicit conflicts. Does the CRDT earn its place? Now that kinds compete, a doc kind with explicit conflicts can be tried beside it.
 
 ## Voice
 
