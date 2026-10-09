@@ -75,9 +75,11 @@ struct Group {
 
 struct Round {
     negentropy: Negentropy<'static, NegentropyStorageVector>,
-    /// Each item's epoch, and its place in the order this session took the items.
-    items: HashMap<[u8; 32], (u64, usize)>,
+    items: Items,
 }
+
+/// Each item's epoch, and its place in the order this session took the items.
+type Items = HashMap<[u8; 32], (u64, usize)>;
 
 /// Runs the connection's one peer stream; the connection closes with it.
 pub(crate) async fn run(
@@ -400,7 +402,7 @@ impl Session {
         Ok(())
     }
 
-    fn storage(&self, group: &Bytes) -> Option<(NegentropyStorageVector, HashMap<[u8; 32], (u64, usize)>)> {
+    fn storage(&self, group: &Bytes) -> Option<(NegentropyStorageVector, Items)> {
         let theirs = self.groups.get(group)?.theirs.as_ref()?;
         let items = self.inner.groups.items(&group.0, sync::lowest(&self.inner.groups.hello(&group.0), theirs));
         Some((sync::storage(&items), items.into_iter().enumerate().map(|(at, (epoch, id))| (id, (epoch, at))).collect()))
