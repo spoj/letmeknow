@@ -207,22 +207,16 @@ impl Session {
     async fn frame(&mut self, frame: Frame) -> Result<()> {
         match frame {
             Frame::Hello { groups, heads, certificates } => {
-                let before = self.shared();
                 if !self.leaves().is_empty() {
                     for certificate in certificates {
                         self.inner.groups.certificate(self.peer, certificate);
                     }
                 }
                 let shared = self.shared();
-                // Newly served groups get our state before anything else of them, as a sync's first round needs it.
-                let served: Vec<Vec<u8>> = shared.iter().filter(|g| !before.contains(g)).cloned().collect();
-                if !served.is_empty() {
-                    self.send_hello(&served).await?;
-                }
                 let logs = self.logs(&shared);
-                // A session ignores what a hello shows of a group it is not in yet or a log it does not follow yet,
-                // so a hello that shows us a group we had none for, or a log we are behind on, gets ours in return:
-                // the peer forwards and syncs by it.
+                // A session ignores what a hello shows of a group it does not serve the peer yet or a log it does not
+                // follow yet, so a hello that shows us a group we had none for, or a log we are behind on, gets ours in
+                // return, before any sync of it, whose first round needs it: the peer forwards and syncs by it.
                 let mut answer = false;
                 for theirs in heads.into_iter().filter(|head| logs.contains(&head.log.0)) {
                     let log = theirs.log.clone();
@@ -234,15 +228,17 @@ impl Session {
                     self.logs.entry(log.clone()).or_default().theirs = Some(theirs);
                     self.forward(&log).await?;
                 }
-                for hello in groups.into_iter().filter(|hello| shared.contains(&hello.group.0)) {
-                    let group = hello.group.clone();
-                    let state = self.groups.entry(group.clone()).or_default();
+                let groups: Vec<Hello> = groups.into_iter().filter(|hello| shared.contains(&hello.group.0)).collect();
+                for hello in &groups {
+                    let state = self.groups.entry(hello.group.clone()).or_default();
                     answer |= state.theirs.is_none();
-                    state.theirs = Some(hello);
-                    self.sync(&group).await?;
+                    state.theirs = Some(hello.clone());
                 }
                 if answer {
                     self.send_hello(&shared).await?;
+                }
+                for hello in groups {
+                    self.sync(&hello.group).await?;
                 }
             }
             Frame::Entries { log, entries, head } => self.on_entries(log, entries, head).await?,
