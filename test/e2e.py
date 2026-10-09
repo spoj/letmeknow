@@ -152,10 +152,12 @@ def compat(old, listeners):
     run("cleo", "join", run("ann", "invite", f"--group={chat['group']}")["link"], bin=old)
     run("cleo", "send", "@ann from 0.10.0", bin=old)
     ann.expect("message", lambda e: e["content"] == "@ann from 0.10.0")
-    run("ann", "send", f"--group={chat['group']}", "@cleo from 0.10.1")
-    cleo.expect("message", lambda e: e["content"] == "@cleo from 0.10.1")
+    # Read rather than wait for it to print: it comes after messages from before cleo joined, which never reach her.
+    sent = run("ann", "send", f"--group={chat['group']}", "@cleo from 0.10.1")
+    got = until(lambda: run("cleo", "read", sent["id"], ok=False, bin=old), lambda got: isinstance(got, list))
+    check(got[0]["content"] == "@cleo from 0.10.1", "a 0.10.0 peer and this build exchange messages")
     run("ann", "introduce", f"--group={chat['group']}", "Ben", "--to", "Cleo")
-    check(cleo.expect("introduced", lambda e: e["how"] == "introduce")["identity"]["name"] == "Ben", "a 0.10.0 peer and this build talk")
+    check(cleo.expect("introduced", lambda e: e["how"] == "introduce")["identity"]["name"] == "Ben", "and introductions, which it takes as for everyone")
     for listener in (ann, ben, phone, cleo):
         listener.stop()
         listeners.remove(listener)
