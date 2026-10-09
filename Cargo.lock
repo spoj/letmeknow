@@ -2573,6 +2573,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "letmeknow-kind-doc"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "lmk-proto",
+ "notify",
+ "serde_json",
+ "sha2 0.11.0",
+ "similar",
+ "yrs",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
