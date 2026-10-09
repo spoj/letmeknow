@@ -348,3 +348,60 @@ async fn a_device_that_stopped_before_it_was_saved_is_still_on_its_identity() {
     assert_eq!(node.identities(), [(bob, "Bob".to_owned())]);
     node.shutdown().await.unwrap();
 }
+
+/// A member catching up from a holder gets a sender's messages about as they were sent, so more than the 1000 that MLS
+/// opens out of order all arrive.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_catching_up_takes_more_than_a_thousand_messages_of_one_sender() {
+    use lmk_core::provider::SqliteProvider;
+    const MESSAGES: usize = 1100;
+    let relay = relay().await;
+    let dir = folder("thousand");
+    std::fs::create_dir_all(&dir).unwrap();
+    let carol_config = || Config {
+        name: "Carol".into(),
+        device_key: false,
+        relay: relay.url.clone(),
+        ca: CaTlsConfig::custom_roots([relay.cert.clone()]),
+        home: None,
+        files: None,
+        disk: None,
+        file_limit: 100 << 20,
+        window: Window::default(),
+        kinds: vec![CHAT.into()],
+    };
+    let carol_device = Device::new("Carol's laptop");
+    let carol_db = dir.join("carol.db");
+    let mut alice = session(&relay, "Alice").await;
+    let mut bob = session(&relay, "Bob").await;
+    let (carol, _events) = Node::start(SqliteProvider::open(&carol_db).unwrap(), carol_device.clone(), carol_config()).await.unwrap();
+    let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    let link = alice.node.invite(Target::Group(gid.0.clone()), None, None).unwrap();
+    bob.node.join(&Invite::parse(&link).unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let link = alice.node.invite(Target::Group(gid.0.clone()), None, None).unwrap();
+    carol.join(&Invite::parse(&link).unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    bob.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    carol.shutdown().await.unwrap();
+    drop(carol);
+    for n in 0..MESSAGES {
+        alice.node.send(&gid.0, &message(&n.to_string()), false).await.unwrap();
+    }
+    for _ in 0..MESSAGES {
+        bob.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
+    }
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+    let (carol, mut events) = Node::start(SqliteProvider::open(&carol_db).unwrap(), carol_device, carol_config()).await.unwrap();
+    let mut taken = 0;
+    let all = async {
+        while taken < MESSAGES {
+            if let Event::Message(_) = events.recv().await.unwrap() {
+                taken += 1;
+            }
+        }
+    };
+    tokio::time::timeout(WAIT, all).await.expect("Carol took every message");
+    carol.shutdown().await.unwrap();
+}

@@ -75,7 +75,8 @@ struct Group {
 
 struct Round {
     negentropy: Negentropy<'static, NegentropyStorageVector>,
-    epochs: HashMap<[u8; 32], u64>,
+    /// Each item's epoch, and its place in the order this session took the items.
+    items: HashMap<[u8; 32], (u64, usize)>,
 }
 
 /// Runs the connection's one peer stream; the connection closes with it.
@@ -399,17 +400,17 @@ impl Session {
         Ok(())
     }
 
-    fn storage(&self, group: &Bytes) -> Option<(NegentropyStorageVector, HashMap<[u8; 32], u64>)> {
+    fn storage(&self, group: &Bytes) -> Option<(NegentropyStorageVector, HashMap<[u8; 32], (u64, usize)>)> {
         let theirs = self.groups.get(group)?.theirs.as_ref()?;
         let items = self.inner.groups.items(&group.0, sync::lowest(&self.inner.groups.hello(&group.0), theirs));
-        Some((sync::storage(&items), items.into_iter().map(|(epoch, id)| (id, epoch)).collect()))
+        Some((sync::storage(&items), items.into_iter().enumerate().map(|(at, (epoch, id))| (id, (epoch, at))).collect()))
     }
 
     async fn initiate(&mut self, group: &Bytes) -> Result<()> {
-        let Some((storage, epochs)) = self.storage(group) else { return Ok(()) };
+        let Some((storage, items)) = self.storage(group) else { return Ok(()) };
         let mut negentropy = Negentropy::owned(storage, 0)?;
         let msg = Bytes(negentropy.initiate()?);
-        self.groups.get_mut(group).unwrap().initiator = Some(Round { negentropy, epochs });
+        self.groups.get_mut(group).unwrap().initiator = Some(Round { negentropy, items });
         self.write(&Frame::Reconcile { group: group.clone(), msg }).await
     }
 
@@ -432,7 +433,11 @@ impl Session {
         if let Some(round) = &mut state.initiator {
             let (mut have, mut need) = (Vec::new(), Vec::new());
             let next = round.negentropy.reconcile_with_ids(&msg.0, &mut have, &mut need)?;
-            let have: Vec<(u64, [u8; 32])> = have.iter().map(|id| (round.epochs[&id.to_bytes()], id.to_bytes())).collect();
+            // In the order this session took them, which is about each sender's: MLS opens a sender's messages at most
+            // 1000 out of order.
+            let mut have: Vec<[u8; 32]> = have.iter().map(|id| id.to_bytes()).collect();
+            have.sort_by_key(|id| round.items[id].1);
+            let have: Vec<(u64, [u8; 32])> = have.into_iter().map(|id| (round.items[&id].0, id)).collect();
             if next.is_none() {
                 state.initiator = None;
             }

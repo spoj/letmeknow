@@ -56,7 +56,7 @@ pub trait Groups: Send + Sync + 'static {
     /// Applies entries that directly follow this session's log and end at `head`, already
     /// checked against its chain.
     fn apply(&self, group: &[u8], entries: Vec<Bytes>, head: Head) -> Result<()>;
-    /// (epoch, message id) of every message held or given up on, from epoch `from`.
+    /// (epoch, message id) of every message held or given up on, from epoch `from`, in the order this session took them.
     fn items(&self, group: &[u8], from: u64) -> Vec<(u64, [u8; 32])>;
     /// A held message's MLS ciphertext.
     fn message(&self, group: &[u8], id: &[u8; 32]) -> Option<Vec<u8>>;
