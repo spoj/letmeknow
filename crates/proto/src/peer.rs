@@ -145,6 +145,9 @@ pub struct Admitted {
     /// The ids of the messages from before the joiner's epoch that the inviter holds, which the joiner never gets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub before: Vec<Bytes>,
+    /// The certificates the inviter holds of the group's members.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub certificates: Vec<Envelope>,
 }
 
 #[cfg(test)]

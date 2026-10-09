@@ -184,7 +184,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Some(state) => Some(self.state_file(gid, state).await?),
             None => None,
         };
-        Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc, before })
+        let certificates = lmk_net::Groups::certificates(&**self, &[gid.to_vec()]);
+        Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc, before, certificates })
     }
 
     fn answer(&self, group: Option<&[u8]>, admitted: Result<Admitted>) -> Answer<Admitted> {
@@ -347,22 +348,26 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
     }
 
     fn certificate(&self, _: EndpointId, certificate: Envelope) {
-        let Some(certified) = certified(&certificate) else { return };
-        let mut st = self.state.lock().unwrap();
-        let member = st.groups.values().flat_map(|g| g.mls.members()).find_map(|m| m.credential.filter(|c| c.key == certified.key));
-        let Some(credential) = member.filter(|c| c.identity.as_ref().is_some_and(|i| i.id == certified.identity)) else { return };
-        let key = (certified.key.0.clone(), certified.identity.0.clone());
-        let log = st.keys.get(&certified.identity.0).map(|known| &known.log);
-        let valid = |c: &Envelope| log.is_some_and(|log| check(Some(c), &credential, log, now()).is_ok());
-        // A valid certificate beats one that is not, and else the later one wins.
-        let newer = st.certificates.get(&key).is_none_or(|held| match (valid(&certificate), valid(held)) {
-            (true, false) => true,
-            (false, true) => false,
-            _ => certified.expires > lmk_core::identity::certified(held).map_or(0, |held| held.expires),
-        });
-        if newer {
-            st.certificates.insert(key, certificate);
-        }
+        take_certificate(&mut self.state.lock().unwrap(), certificate);
+    }
+}
+
+/// Holds a certificate a peer showed, even of a session not yet a member here, as one whose Add is still on its way.
+/// A valid certificate beats one that is not, and else the later one wins.
+pub(crate) fn take_certificate<P: Provider>(st: &mut State<P>, certificate: Envelope) {
+    let Some(certified) = certified(&certificate) else { return };
+    let members = st.groups.values().flat_map(|g| g.mls.members());
+    let credential = members.filter_map(|m| m.credential).find(|c| c.key == certified.key && c.identity.as_ref().is_some_and(|i| i.id == certified.identity));
+    let log = st.keys.get(&certified.identity.0).map(|known| &known.log);
+    let valid = |c: &Envelope| matches!((&credential, log), (Some(credential), Some(log)) if check(Some(c), credential, log, now()).is_ok());
+    let key = (certified.key.0.clone(), certified.identity.0.clone());
+    let newer = st.certificates.get(&key).is_none_or(|held| match (valid(&certificate), valid(held)) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => certified.expires > lmk_core::identity::certified(held).map_or(0, |held| held.expires),
+    });
+    if newer {
+        st.certificates.insert(key, certificate);
     }
 }
 

@@ -1426,6 +1426,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let given_up = admitted.before.iter().map(|id| (0, id.clone())).collect();
             let rec = Rec { position: admitted.position, logged: admitted.position, given_up, ..Rec::default() };
             let gid = st.add_group(mls, rec)?;
+            for certificate in admitted.certificates {
+                groups::take_certificate(st, certificate);
+            }
             if admitted.doc.is_some() {
                 st.groups.get_mut(&gid).unwrap().asked = now();
             }
