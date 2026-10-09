@@ -31,10 +31,6 @@ pub struct Settings {
     pub open: Vec<Named>,
     pub keep: u32,
     pub membership: Service,
-    /// The id of the kind's log at the membership service: random, so that only members can tie it to the group. In a
-    /// group of a plugin's kind.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub log: Option<Bytes>,
 }
 
 /// An identity, by id, with the name its group knows it by.
@@ -99,10 +95,22 @@ pub enum Control {
     },
     /// The messages the sender gave up since it last said so.
     Refused { messages: Vec<Refusal> },
+    /// An invite, which any member admits a joiner by once: SHA-256 of its secret, when it expires (milliseconds), and
+    /// whom it is for.
+    Invite {
+        hash: Bytes,
+        expires: u64,
+        /// `--for`: the inviter's name for whoever joins by it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// `--to`: the only identity that may join by it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<Bytes>,
+    },
 }
 
 impl Control {
-    pub const TYPES: [&str; 3] = ["leave", "introduce", "refused"];
+    pub const TYPES: [&str; 4] = ["leave", "introduce", "refused", "invite"];
 }
 
 /// A message a member gave up, and why.
@@ -132,7 +140,7 @@ pub fn type_of(payload: &serde_json::Value) -> &str {
 
 /// Whether members hold a payload: those of these types always, and others when their sender marks them so.
 pub fn held_by_type(payload: &serde_json::Value) -> bool {
-    matches!(type_of(payload), "message" | "leave" | "refused")
+    matches!(type_of(payload), "message" | "leave" | "refused" | "invite")
 }
 
 /// A chat message, the payload of the built-in kind.

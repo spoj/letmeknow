@@ -10,8 +10,7 @@ use lmk_net::Event;
 use lmk_proto::{
     Answer, Bytes,
     identity::Envelope,
-    links::Invite,
-    peer::Frame,
+    peer::{Frame, Join},
 };
 
 const G: &[u8] = b"group";
@@ -314,15 +313,20 @@ async fn invite_and_join() {
     let service = service();
     let inviter = node(&relay, keys[0].clone(), Fake::new(&service), Options::default()).await;
     let joiner = node(&relay, keys[1].clone(), Fake::new(&service), Options { relay_only: true, ..Options::default() }).await;
-    let invite = |secret| Invite { device: false, key: *keys[0].public().as_bytes(), secret, relay: Some(relay.url.to_string()) };
-    let request = || b"kp".to_vec();
+    let join = |secret: Option<[u8; 16]>, group: Option<&[u8]>| Join {
+        secret: secret.map(Bytes::from),
+        group: group.map(Bytes::from),
+        key_package: Bytes(b"kp".to_vec()),
+        certificate: None,
+    };
+    let ask = |join| joiner.net.join(keys[0].public(), relay.url.clone(), join);
 
-    let Answer::Ok(admitted) = joiner.net.redeem(&invite(SECRET), request(), None).await.unwrap() else { panic!("refused") };
-    assert_eq!((admitted.welcome.0.as_slice(), admitted.position), (&b"welcome"[..], 3));
-    let refused = joiner.net.redeem(&invite([0; 16]), request(), None).await.unwrap();
-    assert_eq!(refused, Answer::Refused { refused: "unknown secret".into() });
-    let joined = joiner.net.join(keys[0].public(), relay.url.clone(), b"open", b"kp".to_vec(), Envelope { body: Bytes::default(), sig: Bytes::default() }).await.unwrap();
-    assert!(matches!(joined, Answer::Ok(admitted) if admitted.welcome.0 == b"open"));
+    // Requests on one connection, answered by id.
+    joiner.net.dial(keys[0].public(), relay.url.clone()).await.unwrap();
+    let (invited, refused, opened) = tokio::join!(ask(join(Some(SECRET), None)), ask(join(Some([0; 16]), None)), ask(join(None, Some(b"open"))));
+    assert!(matches!(invited.unwrap(), Answer::Ok(admitted) if admitted.welcome.0 == b"invited"));
+    assert_eq!(refused.unwrap(), Answer::Refused { refused: "unknown secret".into() });
+    assert!(matches!(opened.unwrap(), Answer::Ok(admitted) if admitted.welcome.0 == b"open"));
     inviter.net.shutdown().await.unwrap();
     joiner.net.shutdown().await.unwrap();
 }

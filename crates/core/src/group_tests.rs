@@ -12,7 +12,6 @@ pub(crate) fn settings(name: &str) -> Settings {
         open: vec![],
         keep: 90,
         membership: Service::Folder("/tmp/lmk".into()),
-        log: None,
     }
 }
 

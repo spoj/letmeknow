@@ -125,7 +125,6 @@ fn settings(kind: &str, folder: &Path) -> Settings {
         open: vec![],
         keep: 90,
         membership: Service::Folder(folder.to_str().unwrap().into()),
-        log: None,
     }
 }
 
@@ -144,14 +143,14 @@ async fn chat_and_removal() {
     let mut alice = session(&relay, "Alice").await;
     let mut bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
-    let link = alice.node.invite(&gid.0, Some("Bob (Acme)".into()), None).unwrap();
-    let joined = bob.node.join(&link, None).await.unwrap();
+    let link = alice.node.invite(&gid.0, Some("Bob (Acme)".into()), None).await.unwrap();
+    let (joined, _) = bob.node.join(&link, None).await.unwrap();
     assert_eq!(joined, gid);
-    let (member, label) = alice.until(|e| match e {
-        Event::Joined { member, label, .. } => Some((member, label)),
+    let (member, label, introduces) = alice.until(|e| match e {
+        Event::Joined { member, label, introduces, .. } => Some((member, label, introduces)),
         _ => None,
     }).await;
-    assert_eq!((member.name.as_str(), label.as_deref()), ("Bob", Some("Bob (Acme)")));
+    assert_eq!((member.name.as_str(), label.as_deref(), introduces), ("Bob", Some("Bob (Acme)"), true));
     assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
 
     let (id, delivery) = bob.node.send(&gid.0, &message("hello"), false).await.unwrap();
@@ -185,12 +184,12 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
     let carol = node(&relay, "Carol", &[CHAT]).await;
     let gid = alice.node.create(settings(KIND, &dir), None).unwrap();
     assert!(carol.node.create(settings(KIND, &dir), None).is_err(), "a session makes no group of a kind it lacks");
-    let link = alice.node.invite(&gid.0, None, None).unwrap();
+    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
     let refused = carol.node.join(&link, None).await.unwrap_err();
     assert!(format!("{refused:#}").contains("does not support test groups"), "{refused:#}");
 
     // The inviter's kind hands the joiner its state.
-    let link = alice.node.invite(&gid.0, None, None).unwrap();
+    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
     let joining = tokio::spawn(async move { bob.node.join(&link, None).await.map(|_| bob) });
     let reply = alice.until(|e| match e {
         Event::Snapshot { reply, .. } => Some(reply),
@@ -280,9 +279,8 @@ async fn a_kinds_log_orders_appends_and_a_member_behind_it_takes_a_state() {
     let mut alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(Settings { membership, ..settings(KIND, &dir) }, None).unwrap();
-    assert!(alice.node.settings(&gid.0).unwrap().log.is_some(), "a group of a plugin's kind has a log");
     alice.node.follow_log(&gid.0, Some(0)).unwrap();
-    let link = alice.node.invite(&gid.0, None, None).unwrap();
+    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
     let joining = tokio::spawn(async move { bob.node.join(&link, None).await.map(|_| bob) });
     alice.snapshot(Some(b"empty")).await;
     let mut bob = joining.await.unwrap().unwrap();
@@ -313,7 +311,7 @@ async fn a_kinds_log_orders_appends_and_a_member_behind_it_takes_a_state() {
     // Carol joins with no state and reads from the start: the messages the entries name are from before she joined,
     // so she asks a member for the kind's state, and follows from where it leaves off.
     let carol = session(&relay, "Carol").await;
-    let link = bob.node.invite(&gid.0, None, None).unwrap();
+    let link = bob.node.invite(&gid.0, None, None).await.unwrap();
     let joining = tokio::spawn(async move { carol.node.join(&link, None).await.map(|_| carol) });
     bob.snapshot(None).await;
     let mut carol = joining.await.unwrap().unwrap();
@@ -389,7 +387,7 @@ async fn devices_share_an_identity_and_certify_their_sessions_with_its_key() {
     laptop_devices.set_contact(&[9; 32], lmk_core::contacts::Contact { name: "Carol".into(), how: lmk_core::contacts::How::Verified, by: None, at: 1 }).await.unwrap();
 
     // A device link: the tablet gets the identity's state, its key and contacts among it.
-    let link = lmk_proto::links::Invite::parse(&laptop_devices.invite(&bob.id.0).unwrap()).unwrap();
+    let link = lmk_proto::links::Invite::parse(&laptop_devices.invite(&bob.id.0).await.unwrap()).unwrap();
     tablet_devices.join(&link).await.unwrap();
     identified(&tablet_devices).await;
     assert_eq!(tablet_devices.identities(), [(bob.clone(), "Bob".to_owned())]);
@@ -415,7 +413,7 @@ async fn devices_share_an_identity_and_certify_their_sessions_with_its_key() {
         }
     }).await.expect("an opening reaches every device");
     tablet.node.join_open(&opening, bob.clone()).await.unwrap();
-    let link = alice.node.invite(&chat.0, None, None).unwrap();
+    let link = alice.node.invite(&chat.0, None, None).await.unwrap();
     laptop.node.join(&link, Some(bob.clone())).await.unwrap();
     let seen = alice.checked(&chat, "tablet", true).await;
     assert_eq!((seen.device_name.as_str(), seen.identity.unwrap().added_by_device.as_deref()), ("tablet", Some("laptop")));
@@ -492,10 +490,10 @@ async fn a_member_catching_up_takes_more_than_a_thousand_messages_of_one_sender(
     let mut bob = session(&relay, "Bob").await;
     let (carol, _events) = Node::start(SqliteProvider::open(&carol_db).unwrap(), carol_config()).await.unwrap();
     let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
-    let link = alice.node.invite(&gid.0, None, None).unwrap();
+    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
     bob.node.join(&link, None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    let link = alice.node.invite(&gid.0, None, None).unwrap();
+    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
     carol.join(&link, None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     bob.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;

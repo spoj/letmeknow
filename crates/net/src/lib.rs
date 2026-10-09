@@ -1,5 +1,5 @@
 //! Everything a session says to its peers over iroh: one `letmeknow/1` connection per pair of
-//! sessions, its `peer` and `invite` streams, and files over iroh-blobs. MLS stays outside, behind
+//! sessions, its `peer` stream, and files over iroh-blobs. MLS stays outside, behind
 //! [`Groups`]: this crate moves ciphertexts and holds no keys.
 
 mod files;
@@ -25,8 +25,8 @@ use lmk_proto::{
     frame::{self, ALPN, Open, Stream},
     head::Head,
     identity::Envelope,
-    links::{FileLink, Invite},
-    peer::{Admitted, Frame, Hello, InviteRequest},
+    links::FileLink,
+    peer::{Admitted, Frame, Hello, Join},
 };
 use n0_future::{boxed::BoxFuture, join_all, task::spawn, time::timeout};
 use tokio::{
@@ -104,11 +104,9 @@ pub enum Taken {
     Waiting,
 }
 
-/// The inviter's decisions; each may commit an Add before it answers.
+/// A member's decision on a joiner's request; it may commit an Add before it answers.
 pub trait Admit: Send + Sync + 'static {
-    fn invite(&self, peer: EndpointId, request: InviteRequest) -> BoxFuture<Answer<Admitted>>;
-    /// A `join` request for an open group.
-    fn join(&self, peer: EndpointId, group: Vec<u8>, key_package: Vec<u8>, certificate: Envelope) -> BoxFuture<Answer<Admitted>>;
+    fn join(&self, peer: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,8 +126,6 @@ pub enum Event {
 }
 
 pub struct Config {
-    /// The relay for an invite link that names none.
-    pub relay: RelayUrl,
     /// `LETMEKNOW_HOME`, where sessions of one device publish their addresses to each other.
     pub home: Option<PathBuf>,
     /// Where files are kept; in memory if none.
@@ -231,27 +227,12 @@ impl Net {
         self.inner.changed(group);
     }
 
-    /// Redeems an invite link on an `invite` stream to the inviter.
-    pub async fn redeem(&self, invite: &Invite, key_package: Vec<u8>, certificate: Option<Envelope>) -> Result<Answer<Admitted>> {
-        let key = EndpointId::from_bytes(&invite.key)?;
-        let relay = match &invite.relay {
-            Some(relay) => relay.parse()?,
-            None => self.inner.config.relay.clone(),
-        };
-        let conn = self.inner.connection(key, relay).await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        frame::write(&mut send, &Open { stream: Stream::Invite }).await?;
-        frame::write(&mut send, &InviteRequest { secret: invite.secret.into(), key_package: Bytes(key_package), certificate }).await?;
-        send.finish()?;
-        frame::read(&mut recv).await
-    }
-
-    /// Asks a member of an open group to admit this session, which shows its certificate.
-    pub async fn join(&self, peer: EndpointId, relay: RelayUrl, group: &[u8], key_package: Vec<u8>, certificate: Envelope) -> Result<Answer<Admitted>> {
+    /// Asks a member to admit this session.
+    pub async fn join(&self, peer: EndpointId, relay: RelayUrl, join: Join) -> Result<Answer<Admitted>> {
         self.inner.connection(peer, relay).await?;
         let (reply, answer) = oneshot::channel();
         let input = self.inner.links.lock().unwrap().get(&peer).map(|link| link.input.clone()).context("not connected")?;
-        input.send(Input::Join { group: group.into(), key_package: Bytes(key_package), certificate, reply })?;
+        input.send(Input::Join { join, reply })?;
         Ok(answer.await?)
     }
 
@@ -383,32 +364,13 @@ impl Inner {
         }
         while let Ok((send, mut recv)) = conn.accept_bi().await {
             let Ok(open) = frame::read::<Open, _>(&mut recv).await else { continue };
-            match open.stream {
-                Stream::Peer => {
-                    if let Some(rx) = rx.take() {
-                        spawn(peer::run(self.clone(), conn.clone(), false, send, recv, input.clone(), rx));
-                    }
-                }
-                Stream::Invite => {
-                    let inner = self.clone();
-                    spawn(async move {
-                        if let Err(e) = inner.answer_invite(peer, send, recv).await {
-                            tracing::debug!("invite stream from {}: {e:#}", peer.fmt_short());
-                        }
-                    });
-                }
-                Stream::Membership => {}
+            if open.stream == Stream::Peer
+                && let Some(rx) = rx.take()
+            {
+                spawn(peer::run(self.clone(), conn.clone(), false, send, recv, input.clone(), rx));
             }
         }
         self.unregister(&conn);
-    }
-
-    async fn answer_invite(&self, peer: EndpointId, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
-        let request = frame::read(&mut recv).await?;
-        let answer = self.admit.invite(peer, request).await;
-        frame::write(&mut send, &answer).await?;
-        send.finish()?;
-        Ok(())
     }
 
     /// The peers online that are members of a group, by this session's view.

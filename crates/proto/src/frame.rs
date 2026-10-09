@@ -19,7 +19,6 @@ pub struct Open {
 pub enum Stream {
     Membership,
     Peer,
-    Invite,
 }
 
 pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {

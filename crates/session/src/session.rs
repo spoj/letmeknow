@@ -449,11 +449,11 @@ impl Session {
 
     async fn on(&mut self, event: Event) -> Result<()> {
         match event {
-            Event::Joined { group, member, by, how, label } => {
+            Event::Joined { group, member, by, how, introduces, label } => {
                 let item = json!({ "type": "joined", "group": b64(&group.0), "member": self.describe(&group, &member)?, "by": self.describe(&group, &by)?, "how": how });
                 self.outbox.deliver(item, true);
-                if by.key == self.node.key() {
-                    self.admitted(&group, &member, how, label).await?;
+                if introduces {
+                    self.introduce_joiner(&group, &member, how, label).await?;
                 }
                 self.refresh_opening(&group).await?;
             }
@@ -549,9 +549,9 @@ impl Session {
         Ok(())
     }
 
-    /// This session admitted a member: it tells the group who the member is to it, and the member of an invite meant
-    /// for someone becomes that contact.
-    async fn admitted(&mut self, gid: &Bytes, member: &Member, how: How, label: Option<String>) -> Result<()> {
+    /// A member came in by this session's invite, or was admitted by it to an open group: it tells the group who the
+    /// member is to it, and the member of an invite meant for someone becomes that contact.
+    async fn introduce_joiner(&mut self, gid: &Bytes, member: &Member, how: How, label: Option<String>) -> Result<()> {
         let Some(claim) = member.identity.clone().filter(|claim| claim.error.is_none()) else { return Ok(()) };
         if let Some(label) = &label {
             let contact = Contact { name: label.clone(), how: contacts::How::Verified, by: None, at: lmk_node::now() };
@@ -679,7 +679,7 @@ impl Session {
             Some(identity) => {
                 let (identity, name) = self.own_identity(&identity)?;
                 answer["identity"] = json!({ "id": identity.id, "name": name });
-                self.devices()?.invite(&identity.id.0)?
+                self.devices()?.invite(&identity.id.0).await?
             }
             None => {
                 let gid = match group {
@@ -694,7 +694,6 @@ impl Session {
                             open: Vec::new(),
                             keep,
                             membership,
-                            log: None,
                         };
                         let gid = self.node.create(settings, as_)?;
                         if kind != CHAT {
@@ -716,7 +715,7 @@ impl Session {
                 if !settings.name.is_empty() {
                     answer["name"] = json!(settings.name);
                 }
-                self.node.invite(&gid.0, for_.clone(), to.as_ref().map(|to| to.0.clone()))?.link()
+                self.node.invite(&gid.0, for_.clone(), to.clone()).await?.link()
             }
         };
         if let Some(for_) = &for_ {
@@ -863,7 +862,7 @@ impl Session {
         }
         let as_ = self.speaking_as(as_).await?;
         let gid = if target.contains('#') {
-            self.node.join(&Invite::parse(target.trim())?, as_).await?
+            self.node.join(&Invite::parse(target.trim())?, as_).await?.0
         } else {
             let opening = self.device_state()?.openings.into_iter().find(|o| b64(&o.group.0) == target || o.name == target);
             let opening = opening.context("expected an invite link, or the id or name of a group open to your identity")?;

@@ -24,7 +24,7 @@ use lmk_proto::{
     head::{self, Head},
     identity::Envelope,
     links::FileLink,
-    peer::{Admitted, Hello, InviteRequest},
+    peer::{Admitted, Hello, Join},
 };
 use n0_future::boxed::BoxFuture;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -93,8 +93,7 @@ pub async fn node(relay: &Relay, key: SecretKey, fake: Arc<Fake>, options: Optio
     }
     let endpoint = builder.bind().await.unwrap();
     tokio::time::timeout(WAIT, endpoint.online()).await.expect("online");
-    let (relay_url, files, file_limit) = (relay.url.clone(), None, options.file_limit);
-    let config = Config { relay: relay_url, home: options.home, files, disk: options.disk, file_limit, resync: options.resync, collect: options.collect };
+    let config = Config { home: options.home, files: None, disk: options.disk, file_limit: options.file_limit, resync: options.resync, collect: options.collect };
     let (net, events) = Net::spawn(endpoint, config, fake.clone(), Arc::new(Inviter)).await.unwrap();
     Node { net, events, fake }
 }
@@ -142,22 +141,19 @@ pub fn id(ciphertext: &[u8]) -> [u8; 32] {
 
 pub const SECRET: [u8; 16] = [5; 16];
 
-/// Admits whoever brings `SECRET`, and every join request.
+/// Admits whoever brings `SECRET`, and every request for a group, with a Welcome that is the group's id.
 pub struct Inviter;
 
 impl Admit for Inviter {
-    fn invite(&self, _: EndpointId, request: InviteRequest) -> BoxFuture<Answer<Admitted>> {
+    fn join(&self, _: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>> {
+        let admitted = |welcome: &[u8]| Answer::Ok(Admitted { welcome: Bytes(welcome.to_vec()), position: 1, doc: None, before: Vec::new(), certificates: Vec::new(), logs: Vec::new() });
         Box::pin(async move {
-            if request.secret.0 == SECRET {
-                Answer::Ok(Admitted { welcome: Bytes(b"welcome".to_vec()), position: 3, doc: None, before: Vec::new(), certificates: Vec::new() })
-            } else {
-                Answer::Refused { refused: "unknown secret".into() }
+            match (join.secret, join.group) {
+                (Some(secret), _) if secret.0 == SECRET => admitted(b"invited"),
+                (None, Some(group)) => admitted(&group.0),
+                _ => Answer::Refused { refused: "unknown secret".into() },
             }
         })
-    }
-
-    fn join(&self, _: EndpointId, group: Vec<u8>, _: Vec<u8>, _: Envelope) -> BoxFuture<Answer<Admitted>> {
-        Box::pin(async move { Answer::Ok(Admitted { welcome: Bytes(group), position: 1, doc: None, before: Vec::new(), certificates: Vec::new() }) })
     }
 }
 

@@ -184,16 +184,26 @@ pub struct Change {
     pub add: Vec<Vec<u8>>,
     /// How the added members came in, carried in the commit's authenticated data.
     pub how: Option<How>,
+    /// SHA-256 of the secret of the invite the added member came in by, carried in the commit's authenticated data.
+    pub invite: Option<Bytes>,
+    /// For a removal in a group with a kind's log: the position in the kind's order where the log ends, carried in the
+    /// commit's authenticated data.
+    pub end: Option<u64>,
     /// Leaf indices.
     pub remove: Vec<u32>,
     pub settings: Option<Settings>,
     pub leaf: Option<Leaf>,
 }
 
-/// A commit's authenticated data: how the members it adds came in.
-#[derive(Serialize, Deserialize)]
+/// A commit's authenticated data: how the members it adds came in, and where the kind's log ends.
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Aad {
-    how: How,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    how: Option<How>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invite: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    end: Option<u64>,
 }
 
 /// An application message's authenticated data: a payload its sender marks as held.
@@ -274,6 +284,10 @@ pub enum Applied {
         /// As their KeyPackages show them; `index` is their new leaf.
         added: Vec<Member>,
         how: Option<How>,
+        /// SHA-256 of the secret of the invite the added member came in by.
+        invite: Option<Bytes>,
+        /// Where the kind's log ends, as the commit says.
+        end: Option<u64>,
         removed: Vec<Member>,
         settings: bool,
         /// This session was removed.
@@ -310,6 +324,8 @@ pub struct Added {
     pub member: Credential,
     pub by: Credential,
     pub how: Option<How>,
+    /// SHA-256 of the secret of the invite it came in by.
+    pub invite: Option<Bytes>,
     /// The epoch the add started.
     pub epoch: u64,
 }
@@ -318,8 +334,8 @@ pub struct Added {
 struct State {
     /// The bytes of this session's pending commit, as posted.
     posted: Option<Bytes>,
-    /// How the members it adds came in.
-    how: Option<How>,
+    /// Its authenticated data.
+    aad: Aad,
     window: Window,
     joined: u64,
     /// Removed members' keys, with when their removal was applied.
@@ -435,14 +451,27 @@ impl Group {
         &self.state.added
     }
 
+    /// Whether a commit this session applied added a member by the invite whose secret hashes to `hash`.
+    pub fn used(&self, hash: &[u8]) -> bool {
+        self.state.added.iter().any(|added| added.invite.as_ref().is_some_and(|invite| invite.0 == hash))
+    }
+
+    /// 16 bytes the current epoch's exporter secret derives under `label`: the same for every member of the epoch, and
+    /// unknown to all others.
+    pub fn exported<P: Provider>(&self, provider: &P, label: &str) -> Result<[u8; 16]> {
+        let secret = self.mls.export_secret(provider.crypto(), label, &[], 16)?;
+        Ok(secret.try_into().expect("16 bytes"))
+    }
+
     /// Builds a commit and keeps it pending, with its bytes saved: post them next, then read the log.
     pub fn commit<P: Provider>(&mut self, provider: &P, session: &Session, change: Change) -> Result<Commit> {
         ensure!(self.state.posted.is_none(), "a commit is already pending");
         // One staged but never saved, so never posted.
         self.mls.clear_pending_commit(provider.storage())?;
         let adds = change.add.iter().map(|bytes| key_package_in(provider, bytes)).collect::<Result<Vec<_>>>()?;
-        if let Some(how) = change.how {
-            self.mls.set_aad(serde_json::to_vec(&Aad { how })?);
+        let aad = Aad { how: change.how, invite: change.invite, end: change.end };
+        if aad.how.is_some() || aad.end.is_some() {
+            self.mls.set_aad(serde_json::to_vec(&aad)?);
         }
         let mut builder = self
             .mls
@@ -469,7 +498,7 @@ impl Group {
         let (commit, welcome, _) = bundle.into_messages();
         let commit = commit.to_bytes()?;
         self.state.posted = Some(Bytes(commit.clone()));
-        self.state.how = change.how;
+        self.state.aad = aad;
         self.save(provider)?;
         Ok(Commit { commit, welcome: welcome.map(|welcome| welcome.to_bytes()).transpose()? })
     }
@@ -496,18 +525,18 @@ impl Group {
                 self.save(provider)?;
                 return Ok(Applied::Skipped { reason: error.to_string(), lost: true });
             }
-            let how = self.state.how;
-            let applied = observe(&self.mls, &mut self.state, staged, by, how, true, false, now);
+            let aad = self.state.aad.clone();
+            let applied = observe(&self.mls, &mut self.state, staged, by, aad, true, false, now);
             self.mls.merge_pending_commit(provider)?;
             return self.merged(provider, applied);
         }
-        let (staged, by, how) = match self.stage(provider, entry) {
+        let (staged, by, aad) = match self.stage(provider, entry) {
             Ok(staged) => staged,
             Err(error) => return Ok(Applied::Skipped { reason: format!("{error:#}"), lost: false }),
         };
         let lost = self.state.posted.take().is_some();
         self.mls.clear_pending_commit(provider.storage())?;
-        let applied = observe(&self.mls, &mut self.state, &staged, by, how, false, lost, now);
+        let applied = observe(&self.mls, &mut self.state, &staged, by, aad, false, lost, now);
         self.mls.merge_staged_commit(provider, staged)?;
         self.merged(provider, applied)
     }
@@ -516,17 +545,17 @@ impl Group {
         &mut self,
         provider: &P,
         entry: &[u8],
-    ) -> Result<(StagedCommit, LeafNodeIndex, Option<How>)> {
+    ) -> Result<(StagedCommit, LeafNodeIndex, Aad)> {
         let message = parse::<MlsMessageIn>(entry)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Commit, "not a commit");
         let processed = self.mls.process_message(provider, message)?;
-        let how = serde_json::from_slice::<Aad>(processed.aad()).ok().map(|aad| aad.how);
+        let aad = serde_json::from_slice::<Aad>(processed.aad()).unwrap_or_default();
         let Sender::Member(by) = *processed.sender() else { bail!("not from a member") };
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             bail!("not a commit from another member")
         };
         rules(&self.mls, &staged, by)?;
-        Ok((*staged, by, how))
+        Ok((*staged, by, aad))
     }
 
     fn merged<P: Provider>(&mut self, provider: &P, mut applied: Applied) -> Result<Applied> {
@@ -632,7 +661,7 @@ fn observe(
     state: &mut State,
     staged: &StagedCommit,
     by: LeafNodeIndex,
-    how: Option<How>,
+    aad: Aad,
     own: bool,
     lost: bool,
     now: u64,
@@ -656,7 +685,7 @@ fn observe(
     let epoch = staged.epoch().as_u64();
     if let Some(committer) = &committer {
         let credentials = added.iter().filter_map(|member| member.credential.clone());
-        state.added.extend(credentials.map(|member| Added { member, by: committer.clone(), how, epoch }));
+        state.added.extend(credentials.map(|member| Added { member, by: committer.clone(), how: aad.how, invite: aad.invite.clone(), epoch }));
     }
     state.removed.extend(removed.iter().map(|member| (Bytes(member.key.clone()), now)));
     Applied::Commit {
@@ -664,7 +693,9 @@ fn observe(
         own,
         lost,
         added,
-        how,
+        how: aad.how,
+        invite: aad.invite,
+        end: aad.end,
         removed,
         settings: staged.queued_proposals().any(|p| matches!(p.proposal(), Proposal::GroupContextExtensions(_))),
         gone: staged.self_removed(),

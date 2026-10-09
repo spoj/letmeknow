@@ -177,7 +177,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let (id, entry) = identity::create(&seed, name, membership.clone());
         let identity = IdentityRef { id: id.into(), membership: membership.clone() };
         self.node.append_identity(&identity, &entry).await?;
-        let settings = Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), open: Vec::new(), keep: 90, membership, log: None };
+        let settings = Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), open: Vec::new(), keep: 90, membership };
         let gid = self.node.create(settings, None)?;
         let book = Book {
             identity: identity.clone(),
@@ -193,17 +193,17 @@ impl<P: Provider + Send + 'static> Devices<P> {
     }
 
     /// A device link: whoever opens it becomes a device of the identity.
-    pub fn invite(&self, identity: &[u8]) -> Result<String> {
+    pub async fn invite(&self, identity: &[u8]) -> Result<String> {
         let (gid, _) = self.book(identity)?;
-        Ok(Invite { device: true, ..self.node.invite(&gid.0, None, None)? }.link())
+        Ok(self.node.invite(&gid.0, None, None).await?.link())
     }
 
     /// Joins an identity through a device link, and waits a while for its state.
     pub async fn join(&self, link: &Invite) -> Result<()> {
         ensure!(link.device, "not a device link");
-        let gid = self.node.join(link, None).await?;
+        let (gid, by) = self.node.join(link, None).await?;
         ensure!(self.node.settings(&gid.0)?.kind == DEVICES, "the link led to a group, not an identity");
-        let added_by = self.node.members(&gid.0)?.into_iter().find(|m| m.iroh.0 == link.key).map(|m| m.name);
+        let added_by = self.node.members(&gid.0)?.into_iter().find(|m| m.iroh.0 == by).map(|m| m.name);
         let lock = self.lock.lock().unwrap();
         let mut record = self.record(&gid.0);
         (record.added_by, record.since) = (added_by, now());

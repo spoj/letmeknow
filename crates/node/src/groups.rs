@@ -1,8 +1,8 @@
-//! What the peers need from the group logic (`Groups`), what an inviter decides (`Admit`), and taking in a message.
+//! What the peers need from the group logic (`Groups`), whom a member admits (`Admit`), and taking in a message.
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
 use lmk_core::group::{self as core, Change, Removed, Unheld, key_package_credential, key_package_leaf};
@@ -13,7 +13,7 @@ use lmk_proto::group::{CHAT, Control, Credential, How, Reason, Refusal, Service,
 use lmk_proto::head::Head;
 use lmk_proto::identity::Envelope;
 use lmk_proto::links::FileLink;
-use lmk_proto::peer::{Admitted, Hello, InviteRequest};
+use lmk_proto::peer::{Admitted, Hello, Join};
 use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::timeout;
@@ -22,9 +22,12 @@ use tokio::sync::oneshot;
 
 use crate::logs::empty;
 use crate::{
-    Event, Inner, Item, MAX_MESSAGE, Message, SNAPSHOT_WAIT, State, Work, ciphertext_key, endpoint_id, get, message_key,
-    now, put,
+    Event, Inner, Item, MAX_MESSAGE, Message, Rule, SNAPSHOT_WAIT, State, Work, ciphertext_key, endpoint_id, get,
+    message_key, now, put,
 };
+
+/// The answer to a secret no rule admits by: whether it is unknown, used or expired is not told.
+const UNKNOWN: &str = "unknown, used or expired invite";
 
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Takes in a ciphertext from a peer: held, waiting for a commit, or given up.
@@ -114,6 +117,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
                         self.events.send(Event::Introduced { group, by: sender, identity, name, how }).ok();
                     }
                 }
+                Control::Invite { hash, expires, label, to } => {
+                    let held = Message { id: Bytes(id.to_vec()), group, epoch, at: now(), sender, payload };
+                    hold(st, gid, held, ciphertext)?;
+                    let by = Bytes(opened.key.clone());
+                    st.group_mut(gid)?.rec.invites.push(Rule { hash, expires, label, to, by });
+                    st.save(gid)?;
+                }
                 Control::Refused { messages } => {
                     let held = Message { id: Bytes(id.to_vec()), group: group.clone(), epoch, at: now(), sender: sender.clone(), payload };
                     hold(st, gid, held, ciphertext)?;
@@ -143,42 +153,37 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    /// Answers an invite stream's request.
-    async fn redeemed(self: &Arc<Self>, request: InviteRequest) -> Result<Admitted> {
-        let (secret, key_package, now) = (request.secret.0, request.key_package.0, now());
-        let (joiner, bound) = {
-            let st = self.state.lock().unwrap();
-            (key_package_credential(&st.provider, &key_package)?, st.invites.bound(&secret, now).is_some())
+    /// Answers a joiner's request: it brings an invite's secret, or speaks as an identity the group is open to.
+    async fn admit_join(self: &Arc<Self>, join: Join) -> Result<Admitted> {
+        let Join { secret, group, key_package, certificate } = join;
+        let joiner = key_package_credential(&self.state.lock().unwrap().provider, &key_package.0)?;
+        let (gid, how, invite, to) = match (secret, group) {
+            (Some(secret), _) => {
+                let hash = Bytes(Sha256::digest(&secret.0).to_vec());
+                let st = self.state.lock().unwrap();
+                let found = st.groups.iter().find_map(|(gid, g)| Some((gid.clone(), g.rec.invites.iter().find(|rule| rule.hash == hash)?.clone())));
+                let (gid, rule) = found.context(UNKNOWN)?;
+                ensure!(now() < rule.expires && !st.group(&gid)?.mls.used(&hash.0), UNKNOWN);
+                (gid, How::Invite, Some(hash), rule.to)
+            }
+            (None, Some(gid)) => {
+                let open = self.state.lock().unwrap().group(&gid.0)?.mls.settings().open;
+                let identity = joiner.identity.as_ref().filter(|identity| open.iter().any(|named| named.id == identity.id));
+                (gid.0, How::Open, None, Some(identity.context("it speaks as no identity the group is open to")?.id.clone()))
+            }
+            (None, None) => bail!("a request names an invite's secret or a group"),
         };
-        let log = match (bound, &joiner.identity) {
-            (true, Some(identity)) => self.read_keys(identity).await.ok(),
-            _ => None,
-        };
-        let redeemed = {
-            let mut st = self.state.lock().unwrap();
-            let st = &mut *st;
-            st.invites.redeem(&st.provider, &secret, &key_package, request.certificate.as_ref(), log.as_ref(), now)?
-        };
-        if let Some(certificate) = request.certificate {
+        if let Some(to) = to {
+            let identity = joiner.identity.clone().filter(|identity| identity.id == to).context("this invite is for another identity")?;
+            let log = self.read_keys(&identity).await?;
+            if let Err(error) = check(certificate.as_ref(), &joiner, &log, now()) {
+                bail!("{error}");
+            }
+        }
+        if let Some(certificate) = certificate {
             self.certified(&joiner, certificate);
         }
-        self.admit(&redeemed.group, key_package, How::Invite, redeemed.label).await
-    }
-
-    /// Answers a request to join a group open to the joiner's identity.
-    async fn open_join(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, certificate: Envelope) -> Result<Admitted> {
-        let (joiner, open) = {
-            let st = self.state.lock().unwrap();
-            (key_package_credential(&st.provider, &key_package)?, st.group(gid)?.mls.settings().open)
-        };
-        let identity = joiner.identity.clone().filter(|identity| open.iter().any(|named| named.id == identity.id));
-        let identity = identity.context("it speaks as no identity the group is open to")?;
-        let log = self.read_keys(&identity).await?;
-        if let Err(error) = check(Some(&certificate), &joiner, &log, now()) {
-            anyhow::bail!("{error}");
-        }
-        self.certified(&joiner, certificate);
-        self.admit(gid, key_package, How::Open, None).await
+        self.admit(&gid, key_package.0, how, invite).await
     }
 
     /// Holds a joiner's certificate.
@@ -188,28 +193,24 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Commits the Add, and answers with the Welcome and the state of the group's kind, as a file.
-    /// A joiner whose session does not support the group's kind is refused.
-    async fn admit(
-        self: &Arc<Self>,
-        gid: &[u8],
-        key_package: Vec<u8>,
-        how: How,
-        label: Option<String>,
-    ) -> Result<Admitted> {
+    /// Commits the Add, naming the invite the joiner came in by, which no earlier commit may have used, and answers with
+    /// the Welcome and the state of the group's kind, as a file. A joiner whose session does not support the group's kind
+    /// is refused.
+    async fn admit(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, how: How, invite: Option<Bytes>) -> Result<Admitted> {
         {
-            let mut st = self.state.lock().unwrap();
+            let st = self.state.lock().unwrap();
             let kind = st.group(gid)?.mls.settings().kind;
             let leaf = key_package_leaf(&st.provider, &key_package)?;
             ensure!(leaf.kinds.contains(&kind), "its session does not support {kind} groups");
-            if let Some(label) = label {
-                let joiner = key_package_credential(&st.provider, &key_package)?;
-                st.labels.insert(joiner.key.0, label);
-            }
         }
-        let add = Change { add: vec![key_package], how: Some(how), ..Change::default() };
-        let (welcome, position) = self.commit(gid, |_| Ok(add.clone())).await?;
-        let (state, before) = {
+        let add = Change { add: vec![key_package], how: Some(how), invite: invite.clone(), ..Change::default() };
+        let (welcome, position) = self
+            .commit(gid, |g| {
+                ensure!(invite.as_ref().is_none_or(|invite| !g.used(&invite.0)), UNKNOWN);
+                Ok(add.clone())
+            })
+            .await?;
+        let (state, before, logs) = {
             let st = self.state.lock().unwrap();
             let g = st.group(gid)?;
             let before = g.rec.items.iter().filter(|item| item.epoch < g.mls.epoch()).map(|item| item.id.clone()).collect();
@@ -218,7 +219,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 self.events.send(Event::Snapshot { group: Bytes(gid.to_vec()), reply }).ok();
                 state
             });
-            (state, before)
+            (state, before, g.rec.kind_logs.clone())
         };
         let state = match state {
             Some(asked) => timeout(SNAPSHOT_WAIT, asked).await.ok().and_then(Result::ok).flatten(),
@@ -229,18 +230,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
             None => None,
         };
         let certificates = lmk_net::Groups::certificates(&**self, &[gid.to_vec()]);
-        Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc, before, certificates })
+        Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc, before, certificates, logs })
     }
 
-    fn answer(&self, group: Option<&[u8]>, admitted: Result<Admitted>) -> Answer<Admitted> {
-        match admitted {
-            Ok(admitted) => Answer::Ok(admitted),
-            Err(error) => {
-                self.warn(group, format!("refused a join: {error:#}"));
-                Answer::Refused { refused: format!("{error:#}") }
-            }
-        }
-    }
 }
 
 impl<P: Provider + Send + 'static> Groups for Inner<P> {
@@ -269,7 +261,7 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
     fn logs(&self, group: &[u8]) -> Vec<Vec<u8>> {
         let st = self.state.lock().unwrap();
         let Some(g) = st.groups.get(group) else { return Vec::new() };
-        let kind = g.mls.settings().log.map(|id| id.0);
+        let kind = g.rec.kind_logs.iter().map(|log| log.id.0.clone());
         let identities = st.identities(group).into_iter().map(|identity| lmk_proto::identity::address(&identity.id.0).to_vec());
         let mut logs: Vec<Vec<u8>> = [group.to_vec()].into_iter().chain(kind).chain(identities).filter(|id| st.logs.contains_key(id)).collect();
         logs.sort();
@@ -417,19 +409,16 @@ fn hold<P: Provider>(st: &mut State<P>, gid: &[u8], message: Message, ciphertext
 pub(crate) struct Admitter<P>(pub Arc<Inner<P>>);
 
 impl<P: Provider + Send + 'static> Admit for Admitter<P> {
-    fn invite(&self, _: EndpointId, request: InviteRequest) -> BoxFuture<Answer<Admitted>> {
+    fn join(&self, _: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>> {
         let inner = self.0.clone();
         Box::pin(async move {
-            let admitted = inner.redeemed(request).await;
-            inner.answer(None, admitted)
-        })
-    }
-
-    fn join(&self, _: EndpointId, group: Vec<u8>, key_package: Vec<u8>, certificate: Envelope) -> BoxFuture<Answer<Admitted>> {
-        let inner = self.0.clone();
-        Box::pin(async move {
-            let admitted = inner.open_join(&group, key_package, certificate).await;
-            inner.answer(Some(&group), admitted)
+            match inner.admit_join(join).await {
+                Ok(admitted) => Answer::Ok(admitted),
+                Err(error) => {
+                    inner.warn(None, format!("refused a join: {error:#}"));
+                    Answer::Refused { refused: format!("{error:#}") }
+                }
+            }
         })
     }
 }

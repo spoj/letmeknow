@@ -1,8 +1,13 @@
-//! A kind's log: a log of its own at the group's membership service, under the random id in the group's settings, which
-//! orders the group's held messages. An entry is a held message's id; members apply the order as they hold the messages,
-//! and keep what they took for the kind until it asks to read past it. An entry that is not an id, names a message an
+//! A kind's log: a log of its own at the group's membership service, under a random id only members know, which orders
+//! the group's held messages. An entry is a held message's id; members apply the order as they hold the messages, and
+//! keep what they took for the kind until it asks to read past it. An entry that is not an id, names a message an
 //! earlier entry named, or names one of the core's own, is skipped. One whose message this session cannot hold leaves it
 //! behind, as do entries past the service's retention, and it asks a member for the kind's state.
+//!
+//! A commit that removes a member moves the order to a new log, whose id derives from the epoch the commit starts, so
+//! that the removed member does not know it. Its committer first appends `END` to the old log, and the commit names the
+//! position before it: the order goes on in the new log from there, with no position counted twice. A member waits at
+//! an `END` until it applies a removal that names a position at or after it.
 
 use std::sync::Arc;
 
@@ -12,15 +17,21 @@ use lmk_core::provider::Provider;
 use lmk_membership::Refused;
 use lmk_proto::Bytes;
 use lmk_proto::group::{Control, type_of};
-use lmk_proto::peer::Frame;
+use lmk_proto::peer::{Frame, KindLog as LogRef};
 use n0_future::time::timeout;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::logs::{Log, Of, entry_key};
-use crate::{Entry, Event, Inner, Message, Node, SNAPSHOT_WAIT, STATE_ASK, State, get, message_key, now, put};
+use crate::{Entry, Event, Inner, Message, Node, Rec, SNAPSHOT_WAIT, STATE_ASK, State, Work, get, message_key, now, put};
 
-/// What this session holds of its group's kind log, once the kind follows it.
+/// The entry that ends a kind's log.
+pub(crate) const END: &[u8] = b"end";
+/// The label under which a kind's log id derives from an epoch's exporter secret.
+pub(crate) const LOG_LABEL: &str = "letmeknow kind log";
+
+/// What this session holds of its group's kind log, once the kind follows it. Positions are in the kind's order, across
+/// the logs it moved through.
 #[derive(Default, Serialize, Deserialize)]
 pub(crate) struct KindLog {
     /// The last position applied: every entry up to it was taken or skipped.
@@ -37,6 +48,13 @@ pub(crate) fn kept_key(gid: &[u8], position: u64) -> Vec<u8> {
     [b"node/kindlog/".as_slice(), gid, b"/", &position.to_be_bytes()].concat()
 }
 
+impl Rec {
+    /// The log that holds a position of the kind's order: the last that starts before it.
+    fn log_at(&self, position: u64) -> Option<&LogRef> {
+        self.kind_logs.iter().rev().find(|log| log.after < position)
+    }
+}
+
 impl<P: Provider + Send + 'static> Node<P> {
     /// Follows the kind's log after position `after`, as the kind's own state stands; with none, the kind has no state
     /// yet, and this session asks a member for one. Entries kept for the kind up to `after` go. Taken entries come as
@@ -45,11 +63,10 @@ impl<P: Provider + Send + 'static> Node<P> {
         let mut st = self.inner.state.lock().unwrap();
         let st = &mut *st;
         let g = st.groups.get_mut(gid).context("this session is not in that group")?;
-        let settings = g.mls.settings();
-        let id = settings.log.context("this group has no log")?;
+        let first = g.rec.kind_logs.first().context("this group has no log")?.after;
         let log = g.rec.log.get_or_insert_with(KindLog::default);
         match after {
-            Some(after) if after < log.acked => log.behind = true,
+            Some(after) if after < log.acked || after < first => log.behind = true,
             Some(after) => {
                 for position in log.kept.iter().filter(|kept| **kept <= after) {
                     st.provider.delete(&kept_key(gid, *position))?;
@@ -62,21 +79,16 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
             None => log.behind = true,
         }
-        let (behind, read) = (log.behind, log.read);
+        let behind = log.behind;
         st.save(gid)?;
         if behind {
             self.inner.ask_state(st, gid, None);
             return Ok(());
         }
-        match st.logs.get(&id.0) {
-            None => {
-                st.add_log(&id.0, Log::new(Of::Kind(Bytes(gid.to_vec())), settings.membership, read))?;
-                self.inner.follow(&id.0);
-            }
-            Some(log) if log.logged < read => st.restart_log(&id.0, read)?,
-            Some(_) => self.inner.kind_advance(st, gid)?,
+        for id in self.inner.kind_logs(st, gid)? {
+            self.inner.follow(&id);
         }
-        Ok(())
+        self.inner.kind_advance(st, gid)
     }
 
     /// The entries of the kind's log taken after position `after`, in order.
@@ -90,30 +102,32 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Appends the id of a held message of the group to the kind's log, and reads the log through it: once it returns
     /// its position, every entry up to it is taken or skipped.
     pub async fn append(&self, gid: &[u8], message: &[u8]) -> Result<u64> {
-        let (id, service) = {
+        let (log, service) = {
             let st = self.inner.state.lock().unwrap();
             let g = st.group(gid)?;
-            let id = g.mls.settings().log.context("this group has no log")?;
+            let log = g.rec.kind_logs.last().cloned().context("this group has no log")?;
             ensure!(g.rec.items.iter().any(|item| item.id.0 == message), "not a message this group holds");
-            (id.0, g.mls.settings().membership)
+            (log, g.mls.settings().membership)
         };
-        self.inner.read_kind_log(gid, &id).await?;
+        self.inner.read_kind_log(gid, &log.id.0).await?;
         {
             let st = self.inner.state.lock().unwrap();
-            let log = st.group(gid)?.rec.log.as_ref().filter(|log| !log.behind);
-            let log = log.context("this session has not caught up on the group's log")?;
-            ensure!(log.read == st.log(&id)?.logged, "the group's log waits for a message it names");
+            let g = st.group(gid)?;
+            let read = g.rec.log.as_ref().filter(|read| !read.behind).context("this session has not caught up on the group's log")?.read;
+            ensure!(read == log.after + st.log(&log.id.0)?.logged, "the group's log waits for a message it names");
         }
-        let position = self.inner.clients.client(&service)?.append(&id, message).await?.position;
-        self.inner.read_kind_log(gid, &id).await?;
+        let position = log.after + self.inner.clients.client(&service)?.append(&log.id.0, message).await?.position;
+        self.inner.read_kind_log(gid, &log.id.0).await?;
         let st = self.inner.state.lock().unwrap();
-        ensure!(st.group(gid)?.rec.log.as_ref().is_some_and(|log| log.read >= position), "the log did not show the entry it took");
+        let g = st.group(gid)?;
+        ensure!(g.rec.log.as_ref().is_some_and(|read| read.read >= position), "the log did not show the entry it took");
+        ensure!(!g.rec.kind_logs.iter().any(|later| later.after > log.after && later.after < position), "the group's log moved on without the entry");
         Ok(position)
     }
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Reads the kind's log through its end; one whose entries are past the service's retention leaves this session
+    /// Reads a log of the kind through its end; one whose entries are past the service's retention leaves this session
     /// behind.
     async fn read_kind_log(&self, gid: &[u8], id: &[u8]) -> Result<()> {
         match self.read(id).await {
@@ -126,16 +140,58 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Applies the kind's log as far as this session holds the messages it names, keeping those it takes.
+    /// Holds the kind's logs this session reads from where it is, from that place in each: a log not held yet is added,
+    /// and one held short of it starts there anew. Returns those added, to follow at their service.
+    pub(crate) fn kind_logs(&self, st: &mut State<P>, gid: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let g = st.group(gid)?;
+        let (Some(read), membership) = (g.rec.log.as_ref().map(|log| log.read), g.mls.settings().membership) else { return Ok(Vec::new()) };
+        let mut added = Vec::new();
+        for log in g.rec.kind_logs.clone() {
+            let start = read.saturating_sub(log.after);
+            match st.logs.get(&log.id.0) {
+                None => {
+                    st.add_log(&log.id.0, Log::new(Of::Kind(Bytes(gid.to_vec())), membership.clone(), start))?;
+                    added.push(log.id.0);
+                }
+                Some(held) if held.logged < start => st.restart_log(&log.id.0, start)?,
+                Some(_) => {}
+            }
+        }
+        Ok(added)
+    }
+
+    /// A removal moved the kind's order to a new log after position `end`: this session follows it if its kind follows
+    /// the order.
+    pub(crate) fn moved(&self, st: &mut State<P>, gid: &[u8], end: u64) -> Result<()> {
+        let g = st.groups.get_mut(gid).context("this session is not in that group")?;
+        let Some(last) = g.rec.kind_logs.last() else { return Ok(()) };
+        let log = LogRef { id: Bytes(g.mls.exported(&st.provider, LOG_LABEL)?.to_vec()), after: end.max(last.after) };
+        if g.rec.kind_logs.last() == Some(&log) {
+            return Ok(());
+        }
+        g.rec.kind_logs.push(log);
+        st.save(gid)?;
+        for id in self.kind_logs(st, gid)? {
+            self.work.send(Work::Follow(id)).ok();
+        }
+        self.kind_advance(st, gid)
+    }
+
+    /// Applies the kind's order as far as this session holds the messages it names, keeping those it takes; drops the
+    /// logs it has read past.
     pub(crate) fn kind_advance(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
-        let Some(id) = st.group(gid)?.mls.settings().log else { return Ok(()) };
-        let Some(logged) = st.logs.get(&id.0).map(|log| log.logged) else { return Ok(()) };
         let mut took = false;
         loop {
-            let g = st.groups.get_mut(gid).unwrap();
-            let Some(log) = g.rec.log.as_mut().filter(|log| !log.behind && log.read < logged) else { break };
-            let position = log.read + 1;
-            let entry = st.provider.get(&entry_key(&id.0, position))?.context("a stored entry is missing")?;
+            let g = st.groups.get_mut(gid).context("this session is not in that group")?;
+            let Some(read) = g.rec.log.as_ref().filter(|log| !log.behind).map(|log| log.read) else { break };
+            let position = read + 1;
+            let Some(log) = g.rec.log_at(position).cloned() else { break };
+            let local = position - log.after;
+            let later = g.rec.kind_logs.iter().any(|later| later.after > log.after);
+            if st.logs.get(&log.id.0).is_none_or(|held| held.logged < local) {
+                break;
+            }
+            let entry = st.provider.get(&entry_key(&log.id.0, local))?.context("a stored entry is missing")?;
             let item = g.rec.items.iter_mut().find(|item| item.id.0 == entry);
             match item {
                 Some(item) if item.position.is_none() => {
@@ -144,11 +200,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     if !Control::TYPES.contains(&type_of(&message.payload)) {
                         let taken = Entry { position, id: message.id, from: message.sender, payload: message.payload };
                         put(&st.provider, &kept_key(gid, position), &taken)?;
-                        log.kept.push(position);
+                        g.rec.log.as_mut().unwrap().kept.push(position);
                         took = true;
                     }
                 }
                 Some(_) => {}
+                None if entry == END && !later => break,
                 None if entry.len() != 32 => {}
                 None if g.rec.given_up.iter().any(|(_, given)| given.0 == entry) => {
                     self.fell_behind(st, gid, "it could not take a message the log names")?;
@@ -158,6 +215,18 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             st.groups.get_mut(gid).unwrap().rec.log.as_mut().unwrap().read = position;
         }
+        let g = st.group_mut(gid)?;
+        let read = g.rec.log.as_ref().map(|log| log.read);
+        let mut passed = Vec::new();
+        while let (Some(read), [_, next, ..]) = (read, &g.rec.kind_logs[..])
+            && next.after <= read
+        {
+            passed.push(g.rec.kind_logs.remove(0).id);
+        }
+        for id in passed {
+            self.unfollow(&id.0);
+            st.drop_log(&id.0)?;
+        }
         st.save(gid)?;
         if took {
             self.events.send(Event::Logged { group: Bytes(gid.to_vec()) }).ok();
@@ -165,11 +234,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    /// Whether the kind's log waits for a message, with the entries before it applied.
+    /// Whether the kind's order waits for a message, with the entries before it applied.
     pub(crate) fn waits(&self, st: &State<P>, gid: &[u8]) -> bool {
         let Ok(g) = st.group(gid) else { return false };
-        let logged = g.mls.settings().log.and_then(|id| Some(st.logs.get(&id.0)?.logged));
-        g.rec.log.as_ref().zip(logged).is_some_and(|(log, logged)| log.behind || log.read < logged)
+        let Some(log) = &g.rec.log else { return false };
+        let end = g.rec.kind_logs.last().and_then(|last| Some(last.after + st.logs.get(&last.id.0)?.logged));
+        log.behind || end.is_some_and(|end| log.read < end)
     }
 
     /// The kind's log cannot be followed from where this session applied it: it asks a member for the kind's state.

@@ -1,5 +1,5 @@
 //! A `peer` stream: hello and head swap, log entries, negentropy message sync, live messages, want
-//! and have, join requests, and kinds' state links. Every group frame is served only to a member
+//! and have, joiners' requests, and kinds' state links. Every group frame is served only to a member
 //! with a valid certificate of the identity it speaks as, and every log's entries only to such a
 //! member of a group that follows it; certificates go to every member.
 //!
@@ -21,7 +21,7 @@ use lmk_proto::{
     Answer, Bytes, frame,
     head::Head,
     identity::Envelope,
-    peer::{Admitted, Below, Frame, Hello},
+    peer::{Admitted, Below, Frame, Hello, Join},
 };
 use sha2::{Digest, Sha256};
 use n0_future::{task::spawn, time::sleep};
@@ -44,7 +44,7 @@ pub(crate) enum Input {
     /// Time to sync every group again.
     Resync,
     Want { group: Bytes, files: Vec<[u8; 32]>, reply: HaveReply },
-    Join { group: Bytes, key_package: Bytes, certificate: Envelope, reply: oneshot::Sender<Answer<Admitted>> },
+    Join { join: Join, reply: oneshot::Sender<Answer<Admitted>> },
 }
 
 struct Session {
@@ -56,7 +56,8 @@ struct Session {
     groups: HashMap<Bytes, Group>,
     /// Our `want`s awaiting their `have`, in order.
     wants: HashMap<Bytes, VecDeque<HaveReply>>,
-    joins: HashMap<Bytes, oneshot::Sender<Answer<Admitted>>>,
+    /// Our requests to be admitted awaiting their answer, by id.
+    joins: HashMap<u64, oneshot::Sender<Answer<Admitted>>>,
     logs: HashMap<Bytes, Log>,
     /// The certificates shown the peer since the last resync, by signature.
     shown: HashSet<Bytes>,
@@ -145,9 +146,10 @@ pub(crate) async fn run(
                     let files = files.into_iter().map(Bytes::from).collect();
                     session.write(&Frame::Want { group, files }).await?;
                 }
-                Input::Join { group, key_package, certificate, reply } => {
-                    session.joins.insert(group.clone(), reply);
-                    session.write(&Frame::Join { group, key_package, certificate }).await?;
+                Input::Join { join, reply } => {
+                    let id = session.joins.keys().max().map_or(0, |id| id + 1);
+                    session.joins.insert(id, reply);
+                    session.write(&Frame::Join { id, join }).await?;
                 }
             }
         }
@@ -277,23 +279,23 @@ impl Session {
                 self.write(&Frame::Have { group, files: have }).await?;
             }
             Frame::Have { group, files } => self.on_have(group, files),
-            Frame::Join { group, key_package, certificate } => {
+            Frame::Join { id, join } => {
                 let (admit, peer, input) = (self.inner.admit.clone(), self.peer, self.input.clone());
                 spawn(async move {
-                    let frame = match admit.join(peer, group.0.clone(), key_package.0, certificate).await {
-                        Answer::Ok(admitted) => Frame::Admitted { group, admitted },
-                        Answer::Refused { refused } => Frame::Refused { group, refused },
+                    let frame = match admit.join(peer, join).await {
+                        Answer::Ok(admitted) => Frame::Admitted { id, admitted },
+                        Answer::Refused { refused } => Frame::Refused { id, refused },
                     };
                     input.send(Input::Send(frame)).ok();
                 });
             }
-            Frame::Admitted { group, admitted } => {
-                if let Some(reply) = self.joins.remove(&group) {
+            Frame::Admitted { id, admitted } => {
+                if let Some(reply) = self.joins.remove(&id) {
                     reply.send(Answer::Ok(admitted)).ok();
                 }
             }
-            Frame::Refused { group, refused } => {
-                if let Some(reply) = self.joins.remove(&group) {
+            Frame::Refused { id, refused } => {
+                if let Some(reply) = self.joins.remove(&id) {
                     reply.send(Answer::Refused { refused }).ok();
                 }
             }

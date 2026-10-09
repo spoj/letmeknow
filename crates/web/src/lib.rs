@@ -560,13 +560,13 @@ impl App {
             return Ok(());
         }
         match event {
-            Event::Joined { group, member, by, how, label } => {
+            Event::Joined { group, member, by, how, introduces, label } => {
                 let known = self.known(&group.0)?;
                 let item = json!({ "type": "joined", "at": now(), "member": self.describe(&known, &member), "by": self.describe(&known, &by), "how": how });
                 self.remember(&group.0, &item)?;
                 self.emit(json!({ "type": "joined", "group": group }));
-                if by.key == self.node.key() {
-                    self.admitted(&group.0, &member, how, label).await?;
+                if introduces {
+                    self.introduce_joiner(&group.0, &member, how, label).await?;
                 }
                 self.refresh_opening(&group.0).await?;
             }
@@ -668,9 +668,9 @@ impl App {
         put(&self.store, &key("refused", gid), &refused)
     }
 
-    /// This session admitted a member: it tells the group who the member is to it, and the member of an invite meant
-    /// for someone becomes that contact.
-    async fn admitted(&self, gid: &[u8], member: &Member, how: How, label: Option<String>) -> Result<()> {
+    /// A member came in by this session's invite, or was admitted by it to an open group: it tells the group who the
+    /// member is to it, and the member of an invite meant for someone becomes that contact.
+    async fn introduce_joiner(&self, gid: &[u8], member: &Member, how: How, label: Option<String>) -> Result<()> {
         let Some(claim) = member.identity.clone().filter(|claim| claim.error.is_none()) else { return Ok(()) };
         if let Some(label) = &label {
             let contact = Contact { name: label.clone(), how: contacts::How::Verified, by: None, at: now() };
@@ -876,7 +876,7 @@ impl App {
             return Ok(json!({ "device": true }));
         }
         let identity = self.speaking_as().await?;
-        let gid = self.node.join(&invite, identity).await?;
+        let (gid, _) = self.node.join(&invite, identity).await?;
         self.joined(&gid.0, "join")?;
         Ok(json!({ "group": gid }))
     }
@@ -999,7 +999,6 @@ impl Lmk {
             open: Vec::new(),
             keep: 90,
             membership: app.membership.clone(),
-            log: None,
         };
         let identity = app.devices.identities().into_iter().next().map(|(identity, _)| identity);
         let gid = app.node.create(settings, identity).map_err(js)?;
@@ -1009,15 +1008,19 @@ impl Lmk {
     }
 
     /// An invite link into a group, labelled with whom it is for.
-    pub fn invite(&self, gid: &str, label: Option<String>) -> R<String> {
-        let gid = unb64(gid).map_err(js)?;
-        Ok(self.app.node.invite(&gid, label.filter(|l| !l.is_empty()), None).map_err(js)?.link())
+    pub async fn invite(&self, gid: String, label: Option<String>) -> R<String> {
+        let gid = unb64(&gid).map_err(js)?;
+        let link = self.app.node.invite(&gid, label.filter(|l| !l.is_empty()), None).await.map_err(js)?.link();
+        self.app.flush();
+        Ok(link)
     }
 
     /// A device link: whoever opens it becomes a device of this identity.
-    pub fn invite_device(&self, id: &str) -> R<String> {
-        let identity = self.app.own_identity(id).map_err(js)?;
-        self.app.devices.invite(&identity.id.0).map_err(js)
+    pub async fn invite_device(&self, id: String) -> R<String> {
+        let identity = self.app.own_identity(&id).map_err(js)?;
+        let link = self.app.devices.invite(&identity.id.0).await.map_err(js)?;
+        self.app.flush();
+        Ok(link)
     }
 
     /// Joins through an invite link: `{"group"}`, or `{"device": true}` for a device link.

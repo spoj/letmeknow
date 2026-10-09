@@ -1,4 +1,4 @@
-//! A `peer` stream between two sessions that share groups, and an `invite` stream.
+//! A `peer` stream between two sessions, which share groups or one of which asks the other to admit it.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,10 +30,14 @@ pub enum Frame {
     /// BLAKE3 hashes of files.
     Want { group: Bytes, files: Vec<Bytes> },
     Have { group: Bytes, files: Vec<Bytes> },
-    /// A request to join an open group, with the joiner's certificate of the identity it speaks as.
-    Join { group: Bytes, key_package: Bytes, certificate: Envelope },
-    Admitted { group: Bytes, admitted: Admitted },
-    Refused { group: Bytes, refused: String },
+    /// A request to be admitted, answered by `admitted` or `refused` with the same `id`.
+    Join {
+        id: u64,
+        #[serde(flatten)]
+        join: Join,
+    },
+    Admitted { id: u64, admitted: Admitted },
+    Refused { id: u64, refused: String },
     /// A file link to the state of the group's kind, which the sender's kind hands this member; without one, a request
     /// for one.
     State {
@@ -61,16 +65,20 @@ pub struct Hello {
     pub joined: u64,
 }
 
-/// The joiner's request on an `invite` stream, with its certificate if it speaks as an identity.
+/// A joiner's request: an invite's secret, or the group open to the identity its certificate proves it speaks as.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InviteRequest {
-    pub secret: Bytes,
+pub struct Join {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<Bytes>,
     pub key_package: Bytes,
+    /// The certificate of the identity the joiner speaks as, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate: Option<Envelope>,
 }
 
-/// The answer to an invite or a join: answered as `Answer<Admitted>` on an `invite` stream.
+/// The answer to a join.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Admitted {
     pub welcome: Bytes,
@@ -79,12 +87,22 @@ pub struct Admitted {
     /// A file link to the state of the group's kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// The ids of the messages from before the joiner's epoch that the inviter holds, which the joiner never gets.
+    /// The ids of the messages from before the joiner's epoch that the admitting member holds, which the joiner never gets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub before: Vec<Bytes>,
-    /// The certificates the inviter holds of the group's members.
+    /// The certificates the admitting member holds of the group's members.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub certificates: Vec<Envelope>,
+    /// The logs of the kind's order the admitting member reads from where it is, the current one last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<KindLog>,
+}
+
+/// A log of a group's kind: its id, and the position in the kind's order that its first entry follows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KindLog {
+    pub id: Bytes,
+    pub after: u64,
 }
 
 #[cfg(test)]
@@ -100,5 +118,9 @@ mod tests {
         let state: Frame = serde_json::from_str(r#"{"state":{"group":"AQ","link":"lmk:x"}}"#).unwrap();
         assert!(matches!(state, Frame::State { .. }));
         assert!(serde_json::from_str::<Frame>(r#"{"doc":{"group":"AQ"}}"#).is_err(), "a kind has no frames");
+        let join = Frame::Join { id: 7, join: Join { secret: Some(Bytes(vec![2])), group: None, key_package: Bytes(vec![3]), certificate: None } };
+        let text = serde_json::to_string(&join).unwrap();
+        assert_eq!(text, r#"{"join":{"id":7,"secret":"Ag","key_package":"Aw"}}"#);
+        assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), join);
     }
 }
