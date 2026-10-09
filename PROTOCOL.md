@@ -99,7 +99,7 @@ A member checks `device_sig` and the identity's device list (see Identity) when 
 
 - Protocol version 1 fixes: openmls `=0.9.1`; ciphersuite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`; `PURE_CIPHERTEXT_WIRE_FORMAT_POLICY` (commits are PrivateMessages, so the membership service reads nothing); `SenderRatchetConfiguration::new(1000, 100_000)`; KeyPackages built with `Lifetime::init(0, u64::MAX)`, joins with lifetime validation skipped; `RequiredCapabilities` naming `0xff01` and `0xff02`, resent with every settings change, since a GroupContextExtensions proposal replaces the whole list. Settings carry `"protocol": 1`.
 - Ended epochs are kept by `max_past_epochs(256)` and dropped by `delete_past_epoch_secrets(PastEpochDeletion::older_than_duration(7 days))`, which dates an epoch by when it began.
-- State is stored in SQLite with WAL and `synchronous = NORMAL`, encoded as CBOR (ciborium; openmls cannot be read back by bincode). The browser stores openmls state in IndexedDB, one record per key, not as one dump.
+- State is stored in SQLite with WAL, `synchronous = NORMAL` and `secure_delete`, encoded as CBOR (ciborium; openmls cannot be read back by bincode). After it deletes secrets or text (a message's text once shown, messages past `keep`, a group it leaves, epochs dropped when it applies a commit or daily), a session checkpoints with `wal_checkpoint(TRUNCATE)`, so that no copy stays in the WAL. The browser stores openmls state in IndexedDB, one record per key, not as one dump.
 - Every change is inline in its commit; standalone proposals are never sent, and a commit that refers to one is invalid. So is an update that changes a member's credential identity or device.
 - A commit that adds members carries, as its authenticated data, `{"how": "invite" | "open"}`: how they came in, as its committer vouches. It does not bear on the commit's validity.
 - A member reads its group's log in order. For the epoch it is in, the first entry that is a valid commit for that epoch is applied; every other entry is skipped.
@@ -114,7 +114,8 @@ A member checks `device_sig` and the identity's device list (see Identity) when 
 - An entry, before sealing, is `{"body": "<bytes>", "sig": "<sig>"}`. `body` is JSON, `{"prev": "<hash of the previous entry's body>" | null, "op": "create" | "add" | "remove", "device": "<key>", "device_name": "", "by": "<signing device key>"}`, plus `"name"` and `"membership"` on `create`. `sig` is by `by` over `"letmeknow device list v1\0"` ‖ body.
 - The identity's id is SHA-256 of the first entry's body. A credential names the id and its service; the first entry proves both.
 - Valid entries: `create` first, signed by the device it names; then each `prev` names the latest valid entry, and `by` is on the list at that point. A removal is final. Members apply the first valid entry per `prev`, in log order, and skip the rest.
-- A member reads the lists of the identities its groups' members speak as, and of each devices group's identity, when it joins or resumes, when members are added, and again once a list is 10 minutes old. Whenever a list it reads has removed a member's device, it commits that member's removal; a member that finds the removal already done drops its own.
+- A member needs the lists of the identities its groups' members speak as, and of each devices group's identity, when it joins or resumes, when members are added, and again once its copy is 10 minutes old. It reads a list from its service (every entry, and the head of the empty page after them) unless it holds a fresh copy: one read from the service within 10 minutes, or a copy a peer presented whose head's `time` is within 10 minutes. Whenever a list it takes has removed a member's device, it commits that member's removal; a member that finds the removal already done drops its own.
+- Peers present lists in `hello` (see Peer protocol). A presented list counts only if its head is the signature of the service its `create` entry names, over the log at the identity's address, and chains exactly its entries, from h₀. Of a held copy and another, from a peer or the service: if they differ in an entry both have, the service showed two lists, and the session reports it in a `warning` and keeps its own; else the longer wins, or, if they are as long, the one with the later head. A member that takes a newer copy checks every group's members against it and presents it to the peers of the groups it concerns. Lists on a local folder are not presented, as their heads are unsigned.
 
 ### Contacts
 
@@ -126,7 +127,7 @@ An identity's devices group is a chat whose settings carry `devices_of`. Its mem
 
 On a machine, the holder shares the device with its other session processes through two files in `LETMEKNOW_HOME`:
 
-- `device-state.json`: `{"identities": [[<identity ref>, "<name>"]], "contacts": [["<identity id>", <contact>]], "openings": [<opening>]}`, rewritten whenever it changes, by writing `device-state.new` and renaming it over the old. The others read it whenever they need contacts, identities or openings.
+- `device-state.json`: `{"identities": [[<identity ref>, "<name>"]], "contacts": [["<identity id>", <contact>]], "openings": [<opening>]}`, rewritten whenever it changes and by each session process that takes the lock, by writing `device-state.new` and renaming it over the old. `device.json` too is written through a rename, and a devices group in `device.db` whose identity `device.json` lacks, as when a process stopped between joining and saving, puts the identity back. The others read it whenever they need contacts, identities or openings.
 - `device-endpoint`: the holder's second command channel (`{"port", "token"}`, a localhost TCP port taking one JSON line `{"token", "request"}` and answering one line, as each session's own `endpoint`). The others send it the requests only the device's node can answer: `identity`, `invite --identity`, `join` with a device link, and two of their own, `{"cmd": "set_contact", "identity", "contact"}` and `{"cmd": "set_opening", "identity", "opening"}`. The holder rewrites `device-state.json` before it answers.
 
 An opening, in its settings: `{"group", "kind", "name", "membership", "members": ["<iroh key>"]}`. A member that is a device of the identity writes it, and refreshes `members` when the group's membership changes.
@@ -147,7 +148,9 @@ The plaintext of an MLS application message is JSON with a `type`:
 | `edit` | doc | `update`: a Yjs v1 update, sent live to the members online and not held |
 | `diff` | doc | `update`: a Yjs v1 update answering `doc_sv` (see Peer protocol), not held |
 | `leave` | every | none: the sender asks to be removed; the first member to see it commits the Remove |
-| `introduce` | every | `identity` (`id`, `membership`), `name`, `how` (`invite`, `open`, `introduce`): who a member is to the sender; sent after the sender adds someone, and by `introduce` |
+| `introduce` | every | `identity` (`id`, `membership`), `name`, `how` (`invite`, `open`, `introduce`), and optional `to`: who a member is to the sender; sent after the sender adds someone, and by `introduce` |
+
+An `introduce`'s `to` lists the members it is for, as a message's `to` does; only they act on it (record the introduction, offer the contact), and the others ignore it. Without `to`, it is for the whole group. Clients before 0.10.1 ignore `to` and act on every introduction.
 
 A `message`'s fields: `content`, its text, which may be empty with an attachment; `after`, the ids of the messages the sender had read that no other message it read lists in `after`; `to`, the members it addresses, each as the first 8 bytes of SHA-256 of its session key, or none for the group; `reply_to`, the id of the message it answers; `urgent`, `true` to wake every member; `attachment`, `{"link", "name", "size", "type"}`: a file link (see Files), its name, its size in bytes, and its media type, which may be empty.
 
@@ -159,7 +162,7 @@ A `peer` stream joins two sessions that share a group, one stream per pair, kept
 
 | Frame | Meaning |
 |---|---|
-| `{"hello": {"groups": [{"group", "epoch", "head", "floor", "joined"}]}}` | For each group both are in: the epoch the sender is at, the newest signed head it holds, the lowest epoch it accepts, and the epoch it joined |
+| `{"hello": {"groups": [{"group", "epoch", "head", "floor", "joined"}], "lists": [{"identity", "entries", "head"}]}}` | For each group both are in: the epoch the sender is at, the newest signed head it holds, the lowest epoch it accepts, and the epoch it joined. `lists`, if any: the device lists of the identities in those groups, each with all its entries and the service's head over them, that the other side has not yet shown or been shown with that head (see Identity) |
 | `{"commits": {"group", "entries", "head"}}` | Log entries the other lacks, judged by its head; also sent by a commit's author once the service has taken it |
 | `{"reconcile": {"group", "msg"}}` | A negentropy message (see below) |
 | `{"messages": {"group", "items"}}` | MLS ciphertexts the other lacks; also every new message as it is sent |
@@ -170,7 +173,7 @@ A `peer` stream joins two sessions that share a group, one stream per pair, kept
 | `{"join": {"group", "key_package"}}` | A request to join an open group, answered by `admitted` or `refused` |
 | `{"admitted": {"group", "admitted": {"welcome", "position", "doc"}}}`, `{"refused": {"group", "refused"}}` | The answer to `join`, as an invite's |
 
-A side that holds no head for a group yet sends the empty log's: length 0, hash h₀, `time` 0 and no signature, which needs none.
+Clients before 0.10.1 send no `lists` and ignore them. A side that holds no head for a group yet sends the empty log's: length 0, hash h₀, `time` 0 and no signature, which needs none.
 
 A sender learns from receipts who holds its message, and who refused it; it keeps its message as its own pending send until a receipt says a member holds it, and offers it in every sync meanwhile. A receiver that refuses or cannot open a message keeps its id among those it gave up, so a message naming it in `after` shows a known gap rather than waiting.
 

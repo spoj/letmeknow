@@ -356,6 +356,29 @@ fn membership_changes_wake_and_a_removed_session_is_told() {
     });
 }
 
+/// The files of a session's database that hold `secret`. The `-shm` file holds only the WAL's index, and Windows locks
+/// parts of it.
+fn holding(dir: &Path, secret: &str) -> Vec<PathBuf> {
+    let files = ["session.db", "session.db-wal"].map(|name| dir.join(name));
+    files.into_iter().filter(|path| std::fs::read(path).unwrap_or_default().windows(secret.len()).any(|w| w == secret.as_bytes())).collect()
+}
+
+#[test]
+fn text_shown_or_left_behind_stays_in_no_file() {
+    local(async {
+        let world = world("scrub").await;
+        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
+        let secret = "the vault code is 7-tangerine-42";
+        bob.cmd(&["send", &format!("@alice {secret}")]).await.unwrap();
+        assert_eq!(alice.expect("message").await["content"].as_str().unwrap(), format!("@alice {secret}"));
+        alice.cmd(&["status"]).await.unwrap();
+        assert_eq!(holding(&session_dir(&alice.home, "alice").unwrap(), secret), Vec::<PathBuf>::new());
+        alice.cmd(&["remove", "Bob"]).await.unwrap();
+        bob.expect("removed").await;
+        assert_eq!(holding(&session_dir(&bob.home, "bob").unwrap(), secret), Vec::<PathBuf>::new());
+    });
+}
+
 #[test]
 fn a_leaving_member_is_removed_by_another() {
     local(async {
@@ -376,8 +399,12 @@ fn introductions_are_shown_until_accepted() {
         let mut carol = world.start("carol", HOUR).await;
         carol.cmd(&["identity", "create", "Carol"]).await.unwrap();
         assert!(alice.cmd(&["invite", "--group", "x"]).await.is_err());
-        let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
-        carol.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        let mut dave = world.start("dave", HOUR).await;
+        dave.cmd(&["identity", "create", "Dave"]).await.unwrap();
+        for joiner in [&carol, &dave] {
+            let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
+            joiner.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        }
         let introduced = alice.cmd(&["introduce", "Bob", "--to", "Carol"]).await.unwrap();
         assert_eq!(introduced["identity"]["name"], "Bob (Acme)");
         let bob_seen = || async {
@@ -401,8 +428,12 @@ fn introductions_are_shown_until_accepted() {
         assert_eq!(bob_seen["identity"]["claim"], true);
         assert_eq!(bob_seen["identity"]["introduced"][0]["by"]["name"], "Alice");
         assert_eq!(bob_seen["identity"]["introduced"][0]["name"], "Bob (Acme)");
+        // Dave, to whom Alice did not introduce Bob, ignores it.
+        assert_eq!(dave.cmd(&["contacts"]).await.unwrap()["introductions"], json!([]));
+        assert!(dave.printed().await.iter().all(|e| e["type"] != "introduced" || e["how"] != "introduce"));
         let contacts = carol.cmd(&["contacts"]).await.unwrap();
-        let id = contacts["introductions"][0]["identity"].as_str().unwrap().to_owned();
+        let introductions = contacts["introductions"].as_array().unwrap();
+        let id = introductions.iter().find(|i| i["name"] == "Bob (Acme)").unwrap()["identity"].as_str().unwrap().to_owned();
         carol.cmd(&["contacts", "accept", "--", &id]).await.unwrap();
         let members = carol.cmd(&["members"]).await.unwrap();
         let bob_seen = members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Bob").unwrap().clone();
@@ -546,6 +577,42 @@ fn a_restarted_session_resumes_its_groups_and_docs() {
         assert_eq!((groups[0]["name"].as_str(), groups[0]["file"].as_str()), (Some("Notes"), Some(file.as_str())));
         alice.cmd(&["leave"]).await.unwrap();
         assert!(!Path::new(&file).exists());
+    });
+}
+
+#[test]
+fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_twice() {
+    local(async {
+        use base64::Engine;
+        let world = world("carrying").await;
+        let mut alice = world.start("alice", HOUR).await;
+        let invite = alice.cmd(&["invite", "--kind", "doc", "--name", "Notes"]).await.unwrap();
+        let gid = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(invite["group"].as_str().unwrap()).unwrap();
+        let file = invite["file"].as_str().unwrap().to_owned();
+        std::fs::write(&file, "one\n").unwrap();
+        alice.cmd(&["status"]).await.unwrap();
+        alice.stop().await;
+        // Another member's line came in; then it stopped after recording that it carried its own new line onto the doc,
+        // with the doc changed (`applied`) or not, before the file was rewritten and the base stored.
+        for (i, applied) in [true, false].into_iter().enumerate() {
+            let base = std::fs::read_to_string(&file).unwrap();
+            let carried = format!("{base}mine {i}\n");
+            let expected = format!("others {i}\n{carried}");
+            std::fs::write(&file, &carried).unwrap();
+            let db = rusqlite::Connection::open(session_dir(&alice.home, "alice").unwrap().join("session.db")).unwrap();
+            let key = [b"node/doc/".as_slice(), &gid].concat();
+            let state: Vec<u8> = db.query_row("SELECT value FROM lmk WHERE key = ?", [&key], |r| r.get(0)).unwrap();
+            let theirs = lmk_node::doc::apply(&state, &lmk_node::doc::edit(&state, &format!("others {i}\n{base}")).unwrap()).unwrap();
+            let edit = lmk_node::doc::edit(&theirs, &expected).unwrap();
+            let state = if applied { lmk_node::doc::apply(&theirs, &edit).unwrap() } else { theirs };
+            db.execute("UPDATE lmk SET value = ? WHERE key = ?", rusqlite::params![state, key]).unwrap();
+            db.execute("INSERT INTO carrying (gid, file, edit) VALUES (?, ?, ?)", rusqlite::params![gid, carried, edit]).unwrap();
+            drop(db);
+            alice = world.start("alice", HOUR).await;
+            alice.cmd(&["status"]).await.unwrap();
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+            alice.stop().await;
+        }
     });
 }
 

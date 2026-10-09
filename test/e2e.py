@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """End-to-end test: a local `letmeknow serve` (membership service, relay and web client, with a self-signed certificate)
 and several `letmeknow listen` processes, each its own device; then the browser client in Chromium (web/e2e.mjs) with
-native sessions of its own. --no-browser skips building and testing the browser client, which is the same on every OS."""
+native sessions of its own. --no-browser skips building and testing the browser client, which is the same on every OS.
+With LETMEKNOW_OLD naming a 0.10.0 binary, it also checks that state made by 0.10.0 works with this build, and that a
+0.10.0 peer and this build talk."""
 import json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -29,9 +31,9 @@ def home(name):
     return os.path.join(TMP, name)
 
 
-def run(session, *args, ok=True, input=None, device=None):
+def run(session, *args, ok=True, input=None, device=None, bin=BIN):
     env = {**ENV, "LETMEKNOW_HOME": home(device or session)}
-    result = subprocess.run([BIN, "--session", session, *args], env=env, input=input, capture_output=True, text=True, encoding="utf-8", timeout=120)
+    result = subprocess.run([bin, "--session", session, *args], env=env, input=input, capture_output=True, text=True, encoding="utf-8", timeout=120)
     if ok and result.returncode:
         sys.exit(f"{session} {args}: {result.stderr}")
     return json.loads(result.stdout) if result.returncode == 0 else result.stderr
@@ -40,10 +42,10 @@ def run(session, *args, ok=True, input=None, device=None):
 class Listener:
     """A session process, in its own home (its own device) unless it shares `device`'s."""
 
-    def __init__(self, session, device=None):
+    def __init__(self, session, device=None, bin=BIN):
         self.session, self.lines = session, queue.Queue()
         env = {**ENV, "LETMEKNOW_HOME": home(device or session)}
-        args = [BIN, "--session", session, "listen", "--name", session.title(), "--hold", "0"]
+        args = [bin, "--session", session, "listen", "--name", session.title(), "--hold", "0"]
         self.log = open(os.path.join(TMP, f"{session}.log"), "a")
         self.proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8")
         threading.Thread(target=self.read, daemon=True).start()
@@ -111,6 +113,54 @@ def serve():
     membership = proc.stdout.readline().strip().removeprefix("membership: ")
     ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_RELAY=f"https://localhost:{https}", LETMEKNOW_MEMBERSHIP=membership)
     return proc
+
+
+def compat(old, listeners):
+    """State made by 0.10.0's binary works with this build, and a 0.10.0 peer and this build talk."""
+    ann, ben, phone = Listener("ann", bin=old), Listener("ben", bin=old), Listener("phone", bin=old)
+    listeners += [ann, ben, phone]
+    for name in ("ann", "ben"):
+        run(name, "identity", "create", name.title(), bin=old)
+    chat = run("ann", "invite", "--name", "Old", "--for", "Ben", bin=old)
+    run("ben", "join", chat["link"], bin=old)
+    ann.expect("joined")
+    run("ann", "send", "@ben made by 0.10.0", bin=old)
+    ben.expect("message", lambda e: e["content"] == "@ben made by 0.10.0")
+    ann_notes, ben_notes = write("ann-notes.md", "- old line\n"), os.path.join(TMP, "ben-notes.md")
+    doc = run("ann", "invite", "--kind", "doc", "--name", "OldNotes", ann_notes, bin=old)
+    run("ben", "join", doc["link"], ben_notes, bin=old)
+    check(until(lambda: content(ben_notes), lambda text: text == "- old line\n") == "- old line\n", "0.10.0 makes a chat, a doc and an identity")
+    run("phone", "join", run("ann", "invite", "--identity", "Ann", bin=old)["link"], bin=old)
+    for listener in (ann, ben, phone):
+        listener.stop()
+        listeners.remove(listener)
+
+    ann, ben, phone = Listener("ann"), Listener("ben"), Listener("phone")
+    listeners += [ann, ben, phone]
+    check({g.get("name") for g in run("ann", "groups")} == {"Old", "OldNotes"}, "this build resumes 0.10.0's groups")
+    check(len(run("ann", "identity", "list")["identities"][0]["devices"]) == 2, "and its identity with a device link")
+    check(run("ann", "contacts")["contacts"][0]["name"] == "Ben", "and its contacts")
+    run("ann", "send", f"--group={chat['group']}", "@ben from 0.10.1")
+    ben.expect("message", lambda e: e["content"] == "@ben from 0.10.1")
+    with open(ann_notes, "ab") as f:
+        f.write(b"- new line\n")
+    check(until(lambda: content(ben_notes), lambda text: "new line" in text) == "- old line\n- new line\n", "and its doc")
+
+    cleo = Listener("cleo", bin=old)
+    listeners.append(cleo)
+    run("cleo", "identity", "create", "Cleo", bin=old)
+    run("cleo", "join", run("ann", "invite", f"--group={chat['group']}")["link"], bin=old)
+    run("cleo", "send", "@ann from 0.10.0", bin=old)
+    ann.expect("message", lambda e: e["content"] == "@ann from 0.10.0")
+    # Read rather than wait for it to print: it comes after messages from before cleo joined, which never reach her.
+    sent = run("ann", "send", f"--group={chat['group']}", "@cleo from 0.10.1")
+    got = until(lambda: run("cleo", "read", sent["id"], ok=False, bin=old), lambda got: isinstance(got, list))
+    check(got[0]["content"] == "@cleo from 0.10.1", "a 0.10.0 peer and this build exchange messages")
+    run("ann", "introduce", f"--group={chat['group']}", "Ben", "--to", "Cleo")
+    check(cleo.expect("introduced", lambda e: e["how"] == "introduce")["identity"]["name"] == "Ben", "and introductions, which it takes as for everyone")
+    for listener in (ann, ben, phone, cleo):
+        listener.stop()
+        listeners.remove(listener)
 
 
 def main():
@@ -226,6 +276,8 @@ def main():
         # Bob takes his tablet off his identity: its sessions leave his groups.
         run("bob", "identity", "remove", "--", tablet.ready["member"]["device"]["key"])
         check(tablet.expect("removed", timeout=60)["group"] == group, "a device taken off its identity leaves its groups")
+        if os.environ.get("LETMEKNOW_OLD"):
+            compat(os.environ["LETMEKNOW_OLD"], listeners)
         if BROWSER and subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=WEB, env={**ENV, "URL": ENV["LETMEKNOW_RELAY"], "BIN": BIN}).returncode:
             sys.exit("FAIL: the browser test")
         print("all ok")

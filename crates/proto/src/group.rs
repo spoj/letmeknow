@@ -112,7 +112,14 @@ pub enum Payload {
     /// The sender asks to be removed.
     Leave,
     /// Who an identity is to the sender.
-    Introduce { identity: IdentityRef, name: String, how: How },
+    Introduce {
+        identity: IdentityRef,
+        name: String,
+        how: How,
+        /// Fingerprints of the members it is for; empty for the group.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        to: Vec<Bytes>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

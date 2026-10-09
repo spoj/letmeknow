@@ -23,7 +23,7 @@ use lmk_proto::{
     Answer, Bytes,
     head::{self, Head},
     links::FileLink,
-    peer::{Admitted, Hello, InviteRequest},
+    peer::{Admitted, Hello, InviteRequest, List},
 };
 use n0_future::boxed::BoxFuture;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -183,11 +183,20 @@ pub struct Fake {
     pub groups: Mutex<HashMap<Vec<u8>, Group>>,
     /// After this many more membership checks, the peer is no longer a member.
     pub cut: Mutex<Option<(EndpointId, usize)>>,
+    /// The device lists it presents, and those peers presented to it.
+    pub lists: Mutex<Vec<List>>,
+    pub presented: Mutex<Vec<(EndpointId, List)>>,
 }
 
 impl Fake {
     pub fn new(service: &SigningKey) -> Arc<Fake> {
-        Arc::new(Fake { service: service.clone(), groups: Mutex::default(), cut: Mutex::default() })
+        Arc::new(Fake {
+            service: service.clone(),
+            groups: Mutex::default(),
+            cut: Mutex::default(),
+            lists: Mutex::default(),
+            presented: Mutex::default(),
+        })
     }
 
     pub fn with(self: &Arc<Self>, group: &[u8], g: Group) -> Arc<Self> {
@@ -324,5 +333,13 @@ impl Groups for Fake {
 
     fn files(&self, group: &[u8]) -> Vec<FileLink> {
         self.groups.lock().unwrap()[group].files.clone()
+    }
+
+    fn lists(&self, _: &[Vec<u8>]) -> Vec<List> {
+        self.lists.lock().unwrap().clone()
+    }
+
+    fn list(&self, peer: EndpointId, list: List) {
+        self.presented.lock().unwrap().push((peer, list));
     }
 }

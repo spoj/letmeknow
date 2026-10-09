@@ -363,7 +363,7 @@ impl App {
         }
         let contact = self.node.contacts()?.into_iter().find(|(id, _)| *id == claim.identity.id);
         let name = label.or(contact.map(|(_, c)| c.name)).unwrap_or(claim.name);
-        self.node.send(gid, &Payload::Introduce { identity: claim.identity, name, how }).await?;
+        self.node.send(gid, &Payload::Introduce { identity: claim.identity, name, how, to: Vec::new() }).await?;
         Ok(())
     }
 

@@ -5,8 +5,10 @@ use ed25519_dalek::SigningKey;
 use iroh::RelayUrl;
 use lmk_net::Event;
 use lmk_proto::{
-    Answer,
+    Answer, Bytes,
+    head::Head,
     links::Invite,
+    peer::List,
 };
 use yrs::{ReadTxn, Text, Transact, updates::decoder::Decode};
 
@@ -54,6 +56,34 @@ async fn hello_head_swap_and_contradiction() {
     b.until(|e| matches!(e, Event::Contradiction { peer, .. } if *peer == members[2])).await;
     assert_eq!(a.net.connected().len(), 2);
     for node in [&a, &b, &c] {
+        node.net.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn device_lists_are_shown_once_per_head() {
+    let relay = relay().await;
+    let keys = keys(2);
+    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
+    let group = || Group { members: members.clone(), ..Group::default() };
+    let service = service();
+    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
+    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
+    let list = |time| List { identity: Bytes(vec![7; 32]), entries: vec![Bytes(b"e1".to_vec())], head: Head::sign(&service, b"list", 1, [0; 32], time) };
+    a.fake.lists.lock().unwrap().push(list(1));
+    b.fake.lists.lock().unwrap().push(list(1));
+    let presented = |node: &Node| node.fake.presented.lock().unwrap().iter().map(|(_, l)| l.head.time).collect::<Vec<_>>();
+    a.net.dial(members[1], relay.url.clone()).await.unwrap();
+    eventually("each shows the other its list", || presented(&a) == [1] && presented(&b) == [1]).await;
+    a.net.changed(G);
+    *a.fake.lists.lock().unwrap() = vec![list(2)];
+    a.net.changed(G);
+    eventually("a newer head is shown", || presented(&b) == [1, 2]).await;
+    *b.fake.lists.lock().unwrap() = vec![list(2)];
+    b.net.changed(G);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!((presented(&a), presented(&b)), (vec![1], vec![1, 2]), "nothing is shown twice, nor back");
+    for node in [&a, &b] {
         node.net.shutdown().await.unwrap();
     }
 }

@@ -7,7 +7,12 @@ use crate::{Bytes, head::Head};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Frame {
-    Hello { groups: Vec<Hello> },
+    Hello {
+        groups: Vec<Hello>,
+        /// Device lists of the identities in those groups.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lists: Vec<List>,
+    },
     /// Log entries the other lacks, ending at `head`.
     Commits { group: Bytes, entries: Vec<Bytes>, head: Head },
     /// A negentropy message.
@@ -47,6 +52,15 @@ pub struct Hello {
     pub joined: u64,
 }
 
+/// An identity's device list as its membership service showed it: every entry, and the service's signed head over
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct List {
+    pub identity: Bytes,
+    pub entries: Vec<Bytes>,
+    pub head: Head,
+}
+
 /// The joiner's request on an `invite` stream. For a device link, the KeyPackage's credential names the new device.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteRequest {
@@ -63,4 +77,17 @@ pub struct Admitted {
     /// For a doc: a file link to its state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hello_without_lists_is_as_before() {
+        let old = r#"{"hello":{"groups":[]}}"#;
+        let hello: Frame = serde_json::from_str(old).unwrap();
+        assert_eq!(hello, Frame::Hello { groups: vec![], lists: vec![] });
+        assert_eq!(serde_json::to_string(&hello).unwrap(), old);
+    }
 }

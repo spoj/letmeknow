@@ -25,7 +25,7 @@ use lmk_proto::{
     frame::{self, ALPN, Open, Stream},
     head::Head,
     links::{FileLink, Invite},
-    peer::{Admitted, Frame, Hello, InviteRequest},
+    peer::{Admitted, Frame, Hello, InviteRequest, List},
 };
 use n0_future::{boxed::BoxFuture, join_all, task::spawn, time::timeout};
 use tokio::{
@@ -70,6 +70,10 @@ pub trait Groups: Send + Sync + 'static {
     fn diff(&self, group: &[u8], sv: &[u8]) -> Result<Vec<u8>>;
     /// The files the group links now.
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
+    /// The device lists this session holds, with signed heads, of the identities in these groups.
+    fn lists(&self, groups: &[Vec<u8>]) -> Vec<List>;
+    /// A device list `peer` presented.
+    fn list(&self, peer: EndpointId, list: List);
 }
 
 /// What became of a ciphertext a peer sent; the peer hears which unless it waits.

@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS session (name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS taken (id BLOB PRIMARY KEY, gid BLOB NOT NULL, seen INTEGER NOT NULL DEFAULT 0);
 -- A doc's file, and its base: the text the file and the doc last had in common.
 CREATE TABLE IF NOT EXISTS bindings (gid BLOB PRIMARY KEY, path TEXT NOT NULL, base TEXT NOT NULL);
+-- A file's changes on their way onto its doc: the file's text and the doc edit that carries them, until the base is the
+-- result. A session that stopped meanwhile applies the edit again, which a doc takes at most once.
+CREATE TABLE IF NOT EXISTS carrying (gid BLOB PRIMARY KEY, file TEXT NOT NULL, edit BLOB NOT NULL);
 -- Attachments of messages taken in; `path` once the file arrived.
 CREATE TABLE IF NOT EXISTS attachments (hash BLOB NOT NULL, gid BLOB NOT NULL, message BLOB NOT NULL, link TEXT NOT NULL,
     name TEXT NOT NULL, wakes INTEGER NOT NULL, path TEXT, PRIMARY KEY (hash, message));

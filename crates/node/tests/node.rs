@@ -12,8 +12,12 @@ use lmk_core::device::Device;
 use lmk_core::group::Window;
 use lmk_core::invite::Target;
 use lmk_core::provider::MemoryProvider;
+use lmk_membership::service::{Policy, Service as Membership};
+use lmk_membership::store::Store;
 use lmk_node::{Config, Event, Node};
 use lmk_proto::group::{Kind, PROTOCOL, Payload, Service, Settings};
+use lmk_proto::Bytes;
+use lmk_proto::frame::ALPN;
 use lmk_proto::links::Invite;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -231,4 +235,73 @@ async fn a_removed_device_leaves_every_group() {
     let mut expected = vec![devices, chat];
     expected.sort();
     assert_eq!(gone, expected);
+}
+
+/// A membership service like `letmeknow serve`'s, which signs its heads.
+async fn signing_service(relay: &Relay, dir: &Path) -> (Service, iroh::protocol::Router) {
+    let secret = iroh::SecretKey::from_bytes(&lmk_core::random());
+    let relays = iroh::RelayMap::from(iroh::RelayConfig::new(relay.url.clone(), Some(Default::default())));
+    let roots = CaTlsConfig::custom_roots([relay.cert.clone()]);
+    let endpoint = lmk_net::builder(relays).secret_key(secret.clone()).ca_tls_config(roots).bind().await.unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let store = Store::open(&dir.join("membership.db"), ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes())).unwrap();
+    let router = iroh::protocol::Router::builder(endpoint.clone()).accept(ALPN, Membership::new(store, Policy::default())).spawn();
+    let service = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: relay.url.to_string(), addrs: vec![] };
+    (service, router)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removal_spreads_through_peers() {
+    let relay = relay().await;
+    let dir = folder("spread");
+    let (membership, _service) = signing_service(&relay, &dir).await;
+    let mut alice = session(&relay, "Alice").await;
+    let mut laptop = device(&relay, "laptop").await;
+    let tablet = device(&relay, "tablet").await;
+    let bob = laptop.node.identity_create("Bob", membership.clone()).await.unwrap();
+    let link = laptop.node.invite(Target::Device(bob.id.0.clone()), None, None).unwrap();
+    tablet.node.join(&Invite::parse(&link).unwrap(), None).await.unwrap();
+    laptop.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    // Alice shares one chat with the tablet and another with the laptop; she reads Bob's list as each joins.
+    for member in [&tablet, &laptop] {
+        let chat = alice.node.create(Settings { membership: membership.clone(), ..settings(Kind::Chat, &dir) }, None).unwrap();
+        let link = alice.node.invite(Target::Group(chat.0.clone()), None, None).unwrap();
+        member.node.join(&Invite::parse(&link).unwrap(), Some(bob.clone())).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    // Her copy is fresh for 10 minutes, so she learns of the removal only from the laptop, which shows her the list.
+    laptop.node.remove_device(&bob, &tablet.node.device().public()).await.unwrap();
+    let left = alice.until(|e| match e {
+        Event::Left { member, .. } => Some(member),
+        _ => None,
+    }).await;
+    assert_eq!(left.device.0, tablet.node.device().public());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_that_stopped_before_it_was_saved_is_still_on_its_identity() {
+    use lmk_core::provider::SqliteProvider;
+    let relay = relay().await;
+    let dir = folder("unsaved");
+    std::fs::create_dir_all(&dir).unwrap();
+    let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
+    let config = || Config {
+        name: "laptop".into(),
+        device_key: true,
+        relay: relay.url.clone(),
+        ca: CaTlsConfig::custom_roots([relay.cert.clone()]),
+        home: None,
+        files: None,
+        file_limit: 100 << 20,
+        window: Window::default(),
+    };
+    let saved = Device::new("laptop");
+    let (node, _events) = Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), saved.clone(), config()).await.unwrap();
+    let bob = node.identity_create("Bob", membership).await.unwrap();
+    node.shutdown().await.unwrap();
+    drop(node);
+    let (node, _events) = Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), saved, config()).await.unwrap();
+    assert_eq!(node.device().identities, std::slice::from_ref(&bob));
+    assert_eq!(node.identities(), [(bob, "Bob".to_owned())]);
+    node.shutdown().await.unwrap();
 }

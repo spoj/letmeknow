@@ -23,6 +23,7 @@ use lmk_core::provider::Provider;
 use lmk_membership::{Chain, Refused};
 use lmk_net::Net;
 use lmk_proto::group::{Credential, How, IdentityRef, Kind, Leaf, Opening, Payload, Service, Settings};
+use lmk_proto::head::Head;
 use lmk_proto::links::{FileLink, Invite, RELAY};
 use lmk_proto::peer::Admitted;
 use lmk_proto::{Answer, Bytes};
@@ -232,6 +233,42 @@ pub(crate) struct G {
     follow: Option<JoinHandle<()>>,
 }
 
+/// A device list, the entries and signed head it was read from, and since when it counts as fresh: when it was read
+/// from its service or, for a copy a peer presented, its head's time.
+pub(crate) struct Known {
+    list: DeviceList,
+    entries: Vec<Bytes>,
+    head: Head,
+    at: u64,
+}
+
+/// How a copy of a device list compares with the one held.
+#[derive(Debug, PartialEq, Eq)]
+enum Compared {
+    /// They differ in an entry both have: the service showed two lists.
+    Contradicts,
+    Shorter,
+    /// As long, with a head no later.
+    AsLong,
+    /// Longer, or as long with a later head.
+    Newer,
+}
+
+impl Known {
+    fn compare(&self, entries: &[Bytes], head: &Head) -> Compared {
+        let common = self.entries.len().min(entries.len());
+        if self.entries[..common] != entries[..common] {
+            Compared::Contradicts
+        } else if head.length < self.head.length {
+            Compared::Shorter
+        } else if (head.length, head.time) <= (self.head.length, self.head.time) {
+            Compared::AsLong
+        } else {
+            Compared::Newer
+        }
+    }
+}
+
 pub(crate) struct State<P> {
     provider: P,
     session: Session,
@@ -240,8 +277,8 @@ pub(crate) struct State<P> {
     invites: Invites,
     /// Joiners' session keys, and the `--for` of the invites they redeemed.
     labels: HashMap<Vec<u8>, String>,
-    /// Device lists, by identity id, with when they were fetched.
-    lists: HashMap<Vec<u8>, (DeviceList, u64)>,
+    /// Device lists, by identity id.
+    lists: HashMap<Vec<u8>, Known>,
     /// `send`s waiting for receipts.
     waiters: HashMap<[u8; 32], mpsc::UnboundedSender<(EndpointId, Option<String>)>>,
     /// For each doc, the members whose edits or diffs came in since `doc_edits` last handed them out.
@@ -390,7 +427,7 @@ impl<P: Provider> State<P> {
     }
 
     fn claim(&self, credential: &Credential, key: &[u8], identity: IdentityRef) -> Claim {
-        let Some((list, _)) = self.lists.get(&identity.id.0) else {
+        let Some(Known { list, .. }) = self.lists.get(&identity.id.0) else {
             let error = Some("its identity's device list could not be read yet".into());
             return Claim { identity, name: String::new(), error, added_by_device: None };
         };
@@ -428,6 +465,14 @@ impl<P: Provider> State<P> {
         })
     }
 
+    /// The identities a group's members speak as, and the one a devices group is of.
+    fn identities(&self, gid: &[u8]) -> Vec<IdentityRef> {
+        let Some(g) = self.groups.get(gid) else { return Vec::new() };
+        let settings = g.mls.settings();
+        let devices_of = settings.devices_of.map(|id| IdentityRef { id, membership: settings.membership.clone() });
+        g.mls.members().into_iter().filter_map(|m| m.credential?.identity).chain(devices_of).collect()
+    }
+
     fn devices_group(&self, identity: &[u8]) -> Option<Vec<u8>> {
         self.groups
             .iter()
@@ -450,7 +495,7 @@ impl<P: Provider> State<P> {
 
 impl<P: Provider + Send + 'static> Node<P> {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
-    pub async fn start(provider: P, device: Device, config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
+    pub async fn start(provider: P, mut device: Device, config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let secret = match provider.get(b"node/iroh")? {
             Some(bytes) => SecretKey::from_bytes(&bytes.as_slice().try_into().context("an iroh key is 32 bytes")?),
             None => {
@@ -479,6 +524,13 @@ impl<P: Provider + Send + 'static> Node<P> {
             let rec: Rec = get(&provider, &rec_key(&gid.0))?.context("a group without its record")?;
             if let Some(chain) = &rec.chain {
                 logs.client(&mls.settings().membership)?.set_chain(chain.clone());
+            }
+            // A device that stopped after joining an identity's devices group, before it was saved, is on the identity.
+            let settings = mls.settings();
+            if let Some(id) = settings.devices_of
+                && !device.identities.iter().any(|identity| identity.id == id)
+            {
+                device.identities.push(IdentityRef { id, membership: settings.membership });
             }
             groups.insert(gid.0, G { mls, rec, future: Vec::new(), own_at: None, follow: None });
         }
@@ -744,7 +796,13 @@ impl<P: Provider + Send + 'static> Node<P> {
         if let Payload::Message { content, .. } = &mut message.payload {
             content.clear();
         }
-        put(&st.provider, &message_key(id), &message)
+        put(&st.provider, &message_key(id), &message)?;
+        st.provider.scrub()
+    }
+
+    /// Leaves in this session's files no copy of what it deleted.
+    pub fn scrub(&self) -> Result<()> {
+        self.inner.state.lock().unwrap().provider.scrub()
     }
 
     /// A doc's Yjs state.
@@ -980,6 +1038,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 st.groups.get_mut(gid).unwrap().mls.expire(&st.provider).ok();
             }
             self.expire(st);
+            if let Err(error) = st.provider.scrub() {
+                self.warn(None, format!("{error:#}"));
+            }
         }
     }
 
@@ -1131,6 +1192,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         st.save(gid)?;
         if changed {
+            // Applying a commit deletes the secrets of epochs beyond the key window.
+            if let Err(error) = st.provider.scrub() {
+                self.warn(Some(gid), format!("{error:#}"));
+            }
             if let Some(net) = self.net.get() {
                 net.changed(gid);
             }
@@ -1325,14 +1390,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
     async fn refresh(&self, gid: &[u8]) {
         let stale: Vec<IdentityRef> = {
             let st = self.state.lock().unwrap();
-            let Ok(g) = st.group(gid) else { return };
-            let settings = g.mls.settings();
-            let devices_of =
-                settings.devices_of.map(|id| IdentityRef { id, membership: settings.membership.clone() });
-            let identities = g.mls.members().into_iter().filter_map(|m| m.credential?.identity).chain(devices_of);
-            identities
-                .filter(|identity| st.lists.get(&identity.id.0).is_none_or(|(_, at)| at + LIST_FRESH < now()))
-                .collect()
+            let identities = st.identities(gid).into_iter();
+            identities.filter(|identity| st.lists.get(&identity.id.0).is_none_or(|known| known.at + LIST_FRESH < now())).collect()
         };
         for identity in stale {
             if let Err(error) =
@@ -1355,33 +1414,65 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 continue;
             };
             if member.key != st.session.key()
-                && st.lists.get(&id.0).is_some_and(|(list, _)| list.removed(&credential.device.0))
+                && st.lists.get(&id.0).is_some_and(|known| known.list.removed(&credential.device.0))
             {
                 self.work.send(Work::Remove { group: gid.to_vec(), key: member.key }).ok();
             }
         }
     }
 
-    /// Reads an identity's device list from its service.
+    /// Reads an identity's device list from its service; returns the newest copy held.
     async fn list(&self, identity: &IdentityRef) -> Result<DeviceList> {
         let client = self.logs.client(&identity.membership)?;
         let log = lmk_proto::identity::address(&identity.id.0);
         let mut entries = Vec::new();
-        loop {
+        let head = loop {
             let page = client.read(&log, entries.len() as u64).await?;
             if page.entries.is_empty() {
-                break;
+                break page.head;
             }
             entries.extend(page.entries);
-        }
+        };
         let id: [u8; 32] = identity.id.0.as_slice().try_into().context("an identity id is 32 bytes")?;
         let list = DeviceList::replay(&id, entries.iter().map(|entry| entry.0.as_slice()))?;
         let mut st = self.state.lock().unwrap();
-        st.lists.insert(identity.id.0.clone(), (list.clone(), now()));
-        for gid in st.groups.keys() {
-            self.revoke(&st, gid);
+        self.take_list(&mut st, list, entries, head, now(), "its service");
+        Ok(st.lists[&id[..]].list.clone())
+    }
+
+    /// Holds a copy of a device list unless the one held is as new, and then checks every group's members against it
+    /// and shows it to the peers of the groups it concerns. A copy that contradicts the one held is reported.
+    pub(crate) fn take_list(&self, st: &mut State<P>, list: DeviceList, entries: Vec<Bytes>, head: Head, at: u64, from: &str) {
+        let mut at = at;
+        if let Some(held) = st.lists.get_mut(&list.id[..]) {
+            match held.compare(&entries, &head) {
+                Compared::Contradicts => {
+                    let (here, there) = (held.entries.len(), entries.len());
+                    let text = format!(
+                        "the membership service showed different device lists of {}: {here} entries here, {there} from {from}",
+                        held.list.name
+                    );
+                    self.warn(None, text);
+                    return;
+                }
+                Compared::Shorter => return,
+                Compared::AsLong => {
+                    held.at = held.at.max(at);
+                    return;
+                }
+                Compared::Newer => at = at.max(held.at),
+            }
         }
-        Ok(list)
+        let id = list.id;
+        st.lists.insert(id.to_vec(), Known { list, entries, head, at });
+        for gid in st.groups.keys() {
+            self.revoke(st, gid);
+            if let Some(net) = self.net.get()
+                && st.identities(gid).iter().any(|identity| identity.id.0 == id)
+            {
+                net.changed(gid);
+            }
+        }
     }
 
     /// Leaves a group behind: its state and records go.
@@ -1404,6 +1495,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         st.editors.remove(gid);
         g.mls.delete(&st.provider)?;
         st.save_groups()?;
+        st.provider.scrub()?;
         if let Some(net) = self.net.get() {
             net.changed(gid);
         }
@@ -1604,6 +1696,24 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_longer_or_later_device_list_wins_and_one_that_disagrees_contradicts() {
+        let laptop = Device::new("laptop");
+        let (id, first) = identity::create(&laptop, "Bob", Service::Folder("/tmp".into()));
+        let list = DeviceList::replay(&id, [first.as_slice()]).unwrap();
+        let second = list.add(&laptop, &Device::new("phone").public(), "phone");
+        let other = list.add(&laptop, &Device::new("tablet").public(), "tablet");
+        let head = |length, time| Head { log: Bytes::default(), length, hash: Bytes::default(), time, sig: Bytes::default() };
+        let entries = |e: &[&Vec<u8>]| e.iter().map(|e| Bytes(e.to_vec())).collect::<Vec<_>>();
+        let held = Known { list, entries: entries(&[&first, &second]), head: head(2, 10), at: 10 };
+        assert_eq!(held.compare(&entries(&[&first]), &head(1, 20)), Compared::Shorter);
+        assert_eq!(held.compare(&entries(&[&first, &second]), &head(2, 10)), Compared::AsLong);
+        assert_eq!(held.compare(&entries(&[&first, &second]), &head(2, 11)), Compared::Newer);
+        assert_eq!(held.compare(&entries(&[&first, &second, &other]), &head(3, 5)), Compared::Newer);
+        assert_eq!(held.compare(&entries(&[&first, &other]), &head(2, 11)), Compared::Contradicts);
+        assert_eq!(held.compare(&entries(&[&other]), &head(1, 11)), Compared::Contradicts);
+    }
 
     #[test]
     fn a_group_holds_files_linked_within_keep_its_doc_state_and_its_doc_links() {
