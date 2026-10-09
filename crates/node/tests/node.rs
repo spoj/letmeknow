@@ -753,3 +753,43 @@ async fn a_member_catching_up_takes_more_than_a_thousand_messages_of_one_sender(
     tokio::time::timeout(3 * WAIT, all).await.expect("Carol took every message");
     carol.shutdown().await.unwrap();
 }
+
+/// An MLS PrivateMessage under `epoch` whose ciphertext is `size` bytes, as a 0.12.1 sender sealed a message larger
+/// than members take.
+fn oversize(gid: &[u8], epoch: u64, size: u32) -> Vec<u8> {
+    let mut message = vec![0, 1, 0, 2, gid.len() as u8];
+    message.extend(gid);
+    message.extend(epoch.to_be_bytes());
+    message.extend([1, 0, 0]);
+    message.extend((0x8000_0000 | size).to_be_bytes());
+    message.resize(message.len() + size as usize, 0);
+    message
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_refuses_what_it_cannot_take_and_send_names_it() {
+    use lmk_proto::group::Reason;
+    let relay = relay().await;
+    let mut alice = session(&relay, "Alice").await;
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(CHAT, &folder("refuses")), None).unwrap();
+    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    bob.node.join(&link, None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let (_, delivery) = alice.node.send(&gid.0, &json!({ "type": "refused", "messages": "none" }), true).await.unwrap();
+    let refused: Vec<(&str, &Reason)> = delivery.refused.iter().map(|(member, reason)| (member.name.as_str(), reason)).collect();
+    assert_eq!(refused, [("Bob", &Reason::Unreadable)]);
+
+    let big = oversize(&gid.0, bob.node.epoch(&gid.0).unwrap(), 1 << 20);
+    let id = Bytes(Sha256::digest(&big).to_vec());
+    alice.node.net().send(&gid.0, big);
+    let notice = json!({ "type": "refused", "messages": [{ "id": id, "reason": "size" }] });
+    tokio::time::timeout(WAIT, async {
+        while !alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload == notice) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("Bob refused it for its size");
+    assert!(bob.node.given_up(&gid.0, &id.0));
+}

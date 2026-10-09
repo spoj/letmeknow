@@ -439,15 +439,15 @@ try {
   await ann.printed(e => e.type === "message" && e.group === code.group && e.content === "thanks");
   check(true, "and its chat, both ways");
 
-  // A message larger than members take is refused, and shows who refused it.
+  // A message larger than members take is not sent: the page says why, and keeps the text.
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
-  await laptop.locator("textarea:visible").fill(`too long ${"x".repeat(1_100_000)}`);
+  const tooLong = `too long ${"x".repeat(1_100_000)}`;
+  await laptop.locator("textarea:visible").fill(tooLong);
   await laptop.locator("textarea:visible").press("Enter");
-  const refused = laptop.locator(".messages li", { hasText: "too long" }).locator(".status", { hasText: "Not taken by" });
-  await refused.waitFor();
-  const said = await refused.textContent();
-  check(said.includes("Ann") && said.includes("(too large for them)"), "a message the members refuse shows who refused it, and why");
-  check((await refused.getByRole("button", { name: "Resend" }).count()) === 0, "with no Resend, which cannot help");
+  const tooLarge = await until(() => laptop.evaluate(() => window.toasts.splice(0)), told => told.length > 0);
+  check(tooLarge.length === 1 && tooLarge[0].includes("over the 1 MiB members take"), `a message larger than members take is not sent, and the page says why (${tooLarge.join("; ")})`);
+  check((await laptop.locator("textarea:visible").inputValue()) === tooLong, "its text stays in the box");
+  check((await laptop.locator(".messages li", { hasText: "too long" }).count()) === 0, "and it is not listed");
   carl.proc.kill();
 
   // With Ann gone, what the laptop sends to her chat is pending.

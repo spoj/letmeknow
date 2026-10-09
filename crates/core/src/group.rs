@@ -17,8 +17,12 @@ use crate::provider::Provider;
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 /// How long a removed member's messages are still taken after its removal was applied, in milliseconds.
 pub const REMOVED_GRACE: u64 = 5 * 60 * 1000;
+/// The largest message ciphertext taken, and sent.
+pub const MAX_MESSAGE: usize = 1 << 20;
+/// More than an application message's ciphertext adds to its payload and authenticated data.
+const FRAMING: usize = 1024;
 
-/// How long this client keeps ended epochs' keys: a count cap, and an age judged from when each epoch began.
+/// How long this client keeps ended epochs' keys: a count cap, and an age from when it applied the commit that began each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Window {
     pub epochs: usize,
@@ -628,7 +632,8 @@ impl Group {
     }
 
     /// Seals a payload as an application message; returns its id and ciphertext. A payload members hold that is not
-    /// held by its type is marked so in the message's authenticated data.
+    /// held by its type is marked so in the message's authenticated data. One whose ciphertext could be over
+    /// `MAX_MESSAGE` fails before it uses any of the sender's keys.
     pub fn seal<P: Provider>(
         &mut self,
         provider: &P,
@@ -636,10 +641,12 @@ impl Group {
         payload: &serde_json::Value,
         held: bool,
     ) -> Result<([u8; 32], Vec<u8>)> {
-        if held && !held_by_type(payload) {
-            self.mls.set_aad(serde_json::to_vec(&Marks { held })?);
-        }
-        let message = self.mls.create_message(provider, &session.signer, &serde_json::to_vec(payload)?)?.to_bytes()?;
+        let aad = if held && !held_by_type(payload) { serde_json::to_vec(&Marks { held })? } else { Vec::new() };
+        let payload = serde_json::to_vec(payload)?;
+        let size = payload.len() + aad.len() + FRAMING;
+        ensure!(size <= MAX_MESSAGE, "the message is {size} bytes, over the 1 MiB members take");
+        self.mls.set_aad(aad);
+        let message = self.mls.create_message(provider, &session.signer, &payload)?.to_bytes()?;
         Ok((Sha256::digest(&message).into(), message))
     }
 
