@@ -215,7 +215,7 @@ mod tests {
             error: None,
             added_by_device: None,
         });
-        Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), name: name.into(), device_name: "laptop".into(), identity, added: None }
+        Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, name: name.into(), device_name: "laptop".into(), identity, added: None }
     }
 
     #[test]

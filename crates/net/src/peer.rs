@@ -41,6 +41,8 @@ pub(crate) enum Input {
     Closed,
     Send(Frame),
     Changed(Bytes),
+    /// This session serves the peer the group again.
+    Served(Bytes),
     /// Time to sync every group again.
     Resync,
     Want { group: Bytes, files: Vec<[u8; 32]>, reply: HaveReply },
@@ -81,6 +83,9 @@ struct Group {
     /// The dialer's sync is under way, and whether another should follow it.
     busy: bool,
     again: bool,
+    /// The dialer's sync was under way at the last resync too: the peer, which stopped serving this session the group
+    /// meanwhile, dropped it.
+    stale: bool,
 }
 
 struct Round {
@@ -140,6 +145,10 @@ pub(crate) async fn run(
                 Input::Closed => break,
                 Input::Send(frame) => session.write(&frame).await?,
                 Input::Changed(group) => session.changed(group).await?,
+                Input::Served(group) => {
+                    session.groups.remove(&group);
+                    session.changed(group).await?
+                }
                 Input::Resync => session.resync().await?,
                 Input::Want { group, files, reply } => {
                     session.wants.entry(group.clone()).or_default().push_back(reply);
@@ -241,8 +250,9 @@ impl Session {
                 for hello in &groups {
                     let state = self.groups.entry(hello.group.clone()).or_default();
                     answer |= state.theirs.is_none() || hello.anew;
+                    // The peer dropped its state of the group, and with it any round of ours it was in.
                     if hello.anew {
-                        state.synced = None;
+                        *state = Group::default();
                     }
                     state.theirs = Some(hello.clone());
                 }
@@ -468,6 +478,10 @@ impl Session {
     async fn resync(&mut self) -> Result<()> {
         self.shown.clear();
         for state in self.groups.values_mut() {
+            if state.busy && state.stale {
+                *state = Group { theirs: state.theirs.take(), ..Group::default() };
+            }
+            state.stale = state.busy;
             state.synced = None;
         }
         for group in self.inner.groups.groups() {

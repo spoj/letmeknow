@@ -478,11 +478,14 @@ async fn devices_share_an_identity_and_certify_their_sessions_with_its_key() {
     assert_eq!(laptop_devices.keys(), [(bob.id.clone(), Bytes(keys.current().to_vec()))]);
     let laptop_seen = alice.checked(&chat, "laptop", false).await;
     assert_eq!(laptop_seen.identity.unwrap().error.as_deref(), Some("its certificate is not by its identity's current key"));
-    let (_, delivery) = alice.node.send(&chat.0, &message("before the laptop renews"), true).await.unwrap();
+    let (before, delivery) = alice.node.send(&chat.0, &message("before the laptop renews"), true).await.unwrap();
     assert!(delivery.held.is_empty(), "the laptop's session is not served");
     let certificate = laptop_devices.certify(&bob.id.0, laptop.node.key(), "laptop".into()).await.unwrap();
     laptop.node.set_certificate(certificate).unwrap();
     alice.checked(&chat, "laptop", true).await;
+    // Alice asks the laptop to sync anew once she serves it again, so what it missed comes at once, not at the next
+    // resync.
+    laptop.until(|e| matches!(e, Event::Message(message) if message.id == before).then_some(())).await;
     let (id, delivery) = alice.node.send(&chat.0, &message("after it renews"), true).await.unwrap();
     assert_eq!(delivery.held.iter().map(|m| m.device_name.as_str()).collect::<Vec<_>>(), ["laptop"]);
     let got = laptop.until(|e| match e {
@@ -540,6 +543,48 @@ async fn a_device_taken_off_its_identity_leaves_while_its_sessions_are_offline()
     alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "tablet").then_some(())).await;
     let members: Vec<String> = alice.node.members(&chat.0).unwrap().into_iter().map(|m| m.name).collect();
     assert_eq!(members, ["Alice", "phone"]);
+    alice.node.shutdown().await.unwrap();
+}
+
+/// A session whose leaf names an older revision, as 0.12.1's does, writes its own as it starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_updates_an_older_leaf_as_it_starts() {
+    use lmk_core::group::{Change, Group, Session as Mls};
+    use lmk_core::provider::SqliteProvider;
+    use lmk_membership::Membership;
+    let relay = relay().await;
+    let dir = folder("revision");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (logs, bob_db) = (dir.join("logs"), dir.join("bob.db"));
+    let start = || async { Node::start(SqliteProvider::open(&bob_db).unwrap(), config(&relay, "Bob", None, &[CHAT])).await.unwrap().0 };
+    let alice = session(&relay, "Alice").await;
+    let gid = alice.node.create(settings(CHAT, &logs), None).unwrap();
+    let bob = start().await;
+    bob.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    let revision = |wanted: u32| {
+        let (node, gid) = (&alice.node, &gid);
+        tokio::time::timeout(WAIT, async move {
+            while !node.members(&gid.0).unwrap().iter().any(|m| m.name == "Bob" && m.revision == wanted) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+    };
+    revision(lmk_proto::group::REVISION).await.expect("a joiner's leaf names this revision");
+    bob.shutdown().await.unwrap();
+    drop(bob);
+
+    // Bob's leaf goes back to revision 0 while he is stopped.
+    let provider = SqliteProvider::open(&bob_db).unwrap();
+    let mls = Mls::load(&provider).unwrap();
+    let old = lmk_proto::group::Leaf { revision: 0, ..mls.leaf.clone() };
+    let commit = Group::load(&provider, &gid.0).unwrap().commit(&provider, &mls, Change { leaf: Some(old), ..Change::default() }).unwrap();
+    lmk_membership::folder::FolderClient::new(logs.to_str().unwrap()).append(&gid.0, &commit.commit).await.unwrap();
+    drop(provider);
+    revision(0).await.expect("Alice sees Bob's leaf of revision 0");
+
+    let bob = start().await;
+    revision(lmk_proto::group::REVISION).await.expect("Bob's leaf names this revision once he starts");
+    bob.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
 }
 

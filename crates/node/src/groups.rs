@@ -372,12 +372,10 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
 
     fn certificate(&self, peer: EndpointId, certificate: Envelope) {
         let mut st = self.state.lock().unwrap();
-        let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
-        let served = |st: &State<P>| gids.iter().filter(|gid| st.serves(gid, &peer)).cloned().collect::<Vec<_>>();
-        let before = served(&st);
+        let before = st.served(&[peer]);
         take_certificate(&mut st, certificate);
-        for gid in served(&st).into_iter().filter(|gid| !before.contains(gid)) {
-            self.net().changed(&gid);
+        for (gid, peer) in st.served(&[peer]).into_iter().filter(|served| !before.contains(served)) {
+            self.net().served(peer, &gid);
         }
     }
 }

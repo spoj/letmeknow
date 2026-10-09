@@ -223,6 +223,13 @@ impl Net {
         input.is_some_and(|input| input.send(Input::Send(frame)).is_ok())
     }
 
+    /// Tells the peer stream with `peer` that this session serves it a group again: it syncs the group anew.
+    pub fn served(&self, peer: EndpointId, group: &[u8]) {
+        if let Some(link) = self.inner.links.lock().unwrap().get(&peer) {
+            link.input.send(Input::Served(group.into())).ok();
+        }
+    }
+
     /// Tells peers this session's state of a group changed (a log grew, a member added): each
     /// gets a new `hello`, and the entries it lacks.
     pub fn changed(&self, group: &[u8]) {

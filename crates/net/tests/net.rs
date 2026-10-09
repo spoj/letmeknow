@@ -119,8 +119,8 @@ async fn certificates_are_shown_once_even_to_a_member_not_served() {
     }
 }
 
-/// A session that served a peer nothing for a while, and so dropped what it knew of the peer's groups, asks it to sync
-/// anew once it serves it again, so what it holds meanwhile arrives at once, not at the next resync.
+/// A session that served a peer nothing for a while asks it to sync anew once it serves it again, so what it held
+/// meanwhile arrives at once, not at the next resync.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_served_again_syncs_at_once() {
     let relay = relay().await;
@@ -134,11 +134,10 @@ async fn a_peer_served_again_syncs_at_once() {
     a.synced(G, members[1]).await;
     b.synced(G, members[0]).await;
     a.fake.uncertified.lock().unwrap().push(members[1]);
-    a.net.changed(G);
     let meanwhile = message(1, "meanwhile");
     a.fake.hold(G, meanwhile.clone());
     a.fake.uncertified.lock().unwrap().clear();
-    a.net.changed(G);
+    a.net.served(members[1], G);
     eventually("what A held meanwhile reaches B", || b.fake.holds(G, &meanwhile)).await;
     a.net.shutdown().await.unwrap();
     b.net.shutdown().await.unwrap();

@@ -102,6 +102,9 @@ pub struct Member {
     pub key: Bytes,
     /// The iroh key its leaf names.
     pub iroh: Bytes,
+    /// The protocol revision its leaf names.
+    #[serde(default)]
+    pub revision: u32,
     pub name: String,
     /// The name of its device, as its certificate says.
     pub device_name: String,
@@ -502,6 +505,7 @@ impl<P: Provider> State<P> {
         Some(Member {
             key: Bytes(member.key.clone()),
             iroh: member.leaf.as_ref().map(|leaf| leaf.key.clone()).unwrap_or_default(),
+            revision: member.leaf.as_ref().map_or(0, |leaf| leaf.revision),
             name: credential.name,
             device_name,
             identity: claim.map(|(claim, _)| claim),
@@ -543,6 +547,7 @@ impl<P: Provider> State<P> {
         found.unwrap_or_else(|| Member {
             key: Bytes::default(),
             iroh: Bytes(iroh.as_bytes().to_vec()),
+            revision: 0,
             name: String::new(),
             device_name: String::new(),
             identity: None,
@@ -565,6 +570,12 @@ impl<P: Provider> State<P> {
         };
         let log = self.keys.get(&identity.id.0);
         log.is_some_and(|log| check(self.certificate(credential, &identity.id.0), credential, log, now()).is_ok())
+    }
+
+    /// The groups this session serves each of these peers.
+    fn served(&self, peers: &[EndpointId]) -> Vec<(Vec<u8>, EndpointId)> {
+        let gids = self.groups.keys();
+        gids.flat_map(|gid| peers.iter().filter(|peer| self.serves(gid, peer)).map(|peer| (gid.clone(), *peer))).collect()
     }
 
     /// The identities a group's members speak as.
@@ -1621,10 +1632,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
             return Ok(());
         }
         let log = KeyLog::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
+        let peers = self.net().connected();
+        let before = st.served(&peers);
         st.keys.insert(id.to_vec(), log);
         let ahead: Vec<Envelope> = st.ahead.extract_if(|(_, identity), _| identity == id).map(|(_, certificate)| certificate).collect();
         for certificate in ahead {
             groups::take_certificate(st, certificate);
+        }
+        for (gid, peer) in st.served(&peers).into_iter().filter(|served| !before.contains(served)) {
+            self.net().served(peer, &gid);
         }
         self.remove_revoked(st);
         Ok(())
