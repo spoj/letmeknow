@@ -78,7 +78,13 @@ jobs:
       - name: npm
         run: |
           version=${GITHUB_REF_NAME#v}
-          publish() { npm view "$1@$version" version >/dev/null 2>&1 || npm publish --access public --provenance; }
+          # npm scans a package before it shows it, and answers 409 to a publish of a version it still holds.
+          publish() {
+            npm view "$1@$version" version >/dev/null 2>&1 && return
+            npm publish --access public --provenance 2>"$RUNNER_TEMP/publish.log" && return
+            cat "$RUNNER_TEMP/publish.log" >&2
+            grep -q "previously staged version" "$RUNNER_TEMP/publish.log"
+          }
           for dir in dist/npm-*; do
             platform=${dir#dist/npm-}
             os=${platform%-*} cpu=${platform#*-}
@@ -92,9 +98,9 @@ jobs:
           done
           for dir in dist/npm-*; do
             package=@letmeknow/${dir#dist/npm-}@$version
-            # The registry can take several minutes to show a package; after fifteen, fail rather than hang.
+            # Scanning usually takes minutes, but npm may hold a package for review: its platform's users get it later.
             for _ in $(seq 90); do npm view "$package" version --prefer-online >/dev/null 2>&1 && break; sleep 10; done
-            npm view "$package" version --prefer-online >/dev/null
+            npm view "$package" version --prefer-online >/dev/null 2>&1 || echo "::warning::npm does not show $package yet"
           done
           cp README.md LICENSE npm/cli/
           cd npm/cli && npm pkg set version="$version" && publish @letmeknow/cli
