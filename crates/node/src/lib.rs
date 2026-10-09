@@ -354,7 +354,7 @@ pub(crate) struct Known {
 /// How a copy of a key log compares with the one held.
 #[derive(Debug, PartialEq, Eq)]
 enum Compared {
-    /// They differ in an entry both have: the service showed two lists.
+    /// They differ in an entry both have: the service showed two logs.
     Contradicts,
     Shorter,
     /// As long, with a head no later.

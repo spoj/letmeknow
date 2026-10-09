@@ -509,7 +509,7 @@ function joinDialog() {
   );
 }
 
-// Your devices: the identities this browser is a device of, their device lists, and their contacts.
+// Your devices: the identities this browser is a device of, their devices, and their contacts.
 
 function showDevices() {
   show(devicesPage);

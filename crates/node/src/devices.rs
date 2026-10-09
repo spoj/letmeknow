@@ -287,7 +287,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
     /// Takes the events of devices groups, but for their members joining and leaving and warnings; returns every other
     /// event.
     pub fn on(&self, event: Event) -> Option<Event> {
-        let gid = event.group()?.clone();
+        let Some(gid) = event.group().cloned() else { return Some(event) };
         let ours = self.node.settings(&gid.0).is_ok_and(|s| s.kind == DEVICES) || self.node.record(&record_key(&gid.0)).ok().flatten().is_some();
         if !ours {
             return Some(event);
