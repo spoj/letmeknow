@@ -47,7 +47,7 @@ Explorations, kept loose on purpose: ideas, questions and the trade-offs seen so
 ## Identity as a key
 
 - Built in 0.12 (DESIGN.md, Identity): the devices group is an identity's only membership, its public log holds only its keys, and devices certify their sessions with the shared key for a day.
-- Being closed for 0.13: a removed device's sessions that stay offline remain MLS members until they are next online, and can still read commits and commit. A key replacement that removes a device names it, and members remove its sessions at once.
+- Built in 0.12.2: the key log entry that replaces the key for a device taken off names it, and members remove the sessions its certificates name, online or not. Sessions whose certificates no member holds, and those a device about to be removed certified as another's, still stay until they are next online.
 
 ## Delivery and history
 
@@ -59,7 +59,7 @@ Explorations, kept loose on purpose: ideas, questions and the trade-offs seen so
 
 ## Clients
 
-- 0.13 moves client behaviour into one core that the CLI and the browser share (introductions, openings, certificate renewal, member descriptions, plugin hosting), behind one API of requests, responses and events, so a desktop or mobile client is a thin shell: storage, network setup, UI and OS integration.
+- 0.12.2 moves client behaviour into one core that the CLI and the browser share (introductions, openings, certificate renewal, member descriptions, plugin hosting), behind one API of requests, responses and events, so a desktop or mobile client is a thin shell: storage, network setup, UI and OS integration.
 - The core is built natively per platform; WASM only where a platform forces it (the browser) or for plugins. Raw UDP for iroh's direct paths, processes, SQLite and iOS's lack of JIT all argue against WASM elsewhere.
 - Kinds that run as executables cannot run on phones or in the browser. Portable kinds would be libraries linked into each client, and third-party kinds WASM modules speaking the plugin protocol, sandboxed, in every client.
 - Phones suspend apps, and messages move only between members online at once: a phone needs an always-on member of its own, or a push to wake it.

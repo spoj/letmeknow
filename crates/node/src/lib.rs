@@ -573,11 +573,15 @@ impl<P: Provider> State<P> {
         g.mls.members().into_iter().filter_map(|m| m.credential?.identity).collect()
     }
 
-    /// Persists the certificates held of this session and of its groups' members.
+    /// Persists the certificates held of this session, and apart those of its groups' members: 0.12.1 takes every
+    /// certificate under `node/certificates` for the session's own.
     fn save_certificates(&self) -> Result<()> {
+        let me = self.session.key();
         let members: HashSet<Vec<u8>> = self.groups.values().flat_map(|g| g.mls.members()).map(|m| m.key).collect();
-        let held = self.certificates.iter().filter(|((key, _), _)| key == self.session.key() || members.contains(key));
-        put(&self.provider, b"node/certificates", &held.map(|(_, c)| c).collect::<Vec<_>>())
+        let (own, held): (Vec<_>, Vec<_>) =
+            self.certificates.iter().filter(|((key, _), _)| key == me || members.contains(key)).partition(|((key, _), _)| key == me);
+        put(&self.provider, b"node/certificates", &own.into_iter().map(|(_, c)| c).collect::<Vec<_>>())?;
+        put(&self.provider, b"node/member-certificates", &held.into_iter().map(|(_, c)| c).collect::<Vec<_>>())
     }
 
     /// A new group's records, its MLS state, and its log, read after `rec.position`.
@@ -628,7 +632,8 @@ impl<P: Provider + Send + 'static> Node<P> {
         }
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
-        let held: Vec<Envelope> = get(&provider, b"node/certificates")?.unwrap_or_default();
+        let mut held: Vec<Envelope> = get(&provider, b"node/certificates")?.unwrap_or_default();
+        held.extend(get::<Vec<Envelope>>(&provider, b"node/member-certificates")?.unwrap_or_default());
         let certificates = held
             .into_iter()
             .filter_map(|c| {
