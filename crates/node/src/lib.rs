@@ -617,6 +617,18 @@ impl<P: Provider + Send + 'static> Node<P> {
         for log in &followed {
             inner.follow(log);
         }
+        {
+            let mut st = inner.state.lock().unwrap();
+            let identities: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
+                logs::Of::Identity(id) => Some(id.clone()),
+                _ => None,
+            }).collect();
+            for id in identities {
+                if let Err(error) = inner.listed(&mut st, &id.0) {
+                    inner.warn(None, format!("the device list of {}: {error:#}", hex(&id.0)));
+                }
+            }
+        }
         inner.spawn(inner.clone().resume(gids));
         inner.spawn(inner.clone().redial());
         Ok((Node { inner }, events_rx))
@@ -1475,6 +1487,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// are checked.
     pub(crate) fn listed(&self, st: &mut State<P>, id: &[u8]) -> Result<()> {
         let entries = st.entries(&lmk_proto::identity::address(id), 0);
+        if entries.is_empty() {
+            return Ok(());
+        }
         let list = DeviceList::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
         st.lists.insert(id.to_vec(), list);
         for gid in st.groups.keys() {
