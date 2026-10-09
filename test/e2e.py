@@ -253,6 +253,13 @@ def compat(old, listeners):
     with open(ann_notes, "ab") as f:
         f.write(b"- ann's line\n")
     check("ann's line" in until(lambda: content(cleo_notes), lambda text: "ann's line" in text), "and this build's reach it")
+    # A doc this build makes has a log id in its settings, which 0.10.0 does not know; it joins and renames it all the same.
+    fresh, cleo_fresh = write("ann-fresh.md", "- fresh\n"), os.path.join(TMP, "cleo-fresh.md")
+    made = run("ann", "invite", "--kind", "doc", "--name", "Fresh", fresh)
+    run("cleo", "join", made["link"], cleo_fresh, bin=old)
+    check(until(lambda: content(cleo_fresh), lambda text: text == "- fresh\n") == "- fresh\n", "a 0.10.0 peer joins a doc this build made")
+    run("cleo", "name", f"--group={made['group']}", "Renamed", bin=old)
+    check(ann.expect("settings", lambda e: e["group"] == made["group"])["settings"]["name"] == "Renamed", "and its settings change reaches this build")
     for listener in (ann, ben, phone, cleo):
         listener.stop()
         listeners.remove(listener)
