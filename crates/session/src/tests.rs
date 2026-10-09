@@ -406,8 +406,12 @@ fn introductions_are_shown_until_accepted() {
         let mut carol = world.start("carol", HOUR).await;
         carol.cmd(&["identity", "create", "Carol"]).await.unwrap();
         assert!(alice.cmd(&["invite", "--group", "x"]).await.is_err());
-        let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
-        carol.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        let mut dave = world.start("dave", HOUR).await;
+        dave.cmd(&["identity", "create", "Dave"]).await.unwrap();
+        for joiner in [&carol, &dave] {
+            let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
+            joiner.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        }
         let introduced = alice.cmd(&["introduce", "Bob", "--to", "Carol"]).await.unwrap();
         assert_eq!(introduced["identity"]["name"], "Bob (Acme)");
         let bob_seen = || async {
@@ -431,8 +435,12 @@ fn introductions_are_shown_until_accepted() {
         assert_eq!(bob_seen["identity"]["claim"], true);
         assert_eq!(bob_seen["identity"]["introduced"][0]["by"]["name"], "Alice");
         assert_eq!(bob_seen["identity"]["introduced"][0]["name"], "Bob (Acme)");
+        // Dave, to whom Alice did not introduce Bob, ignores it.
+        assert_eq!(dave.cmd(&["contacts"]).await.unwrap()["introductions"], json!([]));
+        assert!(dave.printed().await.iter().all(|e| e["type"] != "introduced" || e["how"] != "introduce"));
         let contacts = carol.cmd(&["contacts"]).await.unwrap();
-        let id = contacts["introductions"][0]["identity"].as_str().unwrap().to_owned();
+        let introductions = contacts["introductions"].as_array().unwrap();
+        let id = introductions.iter().find(|i| i["name"] == "Bob (Acme)").unwrap()["identity"].as_str().unwrap().to_owned();
         carol.cmd(&["contacts", "accept", "--", &id]).await.unwrap();
         let members = carol.cmd(&["members"]).await.unwrap();
         let bob_seen = members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Bob").unwrap().clone();

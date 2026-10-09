@@ -149,7 +149,7 @@ mod tests {
 
         // Alice tells the group who Bob is to her.
         let carol = IdentityRef { id: Bytes(vec![3; 32]), membership: Service::Folder("/tmp/lmk".into()) };
-        let introduce = Payload::Introduce { identity: carol, name: "Carol".into(), how: How::Invite };
+        let introduce = Payload::Introduce { identity: carol, name: "Carol".into(), how: How::Invite, to: Vec::new() };
         let (_, sealed) = alice.group.as_mut().unwrap().seal(&alice.provider, &alice.session, &introduce).unwrap();
         assert_eq!(bob.open(&sealed, 4_000).unwrap().payload, introduce);
     }

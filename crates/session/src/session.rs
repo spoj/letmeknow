@@ -443,7 +443,7 @@ impl Session {
             Some(label) => label,
             None => self.display_name(&claim)?,
         };
-        self.node.send(&gid.0, &Payload::Introduce { identity: claim.identity, name, how }).await?;
+        self.node.send(&gid.0, &Payload::Introduce { identity: claim.identity, name, how, to: Vec::new() }).await?;
         Ok(())
     }
 
@@ -1350,7 +1350,8 @@ impl Session {
         let known = self.known(&gid, &claim)?;
         ensure!(known["how"] != "unknown", "you can introduce only your contacts and your own identities");
         let name = known["name"].as_str().unwrap_or_default().to_owned();
-        let payload = Payload::Introduce { identity: claim.identity.clone(), name: name.clone(), how: How::Introduce };
+        let to_fp = Bytes(Sha256::digest(&to.key.0)[..8].to_vec());
+        let payload = Payload::Introduce { identity: claim.identity.clone(), name: name.clone(), how: How::Introduce, to: vec![to_fp] };
         let (id, _) = self.node.send(&gid.0, &payload).await?;
         Ok(json!({ "id": hex::encode(&id.0), "group": b64(&gid.0), "identity": { "id": claim.identity.id, "name": name }, "to": self.describe(&gid, &to)? }))
     }

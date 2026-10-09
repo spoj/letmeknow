@@ -111,8 +111,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
                 self.events.send(Event::Edited { group, by: sender }).ok();
             }
-            Payload::Introduce { identity, name, how } => {
-                self.events.send(Event::Introduced { group, by: sender, identity, name, how }).ok();
+            Payload::Introduce { identity, name, how, to } => {
+                let me = Bytes(Sha256::digest(st.session.key())[..8].to_vec());
+                if to.is_empty() || to.contains(&me) {
+                    self.events.send(Event::Introduced { group, by: sender, identity, name, how }).ok();
+                }
             }
         }
         Ok(Taken::Held)

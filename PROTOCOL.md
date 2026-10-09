@@ -147,7 +147,9 @@ The plaintext of an MLS application message is JSON with a `type`:
 | `edit` | doc | `update`: a Yjs v1 update, sent live to the members online and not held |
 | `diff` | doc | `update`: a Yjs v1 update answering `doc_sv` (see Peer protocol), not held |
 | `leave` | every | none: the sender asks to be removed; the first member to see it commits the Remove |
-| `introduce` | every | `identity` (`id`, `membership`), `name`, `how` (`invite`, `open`, `introduce`): who a member is to the sender; sent after the sender adds someone, and by `introduce` |
+| `introduce` | every | `identity` (`id`, `membership`), `name`, `how` (`invite`, `open`, `introduce`), and optional `to`: who a member is to the sender; sent after the sender adds someone, and by `introduce` |
+
+An `introduce`'s `to` lists the members it is for, as a message's `to` does; only they act on it (record the introduction, offer the contact), and the others ignore it. Without `to`, it is for the whole group. Clients before 0.10.1 ignore `to` and act on every introduction.
 
 A `message`'s fields: `content`, its text, which may be empty with an attachment; `after`, the ids of the messages the sender had read that no other message it read lists in `after`; `to`, the members it addresses, each as the first 8 bytes of SHA-256 of its session key, or none for the group; `reply_to`, the id of the message it answers; `urgent`, `true` to wake every member; `attachment`, `{"link", "name", "size", "type"}`: a file link (see Files), its name, its size in bytes, and its media type, which may be empty.
 
