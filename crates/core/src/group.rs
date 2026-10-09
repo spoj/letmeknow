@@ -355,6 +355,12 @@ pub struct Group {
     state: State,
 }
 
+/// openmls's default lifetime for a creator's leaf, an hour before now to 12 weeks after, by our clock, not the system's.
+fn creator_lifetime() -> Lifetime {
+    let now = now() / 1000;
+    Lifetime::init(now - 3600, now + 12 * 7 * 86400)
+}
+
 impl Group {
     pub fn create<P: Provider>(provider: &P, session: &Session, settings: &Settings, window: Window) -> Result<Self> {
         ensure!(settings.protocol == PROTOCOL, "settings name protocol {}", settings.protocol);
@@ -367,6 +373,7 @@ impl Group {
             .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
             .max_past_epochs(window.epochs)
             .sender_ratchet_configuration(SenderRatchetConfiguration::new(1000, 100_000))
+            .lifetime(creator_lifetime())
             .build();
         let id = GroupId::from_slice(&crate::random::<16>());
         let mls = MlsGroup::new_with_group_id(provider, &session.signer, &config, id, session.with_key())?;
