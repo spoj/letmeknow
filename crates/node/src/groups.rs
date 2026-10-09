@@ -387,13 +387,16 @@ pub(crate) fn take_certificate<P: Provider>(st: &mut State<P>, certificate: Enve
     let log = st.keys.get(&certified.identity.0);
     let valid = |c: &Envelope| matches!((&credential, log), (Some(credential), Some(log)) if check(Some(c), credential, log, now()).is_ok());
     let key = (certified.key.0.clone(), certified.identity.0.clone());
-    let newer = st.certificates.get(&key).is_none_or(|held| match (valid(&certificate), valid(held)) {
+    let fresh = valid(&certificate);
+    let newer = st.certificates.get(&key).is_none_or(|held| match (fresh, valid(held)) {
         (true, false) => true,
         (false, true) => false,
         _ => certified.expires > lmk_core::identity::certified(held).map_or(0, |held| held.expires),
     });
     if newer {
         st.certificates.insert(key, certificate);
+    } else if credential.is_some() && !fresh {
+        st.ahead.insert(key, certificate);
     }
 }
 

@@ -353,6 +353,9 @@ pub(crate) struct State<P> {
     keys: HashMap<Vec<u8>, KeyLog>,
     /// Members' certificates, this session's own among them, by session key and identity id.
     certificates: HashMap<(Vec<u8>, Vec<u8>), Envelope>,
+    /// Members' certificates that lost to a valid one while not valid themselves, as one by a key this session has
+    /// not read yet is: taken again when their identity's key log grows.
+    ahead: HashMap<(Vec<u8>, Vec<u8>), Envelope>,
     /// Members connected to this session without a valid certificate, by session key: since when.
     uncertified: HashMap<Vec<u8>, u64>,
     /// `send`s waiting for receipts.
@@ -633,6 +636,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             logs,
             keys: HashMap::new(),
             certificates,
+            ahead: HashMap::new(),
             uncertified: HashMap::new(),
             waiters: HashMap::new(),
         };
@@ -1578,6 +1582,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         let log = KeyLog::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
         st.keys.insert(id.to_vec(), log);
+        let ahead: Vec<Envelope> = st.ahead.extract_if(|(_, identity), _| identity == id).map(|(_, certificate)| certificate).collect();
+        for certificate in ahead {
+            groups::take_certificate(st, certificate);
+        }
         Ok(())
     }
 
