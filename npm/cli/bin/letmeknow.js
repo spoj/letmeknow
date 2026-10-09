@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
+const path = require("node:path");
 
 const target = `${process.platform}-${process.arch}`;
 let binary;
@@ -10,10 +11,14 @@ try {
   console.error(`letmeknow: no prebuilt binary for ${target}; see https://github.com/spoj/letmeknow`);
   process.exit(1);
 }
-try {
-  fs.accessSync(binary, fs.constants.X_OK);
-} catch {
-  fs.chmodSync(binary, 0o755);
+// The binary and the plugins beside it, which it runs, must be executable.
+const bin = path.dirname(binary);
+for (const file of fs.readdirSync(bin)) {
+  try {
+    fs.accessSync(path.join(bin, file), fs.constants.X_OK);
+  } catch {
+    fs.chmodSync(path.join(bin, file), 0o755);
+  }
 }
 
 const child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
