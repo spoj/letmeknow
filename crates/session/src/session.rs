@@ -222,8 +222,8 @@ impl Session {
             }
         }
         // Once every doc 0.10 kept is the doc plugin's, the tables it kept them in go.
-        if session.legacy_tables()? && session.db.query_row("SELECT count(*) FROM bindings", [], |r| r.get::<_, i64>(0))? == 0 {
-            session.db.execute_batch("DROP TABLE bindings; DROP TABLE carrying;")?;
+        if session.legacy("bindings")? && session.db.query_row("SELECT count(*) FROM bindings", [], |r| r.get::<_, i64>(0))? == 0 {
+            session.db.execute_batch("DROP TABLE bindings; DROP TABLE IF EXISTS carrying;")?;
         }
         Ok(session)
     }
@@ -602,7 +602,7 @@ impl Session {
         identity: Option<String>,
     ) -> Result<Value> {
         ensure!(kind == CHAT || self.plugins.found.contains_key(&kind), "this session has no plugin for {kind} groups (letmeknow-kind-{kind})");
-        ensure!(args.is_empty() || kind != CHAT || group.is_some(), "a chat takes no arguments");
+        ensure!(args.is_empty() || kind != CHAT, "a chat takes no arguments");
         let to = to.map(|to| self.contact(&to)).transpose()?;
         ensure!(
             for_.is_none() || !self.identities()?.is_empty(),
@@ -714,7 +714,7 @@ impl Session {
         }
         let joined = self.node.groups();
         for opening in self.device_state()?.openings {
-            if !joined.contains(&opening.group) {
+            if !joined.contains(&opening.group) && self.node.kinds().contains(&opening.kind) {
                 groups.push(json!({ "group": b64(&opening.group.0), "kind": opening.kind, "name": opening.name, "joined": false }));
             }
         }
@@ -1190,7 +1190,7 @@ impl Session {
         self.kind_of.insert(gid.clone(), kind.clone());
         let me = self.describe_key(gid, &self.node.key());
         let mut message = json!({ "type": "group", "group": b64(&gid.0), "settings": settings, "me": me });
-        let legacy = self.legacy(gid)?;
+        let legacy = self.legacy_doc(gid)?;
         if let Some(import) = &legacy {
             message["import"] = import.clone();
         }
@@ -1211,18 +1211,18 @@ impl Session {
         Ok(answer)
     }
 
-    fn legacy_tables(&self) -> Result<bool> {
-        Ok(self.db.query_row("SELECT count(*) FROM sqlite_master WHERE name = 'bindings'", [], |r| r.get::<_, i64>(0))? > 0)
+    /// Whether a table 0.10 kept docs in is still here: `bindings`, or `carrying`, which 0.10.0 lacks.
+    fn legacy(&self, table: &str) -> Result<bool> {
+        Ok(self.db.query_row("SELECT count(*) FROM sqlite_master WHERE name = ?", [table], |r| r.get::<_, i64>(0))? > 0)
     }
 
     /// A doc as 0.10 kept it, before the doc plugin did: its state, and its file's binding, which the plugin imports.
-    fn legacy(&self, gid: &Bytes) -> Result<Option<Value>> {
+    fn legacy_doc(&self, gid: &Bytes) -> Result<Option<Value>> {
         if self.node.settings(&gid.0)?.kind != "doc" {
             return Ok(None);
         }
         let state = self.node.legacy_doc(&gid.0)?;
-        let tables = self.legacy_tables()?;
-        let binding: Option<(String, String)> = match tables {
+        let binding: Option<(String, String)> = match self.legacy("bindings")? {
             true => self.db.query_row("SELECT path, base FROM bindings WHERE gid = ?", [&gid.0], |r| Ok((r.get(0)?, r.get(1)?))).optional()?,
             false => None,
         };
@@ -1234,8 +1234,10 @@ impl Session {
             import["state"] = json!(Bytes(state));
         }
         if let Some((path, base)) = binding {
-            let carrying: Option<(String, Vec<u8>)> =
-                self.db.query_row("SELECT file, edit FROM carrying WHERE gid = ?", [&gid.0], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            let carrying: Option<(String, Vec<u8>)> = match self.legacy("carrying")? {
+                true => self.db.query_row("SELECT file, edit FROM carrying WHERE gid = ?", [&gid.0], |r| Ok((r.get(0)?, r.get(1)?))).optional()?,
+                false => None,
+            };
             let made = Path::new(&path).starts_with(self.config.dir.join("docs"));
             let carrying = carrying.map(|(file, edit)| json!({ "file": file, "edit": Bytes(edit) }));
             import = json!({ "state": import["state"], "path": path, "base": base, "made": made, "carrying": carrying });
@@ -1245,8 +1247,8 @@ impl Session {
 
     fn forget_legacy(&self, gid: &Bytes) -> Result<()> {
         self.node.forget_legacy_doc(&gid.0)?;
-        if self.legacy_tables()? {
-            for table in ["bindings", "carrying"] {
+        for table in ["bindings", "carrying"] {
+            if self.legacy(table)? {
                 self.db.execute(&format!("DELETE FROM {table} WHERE gid = ?"), [&gid.0])?;
             }
         }

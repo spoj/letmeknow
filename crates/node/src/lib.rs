@@ -837,13 +837,16 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(())
     }
 
-    /// Holds files for the group's `keep`, as those a held message links; fetches those within this session's limit.
+    /// Holds files for the group's `keep` from now, as those a held message links, unless it holds them already; fetches
+    /// those within this session's limit.
     pub fn hold(&self, gid: &[u8], links: &[String]) -> Result<()> {
         let parsed = links.iter().map(|link| FileLink::parse(link)).collect::<Result<Vec<_>>>()?;
         let mut st = self.inner.state.lock().unwrap();
         let rec = &mut st.group_mut(gid)?.rec;
         for link in links {
-            rec.link(link.clone());
+            if !rec.files.iter().any(|(held, _)| held == link) {
+                rec.link(link.clone());
+            }
         }
         st.save(gid)?;
         self.inner.fetch_within_limit(gid, parsed);

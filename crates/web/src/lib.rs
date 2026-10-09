@@ -501,6 +501,10 @@ impl App {
                 self.refresh_opening(&group.0).await?;
             }
             Event::Message(message) => {
+                // Chat holds the file a message attaches.
+                if let Some(link) = message.payload["attachment"]["link"].as_str() {
+                    self.node.hold(&message.group.0, &[link.to_owned()])?;
+                }
                 self.emit(json!({ "type": "message", "group": message.group, "id": hex::encode(&message.id.0) }));
             }
             Event::Live { group, sender, payload } => {
