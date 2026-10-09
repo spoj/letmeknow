@@ -599,3 +599,18 @@ fn a_kind_payload_is_held_when_its_sender_marks_it() {
     let held: Vec<bool> = [held, live, chat].iter().map(|c| w.m[1].open(c, 0).unwrap().held).collect();
     assert_eq!(held, [true, false, true]);
 }
+
+#[test]
+fn a_payload_that_could_seal_over_the_limit_is_refused() {
+    let mut w = World::new(&["A", "B"]);
+    w.found(0, &[1]);
+    let a = &mut w.m[0];
+    let push = |pad: usize| serde_json::json!({ "type": "push", "pad": "x".repeat(pad) });
+    let largest = MAX_MESSAGE - FRAMING - br#"{"held":true}"#.len() - serde_json::to_vec(&push(0)).unwrap().len();
+    let group = a.group.as_mut().unwrap();
+    let error = group.seal(&a.provider, &a.session, &push(largest + 1), true).unwrap_err();
+    assert_eq!(error.to_string(), format!("the message is {} bytes, over the 1 MiB members take", MAX_MESSAGE + 1));
+    let (_, sealed) = group.seal(&a.provider, &a.session, &push(largest), true).unwrap();
+    assert!(sealed.len() <= MAX_MESSAGE);
+    assert!(w.m[1].open(&sealed, 0).unwrap().held);
+}

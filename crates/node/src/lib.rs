@@ -44,8 +44,6 @@ pub use lmk_proto::clock::now;
 
 /// How often a session replaces its keys in each group.
 const KEY_UPDATE: Duration = Duration::from_secs(24 * 60 * 60);
-/// The largest message taken.
-const MAX_MESSAGE: usize = 1 << 20;
 /// How long `send` waits for the members it wrote to.
 const RECEIPT_WAIT: Duration = Duration::from_secs(5);
 /// How long a member gathers the messages it gives up before it reports them.

@@ -234,37 +234,32 @@ fn held_messages_print_once_the_hold_runs_out() {
 }
 
 #[test]
-fn send_reports_who_holds_a_message_or_that_it_is_pending_or_refused() {
+fn send_reports_who_holds_a_message_or_that_it_is_pending_and_refuses_one_too_large() {
     local(async {
         let world = world("pending").await;
-        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
+        let (alice, mut bob, _) = pair(&world, HOUR).await;
         let big = "x".repeat(1 << 20);
-        let refused = alice.cmd(&["send", "--to", "Bob", &big]).await.unwrap();
-        assert_eq!(refused["refused"][0]["reason"], "size", "{refused}");
-        assert_eq!(refused["refused"][0]["member"]["name"], "Bob");
-        assert_eq!(refused["to"].as_array().unwrap().len(), 1);
+        let refused = alice.cmd(&["send", "--to", "Bob", &big]).await.unwrap_err().to_string();
+        assert!(refused.contains("members take"), "{refused}");
         bob.stop().await;
         let sent = alice.cmd(&["send", "--urgent", "anyone?"]).await.unwrap();
         assert_eq!(sent["pending"], true);
         let status = alice.cmd(&["status"]).await.unwrap();
         assert_eq!(status["groups"][0]["online"], json!([]));
-        assert!(status["groups"][0]["only_here"].as_array().unwrap().iter().any(|p| p["id"] == sent["id"]));
+        assert_eq!(status["groups"][0]["only_here"].as_array().unwrap().iter().map(|p| &p["id"]).collect::<Vec<_>>(), [&sent["id"]]);
         assert!(status["warning"].is_string());
-        // Once Bob is back, he takes it, and it is held here no more; what he refused still is.
+        // Once Bob is back, he takes it, and it is held here no more.
         let mut bob = world.start("bob", HOUR).await;
         let message = bob.expect("message").await;
         assert_eq!(message["content"], "anyone?");
-        // It comes after the message Bob refused, which shows as a known gap rather than keeping it waiting.
-        assert_eq!(message["missing"], json!([refused["id"]]));
         let only_here = || async { alice.cmd(&["status"]).await.unwrap()["groups"][0]["only_here"].clone() };
         for _ in 0..20 {
-            if only_here().await.as_array().unwrap().len() == 1 {
+            if only_here().await.as_array().unwrap().is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        assert_eq!(only_here().await[0]["id"], refused["id"]);
-        assert!(alice.printed().await.iter().all(|e| e["type"] != "warning" && e["type"] != "refused"), "send told of the refusal");
+        assert_eq!(only_here().await, json!([]));
     });
 }
 

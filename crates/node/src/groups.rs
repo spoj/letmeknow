@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 
 use crate::logs::empty;
 use crate::{
-    Event, Inner, Item, MAX_MESSAGE, Message, Rule, SNAPSHOT_WAIT, State, Work, ciphertext_key, endpoint_id, get,
+    Event, Inner, Item, Message, Rule, SNAPSHOT_WAIT, State, Work, ciphertext_key, endpoint_id, get,
     message_key, now, put,
 };
 
@@ -41,7 +41,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             return Taken::Refused;
         }
         let Ok(epoch) = core::epoch_of(ciphertext) else { return Taken::Refused };
-        let opened = if ciphertext.len() > MAX_MESSAGE {
+        let opened = if ciphertext.len() > core::MAX_MESSAGE {
             Err(Reason::Size)
         } else if epoch > g.mls.epoch() {
             if !g.future.iter().any(|waiting| waiting == ciphertext) {
