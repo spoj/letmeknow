@@ -45,6 +45,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Serve(serve) => letmeknow::serve(serve).await,
+        Command::GitRemoteLmk { args } => {
+            let helper = std::env::current_exe()?.with_file_name(format!("git-remote-lmk{}", std::env::consts::EXE_SUFFIX));
+            std::process::exit(std::process::Command::new(helper).args(args).status()?.code().unwrap_or(1));
+        }
         Command::Kind(mut args) => {
             let kind = args.remove(0);
             let session = match cli.session {

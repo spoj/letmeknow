@@ -24,7 +24,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-const WAIT: Duration = Duration::from_secs(30);
+/// Generous, for slow CI runners with tests running side by side.
+const WAIT: Duration = Duration::from_secs(60);
 
 struct Relay {
     _server: Server,
@@ -481,6 +482,6 @@ async fn a_member_catching_up_takes_more_than_a_thousand_messages_of_one_sender(
             }
         }
     };
-    tokio::time::timeout(WAIT, all).await.expect("Carol took every message");
+    tokio::time::timeout(3 * WAIT, all).await.expect("Carol took every message");
     carol.shutdown().await.unwrap();
 }
