@@ -14,10 +14,9 @@ pub fn extend(start: [u8; 32], entries: &[Bytes]) -> [u8; 32] {
     entries.iter().fold(start, |hash, entry| lmk_proto::head::next(&hash, &entry.0))
 }
 
-/// The lowest epoch two members reconcile: neither offers what predates the later join, and the
-/// range starts at the lower floor (each side filters against the other's floor when it sends).
+/// The lowest epoch two members reconcile: neither offers what predates the later join.
 pub fn lowest(mine: &Hello, theirs: &Hello) -> u64 {
-    mine.joined.max(theirs.joined).max(mine.floor.min(theirs.floor))
+    mine.joined.max(theirs.joined)
 }
 
 pub fn storage(items: &[(u64, [u8; 32])]) -> NegentropyStorageVector {
@@ -56,7 +55,7 @@ mod tests {
     fn lowest_epoch() {
         let hello = |floor, joined| Hello { group: Bytes::default(), epoch: 9, floor, joined };
         assert_eq!(lowest(&hello(2, 1), &hello(4, 3)), 3, "the later join");
-        assert_eq!(lowest(&hello(5, 1), &hello(6, 3)), 5, "the lower floor");
+        assert_eq!(lowest(&hello(5, 1), &hello(6, 3)), 3, "the later join, whatever the floors");
     }
 
     #[test]

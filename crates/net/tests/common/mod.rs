@@ -326,7 +326,7 @@ impl Groups for Fake {
         let g = groups.get_mut(group).unwrap();
         if epoch < g.floor {
             g.given_up.insert(id(ciphertext), epoch);
-            return Taken::Refused("below the floor".into());
+            return Taken::Refused;
         }
         if epoch > g.log.len() as u64 {
             return Taken::Waiting;
@@ -338,6 +338,12 @@ impl Groups for Fake {
             _ => g.live.push(ciphertext.to_vec()),
         }
         Taken::Held
+    }
+
+    fn below(&self, group: &[u8], items: Vec<(u64, [u8; 32])>) {
+        let mut groups = self.groups.lock().unwrap();
+        let g = groups.get_mut(group).unwrap();
+        g.given_up.extend(items.into_iter().map(|(epoch, id)| (id, epoch)));
     }
 
     fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>) {

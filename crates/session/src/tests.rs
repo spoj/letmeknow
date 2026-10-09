@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use iroh::tls::CaTlsConfig;
 use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
+use lmk_core::group::Window;
 use lmk_proto::group::Service;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
@@ -26,6 +27,7 @@ struct World {
     root: PathBuf,
     /// For the sessions started from now on.
     causal_wait: Duration,
+    window: Window,
     plugins: Vec<PathBuf>,
 }
 
@@ -60,7 +62,7 @@ async fn world(test: &str) -> World {
     let root = std::env::temp_dir().join(format!("lmk-session-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let network = crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) };
-    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT, plugins: vec![built()] }
+    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT, window: Window::default(), plugins: vec![built()] }
 }
 
 struct Agent {
@@ -90,6 +92,7 @@ impl World {
             name: handle[..1].to_uppercase() + &handle[1..],
             hold,
             causal_wait: self.causal_wait,
+            window: self.window,
             keep_log: false,
             membership: self.membership(),
             plugins: self.plugins.clone(),
@@ -235,7 +238,7 @@ fn send_reports_who_holds_a_message_or_that_it_is_pending_or_refused() {
         let (mut alice, mut bob, _) = pair(&world, HOUR).await;
         let big = "x".repeat(1 << 20);
         let refused = alice.cmd(&["send", "--to", "Bob", &big]).await.unwrap();
-        assert!(refused["refused"][0]["reason"].as_str().unwrap().contains("1 MiB"), "{refused}");
+        assert_eq!(refused["refused"][0]["reason"], "size", "{refused}");
         assert_eq!(refused["refused"][0]["member"]["name"], "Bob");
         assert_eq!(refused["to"].as_array().unwrap().len(), 1);
         bob.stop().await;
@@ -259,7 +262,7 @@ fn send_reports_who_holds_a_message_or_that_it_is_pending_or_refused() {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         assert_eq!(only_here().await[0]["id"], refused["id"]);
-        assert!(alice.printed().await.iter().all(|e| e["type"] != "warning"));
+        assert!(alice.printed().await.iter().all(|e| e["type"] != "warning" && e["type"] != "refused"), "send told of the refusal");
     });
 }
 
@@ -499,6 +502,37 @@ fn a_restarted_session_takes_in_what_it_missed_in_causal_order() {
         assert_eq!(got, [first["id"].as_str().unwrap(), second["id"].as_str().unwrap()]);
         let groups = alice.cmd(&["groups"]).await.unwrap();
         assert_eq!((groups[0]["group"].as_str(), groups[0]["name"].as_str()), (Some(group.as_str()), Some("Later")));
+    });
+}
+
+#[test]
+fn a_member_back_past_its_key_window_reports_what_it_missed_and_the_sender_resends_it() {
+    local(async {
+        let mut world = world("old").await;
+        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
+        bob.stop().await;
+        let file = world.root.join("notes.txt");
+        std::fs::write(&file, "the notes").unwrap();
+        let sent = alice.cmd(&["send", "--attach", file.to_str().unwrap(), "while you were away"]).await.unwrap();
+        assert_eq!(sent["pending"], true);
+        for name in ["one", "two", "three"] {
+            alice.cmd(&["name", name]).await.unwrap();
+        }
+        // Bob keeps the keys of one ended epoch: Alice's message is below his floor when he is back.
+        world.window = Window { epochs: 1, ..Window::default() };
+        let mut bob = world.start("bob", HOUR).await;
+        let refused = alice.expect("refused").await;
+        assert_eq!(refused["member"]["name"], "Bob");
+        let id = sent["id"].as_str().unwrap();
+        let message = &refused["messages"][0];
+        assert_eq!((message["id"].as_str(), message["reason"].as_str(), message["content"].as_str()), (Some(id), Some("old"), Some("while you were away")));
+        let path = message["attachment"]["path"].as_str().unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "the notes");
+        let resent = alice.cmd(&["send", "--reply-to", id, "--attach", path, "while you were away"]).await.unwrap();
+        assert_eq!(resent["held_by"][0]["name"], "Bob");
+        let message = bob.expect("message").await;
+        assert_eq!((message["reply_to"].as_str(), message["content"].as_str()), (Some(id), Some("while you were away")));
+        assert_eq!(message["missing"], json!([id]), "a known gap, not a wait");
     });
 }
 

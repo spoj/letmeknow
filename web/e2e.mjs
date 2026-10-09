@@ -377,9 +377,11 @@ try {
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.locator("textarea:visible").fill(`too long ${"x".repeat(1_100_000)}`);
   await laptop.locator("textarea:visible").press("Enter");
-  const refused = laptop.locator(".messages li", { hasText: "too long" }).locator(".status", { hasText: "Refused by" });
+  const refused = laptop.locator(".messages li", { hasText: "too long" }).locator(".status", { hasText: "Not taken by" });
   await refused.waitFor();
-  check((await refused.textContent()).includes("Ann (larger than 1 MiB)"), "a message the members refuse shows who refused it, and why");
+  const said = await refused.textContent();
+  check(said.includes("Ann") && said.includes("(too large for them)"), "a message the members refuse shows who refused it, and why");
+  check((await refused.getByRole("button", { name: "Resend" }).count()) === 0, "with no Resend, which cannot help");
   carl.proc.kill();
 
   // With Ann gone, what the laptop sends to her chat is pending.

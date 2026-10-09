@@ -67,6 +67,8 @@ pub trait Groups: Send + Sync + 'static {
     fn message(&self, group: &[u8], id: &[u8; 32]) -> Option<Vec<u8>>;
     /// An MLS ciphertext from a peer: decrypt, verify, and hold or apply it, or give it up.
     fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Taken;
+    /// (epoch, message id) of messages a peer holds that this session lacks, below its floor: given up.
+    fn below(&self, group: &[u8], items: Vec<(u64, [u8; 32])>);
     /// A link to the state of the group's kind, which `peer`, a member, hands this session; without one, `peer` asks
     /// for the kind's state.
     fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>);
@@ -84,11 +86,12 @@ pub trait Disk: Send + Sync + 'static {
     fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>);
 }
 
-/// What became of a ciphertext a peer sent; the peer hears which unless it waits.
+/// What became of a ciphertext a peer sent; a receipt tells the peer what was held.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Taken {
     Held,
-    Refused(String),
+    /// Given up.
+    Refused,
     /// Kept until a commit it follows is applied.
     Waiting,
 }
@@ -106,8 +109,8 @@ pub enum Event {
     Disconnected(EndpointId),
     /// Two incompatible signed heads of a log: its membership service showed members different logs.
     Contradiction { log: Vec<u8>, peer: EndpointId, ours: Head, theirs: Head },
-    /// What `peer` did with messages this session sent it.
-    Receipt { group: Vec<u8>, peer: EndpointId, held: Vec<[u8; 32]>, refused: Vec<([u8; 32], String)> },
+    /// Messages this session sent that `peer` holds.
+    Receipt { group: Vec<u8>, peer: EndpointId, held: Vec<[u8; 32]> },
     /// This session and `peer` hold the same log of the group: a time to compare the state of its kind.
     InStep { group: Vec<u8>, peer: EndpointId },
     /// Message sync with `peer` finished.
@@ -199,13 +202,13 @@ impl Net {
 
     /// Sends a new MLS message to the members online; returns whom it went to.
     pub fn send(&self, group: &[u8], ciphertext: Vec<u8>) -> Vec<EndpointId> {
-        let frame = Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)] };
+        let frame = Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)], below: Vec::new() };
         self.inner.members(group).into_iter().filter(|(_, input)| input.send(Input::Send(frame.clone())).is_ok()).map(|(peer, _)| peer).collect()
     }
 
     /// Sends a new MLS message to one member online, if it is connected.
     pub fn send_to(&self, peer: EndpointId, group: &[u8], ciphertext: Vec<u8>) -> bool {
-        self.frame(peer, Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)] })
+        self.frame(peer, Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)], below: Vec::new() })
     }
 
     /// Sends a frame to one member online, if it is connected.

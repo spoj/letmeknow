@@ -168,6 +168,8 @@ def git_kind(alice, bob, dave, listeners):
     check(until(head, lambda h: h == tip) == tip, "both members end at the same tip")
     bob.stop()
     listeners.remove(bob)
+    gone = until(lambda: run("alice", "status"), lambda s: all(not g["online"] for g in s["groups"] if g["group"] == made["group"]))
+    check(all(not g["online"] for g in gone["groups"] if g["group"] == made["group"]), "alice sees bob go")
     write("alice-repo/late.txt", "late")
     git("alice", "add", "late.txt", cwd=ours)
     git("alice", "commit", "-qm", "while bob is away", cwd=ours)

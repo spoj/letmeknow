@@ -8,6 +8,7 @@ use lmk_proto::group::{
     CHAT, Control, Credential, How, IdentityRef, LEAF_EXTENSION, Leaf, Opening, PROTOCOL, SETTINGS_EXTENSION, Service,
     Settings, held_by_type,
 };
+use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use serde::{Deserialize, Serialize};
@@ -212,6 +213,31 @@ struct Marks {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     held: bool,
 }
+
+/// A message sealed under an epoch whose keys this session does not hold: one it never was in, or one past its key
+/// window.
+#[derive(Debug)]
+pub struct Unheld;
+
+impl std::fmt::Display for Unheld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("sealed under an epoch whose keys this session does not hold")
+    }
+}
+
+impl std::error::Error for Unheld {}
+
+/// A message from a member removed more than 5 minutes before it first reached this session.
+#[derive(Debug)]
+pub struct Removed;
+
+impl std::fmt::Display for Removed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("from a member removed more than 5 minutes before")
+    }
+}
+
+impl std::error::Error for Removed {}
 
 /// A commit to post, and for an add, the Welcome to send once the log has taken it.
 pub struct Commit {
@@ -566,11 +592,18 @@ impl Group {
     }
 
     /// Decrypts and verifies a member's message. `now` (milliseconds) is when it first reached this session; a removed
-    /// member's message that first reached it more than 5 minutes after the removal is refused.
+    /// member's message that first reached it more than 5 minutes after the removal fails with `Removed`. A message
+    /// under an epoch whose keys this session does not hold fails with `Unheld`.
     pub fn open<P: Provider>(&mut self, provider: &P, bytes: &[u8], now: u64) -> Result<Opened> {
         let message = parse::<MlsMessageIn>(bytes)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Application, "not an application message");
-        let processed = self.mls.process_message(provider, message)?;
+        let unheld = message.epoch() < self.mls.epoch();
+        let processed = match self.mls.process_message(provider, message) {
+            Err(ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(
+                MessageDecryptionError::SecretTreeError(SecretTreeError::TooDistantInThePast),
+            ))) if unheld => return Err(Unheld.into()),
+            processed => processed?,
+        };
         let epoch = processed.epoch().as_u64();
         let marks = serde_json::from_slice::<Marks>(processed.aad()).unwrap_or_default();
         let sender = credential_of(processed.credential()).context("the sender has no letmeknow credential")?;
@@ -583,7 +616,9 @@ impl Group {
         if current.is_none() {
             let removed = self.state.removed.iter().rev().find(|(sig, _, _)| *sig == sender.device_sig);
             if let Some((_, removed, at)) = removed {
-                ensure!(now <= at + REMOVED_GRACE, "from a member removed more than 5 minutes before");
+                if now > at + REMOVED_GRACE {
+                    return Err(Removed.into());
+                }
                 key = removed.0.clone();
             }
         }

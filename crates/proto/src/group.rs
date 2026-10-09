@@ -105,10 +105,32 @@ pub enum Control {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         to: Vec<Bytes>,
     },
+    /// The messages the sender gave up since it last said so.
+    Refused { messages: Vec<Refusal> },
 }
 
 impl Control {
-    pub const TYPES: [&str; 2] = ["leave", "introduce"];
+    pub const TYPES: [&str; 3] = ["leave", "introduce", "refused"];
+}
+
+/// A message a member gave up, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub id: Bytes,
+    pub reason: Reason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reason {
+    /// Larger than the member takes.
+    Size,
+    /// Sealed under an epoch whose keys the member no longer holds, or below its floor.
+    Old,
+    /// From a member removed more than 5 minutes before it arrived.
+    Removed,
+    /// It did not open.
+    Unreadable,
 }
 
 /// A payload's `type`.
@@ -118,7 +140,7 @@ pub fn type_of(payload: &serde_json::Value) -> &str {
 
 /// Whether members hold a payload: those of these types always, and others when their sender marks them so.
 pub fn held_by_type(payload: &serde_json::Value) -> bool {
-    matches!(type_of(payload), "message" | "leave")
+    matches!(type_of(payload), "message" | "leave" | "refused")
 }
 
 /// The live payloads of a devices group's contacts, a Yjs map synced as a doc's text is: edits; to one member, the hash

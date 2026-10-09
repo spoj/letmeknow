@@ -32,6 +32,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 handle,
                 hold: Duration::from_secs(hold),
                 causal_wait: letmeknow::session::CAUSAL_WAIT,
+                window: Default::default(),
                 keep_log,
                 membership: letmeknow::service(&membership)?,
                 plugins: kinds::dirs(),

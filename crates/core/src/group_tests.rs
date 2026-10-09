@@ -481,7 +481,7 @@ fn leave_and_removed_senders() {
     w.agree(&[0, 1]);
     let opened = w.m[0].open(&early, 1_000 + REMOVED_GRACE).unwrap();
     assert_eq!((opened.current, text(&opened)), (None, "before my removal"));
-    assert!(w.m[0].open(&later, 1_001 + REMOVED_GRACE).is_err());
+    assert!(w.m[0].open(&later, 1_001 + REMOVED_GRACE).unwrap_err().is::<Removed>());
 }
 
 #[test]

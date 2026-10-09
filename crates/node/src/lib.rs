@@ -26,7 +26,9 @@ use lmk_core::invite::{Invites, Target};
 use lmk_core::provider::Provider;
 use lmk_membership::Refused;
 use lmk_net::Net;
-use lmk_proto::group::{CHAT, ContactsUpdate, Credential, How, IdentityRef, Leaf, Opening, Service, Settings, held_by_type};
+use lmk_proto::group::{
+    CHAT, ContactsUpdate, Control, Credential, How, IdentityRef, Leaf, Opening, Reason, Refusal, Service, Settings, held_by_type,
+};
 use lmk_proto::links::{FileLink, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Frame};
 use lmk_proto::{Answer, Bytes};
@@ -47,6 +49,8 @@ const KEY_UPDATE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_MESSAGE: usize = 1 << 20;
 /// How long `send` waits for the members it wrote to.
 const RECEIPT_WAIT: Duration = Duration::from_secs(5);
+/// How long a member gathers the messages it gives up before it reports them.
+const REPORT_WAIT: Duration = Duration::from_secs(1);
 /// How often members not connected are dialed again.
 const REDIAL: Duration = Duration::from_secs(10);
 /// How often connected members sync their groups again.
@@ -131,11 +135,11 @@ pub struct Entry {
     pub payload: Value,
 }
 
-/// Who took a message as `send` waited.
+/// Who held a message, and who refused it, as `send` waited.
 #[derive(Clone, Debug, Default)]
 pub struct Delivery {
     pub held: Vec<Member>,
-    pub refused: Vec<(Member, String)>,
+    pub refused: Vec<(Member, Reason)>,
 }
 
 /// What this session sent that no other member holds yet.
@@ -215,11 +219,11 @@ pub enum Event {
         id: Bytes,
         by: Member,
     },
+    /// A member reports that it gave up messages this session sent, after `send` stopped waiting.
     Refused {
         group: Bytes,
-        id: Bytes,
         by: Member,
-        reason: String,
+        messages: Vec<Refusal>,
     },
     /// A file is held whole.
     File([u8; 32]),
@@ -238,6 +242,11 @@ struct Rec {
     /// Messages this session could not open, so that sync does not offer them again, and those from before it joined
     /// that its inviter held, as of epoch 0.
     given_up: Vec<(u64, Bytes)>,
+    /// Those it gave up and has not reported to the group yet.
+    unreported: Vec<Refusal>,
+    /// The newest epoch of the messages it dropped after `keep`: what it lacks up to there, it may have had, and does
+    /// not report.
+    expired: u64,
     pending: Vec<Pending>,
     /// File links, with when they were linked: those the kind holds (its files added, and those its held messages
     /// link) and states handed to or by this session. Each is held for the group's `keep`.
@@ -297,7 +306,7 @@ pub(crate) struct State<P> {
     /// Device lists, by identity id.
     lists: HashMap<Vec<u8>, DeviceList>,
     /// `send`s waiting for receipts.
-    waiters: HashMap<[u8; 32], mpsc::UnboundedSender<(EndpointId, Option<String>)>>,
+    waiters: HashMap<[u8; 32], mpsc::UnboundedSender<(EndpointId, Option<Reason>)>>,
 }
 
 pub(crate) enum Work {
@@ -331,6 +340,8 @@ pub(crate) enum Work {
         group: Vec<u8>,
         by: EndpointId,
     },
+    /// Messages were given up: report them in a moment.
+    Report(Vec<u8>),
     Net(lmk_net::Event),
 }
 
@@ -1147,6 +1158,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let before = now.saturating_sub(g.mls.settings().keep as u64 * 24 * 3600 * 1000);
             let (old, kept): (Vec<Item>, Vec<Item>) = g.rec.items.drain(..).partition(|item| item.at < before);
             g.rec.items = kept;
+            g.rec.expired = old.iter().map(|item| item.epoch).fold(g.rec.expired, u64::max);
             g.rec.files.retain(|(_, at)| *at >= before);
             for item in old {
                 st.provider.delete(&message_key(&item.id.0)).ok();
@@ -1393,7 +1405,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         gid: &[u8],
         id: [u8; 32],
         ciphertext: Vec<u8>,
-        mut receipts: mpsc::UnboundedReceiver<(EndpointId, Option<String>)>,
+        mut receipts: mpsc::UnboundedReceiver<(EndpointId, Option<Reason>)>,
     ) -> Delivery {
         let mut waiting = self.net().send(gid, ciphertext);
         let mut answers = Vec::new();
@@ -1579,6 +1591,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
                 Work::State { group, link, by } => self.state_from(&group, link, by),
                 Work::StateWanted { group, by } => self.hand_snapshot(&group, by),
+                Work::Report(gid) => {
+                    let inner = self.clone();
+                    self.spawn(async move {
+                        sleep(REPORT_WAIT).await;
+                        inner.report(&gid);
+                    });
+                }
                 Work::Net(event) => self.net_event(event),
             }
         }
@@ -1629,16 +1648,37 @@ impl<P: Provider + Send + 'static> Inner<P> {
         drop(st);
     }
 
+    /// Tells the group, in one held notice, the messages this session gave up since it last did.
+    fn report(self: &Arc<Self>, gid: &[u8]) {
+        let messages = {
+            let mut st = self.state.lock().unwrap();
+            let Ok(g) = st.group_mut(gid) else { return };
+            let messages = std::mem::take(&mut g.rec.unreported);
+            if messages.is_empty() {
+                return;
+            }
+            if let Err(error) = st.save(gid) {
+                self.warn(Some(gid), format!("{error:#}"));
+            }
+            messages
+        };
+        let (node, gid) = (Node { inner: self.clone() }, gid.to_vec());
+        self.spawn(async move {
+            let payload = serde_json::to_value(Control::Refused { messages }).expect("JSON");
+            if let Err(error) = node.send(&gid, &payload, true).await {
+                node.inner.warn(Some(&gid), format!("reporting the messages this session refused: {error:#}"));
+            }
+        });
+    }
+
     fn net_event(self: &Arc<Self>, event: lmk_net::Event) {
         match event {
-            lmk_net::Event::Receipt { group, peer, held, refused } => {
+            lmk_net::Event::Receipt { group, peer, held } => {
                 let mut st = self.state.lock().unwrap();
-                let answers =
-                    held.into_iter().map(|id| (id, None)).chain(refused.into_iter().map(|(id, r)| (id, Some(r))));
                 let mut changed = false;
-                for (id, refused) in answers {
+                for id in held {
                     if let Some(waiter) = st.waiters.get(&id) {
-                        waiter.send((peer, refused)).ok();
+                        waiter.send((peer, None)).ok();
                         continue;
                     }
                     let Ok(g) = st.group_mut(&group) else { return };
@@ -1647,14 +1687,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     }
                     let by = st.by_iroh(&group, &peer);
                     let (group, id) = (Bytes(group.clone()), Bytes(id.to_vec()));
-                    match refused {
-                        None => {
-                            st.group_mut(&group.0).unwrap().rec.pending.retain(|pending| pending.id != id);
-                            changed = true;
-                            self.events.send(Event::Held { group, id, by }).ok();
-                        }
-                        Some(reason) => _ = self.events.send(Event::Refused { group, id, by, reason }),
-                    }
+                    st.group_mut(&group.0).unwrap().rec.pending.retain(|pending| pending.id != id);
+                    changed = true;
+                    self.events.send(Event::Held { group, id, by }).ok();
                 }
                 if changed {
                     st.save(&group).ok();
@@ -1685,6 +1720,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     self.ask_state(&mut st, &group, Some(peer));
                 }
                 drop(st);
+                self.report(&group);
                 // A file only this session held may have reached the peer since.
                 let pending: Vec<[u8; 32]> = {
                     let st = self.state.lock().unwrap();

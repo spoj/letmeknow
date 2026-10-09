@@ -2,15 +2,15 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
-use lmk_core::group::{self as core, Change, key_package_credential, key_package_leaf};
+use lmk_core::group::{self as core, Change, Removed, Unheld, key_package_credential, key_package_leaf};
 use lmk_core::identity::{Verdict, check};
 use lmk_core::invite::Target;
 use lmk_core::provider::Provider;
 use lmk_net::{Admit, Groups, Taken};
-use lmk_proto::group::{CHAT, ContactsUpdate, Control, How, Service, type_of};
+use lmk_proto::group::{CHAT, ContactsUpdate, Control, How, Reason, Refusal, Service, type_of};
 use lmk_proto::head::Head;
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::{Admitted, Hello, InviteRequest};
@@ -22,45 +22,75 @@ use tokio::sync::oneshot;
 
 use crate::logs::empty;
 use crate::{
-    Event, Inner, Item, MAX_MESSAGE, Message, SNAPSHOT_WAIT, State, Work, ciphertext_key, contacts_key, message_key, now,
-    put, yjs,
+    Event, Inner, Item, MAX_MESSAGE, Message, SNAPSHOT_WAIT, State, Work, ciphertext_key, contacts_key, endpoint_id,
+    get, message_key, now, put, yjs,
 };
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Takes in a ciphertext from a peer: what became of it is told to the peer.
+    /// Takes in a ciphertext from a peer: held, waiting for a commit, or given up.
     pub(crate) fn take(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8]) -> Taken {
-        self.open(st, gid, ciphertext).unwrap_or_else(|error| Taken::Refused(format!("{error:#}")))
-    }
-
-    fn open(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8]) -> Result<Taken> {
         let id: [u8; 32] = Sha256::digest(ciphertext).into();
-        let g = st.group_mut(gid)?;
+        let Ok(g) = st.group_mut(gid) else { return Taken::Refused };
         if g.rec.items.iter().any(|item| item.id.0 == id) {
-            return Ok(Taken::Held);
+            return Taken::Held;
         }
-        ensure!(!g.rec.given_up.iter().any(|(_, given)| given.0 == id), "given up");
-        let epoch = core::epoch_of(ciphertext)?;
-        if ciphertext.len() > MAX_MESSAGE {
-            g.rec.given_up.push((epoch, Bytes(id.to_vec())));
-            st.save(gid)?;
-            bail!("larger than 1 MiB");
+        if g.rec.given_up.iter().any(|(_, given)| given.0 == id) {
+            return Taken::Refused;
         }
-        if epoch > g.mls.epoch() {
+        let Ok(epoch) = core::epoch_of(ciphertext) else { return Taken::Refused };
+        let opened = if ciphertext.len() > MAX_MESSAGE {
+            Err(Reason::Size)
+        } else if epoch > g.mls.epoch() {
             if !g.future.iter().any(|waiting| waiting == ciphertext) {
                 g.future.push(ciphertext.to_vec());
             }
             self.work.send(Work::Read(gid.to_vec())).ok();
-            return Ok(Taken::Waiting);
-        }
-        let g = st.groups.get_mut(gid).unwrap();
-        let opened = match g.mls.open(&st.provider, ciphertext, now()) {
-            Ok(opened) => opened,
-            Err(error) => {
-                g.rec.given_up.push((epoch, Bytes(id.to_vec())));
-                st.save(gid)?;
-                return Err(error);
-            }
+            return Taken::Waiting;
+        } else {
+            self.open(st, gid, ciphertext, id, epoch).map_err(|error| {
+                tracing::debug!("a message did not open: {error:#}");
+                if error.is::<Unheld>() {
+                    Reason::Old
+                } else if error.is::<Removed>() {
+                    Reason::Removed
+                } else {
+                    Reason::Unreadable
+                }
+            })
         };
+        match opened {
+            Ok(()) => Taken::Held,
+            Err(reason) => {
+                self.give_up(st, gid, epoch, id, reason);
+                self.given_up(st, gid);
+                Taken::Refused
+            }
+        }
+    }
+
+    /// Saves what was given up, which may leave the kind's log behind.
+    fn given_up(&self, st: &mut State<P>, gid: &[u8]) {
+        if let Err(error) = st.save(gid).and_then(|()| self.kind_advance(st, gid)) {
+            self.warn(Some(gid), format!("{error:#}"));
+        }
+    }
+
+    /// Records a message as given up, and reports it unless it is from before this session joined or as old as one
+    /// it held and dropped after `keep`. The first given up since the last report has the next one sent in a moment.
+    fn give_up(&self, st: &mut State<P>, gid: &[u8], epoch: u64, id: [u8; 32], reason: Reason) {
+        let g = st.groups.get_mut(gid).unwrap();
+        g.rec.given_up.push((epoch, Bytes(id.to_vec())));
+        if epoch >= g.mls.joined() && epoch > g.rec.expired {
+            if g.rec.unreported.is_empty() {
+                self.work.send(Work::Report(gid.to_vec())).ok();
+            }
+            g.rec.unreported.push(Refusal { id: Bytes(id.to_vec()), reason });
+        }
+    }
+
+    fn open(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8], id: [u8; 32], epoch: u64) -> Result<()> {
+        let g = st.groups.get_mut(gid).unwrap();
+        let opened = g.mls.open(&st.provider, ciphertext, now())?;
         let sender = g.mls.members().into_iter().find(|m| m.key == opened.key).unwrap_or(core::Member {
             index: opened.index,
             key: opened.key.clone(),
@@ -84,6 +114,23 @@ impl<P: Provider + Send + 'static> Inner<P> {
                         self.events.send(Event::Introduced { group, by: sender, identity, name, how }).ok();
                     }
                 }
+                Control::Refused { messages } => {
+                    let held = Message { id: Bytes(id.to_vec()), group: group.clone(), epoch, at: now(), sender: sender.clone(), payload };
+                    hold(st, gid, held, ciphertext)?;
+                    let peer = endpoint_id(&sender.iroh.0);
+                    let mut own = Vec::new();
+                    for refusal in messages {
+                        let Ok(sent) = <[u8; 32]>::try_from(&refusal.id.0[..]) else { continue };
+                        if let (Some(waiter), Some(peer)) = (st.waiters.get(&sent), peer) {
+                            waiter.send((peer, Some(refusal.reason))).ok();
+                        } else if get::<Message>(&st.provider, &message_key(&sent))?.is_some_and(|m| m.sender.key.0 == st.session.key()) {
+                            own.push(refusal);
+                        }
+                    }
+                    if !own.is_empty() {
+                        self.events.send(Event::Refused { group, by: sender, messages: own }).ok();
+                    }
+                }
             }
         } else if st.devices(gid) {
             self.contacts(st, gid, &sender, serde_json::from_value(payload)?)?;
@@ -95,7 +142,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         } else {
             self.events.send(Event::Live { group, sender, payload }).ok();
         }
-        Ok(Taken::Held)
+        Ok(())
     }
 
     /// Answers an invite stream's request.
@@ -299,6 +346,18 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
     fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Taken {
         let mut st = self.state.lock().unwrap();
         self.take(&mut st, group, ciphertext)
+    }
+
+    fn below(&self, group: &[u8], items: Vec<(u64, [u8; 32])>) {
+        let floor = self.hello(group).floor;
+        let mut st = self.state.lock().unwrap();
+        let Ok(g) = st.group(group) else { return };
+        let known = |id: &[u8; 32]| g.rec.items.iter().any(|item| item.id.0 == id) || g.rec.given_up.iter().any(|(_, given)| given.0 == id);
+        let lacked: Vec<_> = items.into_iter().filter(|(epoch, id)| *epoch < floor && !known(id)).collect();
+        for (epoch, id) in lacked {
+            self.give_up(&mut st, group, epoch, id, Reason::Old);
+        }
+        self.given_up(&mut st, group);
     }
 
     fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>) {

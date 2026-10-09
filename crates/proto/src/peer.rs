@@ -13,10 +13,14 @@ pub enum Frame {
     Entries { log: Bytes, entries: Vec<Bytes>, head: Head },
     /// A negentropy message.
     Reconcile { group: Bytes, msg: Bytes },
-    /// MLS ciphertexts.
-    Messages { group: Bytes, items: Vec<Bytes> },
-    /// The answer to `messages`: the ids of the items the receiver took, and of those it refused.
-    Receipt { group: Bytes, held: Vec<Bytes>, refused: Vec<Refusal> },
+    /// MLS ciphertexts, and the messages the receiver lacks below its floor, which it gives up.
+    Messages {
+        group: Bytes,
+        items: Vec<Bytes>,
+        below: Vec<Below>,
+    },
+    /// The answer to `messages`: the ids of the items the receiver took.
+    Receipt { group: Bytes, held: Vec<Bytes> },
     /// BLAKE3 hashes of files.
     Want { group: Bytes, files: Vec<Bytes> },
     Have { group: Bytes, files: Vec<Bytes> },
@@ -33,10 +37,11 @@ pub enum Frame {
     },
 }
 
+/// A message the receiver lacks that is older than its floor, so that it records it as given up.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Refusal {
+pub struct Below {
+    pub epoch: u64,
     pub id: Bytes,
-    pub reason: String,
 }
 
 /// One group's state, in `hello`.
@@ -79,6 +84,8 @@ mod tests {
     fn shapes() {
         let hello = Frame::Hello { groups: vec![], heads: vec![] };
         assert_eq!(serde_json::to_string(&hello).unwrap(), r#"{"hello":{"groups":[],"heads":[]}}"#);
+        let messages = Frame::Messages { group: Bytes(vec![1]), items: vec![], below: vec![] };
+        assert_eq!(serde_json::to_string(&messages).unwrap(), r#"{"messages":{"group":"AQ","items":[],"below":[]}}"#);
         let state: Frame = serde_json::from_str(r#"{"state":{"group":"AQ","link":"lmk:x"}}"#).unwrap();
         assert!(matches!(state, Frame::State { .. }));
         assert!(serde_json::from_str::<Frame>(r#"{"doc":{"group":"AQ"}}"#).is_err(), "a kind has no frames");

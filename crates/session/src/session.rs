@@ -11,7 +11,7 @@ use lmk_core::invite::Target;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::{Claim, Event, Member, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings};
+use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, How, IdentityRef, Named, Opening, PROTOCOL, Refusal, Service, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,8 @@ pub struct Config {
     pub hold: Duration,
     /// How long a message waits for those it comes after: `CAUSAL_WAIT`, but in tests.
     pub causal_wait: Duration,
+    /// How long it keeps ended epochs' keys: `Window::default()`, but in tests.
+    pub window: lmk_core::group::Window,
     pub keep_log: bool,
     /// For groups and identities this session creates.
     pub membership: Service,
@@ -513,12 +515,42 @@ impl Session {
             }
             Event::Introduced { group, by, identity, name, how } => self.introduced(&group, &by, identity, name, how)?,
             Event::Held { .. } => {}
-            Event::Refused { group, id, by, reason } => {
-                let item = json!({ "type": "refused", "group": b64(&group.0), "id": hex::encode(&id.0), "member": self.describe(&group, &by)?, "reason": reason });
-                self.outbox.deliver(item, true);
-            }
+            Event::Refused { group, by, messages } => self.refused(&group, &by, &messages).await?,
             Event::File(hash) => self.arrived(hash).await?,
             Event::Warning { group, text } => self.warn(group.as_ref(), text),
+        }
+        Ok(())
+    }
+
+    /// A member refused messages this session sent: its chat messages print, with the reason, their text and a copy
+    /// of their attachment while this session holds them, so that the agent can send them again.
+    async fn refused(&mut self, gid: &Bytes, by: &Member, refusals: &[Refusal]) -> Result<()> {
+        let mut messages = Vec::new();
+        for Refusal { id, reason } in refusals {
+            let Some(message) = self.node.message(&id.0)? else { continue };
+            if message.payload["type"] != "message" {
+                continue;
+            }
+            let chat: ChatMessage = serde_json::from_value(message.payload)?;
+            let mut item = json!({ "id": hex::encode(&id.0), "reason": reason, "content": chat.content });
+            if !chat.to.is_empty() {
+                item["to"] = json!(chat.to.iter().map(|fp| hex::encode(&fp.0)).collect::<Vec<_>>());
+            }
+            if chat.urgent {
+                item["urgent"] = json!(true);
+            }
+            if let Some(attachment) = chat.attachment {
+                let link = FileLink::parse(&attachment.link)?;
+                item["attachment"] = json!(attachment);
+                if let Some(bytes) = self.node.file(&link).await? {
+                    item["attachment"]["path"] = json!(self.save(gid, &link, Some(&attachment.name), &bytes)?);
+                }
+            }
+            messages.push(item);
+        }
+        if !messages.is_empty() {
+            let item = json!({ "type": "refused", "group": b64(&gid.0), "member": self.describe(gid, by)?, "messages": messages });
+            self.outbox.deliver(item, true);
         }
         Ok(())
     }
@@ -1080,12 +1112,13 @@ impl Session {
         Ok(seen.into_iter().filter(|m| !covered.contains(&m.id.0)).filter_map(|m| m.id.0.try_into().ok()).collect())
     }
 
-    /// Records that a message entered the agent's context. Its text is then deleted, unless `listen --keep-log`.
+    /// Records that a message entered the agent's context. Its text is then deleted, unless `listen --keep-log` or it
+    /// is this session's own, which it keeps to send again.
     fn mark_seen(&self, id: &[u8; 32]) -> Result<()> {
         let Some(message) = self.node.message(id)? else { return Ok(()) };
         self.db.execute("INSERT OR IGNORE INTO taken (id, gid) VALUES (?, ?)", params![id, message.group.0])?;
         self.db.execute("UPDATE taken SET seen = 1 WHERE id = ?", [id])?;
-        if !self.config.keep_log && message.payload["type"] == "message" {
+        if !self.config.keep_log && message.payload["type"] == "message" && message.sender.key != self.node.key() {
             let mut payload = message.payload;
             payload["content"] = json!("");
             self.node.redact(id, payload)?;
