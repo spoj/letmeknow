@@ -185,6 +185,12 @@ struct Book {
     refusals: BTreeSet<(usize, String, String)>,
     /// Live messages each member took: by member and nonce.
     live: BTreeSet<(usize, String)>,
+    /// Actions that may keep a live message from its receiver, so far.
+    disruptions: u64,
+    /// Members each member saw join with a valid certificate: by member, group and the joiner's fingerprint.
+    vouched: BTreeSet<(usize, Bytes, String)>,
+    /// Introductions each member was told of: by member, group, and the introducer's fingerprint.
+    introduced: BTreeSet<(usize, Bytes, String)>,
     /// Devices taken off identities: the identity, the member whose device it was, and when.
     revoked: Vec<(Bytes, usize, u64)>,
 }
@@ -275,6 +281,9 @@ impl World {
                 break;
             }
             self.note(format!("#{i} {:?}", action.act));
+            if !matches!(action.act, Act::Send { .. } | Act::Live { .. } | Act::Rename { .. } | Act::Online { .. } | Act::Quiesce) {
+                self.book.lock().unwrap().disruptions += 1;
+            }
             match &action.act {
                 Act::Quiesce => self.quiesce().await,
                 Act::Offline { m } => self.online(*m, false),
@@ -544,11 +553,14 @@ impl World {
                 {
                     let mut book = self.book.lock().unwrap();
                     if !book.groups.contains(&gid) {
-                        book.groups.push(gid);
+                        book.groups.push(gid.clone());
                     }
                 }
                 let link = answer["link"].as_str().context("no link")?;
-                Ok(self.request(n, json!({ "cmd": "join", "target": link })).await?["group"].to_string())
+                let disruptions = self.book.lock().unwrap().disruptions;
+                let joined = self.request(n, json!({ "cmd": "join", "target": link })).await?;
+                self.introduces(m, n, gid, disruptions).await;
+                Ok(joined["group"].to_string())
             }
             Act::JoinOpen { n, group } => {
                 let gid = self.group(group)?;
@@ -613,6 +625,23 @@ impl World {
 
     // Properties.
 
+    /// A member that joins by an invite, as an identity its inviter holds a valid certificate of as it sees it join, is
+    /// introduced to the group by its inviter, in a live message, unless an action in the meantime may have kept it away.
+    async fn introduces(&self, m: usize, n: usize, gid: Bytes, disruptions: u64) {
+        sleep(LIVE_WAIT).await;
+        let (Ok(inviter), Ok(joiner)) = (self.client(m), self.client(n)) else { return };
+        let (inviter, joiner) = (fp(&inviter.node().key().0), fp(&joiner.node().key().0));
+        let book = self.book.lock().unwrap();
+        if book.disruptions != disruptions
+            || !book.vouched.contains(&(m, gid.clone(), joiner))
+            || book.introduced.contains(&(self.index(n), gid.clone(), inviter))
+        {
+            return;
+        }
+        drop(book);
+        self.fail("introduce", format!("m{} was not introduced to {} by m{m}, who invited it", self.index(n), b64(&gid.0)));
+    }
+
     /// What a member was told; with what changes a group, members at one epoch are checked to agree.
     fn told(&self, i: usize, event: ClientEvent) {
         let text = serde_json::to_string(&event).unwrap();
@@ -637,7 +666,15 @@ impl World {
                 self.book.lock().unwrap().left.insert((i, group, member.fp.unwrap_or_default()), elapsed());
             }
             ClientEvent::Joined { group, member, .. } => {
-                self.book.lock().unwrap().left.remove(&(i, group, member.fp.unwrap_or_default()));
+                let mut book = self.book.lock().unwrap();
+                let fp = member.fp.unwrap_or_default();
+                if member.identity.is_some_and(|known| known.error.is_none()) {
+                    book.vouched.insert((i, group.clone(), fp.clone()));
+                }
+                book.left.remove(&(i, group, fp));
+            }
+            ClientEvent::Introduced { group, by, .. } => {
+                self.book.lock().unwrap().introduced.insert((i, group, by.fp.unwrap_or_default()));
             }
             ClientEvent::Refused { member, messages, .. } => {
                 let mut book = self.book.lock().unwrap();
