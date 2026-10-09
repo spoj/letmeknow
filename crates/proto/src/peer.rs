@@ -171,6 +171,15 @@ mod tests {
     }
 
     #[test]
+    fn hello_and_messages_from_before_0_12_reconcile_from_the_lower_floor_and_name_nothing_below() {
+        let head = r#"{"log":"Zw","length":0,"hash":"AA","time":0,"sig":""}"#;
+        let hello: Hello = serde_json::from_str(&format!(r#"{{"group":"Zw","epoch":3,"head":{head},"floor":1,"joined":1}}"#)).unwrap();
+        assert!(!hello.all);
+        let messages: Frame = serde_json::from_str(r#"{"messages":{"group":"Zw","items":["AQ"]}}"#).unwrap();
+        assert_eq!(messages, Frame::Messages { group: Bytes(b"g".to_vec()), items: vec![Bytes(vec![1])], below: vec![] });
+    }
+
+    #[test]
     fn a_kind_frame_keeps_its_wire_form() {
         let doc = r#"{"doc":{"group":"AQ","snapshot":"Ag"}}"#;
         let frame: Frame = serde_json::from_str(doc).unwrap();

@@ -1993,8 +1993,8 @@ mod tests {
     }
 
     #[test]
-    fn a_0_10_record_has_no_links() {
+    fn a_0_10_record_has_no_links_and_nothing_to_report() {
         let rec: Rec = serde_json::from_str(r#"{"position":1,"logged":1,"chain":null,"items":[],"given_up":[],"pending":[],"files":[],"state":null}"#).unwrap();
-        assert!(rec.links.is_empty());
+        assert!(rec.links.is_empty() && rec.unreported.is_empty() && rec.expired == 0);
     }
 }
