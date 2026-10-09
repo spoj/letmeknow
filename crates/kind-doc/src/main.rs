@@ -162,6 +162,7 @@ impl Plugin {
             "start" => {
                 self.dir = PathBuf::from(str(&message["dir"])?);
                 std::fs::create_dir_all(&self.dir)?;
+                self.out.push(answer(&message["id"], Ok(json!({}))));
             }
             "group" => {
                 let file = self.open(&group, message)?;

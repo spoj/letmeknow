@@ -24,7 +24,8 @@ impl Plugin {
             }
         });
         let mut plugin = Plugin { child, stdin, lines };
-        plugin.send(json!({ "type": "start", "kind": "doc", "dir": dir }));
+        plugin.send(json!({ "type": "start", "id": 0, "kind": "doc", "dir": dir }));
+        assert_eq!(plugin.next("answer")["id"], 0);
         plugin
     }
 

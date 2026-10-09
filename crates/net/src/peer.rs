@@ -286,6 +286,9 @@ impl Session {
             tracing::warn!("hello from {}: {e:#}", self.peer.fmt_short());
             return Ok(());
         }
+        if let Some(log) = theirs.log.clone() {
+            self.inner.groups.log_head(self.peer, &group.0, log);
+        }
         self.groups.entry(group.clone()).or_default().theirs = Some(theirs);
         self.catch_up(&group, &mine).await
     }

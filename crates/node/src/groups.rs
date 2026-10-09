@@ -235,12 +235,13 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
     fn hello(&self, group: &[u8]) -> Hello {
         let st = self.state.lock().unwrap();
         let Some(g) = st.groups.get(group) else {
-            return Hello { group: group.into(), epoch: 0, head: empty(group), floor: 0, joined: 0 };
+            return Hello { group: group.into(), epoch: 0, head: empty(group), floor: 0, joined: 0, log: None };
         };
         let (epoch, joined) = (g.mls.epoch(), g.mls.joined());
         let head = g.rec.chain.as_ref().map_or_else(|| empty(group), |chain| chain.head.clone());
         let floor = joined.max(epoch.saturating_sub(self.window.epochs as u64));
-        Hello { group: group.into(), epoch, head, floor, joined }
+        let log = g.rec.log.as_ref().and_then(|log| Some(log.chain.as_ref()?.head.clone()));
+        Hello { group: group.into(), epoch, head, floor, joined, log }
     }
 
     fn verify_head(&self, group: &[u8], head: &Head) -> bool {
@@ -325,8 +326,15 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         }
     }
 
-    fn state(&self, group: &[u8], peer: EndpointId, link: String) {
-        self.work.send(Work::State { group: group.to_vec(), link, by: peer }).ok();
+    fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>) {
+        match link {
+            Some(link) => self.work.send(Work::State { group: group.to_vec(), link, by: peer }).ok(),
+            None => self.work.send(Work::StateWanted { group: group.to_vec(), by: peer }).ok(),
+        };
+    }
+
+    fn log_head(&self, peer: EndpointId, group: &[u8], head: Head) {
+        self.judge_log_head(peer, group, head);
     }
 
     fn files(&self, group: &[u8]) -> Vec<FileLink> {

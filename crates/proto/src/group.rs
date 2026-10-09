@@ -40,6 +40,10 @@ pub struct Settings {
     /// Only in a devices group.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub openings: Vec<Opening>,
+    /// The id of the kind's log at the membership service: random, so that only members can tie it to the group. In a
+    /// group of a plugin's kind made since 0.11.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<Bytes>,
 }
 
 /// An identity, by id, with the name its group knows it by.

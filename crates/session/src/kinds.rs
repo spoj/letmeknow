@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -69,8 +69,8 @@ impl Plugins {
         self.running.contains_key(kind)
     }
 
-    /// Starts a kind's plugin, whose state is in `dir`.
-    pub async fn start(&mut self, kind: &str, dir: &Path) -> Result<()> {
+    /// Starts a kind's plugin; the session's first message to it is `start`.
+    pub async fn start(&mut self, kind: &str) -> Result<()> {
         let path = self.found.get(kind).with_context(|| format!("this session has no plugin for {kind} groups ({PREFIX}{kind})"))?;
         let mut child = Command::new(path).stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn()?;
         let (stdin, stdout) = (child.stdin.take().expect("piped"), child.stdout.take().expect("piped"));
@@ -87,7 +87,7 @@ impl Plugins {
         });
         self.running.insert(kind.to_owned(), Running { _child: child, stdin });
         self.started.insert(kind.to_owned(), std::time::Instant::now());
-        self.send(kind, &serde_json::json!({ "type": "start", "kind": kind, "dir": dir })).await
+        Ok(())
     }
 
     pub async fn send(&mut self, kind: &str, message: &Value) -> Result<()> {
