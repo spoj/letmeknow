@@ -9,8 +9,10 @@ pub const PROTOCOL: u32 = 1;
 pub const SETTINGS_EXTENSION: u16 = 0xff01;
 pub const LEAF_EXTENSION: u16 = 0xff02;
 
-/// The one kind every client supports, built in. Every other kind is a plugin's.
+/// The kind every client supports, built in. Every other kind is a plugin's, but `DEVICES`.
 pub const CHAT: &str = "chat";
+/// The built-in kind of an identity's devices group, which devices join and sessions do not.
+pub const DEVICES: &str = "devices";
 
 /// Where a log lives.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,12 +31,6 @@ pub struct Settings {
     pub open: Vec<Named>,
     pub keep: u32,
     pub membership: Service,
-    /// Marks an identity's devices group.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub devices_of: Option<Bytes>,
-    /// Only in a devices group.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub openings: Vec<Opening>,
     /// The id of the kind's log at the membership service: random, so that only members can tie it to the group. In a
     /// group of a plugin's kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,7 +44,7 @@ pub struct Named {
     pub name: String,
 }
 
-/// A group open to an identity, as its devices group records it.
+/// A group open to an identity, as its devices group keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Opening {
     pub group: Bytes,
@@ -69,20 +65,16 @@ pub struct Leaf {
     pub kinds: Vec<String>,
 }
 
-/// The identity bytes of a session's basic credential.
+/// The identity bytes of a member's basic credential: its name, its MLS signature key, and the identity it speaks as,
+/// which a certificate proves.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credential {
     pub name: String,
-    pub device: Bytes,
-    /// The device key's signature over `SESSION_CONTEXT` ‖ the session's public key.
-    pub device_sig: Bytes,
-    pub device_name: String,
+    pub key: Bytes,
     pub identity: Option<IdentityRef>,
 }
 
-pub const SESSION_CONTEXT: &[u8] = b"letmeknow session v1\0";
-
-/// An identity, by id and the service that keeps its device list.
+/// An identity, by id and the service that keeps its key log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityRef {
     pub id: Bytes,
@@ -141,18 +133,6 @@ pub fn type_of(payload: &serde_json::Value) -> &str {
 /// Whether members hold a payload: those of these types always, and others when their sender marks them so.
 pub fn held_by_type(payload: &serde_json::Value) -> bool {
     matches!(type_of(payload), "message" | "leave" | "refused")
-}
-
-/// The live payloads of a devices group's contacts, a Yjs map synced as a doc's text is: edits; to one member, the hash
-/// of a snapshot to compare, the state vector of a member whose snapshot differs, and the diff that answers it. Updates
-/// are Yjs v1.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContactsUpdate {
-    Edit { update: Bytes },
-    Snapshot { snapshot: Bytes },
-    Sv { sv: Bytes },
-    Diff { update: Bytes },
 }
 
 /// A chat message, the payload of the built-in kind.

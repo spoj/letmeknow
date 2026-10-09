@@ -4,17 +4,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use lmk_proto::Bytes;
-use lmk_proto::group::{
-    CHAT, Control, Credential, How, IdentityRef, LEAF_EXTENSION, Leaf, Opening, PROTOCOL, SETTINGS_EXTENSION, Service,
-    Settings, held_by_type,
-};
+use lmk_proto::group::{Control, Credential, How, LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Settings, held_by_type};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::device::Device;
 use crate::provider::Provider;
 
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
@@ -98,28 +94,16 @@ struct SessionRecord {
 }
 
 impl Session {
-    /// A new session with a fresh MLS key signed by `device`; a provider holds one session.
-    pub fn create<P: Provider>(
-        provider: &P,
-        device: &Device,
-        name: &str,
-        identity: Option<IdentityRef>,
-        leaf: Leaf,
-    ) -> Result<Self> {
-        Self::create_with(provider, SignatureKeyPair::new(SignatureScheme::ED25519)?, device, name, identity, leaf)
+    /// A new session with a fresh MLS key, speaking as no identity; a provider holds one session.
+    pub fn create<P: Provider>(provider: &P, name: &str, leaf: Leaf) -> Result<Self> {
+        Self::create_with(provider, SignatureKeyPair::new(SignatureScheme::ED25519)?, name, leaf)
     }
 
-    /// A session with the given MLS key: in a browser, the device's own (`Device::signer`).
-    pub fn create_with<P: Provider>(
-        provider: &P,
-        signer: SignatureKeyPair,
-        device: &Device,
-        name: &str,
-        identity: Option<IdentityRef>,
-        leaf: Leaf,
-    ) -> Result<Self> {
+    /// A session with the given MLS key: a device's own (`Device::signer`).
+    pub fn create_with<P: Provider>(provider: &P, signer: SignatureKeyPair, name: &str, leaf: Leaf) -> Result<Self> {
         signer.store(provider.storage())?;
-        let session = Session { credential: device.credential(name, signer.public(), identity), signer, leaf };
+        let credential = Credential { name: name.into(), key: signer.public().into(), identity: None };
+        let session = Session { credential, signer, leaf };
         session.save(provider)?;
         Ok(session)
     }
@@ -170,11 +154,16 @@ impl Session {
 }
 
 /// Validates a KeyPackage as it arrives at an inviter, and returns its credential.
-pub fn key_package_credential<P: Provider>(provider: &P, key_package: &[u8]) -> Result<(Credential, Vec<u8>)> {
+pub fn key_package_credential<P: Provider>(provider: &P, key_package: &[u8]) -> Result<Credential> {
     let key_package = key_package_in(provider, key_package)?;
-    let leaf = key_package.leaf_node();
+    leaf_credential(key_package.leaf_node())
+}
+
+/// A leaf's credential, which must name the leaf's own signature key.
+fn leaf_credential(leaf: &LeafNode) -> Result<Credential> {
     let credential = credential_of(leaf.credential()).context("not a letmeknow credential")?;
-    Ok((credential, leaf.signature_key().as_slice().to_vec()))
+    ensure!(credential.key.0 == leaf.signature_key().as_slice(), "a credential that names another key");
+    Ok(credential)
 }
 
 /// The leaf data a KeyPackage carries.
@@ -333,8 +322,8 @@ struct State {
     how: Option<How>,
     window: Window,
     joined: u64,
-    /// Removed members, by `device_sig` (one per session key), with their key and when their removal was applied.
-    removed: Vec<(Bytes, Bytes, u64)>,
+    /// Removed members' keys, with when their removal was applied.
+    removed: Vec<(Bytes, u64)>,
     added: Vec<Added>,
 }
 
@@ -613,14 +602,13 @@ impl Group {
         };
         let current = self.members().into_iter().find(|member| member.credential.as_ref() == Some(&sender));
         let mut key = current.as_ref().map(|member| member.key.clone()).unwrap_or_default();
-        if current.is_none() {
-            let removed = self.state.removed.iter().rev().find(|(sig, _, _)| *sig == sender.device_sig);
-            if let Some((_, removed, at)) = removed {
-                if now > at + REMOVED_GRACE {
-                    return Err(Removed.into());
-                }
-                key = removed.0.clone();
+        if current.is_none()
+            && let Some((removed, at)) = self.state.removed.iter().rev().find(|(key, _)| *key == sender.key)
+        {
+            if now > at + REMOVED_GRACE {
+                return Err(Removed.into());
             }
+            key = removed.0.clone();
         }
         let payload: serde_json::Value = serde_json::from_slice(&message.into_bytes())?;
         ensure!(payload["type"].is_string(), "a payload without a type");
@@ -635,28 +623,6 @@ impl Group {
             payload,
         })
     }
-}
-
-/// The settings of an identity's devices group.
-pub fn devices_settings(identity: &[u8], name: &str, membership: Service) -> Settings {
-    Settings {
-        protocol: PROTOCOL,
-        kind: CHAT.into(),
-        name: name.into(),
-        open: vec![],
-        keep: 90,
-        membership,
-        devices_of: Some(identity.into()),
-        openings: vec![],
-        log: None,
-    }
-}
-
-/// Settings with an opening recorded, replacing the one for the same group; commit them with `Change::settings`.
-pub fn with_opening(mut settings: Settings, opening: Opening) -> Settings {
-    settings.openings.retain(|old| old.group != opening.group);
-    settings.openings.push(opening);
-    settings
 }
 
 /// Records what a commit does, before it is merged.
@@ -692,8 +658,7 @@ fn observe(
         let credentials = added.iter().filter_map(|member| member.credential.clone());
         state.added.extend(credentials.map(|member| Added { member, by: committer.clone(), how, epoch }));
     }
-    let gone = removed.iter().filter_map(|member| Some((member.credential.as_ref()?.device_sig.clone(), member)));
-    state.removed.extend(gone.map(|(sig, member)| (sig, Bytes(member.key.clone()), now)));
+    state.removed.extend(removed.iter().map(|member| (Bytes(member.key.clone()), now)));
     Applied::Commit {
         by: by.u32(),
         own,
@@ -711,27 +676,24 @@ fn state_key(id: &[u8]) -> Vec<u8> {
 }
 
 /// The app's rules on a commit, from MLS state alone, binding the committer too: changes inline only, of the kinds we
-/// make; settings that parse, at protocol 1, with kind and `devices_of` unchanged; and no update of the committer's
-/// leaf that changes its identity or device.
+/// make; added members whose credentials name their own keys; settings that parse, at protocol 1, with the kind
+/// unchanged; and no update of the committer's leaf that changes its credential.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex) -> Result<()> {
     for proposal in staged.queued_proposals() {
         ensure!(proposal.proposal_or_ref_type() == ProposalOrRefType::Proposal, "a proposal by reference");
-        ensure!(
-            matches!(proposal.proposal(), Proposal::Add(_) | Proposal::Remove(_) | Proposal::GroupContextExtensions(_)),
-            "a {:?} proposal",
-            proposal.proposal().proposal_type()
-        );
+        match proposal.proposal() {
+            Proposal::Add(add) => _ = leaf_credential(add.key_package().leaf_node())?,
+            Proposal::Remove(_) | Proposal::GroupContextExtensions(_) => {}
+            other => bail!("a {:?} proposal", other.proposal_type()),
+        }
     }
     let old = settings_of(group.extensions())?;
     let new = settings_of(staged.group_context().extensions())?;
     ensure!(new.protocol == PROTOCOL, "settings name protocol {}", new.protocol);
     ensure!(new.kind == old.kind, "the kind changed");
-    ensure!(new.devices_of == old.devices_of, "devices_of changed");
     if let Some(leaf) = staged.update_path_leaf_node() {
-        let claim = |credential: &Credential| (credential.device.clone(), credential.identity.clone());
-        let before = group.member_at(by).and_then(|member| credential_of(&member.credential)).map(|c| claim(&c));
-        let after = credential_of(leaf.credential()).map(|c| claim(&c));
-        ensure!(before == after, "an update changed the member's identity or device");
+        let before = group.member_at(by).and_then(|member| credential_of(&member.credential));
+        ensure!(before == credential_of(leaf.credential()), "an update changed the member's credential");
     }
     Ok(())
 }

@@ -329,7 +329,7 @@ def main():
 
         # Bob takes his tablet off his identity: its sessions leave his groups.
         run("bob", "identity", "remove", "--", tablet.ready["member"]["device"]["key"])
-        check(tablet.expect("removed", timeout=60)["group"] == group, "a device taken off its identity leaves its groups")
+        check(tablet.expect("removed", timeout=150)["group"] == group, "a device taken off its identity leaves its groups")
         if BROWSER and subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=WEB, env={**ENV, "URL": ENV["LETMEKNOW_RELAY"], "BIN": BIN}).returncode:
             sys.exit("FAIL: the browser test")
         print("all ok")

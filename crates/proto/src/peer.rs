@@ -2,13 +2,19 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Bytes, head::Head};
+use crate::{Bytes, head::Head, identity::Envelope};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Frame {
-    /// The sender's state of the groups both are in, and the newest signed heads it holds of their logs.
-    Hello { groups: Vec<Hello>, heads: Vec<Head> },
+    /// The sender's state of the groups both are in, the newest signed heads it holds of their logs, and the
+    /// certificates it holds of their members.
+    Hello {
+        groups: Vec<Hello>,
+        heads: Vec<Head>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        certificates: Vec<Envelope>,
+    },
     /// Entries of a log the other lacks, ending at `head`.
     Entries { log: Bytes, entries: Vec<Bytes>, head: Head },
     /// A negentropy message.
@@ -24,8 +30,8 @@ pub enum Frame {
     /// BLAKE3 hashes of files.
     Want { group: Bytes, files: Vec<Bytes> },
     Have { group: Bytes, files: Vec<Bytes> },
-    /// A request to join an open group.
-    Join { group: Bytes, key_package: Bytes },
+    /// A request to join an open group, with the joiner's certificate of the identity it speaks as.
+    Join { group: Bytes, key_package: Bytes, certificate: Envelope },
     Admitted { group: Bytes, admitted: Admitted },
     Refused { group: Bytes, refused: String },
     /// A file link to the state of the group's kind, which the sender's kind hands this member; without one, a request
@@ -55,11 +61,13 @@ pub struct Hello {
     pub joined: u64,
 }
 
-/// The joiner's request on an `invite` stream. For a device link, the KeyPackage's credential names the new device.
+/// The joiner's request on an `invite` stream, with its certificate if it speaks as an identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteRequest {
     pub secret: Bytes,
     pub key_package: Bytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<Envelope>,
 }
 
 /// The answer to an invite or a join: answered as `Answer<Admitted>` on an `invite` stream.
@@ -68,12 +76,15 @@ pub struct Admitted {
     pub welcome: Bytes,
     /// The log position the joiner reads from.
     pub position: u64,
-    /// A file link to the state of the group's kind, or of a devices group's contacts.
+    /// A file link to the state of the group's kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     /// The ids of the messages from before the joiner's epoch that the inviter holds, which the joiner never gets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub before: Vec<Bytes>,
+    /// The certificates the inviter holds of the group's members.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub certificates: Vec<Envelope>,
 }
 
 #[cfg(test)]
@@ -82,7 +93,7 @@ mod tests {
 
     #[test]
     fn shapes() {
-        let hello = Frame::Hello { groups: vec![], heads: vec![] };
+        let hello = Frame::Hello { groups: vec![], heads: vec![], certificates: vec![] };
         assert_eq!(serde_json::to_string(&hello).unwrap(), r#"{"hello":{"groups":[],"heads":[]}}"#);
         let messages = Frame::Messages { group: Bytes(vec![1]), items: vec![], below: vec![] };
         assert_eq!(serde_json::to_string(&messages).unwrap(), r#"{"messages":{"group":"AQ","items":[],"below":[]}}"#);

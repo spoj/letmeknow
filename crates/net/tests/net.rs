@@ -9,6 +9,7 @@ use iroh::RelayUrl;
 use lmk_net::Event;
 use lmk_proto::{
     Answer, Bytes,
+    identity::Envelope,
     links::Invite,
     peer::Frame,
 };
@@ -86,6 +87,37 @@ async fn every_log_of_a_group_is_caught_up_from_peers() {
     eventually("an entry A took goes to B at once", || b.fake.log(K).len() == 3).await;
     a.net.shutdown().await.unwrap();
     b.net.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn certificates_are_shown_once_even_to_a_member_not_served() {
+    let relay = relay().await;
+    let keys = keys(2);
+    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
+    let group = || Group { members: members.clone(), log: vec![b"e1".to_vec()], ..Group::default() };
+    let service = service();
+    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
+    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
+    a.fake.uncertified.lock().unwrap().push(members[1]);
+    let certificate = |n: u8| Envelope { body: Bytes(vec![n]), sig: Bytes(vec![n]) };
+    a.fake.certificates.lock().unwrap().push(certificate(1));
+    b.fake.certificates.lock().unwrap().push(certificate(2));
+    a.fake.hold(G, b"\0\0\0\0\0\0\0\x01a's".to_vec());
+    b.fake.hold(G, b"\0\0\0\0\0\0\0\x01b's".to_vec());
+    let certified = |node: &Node| node.fake.certified.lock().unwrap().iter().map(|c| c.sig.0[0]).collect::<Vec<_>>();
+    a.net.dial(members[1], relay.url.clone()).await.unwrap();
+    eventually("each shows the other its certificates", || certified(&a) == [2] && certified(&b) == [1]).await;
+    a.fake.certificates.lock().unwrap().push(certificate(3));
+    a.net.changed(G);
+    eventually("a member not served is shown a new one", || certified(&b) == [1, 3]).await;
+    b.net.changed(G);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!((certified(&a), certified(&b)), (vec![2], vec![1, 3]), "nothing is shown twice");
+    let held = |node: &Node| node.fake.groups.lock().unwrap()[G].held.len();
+    assert_eq!((held(&a), held(&b)), (1, 1), "no messages pass between members one of which does not serve the other");
+    for node in [&a, &b] {
+        node.net.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -285,11 +317,11 @@ async fn invite_and_join() {
     let invite = |secret| Invite { device: false, key: *keys[0].public().as_bytes(), secret, relay: Some(relay.url.to_string()) };
     let request = || b"kp".to_vec();
 
-    let Answer::Ok(admitted) = joiner.net.redeem(&invite(SECRET), request()).await.unwrap() else { panic!("refused") };
+    let Answer::Ok(admitted) = joiner.net.redeem(&invite(SECRET), request(), None).await.unwrap() else { panic!("refused") };
     assert_eq!((admitted.welcome.0.as_slice(), admitted.position), (&b"welcome"[..], 3));
-    let refused = joiner.net.redeem(&invite([0; 16]), request()).await.unwrap();
+    let refused = joiner.net.redeem(&invite([0; 16]), request(), None).await.unwrap();
     assert_eq!(refused, Answer::Refused { refused: "unknown secret".into() });
-    let joined = joiner.net.join(keys[0].public(), relay.url.clone(), b"open", b"kp".to_vec()).await.unwrap();
+    let joined = joiner.net.join(keys[0].public(), relay.url.clone(), b"open", b"kp".to_vec(), Envelope { body: Bytes::default(), sig: Bytes::default() }).await.unwrap();
     assert!(matches!(joined, Answer::Ok(admitted) if admitted.welcome.0 == b"open"));
     inviter.net.shutdown().await.unwrap();
     joiner.net.shutdown().await.unwrap();

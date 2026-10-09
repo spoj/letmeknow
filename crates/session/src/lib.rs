@@ -90,27 +90,22 @@ pub async fn listen(
     let (inbound, queue) = tokio::sync::mpsc::unbounded_channel();
     cli::open_channel(&config.dir.join("endpoint"), inbound.clone()).await?;
     let device_file = home.join("device.json");
-    let device = match device_file.exists() {
-        true => Device::load(&device_file)?,
-        false => {
-            let device = Device::new(&gethostname::gethostname().to_string_lossy());
-            device.save(&device_file)?;
-            device
-        }
-    };
+    if !device_file.exists() {
+        Device::new(&gethostname::gethostname().to_string_lossy()).save(&device_file)?;
+    }
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
     let kinds = [lmk_proto::group::CHAT.to_owned()].into_iter().chain(kinds::discover(&config.plugins).into_keys()).collect();
-    let node_config = node_config(&network, home, &config.name, false, config.dir.join("files"), kinds);
+    let node_config = node_config(&network, home, &config.name, None, config.dir.join("files"), kinds);
     let node_config = lmk_node::Config { window: config.window, ..node_config };
-    let (node, events) = Node::start(provider, device, node_config).await?;
+    let (node, events) = Node::start(provider, node_config).await?;
     let session = session::Session::open(config, node, home, network, inbound).await?;
     session::run(session, queue, events, print, shutdown).await
 }
 
-fn node_config(network: &Network, home: &Path, name: &str, device_key: bool, files: PathBuf, kinds: Vec<String>) -> lmk_node::Config {
+fn node_config(network: &Network, home: &Path, name: &str, device: Option<Device>, files: PathBuf, kinds: Vec<String>) -> lmk_node::Config {
     lmk_node::Config {
         name: name.into(),
-        device_key,
+        device,
         relay: network.relay.clone(),
         ca: network.ca.clone(),
         home: Some(home.to_path_buf()),

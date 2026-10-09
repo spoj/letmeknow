@@ -10,15 +10,14 @@ use iroh::tls::CaTlsConfig;
 use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
 use lmk_core::device::Device;
 use lmk_core::group::Window;
-use lmk_core::invite::Target;
 use lmk_core::provider::MemoryProvider;
 use lmk_membership::service::{Policy, Service as Membership};
 use lmk_membership::store::Store;
+use lmk_node::devices::Devices;
 use lmk_node::{Config, Event, Node};
-use lmk_proto::group::{CHAT, ChatMessage, PROTOCOL, Service, Settings};
+use lmk_proto::group::{CHAT, ChatMessage, DEVICES, Named, PROTOCOL, Service, Settings};
 use lmk_proto::Bytes;
 use lmk_proto::frame::ALPN;
-use lmk_proto::links::Invite;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -64,18 +63,25 @@ struct Session {
 const KIND: &str = "test";
 
 async fn session(relay: &Relay, name: &str) -> Session {
-    node(relay, name, false, &[CHAT, KIND]).await
+    node(relay, name, &[CHAT, KIND]).await
 }
 
-/// A device's own node: its key is the device key.
-async fn device(relay: &Relay, name: &str) -> Session {
-    node(relay, name, true, &[CHAT, KIND]).await
+async fn node(relay: &Relay, name: &str, kinds: &[&str]) -> Session {
+    let (node, events) = Node::start(MemoryProvider::default(), config(relay, name, None, kinds)).await.unwrap();
+    Session { node, events }
 }
 
-async fn node(relay: &Relay, name: &str, device_key: bool, kinds: &[&str]) -> Session {
-    let config = Config {
+/// A device's own node, whose key is the device key, as a browser's is: a device and a session at once.
+async fn device(relay: &Relay, name: &str) -> (Session, Devices<MemoryProvider>) {
+    let device = Device::new(name);
+    let (node, events) = Node::start(MemoryProvider::default(), config(relay, name, Some(device.clone()), &[CHAT, DEVICES])).await.unwrap();
+    (Session { node: node.clone(), events }, Devices::new(node, device))
+}
+
+fn config(relay: &Relay, name: &str, device: Option<Device>, kinds: &[&str]) -> Config {
+    Config {
         name: name.into(),
-        device_key,
+        device,
         relay: relay.url.clone(),
         ca: CaTlsConfig::custom_roots([relay.cert.clone()]),
         home: None,
@@ -84,9 +90,7 @@ async fn node(relay: &Relay, name: &str, device_key: bool, kinds: &[&str]) -> Se
         file_limit: 100 << 20,
         window: Window::default(),
         kinds: kinds.iter().map(|kind| kind.to_string()).collect(),
-    };
-    let (node, events) = Node::start(MemoryProvider::default(), Device::new(&format!("{name}'s laptop")), config).await.unwrap();
-    Session { node, events }
+    }
 }
 
 impl Session {
@@ -121,8 +125,6 @@ fn settings(kind: &str, folder: &Path) -> Settings {
         open: vec![],
         keep: 90,
         membership: Service::Folder(folder.to_str().unwrap().into()),
-        devices_of: None,
-        openings: vec![],
         log: None,
     }
 }
@@ -142,8 +144,8 @@ async fn chat_and_removal() {
     let mut alice = session(&relay, "Alice").await;
     let mut bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
-    let link = alice.node.invite(Target::Group(gid.0.clone()), Some("Bob (Acme)".into()), None).unwrap();
-    let joined = bob.node.join(&Invite::parse(&link).unwrap(), None).await.unwrap();
+    let link = alice.node.invite(&gid.0, Some("Bob (Acme)".into()), None).unwrap();
+    let joined = bob.node.join(&link, None).await.unwrap();
     assert_eq!(joined, gid);
     let (member, label) = alice.until(|e| match e {
         Event::Joined { member, label, .. } => Some((member, label)),
@@ -180,16 +182,16 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
     let dir = folder("kind");
     let mut alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
-    let carol = node(&relay, "Carol", false, &[CHAT]).await;
+    let carol = node(&relay, "Carol", &[CHAT]).await;
     let gid = alice.node.create(settings(KIND, &dir), None).unwrap();
     assert!(carol.node.create(settings(KIND, &dir), None).is_err(), "a session makes no group of a kind it lacks");
-    let link = alice.node.invite(Target::Group(gid.0.clone()), None, None).unwrap();
-    let refused = carol.node.join(&Invite::parse(&link).unwrap(), None).await.unwrap_err();
+    let link = alice.node.invite(&gid.0, None, None).unwrap();
+    let refused = carol.node.join(&link, None).await.unwrap_err();
     assert!(format!("{refused:#}").contains("does not support test groups"), "{refused:#}");
 
     // The inviter's kind hands the joiner its state.
-    let link = alice.node.invite(Target::Group(gid.0.clone()), None, None).unwrap();
-    let joining = tokio::spawn(async move { bob.node.join(&Invite::parse(&link).unwrap(), None).await.map(|_| bob) });
+    let link = alice.node.invite(&gid.0, None, None).unwrap();
+    let joining = tokio::spawn(async move { bob.node.join(&link, None).await.map(|_| bob) });
     let reply = alice.until(|e| match e {
         Event::Snapshot { reply, .. } => Some(reply),
         _ => None,
@@ -233,45 +235,6 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
         _ => None,
     }).await;
     assert_eq!(data, b"newer");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_removed_device_leaves_every_group() {
-    let relay = relay().await;
-    let dir = folder("revoke");
-    let membership = Service::Folder(dir.join("identities").to_str().unwrap().into());
-    let mut alice = session(&relay, "Alice").await;
-    let mut laptop = device(&relay, "laptop").await;
-    let mut tablet = device(&relay, "tablet").await;
-    let bob = laptop.node.identity_create("Bob", membership).await.unwrap();
-    let link = laptop.node.invite(Target::Device(bob.id.0.clone()), None, None).unwrap();
-    let devices = tablet.node.join(&Invite::parse(&link).unwrap(), None).await.unwrap();
-    laptop.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    let chat = alice.node.create(settings(CHAT, &dir), None).unwrap();
-    let link = alice.node.invite(Target::Group(chat.0.clone()), None, None).unwrap();
-    tablet.node.join(&Invite::parse(&link).unwrap(), Some(bob.clone())).await.unwrap();
-    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-
-    laptop.node.remove_device(&bob, &tablet.node.device().public()).await.unwrap();
-    // The laptop notices in the devices group; alice, once she reads the list.
-    laptop.until(|e| matches!(e, Event::Left { .. }).then_some(())).await;
-    alice.node.device_list(&bob).await.unwrap();
-    let left = alice.until(|e| match e {
-        Event::Left { member, .. } => Some(member),
-        _ => None,
-    }).await;
-    assert_eq!(left.device.0, tablet.node.device().public());
-    let mut gone = Vec::new();
-    while gone.len() < 2 {
-        gone.push(tablet.until(|e| match e {
-            Event::Removed { group, .. } => Some(group),
-            _ => None,
-        }).await);
-    }
-    gone.sort();
-    let mut expected = vec![devices, chat];
-    expected.sort();
-    assert_eq!(gone, expected);
 }
 
 /// A membership service like `letmeknow serve`'s, which signs its heads.
@@ -319,8 +282,8 @@ async fn a_kinds_log_orders_appends_and_a_member_behind_it_takes_a_state() {
     let gid = alice.node.create(Settings { membership, ..settings(KIND, &dir) }, None).unwrap();
     assert!(alice.node.settings(&gid.0).unwrap().log.is_some(), "a group of a plugin's kind has a log");
     alice.node.follow_log(&gid.0, Some(0)).unwrap();
-    let link = alice.node.invite(Target::Group(gid.0.clone()), None, None).unwrap();
-    let joining = tokio::spawn(async move { bob.node.join(&Invite::parse(&link).unwrap(), None).await.map(|_| bob) });
+    let link = alice.node.invite(&gid.0, None, None).unwrap();
+    let joining = tokio::spawn(async move { bob.node.join(&link, None).await.map(|_| bob) });
     alice.snapshot(Some(b"empty")).await;
     let mut bob = joining.await.unwrap().unwrap();
     bob.until(|e| matches!(e, Event::State { .. }).then_some(())).await;
@@ -350,8 +313,8 @@ async fn a_kinds_log_orders_appends_and_a_member_behind_it_takes_a_state() {
     // Carol joins with no state and reads from the start: the messages the entries name are from before she joined,
     // so she asks a member for the kind's state, and follows from where it leaves off.
     let carol = session(&relay, "Carol").await;
-    let link = bob.node.invite(Target::Group(gid.0.clone()), None, None).unwrap();
-    let joining = tokio::spawn(async move { carol.node.join(&Invite::parse(&link).unwrap(), None).await.map(|_| carol) });
+    let link = bob.node.invite(&gid.0, None, None).unwrap();
+    let joining = tokio::spawn(async move { carol.node.join(&link, None).await.map(|_| carol) });
     bob.snapshot(None).await;
     let mut carol = joining.await.unwrap().unwrap();
     carol.node.follow_log(&gid.0, Some(0)).unwrap();
@@ -371,61 +334,146 @@ async fn a_kinds_log_orders_appends_and_a_member_behind_it_takes_a_state() {
     assert_eq!(alice.logged(&gid, 3).await[0].from.name, "Carol");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_removal_spreads_through_peers() {
-    let relay = relay().await;
-    let dir = folder("spread");
-    let (membership, _service) = signing_service(&relay, &dir).await;
-    let mut alice = session(&relay, "Alice").await;
-    let mut laptop = device(&relay, "laptop").await;
-    let tablet = device(&relay, "tablet").await;
-    let bob = laptop.node.identity_create("Bob", membership.clone()).await.unwrap();
-    let link = laptop.node.invite(Target::Device(bob.id.0.clone()), None, None).unwrap();
-    tablet.node.join(&Invite::parse(&link).unwrap(), None).await.unwrap();
-    laptop.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    // Alice shares one chat with the tablet and another with the laptop; she reads Bob's list as each joins.
-    for member in [&tablet, &laptop] {
-        let chat = alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &dir) }, None).unwrap();
-        let link = alice.node.invite(Target::Group(chat.0.clone()), None, None).unwrap();
-        member.node.join(&Invite::parse(&link).unwrap(), Some(bob.clone())).await.unwrap();
-        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+impl Session {
+    /// Waits until a member's identity checks out, or not.
+    async fn checked(&self, gid: &Bytes, name: &str, valid: bool) -> lmk_node::Member {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let members = self.node.members(&gid.0).unwrap();
+                if let Some(member) = members.into_iter().find(|m| m.name == name && m.identity.as_ref().is_some_and(|c| c.error.is_none() == valid)) {
+                    return member;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("the check came out as expected")
     }
-    // Her copy is fresh for 10 minutes, so she learns of the removal only from the laptop, which shows her the list.
-    laptop.node.remove_device(&bob, &tablet.node.device().public()).await.unwrap();
-    let left = alice.until(|e| match e {
-        Event::Left { member, .. } => Some(member),
-        _ => None,
-    }).await;
-    assert_eq!(left.device.0, tablet.node.device().public());
+}
+
+/// Has the devices kind take a device's events first, as a client does.
+fn routed(session: &mut Session, devices: Devices<MemoryProvider>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = std::mem::replace(&mut session.events, rx);
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let Some(event) = devices.on(event) {
+                tx.send(event).ok();
+            }
+        }
+    });
+}
+
+/// Waits until a device has its identity's state.
+async fn identified(devices: &Devices<MemoryProvider>) {
+    tokio::time::timeout(WAIT, async {
+        while devices.identities().is_empty() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the identity's state came");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_device_that_stopped_before_it_was_saved_is_still_on_its_identity() {
+async fn devices_share_an_identity_and_certify_their_sessions_with_its_key() {
+    let relay = relay().await;
+    let dir = folder("identity");
+    let (membership, _service) = signing_service(&relay, &dir).await;
+    let alice = session(&relay, "Alice").await;
+    let (mut laptop, laptop_devices) = device(&relay, "laptop").await;
+    let (mut tablet, tablet_devices) = device(&relay, "tablet").await;
+    routed(&mut laptop, laptop_devices.clone());
+    routed(&mut tablet, tablet_devices.clone());
+    let bob = laptop_devices.create("Bob", membership.clone()).await.unwrap();
+    laptop_devices.set_contact(&[9; 32], lmk_core::contacts::Contact { name: "Carol".into(), how: lmk_core::contacts::How::Verified, by: None, at: 1 }).await.unwrap();
+
+    // A device link: the tablet gets the identity's state, its key and contacts among it.
+    let link = lmk_proto::links::Invite::parse(&laptop_devices.invite(&bob.id.0).unwrap()).unwrap();
+    tablet_devices.join(&link).await.unwrap();
+    identified(&tablet_devices).await;
+    assert_eq!(tablet_devices.identities(), [(bob.clone(), "Bob".to_owned())]);
+    assert_eq!(tablet_devices.contacts()[0].1.name, "Carol");
+    let names: Vec<String> = laptop_devices.devices(&bob.id.0).unwrap().into_iter().map(|(_, name)| name).collect();
+    assert_eq!(names.len(), 2);
+
+    // Each certifies itself; alice opens a chat to Bob, which the tablet joins without an invite, and invites the laptop.
+    for (session, devices, name) in [(&laptop, &laptop_devices, "laptop"), (&tablet, &tablet_devices, "tablet")] {
+        let certificate = devices.certify(&bob.id.0, session.node.key(), name.into()).await.unwrap();
+        session.node.set_certificate(certificate).unwrap();
+    }
+    let chat = alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &dir) }, None).unwrap();
+    alice.node.change_settings(&chat.0, |mut s| {
+        s.open.push(Named { id: bob.id.clone(), name: "Bob".into() });
+        s
+    }).await.unwrap();
+    let opening = alice.node.opening(&chat.0).unwrap();
+    tablet_devices.set_opening(&bob.id.0, opening.clone()).await.unwrap();
+    tokio::time::timeout(WAIT, async {
+        while laptop_devices.openings().is_empty() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }).await.expect("an opening reaches every device");
+    tablet.node.join_open(&opening, bob.clone()).await.unwrap();
+    let link = alice.node.invite(&chat.0, None, None).unwrap();
+    laptop.node.join(&link, Some(bob.clone())).await.unwrap();
+    let seen = alice.checked(&chat, "tablet", true).await;
+    assert_eq!((seen.device_name.as_str(), seen.identity.unwrap().added_by_device.as_deref()), ("tablet", Some("laptop")));
+    alice.checked(&chat, "laptop", true).await;
+
+    // The laptop takes the tablet off Bob: the key is replaced, which alice learns from the laptop, so the tablet's
+    // certificate no longer checks out, and the laptop's renewed one does.
+    laptop_devices.remove(&bob.id.0, &tablet.node.key().0).await.unwrap();
+    tokio::time::timeout(WAIT, async {
+        while !tablet_devices.identities().is_empty() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }).await.expect("the tablet is off the identity");
+    let keys = tokio::time::timeout(WAIT, async {
+        loop {
+            let log = laptop.node.read_key_log(&bob).await.unwrap();
+            if log.keys.len() == 2 {
+                return log;
+            }
+        }
+    }).await.unwrap();
+    assert_eq!(laptop_devices.keys(), [(bob.id.clone(), Bytes(keys.current().to_vec()))]);
+    let certificate = laptop_devices.certify(&bob.id.0, laptop.node.key(), "laptop".into()).await.unwrap();
+    laptop.node.set_certificate(certificate).unwrap();
+    let tablet_seen = alice.checked(&chat, "tablet", false).await;
+    assert_eq!(tablet_seen.identity.unwrap().error.as_deref(), Some("its certificate is not by its identity's current key"));
+    alice.checked(&chat, "laptop", true).await;
+
+    // Alice serves the laptop's renewed session, and the tablet's nothing more.
+    let (id, delivery) = alice.node.send(&chat.0, &message("after the key changed"), true).await.unwrap();
+    assert_eq!(delivery.held.iter().map(|m| m.device_name.as_str()).collect::<Vec<_>>(), ["laptop"]);
+    let got = laptop.until(|e| match e {
+        Event::Message(message) if message.group == chat => Some(message.id),
+        _ => None,
+    }).await;
+    assert_eq!(got, id);
+    assert!(tablet.node.message(&id.0).unwrap().is_none(), "the tablet's session is not served");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_keeps_its_identities_across_restarts() {
     use lmk_core::provider::SqliteProvider;
     let relay = relay().await;
-    let dir = folder("unsaved");
+    let dir = folder("restart");
     std::fs::create_dir_all(&dir).unwrap();
     let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
-    let config = || Config {
-        name: "laptop".into(),
-        device_key: true,
-        relay: relay.url.clone(),
-        ca: CaTlsConfig::custom_roots([relay.cert.clone()]),
-        home: None,
-        files: None,
-        disk: None,
-        file_limit: 100 << 20,
-        window: Window::default(),
-        kinds: vec![CHAT.into()],
+    let device = Device::new("laptop");
+    let start = || async {
+        let (node, _events) =
+            Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), config(&relay, "laptop", Some(device.clone()), &[CHAT, DEVICES])).await.unwrap();
+        (node.clone(), Devices::new(node, device.clone()))
     };
-    let saved = Device::new("laptop");
-    let (node, _events) = Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), saved.clone(), config()).await.unwrap();
-    let bob = node.identity_create("Bob", membership).await.unwrap();
+    let (node, devices) = start().await;
+    let bob = devices.create("Bob", membership).await.unwrap();
     node.shutdown().await.unwrap();
-    drop(node);
-    let (node, _events) = Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), saved, config()).await.unwrap();
-    assert_eq!(node.device().identities, std::slice::from_ref(&bob));
-    assert_eq!(node.identities(), [(bob, "Bob".to_owned())]);
+    drop((node, devices));
+    let (node, devices) = start().await;
+    assert_eq!(devices.identities(), [(bob, "Bob".to_owned())]);
     node.shutdown().await.unwrap();
 }
 
@@ -438,29 +486,17 @@ async fn a_member_catching_up_takes_more_than_a_thousand_messages_of_one_sender(
     let relay = relay().await;
     let dir = folder("thousand");
     std::fs::create_dir_all(&dir).unwrap();
-    let carol_config = || Config {
-        name: "Carol".into(),
-        device_key: false,
-        relay: relay.url.clone(),
-        ca: CaTlsConfig::custom_roots([relay.cert.clone()]),
-        home: None,
-        files: None,
-        disk: None,
-        file_limit: 100 << 20,
-        window: Window::default(),
-        kinds: vec![CHAT.into()],
-    };
-    let carol_device = Device::new("Carol's laptop");
+    let carol_config = || config(&relay, "Carol", None, &[CHAT]);
     let carol_db = dir.join("carol.db");
     let mut alice = session(&relay, "Alice").await;
     let mut bob = session(&relay, "Bob").await;
-    let (carol, _events) = Node::start(SqliteProvider::open(&carol_db).unwrap(), carol_device.clone(), carol_config()).await.unwrap();
+    let (carol, _events) = Node::start(SqliteProvider::open(&carol_db).unwrap(), carol_config()).await.unwrap();
     let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
-    let link = alice.node.invite(Target::Group(gid.0.clone()), None, None).unwrap();
-    bob.node.join(&Invite::parse(&link).unwrap(), None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None, None).unwrap();
+    bob.node.join(&link, None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    let link = alice.node.invite(Target::Group(gid.0.clone()), None, None).unwrap();
-    carol.join(&Invite::parse(&link).unwrap(), None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None, None).unwrap();
+    carol.join(&link, None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     bob.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     carol.shutdown().await.unwrap();
@@ -473,7 +509,7 @@ async fn a_member_catching_up_takes_more_than_a_thousand_messages_of_one_sender(
     }
     alice.node.shutdown().await.unwrap();
     drop(alice);
-    let (carol, mut events) = Node::start(SqliteProvider::open(&carol_db).unwrap(), carol_device, carol_config()).await.unwrap();
+    let (carol, mut events) = Node::start(SqliteProvider::open(&carol_db).unwrap(), carol_config()).await.unwrap();
     let mut taken = 0;
     let all = async {
         while taken < MESSAGES {

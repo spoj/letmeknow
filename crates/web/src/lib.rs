@@ -14,13 +14,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow};
 use js_sys::{Array, Function, Promise, Uint8Array};
 use lmk_node::lmk_core::contacts::{self, Contact};
+use lmk_node::devices::{Devices, renewal_due};
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::group::Window;
-use lmk_node::lmk_core::invite::Target;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
 use lmk_node::{Claim, Disk, Event, Member, Node, now};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, How, IdentityRef, Named, PROTOCOL, Reason, Service, Settings};
+use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, DEVICES, How, IdentityRef, Named, PROTOCOL, Reason, Service, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::{Duration, sleep};
@@ -41,6 +41,8 @@ const DOC: &str = "doc";
 const GIT: &str = "git";
 /// How often the files no group links any longer are deleted.
 const COLLECT: Duration = Duration::from_secs(60 * 60);
+/// How often the session checks that its certificates are by its identities' current keys and last another half day.
+const RENEW_CHECK: Duration = Duration::from_secs(10);
 
 type R<T> = Result<T, JsError>;
 
@@ -228,6 +230,9 @@ struct Known {
 
 struct App {
     node: Node<Store>,
+    /// The browser's device, whose key is its session's too, and the devices kind on its node.
+    device: Device,
+    devices: Devices<Store>,
     store: Store,
     membership: Service,
     /// A digest of each record as last persisted.
@@ -287,13 +292,14 @@ impl App {
         if store.get(b"web/name")?.is_none() {
             put(&store, b"web/name", &config.name)?;
         }
-        let device = get(&store, b"web/device")?.unwrap_or_else(|| Device::new(&config.device));
+        let device: Device = get(&store, b"web/device")?.unwrap_or_else(|| Device::new(&config.device));
+        put(&store, b"web/device", &device)?;
         let hashes = kept.iter().map(|hash| hex::decode(hash)?.try_into().map_err(|_| anyhow!("a hash is 32 bytes"))).collect::<Result<_>>()?;
         let (io, mut io_rx) = mpsc::unbounded_channel();
         let kept = Arc::new(Kept { hashes: Mutex::new(hashes), io });
         let node_config = lmk_node::Config {
             name: get(&store, b"web/name")?.context("no name")?,
-            device_key: true,
+            device: Some(device.clone()),
             relay: config.relay.parse()?,
             ca: Default::default(),
             home: None,
@@ -301,15 +307,16 @@ impl App {
             disk: Some(kept.clone()),
             file_limit: FILE_LIMIT,
             window: Window::default(),
-            kinds: vec![CHAT.into(), DOC.into(), GIT.into()],
+            kinds: vec![CHAT.into(), DOC.into(), GIT.into(), DEVICES.into()],
         };
-        let (node, mut events) = Node::start(store.clone(), device, node_config).await?;
+        let (node, mut events) = Node::start(store.clone(), node_config).await?;
+        let devices = Devices::new(node.clone(), device.clone());
         let membership = service(&config.membership)?;
         let (tried, failed, snapshots, asked, handed) = Default::default();
         let docs = RefCell::new(lmk_kind_doc::Page::new(PageStore(store.clone())));
         let git = RefCell::new(lmk_kind_git::Page::new(PageStore(store.clone())));
         let shadow = RefCell::new(shadow);
-        let app = Rc::new(App { node, store, membership, shadow, idb, kept, on_event, tried, failed, docs, git, handed, snapshots, asked });
+        let app = Rc::new(App { node, device, devices, store, membership, shadow, idb, kept, on_event, tried, failed, docs, git, handed, snapshots, asked });
         for gid in app.node.groups() {
             app.open_kind(&gid.0, None)?;
         }
@@ -330,7 +337,9 @@ impl App {
         let events_app = app.clone();
         spawn_local(async move {
             while let Some(event) = events.recv().await {
-                if let Err(e) = events_app.on(event).await {
+                if let Some(event) = events_app.devices.on(event)
+                    && let Err(e) = events_app.on(event).await
+                {
                     events_app.emit(json!({ "type": "warning", "text": format!("{e:#}") }));
                 }
                 events_app.flush();
@@ -345,6 +354,14 @@ impl App {
                 sleep(Duration::from_secs(1)).await;
             }
         });
+        let renewing = Rc::downgrade(&app);
+        spawn_local(async move {
+            while let Some(app) = renewing.upgrade() {
+                app.renew().await;
+                drop(app);
+                sleep(RENEW_CHECK).await;
+            }
+        });
         let collecting = Rc::downgrade(&app);
         spawn_local(async move {
             while let Some(app) = collecting.upgrade() {
@@ -356,10 +373,40 @@ impl App {
         Ok(app)
     }
 
+    /// Renews this session's certificate of each identity it speaks as that is due, and shows it its peers.
+    async fn renew(&self) {
+        let keys = self.devices.keys();
+        for identity in self.node.spoken() {
+            let current = keys.iter().find(|(id, _)| *id == identity.id).map(|(_, key)| key);
+            if renewal_due(self.node.certificate(&identity.id.0).as_ref(), current)
+                && let Err(e) = self.certify(&identity).await
+            {
+                error(&format!("renewing this session's certificate: {e:#}"));
+            }
+        }
+    }
+
+    async fn certify(&self, identity: &IdentityRef) -> Result<()> {
+        let name: String = get(&self.store, b"web/name")?.unwrap_or_default();
+        let certificate = self.devices.certify(&identity.id.0, self.node.key(), name).await?;
+        self.node.set_certificate(certificate)
+    }
+
+    /// The identity a new membership speaks as, the browser's first, with this session's certificate of it.
+    async fn speaking_as(&self) -> Result<Option<IdentityRef>> {
+        let identity = self.devices.identities().into_iter().next().map(|(identity, _)| identity);
+        if let Some(identity) = &identity
+            && self.node.certificate(&identity.id.0).is_none()
+        {
+            self.certify(identity).await?;
+        }
+        Ok(identity)
+    }
+
     /// Joins, once each, the groups open to this browser's identities; one that fails waits for a click.
     fn join_openings(self: &Rc<Self>) {
         let joined = self.node.groups();
-        for opening in self.node.openings() {
+        for opening in self.devices.openings() {
             if joined.contains(&opening.group) || !self.tried.borrow_mut().insert(opening.group.clone()) {
                 continue;
             }
@@ -388,7 +435,6 @@ impl App {
 
     /// Hands the records that changed since the last flush to the page.
     fn flush(&self) {
-        put(&self.store, b"web/device", &self.node.device()).unwrap();
         let values = self.store.0.storage.values.read().unwrap();
         let mut shadow = self.shadow.borrow_mut();
         let puts = Array::new();
@@ -507,6 +553,12 @@ impl App {
     }
 
     async fn on(self: &Rc<Self>, event: Event) -> Result<()> {
+        if let Event::Joined { group, .. } | Event::Left { group, .. } = &event
+            && let Some(identity) = self.devices.identity(&group.0)
+        {
+            self.emit(json!({ "type": "devices", "identity": identity.id }));
+            return Ok(());
+        }
         match event {
             Event::Joined { group, member, by, how, label } => {
                 let known = self.known(&group.0)?;
@@ -622,9 +674,9 @@ impl App {
         let Some(claim) = member.identity.clone().filter(|claim| claim.error.is_none()) else { return Ok(()) };
         if let Some(label) = &label {
             let contact = Contact { name: label.clone(), how: contacts::How::Verified, by: None, at: now() };
-            self.node.set_contact(&claim.identity.id.0, &contact).await?;
+            self.devices.set_contact(&claim.identity.id.0, contact).await?;
         }
-        let contact = self.node.contacts()?.into_iter().find(|(id, _)| *id == claim.identity.id);
+        let contact = self.devices.contacts().into_iter().find(|(id, _)| *id == claim.identity.id);
         let name = label.or(contact.map(|(_, c)| c.name)).unwrap_or(claim.name);
         let introduce = Control::Introduce { identity: claim.identity, name, how, to: Vec::new() };
         self.node.send(gid, &serde_json::to_value(introduce)?, false).await?;
@@ -634,9 +686,9 @@ impl App {
     /// Records, in the devices group of each of this device's identities the group is open to, the group's opening.
     async fn refresh_opening(&self, gid: &[u8]) -> Result<()> {
         let Ok(settings) = self.node.settings(gid) else { return Ok(()) };
-        for (identity, _) in self.node.identities() {
+        for (identity, _) in self.devices.identities() {
             if settings.open.iter().any(|named| named.id == identity.id) {
-                self.node.set_opening(&identity.id.0, self.node.opening(gid)?).await?;
+                self.devices.set_opening(&identity.id.0, self.node.opening(gid)?).await?;
             }
         }
         Ok(())
@@ -649,8 +701,8 @@ impl App {
     fn known(&self, gid: &[u8]) -> Result<Known> {
         Ok(Known {
             me: self.node.key(),
-            identities: self.node.identities(),
-            contacts: self.node.contacts()?,
+            identities: self.devices.identities(),
+            contacts: self.devices.contacts(),
             introductions: get(&self.store, b"web/introductions")?.unwrap_or_default(),
             members: self.node.members(gid).unwrap_or_default(),
         })
@@ -713,20 +765,23 @@ impl App {
 
     fn own_identity(&self, id: &str) -> Result<IdentityRef> {
         let id = unb64(id)?;
-        let identities = self.node.identities();
+        let identities = self.devices.identities();
         Ok(identities.into_iter().find(|(identity, _)| identity.id.0 == id).context("this browser is on no such identity")?.0)
     }
 
     fn groups(&self) -> Result<Value> {
         let mut groups = Vec::new();
         for gid in self.node.groups() {
-            let known = self.known(&gid.0)?;
             let settings = self.node.settings(&gid.0)?;
+            if settings.kind == DEVICES {
+                continue;
+            }
+            let known = self.known(&gid.0)?;
             let members: Vec<Value> = known.members.iter().map(|m| self.describe(&known, m)).collect();
             groups.push(json!({ "group": gid, "settings": settings, "members": members, "joined": true }));
         }
         let joined = self.node.groups();
-        for opening in self.node.openings() {
+        for opening in self.devices.openings() {
             if !joined.contains(&opening.group) && !groups.iter().any(|g| g["group"] == json!(opening.group)) {
                 let failed = self.failed.borrow().contains(&opening.group);
                 groups.push(json!({ "group": opening.group, "settings": { "kind": opening.kind, "name": opening.name }, "joined": false, "failed": failed }));
@@ -817,18 +872,18 @@ impl App {
     async fn join(self: &Rc<Self>, link: &str) -> Result<Value> {
         let invite = Invite::parse(link.trim())?;
         if invite.device {
-            self.node.join(&invite, None).await?;
+            self.devices.join(&invite).await?;
             return Ok(json!({ "device": true }));
         }
-        let identity = self.node.identities().into_iter().next().map(|(identity, _)| identity);
+        let identity = self.speaking_as().await?;
         let gid = self.node.join(&invite, identity).await?;
         self.joined(&gid.0, "join")?;
         Ok(json!({ "group": gid }))
     }
 
     async fn join_open(self: &Rc<Self>, gid: &[u8]) -> Result<Value> {
-        let opening = self.node.openings().into_iter().find(|o| o.group.0 == gid).context("no such open group")?;
-        let identity = self.node.identities().into_iter().next().context("this browser is on no identity")?.0;
+        let opening = self.devices.openings().into_iter().find(|o| o.group.0 == gid).context("no such open group")?;
+        let identity = self.speaking_as().await?.context("this browser is on no identity")?;
         let gid = self.node.join_open(&opening, identity).await?;
         self.joined(&gid.0, "join")?;
         Ok(json!({ "group": gid }))
@@ -840,16 +895,17 @@ impl App {
         self.open_kind(gid, Some(command))
     }
 
-    async fn devices(&self, id: &str) -> Result<Value> {
+    fn devices(&self, id: &str) -> Result<Value> {
         let identity = self.own_identity(id)?;
-        let list = self.node.device_list(&identity).await?;
-        let me = self.node.device().public();
-        let devices: Vec<Value> = list.devices.iter().map(|d| json!({ "key": d.key, "name": d.name, "you": d.key.0 == me })).collect();
-        Ok(json!({ "id": identity.id, "name": list.name, "devices": devices }))
+        let name = self.devices.identities().into_iter().find(|(i, _)| *i == identity).map(|(_, name)| name);
+        let me = self.device.public();
+        let devices = self.devices.devices(&identity.id.0)?;
+        let devices: Vec<Value> = devices.iter().map(|(key, name)| json!({ "key": key, "name": name, "you": key.0 == me })).collect();
+        Ok(json!({ "id": identity.id, "name": name, "devices": devices }))
     }
 
     fn contacts(&self) -> Result<Value> {
-        let contacts = self.node.contacts()?;
+        let contacts = self.devices.contacts();
         let introductions: HashMap<String, Introduction> = get(&self.store, b"web/introductions")?.unwrap_or_default();
         let listed: Vec<Value> = contacts
             .iter()
@@ -866,7 +922,7 @@ impl App {
         let mut introductions: HashMap<String, Introduction> = get(&self.store, b"web/introductions")?.unwrap_or_default();
         let introduction = introductions.remove(id).context("no introduction of that identity")?;
         let contact = Contact { name: name.unwrap_or(introduction.name), how: contacts::How::Introduced, by: Some(introduction.by_id), at: now() };
-        self.node.set_contact(&unb64(id)?, &contact).await?;
+        self.devices.set_contact(&unb64(id)?, contact).await?;
         put(&self.store, b"web/introductions", &introductions)
     }
 
@@ -903,9 +959,9 @@ impl Lmk {
     /// This browser: `{"key", "fp", "name", "device": {"key", "name"}, "identities": [{"id", "name"}]}`.
     pub fn me(&self) -> R<String> {
         let app = &self.app;
-        let device = app.node.device();
+        let device = &app.device;
         let name: String = get(&app.store, b"web/name").map_err(js)?.unwrap_or_default();
-        let identities: Vec<Value> = app.node.identities().into_iter().map(|(i, name)| json!({ "id": i.id, "name": name })).collect();
+        let identities: Vec<Value> = app.devices.identities().into_iter().map(|(i, name)| json!({ "id": i.id, "name": name })).collect();
         let key = app.node.key();
         Ok(json!({ "key": key, "fp": fp(&key.0), "name": name, "device": { "key": Bytes(device.public().to_vec()), "name": device.name }, "identities": identities }).to_string())
     }
@@ -943,11 +999,9 @@ impl Lmk {
             open: Vec::new(),
             keep: 90,
             membership: app.membership.clone(),
-            devices_of: None,
-            openings: Vec::new(),
             log: None,
         };
-        let identity = app.node.identities().into_iter().next().map(|(identity, _)| identity);
+        let identity = app.devices.identities().into_iter().next().map(|(identity, _)| identity);
         let gid = app.node.create(settings, identity).map_err(js)?;
         app.joined(&gid.0, "invite").map_err(js)?;
         app.flush();
@@ -957,13 +1011,13 @@ impl Lmk {
     /// An invite link into a group, labelled with whom it is for.
     pub fn invite(&self, gid: &str, label: Option<String>) -> R<String> {
         let gid = unb64(gid).map_err(js)?;
-        self.app.node.invite(Target::Group(gid), label.filter(|l| !l.is_empty()), None).map_err(js)
+        Ok(self.app.node.invite(&gid, label.filter(|l| !l.is_empty()), None).map_err(js)?.link())
     }
 
     /// A device link: whoever opens it becomes a device of this identity.
     pub fn invite_device(&self, id: &str) -> R<String> {
         let identity = self.app.own_identity(id).map_err(js)?;
-        self.app.node.invite(Target::Device(identity.id.0), None, None).map_err(js)
+        self.app.devices.invite(&identity.id.0).map_err(js)
     }
 
     /// Joins through an invite link: `{"group"}`, or `{"device": true}` for a device link.
@@ -1063,19 +1117,20 @@ impl Lmk {
 
     /// Starts an identity with this browser its first device.
     pub async fn identity_create(&self, name: String) -> R<String> {
-        let identity = self.app.node.identity_create(&name, self.app.membership.clone()).await.map_err(js)?;
+        let identity = self.app.devices.create(&name, self.app.membership.clone()).await.map_err(js)?;
         self.app.flush();
         Ok(b64(&identity.id.0))
     }
 
-    /// An identity's device list: `{"id", "name", "devices": [{"key", "name", "you"}]}`.
-    pub async fn devices(&self, id: String) -> R<String> {
-        Ok(self.app.devices(&id).await.map_err(js)?.to_string())
+    /// An identity's devices: `{"id", "name", "devices": [{"key", "name", "you"}]}`.
+    pub fn devices(&self, id: String) -> R<String> {
+        Ok(self.app.devices(&id).map_err(js)?.to_string())
     }
 
+    /// Takes a device off an identity, and replaces the identity's key.
     pub async fn remove_device(&self, id: String, device: String) -> R<()> {
         let identity = self.app.own_identity(&id).map_err(js)?;
-        self.app.node.remove_device(&identity, &unb64(&device).map_err(js)?).await.map_err(js)?;
+        self.app.devices.remove(&identity.id.0, &unb64(&device).map_err(js)?).await.map_err(js)?;
         self.app.flush();
         Ok(())
     }

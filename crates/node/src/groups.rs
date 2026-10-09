@@ -6,12 +6,12 @@ use anyhow::{Context, Result, ensure};
 use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
 use lmk_core::group::{self as core, Change, Removed, Unheld, key_package_credential, key_package_leaf};
-use lmk_core::identity::{Verdict, check};
-use lmk_core::invite::Target;
+use lmk_core::identity::{certified, check};
 use lmk_core::provider::Provider;
 use lmk_net::{Admit, Groups, Taken};
-use lmk_proto::group::{CHAT, ContactsUpdate, Control, How, Reason, Refusal, Service, type_of};
+use lmk_proto::group::{CHAT, Control, Credential, How, Reason, Refusal, Service, type_of};
 use lmk_proto::head::Head;
+use lmk_proto::identity::Envelope;
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::{Admitted, Hello, InviteRequest};
 use lmk_proto::{Answer, Bytes};
@@ -22,8 +22,8 @@ use tokio::sync::oneshot;
 
 use crate::logs::empty;
 use crate::{
-    Event, Inner, Item, MAX_MESSAGE, Message, SNAPSHOT_WAIT, State, Work, ciphertext_key, contacts_key, endpoint_id,
-    get, message_key, now, put, yjs,
+    Event, Inner, Item, MAX_MESSAGE, Message, SNAPSHOT_WAIT, State, Work, ciphertext_key, endpoint_id, get, message_key,
+    now, put,
 };
 
 impl<P: Provider + Send + 'static> Inner<P> {
@@ -132,8 +132,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     }
                 }
             }
-        } else if st.devices(gid) {
-            self.contacts(st, gid, &sender, serde_json::from_value(payload)?)?;
         } else if opened.held {
             let message = Message { id: Bytes(id.to_vec()), group, epoch, at: now(), sender, payload };
             hold(st, gid, message.clone(), ciphertext)?;
@@ -150,58 +148,47 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let (secret, key_package, now) = (request.secret.0, request.key_package.0, now());
         let (joiner, bound) = {
             let st = self.state.lock().unwrap();
-            let (joiner, _) = key_package_credential(&st.provider, &key_package)?;
-            (joiner, st.invites.bound(&secret, now).is_some())
+            (key_package_credential(&st.provider, &key_package)?, st.invites.bound(&secret, now).is_some())
         };
-        let list = match (bound, &joiner.identity) {
-            (true, Some(identity)) => self.list(identity).await.ok(),
+        let log = match (bound, &joiner.identity) {
+            (true, Some(identity)) => self.read_keys(identity).await.ok(),
             _ => None,
         };
         let redeemed = {
             let mut st = self.state.lock().unwrap();
             let st = &mut *st;
-            st.invites.redeem(&st.provider, &secret, &key_package, list.as_ref(), now)?
+            st.invites.redeem(&st.provider, &secret, &key_package, request.certificate.as_ref(), log.as_ref(), now)?
         };
-        match redeemed.target {
-            Target::Group(gid) => self.admit(&gid, key_package, How::Invite, redeemed.label).await,
-            Target::Device(id) => {
-                let identity = {
-                    let st = self.state.lock().unwrap();
-                    st.device.identities.iter().find(|identity| identity.id.0 == id).cloned()
-                };
-                let identity = identity.context("this device left the identity")?;
-                let list = self.list(&identity).await?;
-                let entry = list.add(
-                    &self.state.lock().unwrap().device,
-                    &redeemed.joiner.device.0,
-                    &redeemed.joiner.device_name,
-                );
-                self.clients.client(&identity.membership)?.append(&lmk_proto::identity::address(&id), &entry).await?;
-                self.list(&identity).await?;
-                let gid = self.state.lock().unwrap().devices_group(&id).context("no devices group")?;
-                self.admit(&gid, key_package, How::Invite, None).await
-            }
+        if let Some(certificate) = request.certificate {
+            self.certified(&joiner, certificate);
         }
+        self.admit(&redeemed.group, key_package, How::Invite, redeemed.label).await
     }
 
     /// Answers a request to join a group open to the joiner's identity.
-    async fn open_join(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>) -> Result<Admitted> {
-        let (joiner, key, open) = {
+    async fn open_join(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, certificate: Envelope) -> Result<Admitted> {
+        let (joiner, open) = {
             let st = self.state.lock().unwrap();
-            let (joiner, key) = key_package_credential(&st.provider, &key_package)?;
-            (joiner, key, st.group(gid)?.mls.settings().open)
+            (key_package_credential(&st.provider, &key_package)?, st.group(gid)?.mls.settings().open)
         };
         let identity = joiner.identity.clone().filter(|identity| open.iter().any(|named| named.id == identity.id));
         let identity = identity.context("it speaks as no identity the group is open to")?;
-        let list = self.list(&identity).await?;
-        ensure!(
-            check(&joiner, &key, Some(&list)) == Verdict::Verified,
-            "its device is not on its identity's device list"
-        );
+        let log = self.read_keys(&identity).await?;
+        if let Err(error) = check(Some(&certificate), &joiner, &log, now()) {
+            anyhow::bail!("{error}");
+        }
+        self.certified(&joiner, certificate);
         self.admit(gid, key_package, How::Open, None).await
     }
 
-    /// Commits the Add, and answers with the Welcome and the state of the group's kind, or of its contacts, as a file.
+    /// Holds a joiner's certificate.
+    fn certified(&self, joiner: &Credential, certificate: Envelope) {
+        if let Some(identity) = &joiner.identity {
+            self.state.lock().unwrap().certificates.insert((joiner.key.0.clone(), identity.id.0.clone()), certificate);
+        }
+    }
+
+    /// Commits the Add, and answers with the Welcome and the state of the group's kind, as a file.
     /// A joiner whose session does not support the group's kind is refused.
     async fn admit(
         self: &Arc<Self>,
@@ -216,8 +203,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let leaf = key_package_leaf(&st.provider, &key_package)?;
             ensure!(leaf.kinds.contains(&kind), "its session does not support {kind} groups");
             if let Some(label) = label {
-                let (_, key) = key_package_credential(&st.provider, &key_package)?;
-                st.labels.insert(key, label);
+                let joiner = key_package_credential(&st.provider, &key_package)?;
+                st.labels.insert(joiner.key.0, label);
             }
         }
         let add = Change { add: vec![key_package], how: Some(how), ..Change::default() };
@@ -226,27 +213,23 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let st = self.state.lock().unwrap();
             let g = st.group(gid)?;
             let before = g.rec.items.iter().filter(|item| item.epoch < g.mls.epoch()).map(|item| item.id.clone()).collect();
-            let state = match (st.devices(gid), g.mls.settings().kind == CHAT) {
-                (true, _) => Ok(st.contacts_state(gid)?),
-                (false, true) => Err(None),
-                (false, false) => {
-                    let (reply, state) = oneshot::channel();
-                    self.events.send(Event::Snapshot { group: Bytes(gid.to_vec()), reply }).ok();
-                    Err(Some(state))
-                }
-            };
+            let state = (g.mls.settings().kind != CHAT).then(|| {
+                let (reply, state) = oneshot::channel();
+                self.events.send(Event::Snapshot { group: Bytes(gid.to_vec()), reply }).ok();
+                state
+            });
             (state, before)
         };
         let state = match state {
-            Ok(state) => Some(state),
-            Err(None) => None,
-            Err(Some(asked)) => timeout(SNAPSHOT_WAIT, asked).await.ok().and_then(Result::ok).flatten(),
+            Some(asked) => timeout(SNAPSHOT_WAIT, asked).await.ok().and_then(Result::ok).flatten(),
+            None => None,
         };
         let doc = match state {
             Some(state) => Some(self.state_file(gid, state).await?),
             None => None,
         };
-        Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc, before })
+        let certificates = lmk_net::Groups::certificates(&**self, &[gid.to_vec()]);
+        Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc, before, certificates })
     }
 
     fn answer(&self, group: Option<&[u8]>, admitted: Result<Admitted>) -> Answer<Admitted> {
@@ -265,11 +248,12 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         self.state.lock().unwrap().groups.keys().cloned().collect()
     }
 
+    fn in_leaf(&self, group: &[u8], peer: &EndpointId) -> bool {
+        self.state.lock().unwrap().in_leaf(group, peer).is_some()
+    }
+
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
-        let st = self.state.lock().unwrap();
-        st.groups.get(group).is_some_and(|g| {
-            g.mls.members().iter().any(|m| m.leaf.as_ref().is_some_and(|leaf| leaf.key.0 == peer.as_bytes()))
-        })
+        self.state.lock().unwrap().serves(group, peer)
     }
 
     fn hello(&self, group: &[u8]) -> Hello {
@@ -374,6 +358,51 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         };
         g.rec.held(g.mls.settings().keep)
     }
+
+    fn certificates(&self, groups: &[Vec<u8>]) -> Vec<Envelope> {
+        let st = self.state.lock().unwrap();
+        let mut certificates: Vec<Envelope> = Vec::new();
+        for member in groups.iter().filter_map(|gid| st.groups.get(gid)).flat_map(|g| g.mls.members()) {
+            let Some(credential) = &member.credential else { continue };
+            let Some(identity) = &credential.identity else { continue };
+            if let Some(certificate) = st.certificate(credential, &identity.id.0)
+                && !certificates.contains(certificate)
+            {
+                certificates.push(certificate.clone());
+            }
+        }
+        certificates
+    }
+
+    fn certificate(&self, peer: EndpointId, certificate: Envelope) {
+        let mut st = self.state.lock().unwrap();
+        let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
+        let served = |st: &State<P>| gids.iter().filter(|gid| st.serves(gid, &peer)).cloned().collect::<Vec<_>>();
+        let before = served(&st);
+        take_certificate(&mut st, certificate);
+        for gid in served(&st).into_iter().filter(|gid| !before.contains(gid)) {
+            self.net().changed(&gid);
+        }
+    }
+}
+
+/// Holds a certificate a peer showed, even of a session not yet a member here, as one whose Add is still on its way.
+/// A valid certificate beats one that is not, and else the later one wins.
+pub(crate) fn take_certificate<P: Provider>(st: &mut State<P>, certificate: Envelope) {
+    let Some(certified) = certified(&certificate) else { return };
+    let members = st.groups.values().flat_map(|g| g.mls.members());
+    let credential = members.filter_map(|m| m.credential).find(|c| c.key == certified.key && c.identity.as_ref().is_some_and(|i| i.id == certified.identity));
+    let log = st.keys.get(&certified.identity.0);
+    let valid = |c: &Envelope| matches!((&credential, log), (Some(credential), Some(log)) if check(Some(c), credential, log, now()).is_ok());
+    let key = (certified.key.0.clone(), certified.identity.0.clone());
+    let newer = st.certificates.get(&key).is_none_or(|held| match (valid(&certificate), valid(held)) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => certified.expires > lmk_core::identity::certified(held).map_or(0, |held| held.expires),
+    });
+    if newer {
+        st.certificates.insert(key, certificate);
+    }
 }
 
 /// Stores a held message and its ciphertext.
@@ -383,28 +412,6 @@ fn hold<P: Provider>(st: &mut State<P>, gid: &[u8], message: Message, ciphertext
     st.provider.put(&ciphertext_key(&id), ciphertext)?;
     put(&st.provider, &message_key(&id), &message)?;
     st.save(gid)
-}
-
-impl<P: Provider + Send + 'static> Inner<P> {
-    /// A live payload of a devices group's contacts, which are synced as a doc's text is: a member whose snapshot
-    /// differs gets this session's state vector, and answers it with a diff of what this session lacks.
-    fn contacts(&self, st: &mut State<P>, gid: &[u8], sender: &crate::Member, update: ContactsUpdate) -> Result<()> {
-        let state = st.contacts_state(gid)?;
-        let peer = || crate::endpoint_id(&sender.iroh.0).context("a sender without an iroh key");
-        match update {
-            ContactsUpdate::Edit { update } | ContactsUpdate::Diff { update } => {
-                st.provider.put(&contacts_key(gid), &yjs::apply(&state, &update.0)?)?;
-            }
-            ContactsUpdate::Snapshot { snapshot } if snapshot.0 != yjs::snapshot(&state)? => {
-                self.send_contacts(st, gid, peer()?, ContactsUpdate::Sv { sv: Bytes(yjs::state_vector(&state)?) })?;
-            }
-            ContactsUpdate::Snapshot { .. } => {}
-            ContactsUpdate::Sv { sv } => {
-                self.send_contacts(st, gid, peer()?, ContactsUpdate::Diff { update: Bytes(yjs::diff(&state, &sv.0)?) })?;
-            }
-        }
-        Ok(())
-    }
 }
 
 pub(crate) struct Admitter<P>(pub Arc<Inner<P>>);
@@ -418,10 +425,10 @@ impl<P: Provider + Send + 'static> Admit for Admitter<P> {
         })
     }
 
-    fn join(&self, _: EndpointId, group: Vec<u8>, key_package: Vec<u8>) -> BoxFuture<Answer<Admitted>> {
+    fn join(&self, _: EndpointId, group: Vec<u8>, key_package: Vec<u8>, certificate: Envelope) -> BoxFuture<Answer<Admitted>> {
         let inner = self.0.clone();
         Box::pin(async move {
-            let admitted = inner.open_join(&group, key_package).await;
+            let admitted = inner.open_join(&group, key_package, certificate).await;
             inner.answer(Some(&group), admitted)
         })
     }

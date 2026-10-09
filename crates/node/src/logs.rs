@@ -1,5 +1,5 @@
-//! Every log this session follows, alike: a group's log of commits, its kind's log of held messages' ids, and the device
-//! lists of the identities its groups' members speak as. Each is read from its membership service, chained, held entry
+//! Every log this session follows, alike: a group's log of commits, its kind's log of held messages' ids, and the key
+//! logs of the identities its groups' members speak as. Each is read from its membership service, chained, held entry
 //! by entry, shown to peers by its newest signed head and caught up from them; what its entries mean is its log type's
 //! (`Of`), to which `Inner::check` hands them once held.
 
@@ -56,7 +56,7 @@ pub(crate) enum Of {
     Group,
     /// The log of a group's kind, which orders held messages by id.
     Kind(Bytes),
-    /// An identity's device list.
+    /// An identity's key log.
     Identity(Bytes),
 }
 
@@ -264,7 +264,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         match st.log(id)?.of.clone() {
             Of::Group => self.advance(st, id),
             Of::Kind(gid) => self.kind_advance(st, &gid.0),
-            Of::Identity(identity) => self.listed(st, &identity.0),
+            Of::Identity(identity) => self.keyed(st, &identity.0),
         }
     }
 
