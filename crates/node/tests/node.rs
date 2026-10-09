@@ -202,6 +202,11 @@ async fn any_member_admits_an_invite_once() {
     let used = erin.node.join(&link, None).await.unwrap_err();
     assert!(format!("{used:#}").contains("unknown, used or expired"), "a used secret is refused");
 
+    // A member that redeems a link is refused, and the link stays unused.
+    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let member = bob.node.join(&link, None).await.unwrap_err();
+    assert!(format!("{member:#}").contains("a member already"), "{member:#}");
+
     // An expired one too.
     let secret = [7u8; 16];
     let expired = json!({ "type": "invite", "hash": Bytes(Sha256::digest(secret).to_vec()), "expires": lmk_node::now() - 1 });
@@ -211,7 +216,6 @@ async fn any_member_admits_an_invite_once() {
     assert!(format!("{:#}", erin.node.join(&expired, None).await.unwrap_err()).contains("unknown, used or expired"));
 
     // With the inviter offline, the other member it named admits the joiner; the inviter, not it, introduces them.
-    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
     alice.node.shutdown().await.unwrap();
     drop(alice);
     let (joined, by) = erin.node.join(&link, None).await.unwrap();
@@ -286,15 +290,103 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
 
 /// A membership service like `letmeknow serve`'s, which signs its heads.
 async fn signing_service(relay: &Relay, dir: &Path) -> (Service, iroh::protocol::Router) {
+    served(relay, dir, |service| service).await
+}
+
+/// A signing membership service, served through `serve`.
+async fn served<H: iroh::protocol::ProtocolHandler>(relay: &Relay, dir: &Path, serve: impl FnOnce(Membership) -> H) -> (Service, iroh::protocol::Router) {
     let secret = iroh::SecretKey::from_bytes(&lmk_core::random());
     let relays = iroh::RelayMap::from(iroh::RelayConfig::new(relay.url.clone(), Some(Default::default())));
     let roots = CaTlsConfig::custom_roots([relay.cert.clone()]);
     let endpoint = lmk_net::builder(relays).secret_key(secret.clone()).ca_tls_config(roots).bind().await.unwrap();
     std::fs::create_dir_all(dir).unwrap();
     let store = Store::open(&dir.join("membership.db"), ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes())).unwrap();
-    let router = iroh::protocol::Router::builder(endpoint.clone()).accept(ALPN, Membership::new(store, Policy::default())).spawn();
+    let router = iroh::protocol::Router::builder(endpoint.clone()).accept(ALPN, serve(Membership::new(store, Policy::default()))).spawn();
     let service = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: relay.url.to_string(), addrs: vec![], rest: Default::default() };
     (service, router)
+}
+
+/// A membership service whose connections opened while `open` is false wait until it is true, each told by `reached`.
+#[derive(Debug)]
+struct Gated {
+    service: Membership,
+    open: tokio::sync::watch::Receiver<bool>,
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl iroh::protocol::ProtocolHandler for Gated {
+    async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
+        if !*self.open.borrow() {
+            self.reached.send(()).ok();
+        }
+        self.open.clone().wait_for(|open| *open).await.ok();
+        iroh::protocol::ProtocolHandler::accept(&self.service, connection).await
+    }
+}
+
+/// The rule a joiner comes by is checked again as the Add is built: an invite that expired, or an opening closed, while
+/// the admitter read the joiner's key log admits no one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_is_checked_again_as_the_add_is_built() {
+    use lmk_core::identity::{DAY, certify, create};
+    use lmk_proto::group::IdentityRef;
+    use lmk_proto::identity::Certified;
+    use lmk_proto::links::Invite;
+    let relay = relay().await;
+    let dir = folder("rebuild");
+    let alice = session(&relay, "Alice").await;
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    bob.node.join(&link, None).await.unwrap();
+    let alice_only = vec![link.members[0].clone()];
+    let alice_iroh = alice.node.members(&gid.0).unwrap().into_iter().find(|m| m.name == "Alice").unwrap().iroh;
+    for closed in [false, true] {
+        let (open, gate) = tokio::sync::watch::channel(true);
+        let (reached, mut reaching) = tokio::sync::mpsc::unbounded_channel();
+        let (membership, _service) = served(&relay, &dir.join(format!("{closed}")), |service| Gated { service, open: gate, reached }).await;
+        let joiner = session(&relay, "Carol").await;
+        let key = lmk_core::random();
+        let (id, first) = create(&key, "Carol", membership.clone());
+        let carol = IdentityRef { id: id.into(), membership };
+        joiner.node.append_identity(&carol, &first).await.unwrap();
+        let certified = Certified { identity: carol.id.clone(), key: joiner.node.key(), name: "Carol".into(), device: "laptop".into(), device_key: None, added_by: None, expires: lmk_node::now() + DAY };
+        joiner.node.set_certificate(certify(&key, &certified)).unwrap();
+        open.send(false).unwrap();
+        let expires = lmk_node::now() + 3000;
+        let joining = if closed {
+            alice.node.change_settings(&gid.0, |mut s| {
+                s.open.push(Named { id: carol.id.clone(), name: "Carol".into(), rest: Default::default() });
+                s
+            }).await.unwrap();
+            let opening = lmk_proto::group::Opening { members: vec![alice_iroh.clone()], ..alice.node.opening(&gid.0).unwrap() };
+            tokio::spawn(async move { joiner.node.join_open(&opening, carol).await })
+        } else {
+            let secret = [8u8; 16];
+            let rule = json!({ "type": "invite", "hash": Bytes(Sha256::digest(secret).to_vec()), "expires": expires, "to": carol.id });
+            let (_, delivery) = bob.node.send(&gid.0, &rule, true).await.unwrap();
+            assert!(delivery.held.iter().any(|m| m.name == "Alice"));
+            let link = Invite { device: false, secret, members: alice_only.clone() };
+            tokio::spawn(async move { joiner.node.join(&link, Some(carol)).await.map(|(gid, _)| gid) })
+        };
+        tokio::time::timeout(WAIT, reaching.recv()).await.unwrap();
+        if closed {
+            bob.node.change_settings(&gid.0, |s| Settings { open: vec![], ..s }).await.unwrap();
+            tokio::time::timeout(WAIT, async {
+                while !alice.node.settings(&gid.0).unwrap().open.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }).await.unwrap();
+        } else {
+            assert!(lmk_node::now() < expires, "the invite was ahead when the request came");
+            tokio::time::sleep(Duration::from_millis(expires + 200 - lmk_node::now())).await;
+        }
+        open.send(true).unwrap();
+        let refused = format!("{:#}", joining.await.unwrap().unwrap_err());
+        let reason = if closed { "no identity the group is open to" } else { "unknown, used or expired" };
+        assert!(refused.contains(reason), "{refused}");
+        assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2);
+    }
 }
 
 impl Session {
@@ -546,7 +638,8 @@ async fn a_device_taken_off_its_identity_leaves_while_its_sessions_are_offline()
     alice.node.shutdown().await.unwrap();
 }
 
-/// A session whose leaf names an older revision, as 0.12.1's does, writes its own as it starts.
+/// A session whose leaf names an older revision, as 0.12.1's does, writes its own as it starts. Meanwhile an `introduce`
+/// toward its group is live, and held once every leaf names this revision.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_updates_an_older_leaf_as_it_starts() {
     use lmk_core::group::{Change, Group, Session as Mls};
@@ -581,9 +674,15 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
     lmk_membership::folder::FolderClient::new(logs.to_str().unwrap()).append(&gid.0, &commit.commit).await.unwrap();
     drop(provider);
     revision(0).await.expect("Alice sees Bob's leaf of revision 0");
+    let introduce = json!({ "type": "introduce", "identity": { "id": "AQ", "membership": { "folder": "/x" } }, "name": "Carol", "how": "introduce" });
+    let introduced = || alice.node.messages(&gid.0).unwrap().iter().filter(|m| m.payload["type"] == "introduce").count();
+    alice.node.send(&gid.0, &introduce, false).await.unwrap();
+    assert_eq!(introduced(), 0, "toward a leaf of revision 0 an introduce is live");
 
     let bob = start().await;
     revision(lmk_proto::group::REVISION).await.expect("Bob's leaf names this revision once he starts");
+    alice.node.send(&gid.0, &introduce, false).await.unwrap();
+    assert_eq!(introduced(), 1, "an introduce is held once every leaf takes it");
     bob.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
 }

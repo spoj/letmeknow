@@ -25,7 +25,10 @@ use lmk_membership::Contradiction;
 use lmk_core::provider::Provider;
 use lmk_membership::Refused;
 use lmk_net::{Net, Network};
-use lmk_proto::group::{CHAT, Control, Credential, DEVICES, How, IdentityRef, Leaf, Opening, REVISION, Reason, Refusal, Settings, held_by_type};
+use lmk_proto::group::{
+    CHAT, Control, Credential, DEVICES, How, INTRODUCE_REVISION, IdentityRef, Leaf, Opening, RENAME_REVISION, REVISION, Reason, Refusal, Settings, held_by_type,
+    type_of,
+};
 use lmk_proto::identity::Envelope;
 use lmk_proto::links::{Address, FileLink, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Frame, Join, KindLog as LogRef};
@@ -932,13 +935,13 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 
     /// Seals a payload, sends it to the members online, and waits a while for their receipts. A held payload (always
-    /// one held by its type) members hold for the group's `keep`, and sync.
+    /// one held by its type, and an `introduce` where every leaf takes it) members hold for the group's `keep`, and sync.
     pub async fn send(&self, gid: &[u8], payload: &Value, held: bool) -> Result<(Bytes, Delivery)> {
-        let held = held || held_by_type(payload);
         let (id, ciphertext, receipts) = {
             let mut st = self.inner.state.lock().unwrap();
             let st = &mut *st;
             let g = st.groups.get_mut(gid).context("this session is not in that group")?;
+            let held = held || held_by_type(payload) || type_of(payload) == "introduce" && g.mls.revised(INTRODUCE_REVISION);
             let (id, ciphertext) = g.mls.seal(&st.provider, &st.session, payload, held)?;
             if held {
                 let epoch = g.mls.epoch();
@@ -2002,7 +2005,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 /// every member's leaf takes a rename.
 fn renaming(g: &Group, device: Option<&str>) -> Option<String> {
     let own = g.members().into_iter().find(|m| m.index == g.own_index())?.credential?;
-    let device = device.filter(|device| g.settings().kind == DEVICES && own.name != *device && g.renames())?;
+    let device = device.filter(|device| g.settings().kind == DEVICES && own.name != *device && g.revised(RENAME_REVISION))?;
     Some(device.to_owned())
 }
 

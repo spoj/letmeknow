@@ -28,6 +28,18 @@ use crate::{
 
 /// The answer to a secret no rule admits by: whether it is unknown, used or expired is not told.
 const UNKNOWN: &str = "unknown, used or expired invite";
+const NOT_OPEN: &str = "it speaks as no identity the group is open to";
+
+/// Whether `g`, as it stands, admits a joiner by the invite with this hash and expiry, or else by an opening: checked
+/// when its request comes, and each time the commit that adds it is built.
+fn admits(g: &core::Group, joiner: &Credential, invite: &Option<(Bytes, u64)>) -> Result<()> {
+    match invite {
+        Some((hash, expires)) => ensure!(now() < *expires && !g.used(&hash.0), UNKNOWN),
+        None => ensure!(joiner.identity.as_ref().is_some_and(|identity| g.settings().open.iter().any(|named| named.id == identity.id)), NOT_OPEN),
+    }
+    ensure!(g.members().iter().all(|member| member.key != joiner.key.0), "this session is a member already");
+    Ok(())
+}
 
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Takes in a ciphertext from a peer: held, waiting for a commit, or given up.
@@ -112,6 +124,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     hold(st, gid, Message { id: Bytes(id.to_vec()), group, epoch, at: now(), sender, payload }, ciphertext)?;
                 }
                 Control::Introduce { identity, name, how, to } => {
+                    if opened.held {
+                        let held = Message { id: Bytes(id.to_vec()), group: group.clone(), epoch, at: now(), sender: sender.clone(), payload };
+                        hold(st, gid, held, ciphertext)?;
+                    }
                     let me = Bytes(Sha256::digest(st.session.key())[..8].to_vec());
                     if to.is_empty() || to.contains(&me) {
                         self.events.send(Event::Introduced { group, by: sender, identity, name, how }).ok();
@@ -163,16 +179,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 let st = self.state.lock().unwrap();
                 let found = st.groups.iter().find_map(|(gid, g)| Some((gid.clone(), g.rec.invites.iter().find(|rule| rule.hash == hash)?.clone())));
                 let (gid, rule) = found.context(UNKNOWN)?;
-                ensure!(now() < rule.expires && !st.group(&gid)?.mls.used(&hash.0), UNKNOWN);
-                (gid, How::Invite, Some(hash), rule.to)
+                (gid, How::Invite, Some((hash, rule.expires)), rule.to)
             }
-            (None, Some(gid)) => {
-                let open = self.state.lock().unwrap().group(&gid.0)?.mls.settings().open;
-                let identity = joiner.identity.as_ref().filter(|identity| open.iter().any(|named| named.id == identity.id));
-                (gid.0, How::Open, None, Some(identity.context("it speaks as no identity the group is open to")?.id.clone()))
-            }
+            (None, Some(gid)) => (gid.0, How::Open, None, Some(joiner.identity.as_ref().context(NOT_OPEN)?.id.clone())),
             (None, None) => bail!("a request names an invite's secret or a group"),
         };
+        admits(&self.state.lock().unwrap().group(&gid)?.mls, &joiner, &invite)?;
         if let Some(to) = to {
             let identity = joiner.identity.clone().filter(|identity| identity.id == to).context("this invite is for another identity")?;
             let log = self.read_keys(&identity).await?;
@@ -183,7 +195,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if let Some(certificate) = certificate {
             self.certified(&joiner, certificate);
         }
-        self.admit(&gid, key_package.0, how, invite).await
+        self.admit(&gid, key_package.0, &joiner, how, invite).await
     }
 
     /// Holds a joiner's certificate.
@@ -193,27 +205,28 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Commits the Add, naming the invite the joiner came in by, which no earlier commit may have used, and answers with
-    /// the Welcome and the state of the group's kind, as a file. A joiner whose session does not support the group's kind
-    /// is refused.
-    async fn admit(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, how: How, invite: Option<Bytes>) -> Result<Admitted> {
+    /// Commits the Add, naming the invite the joiner came in by, and answers with the Welcome and the state of the group's
+    /// kind, as a file. Each build of the commit checks the joiner's rule again. A joiner whose session does not support
+    /// the group's kind is refused.
+    async fn admit(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, joiner: &Credential, how: How, invite: Option<(Bytes, u64)>) -> Result<Admitted> {
         {
             let st = self.state.lock().unwrap();
             let kind = st.group(gid)?.mls.settings().kind;
             let leaf = key_package_leaf(&st.provider, &key_package)?;
             ensure!(leaf.kinds.contains(&kind), "its session does not support {kind} groups");
         }
-        let add = Change { add: vec![key_package], how: Some(how), invite: invite.clone(), ..Change::default() };
+        let add = Change { add: vec![key_package], how: Some(how), invite: invite.as_ref().map(|(hash, _)| hash.clone()), ..Change::default() };
         let (welcome, position) = self
             .commit(gid, |g| {
-                ensure!(invite.as_ref().is_none_or(|invite| !g.used(&invite.0)), UNKNOWN);
+                admits(g, joiner, &invite)?;
                 Ok(add.clone())
             })
             .await?;
         let (state, before, logs) = {
             let st = self.state.lock().unwrap();
             let g = st.group(gid)?;
-            let before = g.rec.items.iter().filter(|item| item.epoch < g.mls.epoch()).map(|item| item.id.clone()).collect();
+            let joined = g.mls.added().iter().rev().find(|added| added.member.key == joiner.key).expect("the Add applied").epoch;
+            let before = g.rec.items.iter().filter(|item| item.epoch < joined).map(|item| item.id.clone()).collect();
             let state = (g.mls.settings().kind != CHAT).then(|| {
                 let (reply, state) = oneshot::channel();
                 self.events.send(Event::Snapshot { group: Bytes(gid.to_vec()), reply }).ok();

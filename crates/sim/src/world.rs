@@ -647,7 +647,7 @@ impl World {
     // Properties.
 
     /// A member that joins by an invite, as an identity its inviter holds a valid certificate of as it sees it join, is
-    /// introduced to the group by its inviter, in a live message, unless an action since a connection's idle timeout
+    /// introduced to the group by its inviter, in a message, unless an action since a connection's idle timeout
     /// before the invite may have kept it away, or it does not serve the inviter.
     async fn introduces(&self, m: usize, n: usize, gid: Bytes, since: u64) {
         sleep(LIVE_WAIT).await;
