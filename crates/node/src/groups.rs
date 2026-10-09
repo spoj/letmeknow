@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
 use lmk_core::group::{self as core, Change, key_package_credential};
-use lmk_core::identity::{Verdict, check};
+use lmk_core::identity::{DeviceList, Verdict, check};
 use lmk_core::invite::Target;
 use lmk_core::provider::Provider;
 use lmk_membership::Chain;
@@ -14,7 +14,7 @@ use lmk_net::{Admit, Groups, Taken};
 use lmk_proto::group::{How, Kind, Payload, Service};
 use lmk_proto::head::{self, Head};
 use lmk_proto::links::FileLink;
-use lmk_proto::peer::{Admitted, Hello, InviteRequest};
+use lmk_proto::peer::{Admitted, Hello, InviteRequest, List};
 use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
 use sha2::{Digest, Sha256};
@@ -341,6 +341,43 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         let settings = g.mls.settings();
         let text = (settings.kind == Kind::Doc).then(|| st.doc_state(group).and_then(|state| doc::text(&state)).ok()).flatten();
         g.rec.held(settings.keep, text.as_deref())
+    }
+
+    fn lists(&self, groups: &[Vec<u8>]) -> Vec<List> {
+        let st = self.state.lock().unwrap();
+        let mut ids: Vec<Bytes> = groups.iter().flat_map(|gid| st.identities(gid)).map(|identity| identity.id).collect();
+        ids.sort();
+        ids.dedup();
+        // A folder signs no heads; its sessions read it directly.
+        let signed = ids.iter().filter_map(|id| st.lists.get(&id.0)).filter(|known| matches!(known.list.membership, Service::Serve { .. }));
+        signed.map(|known| List { identity: Bytes(known.list.id.to_vec()), entries: known.entries.clone(), head: known.head.clone() }).collect()
+    }
+
+    fn list(&self, peer: EndpointId, list: List) {
+        if let Err(error) = self.presented(peer, list) {
+            tracing::debug!("a device list from {}: {error:#}", peer.fmt_short());
+        }
+    }
+}
+
+impl<P: Provider + Send + 'static> Inner<P> {
+    /// Checks a device list a peer presented, and holds it if it is newer than the one held.
+    fn presented(&self, peer: EndpointId, presented: List) -> Result<()> {
+        let id: [u8; 32] = presented.identity.0.as_slice().try_into().context("an identity id is 32 bytes")?;
+        let mut st = self.state.lock().unwrap();
+        let ours = st.groups.keys().any(|gid| st.identities(gid).iter().any(|identity| identity.id.0 == id));
+        ensure!(ours, "an identity none of our groups' members speaks as");
+        let log = lmk_proto::identity::address(&id);
+        let List { entries, head, .. } = presented;
+        let hash = entries.iter().fold(head::start(&log), |hash, entry| head::next(&hash, &entry.0));
+        ensure!(head.log.0 == log && head.length == entries.len() as u64 && head.hash.0 == hash, "its head does not cover its entries");
+        let list = DeviceList::replay(&id, entries.iter().map(|entry| entry.0.as_slice()))?;
+        let Service::Serve { key, .. } = &list.membership else { bail!("a device list in a folder") };
+        let key = VerifyingKey::from_bytes(key.0.as_slice().try_into().context("a service key is 32 bytes")?)?;
+        ensure!(head.verify(&key), "a head its service did not sign");
+        let at = head.time;
+        self.take_list(&mut st, list, entries, head, at, &peer.fmt_short().to_string());
+        Ok(())
     }
 }
 

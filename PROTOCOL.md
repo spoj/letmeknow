@@ -114,7 +114,8 @@ A member checks `device_sig` and the identity's device list (see Identity) when 
 - An entry, before sealing, is `{"body": "<bytes>", "sig": "<sig>"}`. `body` is JSON, `{"prev": "<hash of the previous entry's body>" | null, "op": "create" | "add" | "remove", "device": "<key>", "device_name": "", "by": "<signing device key>"}`, plus `"name"` and `"membership"` on `create`. `sig` is by `by` over `"letmeknow device list v1\0"` ‖ body.
 - The identity's id is SHA-256 of the first entry's body. A credential names the id and its service; the first entry proves both.
 - Valid entries: `create` first, signed by the device it names; then each `prev` names the latest valid entry, and `by` is on the list at that point. A removal is final. Members apply the first valid entry per `prev`, in log order, and skip the rest.
-- A member reads the lists of the identities its groups' members speak as, and of each devices group's identity, when it joins or resumes, when members are added, and again once a list is 10 minutes old. Whenever a list it reads has removed a member's device, it commits that member's removal; a member that finds the removal already done drops its own.
+- A member needs the lists of the identities its groups' members speak as, and of each devices group's identity, when it joins or resumes, when members are added, and again once its copy is 10 minutes old. It reads a list from its service (every entry, and the head of the empty page after them) unless it holds a fresh copy: one read from the service within 10 minutes, or a copy a peer presented whose head's `time` is within 10 minutes. Whenever a list it takes has removed a member's device, it commits that member's removal; a member that finds the removal already done drops its own.
+- Peers present lists in `hello` (see Peer protocol). A presented list counts only if its head is the signature of the service its `create` entry names, over the log at the identity's address, and chains exactly its entries, from h₀. Of a held copy and another, from a peer or the service: if they differ in an entry both have, the service showed two lists, and the session reports it in a `warning` and keeps its own; else the longer wins, or, if they are as long, the one with the later head. A member that takes a newer copy checks every group's members against it and presents it to the peers of the groups it concerns. Lists on a local folder are not presented, as their heads are unsigned.
 
 ### Contacts
 
@@ -161,7 +162,7 @@ A `peer` stream joins two sessions that share a group, one stream per pair, kept
 
 | Frame | Meaning |
 |---|---|
-| `{"hello": {"groups": [{"group", "epoch", "head", "floor", "joined"}]}}` | For each group both are in: the epoch the sender is at, the newest signed head it holds, the lowest epoch it accepts, and the epoch it joined |
+| `{"hello": {"groups": [{"group", "epoch", "head", "floor", "joined"}], "lists": [{"identity", "entries", "head"}]}}` | For each group both are in: the epoch the sender is at, the newest signed head it holds, the lowest epoch it accepts, and the epoch it joined. `lists`, if any: the device lists of the identities in those groups, each with all its entries and the service's head over them, that the other side has not yet shown or been shown with that head (see Identity) |
 | `{"commits": {"group", "entries", "head"}}` | Log entries the other lacks, judged by its head; also sent by a commit's author once the service has taken it |
 | `{"reconcile": {"group", "msg"}}` | A negentropy message (see below) |
 | `{"messages": {"group", "items"}}` | MLS ciphertexts the other lacks; also every new message as it is sent |
@@ -172,7 +173,7 @@ A `peer` stream joins two sessions that share a group, one stream per pair, kept
 | `{"join": {"group", "key_package"}}` | A request to join an open group, answered by `admitted` or `refused` |
 | `{"admitted": {"group", "admitted": {"welcome", "position", "doc"}}}`, `{"refused": {"group", "refused"}}` | The answer to `join`, as an invite's |
 
-A side that holds no head for a group yet sends the empty log's: length 0, hash h₀, `time` 0 and no signature, which needs none.
+Clients before 0.10.1 send no `lists` and ignore them. A side that holds no head for a group yet sends the empty log's: length 0, hash h₀, `time` 0 and no signature, which needs none.
 
 A sender learns from receipts who holds its message, and who refused it; it keeps its message as its own pending send until a receipt says a member holds it, and offers it in every sync meanwhile. A receiver that refuses or cannot open a message keeps its id among those it gave up, so a message naming it in `after` shows a known gap rather than waiting.
 

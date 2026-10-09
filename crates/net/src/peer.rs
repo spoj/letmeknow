@@ -18,7 +18,7 @@ use iroh::{
 use lmk_proto::{
     Answer, Bytes, frame,
     head::Head,
-    peer::{Admitted, Frame, Hello, Refusal},
+    peer::{Admitted, Frame, Hello, List, Refusal},
 };
 use sha2::{Digest, Sha256};
 use n0_future::{task::spawn, time::sleep};
@@ -54,6 +54,8 @@ struct Session {
     /// Our `want`s awaiting their `have`, in order.
     wants: HashMap<Bytes, VecDeque<HaveReply>>,
     joins: HashMap<Bytes, oneshot::Sender<Answer<Admitted>>>,
+    /// The newest head of each device list either side has shown the other.
+    lists: HashMap<Bytes, Head>,
 }
 
 #[derive(Default)]
@@ -104,8 +106,17 @@ pub(crate) async fn run(
         }
         reader.send(Input::Closed).ok();
     });
-    let mut session =
-        Session { inner, peer, dialer, send, input, groups: HashMap::new(), wants: HashMap::new(), joins: HashMap::new() };
+    let mut session = Session {
+        inner,
+        peer,
+        dialer,
+        send,
+        input,
+        groups: HashMap::new(),
+        wants: HashMap::new(),
+        joins: HashMap::new(),
+        lists: HashMap::new(),
+    };
     let result = async {
         session.hello().await?;
         while let Some(input) = rx.recv().await {
@@ -145,13 +156,27 @@ impl Session {
     }
 
     async fn hello(&mut self) -> Result<()> {
-        let groups = self.inner.groups.groups().into_iter().filter(|g| self.member(g)).map(|g| self.inner.groups.hello(&g)).collect();
-        self.write(&Frame::Hello { groups }).await
+        let shared: Vec<Vec<u8>> = self.inner.groups.groups().into_iter().filter(|g| self.member(g)).collect();
+        let groups = shared.iter().map(|g| self.inner.groups.hello(g)).collect();
+        let lists = self.unshown(&shared);
+        self.write(&Frame::Hello { groups, lists }).await
+    }
+
+    /// The device lists of the identities in these groups whose newest head the peer has not seen.
+    fn unshown(&mut self, groups: &[Vec<u8>]) -> Vec<List> {
+        let lists = self.inner.groups.lists(groups);
+        lists.into_iter().filter(|list| self.lists.insert(list.identity.clone(), list.head.clone()).as_ref() != Some(&list.head)).collect()
     }
 
     async fn frame(&mut self, frame: Frame) -> Result<()> {
         match frame {
-            Frame::Hello { groups } => {
+            Frame::Hello { groups, lists } => {
+                if !lists.is_empty() && self.inner.groups.groups().iter().any(|g| self.member(g)) {
+                    for list in lists {
+                        self.lists.insert(list.identity.clone(), list.head.clone());
+                        self.inner.groups.list(self.peer, list);
+                    }
+                }
                 for hello in groups {
                     if self.member(&hello.group.0) {
                         self.on_hello(hello).await?;
@@ -365,7 +390,8 @@ impl Session {
             tracing::warn!("a head from {}: {e:#}", self.peer.fmt_short());
             return Ok(());
         }
-        self.write(&Frame::Hello { groups: vec![mine.clone()] }).await?;
+        let lists = self.unshown(std::slice::from_ref(&group.0));
+        self.write(&Frame::Hello { groups: vec![mine.clone()], lists }).await?;
         self.catch_up(&group, &mine).await
     }
 

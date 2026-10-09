@@ -54,7 +54,7 @@ Policy belongs to each service: who may create logs, how long it keeps entries, 
 Writes go only to the membership service, which alone assigns positions. Reads come from it or from any member:
 
 - A member's copy of entries counts only with a signed head that covers them, checked against the reader's own chain. Members mirror the record; they cannot change it.
-- Whenever two members connect, they swap the latest signed heads they hold for their shared groups. Two incompatible heads prove that the service showed different members different logs; the session reports both in a `warning`. A member that finds itself behind gets the missing entries from that peer.
+- Whenever two members connect, they swap the latest signed heads they hold for their shared groups, and the device lists of the identities in them (see Identity). Two incompatible heads prove that the service showed different members different logs; the session reports both in a `warning`. A member that finds itself behind gets the missing entries from that peer.
 - Once the service has taken a commit, its author pushes it to the members online, so a removal spreads in network time.
 
 A local folder signs nothing, but its sessions all read the folder directly, so nothing needs forwarding.
@@ -100,7 +100,8 @@ A receiver that refuses a message records it as given up, so a reference to it s
 ## Identity
 
 - **Device list**: a membership log on the service named in its first entry. The identity's id is the SHA-256 of that entry, so the id says where to look. The log's address and key derive from the id, so the service sees only ciphertext, and whoever knows the id can read the list. Each entry adds or removes a device key, names the entry before it, and is signed by a device on the list at that point.
-- **Reading lists**: a member reads the device lists of the identities its groups' members speak as when it joins or resumes, when members are added, and again once a list is 10 minutes old.
+- **Reading lists**: a member needs the device lists of the identities its groups' members speak as when it joins or resumes, when members are added, and again once its copy is 10 minutes old; it reads them from their service only when no fresh copy came from a peer.
+- **Lists from peers**: whenever two members connect, they show each other the device lists of the identities in their shared groups, each with every entry and the service's signed head over them, and again whenever one holds a newer copy. A copy counts as fresh while its head is under 10 minutes old. A newer head wins, from whichever source; a copy that disagrees with the one held, on an entry both have, proves that the service showed members different lists, and the session reports both in a `warning`, as for group logs. So a device's removal spreads through peers in network time, and a member that has a fresh copy checks an identity without asking its service.
 - **Devices group**: each identity has a private MLS group of its devices, kept in step with the list by the device that adds or removes one. It carries the identity's openings in its group context and its contacts as a Yjs map. Its members are devices: on a machine, the session process holding the device's lock acts for it, and shares its identities, contacts and openings with the device's other session processes through files in `LETMEKNOW_HOME`; in a browser, the device is the session.
 - **Device links**: an invite link marked as one. The new device sends its device key; the inviter adds it to the list and to the devices group.
 - **Credentials**: a session's credential names its device, with the device's signature on the session key, and the identity it speaks as (`--as`, by default the device's first). A session speaks as one identity per group. Members check it against the device list. A failed check marks the member; it never invalidates a commit.
@@ -185,7 +186,6 @@ Limits:
 ## Later
 
 - Moving a group to another membership service by a commit that names it, and recreating a group (same name, settings and doc text) when its service vanishes.
-- Device lists presented by peers with a signed head, so a member checks an identity without asking its service.
 - Trusted introducers, whose introductions a contact accepts automatically, one level deep.
 - An old identity vouching for its replacement, so contacts can follow a person who lost every device.
 - Harness adapters that steer an agent mid-turn, a review mode for outbound messages, and a loop guard for agent-to-agent traffic.
