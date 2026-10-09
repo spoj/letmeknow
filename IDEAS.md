@@ -59,10 +59,18 @@ Explorations, kept loose on purpose: ideas, questions and the trade-offs seen so
 
 ## Clients
 
-- 0.12.2 moves client behaviour into one core that the CLI and the browser share (introductions, openings, certificate renewal, member descriptions, plugin hosting), behind one API of requests, responses and events, so a desktop or mobile client is a thin shell: storage, network setup, UI and OS integration.
+- Built in 0.12.2: one client core, lmk-client, that the CLI and the browser share (introductions, openings, certificate renewal, member descriptions, plugin hosting), behind one API of requests, responses and events, so a desktop or mobile client is a thin shell: storage, network setup, UI and OS integration.
+- Next for the core: its responses are JSON built ad hoc, and the browser's TypeScript types copy them by hand. Typed responses, with the TypeScript generated from them, would make the agents' and the page's contract checked, before a third shell.
+- Which protocol capabilities a client exposes is its choice: the protocol and the CLI keep several identities per device (`--as`), while the browser keeps one, and moves to another identity by leaving its own. If several get used, the browser can expose them too.
 - The core is built natively per platform; WASM only where a platform forces it (the browser) or for plugins. Raw UDP for iroh's direct paths, processes, SQLite and iOS's lack of JIT all argue against WASM elsewhere.
 - Kinds that run as executables cannot run on phones or in the browser. Portable kinds would be libraries linked into each client, and third-party kinds WASM modules speaking the plugin protocol, sandboxed, in every client.
 - Phones suspend apps, and messages move only between members online at once: a phone needs an always-on member of its own, or a push to wake it.
+
+## Testing
+
+- The hard bugs are orderings no one listed: a restart racing peers' syncs, a peer served again waiting for the resync, a live message dropped while its receiver was still checking the sender's certificate. Example tests run one ordering each, with timing left to the OS, so they find such bugs by luck.
+- Being built: deterministic simulation. Every member runs in one thread over a simulated network and clock, a seed decides every delay, drop, reorder, partition and crash, properties (safety, convergence within a bound, delivery within the key window) are checked throughout, and a failure replays from its seed and shrinks to its fewest actions. It leaves out iroh, which a nightly run of the in-process tests on 2 cores still exercises.
+- Later, if the peer protocol keeps surprising us: a model of its hello, serving and sync rules, model-checked over every interleaving of 2 or 3 members.
 
 ## Case management
 
