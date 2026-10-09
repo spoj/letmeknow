@@ -19,7 +19,7 @@ Everything in a group is end-to-end encrypted with MLS (RFC 9420). Members send 
 - **Identity**: a person, team or agent, as a tightly controlled list of devices ("Matthew": laptop, phone). It makes a member's "Matthew" verifiable and is as strong as its weakest device. No nesting, no admins.
 - **Membership service**: keeps membership logs and is a member of nothing. It sees log ids, entry sizes and timing, and which endpoints connect. It can stall, withhold or split a log, all detectably; it cannot read, forge, or add anyone.
 - **Relay**: an iroh relay. It forwards packets when no direct path exists; browsers always use one. It sees who connects to whom and when, and cannot read.
-- **Page server**: letmeknow.dev serves the browser client, so it could take over every browser member. Accepted for now.
+- **Page server**: letmeknow.dev, or one's own `letmeknow serve`, serves the browser client, so it could take over every browser member it serves. Accepted for now.
 
 ## Membership service
 
@@ -85,7 +85,7 @@ A local folder signs nothing, but its sessions all read the folder directly, so 
 - Every member wants every file its groups link, up to its own size limit (a client setting: 100 MiB for agents, 25 MiB for browsers): attachments since it joined, the files the doc links now, and the doc state beside the latest Welcome. It keeps each one while it is linked and within `keep`. A larger file it fetches only when asked (`fetch`, or opening it in the browser).
 - Connected members tell each other which files they want, and a member fetches each from whoever holds it, from several holders at once. Transfer is iroh-blobs (pinned, and kept inside one module of ours; links are plain BLAKE3, so replacing it later keeps every link valid). A holder serves a file only to current members of a group that links it, checked per connection, per request and per 16 KiB sent, so a member removed mid-transfer is cut off.
 - No one is responsible for a file. The sender has one duty: `send --attach` returns once another member holds a copy, or warns after a few seconds, as it does when the file is larger than every online member's limit and is therefore available only while the sender is online.
-- A browser keeps the ciphertext of files it holds in its own storage, since iroh-blobs gives browsers only a store in memory.
+- A browser keeps the ciphertext of files it holds in its own storage, since iroh-blobs gives browsers only a store in memory, and loads a file into memory only when it is needed: to open it, or for a member that wants it. It holds the files it added, and others' up to its limit; a larger one it fetched when asked stays in memory only, until the page closes, and it serves that to no one.
 
 ## Limits
 
@@ -138,20 +138,21 @@ Trust is local and travels one hop at most.
 ## Browser
 
 - letmeknow.dev serves the client: lmk-node compiled to WebAssembly, under a Content-Security-Policy that allows scripts from its own origin only. A service worker caches it, so the app opens while the page server is down, invite links included. A new version waits until the user accepts it, then every tab reloads.
-- A browser profile is one device and one member; its tabs share one session, which one tab at a time runs.
+- A client served by one's own `letmeknow serve` uses that server's membership service and relay, which the page learns from it; letmeknow.dev's uses letmeknow.dev's.
+- A browser profile is one device and one member; its tabs share one session. One tab at a time runs it, and the others work through that one; when it closes, another takes over. Tabs reach each other by BroadcastChannel, not a SharedWorker, which some mobile browsers lack.
 - It asks for persistent storage (Firefox prompts; Chrome and Safari decide silently). Safari wipes a site's storage after 7 days without a visit, but not a home-screen app's. On iPhone and iPad the home-screen app also has storage of its own, apart from Safari's, so it is a different device: the app asks to be added to the home screen before it creates one.
 - Joining from a link waits for a click, so a link preview or scanner opening it uses nothing up.
 - While open, a browser holds and forwards like any member, and may keep less than `keep`.
 
 ## Deployment
 
-letmeknow.dev is one DigitalOcean droplet (Basic, 1 GB, Ubuntu LTS, Singapore) running one static binary, `letmeknow serve`: the membership service, an embedded iroh relay, and the web client. Its own TCP 443 listener hands `/relay` and `/ping` to the relay and serves the web client otherwise, and it gets its certificate from Let's Encrypt itself (TLS-ALPN-01, on 443). `deploy/deploy.sh` builds and installs it.
+letmeknow.dev is one DigitalOcean droplet (Basic, 1 GB, Ubuntu LTS, Singapore) running one static binary, `letmeknow serve`: the membership service, an embedded iroh relay, and the web client. Its own TCP 443 listener hands `/relay` and `/ping` to the relay, answers `/membership` with the membership service's address for the web client, and serves the web client otherwise, and it gets its certificate from Let's Encrypt itself (TLS-ALPN-01, on 443). `deploy/deploy.sh` builds and installs it.
 
 - systemd restarts it, unattended-upgrades patches the OS, and the cloud firewall opens, on IPv4 and IPv6, TCP 443, TCP 80 (a captive-portal check and redirects), UDP 7842 (QUIC address discovery) and UDP 7843 (the membership service).
 - Its SQLite file is streamed to DigitalOcean Spaces by Litestream.
 - DNS records point at the droplet, unproxied. An uptime check watches https://letmeknow.dev.
 - The relay rate-limits each connection, so large files through it cost time rather than money.
-- Others run the same binary; the relay and the web client are optional.
+- Others run the same binary; the relay and the web client are optional. The web client a server serves uses that server's membership service and relay.
 
 ## Agent interface
 
