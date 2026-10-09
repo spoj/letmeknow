@@ -125,9 +125,11 @@ async function boot() {
   if (invite && had) offer(kind);
 }
 
-async function start(name: string, device: string) {
+/** Starts this browser's session, and unless it is to join an identity by a device link, makes it the first device of an identity of `name`. */
+async function start(name: string, device: string, identity = true) {
   await client.open(name, device);
   navigator.storage?.persist?.();
+  if (identity) await request({ cmd: "identity", op: { create: { name } } });
   await (entered ??= enter());
 }
 
@@ -221,6 +223,7 @@ function welcome(kind: string | undefined) {
   const device = h("input", { required: true, value: guess });
   const deviceField = field("This device", device, "As in “Matthew · phone”, so you can tell your devices apart.");
   const ready = () => name.reportValidity() && device.reportValidity();
+  const elsewhere = h("p", { className: "muted" }, "Already use letmeknow on another device? Make a device link there, under Your devices, and open it here.");
   let body: Child[];
   if (kind === "group") {
     const join = h("button", { className: "primary" }, "Join");
@@ -236,6 +239,7 @@ function welcome(kind: string | undefined) {
           }),
         field("Your name", name, "Everyone you share with sees it."),
         deviceField,
+        elsewhere,
         join
       )
     ];
@@ -249,7 +253,7 @@ function welcome(kind: string | undefined) {
         () =>
           device.reportValidity() &&
           busy(add, "Adding…", async () => {
-            await start(device.value.trim(), device.value.trim());
+            await start(device.value.trim(), device.value.trim(), false);
             await redeem(invite!);
           }),
         field("Name this device", device, "Shown next to your name, as in “Matthew · phone”."),
@@ -263,6 +267,7 @@ function welcome(kind: string | undefined) {
         : [h("h1", {}, "letmeknow"), h("p", { className: "lede" }, "End-to-end encrypted chats and documents, for you and your agents on any computer.")],
       field("Your name", name, "Shown to everyone you share with."),
       deviceField,
+      elsewhere,
       ...starters(async () => {
         if (!ready()) return false;
         await start(name.value.trim(), device.value.trim());
@@ -314,6 +319,7 @@ function starters(before: () => Promise<boolean> = async () => true): HTMLElemen
 function offer(kind: string | undefined) {
   history.replaceState(null, "", "/");
   if (!kind) return toast("That is not a letmeknow invite link.");
+  if (kind === "device" && me.identities[0]) return leaveDialog(invite);
   const go = h("button", { className: "primary", autofocus: true }, kind === "group" ? "Join" : "Add this browser");
   const dialog = modal(
     kind === "group" ? "You're invited" : "Add this browser to your devices",
@@ -333,8 +339,10 @@ function offer(kind: string | undefined) {
     });
 }
 
-/** Uses an invite link: lands in the group it joined, or, for a device link, on this browser's devices. */
+/** Uses an invite link: lands in the group it joined, or, for a device link, on this browser's devices. A browser on an
+ * identity asks first to move to the one a device link is of. */
 async function redeem(link: string) {
+  if (client.kindOf(link) === "device" && me?.identities[0]) return leaveDialog(link);
   const joined = await request({ cmd: "join", target: link });
   history.replaceState(null, "", "/");
   if (joined.group) await select(joined.group);
@@ -536,10 +544,21 @@ async function drawDevices() {
   if (!identity) {
     return update(devicesBody, "none", () => {
       const name = h("input", { value: me.name, required: true });
+      const device = h("input", { value: me.device.name, required: true });
       const create = h("button", { className: "primary" }, "Start");
+      const started = async () => {
+        await request({ cmd: "identity", op: { create: { name: name.value.trim() } } });
+        if (device.value.trim() !== me.device.name) await request({ cmd: "identity", op: { rename: { name: device.value.trim() } } });
+        render();
+      };
       return [
-        h("p", {}, "This browser is no one's device yet. Give your name to make it your first device; you can then add your other devices, and others can tell it is you."),
-        form(() => name.reportValidity() && busy(create, "Starting…", async () => (await request({ cmd: "identity", op: { create: { name: name.value.trim() } } }), render())), field("Your name", name), create),
+        h("p", {}, "This browser is no one's device yet. Start to make it your first device; you can then add your other devices, and others can tell it is you."),
+        form(
+          () => name.reportValidity() && device.reportValidity() && busy(create, "Starting…", started),
+          field("Your name", name),
+          field("This device", device, "As in “Matthew · phone”, so you can tell your devices apart."),
+          create
+        ),
         h("p", { className: "muted" }, "To add this browser to an identity you have on another device, make a device link there and open it here, or paste it into Join.")
       ];
     });
@@ -556,11 +575,13 @@ async function drawDevices() {
           "li",
           {},
           h("span", { title: `key ${d.key}` }, d.name, d.you && h("small", {}, " this browser")),
-          confirmed("Remove", d.you ? "Remove this browser?" : `Remove ${d.name}?`, async () => {
-            await request({ cmd: "identity", op: { remove: { identity: identity.id, device: d.key } } });
-            shown.delete(devicesBody);
-            render();
-          })
+          d.you
+            ? h("span", {}, h("button", { onclick: renameDialog }, "Rename"), h("button", { className: "danger", onclick: () => leaveDialog() }, "Leave"))
+            : confirmed("Remove", `Remove ${d.name}?`, async () => {
+                await request({ cmd: "identity", op: { remove: { identity: identity.id, device: d.key } } });
+                shown.delete(devicesBody);
+                render();
+              })
         )
       )
     ),
@@ -581,6 +602,54 @@ async function drawDevices() {
         })
       )
   ]);
+}
+
+function renameDialog() {
+  const name = h("input", { value: me.device.name, required: true, autofocus: true });
+  const save = h("button", { className: "primary" }, "Rename");
+  const dialog = modal(
+    "Rename this browser",
+    form(
+      () =>
+        name.reportValidity() &&
+        busy(save, "Renaming…", async () => {
+          await request({ cmd: "identity", op: { rename: { name: name.value.trim() } } });
+          render();
+          dialog.close();
+        }),
+      field("This device", name, "Your other devices, and everyone you share with, see it next to your name."),
+      h("div", { className: "buttons" }, save)
+    )
+  );
+}
+
+/** Takes this browser off its identity, saying first what that does; with a device link, then joins the identity it is of. */
+async function leaveDialog(link?: string) {
+  const identity = me.identities[0];
+  const listed: { identities: { identity: string; devices: unknown[] }[] } = await request({ cmd: "identity", op: "list" });
+  const only = (listed.identities.find(i => i.identity === identity.id)?.devices.length ?? 1) === 1;
+  const speaking = groups.filter(g => g.joined && g.members.some(m => m.you && m.identity?.id === identity.id)).map(g => title(g.group));
+  const go = h("button", { className: "danger", autofocus: true }, link ? "Move this browser" : `Leave ${identity.name}`);
+  const dialog = modal(
+    link ? "Move this browser to another identity" : `Leave ${identity.name}`,
+    link && h("p", {}, "This link adds this browser to the identity of whoever made it. A browser is a device of one identity at a time, so it moves:"),
+    h(
+      "ul",
+      {},
+      h("li", {}, only ? `It leaves ${identity.name}, which ends: this browser is its only device.` : `It leaves ${identity.name}; your other devices stay on it.`),
+      h("li", {}, speaking.length ? `It leaves the groups it is in as ${identity.name}: ${speaking.join(", ")}.` : `It is in no group as ${identity.name}.`),
+      link && h("li", {}, "Then it joins the identity that made this link.")
+    ),
+    h("div", { className: "buttons" }, go)
+  );
+  go.onclick = () =>
+    busy(go, link ? "Moving…" : "Leaving…", async () => {
+      await request({ cmd: "identity", op: { leave: { identity: identity.id } } });
+      me = JSON.parse(await lmk.me());
+      dialog.close();
+      if (link) await redeem(link);
+      else render();
+    });
 }
 
 // Invites: a link and its QR code, single use, within 10 minutes. A device link adds a device to an identity.

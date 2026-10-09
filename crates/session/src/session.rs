@@ -241,7 +241,8 @@ impl Session {
         let kinds = vec![lmk_proto::group::CHAT.into(), DEVICES.into()];
         let config = crate::node_config(&self.network, &self.home, &device.name, Some(device.clone()), self.home.join("device-files"), kinds);
         let (node, mut events) = Node::start(provider, config).await?;
-        let devices = Devices::new(node.clone(), device);
+        let path = self.home.join("device.json");
+        let devices = Devices::new(node.clone(), device, Arc::new(move |device: &Device| device.save(&path)));
         let (client, taking) = (self.client.clone(), devices.clone());
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {

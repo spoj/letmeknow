@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Control, Credential, How, LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Settings, held_by_type};
+use lmk_proto::group::{Control, Credential, How, LEAF_EXTENSION, Leaf, PROTOCOL, RENAME_REVISION, SETTINGS_EXTENSION, Settings, held_by_type};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -193,6 +193,8 @@ pub struct Change {
     pub remove: Vec<u32>,
     pub settings: Option<Settings>,
     pub leaf: Option<Leaf>,
+    /// A new name in the committer's credential, which only `Group::renames` allows.
+    pub name: Option<String>,
 }
 
 /// A commit's authenticated data: how the members it adds came in, and where the kind's log ends.
@@ -446,6 +448,11 @@ impl Group {
         self.mls.members().filter_map(|member| Member::of(&self.mls, member.index)).collect()
     }
 
+    /// Whether a member may rename itself in an update: every member's leaf names `RENAME_REVISION` or a later one.
+    pub fn renames(&self) -> bool {
+        renames(&self.mls)
+    }
+
     /// Who added whom, as the log showed it since this session joined.
     pub fn added(&self) -> &[Added] {
         &self.state.added
@@ -473,6 +480,18 @@ impl Group {
         if aad.how.is_some() || aad.end.is_some() {
             self.mls.set_aad(serde_json::to_vec(&aad)?);
         }
+        let mut parameters = LeafNodeParameters::builder();
+        if let Some(leaf) = &change.leaf {
+            parameters = parameters.with_extensions(leaf_extensions(leaf)?);
+        }
+        if let Some(name) = &change.name {
+            let own = self.mls.own_leaf_node().context("no leaf of its own")?;
+            let credential = Credential { name: name.clone(), ..credential_of(own.credential()).context("not a letmeknow credential")? };
+            parameters = parameters.with_credential_with_key(CredentialWithKey {
+                credential: BasicCredential::new(serde_json::to_vec(&credential)?).into(),
+                signature_key: session.signer.public().into(),
+            });
+        }
         let mut builder = self
             .mls
             .commit_builder()
@@ -483,10 +502,7 @@ impl Group {
         if let Some(settings) = &change.settings {
             builder = builder.propose_group_context_extensions(context_extensions(settings)?)?;
         }
-        if let Some(leaf) = &change.leaf {
-            builder = builder
-                .leaf_node_parameters(LeafNodeParameters::builder().with_extensions(leaf_extensions(leaf)?).build());
-        }
+        builder = builder.leaf_node_parameters(parameters.build());
         let bundle = builder
             .load_psks(provider.storage())?
             .build(provider.rand(), provider.crypto(), &session.signer, |_| true)?
@@ -629,7 +645,7 @@ impl Group {
         let ProcessedMessageContent::ApplicationMessage(message) = processed.into_content() else {
             bail!("not an application message")
         };
-        let current = self.members().into_iter().find(|member| member.credential.as_ref() == Some(&sender));
+        let current = self.members().into_iter().find(|member| member.key == sender.key.0);
         let mut key = current.as_ref().map(|member| member.key.clone()).unwrap_or_default();
         if current.is_none()
             && let Some((removed, at)) = self.state.removed.iter().rev().find(|(key, _)| *key == sender.key)
@@ -708,7 +724,7 @@ fn state_key(id: &[u8]) -> Vec<u8> {
 
 /// The app's rules on a commit, from MLS state alone, binding the committer too: changes inline only, of the kinds we
 /// make; added members whose credentials name their own keys; settings that parse, at protocol 1, with the kind
-/// unchanged; and no update of the committer's leaf that changes its credential.
+/// unchanged; and no update of the committer's leaf that changes its credential, but its name where `renames` allows.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex) -> Result<()> {
     for proposal in staged.queued_proposals() {
         ensure!(proposal.proposal_or_ref_type() == ProposalOrRefType::Proposal, "a proposal by reference");
@@ -724,9 +740,15 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex) -> Result<(
     ensure!(new.kind == old.kind, "the kind changed");
     if let Some(leaf) = staged.update_path_leaf_node() {
         let before = group.member_at(by).and_then(|member| credential_of(&member.credential));
-        ensure!(before == credential_of(leaf.credential()), "an update changed the member's credential");
+        let after = credential_of(leaf.credential());
+        let renamed = before.clone().zip(after.clone()).is_some_and(|(before, after)| Credential { name: after.name.clone(), ..before } == after);
+        ensure!(before == after || renamed && renames(group), "an update changed the member's credential");
     }
     Ok(())
+}
+
+fn renames(group: &MlsGroup) -> bool {
+    group.members().all(|member| Member::of(group, member.index).and_then(|m| m.leaf).is_some_and(|leaf| leaf.revision >= RENAME_REVISION))
 }
 
 #[cfg(test)]

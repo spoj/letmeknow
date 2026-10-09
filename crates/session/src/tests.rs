@@ -612,6 +612,40 @@ fn identities_are_created_listed_and_lose_devices() {
     });
 }
 
+/// A session that does not act for its device renames the device and takes it off its identity, through the session
+/// that does: the device's certificates and credential name it anew, and the identity, whose only device it was, ends.
+#[test]
+fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
+    local(async {
+        let world = world("rename").await;
+        let alice = world.start("alice", HOUR).await;
+        let desk = world.start_in("alice", "desk", HOUR).await;
+        let mut carol = world.start("carol", HOUR).await;
+        alice.cmd(&["identity", "create", "Alice"]).await.unwrap();
+        let invite = carol.cmd(&["invite"]).await.unwrap();
+        desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        carol.expect("joined").await;
+
+        assert_eq!(desk.cmd(&["identity", "rename", "studio"]).await.unwrap()["device"]["name"], "studio");
+        let listed = alice.cmd(&["identity", "list"]).await.unwrap();
+        assert_eq!(listed["identities"][0]["devices"][0]["name"], "studio");
+        assert_eq!(lmk_core::device::Device::load(&alice.home.join("device.json")).unwrap().name, "studio");
+        let device = || async { carol.cmd(&["members"]).await.unwrap()["members"].as_array().unwrap().iter().any(|m| m["device"] == "studio") };
+        for _ in 0..120 {
+            if device().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(device().await, "the desk session renews its certificate with the device's new name");
+
+        let left = desk.cmd(&["identity", "leave", "Alice"]).await.unwrap();
+        assert_eq!((&left["left"][0], &left["ended"]), (&invite["group"], &json!(true)));
+        assert_eq!(alice.cmd(&["identity", "list"]).await.unwrap()["identities"], json!([]));
+        assert_eq!(carol.expect("left").await["member"]["name"], "Desk");
+    });
+}
+
 /// Waits, running commands so that what waits prints, until `file` reads as `check` wants.
 async fn until_file(agent: &Agent, file: &Path, check: impl Fn(&str) -> bool) -> String {
     for _ in 0..80 {

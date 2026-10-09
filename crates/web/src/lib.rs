@@ -316,7 +316,8 @@ impl App {
             kinds: vec![CHAT.into(), DOC.into(), GIT.into(), DEVICES.into()],
         };
         let (node, mut events) = Node::start(store.clone(), node_config).await?;
-        let devices = Devices::new(node.clone(), device.clone());
+        let saved = store.clone();
+        let devices = Devices::new(node.clone(), device.clone(), Arc::new(move |device: &Device| put(&saved, b"web/device", device)));
         let membership = service(&config.membership)?;
         let (lines, written) = mpsc::unbounded_channel();
         let plugins = InPage {

@@ -77,7 +77,7 @@ impl Member {
             kinds: vec![CHAT.into(), DEVICES.into(), KIND.into()],
         };
         let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-        let devices = Devices::new(node.clone(), device.clone());
+        let devices = Devices::new(node.clone(), device.clone(), Arc::new(|_: &Device| Ok(())));
         let (lines, written) = mpsc::unbounded_channel();
         let plugin = Arc::new(Recorder { started: Mutex::default(), sent: Mutex::default(), lines });
         let membership = Service::Folder(logs.to_str().unwrap().into());
@@ -192,4 +192,81 @@ async fn a_kinds_plugin_hears_of_its_groups_and_lets_go_of_one_left() {
     assert_eq!(left["left"], true);
     assert_eq!(alice.plugin.sent.lock().unwrap().last().unwrap()["type"], "gone");
     alice.until(|e| matches!(e, ClientEvent::Gone { .. })).await;
+}
+
+/// Asks a member again until its answer is as wanted.
+async fn polled(member: &Member, request: Value, wanted: impl Fn(&Value) -> bool) -> Value {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let answer = member.request(request.clone()).await;
+            if wanted(&answer) {
+                return answer;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the answer came")
+}
+
+/// A device link from the first member's identity, `Bob`, which the second joins.
+async fn devices_of_bob(laptop: &Member, tablet: &Member) {
+    laptop.request(json!({ "cmd": "identity", "op": { "create": { "name": "Bob" } } })).await;
+    let link = laptop.request(json!({ "cmd": "invite", "identity": "Bob" })).await;
+    tablet.request(json!({ "cmd": "join", "target": link["link"] })).await;
+    polled(tablet, json!({ "cmd": "identity", "op": "list" }), |listed| listed["identities"][0]["name"] == "Bob").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_device_shows_its_new_name_to_its_other_devices_and_its_groups() {
+    let (relay, logs) = (relay().await, logs("rename"));
+    let alice = Member::start(&relay, &logs, "Alice").await;
+    let laptop = Member::start(&relay, &logs, "laptop").await;
+    let tablet = Member::start(&relay, &logs, "tablet").await;
+    devices_of_bob(&laptop, &tablet).await;
+    let chat = alice.request(json!({ "cmd": "invite" })).await;
+    laptop.request(json!({ "cmd": "join", "target": chat["link"] })).await;
+    let device = |m: &Value| m["members"].as_array().unwrap().iter().any(|m| m["device"] == "desk");
+    let renamed = laptop.request(json!({ "cmd": "identity", "op": { "rename": { "name": "desk" } } })).await;
+    assert_eq!(renamed["device"]["name"], "desk");
+    assert_eq!(laptop.client.me().unwrap()["device"]["name"], "desk");
+    let names = |listed: &Value| -> Vec<String> {
+        listed["identities"][0]["devices"].as_array().unwrap().iter().map(|d| d["name"].as_str().unwrap().to_owned()).collect()
+    };
+    let listed = polled(&tablet, json!({ "cmd": "identity", "op": "list" }), |listed| names(listed).contains(&"desk".to_owned())).await;
+    assert_eq!(names(&listed).len(), 2, "the tablet lists the laptop by its new name");
+    polled(&alice, json!({ "cmd": "members", "group": chat["group"] }), device).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_device() {
+    let (relay, logs) = (relay().await, logs("leave"));
+    let alice = Member::start(&relay, &logs, "Alice").await;
+    let laptop = Member::start(&relay, &logs, "laptop").await;
+    let tablet = Member::start(&relay, &logs, "tablet").await;
+    devices_of_bob(&laptop, &tablet).await;
+    let chat = alice.request(json!({ "cmd": "invite" })).await;
+    tablet.request(json!({ "cmd": "join", "target": chat["link"] })).await;
+    let key = |m: &Member| m.client.device_state().unwrap().keys;
+    let before = key(&laptop);
+
+    // The tablet leaves Bob: its session leaves the chat first, and the laptop, which removes it, replaces Bob's key.
+    let left = tablet.request(json!({ "cmd": "identity", "op": { "leave": { "identity": "Bob" } } })).await;
+    assert_eq!((left["left"][0].clone(), left["ended"].clone()), (chat["group"].clone(), json!(false)));
+    assert_eq!(tablet.client.me().unwrap()["identities"], json!([]));
+    polled(&alice, json!({ "cmd": "members", "group": chat["group"] }), |m| m["members"].as_array().unwrap().len() == 1).await;
+    polled(&laptop, json!({ "cmd": "identity", "op": "list" }), |listed| listed["identities"][0]["devices"].as_array().unwrap().len() == 1).await;
+    tokio::time::timeout(WAIT, async {
+        while key(&laptop) == before {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the laptop replaces Bob's key");
+
+    // Bob's only device leaves him, and he ends.
+    let left = laptop.request(json!({ "cmd": "identity", "op": { "leave": { "identity": "Bob" } } })).await;
+    assert_eq!((left["left"].clone(), left["ended"].clone()), (json!([]), json!(true)));
+    assert_eq!(laptop.client.me().unwrap()["identities"], json!([]));
+    assert!(laptop.client.node().groups().is_empty(), "its devices group is gone");
 }
