@@ -20,6 +20,7 @@ install -d -o letmeknow -g letmeknow -m 700 /var/lib/letmeknow
 install -d -m 755 /usr/local/share/letmeknow/web
 [ -e /var/lib/letmeknow/membership.key ] || install -o letmeknow -g letmeknow -m 600 /tmp/membership.key /var/lib/letmeknow/
 rm /tmp/membership.key
+printf 'Unattended-Upgrade::Automatic-Reboot "true";\nUnattended-Upgrade::Automatic-Reboot-Time "20:00";\n' > /etc/apt/apt.conf.d/52letmeknow-reboot
 [ -e /swapfile ] || { fallocate -l 1G /swapfile; chmod 600 /swapfile; mkswap -q /swapfile; swapon /swapfile; echo '/swapfile none swap sw 0 0' >> /etc/fstab; }
 command -v litestream >/dev/null || {
   curl -fsSL -o /tmp/litestream.deb https://github.com/benbjohnson/litestream/releases/download/v0.5.17/litestream-0.5.17-linux-x86_64.deb
