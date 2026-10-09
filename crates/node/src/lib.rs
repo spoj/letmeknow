@@ -745,6 +745,11 @@ impl<P: Provider + Send + 'static> Node<P> {
         Bytes(self.inner.state.lock().unwrap().session.key().to_vec())
     }
 
+    /// Its peers: what a transport of the caller's hands the connections peers open, and the files they fetch.
+    pub fn net(&self) -> &Net {
+        self.inner.net()
+    }
+
     /// This session's iroh key and relay.
     pub fn address(&self) -> ([u8; 32], RelayUrl) {
         (*self.inner.net().id().as_bytes(), self.inner.relay.clone())
@@ -760,6 +765,11 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     pub fn epoch(&self, gid: &[u8]) -> Result<u64> {
         Ok(self.inner.state.lock().unwrap().group(gid)?.mls.epoch())
+    }
+
+    /// The epoch this session joined the group at.
+    pub fn joined(&self, gid: &[u8]) -> Result<u64> {
+        Ok(self.inner.state.lock().unwrap().group(gid)?.mls.joined())
     }
 
     pub fn members(&self, gid: &[u8]) -> Result<Vec<Member>> {

@@ -16,6 +16,7 @@ lmk-net = { path = "crates/net" }
 lmk-node = { path = "crates/node" }
 lmk-client = { path = "crates/client" }
 lmk-serve = { path = "crates/serve" }
+lmk-sim = { path = "crates/sim" }
 letmeknow-kind-doc = { path = "crates/kind-doc" }
 letmeknow-kind-git = { path = "crates/kind-git" }
 anyhow = "1"
