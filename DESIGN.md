@@ -88,7 +88,7 @@ Some kinds need an order every member agrees on: two pushes to one branch must n
 - An entry is sealed as a message is, under the epoch current when it is appended, and marked as an entry, so that it cannot pass for a message, nor a message for it. The service's limits apply: letmeknow.dev takes entries up to 1 MiB and 60 appends a minute per connection, and keeps them a year.
 - Members open the entries in log order and hand them to the kind with their positions. An entry that does not open is skipped, as is one sealed under an older epoch than the entry taken before it, so every member decides alike, and a removed member's entries under its old epochs stop counting once a member appends under a newer one. The session keeps what it opened until the kind says it holds it.
 - A kind appends through its session, and learns its entry's position only once every entry before it is opened, so it knows at once how its entry fared. A member cannot open its own entry, so it keeps the payload until its entry comes back.
-- Members follow the log as they follow membership logs: signed heads, their own hash chains, heads swapped with peers, and contradictions reported.
+- Members follow the log as they follow membership logs: signed heads, their own hash chains, heads swapped with peers, and contradictions reported. They read its entries from the service only.
 - The kind says where it reads from: a joiner from where the state it was handed leaves off. A member that holds no keys of an entry's epoch (sealed before it joined, or past its key window), or whose place is past the service's retention, is behind: it asks a member online for the kind's state, and reads on from where that leaves off.
 
 ### Git

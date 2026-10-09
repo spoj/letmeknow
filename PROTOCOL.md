@@ -202,7 +202,7 @@ What a kind may do in its groups, and nothing else:
 
 ### Logs
 
-A group of a plugin's kind has a log of its own at the group's membership service, named by the settings' `log`, and chained, signed and gossiped as a group's log is (see Membership service).
+A group of a plugin's kind has a log of its own at the group's membership service, named by the settings' `log`. It is chained and signed as a group's log is (see Membership service), and members swap its heads in `hello` (see Peer protocol), but read its entries from the service only.
 
 - An entry is an MLS application message whose plaintext is a payload of the kind, sealed under the epoch current when it is appended, with the authenticated data `{"log": true}`. Before sealing, the appender reads its group's log to its end.
 - A member reads the log in order, from where its kind asks, and for each entry: one whose header names an epoch older than that of the last entry taken is skipped; one that is this session's own (it keeps each payload it appends, by SHA-256 of the ciphertext, until its entry is read) is taken; one whose epoch this session has not reached is skipped once the group's log is read to its end; one that opens and is marked is taken; one under an epoch whose keys this session does not hold leaves it behind; any other is skipped. Entries are opened once; the session keeps those taken until its kind asks to read past them.
