@@ -28,7 +28,7 @@ use tokio::{
 };
 
 use crate::{
-    Groups,
+    Disk, Groups,
     seal::{Opener, SEALED, Sealer, sealed_len},
 };
 
@@ -43,6 +43,7 @@ pub(crate) struct Files {
     downloads: Arc<Mutex<HashMap<[u8; 32], Download>>>,
     /// Files just added, kept from deletion until the next collection has seen them.
     added: Arc<Mutex<Vec<TempTag>>>,
+    disk: Option<Arc<dyn Disk>>,
 }
 
 struct Download {
@@ -55,6 +56,7 @@ impl Files {
     pub async fn new(
         endpoint: Endpoint,
         dir: Option<std::path::PathBuf>,
+        disk: Option<Arc<dyn Disk>>,
         groups: Arc<dyn Groups>,
         collect: Duration,
     ) -> Result<Self> {
@@ -80,7 +82,7 @@ impl Files {
             Some(_) => bail!("a browser keeps files in memory"),
             None => (*iroh_blobs::store::mem::MemStore::new_with_opts(iroh_blobs::store::mem::Options { gc_config: Some(gc) })).clone(),
         };
-        Ok(Files { store, endpoint, downloads, added })
+        Ok(Files { store, endpoint, downloads, added, disk })
     }
 
     /// Serves complete files to current members only: checked per connection, per request, and
@@ -174,8 +176,33 @@ impl Files {
         Ok(FileLink { hash, size: size.load(Ordering::Relaxed), key })
     }
 
+    /// Whether a file is whole in memory.
     pub async fn complete(&self, hash: &[u8; 32]) -> Result<bool> {
         Ok(self.bitfield(hash).await?.is_complete())
+    }
+
+    /// Whether a file is held whole, in memory or on a browser's disk.
+    pub async fn has(&self, hash: &[u8; 32]) -> Result<bool> {
+        Ok(self.disk.as_ref().is_some_and(|disk| disk.has(hash)) || self.complete(hash).await?)
+    }
+
+    /// Whether a file is held for the other members, then in memory: with a disk, only the files kept there are.
+    pub async fn serve(&self, hash: &[u8; 32]) -> Result<bool> {
+        match &self.disk {
+            Some(disk) if !disk.has(hash) => Ok(false),
+            _ => self.load(hash).await,
+        }
+    }
+
+    /// Whether a file is in memory, after loading it from a browser's disk if it is kept there.
+    async fn load(&self, hash: &[u8; 32]) -> Result<bool> {
+        if self.complete(hash).await? {
+            return Ok(true);
+        }
+        let Some(disk) = self.disk.as_ref().filter(|disk| disk.has(hash)) else { return Ok(false) };
+        let tag = self.store.add_bytes(disk.load(*hash).await?).temp_tag().await?;
+        self.added.lock().unwrap().push(tag);
+        Ok(true)
     }
 
     /// Verified ciphertext bytes held.
@@ -188,15 +215,8 @@ impl Files {
         Ok(self.store.get_bytes(Hash::from_bytes(*hash)).await?.to_vec())
     }
 
-    /// Holds a file's ciphertext, as `ciphertext` gave it.
-    pub async fn hold(&self, ciphertext: Vec<u8>) -> Result<()> {
-        let tag = self.store.add_bytes(ciphertext).temp_tag().await?;
-        self.added.lock().unwrap().push(tag);
-        Ok(())
-    }
-
     pub async fn read(&self, link: &FileLink, out: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
-        ensure!(self.complete(&link.hash).await?, "{} is not held", link.link());
+        ensure!(self.load(&link.hash).await?, "{} is not held", link.link());
         let mut reader = self.store.reader(Hash::from_bytes(link.hash));
         let mut opener = Opener::new(&link.key, sealed_len(link.size));
         let (mut buf, mut plain) = (vec![0; SEALED], Vec::new());

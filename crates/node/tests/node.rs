@@ -70,6 +70,7 @@ async fn node(relay: &Relay, name: &str, device_key: bool) -> Session {
         ca: CaTlsConfig::custom_roots([relay.cert.clone()]),
         home: None,
         files: None,
+        disk: None,
         file_limit: 100 << 20,
         window: Window::default(),
     };

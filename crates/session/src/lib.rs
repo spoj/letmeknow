@@ -113,6 +113,7 @@ fn node_config(network: &Network, home: &Path, name: &str, device_key: bool, fil
         ca: network.ca.clone(),
         home: Some(home.to_path_buf()),
         files: Some(files),
+        disk: None,
         file_limit: 100 << 20,
         window: Window::default(),
     }
