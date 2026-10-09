@@ -1300,7 +1300,10 @@ impl Session {
     /// A line a plugin wrote, or `None` once it stopped, when it is started again.
     pub async fn plugin_line(&mut self, kind: String, line: Option<Value>) {
         let Some(message) = line else {
-            self.plugins.stopped(&kind);
+            if !self.plugins.stopped(&kind) {
+                self.warn(None, format!("the {kind} plugin stopped; it runs again once this session restarts"));
+                return;
+            }
             self.warn(None, format!("the {kind} plugin stopped; starting it again"));
             let restarted = async {
                 self.plugins.start(&kind, &self.kind_dir(&kind)).await?;

@@ -44,9 +44,13 @@ struct Running {
     stdin: ChildStdin,
 }
 
+/// A plugin that stops within this long of its start is not started again by itself.
+const STEADY: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct Plugins {
     pub found: BTreeMap<String, PathBuf>,
     running: HashMap<String, Running>,
+    started: HashMap<String, std::time::Instant>,
     /// Each plugin's lines, and `None` once it stopped.
     lines: mpsc::UnboundedSender<(String, Option<Value>)>,
 }
@@ -54,7 +58,7 @@ pub struct Plugins {
 impl Plugins {
     pub fn new(found: BTreeMap<String, PathBuf>) -> (Self, mpsc::UnboundedReceiver<(String, Option<Value>)>) {
         let (lines, rx) = mpsc::unbounded_channel();
-        (Plugins { found, running: HashMap::new(), lines }, rx)
+        (Plugins { found, running: HashMap::new(), started: HashMap::new(), lines }, rx)
     }
 
     pub fn running(&self) -> Vec<String> {
@@ -82,6 +86,7 @@ impl Plugins {
             lines.send((name, None)).ok();
         });
         self.running.insert(kind.to_owned(), Running { _child: child, stdin });
+        self.started.insert(kind.to_owned(), std::time::Instant::now());
         self.send(kind, &serde_json::json!({ "type": "start", "kind": kind, "dir": dir })).await
     }
 
@@ -94,8 +99,9 @@ impl Plugins {
         written.with_context(|| format!("the {kind} plugin stopped"))
     }
 
-    /// A plugin's stdout closed.
-    pub fn stopped(&mut self, kind: &str) {
+    /// A plugin's stdout closed; whether it had run steadily, and may be started again.
+    pub fn stopped(&mut self, kind: &str) -> bool {
         self.running.remove(kind);
+        self.started.get(kind).is_some_and(|at| at.elapsed() > STEADY)
     }
 }
