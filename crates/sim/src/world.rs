@@ -183,7 +183,8 @@ struct Book {
     /// When each member was told a member left a group: by member, group and fingerprint.
     left: BTreeMap<(usize, Bytes, String), u64>,
     sent: Vec<Sent>,
-    /// Refusals senders were told of: sender, message id (hex), and the fingerprint of the member that refused it.
+    /// Refusals senders were told of, in `send`'s answer or later: sender, message id (hex), and the fingerprint of the
+    /// member that refused it.
     refusals: BTreeSet<(usize, String, String)>,
     /// Live messages each member took: by member and nonce.
     live: BTreeSet<(usize, String)>,
@@ -194,7 +195,7 @@ struct Book {
     vouched: BTreeSet<(usize, Bytes, String)>,
     /// Introductions each member was told of: by member, group, and the introducer's fingerprint.
     introduced: BTreeSet<(usize, Bytes, String)>,
-    /// Devices taken off identities: the identity, the member whose device it was, and when.
+    /// Devices taken off identities, until they join them again: the identity, the member whose device it was, and when.
     revoked: Vec<(Bytes, usize, u64)>,
 }
 
@@ -530,7 +531,10 @@ impl World {
                 let identity = self.identity(m)?;
                 let link = self.request(m, json!({ "cmd": "invite", "identity": b64(&identity.0) })).await?;
                 let link = link["link"].as_str().context("no link")?;
-                Ok(self.request(n, json!({ "cmd": "join", "target": link })).await?.to_string())
+                let joined = self.request(n, json!({ "cmd": "join", "target": link })).await?;
+                let n = self.index(n);
+                self.book.lock().unwrap().revoked.retain(|(id, j, _)| *id != identity || *j != n);
+                Ok(joined.to_string())
             }
             Act::Invite { m, group, n, label, to } => {
                 let mut invite = json!({ "cmd": "invite" });
@@ -577,7 +581,12 @@ impl World {
                 let chat = Chat { text: format!("from m{m} at {}", elapsed()), to: Vec::new(), reply_to: None, urgent: false, attachment: None };
                 let (id, answer) = client.send(&gid, chat, after).await?;
                 let epoch = client.node().message(&id.0)?.context("a sent message is held")?.epoch;
-                self.book.lock().unwrap().sent.push(Sent { by: m, group: gid, id, epoch });
+                let mut book = self.book.lock().unwrap();
+                for refusal in answer["refused"].as_array().into_iter().flatten() {
+                    let refuser = refusal["member"]["fp"].as_str().unwrap_or_default().to_owned();
+                    book.refusals.insert((m, hex::encode(&id.0), refuser));
+                }
+                book.sent.push(Sent { by: m, group: gid, id, epoch });
                 Ok(answer.to_string())
             }
             Act::Live { m, group } => {
