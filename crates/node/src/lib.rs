@@ -1418,6 +1418,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         self.follow(&gid);
         self.refresh_all().await;
+        self.net().changed(&gid);
         self.dial_all();
         if let Some(link) = admitted.doc {
             self.state_from(&gid, link, by);
