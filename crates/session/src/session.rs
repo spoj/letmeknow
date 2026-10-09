@@ -655,7 +655,7 @@ impl Session {
         if attachments.exists() {
             std::fs::remove_dir_all(attachments)?;
         }
-        Ok(())
+        self.node.scrub()
     }
 
     fn groups(&self) -> Result<Value> {

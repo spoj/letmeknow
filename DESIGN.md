@@ -179,7 +179,7 @@ Limits:
 - **Doc edits relayed in a diff** are vouched for by the member that sent the diff, not their authors; since any member can edit anything, this loses attribution, not access.
 - **Availability**: a message reaches a member only while that member and some holder are online together. Agents that are never online at the same time need a third member to bridge them.
 - **Peer agents** read everything while members; removal restores confidentiality going forward.
-- **Local state**: MLS secrets, held messages, files, docs and, with `--keep-log`, delivered text sit on disk; file permissions protect them. Copies a harness keeps (transcripts, monitor logs) are outside every guarantee here.
+- **Local state**: MLS secrets, held messages, files, docs and, with `--keep-log`, delivered text sit on disk; file permissions protect them. What a session deletes leaves no copy in its database files. Copies a harness keeps (transcripts, monitor logs) are outside every guarantee here.
 - **Open groups**: while a group is open to an identity, any device on its list can join, with no one asked.
 
 ## Later

@@ -11,6 +11,10 @@ pub trait Provider: OpenMlsProvider<StorageProvider: StorageProvider<1, Error: S
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete(&self, key: &[u8]) -> Result<()>;
+    /// Leaves in its files no copy of what was deleted or overwritten.
+    fn scrub(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The browser's provider: everything in one `MemoryStorage`, whose `values` the browser persists, one record per key.
@@ -155,5 +159,47 @@ mod native {
             self.ours.execute("DELETE FROM lmk WHERE key = ?1", [key])?;
             Ok(())
         }
+
+        /// `secure_delete` zeroes deleted records in the database, but the WAL keeps earlier versions of their pages
+        /// until a checkpoint overwrites it; TRUNCATE empties it.
+        fn scrub(&self) -> Result<()> {
+            let busy: i64 = self.ours.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+            anyhow::ensure!(busy == 0, "the database was busy, so deleted records stay in its WAL for now");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::{Provider, SqliteProvider};
+
+    fn in_files(dir: &std::path::Path, secret: &[u8]) -> Vec<String> {
+        let files = std::fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().path());
+        let holding = files.filter(|path| std::fs::read(path).unwrap().windows(secret.len()).any(|w| w == secret));
+        holding.map(|path| path.display().to_string()).collect()
+    }
+
+    #[test]
+    fn deleted_records_are_in_no_file() {
+        let dir = std::env::temp_dir().join(format!("lmk-core-scrub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider = SqliteProvider::open(&dir.join("state.db")).unwrap();
+        let small = b"a secret that must not linger".to_vec();
+        let large: Vec<u8> = small.iter().cycle().take(20_000).copied().collect();
+        provider.put(b"kept", b"something else").unwrap();
+        provider.put(b"small", &small).unwrap();
+        provider.put(b"large", &large).unwrap();
+        provider.put(b"replaced", &[b"old ".as_slice(), &small].concat()).unwrap();
+        assert!(!in_files(&dir, &small).is_empty());
+        provider.delete(b"small").unwrap();
+        provider.delete(b"large").unwrap();
+        provider.put(b"replaced", b"new").unwrap();
+        provider.scrub().unwrap();
+        assert_eq!(in_files(&dir, &small), Vec::<String>::new());
+        assert_eq!(provider.get(b"kept").unwrap().unwrap(), b"something else");
+        // Windows cannot delete a database that is still open.
+        drop(provider);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

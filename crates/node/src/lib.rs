@@ -744,7 +744,13 @@ impl<P: Provider + Send + 'static> Node<P> {
         if let Payload::Message { content, .. } = &mut message.payload {
             content.clear();
         }
-        put(&st.provider, &message_key(id), &message)
+        put(&st.provider, &message_key(id), &message)?;
+        st.provider.scrub()
+    }
+
+    /// Leaves in this session's files no copy of what it deleted.
+    pub fn scrub(&self) -> Result<()> {
+        self.inner.state.lock().unwrap().provider.scrub()
     }
 
     /// A doc's Yjs state.
@@ -980,6 +986,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 st.groups.get_mut(gid).unwrap().mls.expire(&st.provider).ok();
             }
             self.expire(st);
+            if let Err(error) = st.provider.scrub() {
+                self.warn(None, format!("{error:#}"));
+            }
         }
     }
 
@@ -1131,6 +1140,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         st.save(gid)?;
         if changed {
+            // Applying a commit deletes the secrets of epochs beyond the key window.
+            if let Err(error) = st.provider.scrub() {
+                self.warn(Some(gid), format!("{error:#}"));
+            }
             if let Some(net) = self.net.get() {
                 net.changed(gid);
             }
@@ -1404,6 +1417,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         st.editors.remove(gid);
         g.mls.delete(&st.provider)?;
         st.save_groups()?;
+        st.provider.scrub()?;
         if let Some(net) = self.net.get() {
             net.changed(gid);
         }

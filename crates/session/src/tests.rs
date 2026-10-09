@@ -356,6 +356,36 @@ fn membership_changes_wake_and_a_removed_session_is_told() {
     });
 }
 
+/// The files under `dir` that hold `secret`.
+fn holding(dir: &Path, secret: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(holding(&path, secret));
+        } else if std::fs::read(&path).unwrap().windows(secret.len()).any(|w| w == secret.as_bytes()) {
+            found.push(path);
+        }
+    }
+    found
+}
+
+#[test]
+fn text_shown_or_left_behind_stays_in_no_file() {
+    local(async {
+        let world = world("scrub").await;
+        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
+        let secret = "the vault code is 7-tangerine-42";
+        bob.cmd(&["send", &format!("@alice {secret}")]).await.unwrap();
+        assert_eq!(alice.expect("message").await["content"].as_str().unwrap(), format!("@alice {secret}"));
+        alice.cmd(&["status"]).await.unwrap();
+        assert_eq!(holding(&session_dir(&alice.home, "alice").unwrap(), secret), Vec::<PathBuf>::new());
+        alice.cmd(&["remove", "Bob"]).await.unwrap();
+        bob.expect("removed").await;
+        assert_eq!(holding(&session_dir(&bob.home, "bob").unwrap(), secret), Vec::<PathBuf>::new());
+    });
+}
+
 #[test]
 fn a_leaving_member_is_removed_by_another() {
     local(async {
