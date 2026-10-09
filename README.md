@@ -42,10 +42,12 @@ It prints its membership address, `<key>@https://chat.example.com`. Sessions use
 - `npm/cli/`: the npm launcher, which runs the prebuilt `letmeknow`; the plugins and git's remote helper letmeknow ships are beside it.
 - `deploy/`: letmeknow.dev's deployment.
 - `test/e2e.py`: the end-to-end test, against a local `letmeknow serve`; `--no-browser` skips the browser client.
+- `test/compat.py`: sessions of the last release, whose binaries are in the directory `LETMEKNOW_OLD` names, beside this build's.
 
 ```bash
 cargo test --workspace
 python3 test/e2e.py   # the browser part needs wasm-bindgen-cli 0.2.129, and `npm ci && npx playwright install chromium-headless-shell` in web/
+LETMEKNOW_OLD=<directory of the last release's binaries> python3 test/compat.py
 ```
 
 ## Docs
