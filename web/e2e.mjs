@@ -292,8 +292,8 @@ try {
   await kiosk.goto(local(desk.run("invite", "--identity", "Matthew").link));
   const moving = kiosk.locator("dialog", { hasText: "Move this browser to another identity" });
   await moving.waitFor();
-  const said = await moving.textContent();
-  check(said.includes("It leaves Kim, which ends") && said.includes("as Kim: Kiosk notes"), "a device link opened in a browser on an identity says what moving does");
+  const moveSaid = await moving.textContent();
+  check(moveSaid.includes("It leaves Kim, which ends") && moveSaid.includes("as Kim: Kiosk notes"), "a device link opened in a browser on an identity says what moving does");
   await moving.getByRole("button", { name: "Move this browser" }).click();
   await kiosk.locator(".devices li", { hasText: "this browser" }).waitFor();
   check((await kiosk.locator(".me").textContent()).includes("Matthew"), "and moves the browser to the identity of the link");

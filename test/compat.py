@@ -2,7 +2,8 @@
 """Cross-version check: sessions of the last release, whose binaries are in the directory LETMEKNOW_OLD names, beside
 sessions of this build, on a local `letmeknow serve` of this build: invites both ways, chat both ways with a file, a doc
 and a git group, identities with a device of each, a device taken off its identity while a member of the last release is
-in its group, and a home of the last release that this build resumes."""
+in its group, a device of this build renamed and leaving an identity with a device of the last release, and a home of the
+last release that this build resumes."""
 import os, subprocess
 
 import e2e
@@ -112,6 +113,24 @@ def main():
         run("ben", "send", f"--group={chat['group']}", "@ann after the phone left")
         ann.expect("message", lambda e: e["content"] == "@ann after the phone left")
         tab.expect("message", lambda e: e["content"] == "@ann after the phone left")
+
+        # Ann's pad, of this build, renames itself. Her devices group has a device of the last release, which refuses an
+        # update that changes a credential, so the pad keeps its name there; the certificates it signs name the new one.
+        devices = lambda session, bin: sorted(d["name"] for d in run(session, "identity", "list", bin=bin)["identities"][0]["devices"])
+        before = devices("ann", OLD)
+        run("pad", "identity", "rename", "pad-renamed")
+        for session, bin in (("ben", BIN), ("ann", OLD)):
+            seen = until(lambda: member(session, chat["group"], "Pad", bin), lambda m: m and m["device"] == "pad-renamed", timeout=60)
+            check(seen and seen["device"] == "pad-renamed", f"a renamed device's sessions show its new name, as {session} sees them")
+        check(devices("ann", OLD) == devices("pad", BIN) == before, f"a devices group with a device of {VERSION} keeps the old name, on both")
+
+        # The pad leaves Ann's identity: its session leaves the chat first, and Ann's device of the last release commits its
+        # removal, without replacing her key.
+        left = run("pad", "identity", "leave", "Ann")
+        check(left["left"] == [chat["group"]] and left["ended"] is False, "a device of this build leaves an identity, its session leaving its group first")
+        ben.expect("left", lambda e: e["member"]["name"] == "Pad", timeout=60)
+        remaining = until(lambda: devices("ann", OLD), lambda d: len(d) == 1, timeout=60)
+        check(len(remaining) == 1, f"{VERSION} commits the removal of a device that left its identity")
 
         # Ann's home, of the last release, resumed by this build.
         ann.stop()
