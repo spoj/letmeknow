@@ -2543,7 +2543,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "letmeknow"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2841,7 +2841,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "lmk-core"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2865,7 +2865,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-membership"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2888,7 +2888,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-net"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "bao-tree",
@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-node"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "ed25519-dalek 3.0.0",
@@ -2940,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-proto"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2955,7 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-serve"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "ed25519-dalek 3.0.0",
@@ -2979,7 +2979,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-web"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "hex",
