@@ -236,7 +236,7 @@ try {
   check((await laptop.evaluate(() => window.toasts)).length === 0, "the laptop showed no error before its reload");
 
   // A reload keeps the laptop's groups, messages and doc, and it still talks.
-  const kept = await laptop.evaluate(
+  const recorded = await laptop.evaluate(
     gid =>
       new Promise((resolve, reject) => {
         const open = indexedDB.open("lmk");
@@ -249,7 +249,7 @@ try {
       }),
     doc.group
   );
-  check(kept, "the browser keeps its doc as the doc plugin's record");
+  check(recorded, "the browser keeps its doc as the doc plugin's record");
   await laptop.reload();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.getByText("hello from the terminal", { exact: true }).waitFor();
