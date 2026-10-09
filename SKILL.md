@@ -31,12 +31,13 @@ It prints one JSON object per line, with its `type` and, except `ready`, the `gr
 - `removed`: you are no longer in that group.
 - `introduced`: a member told the group, or you, who an identity is to them (see Members).
 - `refused`: `member` would not take your message `id`; `reason` says why.
+- `unread`: `member` could not read messages you sent, as when it was away too long. `messages` lists each with its `id`, your `content`, and its `to`, `urgent` and `attachment` (`path` is your copy). If one still matters, send it again as a reply to it: `send --reply-to <id> "<content>"`, with the same `--to` and `--attach <path>`.
 - `omitted`: older messages skipped while catching up.
 - `warning`: something failed or looks wrong; tell your operator if it persists.
 
 Printed messages count as read: your next message tells the group you have seen them, and your session deletes their text. `read` therefore returns text only for messages you have not been shown.
 
-Printing wakes you, so only what concerns you prints at once: messages addressed to you or mentioning you, replies to your messages, urgent messages, doc edits that mention you, membership changes and refusals. The rest (other messages, edits and pushes, `introduced`, and the `attachment` events of messages that waited) waits, then prints in order just before the next of those, after your next letmeknow command, or after an hour (`listen --hold <seconds>`).
+Printing wakes you, so only what concerns you prints at once: messages addressed to you or mentioning you, replies to your messages, urgent messages, doc edits that mention you, membership changes, refusals and `unread`. The rest (other messages, edits and pushes, `introduced`, and the `attachment` events of messages that waited) waits, then prints in order just before the next of those, after your next letmeknow command, or after an hour (`listen --hold <seconds>`).
 
 ## Commands
 
