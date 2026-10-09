@@ -573,11 +573,11 @@ impl<P: Provider> State<P> {
         g.mls.members().into_iter().filter_map(|m| m.credential?.identity).collect()
     }
 
-    /// Persists this session's own certificates.
+    /// Persists the certificates held of this session and of its groups' members.
     fn save_certificates(&self) -> Result<()> {
-        let me = self.session.key();
-        let own: Vec<&Envelope> = self.certificates.iter().filter(|((key, _), _)| key == me).map(|(_, c)| c).collect();
-        put(&self.provider, b"node/certificates", &own)
+        let members: HashSet<Vec<u8>> = self.groups.values().flat_map(|g| g.mls.members()).map(|m| m.key).collect();
+        let held = self.certificates.iter().filter(|((key, _), _)| key == self.session.key() || members.contains(key));
+        put(&self.provider, b"node/certificates", &held.map(|(_, c)| c).collect::<Vec<_>>())
     }
 
     /// A new group's records, its MLS state, and its log, read after `rec.position`.
@@ -628,9 +628,14 @@ impl<P: Provider + Send + 'static> Node<P> {
         }
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
-        let key = session.key().to_vec();
-        let own: Vec<Envelope> = get(&provider, b"node/certificates")?.unwrap_or_default();
-        let certificates = own.into_iter().filter_map(|c| Some(((key.clone(), certified(&c)?.identity.0), c))).collect();
+        let held: Vec<Envelope> = get(&provider, b"node/certificates")?.unwrap_or_default();
+        let certificates = held
+            .into_iter()
+            .filter_map(|c| {
+                let certified = certified(&c)?;
+                Some(((certified.key.0, certified.identity.0), c))
+            })
+            .collect();
         let state = State {
             provider,
             session,
@@ -1125,11 +1130,16 @@ impl<P: Provider + Send + 'static> Node<P> {
         st.certificate(&st.session.credential, identity).cloned()
     }
 
-    /// Holds a certificate of this session, which it shows its peers.
+    /// Holds a certificate of this session, which it shows its peers, and reads the identity's key log, so that, if a
+    /// new key is why, its peers take the new entries from this session.
     pub fn set_certificate(&self, certificate: Envelope) -> Result<()> {
         let certified = certified(&certificate).context("a certificate that does not parse")?;
         let mut st = self.inner.state.lock().unwrap();
         ensure!(certified.key.0 == st.session.key(), "a certificate of another session");
+        let address = lmk_proto::identity::address(&certified.identity.0);
+        if st.logs.contains_key(&address[..]) {
+            self.inner.work.send(Work::Read(address.to_vec())).ok();
+        }
         let key = (certified.key.0, certified.identity.0);
         st.certificates.insert(key, certificate);
         st.save_certificates()?;
@@ -1537,12 +1547,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Has the members removed that are connected to this session and have gone `CERTIFICATE_GRACE` without a valid
-    /// certificate of the identity they speak as, judged by a key log read since.
+    /// Has the members removed whose certificates are of a device taken off their identity, and those connected to this
+    /// session that have gone `CERTIFICATE_GRACE` without a valid certificate of the identity they speak as, judged by a
+    /// key log read since.
     fn revoke(&self) {
         let connected = self.net().connected();
         let mut st = self.state.lock().unwrap();
         let st = &mut *st;
+        self.remove_revoked(st);
         let now = now();
         let mut seen = HashSet::new();
         for (gid, g) in &st.groups {
@@ -1565,6 +1577,21 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
         }
         st.uncertified.retain(|key, _| seen.contains(key));
+    }
+
+    /// Has the members removed whose certificates are of a device taken off their identity, connected or not.
+    fn remove_revoked(&self, st: &State<P>) {
+        for (gid, g) in &st.groups {
+            for member in g.mls.members().into_iter().filter(|m| m.key != st.session.key()) {
+                let Some(identity) = member.credential.as_ref().and_then(|c| c.identity.as_ref()) else { continue };
+                let certificate = st.certificates.get(&(member.key.clone(), identity.id.0.clone()));
+                if let (Some(log), Some(certificate)) = (st.keys.get(&identity.id.0), certificate)
+                    && log.revokes(certificate)
+                {
+                    self.work.send(Work::Remove { group: gid.clone(), key: member.key.clone() }).ok();
+                }
+            }
+        }
     }
 
     /// Reads an identity's key log from its service.
@@ -1593,6 +1620,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for certificate in ahead {
             groups::take_certificate(st, certificate);
         }
+        self.remove_revoked(st);
         Ok(())
     }
 
@@ -1708,6 +1736,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         let group = Bytes(gid.to_vec());
         let st = self.state.lock().unwrap();
+        if !added.is_empty()
+            && let Err(error) = st.save_certificates()
+        {
+            self.warn(Some(gid), format!("{error:#}"));
+        }
         let by = by.and_then(|by| st.member(gid, &by));
         if gone {
             drop(st);

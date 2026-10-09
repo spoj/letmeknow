@@ -35,11 +35,14 @@ pub struct KeyLog {
     pub keys: Vec<[u8; 32]>,
     /// SHA-256 of the latest valid entry's body.
     latest: [u8; 32],
+    /// The devices taken off the identity: each one's key, and the index in `keys` of the key that replaced the key
+    /// it held.
+    revoked: Vec<(Bytes, usize)>,
 }
 
 /// A new identity whose first key is `seed`'s: its id, and its first entry, sealed.
 pub fn create(seed: &[u8; 32], name: &str, membership: Service) -> ([u8; 32], Vec<u8>) {
-    let body = Body { prev: None, key: public(seed).into(), name: Some(name.into()), membership: Some(membership) };
+    let body = Body { prev: None, key: public(seed).into(), name: Some(name.into()), membership: Some(membership), revoked: None };
     let body = serde_json::to_vec(&body).unwrap();
     let id = id(&body);
     (id, seal(&id, &sign(seed, ENTRY_CONTEXT, body)))
@@ -90,7 +93,7 @@ impl KeyLog {
         if body.prev.is_some() || Sha256::digest(&entry.body.0)[..] != id[..] {
             return None;
         }
-        Some(KeyLog { id: *id, name: body.name?, membership: body.membership?, keys: vec![key], latest: *id })
+        Some(KeyLog { id: *id, name: body.name?, membership: body.membership?, keys: vec![key], latest: *id, revoked: Vec::new() })
     }
 
     /// Applies the next entry of the log if the current key signed it and it extends the log; returns whether it did.
@@ -104,6 +107,9 @@ impl KeyLog {
         if body.prev.as_ref().map(|prev| prev.0.as_slice()) != Some(self.latest.as_slice()) {
             return false;
         }
+        if let Some(device) = body.revoked {
+            self.revoked.push((device, self.keys.len()));
+        }
         self.keys.push(key);
         self.latest = Sha256::digest(&entry.body.0).into();
         true
@@ -114,10 +120,20 @@ impl KeyLog {
         self.keys.last().expect("a log starts with a key")
     }
 
-    /// The sealed entry by which the current key, `seed`'s, hands over to `next`.
-    pub fn rotate(&self, seed: &[u8; 32], next: &[u8; 32]) -> Vec<u8> {
-        let body = Body { prev: Some(self.latest.into()), key: (*next).into(), name: None, membership: None };
+    /// The sealed entry by which the current key, `seed`'s, hands over to `next`, because the device with key
+    /// `revoked`, if any, was taken off the identity.
+    pub fn rotate(&self, seed: &[u8; 32], next: &[u8; 32], revoked: Option<Bytes>) -> Vec<u8> {
+        let body = Body { prev: Some(self.latest.into()), key: (*next).into(), name: None, membership: None, revoked };
         seal(&self.id, &sign(seed, ENTRY_CONTEXT, serde_json::to_vec(&body).unwrap()))
+    }
+
+    /// Whether a certificate is of a device taken off the identity: it names that device, and a key the identity held
+    /// before that device was taken off signed it.
+    pub fn revokes(&self, certificate: &Envelope) -> bool {
+        let Some(device) = certified(certificate).and_then(|c| c.device_key) else { return false };
+        self.revoked.iter().any(|(revoked, replaced)| {
+            *revoked == device && self.keys[..*replaced].iter().any(|key| verify(key, CERTIFICATE_CONTEXT, &certificate.body.0, &certificate.sig.0))
+        })
     }
 }
 
@@ -166,16 +182,16 @@ mod tests {
         let keys = KeyLog::replay(&id, log.iter().map(Vec::as_slice)).unwrap();
         assert_eq!((keys.name.as_str(), keys.current()), ("Matthew", &public(&first)));
         assert!(open(&[0; 32], &log[1]).is_err());
-        log.push(keys.rotate(&first, &public(&second)));
+        log.push(keys.rotate(&first, &public(&second), None));
         // A fork: the first entry that extends the log wins.
-        log.push(keys.rotate(&first, &public(&third)));
+        log.push(keys.rotate(&first, &public(&third), None));
         let keys = KeyLog::replay(&id, log.iter().map(Vec::as_slice)).unwrap();
         assert_eq!(keys.keys, [public(&first), public(&second)]);
         // An old key can sign nothing more.
-        log.push(keys.rotate(&first, &public(&third)));
+        log.push(keys.rotate(&first, &public(&third), None));
         let mut keys = KeyLog::replay(&id, log.iter().map(Vec::as_slice)).unwrap();
         assert_eq!(keys.current(), &public(&second));
-        assert!(keys.apply(&keys.rotate(&second, &public(&third))));
+        assert!(keys.apply(&keys.rotate(&second, &public(&third), None)));
         assert_eq!(keys.current(), &public(&third));
     }
 
@@ -195,15 +211,41 @@ mod tests {
         let identity = IdentityRef { id: id.into(), membership: service() };
         let credential = Credential { name: "Builder".into(), key: Bytes(vec![1; 32]), identity: Some(identity) };
         let certified =
-            Certified { identity: id.into(), key: credential.key.clone(), name: "Builder".into(), device: "laptop".into(), added_by: None, expires: 100 };
+            Certified { identity: id.into(), key: credential.key.clone(), name: "Builder".into(), device: "laptop".into(), device_key: None, added_by: None, expires: 100 };
         let certificate = certify(&seed, &certified);
         assert_eq!(check(Some(&certificate), &credential, &log, 99), Ok(certified.clone()));
         assert!(check(Some(&certificate), &credential, &log, 100).is_err());
         assert!(check(None, &credential, &log, 99).is_err());
         let other = Credential { key: Bytes(vec![2; 32]), ..credential.clone() };
         assert!(check(Some(&certificate), &other, &log, 99).is_err());
-        assert!(log.apply(&log.rotate(&seed, &public(&next))));
+        assert!(log.apply(&log.rotate(&seed, &public(&next), None)));
         assert!(check(Some(&certificate), &credential, &log, 99).is_err());
         assert!(check(Some(&certify(&next, &certified)), &credential, &log, 99).is_ok());
+    }
+
+    #[test]
+    fn a_key_replaced_for_a_device_taken_off_revokes_its_certificates() {
+        let (first, second, third) = (crate::random(), crate::random(), crate::random());
+        let (id, entry) = create(&first, "Matthew", service());
+        let mut log = KeyLog::replay(&id, [entry.as_slice()]).unwrap();
+        let of = |seed: &[u8; 32], device: u8| {
+            let certified = Certified {
+                identity: id.into(),
+                key: Bytes(vec![1; 32]),
+                name: "Builder".into(),
+                device: "tablet".into(),
+                device_key: Some(Bytes(vec![device; 32])),
+                added_by: None,
+                expires: 100,
+            };
+            certify(seed, &certified)
+        };
+        assert!(log.apply(&log.rotate(&first, &public(&second), None)));
+        assert!(!log.revokes(&of(&first, 7)), "a monthly replacement revokes nothing");
+        assert!(log.apply(&log.rotate(&second, &public(&third), Some(Bytes(vec![7; 32])))));
+        assert!(log.revokes(&of(&first, 7)) && log.revokes(&of(&second, 7)));
+        assert!(!log.revokes(&of(&first, 8)), "only the device taken off");
+        assert!(!log.revokes(&of(&third, 7)), "a device added again is certified anew");
+        assert!(!log.revokes(&of(&crate::random(), 7)), "only a certificate by the identity's key");
     }
 }

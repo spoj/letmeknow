@@ -395,6 +395,9 @@ pub(crate) fn take_certificate<P: Provider>(st: &mut State<P>, certificate: Enve
     });
     if newer {
         st.certificates.insert(key, certificate);
+        if let Err(error) = st.save_certificates() {
+            tracing::warn!("saving certificates: {error:#}");
+        }
     } else if credential.is_some() && !fresh {
         st.ahead.insert(key, certificate);
     }
