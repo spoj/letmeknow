@@ -43,8 +43,6 @@ const CONVERGE: Duration = Duration::from_secs(90);
 const LIVE_WAIT: Duration = Duration::from_secs(10);
 /// How long an action may take.
 const ACTION_WAIT: Duration = Duration::from_secs(300);
-/// How often members at one epoch are checked to agree.
-const AGREEMENT_CHECK: Duration = Duration::from_secs(30);
 /// How long after a device is taken off every member holding its sessions' certificates has read the key log entry
 /// that names it: a copy of a key log is fresh for 10 minutes.
 const KEYS_READ: u64 = 11 * 60 * 1000;
@@ -266,14 +264,6 @@ impl World {
                 self.fail("start", format!("m{i} did not start: {error:#}"));
             }
         }
-        let checking = Arc::downgrade(self);
-        let checker = tokio::spawn(async move {
-            loop {
-                sleep(AGREEMENT_CHECK).await;
-                let Some(world) = checking.upgrade() else { return };
-                world.agreement();
-            }
-        });
         let mut last = 0;
         for (i, action) in actions.iter().enumerate() {
             sleep(Duration::from_millis(action.at - last)).await;
@@ -289,6 +279,15 @@ impl World {
                 Act::Restart { m } => self.restart(*m).await,
                 Act::Partition { mask } => self.partition(*mask),
                 Act::Heal => self.partition(0),
+                Act::Sleep { ms } => {
+                    for i in 0..self.size() {
+                        self.crash(i).await;
+                    }
+                    sleep(Duration::from_millis(*ms)).await;
+                    for i in 0..self.size() {
+                        self.start_again(i).await;
+                    }
+                }
                 Act::Drop { m, n } => {
                     let members = self.members.lock().unwrap();
                     let (a, b) = (members[m % members.len()].iroh, members[n % members.len()].iroh);
@@ -312,7 +311,6 @@ impl World {
             self.note("end".into());
             self.quiesce().await;
         }
-        checker.abort();
         for i in 0..self.size() {
             self.stop(i).await;
         }
@@ -437,9 +435,8 @@ impl World {
         }
     }
 
-    /// Crashes a member and starts it again from its storage as it stood.
-    async fn restart(self: &Arc<Self>, m: usize) {
-        let i = self.index(m);
+    /// Stops a member as a crash does, leaving its storage as it stood.
+    async fn crash(&self, i: usize) {
         self.stop(i).await;
         let id = {
             let mut members = self.members.lock().unwrap();
@@ -448,9 +445,18 @@ impl World {
         };
         self.net.kill(id);
         self.peers.lock().unwrap().remove(&id);
+    }
+
+    async fn start_again(self: &Arc<Self>, i: usize) {
         if let Err(error) = self.start(i).await {
             self.fail("start", format!("m{i} did not start again: {error:#}"));
         }
+    }
+
+    async fn restart(self: &Arc<Self>, m: usize) {
+        let i = self.index(m);
+        self.crash(i).await;
+        self.start_again(i).await;
     }
 
     fn online(&self, m: usize, online: bool) {
@@ -578,10 +584,13 @@ impl World {
 
     // Properties.
 
-    /// What a member was told.
+    /// What a member was told; with what changes a group, members at one epoch are checked to agree.
     fn told(&self, i: usize, event: ClientEvent) {
         let text = serde_json::to_string(&event).unwrap();
         self.note(format!("m{i} {text}"));
+        if !matches!(event, ClientEvent::Synced { .. }) {
+            self.agreement();
+        }
         match event {
             ClientEvent::Message { group, id, from, .. } => {
                 let from = from.fp.unwrap_or_default();
@@ -611,13 +620,6 @@ impl World {
         }
     }
 
-    /// Whether, as `m`'s node sees it, it serves `peer` the group: `peer` is in a leaf of its current epoch and, if it
-    /// speaks as an identity, has a valid certificate of it.
-    fn serves(node: &Node<Store>, gid: &[u8], peer: &[u8]) -> bool {
-        let members = node.members(gid).unwrap_or_default();
-        members.iter().find(|m| m.iroh.0 == peer).is_some_and(|m| m.identity.as_ref().is_none_or(|claim| claim.error.is_none()))
-    }
-
     /// Checks a frame on a `peer` stream against the serving rules, as its sender sees them as it sends it.
     fn inspect(&self, from: EndpointId, to: EndpointId, frame: &[u8]) {
         let Ok(frame) = serde_json::from_slice::<Frame>(frame) else { return };
@@ -639,7 +641,7 @@ impl World {
             _ => Vec::new(),
         };
         for (what, gid) in groups {
-            if !Self::serves(node, &gid.0, to.as_bytes()) {
+            if !node.serves(&gid.0, &to) {
                 let to = self.members.lock().unwrap().iter().position(|m| m.iroh == to).map_or_else(|| to.fmt_short().to_string(), |j| format!("m{j}"));
                 self.fail("served", format!("m{i} sent {to} {what} of {}, which it does not serve it", b64(&gid.0)));
             }
@@ -715,7 +717,7 @@ impl World {
             }
             for (a, x) in &inside {
                 for (b, y) in &inside {
-                    if a == b || !Self::serves(x, &gid.0, &y.address().0) || !Self::serves(y, &gid.0, &x.address().0) {
+                    if a == b || !x.serves(&gid.0, &y.net().id()) || !y.serves(&gid.0, &x.net().id()) {
                         continue;
                     }
                     let floor = x.joined(&gid.0).unwrap_or(0).max(y.joined(&gid.0).unwrap_or(0));
@@ -786,7 +788,7 @@ impl World {
                     continue;
                 }
                 for (r, receiver) in inside {
-                    if r != s && Self::serves(sender, &gid.0, &receiver.address().0) && Self::serves(receiver, &gid.0, &sender.address().0) {
+                    if r != s && sender.serves(&gid.0, &receiver.net().id()) && receiver.serves(&gid.0, &sender.net().id()) {
                         expected.push((*s, *r, nonce.clone()));
                     }
                 }

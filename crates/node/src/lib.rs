@@ -1007,6 +1007,11 @@ impl<P: Provider + Send + 'static> Node<P> {
         lmk_net::Groups::files(&*self.inner, gid)
     }
 
+    /// Whether this session serves a peer a group, by the serving rules.
+    pub fn serves(&self, gid: &[u8], peer: &EndpointId) -> bool {
+        lmk_net::Groups::is_member(&*self.inner, gid, peer)
+    }
+
     /// Whether this session gave a message up: it refused it, or could not open it.
     pub fn given_up(&self, gid: &[u8], id: &[u8]) -> bool {
         let st = self.inner.state.lock().unwrap();

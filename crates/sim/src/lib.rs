@@ -59,6 +59,8 @@ pub enum Act {
     Partition { mask: u32 },
     Heal,
     Drop { m: usize, n: usize },
+    /// Every member stops for this many milliseconds, as a browser closed, and starts again from its storage.
+    Sleep { ms: u64 },
     /// Every member online and reachable for a while, then convergence, delivery and revocation are checked.
     Quiesce,
 }
@@ -96,8 +98,8 @@ impl Default for Options {
 }
 
 /// The actions a seed makes: first some members make identities and groups, then actions weighted at random, with
-/// time passing between them, mostly seconds, now and then minutes, hours or days, past the key window and past a
-/// monthly key rotation; every 20, a quiet period.
+/// time passing between them, mostly seconds, now and then minutes or hours; now and then every member stops for days,
+/// past the key window and past a monthly key rotation; every 20, a quiet period.
 pub fn generate(seed: u64, options: Options) -> Vec<Action> {
     let mut rng = Rng(seed);
     let n = options.members;
@@ -116,8 +118,11 @@ pub fn generate(seed: u64, options: Options) -> Vec<Action> {
             700..900 => 5_000 + rng.below(55_000),
             900..970 => 60_000 + rng.below(30 * 60_000),
             970..995 => 3_600_000 + rng.below(12 * 3_600_000),
-            995..999 => 86_400_000 + rng.below(8 * 86_400_000),
-            _ => 31 * 86_400_000,
+            _ => {
+                let ms = if rng.below(5) == 0 { 31 * 86_400_000 } else { 86_400_000 + rng.below(8 * 86_400_000) };
+                actions.push(Action { at, act: Act::Sleep { ms } });
+                continue;
+            }
         };
         let (m, other) = (rng.index(n), rng.index(n));
         let group = rng.index(groups.max(1));
