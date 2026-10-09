@@ -172,7 +172,8 @@ def git_kind(alice, bob, dave, listeners):
     # With no other member online, a push fails and says so.
     bob.stop()
     listeners.remove(bob)
-    gone = until(lambda: run("alice", "status"), lambda s: all(not g["online"] for g in s["groups"] if g["group"] == made["group"]))
+    # A stopped process on Windows closes no connections, so Alice notices only once the connection times out.
+    gone = until(lambda: run("alice", "status"), lambda s: all(not g["online"] for g in s["groups"] if g["group"] == made["group"]), timeout=60)
     check(all(not g["online"] for g in gone["groups"] if g["group"] == made["group"]), "alice sees bob go")
     write("alice-repo/late.txt", "late")
     git("alice", "add", "late.txt", cwd=ours)
