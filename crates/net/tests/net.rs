@@ -1,6 +1,9 @@
 mod common;
 
+use std::sync::Arc;
+
 use common::*;
+use lmk_net::Disk;
 use ed25519_dalek::SigningKey;
 use iroh::RelayUrl;
 use lmk_net::Event;
@@ -215,6 +218,47 @@ async fn small_files_are_fetched_unasked() {
     assert_eq!(a.net.holders(G, link.hash).await, vec![members[1]]);
     a.net.shutdown().await.unwrap();
     b.net.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disk_holds_and_serves_only_what_it_keeps() {
+    let relay = relay().await;
+    let keys = keys(3);
+    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
+    let service = service();
+    let group = || Group { members: members.clone(), log: vec![b"e1".to_vec()], ..Group::default() };
+    let c_disk = Arc::new(FakeDisk::default());
+    let c = node(&relay, keys[2].clone(), Fake::new(&service).with(G, group()), Options { disk: Some(c_disk.clone()), ..Options::default() }).await;
+    let kept = c.net.add_file(std::io::Cursor::new(b"kept".to_vec())).await.unwrap();
+    let fetched = c.net.add_file(std::io::Cursor::new(b"fetched".to_vec())).await.unwrap();
+    assert!(c_disk.has(&kept.hash) && c_disk.has(&fetched.hash), "a browser keeps the files it adds");
+    // A is a browser that keeps one file on its disk, not in memory, and fetches the other, over its limit, into memory.
+    let disk = Arc::new(FakeDisk::default());
+    disk.0.lock().unwrap().insert(kept.hash, c_disk.0.lock().unwrap()[&kept.hash].clone());
+    let options = Options { disk: Some(disk.clone()), file_limit: 0, ..Options::default() };
+    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), options).await;
+    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options { file_limit: 0, ..Options::default() }).await;
+    let own = a.net.add_file(std::io::Cursor::new(b"own".to_vec())).await.unwrap();
+    for fake in [&a.fake, &b.fake, &c.fake] {
+        fake.groups.lock().unwrap().get_mut(G).unwrap().files.extend([kept.clone(), fetched.clone(), own.clone()]);
+    }
+    assert!(a.net.has(kept.hash).await.unwrap());
+    a.net.dial(members[2], relay.url.clone()).await.unwrap();
+    a.net.fetch(G, &fetched).await.unwrap();
+    let mut out = Vec::new();
+    a.net.read_file(&fetched, &mut out).await.unwrap();
+    assert_eq!(out, b"fetched");
+    b.net.dial(members[0], relay.url.clone()).await.unwrap();
+    assert_eq!(b.net.holders(G, kept.hash).await, vec![members[0]], "A loads a kept file to serve it");
+    b.net.fetch(G, &kept).await.unwrap();
+    out.clear();
+    b.net.read_file(&kept, &mut out).await.unwrap();
+    assert_eq!(out, b"kept");
+    assert!(!disk.has(&fetched.hash) && b.net.holders(G, fetched.hash).await.is_empty(), "A keeps and serves no file over its limit that it fetched");
+    assert_eq!(b.net.holders(G, own.hash).await, vec![members[0]], "A serves a file it added, whatever its size");
+    for node in [&a, &b, &c] {
+        node.net.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

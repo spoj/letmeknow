@@ -1,9 +1,11 @@
 // Browser end-to-end test, run by test/e2e.py against its local `letmeknow serve` (URL, serving dist/) with the native
-// binary (BIN): Matthew's laptop joins Ann's chat from a link and they talk and pass files both ways; it joins her doc
-// and they edit it both ways; his desk's identity adds his phone by a device link, and the phone joins a chat open to
-// that identity by itself; the laptop keeps everything across a reload.
+// binary (BIN): Matthew's laptop, which takes its relay and membership service from the server that served it, joins
+// Ann's chat from a link and they talk and pass files both ways; it joins her doc and they edit it both ways; his desk's
+// identity adds his phone by a device link, and the phone joins a chat open to that identity by itself; the laptop keeps
+// everything across a reload, a second tab works through the first and takes over when it closes; introductions,
+// refusals, files kept and deleted, and the service worker's updates.
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -17,10 +19,12 @@ const check = (condition, message) => {
 };
 const local = link => SITE + new URL(link).pathname + new URL(link).hash;
 
+const natives = [];
 /** A native session in a home of its own: its own device. */
 function native(name) {
   const env = { ...process.env, LETMEKNOW_HOME: join(tmp, name) };
   const proc = spawn(BIN, ["--session", name, "listen", "--name", name[0].toUpperCase() + name.slice(1), "--hold", "0"], { env, stdio: ["ignore", "pipe", "inherit"] });
+  natives.push(proc);
   const events = [];
   const waiters = new Set();
   createInterface({ input: proc.stdout }).on("line", line => {
@@ -29,7 +33,7 @@ function native(name) {
   });
   return {
     proc,
-    run: (...args) => JSON.parse(execFileSync(BIN, ["--session", name, ...args], { env, encoding: "utf8" })),
+    run: (...args) => JSON.parse(execFileSync(BIN, ["--session", name, ...args], { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })),
     /** The first event it printed that `predicate` accepts. */
     printed: (predicate, ms = 30_000) =>
       new Promise((resolve, reject) => {
@@ -51,26 +55,42 @@ const ann = native("ann");
 const desk = native("desk");
 const browser = await chromium.launch({ args: ["--ignore-certificate-errors"] });
 const pages = {};
-async function open(name, options) {
+function watch(name, page) {
+  pages[name] = page;
+  page.on("console", message => message.type() === "error" && console.log(`${name}: ${message.text()}`));
+  page.on("pageerror", error => console.log(`${name}: ${error}`));
+  return page;
+}
+/** A browser profile; unless `own`, localStorage names the test's relay and membership service, as the server would. */
+async function open(name, options, own = false) {
   const context = await browser.newContext({ ignoreHTTPSErrors: true, acceptDownloads: true, permissions: ["clipboard-read", "clipboard-write"], ...options });
   await context.addInitScript(
     ([relay, membership]) => {
-      localStorage.setItem("lmk relay", relay);
-      localStorage.setItem("lmk membership", membership);
+      if (relay) localStorage.setItem("lmk relay", relay);
+      if (membership) localStorage.setItem("lmk membership", membership);
       window.toasts = [];
       new MutationObserver(records => records.forEach(r => r.addedNodes.forEach(node => node.className === "toast" && window.toasts.push(node.textContent)))).observe(document, {
         childList: true,
         subtree: true
       });
     },
-    [LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP]
+    own ? [] : [LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP]
   );
-  const page = await context.newPage();
-  pages[name] = page;
-  page.on("console", message => message.type() === "error" && console.log(`${name}: ${message.text()}`));
-  page.on("pageerror", error => console.log(`${name}: ${error}`));
-  return page;
+  return watch(name, await context.newPage());
 }
+/** The hashes of the files a browser keeps in IndexedDB. */
+const kept = page =>
+  page.evaluate(
+    () =>
+      new Promise((resolve, reject) => {
+        const db = indexedDB.open("lmk");
+        db.onsuccess = () => {
+          const request = db.result.transaction("files").objectStore("files").getAllKeys();
+          request.onsuccess = () => (db.result.close(), resolve(request.result));
+          request.onerror = () => reject(request.error);
+        };
+      })
+  );
 const text = page => page.locator(".cm-content").evaluate(content => content.cmTile.view.state.doc.toString());
 async function until(produce, accept, ms = 20_000) {
   const deadline = Date.now() + ms;
@@ -89,7 +109,7 @@ try {
   desk.run("identity", "create", "Matthew");
 
   // Invited by link: what it is, a name, Join, and the chat.
-  const laptop = await open("laptop", { viewport: { width: 1280, height: 800 } });
+  let laptop = await open("laptop", { viewport: { width: 1280, height: 800 } }, true);
   const invite = ann.run("invite", "--name", "Plans");
   await laptop.goto(local(invite.link));
   await laptop.getByRole("heading", { name: "You're invited" }).waitFor();
@@ -163,6 +183,12 @@ try {
     t => t === "- [x] alpha\n- [ ] beta (browser)\n- [ ] gamma\n"
   );
   check(both === "- [x] alpha\n- [ ] beta (browser)\n- [ ] gamma\n", "and the native session's edit reaches the browser");
+  const spec = join(tmp, "spec.txt");
+  writeFileSync(spec, "the spec");
+  const attached = ann.run("attach", `--group=${doc.group}`, spec);
+  writeFileSync(notes, `- [x] alpha\n- [ ] beta (browser)\n- [ ] gamma\n${attached.markdown}\n`);
+  const specHash = attached.link.slice(4, 68);
+  check((await until(() => kept(laptop), hashes => hashes.includes(specHash))).includes(specHash), "the browser keeps a file the doc links");
 
   // A device link adds a phone to Matthew's identity, made on his desk; the phone then joins a chat open to it.
   const phone = await open("phone", { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
@@ -185,6 +211,27 @@ try {
   await phone.locator(".group-list button", { hasText: "Team" }).click();
   await phone.getByText("welcome, phone").waitFor();
   check(true, "and reads what is sent there");
+  const report = join(tmp, "report.txt");
+  writeFileSync(report, "for the team");
+  const before = await kept(phone);
+  desk.run("send", `--group=${team.group}`, "--attach", report, "the report");
+  await phone.locator(".messages li", { hasText: "the report" }).getByRole("button", { name: "Download report.txt" }).waitFor();
+  const [reportHash, ...others] = (await kept(phone)).filter(hash => !before.includes(hash));
+  check(reportHash && !others.length, "the phone keeps a file a message attached");
+  await phone.getByRole("button", { name: "Settings" }).click();
+  await phone.getByRole("button", { name: "Leave chat" }).click();
+  await phone.getByRole("button", { name: "Leave for good?" }).click();
+  await desk.printed(e => e.type === "left" && e.member.device === "phone");
+  await phone.locator(".group-list button", { hasText: "Team" }).waitFor({ state: "detached" });
+  const told = await phone.evaluate(() => window.toasts.splice(0));
+  check(told.every(t => t.startsWith("Asked the others to remove you") || t.startsWith("You were removed from Team")), `the phone leaves the chat (${told.length} notices)`);
+  await phone.reload();
+  await phone.locator(".devices li", { hasText: "phone" }).or(phone.locator(".group-list button")).first().waitFor();
+  const left = await until(
+    () => kept(phone),
+    hashes => !hashes.includes(reportHash)
+  );
+  check(!left.includes(reportHash) && before.every(hash => left.includes(hash)), "and deletes the file no group links any longer");
 
   check((await laptop.evaluate(() => window.toasts)).length === 0, "the laptop showed no error before its reload");
 
@@ -209,6 +256,32 @@ try {
     ).includes("gamma"),
     "and its doc"
   );
+
+  // A second tab works through the session the first one runs, and runs it once the first closes.
+  const second = watch("second tab", await laptop.context().newPage());
+  await second.goto(SITE);
+  await second.locator(".group-list button", { hasText: "Plans" }).click();
+  await second.getByText("still here").waitFor();
+  check(true, "a second tab shows the session's groups and messages");
+  await second.locator("textarea:visible").fill("from the second tab");
+  await second.locator("textarea:visible").press("Enter");
+  await ann.printed(e => e.type === "message" && e.content === "from the second tab");
+  check(true, "and sends through it");
+  await laptop.locator(".group-list button", { hasText: "Plans" }).click();
+  ann.run("send", `--group=${invite.group}`, "to both tabs");
+  await laptop.getByText("to both tabs").waitFor();
+  await second.getByText("to both tabs").waitFor();
+  check(true, "every tab hears the session's events");
+  check((await laptop.evaluate(() => window.toasts)).length === 0, "the first tab showed no error");
+  await laptop.close();
+  delete pages.laptop;
+  laptop = second;
+  ann.run("send", `--group=${invite.group}`, "after the first tab closed");
+  await laptop.getByText("after the first tab closed").waitFor({ timeout: 60_000 });
+  await laptop.locator("textarea:visible").fill("the second tab runs it");
+  await laptop.locator("textarea:visible").press("Enter");
+  await ann.printed(e => e.type === "message" && e.content === "the second tab runs it");
+  check(true, "when the first tab closes, the second runs the session");
 
   // The laptop starts an identity of its own, and its device link adds a native session's device to it.
   await laptop.locator(".me").click();
@@ -240,8 +313,33 @@ try {
   const offered = await until(() => tablet.run("groups"), groups => groups.some(g => g.name === "Ideas" && g.joined === false));
   check(offered.some(g => g.name === "Ideas"), "a chat the browser opens to its identity reaches that identity's other devices");
   check(tablet.run("join", "Ideas").members.length === 2, "and the browser admits one that asks");
+  const ideas = tablet.run("groups").find(g => g.name === "Ideas");
+  check(JSON.stringify(ideas.membership).includes(LETMEKNOW_RELAY), "on the membership service of the server that served the browser");
   await laptop.locator(".people", { hasText: "Matt · " }).waitFor();
   tablet.proc.kill();
+
+  // Ann adds Carl, whom she made an invite for: her word on who Carl is reaches the laptop, which accepts it.
+  const carl = native("carl");
+  await carl.printed(e => e.type === "ready");
+  carl.run("identity", "create", "Carl");
+  carl.run("join", ann.run("invite", `--group=${invite.group}`, "--for", "Carl (Acme)").link);
+  await laptop.locator(".group-list button", { hasText: "Plans" }).click();
+  await laptop.locator(".messages li", { hasText: "introduced Carl (Acme)" }).waitFor();
+  await laptop.locator(".people:visible").click();
+  await laptop.locator("dialog").getByRole("button", { name: "Accept as Carl (Acme)" }).click();
+  await laptop.locator("dialog").waitFor({ state: "detached" });
+  await laptop.locator(".me").click();
+  await laptop.locator(".devices li", { hasText: "Carl (Acme)" }).waitFor();
+  check(true, "the browser accepts an introduction, and the introduced identity becomes a contact");
+
+  // A message larger than members take is refused, and shows who refused it.
+  await laptop.locator(".group-list button", { hasText: "Plans" }).click();
+  await laptop.locator("textarea:visible").fill(`too long ${"x".repeat(1_100_000)}`);
+  await laptop.locator("textarea:visible").press("Enter");
+  const refused = laptop.locator(".messages li", { hasText: "too long" }).locator(".status", { hasText: "Refused by" });
+  await refused.waitFor();
+  check((await refused.textContent()).includes("Ann (larger than 1 MiB)"), "a message the members refuse shows who refused it, and why");
+  carl.proc.kill();
 
   // With Ann gone, what the laptop sends to her chat is pending.
   ann.proc.kill();
@@ -251,7 +349,40 @@ try {
   await laptop.locator(".messages li", { hasText: "anyone there?" }).locator(".status", { hasText: "Pending" }).waitFor();
   check(true, "a message no other member holds shows as pending");
 
+  // The tab that took over loaded no file; it loads the doc's file from IndexedDB when a new member wants it.
+  await laptop.locator(".group-list button", { hasText: "Notes" }).click();
+  await laptop.getByRole("button", { name: "Invite" }).click();
+  await laptop.locator("dialog").getByRole("button", { name: "Make a link" }).click();
+  const readerLink = await laptop.locator("dialog .copy code").first().textContent();
+  const reader = native("reader");
+  await reader.printed(e => e.type === "ready");
+  reader.run("join", readerLink);
+  const fetched = await until(
+    () => {
+      try {
+        return reader.run("fetch", attached.link);
+      } catch {
+        return {};
+      }
+    },
+    answer => answer.path,
+    60_000
+  );
+  check(readFileSync(fetched.path, "utf8") === "the spec", "a tab serves a kept file, loading it from IndexedDB when a member wants it");
+
   for (const [name, page] of Object.entries(pages)) check((await page.evaluate(() => window.toasts)).length === 0, `${name} showed no error`);
+
+  // A new version waits until the person accepts it, then the tab reloads into it.
+  const sw = join("dist", "sw.js");
+  writeFileSync(sw, `${readFileSync(sw, "utf8")}\n// a new version\n`);
+  for (const compressed of [`${sw}.br`, `${sw}.gz`]) rmSync(compressed);
+  await laptop.evaluate(() => ((window.before = true), navigator.serviceWorker.getRegistration().then(registration => registration.update())));
+  await laptop.getByText("A new version of letmeknow is ready.").waitFor();
+  await new Promise(resolve => setTimeout(resolve, 1_000));
+  check(await laptop.evaluate(() => window.before && !!navigator.serviceWorker.controller), "a new version waits for the person to accept it");
+  await Promise.all([laptop.waitForEvent("load"), laptop.getByRole("button", { name: "Reload" }).click()]);
+  await laptop.locator(".group-list button", { hasText: "Plans" }).waitFor();
+  check(await laptop.evaluate(() => !window.before && !document.querySelector(".banner")), "and once accepted, the tab reloads into it");
 
   // The service worker serves the app with the page server unreachable.
   check(await laptop.evaluate(() => !!navigator.serviceWorker.controller), "a service worker controls the page");
@@ -266,6 +397,5 @@ try {
   throw error;
 } finally {
   await browser.close();
-  ann.proc.kill();
-  desk.proc.kill();
+  for (const proc of natives) proc.kill();
 }

@@ -198,6 +198,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         .bind_addr((Ipv6Addr::UNSPECIFIED, config.membership_port))?
         .bind()
         .await?;
+    let membership = Bytes::from(format!("{}@{}", endpoint.id(), config.relay_url()));
     let key = SigningKey::from_bytes(&endpoint.secret_key().to_bytes());
     let store = Store::open(&config.state.join("membership.db"), key)?;
     let _router = Router::builder(endpoint)
@@ -208,7 +209,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
     let web = config.web.map(Arc::new);
     loop {
         let (tcp, _) = https.accept().await?;
-        let (tls, relay, web) = (tls.clone(), relay.clone(), web.clone());
+        let (tls, relay, web, membership) = (tls.clone(), relay.clone(), web.clone(), membership.clone());
         tokio::spawn(async move {
             let stream = match &*tls {
                 Tls::Files(acceptor) => acceptor.accept(tcp).await.ok(),
@@ -221,6 +222,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
             let site = Site {
                 relay: RelayServiceWithNotify::new(relay, Arc::new(Notify::new())),
                 web,
+                membership,
             };
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(MaybeTlsStream::Tls(stream)), site)
@@ -276,10 +278,13 @@ async fn redirect(listener: TcpListener, base: String) {
     }
 }
 
-/// The HTTPS listener's routes: the relay's, and the web client's files for everything else.
+/// The HTTPS listener's routes: the relay's, the membership service's address for the web client, and the web
+/// client's files for everything else.
 struct Site {
     relay: RelayServiceWithNotify,
     web: Option<Arc<PathBuf>>,
+    /// `<iroh key, hex>@<relay URL>`.
+    membership: Bytes,
 }
 
 type Answer = Pin<Box<dyn Future<Output = Result<Response<BytesBody>, HyperError>> + Send>>;
@@ -296,6 +301,12 @@ impl HyperService<Request<Incoming>> for Site {
                 let res = respond(StatusCode::OK)
                     .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                     .body(body(""));
+                return Box::pin(std::future::ready(res.map_err(Into::into)));
+            }
+            "/membership" => {
+                let res = respond(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, content_type("txt"))
+                    .body(body(self.membership.clone()));
                 return Box::pin(std::future::ready(res.map_err(Into::into)));
             }
             _ => {}

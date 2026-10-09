@@ -3,7 +3,9 @@
 // click, so link scanners that open it join nothing.
 import "./app.css";
 import * as client from "./client";
-import type { Attachment, Group, Item, Lmk, Me, Person } from "./client";
+import type { Attachment, Group, Item, Me, Person } from "./client";
+
+const { lmk } = client;
 
 type Child = Node | string | false | undefined | null | 0 | Child[];
 type Message = Extract<Item, { type: "message" }>;
@@ -84,14 +86,11 @@ function modal(title: string, ...content: Child[]): HTMLDialogElement {
   return dialog;
 }
 
-let lmk: Lmk;
 let me: Me;
 let groups: Group[] = [];
 let page: "group" | "devices" | "start" = "start";
 let selected: string | undefined;
-/** Open groups this tab asked to join, and those it failed to join. */
-const tried = new Set<string>();
-const failed = new Set<string>();
+let entered: Promise<void> | undefined;
 const group = (gid: string) => groups.find(g => g.group === gid && g.joined);
 const unread = (gid: string) => Number(localStorage.getItem(`unread ${gid}`) ?? 0);
 
@@ -114,41 +113,33 @@ function offerUpdate(waiting: ServiceWorker) {
   document.body.append(h("div", { className: "banner", role: "status" }, h("span", {}, "A new version of letmeknow is ready."), take));
 }
 
-// One tab at a time runs this browser's session; others wait for it to close.
-navigator.locks.request("letmeknow", { ifAvailable: true }, async lock => {
-  if (lock) return run();
-  root.replaceChildren(h("div", { className: "card notice" }, h("h1", {}, "letmeknow is open in another tab"), h("p", {}, "This tab takes over when that one closes.")));
-  await navigator.locks.request("letmeknow", run);
-});
-
-async function run() {
-  await boot().catch(toast);
-  await new Promise(() => {});
-}
+// Every tab shows the app; one of them runs the session for all (see client.ts).
+boot().catch(toast);
 
 async function boot() {
   const had = await client.prepare();
   const kind = invite && client.kindOf(invite);
-  if (!had) return welcome(kind);
-  lmk = await client.open();
-  enter();
-  if (invite) offer(kind);
+  if (!had) welcome(kind);
+  await client.ready;
+  await (entered ??= enter());
+  if (invite && had) offer(kind);
 }
 
 async function start(name: string, device: string) {
-  lmk = await client.open(name, device);
+  await client.open(name, device);
   navigator.storage?.persist?.();
-  enter();
+  await (entered ??= enter());
 }
 
 client.listen(event => {
-  if (event.type === "message" && event.group && !(page === "group" && event.group === selected && document.visibilityState === "visible")) {
+  // The tab that runs the session counts what is unread; a tab showing the group clears it.
+  if (event.type === "message" && client.runs() && event.group && !(page === "group" && event.group === selected && document.visibilityState === "visible")) {
     localStorage.setItem(`unread ${event.group}`, String(unread(event.group) + 1));
   }
   if (event.type === "warning") toast(event.text);
   if (event.type === "removed") toast(`You were removed from ${title(event.group!)}${event.by ? ` by ${event.by}` : ""}.`);
   if (event.type === "edited") docs.get(event.group!)?.edited();
-  if (lmk) render();
+  if (entered) render();
 });
 
 // Names: a member's identity first, as this browser knows it ("Matthew · phone"), else its own name.
@@ -280,7 +271,7 @@ function starters(before: () => Promise<boolean> = async () => true): HTMLElemen
   const name = h("input", { placeholder: "e.g. Q3 plan" });
   const chat = h("button", { className: "primary" }, "New chat");
   const doc = h("button", { type: "button" }, "New document");
-  const create = (kind: string, button: HTMLButtonElement) => busy(button, "Starting…", async () => (await before()) && select(lmk.create(kind, name.value.trim())));
+  const create = (kind: string, button: HTMLButtonElement) => busy(button, "Starting…", async () => (await before()) && select(await lmk.create(kind, name.value.trim())));
   doc.onclick = () => create("doc", doc);
   const link = h("input", { placeholder: "https://letmeknow.dev/i#…", autocomplete: "off", autocapitalize: "none", spellcheck: false });
   const joinButton = h("button", {}, "Join");
@@ -338,7 +329,7 @@ function offer(kind: string | undefined) {
 async function redeem(link: string) {
   const joined = JSON.parse(await lmk.join(link));
   history.replaceState(null, "", "/");
-  if (joined.group) select(joined.group);
+  if (joined.group) await select(joined.group);
   else showDevices();
 }
 
@@ -371,14 +362,14 @@ const startPage = h("section", { className: "page" });
 const views = new Map<string, View>();
 const docs = new Map<string, DocView>();
 
-function enter() {
-  me = JSON.parse(lmk.me());
-  groups = JSON.parse(lmk.groups());
+async function enter() {
+  me = JSON.parse(await lmk.me());
+  groups = JSON.parse(await lmk.groups());
   root.replaceChildren(layout, toasts);
   const last = localStorage.getItem("group");
   const shown = last && group(last) ? last : groups.filter(g => g.joined).at(-1)?.group;
   if (!shown) return showStart();
-  select(shown);
+  await select(shown);
   if (narrow.matches) layout.classList.remove("in-main");
 }
 
@@ -388,8 +379,8 @@ function show(element: HTMLElement) {
   layout.classList.add("in-main");
 }
 
-function select(gid: string) {
-  groups = JSON.parse(lmk.groups());
+async function select(gid: string) {
+  groups = JSON.parse(await lmk.groups());
   let view = views.get(gid);
   if (!view) {
     view = group(gid)!.settings.kind === "doc" ? new DocView(gid) : new ChatView(gid);
@@ -424,8 +415,8 @@ function render() {
 }
 
 async function draw() {
-  me = JSON.parse(lmk.me());
-  groups = JSON.parse(lmk.groups());
+  me = JSON.parse(await lmk.me());
+  groups = JSON.parse(await lmk.groups());
   for (const [gid, view] of views) {
     if (group(gid)) continue;
     view.el.remove();
@@ -436,27 +427,17 @@ async function draw() {
   }
   if (page === "group" && !selected) {
     const newest = groups.filter(g => g.joined).at(-1);
-    if (newest) select(newest.group);
+    if (newest) await select(newest.group);
     else showStart();
   }
-  joinOpenings();
   drawNav();
   const total = groups.reduce((n, g) => n + unread(g.group), 0);
   document.title = total ? `(${total}) letmeknow` : "letmeknow";
   if (page === "group" && selected && document.visibilityState === "visible") localStorage.removeItem(`unread ${selected}`);
-  if (page === "group" && selected) views.get(selected)!.update();
-  if (page === "devices") drawDevices();
+  if (page === "group" && selected) await views.get(selected)!.update();
+  if (page === "devices") await drawDevices();
 }
 document.addEventListener("visibilitychange", render);
-
-/** Devices of an identity join the groups open to it by themselves; one that fails waits for a click. */
-function joinOpenings() {
-  for (const g of groups) {
-    if (g.joined || tried.has(g.group)) continue;
-    tried.add(g.group);
-    lmk.join_open(g.group).then(render, () => (failed.add(g.group), render()));
-  }
-}
 
 function drawNav() {
   for (const [gid, entry] of navButtons) {
@@ -479,11 +460,11 @@ function drawNav() {
     entry.button.classList.toggle("on", page === "group" && g.group === selected);
   }
   const open = groups.filter(g => !g.joined);
-  update(openList, JSON.stringify(open.map(o => [o.group, o.settings.name, failed.has(o.group)])), () => [
+  update(openList, JSON.stringify(open.map(o => [o.group, o.settings.name, o.failed])), () => [
     open.length > 0 && h("h3", {}, "Open to you"),
     ...open.map(o => {
       const name = `${KINDS[o.settings.kind].mark} ${o.settings.name || `Unnamed ${KINDS[o.settings.kind].name}`}`;
-      if (!failed.has(o.group)) return h("div", { className: "opening" }, h("span", {}, name), h("small", {}, "joining…"));
+      if (!o.failed) return h("div", { className: "opening" }, h("span", {}, name), h("small", {}, "joining…"));
       const join = h("button", {}, "Join");
       join.onclick = () => busy(join, "…", async () => select(JSON.parse(await lmk.join_open(o.group)).group));
       return h("div", { className: "opening" }, h("span", {}, name), join);
@@ -502,7 +483,7 @@ function newGroupDialog(kind: "chat" | "doc") {
     form(
       () =>
         busy(create, "Starting…", async () => {
-          select(lmk.create(kind, name.value.trim()));
+          await select(await lmk.create(kind, name.value.trim()));
           dialog.close();
         }),
       field("Name", name, "Optional. You can rename it later."),
@@ -543,7 +524,7 @@ function showDevices() {
 const devicesBody = h("div", { className: "card" });
 async function drawDevices() {
   const identity = me.identities[0];
-  const contacts: client.Contacts = JSON.parse(lmk.contacts());
+  const contacts: client.Contacts = JSON.parse(await lmk.contacts());
   if (!identity) {
     return update(devicesBody, "none", () => {
       const name = h("input", { value: me.name, required: true });
@@ -603,7 +584,7 @@ async function inviteDialog(target: { gid: string } | { identity: string }) {
   const dialog = modal(device ? "Add a device" : "Invite someone", body);
   const make = async (label?: string) => {
     // The link opens this server's app, which is letmeknow.dev's unless the person runs their own.
-    const made = new URL(device ? lmk.invite_device(target.identity) : lmk.invite(target.gid, label));
+    const made = new URL(device ? await lmk.invite_device(target.identity) : await lmk.invite(target.gid, label));
     const link = location.origin + made.pathname + made.hash;
     const { encode } = await import("uqr");
     const { data, size } = encode(link, { border: 0 });
@@ -691,7 +672,7 @@ class View {
     this.people.onclick = () => this.settingsDialog();
   }
 
-  update() {
+  async update() {
     set(this.heading, title(this.gid));
     const members = group(this.gid)?.members ?? [];
     if (JSON.stringify(members) === JSON.stringify(this.members)) return;
@@ -710,13 +691,13 @@ class View {
 
   destroy() {}
 
-  private settingsDialog() {
+  private async settingsDialog() {
     const gid = this.gid;
     const settings = group(gid)!.settings;
     const kind = KINDS[settings.kind].name;
     const name = h("input", { value: settings.name, placeholder: title(gid), ariaLabel: "Name" });
     const save = h("button", {}, "Rename");
-    const contacts: client.Contacts = JSON.parse(lmk.contacts());
+    const contacts: client.Contacts = JSON.parse(await lmk.contacts());
     const openable = [...me.identities.map(i => ({ ...i, own: true })), ...contacts.contacts.map(c => ({ id: c.id, name: c.name, own: false }))];
     const toggle = (identity: { id: string; name: string; own: boolean }) => {
       const box = h("input", { type: "checkbox", checked: !!settings.open?.some(o => o.id === identity.id) });
@@ -845,9 +826,9 @@ class ChatView extends View {
     this.newer.hidden = true;
   }
 
-  update() {
-    super.update();
-    const items: Item[] = JSON.parse(lmk.items(this.gid));
+  async update() {
+    await super.update();
+    const items: Item[] = JSON.parse(await lmk.items(this.gid));
     const keep = new Set<string>();
     let added = false;
     let previous: Item | undefined;
@@ -855,7 +836,7 @@ class ChatView extends View {
     for (const item of items) {
       const key = "id" in item ? item.id : `${item.type} ${item.at}`;
       const follows = item.type === "message" && previous?.type === "message" && previous.from.key === item.from.key && item.at - previous.at < 300_000 && !item.reply_to;
-      const json = JSON.stringify([item, follows, client.held.has(item.type === "message" && item.attachment ? client.hashOf(item.attachment.link) : "")]);
+      const json = JSON.stringify([item, follows]);
       previous = item;
       keep.add(key);
       let line = this.lines.get(key);
@@ -881,9 +862,9 @@ class ChatView extends View {
         const parent = item.reply_to ? (items.find(i => i.type === "message" && i.id === item.reply_to) as Message | undefined) : undefined;
         const to = item.to?.map(fp => this.members.find(m => m.fp === fp)).filter(m => m != null);
         const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent"];
-        const status = item.pending
-          ? h("p", { className: "status warn" }, "Pending: no other member holds it yet. It goes out when one is online while this browser is open.")
-          : item.refused && h("p", { className: "status warn" }, `Refused by ${item.refused.map(r => `${r.name} (${r.reason})`).join(", ")}`);
+        const status = item.refused
+          ? h("p", { className: "status warn" }, `Refused by ${item.refused.map(r => `${r.name} (${r.reason})`).join(", ")}`)
+          : item.pending && h("p", { className: "status warn" }, "Pending: no other member holds it yet. It goes out when one is online while this browser is open.");
         return h(
           "li",
           { className: classes.filter(Boolean).join(" "), tabIndex: -1 },
@@ -930,18 +911,17 @@ class ChatView extends View {
 
   /** An image shows in the chat; any other file downloads on a click. */
   private attachmentView(file: Attachment): HTMLElement {
-    const hash = client.hashOf(file.link);
-    if (/^image\/(png|jpeg|gif|webp)$/.test(file.type) && (client.held.has(hash) || file.size <= FILE_LIMIT)) {
+    if (/^image\/(png|jpeg|gif|webp)$/.test(file.type) && (file.kept || file.size <= FILE_LIMIT)) {
       const image = h("img", { className: "image", alt: file.name });
       image.onload = () => this.stuck && this.bottom();
-      client.file(lmk, this.gid, file.link).then(
+      client.file(this.gid, file.link).then(
         bytes => (image.src = URL.createObjectURL(new Blob([bytes as BlobPart], { type: file.type }))),
         error => image.replaceWith(h("p", { className: "muted" }, `${file.name} could not be shown: ${error instanceof Error ? error.message : error}`))
       );
       return image;
     }
-    const button = h("button", { className: "download" }, `${client.held.has(hash) ? "Download" : "Fetch"} ${file.name} (${megabytes(file.size)})`);
-    button.onclick = () => busy(button, "Fetching…", async () => download(await client.file(lmk, this.gid, file.link), file.name));
+    const button = h("button", { className: "download" }, `${file.kept ? "Download" : "Fetch"} ${file.name} (${megabytes(file.size)})`);
+    button.onclick = () => busy(button, "Fetching…", async () => download(await client.file(this.gid, file.link), file.name));
     return button;
   }
 
@@ -1053,15 +1033,15 @@ class DocView extends View {
     super(gid);
     docs.set(gid, this);
     this.el.append(h("div", { className: "body" }, this.host));
-    import("./editor").then(({ bind }) => {
+    import("./editor").then(async ({ bind }) => {
       if (!group(gid)) return;
       const files = {
-        show: (link: string) => client.file(lmk, gid, link).then(bytes => URL.createObjectURL(new Blob([bytes as BlobPart]))),
+        show: (link: string) => client.file(gid, link).then(bytes => URL.createObjectURL(new Blob([bytes as BlobPart]))),
         attach: (bytes: Uint8Array) => lmk.add_file(gid, bytes),
-        open: (link: string, name: string) => client.file(lmk, gid, link).then(bytes => download(bytes, name), toast),
+        open: (link: string, name: string) => client.file(gid, link).then(bytes => download(bytes, name), toast),
         fail: toast
       };
-      this.bound = bind(this.host, lmk, gid, files);
+      this.bound = await bind(this.host, lmk, gid, files);
     });
   }
 

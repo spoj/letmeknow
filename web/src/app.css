@@ -70,7 +70,7 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 
 /* First visit and pages */
 .card { display: flex; flex-direction: column; gap: var(--s4); max-width: 30rem; }
-.welcome, .notice { margin: max(var(--s6), 12vh) auto var(--s6); padding: 0 var(--s5); }
+.welcome { margin: max(var(--s6), 12vh) auto var(--s6); padding: 0 var(--s5); }
 .welcome .lede { font-size: var(--t-lg); color: var(--muted); }
 .starter { width: 100%; padding: var(--s4); border: 1px solid var(--line); border-radius: 12px; }
 .starter form { gap: var(--s3); }

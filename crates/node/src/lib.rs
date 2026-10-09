@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 pub use lmk_core;
+pub use lmk_net::Disk;
 
 /// How often a session replaces its keys in each group.
 const KEY_UPDATE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -64,6 +65,7 @@ pub struct Config {
     pub home: Option<PathBuf>,
     /// Where files are kept; in memory if none.
     pub files: Option<PathBuf>,
+    pub disk: Option<Arc<dyn Disk>>,
     /// The largest file fetched without being asked.
     pub file_limit: u64,
     pub window: Window,
@@ -565,6 +567,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             relay: RELAY.parse()?,
             home: config.home,
             files: config.files,
+            disk: config.disk,
             file_limit: config.file_limit,
             resync: RESYNC,
             collect: COLLECT,
@@ -842,14 +845,9 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(Some(plain))
     }
 
-    /// A held file's ciphertext, for a browser to keep in its own storage.
-    pub async fn ciphertext(&self, hash: [u8; 32]) -> Result<Vec<u8>> {
-        self.inner.net().ciphertext(hash).await
-    }
-
-    /// Holds a file's ciphertext again, as `ciphertext` gave it.
-    pub async fn hold(&self, ciphertext: Vec<u8>) -> Result<()> {
-        self.inner.net().hold(ciphertext).await
+    /// The files this session's groups link now, which it holds.
+    pub fn files(&self) -> Vec<FileLink> {
+        self.groups().iter().flat_map(|gid| lmk_net::Groups::files(&*self.inner, &gid.0)).collect()
     }
 
     /// Fetches a file the group links, whatever its size; `Event::File` follows.

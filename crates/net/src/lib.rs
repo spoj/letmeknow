@@ -76,6 +76,16 @@ pub trait Groups: Send + Sync + 'static {
     fn list(&self, peer: EndpointId, list: List);
 }
 
+/// A browser's own storage of the files it holds, since iroh-blobs keeps only memory there. With one, a session keeps
+/// there the files it adds and those it fetches up to its limit, holds and serves only those, and loads each into
+/// memory when it is needed.
+pub trait Disk: Send + Sync + 'static {
+    fn has(&self, hash: &[u8; 32]) -> bool;
+    /// A kept file's ciphertext.
+    fn load(&self, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>>;
+    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>);
+}
+
 /// What became of a ciphertext a peer sent; the peer hears which unless it waits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Taken {
@@ -113,6 +123,7 @@ pub struct Config {
     pub home: Option<PathBuf>,
     /// Where files are kept; in memory if none.
     pub files: Option<PathBuf>,
+    pub disk: Option<Arc<dyn Disk>>,
     /// The largest file fetched without being asked.
     pub file_limit: u64,
     /// How often two connected sessions swap heads and sync their groups again.
@@ -156,7 +167,7 @@ impl Net {
         groups: Arc<dyn Groups>,
         admit: Arc<dyn Admit>,
     ) -> Result<(Net, mpsc::UnboundedReceiver<Event>)> {
-        let files = Arc::new(Files::new(endpoint.clone(), config.files.clone(), groups.clone(), config.collect).await?);
+        let files = Arc::new(Files::new(endpoint.clone(), config.files.clone(), config.disk.clone(), groups.clone(), config.collect).await?);
         #[cfg(not(target_family = "wasm"))]
         if let Some(home) = &config.home {
             addresses::publish(&endpoint, home)?;
@@ -239,7 +250,7 @@ impl Net {
 
     /// Fetches a file from every member online that holds it, whatever its size.
     pub async fn fetch(&self, group: &[u8], link: &FileLink) -> Result<()> {
-        if self.inner.files.complete(&link.hash).await? {
+        if self.inner.files.has(&link.hash).await? {
             return Ok(());
         }
         let holders = self.holders(group, link.hash).await;
@@ -257,22 +268,12 @@ impl Net {
 
     /// Whether a file is held whole.
     pub async fn has(&self, hash: [u8; 32]) -> Result<bool> {
-        self.inner.files.complete(&hash).await
+        self.inner.files.has(&hash).await
     }
 
     /// Verified ciphertext bytes held of a file.
     pub async fn held(&self, hash: [u8; 32]) -> Result<u64> {
         self.inner.files.held(&hash).await
-    }
-
-    /// A held file's ciphertext, for a browser to keep in its own storage.
-    pub async fn ciphertext(&self, hash: [u8; 32]) -> Result<Vec<u8>> {
-        self.inner.files.ciphertext(&hash).await
-    }
-
-    /// Holds a file's ciphertext again, as `ciphertext` gave it.
-    pub async fn hold(&self, ciphertext: Vec<u8>) -> Result<()> {
-        self.inner.files.hold(ciphertext).await
     }
 
     /// Decrypts a held file into `out`.
@@ -402,7 +403,7 @@ impl Inner {
 
     fn offer(self: &Arc<Self>, link: &FileLink, holder: EndpointId) {
         let (events, hash) = (self.events.clone(), link.hash);
-        self.files.offer(link, holder, move |ok| {
+        self.files.offer(link, holder, link.size <= self.config.file_limit, move |ok| {
             if ok {
                 events.send(Event::Fetched(hash)).ok();
             }

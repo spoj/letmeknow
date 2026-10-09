@@ -1,5 +1,6 @@
 // Builds the browser client into dist/, which `letmeknow serve --web web/dist` serves: crates/web compiled to
-// WebAssembly with the workspace's `wasm` profile, the app bundled, and a service worker that caches exactly these files.
+// WebAssembly with the workspace's `wasm` profile, the app bundled, and a service worker that caches exactly these files
+// and the server's membership address.
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -32,7 +33,7 @@ const version = createHash("sha256");
 for (const file of files) version.update(file).update(readFileSync(out + file));
 await build({
   entryPoints: [`${web}src/sw.ts`],
-  define: { FILES: JSON.stringify(files.map(file => `/${file}`)), VERSION: JSON.stringify(version.digest("hex").slice(0, 16)) },
+  define: { FILES: JSON.stringify([...files.map(file => `/${file}`), "/membership"]), VERSION: JSON.stringify(version.digest("hex").slice(0, 16)) },
   bundle: true,
   minify: true,
   target: "es2022",

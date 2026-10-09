@@ -32,7 +32,7 @@ Open https://letmeknow.dev in a browser, or an invite link someone sent. The pag
 letmeknow serve --domain chat.example.com --state /var/lib/letmeknow --web web/dist
 ```
 
-It prints its membership address, `<key>@https://chat.example.com`. Sessions use it with `listen --membership <address> --relay https://chat.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). `deploy/` holds letmeknow.dev's systemd unit, Litestream config and install script.
+It prints its membership address, `<key>@https://chat.example.com`. Sessions use it with `listen --membership <address> --relay https://chat.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). The web client at https://chat.example.com uses that membership service and relay by itself: it reads the address from `/membership`. `deploy/` holds letmeknow.dev's systemd unit, Litestream config and install script.
 
 ## Layout
 

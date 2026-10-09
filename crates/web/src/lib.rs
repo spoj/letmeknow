@@ -1,25 +1,27 @@
 //! The browser client: one lmk-node session whose MLS key is the browser's device key, reaching its peers only through
 //! the relay. The page persists the session's records in IndexedDB, one record per key, and the ciphertext of the files
-//! it holds. Results that are not bytes are JSON strings; message ids and fingerprints are hex, other bytes base64url.
+//! it holds, which the session loads when it needs one. Results that are not bytes are JSON strings; message ids and
+//! fingerprints are hex, other bytes base64url.
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
-use js_sys::{Array, Function, Uint8Array};
+use anyhow::{Context, Result, anyhow};
+use js_sys::{Array, Function, Promise, Uint8Array};
 use lmk_node::lmk_core::contacts::{self, Contact};
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::group::Window;
 use lmk_node::lmk_core::invite::Target;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
-use lmk_node::{Claim, Event, Member, Node, doc, now};
+use lmk_node::{Claim, Disk, Event, Member, Node, doc, now};
 use lmk_proto::Bytes;
 use lmk_proto::group::{Attachment, How, IdentityRef, Kind, Named, PROTOCOL, Payload, Service, Settings};
-use lmk_proto::links::{FileLink, Invite, MEMBERSHIP_KEY, RELAY};
+use lmk_proto::links::{FileLink, Invite};
+use n0_future::boxed::BoxFuture;
 use n0_future::time::{Duration, sleep};
 use openmls_memory_storage::MemoryStorage;
 use openmls_rust_crypto::RustCrypto;
@@ -27,8 +29,14 @@ use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
+
+/// Others' files larger than this are fetched only when asked, and kept only in memory, until the page closes.
+const FILE_LIMIT: u64 = 25 << 20;
+/// How often the files no group links any longer are deleted.
+const COLLECT: Duration = Duration::from_secs(60 * 60);
 
 type R<T> = Result<T, JsError>;
 
@@ -40,6 +48,47 @@ fn js(error: anyhow::Error) -> JsError {
 extern "C" {
     #[wasm_bindgen(js_namespace = console)]
     fn error(text: &str);
+
+    /// The page's IndexedDB.
+    pub type Idb;
+    /// Persists records: `[key, value]` pairs, and keys to delete.
+    #[wasm_bindgen(method)]
+    fn save(this: &Idb, puts: Array, deletes: Array);
+    #[wasm_bindgen(method, js_name = saveFile)]
+    fn save_file(this: &Idb, hash: &str, ciphertext: Vec<u8>);
+    /// Resolves to a kept file's ciphertext.
+    #[wasm_bindgen(method, js_name = loadFile)]
+    fn load_file(this: &Idb, hash: &str) -> Promise;
+    #[wasm_bindgen(method, js_name = deleteFile)]
+    fn delete_file(this: &Idb, hash: &str);
+}
+
+/// The files kept in IndexedDB, which the session loads and saves through the page.
+struct Kept {
+    hashes: Mutex<HashSet<[u8; 32]>>,
+    io: mpsc::UnboundedSender<Io>,
+}
+
+enum Io {
+    Load([u8; 32], oneshot::Sender<Result<Vec<u8>>>),
+    Save([u8; 32], Vec<u8>),
+}
+
+impl Disk for Kept {
+    fn has(&self, hash: &[u8; 32]) -> bool {
+        self.hashes.lock().unwrap().contains(hash)
+    }
+
+    fn load(&self, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>> {
+        let (reply, answer) = oneshot::channel();
+        self.io.send(Io::Load(hash, reply)).ok();
+        Box::pin(async move { answer.await? })
+    }
+
+    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>) {
+        self.hashes.lock().unwrap().insert(hash);
+        self.io.send(Io::Save(hash, ciphertext)).ok();
+    }
 }
 
 /// The session's provider, shared with `App::flush`, which persists it.
@@ -109,12 +158,9 @@ fn digest(value: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// A membership service: `letmeknow.dev`, or `<iroh key, hex>@<relay URL>`.
+/// A membership service: `<iroh key, hex>@<relay URL>`.
 fn service(address: &str) -> Result<Service> {
-    let (key, relay) = match address {
-        "letmeknow.dev" => (MEMBERSHIP_KEY, RELAY),
-        _ => address.split_once('@').context("a membership service is letmeknow.dev or <key>@<relay URL>")?,
-    };
+    let (key, relay) = address.split_once('@').context("a membership service is <key>@<relay URL>")?;
     Ok(Service::Serve { key: Bytes(hex::decode(key)?), relay: relay.into(), addrs: Vec::new() })
 }
 
@@ -123,8 +169,8 @@ struct Config {
     /// The person's name and this device's: used only when the browser has no session yet.
     name: String,
     device: String,
-    relay: Option<String>,
-    membership: Option<String>,
+    relay: String,
+    membership: String,
 }
 
 /// An introduction of an identity that is neither this one nor a contact: someone's word, until accepted.
@@ -151,9 +197,12 @@ struct App {
     membership: Service,
     /// A digest of each record as last persisted.
     shadow: RefCell<HashMap<Vec<u8>, u64>>,
-    save: Function,
-    save_file: Function,
+    idb: Idb,
+    kept: Arc<Kept>,
     on_event: Function,
+    /// Open groups this session tried to join by itself, and those it failed to join.
+    tried: RefCell<HashSet<Bytes>>,
+    failed: RefCell<HashSet<Bytes>>,
 }
 
 /// The browser's session.
@@ -162,13 +211,12 @@ pub struct Lmk {
     app: Rc<App>,
 }
 
-/// Opens the session from its records (`[key, value]` pairs) and the ciphertexts of its files, creating it if there
-/// are none. `save(puts, deletes)` persists records, `save_file(hash, ciphertext)` a file, and `on_event(json)`
-/// hears what happens.
+/// Opens the session from its records (`[key, value]` pairs) and the hashes (hex) of the files kept in IndexedDB,
+/// creating it if there are none. `on_event(json)` hears what happens.
 #[wasm_bindgen]
-pub async fn start(records: Array, files: Array, config: String, save: Function, save_file: Function, on_event: Function) -> R<Lmk> {
+pub async fn start(records: Array, kept: Vec<String>, config: String, idb: Idb, on_event: Function) -> R<Lmk> {
     std::panic::set_hook(Box::new(|info| error(&info.to_string())));
-    let app = App::start(records, files, &config, save, save_file, on_event).await.map_err(js)?;
+    let app = App::start(records, kept, &config, idb, on_event).await.map_err(js)?;
     Ok(Lmk { app })
 }
 
@@ -179,7 +227,7 @@ pub fn invite_kind(link: &str) -> R<String> {
 }
 
 impl App {
-    async fn start(records: Array, files: Array, config: &str, save: Function, save_file: Function, on_event: Function) -> Result<Rc<Self>> {
+    async fn start(records: Array, kept: Vec<String>, config: &str, idb: Idb, on_event: Function) -> Result<Rc<Self>> {
         let config: Config = serde_json::from_str(config)?;
         let store = Store::default();
         let mut shadow = HashMap::new();
@@ -197,23 +245,38 @@ impl App {
             put(&store, b"web/name", &config.name)?;
         }
         let device = get(&store, b"web/device")?.unwrap_or_else(|| Device::new(&config.device));
+        let hashes = kept.iter().map(|hash| hex::decode(hash)?.try_into().map_err(|_| anyhow!("a hash is 32 bytes"))).collect::<Result<_>>()?;
+        let (io, mut io_rx) = mpsc::unbounded_channel();
+        let kept = Arc::new(Kept { hashes: Mutex::new(hashes), io });
         let node_config = lmk_node::Config {
             name: get(&store, b"web/name")?.context("no name")?,
             device_key: true,
-            relay: config.relay.as_deref().unwrap_or(RELAY).parse()?,
+            relay: config.relay.parse()?,
             ca: Default::default(),
             home: None,
             files: None,
-            file_limit: 25 << 20,
+            disk: Some(kept.clone()),
+            file_limit: FILE_LIMIT,
             window: Window::default(),
         };
         let (node, mut events) = Node::start(store.clone(), device, node_config).await?;
-        for file in files.iter() {
-            node.hold(Uint8Array::from(file).to_vec()).await?;
-        }
-        let membership = service(config.membership.as_deref().unwrap_or("letmeknow.dev"))?;
-        let app = Rc::new(App { node, store, membership, shadow: RefCell::new(shadow), save, save_file, on_event });
+        let membership = service(&config.membership)?;
+        let (tried, failed) = Default::default();
+        let app = Rc::new(App { node, store, membership, shadow: RefCell::new(shadow), idb, kept, on_event, tried, failed });
         app.flush();
+        app.join_openings();
+        let io_app = app.clone();
+        spawn_local(async move {
+            while let Some(io) = io_rx.recv().await {
+                match io {
+                    Io::Save(hash, ciphertext) => io_app.idb.save_file(&hex::encode(hash), ciphertext),
+                    Io::Load(hash, reply) => {
+                        let loaded = JsFuture::from(io_app.idb.load_file(&hex::encode(hash))).await;
+                        reply.send(loaded.map(|bytes| Uint8Array::new(&bytes).to_vec()).map_err(|e| anyhow!("loading a file: {e:?}"))).ok();
+                    }
+                }
+            }
+        });
         let events_app = app.clone();
         spawn_local(async move {
             while let Some(event) = events.recv().await {
@@ -221,6 +284,7 @@ impl App {
                     events_app.emit(json!({ "type": "warning", "text": format!("{e:#}") }));
                 }
                 events_app.flush();
+                events_app.join_openings();
             }
         });
         let flushing = Rc::downgrade(&app);
@@ -231,7 +295,45 @@ impl App {
                 sleep(Duration::from_secs(1)).await;
             }
         });
+        let collecting = Rc::downgrade(&app);
+        spawn_local(async move {
+            while let Some(app) = collecting.upgrade() {
+                app.collect();
+                drop(app);
+                sleep(COLLECT).await;
+            }
+        });
         Ok(app)
+    }
+
+    /// Joins, once each, the groups open to this browser's identities; one that fails waits for a click.
+    fn join_openings(self: &Rc<Self>) {
+        let joined = self.node.groups();
+        for opening in self.node.openings() {
+            if joined.contains(&opening.group) || !self.tried.borrow_mut().insert(opening.group.clone()) {
+                continue;
+            }
+            let app = self.clone();
+            spawn_local(async move {
+                if app.join_open(&opening.group.0).await.is_err() {
+                    app.failed.borrow_mut().insert(opening.group.clone());
+                }
+                app.flush();
+                app.emit(json!({ "type": "opening", "group": opening.group }));
+            });
+        }
+    }
+
+    /// Deletes the kept files no group links any longer, by the rule lmk-node holds files by.
+    fn collect(&self) {
+        let linked: HashSet<[u8; 32]> = self.node.files().iter().map(|link| link.hash).collect();
+        self.kept.hashes.lock().unwrap().retain(|hash| {
+            let keep = linked.contains(hash);
+            if !keep {
+                self.idb.delete_file(&hex::encode(hash));
+            }
+            keep
+        });
     }
 
     /// Hands the records that changed since the last flush to the page.
@@ -258,18 +360,12 @@ impl App {
             kept
         });
         if puts.length() > 0 || deletes.length() > 0 {
-            self.save.call2(&JsValue::NULL, &puts, &deletes).ok();
+            self.idb.save(puts, deletes);
         }
     }
 
     fn emit(&self, event: Value) {
         self.on_event.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string())).ok();
-    }
-
-    async fn keep_file(&self, hash: [u8; 32]) -> Result<()> {
-        let ciphertext = self.node.ciphertext(hash).await?;
-        self.save_file.call2(&JsValue::NULL, &JsValue::from_str(&hex::encode(hash)), &Uint8Array::from(&ciphertext[..])).ok();
-        Ok(())
     }
 
     async fn on(self: &Rc<Self>, event: Event) -> Result<()> {
@@ -331,10 +427,7 @@ impl App {
                 self.refused(&group.0, &id.0, &by, &reason)?;
                 self.emit(json!({ "type": "refused", "group": group, "id": hex::encode(&id.0) }));
             }
-            Event::File(hash) => {
-                self.keep_file(hash).await?;
-                self.emit(json!({ "type": "file", "hash": hex::encode(hash) }));
-            }
+            Event::File(hash) => self.emit(json!({ "type": "file", "hash": hex::encode(hash) })),
             Event::Warning { group, text } => self.emit(json!({ "type": "warning", "group": group, "text": text })),
         }
         Ok(())
@@ -464,7 +557,8 @@ impl App {
         let joined = self.node.groups();
         for opening in self.node.openings() {
             if !joined.contains(&opening.group) && !groups.iter().any(|g| g["group"] == json!(opening.group)) {
-                groups.push(json!({ "group": opening.group, "settings": { "kind": opening.kind, "name": opening.name }, "joined": false }));
+                let failed = self.failed.borrow().contains(&opening.group);
+                groups.push(json!({ "group": opening.group, "settings": { "kind": opening.kind, "name": opening.name }, "joined": false, "failed": failed }));
             }
         }
         Ok(Value::Array(groups))
@@ -494,7 +588,9 @@ impl App {
                 item["urgent"] = json!(true);
             }
             if let Some(attachment) = attachment {
+                let kept = self.kept.has(&FileLink::parse(&attachment.link)?.hash);
                 item["attachment"] = json!(attachment);
+                item["attachment"]["kept"] = json!(kept);
             }
             if pending.contains(&message.id.0) {
                 item["pending"] = json!(true);
@@ -527,7 +623,6 @@ impl App {
             Some((name, media_type, bytes)) => {
                 let size = bytes.len() as u64;
                 let link = self.node.add_file(gid, bytes).await?;
-                self.keep_file(link.hash).await?;
                 Some((link.clone(), Attachment { link: link.link(), name, size, media_type }))
             }
             None => None,
@@ -564,8 +659,7 @@ impl App {
         Ok(json!({ "group": gid }))
     }
 
-    async fn join_open(&self, gid: &str) -> Result<Value> {
-        let gid = unb64(gid)?;
+    async fn join_open(&self, gid: &[u8]) -> Result<Value> {
         let opening = self.node.openings().into_iter().find(|o| o.group.0 == gid).context("no such open group")?;
         let identity = self.node.identities().into_iter().next().context("this browser is on no identity")?.0;
         let gid = self.node.join_open(&opening, identity).await?;
@@ -708,7 +802,7 @@ impl Lmk {
 
     /// Joins a group open to this browser's identity.
     pub async fn join_open(&self, gid: String) -> R<String> {
-        let joined = self.app.join_open(&gid).await.map_err(js)?;
+        let joined = self.app.join_open(&unb64(&gid).map_err(js)?).await.map_err(js)?;
         self.app.flush();
         Ok(joined.to_string())
     }
@@ -781,7 +875,6 @@ impl Lmk {
     /// Seals a file for a group and holds it; returns its link.
     pub async fn add_file(&self, gid: String, bytes: Vec<u8>) -> R<String> {
         let link = self.app.node.add_file(&unb64(&gid).map_err(js)?, bytes).await.map_err(js)?;
-        self.app.keep_file(link.hash).await.map_err(js)?;
         self.app.flush();
         Ok(link.link())
     }

@@ -94,6 +94,10 @@ async fn serves_relay_membership_and_page() {
     assert!(compressed.contains("content-encoding: br") && compressed.ends_with("brotli"), "{compressed}");
     assert!(https_get(https, &cert, "/missing.js", "").await.starts_with("HTTP/1.1 404"));
     assert!(https_get(https, &cert, "/ping", "").await.starts_with("HTTP/1.1 200"));
+    let lmk_proto::group::Service::Serve { key, .. } = &service else { unreachable!() };
+    let hex: String = key.0.iter().map(|b| format!("{b:02x}")).collect();
+    let address = https_get(https, &cert, "/membership", "").await;
+    assert!(address.ends_with(&format!("\r\n\r\n{hex}@{relay}")), "{address}");
     let portal = http_get(
         http,
         "GET /generate_204 HTTP/1.1\r\nHost: localhost\r\nX-Iroh-Challenge: abc\r\nConnection: close\r\n\r\n",

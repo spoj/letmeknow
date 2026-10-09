@@ -221,7 +221,7 @@ impl Session {
                     let linked = self.inner.groups.files(&group.0);
                     for file in files {
                         let Ok(hash) = <[u8; 32]>::try_from(&file.0[..]) else { continue };
-                        if linked.iter().any(|link| link.hash == hash) && self.inner.files.complete(&hash).await? {
+                        if linked.iter().any(|link| link.hash == hash) && self.inner.files.serve(&hash).await? {
                             have.push(file);
                         }
                     }
@@ -330,7 +330,7 @@ impl Session {
     async fn want(&mut self, group: &Bytes) -> Result<()> {
         let mut files = Vec::new();
         for link in self.inner.groups.files(&group.0) {
-            if link.size <= self.inner.config.file_limit && !self.inner.files.complete(&link.hash).await? {
+            if link.size <= self.inner.config.file_limit && !self.inner.files.has(&link.hash).await? {
                 files.push(Bytes::from(link.hash));
             }
         }

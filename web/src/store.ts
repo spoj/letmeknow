@@ -1,5 +1,5 @@
 // IndexedDB: "records" holds the session's records, one per key, as the WebAssembly hands them over; "files" the
-// ciphertext of the files it holds, by hash (hex).
+// ciphertext of the files it keeps, by hash (hex), which the session loads one at a time when it needs one.
 const db: Promise<IDBDatabase> = new Promise((resolve, reject) => {
   const request = indexedDB.open("lmk", 1);
   request.onupgradeneeded = () => {
@@ -17,15 +17,17 @@ function done<T>(request: IDBRequest<T>): Promise<T> {
   });
 }
 
-export async function load(): Promise<{ records: [Uint8Array, Uint8Array][]; files: Map<string, Uint8Array> }> {
+/** Whether this browser has a session. */
+export async function has(): Promise<boolean> {
+  return (await done((await db).transaction("records").objectStore("records").count())) > 0;
+}
+
+/** The session's records, and the hashes of the files it keeps. */
+export async function load(): Promise<{ records: [Uint8Array, Uint8Array][]; kept: string[] }> {
   const tx = (await db).transaction(["records", "files"]);
   const records = tx.objectStore("records");
-  const files = tx.objectStore("files");
-  const [keys, values, hashes, sealed] = await Promise.all([done(records.getAllKeys()), done(records.getAll()), done(files.getAllKeys()), done(files.getAll())]);
-  return {
-    records: keys.map((key, i) => [new Uint8Array(key as ArrayBuffer), values[i]]),
-    files: new Map(hashes.map((hash, i) => [hash as string, sealed[i]]))
-  };
+  const [keys, values, kept] = await Promise.all([done(records.getAllKeys()), done(records.getAll()), done(tx.objectStore("files").getAllKeys())]);
+  return { records: keys.map((key, i) => [new Uint8Array(key as ArrayBuffer), values[i]]), kept: kept as string[] };
 }
 
 export async function save(puts: [Uint8Array, Uint8Array][], deletes: Uint8Array[]) {
@@ -37,4 +39,12 @@ export async function save(puts: [Uint8Array, Uint8Array][], deletes: Uint8Array
 
 export async function saveFile(hash: string, ciphertext: Uint8Array) {
   (await db).transaction("files", "readwrite").objectStore("files").put(ciphertext, hash);
+}
+
+export async function loadFile(hash: string): Promise<Uint8Array> {
+  return done((await db).transaction("files").objectStore("files").get(hash));
+}
+
+export async function deleteFile(hash: string) {
+  (await db).transaction("files", "readwrite").objectStore("files").delete(hash);
 }
