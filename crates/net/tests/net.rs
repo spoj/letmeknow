@@ -55,7 +55,7 @@ async fn hello_head_swap_and_contradiction() {
 
     b.net.dial(members[2], relay.url.clone()).await.unwrap();
     b.until(|e| matches!(e, Event::Contradiction { peer, .. } if *peer == members[2])).await;
-    assert_eq!(a.net.connected().len(), 2);
+    eventually("a contradiction closes the connection", || a.net.connected() == [members[1]] && b.net.connected() == [members[0]]).await;
     for node in [&a, &b, &c] {
         node.net.shutdown().await.unwrap();
     }

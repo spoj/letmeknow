@@ -112,8 +112,13 @@ impl World {
 
     /// `creator` makes the group and adds `others` in one commit.
     fn found(&mut self, creator: usize, others: &[usize]) {
+        self.found_kind(creator, others, CHAT);
+    }
+
+    fn found_kind(&mut self, creator: usize, others: &[usize], kind: &str) {
         let c = &mut self.m[creator];
-        c.group = Some(Group::create(&c.provider, &c.session, &settings("Plan"), Window::default()).unwrap());
+        let settings = Settings { kind: kind.into(), ..settings("Plan") };
+        c.group = Some(Group::create(&c.provider, &c.session, &settings, Window::default()).unwrap());
         let adds = others.iter().map(|&i| self.m[i].session.key_package(&self.m[i].provider).unwrap()).collect();
         let commit = self.m[creator].commit(Change { add: adds, ..Change::default() });
         let pos = self.post(commit.commit);
@@ -362,6 +367,30 @@ fn a_member_renames_itself_where_every_leaf_takes_it() {
     assert_eq!(w.m[2].g().members()[b as usize].leaf.as_ref(), Some(&leaf("B")), "the leaf data stays");
     let opened = w.m[2].open(&before, 0).unwrap();
     assert_eq!((opened.sender.name.as_str(), opened.current), ("B", Some(b)));
+}
+
+/// In a group with a kind's log whose members' leaves all name revision 1 or later, a commit that removes members must
+/// name where the log ends; while a leaf names revision 0, as 0.12.1's does, which names none, it need not.
+#[test]
+fn a_removal_ends_the_kinds_log_where_every_leaf_takes_it() {
+    let mut w = World::new(&["A", "B", "C", "D"]);
+    w.m[3].session.leaf.revision = 0;
+    w.found_kind(0, &[1, 2, 3], "test");
+    let c = w.m[3].index_of("C");
+    let commit = w.m[3].commit(Change { remove: vec![c], ..Change::default() });
+    w.post(commit.commit);
+    assert!(w.read(&[0, 1, 2, 3]).iter().all(|reader| is_commit(&reader[0])));
+    let commit = w.m[3].commit(Change { leaf: Some(leaf("D")), ..Change::default() });
+    w.post(commit.commit);
+    w.read(&[0, 1, 3]);
+    let b = w.m[0].index_of("B");
+    let a = &mut w.m[0];
+    let refused = a.group.as_mut().unwrap().commit(&a.provider, &a.session, Change { remove: vec![b], ..Change::default() });
+    assert!(refused.err().unwrap().to_string().contains("does not end the kind's log"));
+    let commit = w.m[0].commit(Change { remove: vec![b], end: Some(0), ..Change::default() });
+    w.post(commit.commit);
+    assert!(w.read(&[0, 1, 3]).iter().all(|reader| is_commit(&reader[0])));
+    w.agree(&[0, 3]);
 }
 
 #[test]

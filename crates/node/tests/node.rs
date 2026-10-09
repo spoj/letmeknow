@@ -389,6 +389,56 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
     }
 }
 
+/// A service that shows a session another version of a log than the session read is reported once, however often the
+/// session reads it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contradiction_is_reported_once() {
+    let relay = relay().await;
+    let dir = folder("contradiction");
+    let (membership, _service) = signing_service(&relay, &dir).await;
+    let mut alice = session(&relay, "Alice").await;
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
+    let rename = |name: &'static str| move |s: Settings| Settings { name: name.into(), ..s };
+    alice.node.change_settings(&gid.0, rename("Release")).await.unwrap();
+    let db = rusqlite::Connection::open(dir.join("membership.db")).unwrap();
+    db.execute("UPDATE logs SET hash = zeroblob(32) WHERE id = ?", [&gid.0]).unwrap();
+    for name in ["Again", "And again"] {
+        assert!(alice.node.change_settings(&gid.0, rename(name)).await.is_err());
+    }
+    let mut warnings = 0;
+    while let Ok(event) = alice.events.try_recv() {
+        warnings += matches!(event, Event::Warning { text, .. } if text.contains("another version")) as usize;
+    }
+    assert_eq!(warnings, 1);
+}
+
+/// A session that crashed after ending the kind's log to remove a member, before the log took its commit, removes the
+/// member as it starts again, even if another commit won the epoch meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removal_cut_short_by_a_crash_is_finished_as_the_session_starts() {
+    use lmk_core::provider::SqliteProvider;
+    let relay = relay().await;
+    let dir = folder("unfinished");
+    let (membership, _service) = signing_service(&relay, &dir).await;
+    let alice_db = dir.join("alice.db");
+    let start = || async { Node::start(SqliteProvider::open(&alice_db).unwrap(), config(&relay, "Alice", None, &[CHAT, KIND])).await.unwrap().0 };
+    let alice = start().await;
+    let mut bob = session(&relay, "Bob").await;
+    let gid = alice.create(Settings { membership, ..settings(KIND, &dir) }, None).unwrap();
+    bob.node.join(&alice.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    let db = rusqlite::Connection::open(dir.join("membership.db")).unwrap();
+    let log: String = gid.0.iter().map(|b| format!("{b:02x}")).collect();
+    db.execute(&format!("CREATE TRIGGER crash BEFORE INSERT ON entries WHEN NEW.log = X'{log}' BEGIN SELECT RAISE(ABORT, 'crash'); END"), []).unwrap();
+    alice.remove(&gid.0, &bob.node.key().0).await.unwrap_err();
+    alice.shutdown().await.unwrap();
+    drop(alice);
+    db.execute("DROP TRIGGER crash", []).unwrap();
+    bob.node.change_settings(&gid.0, |s| Settings { name: "Release".into(), ..s }).await.unwrap();
+    let alice = start().await;
+    bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
+    alice.shutdown().await.unwrap();
+}
+
 impl Session {
     /// Waits for entries of the kind's log after `after`; returns them.
     async fn logged(&mut self, gid: &Bytes, after: u64) -> Vec<lmk_node::Entry> {

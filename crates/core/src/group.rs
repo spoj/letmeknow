@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use lmk_proto::Bytes;
 use lmk_proto::clock::now;
-use lmk_proto::group::{Control, Credential, How, LEAF_EXTENSION, Leaf, PROTOCOL, RENAME_REVISION, SETTINGS_EXTENSION, Settings, held_by_type};
+use lmk_proto::group::{CHAT, Control, Credential, END_REVISION, How, LEAF_EXTENSION, Leaf, PROTOCOL, RENAME_REVISION, SETTINGS_EXTENSION, Settings, held_by_type};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -525,7 +525,7 @@ impl Group {
             .load_psks(provider.storage())?
             .build(provider.rand(), provider.crypto(), &session.signer, |_| true)?
             .stage_commit(provider)?;
-        if let Err(error) = rules(&self.mls, self.mls.pending_commit().unwrap(), self.mls.own_leaf_index()) {
+        if let Err(error) = rules(&self.mls, self.mls.pending_commit().unwrap(), self.mls.own_leaf_index(), &aad) {
             self.mls.clear_pending_commit(provider.storage())?;
             return Err(error);
         }
@@ -554,7 +554,7 @@ impl Group {
             self.state.posted = None;
             let by = self.mls.own_leaf_index();
             let staged = self.mls.pending_commit().expect("a posted commit is pending");
-            if let Err(error) = rules(&self.mls, staged, by) {
+            if let Err(error) = rules(&self.mls, staged, by, &self.state.aad) {
                 self.mls.clear_pending_commit(provider.storage())?;
                 self.save(provider)?;
                 return Ok(Applied::Skipped { reason: error.to_string(), lost: true });
@@ -588,7 +588,7 @@ impl Group {
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             bail!("not a commit from another member")
         };
-        rules(&self.mls, &staged, by)?;
+        rules(&self.mls, &staged, by, &aad)?;
         Ok((*staged, by, aad))
     }
 
@@ -754,8 +754,9 @@ fn state_key(id: &[u8]) -> Vec<u8> {
 
 /// The app's rules on a commit, from MLS state alone, binding the committer too: changes inline only, of the kinds we
 /// make; added members whose credentials name their own keys; settings that parse, at protocol 1, with the kind
-/// unchanged; and no update of the committer's leaf that changes its credential, but its name where `renames` allows.
-fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex) -> Result<()> {
+/// unchanged; no update of the committer's leaf that changes its credential, but its name where `renames` allows; and,
+/// where every leaf names `END_REVISION`, no removal in a group with a kind's log that names no `end`.
+fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad) -> Result<()> {
     for proposal in staged.queued_proposals() {
         ensure!(proposal.proposal_or_ref_type() == ProposalOrRefType::Proposal, "a proposal by reference");
         match proposal.proposal() {
@@ -768,6 +769,8 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex) -> Result<(
     let new = settings_of(staged.group_context().extensions())?;
     ensure!(new.protocol == PROTOCOL, "settings name protocol {}", new.protocol);
     ensure!(new.kind == old.kind, "the kind changed");
+    let ends = aad.end.is_some() || old.kind == CHAT || !revised(group, END_REVISION);
+    ensure!(ends || staged.remove_proposals().next().is_none(), "a removal that does not end the kind's log");
     if let Some(leaf) = staged.update_path_leaf_node() {
         let before = group.member_at(by).and_then(|member| credential_of(&member.credential));
         let after = credential_of(leaf.credential());
@@ -777,6 +780,7 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex) -> Result<(
     Ok(())
 }
 
+/// Whether every member's leaf names `revision` or a later one.
 fn revised(group: &MlsGroup, revision: u32) -> bool {
     group.members().all(|member| Member::of(group, member.index).and_then(|m| m.leaf).is_some_and(|leaf| leaf.revision >= revision))
 }

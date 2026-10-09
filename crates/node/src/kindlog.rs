@@ -7,7 +7,8 @@
 //! A commit that removes a member moves the order to a new log, whose id derives from the epoch the commit starts, so
 //! that the removed member does not know it. Its committer first appends `END` to the old log, and the commit names the
 //! position before it: the order goes on in the new log from there, with no position counted twice. A member waits at
-//! an `END` until it applies a removal that names a position at or after it.
+//! an `END` until it knows a later log, and then skips it: the `END` a commit names lies past where its log ends, so one
+//! read then is one no commit names, as when its committer lost the epoch or stopped before posting.
 
 use std::sync::Arc;
 

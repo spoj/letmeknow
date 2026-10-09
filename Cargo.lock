@@ -2976,6 +2976,7 @@ dependencies = [
  "lmk-transport",
  "n0-future",
  "rcgen",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
