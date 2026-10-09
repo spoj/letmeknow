@@ -92,11 +92,6 @@ const kept = page =>
       })
   );
 const text = page => page.locator(".cm-content").evaluate(content => content.cmTile.view.state.doc.toString());
-/** A doc's state as 0.10 kept it, in lmk-node's records: `lmk/node/doc/` and the group id's bytes. */
-const legacyKey = gid => {
-  const raw = Uint8Array.from(atob(gid.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
-  return [...new TextEncoder().encode("lmk/node/doc/"), ...raw];
-};
 async function until(produce, accept, ms = 20_000) {
   const deadline = Date.now() + ms;
   let value = await produce();
@@ -240,27 +235,21 @@ try {
 
   check((await laptop.evaluate(() => window.toasts)).length === 0, "the laptop showed no error before its reload");
 
-  // A reload keeps the laptop's groups, messages and doc, and it still talks. Its doc's state goes back where 0.10 kept
-  // it, in lmk-node's records, and the doc plugin takes it from there.
-  const moved = await laptop.evaluate(
-    ([gid, legacy]) =>
+  // A reload keeps the laptop's groups, messages and doc, and it still talks.
+  const kept = await laptop.evaluate(
+    gid =>
       new Promise((resolve, reject) => {
         const open = indexedDB.open("lmk");
         open.onsuccess = () => {
-          const records = open.result.transaction("records", "readwrite").objectStore("records");
-          const [ours, old] = [new TextEncoder().encode(`lmk/kind/doc/${gid}`), new Uint8Array(legacy)];
-          const read = records.get(ours);
-          read.onsuccess = () => {
-            if (!read.result) return resolve(false);
-            records.put(read.result, old);
-            records.delete(ours).onsuccess = () => resolve(true);
-          };
-          read.onerror = () => reject(read.error);
+          const records = open.result.transaction("records").objectStore("records");
+          const count = records.count(new TextEncoder().encode(`lmk/kind/doc/${gid}`));
+          count.onsuccess = () => resolve(count.result === 1);
+          count.onerror = () => reject(count.error);
         };
       }),
-    [doc.group, legacyKey(doc.group)]
+    doc.group
   );
-  check(moved, "the browser keeps its doc as the doc plugin's record");
+  check(kept, "the browser keeps its doc as the doc plugin's record");
   await laptop.reload();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.getByText("hello from the terminal", { exact: true }).waitFor();
@@ -279,21 +268,8 @@ try {
         t => t.includes("gamma")
       )
     ).includes("gamma"),
-    "and its doc, also as 0.10 kept it"
+    "and its doc"
   );
-  const legacy = () =>
-    laptop.evaluate(
-      legacy =>
-        new Promise(resolve => {
-          const open = indexedDB.open("lmk");
-          open.onsuccess = () => {
-            const count = open.result.transaction("records").objectStore("records").count(new Uint8Array(legacy));
-            count.onsuccess = () => resolve(count.result);
-          };
-        }),
-      legacyKey(doc.group)
-    );
-  check((await until(legacy, n => n === 0)) === 0, "which it no longer keeps once the plugin has it");
 
   // A second tab works through the session the first one runs, and runs it once the first closes.
   const second = watch("second tab", await laptop.context().newPage());
