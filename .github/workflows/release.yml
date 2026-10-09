@@ -70,9 +70,8 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/archive-*/*
         env:
           GH_TOKEN: ${{ github.token }}
+      # Trusted publishing: npm takes the workflow's OIDC token, so no npm token is kept.
       - name: npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version=${GITHUB_REF_NAME#v}
           publish() { npm view "$1@$version" version >/dev/null 2>&1 || npm publish --access public --provenance; }
@@ -89,8 +88,8 @@ jobs:
           done
           for dir in dist/npm-*; do
             package=@letmeknow/${dir#dist/npm-}@$version
-            # The registry can take a minute or two to show a package; after five, fail rather than hang.
-            for _ in $(seq 30); do npm view "$package" version --prefer-online >/dev/null 2>&1 && break; sleep 10; done
+            # The registry can take several minutes to show a package; after fifteen, fail rather than hang.
+            for _ in $(seq 90); do npm view "$package" version --prefer-online >/dev/null 2>&1 && break; sleep 10; done
             npm view "$package" version --prefer-online >/dev/null
           done
           cp README.md LICENSE npm/cli/
