@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, bail};
 use iroh::EndpointId;
 use lmk_proto::{
     Answer, Bytes, frame,
@@ -269,10 +269,11 @@ impl Session {
                 let mut answer = false;
                 for theirs in heads.into_iter().filter(|head| logs.contains(&head.log.0)) {
                     let log = theirs.log.clone();
-                    if let Err(e) = self.judge(&log, &theirs) {
-                        tracing::warn!("hello from {}: {e:#}", self.peer.fmt_short());
+                    if !self.inner.groups.verify_head(&log.0, &theirs) {
+                        tracing::warn!("hello from {}: a head the service did not sign", self.peer.fmt_short());
                         continue;
                     }
+                    self.judge(&log, &theirs)?;
                     answer |= theirs.length > self.inner.groups.head(&log.0).length;
                     self.logs.entry(log.clone()).or_default().theirs = Some(theirs);
                     self.forward(&log).await?;
@@ -361,9 +362,8 @@ impl Session {
     }
 
     /// Checks a signed head of a log from the peer against our chain, now or, if it is longer, once our chain reaches
-    /// it; reports a contradiction.
+    /// it; reports a contradiction, which ends the stream.
     fn judge(&mut self, log: &Bytes, theirs: &Head) -> Result<()> {
-        ensure!(self.inner.groups.verify_head(&log.0, theirs), "a head the service did not sign");
         let ours = self.inner.groups.head(&log.0);
         let state = self.logs.entry(log.clone()).or_default();
         if theirs.length > ours.length && state.longer.as_ref().is_none_or(|longer| longer.length < theirs.length) {
@@ -465,10 +465,11 @@ impl Session {
             tracing::debug!("{} sent entries of a log we share no group of", self.peer.fmt_short());
             return Ok(());
         }
-        if let Err(e) = self.judge(&log, &head) {
-            tracing::warn!("entries from {}: {e:#}", self.peer.fmt_short());
+        if !self.inner.groups.verify_head(&log.0, &head) {
+            tracing::warn!("entries from {}: a head the service did not sign", self.peer.fmt_short());
             return Ok(());
         }
+        self.judge(&log, &head)?;
         let mine = self.inner.groups.head(&log.0);
         let Some(start) = head.length.checked_sub(entries.len() as u64) else { return Ok(()) };
         if head.length <= mine.length || start > mine.length {
@@ -498,10 +499,7 @@ impl Session {
         }
         let logs = self.inner.groups.logs(&group.0);
         for log in &logs {
-            if let Err(e) = self.judge_longer(&Bytes(log.clone())) {
-                tracing::warn!("a head from {}: {e:#}", self.peer.fmt_short());
-                return Ok(());
-            }
+            self.judge_longer(&Bytes(log.clone()))?;
         }
         for log in logs {
             self.forward(&Bytes(log)).await?;

@@ -289,7 +289,12 @@ impl Plugin {
         }
     }
 
+    /// Takes a state, unless this session took an entry after it meanwhile, as while fetching its bundle.
     fn restore(&mut self, group: &str, state: State, bundle: Option<&Path>) -> Result<()> {
+        let g = self.groups.get(group).context("not a group of this session")?;
+        if g.branches.as_ref().is_some_and(|branches| state.position < branches.position) {
+            return Ok(());
+        }
         let repo = self.repo(group);
         if let Some(bundle) = bundle {
             git(&repo, &["bundle", "unbundle", bundle.to_str().context("a path that is not UTF-8")?])?;

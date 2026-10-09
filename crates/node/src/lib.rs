@@ -299,6 +299,10 @@ struct Rec {
     kind_logs: Vec<LogRef>,
     /// The invites shared with the group, kept for `keep` after they expire.
     invites: Vec<Rule>,
+    /// The session keys of the members this session ended the kind's log to remove, until it applies a commit that
+    /// removes them: it removes them again as it starts and at each resync, as after a crash before posting the commit.
+    #[serde(default)]
+    removing: Vec<Bytes>,
 }
 
 /// An invite, as its inviter shared it with the group.
@@ -409,6 +413,9 @@ pub(crate) enum Work {
     Net(lmk_net::Event),
 }
 
+/// A log, and the lengths and hashes of two heads of it that contradict each other.
+type Contradicted = (Vec<u8>, [(u64, Vec<u8>); 2]);
+
 pub(crate) struct Inner<P> {
     state: Mutex<State<P>>,
     net: OnceLock<Net>,
@@ -426,6 +433,8 @@ pub(crate) struct Inner<P> {
     advanced: tokio::sync::Notify,
     reading: Mutex<HashSet<Vec<u8>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// The contradictions reported, each once.
+    contradictions: Mutex<HashSet<Contradicted>>,
 }
 
 /// One member's session. Clones share it.
@@ -702,6 +711,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             advanced: tokio::sync::Notify::new(),
             reading: Mutex::default(),
             tasks: Mutex::default(),
+            contradictions: Mutex::default(),
         });
         let net_config = lmk_net::Config {
             home: config.home,
@@ -741,6 +751,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
         }
         inner.spawn(inner.clone().resume(gids));
+        inner.spawn(inner.clone().finish_removals());
         inner.spawn(inner.clone().redial());
         Ok((Node { inner }, events_rx))
     }
@@ -1263,6 +1274,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.events.send(Event::Warning { group: group.map(|gid| Bytes(gid.to_vec())), text }).ok();
     }
 
+    /// Removes again, as it starts and then at each resync, the members this session ended a kind's log to remove.
+    async fn finish_removals(self: Arc<Self>) {
+        loop {
+            let removing: Vec<(Vec<u8>, Vec<u8>)> = {
+                let st = self.state.lock().unwrap();
+                st.groups.iter().flat_map(|(gid, g)| g.rec.removing.iter().map(|key| (gid.clone(), key.0.clone()))).collect()
+            };
+            for (group, key) in removing {
+                self.work.send(Work::Remove { group, key }).ok();
+            }
+            sleep(RESYNC).await;
+        }
+    }
+
     /// Catches up on each group, replaces this session's keys, then again daily.
     async fn resume(self: Arc<Self>, gids: Vec<Vec<u8>>) {
         self.refresh_all().await;
@@ -1374,6 +1399,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             let by = g.mls.members().into_iter().find(|m| m.index == by);
             let end = end.filter(|_| !removed.is_empty());
+            g.rec.removing.retain(|key| !removed.iter().any(|m| m.key == key.0));
             self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, invite, removed, settings, gone }).ok();
             if gone {
                 break;
@@ -1418,6 +1444,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
             if let Some(log) = ending.filter(|log| ended.as_ref().is_none_or(|ended| ended.id != log.id)) {
                 let position = client.append(&log.id.0, kindlog::END).await?.position;
                 ended = Some(LogRef { id: log.id, after: log.after + position - 1 });
+                let mut st = self.state.lock().unwrap();
+                let g = st.group_mut(gid)?;
+                let remove = change(&g.mls)?.remove;
+                for member in g.mls.members().into_iter().filter(|m| remove.contains(&m.index)) {
+                    if !g.rec.removing.iter().any(|key| key.0 == member.key) {
+                        g.rec.removing.push(Bytes(member.key));
+                    }
+                }
+                st.save(gid)?;
             }
             let (bytes, welcome, ours) = {
                 let mut st = self.state.lock().unwrap();
@@ -1431,6 +1466,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
                         let mut change = change(&g.mls)?;
                         if !change.remove.is_empty() {
                             change.end = ended.as_ref().filter(|ended| g.rec.kind_logs.last().is_some_and(|log| log.id == ended.id)).map(|ended| ended.after);
+                            // The kind's order moved to another log since this session ended its own: it ends that one.
+                            if change.end.is_none() && !g.rec.kind_logs.is_empty() {
+                                continue;
+                            }
                         }
                         let commit = g.mls.commit(&st.provider, &st.session, change)?;
                         (commit.commit, commit.welcome, true)
@@ -1973,14 +2012,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Reports a log that its service showed differently, here and at `there`.
+    /// Reports a log that its service showed differently, here and at `there`, unless it reported those two heads of it
+    /// already.
     pub(crate) fn contradicted(&self, st: &State<P>, log: &[u8], contradiction: &Contradiction, there: &str) {
+        let Contradiction { ours, theirs } = contradiction;
+        let mut heads = [(ours.length, ours.hash.0.clone()), (theirs.length, theirs.hash.0.clone())];
+        heads.sort();
+        if !self.contradictions.lock().unwrap().insert((log.to_vec(), heads)) {
+            return;
+        }
         let what = match st.logs.get(log).map(|l| &l.of) {
             Some(logs::Of::Kind(_)) => "the log of the group's kind",
             Some(logs::Of::Identity(_)) => "a key log",
             _ => "the group's log",
         };
-        let Contradiction { ours, theirs } = contradiction;
         let text = format!(
             "the membership service showed {there} another version of {what}: length {} with hash {} here, length {} with hash {} there",
             ours.length,
