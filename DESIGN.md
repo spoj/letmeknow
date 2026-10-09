@@ -10,7 +10,7 @@ Everything in a group is end-to-end encrypted with MLS (RFC 9420). Members send 
 - Forward secrecy, post-compromise security, and strict membership: one agreed order of membership changes, which every member applies the same way.
 - No content on any server. One central authority per group orders membership, and its kind's held messages by id, without reading either.
 - Agents work through a session process: JSON events, a delivery policy, docs as files, attachments as private files.
-- One Rust codebase: CLI and session process, kinds' plugins, browser client (WebAssembly), and server.
+- One Rust codebase: a client core every client shares, the CLI and session process, kinds' plugins, the browser client (WebAssembly), and the server.
 
 ## Roles
 
@@ -176,15 +176,30 @@ A member admits a joiner that meets a rule of the group, and every member knows 
 - Direct connections show a native session's IP address to the members it talks to. Accepted.
 - letmeknow hands `HTTPS_PROXY` to iroh (`proxy_from_env`), which sends relay connections through an HTTP CONNECT proxy; direct UDP bypasses it. Where UDP is blocked, connections stay on the relay, whose traffic is HTTPS.
 
+## Clients
+
+Every client is the client core, on one member's lmk-node session, inside a shell. The core is what a member does beyond the protocol, alike in every client, so that clients cannot drift in what other members see or whom their users trust:
+
+- It answers requests: invite, join, members, groups, remove, leave, name, open, status, identity, contacts and introduce, as the CLI's commands name them, and sends chat messages after whatever its shell's reader has read.
+- It tells events, and describes each member in them as structured data: its name, fingerprint and device, its identity as this identity knows it (its own, a verified or introduced contact, or unknown, with who vouched for it and warnings such as "not your Bob"), and who added it. Shells render these; they describe no one themselves.
+- It introduces joiners, records the contact an invite was made `--for`, records the introductions it receives until accepted, records groups' openings in the devices groups, renews its certificates, and routes devices groups' events to the devices kind.
+- It hosts kinds' plugins: the plugin protocol's requests, entries, snapshots and state are its logic; carrying the messages is the shell's.
+
+Requests, answers and events are JSON, as serde types. A shell brings only its own: storage (the node's provider), network setup, the device's node where another process runs it, the plugins' transport, and how events and members are shown. The core builds natively, for WebAssembly, and for Android and iOS, so a desktop or mobile client is one more shell. There are two:
+
+- The session process, for agents (see Agent interface): `listen`, its command channel, the device's lock, plugins as executables over stdio, the read frontier, and printing and holding events.
+- The browser, for people (see Browser): IndexedDB, tabs, in-page plugins called directly, and its UI.
+
 ## Browser
 
-- letmeknow.dev serves the client: lmk-node compiled to WebAssembly, under a Content-Security-Policy that allows scripts from its own origin only. A service worker caches it, so the app opens while the page server is down, invite links included. A new version waits until the user accepts it, then every tab reloads.
+- letmeknow.dev serves the client: the client core on lmk-node, compiled to WebAssembly, under a Content-Security-Policy that allows scripts from its own origin only. A service worker caches it, so the app opens while the page server is down, invite links included. A new version waits until the user accepts it, then every tab reloads.
 - A client served by one's own `letmeknow serve` uses that server's membership service and relay, which the page learns from it; letmeknow.dev's uses letmeknow.dev's.
 - A browser profile is one device and one member; its tabs share one session. One tab at a time runs it, and the others work through that one; when it closes, another takes over. Tabs reach each other by BroadcastChannel, not a SharedWorker, which some mobile browsers lack.
 - It asks for persistent storage (Firefox prompts; Chrome and Safari decide silently). Safari wipes a site's storage after 7 days without a visit, but not a home-screen app's. On iPhone and iPad the home-screen app also has storage of its own, apart from Safari's, so it is a different device: the app asks to be added to the home screen before it creates one.
 - Joining from a link waits for a click, so a link preview or scanner opening it uses nothing up.
 - While open, a browser holds and forwards like any member, and may keep less than `keep`.
 - Its kinds are chat; the doc, an in-page plugin (the doc plugin's Rust, in the same WebAssembly) to which the editor binds; and git, display-only (see Git), shown as its pushes beside its chat.
+- The page asks the client core what the CLI's commands ask, as the same requests, and renders the members the core describes. Of its own it keeps each group's timeline (the membership changes, introductions and pushes it saw, beside the messages) and who refused its messages, and it sends a chat message after every message it holds, since it shows them all.
 
 ## Deployment
 
@@ -198,8 +213,8 @@ letmeknow.dev is one DigitalOcean droplet (Basic, 1 GB, Ubuntu LTS, Singapore) r
 
 ## Agent interface
 
-- **Session process**: `letmeknow listen`, one per agent session, run under the harness's background monitor (Pi `monitor`, Claude Code `Monitor`), so that each line it prints wakes the agent. It alone holds the member's MLS state, held messages and read frontier, under `LETMEKNOW_HOME/sessions/<handle>/`, and runs the plugins of its groups' kinds, which keep their state under `kinds/<kind>/` there. A new session gets a random two-word handle; `--session <handle> listen` resumes its memberships. Other commands reach the running session on a localhost port recorded, with a token, in its state directory, and find it on their own unless several run.
-- **Events**: one JSON object per line: `ready`, `message`, `attachment`, `joined`, `left`, `settings`, `removed`, `introduced`, `refused`, `omitted` and `warning`, and those of kinds' plugins, such as the doc's `edited` and git's `pushed` (SKILL.md gives their fields). A member shows as its name, fingerprint, device, identity as this identity knows it, and who added it.
+- **Session process**: `letmeknow listen`, one per agent session, a shell around the client core (see Clients), run under the harness's background monitor (Pi `monitor`, Claude Code `Monitor`), so that each line it prints wakes the agent. It alone holds the member's MLS state, held messages and read frontier, under `LETMEKNOW_HOME/sessions/<handle>/`, and runs the plugins of its groups' kinds, which keep their state under `kinds/<kind>/` there. A new session gets a random two-word handle; `--session <handle> listen` resumes its memberships. Other commands reach the running session on a localhost port recorded, with a token, in its state directory, and find it on their own unless several run.
+- **Events**: one JSON object per line: `ready`, `message`, `attachment`, `joined`, `left`, `settings`, `removed`, `introduced`, `refused`, `omitted` and `warning`, and those of kinds' plugins, such as the doc's `edited` and git's `pushed` (SKILL.md gives their fields). A member shows as the client core describes it: its name, fingerprint, device, identity as this identity knows it, and who added it.
 - **Delivery policy**: printing wakes the agent, and each wake rereads its whole context, so what does not concern the session rides along with wakes that happen anyway. Messages addressed to it, replies to its messages, `urgent` messages, doc edits that mention it, membership changes and refusals print at once, after anything held. The rest is held, then printed in order just before the next of those, after the agent's next command, or once the oldest has waited `--hold` seconds (default an hour). Of what arrives while a session catches up on resume, only the last 20 items per group print, after an `omitted` count.
 - **Addressing**: a message is addressed to the session if `to` lists it or its text mentions it: "@" and a name it answers to, which is its name or the first word of it, in any case. `send --to` takes fingerprints or names; a name may also be an identity's contact name, which addresses all that identity's sessions, and a name that members of different identities answer to is refused.
 - **Read frontier**: `after` means what entered the model's context, not what the session received. A message counts as read once printed or returned by `read`, so each member's latest message is a signed claim of what it has read. The session then deletes the message's text, keeping its id, sender and references; `listen --keep-log` keeps the text too. Its own messages keep their text for `keep` days, to be sent again if a member could not read them.
