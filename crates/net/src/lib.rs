@@ -86,8 +86,8 @@ pub trait Groups: Send + Sync + 'static {
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
     /// The certificates this session holds of these groups' members.
     fn certificates(&self, groups: &[Vec<u8>]) -> Vec<Envelope>;
-    /// A certificate `peer` presented.
-    fn certificate(&self, peer: EndpointId, certificate: Envelope);
+    /// A certificate a peer presented, of itself or of a member of a group it is in.
+    fn certificate(&self, certificate: Envelope);
 }
 
 /// A browser's own storage of the files it holds, since iroh-blobs keeps only memory there. With one, a session keeps

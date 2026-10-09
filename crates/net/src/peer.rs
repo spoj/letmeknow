@@ -244,7 +244,7 @@ impl Session {
             Frame::Hello { groups, heads, certificates } => {
                 if !self.leaves().is_empty() {
                     for certificate in certificates {
-                        self.inner.groups.certificate(self.peer, certificate);
+                        self.inner.groups.certificate(certificate);
                     }
                 }
                 let shared = self.shared();

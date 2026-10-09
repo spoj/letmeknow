@@ -374,7 +374,7 @@ impl Groups for Fake {
         self.certificates.lock().unwrap().clone()
     }
 
-    fn certificate(&self, _: EndpointId, certificate: Envelope) {
+    fn certificate(&self, certificate: Envelope) {
         self.certified.lock().unwrap().push(certificate);
     }
 }

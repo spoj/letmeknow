@@ -370,11 +370,13 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         certificates
     }
 
-    fn certificate(&self, peer: EndpointId, certificate: Envelope) {
+    /// A certificate may be of a member other than the peer that showed it, and make this session serve that one.
+    fn certificate(&self, certificate: Envelope) {
+        let peers = self.net().connected();
         let mut st = self.state.lock().unwrap();
-        let before = st.served(&[peer]);
+        let before = st.served(&peers);
         take_certificate(&mut st, certificate);
-        for (gid, peer) in st.served(&[peer]).into_iter().filter(|served| !before.contains(served)) {
+        for (gid, peer) in st.served(&peers).into_iter().filter(|served| !before.contains(served)) {
             self.net().served(peer, &gid);
         }
     }
