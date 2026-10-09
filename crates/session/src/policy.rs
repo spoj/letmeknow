@@ -1,6 +1,7 @@
 //! The delivery policy. Printing wakes the agent, so only what concerns this session prints at once; the rest waits,
 //! then prints in order just before the next thing that wakes it, after its next command, or once `--hold` runs out.
 
+use lmk_client::answers;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -8,19 +9,6 @@ use tokio::time::Instant;
 
 /// How many items that arrived while catching up are printed; older ones are counted as `omitted`.
 const CATCH_UP: usize = 20;
-
-/// Whether a described member answers to `name`, in any case: its name, the first word of it, or its identity's name
-/// when this identity knows it: a contact's name, or one of its own.
-pub fn answers(member: &Value, name: &str) -> bool {
-    let (name, own) = (name.to_lowercase(), member["name"].as_str().unwrap_or_default().to_lowercase());
-    let first: String = own.chars().take_while(|c| c.is_alphanumeric()).collect();
-    let identity = &member["identity"];
-    own == name
-        || first == name
-        || identity["error"].is_null()
-            && identity["how"] != "unknown"
-            && identity["name"].as_str().is_some_and(|identity| identity.to_lowercase() == name)
-}
 
 /// Whether `text` mentions `member`: "@" and a name it answers to, as "@claude" does "Claude, Matthew's coding agent".
 pub fn mentions(text: &str, member: &Value) -> bool {

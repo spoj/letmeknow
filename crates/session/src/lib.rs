@@ -11,30 +11,10 @@ use lmk_core::device::Device;
 use lmk_core::group::Window;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::Node;
-use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use std::path::{Path, PathBuf};
 
 pub use lmk_proto::links::RELAY;
-
-/// letmeknow.dev's membership service.
-pub fn letmeknow_dev() -> Service {
-    let key = hex::decode(lmk_proto::links::MEMBERSHIP_KEY).unwrap();
-    Service::Serve { key: Bytes(key), relay: RELAY.into(), addrs: Vec::new() }
-}
-
-/// A membership service from its address: `letmeknow.dev`, `<iroh key, hex>@<relay URL>`, or a folder's absolute path.
-pub fn service(address: &str) -> Result<Service> {
-    if address == "letmeknow.dev" {
-        return Ok(letmeknow_dev());
-    }
-    if let Some((key, relay)) = address.split_once("@https://") {
-        let key = Bytes(hex::decode(key).context("a service key is hex")?);
-        return Ok(Service::Serve { key, relay: format!("https://{relay}"), addrs: Vec::new() });
-    }
-    ensure!(cli::is_folder(address), "a membership service is letmeknow.dev, <key>@<relay URL>, or a folder");
-    Ok(Service::Folder(address.into()))
-}
 
 /// The skill text for agents.
 pub const SKILL: &str = include_str!("../../../SKILL.md");

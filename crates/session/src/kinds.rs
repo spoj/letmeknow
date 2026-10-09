@@ -3,12 +3,14 @@
 //! stdout (PROTOCOL.md, Plugins).
 
 use anyhow::{Context, Result};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 const PREFIX: &str = "letmeknow-kind-";
@@ -41,39 +43,40 @@ pub fn dirs() -> Vec<PathBuf> {
 
 struct Running {
     _child: Child,
-    stdin: ChildStdin,
+    /// Lines for its stdin.
+    stdin: mpsc::UnboundedSender<String>,
+    started: Instant,
 }
 
 /// A plugin that stops within this long of its start is not started again by itself.
-const STEADY: std::time::Duration = std::time::Duration::from_secs(60);
+const STEADY: Duration = Duration::from_secs(60);
 
+/// The plugins found, speaking JSON lines over their stdio.
 pub struct Plugins {
     pub found: BTreeMap<String, PathBuf>,
-    running: HashMap<String, Running>,
-    started: HashMap<String, std::time::Instant>,
+    /// Where each kind's plugin keeps its state, in a directory named after its kind.
+    dir: PathBuf,
+    running: Mutex<HashMap<String, Running>>,
     /// Each plugin's lines, and `None` once it stopped.
     lines: mpsc::UnboundedSender<(String, Option<Value>)>,
 }
 
 impl Plugins {
-    pub fn new(found: BTreeMap<String, PathBuf>) -> (Self, mpsc::UnboundedReceiver<(String, Option<Value>)>) {
+    pub fn new(found: BTreeMap<String, PathBuf>, dir: PathBuf) -> (Self, mpsc::UnboundedReceiver<(String, Option<Value>)>) {
         let (lines, rx) = mpsc::unbounded_channel();
-        (Plugins { found, running: HashMap::new(), started: HashMap::new(), lines }, rx)
+        (Plugins { found, dir, running: Mutex::default(), lines }, rx)
+    }
+}
+
+impl lmk_client::Plugins for Plugins {
+    fn kinds(&self) -> Vec<String> {
+        self.found.keys().cloned().collect()
     }
 
-    pub fn running(&self) -> Vec<String> {
-        self.running.keys().cloned().collect()
-    }
-
-    pub fn is_running(&self, kind: &str) -> bool {
-        self.running.contains_key(kind)
-    }
-
-    /// Starts a kind's plugin; the session's first message to it is `start`.
-    pub async fn start(&mut self, kind: &str) -> Result<()> {
+    fn start(&self, kind: &str) -> Result<Value> {
         let path = self.found.get(kind).with_context(|| format!("this session has no plugin for {kind} groups ({PREFIX}{kind})"))?;
         let mut child = Command::new(path).stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn()?;
-        let (stdin, stdout) = (child.stdin.take().expect("piped"), child.stdout.take().expect("piped"));
+        let (mut stdin, stdout) = (child.stdin.take().expect("piped"), child.stdout.take().expect("piped"));
         let (lines, name) = (self.lines.clone(), kind.to_owned());
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
@@ -85,23 +88,30 @@ impl Plugins {
             }
             lines.send((name, None)).ok();
         });
-        self.running.insert(kind.to_owned(), Running { _child: child, stdin });
-        self.started.insert(kind.to_owned(), std::time::Instant::now());
-        Ok(())
+        let (writer, mut written) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Some(line) = written.recv().await {
+                if stdin.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let running = Running { _child: child, stdin: writer, started: Instant::now() };
+        self.running.lock().unwrap().insert(kind.to_owned(), running);
+        Ok(json!({ "dir": self.dir.join(kind) }))
     }
 
-    pub async fn send(&mut self, kind: &str, message: &Value) -> Result<()> {
-        let running = self.running.get_mut(kind).with_context(|| format!("the {kind} plugin is not running"))?;
-        let written = running.stdin.write_all(format!("{message}\n").as_bytes()).await;
-        if written.is_err() {
-            self.running.remove(kind);
-        }
-        written.with_context(|| format!("the {kind} plugin stopped"))
+    fn running(&self) -> Vec<String> {
+        self.running.lock().unwrap().keys().cloned().collect()
     }
 
-    /// A plugin's stdout closed; whether it had run steadily, and may be started again.
-    pub fn stopped(&mut self, kind: &str) -> bool {
-        self.running.remove(kind);
-        self.started.get(kind).is_some_and(|at| at.elapsed() > STEADY)
+    fn send(&self, kind: &str, message: &Value) -> Result<()> {
+        let running = self.running.lock().unwrap();
+        let running = running.get(kind).with_context(|| format!("the {kind} plugin is not running"))?;
+        running.stdin.send(format!("{message}\n")).ok().with_context(|| format!("the {kind} plugin stopped"))
+    }
+
+    fn stopped(&self, kind: &str) -> bool {
+        self.running.lock().unwrap().remove(kind).is_some_and(|running| running.started.elapsed() > STEADY)
     }
 }

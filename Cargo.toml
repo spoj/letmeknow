@@ -13,6 +13,7 @@ lmk-core = { path = "crates/core" }
 lmk-membership = { path = "crates/membership" }
 lmk-net = { path = "crates/net" }
 lmk-node = { path = "crates/node" }
+lmk-client = { path = "crates/client" }
 lmk-serve = { path = "crates/serve" }
 letmeknow-kind-doc = { path = "crates/kind-doc" }
 letmeknow-kind-git = { path = "crates/kind-git" }
