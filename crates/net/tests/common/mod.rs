@@ -204,8 +204,11 @@ pub struct Fake {
     pub presented: Mutex<Vec<(EndpointId, List)>>,
     /// Kinds' frames and state links from peers.
     pub frames: Mutex<Vec<(EndpointId, KindFrame)>>,
-    pub states: Mutex<Vec<(Vec<u8>, EndpointId, Option<String>)>>,
+    pub states: Mutex<Vec<StateLink>>,
 }
+
+/// A group, the peer, and the link it handed, or none when it asked for a state.
+pub type StateLink = (Vec<u8>, EndpointId, Option<String>);
 
 impl Fake {
     pub fn new(service: &SigningKey) -> Arc<Fake> {
