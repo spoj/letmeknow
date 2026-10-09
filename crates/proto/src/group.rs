@@ -123,6 +123,15 @@ pub fn held_by_type(payload: &serde_json::Value) -> bool {
     matches!(type_of(payload), "message" | "leave")
 }
 
+/// The payloads of a devices group's contacts, a Yjs map synced as a doc's text was: live edits, and diffs answering a
+/// `doc_sv` frame. Both are Yjs v1 updates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContactsUpdate {
+    Edit { update: Bytes },
+    Diff { update: Bytes },
+}
+
 /// A chat message, the payload of the built-in kind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename = "message")]
