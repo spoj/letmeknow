@@ -414,6 +414,8 @@ pub(crate) struct Inner<P> {
     events: mpsc::UnboundedSender<Event>,
     work: mpsc::UnboundedSender<Work>,
     committing: tokio::sync::Mutex<()>,
+    /// Woken whenever a kind's log is applied further, for appends waiting to catch up.
+    advanced: tokio::sync::Notify,
     reading: Mutex<HashSet<Vec<u8>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -652,6 +654,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             events,
             work: work.clone(),
             committing: tokio::sync::Mutex::new(()),
+            advanced: tokio::sync::Notify::new(),
             reading: Mutex::default(),
             tasks: Mutex::default(),
         });

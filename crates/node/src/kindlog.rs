@@ -18,12 +18,15 @@ use lmk_membership::Refused;
 use lmk_proto::Bytes;
 use lmk_proto::group::{Control, type_of};
 use lmk_proto::peer::{Frame, KindLog as LogRef};
-use n0_future::time::timeout;
+use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::logs::{Log, Of, entry_key};
 use crate::{Entry, Event, Inner, Message, Node, Rec, SNAPSHOT_WAIT, STATE_ASK, State, Work, get, message_key, now, put};
+
+/// How long an append waits for this session to take the messages the log names before it.
+const CATCH_UP: Duration = Duration::from_secs(30);
 
 /// The entry that ends a kind's log.
 pub(crate) const END: &[u8] = b"end";
@@ -110,6 +113,22 @@ impl<P: Provider + Send + 'static> Node<P> {
             (log, g.mls.settings().membership)
         };
         self.inner.read_kind_log(gid, &log.id.0).await?;
+        // A session that just came online takes the messages the log names from the others in a moment; one behind
+        // waits for its kind to take a state instead.
+        let caught_up = async {
+            loop {
+                let advanced = self.inner.advanced.notified();
+                {
+                    let st = self.inner.state.lock().unwrap();
+                    let behind = st.group(gid).ok().and_then(|g| g.rec.log.as_ref()).is_none_or(|log| log.behind);
+                    if behind || !self.inner.waits(&st, gid) {
+                        return;
+                    }
+                }
+                advanced.await;
+            }
+        };
+        timeout(CATCH_UP, caught_up).await.ok();
         {
             let st = self.inner.state.lock().unwrap();
             let g = st.group(gid)?;
@@ -231,6 +250,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if took {
             self.events.send(Event::Logged { group: Bytes(gid.to_vec()) }).ok();
         }
+        self.advanced.notify_waiters();
         Ok(())
     }
 
