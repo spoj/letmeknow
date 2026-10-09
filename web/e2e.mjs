@@ -231,7 +231,7 @@ try {
   const told = await phone.evaluate(() => window.toasts.splice(0));
   check(told.every(t => t.startsWith("Asked the others to remove you") || t.startsWith("You were removed from Team")), `the phone leaves the chat (${told.length} notices)`);
   await phone.reload();
-  await phone.locator("button.me").waitFor();
+  await phone.getByRole("heading", { name: "Start", exact: true }).first().waitFor();
   const left = await until(
     () => kept(phone),
     hashes => !hashes.includes(reportHash)
