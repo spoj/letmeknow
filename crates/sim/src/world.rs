@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
 
-use crate::net::Net;
+use crate::net::{IDLE_TIMEOUT, Net};
 use crate::{Act, Action, Options, Outcome, clock};
 
 const RELAY: &str = "https://relay.sim.invalid";
@@ -187,8 +187,9 @@ struct Book {
     refusals: BTreeSet<(usize, String, String)>,
     /// Live messages each member took: by member and nonce.
     live: BTreeSet<(usize, String)>,
-    /// Actions that may keep a live message from its receiver, so far.
-    disruptions: u64,
+    /// When an action last disrupted the network or the members on it, as a crash, which a peer notices only once its
+    /// connection times out.
+    disrupted: u64,
     /// Members each member saw join with a valid certificate: by member, group and the joiner's fingerprint.
     vouched: BTreeSet<(usize, Bytes, String)>,
     /// Introductions each member was told of: by member, group, and the introducer's fingerprint.
@@ -284,7 +285,7 @@ impl World {
             }
             self.note(format!("#{i} {:?}", action.act));
             if !matches!(action.act, Act::Send { .. } | Act::Live { .. } | Act::Rename { .. } | Act::Online { .. } | Act::Quiesce) {
-                self.book.lock().unwrap().disruptions += 1;
+                self.book.lock().unwrap().disrupted = elapsed();
             }
             match &action.act {
                 Act::Quiesce => self.quiesce().await,
@@ -559,9 +560,9 @@ impl World {
                     }
                 }
                 let link = answer["link"].as_str().context("no link")?;
-                let disruptions = self.book.lock().unwrap().disruptions;
+                let since = elapsed();
                 let joined = self.request(n, json!({ "cmd": "join", "target": link })).await?;
-                self.introduces(m, n, gid, disruptions).await;
+                self.introduces(m, n, gid, since).await;
                 Ok(joined["group"].to_string())
             }
             Act::JoinOpen { n, group } => {
@@ -628,9 +629,9 @@ impl World {
     // Properties.
 
     /// A member that joins by an invite, as an identity its inviter holds a valid certificate of as it sees it join, is
-    /// introduced to the group by its inviter, in a live message, unless an action in the meantime may have kept it away,
-    /// or it does not serve the inviter.
-    async fn introduces(&self, m: usize, n: usize, gid: Bytes, disruptions: u64) {
+    /// introduced to the group by its inviter, in a live message, unless an action since a connection's idle timeout
+    /// before the invite may have kept it away, or it does not serve the inviter.
+    async fn introduces(&self, m: usize, n: usize, gid: Bytes, since: u64) {
         sleep(LIVE_WAIT).await;
         let (Ok(inviter), Ok(joiner)) = (self.client(m), self.client(n)) else { return };
         if !joiner.node().serves(&gid.0, &inviter.node().net().id()) {
@@ -638,7 +639,7 @@ impl World {
         }
         let (inviter, joiner) = (fp(&inviter.node().key().0), fp(&joiner.node().key().0));
         let book = self.book.lock().unwrap();
-        if book.disruptions != disruptions
+        if book.disrupted + IDLE_TIMEOUT.as_millis() as u64 >= since
             || !book.vouched.contains(&(m, gid.clone(), joiner))
             || book.introduced.contains(&(self.index(n), gid.clone(), inviter))
         {
@@ -659,8 +660,11 @@ impl World {
             ClientEvent::Message { group, id, from, .. } => {
                 let from = from.fp.unwrap_or_default();
                 let left = self.book.lock().unwrap().left.get(&(i, group.clone(), from.clone())).copied();
+                // A sender added again is a member, though its client may hear of the message before of the Add.
+                let member = self.client(i).is_ok_and(|client| client.node().members(&group.0).unwrap_or_default().iter().any(|m| fp(&m.key.0) == from));
                 if let Some(left) = left
                     && elapsed() > left + REMOVED_GRACE
+                    && !member
                 {
                     self.fail("late", format!("m{i} took {id} from {from}, who left {} at {}", b64(&group.0), clock(left)));
                 }

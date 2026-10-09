@@ -21,6 +21,9 @@ use tokio::time::{Instant, Sleep, sleep, sleep_until};
 
 use crate::Rng;
 
+/// The longest a connection whose path is lost lingers before it closes.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Takes a connection an endpoint accepts.
 pub type Accept = Arc<dyn Fn(Conn) + Send + Sync>;
 /// Sees every frame written but those that open streams: sender, receiver, whether the stream is a `peer` one, and the
@@ -154,7 +157,7 @@ impl Net {
         let now = Instant::now();
         let lost: Vec<usize> = st.conns.iter().filter(|(_, c)| !c.closed && !c.cut && !st.alive(c)).map(|(id, _)| *id).collect();
         for id in lost {
-            let timeout = Duration::from_millis(5_000 + st.rng.below(25_000));
+            let timeout = Duration::from_millis(5_000 + st.rng.below(IDLE_TIMEOUT.as_millis() as u64 - 5_000));
             let conn = st.conns.get_mut(&id).unwrap();
             conn.cut = true;
             for pipe in conn.pipes.clone() {
