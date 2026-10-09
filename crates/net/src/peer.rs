@@ -7,7 +7,7 @@
 //! `reconcile`; the acceptor then does the same the other way.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -19,7 +19,8 @@ use iroh::{
 use lmk_proto::{
     Answer, Bytes, frame,
     head::Head,
-    peer::{Admitted, Frame, Hello, List, Refusal},
+    identity::Envelope,
+    peer::{Admitted, Frame, Hello, Keys, Refusal},
 };
 use sha2::{Digest, Sha256};
 use n0_future::{task::spawn, time::sleep};
@@ -42,7 +43,7 @@ pub(crate) enum Input {
     /// Time to sync every group again.
     Resync,
     Want { group: Bytes, files: Vec<[u8; 32]>, reply: HaveReply },
-    Join { group: Bytes, key_package: Bytes, reply: oneshot::Sender<Answer<Admitted>> },
+    Join { group: Bytes, key_package: Bytes, certificate: Envelope, reply: oneshot::Sender<Answer<Admitted>> },
 }
 
 struct Session {
@@ -55,8 +56,10 @@ struct Session {
     /// Our `want`s awaiting their `have`, in order.
     wants: HashMap<Bytes, VecDeque<HaveReply>>,
     joins: HashMap<Bytes, oneshot::Sender<Answer<Admitted>>>,
-    /// The newest head of each device list either side has shown the other.
-    lists: HashMap<Bytes, Head>,
+    /// The newest head of each key log either side has shown the other.
+    keys: HashMap<Bytes, Head>,
+    /// The certificates either side has shown the other, by signature.
+    certificates: HashSet<Bytes>,
 }
 
 #[derive(Default)]
@@ -119,7 +122,8 @@ pub(crate) async fn run(
         groups: HashMap::new(),
         wants: HashMap::new(),
         joins: HashMap::new(),
-        lists: HashMap::new(),
+        keys: HashMap::new(),
+        certificates: HashSet::new(),
     };
     let result = async {
         session.hello().await?;
@@ -135,9 +139,9 @@ pub(crate) async fn run(
                     let files = files.into_iter().map(Bytes::from).collect();
                     session.write(&Frame::Want { group, files }).await?;
                 }
-                Input::Join { group, key_package, reply } => {
+                Input::Join { group, key_package, certificate, reply } => {
                     session.joins.insert(group.clone(), reply);
-                    session.write(&Frame::Join { group, key_package }).await?;
+                    session.write(&Frame::Join { group, key_package, certificate }).await?;
                 }
             }
         }
@@ -162,23 +166,30 @@ impl Session {
     async fn hello(&mut self) -> Result<()> {
         let shared: Vec<Vec<u8>> = self.inner.groups.groups().into_iter().filter(|g| self.member(g)).collect();
         let groups = shared.iter().map(|g| self.inner.groups.hello(g)).collect();
-        let lists = self.unshown(&shared);
-        self.write(&Frame::Hello { groups, lists }).await
+        let (keys, certificates) = self.unshown(&shared);
+        self.write(&Frame::Hello { groups, keys, certificates }).await
     }
 
-    /// The device lists of the identities in these groups whose newest head the peer has not seen.
-    fn unshown(&mut self, groups: &[Vec<u8>]) -> Vec<List> {
-        let lists = self.inner.groups.lists(groups);
-        lists.into_iter().filter(|list| self.lists.insert(list.identity.clone(), list.head.clone()).as_ref() != Some(&list.head)).collect()
+    /// The key logs of the identities in these groups whose newest head the peer has not seen, and the certificates of
+    /// their members it has not seen.
+    fn unshown(&mut self, groups: &[Vec<u8>]) -> (Vec<Keys>, Vec<Envelope>) {
+        let keys = self.inner.groups.keys(groups);
+        let keys = keys.into_iter().filter(|keys| self.keys.insert(keys.identity.clone(), keys.head.clone()).as_ref() != Some(&keys.head)).collect();
+        let certificates = self.inner.groups.certificates(groups);
+        (keys, certificates.into_iter().filter(|certificate| self.certificates.insert(certificate.sig.clone())).collect())
     }
 
     async fn frame(&mut self, frame: Frame) -> Result<()> {
         match frame {
-            Frame::Hello { groups, lists } => {
-                if !lists.is_empty() && self.inner.groups.groups().iter().any(|g| self.member(g)) {
-                    for list in lists {
-                        self.lists.insert(list.identity.clone(), list.head.clone());
-                        self.inner.groups.list(self.peer, list);
+            Frame::Hello { groups, keys, certificates } => {
+                if self.inner.groups.groups().iter().any(|g| self.member(g)) {
+                    for log in keys {
+                        self.keys.insert(log.identity.clone(), log.head.clone());
+                        self.inner.groups.key_log(self.peer, log);
+                    }
+                    for certificate in certificates {
+                        self.certificates.insert(certificate.sig.clone());
+                        self.inner.groups.certificate(self.peer, certificate);
                     }
                 }
                 for hello in groups {
@@ -225,10 +236,10 @@ impl Session {
                 self.write(&Frame::Have { group, files: have }).await?;
             }
             Frame::Have { group, files } => self.on_have(group, files),
-            Frame::Join { group, key_package } => {
+            Frame::Join { group, key_package, certificate } => {
                 let (admit, peer, input) = (self.inner.admit.clone(), self.peer, self.input.clone());
                 spawn(async move {
-                    let frame = match admit.join(peer, group.0.clone(), key_package.0).await {
+                    let frame = match admit.join(peer, group.0.clone(), key_package.0, certificate).await {
                         Answer::Ok(admitted) => Frame::Admitted { group, admitted },
                         Answer::Refused { refused } => Frame::Refused { group, refused },
                     };
@@ -387,8 +398,8 @@ impl Session {
             tracing::warn!("a head from {}: {e:#}", self.peer.fmt_short());
             return Ok(());
         }
-        let lists = self.unshown(std::slice::from_ref(&group.0));
-        self.write(&Frame::Hello { groups: vec![mine.clone()], lists }).await?;
+        let (keys, certificates) = self.unshown(std::slice::from_ref(&group.0));
+        self.write(&Frame::Hello { groups: vec![mine.clone()], keys, certificates }).await?;
         self.catch_up(&group, &mine).await
     }
 

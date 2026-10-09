@@ -10,8 +10,9 @@ use lmk_net::Event;
 use lmk_proto::{
     Answer, Bytes,
     head::Head,
+    identity::Envelope,
     links::Invite,
-    peer::{Frame, KindFrame, List},
+    peer::{Frame, Keys, KindFrame},
 };
 use serde_json::json;
 
@@ -64,7 +65,7 @@ async fn hello_head_swap_and_contradiction() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn device_lists_are_shown_once_per_head() {
+async fn key_logs_and_certificates_are_shown_once() {
     let relay = relay().await;
     let keys = keys(2);
     let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
@@ -72,20 +73,25 @@ async fn device_lists_are_shown_once_per_head() {
     let service = service();
     let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
     let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
-    let list = |time| List { identity: Bytes(vec![7; 32]), entries: vec![Bytes(b"e1".to_vec())], head: Head::sign(&service, b"list", 1, [0; 32], time) };
-    a.fake.lists.lock().unwrap().push(list(1));
-    b.fake.lists.lock().unwrap().push(list(1));
+    let list = |time| Keys { identity: Bytes(vec![7; 32]), entries: vec![Bytes(b"e1".to_vec())], head: Head::sign(&service, b"keys", 1, [0; 32], time) };
+    a.fake.keys.lock().unwrap().push(list(1));
+    b.fake.keys.lock().unwrap().push(list(1));
+    let certificate = Envelope { body: Bytes(b"body".to_vec()), sig: Bytes(b"sig".to_vec()) };
+    a.fake.certificates.lock().unwrap().push(certificate.clone());
+    b.fake.certificates.lock().unwrap().push(certificate.clone());
     let presented = |node: &Node| node.fake.presented.lock().unwrap().iter().map(|(_, l)| l.head.time).collect::<Vec<_>>();
     a.net.dial(members[1], relay.url.clone()).await.unwrap();
     eventually("each shows the other its list", || presented(&a) == [1] && presented(&b) == [1]).await;
     a.net.changed(G);
-    *a.fake.lists.lock().unwrap() = vec![list(2)];
+    *a.fake.keys.lock().unwrap() = vec![list(2)];
     a.net.changed(G);
     eventually("a newer head is shown", || presented(&b) == [1, 2]).await;
-    *b.fake.lists.lock().unwrap() = vec![list(2)];
+    *b.fake.keys.lock().unwrap() = vec![list(2)];
     b.net.changed(G);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!((presented(&a), presented(&b)), (vec![1], vec![1, 2]), "nothing is shown twice, nor back");
+    let certified = |node: &Node| node.fake.certified.lock().unwrap().len();
+    assert_eq!((certified(&a), certified(&b)), (1, 1), "a certificate is shown once");
     for node in [&a, &b] {
         node.net.shutdown().await.unwrap();
     }
@@ -284,11 +290,11 @@ async fn invite_and_join() {
     let invite = |secret| Invite { device: false, key: *keys[0].public().as_bytes(), secret, relay: Some(relay.url.to_string()) };
     let request = || b"kp".to_vec();
 
-    let Answer::Ok(admitted) = joiner.net.redeem(&invite(SECRET), request()).await.unwrap() else { panic!("refused") };
+    let Answer::Ok(admitted) = joiner.net.redeem(&invite(SECRET), request(), None).await.unwrap() else { panic!("refused") };
     assert_eq!((admitted.welcome.0.as_slice(), admitted.position), (&b"welcome"[..], 3));
-    let refused = joiner.net.redeem(&invite([0; 16]), request()).await.unwrap();
+    let refused = joiner.net.redeem(&invite([0; 16]), request(), None).await.unwrap();
     assert_eq!(refused, Answer::Refused { refused: "unknown secret".into() });
-    let joined = joiner.net.join(keys[0].public(), relay.url.clone(), b"open", b"kp".to_vec()).await.unwrap();
+    let joined = joiner.net.join(keys[0].public(), relay.url.clone(), b"open", b"kp".to_vec(), Envelope { body: Bytes::default(), sig: Bytes::default() }).await.unwrap();
     assert!(matches!(joined, Answer::Ok(admitted) if admitted.welcome.0 == b"open"));
     inviter.net.shutdown().await.unwrap();
     joiner.net.shutdown().await.unwrap();

@@ -24,8 +24,9 @@ use lmk_proto::{
     Answer, Bytes,
     frame::{self, ALPN, Open, Stream},
     head::Head,
+    identity::Envelope,
     links::{FileLink, Invite},
-    peer::{Admitted, Frame, Hello, InviteRequest, KindFrame, List},
+    peer::{Admitted, Frame, Hello, InviteRequest, Keys, KindFrame},
 };
 use n0_future::{boxed::BoxFuture, join_all, task::spawn, time::timeout};
 use tokio::{
@@ -71,10 +72,14 @@ pub trait Groups: Send + Sync + 'static {
     fn log_head(&self, peer: EndpointId, group: &[u8], head: Head);
     /// The files the group links now.
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
-    /// The device lists this session holds, with signed heads, of the identities in these groups.
-    fn lists(&self, groups: &[Vec<u8>]) -> Vec<List>;
-    /// A device list `peer` presented.
-    fn list(&self, peer: EndpointId, list: List);
+    /// The key logs this session holds, with signed heads, of the identities in these groups.
+    fn keys(&self, groups: &[Vec<u8>]) -> Vec<Keys>;
+    /// A key log `peer` presented.
+    fn key_log(&self, peer: EndpointId, keys: Keys);
+    /// The certificates this session holds of these groups' members.
+    fn certificates(&self, groups: &[Vec<u8>]) -> Vec<Envelope>;
+    /// A certificate `peer` presented.
+    fn certificate(&self, peer: EndpointId, certificate: Envelope);
 }
 
 /// A browser's own storage of the files it holds, since iroh-blobs keeps only memory there. With one, a session keeps
@@ -100,7 +105,7 @@ pub enum Taken {
 pub trait Admit: Send + Sync + 'static {
     fn invite(&self, peer: EndpointId, request: InviteRequest) -> BoxFuture<Answer<Admitted>>;
     /// A `join` request for an open group.
-    fn join(&self, peer: EndpointId, group: Vec<u8>, key_package: Vec<u8>) -> BoxFuture<Answer<Admitted>>;
+    fn join(&self, peer: EndpointId, group: Vec<u8>, key_package: Vec<u8>, certificate: Envelope) -> BoxFuture<Answer<Admitted>>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -224,7 +229,7 @@ impl Net {
     }
 
     /// Redeems an invite link on an `invite` stream to the inviter.
-    pub async fn redeem(&self, invite: &Invite, key_package: Vec<u8>) -> Result<Answer<Admitted>> {
+    pub async fn redeem(&self, invite: &Invite, key_package: Vec<u8>, certificate: Option<Envelope>) -> Result<Answer<Admitted>> {
         let key = EndpointId::from_bytes(&invite.key)?;
         let relay = match &invite.relay {
             Some(relay) => relay.parse()?,
@@ -233,17 +238,17 @@ impl Net {
         let conn = self.inner.connection(key, relay).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
         frame::write(&mut send, &Open { stream: Stream::Invite }).await?;
-        frame::write(&mut send, &InviteRequest { secret: invite.secret.into(), key_package: Bytes(key_package) }).await?;
+        frame::write(&mut send, &InviteRequest { secret: invite.secret.into(), key_package: Bytes(key_package), certificate }).await?;
         send.finish()?;
         frame::read(&mut recv).await
     }
 
-    /// Asks a member of an open group to admit this session.
-    pub async fn join(&self, peer: EndpointId, relay: RelayUrl, group: &[u8], key_package: Vec<u8>) -> Result<Answer<Admitted>> {
+    /// Asks a member of an open group to admit this session, which shows its certificate.
+    pub async fn join(&self, peer: EndpointId, relay: RelayUrl, group: &[u8], key_package: Vec<u8>, certificate: Envelope) -> Result<Answer<Admitted>> {
         self.inner.connection(peer, relay).await?;
         let (reply, answer) = oneshot::channel();
         let input = self.inner.links.lock().unwrap().get(&peer).map(|link| link.input.clone()).context("not connected")?;
-        input.send(Input::Join { group: group.into(), key_package: Bytes(key_package), reply })?;
+        input.send(Input::Join { group: group.into(), key_package: Bytes(key_package), certificate, reply })?;
         Ok(answer.await?)
     }
 

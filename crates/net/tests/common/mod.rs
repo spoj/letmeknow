@@ -22,8 +22,9 @@ use lmk_net::{Admit, Config, Disk, Event, Groups, Net, Taken};
 use lmk_proto::{
     Answer, Bytes,
     head::{self, Head},
+    identity::Envelope,
     links::FileLink,
-    peer::{Admitted, Hello, InviteRequest, KindFrame, List},
+    peer::{Admitted, Hello, InviteRequest, Keys, KindFrame},
 };
 use n0_future::boxed::BoxFuture;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -155,7 +156,7 @@ impl Admit for Inviter {
         })
     }
 
-    fn join(&self, _: EndpointId, group: Vec<u8>, _: Vec<u8>) -> BoxFuture<Answer<Admitted>> {
+    fn join(&self, _: EndpointId, group: Vec<u8>, _: Vec<u8>, _: Envelope) -> BoxFuture<Answer<Admitted>> {
         Box::pin(async move { Answer::Ok(Admitted { welcome: Bytes(group), position: 1, doc: None, before: Vec::new() }) })
     }
 }
@@ -199,9 +200,11 @@ pub struct Fake {
     pub groups: Mutex<HashMap<Vec<u8>, Group>>,
     /// After this many more membership checks, the peer is no longer a member.
     pub cut: Mutex<Option<(EndpointId, usize)>>,
-    /// The device lists it presents, and those peers presented to it.
-    pub lists: Mutex<Vec<List>>,
-    pub presented: Mutex<Vec<(EndpointId, List)>>,
+    /// The key logs and certificates it presents, and those peers presented to it.
+    pub keys: Mutex<Vec<Keys>>,
+    pub presented: Mutex<Vec<(EndpointId, Keys)>>,
+    pub certificates: Mutex<Vec<Envelope>>,
+    pub certified: Mutex<Vec<Envelope>>,
     /// Kinds' frames and state links from peers.
     pub frames: Mutex<Vec<(EndpointId, KindFrame)>>,
     pub states: Mutex<Vec<StateLink>>,
@@ -216,8 +219,10 @@ impl Fake {
             service: service.clone(),
             groups: Mutex::default(),
             cut: Mutex::default(),
-            lists: Mutex::default(),
+            keys: Mutex::default(),
             presented: Mutex::default(),
+            certificates: Mutex::default(),
+            certified: Mutex::default(),
             frames: Mutex::default(),
             states: Mutex::default(),
         })
@@ -342,11 +347,19 @@ impl Groups for Fake {
         self.groups.lock().unwrap()[group].files.clone()
     }
 
-    fn lists(&self, _: &[Vec<u8>]) -> Vec<List> {
-        self.lists.lock().unwrap().clone()
+    fn keys(&self, _: &[Vec<u8>]) -> Vec<Keys> {
+        self.keys.lock().unwrap().clone()
     }
 
-    fn list(&self, peer: EndpointId, list: List) {
-        self.presented.lock().unwrap().push((peer, list));
+    fn key_log(&self, peer: EndpointId, keys: Keys) {
+        self.presented.lock().unwrap().push((peer, keys));
+    }
+
+    fn certificates(&self, _: &[Vec<u8>]) -> Vec<Envelope> {
+        self.certificates.lock().unwrap().clone()
+    }
+
+    fn certificate(&self, _: EndpointId, certificate: Envelope) {
+        self.certified.lock().unwrap().push(certificate);
     }
 }
