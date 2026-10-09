@@ -799,7 +799,8 @@ fn a_message_waits_for_those_it_comes_after_then_shows_them_missing() {
         let mut carol = world.start("carol", HOUR).await;
         carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
         let bob = world.start("bob", HOUR).await;
-        // Once Bob and Carol have synced, no sync ends before the wait does.
+        // Once Bob and Carol have synced, and the syncs that Bob's key update on resuming starts have ended, no sync
+        // ends before the wait does.
         for _ in 0..40 {
             let online = bob.cmd(&["status"]).await.unwrap()["groups"][0]["online"].clone();
             if online.as_array().unwrap().iter().any(|member| member["name"] == "Carol") {
@@ -807,7 +808,7 @@ fn a_message_waits_for_those_it_comes_after_then_shows_them_missing() {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let sent = std::time::Instant::now();
         bob.cmd(&["send", "@carol see above"]).await.unwrap();
         let got = carol.expect("message").await;

@@ -72,8 +72,8 @@ const COMMIT_TRIES: u32 = 5;
 const INVITE_VALID: u64 = 10 * 60 * 1000;
 /// How many members besides the inviter a link names: those that took the invite first.
 const LINK_MEMBERS: usize = 3;
-/// How long a joiner waits to reach a member, and then for its answer.
-const DIAL_WAIT: Duration = Duration::from_secs(10);
+/// How long a joiner waits to reach the members it asks, all at once, and then for each one's answer.
+const DIAL_WAIT: Duration = Duration::from_secs(30);
 const JOIN_WAIT: Duration = Duration::from_secs(30);
 
 pub struct Config {
@@ -833,9 +833,10 @@ impl<P: Provider + Send + 'static> Node<P> {
             st.session.credential.identity = identity;
             Join { secret, group, key_package: Bytes(st.session.key_package(&st.provider)?), certificate }
         };
+        let dialed = n0_future::join_all(members.iter().map(|(peer, relay)| timeout(DIAL_WAIT, self.inner.net().dial(*peer, relay.clone())))).await;
         let mut refusal = anyhow::anyhow!("no member the invite names is online");
-        for (peer, relay) in members {
-            if !matches!(timeout(DIAL_WAIT, self.inner.net().dial(peer, relay.clone())).await, Ok(Ok(()))) {
+        for ((peer, relay), dialed) in members.into_iter().zip(dialed) {
+            if !matches!(dialed, Ok(Ok(()))) {
                 tracing::debug!("{} is not online", peer.fmt_short());
                 continue;
             }
