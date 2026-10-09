@@ -167,6 +167,8 @@ def git_kind(alice, bob, dave, listeners):
     # With no other member online, a push fails and says so.
     bob.stop()
     listeners.remove(bob)
+    gone = until(lambda: run("alice", "status"), lambda s: all(not g["online"] for g in s["groups"] if g["group"] == made["group"]))
+    check(all(not g["online"] for g in gone["groups"] if g["group"] == made["group"]), "alice sees bob go")
     write("alice-repo/late.txt", "late")
     git("alice", "add", "late.txt", cwd=ours)
     git("alice", "commit", "-qm", "while bob is away", cwd=ours)
