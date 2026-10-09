@@ -63,6 +63,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Ok(opened) => opened,
             Err(error) => {
                 g.rec.given_up.push((epoch, Bytes(id.to_vec())));
+                g.rec.unreported.push(Bytes(id.to_vec()));
                 st.save(gid)?;
                 return Err(error);
             }
@@ -89,6 +90,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     if to.is_empty() || to.contains(&me) {
                         self.events.send(Event::Introduced { group, by: sender, identity, name, how }).ok();
                     }
+                }
+                Control::Unread { ids } => {
+                    let held = Message { id: Bytes(id.to_vec()), group: group.clone(), epoch, at: now(), sender: sender.clone(), payload };
+                    hold(st, gid, held, ciphertext)?;
+                    self.events.send(Event::Unread { group, by: sender, ids }).ok();
                 }
             }
         } else if st.devices(gid) {
@@ -235,13 +241,13 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
     fn hello(&self, group: &[u8]) -> Hello {
         let st = self.state.lock().unwrap();
         let Some(g) = st.groups.get(group) else {
-            return Hello { group: group.into(), epoch: 0, head: empty(group), floor: 0, joined: 0, log: None };
+            return Hello { group: group.into(), epoch: 0, head: empty(group), floor: 0, joined: 0, log: None, all: true };
         };
         let (epoch, joined) = (g.mls.epoch(), g.mls.joined());
         let head = g.rec.chain.as_ref().map_or_else(|| empty(group), |chain| chain.head.clone());
         let floor = joined.max(epoch.saturating_sub(self.window.epochs as u64));
         let log = g.rec.log.as_ref().and_then(|log| Some(log.chain.as_ref()?.head.clone()));
-        Hello { group: group.into(), epoch, head, floor, joined, log }
+        Hello { group: group.into(), epoch, head, floor, joined, log, all: true }
     }
 
     fn verify_head(&self, group: &[u8], head: &Head) -> bool {
@@ -311,6 +317,22 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
     fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Taken {
         let mut st = self.state.lock().unwrap();
         self.take(&mut st, group, ciphertext)
+    }
+
+    fn below(&self, group: &[u8], items: Vec<(u64, [u8; 32])>) {
+        let floor = self.hello(group).floor;
+        let mut st = self.state.lock().unwrap();
+        let Ok(g) = st.group_mut(group) else { return };
+        for (epoch, id) in items.into_iter().filter(|&(epoch, _)| epoch < floor) {
+            let known = g.rec.items.iter().any(|item| item.id.0 == id) || g.rec.given_up.iter().any(|(_, given)| given.0 == id);
+            if !known {
+                g.rec.given_up.push((epoch, Bytes(id.to_vec())));
+                g.rec.unreported.push(Bytes(id.to_vec()));
+            }
+        }
+        if let Err(error) = st.save(group) {
+            self.warn(Some(group), format!("{error:#}"));
+        }
     }
 
     fn frame(&self, peer: EndpointId, frame: KindFrame) {

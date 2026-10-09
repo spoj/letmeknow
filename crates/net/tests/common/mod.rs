@@ -269,7 +269,7 @@ impl Groups for Fake {
         let g = &groups[group];
         let length = g.log.len() as u64;
         let head = Head::sign(&self.service, group, length, Self::chain_of(&g.log, group, g.log.len()), 0);
-        Hello { group: group.into(), epoch: length, head, floor: g.floor, joined: g.joined, log: None }
+        Hello { group: group.into(), epoch: length, head, floor: g.floor, joined: g.joined, log: None, all: true }
     }
 
     fn verify_head(&self, _: &[u8], head: &Head) -> bool {
@@ -326,6 +326,12 @@ impl Groups for Fake {
             _ => g.live.push(ciphertext.to_vec()),
         }
         Taken::Held
+    }
+
+    fn below(&self, group: &[u8], items: Vec<(u64, [u8; 32])>) {
+        let mut groups = self.groups.lock().unwrap();
+        let g = groups.get_mut(group).unwrap();
+        g.given_up.extend(items.into_iter().map(|(epoch, id)| (id, epoch)));
     }
 
     fn frame(&self, peer: EndpointId, frame: KindFrame) {

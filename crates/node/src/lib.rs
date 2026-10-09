@@ -25,7 +25,7 @@ use lmk_core::invite::{Invites, Target};
 use lmk_core::provider::Provider;
 use lmk_membership::{Chain, Refused};
 use lmk_net::Net;
-use lmk_proto::group::{CHAT, ContactsUpdate, Credential, How, IdentityRef, Leaf, Opening, Service, Settings, held_by_type};
+use lmk_proto::group::{CHAT, ContactsUpdate, Control, Credential, How, IdentityRef, Leaf, Opening, Service, Settings, held_by_type};
 use lmk_proto::head::Head;
 use lmk_proto::links::{FileLink, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Frame, KindFrame};
@@ -227,6 +227,12 @@ pub enum Event {
         by: Member,
         reason: String,
     },
+    /// A member reports the messages it gave up: too old to open, or that did not open.
+    Unread {
+        group: Bytes,
+        by: Member,
+        ids: Vec<Bytes>,
+    },
     /// A file is held whole.
     File([u8; 32]),
     Warning {
@@ -247,6 +253,9 @@ struct Rec {
     /// Messages this session could not open, so that sync does not offer them again, and those from before it joined
     /// that its inviter held, as of epoch 0.
     given_up: Vec<(u64, Bytes)>,
+    /// Those it could not open, or that were too old to, that it has not reported to the group yet.
+    #[serde(default)]
+    unreported: Vec<Bytes>,
     pending: Vec<Pending>,
     /// File links, with when they were linked: those the kind holds (its files added, and those its held messages
     /// link) and states handed to or by this session. Each is held for the group's `keep`.
@@ -1812,6 +1821,29 @@ impl<P: Provider + Send + 'static> Inner<P> {
         drop(st);
     }
 
+    /// Tells the group, in one held message, the messages this session gave up since it last did.
+    fn report(self: &Arc<Self>, gid: &[u8]) {
+        let ids = {
+            let mut st = self.state.lock().unwrap();
+            let Ok(g) = st.group_mut(gid) else { return };
+            let ids = std::mem::take(&mut g.rec.unreported);
+            if ids.is_empty() {
+                return;
+            }
+            if let Err(error) = st.save(gid) {
+                self.warn(Some(gid), format!("{error:#}"));
+            }
+            ids
+        };
+        let (node, gid) = (Node { inner: self.clone() }, gid.to_vec());
+        self.spawn(async move {
+            let payload = serde_json::to_value(Control::Unread { ids }).expect("JSON");
+            if let Err(error) = node.send(&gid, &payload, true).await {
+                node.inner.warn(Some(&gid), format!("reporting the messages this session could not read: {error:#}"));
+            }
+        });
+    }
+
     fn net_event(self: &Arc<Self>, event: lmk_net::Event) {
         match event {
             lmk_net::Event::Receipt { group, peer, held, refused } => {
@@ -1826,6 +1858,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     }
                     let Ok(g) = st.group_mut(&group) else { return };
                     if !g.rec.pending.iter().any(|pending| pending.id.0 == id) {
+                        continue;
+                    }
+                    // A report of what this session gave up is the core's: a member that refuses it, as 0.10 does,
+                    // concerns no one.
+                    let report = get::<Message>(&st.provider, &message_key(&id)).ok().flatten().is_some_and(|m| m.payload["type"] == "unread");
+                    if refused.is_some() && report {
                         continue;
                     }
                     let by = st.by_iroh(&group, &peer);
@@ -1869,6 +1907,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             lmk_net::Event::Synced { group, peer } => {
                 self.events.send(Event::Synced { group: Bytes(group.clone()) }).ok();
+                self.report(&group);
                 // A file only this session held may have reached the peer since.
                 let pending: Vec<[u8; 32]> = {
                     let st = self.state.lock().unwrap();

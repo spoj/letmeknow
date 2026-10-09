@@ -19,7 +19,7 @@ use iroh::{
 use lmk_proto::{
     Answer, Bytes, frame,
     head::Head,
-    peer::{Admitted, Frame, Hello, List, Refusal},
+    peer::{Admitted, Below, Frame, Hello, List, Refusal},
 };
 use sha2::{Digest, Sha256};
 use n0_future::{task::spawn, time::sleep};
@@ -189,7 +189,11 @@ impl Session {
             }
             Frame::Commits { group, entries, head } if self.member(&group.0) => self.on_commits(group, entries, head).await?,
             Frame::Reconcile { group, msg } if self.member(&group.0) => self.on_reconcile(group, msg).await?,
-            Frame::Messages { group, items } if self.member(&group.0) => {
+            Frame::Messages { group, items, below } if self.member(&group.0) => {
+                if !below.is_empty() {
+                    let below = below.iter().filter_map(|b| Some((b.epoch, b.id.0.as_slice().try_into().ok()?))).collect();
+                    self.inner.groups.below(&group.0, below);
+                }
                 let (mut held, mut refused) = (Vec::new(), Vec::new());
                 for item in items {
                     let id = Bytes::from(<[u8; 32]>::from(Sha256::digest(&item.0)));
@@ -463,22 +467,25 @@ impl Session {
         self.write(&Frame::Reconcile { group, msg: Bytes(reply) }).await
     }
 
-    /// Sends held messages the peer lacks, none below its floor.
+    /// Sends held messages the peer lacks; of those below its floor, only their epochs and ids.
     async fn push(&mut self, group: &Bytes, have: Vec<(u64, [u8; 32])>) -> Result<()> {
         let floor = self.groups[group].theirs.as_ref().map_or(0, |theirs| theirs.floor);
+        let (have, below): (Vec<_>, Vec<_>) = have.into_iter().partition(|&(epoch, _)| epoch >= floor);
+        let mut below: Vec<Below> = below.into_iter().map(|(epoch, id)| Below { epoch, id: Bytes::from(id) }).collect();
         let mut items = Vec::new();
         let mut size = 0;
-        for (_, id) in have.into_iter().filter(|&(epoch, _)| epoch >= floor) {
+        for (_, id) in have {
             let Some(message) = self.inner.groups.message(&group.0, &id) else { continue };
             size += message.len();
             items.push(Bytes(message));
             if size >= BATCH {
-                self.write(&Frame::Messages { group: group.clone(), items: std::mem::take(&mut items) }).await?;
+                let below = std::mem::take(&mut below);
+                self.write(&Frame::Messages { group: group.clone(), items: std::mem::take(&mut items), below }).await?;
                 size = 0;
             }
         }
-        if !items.is_empty() {
-            self.write(&Frame::Messages { group: group.clone(), items }).await?;
+        if !items.is_empty() || !below.is_empty() {
+            self.write(&Frame::Messages { group: group.clone(), items, below }).await?;
         }
         Ok(())
     }

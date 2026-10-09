@@ -50,6 +50,8 @@ pub struct Config {
     pub hold: Duration,
     /// How long a message waits for those it comes after: `CAUSAL_WAIT`, but in tests.
     pub causal_wait: Duration,
+    /// How long it keeps ended epochs' keys: `Window::default()`, but in tests.
+    pub window: lmk_core::group::Window,
     pub keep_log: bool,
     /// For groups and identities this session creates.
     pub membership: Service,
@@ -447,7 +449,8 @@ impl Session {
             | Event::Snapshot { group, .. }
             | Event::Introduced { group, .. }
             | Event::Held { group, .. }
-            | Event::Refused { group, .. } => Some(group.clone()),
+            | Event::Refused { group, .. }
+            | Event::Unread { group, .. } => Some(group.clone()),
             Event::Message(message) => Some(message.group.clone()),
             Event::File(_) | Event::Warning { .. } => None,
         };
@@ -526,8 +529,35 @@ impl Session {
                 let item = json!({ "type": "refused", "group": b64(&group.0), "id": hex::encode(&id.0), "member": self.describe(&group, &by)?, "reason": reason });
                 self.outbox.deliver(item, true);
             }
+            Event::Unread { group, by, ids } => self.unread(&group, &by, &ids).await?,
             Event::File(hash) => self.arrived(hash).await?,
             Event::Warning { group, text } => self.warn(group.as_ref(), text),
+        }
+        Ok(())
+    }
+
+    /// A member reports messages it could not read: those of this session's chat messages print, with their text and a
+    /// copy of their attachment while this session holds them, so that the agent can send them again.
+    async fn unread(&mut self, gid: &Bytes, by: &Member, ids: &[Bytes]) -> Result<()> {
+        let mut messages = Vec::new();
+        for id in ids {
+            let Some(message) = self.node.message(&id.0)? else { continue };
+            if message.sender.key != self.node.key() || message.payload["type"] != "message" {
+                continue;
+            }
+            let mut item = json!({ "id": hex::encode(&id.0), "content": message.payload["content"] });
+            if let Some(attachment) = message.payload.get("attachment") {
+                item["attachment"] = attachment.clone();
+                let link = FileLink::parse(attachment["link"].as_str().context("an attachment has a link")?)?;
+                if let Some(bytes) = self.node.file(&link).await? {
+                    item["attachment"]["path"] = json!(self.save(gid, &link, attachment["name"].as_str(), &bytes)?);
+                }
+            }
+            messages.push(item);
+        }
+        if !messages.is_empty() {
+            let item = json!({ "type": "unread", "group": b64(&gid.0), "member": self.describe(gid, by)?, "messages": messages });
+            self.outbox.deliver(item, true);
         }
         Ok(())
     }
@@ -1088,12 +1118,13 @@ impl Session {
         Ok(seen.into_iter().filter(|m| !covered.contains(&m.id.0)).filter_map(|m| m.id.0.try_into().ok()).collect())
     }
 
-    /// Records that a message entered the agent's context. Its text is then deleted, unless `listen --keep-log`.
+    /// Records that a message entered the agent's context. Its text is then deleted, unless `listen --keep-log` or it
+    /// is this session's own, which it keeps to send again.
     fn mark_seen(&self, id: &[u8; 32]) -> Result<()> {
         let Some(message) = self.node.message(id)? else { return Ok(()) };
         self.db.execute("INSERT OR IGNORE INTO taken (id, gid) VALUES (?, ?)", params![id, message.group.0])?;
         self.db.execute("UPDATE taken SET seen = 1 WHERE id = ?", [id])?;
-        if !self.config.keep_log && message.payload["type"] == "message" {
+        if !self.config.keep_log && message.payload["type"] == "message" && message.sender.key != self.node.key() {
             let mut payload = message.payload;
             payload["content"] = json!("");
             self.node.redact(id, payload)?;

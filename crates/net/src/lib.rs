@@ -62,6 +62,8 @@ pub trait Groups: Send + Sync + 'static {
     fn message(&self, group: &[u8], id: &[u8; 32]) -> Option<Vec<u8>>;
     /// An MLS ciphertext from a peer: decrypt, verify, and hold or apply it, or give it up.
     fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Taken;
+    /// (epoch, message id) of messages a peer holds that this session lacks, below its floor: given up.
+    fn below(&self, group: &[u8], items: Vec<(u64, [u8; 32])>);
     /// A frame of the group's kind from `peer`, a member.
     fn frame(&self, peer: EndpointId, frame: KindFrame);
     /// A link to the state of the group's kind, which `peer`, a member, hands this session; without one, `peer` asks
@@ -202,13 +204,13 @@ impl Net {
 
     /// Sends a new MLS message to the members online; returns whom it went to.
     pub fn send(&self, group: &[u8], ciphertext: Vec<u8>) -> Vec<EndpointId> {
-        let frame = Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)] };
+        let frame = Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)], below: Vec::new() };
         self.inner.members(group).into_iter().filter(|(_, input)| input.send(Input::Send(frame.clone())).is_ok()).map(|(peer, _)| peer).collect()
     }
 
     /// Sends a new MLS message to one member online, if it is connected.
     pub fn send_to(&self, peer: EndpointId, group: &[u8], ciphertext: Vec<u8>) -> bool {
-        self.frame(peer, Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)] })
+        self.frame(peer, Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)], below: Vec::new() })
     }
 
     /// Sends a frame to one member online, if it is connected.

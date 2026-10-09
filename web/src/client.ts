@@ -35,6 +35,7 @@ export type Item =
       attachment?: Attachment;
       pending?: boolean;
       refused?: { name: string; reason: string }[];
+      unread?: string[];
     }
   | { type: "leave"; id: string; at: number; from: Person }
   | { type: "joined"; at: number; member: Person; by: Person; how: string }

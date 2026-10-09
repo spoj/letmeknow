@@ -536,7 +536,7 @@ impl App {
             }
             Event::Removed { group, by } => {
                 let by = by.map(|by| by.name);
-                for kind in ["timeline", "settings", "refused"] {
+                for kind in ["timeline", "settings", "refused", "unread"] {
                     self.store.delete(&key(kind, &group.0))?;
                 }
                 self.to_kind(DOC, json!({ "type": "gone", "group": group }));
@@ -604,6 +604,17 @@ impl App {
             Event::Refused { group, id, by, reason } => {
                 self.refused(&group.0, &id.0, &by, &reason)?;
                 self.emit(json!({ "type": "refused", "group": group, "id": hex::encode(&id.0) }));
+            }
+            Event::Unread { group, by, ids } => {
+                let name = label(&self.describe(&self.known(&group.0)?, &by));
+                let mut unread: HashMap<String, Vec<String>> = get(&self.store, &key("unread", &group.0))?.unwrap_or_default();
+                for id in ids {
+                    if self.node.message(&id.0)?.is_some_and(|m| m.sender.key == self.node.key()) {
+                        unread.entry(hex::encode(&id.0)).or_default().push(name.clone());
+                    }
+                }
+                put(&self.store, &key("unread", &group.0), &unread)?;
+                self.emit(json!({ "type": "unread", "group": group }));
             }
             Event::File(hash) => self.emit(json!({ "type": "file", "hash": hex::encode(hash) })),
             Event::Warning { group, text } => self.emit(json!({ "type": "warning", "group": group, "text": text })),
@@ -749,11 +760,14 @@ impl App {
         let mut items: Vec<Value> = get(&self.store, &key("timeline", gid))?.unwrap_or_default();
         let pending: HashSet<Vec<u8>> = self.node.only_here(gid)?.into_iter().map(|p| p.id.0).collect();
         let refused: HashMap<String, Value> = get(&self.store, &key("refused", gid))?.unwrap_or_default();
+        let unread: HashMap<String, Value> = get(&self.store, &key("unread", gid))?.unwrap_or_default();
         for message in self.node.messages(gid)? {
             let from = self.describe(&known, &message.sender);
             let id = hex::encode(&message.id.0);
-            let Ok(ChatMessage { content, to, reply_to, urgent, attachment, .. }) = serde_json::from_value(message.payload) else {
+            if message.payload["type"] == "leave" {
                 items.push(json!({ "type": "leave", "id": id, "at": message.at, "from": from }));
+            }
+            let Ok(ChatMessage { content, to, reply_to, urgent, attachment, .. }) = serde_json::from_value(message.payload) else {
                 continue;
             };
             let mut item = json!({ "type": "message", "id": id, "at": message.at, "from": from, "content": content });
@@ -776,6 +790,9 @@ impl App {
             }
             if let Some(refused) = refused.get(&id) {
                 item["refused"] = refused.clone();
+            }
+            if let Some(unread) = unread.get(&id) {
+                item["unread"] = unread.clone();
             }
             items.push(item);
         }
