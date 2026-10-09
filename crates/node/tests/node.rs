@@ -15,11 +15,13 @@ use lmk_core::provider::MemoryProvider;
 use lmk_membership::service::{Policy, Service as Membership};
 use lmk_membership::store::Store;
 use lmk_node::{Config, Event, Node};
-use lmk_proto::group::{Kind, PROTOCOL, Payload, Service, Settings};
+use lmk_proto::group::{CHAT, ChatMessage, PROTOCOL, Service, Settings};
 use lmk_proto::Bytes;
 use lmk_proto::frame::ALPN;
 use lmk_proto::links::Invite;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -57,16 +59,19 @@ struct Session {
     events: UnboundedReceiver<Event>,
 }
 
+/// The kinds the sessions here support, besides chat.
+const KIND: &str = "test";
+
 async fn session(relay: &Relay, name: &str) -> Session {
-    node(relay, name, false).await
+    node(relay, name, false, &[CHAT, KIND]).await
 }
 
 /// A device's own node: its key is the device key.
 async fn device(relay: &Relay, name: &str) -> Session {
-    node(relay, name, true).await
+    node(relay, name, true, &[CHAT, KIND]).await
 }
 
-async fn node(relay: &Relay, name: &str, device_key: bool) -> Session {
+async fn node(relay: &Relay, name: &str, device_key: bool, kinds: &[&str]) -> Session {
     let config = Config {
         name: name.into(),
         device_key,
@@ -77,6 +82,7 @@ async fn node(relay: &Relay, name: &str, device_key: bool) -> Session {
         disk: None,
         file_limit: 100 << 20,
         window: Window::default(),
+        kinds: kinds.iter().map(|kind| kind.to_string()).collect(),
     };
     let (node, events) = Node::start(MemoryProvider::default(), Device::new(&format!("{name}'s laptop")), config).await.unwrap();
     Session { node, events }
@@ -106,10 +112,10 @@ fn folder(test: &str) -> PathBuf {
     dir
 }
 
-fn settings(kind: Kind, folder: &Path) -> Settings {
+fn settings(kind: &str, folder: &Path) -> Settings {
     Settings {
         protocol: PROTOCOL,
-        kind,
+        kind: kind.into(),
         name: "Plan".into(),
         open: vec![],
         keep: 90,
@@ -119,17 +125,21 @@ fn settings(kind: Kind, folder: &Path) -> Settings {
     }
 }
 
-fn message(text: &str) -> Payload {
-    Payload::Message { content: text.into(), after: vec![], to: vec![], reply_to: None, urgent: false, attachment: None }
+fn message(text: &str) -> Value {
+    serde_json::to_value(ChatMessage { content: text.into(), after: vec![], to: vec![], reply_to: None, urgent: false, attachment: None }).unwrap()
+}
+
+fn fp(key: &Bytes) -> String {
+    Sha256::digest(&key.0)[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn chat_doc_and_removal() {
+async fn chat_and_removal() {
     let relay = relay().await;
     let dir = folder("chat");
     let mut alice = session(&relay, "Alice").await;
     let mut bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(Kind::Chat, &dir), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
     let link = alice.node.invite(Target::Group(gid.0.clone()), Some("Bob (Acme)".into()), None).unwrap();
     let joined = bob.node.join(&Invite::parse(&link).unwrap(), None).await.unwrap();
     assert_eq!(joined, gid);
@@ -140,7 +150,7 @@ async fn chat_doc_and_removal() {
     assert_eq!((member.name.as_str(), label.as_deref()), ("Bob", Some("Bob (Acme)")));
     assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
 
-    let (id, delivery) = bob.node.send(&gid.0, &message("hello")).await.unwrap();
+    let (id, delivery) = bob.node.send(&gid.0, &message("hello"), false).await.unwrap();
     assert_eq!(delivery.held[0].name, "Alice");
     let got = alice.until(|e| match e {
         Event::Message(message) => Some(message),
@@ -163,40 +173,70 @@ async fn chat_doc_and_removal() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_doc_reaches_a_joiner_and_edits_go_live() {
+async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_frames_and_files_through() {
     let relay = relay().await;
-    let dir = folder("doc");
+    let dir = folder("kind");
     let mut alice = session(&relay, "Alice").await;
-    let mut bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(Kind::Doc, &dir), None).unwrap();
-    let update = lmk_node::doc::edit(&alice.node.doc(&gid.0).unwrap(), "first line\n").unwrap();
-    alice.node.edit(&gid.0, update).await.unwrap();
+    let bob = session(&relay, "Bob").await;
+    let carol = node(&relay, "Carol", false, &[CHAT]).await;
+    let gid = alice.node.create(settings(KIND, &dir), None).unwrap();
+    assert!(carol.node.create(settings(KIND, &dir), None).is_err(), "a session makes no group of a kind it lacks");
     let link = alice.node.invite(Target::Group(gid.0.clone()), None, None).unwrap();
-    bob.node.join(&Invite::parse(&link).unwrap(), None).await.unwrap();
-    bob.until(|e| matches!(e, Event::Edited { .. }).then_some(())).await;
-    assert_eq!(lmk_node::doc::text(&bob.node.doc(&gid.0).unwrap()).unwrap(), "first line\n");
-    let update = lmk_node::doc::edit(&bob.node.doc(&gid.0).unwrap(), "first line\nsecond\n").unwrap();
-    alice.node.doc_edits(&gid.0).unwrap();
-    bob.node.edit(&gid.0, update).await.unwrap();
-    // Whoever reads the doc before the event is handled still learns who changed it.
-    let editors = tokio::time::timeout(WAIT, async {
-        loop {
-            let (state, editors) = alice.node.doc_edits(&gid.0).unwrap();
-            if lmk_node::doc::text(&state).unwrap() == "first line\nsecond\n" {
-                return editors;
-            }
-            assert!(editors.is_empty());
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(editors.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["Bob"]);
-    let by = alice.until(|e| match e {
-        Event::Edited { by, .. } => Some(by),
+    let refused = carol.node.join(&Invite::parse(&link).unwrap(), None).await.unwrap_err();
+    assert!(format!("{refused:#}").contains("does not support test groups"), "{refused:#}");
+
+    // The inviter's kind hands the joiner its state.
+    let link = alice.node.invite(Target::Group(gid.0.clone()), None, None).unwrap();
+    let joining = tokio::spawn(async move { bob.node.join(&Invite::parse(&link).unwrap(), None).await.map(|_| bob) });
+    let reply = alice.until(|e| match e {
+        Event::Snapshot { reply, .. } => Some(reply),
         _ => None,
     }).await;
-    assert_eq!(by.name, "Bob");
+    reply.send(Some(b"the state".to_vec())).unwrap();
+    let mut bob = joining.await.unwrap().unwrap();
+    let (data, from) = bob.until(|e| match e {
+        Event::State { data, from, .. } => Some((data, from)),
+        _ => None,
+    }).await;
+    assert_eq!((data.as_slice(), from.name.as_str()), (&b"the state"[..], "Alice"));
+
+    // Held and live payloads; a frame and a live payload to one member.
+    let push = json!({ "type": "push", "n": 1 });
+    let (id, delivery) = alice.node.send(&gid.0, &push, true).await.unwrap();
+    assert_eq!(delivery.held[0].name, "Bob");
+    let held = bob.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    }).await;
+    assert_eq!((held.id, held.payload), (id, push));
+    alice.node.send_live(&gid.0, &json!({ "type": "edit", "n": 2 }), Some(&fp(&bob.node.key()))).unwrap();
+    let live = bob.until(|e| match e {
+        Event::Live { payload, sender, .. } => Some((payload, sender.name)),
+        _ => None,
+    }).await;
+    assert_eq!(live, (json!({ "type": "edit", "n": 2 }), "Alice".to_owned()));
+    assert!(bob.node.messages(&gid.0).unwrap().iter().all(|m| m.payload["type"] == "push"), "a live payload is not held");
+    alice.node.frame(&gid.0, &fp(&bob.node.key()), json!({ "doc": { "snapshot": "AA" } })).unwrap();
+    let frame = bob.until(|e| match e {
+        Event::Frame { frame, from, .. } => Some((frame, from.name)),
+        _ => None,
+    }).await;
+    assert_eq!(frame, (json!({ "doc": { "snapshot": "AA" } }), "Alice".to_owned()));
+
+    // A file the kind links now is fetched and held; one it hands as state reaches the member it names.
+    let file = alice.node.add_file(&gid.0, b"linked".to_vec()).await.unwrap();
+    bob.node.set_links(&gid.0, vec![file.link()]).unwrap();
+    let hash = bob.until(|e| match e {
+        Event::File(hash) => Some(hash),
+        _ => None,
+    }).await;
+    assert_eq!((hash, bob.node.linked(&gid.0).contains(&file)), (file.hash, true));
+    alice.node.hand_state(&gid.0, &fp(&bob.node.key()), b"newer".to_vec()).await.unwrap();
+    let data = bob.until(|e| match e {
+        Event::State { data, .. } => Some(data),
+        _ => None,
+    }).await;
+    assert_eq!(data, b"newer");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -211,7 +251,7 @@ async fn a_removed_device_leaves_every_group() {
     let link = laptop.node.invite(Target::Device(bob.id.0.clone()), None, None).unwrap();
     let devices = tablet.node.join(&Invite::parse(&link).unwrap(), None).await.unwrap();
     laptop.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    let chat = alice.node.create(settings(Kind::Chat, &dir), None).unwrap();
+    let chat = alice.node.create(settings(CHAT, &dir), None).unwrap();
     let link = alice.node.invite(Target::Group(chat.0.clone()), None, None).unwrap();
     tablet.node.join(&Invite::parse(&link).unwrap(), Some(bob.clone())).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -265,7 +305,7 @@ async fn a_removal_spreads_through_peers() {
     laptop.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     // Alice shares one chat with the tablet and another with the laptop; she reads Bob's list as each joins.
     for member in [&tablet, &laptop] {
-        let chat = alice.node.create(Settings { membership: membership.clone(), ..settings(Kind::Chat, &dir) }, None).unwrap();
+        let chat = alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &dir) }, None).unwrap();
         let link = alice.node.invite(Target::Group(chat.0.clone()), None, None).unwrap();
         member.node.join(&Invite::parse(&link).unwrap(), Some(bob.clone())).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -296,6 +336,7 @@ async fn a_device_that_stopped_before_it_was_saved_is_still_on_its_identity() {
         disk: None,
         file_limit: 100 << 20,
         window: Window::default(),
+        kinds: vec![CHAT.into()],
     };
     let saved = Device::new("laptop");
     let (node, _events) = Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), saved.clone(), config()).await.unwrap();

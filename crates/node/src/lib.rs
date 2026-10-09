@@ -1,10 +1,12 @@
-//! One member's session over lmk-core, lmk-net and lmk-membership: its groups and their logs, its messages, docs and
-//! files, its invites and joins, and the identities of its device. It stores everything through the core's
-//! `Provider`, so the same code runs natively (SQLite) and in the browser (memory the web client persists).
+//! One member's session over lmk-core, lmk-net and lmk-membership: its groups and their logs, its held messages and
+//! files, its invites and joins, and the identities of its device. A group's kind sees its content through the channels
+//! here (held and live messages, frames to one member, files, and a state link for joiners), and nothing of the rest;
+//! the core reads only its own payloads (`Control`) and a devices group's contacts. It stores everything through the
+//! core's `Provider`, so the same code runs natively (SQLite) and in the browser (memory the web client persists).
 
-pub mod doc;
 mod groups;
 mod logs;
+mod yjs;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -22,16 +24,18 @@ use lmk_core::invite::{Invites, Target};
 use lmk_core::provider::Provider;
 use lmk_membership::{Chain, Refused};
 use lmk_net::Net;
-use lmk_proto::group::{Credential, How, IdentityRef, Kind, Leaf, Opening, Payload, Service, Settings};
+use lmk_proto::group::{ContactsUpdate, Credential, How, IdentityRef, Leaf, Opening, Service, Settings, held_by_type};
 use lmk_proto::head::Head;
 use lmk_proto::links::{FileLink, Invite, RELAY};
-use lmk_proto::peer::Admitted;
+use lmk_proto::peer::{Admitted, Frame, KindFrame};
 use lmk_proto::{Answer, Bytes};
 use n0_future::task::{JoinHandle, spawn};
 use n0_future::time::{Duration, SystemTime, sleep, timeout};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, oneshot};
 
 pub use lmk_core;
 pub use lmk_net::Disk;
@@ -52,6 +56,8 @@ const COLLECT: Duration = Duration::from_secs(60 * 60);
 const LIST_FRESH: u64 = 10 * 60 * 1000;
 /// How long a fetch keeps looking for a member that holds the file.
 const FETCH_TRIES: u32 = 12;
+/// How long an inviter waits for the state of a group's kind.
+const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 const COMMIT_TRIES: u32 = 5;
 
 pub struct Config {
@@ -69,6 +75,8 @@ pub struct Config {
     /// The largest file fetched without being asked.
     pub file_limit: u64,
     pub window: Window,
+    /// The kinds this session supports, `chat` among them.
+    pub kinds: Vec<String>,
 }
 
 /// A group member, from its leaf and credential, checked against its identity's device list.
@@ -98,7 +106,7 @@ pub struct Claim {
     pub added_by_device: Option<String>,
 }
 
-/// A message held for the group: a chat message, or a request to leave.
+/// A message held for the group: a held payload of its kind, or a request to leave.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     pub id: Bytes,
@@ -107,7 +115,7 @@ pub struct Message {
     /// When it reached this session, in milliseconds since the Unix epoch.
     pub at: u64,
     pub sender: Member,
-    pub payload: Payload,
+    pub payload: Value,
 }
 
 /// Who took a message as `send` waited.
@@ -125,7 +133,7 @@ pub struct Pending {
     pub what: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Event {
     /// A member was added. `label` is the invite's `--for`, where this session admitted it.
     Joined {
@@ -150,11 +158,35 @@ pub enum Event {
         settings: Settings,
         by: Member,
     },
+    /// A held payload of the group's kind.
     Message(Message),
-    /// A doc, or the contacts of a devices group, changed by an edit or a diff from `by`.
-    Edited {
+    /// A live payload of the group's kind: not held.
+    Live {
         group: Bytes,
-        by: Member,
+        sender: Member,
+        payload: Value,
+    },
+    /// A frame of the group's kind from one member: `{"<name>": {...}}`.
+    Frame {
+        group: Bytes,
+        from: Member,
+        frame: Value,
+    },
+    /// This session and a connected member hold the same log of the group: a time to compare the kind's state.
+    InStep {
+        group: Bytes,
+        member: Member,
+    },
+    /// The state of the group's kind that `from` handed this session: beside the Welcome that admitted it, or later.
+    State {
+        group: Bytes,
+        from: Member,
+        data: Vec<u8>,
+    },
+    /// A member is being admitted: the state of the group's kind to hand it, if any.
+    Snapshot {
+        group: Bytes,
+        reply: oneshot::Sender<Option<Vec<u8>>>,
     },
     Introduced {
         group: Bytes,
@@ -196,11 +228,14 @@ struct Rec {
     /// that its inviter held, as of epoch 0.
     given_up: Vec<(u64, Bytes)>,
     pending: Vec<Pending>,
-    /// File links, with when they were linked: attachments, files added, and doc states linked beside Welcomes. Each is
-    /// held for the group's `keep`.
+    /// File links, with when they were linked: those the kind holds (its files added, and those its held messages
+    /// link) and states handed to or by this session. Each is held for the group's `keep`.
     files: Vec<(String, u64)>,
-    /// The doc state linked beside the latest Welcome, held however old.
+    /// The state handed to or by this session last, held however old.
     state: Option<String>,
+    /// The files the kind links now, held while it does.
+    #[serde(default)]
+    links: Vec<String>,
 }
 
 impl Rec {
@@ -208,14 +243,12 @@ impl Rec {
         self.files.push((link, now()));
     }
 
-    /// The files this session holds for the group: those linked within `keep`, its doc state, and the doc's current
-    /// links, given its text.
-    fn held(&self, keep: u32, text: Option<&str>) -> Vec<FileLink> {
+    /// The files this session holds for the group: those linked within `keep`, the latest state, and those the kind
+    /// links now.
+    fn held(&self, keep: u32) -> Vec<FileLink> {
         let since = now().saturating_sub(keep as u64 * 24 * 3600 * 1000);
         let linked = self.files.iter().filter(|(_, at)| *at >= since).map(|(link, _)| link).chain(&self.state);
-        let mut held: Vec<FileLink> = linked.filter_map(|link| FileLink::parse(link).ok()).collect();
-        held.extend(text.map(doc::links).unwrap_or_default());
-        held
+        linked.chain(&self.links).filter_map(|link| FileLink::parse(link).ok()).collect()
     }
 }
 
@@ -284,8 +317,6 @@ pub(crate) struct State<P> {
     lists: HashMap<Vec<u8>, Known>,
     /// `send`s waiting for receipts.
     waiters: HashMap<[u8; 32], mpsc::UnboundedSender<(EndpointId, Option<String>)>>,
-    /// For each doc, the members whose edits or diffs came in since `doc_edits` last handed them out.
-    editors: HashMap<Vec<u8>, Vec<Member>>,
 }
 
 pub(crate) enum Work {
@@ -307,6 +338,12 @@ pub(crate) enum Work {
         group: Vec<u8>,
         link: FileLink,
     },
+    /// A state a member handed this session.
+    State {
+        group: Vec<u8>,
+        link: String,
+        by: EndpointId,
+    },
     Net(lmk_net::Event),
 }
 
@@ -317,6 +354,7 @@ pub(crate) struct Inner<P> {
     relay: RelayUrl,
     file_limit: u64,
     window: Window,
+    kinds: Vec<String>,
     events: mpsc::UnboundedSender<Event>,
     work: mpsc::UnboundedSender<Work>,
     committing: tokio::sync::Mutex<()>,
@@ -351,6 +389,7 @@ fn rec_key(gid: &[u8]) -> Vec<u8> {
     [b"node/group/".as_slice(), gid].concat()
 }
 
+/// A devices group's contacts; in 0.10, a doc's state too.
 fn doc_key(gid: &[u8]) -> Vec<u8> {
     [b"node/doc/".as_slice(), gid].concat()
 }
@@ -365,11 +404,6 @@ fn message_key(id: &[u8]) -> Vec<u8> {
 
 fn ciphertext_key(id: &[u8]) -> Vec<u8> {
     [b"node/ciphertext/".as_slice(), id].concat()
-}
-
-/// A group whose state is a Yjs doc: a doc, or a devices group's contacts.
-fn doc_like(settings: &Settings) -> bool {
-    settings.kind == Kind::Doc || settings.devices_of.is_some()
 }
 
 fn endpoint_id(key: &[u8]) -> Option<EndpointId> {
@@ -394,18 +428,19 @@ impl<P: Provider> State<P> {
         put(&self.provider, b"node/groups", &gids)
     }
 
-    fn doc_state(&self, gid: &[u8]) -> Result<Vec<u8>> {
-        self.provider.get(&doc_key(gid))?.context("the group has no doc")
+    fn contacts_state(&self, gid: &[u8]) -> Result<Vec<u8>> {
+        self.provider.get(&doc_key(gid))?.context("the group has no contacts")
     }
 
-    /// Stores a doc's new state, which `by` changed.
-    fn edited(&mut self, gid: &[u8], state: &[u8], by: &Member) -> Result<()> {
-        self.provider.put(&doc_key(gid), state)?;
-        let editors = self.editors.entry(gid.to_vec()).or_default();
-        if !editors.iter().any(|e| e.key == by.key && e.iroh == by.iroh) {
-            editors.push(by.clone());
-        }
-        Ok(())
+    fn devices(&self, gid: &[u8]) -> bool {
+        self.groups.get(gid).is_some_and(|g| g.mls.settings().devices_of.is_some())
+    }
+
+    /// The iroh key of the member with a fingerprint: the first 8 bytes of SHA-256 of its session key, hex.
+    fn by_fp(&self, gid: &[u8], fp: &str) -> Result<EndpointId> {
+        let members = self.group(gid)?.mls.members();
+        let member = members.iter().find(|m| hex(&Sha256::digest(&m.key)[..8]) == fp).with_context(|| format!("no member {fp}"))?;
+        member.leaf.as_ref().and_then(|leaf| endpoint_id(&leaf.key.0)).context("a member without an iroh key")
     }
 
     /// A member as events show it, if it has a letmeknow credential.
@@ -483,11 +518,11 @@ impl<P: Provider> State<P> {
             .map(|(gid, _)| gid.clone())
     }
 
-    /// A new group's records, and its MLS state.
-    fn add_group(&mut self, mls: Group, rec: Rec, doc: Option<Vec<u8>>) -> Result<Vec<u8>> {
+    /// A new group's records, and its MLS state; a devices group's with its contacts.
+    fn add_group(&mut self, mls: Group, rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
-        if let Some(doc) = doc {
-            self.provider.put(&doc_key(&gid), &doc)?;
+        if mls.settings().devices_of.is_some() {
+            self.provider.put(&doc_key(&gid), &Contacts::default().state())?;
         }
         self.groups.insert(gid.clone(), G { mls, rec, future: Vec::new(), own_at: None, follow: None });
         self.save(&gid)?;
@@ -509,7 +544,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         };
         let relays = RelayMap::from(iroh::RelayConfig::new(config.relay.clone(), Some(Default::default())));
         let endpoint = lmk_net::builder(relays).secret_key(secret).ca_tls_config(config.ca).bind().await?;
-        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string() };
+        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone() };
         let mut session = match provider.get(b"session")? {
             Some(_) => Session::load(&provider)?,
             None if config.device_key => {
@@ -548,7 +583,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             labels: HashMap::new(),
             lists: HashMap::new(),
             waiters: HashMap::new(),
-            editors: HashMap::new(),
         };
         let inner = Arc::new(Inner {
             state: Mutex::new(state),
@@ -557,6 +591,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             relay: config.relay.clone(),
             file_limit: config.file_limit,
             window: config.window,
+            kinds: config.kinds,
             events,
             work: work.clone(),
             committing: tokio::sync::Mutex::new(()),
@@ -646,15 +681,20 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(self.inner.state.lock().unwrap().group(gid)?.rec.pending.clone())
     }
 
+    /// The kinds this session supports.
+    pub fn kinds(&self) -> &[String] {
+        &self.inner.kinds
+    }
+
     /// A new group with this session its only member, speaking as `identity`.
     pub fn create(&self, settings: Settings, identity: Option<IdentityRef>) -> Result<Bytes> {
+        ensure!(self.inner.kinds.contains(&settings.kind), "this session does not support {} groups", settings.kind);
         let gid = {
             let mut st = self.inner.state.lock().unwrap();
             let st = &mut *st;
             st.session.credential.identity = identity;
-            let doc = doc_like(&settings).then(|| doc::new(""));
             let mls = Group::create(&st.provider, &st.session, &settings, self.inner.window)?;
-            st.add_group(mls, Rec::default(), doc)?
+            st.add_group(mls, Rec::default())?
         };
         self.inner.follow(&gid);
         Ok(Bytes(gid))
@@ -688,6 +728,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// Asks members of an open group to admit this session, speaking as `identity`.
     pub async fn join_open(&self, opening: &Opening, identity: IdentityRef) -> Result<Bytes> {
+        ensure!(self.inner.kinds.contains(&opening.kind), "this session does not support {} groups", opening.kind);
         let key_package = {
             let mut st = self.inner.state.lock().unwrap();
             st.session.credential.identity = Some(identity);
@@ -733,25 +774,24 @@ impl<P: Provider + Send + 'static> Node<P> {
             self.inner.forget(gid)?;
             return Ok(None);
         }
-        Ok(Some(self.send(gid, &Payload::Leave).await?.1))
+        Ok(Some(self.send(gid, &json!({ "type": "leave" }), true).await?.1))
     }
 
-    /// Seals a payload and sends it to the members online; a message or leave is held for the others.
-    pub async fn send(&self, gid: &[u8], payload: &Payload) -> Result<(Bytes, Delivery)> {
+    /// Seals a payload, sends it to the members online, and waits a while for their receipts. A held payload (always
+    /// one held by its type) members hold for the group's `keep`, and sync.
+    pub async fn send(&self, gid: &[u8], payload: &Value, held: bool) -> Result<(Bytes, Delivery)> {
+        let held = held || held_by_type(payload);
         let (id, ciphertext, receipts) = {
             let mut st = self.inner.state.lock().unwrap();
             let st = &mut *st;
             let g = st.groups.get_mut(gid).context("this session is not in that group")?;
-            let (id, ciphertext) = g.mls.seal(&st.provider, &st.session, payload)?;
-            if matches!(payload, Payload::Message { .. } | Payload::Leave) {
+            let (id, ciphertext) = g.mls.seal(&st.provider, &st.session, payload, held)?;
+            if held {
                 let epoch = g.mls.epoch();
                 let me = g.mls.members().into_iter().find(|m| m.key == st.session.key());
                 let g = st.groups.get_mut(gid).unwrap();
                 g.rec.items.push(Item { epoch, id: Bytes(id.to_vec()), at: now() });
                 g.rec.pending.push(Pending { id: Bytes(id.to_vec()), what: "message".into() });
-                if let Payload::Message { attachment: Some(attachment), .. } = payload {
-                    g.rec.link(attachment.link.clone());
-                }
                 st.provider.put(&ciphertext_key(&id), &ciphertext)?;
                 let sender = me.and_then(|me| st.member(gid, &me)).context("this session is not in the group")?;
                 let message = Message {
@@ -773,6 +813,83 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok((Bytes(id.to_vec()), delivery))
     }
 
+    /// Seals a live payload, not held, and sends it to the members online, or to the one with fingerprint `to`.
+    pub fn send_live(&self, gid: &[u8], payload: &Value, to: Option<&str>) -> Result<()> {
+        ensure!(!held_by_type(payload), "a {} is held", lmk_proto::group::type_of(payload));
+        let (ciphertext, peer) = {
+            let mut st = self.inner.state.lock().unwrap();
+            let st = &mut *st;
+            let peer = to.map(|fp| st.by_fp(gid, fp)).transpose()?;
+            let g = st.groups.get_mut(gid).context("this session is not in that group")?;
+            (g.mls.seal(&st.provider, &st.session, payload, false)?.1, peer)
+        };
+        match peer {
+            Some(peer) => _ = self.inner.net().send_to(peer, gid, ciphertext),
+            None => _ = self.inner.net().send(gid, ciphertext),
+        }
+        Ok(())
+    }
+
+    /// Sends a frame of the group's kind, `{"<name>": {...}}`, to the member with fingerprint `to`, if it is online.
+    pub fn frame(&self, gid: &[u8], to: &str, frame: Value) -> Result<()> {
+        let peer = self.inner.state.lock().unwrap().by_fp(gid, to)?;
+        self.inner.net().frame(peer, Frame::Kind(KindFrame::new(Bytes(gid.to_vec()), frame)?));
+        Ok(())
+    }
+
+    /// Holds files for the group's `keep`, as those a held message links; fetches those within this session's limit.
+    pub fn hold(&self, gid: &[u8], links: &[String]) -> Result<()> {
+        let parsed = links.iter().map(|link| FileLink::parse(link)).collect::<Result<Vec<_>>>()?;
+        let mut st = self.inner.state.lock().unwrap();
+        let rec = &mut st.group_mut(gid)?.rec;
+        for link in links {
+            rec.link(link.clone());
+        }
+        st.save(gid)?;
+        self.inner.fetch_within_limit(gid, parsed);
+        Ok(())
+    }
+
+    /// The files the group's kind links now, held while it does; fetches those new within this session's limit.
+    pub fn set_links(&self, gid: &[u8], links: Vec<String>) -> Result<()> {
+        let mut st = self.inner.state.lock().unwrap();
+        let rec = &mut st.group_mut(gid)?.rec;
+        let new = links.iter().filter(|link| !rec.links.contains(link)).map(|link| FileLink::parse(link)).collect::<Result<Vec<_>>>()?;
+        rec.links = links;
+        st.save(gid)?;
+        self.inner.fetch_within_limit(gid, new);
+        Ok(())
+    }
+
+    /// Hands the member with fingerprint `to` a state of the group's kind, as a file it fetches.
+    pub async fn hand_state(&self, gid: &[u8], to: &str, data: Vec<u8>) -> Result<()> {
+        let peer = self.inner.state.lock().unwrap().by_fp(gid, to)?;
+        let link = self.inner.state_file(gid, data).await?;
+        self.inner.net().frame(peer, Frame::State { group: Bytes(gid.to_vec()), link });
+        Ok(())
+    }
+
+    /// The files a group holds.
+    pub fn linked(&self, gid: &[u8]) -> Vec<FileLink> {
+        lmk_net::Groups::files(&*self.inner, gid)
+    }
+
+    /// A doc's state as 0.10 kept it, before the doc kind kept its own.
+    pub fn legacy_doc(&self, gid: &[u8]) -> Result<Option<Vec<u8>>> {
+        let st = self.inner.state.lock().unwrap();
+        if st.devices(gid) {
+            return Ok(None);
+        }
+        st.provider.get(&doc_key(gid))
+    }
+
+    /// Deletes a doc's state as 0.10 kept it, once the doc kind keeps it.
+    pub fn forget_legacy_doc(&self, gid: &[u8]) -> Result<()> {
+        let st = self.inner.state.lock().unwrap();
+        st.provider.delete(&doc_key(gid))?;
+        st.provider.scrub()
+    }
+
     /// Whether this session gave a message up: it refused it, or could not open it.
     pub fn given_up(&self, gid: &[u8], id: &[u8]) -> bool {
         let st = self.inner.state.lock().unwrap();
@@ -791,15 +908,13 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(items.iter().filter_map(|item| get(&st.provider, &message_key(&item.id.0)).ok().flatten()).collect())
     }
 
-    /// Forgets a held message's text; it is still served to members as ciphertext.
-    pub fn redact(&self, id: &[u8]) -> Result<()> {
+    /// Replaces a held message's payload, as when its text is forgotten; it is still served to members as ciphertext.
+    pub fn redact(&self, id: &[u8], payload: Value) -> Result<()> {
         let st = self.inner.state.lock().unwrap();
         let Some(mut message) = get::<Message>(&st.provider, &message_key(id))? else {
             return Ok(());
         };
-        if let Payload::Message { content, .. } = &mut message.payload {
-            content.clear();
-        }
+        message.payload = payload;
         put(&st.provider, &message_key(id), &message)?;
         st.provider.scrub()
     }
@@ -807,24 +922,6 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Leaves in this session's files no copy of what it deleted.
     pub fn scrub(&self) -> Result<()> {
         self.inner.state.lock().unwrap().provider.scrub()
-    }
-
-    /// A doc's Yjs state.
-    pub fn doc(&self, gid: &[u8]) -> Result<Vec<u8>> {
-        self.inner.state.lock().unwrap().doc_state(gid)
-    }
-
-    /// A doc's Yjs state, with the members whose changes came in since this was last asked: the two are read together,
-    /// so a change is never in the state while its editor waits for the next call.
-    pub fn doc_edits(&self, gid: &[u8]) -> Result<(Vec<u8>, Vec<Member>)> {
-        let mut st = self.inner.state.lock().unwrap();
-        let state = st.doc_state(gid)?;
-        Ok((state, st.editors.remove(gid).unwrap_or_default()))
-    }
-
-    /// Applies an edit to a doc and sends it to the members online.
-    pub async fn edit(&self, gid: &[u8], update: Vec<u8>) -> Result<()> {
-        self.inner.edit(gid, update).await
     }
 
     /// Seals a file and holds it for a group.
@@ -906,7 +1003,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             st.session.credential.identity = None;
             let mls =
                 Group::create(&st.provider, &st.session, &devices_settings(&id, name, membership), self.inner.window)?;
-            st.add_group(mls, Rec::default(), Some(Contacts::default().state()))?
+            st.add_group(mls, Rec::default())?
         };
         self.inner.follow(&gid);
         Ok(identity)
@@ -936,7 +1033,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let mut all = Vec::new();
         for identity in &st.device.identities {
             if let Some(gid) = st.devices_group(&identity.id.0) {
-                all.extend(Contacts::load(&st.doc_state(&gid)?)?.all());
+                all.extend(Contacts::load(&st.contacts_state(&gid)?)?.all());
             }
         }
         Ok(all)
@@ -948,18 +1045,20 @@ impl<P: Provider + Send + 'static> Node<P> {
             let st = self.inner.state.lock().unwrap();
             let identity = st.device.identities.first().context("this device is on no identity")?;
             let gid = st.devices_group(&identity.id.0).context("this device is not in its identity's devices group")?;
-            (gid.clone(), Contacts::load(&st.doc_state(&gid)?)?.set(id, contact))
+            (gid.clone(), Contacts::load(&st.contacts_state(&gid)?)?.set(id, contact))
         };
-        self.inner.edit(&gid, update).await
+        self.inner.edit_contacts(&gid, update)
     }
 
-    /// The groups open to this device's identities, as their devices groups record them.
+    /// The groups open to this device's identities, as their devices groups record them, of the kinds this session
+    /// supports.
     pub fn openings(&self) -> Vec<Opening> {
         let st = self.inner.state.lock().unwrap();
         st.groups
             .values()
             .filter(|g| g.mls.settings().devices_of.is_some())
             .flat_map(|g| g.mls.settings().openings)
+            .filter(|opening| self.inner.kinds.contains(&opening.kind))
             .collect()
     }
 
@@ -1268,14 +1367,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     .identities
                     .push(IdentityRef { id: identity.clone(), membership: settings.membership.clone() });
             }
-            let doc = if settings.devices_of.is_some() {
-                Some(Contacts::default().state())
-            } else {
-                doc_like(&settings).then(|| doc::new(""))
-            };
             let given_up = admitted.before.iter().map(|id| (0, id.clone())).collect();
             let rec = Rec { position: admitted.position, logged: admitted.position, given_up, ..Rec::default() };
-            st.add_group(mls, rec, doc)?
+            st.add_group(mls, rec)?
         };
         if let Err(error) = self.read(&gid).await {
             self.warn(Some(&gid), format!("reading the group's log: {error:#}"));
@@ -1284,34 +1378,58 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.refresh(&gid).await;
         self.dial_all();
         if let Some(link) = admitted.doc {
-            let (inner, gid, link) = (self.clone(), gid.clone(), FileLink::parse(&link)?);
-            self.spawn(async move {
-                if let Err(error) = inner.doc_from(&gid, &link, by).await {
-                    inner.warn(Some(&gid), format!("the doc's text did not arrive: {error:#}"));
-                }
-            });
+            self.state_from(&gid, link, EndpointId::from_bytes(&by)?);
         }
         Ok(Bytes(gid))
     }
 
-    /// Merges a doc state linked in a Welcome, once it is fetched.
-    async fn doc_from(&self, gid: &[u8], link: &FileLink, by: [u8; 32]) -> Result<()> {
-        {
-            let mut st = self.state.lock().unwrap();
-            let rec = &mut st.group_mut(gid)?.rec;
-            rec.link(link.link());
-            rec.state = Some(link.link());
-            st.save(gid)?;
-        }
-        self.fetched(gid, link).await?;
-        let mut state = Vec::new();
-        self.net().read_file(link, &mut state).await?;
+    /// Takes a state `by` handed this session, once it is fetched: a devices group's contacts merge it, and any other
+    /// group's kind is told.
+    pub(crate) fn state_from(self: &Arc<Self>, gid: &[u8], link: String, by: EndpointId) {
+        let (inner, gid) = (self.clone(), gid.to_vec());
+        self.spawn(async move {
+            let taken = async {
+                let file = FileLink::parse(&link)?;
+                {
+                    let mut st = inner.state.lock().unwrap();
+                    let rec = &mut st.group_mut(&gid)?.rec;
+                    rec.link(link.clone());
+                    rec.state = Some(link);
+                    st.save(&gid)?;
+                }
+                inner.fetched(&gid, &file).await?;
+                let mut data = Vec::new();
+                inner.net().read_file(&file, &mut data).await?;
+                let st = inner.state.lock().unwrap();
+                if st.devices(&gid) {
+                    return st.provider.put(&doc_key(&gid), &yjs::apply(&st.contacts_state(&gid)?, &data)?);
+                }
+                let from = st.by_iroh(&gid, &by);
+                inner.events.send(Event::State { group: Bytes(gid.clone()), from, data }).ok();
+                anyhow::Ok(())
+            };
+            if let Err(error) = taken.await {
+                inner.warn(Some(&gid), format!("the group's state did not arrive: {error:#}"));
+            }
+        });
+    }
+
+    /// Seals a state of the group's kind, or of its contacts, as a file to hand a member; holds it.
+    pub(crate) async fn state_file(&self, gid: &[u8], data: Vec<u8>) -> Result<String> {
+        let link = self.net().add_file(std::io::Cursor::new(data)).await?.link();
         let mut st = self.state.lock().unwrap();
-        let merged = doc::apply(&st.doc_state(gid)?, &state)?;
-        let by = st.by_iroh(gid, &EndpointId::from_bytes(&by)?);
-        st.edited(gid, &merged, &by)?;
-        self.events.send(Event::Edited { group: Bytes(gid.to_vec()), by }).ok();
-        Ok(())
+        let rec = &mut st.group_mut(gid)?.rec;
+        rec.link(link.clone());
+        rec.state = Some(link.clone());
+        st.save(gid)?;
+        Ok(link)
+    }
+
+    /// Fetches, in the background, the files linked anew that are within this session's limit.
+    fn fetch_within_limit(&self, gid: &[u8], links: Vec<FileLink>) {
+        for link in links.into_iter().filter(|link| link.size <= self.file_limit) {
+            self.work.send(Work::Fetch { group: gid.to_vec(), link }).ok();
+        }
     }
 
     /// Fetches a file from the members online, trying for a while.
@@ -1327,14 +1445,16 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Err(last)
     }
 
-    async fn edit(&self, gid: &[u8], update: Vec<u8>) -> Result<()> {
+    /// Applies an edit to a devices group's contacts and sends it to the members online.
+    fn edit_contacts(&self, gid: &[u8], update: Vec<u8>) -> Result<()> {
         let ciphertext = {
             let mut st = self.state.lock().unwrap();
             let st = &mut *st;
-            let state = doc::apply(&st.doc_state(gid)?, &update)?;
+            let state = yjs::apply(&st.contacts_state(gid)?, &update)?;
             st.provider.put(&doc_key(gid), &state)?;
             let g = st.groups.get_mut(gid).unwrap();
-            g.mls.seal(&st.provider, &st.session, &Payload::Edit { update: Bytes(update) })?.1
+            let edit = serde_json::to_value(ContactsUpdate::Edit { update: Bytes(update) })?;
+            g.mls.seal(&st.provider, &st.session, &edit, false)?.1
         };
         self.net().send(gid, ciphertext);
         Ok(())
@@ -1492,7 +1612,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         st.provider.delete(&rec_key(gid))?;
         st.provider.delete(&doc_key(gid))?;
-        st.editors.remove(gid);
         g.mls.delete(&st.provider)?;
         st.save_groups()?;
         st.provider.scrub()?;
@@ -1554,6 +1673,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                         }
                     });
                 }
+                Work::State { group, link, by } => self.state_from(&group, link, by),
                 Work::Net(event) => self.net_event(event),
             }
         }
@@ -1684,6 +1804,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     });
                 }
             }
+            lmk_net::Event::InStep { group, peer } => {
+                let st = self.state.lock().unwrap();
+                if !st.devices(&group) {
+                    let member = st.by_iroh(&group, &peer);
+                    self.events.send(Event::InStep { group: Bytes(group), member }).ok();
+                    return;
+                }
+                let Ok(snapshot) = st.contacts_state(&group).and_then(|state| yjs::snapshot(&state)) else { return };
+                let frame = json!({ "doc": { "snapshot": Bytes(snapshot.to_vec()) } });
+                self.net().frame(peer, Frame::Kind(KindFrame::new(Bytes(group), frame).expect("a kind frame")));
+            }
             lmk_net::Event::Connected(_) | lmk_net::Event::Disconnected(_) => {}
         }
     }
@@ -1716,13 +1847,18 @@ mod tests {
     }
 
     #[test]
-    fn a_group_holds_files_linked_within_keep_its_doc_state_and_its_doc_links() {
+    fn a_group_holds_files_linked_within_keep_its_state_and_its_kinds_links() {
         let link = |n: u8| FileLink { hash: [n; 32], size: 1, key: [0; 32] }.link();
         let old = now() - 3 * 24 * 3600 * 1000;
         let files = vec![(link(1), old), (link(2), now()), (link(3), old)];
-        let rec = Rec { files, state: Some(link(3)), ..Rec::default() };
-        let text = format!("see [the plan]({})", link(4));
-        let held: Vec<u8> = rec.held(2, Some(&text)).iter().map(|file| file.hash[0]).collect();
+        let rec = Rec { files, state: Some(link(3)), links: vec![link(4)], ..Rec::default() };
+        let held: Vec<u8> = rec.held(2).iter().map(|file| file.hash[0]).collect();
         assert_eq!(held, [2, 3, 4]);
+    }
+
+    #[test]
+    fn a_0_10_record_has_no_links() {
+        let rec: Rec = serde_json::from_str(r#"{"position":1,"logged":1,"chain":null,"items":[],"given_up":[],"pending":[],"files":[],"state":null}"#).unwrap();
+        assert!(rec.links.is_empty());
     }
 }
