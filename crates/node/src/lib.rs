@@ -10,7 +10,7 @@ mod groups;
 mod kindlog;
 mod logs;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,14 +24,14 @@ use lmk_core::identity::{KeyLog, certified, check};
 use lmk_membership::Contradiction;
 use lmk_core::provider::Provider;
 use lmk_membership::Refused;
-use lmk_net::Net;
+use lmk_net::{Net, Network};
 use lmk_proto::group::{CHAT, Control, Credential, DEVICES, How, IdentityRef, Leaf, Opening, REVISION, Reason, Refusal, Settings, held_by_type};
 use lmk_proto::identity::Envelope;
 use lmk_proto::links::{Address, FileLink, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Frame, Join, KindLog as LogRef};
 use lmk_proto::{Answer, Bytes};
 use n0_future::task::{JoinHandle, spawn};
-use n0_future::time::{Duration, SystemTime, sleep, timeout};
+use n0_future::time::{Duration, sleep, timeout};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -39,7 +39,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
 pub use lmk_core;
-pub use lmk_net::Disk;
+pub use lmk_net::{Disk, Fetch};
+pub use lmk_proto::clock::now;
 
 /// How often a session replaces its keys in each group.
 const KEY_UPDATE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -353,18 +354,18 @@ pub(crate) struct State<P> {
     name: String,
     /// The device's name, which its credential names in its devices groups, where this is a device's node.
     device: Option<String>,
-    groups: HashMap<Vec<u8>, G>,
+    groups: BTreeMap<Vec<u8>, G>,
     /// The logs this session follows, by id.
-    logs: HashMap<Vec<u8>, logs::Log>,
+    logs: BTreeMap<Vec<u8>, logs::Log>,
     /// Key logs, by identity id.
-    keys: HashMap<Vec<u8>, KeyLog>,
+    keys: BTreeMap<Vec<u8>, KeyLog>,
     /// Members' certificates, this session's own among them, by session key and identity id.
-    certificates: HashMap<(Vec<u8>, Vec<u8>), Envelope>,
+    certificates: BTreeMap<(Vec<u8>, Vec<u8>), Envelope>,
     /// Members' certificates that lost to a valid one while not valid themselves, as one by a key this session has
     /// not read yet is: taken again when their identity's key log grows.
-    ahead: HashMap<(Vec<u8>, Vec<u8>), Envelope>,
+    ahead: BTreeMap<(Vec<u8>, Vec<u8>), Envelope>,
     /// Members connected to this session without a valid certificate, by session key: since when.
-    uncertified: HashMap<Vec<u8>, u64>,
+    uncertified: BTreeMap<Vec<u8>, u64>,
     /// `send`s waiting for receipts.
     waiters: HashMap<[u8; 32], mpsc::UnboundedSender<(EndpointId, Option<Reason>)>>,
 }
@@ -436,10 +437,6 @@ impl<P> Clone for Node<P> {
     fn clone(&self) -> Self {
         Node { inner: self.inner.clone() }
     }
-}
-
-pub fn now() -> u64 {
-    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
 fn get<T: DeserializeOwned>(provider: &impl Provider, key: &[u8]) -> Result<Option<T>> {
@@ -620,20 +617,31 @@ impl<P: Provider> State<P> {
     }
 }
 
+/// The session's iroh key, made on first use.
+pub fn iroh_key(provider: &impl Provider) -> Result<SecretKey> {
+    Ok(match provider.get(b"node/iroh")? {
+        Some(bytes) => SecretKey::from_bytes(&bytes.as_slice().try_into().context("an iroh key is 32 bytes")?),
+        None => {
+            let key = SecretKey::from_bytes(&lmk_core::random());
+            provider.put(b"node/iroh", &key.to_bytes())?;
+            key
+        }
+    })
+}
+
 impl<P: Provider + Send + 'static> Node<P> {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
-    pub async fn start(provider: P, config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
-        let secret = match provider.get(b"node/iroh")? {
-            Some(bytes) => SecretKey::from_bytes(&bytes.as_slice().try_into().context("an iroh key is 32 bytes")?),
-            None => {
-                let key = SecretKey::from_bytes(&lmk_core::random());
-                provider.put(b"node/iroh", &key.to_bytes())?;
-                key
-            }
-        };
+    pub async fn start(provider: P, mut config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let relays = RelayMap::from(iroh::RelayConfig::new(config.relay.clone(), Some(Default::default())));
-        let endpoint = lmk_net::builder(relays).secret_key(secret).ca_tls_config(config.ca).bind().await?;
-        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone(), revision: REVISION };
+        let ca = std::mem::take(&mut config.ca);
+        let endpoint = lmk_net::builder(relays).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
+        Self::start_on(provider, config, Network::Iroh(endpoint)).await
+    }
+
+    /// Opens the session on a network of the caller's, whose key is `iroh_key`'s.
+    pub async fn start_on(provider: P, config: Config, network: Network) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
+        let transport = network.transport();
+        let leaf = Leaf { key: Bytes(transport.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone(), revision: REVISION };
         let mut session = match (provider.get(b"session")?, &config.device) {
             (Some(_), _) => Session::load(&provider)?,
             (None, Some(device)) => Session::create_with(&provider, device.signer(), &config.name, leaf.clone())?,
@@ -642,14 +650,14 @@ impl<P: Provider + Send + 'static> Node<P> {
         if session.leaf != leaf {
             session.set_leaf(&provider, leaf)?;
         }
-        let clients = logs::Clients::new(endpoint.clone());
+        let clients = logs::Clients::new(transport);
         let logs = State::load_logs(&provider)?;
         for log in logs.values() {
             if let Some(chain) = &log.chain {
                 clients.client(&log.service)?.set_chain(chain.clone());
             }
         }
-        let mut groups = HashMap::new();
+        let mut groups = BTreeMap::new();
         for gid in get::<Vec<Bytes>>(&provider, b"node/groups")?.unwrap_or_default() {
             let mls = Group::load(&provider, &gid.0)?;
             let rec: Rec = get(&provider, &rec_key(&gid.0))?.context("a group without its record")?;
@@ -673,10 +681,10 @@ impl<P: Provider + Send + 'static> Node<P> {
             session,
             groups,
             logs,
-            keys: HashMap::new(),
+            keys: BTreeMap::new(),
             certificates,
-            ahead: HashMap::new(),
-            uncertified: HashMap::new(),
+            ahead: BTreeMap::new(),
+            uncertified: BTreeMap::new(),
             waiters: HashMap::new(),
         };
         let inner = Arc::new(Inner {
@@ -704,7 +712,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             collect: COLLECT,
         };
         let (net, mut net_events) =
-            Net::spawn(endpoint, net_config, inner.clone(), Arc::new(groups::Admitter(inner.clone()))).await?;
+            Net::spawn(network, net_config, inner.clone(), Arc::new(groups::Admitter(inner.clone()))).await?;
         inner.net.set(net).ok();
         inner.spawn(async move {
             while let Some(event) = net_events.recv().await {
@@ -753,6 +761,11 @@ impl<P: Provider + Send + 'static> Node<P> {
         Bytes(self.inner.state.lock().unwrap().session.key().to_vec())
     }
 
+    /// Its peers: what a transport of the caller's hands the connections peers open, and the files they fetch.
+    pub fn net(&self) -> &Net {
+        self.inner.net()
+    }
+
     /// This session's iroh key and relay.
     pub fn address(&self) -> ([u8; 32], RelayUrl) {
         (*self.inner.net().id().as_bytes(), self.inner.relay.clone())
@@ -768,6 +781,11 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     pub fn epoch(&self, gid: &[u8]) -> Result<u64> {
         Ok(self.inner.state.lock().unwrap().group(gid)?.mls.epoch())
+    }
+
+    /// The epoch this session joined the group at.
+    pub fn joined(&self, gid: &[u8]) -> Result<u64> {
+        Ok(self.inner.state.lock().unwrap().group(gid)?.mls.joined())
     }
 
     pub fn members(&self, gid: &[u8]) -> Result<Vec<Member>> {
@@ -1004,6 +1022,11 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// The files a group holds.
     pub fn linked(&self, gid: &[u8]) -> Vec<FileLink> {
         lmk_net::Groups::files(&*self.inner, gid)
+    }
+
+    /// Whether this session serves a peer a group, by the serving rules.
+    pub fn serves(&self, gid: &[u8], peer: &EndpointId) -> bool {
+        lmk_net::Groups::is_member(&*self.inner, gid, peer)
     }
 
     /// Whether this session gave a message up: it refused it, or could not open it.
@@ -1309,7 +1332,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     fn dial_all(self: &Arc<Self>) {
         let connected = self.net().connected();
         let me = self.net().id();
-        let leaves: HashSet<(EndpointId, String)> = {
+        let leaves: BTreeSet<(EndpointId, String)> = {
             let st = self.state.lock().unwrap();
             st.groups
                 .values()
@@ -1676,7 +1699,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let peers = self.net().connected();
         let before = st.served(&peers);
         st.keys.insert(id.to_vec(), log);
-        let ahead: Vec<Envelope> = st.ahead.extract_if(|(_, identity), _| identity == id).map(|(_, certificate)| certificate).collect();
+        let ahead: Vec<Envelope> = st.ahead.extract_if(.., |(_, identity), _| identity == id).map(|(_, certificate)| certificate).collect();
         for certificate in ahead {
             groups::take_certificate(st, certificate);
         }

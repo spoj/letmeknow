@@ -3,32 +3,32 @@
 //! by entry, shown to peers by its newest signed head and caught up from them; what its entries mean is its log type's
 //! (`Of`), to which `Inner::check` hands them once held.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use iroh::Endpoint;
 use lmk_core::provider::Provider;
 use lmk_membership::client::ServeClient;
 use lmk_membership::{Chain, Contradiction, Membership};
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
+use lmk_transport::Transport;
 use n0_future::task::spawn;
-use n0_future::time::{Duration, sleep};
+use n0_future::time::{Duration, sleep, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Inner, State, Work, get, hex, put};
+use crate::{Inner, RESYNC, State, Work, get, hex, put};
 
-/// One membership client per service, sharing the session's endpoint.
+/// One membership client per service, sharing the session's transport.
 pub(crate) struct Clients {
-    endpoint: Endpoint,
+    transport: Arc<dyn Transport>,
     clients: Mutex<HashMap<String, Arc<dyn Membership>>>,
 }
 
 impl Clients {
-    pub fn new(endpoint: Endpoint) -> Self {
-        Clients { endpoint, clients: Mutex::default() }
+    pub fn new(transport: Arc<dyn Transport>) -> Self {
+        Clients { transport, clients: Mutex::default() }
     }
 
     pub fn client(&self, service: &Service) -> Result<Arc<dyn Membership>> {
@@ -38,7 +38,7 @@ impl Clients {
             return Ok(client.clone());
         }
         let client: Arc<dyn Membership> = match service {
-            Service::Serve { .. } => Arc::new(ServeClient::for_service(self.endpoint.clone(), service)?),
+            Service::Serve { .. } => Arc::new(ServeClient::for_service(self.transport.clone(), service)?),
             #[cfg(not(target_arch = "wasm32"))]
             Service::Folder(path) => Arc::new(lmk_membership::folder::FolderClient::new(path)),
             #[cfg(target_arch = "wasm32")]
@@ -102,7 +102,7 @@ pub(crate) fn entry_key(id: &[u8], position: u64) -> Vec<u8> {
 
 impl<P: Provider> State<P> {
     /// Loads the logs this session follows.
-    pub(crate) fn load_logs(provider: &P) -> Result<HashMap<Vec<u8>, Log>> {
+    pub(crate) fn load_logs(provider: &P) -> Result<BTreeMap<Vec<u8>, Log>> {
         let ids = get::<Vec<Bytes>>(provider, b"node/logs")?.unwrap_or_default();
         ids.into_iter().map(|id| Ok((id.0.clone(), get(provider, &log_key(&id.0))?.context("a log without its record")?))).collect()
     }
@@ -166,7 +166,9 @@ impl<P: Provider> State<P> {
 
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Follows a log at its service: what is new as the service tells of it, and all of it whenever the subscription
-    /// restarts, until this session drops the log.
+    /// restarts and every 5 minutes, until this session drops the log. The read after subscribing may reach the service
+    /// before the subscription does, missing an entry appended in between; a member removed by it learns of it from no
+    /// peer, as none serves it the group any more.
     pub(crate) fn follow(self: &Arc<Self>, log: &[u8]) {
         let (inner, id) = (self.clone(), log.to_vec());
         let task = spawn(async move {
@@ -176,9 +178,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     let client = inner.clients.client(&service)?;
                     let mut subscription = client.subscribe(vec![Bytes(id.clone())]).await?;
                     inner.read(&id).await?;
-                    while let Some(notice) = subscription.next().await {
-                        let notice = notice?;
-                        inner.stored(&id, notice.position - 1, vec![notice.entry], client.chain(&id))?;
+                    loop {
+                        match timeout(RESYNC, subscription.next()).await {
+                            Ok(Some(notice)) => {
+                                let notice = notice?;
+                                inner.stored(&id, notice.position - 1, vec![notice.entry], client.chain(&id))?;
+                            }
+                            Ok(None) => break,
+                            Err(_) => inner.read(&id).await?,
+                        }
                     }
                     anyhow::Ok(())
                 };
@@ -244,14 +252,18 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         let log = st.logs.get_mut(id).unwrap();
         log.logged += fresh.len() as u64;
+        // A joiner's first read anchors its chain: the head it shows its peers is no longer empty, though it took
+        // nothing new, and they sync with it only once it shows the head they do.
+        let anchored = log.chain.is_none() && chain.as_ref().is_some_and(|chain| chain.length() == log.logged);
         if let Some(chain) = chain.filter(|chain| chain.length() == log.logged) {
             log.chain = Some(chain);
         }
         st.save_log(id)?;
-        if fresh.is_empty() {
+        if !fresh.is_empty() {
+            self.check(st, id)?;
+        } else if !anchored {
             return Ok(());
         }
-        self.check(st, id)?;
         if let Some(net) = self.net.get() {
             for gid in st.groups_of(id) {
                 net.changed(&gid);

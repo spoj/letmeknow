@@ -1,5 +1,6 @@
 //! Files over iroh-blobs: the only module that knows it. Links are plain BLAKE3 over the
-//! ciphertext, so replacing iroh-blobs later keeps every link valid.
+//! ciphertext, so replacing iroh-blobs later keeps every link valid. Over a transport other than iroh, files move whole
+//! instead, by `Fetch`.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -28,7 +29,7 @@ use tokio::{
 };
 
 use crate::{
-    Disk, Groups,
+    Disk, Fetch, Groups,
     seal::{Opener, SEALED, Sealer, sealed_len},
 };
 
@@ -37,9 +38,15 @@ const PIECE: u64 = 1024;
 /// How long a download with no holder left waits for another.
 const HOLDER_WAIT: Duration = Duration::from_secs(30);
 
+/// How files are fetched from holders.
+pub(crate) enum Blobs {
+    Iroh(Endpoint),
+    Fetch(Arc<dyn Fetch>),
+}
+
 pub(crate) struct Files {
     store: Store,
-    endpoint: Endpoint,
+    blobs: Blobs,
     downloads: Arc<Mutex<HashMap<[u8; 32], Download>>>,
     /// Files just added, kept from deletion until the next collection has seen them.
     added: Arc<Mutex<Vec<TempTag>>>,
@@ -54,7 +61,7 @@ struct Download {
 impl Files {
     /// Every `collect`, the store deletes the files no group links, unless they are on their way in.
     pub async fn new(
-        endpoint: Endpoint,
+        blobs: Blobs,
         dir: Option<std::path::PathBuf>,
         disk: Option<Arc<dyn Disk>>,
         groups: Arc<dyn Groups>,
@@ -82,7 +89,7 @@ impl Files {
             Some(_) => bail!("a browser keeps files in memory"),
             None => (*iroh_blobs::store::mem::MemStore::new_with_opts(iroh_blobs::store::mem::Options { gc_config: Some(gc) })).clone(),
         };
-        Ok(Files { store, endpoint, downloads, added, disk })
+        Ok(Files { store, blobs, downloads, added, disk })
     }
 
     /// Serves complete files to current members only: checked per connection, per request, and
@@ -145,8 +152,7 @@ impl Files {
 
     /// Seals plaintext under a new key and holds the ciphertext.
     pub async fn add(&self, mut plain: impl AsyncRead + Unpin + Send + Sync + 'static) -> Result<FileLink> {
-        let mut key = [0; 32];
-        getrandom::fill(&mut key)?;
+        let key = lmk_proto::random::random();
         let (sealed, mut rx) = mpsc::channel(4);
         let size = Arc::new(AtomicU64::new(0));
         let read = size.clone();
@@ -213,7 +219,7 @@ impl Files {
         Ok(self.store.remote().local(Hash::from_bytes(*hash)).await?.local_bytes())
     }
 
-    async fn ciphertext(&self, hash: &[u8; 32]) -> Result<Vec<u8>> {
+    pub async fn ciphertext(&self, hash: &[u8; 32]) -> Result<Vec<u8>> {
         Ok(self.store.get_bytes(Hash::from_bytes(*hash)).await?.to_vec())
     }
 
@@ -311,7 +317,18 @@ impl Files {
     }
 
     async fn fetch(&self, holder: EndpointId, hash: &[u8; 32], queue: &Mutex<Vec<ChunkRanges>>) -> Result<()> {
-        let conn = self.endpoint.connect(holder, iroh_blobs::ALPN).await?;
+        let endpoint = match &self.blobs {
+            Blobs::Iroh(endpoint) => endpoint,
+            Blobs::Fetch(fetch) => {
+                let ciphertext = fetch.fetch(holder, *hash).await?;
+                ensure!(blake3::hash(&ciphertext).as_bytes() == hash, "{} sent another file", holder.fmt_short());
+                let tag = self.store.add_bytes(ciphertext).temp_tag().await?;
+                self.added.lock().unwrap().push(tag);
+                queue.lock().unwrap().clear();
+                return Ok(());
+            }
+        };
+        let conn = endpoint.connect(holder, iroh_blobs::ALPN).await?;
         loop {
             let Some(piece) = queue.lock().unwrap().pop() else {
                 return Ok(());

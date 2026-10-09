@@ -5,15 +5,17 @@ use std::sync::Arc;
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
-use iroh::{Endpoint, EndpointAddr, PublicKey, endpoint::Connection};
+use iroh::{EndpointAddr, PublicKey};
 use lmk_proto::{
     Answer, Bytes, frame,
-    frame::{ALPN, Open, Stream},
+    frame::{Open, Stream},
     group::Service,
     head::Head,
     membership::{Appended, Latest, Notice, Page, Request},
 };
+use lmk_transport::{Conn, Transport};
 use serde::de::DeserializeOwned;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::{Chain, Membership, Refused, Subscription, chain::Chains};
@@ -22,15 +24,15 @@ use crate::{Chain, Membership, Refused, Subscription, chain::Chains};
 pub struct ServeClient(Arc<Inner>);
 
 struct Inner {
-    endpoint: Endpoint,
+    transport: Arc<dyn Transport>,
     addr: EndpointAddr,
     chains: Chains,
-    conn: Mutex<Option<Connection>>,
+    conn: Mutex<Option<Conn>>,
 }
 
 impl ServeClient {
     /// A client of the service at `key`, reached through its relay or direct addresses.
-    pub fn new(endpoint: Endpoint, key: &[u8], relay: &str, addrs: &[String]) -> Result<Self> {
+    pub fn new(transport: Arc<dyn Transport>, key: &[u8], relay: &str, addrs: &[String]) -> Result<Self> {
         let key: [u8; 32] = key.try_into().context("a service key is 32 bytes")?;
         let mut addr = EndpointAddr::new(PublicKey::from_bytes(&key)?);
         if !relay.is_empty() {
@@ -41,28 +43,28 @@ impl ServeClient {
         }
         let chains = Chains::new(Some(VerifyingKey::from_bytes(&key)?));
         Ok(ServeClient(Arc::new(Inner {
-            endpoint,
+            transport,
             addr,
             chains,
             conn: Mutex::default(),
         })))
     }
 
-    pub fn for_service(endpoint: Endpoint, service: &Service) -> Result<Self> {
+    pub fn for_service(transport: Arc<dyn Transport>, service: &Service) -> Result<Self> {
         let Service::Serve { key, relay, addrs, .. } = service else {
             anyhow::bail!("not a serve service")
         };
-        Self::new(endpoint, &key.0, relay, addrs)
+        Self::new(transport, &key.0, relay, addrs)
     }
 
-    async fn connection(&self) -> Result<Connection> {
+    async fn connection(&self) -> Result<Conn> {
         let mut conn = self.0.conn.lock().await;
         if let Some(c) = conn.as_ref()
-            && c.close_reason().is_none()
+            && !c.closed()
         {
             return Ok(c.clone());
         }
-        let c = self.0.endpoint.connect(self.0.addr.clone(), ALPN).await?;
+        let c = self.0.transport.connect(self.0.addr.clone()).await?;
         *conn = Some(c.clone());
         Ok(c)
     }
@@ -77,7 +79,7 @@ impl ServeClient {
         )
         .await?;
         frame::write(&mut send, &request).await?;
-        send.finish()?;
+        send.shutdown().await?;
         match frame::read(&mut recv).await? {
             Answer::Ok(answer) => Ok(answer),
             Answer::Refused { refused } => Err(Refused(refused).into()),

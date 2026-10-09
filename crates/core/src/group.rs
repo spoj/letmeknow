@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use lmk_proto::Bytes;
+use lmk_proto::clock::now;
 use lmk_proto::group::{Control, Credential, How, LEAF_EXTENSION, Leaf, PROTOCOL, RENAME_REVISION, SETTINGS_EXTENSION, Settings, held_by_type};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
@@ -96,7 +97,9 @@ struct SessionRecord {
 impl Session {
     /// A new session with a fresh MLS key, speaking as no identity; a provider holds one session.
     pub fn create<P: Provider>(provider: &P, name: &str, leaf: Leaf) -> Result<Self> {
-        Self::create_with(provider, SignatureKeyPair::new(SignatureScheme::ED25519)?, name, leaf)
+        let key = ed25519_dalek::SigningKey::from_bytes(&crate::random());
+        let signer = SignatureKeyPair::from_raw(SignatureScheme::ED25519, key.to_bytes().to_vec(), key.verifying_key().to_bytes().to_vec());
+        Self::create_with(provider, signer, name, leaf)
     }
 
     /// A session with the given MLS key: a device's own (`Device::signer`).
@@ -343,11 +346,21 @@ struct State {
     /// Removed members' keys, with when their removal was applied.
     removed: Vec<(Bytes, u64)>,
     added: Vec<Added>,
+    /// When the current epoch began here, and the ended epochs before it, oldest first, in milliseconds, as far back as
+    /// this client recorded them.
+    #[serde(default)]
+    began: Vec<u64>,
 }
 
 pub struct Group {
     mls: MlsGroup,
     state: State,
+}
+
+/// openmls's default lifetime for a creator's leaf, an hour before now to 12 weeks after, by our clock, not the system's.
+fn creator_lifetime() -> Lifetime {
+    let now = now() / 1000;
+    Lifetime::init(now - 3600, now + 12 * 7 * 86400)
 }
 
 impl Group {
@@ -362,10 +375,11 @@ impl Group {
             .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
             .max_past_epochs(window.epochs)
             .sender_ratchet_configuration(SenderRatchetConfiguration::new(1000, 100_000))
+            .lifetime(creator_lifetime())
             .build();
         let id = GroupId::from_slice(&crate::random::<16>());
         let mls = MlsGroup::new_with_group_id(provider, &session.signer, &config, id, session.with_key())?;
-        let group = Group { state: State { window, joined: mls.epoch().as_u64(), ..State::default() }, mls };
+        let group = Group { state: State { window, joined: mls.epoch().as_u64(), began: vec![now()], ..State::default() }, mls };
         group.save(provider)?;
         Ok(group)
     }
@@ -385,7 +399,7 @@ impl Group {
             settings.protocol
         );
         let mls = staged.into_group(provider)?;
-        let group = Group { state: State { window, joined: mls.epoch().as_u64(), ..State::default() }, mls };
+        let group = Group { state: State { window, joined: mls.epoch().as_u64(), began: vec![now()], ..State::default() }, mls };
         group.save(provider)?;
         Ok(group)
     }
@@ -581,18 +595,27 @@ impl Group {
                 member.index = members.iter().find(|m| m.key == member.key).map_or(0, |m| m.index);
             }
         }
+        self.state.began.push(now());
         self.expire(provider)?;
         self.save(provider)?;
         Ok(applied)
     }
 
     /// Drops ended epochs' keys beyond this client's window. Applying a commit does this too; call it now and then.
+    /// openmls dates epochs by the system clock, so the epochs within the window are also counted by the dates
+    /// recorded here, which a simulator's clock decides.
     pub fn expire<P: Provider>(&mut self, provider: &P) -> Result<()> {
         let window = self.state.window;
-        self.mls.delete_past_epoch_secrets(
-            provider,
-            PastEpochDeletion::older_than_duration(window.age).max_past_epochs(window.epochs),
-        )?;
+        let since = now().saturating_sub(window.age.as_millis() as u64);
+        let kept = match self.state.began.split_last() {
+            Some((current, _)) if *current < since => 0,
+            Some((_, ended)) => ended.iter().rev().position(|began| *began < since).unwrap_or(window.epochs),
+            None => window.epochs,
+        }
+        .min(window.epochs);
+        self.mls.delete_past_epoch_secrets(provider, PastEpochDeletion::older_than_duration(window.age).max_past_epochs(kept))?;
+        let began = &mut self.state.began;
+        began.drain(..began.len().saturating_sub(kept + 1));
         Ok(())
     }
 

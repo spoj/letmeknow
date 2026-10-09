@@ -94,7 +94,7 @@ pub async fn node(relay: &Relay, key: SecretKey, fake: Arc<Fake>, options: Optio
     let endpoint = builder.bind().await.unwrap();
     tokio::time::timeout(WAIT, endpoint.online()).await.expect("online");
     let config = Config { home: options.home, files: None, disk: options.disk, file_limit: options.file_limit, resync: options.resync, collect: options.collect };
-    let (net, events) = Net::spawn(endpoint, config, fake.clone(), Arc::new(Inviter)).await.unwrap();
+    let (net, events) = Net::spawn(lmk_net::Network::Iroh(endpoint), config, fake.clone(), Arc::new(Inviter)).await.unwrap();
     Node { net, events, fake }
 }
 
@@ -374,7 +374,7 @@ impl Groups for Fake {
         self.certificates.lock().unwrap().clone()
     }
 
-    fn certificate(&self, _: EndpointId, certificate: Envelope) {
+    fn certificate(&self, certificate: Envelope) {
         self.certified.lock().unwrap().push(certificate);
     }
 }

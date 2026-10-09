@@ -9,6 +9,7 @@ lmk-core.workspace = true
 lmk-membership.workspace = true
 lmk-net.workspace = true
 lmk-proto.workspace = true
+lmk-transport.workspace = true
 anyhow.workspace = true
 ed25519-dalek.workspace = true
 iroh = { workspace = true, features = ["tls-ring"] }

@@ -2892,6 +2892,9 @@ dependencies = [
  "ciborium",
  "ed25519-dalek 3.0.0",
  "getrandom 0.2.17",
+ "hpke-rs",
+ "hpke-rs-crypto",
+ "hpke-rs-rust-crypto",
  "lmk-proto",
  "openmls",
  "openmls_basic_credential",
@@ -2903,6 +2906,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -2916,6 +2920,7 @@ dependencies = [
  "iroh",
  "iroh-relay",
  "lmk-proto",
+ "lmk-transport",
  "n0-future",
  "notify",
  "rand 0.9.5",
@@ -2939,11 +2944,11 @@ dependencies = [
  "bytes",
  "chacha20poly1305 0.11.0",
  "ed25519-dalek 3.0.0",
- "getrandom 0.4.3",
  "iroh",
  "iroh-blobs",
  "iroh-relay",
  "lmk-proto",
+ "lmk-transport",
  "n0-future",
  "negentropy",
  "rcgen",
@@ -2968,6 +2973,7 @@ dependencies = [
  "lmk-membership",
  "lmk-net",
  "lmk-proto",
+ "lmk-transport",
  "n0-future",
  "rcgen",
  "rustls",
@@ -2985,8 +2991,10 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "ed25519-dalek 3.0.0",
+ "getrandom 0.4.3",
  "hex",
  "hkdf 0.13.0",
+ "n0-future",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3007,6 +3015,7 @@ dependencies = [
  "iroh-relay",
  "lmk-membership",
  "lmk-proto",
+ "lmk-transport",
  "rcgen",
  "rustls",
  "socket2",
@@ -3015,6 +3024,40 @@ dependencies = [
  "tokio-rustls-acme",
  "tokio-stream",
  "tracing",
+]
+
+[[package]]
+name = "lmk-sim"
+version = "0.12.1"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "ed25519-dalek 3.0.0",
+ "hex",
+ "iroh",
+ "lmk-client",
+ "lmk-membership",
+ "lmk-net",
+ "lmk-node",
+ "lmk-proto",
+ "lmk-transport",
+ "n0-future",
+ "openmls_memory_storage",
+ "openmls_traits",
+ "rayon",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+]
+
+[[package]]
+name = "lmk-transport"
+version = "0.12.1"
+dependencies = [
+ "anyhow",
+ "iroh",
+ "lmk-proto",
+ "tokio",
 ]
 
 [[package]]
@@ -3032,7 +3075,6 @@ dependencies = [
  "lmk-proto",
  "n0-future",
  "openmls_memory_storage",
- "openmls_rust_crypto",
  "openmls_traits",
  "rustc-hash",
  "serde",

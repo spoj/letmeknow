@@ -1,6 +1,6 @@
 //! Everything a session says to its peers over iroh: one `letmeknow/1` connection per pair of
 //! sessions, its `peer` stream, and files over iroh-blobs. MLS stays outside, behind
-//! [`Groups`]: this crate moves ciphertexts and holds no keys.
+//! [`Groups`]: this crate moves ciphertexts and holds no keys. A simulator runs it over its own transport instead.
 
 mod files;
 mod peer;
@@ -8,16 +8,16 @@ mod seal;
 mod sync;
 
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl,
-    endpoint::{Builder, Connection, RecvStream, SendStream, presets},
+    endpoint::{Builder, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use lmk_proto::{
@@ -28,13 +28,17 @@ use lmk_proto::{
     links::FileLink,
     peer::{Admitted, Frame, Hello, Join},
 };
+use lmk_transport::{Conn, IrohConnection, Iroh, RecvStream, SendStream, Transport};
 use n0_future::{boxed::BoxFuture, join_all, task::spawn, time::timeout};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{mpsc, oneshot},
 };
 
-use crate::{files::Files, peer::Input};
+use crate::{
+    files::{Blobs, Files},
+    peer::Input,
+};
 
 /// How long to wait for a peer's `have`.
 const ANSWER_WAIT: Duration = Duration::from_secs(5);
@@ -82,8 +86,8 @@ pub trait Groups: Send + Sync + 'static {
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
     /// The certificates this session holds of these groups' members.
     fn certificates(&self, groups: &[Vec<u8>]) -> Vec<Envelope>;
-    /// A certificate `peer` presented.
-    fn certificate(&self, peer: EndpointId, certificate: Envelope);
+    /// A certificate a peer presented, of itself or of a member of a group it is in.
+    fn certificate(&self, certificate: Envelope);
 }
 
 /// A browser's own storage of the files it holds, since iroh-blobs keeps only memory there. With one, a session keeps
@@ -94,6 +98,27 @@ pub trait Disk: Send + Sync + 'static {
     /// A kept file's ciphertext.
     fn load(&self, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>>;
     fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>);
+}
+
+/// How a session reaches its peers: iroh, or another transport, such as a simulator's, over which files move whole.
+pub enum Network {
+    Iroh(Endpoint),
+    Other { transport: Arc<dyn Transport>, fetch: Arc<dyn Fetch> },
+}
+
+impl Network {
+    pub fn transport(&self) -> Arc<dyn Transport> {
+        match self {
+            Network::Iroh(endpoint) => Arc::new(Iroh(endpoint.clone())),
+            Network::Other { transport, .. } => transport.clone(),
+        }
+    }
+}
+
+/// Fetches a file whole from a peer that holds it, over a transport other than iroh: the peer answers by
+/// [`Net::upload`].
+pub trait Fetch: Send + Sync + 'static {
+    fn fetch(&self, holder: EndpointId, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>>;
 }
 
 /// What became of a ciphertext a peer sent; a receipt tells the peer what was held.
@@ -150,50 +175,68 @@ pub fn builder(relays: RelayMap) -> Builder {
 #[derive(Clone)]
 pub struct Net {
     inner: Arc<Inner>,
-    router: Router,
+    router: Option<Router>,
 }
 
 pub(crate) struct Inner {
-    endpoint: Endpoint,
+    transport: Arc<dyn Transport>,
     config: Config,
     groups: Arc<dyn Groups>,
     admit: Arc<dyn Admit>,
     files: Arc<Files>,
-    links: Mutex<HashMap<EndpointId, Link>>,
+    links: Mutex<BTreeMap<EndpointId, Link>>,
     events: mpsc::UnboundedSender<Event>,
 }
 
 struct Link {
-    conn: Connection,
+    conn: Conn,
     dialer: EndpointId,
     input: mpsc::UnboundedSender<Input>,
 }
 
 impl Net {
     pub async fn spawn(
-        endpoint: Endpoint,
+        network: Network,
         config: Config,
         groups: Arc<dyn Groups>,
         admit: Arc<dyn Admit>,
     ) -> Result<(Net, mpsc::UnboundedReceiver<Event>)> {
-        let files = Arc::new(Files::new(endpoint.clone(), config.files.clone(), config.disk.clone(), groups.clone(), config.collect).await?);
+        let (transport, blobs) = match &network {
+            Network::Iroh(endpoint) => (network.transport(), Blobs::Iroh(endpoint.clone())),
+            Network::Other { transport, fetch } => (transport.clone(), Blobs::Fetch(fetch.clone())),
+        };
+        let files = Arc::new(Files::new(blobs, config.files.clone(), config.disk.clone(), groups.clone(), config.collect).await?);
         #[cfg(not(target_family = "wasm"))]
-        if let Some(home) = &config.home {
-            addresses::publish(&endpoint, home)?;
+        if let (Network::Iroh(endpoint), Some(home)) = (&network, &config.home) {
+            addresses::publish(endpoint, home)?;
         }
         let (events, rx) = mpsc::unbounded_channel();
-        let blobs = files.protocol(groups.clone());
-        let inner = Arc::new(Inner { endpoint: endpoint.clone(), config, groups, admit, files, links: Mutex::default(), events });
-        let router = Router::builder(endpoint).accept(ALPN, Handler(inner.clone())).accept(iroh_blobs::ALPN, blobs).spawn();
+        let inner = Arc::new(Inner { transport, config, groups, admit, files, links: Mutex::default(), events });
+        let router = match network {
+            Network::Iroh(endpoint) => {
+                let blobs = inner.files.protocol(inner.groups.clone());
+                Some(Router::builder(endpoint).accept(ALPN, Handler(inner.clone())).accept(iroh_blobs::ALPN, blobs).spawn())
+            }
+            Network::Other { .. } => None,
+        };
         Ok((Net { inner, router }, rx))
     }
 
     pub fn id(&self) -> EndpointId {
-        self.inner.endpoint.id()
+        self.inner.transport.id()
     }
 
-    pub fn endpoint(&self) -> &Endpoint {
-        &self.inner.endpoint
+    /// Serves a connection a peer opened, until it closes.
+    pub async fn accept(&self, conn: Conn) {
+        self.inner.clone().accept(conn).await;
+    }
+
+    /// A file's ciphertext for a peer that fetches it whole (see [`Fetch`]), by the rules iroh-blobs serves files by.
+    pub async fn upload(&self, peer: EndpointId, hash: [u8; 32]) -> Result<Vec<u8>> {
+        let groups = &self.inner.groups;
+        let linked = groups.groups().iter().any(|g| groups.is_member(g, &peer) && groups.files(g).iter().any(|file| file.hash == hash));
+        ensure!(linked && self.inner.files.serve(&hash).await?, "not served");
+        self.inner.files.ciphertext(&hash).await
     }
 
     /// Connects to a member by the key and relay in its leaf, unless already connected.
@@ -294,7 +337,9 @@ impl Net {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        self.router.shutdown().await?;
+        if let Some(router) = &self.router {
+            router.shutdown().await?;
+        }
         #[cfg(not(target_family = "wasm"))]
         if let Some(home) = &self.inner.config.home {
             std::fs::remove_file(addresses::path(home, &self.id()))?;
@@ -304,7 +349,7 @@ impl Net {
 }
 
 impl Inner {
-    async fn connection(self: &Arc<Self>, key: EndpointId, relay: RelayUrl) -> Result<Connection> {
+    async fn connection(self: &Arc<Self>, key: EndpointId, relay: RelayUrl) -> Result<Conn> {
         if let Some(conn) = self.live(&key) {
             return Ok(conn);
         }
@@ -314,7 +359,7 @@ impl Inner {
         if let Some(home) = &self.config.home {
             addr = addresses::read(home, &key).into_iter().fold(addr, EndpointAddr::with_ip_addr);
         }
-        let conn = self.endpoint.connect(addr, ALPN).await?;
+        let conn = self.transport.connect(addr).await?;
         match self.register(&conn, true) {
             Some((input, rx)) => {
                 spawn(self.clone().serve(conn.clone(), true, input, rx));
@@ -324,23 +369,29 @@ impl Inner {
         }
     }
 
-    fn live(&self, key: &EndpointId) -> Option<Connection> {
+    fn live(&self, key: &EndpointId) -> Option<Conn> {
         let links = self.links.lock().unwrap();
-        links.get(key).map(|link| link.conn.clone()).filter(|conn| conn.close_reason().is_none())
+        links.get(key).map(|link| link.conn.clone()).filter(|conn| !conn.closed())
+    }
+
+    async fn accept(self: Arc<Self>, conn: Conn) {
+        if let Some((input, rx)) = self.register(&conn, false) {
+            self.serve(conn, false, input, rx).await;
+        }
     }
 
     /// Keeps one connection per peer: of two live ones, the one dialed by the smaller key, which
     /// both sides pick alike; a redial replaces the old one.
-    fn register(&self, conn: &Connection, dialed: bool) -> Option<(mpsc::UnboundedSender<Input>, mpsc::UnboundedReceiver<Input>)> {
-        let (me, peer) = (self.endpoint.id(), conn.remote_id());
+    fn register(&self, conn: &Conn, dialed: bool) -> Option<(mpsc::UnboundedSender<Input>, mpsc::UnboundedReceiver<Input>)> {
+        let (me, peer) = (self.transport.id(), conn.remote_id());
         let dialer = if dialed { me } else { peer };
         let mut links = self.links.lock().unwrap();
-        match links.get(&peer).filter(|old| old.conn.close_reason().is_none()) {
+        match links.get(&peer).filter(|old| !old.conn.closed()) {
             Some(old) if old.dialer != dialer && old.dialer == me.min(peer) => {
-                conn.close(0u32.into(), b"duplicate");
+                conn.close(b"duplicate");
                 return None;
             }
-            Some(old) => old.conn.close(0u32.into(), b"duplicate"),
+            Some(old) => old.conn.close(b"duplicate"),
             None => {
                 self.events.send(Event::Connected(peer)).ok();
             }
@@ -350,7 +401,7 @@ impl Inner {
         Some((input, rx))
     }
 
-    fn unregister(&self, conn: &Connection) {
+    fn unregister(&self, conn: &Conn) {
         let peer = conn.remote_id();
         let mut links = self.links.lock().unwrap();
         if links.get(&peer).is_some_and(|link| link.conn.stable_id() == conn.stable_id()) {
@@ -360,7 +411,7 @@ impl Inner {
     }
 
     /// Runs a connection's streams until it closes. The dialer opens the one `peer` stream.
-    async fn serve(self: Arc<Self>, conn: Connection, dialed: bool, input: mpsc::UnboundedSender<Input>, rx: mpsc::UnboundedReceiver<Input>) {
+    async fn serve(self: Arc<Self>, conn: Conn, dialed: bool, input: mpsc::UnboundedSender<Input>, rx: mpsc::UnboundedReceiver<Input>) {
         let peer = conn.remote_id();
         let mut rx = Some(rx);
         if dialed {
@@ -404,7 +455,7 @@ impl Inner {
     }
 }
 
-async fn open_peer(conn: &Connection) -> Result<(SendStream, RecvStream)> {
+async fn open_peer(conn: &Conn) -> Result<(SendStream, RecvStream)> {
     let (mut send, recv) = conn.open_bi().await?;
     frame::write(&mut send, &Open { stream: Stream::Peer }).await?;
     Ok((send, recv))
@@ -415,15 +466,13 @@ struct Handler(Arc<Inner>);
 
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Inner").field("id", &self.endpoint.id()).finish()
+        f.debug_struct("Inner").field("id", &self.transport.id()).finish()
     }
 }
 
 impl ProtocolHandler for Handler {
-    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        if let Some((input, rx)) = self.0.register(&conn, false) {
-            self.0.clone().serve(conn, false, input, rx).await;
-        }
+    async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
+        self.0.clone().accept(Arc::new(IrohConnection(conn))).await;
         Ok(())
     }
 }
