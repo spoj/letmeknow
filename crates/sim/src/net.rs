@@ -23,8 +23,9 @@ use crate::Rng;
 
 /// Takes a connection an endpoint accepts.
 pub type Accept = Arc<dyn Fn(Conn) + Send + Sync>;
-/// Sees every frame written on a `peer` stream: sender, receiver, and the frame's JSON.
-pub type Inspect = Arc<dyn Fn(EndpointId, EndpointId, &[u8]) + Send + Sync>;
+/// Sees every frame written but those that open streams: sender, receiver, whether the stream is a `peer` one, and the
+/// frame's JSON.
+pub type Inspect = Arc<dyn Fn(EndpointId, EndpointId, bool, &[u8]) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Net(Arc<Mutex<State>>);
@@ -225,8 +226,8 @@ impl State {
     }
 
     /// Writes to a pipe: lost if its connection's path is, else delivered after a latency, in order. Returns the
-    /// frames of a `peer` stream it completed.
-    fn write(&mut self, id: usize, bytes: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    /// frames it completed but one that opens the stream, and whether the stream is a `peer` one.
+    fn write(&mut self, id: usize, bytes: &[u8]) -> io::Result<(bool, Vec<Vec<u8>>)> {
         let pipe = &self.pipes[&id];
         let (conn, from, to) = (pipe.conn, pipe.from, pipe.to);
         if pipe.reset || pipe.fin.is_some() {
@@ -235,7 +236,7 @@ impl State {
         let now = Instant::now();
         self.trace.update([&(id as u64).to_le_bytes()[..], &lmk_proto::clock::now().to_le_bytes(), bytes].concat());
         if self.conns[&conn].cut {
-            return Ok(Vec::new());
+            return Ok((false, Vec::new()));
         }
         let at = (now + self.latency(from, to) + Duration::from_micros(bytes.len() as u64 / 10)).max(self.pipes[&id].last);
         let pipe = self.pipes.get_mut(&id).unwrap();
@@ -253,12 +254,15 @@ impl State {
             }
             let frame: Vec<u8> = pipe.unframed.drain(..4 + len).skip(4).collect();
             match pipe.peer {
-                None => pipe.peer = Some(frame == br#"{"stream":"peer"}"#),
-                Some(true) => frames.push(frame),
-                Some(false) => {}
+                None if frame.starts_with(br#"{"stream":"#) => pipe.peer = Some(frame == br#"{"stream":"peer"}"#),
+                None => {
+                    pipe.peer = Some(false);
+                    frames.push(frame);
+                }
+                Some(_) => frames.push(frame),
             }
         }
-        Ok(frames)
+        Ok((pipe.peer == Some(true), frames))
     }
 }
 
@@ -396,10 +400,10 @@ impl AsyncWrite for Writer {
             let pipe = &st.pipes[&self.pipe];
             (frames, st.inspect.clone(), (pipe.from, pipe.to))
         };
-        let frames = frames?;
+        let (peer, frames) = frames?;
         if let Some(inspect) = inspect {
             for frame in frames {
-                inspect(ends.0, ends.1, &frame);
+                inspect(ends.0, ends.1, peer, &frame);
             }
         }
         Poll::Ready(Ok(buf.len()))

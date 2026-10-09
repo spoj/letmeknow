@@ -39,6 +39,8 @@ const RELAY: &str = "https://relay.sim.invalid";
 const BASE: u64 = 1_767_225_600_000;
 /// How long members stay connected and undisturbed before they must agree: well under the 5-minute resync.
 const CONVERGE: Duration = Duration::from_secs(90);
+/// How often a member reads its logs again, and syncs with its peers anew.
+const RESYNC: Duration = Duration::from_secs(5 * 60);
 /// How long a live message may take to arrive.
 const LIVE_WAIT: Duration = Duration::from_secs(10);
 /// How long an action may take.
@@ -259,9 +261,9 @@ impl World {
             .collect();
         let world = Arc::new(World { net, membership, members: Mutex::new(members), peers: Mutex::default(), book: Mutex::default(), running: Mutex::default() });
         let inspecting = Arc::downgrade(&world);
-        world.net.inspect(Arc::new(move |from, to, frame| {
+        world.net.inspect(Arc::new(move |from, to, peer, frame| {
             if let Some(world) = inspecting.upgrade() {
-                world.inspect(from, to, frame);
+                world.inspect(from, to, peer, frame);
             }
         }));
         world
@@ -626,10 +628,14 @@ impl World {
     // Properties.
 
     /// A member that joins by an invite, as an identity its inviter holds a valid certificate of as it sees it join, is
-    /// introduced to the group by its inviter, in a live message, unless an action in the meantime may have kept it away.
+    /// introduced to the group by its inviter, in a live message, unless an action in the meantime may have kept it away,
+    /// or it does not serve the inviter.
     async fn introduces(&self, m: usize, n: usize, gid: Bytes, disruptions: u64) {
         sleep(LIVE_WAIT).await;
         let (Ok(inviter), Ok(joiner)) = (self.client(m), self.client(n)) else { return };
+        if !joiner.node().serves(&gid.0, &inviter.node().net().id()) {
+            return;
+        }
         let (inviter, joiner) = (fp(&inviter.node().key().0), fp(&joiner.node().key().0));
         let book = self.book.lock().unwrap();
         if book.disruptions != disruptions
@@ -673,6 +679,9 @@ impl World {
                 }
                 book.left.remove(&(i, group, fp));
             }
+            ClientEvent::Gone { group } => {
+                self.book.lock().unwrap().left.retain(|(j, gid, _), _| *j != i || *gid != group);
+            }
             ClientEvent::Introduced { group, by, .. } => {
                 self.book.lock().unwrap().introduced.insert((i, group, by.fp.unwrap_or_default()));
             }
@@ -687,18 +696,18 @@ impl World {
     }
 
     /// Checks a frame on a `peer` stream against the serving rules, as its sender sees them as it sends it.
-    fn inspect(&self, from: EndpointId, to: EndpointId, bytes: &[u8]) {
-        let Ok(frame) = serde_json::from_slice::<Frame>(bytes) else { return };
+    fn inspect(&self, from: EndpointId, to: EndpointId, peer: bool, bytes: &[u8]) {
+        let name = |id: EndpointId| self.members.lock().unwrap().iter().position(|m| m.iroh == id).map_or_else(|| "service".into(), |j| format!("m{j}"));
+        if std::env::var_os("LMK_SIM_FRAMES").is_some() {
+            let text: String = String::from_utf8_lossy(bytes).chars().take(300).collect();
+            self.book.lock().unwrap().log.push(format!("{} {} -> {} {text}", clock(elapsed()), name(from), name(to)));
+        }
+        let Some(frame) = serde_json::from_slice::<Frame>(bytes).ok().filter(|_| peer) else { return };
         let sender = {
             let members = self.members.lock().unwrap();
             members.iter().position(|m| m.iroh == from).and_then(|i| Some((i, members[i].client.clone()?)))
         };
         let Some((i, client)) = sender else { return };
-        let name = |id: EndpointId| self.members.lock().unwrap().iter().position(|m| m.iroh == id).map_or_else(|| id.fmt_short().to_string(), |j| format!("m{j}"));
-        if std::env::var_os("LMK_SIM_FRAMES").is_some() {
-            let text: String = String::from_utf8_lossy(bytes).chars().take(300).collect();
-            self.book.lock().unwrap().log.push(format!("{} m{i} -> {} {text}", clock(elapsed()), name(to)));
-        }
         let node = client.node();
         let groups: Vec<(&str, Bytes)> = match &frame {
             Frame::Hello { groups, .. } => groups.iter().map(|hello| ("hello", hello.group.clone())).collect(),
@@ -753,19 +762,29 @@ impl World {
         }
         sleep(CONVERGE).await;
         self.agreement();
-        let groups = self.converged();
+        let (groups, stale) = self.converged();
         self.revoked(start);
         self.live(&groups).await;
+        if !stale.is_empty() {
+            sleep(RESYNC).await;
+        }
+        for (i, gid, latest) in stale {
+            if self.client(i).is_ok_and(|client| client.node().epoch(&gid.0).is_ok_and(|epoch| epoch < latest)) {
+                self.fail("convergence", format!("m{i} still holds {}, whose epoch {latest} it is not in", b64(&gid.0)));
+            }
+        }
         if let Some(panic) = PANICS.with_borrow(|panics| panics.first().cloned()) {
             self.fail("panic", panic);
         }
     }
 
-    /// Each group's members, as its latest epoch shows them, checked to have converged; with each one's node.
-    fn converged(&self) -> Vec<(Bytes, Holders)> {
+    /// Each group's members, as its latest epoch shows them, checked to have converged, with each one's node; and those
+    /// that hold a group whose latest epoch they are not in, with that epoch, which they learn of from no peer, as none
+    /// serves them the group any more, but by reading its log within 5 minutes.
+    fn converged(&self) -> (Vec<(Bytes, Holders)>, Vec<(usize, Bytes, u64)>) {
         let clients = self.clients();
         let gids: BTreeSet<Bytes> = clients.iter().flat_map(|(_, c)| c.node().groups()).collect();
-        let mut groups = Vec::new();
+        let (mut groups, mut stale_holders) = (Vec::new(), Vec::new());
         for gid in gids {
             let holders: Vec<(usize, Node<Store>)> = clients.iter().filter(|(_, c)| c.node().groups().contains(&gid)).map(|(i, c)| (*i, c.node().clone())).collect();
             let Some((latest, keys)) = holders
@@ -777,9 +796,7 @@ impl World {
             };
             let group = b64(&gid.0);
             let (inside, stale): (Vec<_>, Vec<_>) = holders.into_iter().partition(|(_, node)| keys.contains(&node.key()));
-            for (i, _) in &stale {
-                self.fail("convergence", format!("m{i} still holds {group}, whose epoch {latest} it is not in"));
-            }
+            stale_holders.extend(stale.into_iter().map(|(i, _)| (i, gid.clone(), latest)));
             for (i, node) in &inside {
                 if node.epoch(&gid.0).ok() != Some(latest) {
                     self.fail("convergence", format!("m{i} is at epoch {:?} of {group}, not {latest}", node.epoch(&gid.0).ok()));
@@ -801,7 +818,7 @@ impl World {
             self.delivered(&gid, &inside);
             groups.push((gid, inside));
         }
-        groups
+        (groups, stale_holders)
     }
 
     /// A member that gave up a message an action sent told its sender, if the sender is still in the group.
