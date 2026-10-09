@@ -4,7 +4,7 @@
 // identity adds his phone by a device link, and the phone joins a chat open to that identity by itself; the laptop keeps
 // everything across a reload, a second tab works through the first and takes over when it closes; introductions,
 // refusals, files kept and deleted, a git group's pushes and chat, and the service worker's updates.
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +34,11 @@ function native(name) {
   return {
     proc,
     run: (...args) => JSON.parse(execFileSync(BIN, ["--session", name, ...args], { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })),
+    /** As `run`, while the test goes on watching the pages. */
+    start: (...args) =>
+      new Promise((resolve, reject) =>
+        execFile(BIN, ["--session", name, ...args], { env, encoding: "utf8" }, (error, stdout) => (error ? reject(error) : resolve(JSON.parse(stdout))))
+      ),
     /** The first event it printed that `predicate` accepts. */
     printed: (predicate, ms = 30_000) =>
       new Promise((resolve, reject) => {
@@ -322,8 +327,9 @@ try {
   check(link.includes("#2.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
   const tablet = native("tablet");
   await tablet.printed(e => e.type === "ready");
-  tablet.run("join", link);
+  const joining = tablet.start("join", link);
   await laptop.getByText("Added. The device now joins your chats and documents.").waitFor();
+  await joining;
   await until(
     () => laptop.locator(".devices li").count(),
     n => n === 2
