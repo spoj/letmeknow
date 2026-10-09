@@ -169,7 +169,6 @@ def git_kind(alice, bob, dave, listeners):
     git("alice", "add", "late.txt", cwd=ours)
     git("alice", "commit", "-qm", "while bob is away", cwd=ours)
     failed = git("alice", "push", "team", "main", cwd=ours, ok=False)
-    print("DEBUG", failed.returncode, failed.stderr, failed.stdout)
     check(failed.returncode != 0 and "no other member is online" in failed.stderr, "a push with no other member online fails and says so")
     bob = Listener("bob")
     listeners.append(bob)
