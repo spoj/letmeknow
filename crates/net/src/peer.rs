@@ -1,5 +1,6 @@
-//! A `peer` stream: hello and head swap, commits, negentropy message sync, live messages, doc
-//! catch-up, want and have, and join requests. Every group frame is served only to a member.
+//! A `peer` stream: hello and head swap, commits, negentropy message sync, live messages, want and
+//! have, join requests, and kinds' frames and state links. Every group frame is served only to a
+//! member.
 //!
 //! Negentropy tells only its initiator what each side lacks, so a sync runs two rounds: the
 //! dialer initiates and pushes what the acceptor lacks, then ends its round with an empty
@@ -205,16 +206,8 @@ impl Session {
                 let refused = refused.iter().filter_map(|r| Some((id(&r.id)?, r.reason.clone()))).collect();
                 self.inner.events.send(Event::Receipt { group: group.0, peer: self.peer, held, refused }).ok();
             }
-            Frame::Doc { group, snapshot } if self.member(&group.0) => {
-                if self.inner.groups.doc(&group.0).is_some_and(|ours| ours[..] != snapshot.0[..]) {
-                    let sv = Bytes(self.inner.groups.doc_sv(&group.0));
-                    self.write(&Frame::DocSv { group, sv }).await?;
-                }
-            }
-            Frame::DocSv { group, sv } if self.member(&group.0) => match self.inner.groups.diff(&group.0, &sv.0) {
-                Ok(diff) => self.write(&Frame::Messages { group, items: vec![Bytes(diff)] }).await?,
-                Err(e) => tracing::warn!("no diff for {}: {e:#}", self.peer.fmt_short()),
-            },
+            Frame::Kind(frame) if self.member(&frame.group.0) => self.inner.groups.frame(self.peer, frame),
+            Frame::State { group, link } if self.member(&group.0) => self.inner.groups.state(&group.0, self.peer, link),
             Frame::Want { group, files } => {
                 let mut have = Vec::new();
                 if self.member(&group.0) {
@@ -310,9 +303,7 @@ impl Session {
             return Ok(());
         }
         state.synced = Some(mine.head.length);
-        if let Some(snapshot) = self.inner.groups.doc(&group.0) {
-            self.write(&Frame::Doc { group: group.clone(), snapshot: snapshot.into() }).await?;
-        }
+        self.inner.events.send(Event::InStep { group: group.0.clone(), peer: self.peer }).ok();
         self.want(group).await?;
         if self.dialer {
             let state = self.groups.get_mut(group).unwrap();

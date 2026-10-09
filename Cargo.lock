@@ -2911,7 +2911,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "yrs",
 ]
 
 [[package]]

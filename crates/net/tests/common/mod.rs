@@ -1,5 +1,5 @@
 //! A local relay with a self-signed certificate, and a fake of the group logic: epochs are log
-//! lengths, and a "ciphertext" is `epoch ‖ kind ‖ body`, kind 0 a message, kind 1 a doc diff.
+//! lengths, and a "ciphertext" is `epoch ‖ kind ‖ body`, kind 0 a held message, kind 1 a live one.
 
 #![allow(dead_code)]
 
@@ -23,16 +23,12 @@ use lmk_proto::{
     Answer, Bytes,
     head::{self, Head},
     links::FileLink,
-    peer::{Admitted, Hello, InviteRequest, List},
+    peer::{Admitted, Hello, InviteRequest, KindFrame, List},
 };
 use n0_future::boxed::BoxFuture;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
-use yrs::{
-    Doc, ReadTxn, StateVector, Transact, Update,
-    updates::{decoder::Decode, encoder::Encode},
-};
 
 pub const WAIT: Duration = Duration::from_secs(30);
 
@@ -172,7 +168,7 @@ pub struct Group {
     pub joined: u64,
     pub held: BTreeMap<[u8; 32], (u64, Vec<u8>)>,
     pub given_up: BTreeMap<[u8; 32], u64>,
-    pub doc: Option<Doc>,
+    pub live: Vec<Vec<u8>>,
     pub files: Vec<FileLink>,
     /// Takes no entries from peers, as when they reach it only from the service; counts those offered.
     pub frozen: bool,
@@ -206,6 +202,9 @@ pub struct Fake {
     /// The device lists it presents, and those peers presented to it.
     pub lists: Mutex<Vec<List>>,
     pub presented: Mutex<Vec<(EndpointId, List)>>,
+    /// Kinds' frames and state links from peers.
+    pub frames: Mutex<Vec<(EndpointId, KindFrame)>>,
+    pub states: Mutex<Vec<(Vec<u8>, EndpointId, String)>>,
 }
 
 impl Fake {
@@ -216,6 +215,8 @@ impl Fake {
             cut: Mutex::default(),
             lists: Mutex::default(),
             presented: Mutex::default(),
+            frames: Mutex::default(),
+            states: Mutex::default(),
         })
     }
 
@@ -235,13 +236,6 @@ impl Fake {
 
     pub fn log(&self, group: &[u8]) -> Vec<Vec<u8>> {
         self.groups.lock().unwrap()[group].log.clone()
-    }
-
-    pub fn text(&self, group: &[u8]) -> String {
-        let groups = self.groups.lock().unwrap();
-        let doc = groups[group].doc.as_ref().unwrap();
-        let text = doc.get_or_insert_text("text");
-        yrs::GetString::get_string(&text, &doc.transact())
     }
 
     fn chain_of(log: &[Vec<u8>], group: &[u8], n: usize) -> [u8; 32] {
@@ -326,29 +320,17 @@ impl Groups for Fake {
             0 => {
                 g.held.insert(id(ciphertext), (epoch, ciphertext.to_vec()));
             }
-            _ => {
-                let update = Update::decode_v1(&ciphertext[9..]).unwrap();
-                g.doc.as_ref().unwrap().transact_mut().apply_update(update).unwrap();
-            }
+            _ => g.live.push(ciphertext.to_vec()),
         }
         Taken::Held
     }
 
-    fn doc(&self, group: &[u8]) -> Option<[u8; 32]> {
-        let groups = self.groups.lock().unwrap();
-        let doc = groups[group].doc.as_ref()?;
-        Some(Sha256::digest(doc.transact().snapshot().encode_v1()).into())
+    fn frame(&self, peer: EndpointId, frame: KindFrame) {
+        self.frames.lock().unwrap().push((peer, frame));
     }
 
-    fn doc_sv(&self, group: &[u8]) -> Vec<u8> {
-        self.groups.lock().unwrap()[group].doc.as_ref().unwrap().transact().state_vector().encode_v1()
-    }
-
-    fn diff(&self, group: &[u8], sv: &[u8]) -> Result<Vec<u8>> {
-        let groups = self.groups.lock().unwrap();
-        let g = &groups[group];
-        let update = g.doc.as_ref().unwrap().transact().encode_state_as_update_v1(&StateVector::decode_v1(sv)?);
-        Ok([&(g.log.len() as u64).to_be_bytes()[..], &[1], &update].concat())
+    fn state(&self, group: &[u8], peer: EndpointId, link: String) {
+        self.states.lock().unwrap().push((group.to_vec(), peer, link));
     }
 
     fn files(&self, group: &[u8]) -> Vec<FileLink> {
