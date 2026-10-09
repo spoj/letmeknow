@@ -1,13 +1,14 @@
 //! One member's session over lmk-core, lmk-net and lmk-membership: its groups and their logs, its held messages and
-//! files, its invites and joins, and the identities of its device. A group's kind sees its content through the channels
-//! here (held and live messages, frames to one member, files, and a state link for joiners), and nothing of the rest;
-//! the core reads only its own payloads (`Control`) and a devices group's contacts. It stores everything through the
-//! core's `Provider`, so the same code runs natively (SQLite) and in the browser (memory the web client persists).
+//! files, its invites and joins, and its members' identities: their key logs and certificates. A group's kind sees its
+//! content through the channels here (held and live messages, frames to one member, files, a log, and a state link for
+//! joiners), and nothing of the rest; the core reads only its own payloads (`Control`). The devices kind (`devices`) is
+//! built on those channels. It stores everything through the core's `Provider`, so the same code runs natively (SQLite)
+//! and in the browser (memory the web client persists).
 
+pub mod devices;
 mod groups;
 mod kindlog;
 mod logs;
-mod yjs;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -17,16 +18,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context, Result, bail, ensure};
 use iroh::tls::CaTlsConfig;
 use iroh::{EndpointId, RelayMap, RelayUrl, SecretKey};
-use lmk_core::contacts::{Contact, Contacts};
 use lmk_core::device::Device;
-use lmk_core::group::{self as core, Change, Group, Session, Window, devices_settings, with_opening};
-use lmk_core::identity::{self, DeviceList, Verdict, check};
-use lmk_core::invite::{Invites, Target};
+use lmk_core::group::{self as core, Change, Group, Session, Window};
+use lmk_core::identity::{KeyLog, certified, check};
+use lmk_core::invite::Invites;
 use lmk_core::provider::Provider;
 use lmk_membership::{Chain, Refused};
 use lmk_net::Net;
-use lmk_proto::group::{CHAT, ContactsUpdate, Credential, How, IdentityRef, Leaf, Opening, Service, Settings, held_by_type};
+use lmk_proto::group::{CHAT, Credential, How, IdentityRef, Leaf, Opening, Settings, held_by_type};
 use lmk_proto::head::Head;
+use lmk_proto::identity::Envelope;
 use lmk_proto::links::{FileLink, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Frame, KindFrame};
 use lmk_proto::{Answer, Bytes};
@@ -53,8 +54,11 @@ const REDIAL: Duration = Duration::from_secs(10);
 const RESYNC: Duration = Duration::from_secs(5 * 60);
 /// How often files no group holds any longer are deleted.
 const COLLECT: Duration = Duration::from_secs(60 * 60);
-/// How long a fetched device list counts as fresh, in milliseconds.
-const LIST_FRESH: u64 = 10 * 60 * 1000;
+/// How long a copy of a key log counts as fresh, in milliseconds.
+const KEYS_FRESH: u64 = 10 * 60 * 1000;
+/// How long a member connected to this session may go without a valid certificate of the identity it speaks as before
+/// it is removed, in milliseconds.
+const CERTIFICATE_GRACE: u64 = 60 * 1000;
 /// How long a fetch keeps looking for a member that holds the file.
 const FETCH_TRIES: u32 = 12;
 /// How long an inviter waits for the state of a group's kind.
@@ -67,8 +71,8 @@ const COMMIT_TRIES: u32 = 5;
 pub struct Config {
     /// The session's name, fixed when it is created.
     pub name: String,
-    /// Whether the device's own key is the session's: a device's node, or a browser.
-    pub device_key: bool,
+    /// The device whose key is the session's: a device's node, or a browser's one session.
+    pub device: Option<Device>,
     pub relay: RelayUrl,
     pub ca: CaTlsConfig,
     /// `LETMEKNOW_HOME`, where sessions of one device publish their addresses.
@@ -83,7 +87,7 @@ pub struct Config {
     pub kinds: Vec<String>,
 }
 
-/// A group member, from its leaf and credential, checked against its identity's device list.
+/// A group member, from its leaf and credential, and its certificate checked against its identity's key log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     /// The session key: the MLS signature key.
@@ -91,22 +95,22 @@ pub struct Member {
     /// The iroh key its leaf names.
     pub iroh: Bytes,
     pub name: String,
-    pub device: Bytes,
+    /// The name of its device, as its certificate says.
     pub device_name: String,
     pub identity: Option<Claim>,
     /// Who added it, by session key, and how; none for the group's creator and this session.
     pub added: Option<(Bytes, How)>,
 }
 
-/// The identity a member speaks as, checked against its device list.
+/// The identity a member speaks as, its certificate checked against the identity's key log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub identity: IdentityRef,
-    /// The identity's own name, from its device list: a claim.
+    /// The identity's own name, from its key log: a claim.
     pub name: String,
     /// Why the check failed, if it did.
     pub error: Option<String>,
-    /// For a device another device of its identity added: that device's name.
+    /// For a device another device of its identity added: that device's name, as the certificate claims.
     pub added_by_device: Option<String>,
 }
 
@@ -235,6 +239,31 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// The group an event concerns, if one.
+    pub fn group(&self) -> Option<&Bytes> {
+        match self {
+            Event::Joined { group, .. }
+            | Event::Left { group, .. }
+            | Event::Removed { group, .. }
+            | Event::Settings { group, .. }
+            | Event::Live { group, .. }
+            | Event::Frame { group, .. }
+            | Event::Synced { group }
+            | Event::InStep { group, .. }
+            | Event::State { group, .. }
+            | Event::Logged { group }
+            | Event::Snapshot { group, .. }
+            | Event::Introduced { group, .. }
+            | Event::Held { group, .. }
+            | Event::Refused { group, .. } => Some(group),
+            Event::Message(message) => Some(&message.group),
+            Event::Warning { group, .. } => group.as_ref(),
+            Event::File(_) => None,
+        }
+    }
+}
+
 /// A group's own record, beside its MLS state.
 #[derive(Default, Serialize, Deserialize)]
 struct Rec {
@@ -313,16 +342,16 @@ pub(crate) struct G {
     asked: u64,
 }
 
-/// A device list, the entries and signed head it was read from, and since when it counts as fresh: when it was read
-/// from its service or, for a copy a peer presented, its head's time.
+/// A key log, the entries and signed head it was read from, and since when it counts as fresh: when it was read from
+/// its service or, for a copy a peer presented, its head's time.
 pub(crate) struct Known {
-    list: DeviceList,
+    log: KeyLog,
     entries: Vec<Bytes>,
     head: Head,
     at: u64,
 }
 
-/// How a copy of a device list compares with the one held.
+/// How a copy of a key log compares with the one held.
 #[derive(Debug, PartialEq, Eq)]
 enum Compared {
     /// They differ in an entry both have: the service showed two lists.
@@ -352,13 +381,16 @@ impl Known {
 pub(crate) struct State<P> {
     provider: P,
     session: Session,
-    device: Device,
     groups: HashMap<Vec<u8>, G>,
     invites: Invites,
     /// Joiners' session keys, and the `--for` of the invites they redeemed.
     labels: HashMap<Vec<u8>, String>,
-    /// Device lists, by identity id.
-    lists: HashMap<Vec<u8>, Known>,
+    /// Key logs, by identity id.
+    keys: HashMap<Vec<u8>, Known>,
+    /// Members' certificates, this session's own among them, by session key and identity id.
+    certificates: HashMap<(Vec<u8>, Vec<u8>), Envelope>,
+    /// Members connected to this session without a valid certificate, by session key: since when.
+    uncertified: HashMap<Vec<u8>, u64>,
     /// `send`s waiting for receipts.
     waiters: HashMap<[u8; 32], mpsc::UnboundedSender<(EndpointId, Option<String>)>>,
 }
@@ -441,9 +473,13 @@ fn rec_key(gid: &[u8]) -> Vec<u8> {
     [b"node/group/".as_slice(), gid].concat()
 }
 
-/// A devices group's contacts; in 0.10, a doc's state too.
+/// A doc's state, as 0.10 kept it.
 fn doc_key(gid: &[u8]) -> Vec<u8> {
     [b"node/doc/".as_slice(), gid].concat()
+}
+
+fn kind_key(key: &str) -> Vec<u8> {
+    [b"kind/", key.as_bytes()].concat()
 }
 
 fn entry_key(gid: &[u8], position: u64) -> Vec<u8> {
@@ -480,14 +516,6 @@ impl<P: Provider> State<P> {
         put(&self.provider, b"node/groups", &gids)
     }
 
-    fn contacts_state(&self, gid: &[u8]) -> Result<Vec<u8>> {
-        self.provider.get(&doc_key(gid))?.context("the group has no contacts")
-    }
-
-    fn devices(&self, gid: &[u8]) -> bool {
-        self.groups.get(gid).is_some_and(|g| g.mls.settings().devices_of.is_some())
-    }
-
     /// The iroh key of the member with a fingerprint: the first 8 bytes of SHA-256 of its session key, hex.
     fn by_fp(&self, gid: &[u8], fp: &str) -> Result<EndpointId> {
         let members = self.group(gid)?.mls.members();
@@ -504,32 +532,35 @@ impl<P: Provider> State<P> {
             let by = g.mls.members().into_iter().find(|m| m.credential.as_ref() == Some(&added.by));
             Some((Bytes(by.map(|by| by.key).unwrap_or_default()), added.how.unwrap_or(How::Invite)))
         });
-        let identity = credential.identity.clone().map(|identity| self.claim(&credential, &member.key, identity));
+        let claim = credential.identity.as_ref().map(|identity| self.claim(&credential, identity));
+        let device_name = claim.as_ref().and_then(|(_, device)| device.clone()).unwrap_or_default();
         Some(Member {
             key: Bytes(member.key.clone()),
             iroh: member.leaf.as_ref().map(|leaf| leaf.key.clone()).unwrap_or_default(),
             name: credential.name,
-            device: credential.device,
-            device_name: credential.device_name,
-            identity,
+            device_name,
+            identity: claim.map(|(claim, _)| claim),
             added,
         })
     }
 
-    fn claim(&self, credential: &Credential, key: &[u8], identity: IdentityRef) -> Claim {
-        let Some(Known { list, .. }) = self.lists.get(&identity.id.0) else {
-            let error = Some("its identity's device list could not be read yet".into());
-            return Claim { identity, name: String::new(), error, added_by_device: None };
+    /// The certificate held of a member speaking as an identity.
+    fn certificate(&self, credential: &Credential, identity: &[u8]) -> Option<&Envelope> {
+        self.certificates.get(&(credential.key.0.clone(), identity.to_vec()))
+    }
+
+    /// The identity a member speaks as, checked; and its device's name, if its certificate checks out.
+    fn claim(&self, credential: &Credential, identity: &IdentityRef) -> (Claim, Option<String>) {
+        let identity = identity.clone();
+        let Some(Known { log, .. }) = self.keys.get(&identity.id.0) else {
+            let error = Some("its identity's key could not be read yet".into());
+            return (Claim { identity, name: String::new(), error, added_by_device: None }, None);
         };
-        let error = match check(credential, key, Some(list)) {
-            Verdict::Verified | Verdict::NoIdentity => None,
-            Verdict::NotListed => Some(format!("its device is not on {}'s device list", list.name)),
-            Verdict::BadSignature => Some("its device did not sign its key".into()),
-        };
-        let listed = list.devices.iter().find(|listed| listed.key == credential.device).filter(|l| l.by != l.key);
-        let added_by_device =
-            listed.and_then(|listed| list.devices.iter().find(|by| by.key == listed.by)).map(|by| by.name.clone());
-        Claim { identity, name: list.name.clone(), error, added_by_device }
+        let name = log.name.clone();
+        match check(self.certificate(credential, &identity.id.0), credential, log, now()) {
+            Ok(certified) => (Claim { identity, name, error: None, added_by_device: certified.added_by }, Some(certified.device)),
+            Err(error) => (Claim { identity, name, error: Some(error.into()), added_by_device: None }, None),
+        }
     }
 
     fn members(&self, gid: &[u8]) -> Result<Vec<Member>> {
@@ -548,34 +579,28 @@ impl<P: Provider> State<P> {
             key: Bytes::default(),
             iroh: Bytes(iroh.as_bytes().to_vec()),
             name: String::new(),
-            device: Bytes::default(),
             device_name: String::new(),
             identity: None,
             added: None,
         })
     }
 
-    /// The identities a group's members speak as, and the one a devices group is of.
+    /// The identities a group's members speak as.
     fn identities(&self, gid: &[u8]) -> Vec<IdentityRef> {
         let Some(g) = self.groups.get(gid) else { return Vec::new() };
-        let settings = g.mls.settings();
-        let devices_of = settings.devices_of.map(|id| IdentityRef { id, membership: settings.membership.clone() });
-        g.mls.members().into_iter().filter_map(|m| m.credential?.identity).chain(devices_of).collect()
+        g.mls.members().into_iter().filter_map(|m| m.credential?.identity).collect()
     }
 
-    fn devices_group(&self, identity: &[u8]) -> Option<Vec<u8>> {
-        self.groups
-            .iter()
-            .find(|(_, g)| g.mls.settings().devices_of.is_some_and(|of| of.0 == identity))
-            .map(|(gid, _)| gid.clone())
+    /// Persists this session's own certificates.
+    fn save_certificates(&self) -> Result<()> {
+        let me = self.session.key();
+        let own: Vec<&Envelope> = self.certificates.iter().filter(|((key, _), _)| key == me).map(|(_, c)| c).collect();
+        put(&self.provider, b"node/certificates", &own)
     }
 
-    /// A new group's records, and its MLS state; a devices group's with its contacts.
+    /// A new group's records, and its MLS state.
     fn add_group(&mut self, mls: Group, rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
-        if mls.settings().devices_of.is_some() {
-            self.provider.put(&doc_key(&gid), &Contacts::default().state())?;
-        }
         self.groups.insert(gid.clone(), G { mls, rec, future: Vec::new(), own_at: None, follow: None, follow_log: None, asked: 0 });
         self.save(&gid)?;
         self.save_groups()?;
@@ -585,7 +610,7 @@ impl<P: Provider> State<P> {
 
 impl<P: Provider + Send + 'static> Node<P> {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
-    pub async fn start(provider: P, mut device: Device, config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
+    pub async fn start(provider: P, config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let secret = match provider.get(b"node/iroh")? {
             Some(bytes) => SecretKey::from_bytes(&bytes.as_slice().try_into().context("an iroh key is 32 bytes")?),
             None => {
@@ -597,12 +622,10 @@ impl<P: Provider + Send + 'static> Node<P> {
         let relays = RelayMap::from(iroh::RelayConfig::new(config.relay.clone(), Some(Default::default())));
         let endpoint = lmk_net::builder(relays).secret_key(secret).ca_tls_config(config.ca).bind().await?;
         let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone() };
-        let mut session = match provider.get(b"session")? {
-            Some(_) => Session::load(&provider)?,
-            None if config.device_key => {
-                Session::create_with(&provider, device.signer(), &device, &config.name, None, leaf.clone())?
-            }
-            None => Session::create(&provider, &device, &config.name, None, leaf.clone())?,
+        let mut session = match (provider.get(b"session")?, &config.device) {
+            (Some(_), _) => Session::load(&provider)?,
+            (None, Some(device)) => Session::create_with(&provider, device.signer(), &config.name, leaf.clone())?,
+            (None, None) => Session::create(&provider, &config.name, leaf.clone())?,
         };
         if session.leaf != leaf {
             session.set_leaf(&provider, leaf)?;
@@ -618,25 +641,22 @@ impl<P: Provider + Send + 'static> Node<P> {
             if let Some(chain) = rec.log.as_ref().and_then(|log| log.chain.clone()) {
                 logs.client(&mls.settings().membership)?.set_chain(chain);
             }
-            // A device that stopped after joining an identity's devices group, before it was saved, is on the identity.
-            let settings = mls.settings();
-            if let Some(id) = settings.devices_of
-                && !device.identities.iter().any(|identity| identity.id == id)
-            {
-                device.identities.push(IdentityRef { id, membership: settings.membership });
-            }
             groups.insert(gid.0, G { mls, rec, future: Vec::new(), own_at: None, follow: None, follow_log: None, asked: 0 });
         }
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
+        let key = session.key().to_vec();
+        let own: Vec<Envelope> = get(&provider, b"node/certificates")?.unwrap_or_default();
+        let certificates = own.into_iter().filter_map(|c| Some(((key.clone(), certified(&c)?.identity.0), c))).collect();
         let state = State {
             provider,
             session,
-            device,
             groups,
             invites: Invites::default(),
             labels: HashMap::new(),
-            lists: HashMap::new(),
+            keys: HashMap::new(),
+            certificates,
+            uncertified: HashMap::new(),
             waiters: HashMap::new(),
         };
         let inner = Arc::new(Inner {
@@ -708,10 +728,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         (*self.inner.net().id().as_bytes(), self.inner.relay.clone())
     }
 
-    pub fn device(&self) -> Device {
-        self.inner.state.lock().unwrap().device.clone()
-    }
-
     pub fn groups(&self) -> Vec<Bytes> {
         self.inner.state.lock().unwrap().groups.keys().map(|gid| Bytes(gid.clone())).collect()
     }
@@ -763,46 +779,46 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(Bytes(gid))
     }
 
-    /// An invite link into a group, or with `Target::Device`, to this device's identity.
-    pub fn invite(&self, target: Target, label: Option<String>, to: Option<Vec<u8>>) -> Result<String> {
-        if let Target::Group(gid) = &target {
-            ensure!(self.settings(gid)?.devices_of.is_none(), "a devices group takes devices by a device link, not an invite");
-        }
-        let device = matches!(target, Target::Device(_));
-        let secret = self.inner.state.lock().unwrap().invites.make(target, label, to, now()).secret;
+    /// An invite into a group: `--for` a contact name, or `--to` an identity.
+    pub fn invite(&self, gid: &[u8], label: Option<String>, to: Option<Vec<u8>>) -> Result<Invite> {
+        self.settings(gid)?;
+        let secret = self.inner.state.lock().unwrap().invites.make(gid.to_vec(), label, to, now()).secret;
         let (key, relay) = self.address();
         let ours: RelayUrl = RELAY.parse()?;
-        Ok(Invite { device, key, secret, relay: (relay != ours).then(|| relay.to_string()) }.link())
+        Ok(Invite { device: false, key, secret, relay: (relay != ours).then(|| relay.to_string()) })
     }
 
-    /// Joins through an invite link, speaking as `identity`; a device link adds this device to an identity.
+    /// Joins through an invite link, speaking as `identity`, with this session's certificate of it.
     pub async fn join(&self, link: &Invite, identity: Option<IdentityRef>) -> Result<Bytes> {
-        let key_package = {
+        let (key_package, certificate) = {
             let mut st = self.inner.state.lock().unwrap();
-            st.session.credential.identity = if link.device { None } else { identity };
-            st.session.key_package(&st.provider)?
+            let certificate = identity.as_ref().and_then(|identity| st.certificate(&st.session.credential, &identity.id.0).cloned());
+            st.session.credential.identity = identity;
+            (st.session.key_package(&st.provider)?, certificate)
         };
-        let admitted = match self.inner.net().redeem(link, key_package).await? {
+        let admitted = match self.inner.net().redeem(link, key_package, certificate).await? {
             Answer::Ok(admitted) => admitted,
             Answer::Refused { refused } => bail!("refused: {refused}"),
         };
         self.inner.welcomed(admitted, link.key).await
     }
 
-    /// Asks members of an open group to admit this session, speaking as `identity`.
+    /// Asks members of an open group to admit this session, speaking as `identity`, with its certificate of it.
     pub async fn join_open(&self, opening: &Opening, identity: IdentityRef) -> Result<Bytes> {
         ensure!(self.inner.kinds.contains(&opening.kind), "this session does not support {} groups", opening.kind);
-        let key_package = {
+        let (key_package, certificate) = {
             let mut st = self.inner.state.lock().unwrap();
+            let certificate = st.certificate(&st.session.credential, &identity.id.0).cloned();
+            let certificate = certificate.context("this session has no certificate of that identity yet")?;
             st.session.credential.identity = Some(identity);
-            st.session.key_package(&st.provider)?
+            (st.session.key_package(&st.provider)?, certificate)
         };
         let mut refusal = anyhow::anyhow!("no member of the group is online");
         for key in &opening.members {
             let Some(peer) = endpoint_id(&key.0) else {
                 continue;
             };
-            let asked = self.inner.net().join(peer, self.inner.relay.clone(), &opening.group.0, key_package.clone());
+            let asked = self.inner.net().join(peer, self.inner.relay.clone(), &opening.group.0, key_package.clone(), certificate.clone());
             match timeout(RECEIPT_WAIT * 4, asked).await {
                 Ok(Ok(Answer::Ok(admitted))) => {
                     return self.inner.welcomed(admitted, *peer.as_bytes()).await;
@@ -942,11 +958,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// A doc's state as 0.10 kept it, before the doc kind kept its own.
     pub fn legacy_doc(&self, gid: &[u8]) -> Result<Option<Vec<u8>>> {
-        let st = self.inner.state.lock().unwrap();
-        if st.devices(gid) {
-            return Ok(None);
-        }
-        st.provider.get(&doc_key(gid))
+        self.inner.state.lock().unwrap().provider.get(&doc_key(gid))
     }
 
     /// Deletes a doc's state as 0.10 kept it, once the doc kind keeps it.
@@ -983,6 +995,19 @@ impl<P: Provider + Send + 'static> Node<P> {
         message.payload = payload;
         put(&st.provider, &message_key(id), &message)?;
         st.provider.scrub()
+    }
+
+    /// A record of a kind built into the client, kept with the session's own.
+    pub fn record(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.state.lock().unwrap().provider.get(&kind_key(key))
+    }
+
+    pub fn put_record(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.inner.state.lock().unwrap().provider.put(&kind_key(key), value)
+    }
+
+    pub fn delete_record(&self, key: &str) -> Result<()> {
+        self.inner.state.lock().unwrap().provider.delete(&kind_key(key))
     }
 
     /// Leaves in this session's files no copy of what it deleted.
@@ -1047,91 +1072,67 @@ impl<P: Provider + Send + 'static> Node<P> {
         holders
     }
 
-    // Identities: their device lists, the devices group, contacts and openings.
+    // Identities: their key logs, and certificates.
 
-    /// This device's identities, with their names.
-    pub fn identities(&self) -> Vec<(IdentityRef, String)> {
+    /// The newest copy of an identity's key log, read from its service unless a copy is fresh.
+    pub async fn key_log(&self, identity: &IdentityRef) -> Result<KeyLog> {
+        let fresh = self.inner.state.lock().unwrap().keys.get(&identity.id.0).filter(|known| known.at + KEYS_FRESH >= now()).map(|known| known.log.clone());
+        match fresh {
+            Some(log) => Ok(log),
+            None => self.inner.read_keys(identity).await,
+        }
+    }
+
+    /// An identity's key log, read from its service now.
+    pub async fn read_key_log(&self, identity: &IdentityRef) -> Result<KeyLog> {
+        self.inner.read_keys(identity).await
+    }
+
+    /// The key log held of an identity, however old.
+    pub fn held_key_log(&self, identity: &[u8]) -> Option<KeyLog> {
+        self.inner.state.lock().unwrap().keys.get(identity).map(|known| known.log.clone())
+    }
+
+    /// Appends a sealed entry to an identity's key log, and reads the log.
+    pub async fn append_identity(&self, identity: &IdentityRef, entry: &[u8]) -> Result<KeyLog> {
+        let log = lmk_proto::identity::address(&identity.id.0);
+        self.inner.logs.client(&identity.membership)?.append(&log, entry).await?;
+        self.inner.read_keys(identity).await
+    }
+
+    /// The identities this session speaks as in its groups.
+    pub fn spoken(&self) -> Vec<IdentityRef> {
         let st = self.inner.state.lock().unwrap();
-        let name = |identity: &IdentityRef| {
-            let devices =
-                st.devices_group(&identity.id.0).and_then(|gid| st.groups.get(&gid).map(|g| g.mls.settings().name));
-            devices.unwrap_or_default()
-        };
-        st.device.identities.iter().map(|identity| (identity.clone(), name(identity))).collect()
-    }
-
-    /// Starts an identity with this device on its list, and its devices group.
-    pub async fn identity_create(&self, name: &str, membership: Service) -> Result<IdentityRef> {
-        let (id, entry) = {
-            let st = self.inner.state.lock().unwrap();
-            identity::create(&st.device, name, membership.clone())
-        };
-        self.inner.logs.client(&membership)?.append(&lmk_proto::identity::address(&id), &entry).await?;
-        let identity = IdentityRef { id: id.into(), membership: membership.clone() };
-        let gid = {
-            let mut st = self.inner.state.lock().unwrap();
-            let st = &mut *st;
-            st.device.identities.push(identity.clone());
-            st.session.credential.identity = None;
-            let mls =
-                Group::create(&st.provider, &st.session, &devices_settings(&id, name, membership), self.inner.window)?;
-            st.add_group(mls, Rec::default())?
-        };
-        self.inner.follow(&gid);
-        Ok(identity)
-    }
-
-    /// An identity's device list, read from its service.
-    pub async fn device_list(&self, identity: &IdentityRef) -> Result<DeviceList> {
-        self.inner.list(identity).await
-    }
-
-    /// Takes a device off one of this device's identities; its sessions then leave every group this session is in.
-    pub async fn remove_device(&self, identity: &IdentityRef, device: &[u8]) -> Result<()> {
-        let list = self.inner.list(identity).await?;
-        ensure!(list.has(device), "that device is not on the list");
-        let entry = list.remove(&self.inner.state.lock().unwrap().device, device);
-        self.inner
-            .logs
-            .client(&identity.membership)?
-            .append(&lmk_proto::identity::address(&identity.id.0), &entry)
-            .await?;
-        self.inner.list(identity).await.map(drop)
-    }
-
-    /// The contacts of this device's identities.
-    pub fn contacts(&self) -> Result<Vec<(Bytes, Contact)>> {
-        let st = self.inner.state.lock().unwrap();
-        let mut all = Vec::new();
-        for identity in &st.device.identities {
-            if let Some(gid) = st.devices_group(&identity.id.0) {
-                all.extend(Contacts::load(&st.contacts_state(&gid)?)?.all());
+        let mut spoken: Vec<IdentityRef> = Vec::new();
+        for g in st.groups.values() {
+            let me = g.mls.members().into_iter().find(|m| m.key == st.session.key());
+            if let Some(identity) = me.and_then(|me| me.credential?.identity)
+                && !spoken.contains(&identity)
+            {
+                spoken.push(identity);
             }
         }
-        Ok(all)
+        spoken
     }
 
-    /// Sets a contact of this device's first identity.
-    pub async fn set_contact(&self, id: &[u8], contact: &Contact) -> Result<()> {
-        let (gid, update) = {
-            let st = self.inner.state.lock().unwrap();
-            let identity = st.device.identities.first().context("this device is on no identity")?;
-            let gid = st.devices_group(&identity.id.0).context("this device is not in its identity's devices group")?;
-            (gid.clone(), Contacts::load(&st.contacts_state(&gid)?)?.set(id, contact))
-        };
-        self.inner.edit_contacts(&gid, update)
-    }
-
-    /// The groups open to this device's identities, as their devices groups record them, of the kinds this session
-    /// supports.
-    pub fn openings(&self) -> Vec<Opening> {
+    /// This session's certificate of an identity, if it holds one.
+    pub fn certificate(&self, identity: &[u8]) -> Option<Envelope> {
         let st = self.inner.state.lock().unwrap();
-        st.groups
-            .values()
-            .filter(|g| g.mls.settings().devices_of.is_some())
-            .flat_map(|g| g.mls.settings().openings)
-            .filter(|opening| self.inner.kinds.contains(&opening.kind))
-            .collect()
+        st.certificate(&st.session.credential, identity).cloned()
+    }
+
+    /// Holds a certificate of this session, which it shows its peers.
+    pub fn set_certificate(&self, certificate: Envelope) -> Result<()> {
+        let certified = certified(&certificate).context("a certificate that does not parse")?;
+        let mut st = self.inner.state.lock().unwrap();
+        ensure!(certified.key.0 == st.session.key(), "a certificate of another session");
+        let key = (certified.key.0, certified.identity.0);
+        st.certificates.insert(key, certificate);
+        st.save_certificates()?;
+        for gid in st.groups.keys() {
+            self.inner.net().changed(gid);
+        }
+        Ok(())
     }
 
     /// What a group this session is in looks like as an opening.
@@ -1147,15 +1148,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             membership: settings.membership,
             members,
         })
-    }
-
-    /// Records an opening in the devices group of an identity, unless it is there already.
-    pub async fn set_opening(&self, identity: &[u8], opening: Opening) -> Result<()> {
-        let gid = self.inner.state.lock().unwrap().devices_group(identity).context("not a device of that identity")?;
-        if self.settings(&gid)?.openings.contains(&opening) {
-            return Ok(());
-        }
-        self.change_settings(&gid, |settings| with_opening(settings, opening.clone())).await.map(drop)
     }
 }
 
@@ -1431,14 +1423,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let st = &mut *st;
             let mls = Group::join(&st.provider, &admitted.welcome.0, self.window)?;
             ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
-            let settings = mls.settings();
-            if let Some(identity) = &settings.devices_of
-                && !st.device.identities.iter().any(|known| known.id == *identity)
-            {
-                st.device
-                    .identities
-                    .push(IdentityRef { id: identity.clone(), membership: settings.membership.clone() });
-            }
             let given_up = admitted.before.iter().map(|id| (0, id.clone())).collect();
             let rec = Rec { position: admitted.position, logged: admitted.position, given_up, ..Rec::default() };
             let gid = st.add_group(mls, rec)?;
@@ -1451,7 +1435,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.warn(Some(&gid), format!("reading the group's log: {error:#}"));
         }
         self.follow(&gid);
-        self.refresh(&gid).await;
+        self.refresh_all().await;
         self.dial_all();
         if let Some(link) = admitted.doc {
             self.state_from(&gid, link, EndpointId::from_bytes(&by)?);
@@ -1459,8 +1443,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(Bytes(gid))
     }
 
-    /// Takes a state `by` handed this session, once it is fetched: a devices group's contacts merge it, and any other
-    /// group's kind is told.
+    /// Takes a state `by` handed this session, once it is fetched, and tells the group's kind.
     pub(crate) fn state_from(self: &Arc<Self>, gid: &[u8], link: String, by: EndpointId) {
         let (inner, gid) = (self.clone(), gid.to_vec());
         self.spawn(async move {
@@ -1476,11 +1459,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 inner.fetched(&gid, &file).await?;
                 let mut data = Vec::new();
                 inner.net().read_file(&file, &mut data).await?;
-                let st = inner.state.lock().unwrap();
-                if st.devices(&gid) {
-                    return st.provider.put(&doc_key(&gid), &yjs::apply(&st.contacts_state(&gid)?, &data)?);
-                }
-                let from = st.by_iroh(&gid, &by);
+                let from = inner.state.lock().unwrap().by_iroh(&gid, &by);
                 inner.events.send(Event::State { group: Bytes(gid.clone()), from, data }).ok();
                 anyhow::Ok(())
             };
@@ -1490,7 +1469,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         });
     }
 
-    /// Seals a state of the group's kind, or of its contacts, as a file to hand a member; holds it.
+    /// Seals a state of the group's kind as a file to hand a member; holds it.
     pub(crate) async fn state_file(&self, gid: &[u8], data: Vec<u8>) -> Result<String> {
         let link = self.net().add_file(std::io::Cursor::new(data)).await?.link();
         let mut st = self.state.lock().unwrap();
@@ -1519,21 +1498,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
             sleep(RECEIPT_WAIT).await;
         }
         Err(last)
-    }
-
-    /// Applies an edit to a devices group's contacts and sends it to the members online.
-    fn edit_contacts(&self, gid: &[u8], update: Vec<u8>) -> Result<()> {
-        let ciphertext = {
-            let mut st = self.state.lock().unwrap();
-            let st = &mut *st;
-            let state = yjs::apply(&st.contacts_state(gid)?, &update)?;
-            st.provider.put(&doc_key(gid), &state)?;
-            let g = st.groups.get_mut(gid).unwrap();
-            let edit = serde_json::to_value(ContactsUpdate::Edit { update: Bytes(update) })?;
-            g.mls.seal(&st.provider, &st.session, &edit, false)?.1
-        };
-        self.net().send(gid, ciphertext);
-        Ok(())
     }
 
     /// Sends a sealed message and waits for the receipts of the members it went to.
@@ -1574,51 +1538,81 @@ impl<P: Provider + Send + 'static> Inner<P> {
         delivery
     }
 
-    /// Fetches the device lists of every identity in this session's groups.
+    /// Reads the key logs of the identities in this session's groups that are not fresh, or that a member's
+    /// certificate needs read anew, then has the members removed that went too long without a valid certificate.
     async fn refresh_all(&self) {
-        let gids: Vec<Vec<u8>> = self.state.lock().unwrap().groups.keys().cloned().collect();
-        for gid in gids {
-            self.refresh(&gid).await;
-        }
-    }
-
-    /// Fetches the device lists of the identities a group's members speak as, or its devices are of, unless fresh.
-    async fn refresh(&self, gid: &[u8]) {
         let stale: Vec<IdentityRef> = {
             let st = self.state.lock().unwrap();
-            let identities = st.identities(gid).into_iter();
-            identities.filter(|identity| st.lists.get(&identity.id.0).is_none_or(|known| known.at + LIST_FRESH < now())).collect()
-        };
-        for identity in stale {
-            if let Err(error) =
-                timeout(RECEIPT_WAIT, self.list(&identity)).await.map_err(anyhow::Error::from).and_then(|r| r)
-            {
-                tracing::debug!("the device list of {}: {error:#}", hex(&identity.id.0));
-            }
-        }
-        self.revoke(&self.state.lock().unwrap(), gid);
-    }
-
-    /// Has the members of a group removed whose device left the identity they speak as or, in a devices group, the
-    /// identity it is of.
-    fn revoke(&self, st: &State<P>, gid: &[u8]) {
-        let Ok(g) = st.group(gid) else { return };
-        let devices_of = g.mls.settings().devices_of;
-        for member in g.mls.members() {
-            let Some(credential) = &member.credential else { continue };
-            let Some(id) = credential.identity.as_ref().map(|identity| &identity.id).or(devices_of.as_ref()) else {
-                continue;
+            let mut identities: Vec<IdentityRef> = st.groups.keys().flat_map(|gid| st.identities(gid)).collect();
+            identities.dedup();
+            let since = |id: &[u8]| {
+                let members = st.groups.values().flat_map(|g| g.mls.members());
+                let speaking = members.filter(|m| m.credential.as_ref().is_some_and(|c| c.identity.as_ref().is_some_and(|i| i.id.0 == id)));
+                speaking.filter_map(|m| st.uncertified.get(&m.key).copied()).min()
             };
-            if member.key != st.session.key()
-                && st.lists.get(&id.0).is_some_and(|known| known.list.removed(&credential.device.0))
+            identities
+                .into_iter()
+                .filter(|identity| {
+                    let known = st.keys.get(&identity.id.0);
+                    known.is_none_or(|known| known.at + KEYS_FRESH < now() || since(&identity.id.0).is_some_and(|since| known.at < since))
+                })
+                .collect()
+        };
+        let mut read = HashSet::new();
+        for identity in stale {
+            if read.insert(identity.id.clone())
+                && let Err(error) = timeout(RECEIPT_WAIT, self.read_keys(&identity)).await.map_err(anyhow::Error::from).and_then(|r| r)
             {
-                self.work.send(Work::Remove { group: gid.to_vec(), key: member.key }).ok();
+                tracing::debug!("the key log of {}: {error:#}", hex(&identity.id.0));
             }
+        }
+        self.revoke();
+    }
+
+    /// Waits a while for the certificates of added members that speak as identities, which their inviter and they show.
+    async fn await_certificates(&self, gid: &[u8], added: &[core::Member]) {
+        let deadline = now() + RECEIPT_WAIT.as_millis() as u64;
+        let missing = || {
+            let st = self.state.lock().unwrap();
+            let speaking = added.iter().filter_map(|m| Some((m.credential.as_ref()?, m.credential.as_ref()?.identity.as_ref()?)));
+            speaking.into_iter().any(|(credential, identity)| st.certificate(credential, &identity.id.0).is_none())
+        };
+        while missing() && now() < deadline && self.state.lock().unwrap().groups.contains_key(gid) {
+            sleep(Duration::from_millis(200)).await;
         }
     }
 
-    /// Reads an identity's device list from its service; returns the newest copy held.
-    async fn list(&self, identity: &IdentityRef) -> Result<DeviceList> {
+    /// Has the members removed that are connected to this session and have gone `CERTIFICATE_GRACE` without a valid
+    /// certificate of the identity they speak as, judged by a key log read since.
+    fn revoke(&self) {
+        let connected = self.net().connected();
+        let mut st = self.state.lock().unwrap();
+        let st = &mut *st;
+        let now = now();
+        let mut seen = HashSet::new();
+        for (gid, g) in &st.groups {
+            for member in g.mls.members() {
+                let (Some(credential), Some(leaf)) = (&member.credential, &member.leaf) else { continue };
+                let Some(identity) = &credential.identity else { continue };
+                let Some(known) = st.keys.get(&identity.id.0) else { continue };
+                if member.key == st.session.key()
+                    || check(st.certificates.get(&(member.key.clone(), identity.id.0.clone())), credential, &known.log, now).is_ok()
+                    || !endpoint_id(&leaf.key.0).is_some_and(|peer| connected.contains(&peer))
+                {
+                    continue;
+                }
+                seen.insert(member.key.clone());
+                let since = *st.uncertified.entry(member.key.clone()).or_insert(now);
+                if known.at >= since && now >= since + CERTIFICATE_GRACE {
+                    self.work.send(Work::Remove { group: gid.clone(), key: member.key.clone() }).ok();
+                }
+            }
+        }
+        st.uncertified.retain(|key, _| seen.contains(key));
+    }
+
+    /// Reads an identity's key log from its service; returns the newest copy held.
+    async fn read_keys(&self, identity: &IdentityRef) -> Result<KeyLog> {
         let client = self.logs.client(&identity.membership)?;
         let log = lmk_proto::identity::address(&identity.id.0);
         let mut entries = Vec::new();
@@ -1630,23 +1624,23 @@ impl<P: Provider + Send + 'static> Inner<P> {
             entries.extend(page.entries);
         };
         let id: [u8; 32] = identity.id.0.as_slice().try_into().context("an identity id is 32 bytes")?;
-        let list = DeviceList::replay(&id, entries.iter().map(|entry| entry.0.as_slice()))?;
+        let keys = KeyLog::replay(&id, entries.iter().map(|entry| entry.0.as_slice()))?;
         let mut st = self.state.lock().unwrap();
-        self.take_list(&mut st, list, entries, head, now(), "its service");
-        Ok(st.lists[&id[..]].list.clone())
+        self.take_keys(&mut st, keys, entries, head, now(), "its service");
+        Ok(st.keys[&id[..]].log.clone())
     }
 
-    /// Holds a copy of a device list unless the one held is as new, and then checks every group's members against it
-    /// and shows it to the peers of the groups it concerns. A copy that contradicts the one held is reported.
-    pub(crate) fn take_list(&self, st: &mut State<P>, list: DeviceList, entries: Vec<Bytes>, head: Head, at: u64, from: &str) {
+    /// Holds a copy of a key log unless the one held is as new, and then shows it to the peers of the groups it concerns.
+    /// A copy that contradicts the one held is reported.
+    pub(crate) fn take_keys(&self, st: &mut State<P>, log: KeyLog, entries: Vec<Bytes>, head: Head, at: u64, from: &str) {
         let mut at = at;
-        if let Some(held) = st.lists.get_mut(&list.id[..]) {
+        if let Some(held) = st.keys.get_mut(&log.id[..]) {
             match held.compare(&entries, &head) {
                 Compared::Contradicts => {
                     let (here, there) = (held.entries.len(), entries.len());
                     let text = format!(
-                        "the membership service showed different device lists of {}: {here} entries here, {there} from {from}",
-                        held.list.name
+                        "the membership service showed different key logs of {}: {here} entries here, {there} from {from}",
+                        held.log.name
                     );
                     self.warn(None, text);
                     return;
@@ -1659,13 +1653,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 Compared::Newer => at = at.max(held.at),
             }
         }
-        let id = list.id;
-        st.lists.insert(id.to_vec(), Known { list, entries, head, at });
-        for gid in st.groups.keys() {
-            self.revoke(st, gid);
-            if let Some(net) = self.net.get()
-                && st.identities(gid).iter().any(|identity| identity.id.0 == id)
-            {
+        let id = log.id;
+        st.keys.insert(id.to_vec(), Known { log, entries, head, at });
+        if let Some(net) = self.net.get() {
+            for gid in st.groups.keys().filter(|gid| st.identities(gid).iter().any(|identity| identity.id.0 == id)) {
                 net.changed(gid);
             }
         }
@@ -1779,8 +1770,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         gone: bool,
     ) {
         if !added.is_empty() {
-            self.refresh(gid).await;
+            self.refresh_all().await;
             self.dial_all();
+            self.await_certificates(gid, &added).await;
         }
         let group = Bytes(gid.to_vec());
         let mut st = self.state.lock().unwrap();
@@ -1898,14 +1890,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 if st.group(&group).is_ok_and(|g| g.rec.log.as_ref().is_some_and(|log| log.behind)) {
                     self.ask_state(&mut st, &group, Some(peer));
                 }
-                if !st.devices(&group) {
-                    let member = st.by_iroh(&group, &peer);
-                    self.events.send(Event::InStep { group: Bytes(group), member }).ok();
-                    return;
-                }
-                let Ok(snapshot) = st.contacts_state(&group).and_then(|state| yjs::snapshot(&state)) else { return };
-                let frame = json!({ "doc": { "snapshot": Bytes(snapshot.to_vec()) } });
-                self.net().frame(peer, Frame::Kind(KindFrame::new(Bytes(group), frame).expect("a kind frame")));
+                let member = st.by_iroh(&group, &peer);
+                self.events.send(Event::InStep { group: Bytes(group), member }).ok();
             }
             lmk_net::Event::Connected(_) | lmk_net::Event::Disconnected(_) => {}
         }
@@ -1921,15 +1907,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_longer_or_later_device_list_wins_and_one_that_disagrees_contradicts() {
-        let laptop = Device::new("laptop");
-        let (id, first) = identity::create(&laptop, "Bob", Service::Folder("/tmp".into()));
-        let list = DeviceList::replay(&id, [first.as_slice()]).unwrap();
-        let second = list.add(&laptop, &Device::new("phone").public(), "phone");
-        let other = list.add(&laptop, &Device::new("tablet").public(), "tablet");
+    fn a_longer_or_later_key_log_wins_and_one_that_disagrees_contradicts() {
+        use lmk_core::identity::{create, public};
+        let seed = lmk_core::random();
+        let (id, first) = create(&seed, "Bob", lmk_proto::group::Service::Folder("/tmp".into()));
+        let log = KeyLog::replay(&id, [first.as_slice()]).unwrap();
+        let second = log.rotate(&seed, &public(&lmk_core::random()));
+        let other = log.rotate(&seed, &public(&lmk_core::random()));
         let head = |length, time| Head { log: Bytes::default(), length, hash: Bytes::default(), time, sig: Bytes::default() };
         let entries = |e: &[&Vec<u8>]| e.iter().map(|e| Bytes(e.to_vec())).collect::<Vec<_>>();
-        let held = Known { list, entries: entries(&[&first, &second]), head: head(2, 10), at: 10 };
+        let held = Known { log, entries: entries(&[&first, &second]), head: head(2, 10), at: 10 };
         assert_eq!(held.compare(&entries(&[&first]), &head(1, 20)), Compared::Shorter);
         assert_eq!(held.compare(&entries(&[&first, &second]), &head(2, 10)), Compared::AsLong);
         assert_eq!(held.compare(&entries(&[&first, &second]), &head(2, 11)), Compared::Newer);
