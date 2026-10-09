@@ -22,6 +22,9 @@ export type Named = { id: string; name: string };
 export type Settings = { kind: "chat" | "doc" | "git"; name: string; open?: Named[]; keep?: number; devices_of?: string };
 export type Group = { group: string; settings: Settings; members: Person[]; joined: boolean; failed?: boolean };
 export type Attachment = { link: string; name: string; size: number; type: string; kept: boolean };
+/** Why a member refused a message: larger than it takes, too old for it to open, from a removed member, or it did not open. */
+export type Reason = "size" | "old" | "removed" | "unreadable";
+
 export type Item =
   | {
       type: "message";
@@ -34,8 +37,7 @@ export type Item =
       urgent?: boolean;
       attachment?: Attachment;
       pending?: boolean;
-      refused?: { name: string; reason: string }[];
-      unread?: string[];
+      refused?: { name: string; reason: Reason }[];
     }
   | { type: "leave"; id: string; at: number; from: Person }
   | { type: "joined"; at: number; member: Person; by: Person; how: string }

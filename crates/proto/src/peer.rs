@@ -27,8 +27,8 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         below: Vec<Below>,
     },
-    /// The answer to `messages`: the ids of the items the receiver took, and of those it refused.
-    Receipt { group: Bytes, held: Vec<Bytes>, refused: Vec<Refusal> },
+    /// The answer to `messages`: the ids of the items the receiver took.
+    Receipt { group: Bytes, held: Vec<Bytes> },
     /// BLAKE3 hashes of files.
     Want { group: Bytes, files: Vec<Bytes> },
     Have { group: Bytes, files: Vec<Bytes> },
@@ -95,12 +95,6 @@ impl<'de> Deserialize<'de> for KindFrame {
         let group = serde_json::from_value(group.ok_or_else(|| D::Error::custom("a frame names its group"))?).map_err(D::Error::custom)?;
         KindFrame::new(group, frame).map_err(D::Error::custom)
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Refusal {
-    pub id: Bytes,
-    pub reason: String,
 }
 
 /// A message the receiver lacks that is older than its floor, so that it records it as given up.

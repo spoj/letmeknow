@@ -20,7 +20,7 @@ use lmk_node::lmk_core::invite::Target;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
 use lmk_node::{Claim, Disk, Event, Member, Node, now};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, How, IdentityRef, Named, PROTOCOL, Service, Settings};
+use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, How, IdentityRef, Named, PROTOCOL, Reason, Service, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::{Duration, sleep};
@@ -536,7 +536,7 @@ impl App {
             }
             Event::Removed { group, by } => {
                 let by = by.map(|by| by.name);
-                for kind in ["timeline", "settings", "refused", "unread"] {
+                for kind in ["timeline", "settings", "refused"] {
                     self.store.delete(&key(kind, &group.0))?;
                 }
                 self.to_kind(DOC, json!({ "type": "gone", "group": group }));
@@ -601,20 +601,10 @@ impl App {
                 self.emit(json!({ "type": "introduced", "group": group }));
             }
             Event::Held { group, id, .. } => self.emit(json!({ "type": "held", "group": group, "id": hex::encode(&id.0) })),
-            Event::Refused { group, id, by, reason } => {
-                self.refused(&group.0, &id.0, &by, &reason)?;
-                self.emit(json!({ "type": "refused", "group": group, "id": hex::encode(&id.0) }));
-            }
-            Event::Unread { group, by, ids } => {
-                let name = label(&self.describe(&self.known(&group.0)?, &by));
-                let mut unread: HashMap<String, Vec<String>> = get(&self.store, &key("unread", &group.0))?.unwrap_or_default();
-                for id in ids {
-                    if self.node.message(&id.0)?.is_some_and(|m| m.sender.key == self.node.key()) {
-                        unread.entry(hex::encode(&id.0)).or_default().push(name.clone());
-                    }
-                }
-                put(&self.store, &key("unread", &group.0), &unread)?;
-                self.emit(json!({ "type": "unread", "group": group }));
+            Event::Refused { group, by, messages } => {
+                let refusals: Vec<_> = messages.into_iter().map(|refusal| (refusal.id, by.clone(), refusal.reason)).collect();
+                self.refused(&group.0, &refusals)?;
+                self.emit(json!({ "type": "refused", "group": group }));
             }
             Event::File(hash) => self.emit(json!({ "type": "file", "hash": hex::encode(hash) })),
             Event::Warning { group, text } => self.emit(json!({ "type": "warning", "group": group, "text": text })),
@@ -629,9 +619,13 @@ impl App {
         put(&self.store, &key("timeline", gid), &timeline)
     }
 
-    fn refused(&self, gid: &[u8], id: &[u8], by: &Member, reason: &str) -> Result<()> {
+    /// Records which members refused this session's messages, and why.
+    fn refused(&self, gid: &[u8], refusals: &[(Bytes, Member, Reason)]) -> Result<()> {
+        let known = self.known(gid)?;
         let mut refused: HashMap<String, Vec<Value>> = get(&self.store, &key("refused", gid))?.unwrap_or_default();
-        refused.entry(hex::encode(id)).or_default().push(json!({ "name": by.name, "reason": reason }));
+        for (id, by, reason) in refusals {
+            refused.entry(hex::encode(&id.0)).or_default().push(json!({ "name": label(&self.describe(&known, by)), "reason": reason }));
+        }
         put(&self.store, &key("refused", gid), &refused)
     }
 
@@ -760,7 +754,6 @@ impl App {
         let mut items: Vec<Value> = get(&self.store, &key("timeline", gid))?.unwrap_or_default();
         let pending: HashSet<Vec<u8>> = self.node.only_here(gid)?.into_iter().map(|p| p.id.0).collect();
         let refused: HashMap<String, Value> = get(&self.store, &key("refused", gid))?.unwrap_or_default();
-        let unread: HashMap<String, Value> = get(&self.store, &key("unread", gid))?.unwrap_or_default();
         for message in self.node.messages(gid)? {
             let from = self.describe(&known, &message.sender);
             let id = hex::encode(&message.id.0);
@@ -790,9 +783,6 @@ impl App {
             }
             if let Some(refused) = refused.get(&id) {
                 item["refused"] = refused.clone();
-            }
-            if let Some(unread) = unread.get(&id) {
-                item["unread"] = unread.clone();
             }
             items.push(item);
         }
@@ -827,9 +817,8 @@ impl App {
             attachment: attachment.as_ref().map(|(_, a)| a.clone()),
         };
         let (id, delivery) = self.node.send(gid, &serde_json::to_value(payload)?, true).await?;
-        for (member, reason) in &delivery.refused {
-            self.refused(gid, &id.0, member, reason)?;
-        }
+        let refusals: Vec<_> = delivery.refused.into_iter().map(|(member, reason)| (id.clone(), member, reason)).collect();
+        self.refused(gid, &refusals)?;
         let mut answer = json!({ "id": hex::encode(&id.0), "held_by": delivery.held.iter().map(|m| &m.name).collect::<Vec<_>>() });
         if let Some((link, _)) = attachment {
             let holders = self.node.spread(gid, &link).await;

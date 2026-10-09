@@ -89,11 +89,12 @@ pub trait Disk: Send + Sync + 'static {
     fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>);
 }
 
-/// What became of a ciphertext a peer sent; the peer hears which unless it waits.
+/// What became of a ciphertext a peer sent; a receipt tells the peer what was held.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Taken {
     Held,
-    Refused(String),
+    /// Given up.
+    Refused,
     /// Kept until a commit it follows is applied.
     Waiting,
 }
@@ -111,8 +112,8 @@ pub enum Event {
     Disconnected(EndpointId),
     /// Two incompatible signed heads: the membership service showed members different logs.
     Contradiction { group: Vec<u8>, peer: EndpointId, ours: Head, theirs: Head },
-    /// What `peer` did with messages this session sent it.
-    Receipt { group: Vec<u8>, peer: EndpointId, held: Vec<[u8; 32]>, refused: Vec<([u8; 32], String)> },
+    /// Messages this session sent that `peer` holds.
+    Receipt { group: Vec<u8>, peer: EndpointId, held: Vec<[u8; 32]> },
     /// This session and `peer` hold the same log of the group: a time to compare the state of its kind.
     InStep { group: Vec<u8>, peer: EndpointId },
     /// Message sync with `peer` finished.

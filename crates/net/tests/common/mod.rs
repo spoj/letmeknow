@@ -314,7 +314,7 @@ impl Groups for Fake {
         let g = groups.get_mut(group).unwrap();
         if epoch < g.floor {
             g.given_up.insert(id(ciphertext), epoch);
-            return Taken::Refused("below the floor".into());
+            return Taken::Refused;
         }
         if epoch > g.log.len() as u64 {
             return Taken::Waiting;

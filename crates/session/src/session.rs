@@ -11,7 +11,7 @@ use lmk_core::invite::Target;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::{Claim, Event, Member, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings};
+use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, How, IdentityRef, Named, Opening, PROTOCOL, Refusal, Service, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -449,8 +449,7 @@ impl Session {
             | Event::Snapshot { group, .. }
             | Event::Introduced { group, .. }
             | Event::Held { group, .. }
-            | Event::Refused { group, .. }
-            | Event::Unread { group, .. } => Some(group.clone()),
+            | Event::Refused { group, .. } => Some(group.clone()),
             Event::Message(message) => Some(message.group.clone()),
             Event::File(_) | Event::Warning { .. } => None,
         };
@@ -525,28 +524,24 @@ impl Session {
             }
             Event::Introduced { group, by, identity, name, how } => self.introduced(&group, &by, identity, name, how)?,
             Event::Held { .. } => {}
-            Event::Refused { group, id, by, reason } => {
-                let item = json!({ "type": "refused", "group": b64(&group.0), "id": hex::encode(&id.0), "member": self.describe(&group, &by)?, "reason": reason });
-                self.outbox.deliver(item, true);
-            }
-            Event::Unread { group, by, ids } => self.unread(&group, &by, &ids).await?,
+            Event::Refused { group, by, messages } => self.refused(&group, &by, &messages).await?,
             Event::File(hash) => self.arrived(hash).await?,
             Event::Warning { group, text } => self.warn(group.as_ref(), text),
         }
         Ok(())
     }
 
-    /// A member reports messages it could not read: those of this session's chat messages print, with their text and a
-    /// copy of their attachment while this session holds them, so that the agent can send them again.
-    async fn unread(&mut self, gid: &Bytes, by: &Member, ids: &[Bytes]) -> Result<()> {
+    /// A member refused messages this session sent: its chat messages print, with the reason, their text and a copy
+    /// of their attachment while this session holds them, so that the agent can send them again.
+    async fn refused(&mut self, gid: &Bytes, by: &Member, refusals: &[Refusal]) -> Result<()> {
         let mut messages = Vec::new();
-        for id in ids {
+        for Refusal { id, reason } in refusals {
             let Some(message) = self.node.message(&id.0)? else { continue };
-            if message.sender.key != self.node.key() || message.payload["type"] != "message" {
+            if message.payload["type"] != "message" {
                 continue;
             }
             let chat: ChatMessage = serde_json::from_value(message.payload)?;
-            let mut item = json!({ "id": hex::encode(&id.0), "content": chat.content });
+            let mut item = json!({ "id": hex::encode(&id.0), "reason": reason, "content": chat.content });
             if !chat.to.is_empty() {
                 item["to"] = json!(chat.to.iter().map(|fp| hex::encode(&fp.0)).collect::<Vec<_>>());
             }
@@ -563,7 +558,7 @@ impl Session {
             messages.push(item);
         }
         if !messages.is_empty() {
-            let item = json!({ "type": "unread", "group": b64(&gid.0), "member": self.describe(gid, by)?, "messages": messages });
+            let item = json!({ "type": "refused", "group": b64(&gid.0), "member": self.describe(gid, by)?, "messages": messages });
             self.outbox.deliver(item, true);
         }
         Ok(())

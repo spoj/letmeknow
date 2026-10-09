@@ -19,7 +19,7 @@ use iroh::{
 use lmk_proto::{
     Answer, Bytes, frame,
     head::Head,
-    peer::{Admitted, Below, Frame, Hello, List, Refusal},
+    peer::{Admitted, Below, Frame, Hello, List},
 };
 use sha2::{Digest, Sha256};
 use n0_future::{task::spawn, time::sleep};
@@ -194,24 +194,19 @@ impl Session {
                     let below = below.iter().filter_map(|b| Some((b.epoch, b.id.0.as_slice().try_into().ok()?))).collect();
                     self.inner.groups.below(&group.0, below);
                 }
-                let (mut held, mut refused) = (Vec::new(), Vec::new());
+                let mut held = Vec::new();
                 for item in items {
-                    let id = Bytes::from(<[u8; 32]>::from(Sha256::digest(&item.0)));
-                    match self.inner.groups.receive(&group.0, &item.0) {
-                        Taken::Held => held.push(id),
-                        Taken::Refused(reason) => refused.push(Refusal { id, reason }),
-                        Taken::Waiting => {}
+                    if self.inner.groups.receive(&group.0, &item.0) == Taken::Held {
+                        held.push(Bytes::from(<[u8; 32]>::from(Sha256::digest(&item.0))));
                     }
                 }
-                if !held.is_empty() || !refused.is_empty() {
-                    self.write(&Frame::Receipt { group, held, refused }).await?;
+                if !held.is_empty() {
+                    self.write(&Frame::Receipt { group, held }).await?;
                 }
             }
-            Frame::Receipt { group, held, refused } => {
-                let id = |id: &Bytes| <[u8; 32]>::try_from(&id.0[..]).ok();
-                let held = held.iter().filter_map(id).collect();
-                let refused = refused.iter().filter_map(|r| Some((id(&r.id)?, r.reason.clone()))).collect();
-                self.inner.events.send(Event::Receipt { group: group.0, peer: self.peer, held, refused }).ok();
+            Frame::Receipt { group, held } => {
+                let held = held.iter().filter_map(|id| <[u8; 32]>::try_from(&id.0[..]).ok()).collect();
+                self.inner.events.send(Event::Receipt { group: group.0, peer: self.peer, held }).ok();
             }
             Frame::Kind(frame) if self.member(&frame.group.0) => self.inner.groups.frame(self.peer, frame),
             Frame::State { group, link } if self.member(&group.0) => self.inner.groups.state(&group.0, self.peer, link),

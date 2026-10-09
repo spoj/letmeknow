@@ -229,6 +229,18 @@ impl std::fmt::Display for Unheld {
 
 impl std::error::Error for Unheld {}
 
+/// A message from a member removed more than 5 minutes before it first reached this session.
+#[derive(Debug)]
+pub struct Removed;
+
+impl std::fmt::Display for Removed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("from a member removed more than 5 minutes before")
+    }
+}
+
+impl std::error::Error for Removed {}
+
 /// A commit to post, and for an add, the Welcome to send once the log has taken it.
 pub struct Commit {
     pub commit: Vec<u8>,
@@ -596,8 +608,8 @@ impl Group {
     }
 
     /// Decrypts and verifies a member's message. `now` (milliseconds) is when it first reached this session; a removed
-    /// member's message that first reached it more than 5 minutes after the removal is refused. A message under an
-    /// epoch whose keys this session does not hold fails with `Unheld`.
+    /// member's message that first reached it more than 5 minutes after the removal fails with `Removed`. A message
+    /// under an epoch whose keys this session does not hold fails with `Unheld`.
     pub fn open<P: Provider>(&mut self, provider: &P, bytes: &[u8], now: u64) -> Result<Opened> {
         let message = parse::<MlsMessageIn>(bytes)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Application, "not an application message");
@@ -620,7 +632,9 @@ impl Group {
         if current.is_none() {
             let removed = self.state.removed.iter().rev().find(|(sig, _, _)| *sig == sender.device_sig);
             if let Some((_, removed, at)) = removed {
-                ensure!(now <= at + REMOVED_GRACE, "from a member removed more than 5 minutes before");
+                if now > at + REMOVED_GRACE {
+                    return Err(Removed.into());
+                }
                 key = removed.0.clone();
             }
         }
