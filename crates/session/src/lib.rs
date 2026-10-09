@@ -6,7 +6,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use lmk_core::device::Device;
 use lmk_core::group::Window;
 use lmk_core::provider::SqliteProvider;
@@ -32,7 +32,7 @@ pub fn service(address: &str) -> Result<Service> {
         let key = Bytes(hex::decode(key).context("a service key is hex")?);
         return Ok(Service::Serve { key, relay: format!("https://{relay}"), addrs: Vec::new() });
     }
-    anyhow::ensure!(cli::is_folder(address), "a membership service is letmeknow.dev, <key>@<relay URL>, or a folder");
+    ensure!(cli::is_folder(address), "a membership service is letmeknow.dev, <key>@<relay URL>, or a folder");
     Ok(Service::Folder(address.into()))
 }
 
@@ -86,7 +86,14 @@ pub async fn listen(
     print: impl FnMut(String),
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    let format = home.join("format");
+    ensure!(
+        format.exists() || !home.join("device.json").exists(),
+        "{} holds the state of a letmeknow before 0.12, which this one cannot read: move it away, or use another --home",
+        home.display()
+    );
     cli::private_dir(&config.dir)?;
+    std::fs::write(&format, "2\n")?;
     let (inbound, queue) = tokio::sync::mpsc::unbounded_channel();
     cli::open_channel(&config.dir.join("endpoint"), inbound.clone()).await?;
     let device_file = home.join("device.json");

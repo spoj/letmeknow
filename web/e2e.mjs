@@ -108,8 +108,22 @@ try {
   ann.run("identity", "create", "Ann");
   desk.run("identity", "create", "Matthew");
 
-  // Invited by link: what it is, a name, Join, and the chat.
+  // Invited by link: what it is, a name, Join, and the chat. The profile holds what a letmeknow before 0.12 kept,
+  // which the app sets aside.
   let laptop = await open("laptop", { viewport: { width: 1280, height: 800 } }, true);
+  await laptop.goto(`${SITE}/ping`);
+  await laptop.evaluate(
+    () =>
+      new Promise((resolve, reject) => {
+        const request = indexedDB.open("lmk", 1);
+        request.onupgradeneeded = () => {
+          request.result.createObjectStore("records").put(new Uint8Array([1]), new Uint8Array([1]).buffer);
+          request.result.createObjectStore("files").put(new Uint8Array([1]), "00");
+        };
+        request.onsuccess = () => (request.result.close(), resolve());
+        request.onerror = () => reject(request.error);
+      })
+  );
   const invite = ann.run("invite", "--name", "Plans");
   await laptop.goto(local(invite.link));
   await laptop.getByRole("heading", { name: "You're invited" }).waitFor();
@@ -117,6 +131,7 @@ try {
   await laptop.getByRole("button", { name: "Join", exact: true }).click();
   await laptop.locator(".people", { hasText: "Ann" }).waitFor();
   check(new URL(laptop.url()).pathname === "/", "a browser joins from an invite link, with a click");
+  check(!(await kept(laptop)).includes("00"), "a profile that a letmeknow before 0.12 used starts afresh");
   await ann.printed(e => e.type === "joined" && e.member.name === "Matthew");
   check(true, "the native session sees the browser join");
 
@@ -304,7 +319,7 @@ try {
   await laptop.locator(".devices li", { hasText: "this browser" }).waitFor();
   await laptop.getByRole("button", { name: "Add a device" }).click();
   const link = await laptop.locator("dialog .copy code").first().textContent();
-  check(link.includes("#1.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
+  check(link.includes("#2.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
   const tablet = native("tablet");
   await tablet.printed(e => e.type === "ready");
   tablet.run("join", link);

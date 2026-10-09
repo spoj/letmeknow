@@ -1,8 +1,10 @@
 // IndexedDB: "records" holds the session's records, one per key, as the WebAssembly hands them over; "files" the
 // ciphertext of the files it keeps, by hash (hex), which the session loads one at a time when it needs one.
 const db: Promise<IDBDatabase> = new Promise((resolve, reject) => {
-  const request = indexedDB.open("lmk", 1);
+  const request = indexedDB.open("lmk", 2);
   request.onupgradeneeded = () => {
+    // Version 1 held the session of a letmeknow before 0.12, which this one cannot read.
+    for (const store of [...request.result.objectStoreNames]) request.result.deleteObjectStore(store);
     request.result.createObjectStore("records");
     request.result.createObjectStore("files");
   };
