@@ -389,7 +389,8 @@ impl Plugin {
 
     /// `letmeknow doc attach [--group <group>] <path>`: makes a file linkable from a doc; answers with its markdown link.
     fn command(&mut self, message: &Value) -> Result<()> {
-        let args: Vec<&str> = message["args"].as_array().context("no args")?.iter().filter_map(Value::as_str).collect();
+        let args = message["args"].as_array().context("no args")?.iter().filter_map(Value::as_str);
+        let args: Vec<&str> = args.flat_map(|arg| arg.strip_prefix("--group=").map_or(vec![arg], |group| vec!["--group", group])).collect();
         let (group, path) = match args[..] {
             ["attach", path] => (None, path),
             ["attach", "--group", group, path] | ["attach", path, "--group", group] => (Some(group), path),

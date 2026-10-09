@@ -58,7 +58,7 @@ fn a_doc_in_a_file_its_commands_and_frames() {
     assert_eq!(edit["payload"]["type"], "edit", "the file's text is the new doc's");
     assert_eq!(plugin.next("answer")["answer"]["file"], dir.join("plan.md").to_str().unwrap());
 
-    plugin.send(json!({ "type": "command", "id": 2, "args": ["attach", "chart.png"], "cwd": dir }));
+    plugin.send(json!({ "type": "command", "id": 2, "args": ["attach", "--group=Plan", "chart.png"], "cwd": dir }));
     let add = plugin.next("add");
     assert_eq!(add["group"], "g1");
     plugin.send(json!({ "type": "answer", "id": add["id"], "answer": { "link": "lmk:x" } }));
