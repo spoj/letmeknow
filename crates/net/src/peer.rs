@@ -181,10 +181,12 @@ impl Session {
         frame::write(&mut self.send, frame).await
     }
 
-    /// Writes a frame, but keeps messages of a group the peer has not shown in a `hello` yet, the latest `WAITING`.
+    /// Writes a frame, but keeps messages of a group the peer has not shown in a `hello` yet, the latest `WAITING`,
+    /// for a peer of revision 1 or later, which shows a group it joins.
     async fn send(&mut self, frame: Frame) -> Result<()> {
         if let Frame::Messages { group, .. } = &frame
             && self.groups.get(group).is_none_or(|state| state.theirs.is_none())
+            && self.inner.groups.revision(&group.0, &self.peer) >= 1
         {
             let waiting = self.waiting.entry(group.clone()).or_default();
             if waiting.len() == WAITING {
