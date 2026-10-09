@@ -96,6 +96,7 @@ fn pair(old: &[&str], new: &[&str]) -> Vec<Option<usize>> {
 }
 
 /// Writes a doc's file whole, through a rename, so that its readers never see half of it. The file keeps its permissions.
+/// Windows refuses to replace a file that another program has open; then the file is written in place.
 pub fn write_file(path: &Path, text: &str) -> Result<()> {
     let temp = path.with_file_name(format!(".{}.letmeknow", path.file_name().context("not a file")?.to_string_lossy()));
     std::fs::create_dir_all(path.parent().context("not a file")?)?;
@@ -103,7 +104,10 @@ pub fn write_file(path: &Path, text: &str) -> Result<()> {
     if let Ok(metadata) = std::fs::metadata(path) {
         std::fs::set_permissions(&temp, metadata.permissions())?;
     }
-    std::fs::rename(&temp, path)?;
+    if std::fs::rename(&temp, path).is_err() {
+        std::fs::remove_file(&temp)?;
+        std::fs::write(path, text)?;
+    }
     Ok(())
 }
 
@@ -205,6 +209,22 @@ mod tests {
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
         }
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_another_program_has_open_is_written_in_place() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("lmk-doc-open-{}", std::process::id()));
+        let path = dir.join("plan.md");
+        write_file(&path, "one\n").unwrap();
+        // As editors open a file: others may read and write it, but not delete or replace it.
+        let open = std::fs::OpenOptions::new().read(true).share_mode(1 | 2).open(&path).unwrap();
+        write_file(&path, "two\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two\n");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        drop(open);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
