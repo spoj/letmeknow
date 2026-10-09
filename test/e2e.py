@@ -163,6 +163,9 @@ def git_kind(alice, bob, dave, listeners):
     check(bob.expect("message", lambda e: e["content"] == "@bob the build is green")["group"] == made["group"], "a git group carries chat")
 
     # With no other member online, a push fails and says so.
+    tip = git(loser, "rev-parse", "HEAD", cwd=repo).stdout.strip()
+    head = lambda: (git("alice", "pull", "-q", "--ff-only", "team", "main", cwd=ours, ok=False), git("alice", "rev-parse", "HEAD", cwd=ours).stdout.strip())[1]
+    check(until(head, lambda h: h == tip) == tip, "both members end at the same tip")
     bob.stop()
     listeners.remove(bob)
     write("alice-repo/late.txt", "late")
