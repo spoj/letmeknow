@@ -200,3 +200,41 @@ pub fn answers(member: &Value, name: &str) -> bool {
             && identity["how"] != "unknown"
             && identity["name"].as_str().is_some_and(|identity| identity.to_lowercase() == name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lmk_proto::group::Service;
+    use serde_json::json;
+
+    fn member(name: &str, key: u8, identity: Option<(u8, &str)>) -> Member {
+        let identity = identity.map(|(id, claimed)| Claim {
+            identity: IdentityRef { id: Bytes(vec![id]), membership: Service::Folder("/logs".into()) },
+            name: claimed.into(),
+            error: None,
+            added_by_device: None,
+        });
+        Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), name: name.into(), device_name: "laptop".into(), identity, added: None }
+    }
+
+    #[test]
+    fn a_stranger_shows_its_claim_who_vouched_for_it_and_whose_name_it_takes() {
+        let ann = member("Ann", 1, Some((10, "Ann")));
+        let bob = member("Bob", 2, Some((20, "Bob")));
+        let contact = Contact { name: "Bob".into(), how: contacts::How::Verified, by: None, at: 0 };
+        let vouched = Introduction { identity: Bytes(vec![20]), name: "Robert (Acme)".into(), by: Described { name: Some("Ann".into()), ..Described::default() }, by_id: Bytes(vec![10]) };
+        let describer = Describer {
+            me: Bytes(vec![1]),
+            name: "Ann".into(),
+            identities: Vec::new(),
+            contacts: vec![(Bytes(vec![30]), contact)],
+            introductions: vec![vouched],
+            members: vec![ann, bob.clone()],
+        };
+        let shown = serde_json::to_value(describer.describe(&bob)).unwrap();
+        let identity = json!({ "id": "FA", "name": "Bob", "how": "unknown", "claim": true, "warning": "not your Bob", "introduced": [{ "by": { "name": "Ann" }, "name": "Robert (Acme)" }] });
+        assert_eq!(shown, json!({ "name": "Bob", "fp": crate::fp(&[2]), "device": "laptop", "identity": identity }));
+        let peer = Member { key: Bytes::default(), ..member("", 3, None) };
+        assert_eq!(serde_json::to_value(describer.describe(&peer)).unwrap(), json!({ "iroh": "Aw" }));
+    }
+}
