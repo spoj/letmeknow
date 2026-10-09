@@ -245,7 +245,7 @@ impl App {
             put(&store, b"web/name", &config.name)?;
         }
         let device = get(&store, b"web/device")?.unwrap_or_else(|| Device::new(&config.device));
-        let hashes = kept.iter().map(|hash| Ok(hex::decode(hash)?.try_into().map_err(|_| anyhow!("a hash is 32 bytes"))?)).collect::<Result<_>>()?;
+        let hashes = kept.iter().map(|hash| hex::decode(hash)?.try_into().map_err(|_| anyhow!("a hash is 32 bytes"))).collect::<Result<_>>()?;
         let (io, mut io_rx) = mpsc::unbounded_channel();
         let kept = Arc::new(Kept { hashes: Mutex::new(hashes), io });
         let node_config = lmk_node::Config {
