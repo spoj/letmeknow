@@ -72,12 +72,14 @@ pub trait Groups: Send + Sync + 'static {
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
 }
 
-/// A browser's own storage of the files it holds, since iroh-blobs keeps only memory there. With one, a session holds
-/// and serves only the files kept on it, and loads each into memory when it is needed.
+/// A browser's own storage of the files it holds, since iroh-blobs keeps only memory there. With one, a session keeps
+/// there the files it adds and those it fetches up to its limit, holds and serves only those, and loads each into
+/// memory when it is needed.
 pub trait Disk: Send + Sync + 'static {
     fn has(&self, hash: &[u8; 32]) -> bool;
     /// A kept file's ciphertext.
     fn load(&self, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>>;
+    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>);
 }
 
 /// What became of a ciphertext a peer sent; the peer hears which unless it waits.
@@ -270,11 +272,6 @@ impl Net {
         self.inner.files.held(&hash).await
     }
 
-    /// A held file's ciphertext, for a browser to keep in its own storage.
-    pub async fn ciphertext(&self, hash: [u8; 32]) -> Result<Vec<u8>> {
-        self.inner.files.ciphertext(&hash).await
-    }
-
     /// Decrypts a held file into `out`.
     pub async fn read_file(&self, link: &FileLink, out: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
         self.inner.files.read(link, out).await
@@ -402,7 +399,7 @@ impl Inner {
 
     fn offer(self: &Arc<Self>, link: &FileLink, holder: EndpointId) {
         let (events, hash) = (self.events.clone(), link.hash);
-        self.files.offer(link, holder, move |ok| {
+        self.files.offer(link, holder, link.size <= self.config.file_limit, move |ok| {
             if ok {
                 events.send(Event::Fetched(hash)).ok();
             }

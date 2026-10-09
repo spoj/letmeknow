@@ -192,6 +192,10 @@ impl Disk for FakeDisk {
         let ciphertext = self.0.lock().unwrap()[&hash].clone();
         Box::pin(async move { Ok(ciphertext) })
     }
+
+    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>) {
+        self.0.lock().unwrap().insert(hash, ciphertext);
+    }
 }
 
 pub struct Fake {

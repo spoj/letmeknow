@@ -787,11 +787,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(Some(plain))
     }
 
-    /// A held file's ciphertext, for a browser to keep in its own storage.
-    pub async fn ciphertext(&self, hash: [u8; 32]) -> Result<Vec<u8>> {
-        self.inner.net().ciphertext(hash).await
-    }
-
     /// The files this session's groups link now, which it holds.
     pub fn files(&self) -> Vec<FileLink> {
         self.groups().iter().flat_map(|gid| lmk_net::Groups::files(&*self.inner, &gid.0)).collect()

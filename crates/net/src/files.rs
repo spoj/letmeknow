@@ -173,6 +173,9 @@ impl Files {
         let tag = self.store.add_stream(stream).await.temp_tag().await?;
         let hash = *tag.hash().as_bytes();
         self.added.lock().unwrap().push(tag);
+        if let Some(disk) = &self.disk {
+            disk.save(hash, self.ciphertext(&hash).await?);
+        }
         Ok(FileLink { hash, size: size.load(Ordering::Relaxed), key })
     }
 
@@ -210,8 +213,7 @@ impl Files {
         Ok(self.store.remote().local(Hash::from_bytes(*hash)).await?.local_bytes())
     }
 
-    /// A held file's ciphertext, whole.
-    pub async fn ciphertext(&self, hash: &[u8; 32]) -> Result<Vec<u8>> {
+    async fn ciphertext(&self, hash: &[u8; 32]) -> Result<Vec<u8>> {
         Ok(self.store.get_bytes(Hash::from_bytes(*hash)).await?.to_vec())
     }
 
@@ -234,8 +236,9 @@ impl Files {
         Ok(())
     }
 
-    /// Adds a holder to the file's download, starting one if none runs; `done` is called once it ends.
-    pub fn offer(self: &Arc<Self>, link: &FileLink, holder: EndpointId, done: impl FnOnce(bool) + Send + 'static) {
+    /// Adds a holder to the file's download, starting one if none runs; `done` is called once it ends. A browser keeps
+    /// the file on its disk if `keep`.
+    pub fn offer(self: &Arc<Self>, link: &FileLink, holder: EndpointId, keep: bool, done: impl FnOnce(bool) + Send + 'static) {
         let mut downloads = self.downloads.lock().unwrap();
         if let Some(download) = downloads.get(&link.hash)
             && download.holders.send(holder).is_ok()
@@ -248,7 +251,10 @@ impl Files {
         downloads.insert(link.hash, Download { holders, done: done_rx });
         let (files, hash, sealed) = (self.clone(), link.hash, sealed_len(link.size));
         spawn(async move {
-            let result = files.download(hash, sealed, rx).await;
+            let mut result = files.download(hash, sealed, rx).await;
+            if let (Ok(()), Some(disk), true) = (&result, &files.disk, keep) {
+                result = files.ciphertext(&hash).await.map(|ciphertext| disk.save(hash, ciphertext));
+            }
             if let Err(e) = &result {
                 tracing::debug!("download of {} stopped: {e:#}", Hash::from_bytes(hash));
             }

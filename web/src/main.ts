@@ -862,9 +862,9 @@ class ChatView extends View {
         const parent = item.reply_to ? (items.find(i => i.type === "message" && i.id === item.reply_to) as Message | undefined) : undefined;
         const to = item.to?.map(fp => this.members.find(m => m.fp === fp)).filter(m => m != null);
         const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent"];
-        const status = item.pending
-          ? h("p", { className: "status warn" }, "Pending: no other member holds it yet. It goes out when one is online while this browser is open.")
-          : item.refused && h("p", { className: "status warn" }, `Refused by ${item.refused.map(r => `${r.name} (${r.reason})`).join(", ")}`);
+        const status = item.refused
+          ? h("p", { className: "status warn" }, `Refused by ${item.refused.map(r => `${r.name} (${r.reason})`).join(", ")}`)
+          : item.pending && h("p", { className: "status warn" }, "Pending: no other member holds it yet. It goes out when one is online while this browser is open.");
         return h(
           "li",
           { className: classes.filter(Boolean).join(" "), tabIndex: -1 },

@@ -33,7 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
-/// Others' files larger than this are fetched only when asked, and not kept.
+/// Others' files larger than this are fetched only when asked, and kept only in memory, until the page closes.
 const FILE_LIMIT: u64 = 25 << 20;
 /// How often the files no group links any longer are deleted.
 const COLLECT: Duration = Duration::from_secs(60 * 60);
@@ -63,10 +63,15 @@ extern "C" {
     fn delete_file(this: &Idb, hash: &str);
 }
 
-/// The files kept in IndexedDB, which the session loads through the page.
+/// The files kept in IndexedDB, which the session loads and saves through the page.
 struct Kept {
     hashes: Mutex<HashSet<[u8; 32]>>,
-    loads: mpsc::UnboundedSender<([u8; 32], oneshot::Sender<Result<Vec<u8>>>)>,
+    io: mpsc::UnboundedSender<Io>,
+}
+
+enum Io {
+    Load([u8; 32], oneshot::Sender<Result<Vec<u8>>>),
+    Save([u8; 32], Vec<u8>),
 }
 
 impl Disk for Kept {
@@ -76,8 +81,13 @@ impl Disk for Kept {
 
     fn load(&self, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>> {
         let (reply, answer) = oneshot::channel();
-        self.loads.send((hash, reply)).ok();
+        self.io.send(Io::Load(hash, reply)).ok();
         Box::pin(async move { answer.await? })
+    }
+
+    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>) {
+        self.hashes.lock().unwrap().insert(hash);
+        self.io.send(Io::Save(hash, ciphertext)).ok();
     }
 }
 
@@ -236,8 +246,8 @@ impl App {
         }
         let device = get(&store, b"web/device")?.unwrap_or_else(|| Device::new(&config.device));
         let hashes = kept.iter().map(|hash| Ok(hex::decode(hash)?.try_into().map_err(|_| anyhow!("a hash is 32 bytes"))?)).collect::<Result<_>>()?;
-        let (loads, mut loading) = mpsc::unbounded_channel();
-        let kept = Arc::new(Kept { hashes: Mutex::new(hashes), loads });
+        let (io, mut io_rx) = mpsc::unbounded_channel();
+        let kept = Arc::new(Kept { hashes: Mutex::new(hashes), io });
         let node_config = lmk_node::Config {
             name: get(&store, b"web/name")?.context("no name")?,
             device_key: true,
@@ -255,11 +265,16 @@ impl App {
         let app = Rc::new(App { node, store, membership, shadow: RefCell::new(shadow), idb, kept, on_event, tried, failed });
         app.flush();
         app.join_openings();
-        let loading_app = app.clone();
+        let io_app = app.clone();
         spawn_local(async move {
-            while let Some((hash, reply)) = loading.recv().await {
-                let loaded = JsFuture::from(loading_app.idb.load_file(&hex::encode(hash))).await;
-                reply.send(loaded.map(|bytes| Uint8Array::new(&bytes).to_vec()).map_err(|e| anyhow!("loading a file: {e:?}"))).ok();
+            while let Some(io) = io_rx.recv().await {
+                match io {
+                    Io::Save(hash, ciphertext) => io_app.idb.save_file(&hex::encode(hash), ciphertext),
+                    Io::Load(hash, reply) => {
+                        let loaded = JsFuture::from(io_app.idb.load_file(&hex::encode(hash))).await;
+                        reply.send(loaded.map(|bytes| Uint8Array::new(&bytes).to_vec()).map_err(|e| anyhow!("loading a file: {e:?}"))).ok();
+                    }
+                }
             }
         });
         let events_app = app.clone();
@@ -353,22 +368,6 @@ impl App {
         self.on_event.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string())).ok();
     }
 
-    async fn keep_file(&self, hash: [u8; 32]) -> Result<()> {
-        let ciphertext = self.node.ciphertext(hash).await?;
-        self.idb.save_file(&hex::encode(hash), ciphertext);
-        self.kept.hashes.lock().unwrap().insert(hash);
-        Ok(())
-    }
-
-    /// A file fetched from others is kept up to the limit; a larger one stays only in memory, until the page closes.
-    async fn fetched(&self, hash: [u8; 32]) -> Result<()> {
-        let small = self.node.files().iter().any(|link| link.hash == hash && link.size <= FILE_LIMIT);
-        if small && !self.kept.has(&hash) {
-            self.keep_file(hash).await?;
-        }
-        Ok(())
-    }
-
     async fn on(self: &Rc<Self>, event: Event) -> Result<()> {
         match event {
             Event::Joined { group, member, by, how, label } => {
@@ -428,10 +427,7 @@ impl App {
                 self.refused(&group.0, &id.0, &by, &reason)?;
                 self.emit(json!({ "type": "refused", "group": group, "id": hex::encode(&id.0) }));
             }
-            Event::File(hash) => {
-                self.fetched(hash).await?;
-                self.emit(json!({ "type": "file", "hash": hex::encode(hash) }));
-            }
+            Event::File(hash) => self.emit(json!({ "type": "file", "hash": hex::encode(hash) })),
             Event::Warning { group, text } => self.emit(json!({ "type": "warning", "group": group, "text": text })),
         }
         Ok(())
@@ -627,7 +623,6 @@ impl App {
             Some((name, media_type, bytes)) => {
                 let size = bytes.len() as u64;
                 let link = self.node.add_file(gid, bytes).await?;
-                self.keep_file(link.hash).await?;
                 Some((link.clone(), Attachment { link: link.link(), name, size, media_type }))
             }
             None => None,
@@ -880,7 +875,6 @@ impl Lmk {
     /// Seals a file for a group and holds it; returns its link.
     pub async fn add_file(&self, gid: String, bytes: Vec<u8>) -> R<String> {
         let link = self.app.node.add_file(&unb64(&gid).map_err(js)?, bytes).await.map_err(js)?;
-        self.app.keep_file(link.hash).await.map_err(js)?;
         self.app.flush();
         Ok(link.link())
     }
