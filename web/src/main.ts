@@ -882,6 +882,7 @@ class ChatView extends View {
           item.content && h("div", { className: "text" }, item.content),
           item.attachment && this.attachmentView(item.attachment),
           status,
+          item.unread && this.unreadView(item, item.unread),
           h("div", { className: "actions" }, h("button", { className: "quiet", onclick: () => this.reply(item) }, "Reply"))
         );
       }
@@ -982,6 +983,19 @@ class ChatView extends View {
           )
       ])
     );
+  }
+
+  /** Who could not read a message of this browser's, and a button that sends it again as a new message replying to it. */
+  private unreadView(item: Message, names: string[]): HTMLElement {
+    const resend = h("button", { className: "quiet" }, "Resend");
+    resend.onclick = () =>
+      busy(resend, "Sending…", async () => {
+        const { attachment } = item;
+        const bytes = attachment && (await client.file(this.gid, attachment.link));
+        await lmk.send(this.gid, item.content, item.id, item.to ?? [], !!item.urgent, attachment?.name, attachment?.type, bytes);
+        render();
+      });
+    return h("p", { className: "status warn" }, `${names.join(", ")} could not read this `, resend);
   }
 
   private reply(item: Message) {

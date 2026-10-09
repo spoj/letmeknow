@@ -14,10 +14,14 @@ pub fn extend(start: [u8; 32], entries: &[Bytes]) -> [u8; 32] {
     entries.iter().fold(start, |hash, entry| lmk_proto::head::next(&hash, &entry.0))
 }
 
-/// The lowest epoch two members reconcile: neither offers what predates the later join, and the
-/// range starts at the lower floor (each side filters against the other's floor when it sends).
+/// The lowest epoch two members reconcile: neither offers what predates the later join. A peer
+/// before 0.12 starts at the lower floor too.
 pub fn lowest(mine: &Hello, theirs: &Hello) -> u64 {
-    mine.joined.max(theirs.joined).max(mine.floor.min(theirs.floor))
+    let joined = mine.joined.max(theirs.joined);
+    match theirs.all {
+        true => joined,
+        false => joined.max(mine.floor.min(theirs.floor)),
+    }
 }
 
 pub fn storage(items: &[(u64, [u8; 32])]) -> NegentropyStorageVector {
@@ -54,9 +58,10 @@ mod tests {
 
     #[test]
     fn lowest_epoch() {
-        let hello = |floor, joined| Hello { group: Bytes::default(), epoch: 9, head: head(0, [0; 32]), floor, joined, log: None };
-        assert_eq!(lowest(&hello(2, 1), &hello(4, 3)), 3, "the later join");
-        assert_eq!(lowest(&hello(5, 1), &hello(6, 3)), 5, "the lower floor");
+        let hello = |floor, joined, all| Hello { group: Bytes::default(), epoch: 9, head: head(0, [0; 32]), floor, joined, log: None, all };
+        assert_eq!(lowest(&hello(2, 1, true), &hello(4, 3, true)), 3, "the later join");
+        assert_eq!(lowest(&hello(5, 1, true), &hello(6, 3, true)), 3, "the later join, whatever the floors");
+        assert_eq!(lowest(&hello(5, 1, true), &hello(6, 3, false)), 5, "the lower floor, with a peer before 0.12");
     }
 
     #[test]

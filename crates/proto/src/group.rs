@@ -111,10 +111,12 @@ pub enum Control {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         to: Vec<Bytes>,
     },
+    /// Messages the sender gave up since it last said so: too old to open, or that did not open. Marked held.
+    Unread { ids: Vec<Bytes> },
 }
 
 impl Control {
-    pub const TYPES: [&str; 2] = ["leave", "introduce"];
+    pub const TYPES: [&str; 3] = ["leave", "introduce", "unread"];
 }
 
 /// A payload's `type`.

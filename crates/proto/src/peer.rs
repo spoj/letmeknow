@@ -20,8 +20,13 @@ pub enum Frame {
     Commits { group: Bytes, entries: Vec<Bytes>, head: Head },
     /// A negentropy message.
     Reconcile { group: Bytes, msg: Bytes },
-    /// MLS ciphertexts.
-    Messages { group: Bytes, items: Vec<Bytes> },
+    /// MLS ciphertexts, and the messages the receiver lacks below its floor, which it gives up.
+    Messages {
+        group: Bytes,
+        items: Vec<Bytes>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        below: Vec<Below>,
+    },
     /// The answer to `messages`: the ids of the items the receiver took, and of those it refused.
     Receipt { group: Bytes, held: Vec<Bytes>, refused: Vec<Refusal> },
     /// BLAKE3 hashes of files.
@@ -98,6 +103,13 @@ pub struct Refusal {
     pub reason: String,
 }
 
+/// A message the receiver lacks that is older than its floor, so that it records it as given up.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Below {
+    pub epoch: u64,
+    pub id: Bytes,
+}
+
 /// One group's state, in `hello`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -111,6 +123,9 @@ pub struct Hello {
     /// The newest signed head the sender holds of the kind's log, if it follows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<Head>,
+    /// The sender reconciles every message from the later join, whatever the floors (since 0.12).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
 }
 
 /// An identity's device list as its membership service showed it: every entry, and the service's signed head over
@@ -153,6 +168,15 @@ mod tests {
         let hello: Frame = serde_json::from_str(old).unwrap();
         assert_eq!(hello, Frame::Hello { groups: vec![], lists: vec![] });
         assert_eq!(serde_json::to_string(&hello).unwrap(), old);
+    }
+
+    #[test]
+    fn hello_and_messages_from_before_0_12_reconcile_from_the_lower_floor_and_name_nothing_below() {
+        let head = r#"{"log":"Zw","length":0,"hash":"AA","time":0,"sig":""}"#;
+        let hello: Hello = serde_json::from_str(&format!(r#"{{"group":"Zw","epoch":3,"head":{head},"floor":1,"joined":1}}"#)).unwrap();
+        assert!(!hello.all);
+        let messages: Frame = serde_json::from_str(r#"{"messages":{"group":"Zw","items":["AQ"]}}"#).unwrap();
+        assert_eq!(messages, Frame::Messages { group: Bytes(b"g".to_vec()), items: vec![Bytes(vec![1])], below: vec![] });
     }
 
     #[test]

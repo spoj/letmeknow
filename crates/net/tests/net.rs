@@ -127,7 +127,8 @@ async fn messages_sync_after_both_were_offline() {
     }
     assert!(!b.fake.holds(G, &before_b_joined), "nothing from before B joined");
     assert!(!b.fake.holds(G, &below_b_floor), "nothing below B's floor");
-    assert!(b.fake.groups.lock().unwrap()[G].given_up.is_empty(), "nothing below B's floor was even offered");
+    let given_up = b.fake.groups.lock().unwrap()[G].given_up.clone();
+    assert_eq!(given_up.into_iter().collect::<Vec<_>>(), [(id(&below_b_floor), 2)], "B learns, with its epoch, what it lacks below its floor");
     assert_eq!(b.fake.groups.lock().unwrap()[G].held.len(), 5);
 
     let live = message(5, "live");
