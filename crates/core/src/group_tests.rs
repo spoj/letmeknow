@@ -352,7 +352,7 @@ fn a_member_renames_itself_where_every_leaf_takes_it() {
     let commit = w.m[2].commit(Change { leaf: Some(leaf("C")), ..Change::default() });
     w.post(commit.commit);
     w.read(&[0, 1, 2]);
-    assert!(w.m[0].g().renames());
+    assert!(w.m[0].g().revised(RENAME_REVISION));
     let commit = w.m[1].commit(Change { name: Some("Bee".into()), ..Change::default() });
     w.post(commit.commit);
     let applied = w.read(&[0, 1, 2]);

@@ -158,6 +158,12 @@ async fn an_invite_made_for_someone_makes_its_joiner_that_contact_and_describes_
     // Whom the invite was for becomes a contact, and the group is told who they are.
     let ClientEvent::Introduced { identity, by, .. } = bob.until(|e| matches!(e, ClientEvent::Introduced { .. })).await else { unreachable!() };
     assert_eq!((identity.name.as_str(), by.name.as_deref()), ("Bob (Acme)", Some("Alice's laptop")));
+    // Every leaf names revision 1, so the introduce is held, by its sender and by those it reaches.
+    let holds_introduce = |m: &Member| {
+        let node = m.client.node();
+        node.groups().iter().any(|g| node.messages(&g.0).unwrap().iter().any(|message| message.payload["type"] == "introduce"))
+    };
+    assert!(holds_introduce(&alice) && holds_introduce(&bob));
     // The contact is the identity's once its devices group's log takes it.
     let mut contacts = alice.request(json!({ "cmd": "contacts" })).await;
     for _ in 0..200 {

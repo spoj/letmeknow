@@ -331,7 +331,7 @@ pub struct Added {
     pub how: Option<How>,
     /// SHA-256 of the secret of the invite it came in by.
     pub invite: Option<Bytes>,
-    /// The epoch the add started.
+    /// The epoch the Add moves into.
     pub epoch: u64,
 }
 
@@ -462,9 +462,9 @@ impl Group {
         self.mls.members().filter_map(|member| Member::of(&self.mls, member.index)).collect()
     }
 
-    /// Whether a member may rename itself in an update: every member's leaf names `RENAME_REVISION` or a later one.
-    pub fn renames(&self) -> bool {
-        renames(&self.mls)
+    /// Whether every member's leaf names `revision` or a later one.
+    pub fn revised(&self, revision: u32) -> bool {
+        revised(&self.mls, revision)
     }
 
     /// Who added whom, as the log showed it since this session joined.
@@ -765,13 +765,13 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex) -> Result<(
         let before = group.member_at(by).and_then(|member| credential_of(&member.credential));
         let after = credential_of(leaf.credential());
         let renamed = before.clone().zip(after.clone()).is_some_and(|(before, after)| Credential { name: after.name.clone(), ..before } == after);
-        ensure!(before == after || renamed && renames(group), "an update changed the member's credential");
+        ensure!(before == after || renamed && revised(group, RENAME_REVISION), "an update changed the member's credential");
     }
     Ok(())
 }
 
-fn renames(group: &MlsGroup) -> bool {
-    group.members().all(|member| Member::of(group, member.index).and_then(|m| m.leaf).is_some_and(|leaf| leaf.revision >= RENAME_REVISION))
+fn revised(group: &MlsGroup, revision: u32) -> bool {
+    group.members().all(|member| Member::of(group, member.index).and_then(|m| m.leaf).is_some_and(|leaf| leaf.revision >= revision))
 }
 
 #[cfg(test)]
