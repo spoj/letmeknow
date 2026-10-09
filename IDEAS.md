@@ -1,6 +1,6 @@
 # Ideas
 
-Explorations for after 0.10, kept loose on purpose: ideas, questions and the trade-offs seen so far. Designs come later, once more ideas have accumulated and crossed.
+Explorations, kept loose on purpose: ideas, questions and the trade-offs seen so far. Designs come later, once more ideas have accumulated and crossed.
 
 ## Where we stand
 
@@ -47,7 +47,28 @@ Explorations for after 0.10, kept loose on purpose: ideas, questions and the tra
 ## Identity as a key
 
 - Built in 0.12 (DESIGN.md, Identity): the devices group is an identity's only membership, its public log holds only its keys, and devices certify their sessions with the shared key for a day.
-- Open: a removed device's sessions that stay offline remain members, marked, until they are next online; members could also remove sessions whose certificates have been lapsed for longer than the key window.
+- Being closed for 0.13: a removed device's sessions that stay offline remain MLS members until they are next online, and can still read commits and commit. A key replacement that removes a device names it, and members remove its sessions at once.
+
+## Delivery and history
+
+- Delivery is peer to peer and transitive: every member holds what it opened for `keep` days and syncs it to any member it meets, so a message travels A to B to C even if A and C never overlap. Each hop must open the message within the key window (7 days from its epoch's start), so a chain finishes within about a week or the message is refused `old`, and its sender is told.
+- So the cost of peer to peer is availability within the window, not history: groups of intermittent members (laptops that sleep, phones) may not overlap in time. An always-on member (an agent on a server, a desktop) closes the gap with no new infrastructure.
+- History beyond the window is gone by design, mailbox or not: a member that kept its state can replay commits from the membership log, but keeps an epoch's keys only for the window (forward secrecy, and openmls rewrites every kept epoch on each send). Docs and repositories are not bound by it: their state reaches any member however long it was away, so chat is for live coordination and lasting things go in a doc or a repository.
+- A mailbox was considered and deferred: an optional service, named in a group's settings, holding ciphertext unordered under per-epoch addresses derived from the MLS exporter, so only that epoch's members can read or write, a removal revokes by itself, and the service cannot tie epochs to a group. It would sync like a member that opens nothing. It sees addresses, sizes, timing and IPs, its retention only helps up to the key window, and it needs revocation of its own, since a stolen device's state can derive later epochs' addresses until its sessions are removed. Revisit if phones make overlap too rare; with push, a member could register a token for a content-free wake-up.
+- A new device of an identity starts empty, as MLS joiners do; the identity's other devices hold the plaintext and could hand it over through the devices group, as Signal's transfer does.
+
+## Clients
+
+- 0.13 moves client behaviour into one core that the CLI and the browser share (introductions, openings, certificate renewal, member descriptions, plugin hosting), behind one API of requests, responses and events, so a desktop or mobile client is a thin shell: storage, network setup, UI and OS integration.
+- The core is built natively per platform; WASM only where a platform forces it (the browser) or for plugins. Raw UDP for iroh's direct paths, processes, SQLite and iOS's lack of JIT all argue against WASM elsewhere.
+- Kinds that run as executables cannot run on phones or in the browser. Portable kinds would be libraries linked into each client, and third-party kinds WASM modules speaking the plugin protocol, sandboxed, in every client.
+- Phones suspend apps, and messages move only between members online at once: a phone needs an always-on member of its own, or a push to wake it.
+
+## Case management
+
+- A corporate case is a group: its members are exactly who may see it, the membership log records who could see what when, and the service's signed heads timestamp each event.
+- A `case` kind on the kind's log would be a replicated state machine: operations (open, note, assign, transition from one state to another, approve, close) checked by every member against the case's workflow, so a claim is won once and four-eyes approval holds with no trusted server. A register group would number cases by log position and hold queues, with each case's content in its own group.
+- Companies would add an always-on records member in every case group, visible to all, for retention and e-discovery, and certify identities with roles so that groups open to a role.
 
 ## Transactions
 
