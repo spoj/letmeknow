@@ -314,9 +314,17 @@ def main():
         alice.expect("left", lambda e: e["member"]["name"] == "Carol")
         check(run("carol", "groups") == [], "and is in no group")
 
+        # Any member that holds an invite admits by it: erin gets in while bob, who made her link, is stopped.
+        link = run("bob", "invite", f"--group={group}")["link"]
+        erin = Listener("erin")
+        listeners.append(erin)
+
         # A restart: bob misses a message and a commit, and catches up when he is back.
         bob.stop()
         listeners.remove(bob)
+        joined = run("erin", "join", link)
+        check(joined["group"] == group and len(joined["members"]) == 4, "a joiner gets in while the inviter is stopped")
+        check(alice.expect("joined", lambda e: e["member"]["name"] == "Erin")["by"]["name"] != "Bob", "admitted by another member")
         run("alice", "name", f"--group={group}", "Release")
         missed = run("alice", "send", f"--group={group}", "while you were away")
         check("held_by" in missed, "the tablet holds what bob misses")
