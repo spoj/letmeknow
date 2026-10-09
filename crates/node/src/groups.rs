@@ -106,10 +106,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if Control::TYPES.contains(&type_of(&payload)) {
             match serde_json::from_value(payload.clone())? {
                 Control::Leave => {
-                    if opened.current.is_some() {
-                        self.work.send(Work::Remove { group: gid.to_vec(), key: opened.key.clone() }).ok();
-                    }
                     hold(st, gid, Message { id: Bytes(id.to_vec()), group, epoch, at: now(), sender, payload }, ciphertext)?;
+                    self.leavers(st, gid)?;
                 }
                 Control::Introduce { identity, name, how, to } => {
                     let me = Bytes(Sha256::digest(st.session.key())[..8].to_vec());
@@ -207,9 +205,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let (welcome, position) = self
             .commit(gid, |g| {
                 ensure!(invite.as_ref().is_none_or(|invite| !g.used(&invite.0)), UNKNOWN);
-                Ok(add.clone())
+                Ok(Some(add.clone()))
             })
-            .await?;
+            .await?
+            .context("an Add has effect")?;
         let (state, before, logs) = {
             let st = self.state.lock().unwrap();
             let g = st.group(gid)?;

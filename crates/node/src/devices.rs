@@ -261,15 +261,17 @@ impl<P: Provider + Send + 'static> Devices<P> {
         self.enter(&gid.0, Entry::Opening { opening }).await
     }
 
-    /// Takes a device off an identity, and replaces the identity's key, which it held.
+    /// Takes a device off an identity, and replaces the identity's key, which it held, if this device's commit took it off.
     pub async fn remove(&self, identity: &[u8], device: &[u8]) -> Result<()> {
         ensure!(device != self.device.public(), "to take this device off its identity, leave it");
         let (gid, _) = self.book(identity)?;
         let device = Bytes(device.to_vec());
         self.removing.lock().unwrap().insert(device.clone());
         let removed = async {
-            self.node.remove(&gid.0, &device.0).await?;
-            self.revoke(&gid.0, device.clone()).await
+            match self.node.remove(&gid.0, &device.0).await? {
+                true => self.revoke(&gid.0, device.clone()).await,
+                false => Ok(()),
+            }
         };
         let removed = removed.await;
         self.removing.lock().unwrap().remove(&device);

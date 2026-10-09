@@ -25,7 +25,7 @@ use lmk_membership::Contradiction;
 use lmk_core::provider::Provider;
 use lmk_membership::Refused;
 use lmk_net::{Net, Network};
-use lmk_proto::group::{CHAT, Control, Credential, DEVICES, How, IdentityRef, Leaf, Opening, REVISION, Reason, Refusal, Settings, held_by_type};
+use lmk_proto::group::{CHAT, Control, Credential, DEVICES, How, IdentityRef, Leaf, Opening, REVISION, Reason, Refusal, Settings, held_by_type, type_of};
 use lmk_proto::identity::Envelope;
 use lmk_proto::links::{Address, FileLink, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Frame, Join, KindLog as LogRef};
@@ -179,7 +179,9 @@ pub enum Event {
         member: Member,
         by: Member,
     },
-    /// This session was removed; the group is gone from it.
+    /// This session was removed, by `by` as it applied the commit, or else with no `by`: by a commit applied before it
+    /// stopped, left the only member of a group it asked to leave, or away past its log's retention. The group is gone
+    /// from it.
     Removed {
         group: Bytes,
         by: Option<Member>,
@@ -389,6 +391,8 @@ pub(crate) enum Work {
         group: Vec<u8>,
         key: Vec<u8>,
     },
+    /// A group this session is out of, by no one's commit.
+    Gone(Vec<u8>),
     Fetch {
         group: Vec<u8>,
         link: FileLink,
@@ -425,6 +429,8 @@ pub(crate) struct Inner<P> {
     /// Woken whenever a kind's log is applied further, for appends waiting to catch up.
     advanced: tokio::sync::Notify,
     reading: Mutex<HashSet<Vec<u8>>>,
+    /// The removals under way, by group and member key.
+    removing: Mutex<HashSet<(Vec<u8>, Vec<u8>)>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -701,6 +707,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             committing: tokio::sync::Mutex::new(()),
             advanced: tokio::sync::Notify::new(),
             reading: Mutex::default(),
+            removing: Mutex::default(),
             tasks: Mutex::default(),
         });
         let net_config = lmk_net::Config {
@@ -737,6 +744,17 @@ impl<P: Provider + Send + 'static> Node<P> {
             for id in identities {
                 if let Err(error) = inner.keyed(&mut st, &id.0) {
                     inner.warn(None, format!("the key log of {}: {error:#}", hex(&id.0)));
+                }
+            }
+        }
+        {
+            // A session removed by a commit it applied before it stopped is told so now.
+            let st = inner.state.lock().unwrap();
+            for gid in &gids {
+                if !st.group(gid)?.mls.active() {
+                    inner.work.send(Work::Gone(gid.clone())).ok();
+                } else if let Err(error) = inner.leavers(&st, gid) {
+                    inner.warn(Some(gid), format!("{error:#}"));
                 }
             }
         }
@@ -906,19 +924,21 @@ impl<P: Provider + Send + 'static> Node<P> {
         Err(refusal)
     }
 
-    pub async fn remove(&self, gid: &[u8], key: &[u8]) -> Result<()> {
-        self.inner
-            .commit(gid, |g| {
-                let member = g.members().into_iter().find(|m| m.key == key).context("not a member")?;
-                Ok(Change { remove: vec![member.index], ..Change::default() })
-            })
-            .await
-            .map(drop)
+    /// Removes a member. Returns whether this session's commit removed it, which it need not once another's did.
+    pub async fn remove(&self, gid: &[u8], key: &[u8]) -> Result<bool> {
+        ensure!(self.inner.state.lock().unwrap().group(gid)?.mls.members().iter().any(|m| m.key == key), "not a member");
+        let remove = |g: &Group| Ok(g.members().into_iter().find(|m| m.key == key).map(|member| Change { remove: vec![member.index], ..Change::default() }));
+        Ok(self.inner.commit(gid, remove).await?.is_some())
     }
 
     /// Changes the group's settings, from the current ones.
     pub async fn change_settings(&self, gid: &[u8], change: impl Fn(Settings) -> Settings) -> Result<Settings> {
-        self.inner.commit(gid, |g| Ok(Change { settings: Some(change(g.settings())), ..Change::default() })).await?;
+        self.inner
+            .commit(gid, |g| {
+                let settings = change(g.settings());
+                Ok((settings != g.settings()).then(|| Change { settings: Some(settings), ..Change::default() }))
+            })
+            .await?;
         self.settings(gid)
     }
 
@@ -1215,10 +1235,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub async fn rename_device(&self, name: &str) -> Result<()> {
         self.inner.state.lock().unwrap().device = Some(name.into());
         for gid in self.groups() {
-            let due = self.inner.state.lock().unwrap().group(&gid.0).is_ok_and(|g| renaming(&g.mls, Some(name)).is_some());
-            if due {
-                self.inner.commit(&gid.0, |g| Ok(Change { name: renaming(g, Some(name)), ..Change::default() })).await?;
-            }
+            self.inner.commit(&gid.0, |g| Ok(renaming(g, Some(name)).map(|name| Change { name: Some(name), ..Change::default() }))).await?;
         }
         Ok(())
     }
@@ -1274,7 +1291,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     let st = self.state.lock().unwrap();
                     (st.session.leaf.clone(), st.device.clone())
                 };
-                let change = |g: &Group| Ok(Change { leaf: Some(leaf.clone()), name: renaming(g, device.as_deref()), ..Change::default() });
+                let change = |g: &Group| Ok(Some(Change { leaf: Some(leaf.clone()), name: renaming(g, device.as_deref()), ..Change::default() }));
                 let updated = async {
                     self.read(gid).await.context("catching up")?;
                     self.commit(gid, change).await.context("key update")
@@ -1401,9 +1418,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Commits a change built on the group's current epoch, posts it, and reads the log until it is known whether it
-    /// won its epoch; if another commit won, builds it again. Returns the Welcome, if it adds, and the position. A removal
-    /// in a group with a kind's log first ends that log, and names where.
-    async fn commit(&self, gid: &[u8], change: impl Fn(&Group) -> Result<Change>) -> Result<(Option<Vec<u8>>, u64)> {
+    /// won its epoch; if another commit won, builds it again. Returns the Welcome, if it adds, and the position; none
+    /// once the change has no effect (`None`), and it commits nothing. A removal in a group with a kind's log first ends
+    /// that log, and names where.
+    async fn commit(&self, gid: &[u8], change: impl Fn(&Group) -> Result<Option<Change>>) -> Result<Option<(Option<Vec<u8>>, u64)>> {
         let _committing = self.committing.lock().await;
         let mut ended: Option<LogRef> = None;
         for _ in 0..COMMIT_TRIES {
@@ -1411,7 +1429,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let (ending, service) = {
                 let st = self.state.lock().unwrap();
                 let g = st.group(gid)?;
-                let removes = g.mls.posted().is_none() && !change(&g.mls)?.remove.is_empty();
+                let removes = g.mls.posted().is_none() && change(&g.mls)?.is_some_and(|change| !change.remove.is_empty());
                 (g.rec.kind_logs.last().filter(|_| removes).cloned(), g.mls.settings().membership)
             };
             let client = self.clients.client(&service)?;
@@ -1428,7 +1446,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 match g.mls.posted() {
                     Some(posted) => (posted.to_vec(), None, false),
                     None => {
-                        let mut change = change(&g.mls)?;
+                        let Some(mut change) = change(&g.mls)? else { return Ok(None) };
                         if !change.remove.is_empty() {
                             change.end = ended.as_ref().filter(|ended| g.rec.kind_logs.last().is_some_and(|log| log.id == ended.id)).map(|ended| ended.after);
                         }
@@ -1452,10 +1470,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let g = st.group(gid)?;
             ensure!(g.rec.position >= position, "the log did not show the commit it took");
             if ours && g.own_at == Some(position) {
-                return Ok((welcome, position));
+                return Ok(Some((welcome, position)));
             }
         }
-        bail!("the group kept changing; try again")
+        bail!("the group kept changing over {COMMIT_TRIES} tries; try again")
     }
 
     /// Joins a group from the Welcome a member at `by` sent.
@@ -1756,27 +1774,24 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     }
                 }
                 Work::Remove { group, key } => {
-                    let inner = self.clone();
-                    self.spawn(async move {
-                        let still = inner
-                            .state
-                            .lock()
-                            .unwrap()
-                            .group(&group)
-                            .is_ok_and(|g| g.mls.members().iter().any(|m| m.key == key));
-                        if still
-                            && let Err(error) = (Node { inner: inner.clone() }).remove(&group, &key).await
-                            && inner
-                                .state
-                                .lock()
-                                .unwrap()
-                                .group(&group)
-                                .is_ok_and(|g| g.mls.members().iter().any(|m| m.key == key))
-                        {
-                            inner.warn(Some(&group), format!("removing a member: {error:#}"));
-                        }
-                    });
+                    if self.removing.lock().unwrap().insert((group.clone(), key.clone())) {
+                        let inner = self.clone();
+                        self.spawn(async move {
+                            if let Err(error) = (Node { inner: inner.clone() }).remove(&group, &key).await
+                                && inner
+                                    .state
+                                    .lock()
+                                    .unwrap()
+                                    .group(&group)
+                                    .is_ok_and(|g| g.mls.members().iter().any(|m| m.key == key))
+                            {
+                                inner.warn(Some(&group), format!("removing a member: {error:#}"));
+                            }
+                            inner.removing.lock().unwrap().remove(&(group, key));
+                        });
+                    }
                 }
+                Work::Gone(group) => self.gone(&group, None),
                 Work::Fetch { group, link } => {
                     if self.net().has(link.hash).await.unwrap_or(false) {
                         self.events.send(Event::File(link.hash)).ok();
@@ -1830,10 +1845,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let by = by.and_then(|by| st.member(gid, &by));
         if gone {
             drop(st);
-            if let Err(error) = self.forget(gid) {
-                self.warn(Some(gid), format!("{error:#}"));
-            }
-            self.events.send(Event::Removed { group, by }).ok();
+            self.gone(gid, by);
             return;
         }
         let Some(by) = by else { return };
@@ -1859,7 +1871,45 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if settings && let Ok(g) = st.group(gid) {
             self.events.send(Event::Settings { group, settings: g.mls.settings(), by }).ok();
         }
-        drop(st);
+        if !removed.is_empty()
+            && let Err(error) = self.leavers(&st, gid)
+        {
+            self.warn(Some(gid), format!("{error:#}"));
+        }
+    }
+
+    /// Tells that this session is out of a group, then forgets it, unless it did so already.
+    fn gone(&self, gid: &[u8], by: Option<Member>) {
+        if !self.state.lock().unwrap().groups.contains_key(gid) {
+            return;
+        }
+        self.events.send(Event::Removed { group: Bytes(gid.to_vec()), by }).ok();
+        if let Err(error) = self.forget(gid) {
+            self.warn(Some(gid), format!("{error:#}"));
+        }
+    }
+
+    /// Has the members removed whose `leave` this session holds, sealed since the Add that brought them in last; has the
+    /// group gone once this session holds its own and is the only member left.
+    fn leavers(&self, st: &State<P>, gid: &[u8]) -> Result<()> {
+        let Ok(g) = st.group(gid) else { return Ok(()) };
+        let added = |key: &[u8]| g.mls.added().iter().rev().find(|added| added.member.key.0 == key).map_or(0, |added| added.epoch);
+        let mut leaving = HashSet::new();
+        for item in &g.rec.items {
+            let message: Message = get(&st.provider, &message_key(&item.id.0))?.context("a held message is missing")?;
+            if type_of(&message.payload) == "leave" && message.epoch >= added(&message.sender.key.0) {
+                leaving.insert(message.sender.key.0);
+            }
+        }
+        let me = st.session.key();
+        let members = g.mls.members();
+        if members.len() == 1 && leaving.contains(me) {
+            self.work.send(Work::Gone(gid.to_vec())).ok();
+        }
+        for member in members.into_iter().filter(|m| m.key != me && leaving.contains(&m.key)) {
+            self.work.send(Work::Remove { group: gid.to_vec(), key: member.key }).ok();
+        }
+        Ok(())
     }
 
     /// Tells the group, in one held notice, the messages this session gave up since it last did.
@@ -1928,8 +1978,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             lmk_net::Event::Synced { group, peer } => {
                 self.events.send(Event::Synced { group: Bytes(group.clone()) }).ok();
-                // A message the kind's log names that this sync did not bring will not come from this peer.
                 let mut st = self.state.lock().unwrap();
+                if let Err(error) = self.leavers(&st, &group) {
+                    self.warn(Some(&group), format!("{error:#}"));
+                }
+                // A message the kind's log names that this sync did not bring will not come from this peer.
                 if self.waits(&st, &group) {
                     self.ask_state(&mut st, &group, Some(peer));
                 }
