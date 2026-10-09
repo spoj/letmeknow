@@ -1,8 +1,9 @@
-//! The browser client: one lmk-node session whose MLS key is the browser's device key, reaching its peers only through
-//! the relay. Chat is built in; the doc kind (`lmk_kind_doc::Page`) and the git kind, display-only
-//! (`lmk_kind_git::Page`), are in-page plugins, which this hosts in the plugin protocol. The page persists the session's records in IndexedDB, one record per key, and the ciphertext of the
-//! files it holds, which the session loads when it needs one. Results that are not bytes are JSON strings; message ids
-//! and fingerprints are hex, other bytes base64url.
+//! The browser client: the client core on one lmk-node session whose MLS key is the browser's device key, reaching its
+//! peers only through the relay, with the devices kind on the same node. Chat is built in; the doc kind
+//! (`lmk_kind_doc::Page`) and the git kind, display-only (`lmk_kind_git::Page`), are in-page plugins, whose messages go
+//! to and from the core as calls. The page persists the session's records in IndexedDB, one record per key, and the
+//! ciphertext of the files it holds, which the session loads when it needs one. Results that are not bytes are JSON
+//! strings; message ids and fingerprints are hex, other bytes base64url.
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::RefCell;
@@ -13,14 +14,14 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use js_sys::{Array, Function, Promise, Uint8Array};
-use lmk_node::lmk_core::contacts::{self, Contact};
-use lmk_node::devices::{Devices, renewal_due};
+use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Introduction, Request, message_id, service};
+use lmk_node::devices::Devices;
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::group::Window;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
-use lmk_node::{Claim, Disk, Event, Member, Node, now};
+use lmk_node::{Disk, Node, now};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, DEVICES, How, IdentityRef, Named, PROTOCOL, Reason, Service, Settings};
+use lmk_proto::group::{CHAT, DEVICES, PROTOCOL, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::{Duration, sleep};
@@ -29,7 +30,6 @@ use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -164,6 +164,45 @@ impl lmk_kind_git::Store for PageStore {
     }
 }
 
+/// The in-page plugins: what they send in answer to a message goes to the client as their lines.
+struct InPage {
+    docs: Mutex<lmk_kind_doc::Page<PageStore>>,
+    git: Mutex<lmk_kind_git::Page<PageStore>>,
+    started: Mutex<HashSet<String>>,
+    lines: mpsc::UnboundedSender<(String, Option<Value>)>,
+}
+
+impl lmk_client::Plugins for InPage {
+    fn kinds(&self) -> Vec<String> {
+        vec![DOC.into(), GIT.into()]
+    }
+
+    fn start(&self, kind: &str) -> Result<Value> {
+        anyhow::ensure!([DOC, GIT].contains(&kind), "this browser has no plugin for {kind} groups");
+        self.started.lock().unwrap().insert(kind.to_owned());
+        Ok(json!({}))
+    }
+
+    fn running(&self) -> Vec<String> {
+        self.started.lock().unwrap().iter().cloned().collect()
+    }
+
+    fn send(&self, kind: &str, message: &Value) -> Result<()> {
+        let out = match kind {
+            DOC => self.docs.lock().unwrap().input(message),
+            _ => self.git.lock().unwrap().input(message),
+        };
+        for line in out {
+            self.lines.send((kind.to_owned(), Some(line))).ok();
+        }
+        Ok(())
+    }
+
+    fn stopped(&self, _: &str) -> bool {
+        unreachable!("an in-page plugin does not stop")
+    }
+}
+
 fn get<T: for<'de> Deserialize<'de>>(store: &Store, key: &[u8]) -> Result<Option<T>> {
     Ok(store.get(key)?.map(|bytes| serde_json::from_slice(&bytes)).transpose()?)
 }
@@ -174,14 +213,6 @@ fn put<T: Serialize>(store: &Store, key: &[u8], value: &T) -> Result<()> {
 
 fn key(kind: &str, gid: &[u8]) -> Vec<u8> {
     [format!("web/{kind}/").as_bytes(), gid].concat()
-}
-
-fn fp(key: &[u8]) -> String {
-    hex::encode(&Sha256::digest(key)[..8])
-}
-
-fn b64(bytes: &[u8]) -> String {
-    serde_json::to_value(Bytes(bytes.to_vec())).unwrap().as_str().unwrap().to_owned()
 }
 
 fn unb64(text: &str) -> Result<Vec<u8>> {
@@ -195,12 +226,6 @@ fn digest(value: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// A membership service: `<iroh key, hex>@<relay URL>`.
-fn service(address: &str) -> Result<Service> {
-    let (key, relay) = address.split_once('@').context("a membership service is <key>@<relay URL>")?;
-    Ok(Service::Serve { key: Bytes(hex::decode(key)?), relay: relay.into(), addrs: Vec::new() })
-}
-
 #[derive(Deserialize)]
 struct Config {
     /// The person's name and this device's: used only when the browser has no session yet.
@@ -210,31 +235,19 @@ struct Config {
     membership: String,
 }
 
-/// An introduction of an identity that is neither this one nor a contact: someone's word, until accepted.
-#[derive(Clone, Serialize, Deserialize)]
-struct Introduction {
+/// An introduction as letmeknow 0.12 kept it, in the record `web/introductions`, by identity id.
+#[derive(Deserialize)]
+struct Kept012 {
     name: String,
-    /// The introducer, as this session showed it.
+    /// The introducer's label.
     by: String,
     by_id: Bytes,
 }
 
-/// What describing members needs, gathered once per call.
-struct Known {
-    me: Bytes,
-    identities: Vec<(IdentityRef, String)>,
-    contacts: Vec<(Bytes, Contact)>,
-    introductions: HashMap<String, Introduction>,
-    members: Vec<Member>,
-}
-
 struct App {
-    node: Node<Store>,
-    /// The browser's device, whose key is its session's too, and the devices kind on its node.
-    device: Device,
-    devices: Devices<Store>,
+    client: Client<Store>,
     store: Store,
-    membership: Service,
+    membership: lmk_proto::group::Service,
     /// A digest of each record as last persisted.
     shadow: RefCell<HashMap<Vec<u8>, u64>>,
     idb: Idb,
@@ -243,14 +256,6 @@ struct App {
     /// Open groups this session tried to join by itself, and those it failed to join.
     tried: RefCell<HashSet<Bytes>>,
     failed: RefCell<HashSet<Bytes>>,
-    /// The in-page plugins.
-    docs: RefCell<lmk_kind_doc::Page<PageStore>>,
-    git: RefCell<lmk_kind_git::Page<PageStore>>,
-    /// The last position of each git group's log handed to its plugin, once it follows the log.
-    handed: RefCell<HashMap<Vec<u8>, u64>>,
-    /// Requests for a group's state, by request id.
-    snapshots: RefCell<HashMap<u64, oneshot::Sender<Option<Vec<u8>>>>>,
-    asked: std::cell::Cell<u64>,
 }
 
 /// The browser's session.
@@ -297,8 +302,9 @@ impl App {
         let hashes = kept.iter().map(|hash| hex::decode(hash)?.try_into().map_err(|_| anyhow!("a hash is 32 bytes"))).collect::<Result<_>>()?;
         let (io, mut io_rx) = mpsc::unbounded_channel();
         let kept = Arc::new(Kept { hashes: Mutex::new(hashes), io });
+        let name: String = get(&store, b"web/name")?.context("no name")?;
         let node_config = lmk_node::Config {
-            name: get(&store, b"web/name")?.context("no name")?,
+            name: name.clone(),
             device: Some(device.clone()),
             relay: config.relay.parse()?,
             ca: Default::default(),
@@ -312,14 +318,36 @@ impl App {
         let (node, mut events) = Node::start(store.clone(), node_config).await?;
         let devices = Devices::new(node.clone(), device.clone());
         let membership = service(&config.membership)?;
-        let (tried, failed, snapshots, asked, handed) = Default::default();
-        let docs = RefCell::new(lmk_kind_doc::Page::new(PageStore(store.clone())));
-        let git = RefCell::new(lmk_kind_git::Page::new(PageStore(store.clone())));
+        let (lines, written) = mpsc::unbounded_channel();
+        let plugins = InPage {
+            docs: Mutex::new(lmk_kind_doc::Page::new(PageStore(store.clone()))),
+            git: Mutex::new(lmk_kind_git::Page::new(PageStore(store.clone()))),
+            started: Mutex::default(),
+            lines,
+        };
+        let client_config = lmk_client::Config { name, device, membership: membership.clone() };
+        let (client, mut told) = Client::new(node, client_config, Access::Here(devices), Arc::new(plugins), written);
+        let (tried, failed) = Default::default();
         let shadow = RefCell::new(shadow);
-        let app = Rc::new(App { node, device, devices, store, membership, shadow, idb, kept, on_event, tried, failed, docs, git, handed, snapshots, asked });
-        for gid in app.node.groups() {
-            app.open_kind(&gid.0, None)?;
-        }
+        let app = Rc::new(App { client, store, membership, shadow, idb, kept, on_event, tried, failed });
+        app.take_introductions()?;
+        let told_app = app.clone();
+        spawn_local(async move {
+            while let Some(event) = told.recv().await {
+                if let Err(e) = told_app.on(event) {
+                    told_app.emit(json!({ "type": "warning", "text": format!("{e:#}") }));
+                }
+                told_app.flush();
+            }
+        });
+        let client = app.client.clone();
+        spawn_local(async move {
+            loop {
+                let (kind, line) = client.next_line().await;
+                client.plugin_line(kind, line).await;
+            }
+        });
+        app.client.start().await;
         app.flush();
         app.join_openings();
         let io_app = app.clone();
@@ -337,11 +365,7 @@ impl App {
         let events_app = app.clone();
         spawn_local(async move {
             while let Some(event) = events.recv().await {
-                if let Some(event) = events_app.devices.on(event)
-                    && let Err(e) = events_app.on(event).await
-                {
-                    events_app.emit(json!({ "type": "warning", "text": format!("{e:#}") }));
-                }
+                events_app.client.event(event).await;
                 events_app.flush();
                 events_app.join_openings();
             }
@@ -357,7 +381,9 @@ impl App {
         let renewing = Rc::downgrade(&app);
         spawn_local(async move {
             while let Some(app) = renewing.upgrade() {
-                app.renew().await;
+                for e in app.client.renew().await {
+                    error(&format!("renewing this session's certificate: {e:#}"));
+                }
                 drop(app);
                 sleep(RENEW_CHECK).await;
             }
@@ -373,46 +399,27 @@ impl App {
         Ok(app)
     }
 
-    /// Renews this session's certificate of each identity it speaks as that is due, and shows it its peers.
-    async fn renew(&self) {
-        let keys = self.devices.keys();
-        for identity in self.node.spoken() {
-            let current = keys.iter().find(|(id, _)| *id == identity.id).map(|(_, key)| key);
-            if renewal_due(self.node.certificate(&identity.id.0).as_ref(), current)
-                && let Err(e) = self.certify(&identity).await
-            {
-                error(&format!("renewing this session's certificate: {e:#}"));
-            }
+    /// Hands the client the introductions that letmeknow 0.12 kept in this browser's own record.
+    fn take_introductions(&self) -> Result<()> {
+        let Some(kept) = get::<HashMap<String, Kept012>>(&self.store, b"web/introductions")? else { return Ok(()) };
+        for (id, introduction) in kept {
+            let by = Described { name: Some(introduction.by), ..Described::default() };
+            self.client.add_introduction(Introduction { identity: Bytes(unb64(&id)?), name: introduction.name, by, by_id: introduction.by_id })?;
         }
-    }
-
-    async fn certify(&self, identity: &IdentityRef) -> Result<()> {
-        let name: String = get(&self.store, b"web/name")?.unwrap_or_default();
-        let certificate = self.devices.certify(&identity.id.0, self.node.key(), name).await?;
-        self.node.set_certificate(certificate)
-    }
-
-    /// The identity a new membership speaks as, the browser's first, with this session's certificate of it.
-    async fn speaking_as(&self) -> Result<Option<IdentityRef>> {
-        let identity = self.devices.identities().into_iter().next().map(|(identity, _)| identity);
-        if let Some(identity) = &identity
-            && self.node.certificate(&identity.id.0).is_none()
-        {
-            self.certify(identity).await?;
-        }
-        Ok(identity)
+        self.store.delete(b"web/introductions")
     }
 
     /// Joins, once each, the groups open to this browser's identities; one that fails waits for a click.
     fn join_openings(self: &Rc<Self>) {
-        let joined = self.node.groups();
-        for opening in self.devices.openings() {
+        let joined = self.client.node().groups();
+        let Ok(state) = self.client.device_state() else { return };
+        for opening in state.openings {
             if joined.contains(&opening.group) || !self.tried.borrow_mut().insert(opening.group.clone()) {
                 continue;
             }
             let app = self.clone();
             spawn_local(async move {
-                if app.join_open(&opening.group.0).await.is_err() {
+                if app.request(join(&opening.group)).await.is_err() {
                     app.failed.borrow_mut().insert(opening.group.clone());
                 }
                 app.flush();
@@ -423,7 +430,7 @@ impl App {
 
     /// Deletes the kept files no group links any longer, by the rule lmk-node holds files by.
     fn collect(&self) {
-        let linked: HashSet<[u8; 32]> = self.node.files().iter().map(|link| link.hash).collect();
+        let linked: HashSet<[u8; 32]> = self.client.node().files().iter().map(|link| link.hash).collect();
         self.kept.hashes.lock().unwrap().retain(|hash| {
             let keep = linked.contains(hash);
             if !keep {
@@ -464,189 +471,65 @@ impl App {
         self.on_event.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string())).ok();
     }
 
-    /// Tells a group's in-page plugin of the group, made or joined by `command`.
-    fn open_kind(self: &Rc<Self>, gid: &[u8], command: Option<&str>) -> Result<()> {
-        let settings = self.node.settings(gid)?;
-        if ![DOC, GIT].contains(&settings.kind.as_str()) {
-            return Ok(());
+    /// A request of the client core; a group joined has its settings remembered, for the changes to them.
+    async fn request(&self, request: Request) -> Result<Value> {
+        let joining = matches!(request, Request::Join { .. });
+        let answer = self.client.request(request).await?;
+        if joining && let Some(gid) = answer["group"].as_str() {
+            self.remember_settings(&unb64(gid)?)?;
         }
-        let message = json!({ "type": "group", "group": b64(gid), "settings": settings, "id": 0, "command": command });
-        let answers = self.to_kind(&settings.kind, message);
-        if let Some(error) = answers.iter().find_map(|answer| answer["error"].as_str()) {
-            return Err(anyhow!("{error}"));
-        }
-        Ok(())
+        Ok(answer)
     }
 
-    /// Gives a kind's in-page plugin a message, and carries out what it asks through the group's channels; returns its
-    /// answers.
-    fn to_kind(self: &Rc<Self>, kind: &str, message: Value) -> Vec<Value> {
-        let out = match kind {
-            DOC => self.docs.borrow_mut().input(&message),
-            _ => self.git.borrow_mut().input(&message),
-        };
-        let mut answers = Vec::new();
-        for message in out {
-            let gid = message["group"].as_str().map(unb64).transpose();
-            let done = gid.and_then(|gid| {
-                let gid = gid.unwrap_or_default();
-                match message["type"].as_str().unwrap_or_default() {
-                    "answer" => {
-                        let asked = message["id"].as_u64().and_then(|id| self.snapshots.borrow_mut().remove(&id));
-                        match asked {
-                            Some(reply) => drop(reply.send(message["answer"]["data"].as_str().map(unb64).transpose()?)),
-                            None => answers.push(message.clone()),
-                        }
-                    }
-                    "send" => self.node.send_live(&gid, &message["payload"], message["to"].as_str())?,
-                    "links" => self.node.set_links(&gid, serde_json::from_value(message["links"].clone())?)?,
-                    "log" => {
-                        let after = message["after"].as_u64();
-                        self.node.follow_log(&gid, after)?;
-                        if let Some(after) = after {
-                            self.handed.borrow_mut().insert(gid.clone(), after);
-                            self.hand_entries(&gid)?;
-                        }
-                    }
-                    "event" => {
-                        let mut event = message["event"].clone();
-                        if event["type"] == "pushed" {
-                            let item = json!({ "type": "pushed", "at": now(), "by": event["by"], "ref": event["ref"], "subjects": event["subjects"] });
-                            self.remember(&gid, &item)?;
-                        }
-                        event["group"] = message["group"].clone();
-                        event["kind"] = json!(kind);
-                        self.emit(event);
-                    }
-                    other => anyhow::bail!("the {kind} plugin asked for {other}"),
-                }
-                Ok(())
-            });
-            if let Err(error) = done {
-                self.emit(json!({ "type": "warning", "group": message["group"], "text": format!("{error:#}") }));
-            }
-        }
-        answers
-    }
-
-    /// Hands a node event about a group to its kind's in-page plugin, if it has one.
-    fn tell_kind(self: &Rc<Self>, gid: &[u8], mut message: Value) -> Result<()> {
-        let kind = self.node.settings(gid)?.kind;
-        if [DOC, GIT].contains(&kind.as_str()) {
-            message["group"] = json!(b64(gid));
-            self.to_kind(&kind, message);
-        }
-        Ok(())
-    }
-
-    /// Hands a git group's plugin the entries of its log it has not had.
-    fn hand_entries(self: &Rc<Self>, gid: &[u8]) -> Result<()> {
-        let Some(after) = self.handed.borrow().get(gid).copied() else { return Ok(()) };
-        let known = self.known(gid)?;
-        for entry in self.node.entries(gid, after)? {
-            self.handed.borrow_mut().insert(gid.to_vec(), entry.position);
-            let from = self.describe(&known, &entry.from);
-            let message = json!({ "type": "entry", "group": b64(gid), "position": entry.position, "id": hex::encode(&entry.id.0), "from": from, "payload": entry.payload });
-            self.to_kind(GIT, message);
-        }
-        Ok(())
-    }
-
-    async fn on(self: &Rc<Self>, event: Event) -> Result<()> {
-        if let Event::Joined { group, .. } | Event::Left { group, .. } = &event
-            && let Some(identity) = self.devices.identity(&group.0)
-        {
-            self.emit(json!({ "type": "devices", "identity": identity.id }));
-            return Ok(());
-        }
+    /// What the client tells: kept in its group's timeline and told the page.
+    fn on(&self, event: ClientEvent) -> Result<()> {
         match event {
-            Event::Joined { group, member, by, how, introduces, label } => {
-                let known = self.known(&group.0)?;
-                let item = json!({ "type": "joined", "at": now(), "member": self.describe(&known, &member), "by": self.describe(&known, &by), "how": how });
-                self.remember(&group.0, &item)?;
+            ClientEvent::Joined { group, member, by, how } => {
+                self.remember(&group.0, &json!({ "type": "joined", "at": now(), "member": member, "by": by, "how": how }))?;
                 self.emit(json!({ "type": "joined", "group": group }));
-                if introduces {
-                    self.introduce_joiner(&group.0, &member, how, label).await?;
-                }
-                self.refresh_opening(&group.0).await?;
             }
-            Event::Left { group, member, by } => {
-                let known = self.known(&group.0)?;
-                let item = json!({ "type": "left", "at": now(), "member": self.describe(&known, &member), "by": self.describe(&known, &by) });
-                self.remember(&group.0, &item)?;
+            ClientEvent::Left { group, member, by } => {
+                self.remember(&group.0, &json!({ "type": "left", "at": now(), "member": member, "by": by }))?;
                 self.emit(json!({ "type": "left", "group": group }));
-                self.refresh_opening(&group.0).await?;
             }
-            Event::Removed { group, by } => {
-                let by = by.map(|by| by.name);
+            ClientEvent::Removed { group, by } => self.emit(json!({ "type": "removed", "group": group, "by": by.and_then(|by| by.name) })),
+            ClientEvent::Gone { group } => {
                 for kind in ["timeline", "settings", "refused"] {
                     self.store.delete(&key(kind, &group.0))?;
                 }
-                self.to_kind(DOC, json!({ "type": "gone", "group": group }));
-                self.to_kind(GIT, json!({ "type": "gone", "group": group }));
-                self.handed.borrow_mut().remove(&group.0);
-                self.emit(json!({ "type": "removed", "group": group, "by": by }));
             }
-            Event::Settings { group, settings, by } => {
-                let known = self.known(&group.0)?;
+            ClientEvent::Settings { group, settings, by } => {
                 let before: Option<Settings> = get(&self.store, &key("settings", &group.0))?;
                 put(&self.store, &key("settings", &group.0), &settings)?;
-                let item = json!({ "type": "settings", "at": now(), "by": self.describe(&known, &by), "before": before, "settings": settings });
+                let item = json!({ "type": "settings", "at": now(), "by": by, "before": before, "settings": settings });
                 self.remember(&group.0, &item)?;
                 self.emit(json!({ "type": "settings", "group": group }));
-                self.refresh_opening(&group.0).await?;
             }
-            Event::Message(message) => {
-                // Chat holds the file a message attaches.
-                if let Some(link) = message.payload["attachment"]["link"].as_str() {
-                    self.node.hold(&message.group.0, &[link.to_owned()])?;
-                }
-                self.emit(json!({ "type": "message", "group": message.group, "id": hex::encode(&message.id.0) }));
-            }
-            Event::Live { group, sender, payload } => {
-                let from = self.describe(&self.known(&group.0)?, &sender);
-                self.tell_kind(&group.0, json!({ "type": "message", "from": from, "payload": payload, "held": false }))?;
-            }
-            // The page shows messages as they come, waiting for none.
-            Event::Synced { .. } => {}
-            Event::InStep { group, member } => {
-                let member = self.describe(&self.known(&group.0)?, &member);
-                self.tell_kind(&group.0, json!({ "type": "synced", "member": member }))?;
-            }
-            Event::State { group, from, data } => {
-                let from = self.describe(&self.known(&group.0)?, &from);
-                self.tell_kind(&group.0, json!({ "type": "state", "from": from, "data": Bytes(data) }))?;
-            }
-            Event::Logged { group } => self.hand_entries(&group.0)?,
-            Event::Snapshot { group, reply } => {
-                let id = self.asked.get() + 1;
-                self.asked.set(id);
-                self.snapshots.borrow_mut().insert(id, reply);
-                self.tell_kind(&group.0, json!({ "type": "snapshot", "id": id }))?;
-            }
-            Event::Introduced { group, by, identity, name, how } => {
-                let known = self.known(&group.0)?;
-                let described = self.describe(&known, &by);
-                let own = known.identities.iter().any(|(own, _)| own.id == identity.id);
-                if !own && !known.contacts.iter().any(|(id, _)| *id == identity.id) {
-                    let mut introductions = known.introductions;
-                    let by_id = by.identity.as_ref().map_or_else(|| by.key.clone(), |claim| claim.identity.id.clone());
-                    let introduction = Introduction { name: name.clone(), by: label(&described), by_id };
-                    introductions.insert(b64(&identity.id.0), introduction);
-                    put(&self.store, b"web/introductions", &introductions)?;
-                }
-                let item = json!({ "type": "introduced", "at": now(), "by": described, "identity": { "id": identity.id, "name": name }, "how": how });
-                self.remember(&group.0, &item)?;
+            ClientEvent::Introduced { group, by, identity, how } => {
+                self.remember(&group.0, &json!({ "type": "introduced", "at": now(), "by": by, "identity": identity, "how": how }))?;
                 self.emit(json!({ "type": "introduced", "group": group }));
             }
-            Event::Held { group, id, .. } => self.emit(json!({ "type": "held", "group": group, "id": hex::encode(&id.0) })),
-            Event::Refused { group, by, messages } => {
-                let refusals: Vec<_> = messages.into_iter().map(|refusal| (refusal.id, by.clone(), refusal.reason)).collect();
-                self.refused(&group.0, &refusals)?;
+            ClientEvent::Message { group, id, .. } => self.emit(json!({ "type": "message", "group": group, "id": id })),
+            ClientEvent::Held { group, id } => self.emit(json!({ "type": "held", "group": group, "id": id })),
+            ClientEvent::Refused { group, member, messages } => {
+                let by = label(&serde_json::to_value(member)?);
+                self.refused(&group.0, messages.into_iter().map(|refusal| (hex::encode(&refusal.id.0), by.clone(), json!(refusal.reason))))?;
                 self.emit(json!({ "type": "refused", "group": group }));
             }
-            Event::File(hash) => self.emit(json!({ "type": "file", "hash": hex::encode(hash) })),
-            Event::Warning { group, text } => self.emit(json!({ "type": "warning", "group": group, "text": text })),
+            ClientEvent::File { hash } => self.emit(json!({ "type": "file", "hash": hash })),
+            ClientEvent::Plugin { group, kind, mut event, .. } => {
+                if event.get("type") == Some(&json!("pushed")) {
+                    let item = json!({ "type": "pushed", "at": now(), "by": event["by"], "ref": event["ref"], "subjects": event["subjects"] });
+                    self.remember(&group.0, &item)?;
+                }
+                event.insert("group".into(), json!(group));
+                event.insert("kind".into(), json!(kind));
+                self.emit(Value::Object(event));
+            }
+            ClientEvent::Devices { identity } => self.emit(json!({ "type": "devices", "identity": identity })),
+            ClientEvent::Warning { group, text } => self.emit(json!({ "type": "warning", "group": group, "text": text })),
+            // The page shows messages as they come, waiting for none.
+            ClientEvent::Synced { .. } => {}
         }
         Ok(())
     }
@@ -658,130 +541,32 @@ impl App {
         put(&self.store, &key("timeline", gid), &timeline)
     }
 
-    /// Records which members refused this session's messages, and why.
-    fn refused(&self, gid: &[u8], refusals: &[(Bytes, Member, Reason)]) -> Result<()> {
-        let known = self.known(gid)?;
+    /// Records which members refused this session's messages, and why: by message id, the member's label and the reason.
+    fn refused(&self, gid: &[u8], refusals: impl Iterator<Item = (String, String, Value)>) -> Result<()> {
         let mut refused: HashMap<String, Vec<Value>> = get(&self.store, &key("refused", gid))?.unwrap_or_default();
-        for (id, by, reason) in refusals {
-            refused.entry(hex::encode(&id.0)).or_default().push(json!({ "name": label(&self.describe(&known, by)), "reason": reason }));
+        for (id, name, reason) in refusals {
+            refused.entry(id).or_default().push(json!({ "name": name, "reason": reason }));
         }
         put(&self.store, &key("refused", gid), &refused)
     }
 
-    /// A member came in by this session's invite, or was admitted by it to an open group: it tells the group who the
-    /// member is to it, and the member of an invite meant for someone becomes that contact.
-    async fn introduce_joiner(&self, gid: &[u8], member: &Member, how: How, label: Option<String>) -> Result<()> {
-        let Some(claim) = member.identity.clone().filter(|claim| claim.error.is_none()) else { return Ok(()) };
-        if let Some(label) = &label {
-            let contact = Contact { name: label.clone(), how: contacts::How::Verified, by: None, at: now() };
-            self.devices.set_contact(&claim.identity.id.0, contact).await?;
-        }
-        let contact = self.devices.contacts().into_iter().find(|(id, _)| *id == claim.identity.id);
-        let name = label.or(contact.map(|(_, c)| c.name)).unwrap_or(claim.name);
-        let introduce = Control::Introduce { identity: claim.identity, name, how, to: Vec::new() };
-        self.node.send(gid, &serde_json::to_value(introduce)?, false).await?;
-        Ok(())
-    }
-
-    /// Records, in the devices group of each of this device's identities the group is open to, the group's opening.
-    async fn refresh_opening(&self, gid: &[u8]) -> Result<()> {
-        let Ok(settings) = self.node.settings(gid) else { return Ok(()) };
-        for (identity, _) in self.devices.identities() {
-            if settings.open.iter().any(|named| named.id == identity.id) {
-                self.devices.set_opening(&identity.id.0, self.node.opening(gid)?).await?;
-            }
-        }
-        Ok(())
-    }
-
     fn remember_settings(&self, gid: &[u8]) -> Result<()> {
-        put(&self.store, &key("settings", gid), &self.node.settings(gid)?)
-    }
-
-    fn known(&self, gid: &[u8]) -> Result<Known> {
-        Ok(Known {
-            me: self.node.key(),
-            identities: self.devices.identities(),
-            contacts: self.devices.contacts(),
-            introductions: get(&self.store, b"web/introductions")?.unwrap_or_default(),
-            members: self.node.members(gid).unwrap_or_default(),
-        })
-    }
-
-    /// A member as the page shows it: its names, its identity as this one knows it, and who added it.
-    fn describe(&self, known: &Known, member: &Member) -> Value {
-        if member.key.0.is_empty() {
-            return json!({ "name": "", "iroh": member.iroh });
-        }
-        let mut described = json!({ "key": member.key, "fp": fp(&member.key.0), "name": member.name, "device": member.device_name });
-        if member.key == known.me {
-            described["you"] = json!(true);
-        }
-        if let Some(claim) = &member.identity {
-            described["identity"] = self.identity(known, claim);
-        }
-        if let Some((by, how)) = &member.added {
-            let adder = known.members.iter().find(|m| &m.key == by);
-            described["added_by"] = json!({ "name": adder.map(|a| a.name.clone()), "how": how });
-        }
-        described
-    }
-
-    /// An identity as this one knows it: its own (`self`), a contact (`verified` or `introduced`), or `unknown`: only
-    /// its own claim, with the introductions others made of it.
-    fn identity(&self, known: &Known, claim: &Claim) -> Value {
-        let id = &claim.identity.id;
-        let mut identity = json!({ "id": id });
-        if let Some((_, name)) = known.identities.iter().find(|(own, _)| &own.id == id) {
-            identity["name"] = json!(name);
-            identity["how"] = json!("self");
-        } else if let Some((_, contact)) = known.contacts.iter().find(|(cid, _)| cid == id) {
-            identity["name"] = json!(contact.name);
-            identity["how"] = json!(contact.how);
-            if let Some(by) = &contact.by {
-                let name = known.contacts.iter().find(|(cid, _)| cid == by).map_or_else(|| b64(&by.0), |(_, c)| c.name.clone());
-                identity["by"] = json!(name);
-            }
-        } else {
-            identity["name"] = json!(claim.name);
-            identity["how"] = json!("unknown");
-            if known.contacts.iter().any(|(_, c)| c.name.eq_ignore_ascii_case(&claim.name)) {
-                identity["warning"] = json!(format!("not your {}", claim.name));
-            }
-            if let Some(introduction) = known.introductions.get(&b64(&id.0)) {
-                identity["introduced"] = json!({ "by": introduction.by, "name": introduction.name });
-            }
-        }
-        if let Some(error) = &claim.error {
-            identity["error"] = json!(error);
-        }
-        if let Some(device) = &claim.added_by_device
-            && identity["how"] != "self"
-        {
-            identity["new_device"] = json!(format!("added by {device}"));
-        }
-        identity
-    }
-
-    fn own_identity(&self, id: &str) -> Result<IdentityRef> {
-        let id = unb64(id)?;
-        let identities = self.devices.identities();
-        Ok(identities.into_iter().find(|(identity, _)| identity.id.0 == id).context("this browser is on no such identity")?.0)
+        put(&self.store, &key("settings", gid), &self.client.node().settings(gid)?)
     }
 
     fn groups(&self) -> Result<Value> {
+        let node = self.client.node();
         let mut groups = Vec::new();
-        for gid in self.node.groups() {
-            let settings = self.node.settings(&gid.0)?;
+        for gid in node.groups() {
+            let settings = node.settings(&gid.0)?;
             if settings.kind == DEVICES {
                 continue;
             }
-            let known = self.known(&gid.0)?;
-            let members: Vec<Value> = known.members.iter().map(|m| self.describe(&known, m)).collect();
+            let members = self.client.described_members(&gid)?;
             groups.push(json!({ "group": gid, "settings": settings, "members": members, "joined": true }));
         }
-        let joined = self.node.groups();
-        for opening in self.devices.openings() {
+        let joined = node.groups();
+        for opening in self.client.device_state()?.openings {
             if !joined.contains(&opening.group) && !groups.iter().any(|g| g["group"] == json!(opening.group)) {
                 let failed = self.failed.borrow().contains(&opening.group);
                 groups.push(json!({ "group": opening.group, "settings": { "kind": opening.kind, "name": opening.name }, "joined": false, "failed": failed }));
@@ -791,18 +576,19 @@ impl App {
     }
 
     /// A group's timeline: its held messages, and the changes this session saw, oldest first.
-    fn items(&self, gid: &[u8]) -> Result<Value> {
-        let known = self.known(gid)?;
-        let mut items: Vec<Value> = get(&self.store, &key("timeline", gid))?.unwrap_or_default();
-        let pending: HashSet<Vec<u8>> = self.node.only_here(gid)?.into_iter().map(|p| p.id.0).collect();
-        let refused: HashMap<String, Value> = get(&self.store, &key("refused", gid))?.unwrap_or_default();
-        for message in self.node.messages(gid)? {
-            let from = self.describe(&known, &message.sender);
+    fn items(&self, gid: &Bytes) -> Result<Value> {
+        let node = self.client.node();
+        let describer = self.client.describer(gid)?;
+        let mut items: Vec<Value> = get(&self.store, &key("timeline", &gid.0))?.unwrap_or_default();
+        let pending: HashSet<Vec<u8>> = node.only_here(&gid.0)?.into_iter().map(|p| p.id.0).collect();
+        let refused: HashMap<String, Value> = get(&self.store, &key("refused", &gid.0))?.unwrap_or_default();
+        for message in node.messages(&gid.0)? {
+            let from = describer.describe(&message.sender);
             let id = hex::encode(&message.id.0);
             if message.payload["type"] == "leave" {
                 items.push(json!({ "type": "leave", "id": id, "at": message.at, "from": from }));
             }
-            let Ok(ChatMessage { content, to, reply_to, urgent, attachment, .. }) = serde_json::from_value(message.payload) else {
+            let Ok(lmk_proto::group::ChatMessage { content, to, reply_to, urgent, attachment, .. }) = serde_json::from_value(message.payload) else {
                 continue;
             };
             let mut item = json!({ "type": "message", "id": id, "at": message.at, "from": from, "content": content });
@@ -832,113 +618,20 @@ impl App {
         Ok(Value::Array(items))
     }
 
-    /// The messages no other held message comes after: what a new message names in `after`.
-    fn tips(&self, gid: &[u8]) -> Result<Vec<Bytes>> {
-        let messages: Vec<(Bytes, ChatMessage)> =
-            self.node.messages(gid)?.into_iter().filter_map(|m| Some((m.id, serde_json::from_value(m.payload).ok()?))).collect();
-        let covered: HashSet<&Bytes> = messages.iter().flat_map(|(_, chat)| &chat.after).collect();
-        Ok(messages.iter().filter(|(id, _)| !covered.contains(id)).map(|(id, _)| id.clone()).collect())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn send(&self, gid: &[u8], content: String, reply_to: Option<String>, to: Vec<String>, urgent: bool, file: Option<(String, String, Vec<u8>)>) -> Result<Value> {
-        let attachment = match file {
-            Some((name, media_type, bytes)) => {
-                let size = bytes.len() as u64;
-                let link = self.node.add_file(gid, bytes).await?;
-                Some((link.clone(), Attachment { link: link.link(), name, size, media_type }))
-            }
-            None => None,
-        };
-        let payload = ChatMessage {
-            content,
-            after: self.tips(gid)?,
-            to: to.iter().map(|fp| Ok(Bytes(hex::decode(fp)?))).collect::<Result<_>>()?,
-            reply_to: reply_to.map(|id| Ok::<_, anyhow::Error>(Bytes(hex::decode(id)?))).transpose()?,
-            urgent,
-            attachment: attachment.as_ref().map(|(_, a)| a.clone()),
-        };
-        let (id, delivery) = self.node.send(gid, &serde_json::to_value(payload)?, true).await?;
-        let refusals: Vec<_> = delivery.refused.into_iter().map(|(member, reason)| (id.clone(), member, reason)).collect();
-        self.refused(gid, &refusals)?;
-        let mut answer = json!({ "id": hex::encode(&id.0), "held_by": delivery.held.iter().map(|m| &m.name).collect::<Vec<_>>() });
-        if let Some((link, _)) = attachment {
-            let holders = self.node.spread(gid, &link).await;
-            answer["attachment"] = json!({ "held_by": holders.iter().map(|m| &m.name).collect::<Vec<_>>() });
-        }
+    async fn send(&self, gid: &Bytes, chat: Chat) -> Result<Value> {
+        // The page shows every message it holds, so it has read them all.
+        let after = self.client.tips(gid, |_| true)?;
+        let (id, answer) = self.client.send(gid, chat, after).await?;
+        let refusals = answer["refused"].as_array().into_iter().flatten();
+        self.refused(&gid.0, refusals.map(|r| (hex::encode(&id.0), label(&r["member"]), r["reason"].clone())))?;
         Ok(answer)
     }
+}
 
-    async fn join(self: &Rc<Self>, link: &str) -> Result<Value> {
-        let invite = Invite::parse(link.trim())?;
-        if invite.device {
-            self.devices.join(&invite).await?;
-            return Ok(json!({ "device": true }));
-        }
-        let identity = self.speaking_as().await?;
-        let (gid, _) = self.node.join(&invite, identity).await?;
-        self.joined(&gid.0, "join")?;
-        Ok(json!({ "group": gid }))
-    }
-
-    async fn join_open(self: &Rc<Self>, gid: &[u8]) -> Result<Value> {
-        let opening = self.devices.openings().into_iter().find(|o| o.group.0 == gid).context("no such open group")?;
-        let identity = self.speaking_as().await?.context("this browser is on no identity")?;
-        let gid = self.node.join_open(&opening, identity).await?;
-        self.joined(&gid.0, "join")?;
-        Ok(json!({ "group": gid }))
-    }
-
-    /// A group this browser made (`invite`) or joined (`join`).
-    fn joined(self: &Rc<Self>, gid: &[u8], command: &str) -> Result<()> {
-        self.remember_settings(gid)?;
-        self.open_kind(gid, Some(command))
-    }
-
-    fn devices(&self, id: &str) -> Result<Value> {
-        let identity = self.own_identity(id)?;
-        let name = self.devices.identities().into_iter().find(|(i, _)| *i == identity).map(|(_, name)| name);
-        let me = self.device.public();
-        let devices = self.devices.devices(&identity.id.0)?;
-        let devices: Vec<Value> = devices.iter().map(|(key, name)| json!({ "key": key, "name": name, "you": key.0 == me })).collect();
-        Ok(json!({ "id": identity.id, "name": name, "devices": devices }))
-    }
-
-    fn contacts(&self) -> Result<Value> {
-        let contacts = self.devices.contacts();
-        let introductions: HashMap<String, Introduction> = get(&self.store, b"web/introductions")?.unwrap_or_default();
-        let listed: Vec<Value> = contacts
-            .iter()
-            .map(|(id, c)| {
-                let by = c.by.as_ref().map(|by| contacts.iter().find(|(i, _)| i == by).map_or_else(|| b64(&by.0), |(_, i)| i.name.clone()));
-                json!({ "id": id, "name": c.name, "how": c.how, "by": by })
-            })
-            .collect();
-        let introduced: Vec<Value> = introductions.iter().map(|(id, i)| json!({ "id": id, "name": i.name, "by": i.by })).collect();
-        Ok(json!({ "contacts": listed, "introductions": introduced }))
-    }
-
-    async fn accept(&self, id: &str, name: Option<String>) -> Result<()> {
-        let mut introductions: HashMap<String, Introduction> = get(&self.store, b"web/introductions")?.unwrap_or_default();
-        let introduction = introductions.remove(id).context("no introduction of that identity")?;
-        let contact = Contact { name: name.unwrap_or(introduction.name), how: contacts::How::Introduced, by: Some(introduction.by_id), at: now() };
-        self.devices.set_contact(&unb64(id)?, contact).await?;
-        put(&self.store, b"web/introductions", &introductions)
-    }
-
-    async fn set_open(&self, gid: &[u8], id: &str, name: &str, open: bool) -> Result<()> {
-        let id = Bytes(unb64(id)?);
-        self.node
-            .change_settings(gid, |mut settings| {
-                settings.open.retain(|named| named.id != id);
-                if open {
-                    settings.open.push(Named { id: id.clone(), name: name.into() });
-                }
-                settings
-            })
-            .await?;
-        self.refresh_opening(gid).await
-    }
+/// A request to join a group open to this browser's identity.
+fn join(gid: &Bytes) -> Request {
+    let target = json!(gid).as_str().expect("base64url").to_owned();
+    Request::Join { target, args: Vec::new(), cwd: String::new(), as_: None }
 }
 
 /// A member's label: the name its identity goes by here, and its device; else its own name.
@@ -956,14 +649,17 @@ impl Lmk {
         self.app.flush();
     }
 
-    /// This browser: `{"key", "fp", "name", "device": {"key", "name"}, "identities": [{"id", "name"}]}`.
+    /// This browser: `{"name", "fp", "device": {"key", "name"}, "identities": [{"id", "name"}]}`.
     pub fn me(&self) -> R<String> {
-        let app = &self.app;
-        let device = &app.device;
-        let name: String = get(&app.store, b"web/name").map_err(js)?.unwrap_or_default();
-        let identities: Vec<Value> = app.devices.identities().into_iter().map(|(i, name)| json!({ "id": i.id, "name": name })).collect();
-        let key = app.node.key();
-        Ok(json!({ "key": key, "fp": fp(&key.0), "name": name, "device": { "key": Bytes(device.public().to_vec()), "name": device.name }, "identities": identities }).to_string())
+        Ok(self.app.client.me().map_err(js)?.to_string())
+    }
+
+    /// A request of the client core, as `letmeknow`'s command channel takes it (`{"cmd", ...}`); answers as it does.
+    pub async fn request(&self, request: String) -> R<String> {
+        let request: Request = serde_json::from_str(&request).map_err(|e| js(e.into()))?;
+        let answer = self.app.request(request).await.map_err(js)?;
+        self.app.flush();
+        Ok(answer.to_string())
     }
 
     /// Every group this browser is in, with its settings and members, then the open groups it could join.
@@ -971,73 +667,22 @@ impl Lmk {
         Ok(self.app.groups().map_err(js)?.to_string())
     }
 
-    pub fn members(&self, gid: &str) -> R<String> {
-        let gid = unb64(gid).map_err(js)?;
-        let known = self.app.known(&gid).map_err(js)?;
-        Ok(Value::Array(known.members.iter().map(|m| self.app.describe(&known, m)).collect()).to_string())
-    }
-
     pub fn items(&self, gid: &str) -> R<String> {
-        Ok(self.app.items(&unb64(gid).map_err(js)?).map_err(js)?.to_string())
+        Ok(self.app.items(&Bytes(unb64(gid).map_err(js)?)).map_err(js)?.to_string())
     }
 
-    /// The members online now, and what only this browser holds.
-    pub fn status(&self, gid: &str) -> R<String> {
-        let gid = unb64(gid).map_err(js)?;
-        let online: Vec<String> = self.app.node.online(&gid).map_err(js)?.into_iter().map(|m| m.name).collect();
-        let only_here = self.app.node.only_here(&gid).map_err(js)?;
-        Ok(json!({ "online": online, "only_here": only_here.len() }).to_string())
-    }
-
-    /// A new chat or doc, speaking as this browser's first identity; returns its id.
-    pub fn create(&self, kind: &str, name: &str) -> R<String> {
+    /// A new chat, doc or git repository, speaking as this browser's first identity; returns its id.
+    pub async fn create(&self, kind: String, name: String) -> R<String> {
         let app = &self.app;
-        let settings = Settings {
-            protocol: PROTOCOL,
-            kind: kind.into(),
-            name: name.into(),
-            open: Vec::new(),
-            keep: 90,
-            membership: app.membership.clone(),
-        };
-        let identity = app.devices.identities().into_iter().next().map(|(identity, _)| identity);
-        let gid = app.node.create(settings, identity).map_err(js)?;
-        app.joined(&gid.0, "invite").map_err(js)?;
+        let settings = Settings { protocol: PROTOCOL, kind, name, open: Vec::new(), keep: 90, membership: app.membership.clone() };
+        let (gid, _) = app.client.create(settings, None, (Vec::new(), String::new())).await.map_err(js)?;
+        app.remember_settings(&gid.0).map_err(js)?;
         app.flush();
-        Ok(b64(&gid.0))
+        Ok(json!(gid).as_str().expect("base64url").to_owned())
     }
 
-    /// An invite link into a group, labelled with whom it is for.
-    pub async fn invite(&self, gid: String, label: Option<String>) -> R<String> {
-        let gid = unb64(&gid).map_err(js)?;
-        let link = self.app.node.invite(&gid, label.filter(|l| !l.is_empty()), None).await.map_err(js)?.link();
-        self.app.flush();
-        Ok(link)
-    }
-
-    /// A device link: whoever opens it becomes a device of this identity.
-    pub async fn invite_device(&self, id: String) -> R<String> {
-        let identity = self.app.own_identity(&id).map_err(js)?;
-        let link = self.app.devices.invite(&identity.id.0).await.map_err(js)?;
-        self.app.flush();
-        Ok(link)
-    }
-
-    /// Joins through an invite link: `{"group"}`, or `{"device": true}` for a device link.
-    pub async fn join(&self, link: String) -> R<String> {
-        let joined = self.app.join(&link).await.map_err(js)?;
-        self.app.flush();
-        Ok(joined.to_string())
-    }
-
-    /// Joins a group open to this browser's identity.
-    pub async fn join_open(&self, gid: String) -> R<String> {
-        let joined = self.app.join_open(&unb64(&gid).map_err(js)?).await.map_err(js)?;
-        self.app.flush();
-        Ok(joined.to_string())
-    }
-
-    /// Sends a chat message, with an optional file: `{"id", "held_by", "attachment": {"held_by"}}`.
+    /// Sends a chat message, with an optional file, as `letmeknow send` does: `{"id", "held_by" | "pending", "refused",
+    /// "attachment": {"held_by"} | {"pending"}}`.
     #[allow(clippy::too_many_arguments)]
     pub async fn send(
         &self,
@@ -1050,103 +695,39 @@ impl Lmk {
         file_type: Option<String>,
         file: Option<Vec<u8>>,
     ) -> R<String> {
-        let gid = unb64(&gid).map_err(js)?;
-        let file = file.map(|bytes| (file_name.unwrap_or_default(), file_type.unwrap_or_default(), bytes));
-        let sent = self.app.send(&gid, content, reply_to, to, urgent, file).await.map_err(js)?;
+        let gid = Bytes(unb64(&gid).map_err(js)?);
+        let attachment = file.map(|data| File { name: file_name.unwrap_or_default(), media_type: file_type.unwrap_or_default(), data });
+        let reply_to = reply_to.map(|id| message_id(&id)).transpose().map_err(js)?;
+        let sent = self.app.send(&gid, Chat { text: content, to, reply_to, urgent, attachment }).await.map_err(js)?;
         self.app.flush();
         Ok(sent.to_string())
     }
 
-    pub async fn remove(&self, gid: String, key: String) -> R<()> {
-        self.app.node.remove(&unb64(&gid).map_err(js)?, &unb64(&key).map_err(js)?).await.map_err(js)?;
-        self.app.flush();
-        Ok(())
-    }
-
-    /// Leaves a group: true once gone, false while another member is to commit the removal.
-    pub async fn leave(&self, gid: String) -> R<bool> {
-        let gone = self.app.node.leave(&unb64(&gid).map_err(js)?).await.map_err(js)?.is_none();
-        self.app.flush();
-        Ok(gone)
-    }
-
-    pub async fn rename(&self, gid: String, name: String) -> R<()> {
-        let gid = unb64(&gid).map_err(js)?;
-        self.app.node.change_settings(&gid, |settings| Settings { name: name.clone(), ..settings }).await.map_err(js)?;
-        self.app.flush();
-        Ok(())
-    }
-
-    /// Opens a group to an identity's devices, or closes it.
-    pub async fn set_open(&self, gid: String, id: String, name: String, open: bool) -> R<()> {
-        self.app.set_open(&unb64(&gid).map_err(js)?, &id, &name, open).await.map_err(js)?;
-        self.app.flush();
-        Ok(())
-    }
-
     /// A command of a kind's in-page plugin, `args` a JSON array; answers its answer, as JSON. The doc kind's bind an
     /// editor to a doc: `["state", group]`, `["diff", group, state vector]` and `["edit", group, update]`.
-    pub fn command(&self, kind: &str, args: &str) -> R<String> {
-        if kind != DOC {
-            return Err(JsError::new(&format!("this browser has no plugin for {kind} groups")));
-        }
-        let args: Value = serde_json::from_str(args).map_err(|e| js(e.into()))?;
-        let answers = self.app.to_kind(DOC, json!({ "type": "command", "id": 0, "args": args }));
+    pub async fn command(&self, kind: String, args: String) -> R<String> {
+        let args: Vec<String> = serde_json::from_str(&args).map_err(|e| js(e.into()))?;
+        let answered = self.app.client.command(&kind, args, String::new()).await.map_err(js)?;
+        let answer = answered.await.map_err(|_| JsError::new("the plugin stopped"))?.map_err(js)?;
         self.app.flush();
-        let answer = answers.into_iter().next().ok_or_else(|| JsError::new("the doc plugin did not answer"))?;
-        match answer["error"].as_str() {
-            Some(error) => Err(JsError::new(error)),
-            None => Ok(answer["answer"].to_string()),
-        }
+        Ok(answer.to_string())
     }
 
     /// Seals a file for a group and holds it; returns its link.
     pub async fn add_file(&self, gid: String, bytes: Vec<u8>) -> R<String> {
-        let link = self.app.node.add_file(&unb64(&gid).map_err(js)?, bytes).await.map_err(js)?;
+        let link = self.app.client.node().add_file(&unb64(&gid).map_err(js)?, bytes).await.map_err(js)?;
         self.app.flush();
         Ok(link.link())
     }
 
     /// A file's plaintext, if it is held.
     pub async fn file(&self, link: String) -> R<Option<Vec<u8>>> {
-        self.app.node.file(&FileLink::parse(&link).map_err(js)?).await.map_err(js)
+        self.app.client.node().file(&FileLink::parse(&link).map_err(js)?).await.map_err(js)
     }
 
     /// Fetches a file a group links, whatever its size; a `file` event follows.
     pub fn fetch(&self, gid: &str, link: &str) -> R<()> {
-        self.app.node.fetch(&unb64(gid).map_err(js)?, FileLink::parse(link).map_err(js)?);
-        Ok(())
-    }
-
-    /// Starts an identity with this browser its first device.
-    pub async fn identity_create(&self, name: String) -> R<String> {
-        let identity = self.app.devices.create(&name, self.app.membership.clone()).await.map_err(js)?;
-        self.app.flush();
-        Ok(b64(&identity.id.0))
-    }
-
-    /// An identity's devices: `{"id", "name", "devices": [{"key", "name", "you"}]}`.
-    pub fn devices(&self, id: String) -> R<String> {
-        Ok(self.app.devices(&id).map_err(js)?.to_string())
-    }
-
-    /// Takes a device off an identity, and replaces the identity's key.
-    pub async fn remove_device(&self, id: String, device: String) -> R<()> {
-        let identity = self.app.own_identity(&id).map_err(js)?;
-        self.app.devices.remove(&identity.id.0, &unb64(&device).map_err(js)?).await.map_err(js)?;
-        self.app.flush();
-        Ok(())
-    }
-
-    /// `{"contacts": [{"id", "name", "how", "by"}], "introductions": [{"id", "name", "by"}]}`.
-    pub fn contacts(&self) -> R<String> {
-        Ok(self.app.contacts().map_err(js)?.to_string())
-    }
-
-    /// Makes an introduced identity a contact.
-    pub async fn accept(&self, id: String, name: Option<String>) -> R<()> {
-        self.app.accept(&id, name).await.map_err(js)?;
-        self.app.flush();
+        self.app.client.node().fetch(&unb64(gid).map_err(js)?, FileLink::parse(link).map_err(js)?);
         Ok(())
     }
 }

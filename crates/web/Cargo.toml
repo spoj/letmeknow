@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 # Only the browser build has anything in it.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+lmk-client.workspace = true
 lmk-node.workspace = true
 letmeknow-kind-doc.workspace = true
 letmeknow-kind-git.workspace = true
@@ -24,7 +25,6 @@ openmls_traits.workspace = true
 rustc-hash = "2"
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 wasm-bindgen = "=0.2.129"
 wasm-bindgen-futures = "0.4"

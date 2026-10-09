@@ -7,7 +7,7 @@
 mod describe;
 mod request;
 
-pub use describe::{AddedBy, Described, Introduced, Introduction, Known, Standing, answers};
+pub use describe::{AddedBy, Described, Describer, Introduced, Introduction, Known, Standing, answers};
 pub use n0_future::boxed::BoxFuture;
 pub use request::{ContactsOp, IdentityOp, Request};
 
@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use describe::Describer;
 use lmk_core::contacts::{self, Contact};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
@@ -863,7 +862,8 @@ impl<P: Provider + Send + 'static> Client<P> {
 
     // Members, identities and contacts.
 
-    fn describer(&self, gid: &Bytes) -> Result<Describer> {
+    /// What describes a group's members, gathered once for many.
+    pub fn describer(&self, gid: &Bytes) -> Result<Describer> {
         let DeviceState { identities, contacts, .. } = self.device_state()?;
         Ok(Describer {
             me: self.inner.node.key(),

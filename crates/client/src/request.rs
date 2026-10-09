@@ -16,6 +16,7 @@ pub enum Request {
         group: Option<String>,
         /// What a new group shares: a chat (messages in order), or a kind a plugin of this session supports, such as a doc (one text everyone edits at once)
         #[cfg_attr(feature = "clap", arg(long, default_value = "chat", conflicts_with = "group"))]
+        #[serde(default = "chat")]
         kind: String,
         /// The new group's name
         #[cfg_attr(feature = "clap", arg(long, conflicts_with = "group"))]
@@ -30,6 +31,7 @@ pub enum Request {
         cwd: String,
         /// Days members hold a new group's messages and files for one another
         #[cfg_attr(feature = "clap", arg(long, default_value_t = 90, conflicts_with = "group"))]
+        #[serde(default = "keep")]
         keep: u32,
         /// The new group's membership service [default: listen's]
         #[cfg_attr(feature = "clap", arg(long, conflicts_with = "group"))]
@@ -174,6 +176,14 @@ pub enum ContactsOp {
         #[cfg_attr(feature = "clap", arg(long))]
         name: Option<String>,
     },
+}
+
+fn chat() -> String {
+    lmk_proto::group::CHAT.into()
+}
+
+fn keep() -> u32 {
+    90
 }
 
 impl Request {

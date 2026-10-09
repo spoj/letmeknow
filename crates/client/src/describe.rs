@@ -97,13 +97,13 @@ pub struct Introduction {
 }
 
 /// What describing a group's members takes, gathered once.
-pub(crate) struct Describer {
-    pub me: Bytes,
-    pub name: String,
-    pub identities: Vec<(IdentityRef, String)>,
-    pub contacts: Vec<(Bytes, Contact)>,
-    pub introductions: Vec<Introduction>,
-    pub members: Vec<Member>,
+pub struct Describer {
+    pub(crate) me: Bytes,
+    pub(crate) name: String,
+    pub(crate) identities: Vec<(IdentityRef, String)>,
+    pub(crate) contacts: Vec<(Bytes, Contact)>,
+    pub(crate) introductions: Vec<Introduction>,
+    pub(crate) members: Vec<Member>,
 }
 
 impl Describer {
@@ -182,7 +182,7 @@ impl Describer {
     }
 
     /// The name this identity gives another: its contact name, else the other's own claim.
-    pub fn display_name(&self, claim: &Claim) -> String {
+    pub(crate) fn display_name(&self, claim: &Claim) -> String {
         let contact = self.contacts.iter().find(|(id, _)| *id == claim.identity.id);
         contact.map_or_else(|| claim.name.clone(), |(_, c)| c.name.clone())
     }
