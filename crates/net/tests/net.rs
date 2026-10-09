@@ -8,7 +8,7 @@ use ed25519_dalek::SigningKey;
 use iroh::RelayUrl;
 use lmk_net::Event;
 use lmk_proto::{
-    Answer, Bytes,
+    Answer, Bytes, frame,
     identity::Envelope,
     peer::{Frame, Join},
 };
@@ -117,6 +117,53 @@ async fn certificates_are_shown_once_even_to_a_member_not_served() {
     for node in [&a, &b] {
         node.net.shutdown().await.unwrap();
     }
+}
+
+/// A session that served a peer nothing for a while asks it to sync anew once it serves it again, so what it held
+/// meanwhile arrives at once, not at the next resync.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_served_again_syncs_at_once() {
+    let relay = relay().await;
+    let keys = keys(2);
+    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
+    let group = || Group { members: members.clone(), log: vec![b"e1".to_vec()], ..Group::default() };
+    let service = service();
+    let mut a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
+    let mut b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
+    a.net.dial(members[1], relay.url.clone()).await.unwrap();
+    a.synced(G, members[1]).await;
+    b.synced(G, members[0]).await;
+    a.fake.uncertified.lock().unwrap().push(members[1]);
+    let meanwhile = message(1, "meanwhile");
+    a.fake.hold(G, meanwhile.clone());
+    a.fake.uncertified.lock().unwrap().clear();
+    a.net.served(members[1], G);
+    eventually("what A held meanwhile reaches B", || b.fake.holds(G, &meanwhile)).await;
+    a.net.shutdown().await.unwrap();
+    b.net.shutdown().await.unwrap();
+}
+
+/// A frame this session does not know, as a newer letmeknow may send, is skipped, and the stream stays up.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_frame_is_skipped() {
+    let relay = relay().await;
+    let keys = keys(2);
+    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
+    let service = service();
+    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, Group { members: members.clone(), ..Group::default() }), Options::default()).await;
+    let peer = lmk_net::builder(relay.map.clone()).secret_key(keys[1].clone()).ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone()]));
+    let peer = peer.bind().await.unwrap();
+    let conn = peer.connect(iroh::EndpointAddr::new(members[0]).with_relay_url(relay.url.clone()), frame::ALPN).await.unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    frame::write(&mut send, &frame::Open { stream: frame::Stream::Peer }).await.unwrap();
+    let (first, second) = (message(0, "first"), message(0, "second"));
+    let messages = |m: &[u8]| Frame::Messages { group: Bytes(G.to_vec()), items: vec![Bytes(m.to_vec())], below: Vec::new() };
+    frame::write(&mut send, &messages(&first)).await.unwrap();
+    frame::write(&mut send, &serde_json::json!({"newer": {"group": "Zw"}})).await.unwrap();
+    frame::write(&mut send, &messages(&second)).await.unwrap();
+    eventually("the frame after the unknown one arrives", || a.fake.holds(G, &second)).await;
+    assert!(a.fake.holds(G, &first));
+    a.net.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

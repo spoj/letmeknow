@@ -41,6 +41,8 @@ pub(crate) enum Input {
     Closed,
     Send(Frame),
     Changed(Bytes),
+    /// This session serves the peer the group again.
+    Served(Bytes),
     /// Time to sync every group again.
     Resync,
     Want { group: Bytes, files: Vec<[u8; 32]>, reply: HaveReply },
@@ -81,6 +83,9 @@ struct Group {
     /// The dialer's sync is under way, and whether another should follow it.
     busy: bool,
     again: bool,
+    /// The dialer's sync was under way at the last resync too: the peer, which stopped serving this session the group
+    /// meanwhile, dropped it.
+    stale: bool,
 }
 
 struct Round {
@@ -113,7 +118,7 @@ pub(crate) async fn run(
     });
     let reader = input.clone();
     spawn(async move {
-        while let Ok(frame) = frame::read(&mut recv).await {
+        while let Ok(frame) = frame::read_known(&mut recv).await {
             if reader.send(Input::Frame(frame)).is_err() {
                 return;
             }
@@ -140,6 +145,10 @@ pub(crate) async fn run(
                 Input::Closed => break,
                 Input::Send(frame) => session.write(&frame).await?,
                 Input::Changed(group) => session.changed(group).await?,
+                Input::Served(group) => {
+                    session.groups.remove(&group);
+                    session.changed(group).await?
+                }
                 Input::Resync => session.resync().await?,
                 Input::Want { group, files, reply } => {
                     session.wants.entry(group.clone()).or_default().push_back(reply);
@@ -197,7 +206,13 @@ impl Session {
     /// Sends our state of these groups, and the certificates of the members of every group the peer is in that it has
     /// not been shown: a peer this session does not serve still learns of the certificates it needs to serve this one.
     async fn send_hello(&mut self, groups: &[Vec<u8>]) -> Result<()> {
-        let hellos: Vec<Hello> = groups.iter().map(|g| self.inner.groups.hello(g)).collect();
+        let hellos: Vec<Hello> = groups
+            .iter()
+            .map(|g| {
+                let theirs = self.groups.get(&Bytes(g.clone())).is_some_and(|state| state.theirs.is_some());
+                Hello { anew: !theirs && self.inner.groups.revision(g, &self.peer) >= 1, ..self.inner.groups.hello(g) }
+            })
+            .collect();
         let heads: Vec<Head> = self.logs(groups).iter().map(|log| self.inner.groups.head(log)).collect();
         let certificates: Vec<Envelope> = self.inner.groups.certificates(&self.leaves()).into_iter().filter(|c| self.shown.insert(c.sig.clone())).collect();
         if hellos.is_empty() && certificates.is_empty() {
@@ -217,8 +232,9 @@ impl Session {
                 let shared = self.shared();
                 let logs = self.logs(&shared);
                 // A session ignores what a hello shows of a group it does not serve the peer yet or a log it does not
-                // follow yet, so a hello that shows us a group we had none for, or a log we are behind on, gets ours in
-                // return, before any sync of it, whose first round needs it: the peer forwards and syncs by it.
+                // follow yet, so a hello that shows us a group we had none for, or a log we are behind on, or that asks
+                // for it, gets ours in return, before any sync of it, whose first round needs it: the peer forwards and
+                // syncs by it.
                 let mut answer = false;
                 for theirs in heads.into_iter().filter(|head| logs.contains(&head.log.0)) {
                     let log = theirs.log.clone();
@@ -233,7 +249,11 @@ impl Session {
                 let groups: Vec<Hello> = groups.into_iter().filter(|hello| shared.contains(&hello.group.0)).collect();
                 for hello in &groups {
                     let state = self.groups.entry(hello.group.clone()).or_default();
-                    answer |= state.theirs.is_none();
+                    answer |= state.theirs.is_none() || hello.anew;
+                    // The peer dropped its state of the group, and with it any round of ours it was in.
+                    if hello.anew {
+                        *state = Group::default();
+                    }
                     state.theirs = Some(hello.clone());
                 }
                 if answer {
@@ -458,6 +478,10 @@ impl Session {
     async fn resync(&mut self) -> Result<()> {
         self.shown.clear();
         for state in self.groups.values_mut() {
+            if state.busy && state.stale {
+                *state = Group { theirs: state.theirs.take(), ..Group::default() };
+            }
+            state.stale = state.busy;
             state.synced = None;
         }
         for group in self.inner.groups.groups() {

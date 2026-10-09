@@ -248,14 +248,18 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
         self.state.lock().unwrap().serves(group, peer)
     }
 
+    fn revision(&self, group: &[u8], peer: &EndpointId) -> u32 {
+        self.state.lock().unwrap().in_leaf(group, peer).and_then(|m| m.leaf).map_or(0, |leaf| leaf.revision)
+    }
+
     fn hello(&self, group: &[u8]) -> Hello {
         let st = self.state.lock().unwrap();
         let Some(g) = st.groups.get(group) else {
-            return Hello { group: group.into(), epoch: 0, floor: 0, joined: 0 };
+            return Hello { group: group.into(), epoch: 0, floor: 0, joined: 0, anew: false };
         };
         let (epoch, joined) = (g.mls.epoch(), g.mls.joined());
         let floor = joined.max(epoch.saturating_sub(self.window.epochs as u64));
-        Hello { group: group.into(), epoch, floor, joined }
+        Hello { group: group.into(), epoch, floor, joined, anew: false }
     }
 
     fn logs(&self, group: &[u8]) -> Vec<Vec<u8>> {
@@ -284,7 +288,7 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
                 key.and_then(|key| VerifyingKey::from_bytes(&key).ok()).is_some_and(|key| head.verify(&key))
             }
             Some(Service::Folder(_)) => true,
-            None => false,
+            Some(Service::Newer(_)) | None => false,
         }
     }
 
@@ -368,12 +372,10 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
 
     fn certificate(&self, peer: EndpointId, certificate: Envelope) {
         let mut st = self.state.lock().unwrap();
-        let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
-        let served = |st: &State<P>| gids.iter().filter(|gid| st.serves(gid, &peer)).cloned().collect::<Vec<_>>();
-        let before = served(&st);
+        let before = st.served(&[peer]);
         take_certificate(&mut st, certificate);
-        for gid in served(&st).into_iter().filter(|gid| !before.contains(gid)) {
-            self.net().changed(&gid);
+        for (gid, peer) in st.served(&[peer]).into_iter().filter(|served| !before.contains(served)) {
+            self.net().served(peer, &gid);
         }
     }
 }

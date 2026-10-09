@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn lowest_epoch() {
-        let hello = |floor, joined| Hello { group: Bytes::default(), epoch: 9, floor, joined };
+        let hello = |floor, joined| Hello { group: Bytes::default(), epoch: 9, floor, joined, anew: false };
         assert_eq!(lowest(&hello(2, 1), &hello(4, 3)), 3, "the later join");
         assert_eq!(lowest(&hello(5, 1), &hello(6, 3)), 3, "the later join, whatever the floors");
     }

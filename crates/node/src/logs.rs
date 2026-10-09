@@ -43,6 +43,7 @@ impl Clients {
             Service::Folder(path) => Arc::new(lmk_membership::folder::FolderClient::new(path)),
             #[cfg(target_arch = "wasm32")]
             Service::Folder(_) => anyhow::bail!("a browser cannot reach a folder"),
+            Service::Newer(_) => anyhow::bail!("a newer letmeknow made this membership service; update letmeknow"),
         };
         clients.insert(name, client.clone());
         Ok(client)

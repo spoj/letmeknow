@@ -17,6 +17,7 @@ use lmk_proto::links::Invite;
 use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::{Event, Node, hex, now};
 
@@ -47,6 +48,9 @@ struct Book {
     keys: Vec<(Bytes, u64)>,
     contacts: Vec<(Bytes, Contact)>,
     openings: Vec<Opening>,
+    /// Fields a newer letmeknow added, kept when this device hands the state on.
+    #[serde(flatten)]
+    rest: Map<String, Value>,
 }
 
 impl Book {
@@ -178,7 +182,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let (id, entry) = identity::create(&seed, name, membership.clone());
         let identity = IdentityRef { id: id.into(), membership: membership.clone() };
         self.node.append_identity(&identity, &entry).await?;
-        let settings = Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), open: Vec::new(), keep: 90, membership };
+        let settings = Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), open: Vec::new(), keep: 90, membership, rest: Default::default() };
         let gid = self.node.create(settings, None)?;
         let book = Book {
             identity: identity.clone(),
@@ -187,6 +191,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
             keys: vec![(Bytes(seed.to_vec()), now())],
             contacts: Vec::new(),
             openings: Vec::new(),
+            rest: Map::new(),
         };
         self.save(&gid.0, &Record { book: Some(book), added_by: None, since: now() })?;
         self.node.follow_log(&gid.0, Some(0))?;
@@ -228,9 +233,15 @@ impl<P: Provider + Send + 'static> Devices<P> {
         self.enter(&gid.0, Entry::Contact { identity: Bytes(id.to_vec()), contact }).await
     }
 
-    /// Records a group open to an identity, unless it is recorded so already.
-    pub async fn set_opening(&self, identity: &[u8], opening: Opening) -> Result<()> {
+    /// Records a group open to an identity, keeping the fields a newer letmeknow added to its record, unless it is
+    /// recorded so already.
+    pub async fn set_opening(&self, identity: &[u8], mut opening: Opening) -> Result<()> {
         let (gid, book) = self.book(identity)?;
+        if let Some(held) = book.openings.iter().find(|held| held.group == opening.group) {
+            for (field, value) in &held.rest {
+                opening.rest.entry(field.clone()).or_insert_with(|| value.clone());
+            }
+        }
         if book.openings.contains(&opening) {
             return Ok(());
         }

@@ -63,7 +63,7 @@ fn merge(into: &mut Value, from: Value) {
 /// letmeknow.dev's membership service.
 pub fn letmeknow_dev() -> Service {
     let key = hex::decode(lmk_proto::links::MEMBERSHIP_KEY).unwrap();
-    Service::Serve { key: Bytes(key), relay: lmk_proto::links::RELAY.into(), addrs: Vec::new() }
+    Service::Serve { key: Bytes(key), relay: lmk_proto::links::RELAY.into(), addrs: Vec::new(), rest: Default::default() }
 }
 
 /// A membership service from its address: `letmeknow.dev`, `<iroh key, hex>@<relay URL>`, or a folder's absolute path.
@@ -73,7 +73,7 @@ pub fn service(address: &str) -> Result<Service> {
     }
     if let Some((key, relay)) = address.split_once("@https://") {
         let key = Bytes(hex::decode(key).context("a service key is hex")?);
-        return Ok(Service::Serve { key, relay: format!("https://{relay}"), addrs: Vec::new() });
+        return Ok(Service::Serve { key, relay: format!("https://{relay}"), addrs: Vec::new(), rest: Default::default() });
     }
     ensure!(is_folder(address), "a membership service is letmeknow.dev, <key>@<relay URL>, or a folder");
     Ok(Service::Folder(address.into()))
@@ -358,7 +358,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                     .change_settings(&gid.0, |mut settings| {
                         settings.open.retain(|o| o.id != id);
                         if !close {
-                            settings.open.push(Named { id: id.clone(), name: name.clone() });
+                            settings.open.push(Named { id: id.clone(), name: name.clone(), rest: Default::default() });
                         }
                         settings
                     })
@@ -417,7 +417,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                     None => {
                         let membership = membership.map(|m| service(&m)).transpose()?.unwrap_or(self.inner.config.membership.clone());
                         let settings =
-                            Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), open: Vec::new(), keep, membership };
+                            Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), open: Vec::new(), keep, membership, rest: Default::default() };
                         let (gid, opened) = self.create(settings, as_, args).await?;
                         merge(&mut answer, opened);
                         gid
@@ -782,7 +782,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             Event::Joined { group, member, by, how, introduces, label } => {
                 let describer = self.describer(&group)?;
                 let (member_described, by) = (describer.describe(&member), describer.describe(&by));
-                self.emit(ClientEvent::Joined { group: group.clone(), member: member_described, by, how });
+                self.emit(ClientEvent::Joined { group: group.clone(), member: member_described, by, how: how.clone() });
                 if introduces {
                     self.introduce_joiner(&group, &member, how, label).await?;
                 }
@@ -920,7 +920,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             let by_id = by.identity.as_ref().map_or_else(|| by.key.clone(), |claim| claim.identity.id.clone());
             self.add_introduction(Introduction { identity: identity.id.clone(), name: name.clone(), by: sender.clone(), by_id })?;
         }
-        self.emit(ClientEvent::Introduced { group: gid.clone(), by: sender, identity: Named { id: identity.id, name }, how });
+        self.emit(ClientEvent::Introduced { group: gid.clone(), by: sender, identity: Named { id: identity.id, name, rest: Default::default() }, how });
         Ok(())
     }
 
@@ -929,7 +929,7 @@ impl<P: Provider + Send + 'static> Client<P> {
     async fn introduce_joiner(&self, gid: &Bytes, member: &Member, how: How, label: Option<String>) -> Result<()> {
         let Some(claim) = member.identity.clone().filter(|claim| claim.error.is_none()) else { return Ok(()) };
         if let Some(label) = &label {
-            let contact = Contact { name: label.clone(), how: contacts::How::Verified, by: None, at: lmk_node::now() };
+            let contact = Contact { name: label.clone(), how: contacts::How::Verified, by: None, at: lmk_node::now(), rest: Default::default() };
             self.set_contact(&claim.identity.id, contact).await?;
         }
         let name = match label {
@@ -1086,7 +1086,7 @@ impl<P: Provider + Send + 'static> Client<P> {
     async fn accept(&self, identity: &str, name: Option<String>) -> Result<Value> {
         let id = Bytes(URL_SAFE_NO_PAD.decode(identity).context("expected an identity id")?);
         let introduction = self.introductions()?.into_iter().find(|i| i.identity == id).context("no introduction of that identity")?;
-        let contact = Contact { name: name.unwrap_or(introduction.name), how: contacts::How::Introduced, by: Some(introduction.by_id), at: lmk_node::now() };
+        let contact = Contact { name: name.unwrap_or(introduction.name), how: contacts::How::Introduced, by: Some(introduction.by_id), at: lmk_node::now(), rest: Default::default() };
         self.set_contact(&id, contact.clone()).await?;
         self.change_introductions(|introductions| introductions.retain(|i| i.identity != id))?;
         Ok(json!({ "identity": id, "name": contact.name, "how": contact.how }))
@@ -1376,7 +1376,9 @@ impl<P: Provider + Send + 'static> Client<P> {
                     None => {}
                 }
             }
-            other => bail!("unknown message {other:?}"),
+            // A newer plugin's: a request is refused, anything else skipped.
+            _ if id.is_null() => {}
+            other => bail!("unknown request {other:?}"),
         }
         Ok(())
     }

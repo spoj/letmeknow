@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::provider::MemoryProvider;
-use lmk_proto::group::{CHAT, ChatMessage, Control, Named, Service};
+use lmk_proto::group::{CHAT, ChatMessage, Control, Named, REVISION, Service};
 
 pub(crate) fn settings(name: &str) -> Settings {
     Settings {
@@ -12,11 +12,12 @@ pub(crate) fn settings(name: &str) -> Settings {
         open: vec![],
         keep: 90,
         membership: Service::Folder("/tmp/lmk".into()),
+        rest: Default::default(),
     }
 }
 
 pub(crate) fn leaf(name: &str) -> Leaf {
-    Leaf { key: Bytes(name.as_bytes().to_vec()), relay: "https://relay.example/".into(), kinds: vec![CHAT.into()] }
+    Leaf { key: Bytes(name.as_bytes().to_vec()), relay: "https://relay.example/".into(), kinds: vec![CHAT.into()], revision: REVISION }
 }
 
 pub(crate) struct Member<P: Provider = MemoryProvider> {
@@ -272,6 +273,24 @@ fn past_epochs() {
     assert_eq!(text(&w.m[1].open(&batch[0], 0).unwrap()), "n1");
 }
 
+/// A member that renames the group keeps a field of the settings that a newer letmeknow wrote.
+#[test]
+fn a_rename_keeps_settings_fields_the_renamer_does_not_know() {
+    let mut w = World::new(&["A", "B"]);
+    w.found(0, &[1]);
+    let mut newer = w.m[0].g().settings();
+    newer.rest.insert("color".into(), "red".into());
+    let commit = w.m[0].commit(Change { settings: Some(newer), ..Change::default() });
+    w.post(commit.commit);
+    w.read(&[0, 1]);
+    let renamed = Settings { name: "Release".into(), ..w.m[1].g().settings() };
+    let commit = w.m[1].commit(Change { settings: Some(renamed), ..Change::default() });
+    w.post(commit.commit);
+    w.read(&[0, 1]);
+    let settings = w.m[0].g().settings();
+    assert_eq!((settings.name.as_str(), &settings.rest["color"]), ("Release", &serde_json::json!("red")));
+}
+
 #[test]
 fn settings_in_the_welcome() {
     let mut w = World::new(&["A", "B", "C", "D"]);
@@ -279,7 +298,7 @@ fn settings_in_the_welcome() {
     let mut changed = w.m[0].g().settings();
     changed.name = "Plan v2".into();
     changed.keep = 30;
-    changed.open.push(Named { id: Bytes(vec![1; 32]), name: "Alice".into() });
+    changed.open.push(Named { id: Bytes(vec![1; 32]), name: "Alice".into(), rest: Default::default() });
     changed.membership = Service::Folder("/elsewhere".into());
     let commit = w.m[0].commit(Change { settings: Some(changed.clone()), ..Change::default() });
     w.post(commit.commit);

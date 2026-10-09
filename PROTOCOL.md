@@ -9,6 +9,22 @@ The exact formats behind DESIGN.md. The crate `lmk-proto` (`crates/proto`) imple
 - Hashes are SHA-256, keys and signatures Ed25519, except files, which hash with BLAKE3 (see Files).
 - On a QUIC stream, every frame is a 4-byte big-endian length, then that many bytes of JSON.
 
+### Compatibility
+
+Releases of one minor version (0.12.x) run side by side: each adds only what the others can ignore, and a breaking change waits for the next minor version. Every reader and writer follows these rules.
+
+- **Unknown input**: readers ignore fields they do not know, and skip what they cannot parse (a frame, a payload, a log entry, a subscription notice, a plugin's line) without closing a stream over it.
+- **Growing enums**: an enum whose values may grow parses an unknown value to a catch-all where the value is advisory: a refusal's `reason`, the `how` of an introduction, of a commit's authenticated data and of a contact. Where it is not, the error says a newer letmeknow made it: a membership service of a kind it does not know is kept as it is, and fails so when used.
+- **Shared records**: whoever rewrites a shared record keeps the fields it does not know: a group's settings, with the identities and the service in them, and a devices group's state, with its contacts and openings, which a device hands on and refreshes.
+- **Revisions**: a leaf names its session's protocol revision (see Leaf data), a number that grows with each compatible addition; a leaf without one is revision 0. A session uses what a revision added only toward members whose leaves name that revision or a later one; their leaves are in the group's state even while they are offline. A session whose leaf differs from what it would write now (revision, kinds, relay) updates it as it starts (see Leaf data).
+- **Unknown requests**: the membership service answers a request it does not know with `{"refused": "unknown request"}`; the session and plugins answer a plugin message with an `id` and a `type` they do not know with an error.
+- **Breaking changes** happen only through these switches: the ALPN (`letmeknow/1`), a group's `protocol` (2, see Commits), the invite link version (2, see Invites), the home's `format` (2) and IndexedDB's version (2, see Connections).
+
+| Revision | Release | Added |
+|---|---|---|
+| 0 | 0.12.1 | (leaves name no revision) |
+| 1 | 0.12.2 | leaves' `revision`; `hello`'s `anew`; key log entries' `revoked`; certificates' `device_key` |
+
 ## Connections
 
 - All of our protocols use one ALPN, `letmeknow/1`, so two endpoints keep one connection. Each exchange is a bidirectional stream whose first frame names it: `{"stream": "membership" | "peer"}`. File transfers use iroh-blobs' own ALPN.
@@ -47,7 +63,7 @@ A client opens one `membership` stream per request and gets one answer, except `
 | `{"head": {"log"}}` | `{"head"}` |
 | `{"subscribe": {"logs": [...]}}` | a frame `{"log", "position", "entry", "head"}` per new entry, until the stream closes; sending another `subscribe` on it replaces the set |
 
-The first append to an unknown log creates it, if the service's policy allows.
+The first append to an unknown log creates it, if the service's policy allows. A request the service does not know is answered `{"refused": "unknown request"}`; on a subscription, it is skipped, as a client skips a frame it does not know.
 
 A head is `{"log", "length", "hash", "time", "sig"}`, where `time` is milliseconds since the Unix epoch and `sig` is the service's Ed25519 signature, by its iroh key, over:
 
@@ -81,10 +97,10 @@ A group context extension, of the private-use type `0xff01`, whose data is JSON:
 A leaf node extension, of type `0xff02`, whose data is JSON:
 
 ```json
-{"key": "<iroh key>", "relay": "<url>", "kinds": ["chat", "doc"]}
+{"key": "<iroh key>", "relay": "<url>", "kinds": ["chat", "doc"], "revision": 1}
 ```
 
-`kinds` lists the kinds the session supports, `chat` always among them. A changed relay or list of kinds is an update commit.
+`kinds` lists the kinds the session supports, `chat` always among them; `revision` is the session's protocol revision (see Compatibility). A session's leaf changes by an update commit: the key update it commits for each group as it starts carries its leaf as it would write it now.
 
 ### Credential
 
@@ -125,7 +141,7 @@ An MLS basic credential whose identity bytes are JSON:
 - A device certifies only with the identity's current key, as a fresh copy of its key log shows it. A session asks its device for a certificate before it joins or makes a group as an identity, and again whenever the one it holds lasts less than another 12 hours or is not by the current key; it checks every 10 seconds. A session that takes a new certificate reads its identity's key log, so that, when a new key is why, its peers take the new entries from it.
 - Members show certificates in `hello`: their own, and those they hold of the members of every group the peer is in, each once per connection until the next resync; the member that admits a joiner hands it those of the group's members beside the Welcome. A member keeps one per session key and identity, also of a session it does not know yet, whose Add may still be on its way: a valid one over one that is not, else the later. It stores those of its groups' members, so it holds them across restarts and shows them while those members are offline.
 - A member's certificate checks out if it names the member's credential's key, name and identity, is signed by the identity's current key, and has not run out. A member that fails the check is shown with why; it stays in its groups, except as follows.
-- A session serves a peer nothing of a group (the groups and heads of `hello`, log entries, held messages, files, the kind's state) while the peer's credential speaks as an identity and the session holds no valid certificate of it. It still shows such a peer certificates and takes those it shows; once one makes the peer valid, it sends the peer its `hello` of the groups it now serves before anything else of them.
+- A session serves a peer nothing of a group (the groups and heads of `hello`, log entries, held messages, files, the kind's state) while the peer's credential speaks as an identity and the session holds no valid certificate of it. It still shows such a peer certificates and takes those it shows; once one, or a key log entry, makes the peer valid, it drops what it knew of the peer's state of the groups it now serves and sends the peer its `hello` of them, which asks for an answer (`anew`, see Peer protocol), before anything else of them.
 - A member whose certificate is revoked is removed from the group by every session that holds the certificate and the key log entry, online or not, once it holds both; whichever commits first wins the epoch, and the others find it done. A certificate is revoked if its `device_key` is the `revoked` of a key log entry and a key before that entry signed it, whether or not it ran out. A session that holds no certificate of a member cannot tell its device, and leaves it to those that can, or to the next rule.
 - A member connected to this session that speaks as an identity, and has gone 60 seconds without a valid certificate judged by a key log read since, is removed from the group by this session. A session whose device holds the current key renews within seconds of a new key, so it is the sessions of a device that no longer holds the identity's key that go. A session that is offline with a certificate no key log entry revokes, as after a monthly replacement, is judged when it is next online.
 - Before removing such a member, a session reads the identity's key log anew if its copy is older than the first time it saw the member without a valid certificate, so that a key it has not seen yet does not count against the member.
@@ -142,10 +158,10 @@ Its state is the identity, its private keys, its contacts and its openings, kept
 | `contact` | `identity` (id) and `contact` (below): replaces the contact of that identity |
 | `opening` | `opening` (below): replaces the opening of the same group |
 
-The kind's state, given on `snapshot` and taken on `state` like any kind's, is JSON: `{"identity": <identity ref>, "name", "position", "keys": [["<seed>", <at>]], "contacts": [["<identity id>", <contact>]], "openings": [<opening>]}`, as the log stands at `position`. The device that makes the identity holds its first key in its state. A device follows the log from the state it was handed; behind it, it asks a member for the state, as any kind does.
+The kind's state, given on `snapshot` and taken on `state` like any kind's, is JSON: `{"identity": <identity ref>, "name", "position", "keys": [["<seed>", <at>]], "contacts": [["<identity id>", <contact>]], "openings": [<opening>]}`, as the log stands at `position`. The device that makes the identity holds its first key in its state. A device follows the log from the state it was handed; behind it, it asks a member for the state, as any kind does. A device that refreshes an opening keeps the fields of the one it holds that it does not know.
 
 - **Rotation**: a device replaces the identity's key when it takes a device off the identity, after committing that device's removal, and when the current key is 30 days old by its `at`. It sends the new key first, as a held message of the devices group, sealed under the current epoch, and appends it to the group's log, so that a removed device cannot read it, then the key log entry signed by the current key, naming in `revoked` the device taken off, if that is why. Of two devices that replace it at once, the key log takes one; devices hold both keys, and use the one the key log names. A device whose entry naming a device lost replaces the key again, once it holds the key that won.
-- **Contacts**: `{"name", "how": "verified" | "introduced", "by", "at"}` (`by`: the introducer's identity id). A device on several identities writes contacts to the one it joined first.
+- **Contacts**: `{"name", "how": "verified" | "introduced", "by", "at"}` (`by`: the introducer's identity id); a `how` a newer letmeknow named counts as `introduced`. A device on several identities writes contacts to the one it joined first.
 - **Openings**: `{"group", "kind", "name", "membership", "members": ["<iroh key>"]}`. A session speaking as the identity in a group open to it has its device record the opening, and refresh `members` when the group's membership changes.
 
 On a machine, the holder shares the device with its other session processes through two files in `LETMEKNOW_HOME`:
@@ -188,11 +204,11 @@ A message's id is SHA-256 of its MLS ciphertext. A payload is held or live. Held
 
 ## Peer protocol
 
-A `peer` stream joins two sessions that share a group, or one that asks the other to admit it, one stream per pair, kept open while both are online. Either side may send a frame at any time; every frame but `join` and its answers names its group, or a log of its groups, and a side serves a group, and its logs, only to a peer whose iroh key is in a leaf of that group's current epoch and, if the peer speaks as an identity, whose valid certificate it holds (see Certificates). Each side sends `hello` when the stream opens and when its state of a group changes, after the entries the peer lacks. A side ignores what a `hello` shows of a group it does not serve the peer yet or of a log it does not follow yet, so it answers a `hello` that shows it a group it had no `hello` for, or a head longer than its own, with its own, before syncing. Every 5 minutes it sends `hello` again and syncs each group anew, even if nothing changed, so a message lost on its way is found within 5 minutes.
+A `peer` stream joins two sessions that share a group, or one that asks the other to admit it, one stream per pair, kept open while both are online. Either side may send a frame at any time; every frame but `join` and its answers names its group, or a log of its groups, and a side serves a group, and its logs, only to a peer whose iroh key is in a leaf of that group's current epoch and, if the peer speaks as an identity, whose valid certificate it holds (see Certificates). Each side sends `hello` when the stream opens and when its state of a group changes, after the entries the peer lacks. A side ignores what a `hello` shows of a group it does not serve the peer yet or of a log it does not follow yet, so it answers a `hello` that shows it a group it had no `hello` for, or a head longer than its own, with its own, before syncing. A side that holds no `hello` of a group from the peer, as when the stream opens or when it serves the peer the group again, marks the group `anew` in its `hello`, toward a peer whose leaf names revision 1 or later: the peer drops what it knew of the side's state of the group, sync rounds included, answers with its own `hello`, and syncs the group anew. Every 5 minutes a side sends `hello` again and syncs each group anew, even if nothing changed, so a message lost on its way is found within 5 minutes; a sync round of its own that was still under way at the last of these, and so was dropped by a peer that stopped serving it the group, it drops too.
 
 | Frame | Meaning |
 |---|---|
-| `{"hello": {"groups": [{"group", "epoch", "floor", "joined"}], "heads": [<head>], "certificates": [<certificate>]}}` | For each group both are in: the epoch the sender is at, the lowest epoch it accepts, and the epoch it joined. `heads`: the newest signed head the sender holds of each log it follows for those groups (see Gossip). `certificates`, if any: those the sender holds of the members of every group the receiver is in, its own among them, not yet shown on this connection since the last resync (see Identity). A sender with neither groups nor certificates to show sends no `hello` |
+| `{"hello": {"groups": [{"group", "epoch", "floor", "joined", "anew"}], "heads": [<head>], "certificates": [<certificate>]}}` | For each group both are in: the epoch the sender is at, the lowest epoch it accepts, the epoch it joined, and, as `anew: true`, that it holds no `hello` of the group from the receiver. `heads`: the newest signed head the sender holds of each log it follows for those groups (see Gossip). `certificates`, if any: those the sender holds of the members of every group the receiver is in, its own among them, not yet shown on this connection since the last resync (see Identity). A sender with neither groups nor certificates to show sends no `hello` |
 | `{"entries": {"log", "entries", "head"}}` | Entries of a log the other lacks, judged by the head it showed, ending at `head`; served only to a member of a group whose log it is |
 | `{"reconcile": {"group", "msg"}}` | A negentropy message (see below) |
 | `{"messages": {"group", "items", "below": [{"epoch", "id"}]}}` | MLS ciphertexts the other lacks; also every new message as it is sent, to the members online or to one. `below`: the messages the other lacks under epochs below its `floor`, which are not sent |
@@ -243,7 +259,7 @@ A group of any kind but chat orders its kind's held messages in a log of its own
 
 A native session finds a kind's plugin as the executable `letmeknow-kind-<kind>` (`.exe` on Windows) in the directory of its own executable, then in each directory of `PATH`; the first found wins. Its leaf lists `chat` and every kind it found. It starts a plugin when it has a group of its kind (when it starts, makes one or joins one) or a command for it, with stdin and stdout piped and stderr its own, and stops it with itself; one that stops, it starts again and tells it its groups.
 
-They speak JSON lines: one JSON object per line, each way. Bytes are unpadded base64url, and so are group ids; message ids are hex. A member is described as `listen` events describe it (`name`, `fp`, `device`, `identity`, `added_by`, `you`), and named by its `fp` in `to`. A message with an `id` is a request: the other side answers `{"type": "answer", "id", "answer"}`, or `{"type": "answer", "id", "error"}`. A plugin hears only of its kind's groups, and the session refuses what it asks of others.
+They speak JSON lines: one JSON object per line, each way. Bytes are unpadded base64url, and so are group ids; message ids are hex. A member is described as `listen` events describe it (`name`, `fp`, `device`, `identity`, `added_by`, `you`), and named by its `fp` in `to`. A message with an `id` is a request: the other side answers `{"type": "answer", "id", "answer"}`, or `{"type": "answer", "id", "error"}`. A side skips a message of a `type` it does not know, but answers one with an `id` with an error. A plugin hears only of its kind's groups, and the session refuses what it asks of others.
 
 The session sends:
 

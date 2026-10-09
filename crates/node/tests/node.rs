@@ -125,6 +125,7 @@ fn settings(kind: &str, folder: &Path) -> Settings {
         open: vec![],
         keep: 90,
         membership: Service::Folder(folder.to_str().unwrap().into()),
+        rest: Default::default(),
     }
 }
 
@@ -292,7 +293,7 @@ async fn signing_service(relay: &Relay, dir: &Path) -> (Service, iroh::protocol:
     std::fs::create_dir_all(dir).unwrap();
     let store = Store::open(&dir.join("membership.db"), ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes())).unwrap();
     let router = iroh::protocol::Router::builder(endpoint.clone()).accept(ALPN, Membership::new(store, Policy::default())).spawn();
-    let service = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: relay.url.to_string(), addrs: vec![] };
+    let service = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: relay.url.to_string(), addrs: vec![], rest: Default::default() };
     (service, router)
 }
 
@@ -431,7 +432,7 @@ async fn devices_share_an_identity_and_certify_their_sessions_with_its_key() {
     routed(&mut laptop, laptop_devices.clone());
     routed(&mut tablet, tablet_devices.clone());
     let bob = laptop_devices.create("Bob", membership.clone()).await.unwrap();
-    laptop_devices.set_contact(&[9; 32], lmk_core::contacts::Contact { name: "Carol".into(), how: lmk_core::contacts::How::Verified, by: None, at: 1 }).await.unwrap();
+    laptop_devices.set_contact(&[9; 32], lmk_core::contacts::Contact { name: "Carol".into(), how: lmk_core::contacts::How::Verified, by: None, at: 1, rest: Default::default() }).await.unwrap();
 
     // A device link: the tablet gets the identity's state, its key and contacts among it.
     let link = lmk_proto::links::Invite::parse(&laptop_devices.invite(&bob.id.0).await.unwrap()).unwrap();
@@ -449,7 +450,7 @@ async fn devices_share_an_identity_and_certify_their_sessions_with_its_key() {
     }
     let chat = alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &dir) }, None).unwrap();
     alice.node.change_settings(&chat.0, |mut s| {
-        s.open.push(Named { id: bob.id.clone(), name: "Bob".into() });
+        s.open.push(Named { id: bob.id.clone(), name: "Bob".into(), rest: Default::default() });
         s
     }).await.unwrap();
     let opening = alice.node.opening(&chat.0).unwrap();
@@ -477,11 +478,14 @@ async fn devices_share_an_identity_and_certify_their_sessions_with_its_key() {
     assert_eq!(laptop_devices.keys(), [(bob.id.clone(), Bytes(keys.current().to_vec()))]);
     let laptop_seen = alice.checked(&chat, "laptop", false).await;
     assert_eq!(laptop_seen.identity.unwrap().error.as_deref(), Some("its certificate is not by its identity's current key"));
-    let (_, delivery) = alice.node.send(&chat.0, &message("before the laptop renews"), true).await.unwrap();
+    let (before, delivery) = alice.node.send(&chat.0, &message("before the laptop renews"), true).await.unwrap();
     assert!(delivery.held.is_empty(), "the laptop's session is not served");
     let certificate = laptop_devices.certify(&bob.id.0, laptop.node.key(), "laptop".into()).await.unwrap();
     laptop.node.set_certificate(certificate).unwrap();
     alice.checked(&chat, "laptop", true).await;
+    // Alice asks the laptop to sync anew once she serves it again, so what it missed comes at once, not at the next
+    // resync.
+    laptop.until(|e| matches!(e, Event::Message(message) if message.id == before).then_some(())).await;
     let (id, delivery) = alice.node.send(&chat.0, &message("after it renews"), true).await.unwrap();
     assert_eq!(delivery.held.iter().map(|m| m.device_name.as_str()).collect::<Vec<_>>(), ["laptop"]);
     let got = laptop.until(|e| match e {
@@ -539,6 +543,48 @@ async fn a_device_taken_off_its_identity_leaves_while_its_sessions_are_offline()
     alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "tablet").then_some(())).await;
     let members: Vec<String> = alice.node.members(&chat.0).unwrap().into_iter().map(|m| m.name).collect();
     assert_eq!(members, ["Alice", "phone"]);
+    alice.node.shutdown().await.unwrap();
+}
+
+/// A session whose leaf names an older revision, as 0.12.1's does, writes its own as it starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_updates_an_older_leaf_as_it_starts() {
+    use lmk_core::group::{Change, Group, Session as Mls};
+    use lmk_core::provider::SqliteProvider;
+    use lmk_membership::Membership;
+    let relay = relay().await;
+    let dir = folder("revision");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (logs, bob_db) = (dir.join("logs"), dir.join("bob.db"));
+    let start = || async { Node::start(SqliteProvider::open(&bob_db).unwrap(), config(&relay, "Bob", None, &[CHAT])).await.unwrap().0 };
+    let alice = session(&relay, "Alice").await;
+    let gid = alice.node.create(settings(CHAT, &logs), None).unwrap();
+    let bob = start().await;
+    bob.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    let revision = |wanted: u32| {
+        let (node, gid) = (&alice.node, &gid);
+        tokio::time::timeout(WAIT, async move {
+            while !node.members(&gid.0).unwrap().iter().any(|m| m.name == "Bob" && m.revision == wanted) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+    };
+    revision(lmk_proto::group::REVISION).await.expect("a joiner's leaf names this revision");
+    bob.shutdown().await.unwrap();
+    drop(bob);
+
+    // Bob's leaf goes back to revision 0 while he is stopped.
+    let provider = SqliteProvider::open(&bob_db).unwrap();
+    let mls = Mls::load(&provider).unwrap();
+    let old = lmk_proto::group::Leaf { revision: 0, ..mls.leaf.clone() };
+    let commit = Group::load(&provider, &gid.0).unwrap().commit(&provider, &mls, Change { leaf: Some(old), ..Change::default() }).unwrap();
+    lmk_membership::folder::FolderClient::new(logs.to_str().unwrap()).append(&gid.0, &commit.commit).await.unwrap();
+    drop(provider);
+    revision(0).await.expect("Alice sees Bob's leaf of revision 0");
+
+    let bob = start().await;
+    revision(lmk_proto::group::REVISION).await.expect("Bob's leaf names this revision once he starts");
+    bob.shutdown().await.unwrap();
     alice.node.shutdown().await.unwrap();
 }
 

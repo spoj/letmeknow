@@ -49,6 +49,8 @@ pub trait Groups: Send + Sync + 'static {
     /// Whether this session serves `peer` the group: it is in a leaf and, speaking as an identity, has shown a valid
     /// certificate of it.
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool;
+    /// The protocol revision `peer`'s leaf in the group names; 0 if it names none.
+    fn revision(&self, group: &[u8], peer: &EndpointId) -> u32;
     /// This session's state of the group, as `hello` carries it.
     fn hello(&self, group: &[u8]) -> Hello;
     /// The logs this session follows for a group: the group's own, whose id is the group's, and others, such as its
@@ -219,6 +221,13 @@ impl Net {
     pub fn frame(&self, peer: EndpointId, frame: Frame) -> bool {
         let input = self.inner.links.lock().unwrap().get(&peer).map(|link| link.input.clone());
         input.is_some_and(|input| input.send(Input::Send(frame)).is_ok())
+    }
+
+    /// Tells the peer stream with `peer` that this session serves it a group again: it syncs the group anew.
+    pub fn served(&self, peer: EndpointId, group: &[u8]) {
+        if let Some(link) = self.inner.links.lock().unwrap().get(&peer) {
+            link.input.send(Input::Served(group.into())).ok();
+        }
     }
 
     /// Tells peers this session's state of a group changed (a log grew, a member added): each

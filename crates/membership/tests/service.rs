@@ -7,7 +7,7 @@ use std::{
 
 use ed25519_dalek::SigningKey;
 use iroh::{
-    Endpoint, RelayConfig, RelayMap, RelayMode, SecretKey,
+    Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, SecretKey,
     endpoint::{Builder, presets},
     protocol::Router,
     tls::CaTlsConfig,
@@ -22,7 +22,10 @@ use lmk_membership::{
     service::{Policy, Service},
     store::Store,
 };
-use lmk_proto::{Bytes, frame::ALPN};
+use lmk_proto::{
+    Answer, Bytes,
+    frame::{self, ALPN, Open, Stream},
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 struct Net {
@@ -215,6 +218,15 @@ async fn refusals() {
     assert_eq!(refused(client.append(&[0; 65], b"x").await), "policy");
     client.append(b"g", b"x").await.unwrap();
     assert_eq!(refused(client.append(b"g", b"y").await), "rate");
+
+    // A request of a newer letmeknow.
+    let endpoint = net.builder().clear_ip_transports().bind().await.unwrap();
+    let addr = EndpointAddr::new(secret.public()).with_relay_url(net.config.url.clone());
+    let (mut send, mut recv) = endpoint.connect(addr, ALPN).await.unwrap().open_bi().await.unwrap();
+    frame::write(&mut send, &Open { stream: Stream::Membership }).await.unwrap();
+    frame::write(&mut send, &serde_json::json!({"compact": {"log": "Zw"}})).await.unwrap();
+    let answer: Answer<()> = frame::read(&mut recv).await.unwrap();
+    assert_eq!(answer, Answer::Refused { refused: "unknown request".into() });
 }
 
 #[tokio::test(flavor = "multi_thread")]

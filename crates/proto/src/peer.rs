@@ -63,6 +63,9 @@ pub struct Hello {
     pub floor: u64,
     /// The epoch the sender joined.
     pub joined: u64,
+    /// The sender holds no `hello` of the group from the receiver, which it asks to answer with its own and sync anew.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anew: bool,
 }
 
 /// A joiner's request: an invite's secret, or the group open to the identity its certificate proves it speaks as.

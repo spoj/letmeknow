@@ -86,7 +86,12 @@ impl Service {
             return Ok(());
         }
         let (store, policy) = (&self.0.store, &self.0.policy);
-        match frame::read(&mut recv).await? {
+        let Ok(request) = serde_json::from_slice(&frame::read_body(&mut recv).await?) else {
+            frame::write(&mut send, &refused::<()>("unknown request")).await?;
+            send.finish()?;
+            return Ok(());
+        };
+        match request {
             Request::Append { log, entry } => {
                 let answer = if entry.0.len() > policy.max_entry {
                     refused("size")
@@ -134,7 +139,7 @@ impl Service {
         let mut logs: HashSet<Bytes> = logs.into_iter().collect();
         let (requests, mut changes) = mpsc::channel(1);
         tokio::spawn(async move {
-            while let Ok(request) = frame::read::<Request, _>(&mut recv).await
+            while let Ok(request) = frame::read_known::<Request, _>(&mut recv).await
                 && requests.send(request).await.is_ok()
             {}
         });

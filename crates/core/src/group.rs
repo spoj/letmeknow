@@ -685,7 +685,7 @@ fn observe(
     let epoch = staged.epoch().as_u64();
     if let Some(committer) = &committer {
         let credentials = added.iter().filter_map(|member| member.credential.clone());
-        state.added.extend(credentials.map(|member| Added { member, by: committer.clone(), how: aad.how, invite: aad.invite.clone(), epoch }));
+        state.added.extend(credentials.map(|member| Added { member, by: committer.clone(), how: aad.how.clone(), invite: aad.invite.clone(), epoch }));
     }
     state.removed.extend(removed.iter().map(|member| (Bytes(member.key.clone()), now)));
     Applied::Commit {
