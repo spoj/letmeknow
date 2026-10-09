@@ -338,6 +338,32 @@ fn leaf_data() {
     w.agree(&[0, 1, 2]);
 }
 
+/// A member renames itself in an update only where every member's leaf names a revision that takes it; a message from
+/// before the rename still names its sender.
+#[test]
+fn a_member_renames_itself_where_every_leaf_takes_it() {
+    let mut w = World::new(&["A", "B", "C"]);
+    w.m[2].session.leaf.revision = 0;
+    w.found(0, &[1, 2]);
+    let before = w.m[1].send("before the rename");
+    let b = &mut w.m[1];
+    let refused = b.group.as_mut().unwrap().commit(&b.provider, &b.session, Change { name: Some("Bee".into()), ..Change::default() });
+    assert!(refused.err().unwrap().to_string().contains("credential"), "C's leaf names revision 0, as 0.12.1's does");
+    let commit = w.m[2].commit(Change { leaf: Some(leaf("C")), ..Change::default() });
+    w.post(commit.commit);
+    w.read(&[0, 1, 2]);
+    assert!(w.m[0].g().renames());
+    let commit = w.m[1].commit(Change { name: Some("Bee".into()), ..Change::default() });
+    w.post(commit.commit);
+    let applied = w.read(&[0, 1, 2]);
+    assert!(applied.iter().all(|reader| is_commit(&reader[0])));
+    w.agree(&[0, 1, 2]);
+    let b = w.m[0].index_of("Bee");
+    assert_eq!(w.m[2].g().members()[b as usize].leaf.as_ref(), Some(&leaf("B")), "the leaf data stays");
+    let opened = w.m[2].open(&before, 0).unwrap();
+    assert_eq!((opened.sender.name.as_str(), opened.current), ("B", Some(b)));
+}
+
 #[test]
 fn key_packages_never_expire() {
     let w = World::new(&["A"]);
@@ -392,8 +418,9 @@ fn rules_bind_everyone() {
         w.agree(&[0, 1, 2]);
     }
 
-    // An update that changes the committer's credential: C claims another name.
-    w.m[2].session.credential.name = "Mallory".into();
+    // An update that changes the committer's credential beyond its name: C claims an identity.
+    let identity = lmk_proto::group::IdentityRef { id: Bytes(vec![1; 32]), membership: Service::Folder("/tmp/lmk".into()) };
+    w.m[2].session.credential.identity = Some(identity);
     let c = &mut w.m[2];
     let group = c.group.as_mut().unwrap();
     let mut leaf = LeafNodeParameters::builder().with_credential_with_key(c.session.with_key()).build();

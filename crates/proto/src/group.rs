@@ -8,6 +8,8 @@ use crate::Bytes;
 pub const PROTOCOL: u32 = 2;
 /// This release's protocol revision, which grows with each compatible addition; a leaf without one is revision 0.
 pub const REVISION: u32 = 1;
+/// The revision from which a member's update may rename it: every member must name it or a later one.
+pub const RENAME_REVISION: u32 = 1;
 /// The private-use extension types: settings in the group context, and leaf data.
 pub const SETTINGS_EXTENSION: u16 = 0xff01;
 pub const LEAF_EXTENSION: u16 = 0xff02;
