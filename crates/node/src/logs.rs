@@ -15,10 +15,10 @@ use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
 use lmk_transport::Transport;
 use n0_future::task::spawn;
-use n0_future::time::{Duration, sleep};
+use n0_future::time::{Duration, sleep, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Inner, State, Work, get, hex, put};
+use crate::{Inner, RESYNC, State, Work, get, hex, put};
 
 /// One membership client per service, sharing the session's transport.
 pub(crate) struct Clients {
@@ -166,7 +166,9 @@ impl<P: Provider> State<P> {
 
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Follows a log at its service: what is new as the service tells of it, and all of it whenever the subscription
-    /// restarts, until this session drops the log.
+    /// restarts and every 5 minutes, until this session drops the log. The read after subscribing may reach the service
+    /// before the subscription does, missing an entry appended in between; a member removed by it learns of it from no
+    /// peer, as none serves it the group any more.
     pub(crate) fn follow(self: &Arc<Self>, log: &[u8]) {
         let (inner, id) = (self.clone(), log.to_vec());
         let task = spawn(async move {
@@ -176,9 +178,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     let client = inner.clients.client(&service)?;
                     let mut subscription = client.subscribe(vec![Bytes(id.clone())]).await?;
                     inner.read(&id).await?;
-                    while let Some(notice) = subscription.next().await {
-                        let notice = notice?;
-                        inner.stored(&id, notice.position - 1, vec![notice.entry], client.chain(&id))?;
+                    loop {
+                        match timeout(RESYNC, subscription.next()).await {
+                            Ok(Some(notice)) => {
+                                let notice = notice?;
+                                inner.stored(&id, notice.position - 1, vec![notice.entry], client.chain(&id))?;
+                            }
+                            Ok(None) => break,
+                            Err(_) => inner.read(&id).await?,
+                        }
                     }
                     anyhow::Ok(())
                 };

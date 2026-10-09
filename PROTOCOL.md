@@ -50,7 +50,7 @@ A log is named by an id: a group's MLS group id, a kind's log id (see Kinds), or
 - h₀ = SHA-256(`"letmeknow log v1\0"` ‖ log id)
 - hₙ = SHA-256(hₙ₋₁ ‖ SHA-256(entryₙ))
 
-A member holds every log alike: it reads it from its service from the position after the last it holds, page by page, follows it by `subscribe` (a group's log and its kind's) or reads it again when it needs it (a key log), holds each entry, and keeps the chain over what it holds, anchored at the first head it reads when it starts past position 0, as a joiner does. Only once an entry is held does the log's type read it: a group's applies commits (see Groups), a kind's takes held messages (see Kinds), a key log's replays the identity's keys (see Identity).
+A member holds every log alike: it reads it from its service from the position after the last it holds, page by page, follows it by `subscribe` (a group's log and its kind's), reading it again every 5 minutes, since a read sent after a `subscribe` may reach the service first and miss an entry appended in between, or reads it again when it needs it (a key log), holds each entry, and keeps the chain over what it holds, anchored at the first head it reads when it starts past position 0, as a joiner does. Only once an entry is held does the log's type read it: a group's applies commits (see Groups), a kind's takes held messages (see Kinds), a key log's replays the identity's keys (see Identity).
 
 ### `letmeknow serve`
 

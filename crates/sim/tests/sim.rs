@@ -32,3 +32,10 @@ fn a_seed_replays_exactly() {
 fn a_certificate_shown_by_another_peer() {
     passes(46, &[0, 1, 2, 3, 5, 7, 8, 9, 12, 13, 15, 16, 17, 18, 19, 23, 24, 26, 27, 28, 31, 32, 33, 34, 35, 37, 39]);
 }
+
+/// The read a member sends after subscribing to a log reached the service before the subscription, missing the commit
+/// that removed the member, of which no peer told it either.
+#[test]
+fn a_read_that_overtakes_its_subscription() {
+    passes(1445, &[0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 14, 17, 18, 19]);
+}
