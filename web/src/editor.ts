@@ -10,7 +10,7 @@ import { EditorState, type Range, StateField } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, ViewPlugin, type ViewUpdate, WidgetType, keymap, placeholder, showPanel } from "@codemirror/view";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import * as Y from "yjs";
-import type { Lmk } from "./client";
+import type { Session } from "./client";
 
 class Checkbox extends WidgetType {
   constructor(readonly checked: boolean) {
@@ -258,13 +258,13 @@ function insertFiles(view: EditorView, blobs: Blobs, event: Event, files: FileLi
 const REMOTE = "lmk";
 
 /** An editor of the doc `gid`. `edited` takes in what the session's copy has that this one lacks. */
-export function bind(parent: HTMLElement, lmk: Lmk, gid: string, blobs: Blobs) {
+export async function bind(parent: HTMLElement, lmk: Session, gid: string, blobs: Blobs) {
   const doc = new Y.Doc();
-  Y.applyUpdate(doc, lmk.doc(gid), REMOTE);
+  Y.applyUpdate(doc, await lmk.doc(gid), REMOTE);
   doc.on("update", (update: Uint8Array, origin: unknown) => origin !== REMOTE && lmk.edit(gid, update).catch(blobs.fail));
   const view = editor(parent, doc.getText("text"), blobs);
   return {
-    edited: () => Y.applyUpdate(doc, lmk.doc_diff(gid, Y.encodeStateVector(doc)), REMOTE),
+    edited: () => lmk.doc_diff(gid, Y.encodeStateVector(doc)).then(diff => Y.applyUpdate(doc, diff, REMOTE), blobs.fail),
     measure: () => view.requestMeasure(),
     destroy: () => (view.destroy(), doc.destroy())
   };

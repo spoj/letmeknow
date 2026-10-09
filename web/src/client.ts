@@ -1,5 +1,8 @@
-// The browser's session: lmk-node in WebAssembly (crates/web), its records and files kept in IndexedDB. Its relay and
-// membership service are letmeknow.dev's unless localStorage names others ("lmk relay", "lmk membership"), as tests do.
+// The browser's session: lmk-node in WebAssembly (crates/web), its records and files kept in IndexedDB. One tab at a
+// time runs it, holding the Web Lock "letmeknow"; the other tabs call it over the BroadcastChannel "letmeknow", and hear
+// its events there. When that tab closes, a waiting tab takes the lock and runs the session from IndexedDB. Its relay and
+// membership service are those of the server the page came from, unless localStorage names others ("lmk relay",
+// "lmk membership"), as tests do.
 import init, { type Lmk, invite_kind, start } from "../pkg/lmk_web.js";
 import wasm from "../pkg/lmk_web_bg.wasm";
 import * as store from "./store";
@@ -17,8 +20,8 @@ export type Identity = {
 export type Person = { key: string; fp: string; name: string; device: string; you?: boolean; identity?: Identity; added_by?: { name?: string; how: string } };
 export type Named = { id: string; name: string };
 export type Settings = { kind: "chat" | "doc"; name: string; open?: Named[]; keep?: number; devices_of?: string };
-export type Group = { group: string; settings: Settings; members: Person[]; joined: boolean };
-export type Attachment = { link: string; name: string; size: number; type: string };
+export type Group = { group: string; settings: Settings; members: Person[]; joined: boolean; failed?: boolean };
+export type Attachment = { link: string; name: string; size: number; type: string; kept: boolean };
 export type Item =
   | {
       type: "message";
@@ -42,6 +45,12 @@ export type Event = { type: string; group?: string; id?: string; hash?: string; 
 export type Me = { key: string; fp: string; name: string; device: { key: string; name: string }; identities: Named[] };
 export type Contacts = { contacts: (Named & { how: string; by?: string })[]; introductions: (Named & { by: string })[] };
 
+/** The session's methods, as every tab calls them: asynchronously, wherever it runs. */
+type Methods = Exclude<keyof Lmk, "free" | symbol>;
+export type Session = { [K in Methods]: Lmk[K] extends (...args: infer A) => infer R ? (...args: A) => Promise<Awaited<R>> : never };
+type Call = { id: string; method: string; args: unknown[] };
+type Message = Partial<Call> & { ready?: boolean; ask?: boolean; event?: Event; result?: unknown; error?: string };
+
 export const kindOf = (link: string): string | undefined => {
   try {
     return invite_kind(link);
@@ -50,60 +59,119 @@ export const kindOf = (link: string): string | undefined => {
   }
 };
 
-/** Files whose ciphertext this browser holds, by hash. */
-export const held = new Set<string>();
 const listeners = new Set<(event: Event) => void>();
 export const listen = (listener: (event: Event) => void) => listeners.add(listener);
 export const unlisten = (listener: (event: Event) => void) => listeners.delete(listener);
+const dispatch = (event: Event) => listeners.forEach(listener => listener(event));
 
-let records: [Uint8Array, Uint8Array][];
-let files: Map<string, Uint8Array>;
+const channel = new BroadcastChannel("letmeknow");
+const tab = crypto.randomUUID();
+let calls = 0;
+/** This tab's calls not answered yet: sent again whenever a tab starts running the session. */
+const pending = new Map<string, Call & { resolve: (result: unknown) => void; reject: (error: Error) => void }>();
+/** Calls this tab took while running the session, so a call sent again runs once. */
+const taken = new Set<string>();
+let local: Lmk | undefined;
+let leading = false;
+let readied: () => void;
+let ran: () => void;
+/** Resolves once the session runs, in this tab or another. */
+export const ready = new Promise<void>(resolve => (readied = resolve));
+const runsHere = new Promise<void>(resolve => (ran = resolve));
+/** Whether this tab runs the session. */
+export const runs = () => leading;
 
-/** Loads what this browser keeps; true if it has a session. */
+function call(method: string, args: unknown[]): Promise<unknown> {
+  if (leading) return method === "open" ? run(...(args as string[])) : runsHere.then(() => (local![method as Methods] as (...a: unknown[]) => unknown)(...args));
+  const id = `${tab} ${calls++}`;
+  return new Promise((resolve, reject) => {
+    pending.set(id, { id, method, args, resolve, reject });
+    channel.postMessage({ id, method, args });
+  });
+}
+
+export const lmk = new Proxy({} as Session, { get: (_, method: string) => (...args: unknown[]) => call(method, args) });
+
+/** Starts the session in another tab, or in this one if it holds the lock, as `name` on device `device` if new. */
+export const open = (name: string, device: string) => call("open", [name, device]) as Promise<void>;
+
+async function answer({ id, method, args }: Call) {
+  try {
+    channel.postMessage({ id, result: await call(method, args) });
+  } catch (error) {
+    channel.postMessage({ id, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+channel.onmessage = ({ data }: MessageEvent<Message>) => {
+  if (data.method && leading && (local || data.method === "open") && !taken.has(data.id!)) {
+    taken.add(data.id!);
+    answer(data as Call);
+  }
+  if (data.ask && local) channel.postMessage({ ready: true });
+  if (data.ready) {
+    readied();
+    for (const { id, method, args } of pending.values()) channel.postMessage({ id, method, args });
+  }
+  if (data.event) dispatch(data.event);
+  const waiting = data.id !== undefined && !data.method && pending.get(data.id);
+  if (!waiting) return;
+  pending.delete(waiting.id);
+  if (data.error !== undefined) waiting.reject(new Error(data.error));
+  else waiting.resolve(data.result);
+};
+
+let running: Promise<void> | undefined;
+/** Runs the session in this tab, from what IndexedDB keeps, creating it as `name` on `device` if there is none. */
+function run(name = "", device = ""): Promise<void> {
+  running ??= (async () => {
+    const { records, kept } = await store.load();
+    const config = { name, device, relay: localStorage.getItem("lmk relay") ?? undefined, membership: localStorage.getItem("lmk membership") ?? undefined };
+    local = await start(records, kept, JSON.stringify(config), store, (json: string) => {
+      const event = JSON.parse(json) as Event;
+      dispatch(event);
+      channel.postMessage({ event });
+    });
+    addEventListener("pagehide", () => local!.flush());
+    ran();
+    readied();
+    for (const waiting of pending.values()) {
+      pending.delete(waiting.id);
+      call(waiting.method, waiting.args).then(waiting.resolve, waiting.reject);
+    }
+    channel.postMessage({ ready: true });
+  })();
+  return running;
+}
+
+/** Loads the WebAssembly and waits for the lock; resolves whether this browser has a session. */
 export async function prepare(): Promise<boolean> {
   await init({ module_or_path: wasm });
-  ({ records, files } = await store.load());
-  return records.length > 0;
-}
-
-export async function open(name = "", device = ""): Promise<Lmk> {
-  for (const hash of files.keys()) held.add(hash);
-  const config = { name, device, relay: localStorage.getItem("lmk relay") ?? undefined, membership: localStorage.getItem("lmk membership") ?? undefined };
-  const saveFile = (hash: string, ciphertext: Uint8Array) => {
-    held.add(hash);
-    store.saveFile(hash, ciphertext);
-  };
-  const lmk = await start(records, [...files.values()], JSON.stringify(config), store.save, saveFile, (json: string) => {
-    const event = JSON.parse(json) as Event;
-    for (const listener of listeners) listener(event);
+  navigator.locks.request("letmeknow", async () => {
+    leading = true;
+    if (await store.has()) await run();
+    await new Promise(() => {});
   });
-  records = [];
-  files.clear();
-  addEventListener("pagehide", () => lmk.flush());
-  return lmk;
+  channel.postMessage({ ask: true });
+  return store.has();
 }
-
-/** The hash a file link names. */
-export const hashOf = (link: string) => /^lmk:([0-9a-f]{64})\./.exec(link)?.[1] ?? "";
 
 /** A file's plaintext, fetched from the members online if this browser does not hold it yet. */
-export async function file(lmk: Lmk, gid: string, link: string): Promise<Uint8Array> {
-  const hash = hashOf(link);
-  if (!held.has(hash)) {
-    const arrived = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => (listeners.delete(wait), reject(new Error("no member online holds the file"))), 90_000);
-      const wait = (event: Event) => {
-        if (event.type !== "file" || event.hash !== hash) return;
-        clearTimeout(timer);
-        listeners.delete(wait);
-        resolve();
-      };
-      listeners.add(wait);
-    });
-    lmk.fetch(gid, link);
-    await arrived;
-  }
+export async function file(gid: string, link: string): Promise<Uint8Array> {
+  const held = await lmk.file(link);
+  if (held) return held;
+  const hash = /^lmk:([0-9a-f]{64})\./.exec(link)?.[1];
+  const arrived = new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => (listeners.delete(wait), reject(new Error("no member online holds the file"))), 90_000);
+    const wait = (event: Event) => {
+      if (event.type !== "file" || event.hash !== hash) return;
+      clearTimeout(timer);
+      listeners.delete(wait);
+      resolve();
+    };
+    listeners.add(wait);
+  });
+  await lmk.fetch(gid, link);
+  await arrived;
   return (await lmk.file(link))!;
 }
-
-export type { Lmk };
