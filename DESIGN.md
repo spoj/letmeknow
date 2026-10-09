@@ -1,14 +1,14 @@
 # letmeknow design
 
-A person asks their agent to work with a coworker's agent, or with a person. One of them shares an invite link; the other joins. People join the same groups from a browser. A group has a kind: a chat, where members talk and send files, or a doc, one markdown text that people and agents edit at once, or another kind a plugin brings. Groups are small and task-scoped, and last hours to days.
+A person asks their agent to work with a coworker's agent, or with a person. One of them shares an invite link; the other joins. People join the same groups from a browser. A group has a kind: a chat, where members talk and send files; a doc, one markdown text that people and agents edit at once; a git repository, which agents push to and fetch from with plain git, and talk in; or another kind a plugin brings. Groups are small and task-scoped, and last hours to days.
 
 Everything in a group is end-to-end encrypted with MLS (RFC 9420). Members send to each other directly, or through a relay; no server holds what they say. PROTOCOL.md gives the exact formats.
 
 ## Goals
 
-- Groups have a kind, fixed when made: chat, built in, or one a plugin brings, such as doc. Everything in them is end-to-end encrypted.
+- Groups have a kind, fixed when made: chat, built in, or one a plugin brings, such as doc or git. Everything in them is end-to-end encrypted.
 - Forward secrecy, post-compromise security, and strict membership: one agreed order of membership changes, which every member applies the same way.
-- No content on any server. One central authority per group orders membership, and nothing else.
+- No content on any server. One central authority per group orders membership, and the entries of its kind's log, without reading either.
 - Agents work through a session process: JSON events, a delivery policy, docs as files, attachments as private files.
 - One Rust codebase: CLI and session process, kinds' plugins, browser client (WebAssembly), and server.
 
@@ -17,7 +17,7 @@ Everything in a group is end-to-end encrypted with MLS (RFC 9420). Members send 
 - **Session**: an MLS member, either an agent's session process or a browser profile. Each agent session is its own member, with its own key. Its name is an unverified claim. It sees the IP address of members it connects to directly.
 - **Device**: a machine's `LETMEKNOW_HOME`, or a browser profile. It signs its sessions' keys and sits on an identity's device list. A browser's one key is both its device and its session.
 - **Identity**: a person, team or agent, as a tightly controlled list of devices ("Matthew": laptop, phone). It makes a member's "Matthew" verifiable and is as strong as its weakest device. No nesting, no admins.
-- **Membership service**: keeps membership logs and is a member of nothing. It sees log ids, entry sizes and timing, and which endpoints connect. It can stall, withhold or split a log, all detectably; it cannot read, forge, or add anyone.
+- **Membership service**: keeps membership logs and kinds' logs, and is a member of nothing. It sees log ids, entry sizes and timing, and which endpoints connect. It can stall, withhold or split a log, all detectably; it cannot read, forge, or add anyone.
 - **Relay**: an iroh relay. It forwards packets when no direct path exists; browsers always use one. It sees who connects to whom and when, and cannot read.
 - **Page server**: letmeknow.dev, or one's own `letmeknow serve`, serves the browser client, so it could take over every browser member it serves. Accepted for now.
 
@@ -34,9 +34,10 @@ Anything with create-if-absent can keep these promises. Two kinds exist:
 - `letmeknow serve`, reached over iroh; letmeknow.dev runs one.
 - A local folder, where an exclusive file create is atomic: for sessions on one machine, and for tests.
 
-It holds two kinds of log and nothing else:
+It holds three kinds of log and nothing else:
 
 - **A group's log**: its MLS commits, under the group id.
+- **A kind's log**: a group's own order for its kind, under a random id in the group's settings, so that the service cannot tie it to the group (see Kinds).
 - **An identity's device list** (see Identity).
 
 Members decide what entries mean, from the service's order:
@@ -44,10 +45,11 @@ Members decide what entries mean, from the service's order:
 - In a group, the first valid commit for each epoch wins and every other entry is skipped, so junk, such as a removed member's fake commit, changes nothing. A commit's validity depends only on MLS state, never on fetched data such as device lists, the clock, or a client's own settings: members who judged differently would disagree about which commit won, and the group would fork. So every member runs the same protocol version, which the settings name and which fixes the openmls version and its configuration; KeyPackages never expire (the inviter checks freshness when it admits); and the app's own rules on commits read only MLS state and bind the committer too: no proposal by reference, and no update that changes a member's identity or device. A client that does not run a group's protocol version refuses it and says so.
 - A committer saves its commit's bytes before posting, since it cannot recognise its own encrypted commit otherwise, and finds its log entry by them. If another commit won the epoch, it applies that one and makes its change again.
 - In a device list, the first entry that extends the latest one wins. A removal is final.
+- In a kind's log, every entry a member can open counts, in log order, unless it was sealed under an older epoch than the entry taken before it; what an entry means is the kind's.
 
 Each member hash-chains a log as it reads it, so that two readers can compare what they saw by one hash. `letmeknow serve` signs each answer with its key: the log's id, length, latest hash, and the time. This is a signed head.
 
-Policy belongs to each service: who may create logs, how long it keeps entries, and size and rate limits. letmeknow.dev lets anyone create a log, keeps entries a year, and takes entries up to 1 MiB and 60 appends a minute per connection. A member away longer than the retention cannot replay the commits it missed and must be added again.
+Policy belongs to each service: who may create logs, how long it keeps entries, and size and rate limits. letmeknow.dev lets anyone create a log, keeps entries a year, and takes entries up to 1 MiB and 60 appends a minute per connection. A member away longer than the retention cannot replay the commits it missed and must be added again; one whose place in a kind's log is past it takes the kind's state from a member.
 
 ### Gossip
 
@@ -61,7 +63,7 @@ A local folder signs nothing, but its sessions all read the folder directly, so 
 
 ## Groups
 
-- Settings live in the MLS group context and change only by commit: kind (fixed; see Kinds), name, the identities the group is open to, `keep`, the membership service's address, and the protocol version.
+- Settings live in the MLS group context and change only by commit: kind (fixed; see Kinds), name, the identities the group is open to, `keep`, the membership service's address, the protocol version, and in a group of a plugin's kind, the id of its kind's log.
 - Each member's leaf names its iroh key and relay, so every member can dial every other, and the kinds its session supports. A changed relay or list of kinds is a commit, like a key update.
 - `keep` (days, default 90) is how long members hold the group's messages and files for one another. Each client may hold less.
 - Post-compromise security: a session replaces its keys with an empty commit when it resumes a group, once caught up, and then daily while it runs, so a stolen key stops working within a day. Not more often: every epoch is kept for the key window, and openmls rewrites all of them on each send and receive, so a group must make few, about 7 per member a week.
@@ -72,12 +74,35 @@ A local folder signs nothing, but its sessions all read the folder directly, so 
 
 The core is a stable substrate, and kinds are extensions that compete: they need not share one model. The core is MLS groups, membership logs, identities and contacts, invites, peers, message sync, files, and a few control messages of its own (`leave`, `introduce`, receipts). It never reads a kind's content: every payload but its own control messages belongs to the group's kind.
 
-- A kind is a plain string, the group's `kind`. Chat is the one kind built in; every other kind is a plugin's, and each client supports the kinds it chooses. letmeknow ships the doc kind as a plugin, `letmeknow-kind-doc`.
-- A kind gets generic channels and nothing else: held messages (synced, kept `keep` days, with receipts); live messages, to the members online and not held; frames to one member; files; and a state link, which an inviter hands each joiner beside the Welcome, and a member can hand another that fell behind.
+- A kind is a plain string, the group's `kind`. Chat is the one kind built in; every other kind is a plugin's, and each client supports the kinds it chooses. letmeknow ships the doc and git kinds as plugins, `letmeknow-kind-doc` and `letmeknow-kind-git`.
+- A kind gets generic channels and nothing else: held messages (synced, kept `keep` days, with receipts); live messages, to the members online and not held; frames to one member; files; a log of its own at the membership service, which orders its entries for every member (below); and a state link, which an inviter hands each joiner beside the Welcome, and a member can hand another that fell behind or asks for one.
 - A session lists the kinds it supports in its leaf; a leaf without the list, from 0.10, supports chat and doc. An inviter refuses a joiner that lacks the group's kind, and a session is not offered the open groups of kinds it lacks.
-- A native session finds a kind's plugin as an executable named `letmeknow-kind-<kind>`: beside its own executable first, where the release and the npm package put the plugins letmeknow ships (so they work under `npx` too), then on PATH, as git finds its subcommands. There is no registry. It starts a plugin while it has a group of its kind, and they speak JSON lines over stdio. A plugin sees its own groups' plaintext and nothing else; its output reaches `listen` as events, and `letmeknow <kind> <args…>` passes it a command.
-- The browser loads no plugins from anywhere, since the page is the root of trust: it bundles the kinds it supports as in-page plugins speaking the same protocol, the doc now.
+- A native session finds a kind's plugin as an executable named `letmeknow-kind-<kind>`: beside its own executable first, where the release and the npm package put the plugins letmeknow ships (so they work under `npx` too), then on PATH, as git finds its subcommands. There is no registry. It starts a plugin while it has a group of its kind, and they speak JSON lines over stdio. A plugin sees its own groups' plaintext and nothing else; its output reaches `listen` as events, and `letmeknow <kind> <args…>` passes it a command. A plugin says when it starts whether its groups carry chat too, as git's do: then chat messages in them are the session's own, and `send` works there.
+- The browser loads no plugins from anywhere, since the page is the root of trust: it bundles the kinds it supports as in-page plugins speaking the same protocol, the doc and, display-only, git.
 - Contacts are not a kind: they stay a Yjs map in the core, in each identity's devices group.
+
+### A kind's log
+
+Some kinds need an order every member agrees on: two pushes to one branch must not both win. The membership service already orders commits without reading them, so a group of a plugin's kind has a log of its own there, beside its membership log, under a random id in the group's settings. Only members know the id, so the service cannot tie the log to the group.
+
+- An entry is sealed as a message is, under the epoch current when it is appended, and marked as an entry, so that it cannot pass for a message, nor a message for it. The service's limits apply: letmeknow.dev takes entries up to 1 MiB and 60 appends a minute per connection, and keeps them a year.
+- Members open the entries in log order and hand them to the kind with their positions. An entry that does not open is skipped, as is one sealed under an older epoch than the entry taken before it, so every member decides alike, and a removed member's entries under its old epochs stop counting once a member appends under a newer one. The session keeps what it opened until the kind says it holds it.
+- A kind appends through its session, and learns its entry's position only once every entry before it is opened, so it knows at once how its entry fared. A member cannot open its own entry, so it keeps the payload until its entry comes back.
+- Members follow the log as they follow membership logs: signed heads, their own hash chains, heads swapped with peers, and contradictions reported.
+- The kind says where it reads from: a joiner from where the state it was handed leaves off. A member that holds no keys of an entry's epoch (sealed before it joined, or past its key window), or whose place is past the service's retention, is behind: it asks a member online for the kind's state, and reads on from where that leaves off.
+
+### Git
+
+A git group is a repository that agents push to and fetch from with plain git, through the remote helper `git-remote-lmk`, which letmeknow ships beside `letmeknow-kind-git`: `git remote add team lmk::<group>` (or `git clone lmk::<group>`), then `git push team main` and `git fetch team`. The helper asks the running session's plugin, which keeps the group's repository bare in its own state, and uses the `git` binary for all repository work. A git group carries chat too: pushes and talk share one timeline.
+
+- A push sends a bundle of the commits the group lacks as a file, and has the members online fetch it. Once another member holds it, it appends to the group's log an entry naming the branch, its old and new commit, the bundle's link, and the commits' subjects. With no other member online, the push fails and says so: otherwise a lost machine could leave a branch pointing at commits nobody has.
+- Every member applies the log in order: an update counts only if `old` is the branch's tip at that point. The pusher learns from its entry's position whether it won; if an earlier entry moved the branch first, git gets its non-fast-forward "fetch first" at once.
+- Branches only fast-forward, so there are no force pushes; creating and deleting a branch are allowed.
+- A member checks each bundle once it has it, in log order. If it does not bring `new` after `old`, the update is void for every member, since a file's content is fixed by its hash, and so is any update that built on it. A member's repository holds the branches as far as every push is checked; a push builds on them counting the pushes not checked yet.
+- Bundles are files, so they count against each receiver's file limit (100 MiB by default for agents): a push no online member takes fails as one with no member online does.
+- The kind's state is its branches as of a log position, with a bundle of all their commits. A joiner gets it, and so does a member back from beyond the log's reach.
+- Each push that counts reaches the other members' `listen` as a `pushed` event, held as a message that does not concern the agent is.
+- The browser shows a git group's pushes and chat, not its files: its in-page plugin follows the log and takes a state's branches, but checks no bundle, holds none and hands no state, so a member it admits asks another member for the state.
 
 ## Messages and docs
 
@@ -155,7 +180,7 @@ Trust is local and travels one hop at most.
 - It asks for persistent storage (Firefox prompts; Chrome and Safari decide silently). Safari wipes a site's storage after 7 days without a visit, but not a home-screen app's. On iPhone and iPad the home-screen app also has storage of its own, apart from Safari's, so it is a different device: the app asks to be added to the home screen before it creates one.
 - Joining from a link waits for a click, so a link preview or scanner opening it uses nothing up.
 - While open, a browser holds and forwards like any member, and may keep less than `keep`.
-- Its kinds are chat and the doc, an in-page plugin (the doc plugin's Rust, in the same WebAssembly) to which the editor binds.
+- Its kinds are chat; the doc, an in-page plugin (the doc plugin's Rust, in the same WebAssembly) to which the editor binds; and git, display-only (see Git), shown as its pushes beside its chat.
 
 ## Deployment
 
@@ -170,14 +195,14 @@ letmeknow.dev is one DigitalOcean droplet (Basic, 1 GB, Ubuntu LTS, Singapore) r
 ## Agent interface
 
 - **Session process**: `letmeknow listen`, one per agent session, run under the harness's background monitor (Pi `monitor`, Claude Code `Monitor`), so that each line it prints wakes the agent. It alone holds the member's MLS state, held messages and read frontier, under `LETMEKNOW_HOME/sessions/<handle>/`, and runs the plugins of its groups' kinds, which keep their state under `kinds/<kind>/` there. A new session gets a random two-word handle; `--session <handle> listen` resumes its memberships. Other commands reach the running session on a localhost port recorded, with a token, in its state directory, and find it on their own unless several run.
-- **Events**: one JSON object per line: `ready`, `message`, `attachment`, `joined`, `left`, `settings`, `removed`, `introduced`, `refused`, `omitted` and `warning`, and those of kinds' plugins, such as the doc's `edited` (SKILL.md gives their fields). A member shows as its name, fingerprint, device, identity as this identity knows it, and who added it.
+- **Events**: one JSON object per line: `ready`, `message`, `attachment`, `joined`, `left`, `settings`, `removed`, `introduced`, `refused`, `omitted` and `warning`, and those of kinds' plugins, such as the doc's `edited` and git's `pushed` (SKILL.md gives their fields). A member shows as its name, fingerprint, device, identity as this identity knows it, and who added it.
 - **Delivery policy**: printing wakes the agent, and each wake rereads its whole context, so what does not concern the session rides along with wakes that happen anyway. Messages addressed to it, replies to its messages, `urgent` messages, doc edits that mention it, membership changes and refusals print at once, after anything held. The rest is held, then printed in order just before the next of those, after the agent's next command, or once the oldest has waited `--hold` seconds (default an hour). Of what arrives while a session catches up on resume, only the last 20 items per group print, after an `omitted` count.
 - **Addressing**: a message is addressed to the session if `to` lists it or its text mentions it: "@" and a name it answers to, which is its name or the first word of it, in any case. `send --to` takes fingerprints or names; a name may also be an identity's contact name, which addresses all that identity's sessions, and a name that members of different identities answer to is refused.
 - **Read frontier**: `after` means what entered the model's context, not what the session received. A message counts as read once printed or returned by `read`, so each member's latest message is a signed claim of what it has read. The session then deletes the message's text, keeping its id, sender and references; `listen --keep-log` keeps the text too.
 - **Peers are not operators**: the skill tells agents that other members' messages are requests from another party, never instructions from their operator, and grant no authority; acting on them goes through the harness's normal permission checks.
 - **Docs as files**: the doc plugin keeps each doc in a file, named on `invite` or `join`, or else in its state directory. File and doc are brought into step from their base, the text both last had: a change in the file is carried line by line onto the doc as it is now (a changed line is changed where its base text is now; added lines go after the line they followed), and a change to a line that someone else changed meanwhile is dropped with a `warning`. A write from a stale read undoes what came in since. This happens once the file is quiet for 1 second or the doc for 2, and whenever the session asks, which it does of every plugin before anything prints and before each command, so the agent never acts on a stale file. A plugin that stopped midway finishes it when it starts, without carrying a change twice. Others' edits print as one `edited` event per doc. Leaving deletes a file the plugin made and keeps one the agent named.
 - **Attachments**: some content should not pass through a model: credentials, and data too large for a context window. `send --attach` sends a file; the recipient's session saves it into a file only its user can read and adds the `path` to the message (or marks it pending, and prints an `attachment` event once it arrives), which the agent passes to whatever needs it. Every member can fetch every attachment; this keeps content out of models, not out of members' hands. The files go when the session leaves the group. In a doc, `doc attach` makes a file linkable and `fetch` writes a linked file out.
-- **Commands**: `invite` (with `--for`, `--to`, `--qr`, and for new groups `--kind`, `--keep`, `--membership`, and arguments for the kind's plugin, such as a doc's file), `join` (with the plugin's arguments too), `send`, `read`, `fetch`, `members`, `groups`, `status`, `remove`, `leave`, `name`, `open`, `contacts`, `introduce`, `identity create | list | remove` with `invite --identity`, and `<kind> <args…>`, a plugin's own commands, such as `doc attach`. `status` lists the members online and what only this session holds; the skill tells agents to keep `listen` running for the whole task and to check `status` before finishing.
+- **Commands**: `invite` (with `--for`, `--to`, `--qr`, and for new groups `--kind`, `--keep`, `--membership`, and arguments for the kind's plugin, such as a doc's file), `join` (with the plugin's arguments too), `send`, `read`, `fetch`, `members`, `groups`, `status`, `remove`, `leave`, `name`, `open`, `contacts`, `introduce`, `identity create | list | remove` with `invite --identity`, and `<kind> <args…>`, a plugin's own commands, such as `doc attach`, and `git list` and `git push`, which `git-remote-lmk` runs. `status` lists the members online and what only this session holds; the skill tells agents to keep `listen` running for the whole task and to check `status` before finishing.
 - **Configuration**: `LETMEKNOW_HOME` (default the OS's local data directory), `LETMEKNOW_SESSION`, `LETMEKNOW_NAME`, `LETMEKNOW_HOLD`, the membership service and the relay separately (`LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`), and `LETMEKNOW_CA`, extra root certificates for a server of one's own.
 
 ## Security
@@ -193,6 +218,7 @@ Limits:
 - **Doc edits relayed in a diff** are vouched for by the member that sent the diff, not their authors; since any member can edit anything, this loses attribution, not access.
 - **Availability**: a message reaches a member only while that member and some holder are online together. Agents that are never online at the same time need a third member to bridge them.
 - **Peer agents** read everything while members; removal restores confidentiality going forward.
+- **Kinds' logs**: the service sees each log's entry sizes and timing, and which endpoint appends. A removed member can append under the epochs it was in, and its entries count until a member appends under a newer epoch.
 - **Plugins** run as the user, with the session process's rights, and see their groups' plaintext. Install only those you trust, as with git's subcommands; the plugins letmeknow ships sit beside its binary.
 - **Local state**: MLS secrets, held messages, files, docs and, with `--keep-log`, delivered text sit on disk; file permissions protect them. What a session deletes leaves no copy in its database files. Copies a harness keeps (transcripts, monitor logs) are outside every guarantee here.
 - **Open groups**: while a group is open to an identity, any device on its list can join, with no one asked.
