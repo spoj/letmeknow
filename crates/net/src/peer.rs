@@ -13,16 +13,14 @@ use std::{
 };
 
 use anyhow::{Result, bail, ensure};
-use iroh::{
-    EndpointId,
-    endpoint::{Connection, RecvStream, SendStream},
-};
+use iroh::EndpointId;
 use lmk_proto::{
     Answer, Bytes, frame,
     head::Head,
     identity::Envelope,
     peer::{Admitted, Below, Frame, Hello, Join},
 };
+use lmk_transport::{Conn, RecvStream, SendStream};
 use sha2::{Digest, Sha256};
 use n0_future::{task::spawn, time::sleep};
 use negentropy::{Negentropy, NegentropyStorageVector};
@@ -103,7 +101,7 @@ type Items = HashMap<[u8; 32], (u64, usize)>;
 /// Runs the connection's one peer stream; the connection closes with it.
 pub(crate) async fn run(
     inner: Arc<Inner>,
-    conn: Connection,
+    conn: Conn,
     dialer: bool,
     send: SendStream,
     mut recv: RecvStream,
@@ -173,7 +171,7 @@ pub(crate) async fn run(
     if let Err(e) = result {
         tracing::debug!("peer stream with {} ended: {e:#}", peer.fmt_short());
     }
-    conn.close(0u32.into(), b"peer stream ended");
+    conn.close(b"peer stream ended");
 }
 
 impl Session {

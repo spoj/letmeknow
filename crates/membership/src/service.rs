@@ -3,22 +3,24 @@
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::Result;
-use iroh::{
-    endpoint::{Connection, RecvStream, SendStream},
-    protocol::{AcceptError, ProtocolHandler},
-};
+use iroh::protocol::{AcceptError, ProtocolHandler};
 use lmk_proto::{
-    Answer, Bytes, frame,
+    Answer, Bytes,
+    clock::now,
+    frame,
     frame::{Open, Stream},
     membership::{Latest, Notice, Request},
 };
+use lmk_transport::{Conn, IrohConnection, RecvStream, SendStream};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::Instant;
 
-use crate::store::{Store, now};
+use crate::store::Store;
 
 /// What the service accepts. Anyone may create a log, by appending to it.
 #[derive(Clone, Debug)]
@@ -88,7 +90,7 @@ impl Service {
         let (store, policy) = (&self.0.store, &self.0.policy);
         let Ok(request) = serde_json::from_slice(&frame::read_body(&mut recv).await?) else {
             frame::write(&mut send, &refused::<()>("unknown request")).await?;
-            send.finish()?;
+            send.shutdown().await?;
             return Ok(());
         };
         match request {
@@ -130,7 +132,7 @@ impl Service {
             }
             Request::Subscribe { logs } => return self.subscribe(send, recv, logs).await,
         }
-        send.finish()?;
+        send.shutdown().await?;
         Ok(())
     }
 
@@ -145,6 +147,7 @@ impl Service {
         });
         loop {
             tokio::select! {
+                biased;
                 notice = notices.recv() => {
                     let notice = notice?;
                     if logs.contains(&notice.log) {
@@ -184,8 +187,9 @@ impl Window {
     }
 }
 
-impl ProtocolHandler for Service {
-    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+impl Service {
+    /// Serves a connection's streams until it closes.
+    pub async fn accept(&self, conn: Conn) {
         let appends = Arc::new(Mutex::new(Window {
             start: Instant::now(),
             count: 0,
@@ -198,6 +202,12 @@ impl ProtocolHandler for Service {
                 }
             });
         }
+    }
+}
+
+impl ProtocolHandler for Service {
+    async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
+        Service::accept(self, Arc::new(IrohConnection(conn))).await;
         Ok(())
     }
 }

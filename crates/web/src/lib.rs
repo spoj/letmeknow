@@ -16,6 +16,7 @@ use anyhow::{Context, Result, anyhow};
 use js_sys::{Array, Function, Promise, Uint8Array};
 use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Introduction, Request, message_id, service};
 use lmk_node::devices::Devices;
+use lmk_node::lmk_core::crypto::{Crypto, Rand};
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::group::Window;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
@@ -26,7 +27,6 @@ use lmk_proto::links::{FileLink, Invite};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::{Duration, sleep};
 use openmls_memory_storage::MemoryStorage;
-use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -102,19 +102,19 @@ impl Disk for Kept {
 struct Store(Arc<MemoryProvider>);
 
 impl OpenMlsProvider for Store {
-    type CryptoProvider = RustCrypto;
-    type RandProvider = RustCrypto;
+    type CryptoProvider = Crypto;
+    type RandProvider = Rand;
     type StorageProvider = MemoryStorage;
 
     fn storage(&self) -> &MemoryStorage {
         self.0.storage()
     }
 
-    fn crypto(&self) -> &RustCrypto {
+    fn crypto(&self) -> &Crypto {
         self.0.crypto()
     }
 
-    fn rand(&self) -> &RustCrypto {
+    fn rand(&self) -> &Rand {
         self.0.rand()
     }
 }

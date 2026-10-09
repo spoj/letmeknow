@@ -9,6 +9,9 @@ lmk-proto.workspace = true
 anyhow.workspace = true
 chacha20poly1305.workspace = true
 ed25519-dalek.workspace = true
+hpke-rs = "=0.7.0"
+hpke-rs-crypto = "=0.7.0"
+hpke-rs-rust-crypto = "=0.7.0"
 openmls.workspace = true
 openmls_basic_credential.workspace = true
 openmls_memory_storage.workspace = true
@@ -17,6 +20,7 @@ openmls_traits.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+zeroize = "1.8"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ciborium.workspace = true

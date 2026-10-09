@@ -128,7 +128,7 @@ async fn serves_relay_membership_and_page() {
         .bind()
         .await
         .unwrap();
-    let client = ServeClient::for_service(endpoint, &service).unwrap();
+    let client = ServeClient::for_service(std::sync::Arc::new(lmk_transport::Iroh(endpoint)), &service).unwrap();
     let appended = tokio::time::timeout(Duration::from_secs(10), client.append(b"g", b"commit"))
         .await
         .unwrap()
@@ -144,7 +144,7 @@ async fn serves_relay_membership_and_page() {
     let lmk_proto::group::Service::Serve { key, .. } = service else {
         unreachable!()
     };
-    let direct = ServeClient::new(endpoint, &key.0, "", &[format!("127.0.0.1:{membership}")]).unwrap();
+    let direct = ServeClient::new(std::sync::Arc::new(lmk_transport::Iroh(endpoint)), &key.0, "", &[format!("127.0.0.1:{membership}")]).unwrap();
     let page = direct.read(b"g", 0).await.unwrap();
     assert_eq!(page.entries[0].0, b"commit");
     let head = direct.head(b"g").await.unwrap();

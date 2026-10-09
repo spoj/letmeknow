@@ -12,13 +12,14 @@ use anyhow::Result;
 use async_trait::async_trait;
 use lmk_proto::{
     Bytes,
+    clock::now,
     head::{self, Head},
     membership::{Appended, Notice, Page},
 };
 use notify::{RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
-use crate::{Chain, Membership, Subscription, chain::Chains, store::now};
+use crate::{Chain, Membership, Subscription, chain::Chains};
 
 const PAGE_BYTES: usize = 4 << 20;
 

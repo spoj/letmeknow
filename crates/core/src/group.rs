@@ -96,7 +96,9 @@ struct SessionRecord {
 impl Session {
     /// A new session with a fresh MLS key, speaking as no identity; a provider holds one session.
     pub fn create<P: Provider>(provider: &P, name: &str, leaf: Leaf) -> Result<Self> {
-        Self::create_with(provider, SignatureKeyPair::new(SignatureScheme::ED25519)?, name, leaf)
+        let key = ed25519_dalek::SigningKey::from_bytes(&crate::random());
+        let signer = SignatureKeyPair::from_raw(SignatureScheme::ED25519, key.to_bytes().to_vec(), key.verifying_key().to_bytes().to_vec());
+        Self::create_with(provider, signer, name, leaf)
     }
 
     /// A session with the given MLS key: a device's own (`Device::signer`).

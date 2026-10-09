@@ -20,7 +20,6 @@ iroh = { workspace = true, features = ["tls-ring"] }
 js-sys = "0.3"
 n0-future = "0.3"
 openmls_memory_storage.workspace = true
-openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 rustc-hash = "2"
 serde.workspace = true

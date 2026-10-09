@@ -26,6 +26,7 @@ use lmk_proto::{
     Answer, Bytes,
     frame::{self, ALPN, Open, Stream},
 };
+use lmk_transport::Iroh;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 struct Net {
@@ -96,7 +97,7 @@ impl Net {
     async fn client(&self, service: &SecretKey) -> ServeClient {
         let endpoint = self.builder().clear_ip_transports().bind().await.unwrap();
         let relay = self.config.url.to_string();
-        ServeClient::new(endpoint, service.public().as_bytes(), &relay, &[]).unwrap()
+        ServeClient::new(Arc::new(Iroh(endpoint)), service.public().as_bytes(), &relay, &[]).unwrap()
     }
 }
 

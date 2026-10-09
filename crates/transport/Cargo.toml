@@ -1,0 +1,11 @@
+[package]
+name = "lmk-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+iroh = { workspace = true, features = ["tls-ring"] }
+lmk-proto.workspace = true
+tokio = { workspace = true, features = ["io-util"] }

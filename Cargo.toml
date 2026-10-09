@@ -11,6 +11,7 @@ license = "MIT"
 lmk-proto = { path = "crates/proto" }
 lmk-core = { path = "crates/core" }
 lmk-membership = { path = "crates/membership" }
+lmk-transport = { path = "crates/transport" }
 lmk-net = { path = "crates/net" }
 lmk-node = { path = "crates/node" }
 lmk-client = { path = "crates/client" }

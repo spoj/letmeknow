@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 lmk-proto.workspace = true
+lmk-transport.workspace = true
 anyhow.workspace = true
 async-trait = "0.1"
 ed25519-dalek.workspace = true
@@ -15,7 +16,7 @@ n0-future = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 thiserror = "2"
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "io-util"] }
 tracing = "0.1"
 
 # The browser has only the client of `letmeknow serve`.

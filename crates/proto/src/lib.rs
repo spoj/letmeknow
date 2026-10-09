@@ -1,5 +1,6 @@
 //! The wire formats of PROTOCOL.md, shared by every crate.
 
+pub mod clock;
 pub mod frame;
 pub mod group;
 pub mod head;
@@ -7,6 +8,7 @@ pub mod identity;
 pub mod links;
 pub mod membership;
 pub mod peer;
+pub mod random;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

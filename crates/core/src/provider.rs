@@ -2,9 +2,10 @@
 
 use anyhow::Result;
 use openmls_memory_storage::MemoryStorage;
-use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
 use openmls_traits::storage::StorageProvider;
+
+use crate::crypto::{Crypto, Rand};
 
 /// An openmls provider that also keeps our own records, by key.
 pub trait Provider: OpenMlsProvider<StorageProvider: StorageProvider<1, Error: Send + Sync + 'static>> {
@@ -21,25 +22,26 @@ pub trait Provider: OpenMlsProvider<StorageProvider: StorageProvider<1, Error: S
 /// Our own records sit under keys starting with `lmk/`.
 #[derive(Default)]
 pub struct MemoryProvider {
-    crypto: RustCrypto,
+    crypto: Crypto,
+    rand: Rand,
     pub storage: MemoryStorage,
 }
 
 impl OpenMlsProvider for MemoryProvider {
-    type CryptoProvider = RustCrypto;
-    type RandProvider = RustCrypto;
+    type CryptoProvider = Crypto;
+    type RandProvider = Rand;
     type StorageProvider = MemoryStorage;
 
     fn storage(&self) -> &MemoryStorage {
         &self.storage
     }
 
-    fn crypto(&self) -> &RustCrypto {
+    fn crypto(&self) -> &Crypto {
         &self.crypto
     }
 
-    fn rand(&self) -> &RustCrypto {
-        &self.crypto
+    fn rand(&self) -> &Rand {
+        &self.rand
     }
 }
 
@@ -71,10 +73,11 @@ mod native {
     use std::path::Path;
 
     use anyhow::Result;
-    use openmls_rust_crypto::RustCrypto;
     use openmls_sqlite_storage::{Codec, Connection, SqliteStorageProvider};
     use openmls_traits::OpenMlsProvider;
     use rusqlite::OptionalExtension;
+
+    use crate::crypto::{Crypto, Rand};
 
     /// openmls state as CBOR: compact, and readable back (bincode is not).
     #[derive(Default)]
@@ -107,7 +110,8 @@ mod native {
 
     /// One SQLite file: openmls's tables, and ours (`lmk`) on a second connection.
     pub struct SqliteProvider {
-        crypto: RustCrypto,
+        crypto: Crypto,
+        rand: Rand,
         storage: SqliteStorageProvider<Cbor, Connection>,
         ours: Connection,
     }
@@ -123,25 +127,25 @@ mod native {
             let ours = Connection::open(path)?;
             ours.execute_batch(PRAGMAS)?;
             ours.execute_batch("CREATE TABLE IF NOT EXISTS lmk (key BLOB PRIMARY KEY, value BLOB NOT NULL)")?;
-            Ok(SqliteProvider { crypto: RustCrypto::default(), storage, ours })
+            Ok(SqliteProvider { crypto: Crypto::default(), rand: Rand, storage, ours })
         }
     }
 
     impl OpenMlsProvider for SqliteProvider {
-        type CryptoProvider = RustCrypto;
-        type RandProvider = RustCrypto;
+        type CryptoProvider = Crypto;
+        type RandProvider = Rand;
         type StorageProvider = SqliteStorageProvider<Cbor, Connection>;
 
         fn storage(&self) -> &Self::StorageProvider {
             &self.storage
         }
 
-        fn crypto(&self) -> &RustCrypto {
+        fn crypto(&self) -> &Crypto {
             &self.crypto
         }
 
-        fn rand(&self) -> &RustCrypto {
-            &self.crypto
+        fn rand(&self) -> &Rand {
+            &self.rand
         }
     }
 

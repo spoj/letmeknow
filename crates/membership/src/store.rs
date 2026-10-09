@@ -1,15 +1,12 @@
 //! The logs of `letmeknow serve`, in SQLite.
 
-use std::{
-    path::Path,
-    sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{path::Path, sync::Mutex};
 
 use anyhow::Result;
 use ed25519_dalek::SigningKey;
 use lmk_proto::{
     Bytes,
+    clock::now,
     head::{self, Head},
     membership::{Appended, Page},
 };
@@ -18,10 +15,6 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub struct Store {
     db: Mutex<Connection>,
     key: SigningKey,
-}
-
-pub fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
 impl Store {
