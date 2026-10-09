@@ -1,0 +1,30 @@
+[package]
+name = "lmk-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# The requests as a command line's subcommands.
+clap = ["dep:clap"]
+
+[dependencies]
+lmk-core.workspace = true
+lmk-node.workspace = true
+lmk-proto.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+clap = { workspace = true, optional = true }
+hex.workspace = true
+n0-future = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+iroh = { workspace = true, features = ["tls-ring"] }
+iroh-relay = { workspace = true, features = ["server"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { workspace = true, features = ["full"] }

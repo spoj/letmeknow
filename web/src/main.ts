@@ -5,7 +5,7 @@ import "./app.css";
 import * as client from "./client";
 import type { Attachment, Group, Item, Me, Person, Reason } from "./client";
 
-const { lmk } = client;
+const { lmk, request } = client;
 
 type Child = Node | string | false | undefined | null | 0 | Child[];
 type Message = Extract<Item, { type: "message" }>;
@@ -133,7 +133,7 @@ async function start(name: string, device: string) {
 
 client.listen(event => {
   // The tab that runs the session counts what is unread; a tab showing the group clears it.
-  if (event.type === "message" && client.runs() && event.group && !(page === "group" && event.group === selected && document.visibilityState === "visible")) {
+  if ((event.type === "message" || event.type === "pushed") && client.runs() && event.group && !(page === "group" && event.group === selected && document.visibilityState === "visible")) {
     localStorage.setItem(`unread ${event.group}`, String(unread(event.group) + 1));
   }
   if (event.type === "warning") toast(event.text);
@@ -145,7 +145,7 @@ client.listen(event => {
 // Names: a member's identity first, as this browser knows it ("Matthew · phone"), else its own name.
 
 function label(p: Person): string {
-  return p.identity && !p.identity.error ? `${p.identity.name} · ${p.device}` : p.name;
+  return p.identity && !p.identity.error ? `${p.identity.name} · ${p.device}` : (p.name ?? "");
 }
 
 /** What a member's name rests on: this browser's own identity, a contact, an introduction, or only its own word. */
@@ -156,7 +156,16 @@ function standing(p: Person): string | undefined {
   if (i.how === "self") return "you";
   if (i.how === "verified") return "verified contact";
   if (i.how === "introduced") return `introduced by ${i.by}`;
-  return i.introduced ? `their own name; ${i.introduced.by} says they are ${i.introduced.name}` : "their own name, not a contact";
+  const introduced = introduction(i);
+  return introduced ? `their own name; ${introduced.by} says they are ${introduced.name}` : "their own name, not a contact";
+}
+
+/** Who vouched for an unknown identity first, by their label, and as whom. */
+function introduction(i: client.Identity): { by: string; name: string } | undefined {
+  if (!i.introduced) return undefined;
+  if (!Array.isArray(i.introduced)) return i.introduced;
+  const [first] = i.introduced;
+  return first && { by: label(first.by), name: first.name };
 }
 
 function who(p: Person): HTMLElement {
@@ -326,7 +335,7 @@ function offer(kind: string | undefined) {
 
 /** Uses an invite link: lands in the group it joined, or, for a device link, on this browser's devices. */
 async function redeem(link: string) {
-  const joined = JSON.parse(await lmk.join(link));
+  const joined = await request({ cmd: "join", target: link });
   history.replaceState(null, "", "/");
   if (joined.group) await select(joined.group);
   else showDevices();
@@ -465,7 +474,7 @@ function drawNav() {
       const name = `${KINDS[o.settings.kind].mark} ${o.settings.name || `Unnamed ${KINDS[o.settings.kind].name}`}`;
       if (!o.failed) return h("div", { className: "opening" }, h("span", {}, name), h("small", {}, "joining…"));
       const join = h("button", {}, "Join");
-      join.onclick = () => busy(join, "…", async () => select(JSON.parse(await lmk.join_open(o.group)).group));
+      join.onclick = () => busy(join, "…", async () => select((await request({ cmd: "join", target: o.group })).group));
       return h("div", { className: "opening" }, h("span", {}, name), join);
     })
   ]);
@@ -523,19 +532,20 @@ function showDevices() {
 const devicesBody = h("div", { className: "card" });
 async function drawDevices() {
   const identity = me.identities[0];
-  const contacts: client.Contacts = JSON.parse(await lmk.contacts());
+  const contacts: client.Contacts = await request({ cmd: "contacts" });
   if (!identity) {
     return update(devicesBody, "none", () => {
       const name = h("input", { value: me.name, required: true });
       const create = h("button", { className: "primary" }, "Start");
       return [
         h("p", {}, "This browser is no one's device yet. Give your name to make it your first device; you can then add your other devices, and others can tell it is you."),
-        form(() => name.reportValidity() && busy(create, "Starting…", async () => (await lmk.identity_create(name.value.trim()), render())), field("Your name", name), create),
+        form(() => name.reportValidity() && busy(create, "Starting…", async () => (await request({ cmd: "identity", op: { create: { name: name.value.trim() } } }), render())), field("Your name", name), create),
         h("p", { className: "muted" }, "To add this browser to an identity you have on another device, make a device link there and open it here, or paste it into Join.")
       ];
     });
   }
-  const list: { devices: { key: string; name: string; you: boolean }[] } = await lmk.devices(identity.id).then(JSON.parse, () => ({ devices: [] }));
+  const listed: { identities: { identity: string; devices: { key: string; name: string; you: boolean }[] }[] } = await request({ cmd: "identity", op: "list" });
+  const list = listed.identities.find(i => i.identity === identity.id) ?? { devices: [] };
   update(devicesBody, JSON.stringify([identity, list, contacts]), () => [
     h("p", {}, `The browsers and computers that are you, ${identity.name}. They join the chats and documents open to you, and others see them as yours.`),
     h(
@@ -547,7 +557,7 @@ async function drawDevices() {
           {},
           h("span", { title: `key ${d.key}` }, d.name, d.you && h("small", {}, " this browser")),
           confirmed("Remove", d.you ? "Remove this browser?" : `Remove ${d.name}?`, async () => {
-            await lmk.remove_device(identity.id, d.key);
+            await request({ cmd: "identity", op: { remove: { identity: identity.id, device: d.key } } });
             shown.delete(devicesBody);
             render();
           })
@@ -566,8 +576,8 @@ async function drawDevices() {
         { className: "devices" },
         ...contacts.introductions.map(i => {
           const accept = h("button", {}, "Accept");
-          accept.onclick = () => busy(accept, "…", async () => (await lmk.accept(i.id, undefined), render()));
-          return h("li", {}, h("span", {}, i.name, h("small", {}, ` by ${i.by}`)), accept);
+          accept.onclick = () => busy(accept, "…", async () => (await request({ cmd: "contacts", op: { accept: { identity: i.identity } } }), render()));
+          return h("li", {}, h("span", {}, i.name, h("small", {}, ` by ${label(i.by)}`)), accept);
         })
       )
   ]);
@@ -583,7 +593,8 @@ async function inviteDialog(target: { gid: string } | { identity: string }) {
   const dialog = modal(device ? "Add a device" : "Invite someone", body);
   const make = async (label?: string) => {
     // The link opens this server's app, which is letmeknow.dev's unless the person runs their own.
-    const made = new URL(device ? await lmk.invite_device(target.identity) : await lmk.invite(target.gid, label));
+    const invite = device ? { identity: target.identity } : { group: target.gid, for: label || undefined };
+    const made = new URL((await request({ cmd: "invite", ...invite })).link);
     const link = location.origin + made.pathname + made.hash;
     const { encode } = await import("uqr");
     const { data, size } = encode(link, { border: 0 });
@@ -693,13 +704,13 @@ class View {
     const kind = KINDS[settings.kind].name;
     const name = h("input", { value: settings.name, placeholder: title(gid), ariaLabel: "Name" });
     const save = h("button", {}, "Rename");
-    const contacts: client.Contacts = JSON.parse(await lmk.contacts());
-    const openable = [...me.identities.map(i => ({ ...i, own: true })), ...contacts.contacts.map(c => ({ id: c.id, name: c.name, own: false }))];
+    const contacts: client.Contacts = await request({ cmd: "contacts" });
+    const openable = [...me.identities.map(i => ({ ...i, own: true })), ...contacts.contacts.map(c => ({ id: c.identity, name: c.name, own: false }))];
     const toggle = (identity: { id: string; name: string; own: boolean }) => {
       const box = h("input", { type: "checkbox", checked: !!settings.open?.some(o => o.id === identity.id) });
       box.onchange = async () => {
         box.disabled = true;
-        await lmk.set_open(gid, identity.id, identity.name, box.checked).catch(error => ((box.checked = !box.checked), toast(error)));
+        await request({ cmd: "open", group: gid, close: !box.checked, identity: identity.id }).catch(error => ((box.checked = !box.checked), toast(error)));
         box.disabled = false;
       };
       const text = identity.own ? "Your other devices can join" : `${identity.name}'s devices can join`;
@@ -707,15 +718,15 @@ class View {
     };
     const dialog = modal(
       kind[0].toUpperCase() + kind.slice(1),
-      form(() => busy(save, "Renaming…", () => lmk.rename(gid, name.value.trim())), field("Name", h("div", { className: "row" }, name, save))),
+      form(() => busy(save, "Renaming…", () => request({ cmd: "name", group: gid, name: name.value.trim() })), field("Name", h("div", { className: "row" }, name, save))),
       h("h3", {}, "People"),
       h(
         "ul",
         { className: "people-list" },
         ...this.members.map(m => {
-          const introduced = m.identity?.how === "unknown" && m.identity.introduced;
+          const introduced = m.identity?.how === "unknown" && introduction(m.identity);
           const accept = introduced && h("button", {}, `Accept as ${introduced.name}`);
-          if (accept) accept.onclick = () => busy(accept, "…", async () => (await lmk.accept(m.identity!.id, undefined), render(), dialog.close()));
+          if (accept) accept.onclick = () => busy(accept, "…", async () => (await request({ cmd: "contacts", op: { accept: { identity: m.identity!.id } } }), render(), dialog.close()));
           return h(
             "li",
             {},
@@ -728,7 +739,7 @@ class View {
               m.added_by && h("p", { className: "muted" }, `added by ${m.added_by.name ?? "a former member"} (${m.added_by.how})`)
             ),
             accept,
-            !m.you && confirmed("Remove", `Remove ${label(m)}?`, () => lmk.remove(gid, m.key))
+            !m.you && confirmed("Remove", `Remove ${label(m)}?`, () => request({ cmd: "remove", group: gid, member: m.fp }))
           );
         })
       ),
@@ -737,7 +748,7 @@ class View {
         "div",
         { className: "buttons leave" },
         confirmed(`Leave ${kind}`, "Leave for good?", async () => {
-          if (!(await lmk.leave(gid))) toast("Asked the others to remove you; you leave once one of them is online.");
+          if ((await request({ cmd: "leave", group: gid })).status) toast("Asked the others to remove you; you leave once one of them is online.");
           render();
           dialog.close();
         })
@@ -830,7 +841,7 @@ class ChatView extends View {
     let at: Element | null = this.list.firstElementChild;
     for (const item of items) {
       const key = "id" in item ? item.id : `${item.type} ${item.at}`;
-      const follows = item.type === "message" && previous?.type === "message" && previous.from.key === item.from.key && item.at - previous.at < 300_000 && !item.reply_to;
+      const follows = item.type === "message" && previous?.type === "message" && previous.from.fp === item.from.fp && item.at - previous.at < 300_000 && !item.reply_to;
       const json = JSON.stringify([item, follows]);
       previous = item;
       keep.add(key);
@@ -884,7 +895,7 @@ class ChatView extends View {
         return h("li", { className: "event" }, who(item.from), " asked to leave", at);
       case "joined":
       case "left": {
-        const self = item.by.key === item.member.key;
+        const self = item.by.fp === item.member.fp;
         const said =
           item.type === "joined" ? [who(item.by), item.how === "open" ? " let in " : " added ", who(item.member)] : self ? [who(item.member), " left"] : [who(item.by), " removed ", who(item.member)];
         return h("li", { className: "event" }, ...said, at);
@@ -1032,7 +1043,7 @@ class ChatView extends View {
       const sent = lmk.send(this.gid, content, replyTo?.id, to, urgent, attachment?.name, attachment?.type, bytes);
       setTimeout(render, 50);
       const answer = JSON.parse(await sent);
-      if (answer.attachment && answer.attachment.held_by.length === 0) toast(`No other member holds ${attachment!.name} yet: it is available only while this browser is open.`);
+      if (answer.attachment?.pending) toast(`No other member holds ${attachment!.name} yet: it is available only while this browser is open.`);
     } catch (error) {
       toast(error);
       if (!this.input.value) this.input.value = content;

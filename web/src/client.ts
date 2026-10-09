@@ -7,6 +7,7 @@ import init, { type Lmk, invite_kind, start } from "../pkg/lmk_web.js";
 import wasm from "../pkg/lmk_web_bg.wasm";
 import * as store from "./store";
 
+/** A member as the client core describes it; an endpoint that is not one has only its `iroh` key. */
 export type Identity = {
   id: string;
   name: string;
@@ -15,9 +16,10 @@ export type Identity = {
   warning?: string;
   error?: string;
   new_device?: string;
-  introduced?: { by: string; name: string };
+  /** Who vouched for it, and as whom; letmeknow 0.12 recorded one, its introducer's label. */
+  introduced?: { by: Person; name: string }[] | { by: string; name: string };
 };
-export type Person = { key: string; fp: string; name: string; device: string; you?: boolean; identity?: Identity; added_by?: { name?: string; how: string } };
+export type Person = { fp: string; name: string; device: string; you?: boolean; identity?: Identity; added_by?: { name?: string; how: string } };
 export type Named = { id: string; name: string };
 export type Settings = { kind: "chat" | "doc" | "git"; name: string; open?: Named[]; keep?: number };
 export type Group = { group: string; settings: Settings; members: Person[]; joined: boolean; failed?: boolean };
@@ -46,8 +48,8 @@ export type Item =
   | { type: "introduced"; at: number; by: Person; identity: Named; how: string }
   | { type: "pushed"; at: number; by: Person; ref: string; subjects: string[] };
 export type Event = { type: string; group?: string; identity?: string; id?: string; hash?: string; text?: string; by?: string };
-export type Me = { key: string; fp: string; name: string; device: { key: string; name: string }; identities: Named[] };
-export type Contacts = { contacts: (Named & { how: string; by?: string })[]; introductions: (Named & { by: string })[] };
+export type Me = { fp: string; name: string; device: { key: string; name: string }; identities: Named[] };
+export type Contacts = { contacts: { identity: string; name: string; how: string; by?: string }[]; introductions: { identity: string; name: string; by: Person }[] };
 
 /** The session's methods, as every tab calls them: asynchronously, wherever it runs. */
 type Methods = Exclude<keyof Lmk, "free" | symbol>;
@@ -95,6 +97,10 @@ function call(method: string, args: unknown[]): Promise<unknown> {
 }
 
 export const lmk = new Proxy({} as Session, { get: (_, method: string) => (...args: unknown[]) => call(method, args) });
+
+/** A request of the client core, as `letmeknow`'s command channel takes it: `{cmd, ...}`. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const request = async (request: { cmd: string } & Record<string, unknown>): Promise<any> => JSON.parse(await lmk.request(JSON.stringify(request)));
 
 /** Starts the session in another tab, or in this one if it holds the lock, as `name` on device `device` if new. */
 export const open = (name: string, device: string) => call("open", [name, device]) as Promise<void>;

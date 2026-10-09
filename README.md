@@ -37,7 +37,7 @@ It prints its membership address, `<key>@https://chat.example.com`. Sessions use
 
 ## Layout
 
-- `crates/`: the Rust workspace. `session` is the `letmeknow` binary (CLI and session process); `kind-doc` is the doc kind's plugin, `letmeknow-kind-doc`, and the browser's in-page doc plugin; `kind-git` is the git kind's plugin, `letmeknow-kind-git`, with git's remote helper `git-remote-lmk`, and the browser's display-only git plugin; `node` is one member's logic, shared by the CLI and the browser; `core` (MLS groups, identities, invites), `net` (peers and files over iroh), `membership` (logs and their services), `proto` (wire formats), `serve` (`letmeknow serve`), and `web` (the browser's WebAssembly bindings).
+- `crates/`: the Rust workspace. `session` is the `letmeknow` binary (CLI and session process); `kind-doc` is the doc kind's plugin, `letmeknow-kind-doc`, and the browser's in-page doc plugin; `kind-git` is the git kind's plugin, `letmeknow-kind-git`, with git's remote helper `git-remote-lmk`, and the browser's display-only git plugin; `node` is one member's session, and `client` the client core on it (requests, events, described members, plugin hosting), both shared by the CLI and the browser; `core` (MLS groups, identities, invites), `net` (peers and files over iroh), `membership` (logs and their services), `proto` (wire formats), `serve` (`letmeknow serve`), and `web` (the browser's WebAssembly bindings).
 - `web/`: the browser client; `npm run build` writes `web/dist`.
 - `npm/cli/`: the npm launcher, which runs the prebuilt `letmeknow`; the plugins and git's remote helper letmeknow ships are beside it.
 - `deploy/`: letmeknow.dev's deployment.

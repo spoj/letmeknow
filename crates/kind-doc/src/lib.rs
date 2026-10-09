@@ -161,9 +161,11 @@ impl<S: Store> Page<S> {
                     out.push(answer(id, Ok(json!({}))));
                 }
             }
+            "start" => out.push(answer(&message["id"], Ok(json!({})))),
             "gone" => {
                 self.docs.states.remove(group);
                 self.store.delete(&key);
+                out.push(answer(&message["id"], Ok(json!({}))));
             }
             "command" => {
                 let answer_to = &message["id"];

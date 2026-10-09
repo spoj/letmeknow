@@ -14,9 +14,6 @@ CREATE TABLE IF NOT EXISTS taken (id BLOB PRIMARY KEY, gid BLOB NOT NULL, seen I
 -- Attachments of messages taken in; `path` once the file arrived.
 CREATE TABLE IF NOT EXISTS attachments (hash BLOB NOT NULL, gid BLOB NOT NULL, message BLOB NOT NULL, link TEXT NOT NULL,
     name TEXT NOT NULL, wakes INTEGER NOT NULL, path TEXT, PRIMARY KEY (hash, message));
--- Who told this session who an identity is, and under what name, until it is a contact.
-CREATE TABLE IF NOT EXISTS introductions (identity BLOB NOT NULL, by TEXT NOT NULL, name TEXT NOT NULL, ref TEXT NOT NULL,
-    PRIMARY KEY (identity, by));
 ";
 
 pub fn open(path: &Path) -> Result<Connection> {

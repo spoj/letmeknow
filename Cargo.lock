@@ -2554,6 +2554,7 @@ dependencies = [
  "iroh",
  "iroh-relay",
  "letmeknow-kind-doc",
+ "lmk-client",
  "lmk-core",
  "lmk-node",
  "lmk-proto",
@@ -2566,7 +2567,6 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tokio",
  "tracing-subscriber",
 ]
@@ -2862,6 +2862,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
+name = "lmk-client"
+version = "0.12.1"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "clap",
+ "hex",
+ "iroh",
+ "iroh-relay",
+ "lmk-core",
+ "lmk-node",
+ "lmk-proto",
+ "n0-future",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+]
+
+[[package]]
 name = "lmk-core"
 version = "0.12.1"
 dependencies = [
@@ -3004,6 +3026,7 @@ dependencies = [
  "js-sys",
  "letmeknow-kind-doc",
  "letmeknow-kind-git",
+ "lmk-client",
  "lmk-node",
  "lmk-proto",
  "n0-future",
@@ -3013,7 +3036,6 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",

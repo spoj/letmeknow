@@ -13,9 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::session::Inbound;
-use lmk_core::contacts::Contact;
-use lmk_proto::Bytes;
-use lmk_proto::group::Opening;
+use lmk_client::{IdentityOp, is_folder};
 
 /// End-to-end encrypted chats and documents for agents and their people.
 #[derive(Parser)]
@@ -97,67 +95,12 @@ pub struct Serve {
     pub key: Option<PathBuf>,
 }
 
-/// Requests an agent sends to its session process.
+/// Requests an agent sends to its session process: the client core's, and those of its own.
 #[derive(Subcommand, Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    /// Make a one-time invite link, valid for 10 minutes: into a group (a new one unless --group is given), or with --identity, for another device to join an identity
-    Invite {
-        #[arg(long)]
-        group: Option<String>,
-        /// What a new group shares: a chat (messages in order), or a kind a plugin of this session supports, such as a doc (one text everyone edits at once)
-        #[arg(long, default_value = "chat", conflicts_with = "group")]
-        kind: String,
-        /// The new group's name
-        #[arg(long, conflicts_with = "group")]
-        name: Option<String>,
-        /// For the new group's kind: a doc's file, kept in step with the doc, and its first text if it exists [default: a new file in the session's state]
-        #[arg(conflicts_with_all = ["group", "identity"])]
-        #[serde(default)]
-        args: Vec<String>,
-        /// The command's directory, which the arguments are relative to
-        #[arg(skip)]
-        #[serde(default)]
-        cwd: String,
-        /// Days members hold a new group's messages and files for one another
-        #[arg(long, default_value_t = 90, conflicts_with = "group")]
-        keep: u32,
-        /// The new group's membership service [default: listen's]
-        #[arg(long, conflicts_with = "group")]
-        membership: Option<String>,
-        /// What this session speaks as in a new group: one of its device's identities [default: the device's first]
-        #[arg(long = "as", value_name = "IDENTITY")]
-        #[serde(rename = "as")]
-        as_: Option<String>,
-        /// Whom the link is for: whoever redeems it becomes your contact under this name, verified
-        #[arg(long = "for", value_name = "NAME")]
-        #[serde(rename = "for")]
-        for_: Option<String>,
-        /// A contact: only that identity can redeem the link
-        #[arg(long)]
-        to: Option<String>,
-        /// Also show the link as a QR code, on stderr
-        #[arg(long)]
-        qr: bool,
-        /// Invite another device (a machine or a browser) into this identity, instead of a session into a group
-        #[arg(long, conflicts_with_all = ["group", "as_", "name", "for_", "to"])]
-        identity: Option<String>,
-    },
-    /// Join a group through an invite link, or a group open to your identity by its id; a device link adds this device to an identity
-    Join {
-        target: String,
-        /// For the group's kind: a doc's new file to keep in step with it [default: a new file in the session's state]
-        #[serde(default)]
-        args: Vec<String>,
-        #[arg(skip)]
-        #[serde(default)]
-        cwd: String,
-        /// What this session speaks as in the group: one of its device's identities [default: the device's first]
-        #[arg(long = "as", value_name = "IDENTITY")]
-        #[serde(rename = "as")]
-        as_: Option<String>,
-    },
     /// Send a message in a chat ("-" reads the text from stdin)
+    #[command(display_order = 12)]
     Send {
         #[arg(long)]
         group: Option<String>,
@@ -181,110 +124,21 @@ pub enum Request {
         text: String,
     },
     /// Show a message and its causal history
+    #[command(display_order = 13)]
     Read {
         id: String,
         #[arg(long, default_value_t = 0)]
         ancestors: usize,
     },
-    /// List members of a group
-    Members {
-        #[arg(long)]
-        group: Option<String>,
-    },
-    /// List this session's groups, and those open to its identities
-    Groups,
-    /// Remove a member (by fingerprint or name) from a group
-    Remove {
-        #[arg(long)]
-        group: Option<String>,
-        member: String,
-    },
-    /// Leave a group
-    Leave {
-        #[arg(long)]
-        group: Option<String>,
-    },
-    /// Name the group, for everyone in it
-    Name {
-        #[arg(long)]
-        group: Option<String>,
-        name: String,
-    },
-    /// Let sessions of an identity join the group without an invite (they run `join <group>`), or with --close, no longer
-    Open {
-        #[arg(long)]
-        group: Option<String>,
-        #[arg(long)]
-        close: bool,
-        identity: String,
-    },
     /// The file a message or a group's kind (a doc) links, decrypted into a file only you can read; prints its path
+    #[command(display_order = 20)]
     Fetch { link: String },
-    /// The members online in each group, and what only this session holds
-    Status,
-    /// Identities this device is on: create one, list them, or take a device off one
-    Identity {
-        #[command(subcommand)]
-        op: IdentityOp,
-    },
-    /// Your identity's contacts, and introductions waiting to be accepted
-    Contacts {
-        #[command(subcommand)]
-        op: Option<ContactsOp>,
-    },
-    /// Tell a member who another member's identity is to you
-    Introduce {
-        #[arg(long)]
-        group: Option<String>,
-        member: String,
-        #[arg(long)]
-        to: String,
-    },
-    /// Sets a contact of the device's first identity; sent to the session process that acts for the device.
-    #[command(skip)]
-    SetContact { identity: Bytes, contact: Contact },
-    /// Records an opening in an identity's devices group; sent to the session process that acts for the device.
-    #[command(skip)]
-    SetOpening { identity: Bytes, opening: Opening },
-    /// A certificate of a session of this device, by an identity's key; sent to the session process that acts for the
-    /// device.
-    #[command(skip)]
-    Certify { identity: Bytes, key: Bytes, name: String },
     /// A command of a kind's plugin, from `letmeknow <kind> <args>...`.
     #[command(skip)]
     Kind { kind: String, args: Vec<String>, cwd: String },
-}
-
-#[derive(Subcommand, Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "snake_case")]
-pub enum IdentityOp {
-    /// Start an identity with this device as its first device
-    Create {
-        name: String,
-        /// The membership service that keeps its key log [default: listen's]
-        #[arg(long)]
-        membership: Option<String>,
-    },
-    /// The identities this device is on, and their devices
-    List,
-    /// Take a device, by key or name, off an identity, whose key is then replaced
-    Remove {
-        #[arg(long)]
-        identity: Option<String>,
-        device: String,
-    },
-}
-
-#[derive(Subcommand, Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "snake_case")]
-pub enum ContactsOp {
-    /// Accept an introduction: the identity becomes a contact, known as introduced
-    Accept {
-        identity: String,
-        /// Your name for it [default: the introducer's]
-        #[arg(long)]
-        name: Option<String>,
-    },
+    #[command(flatten)]
+    #[serde(untagged)]
+    Client(lmk_client::Request),
 }
 
 /// Where a running session process accepts requests: a localhost port guarded by a token.
@@ -381,7 +235,7 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
     let response = match serde_json::from_str::<Call>(&line) {
         Ok(call) if call.token == token => {
             let (reply, answer) = oneshot::channel();
-            let _ = inbound.send(Inbound::Request(Box::new(call.request), reply));
+            let _ = inbound.send((call.request, reply));
             answer.await.unwrap_or_else(|_| json!({ "error": "session process stopped" }))
         }
         Ok(_) => json!({ "error": "bad token" }),
@@ -414,11 +268,15 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
             std::io::stdin().read_to_string(text)?;
         }
     }
-    if let Request::Invite { cwd, .. } | Request::Join { cwd, .. } | Request::Kind { cwd, .. } = &mut request {
+    if let Request::Client(lmk_client::Request::Invite { cwd, .. } | lmk_client::Request::Join { cwd, .. }) | Request::Kind { cwd, .. } =
+        &mut request
+    {
         *cwd = absolute(".")?;
     }
     let membership = match &mut request {
-        Request::Invite { membership, .. } | Request::Identity { op: IdentityOp::Create { membership, .. } } => membership.as_mut(),
+        Request::Client(
+            lmk_client::Request::Invite { membership, .. } | lmk_client::Request::Identity { op: IdentityOp::Create { membership, .. } },
+        ) => membership.as_mut(),
         _ => None,
     };
     if let Some(membership) = membership.filter(|m| is_folder(m)) {
@@ -441,11 +299,6 @@ pub async fn exchange((stream, token): (TcpStream, String), request: Request) ->
         bail!("{error}");
     }
     Ok(response)
-}
-
-/// A membership address names a folder when it is a path, not a service at a relay.
-pub fn is_folder(address: &str) -> bool {
-    !address.contains("@https://") && (address.contains(['/', '\\']) || address.starts_with('.'))
 }
 
 fn absolute(path: &str) -> Result<String> {

@@ -34,7 +34,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 causal_wait: letmeknow::session::CAUSAL_WAIT,
                 window: Default::default(),
                 keep_log,
-                membership: letmeknow::service(&membership)?,
+                membership: lmk_client::service(&membership)?,
                 plugins: kinds::dirs(),
             };
             let print = |line: String| println!("{line}");
@@ -63,7 +63,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(session) => session,
                 None => running_session(&home).await?,
             };
-            let qr = matches!(request, Request::Invite { qr: true, .. });
+            let qr = matches!(request, Request::Client(lmk_client::Request::Invite { qr: true, .. }));
             let answer = call(&home, &session, request).await?;
             println!("{answer}");
             if qr && let Some(link) = answer["link"].as_str() {

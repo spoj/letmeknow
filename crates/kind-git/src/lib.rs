@@ -211,9 +211,11 @@ impl<S: Store> Page<S> {
                     out.push(answer(id, Ok(json!({}))));
                 }
             }
+            "start" => out.push(answer(&message["id"], Ok(json!({ "chat": true })))),
             "gone" => {
                 self.groups.remove(&group);
                 self.store.delete(&format!("kind/git/{group}"));
+                out.push(answer(&message["id"], Ok(json!({}))));
             }
             "state" => {
                 let state: State = serde_json::from_slice(&bytes(&message["data"])?)?;
