@@ -335,9 +335,12 @@ def main():
         renamed = until(lambda: run("bob", "groups"), lambda gs: any(g.get("name") == "Release" for g in gs))
         check(any(g.get("name") == "Release" for g in renamed), "and on the commits it missed")
 
-        # Bob takes his tablet off his identity: its sessions leave his groups.
+        # Bob takes his tablet off his identity while it is stopped: its session leaves his groups all the same.
+        tablet.stop()
+        listeners.remove(tablet)
         run("bob", "identity", "remove", "--", tablet.ready["member"]["device"]["key"])
-        check(tablet.expect("removed", timeout=150)["group"] == group, "a device taken off its identity leaves its groups")
+        left = alice.expect("left", lambda e: e["member"]["name"] == "Tablet", timeout=60)
+        check(left["group"] == group, "a device taken off its identity while it is stopped leaves its groups")
         if BROWSER and subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=WEB, env={**ENV, "URL": ENV["LETMEKNOW_RELAY"], "BIN": BIN}).returncode:
             sys.exit("FAIL: the browser test")
         print("all ok")
