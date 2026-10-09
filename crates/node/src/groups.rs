@@ -63,7 +63,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Ok(opened) => opened,
             Err(error) => {
                 g.rec.given_up.push((epoch, Bytes(id.to_vec())));
-                g.rec.unreported.push(Bytes(id.to_vec()));
+                if epoch > g.rec.expired {
+                    g.rec.unreported.push(Bytes(id.to_vec()));
+                }
                 st.save(gid)?;
                 return Err(error);
             }
@@ -327,7 +329,9 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
             let known = g.rec.items.iter().any(|item| item.id.0 == id) || g.rec.given_up.iter().any(|(_, given)| given.0 == id);
             if !known {
                 g.rec.given_up.push((epoch, Bytes(id.to_vec())));
-                g.rec.unreported.push(Bytes(id.to_vec()));
+                if epoch > g.rec.expired {
+                    g.rec.unreported.push(Bytes(id.to_vec()));
+                }
             }
         }
         if let Err(error) = st.save(group) {

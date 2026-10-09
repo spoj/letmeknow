@@ -256,6 +256,10 @@ struct Rec {
     /// Those it could not open, or that were too old to, that it has not reported to the group yet.
     #[serde(default)]
     unreported: Vec<Bytes>,
+    /// The newest epoch of the messages it dropped after `keep`: what it lacks up to there, it may have had, and does
+    /// not report.
+    #[serde(default)]
+    expired: u64,
     pending: Vec<Pending>,
     /// File links, with when they were linked: those the kind holds (its files added, and those its held messages
     /// link) and states handed to or by this session. Each is held for the group's `keep`.
@@ -1232,6 +1236,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let before = now.saturating_sub(g.mls.settings().keep as u64 * 24 * 3600 * 1000);
             let (old, kept): (Vec<Item>, Vec<Item>) = g.rec.items.drain(..).partition(|item| item.at < before);
             g.rec.items = kept;
+            g.rec.expired = old.iter().map(|item| item.epoch).fold(g.rec.expired, u64::max);
             g.rec.files.retain(|(_, at)| *at >= before);
             for item in old {
                 st.provider.delete(&message_key(&item.id.0)).ok();
