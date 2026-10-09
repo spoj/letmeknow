@@ -161,7 +161,7 @@ A message's id is SHA-256 of its MLS ciphertext. A payload is held or live. Held
 
 ## Peer protocol
 
-A `peer` stream joins two sessions that share a group, one stream per pair, kept open while both are online. Either side may send a frame at any time; every frame names its group, or a log of its groups, and a side serves a group, and its logs, only to a peer whose iroh key is in a leaf of that group's current epoch. Each side sends `hello` when the stream opens and when its state of a group changes, after the entries the peer lacks; it answers with its own a `hello` that shows it a group it had no `hello` for, or a head longer than its own, since a side ignores what a `hello` shows of a group it is not in yet or a log it does not follow yet; and every 5 minutes it sends `hello` again and syncs each group anew, even if nothing changed, so a message lost on its way is found within 5 minutes.
+A `peer` stream joins two sessions that share a group, one stream per pair, kept open while both are online. Either side may send a frame at any time; every frame names its group, or a log of its groups, and a side serves a group, and its logs, only to a peer whose iroh key is in a leaf of that group's current epoch. Each side sends `hello` when the stream opens and when its state of a group changes, after the entries the peer lacks. A side ignores what a `hello` shows of a group it is not in yet or of a log it does not follow yet, so it answers a `hello` that shows it a group it had no `hello` for, or a head longer than its own, with its own. Every 5 minutes it sends `hello` again and syncs each group anew, even if nothing changed, so a message lost on its way is found within 5 minutes.
 
 | Frame | Meaning |
 |---|---|

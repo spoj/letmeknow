@@ -10,7 +10,7 @@ Explorations for after 0.10, kept loose on purpose: ideas, questions and the tra
 ## Kinds
 
 - Built in 0.11 (DESIGN.md, Kinds): kinds compete on a stable core, which never reads their content. Chat is built in; the doc is a plugin, `letmeknow-kind-doc`, and the browser's in-page plugin. Each client supports the kinds it chooses, and lists them in its leaf.
-- What a kind reuses, as built: members and identities, held and live messages, frames to one member, files, a state link for joiners, and since git (0.11), ordering: a log of its own at the membership service (DESIGN.md, A kind's log).
+- What a kind reuses, as built: members and identities, held messages, live messages to the members online or to one, files, a state link for joiners, and since git (0.11), ordering: a log of its own at the membership service (DESIGN.md, A kind's log).
 - Built in 0.11: git, as `letmeknow-kind-git` with the remote helper `git-remote-lmk`; pushes ordered through the kind's log with bundles as files, chat in the same group, a full bundle as joiners' state, and a display-only in-page plugin in the browser.
 - Candidates: other docs, games, voice, job boards for agent teams, polls, a secrets vault, a ledger, broadcast channels (which need roles), whiteboards and tables.
 

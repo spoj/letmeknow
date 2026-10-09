@@ -191,13 +191,19 @@ async fn file_from_two_holders_one_cut_off() {
     }
     b.net.fetch(G, &link).await.unwrap();
 
-    c.net.dial(members[0], relay.url.clone()).await.unwrap();
     c.net.dial(members[1], relay.url.clone()).await.unwrap();
     assert_eq!(c.net.held(link.hash).await.unwrap(), 0, "16 MiB is over C's limit, so C waits to be asked");
-    // B stops counting C as a member partway through the transfer: after about 3 MiB, at 16 KiB a check.
+    // B, the one holder C knows, stops counting C as a member partway through the transfer: after about 3 MiB, at
+    // 16 KiB a check. C then finds A, and the same fetch takes the rest from it.
     *fake_b.cut.lock().unwrap() = Some((members[2], 200));
-    c.net.fetch(G, &link).await.unwrap();
-    assert_eq!(*fake_b.cut.lock().unwrap(), Some((members[2], 0)), "B cut C off mid-transfer");
+    let resume = async {
+        eventually("B cut C off mid-transfer", || *fake_b.cut.lock().unwrap() == Some((members[2], 0))).await;
+        assert!(c.net.held(link.hash).await.unwrap() > 0);
+        c.net.dial(members[0], relay.url.clone()).await.unwrap();
+        c.net.fetch(G, &link).await.unwrap();
+    };
+    let (fetched, ()) = tokio::join!(c.net.fetch(G, &link), resume);
+    fetched.unwrap();
     let mut out = Vec::new();
     c.net.read_file(&link, &mut out).await.unwrap();
     assert!(out == plain);
