@@ -301,7 +301,7 @@ async fn a_device_that_stopped_before_it_was_saved_is_still_on_its_identity() {
     node.shutdown().await.unwrap();
     drop(node);
     let (node, _events) = Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), saved, config()).await.unwrap();
-    assert_eq!(node.device().identities, [bob.clone()]);
+    assert_eq!(node.device().identities, std::slice::from_ref(&bob));
     assert_eq!(node.identities(), [(bob, "Bob".to_owned())]);
     node.shutdown().await.unwrap();
 }
