@@ -195,7 +195,7 @@ What a kind may do in its groups, and nothing else:
 
 - **Held messages**: payloads marked held (see Messages), synced, kept `keep` days, answered by receipts, and pending until another member holds them.
 - **Live messages**: payloads to the members online, or to one, not held.
-- **Frames to one member**: `{"<name>": {...}}`, sent as the peer frame `{"<name>": {"group", ...}}` to a current member online. A name of the core's frames is refused. Clients before 0.11 close the stream on a frame they do not know, so a kind sends frames only in its own groups, whose members all support it; 0.10 knows the doc's.
+- **Frames to one member**: `{"<name>": {...}}`, sent as the peer frame `{"<name>": {"group", ...}}` to a current member online. A name of the core's frames is refused. Clients before 0.11 close the stream on a frame they do not know, so a kind sends frames only in its own groups, whose members all support it; 0.10 knows the doc's frames, but not `state`.
 - **Files**: files it adds, held `keep` days; files it holds `keep` days from when it says, as those a held message links; and the files it links now, held while it does. A member fetches those within its limit.
 - **A state link**: when a member is admitted, the inviter asks its kind for a state and links it in `admitted`'s `doc`; a kind can also hand a member that fell behind a state, which goes as a `state` frame. The member fetches the file and gives it to its kind.
 
