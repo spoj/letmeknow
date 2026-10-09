@@ -1,6 +1,6 @@
 //! The browser client: one lmk-node session whose MLS key is the browser's device key, reaching its peers only through
-//! the relay. Chat is built in; the doc kind is an in-page plugin (`lmk_kind_doc::Page`), which this hosts in the
-//! plugin protocol. The page persists the session's records in IndexedDB, one record per key, and the ciphertext of the
+//! the relay. Chat is built in; the doc kind (`lmk_kind_doc::Page`) and the git kind, display-only
+//! (`lmk_kind_git::Page`), are in-page plugins, which this hosts in the plugin protocol. The page persists the session's records in IndexedDB, one record per key, and the ciphertext of the
 //! files it holds, which the session loads when it needs one. Results that are not bytes are JSON strings; message ids
 //! and fingerprints are hex, other bytes base64url.
 #![cfg(target_arch = "wasm32")]
@@ -18,7 +18,6 @@ use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::group::Window;
 use lmk_node::lmk_core::invite::Target;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
-use lmk_kind_doc::Page;
 use lmk_node::{Claim, Disk, Event, Member, Node, now};
 use lmk_proto::Bytes;
 use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, How, IdentityRef, Named, PROTOCOL, Service, Settings};
@@ -39,6 +38,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 const FILE_LIMIT: u64 = 25 << 20;
 /// The kinds the browser supports: chat, and those of its in-page plugins.
 const DOC: &str = "doc";
+const GIT: &str = "git";
 /// How often the files no group links any longer are deleted.
 const COLLECT: Duration = Duration::from_secs(60 * 60);
 
@@ -131,7 +131,7 @@ impl Provider for Store {
     }
 }
 
-/// The in-page doc plugin's records, among the session's.
+/// The in-page plugins' records, among the session's.
 struct PageStore(Store);
 
 impl lmk_kind_doc::Store for PageStore {
@@ -145,6 +145,20 @@ impl lmk_kind_doc::Store for PageStore {
 
     fn delete(&self, key: &str) {
         self.0.delete(key.as_bytes()).ok();
+    }
+}
+
+impl lmk_kind_git::Store for PageStore {
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        lmk_kind_doc::Store::get(self, key)
+    }
+
+    fn put(&self, key: &str, value: &[u8]) {
+        lmk_kind_doc::Store::put(self, key, value)
+    }
+
+    fn delete(&self, key: &str) {
+        lmk_kind_doc::Store::delete(self, key)
     }
 }
 
@@ -224,9 +238,12 @@ struct App {
     /// Open groups this session tried to join by itself, and those it failed to join.
     tried: RefCell<HashSet<Bytes>>,
     failed: RefCell<HashSet<Bytes>>,
-    /// The doc kind's in-page plugin.
-    docs: RefCell<Page<PageStore>>,
-    /// Inviters' requests for a doc's state, by request id.
+    /// The in-page plugins.
+    docs: RefCell<lmk_kind_doc::Page<PageStore>>,
+    git: RefCell<lmk_kind_git::Page<PageStore>>,
+    /// The last position of each git group's log handed to its plugin, once it follows the log.
+    handed: RefCell<HashMap<Vec<u8>, u64>>,
+    /// Requests for a group's state, by request id.
     snapshots: RefCell<HashMap<u64, oneshot::Sender<Option<Vec<u8>>>>>,
     asked: std::cell::Cell<u64>,
 }
@@ -284,17 +301,17 @@ impl App {
             disk: Some(kept.clone()),
             file_limit: FILE_LIMIT,
             window: Window::default(),
-            kinds: vec![CHAT.into(), DOC.into()],
+            kinds: vec![CHAT.into(), DOC.into(), GIT.into()],
         };
         let (node, mut events) = Node::start(store.clone(), device, node_config).await?;
         let membership = service(&config.membership)?;
-        let (tried, failed, snapshots, asked) = Default::default();
-        let docs = RefCell::new(Page::new(PageStore(store.clone())));
-        let app = Rc::new(App { node, store, membership, shadow: RefCell::new(shadow), idb, kept, on_event, tried, failed, docs, snapshots, asked });
+        let (tried, failed, snapshots, asked, handed) = Default::default();
+        let docs = RefCell::new(lmk_kind_doc::Page::new(PageStore(store.clone())));
+        let git = RefCell::new(lmk_kind_git::Page::new(PageStore(store.clone())));
+        let shadow = RefCell::new(shadow);
+        let app = Rc::new(App { node, store, membership, shadow, idb, kept, on_event, tried, failed, docs, git, handed, snapshots, asked });
         for gid in app.node.groups() {
-            if app.node.settings(&gid.0)?.kind == DOC {
-                app.open_doc(&gid.0)?;
-            }
+            app.open_kind(&gid.0, None)?;
         }
         app.flush();
         app.join_openings();
@@ -401,14 +418,19 @@ impl App {
         self.on_event.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string())).ok();
     }
 
-    /// Tells the in-page doc plugin of a doc, with the state 0.10 kept of it if it has none of its own yet.
-    fn open_doc(self: &Rc<Self>, gid: &[u8]) -> Result<()> {
-        let mut message = json!({ "type": "group", "group": b64(gid), "settings": self.node.settings(gid)?, "id": 0 });
-        let legacy = self.node.legacy_doc(gid)?;
+    /// Tells a group's in-page plugin of the group, made or joined by `command`; a doc with the state 0.10 kept of it
+    /// if it has none of its own yet.
+    fn open_kind(self: &Rc<Self>, gid: &[u8], command: Option<&str>) -> Result<()> {
+        let settings = self.node.settings(gid)?;
+        if ![DOC, GIT].contains(&settings.kind.as_str()) {
+            return Ok(());
+        }
+        let mut message = json!({ "type": "group", "group": b64(gid), "settings": settings, "id": 0, "command": command });
+        let legacy = self.node.legacy_doc(gid)?.filter(|_| settings.kind == DOC);
         if let Some(state) = &legacy {
             message["import"] = json!({ "state": Bytes(state.clone()) });
         }
-        let answers = self.to_doc(message);
+        let answers = self.to_kind(&settings.kind, message);
         if let Some(error) = answers.iter().find_map(|answer| answer["error"].as_str()) {
             return Err(anyhow!("{error}"));
         }
@@ -418,10 +440,13 @@ impl App {
         Ok(())
     }
 
-    /// Gives the in-page doc plugin a message, and carries out what it asks through the group's channels; returns its
+    /// Gives a kind's in-page plugin a message, and carries out what it asks through the group's channels; returns its
     /// answers.
-    fn to_doc(self: &Rc<Self>, message: Value) -> Vec<Value> {
-        let out = self.docs.borrow_mut().input(&message);
+    fn to_kind(self: &Rc<Self>, kind: &str, message: Value) -> Vec<Value> {
+        let out = match kind {
+            DOC => self.docs.borrow_mut().input(&message),
+            _ => self.git.borrow_mut().input(&message),
+        };
         let mut answers = Vec::new();
         for message in out {
             let gid = message["group"].as_str().map(unb64).transpose();
@@ -438,13 +463,25 @@ impl App {
                     "send" => self.node.send_live(&gid, &message["payload"], message["to"].as_str())?,
                     "frame" => self.node.frame(&gid, message["to"].as_str().context("no member")?, message["frame"].clone())?,
                     "links" => self.node.set_links(&gid, serde_json::from_value(message["links"].clone())?)?,
+                    "log" => {
+                        let from = message["after"].as_u64().map(|after| (after, message["epoch"].as_u64().unwrap_or_default()));
+                        self.node.follow_log(&gid, from)?;
+                        if let Some((after, _)) = from {
+                            self.handed.borrow_mut().insert(gid.clone(), after);
+                            self.hand_entries(&gid)?;
+                        }
+                    }
                     "event" => {
                         let mut event = message["event"].clone();
+                        if event["type"] == "pushed" {
+                            let item = json!({ "type": "pushed", "at": now(), "by": event["by"], "ref": event["ref"], "subjects": event["subjects"] });
+                            self.remember(&gid, &item)?;
+                        }
                         event["group"] = message["group"].clone();
-                        event["kind"] = json!(DOC);
+                        event["kind"] = json!(kind);
                         self.emit(event);
                     }
-                    other => anyhow::bail!("the doc plugin asked for {other}"),
+                    other => anyhow::bail!("the {kind} plugin asked for {other}"),
                 }
                 Ok(())
             });
@@ -455,11 +492,25 @@ impl App {
         answers
     }
 
-    /// Hands a node event about a doc to the in-page doc plugin.
-    fn tell_doc(self: &Rc<Self>, gid: &[u8], mut message: Value) -> Result<()> {
-        if self.node.settings(gid)?.kind == DOC {
+    /// Hands a node event about a group to its kind's in-page plugin, if it has one.
+    fn tell_kind(self: &Rc<Self>, gid: &[u8], mut message: Value) -> Result<()> {
+        let kind = self.node.settings(gid)?.kind;
+        if [DOC, GIT].contains(&kind.as_str()) {
             message["group"] = json!(b64(gid));
-            self.to_doc(message);
+            self.to_kind(&kind, message);
+        }
+        Ok(())
+    }
+
+    /// Hands a git group's plugin the entries of its log it has not had.
+    fn hand_entries(self: &Rc<Self>, gid: &[u8]) -> Result<()> {
+        let Some(after) = self.handed.borrow().get(gid).copied() else { return Ok(()) };
+        let known = self.known(gid)?;
+        for entry in self.node.entries(gid, after)? {
+            self.handed.borrow_mut().insert(gid.to_vec(), entry.position);
+            let from = self.describe(&known, &entry.from);
+            let message = json!({ "type": "entry", "group": b64(gid), "position": entry.position, "epoch": entry.epoch, "from": from, "payload": entry.payload });
+            self.to_kind(GIT, message);
         }
         Ok(())
     }
@@ -488,7 +539,9 @@ impl App {
                 for kind in ["timeline", "settings", "refused"] {
                     self.store.delete(&key(kind, &group.0))?;
                 }
-                self.to_doc(json!({ "type": "gone", "group": group }));
+                self.to_kind(DOC, json!({ "type": "gone", "group": group }));
+                self.to_kind(GIT, json!({ "type": "gone", "group": group }));
+                self.handed.borrow_mut().remove(&group.0);
                 self.emit(json!({ "type": "removed", "group": group, "by": by }));
             }
             Event::Settings { group, settings, by } => {
@@ -509,25 +562,26 @@ impl App {
             }
             Event::Live { group, sender, payload } => {
                 let from = self.describe(&self.known(&group.0)?, &sender);
-                self.tell_doc(&group.0, json!({ "type": "message", "from": from, "payload": payload, "held": false }))?;
+                self.tell_kind(&group.0, json!({ "type": "message", "from": from, "payload": payload, "held": false }))?;
             }
             Event::Frame { group, from, frame } => {
                 let from = self.describe(&self.known(&group.0)?, &from);
-                self.tell_doc(&group.0, json!({ "type": "frame", "from": from, "frame": frame }))?;
+                self.tell_kind(&group.0, json!({ "type": "frame", "from": from, "frame": frame }))?;
             }
             Event::InStep { group, member } => {
                 let member = self.describe(&self.known(&group.0)?, &member);
-                self.tell_doc(&group.0, json!({ "type": "synced", "member": member }))?;
+                self.tell_kind(&group.0, json!({ "type": "synced", "member": member }))?;
             }
             Event::State { group, from, data } => {
                 let from = self.describe(&self.known(&group.0)?, &from);
-                self.tell_doc(&group.0, json!({ "type": "state", "from": from, "data": Bytes(data) }))?;
+                self.tell_kind(&group.0, json!({ "type": "state", "from": from, "data": Bytes(data) }))?;
             }
+            Event::Logged { group } => self.hand_entries(&group.0)?,
             Event::Snapshot { group, reply } => {
                 let id = self.asked.get() + 1;
                 self.asked.set(id);
                 self.snapshots.borrow_mut().insert(id, reply);
-                self.tell_doc(&group.0, json!({ "type": "snapshot", "id": id }))?;
+                self.tell_kind(&group.0, json!({ "type": "snapshot", "id": id }))?;
             }
             Event::Introduced { group, by, identity, name, how } => {
                 let known = self.known(&group.0)?;
@@ -773,7 +827,7 @@ impl App {
         }
         let identity = self.node.identities().into_iter().next().map(|(identity, _)| identity);
         let gid = self.node.join(&invite, identity).await?;
-        self.joined(&gid.0)?;
+        self.joined(&gid.0, "join")?;
         Ok(json!({ "group": gid }))
     }
 
@@ -781,17 +835,14 @@ impl App {
         let opening = self.node.openings().into_iter().find(|o| o.group.0 == gid).context("no such open group")?;
         let identity = self.node.identities().into_iter().next().context("this browser is on no identity")?.0;
         let gid = self.node.join_open(&opening, identity).await?;
-        self.joined(&gid.0)?;
+        self.joined(&gid.0, "join")?;
         Ok(json!({ "group": gid }))
     }
 
-    /// A group this browser made or joined.
-    fn joined(self: &Rc<Self>, gid: &[u8]) -> Result<()> {
+    /// A group this browser made (`invite`) or joined (`join`).
+    fn joined(self: &Rc<Self>, gid: &[u8], command: &str) -> Result<()> {
         self.remember_settings(gid)?;
-        if self.node.settings(gid)?.kind == DOC {
-            self.open_doc(gid)?;
-        }
-        Ok(())
+        self.open_kind(gid, Some(command))
     }
 
     async fn devices(&self, id: &str) -> Result<Value> {
@@ -899,10 +950,11 @@ impl Lmk {
             membership: app.membership.clone(),
             devices_of: None,
             openings: Vec::new(),
+            log: None,
         };
         let identity = app.node.identities().into_iter().next().map(|(identity, _)| identity);
         let gid = app.node.create(settings, identity).map_err(js)?;
-        app.joined(&gid.0).map_err(js)?;
+        app.joined(&gid.0, "invite").map_err(js)?;
         app.flush();
         Ok(b64(&gid.0))
     }
@@ -987,7 +1039,7 @@ impl Lmk {
             return Err(JsError::new(&format!("this browser has no plugin for {kind} groups")));
         }
         let args: Value = serde_json::from_str(args).map_err(|e| js(e.into()))?;
-        let answers = self.app.to_doc(json!({ "type": "command", "id": 0, "args": args }));
+        let answers = self.app.to_kind(DOC, json!({ "type": "command", "id": 0, "args": args }));
         self.app.flush();
         let answer = answers.into_iter().next().ok_or_else(|| JsError::new("the doc plugin did not answer"))?;
         match answer["error"].as_str() {

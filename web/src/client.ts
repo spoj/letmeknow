@@ -19,7 +19,7 @@ export type Identity = {
 };
 export type Person = { key: string; fp: string; name: string; device: string; you?: boolean; identity?: Identity; added_by?: { name?: string; how: string } };
 export type Named = { id: string; name: string };
-export type Settings = { kind: "chat" | "doc"; name: string; open?: Named[]; keep?: number; devices_of?: string };
+export type Settings = { kind: "chat" | "doc" | "git"; name: string; open?: Named[]; keep?: number; devices_of?: string };
 export type Group = { group: string; settings: Settings; members: Person[]; joined: boolean; failed?: boolean };
 export type Attachment = { link: string; name: string; size: number; type: string; kept: boolean };
 export type Item =
@@ -40,7 +40,8 @@ export type Item =
   | { type: "joined"; at: number; member: Person; by: Person; how: string }
   | { type: "left"; at: number; member: Person; by: Person }
   | { type: "settings"; at: number; by: Person; before?: Settings; settings: Settings }
-  | { type: "introduced"; at: number; by: Person; identity: Named; how: string };
+  | { type: "introduced"; at: number; by: Person; identity: Named; how: string }
+  | { type: "pushed"; at: number; by: Person; ref: string; subjects: string[] };
 export type Event = { type: string; group?: string; id?: string; hash?: string; text?: string; by?: string };
 export type Me = { key: string; fp: string; name: string; device: { key: string; name: string }; identities: Named[] };
 export type Contacts = { contacts: (Named & { how: string; by?: string })[]; introductions: (Named & { by: string })[] };

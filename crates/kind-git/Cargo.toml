@@ -1,0 +1,23 @@
+[package]
+name = "letmeknow-kind-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "lmk_kind_git"
+path = "src/lib.rs"
+
+[[bin]]
+name = "letmeknow-kind-git"
+path = "src/main.rs"
+
+[[bin]]
+name = "git-remote-lmk"
+path = "src/helper.rs"
+
+[dependencies]
+anyhow.workspace = true
+lmk-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true

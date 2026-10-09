@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 lmk-node.workspace = true
 letmeknow-kind-doc.workspace = true
+letmeknow-kind-git.workspace = true
 lmk-proto.workspace = true
 anyhow.workspace = true
 hex.workspace = true

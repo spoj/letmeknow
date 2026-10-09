@@ -1,4 +1,4 @@
-// The page: this browser's session and its groups, each a chat or a doc. Background work ends in render(), which patches
+// The page: this browser's session and its groups, each a chat, a doc, or a repository, shown as its pushes and chat. Background work ends in render(), which patches
 // only what changed, so what a person is typing, selecting or scrolling stays put. Joining from a link waits for a
 // click, so link scanners that open it join nothing.
 import "./app.css";
@@ -28,7 +28,7 @@ const set = (element: HTMLElement, text: string) => element.textContent !== text
 const form = (submit: () => unknown, ...children: Child[]) => h("form", { onsubmit: (event: Event) => (event.preventDefault(), submit()) }, ...children);
 const field = (label: string, input: HTMLElement, hint?: string) => h("label", { className: "field" }, h("span", {}, label), input, hint && h("small", {}, hint));
 const megabytes = (bytes: number) => (bytes < 1e6 ? `${Math.ceil(bytes / 1000)} KB` : `${(bytes / 1e6).toFixed(1)} MB`);
-const KINDS = { chat: { name: "chat", mark: "💬" }, doc: { name: "document", mark: "📄" } };
+const KINDS = { chat: { name: "chat", mark: "💬" }, doc: { name: "document", mark: "📄" }, git: { name: "repository", mark: "🌿" } };
 /** Files up to this size every member fetches; larger ones only on request. */
 const FILE_LIMIT = 25 << 20;
 const INVITE_PREFIX = "https://letmeknow.dev/i";
@@ -906,6 +906,15 @@ class ChatView extends View {
       }
       case "introduced":
         return h("li", { className: "event" }, who(item.by), ` introduced ${item.identity.name}`, at);
+      case "pushed":
+        return h(
+          "li",
+          { className: "event pushed" },
+          who(item.by),
+          ` pushed to ${item.ref.replace(/^refs\/heads\//, "")}`,
+          at,
+          h("ul", {}, ...item.subjects.map(subject => h("li", {}, subject)))
+        );
     }
   }
 
