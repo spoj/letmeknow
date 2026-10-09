@@ -44,6 +44,15 @@ Explorations for after 0.10, kept loose on purpose: ideas, questions and the tra
 - A leader per group, chosen through the log, could sequence messages, do one-off chores, and keep clocks. There is at most one per claim, but someone leads only while someone online can take over. It remains an idea for frequent kinds, such as games, which the service's order is too slow for.
 - With leaders, the service could order only claims and device lists: a leader would sequence its group's commits and anchor its head at the service now and then, so the service would see far less, and a group could change members while the service is unreachable. The cost is failover: a commit the old leader took that the new one never saw forks the group's keys, and the members that applied it must be added again. Who leads must still come from one place.
 
+## Identity as a key
+
+- Today an identity is a public device list on its service plus a private devices group, kept in step: two memberships that must mirror each other.
+- Instead, the devices group could be the only membership, and the public log could hold only the identity's key: each new public key signed by the previous one, the id still the hash of the first entry.
+- The devices group shares the private key; a new device gets it with its Welcome. Sessions never use it directly: their device signs certificates for them that last a day, shown to peers in `hello` as device lists are shown now.
+- Removing a device removes it from the group and rotates the key; the removed device can certify nothing new, and its certificates run out within a day. Rotating also monthly bounds a leaked key.
+- It buys no mirroring, nothing public on adding a device, and privacy: today whoever knows an identity's id sees its devices' keys, names, count and history; then only rotations.
+- It costs a rotation per removal, with every device re-certifying its sessions; "added by laptop" becomes a claim inside a certificate; and a migration, since identities exist. A device about to be removed can race to rotate first, as today it can remove the others first.
+
 ## Transactions
 
 - All-or-nothing among members that cooperate is a classic problem with classic answers.
