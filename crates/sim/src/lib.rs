@@ -4,6 +4,8 @@
 //! replays exactly from its seed, and shrinks to the fewest actions that still fail.
 
 pub mod net;
+pub mod props;
+pub mod trace;
 mod world;
 
 use std::fmt;
