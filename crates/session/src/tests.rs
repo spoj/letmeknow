@@ -784,7 +784,7 @@ fn git_pushes_count_in_the_groups_log_in_order() {
     local(async {
         let world = world("git").await;
         let mut alice = world.start("alice", HOUR).await;
-        let bob = world.start("bob", HOUR).await;
+        let mut bob = world.start("bob", HOUR).await;
         let mut carol = world.start("carol", HOUR).await;
         let group = alice.cmd(&["invite", "--kind", "git", "--name", "Repo"]).await.unwrap()["group"].as_str().unwrap().to_owned();
         for joiner in [&bob, &carol] {
@@ -818,7 +818,18 @@ fn git_pushes_count_in_the_groups_log_in_order() {
         let fp = members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Carol").unwrap()["fp"].as_str().unwrap().to_owned();
         alice.cmd(&["remove", &fp]).await.unwrap();
         carol.expect("removed").await;
-        let (_, position) = push(&first, 2).await;
+        let (second, position) = push(&first, 2).await;
         assert_eq!(position.as_u64(), Some(first_position + 2), "after the removal's commit");
+
+        // With no other member online to take its bundle, a push is refused, and nothing counts.
+        bob.stop().await;
+        std::fs::write(repo.join("file.txt"), "3").unwrap();
+        git(&repo, &["commit", "-qam", "change 3"]);
+        let (new, bundle) = (git(&repo, &["rev-parse", "HEAD"]), world.root.join("3.bundle"));
+        git(&repo, &["bundle", "create", bundle.to_str().unwrap(), &format!("{second}..main")]);
+        let refused = alice.cmd(&["git", "push", &group, "refs/heads/main", &second, &new, bundle.to_str().unwrap()]).await.unwrap_err().to_string();
+        assert!(refused.contains("no other member online took the push's bundle"), "{refused}");
+        let tips = alice.cmd(&["git", "list", &group, "--push"]).await.unwrap();
+        assert_eq!(tips["refs"]["refs/heads/main"], second.as_str(), "the push did not count");
     });
 }

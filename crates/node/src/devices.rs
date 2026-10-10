@@ -527,9 +527,9 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let position = book.position;
         self.save(gid, &record)?;
         self.node.follow_log(gid, Some(position))?;
-        match record.stopped {
-            Some(_) => self.node.follow_log(gid, None),
-            None => Ok(()),
-        }
+        let Some(lost) = record.stopped else { return Ok(()) };
+        let text = format!("this device lost the message at position {lost} of its identity's devices group: it waits for a device's state past it");
+        self.node.warn(gid, text);
+        self.node.follow_log(gid, None)
     }
 }

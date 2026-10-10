@@ -1117,3 +1117,159 @@ async fn a_member_away_past_the_retention_drops_the_group() {
     eventually("Bob forgot the group", || bob.node.groups().is_empty()).await;
     bob.node.shutdown().await.unwrap();
 }
+
+/// A member on SQLite at `db`, which survives a restart.
+async fn stored(relay: &Relay, name: &str, db: &Path) -> Session<SqliteProvider> {
+    let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), config(relay, name, None, &[CHAT])).await.unwrap();
+    Session { node, events }
+}
+
+/// A member that applies the commit deleting an epoch's keys while no member online holds a message of it loses that
+/// message, and announces it: every member gets the announcement, and the sender is told its message was lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_announced_loss_reaches_every_member() {
+    let relay = relay().await;
+    let dir = folder("lost");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = stored(&relay, "Alice", &db("alice")).await;
+    let bob = stored(&relay, "Bob", &db("bob")).await;
+    let carol = stored(&relay, "Carol", &db("carol")).await;
+    let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("Carol has both Adds", || carol.node.members(&gid.0).unwrap().len() == 3).await;
+    for session in [&alice, &carol] {
+        session.node.shutdown().await.unwrap();
+    }
+    drop((alice, carol));
+
+    // Only Bob holds his message; Alice, back while he is away, commits twice, and so loses it.
+    let sent = bob.node.send(&gid.0, &message("only Bob holds this")).await.unwrap();
+    let position = sent.position.unwrap();
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+    let mut alice = stored(&relay, "Alice", &db("alice")).await;
+    for name in ["One", "Two"] {
+        alice.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
+    }
+    let lost = alice.until(|e| match e {
+        Event::Lost(lost) => Some(lost),
+        _ => None,
+    }).await;
+    assert_eq!((lost.member.name.as_str(), lost.positions.clone(), lost.ids.clone()), ("Alice", vec![position], vec![sent.id.clone()]));
+    let announced = lost.position;
+
+    // Bob hears that Alice lost his message; Carol, who gets it from Bob, holds the announcement too.
+    let mut bob = stored(&relay, "Bob", &db("bob")).await;
+    let told = bob.until(|e| match e {
+        Event::Lost(lost) => Some(lost),
+        _ => None,
+    }).await;
+    assert_eq!((told.member.name.as_str(), told.positions, told.ids, told.position), ("Alice", vec![position], vec![sent.id.clone()], announced));
+    let carol = stored(&relay, "Carol", &db("carol")).await;
+    let alices = |node: &Node<SqliteProvider>| node.losses(&gid.0).unwrap().iter().any(|l| l.member.name == "Alice" && l.positions == [position]);
+    eventually("Carol holds Alice's announcement", || alices(&carol.node)).await;
+    assert!(alices(&bob.node) && alices(&alice.node));
+    assert!(carol.node.message(&sent.id.0).unwrap().is_some(), "Carol got the message from Bob");
+    for session in [&alice, &bob, &carol] {
+        session.node.shutdown().await.unwrap();
+    }
+}
+
+/// A device that loses a message of its devices group stops there, and takes the state of a device that has it.
+#[tokio::test(flavor = "multi_thread")]
+async fn devices_stop_at_a_loss_and_resume_from_a_state_past_it() {
+    let relay = relay().await;
+    let dir = folder("devices-lost");
+    std::fs::create_dir_all(&dir).unwrap();
+    let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
+    let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
+    let (tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
+    let bob = laptop_devices.create("Bob", membership).await.unwrap();
+    let link = lmk_proto::links::Invite::parse(&laptop_devices.invite(&bob.id.0).await.unwrap()).unwrap();
+    tablet_devices.join(&link).await.unwrap();
+    identified(&tablet_devices).await;
+    tablet.node.shutdown().await.unwrap();
+    drop((tablet, tablet_devices));
+    let carol = lmk_core::contacts::Contact { name: "Carol".into(), how: lmk_core::contacts::How::Verified, by: None, at: 1, rest: Default::default() };
+    laptop_devices.set_contact(&[9; 32], carol).await.unwrap();
+    laptop.node.shutdown().await.unwrap();
+    drop((laptop, laptop_devices));
+
+    // The tablet, alone, commits twice and so loses the contact: it stops.
+    let (mut tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
+    for name in ["tab", "slate"] {
+        tablet_devices.rename(name).await.unwrap();
+    }
+    tablet.until(|e| matches!(e, Event::Warning { text, .. } if text.contains("waits for a device's state")).then_some(())).await;
+    assert!(tablet_devices.contacts().is_empty());
+
+    // The laptop comes back and hands it the state, past the loss.
+    let (_laptop, _laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
+    eventually("the tablet takes the laptop's state", || tablet_devices.contacts().iter().any(|(_, c)| c.name == "Carol")).await;
+}
+
+/// The members a key log entry drops are removed by one commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_removes_every_member_due_in_one_commit() {
+    use lmk_core::identity::public;
+    let relay = relay().await;
+    let dir = folder("one-commit");
+    let (membership, _service) = signing_service(&relay, &dir).await;
+    let mut alice = session(&relay, "Alice").await;
+    let (carol, key, laptop) = identity(&alice.node, "Carol", membership.clone()).await;
+    let (tablet_key, phone_key): ([u8; 32], [u8; 32]) = (lmk_core::random(), lmk_core::random());
+    let log = alice.node.read_key_log(&carol).await.unwrap();
+    let all = vec![listed(&laptop, "laptop"), listed(&tablet_key, "tablet"), listed(&phone_key, "phone")];
+    alice.node.append_identity(&carol, &log.next(&key, &public(&key), all)).await.unwrap();
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
+    let (tablet, phone) = (session(&relay, "tablet").await, session(&relay, "phone").await);
+    for (joiner, device, name) in [(&tablet, &tablet_key, "tablet"), (&phone, &phone_key, "phone")] {
+        let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+        joiner.node.join(&link, Some(certificate(&carol, device, &joiner.node.key()))).await.unwrap();
+        alice.checked(&gid, name, true).await;
+    }
+    for session in [&tablet, &phone] {
+        session.node.shutdown().await.unwrap();
+    }
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    let log = alice.node.read_key_log(&carol).await.unwrap();
+    alice.node.append_identity(&carol, &log.next(&key, &public(&lmk_core::random()), vec![listed(&laptop, "laptop")])).await.unwrap();
+    let mut removed = alice.until(|e| match e {
+        Event::Revoked { removed, .. } => Some(removed.into_iter().map(|m| m.name).collect::<Vec<_>>()),
+        _ => None,
+    }).await;
+    removed.sort();
+    assert_eq!(removed, ["phone", "tablet"]);
+    assert_eq!((alice.node.epoch(&gid.0).unwrap(), alice.node.members(&gid.0).unwrap().len()), (epoch + 1, 1));
+}
+
+/// Members update their leaves every T. One that leaves asks again once its `leave` is older than the prior epoch,
+/// and is removed once a member that can is back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leaver_asks_again_while_it_updates_every_t() {
+    let relay = relay().await;
+    let dir = folder("leave-again-t");
+    std::fs::create_dir_all(&dir).unwrap();
+    let alice_db = dir.join("alice.db");
+    let alice = stored(&relay, "Alice", &alice_db).await;
+    let mut bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(Settings { update: 2, ..settings(CHAT, &dir.join("logs")) }, None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+
+    let epoch = bob.node.epoch(&gid.0).unwrap();
+    bob.node.leave(&gid.0).await.unwrap().unwrap();
+    let leaves = || bob.node.messages(&gid.0).unwrap().iter().filter(|m| m.payload["type"] == "leave").count();
+    eventually("Bob asks again", || leaves() >= 2).await;
+    assert!(bob.node.epoch(&gid.0).unwrap() >= epoch + 2, "Bob updated his leaf meanwhile");
+
+    let alice = stored(&relay, "Alice", &alice_db).await;
+    bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
+    eventually("Alice is alone", || alice.node.members(&gid.0).unwrap().len() == 1).await;
+    alice.node.shutdown().await.unwrap();
+}

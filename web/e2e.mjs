@@ -437,15 +437,18 @@ try {
   await ann.printed(e => e.type === "message" && e.group === code.group && e.content === "thanks");
   check(true, "and its chat, both ways");
 
-  // A message larger than members take is not sent: the page says why, and keeps the text.
+  // A message larger than members take is not sent: the timeline keeps its text, says why, and offers Retry.
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   const tooLong = `too long ${"x".repeat(1_100_000)}`;
   await laptop.locator("textarea:visible").fill(tooLong);
   await laptop.locator("textarea:visible").press("Enter");
-  const tooLarge = await until(() => laptop.evaluate(() => window.toasts.splice(0)), told => told.length > 0);
-  check(tooLarge.length === 1 && tooLarge[0].includes("over the 1 MiB members take"), `a message larger than members take is not sent, and the page says why (${tooLarge.join("; ")})`);
-  check((await laptop.locator("textarea:visible").inputValue()) === tooLong, "its text stays in the box");
-  check((await laptop.locator(".messages li", { hasText: "too long" }).count()) === 0, "and it is not listed");
+  const failed = laptop.locator(".messages li.unsent", { hasText: "too long" });
+  await failed.waitFor();
+  check((await failed.textContent()).includes("over the 1 MiB members take"), "a message larger than members take is not sent, and the timeline keeps it, saying why");
+  check((await failed.getByRole("button", { name: "Retry" }).count()) === 1, "with Retry");
+  await failed.getByRole("button", { name: "Drop" }).click();
+  await until(() => failed.count(), n => n === 0);
+  check(true, "and drops it when asked");
   carl.proc.kill();
 
   // With Ann gone, what the laptop sends to her chat still counts on the group's log.
