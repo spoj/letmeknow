@@ -880,7 +880,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let (removed, added) = (removed.iter().map(|m| describer.describe(m)).collect(), added.iter().map(|m| describer.describe(m)).collect());
                 self.emit(ClientEvent::Revoked { group, removed, added });
             }
-            Event::Keys { .. } => {}
+            Event::Keys { .. } | Event::Duties { .. } => {}
             Event::Removed { group, by } => {
                 let by = by.map(|by| self.describe(&group, &by)).transpose()?;
                 self.drop_group(&group).await?;

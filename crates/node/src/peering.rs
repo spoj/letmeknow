@@ -25,6 +25,8 @@ use crate::{Event, Inner, Member, Node, Out, State, Work, days, endpoint_id, get
 
 /// How often `Peers` is polled.
 const POLL: Duration = Duration::from_millis(250);
+/// How often members not connected are dialed, in milliseconds.
+const REDIAL: u64 = 10_000;
 
 /// A member's latest summary of a group, as saved: what it held and read within H, and when it was heard.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,9 +216,15 @@ impl<P: Provider> State<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
+    /// Polls `Peers` every `POLL`, and dials the members not connected every `REDIAL`.
     pub(crate) async fn polling(self: Arc<Self>) {
+        let mut dialed = 0;
         loop {
             sleep(POLL).await;
+            if now() >= dialed + REDIAL {
+                dialed = now();
+                self.dial_all();
+            }
             let mut st = self.lock();
             if let Err(error) = self.poll(&mut st) {
                 self.warn(None, format!("{error:#}"));

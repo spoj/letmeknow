@@ -58,8 +58,6 @@ const SEND_WAIT: Duration = Duration::from_secs(5);
 /// How long some waits for other members last: for those online to hold a file or an invite, for added members'
 /// certificates.
 const MEMBER_WAIT: Duration = Duration::from_secs(5);
-/// How often members not connected are dialed again.
-const REDIAL: Duration = Duration::from_secs(10);
 /// How often a followed log is read again whole.
 const REREAD: Duration = Duration::from_secs(5 * 60);
 /// How often files no group holds any longer are deleted.
@@ -350,6 +348,10 @@ pub enum Event {
     File([u8; 32]),
     /// An identity's key log grew, as this session read it.
     Keys { identity: Bytes },
+    /// A pass of a devices group's duties ran: the devices kind runs its own.
+    Duties {
+        group: Bytes,
+    },
     Warning {
         group: Option<Bytes>,
         text: String,
@@ -368,6 +370,7 @@ impl Event {
             | Event::Live { group, .. }
             | Event::Synced { group, .. }
             | Event::Heard { group }
+            | Event::Duties { group }
             | Event::State { group, .. }
             | Event::Logged { group }
             | Event::Snapshot { group, .. }
@@ -1067,7 +1070,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
         }
         inner.spawn(inner.clone().resume());
-        inner.spawn(inner.clone().redial());
         inner.spawn(inner.clone().polling());
         Ok((Node { inner }, events_rx))
     }
@@ -1676,43 +1678,27 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Catches up on each group, and runs its duties then and every while; drops what each kept past H.
+    /// Catches up as this session starts: the key logs it lacks, then the entries it stored and had not applied, as
+    /// while waiting before a commit. Then runs every group's duties, now and every `duties::TIMER`, and scrubs.
     async fn resume(self: Arc<Self>) {
         self.refresh_all().await;
-        self.dial_all();
+        let gids: Vec<Vec<u8>> = self.lock().groups.keys().cloned().collect();
+        for gid in &gids {
+            if let Err(error) = self.advance(&mut self.lock(), gid) {
+                tracing::debug!("applying the stored log of {}: {error:#}", hex(gid));
+            }
+        }
         loop {
-            let gids: Vec<Vec<u8>> = self.lock().groups.keys().cloned().collect();
-            for gid in &gids {
-                if let Err(error) = self.read(gid).await {
-                    tracing::debug!("catching up on {}: {error:#}", hex(gid));
-                }
-                // Entries stored before a stop that had not applied yet, as while waiting before a commit.
-                if let Err(error) = self.advance(&mut self.lock(), gid) {
-                    tracing::debug!("applying the stored log of {}: {error:#}", hex(gid));
-                }
+            for gid in self.lock().groups.keys() {
                 self.work.send(Work::Duties(gid.clone())).ok();
             }
             sleep(duties::TIMER).await;
-            let mut st = self.lock();
-            for gid in st.groups.keys().cloned().collect::<Vec<_>>() {
-                if let Err(error) = st.expire(&gid) {
-                    self.warn(Some(&gid), format!("{error:#}"));
-                }
-            }
-            st.scrub = true;
-        }
-    }
-
-    async fn redial(self: Arc<Self>) {
-        loop {
-            sleep(REDIAL).await;
-            self.dial_all();
-            self.refresh_all().await;
+            self.lock().scrub = true;
         }
     }
 
     /// Dials every member of every group that is not connected.
-    fn dial_all(self: &Arc<Self>) {
+    pub(crate) fn dial_all(self: &Arc<Self>) {
         let connected = self.net().connected();
         let me = self.net().id();
         let leaves: BTreeSet<(EndpointId, String)> = {
@@ -1894,8 +1880,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Reads the key logs of the identities in this session's groups that it holds none of, and once more for each
-    /// device a member's certificate names that its identity does not list; then has the members removed whose devices
-    /// their identities dropped.
+    /// device a member's certificate names that its identity does not list. A log read is followed from then on.
     async fn refresh_all(&self) {
         let unread: Vec<IdentityRef> = {
             let mut st = self.lock();

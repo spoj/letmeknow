@@ -29,8 +29,6 @@ use crate::{Event, Item, Member, Node, hex, now};
 const ROTATE: u64 = 30 * DAY;
 /// How many half seconds a new device waits for its identity's state.
 const STATE_WAIT: u32 = 60;
-/// How often a device runs its duties in each of its devices groups, besides as their logs move.
-const DUTY_CHECK: Duration = Duration::from_secs(10 * 60);
 
 /// A devices group's state, as the group's log stands at `position`.
 #[derive(Clone, Serialize, Deserialize)]
@@ -130,21 +128,9 @@ fn record_key(gid: &[u8]) -> String {
 }
 
 impl<P: Provider + Send + 'static> Devices<P> {
-    /// The devices kind on `node`, kept by `save`; it runs its duties in each devices group now, then every while.
+    /// The devices kind on `node`, kept by `save`. Its duties run as each devices group's do (`Event::Duties`).
     pub fn new(node: Node<P>, device: Device, save: Save) -> Self {
-        let devices = Devices { node, device, save, lock: Arc::default(), passing: Arc::default(), asked: Arc::default() };
-        let checking = devices.clone();
-        spawn(async move {
-            loop {
-                for (gid, _) in checking.books() {
-                    if let Err(error) = checking.duties(&gid.0).await {
-                        tracing::warn!("the duties of a devices group: {error:#}");
-                    }
-                }
-                sleep(DUTY_CHECK).await;
-            }
-        });
-        devices
+        Devices { node, device, save, lock: Arc::default(), passing: Arc::default(), asked: Arc::default() }
     }
 
     fn record(&self, gid: &[u8]) -> Record {
@@ -422,7 +408,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
     }
 
     /// Takes the events of devices groups, but for their members joining and leaving and warnings; returns every other
-    /// event. Its duties run as the group or the identity's key log moves.
+    /// event. Its duties run as the group's do, and as the identity's key log moves.
     pub fn on(&self, event: Event) -> Option<Event> {
         if let Event::Keys { identity } = &event {
             if let Ok((gid, _)) = self.book(&identity.0) {
@@ -448,15 +434,11 @@ impl<P: Provider + Send + 'static> Devices<P> {
                 self.asked.lock().unwrap().remove(&gid.0);
                 self.node.delete_record(&record_key(&gid.0))
             }
-            Event::Joined { .. } | Event::Left { .. } => {
-                self.due(&gid.0);
-                return Some(event);
-            }
-            Event::Warning { .. } => return Some(event),
-            Event::Settings { .. } => {
+            Event::Duties { .. } => {
                 self.due(&gid.0);
                 Ok(())
             }
+            Event::Joined { .. } | Event::Left { .. } | Event::Warning { .. } => return Some(event),
             _ => Ok(()),
         };
         taken.err().map(|error| Event::Warning { group: Some(gid), text: format!("{error:#}") })
