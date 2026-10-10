@@ -16,8 +16,8 @@ use tokio::sync::oneshot;
 
 use lmk_proto::peer::{Frame, Item};
 
-use crate::reading::{Judged, ciphertext_key};
-use crate::{Event, Inner, Message, SendError, State, get, now, put};
+use crate::reading::ciphertext_key;
+use crate::{Event, Inner, Message, Out, SendError, State, get, now, put};
 
 /// How long a send waits before it appends again after an answer that did not come.
 const RETRY: Duration = Duration::from_secs(5);
@@ -42,8 +42,8 @@ pub(crate) fn send_key(handle: &[u8]) -> Vec<u8> {
     [b"node/send/".as_slice(), handle].concat()
 }
 
-/// A send's position once its entry counts, or why it failed.
-pub(crate) type Outcome = Result<u64, Arc<SendError>>;
+/// A send's position and final id once its entry counts, or why it failed.
+pub(crate) type Outcome = Result<(u64, Bytes), Arc<SendError>>;
 pub(crate) type Counted = oneshot::Receiver<Outcome>;
 
 impl<P: Provider> State<P> {
@@ -120,26 +120,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok((handle, outcome))
     }
 
-    /// `send` answered that a send is pending: once it counts, `Event::Sent` tells. Unless it counted just now: then
-    /// its position.
-    pub(crate) fn pending(&self, handle: &Bytes, outcome: &mut Counted) -> Result<Option<u64>> {
+    /// `send` answers that a send is pending: once it counts, `Event::Sent` tells. False if it is no longer held, as
+    /// it counted or failed just now: its outcome is on its way.
+    pub(crate) fn pending(&self, handle: &Bytes) -> Result<bool> {
         let st = self.lock();
-        if let Ok(counted) = outcome.try_recv() {
-            return Ok(Some(counted.map_err(|error| anyhow::anyhow!(error))?));
-        }
-        if let Some(mut send) = get::<Held>(&st.provider, &send_key(&handle.0))? {
-            send.pending = true;
-            put(&st.provider, &send_key(&handle.0), &send)?;
-        }
-        Ok(None)
-    }
-
-    /// The id of the message counted at a position.
-    pub(crate) fn sent_id(&self, gid: &[u8], position: u64) -> Result<Bytes> {
-        match self.lock().pos(gid, position)?.context("a counted position has its record")?.judged {
-            Judged::Counted { id } => Ok(id),
-            _ => anyhow::bail!("not a counted position"),
-        }
+        let Some(mut send) = get::<Held>(&st.provider, &send_key(&handle.0))? else { return Ok(false) };
+        send.pending = true;
+        put(&st.provider, &send_key(&handle.0), &send)?;
+        Ok(true)
     }
 
     /// A send's entry counts at `position`: its ciphertext goes to the members online, and its plaintext is that
@@ -153,13 +141,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
         g.rec.sends.retain(|sent| *sent != handle);
         let me = g.mls.members().into_iter().find(|m| m.index == g.mls.own_index()).context("a member of its group")?;
         let sender = st.member(gid, &me).context("this session has a letmeknow credential")?;
-        let message = Message { id: send.id, group: Bytes(gid.to_vec()), epoch: send.epoch, position, at: now(), sender, payload: send.payload, missing: Vec::new() };
+        let message = Message { id: send.id.clone(), group: Bytes(gid.to_vec()), epoch: send.epoch, position, at: now(), sender, payload: send.payload, missing: Vec::new() };
         self.deliver(st, gid, message, true)?;
         let item = Item { position, ciphertext: send.ciphertext };
         st.broadcast(gid, Frame::Messages { group: Bytes(gid.to_vec()), items: vec![item], answers: None });
-        for waiter in st.waiters.remove(&handle.0).unwrap_or_default() {
-            waiter.send(Ok(position)).ok();
-        }
+        let waiters = st.waiters.remove(&handle.0).unwrap_or_default();
+        st.out.push(Out::Outcome { waiters, outcome: Ok((position, send.id)) });
         if send.pending {
             self.events.send(Event::Sent { group: Bytes(gid.to_vec()), id: handle, position }).ok();
         }
@@ -265,9 +252,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 g.rec.sends.retain(|sent| sent != handle);
             }
             st.save(gid).ok();
-            for waiter in st.waiters.remove(&handle.0).unwrap_or_default() {
-                waiter.send(Err(error.clone())).ok();
-            }
+            let waiters = st.waiters.remove(&handle.0).unwrap_or_default();
+            st.out.push(Out::Outcome { waiters, outcome: Err(error.clone()) });
             if send.pending {
                 self.warn(Some(gid), format!("a pending send ({}) failed: {error}", crate::hex(&handle.0)));
             }

@@ -11,7 +11,7 @@ use lmk_net::{Admit, Groups};
 use lmk_proto::entry::Entry;
 use lmk_proto::group::{CHAT, Credential, How};
 use lmk_proto::links::FileLink;
-use lmk_proto::peer::{Admitted, Join};
+use lmk_proto::peer::{Admitted, Frame, Join};
 use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::timeout;
@@ -152,6 +152,10 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
             return Vec::new();
         };
         g.rec.held(g.mls.settings().carry)
+    }
+
+    fn admit(&self, peer: &EndpointId, frame: Frame) -> Option<Frame> {
+        self.lock().admissible(peer, frame)
     }
 }
 

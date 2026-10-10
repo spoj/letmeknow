@@ -21,7 +21,7 @@ use lmk_net::{Admit, Config, Disk, Event, Groups, Net};
 use lmk_proto::{
     Answer, Bytes,
     links::FileLink,
-    peer::{Admitted, Join},
+    peer::{Admitted, Frame, Join},
 };
 use n0_future::boxed::BoxFuture;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -182,6 +182,10 @@ impl Fake {
 }
 
 impl Groups for Fake {
+    fn admit(&self, _: &EndpointId, frame: Frame) -> Option<Frame> {
+        Some(frame)
+    }
+
     fn groups(&self) -> Vec<Vec<u8>> {
         self.groups.lock().unwrap().keys().cloned().collect()
     }
