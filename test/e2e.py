@@ -236,7 +236,7 @@ def main():
         bob.expect("introduced", lambda e: e["identity"]["name"] == "Bob (Acme)")
 
         sent = run("alice", "send", "hello bob")
-        check(sent["held_by"][0]["name"] == "Bob", "send reports who holds the message")
+        check(isinstance(sent.get("position"), int), "send answers the message's position in the group's log")
         got = bob.expect("message")
         check(got["content"] == "hello bob" and got["from"]["identity"]["how"] == "unknown", "bob receives it; alice is only her own claim to him")
         reply = run("bob", "send", "--reply-to", got["id"], "hi alice")["id"]
@@ -327,7 +327,7 @@ def main():
         check(alice.expect("joined", lambda e: e["member"]["name"] == "Erin")["by"]["name"] != "Bob", "admitted by another member")
         run("alice", "name", f"--group={group}", "Release")
         missed = run("alice", "send", f"--group={group}", "while you were away")
-        check("held_by" in missed, "the tablet holds what bob misses")
+        check(isinstance(missed.get("position"), int), "the group's log takes what bob misses")
         bob = Listener("bob")
         listeners.append(bob)
         got = bob.expect("message", lambda e: e["content"] == "while you were away", timeout=60)
