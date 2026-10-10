@@ -933,17 +933,21 @@ impl World {
     }
 }
 
-/// What a 0.12 peer frame says of each group, as the properties look; `entries` only of a group's own log.
+/// What a peer frame says of each group, as the properties look; `entries` only of a group's own log.
 fn frames(node: &Node<Store>, frame: &lmk_proto::peer::Frame) -> Vec<(Bytes, Frame)> {
     use lmk_proto::peer::Frame as F;
-    let none = || Frame::Hello { head: 0, held: Default::default(), fetching: Default::default() };
     match frame {
-        F::Hello { groups, .. } => groups.iter().map(|hello| (hello.group.clone(), none())).collect(),
+        F::Hello { groups, .. } => groups
+            .iter()
+            .map(|summary| (summary.group.clone(), Frame::Hello { head: summary.head.length, held: summary.held.iter().collect(), fetching: summary.fetching.iter().collect() }))
+            .collect(),
         F::Entries { log, .. } if node.groups().contains(log) => vec![(log.clone(), Frame::Entries)],
-        F::Reconcile { group, .. } => vec![(group.clone(), Frame::Other("reconcile"))],
-        F::Messages { group, .. } => vec![(group.clone(), Frame::Messages { positions: Default::default() })],
+        // A `want` from a peer the gate does not admit is answered, with nothing.
+        F::Messages { group, items, .. } if !items.is_empty() => vec![(group.clone(), Frame::Messages { positions: items.iter().map(|item| item.position).collect() })],
+        F::Want { group, positions } => vec![(group.clone(), Frame::Want { positions: positions.iter().collect() })],
         F::State { group, .. } => vec![(group.clone(), Frame::State)],
-        F::Want { group, .. } => vec![(group.clone(), Frame::Want { positions: Default::default() })],
+        F::Live { group, .. } => vec![(group.clone(), Frame::Live)],
+        F::WantFiles { group, .. } => vec![(group.clone(), Frame::Files)],
         F::Have { group, files } if !files.is_empty() => vec![(group.clone(), Frame::Files)],
         _ => Vec::new(),
     }

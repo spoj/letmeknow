@@ -18,7 +18,7 @@ use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Inner, Out, RESYNC, State, Work, get, hex, put};
+use crate::{Inner, REREAD, State, Work, get, hex, put};
 
 /// One membership client per service, sharing the session's transport.
 pub(crate) struct Clients {
@@ -166,7 +166,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     let mut subscription = client.subscribe(vec![Bytes(id.clone())]).await?;
                     inner.read(&id).await?;
                     loop {
-                        match timeout(RESYNC, subscription.next()).await {
+                        match timeout(REREAD, subscription.next()).await {
                             Ok(Some(notice)) => {
                                 let notice = notice?;
                                 inner.stored(&id, notice.position - 1, vec![notice.entry], client.chain(&id))?;
@@ -232,8 +232,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// client's, recorded when it covers just what is held, so that the head this session shows its peers matches its
     /// entries.
     pub(crate) fn stored(&self, id: &[u8], after: u64, entries: Vec<Bytes>, chain: Option<Chain>) -> Result<()> {
-        let mut st = self.lock();
-        let st = &mut *st;
+        self.store(&mut self.lock(), id, after, entries, chain)
+    }
+
+    fn store(&self, st: &mut State<P>, id: &[u8], after: u64, entries: Vec<Bytes>, chain: Option<Chain>) -> Result<()> {
         let logged = st.log(id)?.logged;
         if after > logged {
             self.work.send(Work::Read(id.to_vec())).ok();
@@ -245,20 +247,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         let log = st.logs.get_mut(id).unwrap();
         log.logged += fresh.len() as u64;
-        // A joiner's first read anchors its chain: the head it shows its peers is no longer empty, though it took
-        // nothing new, and they sync with it only once it shows the head they do.
-        let anchored = log.chain.is_none() && chain.as_ref().is_some_and(|chain| chain.length() == log.logged);
         if let Some(chain) = chain.filter(|chain| chain.length() == log.logged) {
             log.chain = Some(chain);
         }
         st.save_log(id)?;
         if !fresh.is_empty() {
             self.check(st, id)?;
-        } else if !anchored {
-            return Ok(());
-        }
-        for gid in st.groups_of(id) {
-            st.out.push(Out::Changed(gid));
         }
         Ok(())
     }
@@ -271,18 +265,22 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Takes entries of a log from a peer: they directly follow this session's copy and end at `head`.
-    pub(crate) fn take_entries(&self, id: &[u8], entries: Vec<Bytes>, head: Head) -> Result<()> {
-        let (after, chain) = {
-            let mut st = self.lock();
-            let log = st.logs.get_mut(id).context("this session does not follow that log")?;
-            let mut chain = log.chain.clone().context("no chain of the log yet")?;
-            let after = chain.length();
-            chain.extend(after, &entries, &head)?;
-            log.at = log.at.max(head.time);
-            self.clients.client(&log.service)?.set_chain(chain.clone());
-            (after, chain)
-        };
-        self.stored(id, after, entries, Some(chain))
+    /// Takes entries of a log from a peer, those ending at `head`, a head its service signed: the new ones, if they
+    /// chain on to this session's copy.
+    pub(crate) fn take_entries(&self, st: &mut State<P>, id: &[u8], entries: Vec<Bytes>, head: Head) -> Result<()> {
+        let log = st.logs.get_mut(id).context("this session does not follow that log")?;
+        let Some(mut chain) = log.chain.clone() else { return Ok(()) };
+        let (after, start) = (chain.length(), head.length.saturating_sub(entries.len() as u64));
+        if head.length <= after || chain.hash_at(start).is_none() {
+            return Ok(());
+        }
+        if let Err(error) = chain.extend(start, &entries, &head) {
+            tracing::debug!("entries that do not end at their head: {error:#}");
+            return Ok(());
+        }
+        log.at = log.at.max(head.time);
+        self.clients.client(&log.service)?.set_chain(chain.clone());
+        let fresh = entries[(after - start) as usize..].to_vec();
+        self.store(st, id, after, fresh, Some(chain))
     }
 }

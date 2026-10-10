@@ -36,6 +36,10 @@ impl Ranges {
         *self = self.union(&Self::range(position, position));
     }
 
+    pub fn remove(&mut self, position: u64) {
+        *self = self.difference(&Self::range(position, position));
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
         self.0.iter().flat_map(|&(first, last)| first..=last)
     }

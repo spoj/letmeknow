@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+use lmk_proto::peer::{Frame, Item};
+
 use crate::reading::{Judged, ciphertext_key};
-use crate::{Event, Inner, Message, Out, SendError, State, get, now, put};
+use crate::{Event, Inner, Message, SendError, State, get, now, put};
 
 /// How long a send waits before it appends again after an answer that did not come.
 const RETRY: Duration = Duration::from_secs(5);
@@ -147,12 +149,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
         st.provider.delete(&send_key(&handle.0))?;
         let g = st.group_mut(gid)?;
         g.rec.unopened.remove(&position);
+        g.rec.own.insert(position);
         g.rec.sends.retain(|sent| *sent != handle);
         let me = g.mls.members().into_iter().find(|m| m.index == g.mls.own_index()).context("a member of its group")?;
         let sender = st.member(gid, &me).context("this session has a letmeknow credential")?;
         let message = Message { id: send.id, group: Bytes(gid.to_vec()), epoch: send.epoch, position, at: now(), sender, payload: send.payload, missing: Vec::new() };
         self.deliver(st, gid, message, true)?;
-        st.out.push(Out::Push { group: gid.to_vec(), ciphertext: send.ciphertext.0 });
+        let item = Item { position, ciphertext: send.ciphertext };
+        st.broadcast(gid, Frame::Messages { group: Bytes(gid.to_vec()), items: vec![item], answers: None });
         for waiter in st.waiters.remove(&handle.0).unwrap_or_default() {
             waiter.send(Ok(position)).ok();
         }
@@ -211,7 +215,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     fn batch(&self, gid: &[u8]) -> Result<Option<Option<(lmk_proto::group::Service, Vec<(Bytes, Vec<u8>)>)>>> {
         let mut st = self.lock();
         let Ok(g) = st.group(gid) else { return Ok(Some(None)) };
-        if g.rec.position < st.log(gid)?.logged || g.wait.is_some() {
+        if !st.at_head(gid) {
             return Ok(None);
         }
         if g.rec.sends.is_empty() {

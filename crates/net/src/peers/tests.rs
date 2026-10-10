@@ -134,13 +134,13 @@ fn summaries_are_saved_whatever_the_gate_but_used_only_while_it_admits() {
     let heard = p.frame(&key(1), &hello(vec![theirs.clone()]), 1_100);
     assert_eq!(heard, vec![Heard { peer: Bytes::from(key(1)), summary: theirs, at: 1_100 }]);
     assert!(wants(&p.poll(1_100)).is_empty());
-    assert_eq!(p.wait(&id(G), &r(&[(4, 4)]), 3_000), Decision::Lose(r(&[(4, 4)])), "an unadmitted holder does not hold the wait");
-    p.served(&key(1), served(&[G]), 3_000);
-    assert_eq!(wants(&p.poll(3_000)), vec![(key(1), r(&[(4, 4)]))]);
-    p.served(&key(1), served(&[]), 3_100);
-    p.connect(key(2), served(&[G]), 3_100);
-    p.frame(&key(2), &hello(vec![summary(G, 10, r(&[(1, 10)]), Ranges::default())]), 3_100);
-    assert_eq!(wants(&p.poll(3_100)), vec![(key(2), r(&[(4, 4)]))], "a closed gate gives up its request");
+    assert_eq!(p.wait(&id(G), &r(&[(4, 4)]), 4_000), Decision::Lose(r(&[(4, 4)])), "an unadmitted holder does not hold the wait");
+    p.served(&key(1), served(&[G]), 4_000);
+    assert_eq!(wants(&p.poll(4_000)), vec![(key(1), r(&[(4, 4)]))]);
+    p.served(&key(1), served(&[]), 4_100);
+    p.connect(key(2), served(&[G]), 4_100);
+    p.frame(&key(2), &hello(vec![summary(G, 10, r(&[(1, 10)]), Ranges::default())]), 4_100);
+    assert_eq!(wants(&p.poll(4_100)), vec![(key(2), r(&[(4, 4)]))], "a closed gate gives up its request");
 }
 
 #[test]
@@ -223,6 +223,22 @@ fn repair_and_the_wait_use_only_summaries_heard_on_the_current_connection() {
     assert_eq!(wants(&p.poll(4_000)), vec![(key(1), r(&[(4, 4)]))]);
     p.disconnect(&key(1));
     assert!(wants(&p.poll(4_100)).is_empty());
+}
+
+#[test]
+fn a_member_comes_online_as_it_starts_or_connects_after_none() {
+    let lacking = r(&[(4, 4)]);
+    let mut p = member(lacking.clone());
+    assert_eq!(p.wait(&id(G), &lacking, ONLINE - 1), Decision::Wait);
+    p.connect(key(1), served(&[G]), 10_000);
+    assert_eq!(p.wait(&id(G), &lacking, 10_000 + ONLINE - 1), Decision::Wait, "its first connection after none");
+    p.connect(key(2), served(&[G]), 20_000);
+    p.connect(key(1), served(&[G]), 20_000);
+    assert_eq!(p.wait(&id(G), &lacking, 20_000), Decision::Lose(lacking.clone()), "another, or one replaced, is not");
+    p.disconnect(&key(1));
+    p.disconnect(&key(2));
+    p.connect(key(1), served(&[G]), 30_000);
+    assert_eq!(p.wait(&id(G), &lacking, 30_000), Decision::Wait);
 }
 
 #[test]

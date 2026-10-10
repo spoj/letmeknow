@@ -1,26 +1,25 @@
-//! What the peers need from the group logic (`Groups`), and whom a member admits (`Admit`).
+//! What the peers need from the group logic to serve files (`Groups`), and whom a member admits (`Admit`).
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
-use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
 use lmk_core::group::{self as core, Change, key_package_credential, key_package_leaf};
 use lmk_core::identity::Verdict;
 use lmk_core::provider::Provider;
 use lmk_net::{Admit, Groups};
-use lmk_proto::group::{CHAT, Credential, How, Service};
-use lmk_proto::head::Head;
+use lmk_proto::entry::Entry;
+use lmk_proto::group::{CHAT, Credential, How};
 use lmk_proto::links::FileLink;
-use lmk_proto::peer::{Admitted, Hello, Join};
+use lmk_proto::peer::{Admitted, Join};
 use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::timeout;
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
-use crate::logs::empty;
-use crate::{Event, Inner, SNAPSHOT_WAIT, Work, now};
+use crate::reading::Judged;
+use crate::{Event, Inner, SNAPSHOT_WAIT, State, now};
 
 /// The answer to a secret no rule admits by: whether it is unknown, used or expired is not told.
 const UNKNOWN: &str = "unknown, used or expired invite";
@@ -53,6 +52,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
             (None, Some(gid)) => (gid.0, How::Open, None, Some(joiner.identity().context(NOT_OPEN)?.id.clone())),
             (None, None) => bail!("a request names an invite's secret or a group"),
         };
+        // A joiner the log shows added, whose answer was lost, asks again with the same KeyPackage.
+        self.caught_up(&gid).await?;
+        let logged = self.lock().logged_welcome(&gid, &joiner, &key_package.0)?;
+        if let Some((welcome, position)) = logged {
+            return self.admitted(&gid, welcome, position).await;
+        }
         admits(&self.lock().group(&gid)?.mls, &joiner, &invite)?;
         // Its identity's key log, read afresh, must list the device that certified it.
         if let Some(to) = to {
@@ -84,6 +89,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
             })
             .await?
             .context("an Add has effect")?;
+        self.admitted(gid, welcome.context("an add makes a Welcome")?, position).await
+    }
+
+    /// The answer to a joiner added at `position`: the Welcome, and the state of the group's kind, as a file.
+    async fn admitted(self: &Arc<Self>, gid: &[u8], welcome: Vec<u8>, position: u64) -> Result<Admitted> {
         let state = {
             let st = self.lock();
             let g = st.group(gid)?;
@@ -102,9 +112,29 @@ impl<P: Provider + Send + 'static> Inner<P> {
             None => None,
         };
         self.durable().await?;
-        Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc })
+        Ok(Admitted { welcome: Bytes(welcome), position, doc })
     }
+}
 
+impl<P: Provider> State<P> {
+    /// The Welcome and position of the commit entry that added the joiner with this KeyPackage, if the joiner is a member
+    /// whose leaf has not updated since.
+    fn logged_welcome(&self, gid: &[u8], joiner: &Credential, key_package: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
+        let g = self.group(gid)?;
+        if !g.mls.unchanged(&self.provider, key_package)? {
+            return Ok(None);
+        }
+        let Some(added) = g.mls.added().iter().rev().find(|added| added.member.key == joiner.key) else { return Ok(None) };
+        for position in (g.rec.expired + 1..=g.rec.position).rev() {
+            let Some(pos) = self.pos(gid, position)? else { continue };
+            if matches!(pos.judged, Judged::Commit { .. }) && pos.epoch + 1 == added.epoch {
+                let entry = self.provider.get(&crate::logs::entry_key(gid, position))?.context("a stored entry is missing")?;
+                let Entry::Commit { welcome: Some(welcome), .. } = Entry::parse(&entry)? else { return Ok(None) };
+                return Ok(Some((welcome, position)));
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl<P: Provider + Send + 'static> Groups for Inner<P> {
@@ -114,84 +144,6 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
 
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
         self.lock().serves(group, peer)
-    }
-
-    fn revision(&self, group: &[u8], peer: &EndpointId) -> u32 {
-        self.lock().in_leaf(group, peer).and_then(|m| m.leaf).map_or(0, |leaf| leaf.revision)
-    }
-
-    fn hello(&self, group: &[u8]) -> Hello {
-        let st = self.lock();
-        let Some(g) = st.groups.get(group) else {
-            return Hello { group: group.into(), epoch: 0, floor: 0, joined: 0, anew: false };
-        };
-        let (epoch, joined) = (g.mls.epoch(), g.mls.joined());
-        Hello { group: group.into(), epoch, floor: joined, joined, anew: false }
-    }
-
-    fn logs(&self, group: &[u8]) -> Vec<Vec<u8>> {
-        let st = self.lock();
-        if !st.groups.contains_key(group) {
-            return Vec::new();
-        }
-        let identities = st.identities(group).into_iter().map(|identity| lmk_proto::identity::address(&identity.id.0).to_vec());
-        let mut logs: Vec<Vec<u8>> = [group.to_vec()].into_iter().chain(identities).filter(|id| st.logs.contains_key(id)).collect();
-        logs.sort();
-        logs.dedup();
-        logs
-    }
-
-    fn head(&self, log: &[u8]) -> Head {
-        self.lock().logs.get(log).map_or_else(|| empty(log), |l| l.head(log))
-    }
-
-    fn verify_head(&self, log: &[u8], head: &Head) -> bool {
-        if head.length == 0 && head.hash == empty(log).hash {
-            return true;
-        }
-        let st = self.lock();
-        match st.logs.get(log).map(|l| &l.service) {
-            Some(Service::Serve { key, .. }) => {
-                let key: Option<[u8; 32]> = key.0.clone().try_into().ok();
-                key.and_then(|key| VerifyingKey::from_bytes(&key).ok()).is_some_and(|key| head.verify(&key))
-            }
-            Some(Service::Folder(_)) => true,
-            Some(Service::Newer(_)) | None => false,
-        }
-    }
-
-    fn chain(&self, log: &[u8], position: u64) -> Option<[u8; 32]> {
-        self.lock().logs.get(log)?.chain.as_ref()?.hash_at(position)
-    }
-
-    fn entries(&self, log: &[u8], after: u64) -> Vec<Bytes> {
-        self.lock().entries(log, after)
-    }
-
-    fn apply(&self, log: &[u8], entries: Vec<Bytes>, head: Head) -> Result<()> {
-        self.take_entries(log, entries, head)
-    }
-
-    fn items(&self, group: &[u8], from: u64) -> Vec<(u64, [u8; 32])> {
-        self.lock().carried(group, from).unwrap_or_default()
-    }
-
-    fn message(&self, group: &[u8], epoch: u64, id: &[u8; 32]) -> Option<Vec<u8>> {
-        self.lock().ciphertext(group, epoch, id).ok()?
-    }
-
-    fn receive(&self, group: &[u8], ciphertext: &[u8]) {
-        let mut st = self.lock();
-        if let Err(error) = self.take(&mut st, group, ciphertext) {
-            self.warn(Some(group), format!("{error:#}"));
-        }
-    }
-
-    fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>) {
-        match link {
-            Some(link) => self.work.send(Work::State { group: group.to_vec(), link, by: peer }).ok(),
-            None => self.work.send(Work::StateWanted { group: group.to_vec(), by: peer }).ok(),
-        };
     }
 
     fn files(&self, group: &[u8]) -> Vec<FileLink> {

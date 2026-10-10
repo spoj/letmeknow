@@ -1,10 +1,10 @@
-//! A local relay with a self-signed certificate, and a fake of the group logic: epochs are log
-//! lengths, and a "ciphertext" is `epoch ‖ kind ‖ body`, kind 0 a held message, kind 1 a live one.
+//! A local relay with a self-signed certificate, and a fake of the group logic: who is in which group, and the files
+//! each links.
 
 #![allow(dead_code)]
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -12,7 +12,6 @@ use std::{
 };
 
 use anyhow::Result;
-use ed25519_dalek::SigningKey;
 use iroh::{EndpointId, RelayMap, RelayUrl, SecretKey, tls::CaTlsConfig};
 use iroh_relay::{
     RelayQuicConfig,
@@ -21,13 +20,11 @@ use iroh_relay::{
 use lmk_net::{Admit, Config, Disk, Event, Groups, Net};
 use lmk_proto::{
     Answer, Bytes,
-    head::{self, Head},
     links::FileLink,
-    peer::{Admitted, Hello, Join},
+    peer::{Admitted, Join},
 };
 use n0_future::boxed::BoxFuture;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 pub const WAIT: Duration = Duration::from_secs(30);
@@ -74,14 +71,12 @@ pub struct Options {
     pub disk: Option<Arc<dyn Disk>>,
     pub home: Option<PathBuf>,
     pub file_limit: u64,
-    pub resync: Duration,
     pub collect: Duration,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        let (resync, collect) = (Duration::from_secs(300), Duration::from_secs(3600));
-        Options { relay_only: false, disk: None, home: None, file_limit: 100 << 20, resync, collect }
+        Options { relay_only: false, disk: None, home: None, file_limit: 100 << 20, collect: Duration::from_secs(3600) }
     }
 }
 
@@ -92,7 +87,7 @@ pub async fn node(relay: &Relay, key: SecretKey, fake: Arc<Fake>, options: Optio
     }
     let endpoint = builder.bind().await.unwrap();
     tokio::time::timeout(WAIT, endpoint.online()).await.expect("online");
-    let config = Config { home: options.home, files: None, disk: options.disk, file_limit: options.file_limit, resync: options.resync, collect: options.collect };
+    let config = Config { home: options.home, files: None, disk: options.disk, file_limit: options.file_limit, collect: options.collect };
     let (net, events) = Net::spawn(lmk_net::Network::Iroh(endpoint), config, fake.clone(), Arc::new(Inviter)).await.unwrap();
     Node { net, events, fake }
 }
@@ -110,10 +105,6 @@ impl Node {
         .await
         .expect("the event came")
     }
-
-    pub async fn synced(&mut self, group: &[u8], peer: EndpointId) {
-        self.until(|e| *e == Event::Synced { group: group.to_vec(), peer }).await;
-    }
 }
 
 pub async fn eventually(what: &str, check: impl Fn() -> bool) {
@@ -128,14 +119,6 @@ pub async fn eventually(what: &str, check: impl Fn() -> bool) {
 
 pub fn keys(n: usize) -> Vec<SecretKey> {
     (0..n).map(|_| SecretKey::generate()).collect()
-}
-
-pub fn message(epoch: u64, text: &str) -> Vec<u8> {
-    [&epoch.to_be_bytes()[..], &[0], text.as_bytes()].concat()
-}
-
-pub fn id(ciphertext: &[u8]) -> [u8; 32] {
-    Sha256::digest(ciphertext).into()
 }
 
 pub const SECRET: [u8; 16] = [5; 16];
@@ -159,17 +142,7 @@ impl Admit for Inviter {
 #[derive(Default)]
 pub struct Group {
     pub members: Vec<EndpointId>,
-    pub log: Vec<Vec<u8>>,
-    pub floor: u64,
-    pub joined: u64,
-    pub held: BTreeMap<[u8; 32], (u64, Vec<u8>)>,
-    pub live: Vec<Vec<u8>>,
     pub files: Vec<FileLink>,
-    /// Takes no entries from peers, as when they reach it only from the service; counts those offered.
-    pub frozen: bool,
-    pub offered: usize,
-    /// Other logs it follows for the group, such as its kind's, by id.
-    pub others: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
 }
 
 /// A browser's storage of files.
@@ -192,55 +165,19 @@ impl Disk for FakeDisk {
 }
 
 pub struct Fake {
-    service: SigningKey,
     pub groups: Mutex<HashMap<Vec<u8>, Group>>,
     /// After this many more membership checks, the peer is no longer a member.
     pub cut: Mutex<Option<(EndpointId, usize)>>,
-    /// Members in a leaf it does not serve, for want of their devices on their identities' lists.
-    pub unlisted: Mutex<Vec<EndpointId>>,
-    /// State links from peers.
-    pub states: Mutex<Vec<StateLink>>,
 }
 
-/// A group, the peer, and the link it handed, or none when it asked for a state.
-pub type StateLink = (Vec<u8>, EndpointId, Option<String>);
-
 impl Fake {
-    pub fn new(service: &SigningKey) -> Arc<Fake> {
-        Arc::new(Fake {
-            service: service.clone(),
-            groups: Mutex::default(),
-            cut: Mutex::default(),
-            unlisted: Mutex::default(),
-            states: Mutex::default(),
-        })
+    pub fn new() -> Arc<Fake> {
+        Arc::new(Fake { groups: Mutex::default(), cut: Mutex::default() })
     }
 
     pub fn with(self: &Arc<Self>, group: &[u8], g: Group) -> Arc<Self> {
         self.groups.lock().unwrap().insert(group.to_vec(), g);
         self.clone()
-    }
-
-    pub fn hold(&self, group: &[u8], ciphertext: Vec<u8>) {
-        let epoch = u64::from_be_bytes(ciphertext[..8].try_into().unwrap());
-        self.groups.lock().unwrap().get_mut(group).unwrap().held.insert(id(&ciphertext), (epoch, ciphertext));
-    }
-
-    pub fn holds(&self, group: &[u8], ciphertext: &[u8]) -> bool {
-        self.groups.lock().unwrap()[group].held.contains_key(&id(ciphertext))
-    }
-
-    /// The entries of a log: a group's own, or another it follows.
-    pub fn log(&self, log: &[u8]) -> Vec<Vec<u8>> {
-        let groups = self.groups.lock().unwrap();
-        match groups.get(log) {
-            Some(g) => g.log.clone(),
-            None => groups.values().find_map(|g| g.others.get(log)).cloned().unwrap_or_default(),
-        }
-    }
-
-    fn chain_of(entries: &[Vec<u8>], log: &[u8], n: usize) -> [u8; 32] {
-        entries[..n].iter().fold(head::start(log), |hash, entry| head::next(&hash, entry))
     }
 }
 
@@ -250,9 +187,6 @@ impl Groups for Fake {
     }
 
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
-        if self.unlisted.lock().unwrap().contains(peer) {
-            return false;
-        }
         let mut cut = self.cut.lock().unwrap();
         if let Some((who, left)) = cut.as_mut()
             && who == peer
@@ -263,84 +197,6 @@ impl Groups for Fake {
             *left -= 1;
         }
         self.groups.lock().unwrap().get(group).is_some_and(|g| g.members.contains(peer))
-    }
-
-    fn revision(&self, _: &[u8], _: &EndpointId) -> u32 {
-        lmk_proto::group::REVISION
-    }
-
-    fn hello(&self, group: &[u8]) -> Hello {
-        let groups = self.groups.lock().unwrap();
-        let g = &groups[group];
-        Hello { group: group.into(), epoch: g.log.len() as u64, floor: g.floor, joined: g.joined, anew: false }
-    }
-
-    fn logs(&self, group: &[u8]) -> Vec<Vec<u8>> {
-        let groups = self.groups.lock().unwrap();
-        [group.to_vec()].into_iter().chain(groups[group].others.keys().cloned()).collect()
-    }
-
-    fn head(&self, log: &[u8]) -> Head {
-        let entries = self.log(log);
-        Head::sign(&self.service, log, entries.len() as u64, Self::chain_of(&entries, log, entries.len()), 0)
-    }
-
-    fn verify_head(&self, _: &[u8], head: &Head) -> bool {
-        head.verify(&self.service.verifying_key())
-    }
-
-    fn chain(&self, log: &[u8], position: u64) -> Option<[u8; 32]> {
-        let entries = self.log(log);
-        (position as usize <= entries.len()).then(|| Self::chain_of(&entries, log, position as usize))
-    }
-
-    fn entries(&self, log: &[u8], after: u64) -> Vec<Bytes> {
-        self.log(log)[after as usize..].iter().map(|e| Bytes(e.clone())).collect()
-    }
-
-    fn apply(&self, log: &[u8], entries: Vec<Bytes>, _: Head) -> Result<()> {
-        let mut groups = self.groups.lock().unwrap();
-        let entries = entries.into_iter().map(|e| e.0);
-        if let Some(g) = groups.get_mut(log) {
-            if g.frozen {
-                g.offered += entries.len();
-                anyhow::bail!("frozen");
-            }
-            g.log.extend(entries);
-            return Ok(());
-        }
-        let other = groups.values_mut().find_map(|g| g.others.get_mut(log)).unwrap();
-        other.extend(entries);
-        Ok(())
-    }
-
-    fn items(&self, group: &[u8], from: u64) -> Vec<(u64, [u8; 32])> {
-        let groups = self.groups.lock().unwrap();
-        let g = &groups[group];
-        g.held.iter().map(|(id, (epoch, _))| (*epoch, *id)).filter(|(epoch, _)| *epoch >= from).collect()
-    }
-
-    fn message(&self, group: &[u8], _: u64, id: &[u8; 32]) -> Option<Vec<u8>> {
-        self.groups.lock().unwrap()[group].held.get(id).map(|(_, ciphertext)| ciphertext.clone())
-    }
-
-    fn receive(&self, group: &[u8], ciphertext: &[u8]) {
-        let epoch = u64::from_be_bytes(ciphertext[..8].try_into().unwrap());
-        let mut groups = self.groups.lock().unwrap();
-        let g = groups.get_mut(group).unwrap();
-        if epoch < g.floor || epoch > g.log.len() as u64 {
-            return;
-        }
-        match ciphertext[8] {
-            0 => {
-                g.held.insert(id(ciphertext), (epoch, ciphertext.to_vec()));
-            }
-            _ => g.live.push(ciphertext.to_vec()),
-        }
-    }
-
-    fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>) {
-        self.states.lock().unwrap().push((group.to_vec(), peer, link));
     }
 
     fn files(&self, group: &[u8]) -> Vec<FileLink> {

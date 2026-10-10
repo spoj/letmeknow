@@ -17,7 +17,10 @@ use lmk_node::{Config, Event, Node};
 use lmk_proto::group::{CHAT, Certificate, ChatMessage, DEVICES, IdentityRef, Named, PROTOCOL, Service, Settings, type_of};
 use lmk_proto::identity::Listed;
 use lmk_proto::Bytes;
-use lmk_proto::frame::ALPN;
+use lmk_proto::frame::{self, ALPN};
+use lmk_proto::head::Head;
+use lmk_proto::peer::{Frame, Item, Summary};
+use lmk_proto::ranges::Ranges;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1135,7 +1138,7 @@ async fn a_member_away_past_the_retention_drops_the_group() {
     bob.node.shutdown().await.unwrap();
 }
 
-/// A member on SQLite at `db`, which survives a restart.
+/// A session on SQLite at `db`, which survives a restart.
 async fn stored(relay: &Relay, name: &str, db: &Path) -> Session<SqliteProvider> {
     let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), config(relay, name, None, &[CHAT])).await.unwrap();
     Session { node, events }
@@ -1289,4 +1292,345 @@ async fn a_leaver_asks_again_while_it_updates_every_t() {
     bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     eventually("Alice is alone", || alice.node.members(&gid.0).unwrap().len() == 1).await;
     alice.node.shutdown().await.unwrap();
+}
+
+/// What a stopped session at `db` held: its iroh key, its head of the group's log, and its ciphertexts at `positions`.
+fn holdings(db: &Path, gid: &Bytes, positions: &[u64]) -> (iroh::SecretKey, Head, Vec<Bytes>) {
+    let provider = SqliteProvider::open(db).unwrap();
+    let key = lmk_node::iroh_key(&provider).unwrap();
+    let log: Value = serde_json::from_slice(&provider.get(&[b"node/log/".as_slice(), &gid.0].concat()).unwrap().unwrap()).unwrap();
+    let head = serde_json::from_value(log["chain"]["head"].clone()).unwrap();
+    let ciphertext = |p: &u64| Bytes(provider.get(&[b"node/ciphertext/".as_slice(), &gid.0, b"/", &p.to_be_bytes()].concat()).unwrap().unwrap());
+    (key, head, positions.iter().map(ciphertext).collect())
+}
+
+/// A peer speaking the peer protocol by hand, on a connection it opens to a node.
+struct Hand {
+    _endpoint: iroh::Endpoint,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+}
+
+async fn hand<P: Provider + Send + 'static>(relay: &Relay, key: iroh::SecretKey, to: &Node<P>) -> Hand {
+    let relays = iroh::RelayMap::from(iroh::RelayConfig::new(relay.url.clone(), Some(Default::default())));
+    let endpoint = lmk_net::builder(relays).secret_key(key).ca_tls_config(CaTlsConfig::custom_roots([relay.cert.clone()])).bind().await.unwrap();
+    let (id, relay) = to.address();
+    let addr = iroh::EndpointAddr::new(iroh::EndpointId::from_bytes(&id).unwrap()).with_relay_url(relay);
+    let conn = endpoint.connect(addr, ALPN).await.unwrap();
+    let (mut send, recv) = conn.open_bi().await.unwrap();
+    frame::write(&mut send, &frame::Open { stream: frame::Stream::Peer }).await.unwrap();
+    Hand { _endpoint: endpoint, send, recv }
+}
+
+impl Hand {
+    async fn send(&mut self, frame: &Frame) {
+        frame::write(&mut self.send, frame).await.unwrap();
+    }
+
+    /// Reads frames until one `pick` takes.
+    async fn until<T>(&mut self, mut pick: impl FnMut(Frame) -> Option<T>) -> T {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if let Some(found) = pick(frame::read_known(&mut self.recv).await.unwrap()) {
+                    return found;
+                }
+            }
+        })
+        .await
+        .expect("the frame came")
+    }
+
+    /// The positions the node asks for next.
+    async fn wanted(&mut self) -> Ranges {
+        self.until(|f| match f {
+            Frame::Want { positions, .. } => Some(positions),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Asks the node for a position and waits for its answer: it has handled every frame sent before. Returns what it
+    /// gave.
+    async fn settle(&mut self, gid: &Bytes) -> Vec<Item> {
+        self.send(&Frame::Want { group: gid.clone(), positions: Ranges::range(1, 1) }).await;
+        self.until(|f| match f {
+            Frame::Messages { items, answers: Some(_), .. } => Some(items),
+            _ => None,
+        })
+        .await
+    }
+}
+
+/// A `hello` showing a group's log at `head`, with `held` held.
+fn summary(gid: &Bytes, head: &Head, held: Ranges) -> Frame {
+    let summary = Summary { group: gid.clone(), head: head.clone(), held: held.clone(), read: held, fetching: Ranges::default() };
+    Frame::Hello { groups: vec![summary], heads: vec![] }
+}
+
+fn one(position: u64) -> Ranges {
+    Ranges::range(position, position)
+}
+
+/// The answer to a `want` of `asked`, carrying a ciphertext at a position, or none.
+fn answer(gid: &Bytes, asked: u64, item: Option<(u64, &Bytes)>) -> Frame {
+    let items = item.map(|(position, ciphertext)| Item { position, ciphertext: ciphertext.clone() }).into_iter().collect();
+    Frame::Messages { group: gid.clone(), items, answers: Some(one(asked)) }
+}
+
+/// Each peer's latest summary of a group is saved over the last, survives a restart, shows what it held and read, and
+/// goes when its Remove applies; `synced` fires on a `hello` at this session's head; `only_here` and Away follow.
+#[tokio::test(flavor = "multi_thread")]
+async fn summaries_are_kept_shown_and_dropped_with_their_member() {
+    let relay = relay().await;
+    let dir = folder("summaries");
+    std::fs::create_dir_all(&dir).unwrap();
+    let alice_db = dir.join("alice.db");
+    let mut alice = stored(&relay, "Alice", &alice_db).await;
+    let bob = session(&relay, "Bob").await;
+    let carol = session(&relay, "Carol").await;
+    let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    let p = alice.node.send(&gid.0, &message("hello")).await.unwrap().position.unwrap();
+    eventually("both hold Alice's message", || !alice.node.only_here(&gid.0).unwrap().contains(p)).await;
+    bob.node.mark_read(&gid.0, &one(p)).unwrap();
+    eventually("Bob's summary shows it read", || {
+        alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.name == "Bob" && h.held.contains(p) && h.read.contains(p))
+    })
+    .await;
+    alice.until(|e| matches!(e, Event::Synced { member, .. } if member.name == "Bob").then_some(())).await;
+    assert!(alice.node.away(&gid.0).unwrap().is_empty());
+
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+    let alice = stored(&relay, "Alice", &alice_db).await;
+    let mut names: Vec<String> = alice.node.heard(&gid.0).unwrap().into_iter().map(|h| h.member.name).collect();
+    names.sort();
+    assert_eq!(names, ["Bob", "Carol"], "saved across the restart");
+    alice.node.remove(&gid.0, &carol.node.key().0).await.unwrap();
+    assert!(alice.node.heard(&gid.0).unwrap().iter().all(|h| h.member.name != "Carol"), "gone with its member");
+    bob.node.shutdown().await.unwrap();
+    let q = alice.node.send(&gid.0, &message("alone")).await.unwrap().position.unwrap();
+    let only_here = alice.node.only_here(&gid.0).unwrap();
+    assert!(only_here.contains(q) && !only_here.contains(p), "Bob's saved summary holds the first, not the second");
+    alice.node.shutdown().await.unwrap();
+}
+
+/// A missing position holds up the later ones of its epoch while it is being fetched; once no summary shows it, they open
+/// past it; it opens still if it comes while its epoch's keys are kept; and one still missing as a commit deletes them is
+/// lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_holds_up_its_epoch_while_fetched_then_is_passed_and_opens_late_or_is_lost() {
+    let relay = relay().await;
+    let dir = folder("gap");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (sam_db, bob_db) = (dir.join("sam.db"), dir.join("bob.db"));
+    let sam = stored(&relay, "Sam", &sam_db).await;
+    let bob = stored(&relay, "Bob", &bob_db).await;
+    let gid = sam.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    bob.node.join(&sam.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    eventually("Bob is in", || sam.node.members(&gid.0).unwrap().len() == 2).await;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+    let mut sent = Vec::new();
+    for text in ["one", "two", "three"] {
+        sent.push(sam.node.send(&gid.0, &message(text)).await.unwrap());
+    }
+    let epoch = sam.node.epoch(&gid.0).unwrap();
+    sam.node.shutdown().await.unwrap();
+    drop(sam);
+    let p: Vec<u64> = sent.iter().map(|s| s.position.unwrap()).collect();
+    let (key, head, ciphertexts) = holdings(&sam_db, &gid, &p);
+
+    // Bob comes back. Sam, by hand, holds the first two: Bob asks for them, and gets the second only.
+    let mut bob = stored(&relay, "Bob", &bob_db).await;
+    let mut sam = hand(&relay, key, &bob.node).await;
+    let held = Ranges::range(1, head.length).difference(&one(p[2]));
+    sam.send(&summary(&gid, &head, held.clone())).await;
+    assert_eq!(sam.wanted().await, Ranges::range(p[0], p[1]));
+    sam.send(&answer(&gid, p[1], Some((p[1], &ciphertexts[1])))).await;
+    // The first is being fetched still: the second waits for it.
+    assert_eq!(sam.wanted().await, one(p[0]));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(bob.node.messages(&gid.0).unwrap().is_empty(), "the second waits while the first is fetched");
+    // Sam has not got the first after all: no summary shows it, and the second opens past it.
+    sam.send(&answer(&gid, p[0], None)).await;
+    let got = bob.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    }).await;
+    assert_eq!(got.id, sent[1].id);
+    // Sam's next summary shows it again: it opens late.
+    sam.send(&summary(&gid, &head, held)).await;
+    assert_eq!(sam.wanted().await, one(p[0]));
+    sam.send(&answer(&gid, p[0], Some((p[0], &ciphertexts[0])))).await;
+    let got = bob.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    }).await;
+    assert_eq!((got.id, got.position), (sent[0].id.clone(), p[0]));
+
+    // No member holds the third: once its epoch's keys go, it is lost.
+    eventually("Bob updated his leaf as he started", || bob.node.epoch(&gid.0).unwrap() == epoch + 1).await;
+    bob.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
+    assert!(bob.node.lost(&gid.0, &sent[2].id.0));
+    assert!(!bob.node.lost(&gid.0, &sent[0].id.0));
+    bob.node.shutdown().await.unwrap();
+}
+
+/// The line S–Q–R (G3): R, which reaches only Q, waits before the commit that deletes the keys of a message it lacks
+/// while Q fetches the message from S, then gets it from Q. Behind its log's head, Q takes no `state`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_waits_while_the_member_between_it_and_the_holder_fetches() {
+    let relay = relay().await;
+    let dir = folder("line");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dbs = ["sam", "quinn", "rita"].map(|name| dir.join(format!("{name}.db")));
+    let sam = stored(&relay, "Sam", &dbs[0]).await;
+    let gid = sam.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    let links = [sam.node.invite(&gid.0, None, None).await.unwrap(), sam.node.invite(&gid.0, None, None).await.unwrap()];
+    for ((name, db), link) in [("Quinn", &dbs[1]), ("Rita", &dbs[2])].into_iter().zip(links) {
+        let joiner = stored(&relay, name, db).await;
+        joiner.node.join(&link, None).await.unwrap();
+        eventually("the joiner has its Add", || joiner.node.members(&gid.0).unwrap().iter().any(|m| m.name == name)).await;
+        joiner.node.shutdown().await.unwrap();
+    }
+    let sent = sam.node.send(&gid.0, &message("p")).await.unwrap();
+    let epoch = sam.node.epoch(&gid.0).unwrap();
+    for name in ["One", "Two"] {
+        sam.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
+    }
+    sam.node.shutdown().await.unwrap();
+    drop(sam);
+    let p = sent.position.unwrap();
+    let (key, head, ciphertexts) = holdings(&dbs[0], &gid, &[p]);
+
+    // Q comes back, reads to the second rename, which deletes p's keys, and fetches p from S.
+    let quinn = stored(&relay, "Quinn", &dbs[1]).await;
+    let mut sam = hand(&relay, key, &quinn.node).await;
+    sam.send(&summary(&gid, &head, Ranges::range(1, head.length))).await;
+    assert_eq!(sam.wanted().await, one(p));
+    let file = lmk_proto::links::FileLink { hash: [7; 32], size: 1, key: [0; 32] };
+    sam.send(&Frame::State { group: gid.clone(), link: Some(file.link()) }).await;
+    sam.settle(&gid).await;
+    assert!(!quinn.node.linked(&gid.0).contains(&file), "no state while behind");
+
+    // R comes back too, reaching only Q, whose summary shows p fetching: R waits.
+    let mut rita = stored(&relay, "Rita", &dbs[2]).await;
+    eventually("R reached the second rename", || rita.node.epoch(&gid.0).unwrap() == epoch + 1).await;
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        sam.send(&summary(&gid, &head, Ranges::range(1, head.length))).await;
+    }
+    assert_eq!(rita.node.epoch(&gid.0).unwrap(), epoch + 1, "R waits past the 3 seconds after it came online");
+    sam.send(&answer(&gid, p, Some((p, &ciphertexts[0])))).await;
+    let got = rita.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    }).await;
+    assert_eq!((got.id, got.position), (sent.id.clone(), p));
+    eventually("R applied the second rename", || rita.node.epoch(&gid.0).unwrap() >= epoch + 2).await;
+    assert!(!rita.node.lost(&gid.0, &sent.id.0));
+    sam.send(&Frame::State { group: gid.clone(), link: Some(file.link()) }).await;
+    eventually("at its head, Q takes a state", || quinn.node.linked(&gid.0).contains(&file)).await;
+    quinn.node.shutdown().await.unwrap();
+    rita.node.shutdown().await.unwrap();
+}
+
+/// Every row of every table in a session's database.
+fn dump(db: &Path) -> Vec<String> {
+    let db = rusqlite::Connection::open(db).unwrap();
+    let mut tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").unwrap();
+    let tables: Vec<String> = tables.query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+    let mut rows = Vec::new();
+    for table in tables {
+        let mut select = db.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+        let columns = select.column_count();
+        let mut query = select.query([]).unwrap();
+        while let Some(row) = query.next().unwrap() {
+            let values: Vec<rusqlite::types::Value> = (0..columns).map(|i| row.get(i).unwrap()).collect();
+            rows.push(format!("{table} {values:?}"));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// What a peer the gate does not admit sends changes nothing: a forged ciphertext, entries under a head the service did
+/// not sign, a `state`, live payloads; and its `want` gets nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_not_admitted_changes_nothing() {
+    let relay = relay().await;
+    let dir = folder("forged");
+    let (membership, _service) = signing_service(&relay, &dir).await;
+    let alice_db = dir.join("alice.db");
+    let mut alice = stored(&relay, "Alice", &alice_db).await;
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    let sent = bob.node.send(&gid.0, &message("real")).await.unwrap();
+    alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
+    bob.node.shutdown().await.unwrap();
+    eventually("Bob is gone", || alice.node.online(&gid.0).unwrap().is_empty()).await;
+    let before = dump(&alice_db);
+
+    let mut mallory = hand(&relay, iroh::SecretKey::from_bytes(&lmk_core::random()), &alice.node).await;
+    let p = sent.position.unwrap();
+    let real = Bytes(rusqlite::Connection::open(&alice_db).unwrap().query_row(
+        "SELECT value FROM lmk WHERE key = ?",
+        [[b"node/ciphertext/".as_slice(), &gid.0, b"/", &p.to_be_bytes()].concat()],
+        |row| row.get(0),
+    ).unwrap());
+    let forged = |n: u8| {
+        let mut forged = real.clone();
+        *forged.0.last_mut().unwrap() ^= n;
+        forged
+    };
+    let items = vec![Item { position: p, ciphertext: forged(1) }, Item { position: p + 1, ciphertext: forged(2) }];
+    mallory.send(&Frame::Messages { group: gid.clone(), items, answers: None }).await;
+    let head = Head { log: gid.clone(), length: p + 1, hash: Bytes(vec![9; 32]), time: lmk_node::now(), sig: Bytes(vec![0; 64]) };
+    mallory.send(&Frame::Entries { log: gid.clone(), entries: vec![Bytes(b"junk".to_vec())], head }).await;
+    let file = lmk_proto::links::FileLink { hash: [7; 32], size: 1, key: [0; 32] };
+    mallory.send(&Frame::State { group: gid.clone(), link: Some(file.link()) }).await;
+    mallory.send(&Frame::Live { group: gid.clone(), items: vec![forged(3)] }).await;
+    assert!(mallory.settle(&gid).await.is_empty(), "a want the gate does not take gets nothing");
+    assert_eq!(dump(&alice_db), before);
+    assert!(!alice.node.linked(&gid.0).contains(&file));
+    while let Ok(event) = alice.events.try_recv() {
+        assert!(!matches!(event, Event::Message(_) | Event::Live { .. } | Event::State { .. }), "{event:?}");
+    }
+    alice.node.shutdown().await.unwrap();
+}
+
+/// A joiner whose `admitted` was lost asks again with the KeyPackage it kept: the member answers with the Welcome its log
+/// holds, and adds it no second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joiner_whose_answer_was_lost_is_admitted_by_the_logged_welcome() {
+    let relay = relay().await;
+    let dir = folder("lost-answer");
+    let mut alice = session(&relay, "Alice").await;
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(KIND, &dir), None).unwrap();
+    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let (node, first) = (bob.node.clone(), link.clone());
+    let joining = tokio::spawn(async move { node.join(&first, None).await });
+    // The Add is in: its answer waits for the kind's state, and the joiner stops waiting for it.
+    let reply = alice.until(|e| match e {
+        Event::Snapshot { reply, .. } => Some(reply),
+        _ => None,
+    }).await;
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    joining.abort();
+    assert!(joining.await.is_err());
+    drop(reply);
+
+    let node = bob.node.clone();
+    let again = tokio::spawn(async move { node.join(&link, None).await });
+    alice.snapshot(Some(b"state")).await;
+    let (joined, _) = again.await.unwrap().unwrap();
+    assert_eq!(joined, gid);
+    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch, "no second Add");
+    assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
 }

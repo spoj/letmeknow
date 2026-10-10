@@ -79,7 +79,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let (commit, next) = {
             let mut st = self.lock();
             let Some(g) = st.groups.get(gid) else { return Ok(()) };
-            if !g.mls.active() || g.rec.position < st.log(gid)?.logged || g.wait.is_some() {
+            if !g.mls.active() || g.rec.position < st.log(gid)?.logged || g.waiting {
                 return Ok(());
             }
             if g.rec.leaving && g.mls.members().len() == 1 {
@@ -133,7 +133,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 told.extend(positions);
             }
         }
-        let positions: Vec<u64> = g.rec.lost.difference(&told).copied().collect();
+        let positions: Vec<u64> = g.rec.lost.iter().filter(|position| !told.contains(position)).collect();
         if !positions.is_empty() {
             self.start_send(st, gid, &serde_json::to_value(Control::Lost { positions })?)?;
         }

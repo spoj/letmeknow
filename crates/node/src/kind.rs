@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::reading::{Judged, Pos};
-use crate::{Entry, Event, Inner, Item, Lost, Member, Message, Node, Out, SNAPSHOT_WAIT, STATE_ASK, State, get, message_key, now, put};
+use crate::{Entry, Event, Inner, Item, Lost, Member, Message, Node, SNAPSHOT_WAIT, STATE_ASK, State, get, message_key, now, put};
 
 /// What a group's kind took of its held messages, once it follows them.
 #[derive(Default, Serialize, Deserialize)]
@@ -221,19 +221,16 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Asks a member online, `peer` or else any, for the kind's state, unless this session asked or was handed one in
     /// the last minute.
     pub(crate) fn ask_state(&self, st: &mut State<P>, gid: &[u8], peer: Option<EndpointId>) {
-        let Some(net) = self.net.get() else { return };
-        let me = net.id();
-        let connected = net.connected();
-        let Ok(g) = st.group_mut(gid) else { return };
-        if g.asked + STATE_ASK > now() {
+        if !st.at_head(gid) || st.group(gid).is_ok_and(|g| g.asked + STATE_ASK > now()) {
             return;
         }
-        let members = g.mls.members().into_iter().filter_map(|m| crate::endpoint_id(&m.leaf?.key.0));
-        let online = members.filter(|key| *key != me && connected.contains(key)).find(|key| peer.is_none_or(|peer| peer == *key));
-        if let Some(peer) = online {
+        let group = Bytes(gid.to_vec());
+        let mut connected = st.served.iter().filter(|(_, served)| served.contains(&group)).map(|(key, _)| *key);
+        let Some(peer) = connected.find(|key| peer.is_none_or(|peer| peer == *key)) else { return };
+        if let Ok(g) = st.group_mut(gid) {
             g.asked = now();
-            st.out.push(Out::Frame { peer, frame: Frame::State { group: Bytes(gid.to_vec()), link: None } });
         }
+        st.emit(gid, peer, Frame::State { group, link: None });
     }
 
     /// Hands a member that asked for it the kind's state, if the kind gives one.
@@ -244,7 +241,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.spawn(async move {
             let Some(data) = timeout(SNAPSHOT_WAIT, state).await.ok().and_then(Result::ok).flatten() else { return };
             match inner.state_file(&gid, data).await {
-                Ok(link) => inner.lock().out.push(Out::Frame { peer: by, frame: Frame::State { group: Bytes(gid), link: Some(link) } }),
+                Ok(link) => inner.lock().emit(&gid, by, Frame::State { group: Bytes(gid.clone()), link: Some(link) }),
                 Err(error) => inner.warn(Some(&gid), format!("handing a member the group's state: {error:#}")),
             }
         });

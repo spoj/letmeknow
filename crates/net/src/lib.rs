@@ -1,12 +1,12 @@
-//! Everything a session says to its peers over iroh: one `letmeknow/2` connection per pair of
-//! sessions, its `peer` stream, and files over iroh-blobs. MLS stays outside, behind
-//! [`Groups`]: this crate moves ciphertexts and holds no keys. A simulator runs it over its own transport instead.
+//! Everything a session says to its peers over iroh: one `letmeknow/2` connection per pair of sessions, its `peer`
+//! stream of frames, an `admission` stream per joiner's request, and files over iroh-blobs. What the frames mean is the
+//! node's (see [`peers`]): this crate moves them, answers the files' `want_files`, and holds no keys. A simulator runs
+//! it over its own transport instead.
 
 mod files;
 mod peer;
 pub mod peers;
 mod seal;
-mod sync;
 
 use std::{
     collections::BTreeMap,
@@ -22,11 +22,10 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use lmk_proto::{
-    Answer, Bytes,
+    Answer,
     frame::{self, ALPN, Open, Stream},
-    head::Head,
     links::FileLink,
-    peer::{Admitted, Frame, Hello, Join},
+    peer::{Admitted, Frame, Join},
 };
 use lmk_transport::{Conn, IrohConnection, Iroh, RecvStream, SendStream, Transport};
 use n0_future::{boxed::BoxFuture, join_all, task::spawn, time::timeout};
@@ -43,41 +42,13 @@ use crate::{
 /// How long to wait for a peer's `have`.
 const ANSWER_WAIT: Duration = Duration::from_secs(5);
 
-/// What this crate needs from the group logic, which holds the MLS state, the logs and the
-/// messages. Calls are quick and local.
+/// What this crate needs from the group logic to serve files. Calls are quick and local.
 pub trait Groups: Send + Sync + 'static {
     /// The groups this session is in.
     fn groups(&self) -> Vec<Vec<u8>>;
     /// Whether this session serves `peer` the group: it is in a leaf and, speaking as an identity, its device is on the
     /// identity's list.
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool;
-    /// The protocol revision `peer`'s leaf in the group names; 0 if it names none.
-    fn revision(&self, group: &[u8], peer: &EndpointId) -> u32;
-    /// This session's state of the group, as `hello` carries it.
-    fn hello(&self, group: &[u8]) -> Hello;
-    /// The logs this session follows for a group: the group's own, whose id is the group's, and others, such as its
-    /// kind's.
-    fn logs(&self, group: &[u8]) -> Vec<Vec<u8>>;
-    /// The newest signed head this session holds of a log it follows.
-    fn head(&self, log: &[u8]) -> Head;
-    /// Whether the log's membership service signed `head`; a folder's heads are unsigned.
-    fn verify_head(&self, log: &[u8], head: &Head) -> bool;
-    /// This session's chain hash of a log after `position` entries, if it knows it.
-    fn chain(&self, log: &[u8], position: u64) -> Option<[u8; 32]>;
-    /// This session's entries of a log after `position`, if it holds them.
-    fn entries(&self, log: &[u8], after: u64) -> Vec<Bytes>;
-    /// Takes entries that directly follow this session's copy of a log and end at `head`, already checked against its
-    /// chain.
-    fn apply(&self, log: &[u8], entries: Vec<Bytes>, head: Head) -> Result<()>;
-    /// (epoch, message id) of every message held, from epoch `from`, in log order.
-    fn items(&self, group: &[u8], from: u64) -> Vec<(u64, [u8; 32])>;
-    /// A held message's MLS ciphertext.
-    fn message(&self, group: &[u8], epoch: u64, id: &[u8; 32]) -> Option<Vec<u8>>;
-    /// An MLS ciphertext from a peer: held if it fills a counted position, or a live payload.
-    fn receive(&self, group: &[u8], ciphertext: &[u8]);
-    /// A link to the state of the group's kind, which `peer`, a member, hands this session; without one, `peer` asks
-    /// for the kind's state.
-    fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>);
     /// The files the group links now.
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
 }
@@ -120,14 +91,11 @@ pub trait Admit: Send + Sync + 'static {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// A `peer` stream with the peer started, replacing any other.
     Connected(EndpointId),
     Disconnected(EndpointId),
-    /// Two incompatible signed heads of a log: its membership service showed members different logs.
-    Contradiction { log: Vec<u8>, peer: EndpointId, ours: Head, theirs: Head },
-    /// This session and `peer` hold the same log of the group: a time to compare the state of its kind.
-    InStep { group: Vec<u8>, peer: EndpointId },
-    /// Message sync with `peer` finished.
-    Synced { group: Vec<u8>, peer: EndpointId },
+    /// A frame on the peer's stream, but files' `want_files` and `have`, which this crate answers.
+    Frame(EndpointId, Frame),
     /// A file is now held whole.
     Fetched([u8; 32]),
 }
@@ -140,8 +108,6 @@ pub struct Config {
     pub disk: Option<Arc<dyn Disk>>,
     /// The largest file fetched without being asked.
     pub file_limit: u64,
-    /// How often two connected sessions swap heads and sync their groups again.
-    pub resync: Duration,
     /// How often the files no group links any longer are deleted.
     pub collect: Duration,
 }
@@ -229,38 +195,34 @@ impl Net {
         self.inner.links.lock().unwrap().keys().copied().collect()
     }
 
-    /// Sends a new MLS message to the members online; returns whom it went to.
-    pub fn send(&self, group: &[u8], ciphertext: Vec<u8>) -> Vec<EndpointId> {
-        let frame = Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)] };
-        self.inner.members(group).into_iter().filter(|(_, input)| input.send(Input::Send(frame.clone())).is_ok()).map(|(peer, _)| peer).collect()
-    }
-
-    /// Sends a frame to one member online, if it is connected.
+    /// Sends a frame to a peer, if it is connected.
     pub fn frame(&self, peer: EndpointId, frame: Frame) -> bool {
-        let input = self.inner.links.lock().unwrap().get(&peer).map(|link| link.input.clone());
-        input.is_some_and(|input| input.send(Input::Send(frame)).is_ok())
+        self.inner.input(&peer).is_some_and(|input| input.send(Input::Send(frame)).is_ok())
     }
 
-    /// Tells the peer stream with `peer` that this session serves it a group again: it syncs the group anew.
-    pub fn served(&self, peer: EndpointId, group: &[u8]) {
-        if let Some(link) = self.inner.links.lock().unwrap().get(&peer) {
-            link.input.send(Input::Served(group.into())).ok();
-        }
+    /// Asks a peer for the files the group links that this session lacks, within its limit, and fetches those it has.
+    pub fn want_files(&self, peer: EndpointId, group: &[u8]) {
+        let (inner, group) = (self.inner.clone(), group.to_vec());
+        spawn(async move {
+            let mut files = Vec::new();
+            for link in inner.groups.files(&group) {
+                if link.size <= inner.config.file_limit && !inner.files.has(&link.hash).await.unwrap_or(true) {
+                    files.push(link.hash);
+                }
+            }
+            if let (false, Some(input)) = (files.is_empty(), inner.input(&peer)) {
+                input.send(Input::Want { group: lmk_proto::Bytes(group), files, reply: None }).ok();
+            }
+        });
     }
 
-    /// Tells peers this session's state of a group changed (a log grew, a member added): each
-    /// gets a new `hello`, and the entries it lacks.
-    pub fn changed(&self, group: &[u8]) {
-        self.inner.changed(group);
-    }
-
-    /// Asks a member to admit this session.
+    /// Asks a member to admit this session, on an `admission` stream of its own.
     pub async fn join(&self, peer: EndpointId, relay: RelayUrl, join: Join) -> Result<Answer<Admitted>> {
-        self.inner.connection(peer, relay).await?;
-        let (reply, answer) = oneshot::channel();
-        let input = self.inner.links.lock().unwrap().get(&peer).map(|link| link.input.clone()).context("not connected")?;
-        input.send(Input::Join { join, reply })?;
-        Ok(answer.await?)
+        let conn = self.inner.connection(peer, relay).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        frame::write(&mut send, &Open { stream: Stream::Admission }).await?;
+        frame::write(&mut send, &join).await?;
+        frame::read(&mut recv).await
     }
 
     /// Seals a file under a new key and holds it.
@@ -349,6 +311,10 @@ impl Inner {
         links.get(key).map(|link| link.conn.clone()).filter(|conn| !conn.closed())
     }
 
+    fn input(&self, peer: &EndpointId) -> Option<mpsc::UnboundedSender<Input>> {
+        self.links.lock().unwrap().get(peer).map(|link| link.input.clone())
+    }
+
     async fn accept(self: Arc<Self>, conn: Conn) {
         if let Some((input, rx)) = self.register(&conn, false) {
             self.serve(conn, false, input, rx).await;
@@ -367,9 +333,7 @@ impl Inner {
                 return None;
             }
             Some(old) => old.conn.close(b"duplicate"),
-            None => {
-                self.events.send(Event::Connected(peer)).ok();
-            }
+            None => {}
         }
         let (input, rx) = mpsc::unbounded_channel();
         links.insert(peer, Link { conn: conn.clone(), dialer, input: input.clone() });
@@ -392,32 +356,44 @@ impl Inner {
         if dialed {
             match open_peer(&conn).await {
                 Ok((send, recv)) => {
-                    spawn(peer::run(self.clone(), conn.clone(), true, send, recv, input.clone(), rx.take().unwrap()));
+                    spawn(peer::run(self.clone(), conn.clone(), send, recv, input.clone(), rx.take().unwrap()));
                 }
                 Err(e) => tracing::debug!("no peer stream to {}: {e:#}", peer.fmt_short()),
             }
         }
         while let Ok((send, mut recv)) = conn.accept_bi().await {
             let Ok(open) = frame::read::<Open, _>(&mut recv).await else { continue };
-            if open.stream == Stream::Peer
-                && let Some(rx) = rx.take()
-            {
-                spawn(peer::run(self.clone(), conn.clone(), false, send, recv, input.clone(), rx));
+            match open.stream {
+                Stream::Peer => {
+                    if let Some(rx) = rx.take() {
+                        spawn(peer::run(self.clone(), conn.clone(), send, recv, input.clone(), rx));
+                    }
+                }
+                Stream::Admission => {
+                    spawn(self.clone().admit(peer, send, recv));
+                }
+                Stream::Membership => {}
             }
         }
         self.unregister(&conn);
+    }
+
+    /// Answers a joiner's request to be admitted.
+    async fn admit(self: Arc<Self>, peer: EndpointId, mut send: SendStream, mut recv: RecvStream) {
+        let answered = async {
+            let join: Join = frame::read(&mut recv).await?;
+            let answer = self.admit.join(peer, join).await;
+            frame::write(&mut send, &answer).await
+        };
+        if let Err(e) = answered.await {
+            tracing::debug!("admitting {}: {e:#}", peer.fmt_short());
+        }
     }
 
     /// The peers online that are members of a group, by this session's view.
     fn members(&self, group: &[u8]) -> Vec<(EndpointId, mpsc::UnboundedSender<Input>)> {
         let links: Vec<_> = self.links.lock().unwrap().iter().map(|(peer, link)| (*peer, link.input.clone())).collect();
         links.into_iter().filter(|(peer, _)| self.groups.is_member(group, peer)).collect()
-    }
-
-    fn changed(&self, group: &[u8]) {
-        for link in self.links.lock().unwrap().values() {
-            link.input.send(Input::Changed(group.into())).ok();
-        }
     }
 
     fn offer(self: &Arc<Self>, link: &FileLink, holder: EndpointId) {
