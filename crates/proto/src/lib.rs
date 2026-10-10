@@ -8,7 +8,9 @@ pub mod identity;
 pub mod links;
 pub mod membership;
 pub mod peer;
+pub mod peer2;
 pub mod random;
+pub mod ranges;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
