@@ -253,8 +253,8 @@ async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_de
     devices_of_bob(&laptop, &tablet).await;
     let chat = alice.request(json!({ "cmd": "invite" })).await;
     tablet.request(json!({ "cmd": "join", "target": chat["link"] })).await;
-    let key = |m: &Member| m.client.device_state().unwrap().keys;
-    let before = key(&laptop);
+    let bob = laptop.client.device_state().unwrap().identities[0].0.clone();
+    let before = *laptop.client.node().read_key_log(&bob).await.unwrap().current();
 
     // The tablet leaves Bob: its session leaves the chat first, and the laptop, which removes it, replaces Bob's key.
     let left = tablet.request(json!({ "cmd": "identity", "op": { "leave": { "identity": "Bob" } } })).await;
@@ -263,7 +263,7 @@ async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_de
     polled(&alice, json!({ "cmd": "members", "group": chat["group"] }), |m| m["members"].as_array().unwrap().len() == 1).await;
     polled(&laptop, json!({ "cmd": "identity", "op": "list" }), |listed| listed["identities"][0]["devices"].as_array().unwrap().len() == 1).await;
     tokio::time::timeout(WAIT, async {
-        while key(&laptop) == before {
+        while *laptop.client.node().read_key_log(&bob).await.unwrap().current() == before {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     })

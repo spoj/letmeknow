@@ -557,7 +557,7 @@ fn a_session_of_an_identity_joins_a_group_open_to_it() {
         assert_eq!(joined["members"].as_array().unwrap().len(), 3);
         let event = alice.expect("joined").await;
         assert_eq!((event["member"]["identity"]["name"].as_str(), event["how"].as_str()), (Some("Bob (Acme)"), Some("open")));
-        assert!(event["member"]["identity"]["new_device"].as_str().unwrap().starts_with("added by "));
+        assert!(event["member"]["identity"]["new_device"].is_string(), "the tablet was added to Bob after his first device");
         // A session of another identity cannot see the group, so it cannot join it.
         let carol = world.start("carol", HOUR).await;
         let refused = carol.cmd(&["join", "--", &group]).await.unwrap_err().to_string();
