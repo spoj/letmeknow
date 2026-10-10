@@ -1,6 +1,23 @@
 //! What the world observes of a run, as plain data the properties check: what its own actions did, what crossed the
 //! simulated wire, and what each member's node reported. Members are the world's indices; sessions are their MLS
 //! signature keys; times are milliseconds since the start; positions are a group log's.
+//!
+//! What the 0.13 node must provide for the pending properties (`props::pending`), each event sent once its step's
+//! transaction commits:
+//! - `Event::Read { group, position, entry (SHA-256), epoch, verdict }`, its own commits included; `Event::Joined
+//!   { group, start }`, at create too; `Event::Head { group, head }` on each head read from the service;
+//! - `Event::Opened { group, position, kind, sender, generation, plaintext (SHA-256) }`; `Event::Lost { group,
+//!   positions }`; `Event::Announced { group, position, positions }` when its own `lost` counts; `Event::Handed { group,
+//!   kind, position }` for kinds but chat; `Event::Live` with `epoch` and `generation`; `Event::State` with `from`;
+//!   `Event::Dropped { group, reason }`;
+//! - `Node::positions(group) -> { start, head, held, opened, lost }`, for the views at quiet periods; and
+//!   `lmk_node::saved(&provider, group) -> Saved`, read from storage alone as a member starts again, with storage
+//!   snapshots taking committed steps only;
+//! - `ClientEvent::Message { position, missing }`, `ClientEvent::Lost { group, member, positions }`, `ClientEvent::Sent
+//!   { group, id, position }`; `send` answering `{id, position}`, `{id, pending}` or `unavailable`, `rate`, `size`; and
+//!   `join` answering with the joiner's start;
+//! - on the wire, 0.13's `hello` (per group: head, held, fetching), `messages` and `want` with positions, `admitted`
+//!   with the start, and appends of several entries.
 
 use std::collections::BTreeSet;
 

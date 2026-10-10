@@ -7,9 +7,12 @@ use lmk_proto::Bytes;
 use super::{inside, quiets, short};
 use crate::trace::{Trace, What};
 
+/// A member's leaves at an epoch, by session and iroh key, and its settings there.
+type Seen<'a> = (usize, Vec<(&'a Bytes, &'a Bytes)>, &'a String);
+
 /// Members active at one epoch of a group see the same leaves (session and iroh keys) and settings.
 pub fn agreement(t: &Trace) -> Result<(), String> {
-    let mut seen: BTreeMap<(&Bytes, u64), (usize, Vec<(&Bytes, &Bytes)>, &String)> = BTreeMap::new();
+    let mut seen: BTreeMap<(&Bytes, u64), Seen> = BTreeMap::new();
     for o in &t.0 {
         let What::Roster { m, key, group, epoch, leaves, settings } = &o.what else { continue };
         if !leaves.iter().any(|leaf| leaf.key == *key) {
