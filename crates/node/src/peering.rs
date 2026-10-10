@@ -159,11 +159,12 @@ impl<P: Provider> State<P> {
     /// What of a frame goes to a peer as it is written, by the gate as it is then: a step may have removed the peer
     /// since another queued the frame.
     pub(crate) fn admissible(&mut self, peer: &EndpointId, frame: Frame) -> Option<Frame> {
+        if let Frame::Hello { groups, heads } = frame {
+            let groups = groups.into_iter().filter(|summary| self.admitted(&summary.group.0, peer)).collect();
+            return Some(Frame::Hello { groups, heads });
+        }
         let group = match &frame {
-            Frame::Hello { groups, heads } => {
-                let groups = groups.iter().filter(|summary| self.admitted(&summary.group.0, peer)).cloned().collect();
-                return Some(Frame::Hello { groups, heads: heads.clone() });
-            }
+            Frame::Hello { .. } => None,
             // Every `want` is answered, with nothing if the gate refuses it.
             Frame::Messages { items, .. } if items.is_empty() => None,
             Frame::Entries { log, .. } => Some(log).filter(|log| self.groups.contains_key(&log.0)),

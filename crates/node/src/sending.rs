@@ -146,7 +146,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let item = Item { position, ciphertext: send.ciphertext };
         st.broadcast(gid, Frame::Messages { group: Bytes(gid.to_vec()), items: vec![item], answers: None });
         let waiters = st.waiters.remove(&handle.0).unwrap_or_default();
-        st.out.push(Out::Outcome { waiters, outcome: Ok((position, send.id.clone())) });
+        st.out.push(Out::Outcome { waiters, outcome: Ok((position, send.id)) });
         if send.pending {
             self.events.send(Event::Sent { group: Bytes(gid.to_vec()), id: handle, position }).ok();
         }
