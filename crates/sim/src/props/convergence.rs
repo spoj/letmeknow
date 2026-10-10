@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lmk_proto::Bytes;
 
-use super::{inside, judged, quiets, removed, short};
+use super::{inside, judged, quiets, removed, short, through};
 use crate::trace::{Frame, Hash, Positions, Trace, Verdict, What};
 
 /// How long a member waits, without progress, before it applies a commit that deletes keys of positions it lacks.
@@ -62,7 +62,7 @@ pub fn loss_allowed(t: &Trace) -> Result<(), String> {
     }
     for (i, o) in t.0.iter().enumerate() {
         let What::Lost { m, group, positions } = &o.what else { continue };
-        let earlier = &t.0[..=i];
+        let earlier = through(t, i);
         for &p in positions {
             let Some(j) = judged.get(&(group, p)) else {
                 return Err(format!("m{m} lost position {p} of {}, which no member judged", short(group)));

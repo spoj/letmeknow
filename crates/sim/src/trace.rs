@@ -33,6 +33,8 @@ pub enum What {
     Down { m: usize },
     /// An action cut a member's paths: offline, a partition, a dropped connection, a lost answer.
     Disrupted { m: usize },
+    /// A member's paths are whole again: online, partitions healed.
+    Reconnected { m: usize },
     /// A device was put on its identity's list, or taken off it.
     Device { identity: Bytes, device: Bytes, listed: bool },
     /// A join was answered.
@@ -64,8 +66,8 @@ pub enum What {
     Roster { m: usize, key: Key, group: Bytes, epoch: u64, leaves: Vec<Leaf>, settings: String },
     /// The log's head, as the member last read it from the service.
     Head { m: usize, group: Bytes, head: u64 },
-    /// A member joined a group: its Add's position, where it starts.
-    Joined { m: usize, group: Bytes, start: u64 },
+    /// A member joined a group with a key: its Add's position, where it starts.
+    Joined { m: usize, key: Key, group: Bytes, start: u64 },
     /// A member judged a log position, in the epoch it was at: a commit it applied, an entry that counts, or one skipped.
     Read { m: usize, group: Bytes, position: u64, entry: Hash, epoch: u64, verdict: Verdict },
     /// A member opened a counted position, or counted one of its own: of the group's kind, or a core payload's type.

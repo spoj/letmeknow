@@ -22,7 +22,7 @@ impl<'a> Seen<'a> {
         match what {
             What::Roster { m, group, leaves, .. } => drop(self.leaves.insert((*m, group), leaves)),
             What::Head { m, group, head } => drop(self.heads.insert((*m, group), *head)),
-            What::Joined { m, group, start: position } | What::Read { m, group, position, .. } => drop(self.read.insert((*m, group), *position)),
+            What::Joined { m, group, start: position, .. } | What::Read { m, group, position, .. } => drop(self.read.insert((*m, group), *position)),
             _ => {}
         }
     }

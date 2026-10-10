@@ -3,15 +3,20 @@
 use super::{CONVERGE, judged, quiets, short};
 use crate::trace::{Answer, Trace, Verdict, What};
 
-/// A send answered with a position counts its id there; one answered pending is reported sent, at a position that
-/// counts its id, by the end of the next quiet period its sender is in the group for.
+/// A send answered with a position counts its id there; one answered pending is reported sent, by the id it was
+/// answered with, at a position that counts its message, sealed again if a commit came first, by the end of the next
+/// quiet period its sender is in the group for.
 pub fn send_settles(t: &Trace) -> Result<(), String> {
     let judged = judged(t);
     let counts = |group, position, id| judged.get(&(group, position)).is_none_or(|j| *j.verdict == Verdict::Counted { id: Clone::clone(id) });
+    let own = |m, group, position| t.0.iter().any(|o| matches!(&o.what, What::Opened { m: j, group: g, position: p, .. } if *j == m && g == group && *p == position));
     for o in &t.0 {
         match &o.what {
-            What::Send { m, group, id, answer: Answer::Position(p) } | What::Sent { m, group, id, position: p } if !counts(group, *p, id) => {
+            What::Send { m, group, id, answer: Answer::Position(p) } if !counts(group, *p, id) => {
                 return Err(format!("m{m}'s send of {} was answered at {p} of {}, which does not count it", short(id), short(group)));
+            }
+            What::Sent { m, group, id, position: p } if !matches!(judged.get(&(group, *p)).map(|j| j.verdict), Some(Verdict::Counted { .. })) || !own(*m, group, *p) => {
+                return Err(format!("m{m}'s pending send of {} was sent at {p} of {}, which does not count its message", short(id), short(group)));
             }
             What::Send { m, group, id, answer: Answer::Pending } => {
                 for (at, views) in quiets(t).filter(|(at, _)| *at >= o.at + CONVERGE) {
@@ -47,6 +52,8 @@ mod tests {
         let quiet = (CONVERGE + 10, What::Quiet { views: vec![view(0, 1, &[0, 1])] });
         assert!(send_settles(&trace(vec![send(Answer::Pending), quiet.clone()])).unwrap_err().contains("not sent"));
         let sent = (5, What::Sent { m: 0, group: g(), id: id(1), position: 3 });
-        assert!(send_settles(&trace(vec![send(Answer::Pending), (4, read(1, 3, 1, counted(1))), sent, quiet])).is_ok());
+        let own = (4, What::Opened { m: 0, group: g(), position: 3, kind: "chat".into(), sender: key(0), plaintext: [0; 32] });
+        assert!(send_settles(&trace(vec![send(Answer::Pending), (4, read(1, 3, 1, counted(2))), own, sent.clone(), quiet.clone()])).is_ok(), "sealed again");
+        assert!(send_settles(&trace(vec![send(Answer::Pending), (4, read(1, 3, 1, counted(2))), sent, quiet])).unwrap_err().contains("does not count its message"));
     }
 }

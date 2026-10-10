@@ -18,7 +18,7 @@ pub fn strict_entries(t: &Trace) -> Result<(), String> {
     let mut counted: BTreeSet<(usize, &Bytes, u64)> = BTreeSet::new();
     for o in &t.0 {
         match &o.what {
-            What::Joined { m, group, start } => drop(cursor.insert((*m, group), *start)),
+            What::Joined { m, group, start, .. } => drop(cursor.insert((*m, group), *start)),
             What::Read { m, group, position, entry, epoch, verdict } => {
                 let g = short(group);
                 match cursor.get(&(*m, group)) {
@@ -95,7 +95,7 @@ pub fn admission(t: &Trace) -> Result<(), String> {
         if ours != [*start] {
             return Err(format!("m{m} joined {} at {start}, its key added at {ours:?}", short(group)));
         }
-        let joined = t.0.iter().any(|j| matches!(&j.what, What::Joined { m: n, group: g, start: s } if n == m && g == group && s == start));
+        let joined = t.0.iter().any(|j| matches!(&j.what, What::Joined { m: n, group: g, start: s, .. } if n == m && g == group && s == start));
         if !joined {
             return Err(format!("m{m} was answered it joined {} at {start}, but never did", short(group)));
         }
@@ -109,7 +109,7 @@ mod tests {
     use crate::props::build::*;
 
     fn joined(m: usize, start: u64) -> What {
-        What::Joined { m, group: g(), start }
+        What::Joined { m, key: key(m), group: g(), start }
     }
 
     #[test]

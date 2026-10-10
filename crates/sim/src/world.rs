@@ -310,7 +310,10 @@ impl World {
                     self.disrupt(&[m]);
                     self.online(m, false);
                 }
-                Act::Online { m } => self.online(m, true),
+                Act::Online { m } => {
+                    self.online(m, true);
+                    self.reconnected(self.index(m));
+                }
                 Act::Restart { m } => {
                     let i = self.index(m);
                     self.crash(i).await;
@@ -322,7 +325,7 @@ impl World {
                     self.disrupt(&(0..self.size()).collect::<Vec<_>>());
                     self.partition(mask);
                 }
-                Act::Heal => self.partition(0),
+                Act::Heal => self.heal(),
                 Act::Drop { m, n } => {
                     self.disrupt(&[m, n]);
                     let (a, b) = (self.iroh(m), self.iroh(n));
@@ -420,6 +423,13 @@ impl World {
     fn clients(&self) -> Vec<(usize, Client<Store>)> {
         let members = self.members.lock().unwrap();
         members.iter().enumerate().filter_map(|(i, m)| Some((i, m.client.clone()?))).collect()
+    }
+
+    /// How many times a member started, if it runs: a session that stops answers nothing more.
+    fn starts(&self, m: usize) -> Option<u64> {
+        let members = self.members.lock().unwrap();
+        let member = &members[m % members.len()];
+        member.client.is_some().then_some(member.starts)
     }
 
     fn size(&self) -> usize {
@@ -590,6 +600,20 @@ impl World {
 
     fn online(&self, m: usize, online: bool) {
         self.net.set_online(self.iroh(m), online);
+    }
+
+    fn heal(&self) {
+        self.partition(0);
+        for m in 0..self.size() {
+            self.reconnected(m);
+        }
+    }
+
+    /// Records that a member's paths are whole, if it reaches the service now.
+    fn reconnected(&self, m: usize) {
+        if self.net.path(self.iroh(m), self.service) {
+            self.observe(What::Reconnected { m });
+        }
     }
 
     fn partition(&self, mask: u32) {
@@ -828,7 +852,9 @@ impl World {
                 let client = self.client(m)?;
                 let after = client.tips(&gid, |_| true)?;
                 let chat = Chat { text: format!("from m{m} at {}", elapsed()), to: Vec::new(), reply_to: None, urgent: false, attachment: None };
+                let starts = self.starts(m);
                 let sent = client.send(&gid, chat, after).await;
+                ensure!(self.starts(m) == starts, "m{m} stopped before it answered");
                 let (id, answer) = match &sent {
                     Ok((_, answer)) => {
                         let id = Bytes(hex::decode(answer["id"].as_str().context("no id")?)?);
@@ -902,7 +928,9 @@ impl World {
 
     /// `m` joins by a link or an opening, answered with the group, where it starts.
     async fn join(&self, m: usize, target: &str) -> Result<Value> {
+        let starts = self.starts(m);
         let joined = self.request(m, json!({ "cmd": "join", "target": target })).await?;
+        ensure!(self.starts(m) == starts, "m{m} stopped before it answered");
         let gid = Bytes(URL_SAFE_NO_PAD.decode(joined["group"].as_str().context("no group")?)?);
         let node = self.client(m)?.node().clone();
         let start = node.positions(&gid.0)?.start;
@@ -959,10 +987,10 @@ impl World {
         for task in running {
             task.await.ok();
         }
-        self.partition(0);
         for m in 0..self.size() {
             self.online(m, true);
         }
+        self.heal();
         sleep(Duration::from_millis(CONVERGE)).await;
         self.observe(What::Quiet { views: self.views() });
         self.connections();
@@ -1005,7 +1033,7 @@ fn observed(m: usize, observation: Observation) -> What {
             };
             What::Read { m, group, position, entry, epoch, verdict }
         }
-        Observation::Joined { group, start } => What::Joined { m, group, start },
+        Observation::Joined { group, key, start } => What::Joined { m, key, group, start },
         Observation::Head { group, head } => What::Head { m, group, head },
         Observation::Opened { group, position, kind, sender, plaintext } => What::Opened { m, group, position, kind, sender, plaintext },
         Observation::Lost { group, position } => What::Lost { m, group, positions: [position].into() },

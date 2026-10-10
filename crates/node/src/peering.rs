@@ -193,9 +193,12 @@ impl<P: Provider> State<P> {
         }
     }
 
-    /// Saves a peer's summary of a group, over the last.
+    /// Saves a peer's summary of a group, over the last, while the peer is in a leaf of its current epoch.
     fn hear(&mut self, heard: peers::Heard) -> Result<()> {
         let gid = heard.summary.group.0.clone();
+        if endpoint_id(&heard.peer.0).and_then(|peer| self.in_leaf(&gid, &peer)).is_none() {
+            return Ok(());
+        }
         let g = self.groups.get_mut(&gid).context("this session is not in that group")?;
         let new = g.heard.insert(heard.peer.clone(), heard.clone()).is_none();
         put(&self.provider, &heard_key(&gid, &heard.peer.0), &heard)?;

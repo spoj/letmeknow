@@ -22,6 +22,8 @@ pub const CONVERGE: u64 = 90_000;
 /// How long after a device is taken off every member holding its sessions' certificates has read the key log entry
 /// that names it: a copy of a key log is fresh for 10 minutes.
 pub const KEYS_READ: u64 = 11 * 60_000;
+/// The slow timer duties run on, besides at the log's head.
+pub const TIMER: u64 = 10 * 60_000;
 /// T, the leaf update period, by default, and the slow timer that may run a due update late.
 pub const UPDATE: u64 = 86_400_000 + 3_600_000;
 
@@ -94,10 +96,17 @@ pub(crate) fn inside(views: &[View]) -> Vec<&View> {
     views.iter().filter(|v| v.active() && latest[&v.group] == v.epoch).collect()
 }
 
-/// A member's session key in a group, as its last roster of it among these observations shows.
+/// The observations up to the `i`th and those at the same time after it: a loss is observed in the step that applies
+/// the commit causing it, before the commit's verdict.
+pub(crate) fn through(t: &Trace, i: usize) -> &[Obs] {
+    let end = t.0[i..].iter().take_while(|o| o.at == t.0[i].at).count();
+    &t.0[..i + end]
+}
+
+/// A member's session key in a group, as it last joined it or sampled its roster among these observations.
 pub(crate) fn key_of<'a>(obs: &'a [Obs], m: usize, group: &Bytes) -> Option<&'a Key> {
     obs.iter().rev().find_map(|o| match &o.what {
-        What::Roster { m: j, key, group: g, .. } if *j == m && g == group => Some(key),
+        What::Roster { m: j, key, group: g, .. } | What::Joined { m: j, key, group: g, .. } if *j == m && g == group => Some(key),
         _ => None,
     })
 }

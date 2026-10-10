@@ -112,8 +112,8 @@ pub type Observe = Arc<dyn Fn(Observation) + Send + Sync>;
 pub enum Observation {
     /// A position of the group's log judged, in the epoch current then; `entry` is SHA-256 of its bytes.
     Read { group: Bytes, position: u64, entry: [u8; 32], epoch: u64, verdict: Judgement },
-    /// This session is in the group from after `start`: its Add, or 0 for the group's creator.
-    Joined { group: Bytes, start: u64 },
+    /// This session is in the group with `key` from after `start`: its Add, or 0 for the group's creator.
+    Joined { group: Bytes, key: Bytes, start: u64 },
     /// The last position of the group's log held.
     Head { group: Bytes, head: u64 },
     /// A counted position opened, or one of this session's own: of the group's kind or a core payload's type, with
@@ -820,8 +820,9 @@ impl<P: Provider> State<P> {
     fn add_group(&mut self, mls: Group, mut rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
         (rec.updated, rec.shown) = (now(), rec.position);
-        let start = rec.start;
-        self.observe(|| Observation::Joined { group: Bytes(gid.clone()), start });
+        let own = mls.members().into_iter().find(|m| m.index == mls.own_index()).context("a member of its group")?;
+        let (key, start) = (Bytes(own.key), rec.start);
+        self.observe(|| Observation::Joined { group: Bytes(gid.clone()), key, start });
         self.add_log(&gid, logs::Log::new(logs::Of::Group, mls.settings().membership, rec.position))?;
         self.groups.insert(gid.clone(), G::new(mls, rec, BTreeMap::new()));
         self.save(&gid)?;
