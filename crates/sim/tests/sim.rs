@@ -27,6 +27,33 @@ fn a_seed_replays_exactly() {
     assert_eq!(replay(7, Options::default(), &actions).trace, replay(7, Options::default(), &actions).trace);
 }
 
+/// Lost answers, crashes as a member writes, members down and woken, and an attacker's entries replay exactly too.
+#[test]
+fn the_world_s_own_actions_replay_exactly() {
+    use lmk_sim::{Forgery, Output};
+    let invite = |m, group, n| Act::Invite { m, group, n, label: false, to: None, wait: 0, race: None };
+    let actions: Vec<Action> = [
+        (0, Act::CreateIdentity { m: 0 }),
+        (1_000, invite(0, None, 1)),
+        (2_000, Act::LoseAnswer { m: 0 }),
+        (2_100, Act::CrashAfter { m: 1, what: Output::Frame }),
+        (3_000, invite(0, Some(0), 2)),
+        (20_000, Act::Send { m: 1, group: 0 }),
+        (21_000, Act::Down { m: 2, ms: 3_600_000 }),
+        (22_000, Act::Forge { m: 0, group: 0, what: Forgery::Junk }),
+        (23_000, Act::Forge { m: 0, group: 0, what: Forgery::Replay }),
+        (60_000, Act::Wake { m: 2, ms: 5_000 }),
+        (70_000, Act::Quiesce),
+    ]
+    .into_iter()
+    .map(|(at, act)| Action { at, act })
+    .collect();
+    let options = Options { members: 3, actions: actions.len(), pending: false };
+    let first = replay(3, options, &actions);
+    assert!(first.failure.is_none(), "{}", first.log.join("\n"));
+    assert_eq!(first.trace, replay(3, options, &actions).trace);
+}
+
 /// A certificate of a member, shown by another peer after the Add that names it was applied, made a session serve it
 /// without a hello, so live messages to it waited for the 5-minute resync.
 #[test]
