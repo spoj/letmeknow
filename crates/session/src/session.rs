@@ -78,6 +78,7 @@ impl Remote for Published {
 pub struct Session {
     db: Connection,
     client: Client<SqliteProvider>,
+    plugins: Arc<Plugins>,
     /// What the client tells.
     told: mpsc::UnboundedReceiver<ClientEvent>,
     /// The device's node, when this process holds the device's lock.
@@ -146,11 +147,13 @@ impl Session {
         let device = Device::load(&home.join("device.json"))?;
         let client_config = lmk_client::Config { name: config.name.clone(), device, membership: config.membership.clone() };
         let access = Access::Elsewhere(Arc::new(Published(home.to_path_buf())));
-        let (client, told) = Client::new(node, client_config, access, Arc::new(plugins), lines);
+        let plugins = Arc::new(plugins);
+        let (client, told) = Client::new(node, client_config, access, plugins.clone(), lines);
         let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("device.lock"))?;
         let mut session = Self {
             db,
             client,
+            plugins,
             told,
             device: None,
             lock,
@@ -625,7 +628,7 @@ impl Session {
     }
 
     pub async fn shutdown(&self) {
-        // Plugins stop with the session: their stdin closes when it ends.
+        self.plugins.stop().await;
         let _ = self.client.node().shutdown().await;
         if let Some(device) = &self.device {
             let _ = device.shutdown().await;
