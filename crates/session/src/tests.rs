@@ -482,6 +482,29 @@ fn a_leave_is_pending_until_another_member_holds_it() {
     });
 }
 
+/// Bob is away while Alice sends, and two commits pass before he is back with no member online holding it: he loses
+/// it, and Alice is told, with what to do.
+#[test]
+fn a_sender_is_told_who_lost_its_message() {
+    local(async {
+        let world = world("lost").await;
+        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
+        bob.stop().await;
+        let sent = alice.cmd(&["send", "while you were out"]).await.unwrap();
+        alice.cmd(&["name", "Once"]).await.unwrap();
+        alice.cmd(&["name", "Twice"]).await.unwrap();
+        alice.stop().await;
+        let mut bob = world.start("bob", HOUR).await;
+        let own = bob.expect("lost").await;
+        assert!(own["member"]["you"] == true && own["positions"].as_array().unwrap().contains(&sent["position"]), "{own}");
+        assert!(own.get("text").is_none());
+        let mut alice = world.start("alice", HOUR).await;
+        let lost = alice.expect("lost").await;
+        assert!(lost["member"]["name"] == "Bob" && lost["ids"].as_array().unwrap().contains(&sent["id"]), "{lost}");
+        assert!(lost["text"].as_str().unwrap().contains("--reply-to"), "{lost}");
+    });
+}
+
 #[test]
 fn introductions_are_shown_until_accepted() {
     local(async {
