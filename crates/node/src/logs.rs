@@ -18,7 +18,10 @@ use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Dropped, Inner, Observation, REREAD, State, Work, get, hex, put};
+use lmk_core::identity::{KeyLog, Verdict};
+use lmk_proto::group::IdentityRef;
+
+use crate::{Dropped, Event, Inner, MEMBER_WAIT, Observation, REREAD, State, Work, get, hex, put};
 
 /// One membership client per service, sharing the session's transport.
 pub(crate) struct Clients {
@@ -144,7 +147,8 @@ impl<P: Provider> State<P> {
         match self.logs.get(id).map(|log| &log.of) {
             Some(Of::Group) => vec![id.to_vec()],
             Some(Of::Identity(identity)) => {
-                self.groups.keys().filter(|gid| self.identities(gid).iter().any(|i| i.id == *identity)).cloned().collect()
+                let of = |gid: &Vec<u8>| self.identities(gid).iter().any(|i| i.id == *identity) || self.devices_log(gid).is_some_and(|log| log.id[..] == identity.0[..]);
+                self.groups.keys().filter(|gid| of(gid)).cloned().collect()
             }
             None => Vec::new(),
         }
@@ -287,5 +291,94 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.clients.client(&log.service)?.set_chain(chain.clone());
         let fresh = entries[(after - start) as usize..].to_vec();
         self.store(st, id, after, fresh, Some(chain))
+    }
+}
+
+impl<P: Provider + Send + 'static> Inner<P> {
+    /// Reads the key logs of the identities in this session's groups that it holds none of, and once more for each
+    /// device a member's certificate names that its identity does not list. A log read is followed from then on.
+    pub(crate) async fn refresh_all(self: &Arc<Self>) {
+        let unread: Vec<IdentityRef> = {
+            let mut st = self.lock();
+            let st = &mut *st;
+            let mut unread = Vec::new();
+            for credential in st.groups.values().flat_map(|g| g.mls.members()).filter_map(|m| m.credential) {
+                let Some(certificate) = &credential.certificate else { continue };
+                let identity = &certificate.identity;
+                let read = match st.keys.get(&identity.id.0) {
+                    None => true,
+                    Some(log) => log.verify(&credential) == Verdict::Unverified && st.unlisted.insert((identity.id.0.clone(), certificate.device.0.clone())),
+                };
+                if read && !unread.contains(identity) {
+                    unread.push(identity.clone());
+                }
+            }
+            unread
+        };
+        for identity in unread {
+            if let Err(error) = timeout(MEMBER_WAIT, self.read_keys(&identity)).await.map_err(anyhow::Error::from).and_then(|r| r) {
+                tracing::debug!("the key log of {}: {error:#}", hex(&identity.id.0));
+            }
+        }
+    }
+
+    /// Reads an identity's key log from its service; a log not held yet is followed from then on.
+    pub(crate) async fn read_keys(self: &Arc<Self>, identity: &IdentityRef) -> Result<KeyLog> {
+        let address = lmk_proto::identity::address(&identity.id.0);
+        {
+            let mut st = self.lock();
+            if !st.logs.contains_key(&address[..]) {
+                let of = Of::Identity(identity.id.clone());
+                st.add_log(&address, Log::new(of, identity.membership.clone(), 0))?;
+                self.follow(&address);
+            }
+        }
+        self.read(&address).await?;
+        self.lock().keys.get(&identity.id.0).cloned().context("the key log has no valid first entry")
+    }
+
+    /// Replays an identity's key log, against which its members' certificates are checked.
+    pub(crate) fn keyed(&self, st: &mut State<P>, id: &[u8]) -> Result<()> {
+        let entries = st.entries(&lmk_proto::identity::address(id), 0);
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let log = KeyLog::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
+        st.keys.insert(id.to_vec(), log);
+        st.gate = true;
+        for gid in st.groups_of(&lmk_proto::identity::address(id)) {
+            self.work.send(Work::Duties(gid)).ok();
+        }
+        self.events.send(Event::Keys { identity: Bytes(id.to_vec()) }).ok();
+        Ok(())
+    }
+
+    /// Reports a log that its service showed differently, here and at `there`, unless it reported those two heads of it
+    /// already.
+    pub(crate) fn contradicted(&self, st: &State<P>, log: &[u8], contradiction: &Contradiction, there: &str) {
+        let Contradiction { ours, theirs } = contradiction;
+        let mut heads = [(ours.length, ours.hash.0.clone()), (theirs.length, theirs.hash.0.clone())];
+        heads.sort();
+        if !self.contradictions.lock().unwrap().insert((log.to_vec(), heads)) {
+            return;
+        }
+        let what = match st.logs.get(log).map(|l| &l.of) {
+            Some(Of::Identity(_)) => "a key log",
+            _ => "the group's log",
+        };
+        let text = format!(
+            "the membership service showed {there} another version of {what}: length {} with hash {} here, length {} with hash {} there",
+            ours.length,
+            hex(&ours.hash.0),
+            theirs.length,
+            hex(&theirs.hash.0)
+        );
+        let groups = st.groups_of(log);
+        if groups.is_empty() {
+            self.warn(None, text.clone());
+        }
+        for gid in groups {
+            self.warn(Some(&gid), text.clone());
+        }
     }
 }

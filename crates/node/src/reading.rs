@@ -30,7 +30,6 @@ pub(crate) struct Pos {
     pub at: u64,
     pub judged: Judged,
     /// A counted position this session can no longer open.
-    #[serde(default)]
     pub lost: bool,
 }
 
@@ -190,38 +189,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 self.work.send(Work::Gone(gid.to_vec())).ok();
                 return Ok(false);
             }
-            Verdict::Commit { removes } => {
-                if !self.cleared(st, gid, position)? {
-                    return Ok(false);
-                }
-                self.before_commit(st, gid, removes)?;
-                let g = st.groups.get_mut(gid).unwrap();
-                let applied = g.mls.apply(&st.provider, entry)?;
-                let current = g.mls.epoch();
-                g.early.retain(|(_, early)| core::header(early).is_ok_and(|(epoch, _)| epoch >= current));
-                let members = g.mls.members();
-                g.rec.leaves.retain(|(key, _)| members.iter().any(|m| m.key == key.0));
-                let by = members.into_iter().find(|m| m.index == applied.by);
-                let own = applied.own;
-                let gone = applied.gone;
-                if own {
-                    g.rec.updated = now;
-                }
-                st.scrub = true;
-                st.gate = true;
-                for leaf in applied.removed.iter().filter_map(|m| m.leaf.as_ref()) {
-                    st.unhear(gid, &leaf.key.0)?;
-                }
-                let core::Applied { added, how, invite, removed, settings, .. } = applied;
-                let keys = |members: &[core::Member]| members.iter().map(|m| Bytes(m.key.clone())).collect();
-                let verdict = Judgement::Commit { committer: Bytes(by.as_ref().map(|by| by.key.clone()).unwrap_or_default()), added: keys(&added), removed: keys(&removed) };
-                st.observe(|| read(verdict));
-                self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, invite, removed, settings, gone }).ok();
-                let pos = Pos { epoch, at: now, judged: Judged::Commit { own }, lost: false };
-                put(&st.provider, &pos_key(gid, position), &pos)?;
-                st.group_mut(gid)?.rec.position = position;
-                return Ok(!gone);
-            }
+            Verdict::Commit { removes } => return self.apply(st, gid, position, entry, removes, now),
         };
         if judged == Judged::Skipped {
             st.observe(|| read(Judgement::Skipped));
@@ -229,6 +197,43 @@ impl<P: Provider + Send + 'static> Inner<P> {
         put(&st.provider, &pos_key(gid, position), &Pos { epoch, at: now, judged, lost: false })?;
         st.group_mut(gid)?.rec.position = position;
         Ok(true)
+    }
+
+    /// Applies the commit at `position`, unless it waits (`cleared`); false if it waits, or removed this session.
+    fn apply(&self, st: &mut State<P>, gid: &[u8], position: u64, entry: &[u8], removes: bool, now: u64) -> Result<bool> {
+        if !self.cleared(st, gid, position)? {
+            return Ok(false);
+        }
+        self.before_commit(st, gid, removes)?;
+        let g = st.groups.get_mut(gid).unwrap();
+        let epoch = g.mls.epoch();
+        let applied = g.mls.apply(&st.provider, entry)?;
+        let current = g.mls.epoch();
+        g.early.retain(|(_, early)| core::header(early).is_ok_and(|(epoch, _)| epoch >= current));
+        let members = g.mls.members();
+        g.rec.leaves.retain(|(key, _)| members.iter().any(|m| m.key == key.0));
+        g.rec.starts.retain(|(key, _)| members.iter().any(|m| m.key == key.0) && !applied.added.iter().any(|m| m.key == key.0));
+        g.rec.starts.extend(applied.added.iter().map(|m| (Bytes(m.key.clone()), position)));
+        let by = members.into_iter().find(|m| m.index == applied.by);
+        let own = applied.own;
+        let gone = applied.gone;
+        if own {
+            g.rec.updated = now;
+        }
+        st.scrub = true;
+        st.gate = true;
+        for leaf in applied.removed.iter().filter_map(|m| m.leaf.as_ref()) {
+            st.unhear(gid, &leaf.key.0)?;
+        }
+        let core::Applied { added, how, invite, removed, settings, .. } = applied;
+        let keys = |members: &[core::Member]| members.iter().map(|m| Bytes(m.key.clone())).collect();
+        let verdict = Judgement::Commit { committer: Bytes(by.as_ref().map(|by| by.key.clone()).unwrap_or_default()), added: keys(&added), removed: keys(&removed) };
+        st.observe(|| Observation::Read { group: Bytes(gid.to_vec()), position, entry: Sha256::digest(entry).into(), epoch, verdict });
+        self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, invite, removed, settings, gone }).ok();
+        let pos = Pos { epoch, at: now, judged: Judged::Commit { own }, lost: false };
+        put(&st.provider, &pos_key(gid, position), &pos)?;
+        st.group_mut(gid)?.rec.position = position;
+        Ok(!gone)
     }
 
     /// A message entry counts: its ciphertext is this session's own send, one that came early, or yet to come.

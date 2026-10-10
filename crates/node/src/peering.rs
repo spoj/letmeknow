@@ -10,7 +10,9 @@ use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
 use lmk_core::provider::Provider;
 use lmk_membership::Contradiction;
+use lmk_net::Groups;
 use lmk_net::peers::{self, Own};
+use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use lmk_proto::head::Head;
@@ -21,10 +23,12 @@ use n0_future::time::{Duration, sleep};
 
 use crate::logs::empty;
 use crate::reading::ciphertext_key;
-use crate::{Event, Inner, Member, Node, Out, State, Work, days, endpoint_id, get, now, put};
+use crate::{Event, Inner, Member, Node, Out, State, days, endpoint_id, get, now, put};
 
 /// How often `Peers` is polled.
 const POLL: Duration = Duration::from_millis(250);
+/// How often members not connected are dialed, in milliseconds.
+const REDIAL: u64 = 10_000;
 
 /// A member's latest summary of a group, as saved: what it held and read within H, and when it was heard.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,9 +218,15 @@ impl<P: Provider> State<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
+    /// Polls `Peers` every `POLL`, and dials the members not connected every `REDIAL`.
     pub(crate) async fn polling(self: Arc<Self>) {
+        let mut dialed = 0;
         loop {
             sleep(POLL).await;
+            if now() >= dialed + REDIAL {
+                dialed = now();
+                self.dial_all();
+            }
             let mut st = self.lock();
             if let Err(error) = self.poll(&mut st) {
                 self.warn(None, format!("{error:#}"));
@@ -286,6 +296,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 let group = heard.summary.group.clone();
                 st.hear(heard)?;
                 self.events.send(Event::Heard { group }).ok();
+                self.heard.notify_waiters();
             }
             for summary in groups {
                 let gid = summary.group.0;
@@ -325,8 +336,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
                             self.live(st, &gid, &item.0)?;
                         }
                     }
-                    Frame::State { link: Some(link), .. } => drop(self.work.send(Work::State { group: gid, link, by: peer })),
-                    Frame::State { link: None, .. } => drop(self.work.send(Work::StateWanted { group: gid, by: peer })),
+                    Frame::State { link: Some(link), .. } => self.state_from(&gid, link, peer),
+                    Frame::State { link: None, .. } => self.hand_snapshot(&gid, peer),
                     _ => {}
                 }
             }
@@ -369,14 +380,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.ask_state(st, gid, Some(peer));
         }
         // A file only this session held may have reached the peer since.
-        let pending = st.group(gid)?.rec.pending.iter().filter_map(|p| <[u8; 32]>::try_from(p.id.0.as_slice()).ok()).collect::<Vec<_>>();
+        let pending = st.group(gid)?.rec.pending.clone();
         for hash in pending {
             let (inner, gid) = (self.clone(), gid.to_vec());
             spawn(async move {
                 if inner.net().holders(&gid, hash).await.contains(&peer) {
                     let mut st = inner.lock();
                     if let Ok(g) = st.group_mut(&gid) {
-                        g.rec.pending.retain(|pending| pending.id.0 != hash);
+                        g.rec.pending.retain(|pending| *pending != hash);
                         st.save(&gid).ok();
                     }
                 }
@@ -406,19 +417,17 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 
     /// This session's own counted positions within H that no other member's summary shows held, but an away one's;
-    /// less those before every other member's start, which none of them can hold.
+    /// less those up to every other member's start, which none of them can hold. A member there before this session
+    /// started before all of its positions.
     pub fn only_here(&self, gid: &[u8]) -> Result<Ranges> {
-        let (since, others) = (self.carried_since(gid)?, self.members(gid)?.len() - 1);
+        let since = self.carried_since(gid)?;
         let st = self.inner.lock();
         let g = st.group(gid)?;
-        let summaries: Vec<&peers::Heard> = g.heard.values().filter(|h| endpoint_id(&h.peer.0).is_some_and(|peer| st.in_leaf(gid, &peer).is_some())).collect();
-        let start = |h: &&peers::Heard| {
-            let covered = h.summary.held.union(&h.summary.read).union(&h.summary.fetching);
-            covered.first().unwrap_or(h.summary.head.length + 1)
-        };
-        let first = summaries.iter().map(start).min().filter(|first| *first > 0 && summaries.len() == others);
-        let before = first.map_or_else(Ranges::default, |first| Ranges::range(0, first - 1));
-        let held = summaries.iter().filter(|h| h.at >= since).fold(Ranges::default(), |held, h| held.union(&h.summary.held));
+        let start = |m: &lmk_core::group::Member| g.rec.starts.iter().find(|(key, _)| key.0 == m.key).map_or(0, |(_, start)| *start);
+        let first = g.mls.members().iter().filter(|m| m.key != st.me(gid)).map(start).min();
+        let before = first.map_or_else(Ranges::default, |first| Ranges::range(0, first));
+        let summaries = g.heard.values().filter(|h| h.at >= since && endpoint_id(&h.peer.0).is_some_and(|peer| st.in_leaf(gid, &peer).is_some()));
+        let held = summaries.fold(Ranges::default(), |held, h| held.union(&h.summary.held));
         Ok(g.rec.own.difference(&held).difference(&before))
     }
 
@@ -440,5 +449,27 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// H ago.
     fn carried_since(&self, gid: &[u8]) -> Result<u64> {
         Ok(now().saturating_sub(days(self.settings(gid)?.carry)))
+    }
+}
+
+impl<P: Provider + Send + 'static> Groups for Inner<P> {
+    fn groups(&self) -> Vec<Vec<u8>> {
+        self.lock().groups.keys().cloned().collect()
+    }
+
+    fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
+        self.lock().serves(group, peer)
+    }
+
+    fn files(&self, group: &[u8]) -> Vec<FileLink> {
+        let st = self.lock();
+        let Some(g) = st.groups.get(group) else {
+            return Vec::new();
+        };
+        g.rec.held(g.mls.settings().carry)
+    }
+
+    fn admit(&self, peer: &EndpointId, frame: Frame) -> Option<Frame> {
+        self.lock().admissible(peer, frame)
     }
 }

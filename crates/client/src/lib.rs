@@ -20,7 +20,7 @@ use lmk_core::contacts::{self, Contact};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
 use lmk_node::devices::Devices;
-use lmk_node::{Event, Heard, Item, Member, Message, Node};
+use lmk_node::{Event, Heard, INVITE_VALID, Item, Member, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::ranges::Ranges;
 use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, Control, DEVICES, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings, UPDATE};
@@ -32,7 +32,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
-const INVITE_TTL: u64 = 600;
 /// How long the client waits for a plugin's answer, but to a command.
 const ASK_WAIT: Duration = Duration::from_secs(60);
 /// How long a plugin's `spread` waits for a member online to hold its file.
@@ -467,7 +466,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             for_.is_none() || !self.device_state()?.identities.is_empty(),
             "contacts belong to an identity: create one with `identity create`"
         );
-        let mut answer = json!({ "expires_in": INVITE_TTL });
+        let mut answer = json!({ "expires_in": INVITE_VALID / 1000 });
         let link = match identity {
             Some(identity) => {
                 let (identity, name) = self.own_identity(&identity)?;
@@ -653,7 +652,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                     None => json!({ "position": position }),
                 })
                 .collect();
-            only_here.extend(node.pending_files(&gid.0)?.iter().map(|p| json!({ "what": p.what, "id": hex::encode(&p.id.0) })));
+            only_here.extend(node.pending_files(&gid.0)?.iter().map(|hash| json!({ "what": "file", "id": hex::encode(hash) })));
             only_here_count += only_here.len();
             let mut group = json!({ "group": b64(&gid.0), "online": online, "away": away, "only_here": only_here });
             if let Some(name) = Some(node.settings(&gid.0)?.name).filter(|n| !n.is_empty()) {
@@ -880,7 +879,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let (removed, added) = (removed.iter().map(|m| describer.describe(m)).collect(), added.iter().map(|m| describer.describe(m)).collect());
                 self.emit(ClientEvent::Revoked { group, removed, added });
             }
-            Event::Keys { .. } => {}
+            Event::Keys { .. } | Event::Duties { .. } => {}
             Event::Removed { group, by } => {
                 let by = by.map(|by| self.describe(&group, &by)).transpose()?;
                 self.drop_group(&group).await?;

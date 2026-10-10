@@ -291,6 +291,20 @@ impl Peers {
                 self.changed.get_or_insert(now);
             }
         }
+        let mut out = self.hellos(now);
+        for (id, g) in &mut self.groups {
+            if g.request.is_none()
+                && let Some((holder, positions)) = choose(id, g, &self.conns)
+            {
+                g.request = Some(Request { holder, at: now });
+                out.push(Out::Frame(holder, Frame::Want { group: id.clone(), positions }));
+            }
+        }
+        out
+    }
+
+    /// The entries each peer lacks of the logs of the groups served to it, and the `hello`s due.
+    fn hellos(&mut self, now: u64) -> Vec<Out> {
         let periodic = now - self.full >= PERIOD;
         if periodic {
             self.full = now;
@@ -324,14 +338,6 @@ impl Peers {
             self.changed = None;
             for g in self.groups.values_mut() {
                 g.dirty = false;
-            }
-        }
-        for (id, g) in &mut self.groups {
-            if g.request.is_none()
-                && let Some((holder, positions)) = choose(id, g, &self.conns)
-            {
-                g.request = Some(Request { holder, at: now });
-                out.push(Out::Frame(holder, Frame::Want { group: id.clone(), positions }));
             }
         }
         out

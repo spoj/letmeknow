@@ -1,8 +1,9 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
-//! advance, at start, and every `TIMER`. It commits at most once, with every Remove due (members whose counted `leave`
-//! was sealed in their current membership, and members whose devices their identities dropped) and this session's
-//! update if due (each T, at an offset of its own); asks the others to remove this session while it leaves; and
-//! announces this session's known losses.
+//! advance, at start, and every `TIMER`. It drops what the group kept past H; commits at most once, with every Remove
+//! due (members whose counted `leave` was sealed in their current membership, and members whose devices their
+//! identities dropped, or in a devices group, devices its identity dropped) and this session's update if due (each T, at an offset of its own); asks the others to remove
+//! this session while it leaves; announces this session's known losses; and in a devices group, has the devices kind
+//! run its own (`Event::Duties`).
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -11,12 +12,18 @@ use anyhow::Result;
 use lmk_core::group::{self as core, Change};
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
-use lmk_proto::group::{Control, type_of};
+use lmk_proto::group::{Control, DEVICES, type_of};
 use n0_future::time::{Duration, sleep};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::{Dropped, Event, G, Inner, Observation, State, Work, dropped, now, renaming};
+use std::collections::BTreeMap;
+
+use lmk_core::identity::{KeyLog, Verdict};
+use lmk_proto::group::Credential;
+
+use crate::groups::renaming;
+use crate::{Dropped, Event, G, Inner, Observation, State, Work, now};
 
 /// How often every group's duties run, besides as its log moves.
 pub(crate) const TIMER: Duration = Duration::from_secs(10 * 60);
@@ -38,7 +45,9 @@ fn due<P: Provider>(st: &State<P>, g: &G) -> Option<(Change, Vec<core::Member>)>
     let added = |key: &[u8]| g.mls.added().iter().rev().find(|added| added.member.key.0 == key).map_or(0, |added| added.epoch);
     let left = |m: &core::Member| g.rec.leaves.iter().any(|(key, epoch)| key.0 == m.key && *epoch >= added(&m.key));
     let others = members.iter().filter(|m| m.key != me);
-    let dropped: Vec<core::Member> = others.clone().filter(|m| m.credential.as_ref().is_some_and(|c| dropped(&st.keys, c))).cloned().collect();
+    let devices = st.devices_log(g.mls.id());
+    let dropped = |m: &&core::Member| m.credential.as_ref().is_some_and(|c| dropped(&st.keys, c)) || devices.is_some_and(|log| log.dropped(&m.key));
+    let dropped: Vec<core::Member> = others.clone().filter(dropped).cloned().collect();
     let remove: Vec<u32> = others.filter(|m| left(m) || dropped.iter().any(|d| d.index == m.index)).map(|m| m.index).collect();
     let own = members.iter().find(|m| m.index == g.mls.own_index())?;
     let name = renaming(&g.mls, st.device.as_deref());
@@ -88,8 +97,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 self.gone(gid, None);
                 return Ok(());
             }
+            let expired = g.rec.expired;
+            st.expire(gid)?;
+            st.scrub |= st.group(gid)?.rec.expired != expired;
             self.leaving(&mut st, gid)?;
             self.announce(&mut st, gid)?;
+            if st.group(gid)?.mls.settings().kind == DEVICES {
+                self.events.send(Event::Duties { group: Bytes(gid.to_vec()) }).ok();
+            }
             let g = st.group(gid)?;
             (due(&st, g).is_some(), next_update(g.rec.updated, g.mls.settings().update, st.me(gid)))
         };
@@ -171,6 +186,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.events.send(Event::Revoked { group: Bytes(gid.to_vec()), removed, added }).ok();
         Ok(())
     }
+}
+
+/// Whether a member's device was dropped from its identity's list, as the key logs held show it. In a devices group,
+/// whose members are the devices themselves, see `State::devices_log`.
+fn dropped(keys: &BTreeMap<Vec<u8>, KeyLog>, credential: &Credential) -> bool {
+    let log = credential.identity().and_then(|identity| keys.get(&identity.id.0));
+    log.is_some_and(|log| log.verify(credential) == Verdict::Dropped)
 }
 
 #[cfg(test)]

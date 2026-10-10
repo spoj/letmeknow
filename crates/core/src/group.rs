@@ -329,7 +329,6 @@ struct State {
     posted: Option<Bytes>,
     /// Its authenticated data.
     aad: Aad,
-    joined: u64,
     added: Vec<Added>,
 }
 
@@ -360,7 +359,7 @@ impl Group {
             .build();
         let id = GroupId::from_slice(&crate::random::<16>());
         let mls = MlsGroup::new_with_group_id(provider, &session.signer, &config, id, session.with_key())?;
-        let group = Group { state: State { joined: mls.epoch().as_u64(), ..State::default() }, mls };
+        let group = Group { state: State::default(), mls };
         group.save(provider)?;
         Ok(group)
     }
@@ -380,7 +379,7 @@ impl Group {
             settings.protocol
         );
         let mls = staged.into_group(provider)?;
-        let group = Group { state: State { joined: mls.epoch().as_u64(), ..State::default() }, mls };
+        let group = Group { state: State::default(), mls };
         group.save(provider)?;
         Ok(group)
     }
@@ -407,11 +406,6 @@ impl Group {
 
     pub fn epoch(&self) -> u64 {
         self.mls.epoch().as_u64()
-    }
-
-    /// The epoch this session joined at.
-    pub fn joined(&self) -> u64 {
-        self.state.joined
     }
 
     pub fn settings(&self) -> Settings {
