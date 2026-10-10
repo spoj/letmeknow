@@ -332,7 +332,7 @@ try {
           const bytes = id.match(/../g).map(byte => parseInt(byte, 16));
           const at = prefix => records.get(new Uint8Array([...new TextEncoder().encode(prefix), ...bytes]));
           const [timeline, node] = [at("lmk/web/message/"), at("lmk/node/message/")];
-          const content = record => JSON.parse(new TextDecoder().decode(record.result)).payload.content;
+          const content = record => record.result && JSON.parse(new TextDecoder().decode(record.result)).payload.content;
           node.onsuccess = () => resolve([content(timeline), content(node)]);
           node.onerror = () => reject(node.error);
         };
