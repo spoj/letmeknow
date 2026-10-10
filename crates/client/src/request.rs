@@ -55,7 +55,7 @@ pub enum Request {
         #[cfg_attr(feature = "clap", arg(long, conflicts_with_all = ["group", "as_", "name", "for_", "to"]))]
         identity: Option<String>,
     },
-    /// Join a group through an invite link, or a group open to your identity by its id; a device link adds this device to an identity
+    /// Join a group through an invite link, or a group open to your identity by its id
     #[cfg_attr(feature = "clap", command(display_order = 11))]
     Join {
         target: String,
@@ -112,7 +112,7 @@ pub enum Request {
     /// The members online in each group, and what only this session holds
     #[cfg_attr(feature = "clap", command(display_order = 21))]
     Status,
-    /// Identities this device is on: create one, list them, take a device off one, leave one, or rename this device
+    /// Identities this device is on: create one, join one through a device link, list them, take a device off one, leave one, or rename this device
     #[cfg_attr(feature = "clap", command(display_order = 22))]
     Identity {
         #[cfg_attr(feature = "clap", command(subcommand))]
