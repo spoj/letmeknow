@@ -44,11 +44,12 @@ export type Item =
   | { type: "leave"; id: string; at: number; from: Person }
   | { type: "joined"; at: number; member: Person; by: Person; how: string }
   | { type: "left"; at: number; member: Person; by: Person }
+  | { type: "revoked"; at: number; removed: Person[]; added: Person[] }
   | { type: "settings"; at: number; by: Person; before?: Settings; settings: Settings }
   | { type: "introduced"; at: number; by: Person; identity: Named; how: string }
   | { type: "pushed"; at: number; by: Person; ref: string; subjects: string[] };
 export type Event = { type: string; group?: string; identity?: string; id?: string; hash?: string; text?: string; by?: string };
-export type Me = { fp: string; name: string; device: { key: string; name: string }; identities: Named[] };
+export type Me = { fp: string; name: string; device: { name: string }; identities: (Named & { device?: string })[] };
 export type Contacts = { contacts: { identity: string; name: string; how: string; by?: string }[]; introductions: { identity: string; name: string; by: Person }[] };
 
 /** The session's methods, as every tab calls them: asynchronously, wherever it runs. */

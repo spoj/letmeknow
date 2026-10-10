@@ -482,6 +482,10 @@ impl App {
                 self.remember(&group.0, &json!({ "type": "left", "at": now(), "member": member, "by": by }))?;
                 self.emit(json!({ "type": "left", "group": group }));
             }
+            ClientEvent::Revoked { group, removed, added } => {
+                self.remember(&group.0, &json!({ "type": "revoked", "at": now(), "removed": removed, "added": added }))?;
+                self.emit(json!({ "type": "revoked", "group": group }));
+            }
             ClientEvent::Removed { group, by } => self.emit(json!({ "type": "removed", "group": group, "by": by.and_then(|by| by.name) })),
             ClientEvent::Gone { group } => {
                 for kind in ["timeline", "settings", "refused"] {
