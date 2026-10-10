@@ -9,13 +9,13 @@
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use js_sys::{Array, Function, Promise, Uint8Array};
-use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Introduction, Request, fp, message_id, service};
+use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Request, fp, message_id, service};
 use lmk_node::devices::Devices;
 use lmk_node::lmk_core::crypto::{Crypto, Rand};
 use lmk_node::lmk_core::device::Device;
@@ -256,15 +256,6 @@ struct Config {
     membership: String,
 }
 
-/// An introduction as letmeknow 0.12 kept it, in the record `web/introductions`, by identity id.
-#[derive(Deserialize)]
-struct Kept012 {
-    name: String,
-    /// The introducer's label.
-    by: String,
-    by_id: Bytes,
-}
-
 struct App {
     client: Client<Store>,
     store: Store,
@@ -360,7 +351,6 @@ impl App {
         let (client, mut told) = Client::new(node, client_config, Access::Here(devices), Arc::new(plugins), written);
         let (tried, failed) = Default::default();
         let app = Rc::new(App { client, store, membership, idb, kept, on_event, tried, failed });
-        app.take_introductions()?;
         let told_app = app.clone();
         spawn_local(async move {
             while let Some(event) = told.recv().await {
@@ -417,16 +407,6 @@ impl App {
             }
         });
         Ok(app)
-    }
-
-    /// Hands the client the introductions that letmeknow 0.12 kept in this browser's own record.
-    fn take_introductions(&self) -> Result<()> {
-        let Some(kept) = get::<HashMap<String, Kept012>>(&self.store, b"web/introductions")? else { return Ok(()) };
-        for (id, introduction) in kept {
-            let by = Described { name: Some(introduction.by), ..Described::default() };
-            self.client.add_introduction(Introduction { identity: Bytes(unb64(&id)?), name: introduction.name, by, by_id: introduction.by_id })?;
-        }
-        self.store.delete(b"web/introductions")
     }
 
     /// Joins, once each, the groups open to this browser's identities; one that fails waits for a click.

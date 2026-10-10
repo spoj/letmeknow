@@ -167,9 +167,7 @@ function standing(p: Person): string | undefined {
 
 /** Who vouched for an unknown identity first, by their label, and as whom. */
 function introduction(i: client.Identity): { by: string; name: string } | undefined {
-  if (!i.introduced) return undefined;
-  if (!Array.isArray(i.introduced)) return i.introduced;
-  const [first] = i.introduced;
+  const first = i.introduced?.[0];
   return first && { by: label(first.by), name: first.name };
 }
 
