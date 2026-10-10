@@ -77,20 +77,26 @@ pub fn forgery(t: &Trace) -> Result<(), String> {
 }
 
 /// A join answered ok starts at the only Add of the joiner's key since its last membership of the group, however
-/// many answers were lost on the way.
+/// many answers were lost on the way: since its last join, or the last Remove of its key, as of a leaf a join left
+/// stranded when it gave up.
 pub fn admission(t: &Trace) -> Result<(), String> {
     let mut adds: BTreeMap<(&Bytes, &Bytes), BTreeSet<u64>> = BTreeMap::new();
+    let mut removes: BTreeMap<(&Bytes, &Bytes), BTreeSet<u64>> = BTreeMap::new();
     for ((group, position), j) in judged(t) {
-        if let Verdict::Commit { added, .. } = j.verdict {
+        if let Verdict::Commit { added, removed, .. } = j.verdict {
             for key in added {
                 adds.entry((group, key)).or_default().insert(position);
+            }
+            for key in removed {
+                removes.entry((group, key)).or_default().insert(position);
             }
         }
     }
     let mut last: BTreeMap<(usize, &Bytes), u64> = BTreeMap::new();
     for o in &t.0 {
         let What::Join { m, key, group, answer: Answer::Position(start) } = &o.what else { continue };
-        let since = last.insert((*m, group), *start).unwrap_or(0);
+        let removed = removes.get(&(group, key)).and_then(|removes| removes.range(..*start).next_back()).copied().unwrap_or(0);
+        let since = last.insert((*m, group), *start).unwrap_or(0).max(removed);
         let ours: Vec<u64> = adds.get(&(group, key)).into_iter().flatten().copied().filter(|p| *p > since && *p <= *start).collect();
         if ours != [*start] {
             return Err(format!("m{m} joined {} at {start}, its key added at {ours:?}", short(group)));
@@ -150,5 +156,8 @@ mod tests {
         assert!(admission(&trace(twice)).unwrap_err().contains("added at [3, 4]"), "a stranded leaf at 3");
         let never = vec![(1, add(3, key(1))), (2, join(3))];
         assert!(admission(&trace(never)).unwrap_err().contains("never did"));
+        let remove = read(0, 4, 2, Verdict::Commit { committer: key(0), added: vec![], removed: vec![key(1)] });
+        let removed = vec![(1, add(3, key(1))), (1, remove), (1, add(5, key(1))), (2, joined(1, 5)), (2, join(5))];
+        assert!(admission(&trace(removed)).is_ok(), "the leaf a join gave up on was removed");
     }
 }

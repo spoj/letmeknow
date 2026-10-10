@@ -8,9 +8,10 @@ use lmk_proto::Bytes;
 use super::{CONVERGE, TIMER, UPDATE, inside, judged, quiets, removed, short, through};
 use crate::trace::{Trace, Verdict, What};
 
-/// By the end of a quiet period: a member that asked to leave a group holds it no more, if another member of it runs and
-/// every member running had whole paths for the slow timer's period before, after the leave was asked (a pass that
-/// fails to commit runs again on the timer); every member that ran with whole paths, in the group, for T and the slow
+/// By the end of a quiet period: a member that asked to leave a group holds it no more, if another member of it runs that
+/// opened its `leave` (one added after it counted cannot tell, and the leaver sends it again only once it counts in
+/// neither the current nor the prior epoch), and every member running had whole paths for the slow timer's period
+/// before, after the leave was asked (a pass that fails to commit runs again on the timer); every member that ran with whole paths, in the group, for T and the slow
 /// timer updated its leaf in that time; and no member announced the loss of one position twice.
 pub fn duties(t: &Trace) -> Result<(), String> {
     let mut announced: BTreeSet<(usize, &Bytes, u64)> = BTreeSet::new();
@@ -28,7 +29,13 @@ pub fn duties(t: &Trace) -> Result<(), String> {
             let What::Leaving { m, group } = &o.what else { continue };
             let back = t.0.iter().take_while(before).any(|j| j.at > o.at && matches!(&j.what, What::Joined { m: n, group: g, .. } if n == m && g == group));
             let holds = views.iter().any(|v| v.m == *m && v.group == *group);
-            let others = views.iter().any(|v| v.m != *m && v.group == *group && v.active());
+            let key = super::key_of(&t.0, *m, group);
+            let opened = |j: usize| {
+                t.0.iter().take_while(before).any(|n| {
+                    n.at > o.at && matches!(&n.what, What::Opened { m: k, group: g, kind, sender, .. } if *k == j && g == group && kind == "leave" && Some(sender) == key)
+                })
+            };
+            let others = views.iter().any(|v| v.m != *m && v.group == *group && v.active() && opened(v.m));
             let settled = views.iter().filter(|v| v.group == *group).all(|v| whole(t, v.m, since, at));
             if !back && holds && others && settled {
                 return Err(format!("m{m} asked to leave {} at {}, and still holds it at {}", short(group), super::clock(o.at), super::clock(at)));
@@ -128,7 +135,8 @@ mod tests {
 
     #[test]
     fn a_leaver_is_gone_once_its_members_ran_whole_for_the_slow_timer() {
-        let base = vec![(0, What::Up { m: 0 }), (0, What::Up { m: 1 }), (1_000, What::Leaving { m: 1, group: g() })];
+        let leave = What::Opened { m: 0, group: g(), position: 3, kind: "leave".into(), sender: key(1), plaintext: [0; 32] };
+        let base = vec![(0, What::Up { m: 0 }), (0, What::Up { m: 1 }), (0, roster(1, 1, &[0, 1])), (1_000, What::Leaving { m: 1, group: g() }), (1_100, leave)];
         let at = TIMER + 2_000;
         let still = [base.clone(), vec![quiet(at, vec![view(0, 2, &[0, 1]), view(1, 2, &[0, 1])])]].concat();
         assert!(duties(&trace(still)).unwrap_err().contains("still holds it"));
@@ -138,6 +146,9 @@ mod tests {
         assert!(duties(&trace(alone)).is_ok(), "no other member runs to commit its removal");
         let cut = [base, vec![(at - 5_000, What::Disrupted { m: 0 }), quiet(at, vec![view(0, 2, &[0, 1]), view(1, 2, &[0, 1])])]].concat();
         assert!(duties(&trace(cut)).is_ok(), "the pass may have failed, and the timer not run since");
+        let unseen = vec![(0, What::Up { m: 0 }), (0, What::Up { m: 1 }), (1_000, What::Leaving { m: 1, group: g() })];
+        let unseen = [unseen, vec![quiet(at, vec![view(0, 2, &[0, 1]), view(1, 2, &[0, 1])])]].concat();
+        assert!(duties(&trace(unseen)).is_ok(), "no other member running opened the leave");
     }
 
     #[test]
