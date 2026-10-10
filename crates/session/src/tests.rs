@@ -210,6 +210,9 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     assert_eq!(event["member"]["name"], "Bob");
     assert_eq!(event["by"]["name"], "Alice");
     assert_eq!(event["how"], "invite");
+    // Alice records Bob as her contact, then introduces him, just after `joined` prints.
+    let contacts = until(|| async { alice.cmd(&["contacts"]).await.unwrap() }, |c| c["contacts"][0]["name"] == "Bob (Acme)").await;
+    assert_eq!(contacts["contacts"][0]["name"], "Bob (Acme)", "{contacts}");
     (alice, bob, invite["group"].as_str().unwrap().to_owned())
 }
 
@@ -898,8 +901,9 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
         let invite = second.cmd(&["invite", "--for", "Bob (Acme)"]).await.unwrap();
         bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         second.expect("joined").await;
+        // The contact is recorded just after `joined` prints.
         for agent in [&first, &second] {
-            let contacts = agent.cmd(&["contacts"]).await.unwrap();
+            let contacts = until(|| async { agent.cmd(&["contacts"]).await.unwrap() }, |c| c["contacts"][0]["name"] == "Bob (Acme)").await;
             assert_eq!(contacts["contacts"][0]["name"], "Bob (Acme)", "{contacts}");
         }
         let members = second.cmd(&["members"]).await.unwrap();

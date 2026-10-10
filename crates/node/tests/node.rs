@@ -295,7 +295,7 @@ async fn a_silent_member_reached_first_holds_up_no_other() {
     let silent = Address { key: *key.public().as_bytes(), relay: Some(relay.url.to_string()) };
     let _silent = hand(&relay, key.clone(), &bob.node).await;
     eventually("the silent member is connected", || bob.node.net().connected().contains(&key.public())).await;
-    let (joined, by) = bob.node.join(&Invite { members: vec![link.members[0].clone(), silent], ..link.clone() }, None).await.unwrap();
+    let (joined, by) = bob.node.join(&Invite { members: vec![silent, link.members[0].clone()], ..link.clone() }, None).await.unwrap();
     assert_eq!((joined, by), (gid, link.members[0].key));
     alice.node.shutdown().await.unwrap();
 }
