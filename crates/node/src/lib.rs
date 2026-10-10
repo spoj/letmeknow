@@ -55,7 +55,8 @@ pub use lmk_proto::clock::now;
 const UNFINISHED: &str = "the send ended unfinished, as this session stopped or left the group";
 /// How long `send` waits for its entry to count before it answers that the send is pending.
 const SEND_WAIT: Duration = Duration::from_secs(5);
-/// How long some waits for other members last: for those online to hold a file, for added members' certificates.
+/// How long some waits for other members last: for those online to hold a file or an invite, for added members'
+/// certificates.
 const MEMBER_WAIT: Duration = Duration::from_secs(5);
 /// How often members not connected are dialed again.
 const REDIAL: Duration = Duration::from_secs(10);
@@ -72,7 +73,7 @@ const STATE_ASK: u64 = 60 * 1000;
 const COMMIT_TRIES: u32 = 5;
 /// How long an invite is valid, in milliseconds.
 const INVITE_VALID: u64 = 10 * 60 * 1000;
-/// How many members besides the inviter a link names: those that took the invite first.
+/// How many members besides the inviter a link names, of those online that hold the invite's message.
 const LINK_MEMBERS: usize = 3;
 /// How long a joiner waits to reach the members it asks, all at once, and then for each one's answer.
 const DIAL_WAIT: Duration = Duration::from_secs(30);
@@ -470,6 +471,8 @@ pub(crate) enum Out {
     Frame { peer: EndpointId, frame: Frame },
     /// Ask the peer for the files the group links that this session lacks.
     WantFiles { peer: EndpointId, group: Vec<u8> },
+    /// A send's outcome, for those waiting on it.
+    Outcome { waiters: Vec<oneshot::Sender<sending::Outcome>>, outcome: sending::Outcome },
 }
 
 /// One step: the state, locked, with a transaction open on its storage; committed when the step ends, and only then
@@ -1012,7 +1015,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 
     /// An invite into a group, `--for` a contact name or `--to` an identity: shared with the members as a held
-    /// message, and a link that names this session and up to three members that took it.
+    /// message, and a link that names this session and up to three members online that hold it.
     pub async fn invite(&self, gid: &[u8], label: Option<String>, to: Option<Bytes>) -> Result<Invite> {
         let secret: [u8; 16] = lmk_core::random();
         let hash = Bytes(Sha256::digest(secret).to_vec());
@@ -1026,12 +1029,28 @@ impl<P: Provider + Send + 'static> Node<P> {
             st.group(gid)?.mls.settings().kind == DEVICES
         };
         let rule = serde_json::to_value(Control::Invite { hash, expires, label, to })?;
-        self.send(gid, &rule).await?;
-        // The members online, which took the invite once it counted, admit by it too.
+        let position = self.send(gid, &rule).await?.position;
+        // The members online whose summaries hold the invite's message admit by it too: a member asked before its push
+        // arrived would refuse the joiner.
         let online = self.online(gid)?;
+        let holding = || -> Result<Vec<Member>> {
+            let heard = self.heard(gid)?;
+            let holds = |m: &Member| position.is_some_and(|p| heard.iter().any(|h| h.member.key == m.key && h.held.contains(p)));
+            Ok(online.iter().filter(|m| holds(m)).cloned().collect())
+        };
+        if position.is_some() {
+            let all = async {
+                while holding()?.len() < online.len() {
+                    sleep(Duration::from_millis(100)).await;
+                }
+                anyhow::Ok(())
+            };
+            timeout(MEMBER_WAIT, all).await.unwrap_or(Ok(()))?;
+        }
+        let holders = holding()?;
         let st = self.inner.lock();
         let mut members = vec![address(*self.inner.net().id().as_bytes(), self.inner.relay.as_str())];
-        for member in online.iter().take(LINK_MEMBERS) {
+        for member in holders.iter().take(LINK_MEMBERS) {
             let Some(leaf) = endpoint_id(&member.iroh.0).and_then(|peer| st.in_leaf(gid, &peer)?.leaf) else { continue };
             members.push(address(*endpoint_id(&leaf.key.0).context("an iroh key")?.as_bytes(), &leaf.relay));
         }
@@ -1137,7 +1156,8 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 
     /// Marks the group as one this session leaves, and asks the others to remove it; or forgets a group it is alone
-    /// in. Until a member removes it, its duties ask again (`duties`).
+    /// in. Until a member removes it, its duties ask again (`duties`). None once this session is out of the group: it
+    /// was alone in it, or was removed before its `leave` counted.
     pub async fn leave(&self, gid: &[u8]) -> Result<Option<Sent>> {
         let (id, counted) = {
             let mut st = self.inner.lock();
@@ -1151,7 +1171,10 @@ impl<P: Provider + Send + 'static> Node<P> {
                 return Ok(None);
             }
         };
-        Ok(Some(self.answered(gid, id, counted).await?))
+        match self.answered(id, counted).await {
+            Err(_) if !self.inner.lock().groups.contains_key(gid) => Ok(None),
+            sent => sent.map(Some),
+        }
     }
 
     /// Sends a held payload: the node seals it, appends its entry to the group's log, and pushes it to the members
@@ -1160,25 +1183,24 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// when the service certainly did not take it (`SendError`).
     pub async fn send(&self, gid: &[u8], payload: &Value) -> Result<Sent> {
         let (id, counted) = self.inner.held_send(gid, payload)?;
-        self.answered(gid, id, counted).await
+        self.answered(id, counted).await
     }
 
     /// What `send` answers: a send's position once it counts, or that it is pending after a few seconds.
-    async fn answered(&self, gid: &[u8], id: Bytes, mut counted: sending::Counted) -> Result<Sent> {
-        let position = match timeout(SEND_WAIT, &mut counted).await {
-            Ok(counted) => Some(counted.context(UNFINISHED)?.map_err(|error| anyhow::anyhow!(error))?),
-            Err(_) => self.inner.pending(&id, &mut counted)?,
+    async fn answered(&self, id: Bytes, mut counted: sending::Counted) -> Result<Sent> {
+        let outcome = match timeout(SEND_WAIT, &mut counted).await {
+            Ok(outcome) => outcome,
+            Err(_) if self.inner.pending(&id)? => return Ok(Sent { id, position: None }),
+            Err(_) => counted.await,
         };
-        Ok(match position {
-            Some(position) => Sent { id: self.inner.sent_id(gid, position)?, position: Some(position) },
-            None => Sent { id, position: None },
-        })
+        let (position, id) = outcome.context(UNFINISHED)?.map_err(|error| anyhow::anyhow!(error))?;
+        Ok(Sent { id, position: Some(position) })
     }
 
     /// Sends a held payload and waits as long as it takes for its entry to count; answers its position.
     pub async fn send_counted(&self, gid: &[u8], payload: &Value) -> Result<u64> {
         let (_, counted) = self.inner.held_send(gid, payload)?;
-        counted.await.context(UNFINISHED)?.map_err(|error| anyhow::anyhow!(error))
+        Ok(counted.await.context(UNFINISHED)?.map_err(|error| anyhow::anyhow!(error))?.0)
     }
 
     /// Seals a live payload, not held, and sends it to the members online, or to the one with fingerprint `to`; none
@@ -1479,17 +1501,18 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Sends what steps produced for the peers, in order, once it is durable.
+    /// Sends what steps produced, in order, once it is durable.
     async fn send_out(self: Arc<Self>, mut outbox: mpsc::UnboundedReceiver<Vec<Out>>) {
         while let Some(out) = outbox.recv().await {
             if let Err(error) = self.durable().await {
                 self.warn(None, format!("saving this session's state: {error:#}"));
             }
-            let Some(net) = self.net.get() else { continue };
             for out in out {
-                match out {
-                    Out::Frame { peer, frame } => drop(net.frame(peer, frame)),
-                    Out::WantFiles { peer, group } => net.want_files(peer, &group),
+                match (out, self.net.get()) {
+                    (Out::Outcome { waiters, outcome }, _) => waiters.into_iter().for_each(|waiter| drop(waiter.send(outcome.clone()))),
+                    (Out::Frame { peer, frame }, Some(net)) => drop(net.frame(peer, frame)),
+                    (Out::WantFiles { peer, group }, Some(net)) => net.want_files(peer, &group),
+                    _ => {}
                 }
             }
         }
