@@ -4,6 +4,7 @@
 
 mod files;
 mod peer;
+pub mod peers;
 mod seal;
 mod sync;
 
