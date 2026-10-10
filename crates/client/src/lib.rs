@@ -589,7 +589,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         for gid in node.groups() {
             let describer = self.describer(&gid)?;
             let online: Vec<Described> = node.online(&gid.0)?.iter().map(|m| describer.describe(m)).collect();
-            let only_here: Vec<Value> = node.only_here(&gid.0)?.iter().map(|p| json!({ "id": hex::encode(&p.id.0), "what": p.what })).collect();
+            let only_here: Vec<Value> = node.pending_files(&gid.0)?.iter().map(|p| json!({ "id": hex::encode(&p.id.0), "what": p.what })).collect();
             only_here_count += only_here.len();
             let mut group = json!({ "group": b64(&gid.0), "online": online, "only_here": only_here });
             if let Some(name) = Some(node.settings(&gid.0)?.name).filter(|n| !n.is_empty()) {
@@ -843,10 +843,10 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let item = json!({ "type": "message", "from": self.describe(&group, &sender)?, "payload": payload, "held": false });
                 self.tell_plugin(&group, item)?;
             }
-            Event::Synced { group } => self.emit(ClientEvent::Synced { group }),
-            Event::InStep { group, member } => {
+            Event::Synced { group, member } => {
                 let item = json!({ "type": "synced", "member": self.describe(&group, &member)? });
                 self.tell_plugin(&group, item)?;
+                self.emit(ClientEvent::Synced { group });
             }
             Event::State { group, from, data } => {
                 let item = json!({ "type": "state", "from": self.describe(&group, &from)?, "data": Bytes(data) });

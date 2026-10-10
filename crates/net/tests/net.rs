@@ -3,135 +3,44 @@ mod common;
 use std::sync::Arc;
 
 use common::*;
-use lmk_net::Disk;
-use ed25519_dalek::SigningKey;
 use iroh::RelayUrl;
-use lmk_net::Event;
+use lmk_net::{Disk, Event};
 use lmk_proto::{
     Answer, Bytes, frame,
     peer::{Frame, Join},
+    ranges::Ranges,
 };
 
 const G: &[u8] = b"group";
 
-fn service() -> SigningKey {
-    SigningKey::from_bytes(&[1; 32])
+fn want(n: u64) -> Frame {
+    Frame::Want { group: Bytes(G.to_vec()), positions: Ranges::range(n, n) }
 }
 
+/// Each side of a new connection is told of it, then of the frames on its `peer` stream in order; frames of either
+/// side's groups pass whatever the gate, which is the node's; a closed connection is told too.
 #[tokio::test(flavor = "multi_thread")]
-async fn hello_head_swap_and_contradiction() {
+async fn frames_go_both_ways_in_order() {
     let relay = relay().await;
-    let keys = keys(3);
+    let keys = keys(2);
     let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let log = |entries: &[&[u8]]| Group { members: members.clone(), log: entries.iter().map(|e| e.to_vec()).collect(), ..Group::default() };
-    let service = service();
-    let mut a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, log(&[b"e1", b"e2", b"e3"])), Options::default()).await;
-    let mut b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, log(&[b"e1", b"e2"])), Options::default()).await;
-    // The service showed C another third entry.
-    let relay_only = Options { relay_only: true, ..Options::default() };
-    let mut c = node(&relay, keys[2].clone(), Fake::new(&service).with(G, log(&[b"e1", b"e2", b"x3"])), relay_only).await;
-
+    let mut a = node(&relay, keys[0].clone(), Fake::new(), Options::default()).await;
+    let mut b = node(&relay, keys[1].clone(), Fake::new(), Options { relay_only: true, ..Options::default() }).await;
     a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    a.synced(G, members[1]).await;
-    b.synced(G, members[0]).await;
-    assert_eq!(b.fake.log(G), a.fake.log(G), "B caught up from A's commits");
-
-    c.net.dial(members[0], relay.url.clone()).await.unwrap();
-    for (node, peer) in [(&mut a, members[2]), (&mut c, members[0])] {
-        let event = node.until(|e| matches!(e, Event::Contradiction { .. })).await;
-        let Event::Contradiction { log, peer: from, ours, theirs } = event else { unreachable!() };
-        assert_eq!((log.as_slice(), from), (G, peer));
-        assert_eq!((ours.length, theirs.length), (3, 3));
-        assert_ne!(ours.hash, theirs.hash);
+    assert_eq!(a.until(|e| matches!(e, Event::Connected(_))).await, Event::Connected(members[1]));
+    assert_eq!(b.until(|e| matches!(e, Event::Connected(_))).await, Event::Connected(members[0]));
+    for n in 1..=3 {
+        assert!(a.net.frame(members[1], want(n)));
     }
-    assert_eq!(c.fake.log(G)[2], b"x3", "nothing applied across a contradiction");
-
-    // A's next commit, once the service took it, goes to B at once.
-    a.fake.groups.lock().unwrap().get_mut(G).unwrap().log.push(b"e4".to_vec());
-    a.net.changed(G);
-    b.synced(G, members[0]).await;
-    assert_eq!(b.fake.log(G).len(), 4);
-
-    b.net.dial(members[2], relay.url.clone()).await.unwrap();
-    b.until(|e| matches!(e, Event::Contradiction { peer, .. } if *peer == members[2])).await;
-    eventually("a contradiction closes the connection", || a.net.connected() == [members[1]] && b.net.connected() == [members[0]]).await;
-    for node in [&a, &b, &c] {
-        node.net.shutdown().await.unwrap();
+    for n in 1..=3 {
+        assert_eq!(b.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(members[0], want(n)));
     }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn every_log_of_a_group_is_caught_up_from_peers() {
-    const K: &[u8] = b"kind log";
-    const L: &[u8] = b"only A's";
-    let relay = relay().await;
-    let keys = keys(2);
-    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let service = service();
-    let group = |others: &[(&[u8], &[&[u8]])]| Group {
-        members: members.clone(),
-        log: vec![b"e1".to_vec()],
-        others: others.iter().map(|(id, entries)| (id.to_vec(), entries.iter().map(|e| e.to_vec()).collect())).collect(),
-        ..Group::default()
-    };
-    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group(&[(K, &[b"k1", b"k2"]), (L, &[b"l1"])])), Options::default()).await;
-    let mut b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group(&[(K, &[b"k1"])])), Options::default()).await;
-    a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    b.synced(G, members[0]).await;
-    eventually("B catches up on the kind's log", || b.fake.log(K).len() == 2).await;
-    assert!(b.fake.log(L).is_empty(), "a log B does not follow is not B's");
-    a.fake.groups.lock().unwrap().get_mut(G).unwrap().others.get_mut(K).unwrap().push(b"k3".to_vec());
-    a.net.changed(G);
-    eventually("an entry A took goes to B at once", || b.fake.log(K).len() == 3).await;
-    a.net.shutdown().await.unwrap();
+    assert!(b.net.frame(members[0], want(4)));
+    assert_eq!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(members[1], want(4)));
     b.net.shutdown().await.unwrap();
-}
-
-/// A session that served a peer nothing for a while asks it to sync anew once it serves it again, so what it held
-/// meanwhile arrives at once, not at the next resync.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_peer_served_again_syncs_at_once() {
-    let relay = relay().await;
-    let keys = keys(2);
-    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let group = || Group { members: members.clone(), log: vec![b"e1".to_vec()], ..Group::default() };
-    let service = service();
-    let mut a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
-    let mut b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
-    a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    a.synced(G, members[1]).await;
-    b.synced(G, members[0]).await;
-    a.fake.unlisted.lock().unwrap().push(members[1]);
-    let meanwhile = message(1, "meanwhile");
-    a.fake.hold(G, meanwhile.clone());
-    a.fake.unlisted.lock().unwrap().clear();
-    a.net.served(members[1], G);
-    eventually("what A held meanwhile reaches B", || b.fake.holds(G, &meanwhile)).await;
+    a.until(|e| *e == Event::Disconnected(members[1])).await;
+    assert!(!a.net.frame(members[1], want(5)), "no frame goes to a peer not connected");
     a.net.shutdown().await.unwrap();
-    b.net.shutdown().await.unwrap();
-}
-
-/// A message sent to a peer that does not serve this session the group yet, as a joiner reading the inviter's
-/// key log, waits for the peer's hello of the group, which it would otherwise drop, live ones for good.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_message_waits_until_the_peer_shows_the_group() {
-    let relay = relay().await;
-    let keys = keys(2);
-    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let group = || Group { members: members.clone(), log: vec![b"e1".to_vec()], ..Group::default() };
-    let service = service();
-    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
-    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
-    b.fake.unlisted.lock().unwrap().push(members[0]);
-    a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    let live = [&1u64.to_be_bytes()[..], &[1], b"introduce"].concat();
-    assert!(a.net.frame(members[1], Frame::Messages { group: Bytes(G.to_vec()), items: vec![Bytes(live.clone())] }));
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    b.fake.unlisted.lock().unwrap().clear();
-    b.net.served(members[0], G);
-    eventually("the live message reaches B once B serves A", || !b.fake.groups.lock().unwrap()[G].live.is_empty()).await;
-    a.net.shutdown().await.unwrap();
-    b.net.shutdown().await.unwrap();
 }
 
 /// A frame this session does not know, as a newer letmeknow may send, is skipped, and the stream stays up.
@@ -139,100 +48,19 @@ async fn a_message_waits_until_the_peer_shows_the_group() {
 async fn an_unknown_frame_is_skipped() {
     let relay = relay().await;
     let keys = keys(2);
-    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let service = service();
-    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, Group { members: members.clone(), ..Group::default() }), Options::default()).await;
+    let mut a = node(&relay, keys[0].clone(), Fake::new(), Options::default()).await;
     let peer = lmk_net::builder(relay.map.clone()).secret_key(keys[1].clone()).ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone()]));
     let peer = peer.bind().await.unwrap();
-    let conn = peer.connect(iroh::EndpointAddr::new(members[0]).with_relay_url(relay.url.clone()), frame::ALPN).await.unwrap();
+    let conn = peer.connect(iroh::EndpointAddr::new(keys[0].public()).with_relay_url(relay.url.clone()), frame::ALPN).await.unwrap();
     let (mut send, _recv) = conn.open_bi().await.unwrap();
     frame::write(&mut send, &frame::Open { stream: frame::Stream::Peer }).await.unwrap();
-    let (first, second) = (message(0, "first"), message(0, "second"));
-    let messages = |m: &[u8]| Frame::Messages { group: Bytes(G.to_vec()), items: vec![Bytes(m.to_vec())] };
-    frame::write(&mut send, &messages(&first)).await.unwrap();
+    frame::write(&mut send, &want(1)).await.unwrap();
     frame::write(&mut send, &serde_json::json!({"newer": {"group": "Zw"}})).await.unwrap();
-    frame::write(&mut send, &messages(&second)).await.unwrap();
-    eventually("the frame after the unknown one arrives", || a.fake.holds(G, &second)).await;
-    assert!(a.fake.holds(G, &first));
+    frame::write(&mut send, &want(2)).await.unwrap();
+    let from = keys[1].public();
+    assert_eq!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(from, want(1)));
+    assert_eq!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(from, want(2)));
     a.net.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn messages_sync_after_both_were_offline() {
-    let relay = relay().await;
-    let keys = keys(2);
-    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let service = service();
-    let log: Vec<Vec<u8>> = (1..=5).map(|n| vec![n]).collect();
-    let group = |floor, joined| Group { members: members.clone(), log: log.clone(), floor, joined, ..Group::default() };
-    // A was there from the start; B joined at epoch 2 and accepts nothing below epoch 3.
-    let fake_a = Fake::new(&service).with(G, group(0, 0));
-    let fake_b = Fake::new(&service).with(G, group(3, 2));
-    let before_b_joined = message(1, "a1");
-    let below_b_floor = message(2, "a2");
-    let from_a = [message(4, "a4"), message(5, "a5")];
-    let from_b = [message(3, "b3"), message(5, "b5")];
-    let both = message(4, "both");
-    for m in [&before_b_joined, &below_b_floor, &from_a[0], &from_a[1], &both] {
-        fake_a.hold(G, m.clone());
-    }
-    for m in [&from_b[0], &from_b[1], &both] {
-        fake_b.hold(G, m.clone());
-    }
-
-    let mut a = node(&relay, keys[0].clone(), fake_a, Options::default()).await;
-    let mut b = node(&relay, keys[1].clone(), fake_b, Options { relay_only: true, ..Options::default() }).await;
-    b.net.dial(members[0], relay.url.clone()).await.unwrap();
-    a.synced(G, members[1]).await;
-    b.synced(G, members[0]).await;
-    for m in &from_a {
-        assert!(b.fake.holds(G, m));
-    }
-    for m in &from_b {
-        assert!(a.fake.holds(G, m));
-    }
-    assert!(!b.fake.holds(G, &before_b_joined), "nothing from before B joined");
-    assert!(!b.fake.holds(G, &below_b_floor), "nothing below B's floor");
-    assert_eq!(b.fake.groups.lock().unwrap()[G].held.len(), 5);
-
-    let live = message(5, "live");
-    assert_eq!(a.net.send(G, live.clone()), vec![members[1]]);
-    eventually("the live message arrives", || b.fake.holds(G, &live)).await;
-    a.net.shutdown().await.unwrap();
-    b.net.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn live_messages_and_state_links_reach_one_member() {
-    let relay = relay().await;
-    let keys = keys(3);
-    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let service = service();
-    let group = |members: &[_]| Group { members: members.to_vec(), log: vec![b"e1".to_vec()], ..Group::default() };
-    let mut a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group(&members)), Options::default()).await;
-    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group(&members)), Options::default()).await;
-    // C is no member, as far as A knows.
-    let c = node(&relay, keys[2].clone(), Fake::new(&service).with(G, group(&members[1..])), Options::default()).await;
-    a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    a.net.dial(members[2], relay.url.clone()).await.unwrap();
-    let in_step = a.until(|e| matches!(e, Event::InStep { .. })).await;
-    assert_eq!(in_step, Event::InStep { group: G.to_vec(), peer: members[1] });
-    let live = [&1u64.to_be_bytes()[..], &[1], b"edit"].concat();
-    for peer in [members[1], members[2]] {
-        assert!(a.net.frame(peer, Frame::State { group: Bytes(G.to_vec()), link: Some("lmk:state".into()) }));
-        assert!(a.net.frame(peer, Frame::Messages { group: Bytes(G.to_vec()), items: vec![Bytes(live.clone())] }));
-    }
-    eventually("the state link and live message reach B", || {
-        !b.fake.states.lock().unwrap().is_empty() && !b.fake.groups.lock().unwrap()[G].live.is_empty()
-    })
-    .await;
-    assert_eq!(b.fake.states.lock().unwrap()[0], (G.to_vec(), members[0], Some("lmk:state".to_string())));
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert!(c.fake.states.lock().unwrap().is_empty(), "none reach a non-member");
-    assert!(c.fake.groups.lock().unwrap()[G].live.is_empty());
-    a.net.shutdown().await.unwrap();
-    b.net.shutdown().await.unwrap();
-    c.net.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -240,9 +68,8 @@ async fn file_from_two_holders_one_cut_off() {
     let relay = relay().await;
     let keys = keys(3);
     let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let service = service();
-    let group = || Group { members: members.clone(), log: vec![b"e1".to_vec()], ..Group::default() };
-    let (fake_a, fake_b, fake_c) = (Fake::new(&service).with(G, group()), Fake::new(&service).with(G, group()), Fake::new(&service).with(G, group()));
+        let group = || Group { members: members.clone(), ..Group::default() };
+    let (fake_a, fake_b, fake_c) = (Fake::new().with(G, group()), Fake::new().with(G, group()), Fake::new().with(G, group()));
     let a = node(&relay, keys[0].clone(), fake_a.clone(), Options::default()).await;
     let b = node(&relay, keys[1].clone(), fake_b.clone(), Options::default()).await;
     // C, like a browser, goes through the relay, and would fetch only files up to 1 MiB unasked.
@@ -280,18 +107,18 @@ async fn file_from_two_holders_one_cut_off() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn small_files_are_fetched_unasked() {
+async fn small_files_are_fetched_when_wanted() {
     let relay = relay().await;
     let keys = keys(2);
     let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let service = service();
-    let group = || Group { members: members.clone(), log: vec![b"e1".to_vec()], ..Group::default() };
-    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
+        let group = || Group { members: members.clone(), ..Group::default() };
+    let a = node(&relay, keys[0].clone(), Fake::new().with(G, group()), Options::default()).await;
     let link = a.net.add_file(std::io::Cursor::new(b"attachment".to_vec())).await.unwrap();
     a.fake.groups.lock().unwrap().get_mut(G).unwrap().files.push(link.clone());
-    let mut b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
+    let mut b = node(&relay, keys[1].clone(), Fake::new().with(G, group()), Options::default()).await;
     b.fake.groups.lock().unwrap().get_mut(G).unwrap().files.push(link.clone());
     b.net.dial(members[0], relay.url.clone()).await.unwrap();
+    b.net.want_files(members[0], G);
     b.until(|e| *e == Event::Fetched(link.hash)).await;
     let mut out = Vec::new();
     b.net.read_file(&link, &mut out).await.unwrap();
@@ -306,10 +133,9 @@ async fn a_disk_holds_and_serves_only_what_it_keeps() {
     let relay = relay().await;
     let keys = keys(3);
     let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let service = service();
-    let group = || Group { members: members.clone(), log: vec![b"e1".to_vec()], ..Group::default() };
+        let group = || Group { members: members.clone(), ..Group::default() };
     let c_disk = Arc::new(FakeDisk::default());
-    let c = node(&relay, keys[2].clone(), Fake::new(&service).with(G, group()), Options { disk: Some(c_disk.clone()), ..Options::default() }).await;
+    let c = node(&relay, keys[2].clone(), Fake::new().with(G, group()), Options { disk: Some(c_disk.clone()), ..Options::default() }).await;
     let kept = c.net.add_file(std::io::Cursor::new(b"kept".to_vec())).await.unwrap();
     let fetched = c.net.add_file(std::io::Cursor::new(b"fetched".to_vec())).await.unwrap();
     assert!(c_disk.has(&kept.hash) && c_disk.has(&fetched.hash), "a browser keeps the files it adds");
@@ -317,8 +143,8 @@ async fn a_disk_holds_and_serves_only_what_it_keeps() {
     let disk = Arc::new(FakeDisk::default());
     disk.0.lock().unwrap().insert(kept.hash, c_disk.0.lock().unwrap()[&kept.hash].clone());
     let options = Options { disk: Some(disk.clone()), file_limit: 0, ..Options::default() };
-    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), options).await;
-    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options { file_limit: 0, ..Options::default() }).await;
+    let a = node(&relay, keys[0].clone(), Fake::new().with(G, group()), options).await;
+    let b = node(&relay, keys[1].clone(), Fake::new().with(G, group()), Options { file_limit: 0, ..Options::default() }).await;
     let own = a.net.add_file(std::io::Cursor::new(b"own".to_vec())).await.unwrap();
     for fake in [&a.fake, &b.fake, &c.fake] {
         fake.groups.lock().unwrap().get_mut(G).unwrap().files.extend([kept.clone(), fetched.clone(), own.clone()]);
@@ -342,21 +168,19 @@ async fn a_disk_holds_and_serves_only_what_it_keeps() {
     }
 }
 
+/// Each request to be admitted goes on a stream of its own, answered there.
 #[tokio::test(flavor = "multi_thread")]
-async fn requests_to_be_admitted_are_answered_by_id() {
+async fn requests_to_be_admitted_are_answered_each_on_its_stream() {
     let relay = relay().await;
     let keys = keys(2);
-    let service = service();
-    let member = node(&relay, keys[0].clone(), Fake::new(&service), Options::default()).await;
-    let joiner = node(&relay, keys[1].clone(), Fake::new(&service), Options { relay_only: true, ..Options::default() }).await;
+    let member = node(&relay, keys[0].clone(), Fake::new(), Options::default()).await;
+    let joiner = node(&relay, keys[1].clone(), Fake::new(), Options { relay_only: true, ..Options::default() }).await;
     let join = |secret: Option<[u8; 16]>, group: Option<&[u8]>| Join {
         secret: secret.map(Bytes::from),
         group: group.map(Bytes::from),
         key_package: Bytes(b"kp".to_vec()),
     };
     let ask = |join| joiner.net.join(keys[0].public(), relay.url.clone(), join);
-
-    // Requests on one connection, answered by id.
     joiner.net.dial(keys[0].public(), relay.url.clone()).await.unwrap();
     let (invited, refused, opened) = tokio::join!(ask(join(Some(SECRET), None)), ask(join(Some([0; 16]), None)), ask(join(None, Some(b"open"))));
     assert!(matches!(invited.unwrap(), Answer::Ok(admitted) if admitted.welcome.0 == b"invited"));
@@ -366,70 +190,32 @@ async fn requests_to_be_admitted_are_answered_by_id() {
     joiner.net.shutdown().await.unwrap();
 }
 
+/// Sessions of one device reach each other by the addresses they publish in `LETMEKNOW_HOME`, with no relay.
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_of_one_device_find_each_other() {
     let relay = relay().await;
     let home = tempfile::tempdir().unwrap();
     let keys = keys(2);
     let options = || Options { home: Some(home.path().to_path_buf()), ..Options::default() };
-    let service = service();
-    let a = node(&relay, keys[0].clone(), Fake::new(&service), options()).await;
-    let mut b = node(&relay, keys[1].clone(), Fake::new(&service), options()).await;
+    let a = node(&relay, keys[0].clone(), Fake::new(), options()).await;
+    let b = node(&relay, keys[1].clone(), Fake::new(), options()).await;
     let published = home.path().join("addresses").join(format!("{}.json", keys[0].public()));
-    eventually("A publishes its addresses", || published.exists()).await;
+    let addresses = || std::fs::read(&published).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    eventually("A publishes its addresses", || addresses().is_some_and(|a| a["addrs"].as_array().is_some_and(|addrs| !addrs.is_empty()))).await;
     // A relay that is not there: only the published addresses lead to A.
     let nowhere: RelayUrl = "https://localhost:1".parse().unwrap();
     b.net.dial(keys[0].public(), nowhere).await.unwrap();
-    b.until(|e| *e == Event::Connected(keys[0].public())).await;
+    assert_eq!(b.net.connected(), [keys[0].public()]);
     a.net.shutdown().await.unwrap();
     assert!(!published.exists());
     b.net.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_longer_head_is_judged_once_the_log_reaches_it() {
-    let relay = relay().await;
-    let keys = keys(2);
-    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let service = service();
-    let log = |entries: &[&[u8]], frozen| Group { members: members.clone(), log: entries.iter().map(|e| e.to_vec()).collect(), frozen, ..Group::default() };
-    let mut a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, log(&[b"e1", b"e2", b"x3", b"x4"], false)), Options::default()).await;
-    let mut b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, log(&[b"e1", b"e2"], true)), Options::default()).await;
-    a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    // B cannot judge A's longer head yet, and takes its entries only from the service.
-    eventually("A offers B its entries", || b.fake.groups.lock().unwrap()[G].offered > 0).await;
-    b.fake.groups.lock().unwrap().get_mut(G).unwrap().log.extend([b"e3".to_vec(), b"e4".to_vec()]);
-    b.net.changed(G);
-    let event = b.until(|e| matches!(e, Event::Contradiction { .. })).await;
-    let Event::Contradiction { ours, theirs, .. } = event else { unreachable!() };
-    assert_eq!((ours.length, theirs.length), (4, 4));
-    assert_ne!(ours.hash, theirs.hash);
-    assert!(a.events.try_recv().into_iter().all(|e| !matches!(e, Event::Contradiction { .. })));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn connected_peers_sync_again() {
-    let relay = relay().await;
-    let keys = keys(2);
-    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let service = service();
-    let group = || Group { members: members.clone(), log: vec![b"e1".to_vec()], ..Group::default() };
-    let often = || Options { resync: std::time::Duration::from_millis(200), ..Options::default() };
-    let mut a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), often()).await;
-    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), often()).await;
-    a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    a.synced(G, members[1]).await;
-    // A message that reached A but was never sent on, as when a live send was lost.
-    let missed = message(1, "missed");
-    a.fake.hold(G, missed.clone());
-    eventually("the next sync brings it", || b.fake.holds(G, &missed)).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn files_no_group_links_are_deleted() {
     let relay = relay().await;
     let keys = keys(1);
-    let fake = Fake::new(&service()).with(G, Group { members: vec![keys[0].public()], ..Group::default() });
+    let fake = Fake::new().with(G, Group { members: vec![keys[0].public()], ..Group::default() });
     let options = Options { collect: std::time::Duration::from_millis(100), ..Options::default() };
     let a = node(&relay, keys[0].clone(), fake, options).await;
     let linked = a.net.add_file(std::io::Cursor::new(b"linked".to_vec())).await.unwrap();

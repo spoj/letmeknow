@@ -15,7 +15,6 @@ iroh-blobs.workspace = true
 lmk-proto.workspace = true
 lmk-transport.workspace = true
 n0-future = "0.3"
-negentropy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

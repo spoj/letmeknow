@@ -9,7 +9,6 @@ pub mod identity;
 pub mod links;
 pub mod membership;
 pub mod peer;
-pub mod peer2;
 pub mod random;
 pub mod ranges;
 

@@ -10,6 +10,7 @@ pub mod devices;
 mod groups;
 mod kind;
 mod logs;
+mod peering;
 mod reading;
 mod sending;
 
@@ -28,10 +29,12 @@ use lmk_core::identity::{KeyLog, Verdict};
 use lmk_membership::Contradiction;
 use lmk_core::provider::Provider;
 use lmk_membership::Refused;
+use lmk_net::peers::{self, Peers};
 use lmk_net::{Net, Network};
 use lmk_proto::group::{Certificate, Control, Credential, DEVICES, How, IdentityRef, Leaf, Opening, REVISION, Settings};
 use lmk_proto::links::{Address, FileLink, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Frame, Join};
+use lmk_proto::ranges::Ranges;
 use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
 use n0_future::task::{JoinHandle, spawn};
@@ -44,6 +47,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use lmk_core;
 pub use lmk_net::{Disk, Fetch};
+pub use peering::Heard;
 pub use lmk_proto::clock::now;
 
 /// How often a session replaces its keys in each group.
@@ -56,8 +60,8 @@ const SEND_WAIT: Duration = Duration::from_secs(5);
 const MEMBER_WAIT: Duration = Duration::from_secs(5);
 /// How often members not connected are dialed again.
 const REDIAL: Duration = Duration::from_secs(10);
-/// How often connected members sync their groups again.
-const RESYNC: Duration = Duration::from_secs(5 * 60);
+/// How often a followed log is read again whole.
+const REREAD: Duration = Duration::from_secs(5 * 60);
 /// How often files no group holds any longer are deleted.
 const COLLECT: Duration = Duration::from_secs(60 * 60);
 /// How long a fetch keeps looking for a member that holds the file.
@@ -227,11 +231,9 @@ pub enum Event {
         sender: Member,
         payload: Value,
     },
-    /// A sync of the group's held messages with a member finished: this session holds every message that member held
-    /// for it and could open.
-    Synced { group: Bytes },
-    /// This session and a connected member hold the same log of the group: a time to compare the kind's state.
-    InStep {
+    /// A connected member's `hello` shows the same head of the group's log as this session's: a time to compare the
+    /// kind's state.
+    Synced {
         group: Bytes,
         member: Member,
     },
@@ -283,8 +285,7 @@ impl Event {
             | Event::Removed { group, .. }
             | Event::Settings { group, .. }
             | Event::Live { group, .. }
-            | Event::Synced { group }
-            | Event::InStep { group, .. }
+            | Event::Synced { group, .. }
             | Event::State { group, .. }
             | Event::Logged { group }
             | Event::Snapshot { group, .. }
@@ -324,6 +325,20 @@ struct Rec {
     invites: Vec<Rule>,
     /// Counted `leave`s: each sender's key, and the epoch it was sealed in; kept until moot.
     leaves: Vec<(Bytes, u64)>,
+    /// Of the positions kept (after `expired`): the counted ones; those of this session's sends; those lacking their
+    /// ciphertext, which this session can still open; the known losses; and those its client marked read.
+    messages: Ranges,
+    own: Ranges,
+    lacking: Ranges,
+    lost: Ranges,
+    read: Ranges,
+}
+
+/// A joiner's KeyPackage, whose private keys openmls keeps, and the device key it is made with for a devices group.
+#[derive(Serialize, Deserialize)]
+struct Joining {
+    key_package: Bytes,
+    device: Option<Bytes>,
 }
 
 /// An invite, as its inviter shared it with the group.
@@ -360,12 +375,23 @@ fn days(days: u32) -> u64 {
 pub(crate) struct G {
     mls: Group,
     rec: Rec,
-    /// Ciphertexts that came before their entries were read: of the current epoch or the next.
-    early: Vec<Vec<u8>>,
+    /// Ciphertexts that came before their entries were read, of the current epoch or the next, and the peers that sent
+    /// them.
+    early: Vec<(EndpointId, Vec<u8>)>,
     /// When this session last asked a member for the kind's state, or was handed one, in milliseconds.
     asked: u64,
-    /// The wait before the commit that deletes an epoch's keys while this session lacks some of its messages.
-    wait: Option<reading::Wait>,
+    /// Reading waits before a commit that deletes the keys of an epoch whose messages this session lacks.
+    waiting: bool,
+    /// Each peer's latest summary of the group, by its iroh key, as saved.
+    heard: BTreeMap<Bytes, peers::Heard>,
+    /// The key logs this session follows of the identities the group's members speak as.
+    keys: Vec<Vec<u8>>,
+}
+
+impl G {
+    fn new(mls: Group, rec: Rec, heard: BTreeMap<Bytes, peers::Heard>) -> Self {
+        G { mls, rec, early: Vec::new(), asked: 0, waiting: false, heard, keys: Vec::new() }
+    }
 }
 
 pub(crate) struct State<P> {
@@ -389,17 +415,20 @@ pub(crate) struct State<P> {
     device_keys: BTreeMap<Vec<u8>, ([u8; 32], Session)>,
     /// `send`s waiting for their entries to count, by the id they started with.
     waiters: HashMap<Vec<u8>, Vec<oneshot::Sender<sending::Outcome>>>,
+    peers: Peers,
+    /// The peers connected now, and the groups the gate admits each to.
+    served: BTreeMap<EndpointId, BTreeSet<Bytes>>,
+    /// The rosters or the key logs changed since `served` was worked out.
+    gate: bool,
+    /// The latest time a step saw, in milliseconds: `Peers` takes no time from before.
+    time: u64,
 }
 
 /// What a step produced for the peers.
 pub(crate) enum Out {
-    /// A held message whose entry counts, or a live one, to the members online.
-    Push { group: Vec<u8>, ciphertext: Vec<u8> },
     Frame { peer: EndpointId, frame: Frame },
-    /// This session's state of a group changed: its peers hear.
-    Changed(Vec<u8>),
-    /// This session serves a peer a group anew: they sync it again.
-    Served { peer: EndpointId, group: Vec<u8> },
+    /// Ask the peer for the files the group links that this session lacks.
+    WantFiles { peer: EndpointId, group: Vec<u8> },
 }
 
 /// One step: the state, locked, with a transaction open on its storage; committed when the step ends, and only then
@@ -480,9 +509,8 @@ pub(crate) enum Work {
     },
     /// Held sends of a group to append.
     Send(Vec<u8>),
-    /// A group waits before a commit: read on once the wait is over.
-    Wait(Vec<u8>),
-    Net(lmk_net::Event),
+    /// A file is held whole.
+    Fetched([u8; 32]),
 }
 
 /// A log, and the lengths and hashes of two heads of it that contradict each other.
@@ -685,12 +713,6 @@ impl<P: Provider> State<P> {
         log.is_some_and(|log| matches!(log.verify(credential), Verdict::Verified { .. }))
     }
 
-    /// The groups this session serves each of these peers.
-    fn served(&self, peers: &[EndpointId]) -> Vec<(Vec<u8>, EndpointId)> {
-        let gids = self.groups.keys();
-        gids.flat_map(|gid| peers.iter().filter(|peer| self.serves(gid, peer)).map(|peer| (gid.clone(), *peer))).collect()
-    }
-
     /// The identities a group's members speak as.
     fn identities(&self, gid: &[u8]) -> Vec<IdentityRef> {
         let Some(g) = self.groups.get(gid) else { return Vec::new() };
@@ -701,9 +723,11 @@ impl<P: Provider> State<P> {
     fn add_group(&mut self, mls: Group, rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
         self.add_log(&gid, logs::Log::new(logs::Of::Group, mls.settings().membership, rec.position))?;
-        self.groups.insert(gid.clone(), G { mls, rec, early: Vec::new(), asked: 0, wait: None });
+        self.groups.insert(gid.clone(), G::new(mls, rec, BTreeMap::new()));
         self.save(&gid)?;
         self.save_groups()?;
+        self.gate = true;
+        self.refresh(&gid);
         Ok(gid)
     }
 }
@@ -751,7 +775,8 @@ impl<P: Provider + Send + 'static> Node<P> {
         for gid in get::<Vec<Bytes>>(&provider, b"node/groups")?.unwrap_or_default() {
             let mls = Group::load(&provider, &gid.0)?;
             let rec: Rec = get(&provider, &rec_key(&gid.0))?.context("a group without its record")?;
-            groups.insert(gid.0, G { mls, rec, early: Vec::new(), asked: 0, wait: None });
+            let heard = peering::load_heard(&provider, &gid.0)?;
+            groups.insert(gid.0, G::new(mls, rec, heard));
         }
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
@@ -768,13 +793,18 @@ impl<P: Provider + Send + 'static> Node<P> {
             unlisted: HashSet::new(),
             device_keys: BTreeMap::new(),
             waiters: HashMap::new(),
+            peers: Peers::new(now()),
+            served: BTreeMap::new(),
+            gate: true,
+            time: now(),
         };
         for gid in state.groups.keys().cloned().collect::<Vec<_>>() {
             if let Some(seed) = get::<Bytes>(&state.provider, &device_key_key(&gid))? {
                 let seed: [u8; 32] = seed.0.as_slice().try_into().context("a device key is 32 bytes")?;
                 let session = state.keyed(seed)?;
-                state.device_keys.insert(gid, (seed, session));
+                state.device_keys.insert(gid.clone(), (seed, session));
             }
+            state.refresh(&gid);
         }
         let inner = Arc::new(Inner {
             state: Mutex::new(state),
@@ -802,15 +832,18 @@ impl<P: Provider + Send + 'static> Node<P> {
             files: config.files,
             disk: config.disk,
             file_limit: config.file_limit,
-            resync: RESYNC,
             collect: COLLECT,
         };
         let (net, mut net_events) =
             Net::spawn(network, net_config, inner.clone(), Arc::new(groups::Admitter(inner.clone()))).await?;
         inner.net.set(net).ok();
+        let peering = inner.clone();
         inner.spawn(async move {
             while let Some(event) = net_events.recv().await {
-                work.send(Work::Net(event)).ok();
+                match event {
+                    lmk_net::Event::Fetched(hash) => drop(work.send(Work::Fetched(hash))),
+                    event => peering.peer_event(event),
+                }
             }
         });
         inner.spawn(inner.clone().drive(work_rx));
@@ -853,7 +886,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         }
         inner.spawn(inner.clone().resume(gids));
         inner.spawn(inner.clone().redial());
-        inner.spawn(inner.clone().passing());
+        inner.spawn(inner.clone().polling());
         Ok((Node { inner }, events_rx))
     }
 
@@ -911,8 +944,8 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(members.into_iter().filter(|m| connected.iter().any(|peer| peer.as_bytes()[..] == m.iroh.0[..])).collect())
     }
 
-    /// What this session sent to a group that no other member holds yet.
-    pub fn only_here(&self, gid: &[u8]) -> Result<Vec<Pending>> {
+    /// The files this session added to a group that no other member held yet.
+    pub fn pending_files(&self, gid: &[u8]) -> Result<Vec<Pending>> {
         Ok(self.inner.lock().group(gid)?.rec.pending.clone())
     }
 
@@ -997,26 +1030,54 @@ impl<P: Provider + Send + 'static> Node<P> {
         identity: Option<Certificate>,
         devices: bool,
     ) -> Result<(Bytes, [u8; 32])> {
+        // The KeyPackage, its private keys and its device key are kept until this session joins or every member it asks
+        // refuses it: a member that added it asks again answers with the Welcome its log holds.
+        let target = secret.as_ref().map_or_else(|| group.clone().unwrap_or_default().0, |secret| Sha256::digest(&secret.0).to_vec());
+        let joining = [b"node/joining/".as_slice(), &target].concat();
         let (join, device_key) = {
             let mut st = self.inner.lock();
             st.speak(identity);
-            let device_key = devices.then(|| st.device_key()).transpose()?;
-            let session = device_key.as_ref().map_or(&st.session, |(_, session)| session);
-            (Join { secret, group, key_package: Bytes(session.key_package(&st.provider)?) }, device_key.map(|(seed, _)| seed))
+            let kept = match get::<Joining>(&st.provider, &joining)? {
+                Some(kept) => kept,
+                None => {
+                    let device_key = devices.then(|| st.device_key()).transpose()?;
+                    let session = device_key.as_ref().map_or(&st.session, |(_, session)| session);
+                    let kept = Joining { key_package: Bytes(session.key_package(&st.provider)?), device: device_key.map(|(seed, _)| Bytes(seed.to_vec())) };
+                    put(&st.provider, &joining, &kept)?;
+                    kept
+                }
+            };
+            let device_key = kept.device.map(|seed| seed.0.try_into()).transpose().ok().context("a device key is 32 bytes")?;
+            (Join { secret, group, key_package: kept.key_package }, device_key)
         };
         let dialed = n0_future::join_all(members.iter().map(|(peer, relay)| timeout(DIAL_WAIT, self.inner.net().dial(*peer, relay.clone())))).await;
         let mut refusal = anyhow::anyhow!("no member the invite names is online");
+        let mut refused_by_all = true;
         for ((peer, relay), dialed) in members.into_iter().zip(dialed) {
             if !matches!(dialed, Ok(Ok(()))) {
                 tracing::debug!("{} is not online", peer.fmt_short());
+                refused_by_all = false;
                 continue;
             }
             match timeout(JOIN_WAIT, self.inner.net().join(peer, relay, join.clone())).await {
-                Ok(Ok(Answer::Ok(admitted))) => return Ok((self.inner.welcomed(admitted, peer, device_key).await?, *peer.as_bytes())),
+                Ok(Ok(Answer::Ok(admitted))) => {
+                    let gid = self.inner.welcomed(admitted, peer, device_key).await?;
+                    self.inner.lock().provider.delete(&joining)?;
+                    return Ok((gid, *peer.as_bytes()));
+                }
                 Ok(Ok(Answer::Refused { refused })) => refusal = anyhow::anyhow!("refused: {refused}"),
-                Ok(Err(error)) => tracing::debug!("asking {} to admit this session: {error:#}", peer.fmt_short()),
-                Err(_) => tracing::debug!("{} did not answer", peer.fmt_short()),
+                Ok(Err(error)) => {
+                    refused_by_all = false;
+                    tracing::debug!("asking {} to admit this session: {error:#}", peer.fmt_short());
+                }
+                Err(_) => {
+                    refused_by_all = false;
+                    tracing::debug!("{} did not answer", peer.fmt_short());
+                }
             }
+        }
+        if refused_by_all {
+            self.inner.lock().provider.delete(&joining)?;
         }
         Err(refusal)
     }
@@ -1070,18 +1131,23 @@ impl<P: Provider + Send + 'static> Node<P> {
         counted.await.context(UNFINISHED)?.map_err(|error| anyhow::anyhow!(error))
     }
 
-    /// Seals a live payload, not held, and sends it to the members online, or to the one with fingerprint `to`.
+    /// Seals a live payload, not held, and sends it to the members online, or to the one with fingerprint `to`; none
+    /// while this session has not applied the group's log to its head.
     pub fn send_live(&self, gid: &[u8], payload: &Value, to: Option<&str>) -> Result<()> {
         let mut st = self.inner.lock();
         let st = &mut *st;
         let peer = to.map(|fp| st.by_fp(gid, fp)).transpose()?;
+        if !st.at_head(gid) {
+            return Ok(());
+        }
         let g = st.groups.get_mut(gid).context("this session is not in that group")?;
         let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
         let ciphertext = g.mls.seal(&st.provider, session, payload, true)?.1;
-        st.out.push(match peer {
-            Some(peer) => Out::Frame { peer, frame: Frame::Messages { group: Bytes(gid.to_vec()), items: vec![Bytes(ciphertext)] } },
-            None => Out::Push { group: gid.to_vec(), ciphertext },
-        });
+        let frame = Frame::Live { group: Bytes(gid.to_vec()), items: vec![Bytes(ciphertext)] };
+        match peer {
+            Some(peer) => st.emit(gid, peer, frame),
+            None => st.broadcast(gid, frame),
+        }
         Ok(())
     }
 
@@ -1116,7 +1182,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub async fn hand_state(&self, gid: &[u8], to: &str, data: Vec<u8>) -> Result<()> {
         let peer = self.inner.lock().by_fp(gid, to)?;
         let link = self.inner.state_file(gid, data).await?;
-        self.inner.lock().out.push(Out::Frame { peer, frame: Frame::State { group: Bytes(gid.to_vec()), link: Some(link) } });
+        self.inner.lock().emit(gid, peer, Frame::State { group: Bytes(gid.to_vec()), link: Some(link) });
         Ok(())
     }
 
@@ -1127,7 +1193,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// Whether this session serves a peer a group, by the serving rules.
     pub fn serves(&self, gid: &[u8], peer: &EndpointId) -> bool {
-        lmk_net::Groups::is_member(&*self.inner, gid, peer)
+        self.inner.lock().serves(gid, peer)
     }
 
     /// Whether this session lost a held message: its entry counted, and it can no longer open it.
@@ -1283,7 +1349,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Asks a member online, by its iroh key, for the state of the group's kind.
     pub fn ask_state(&self, gid: &[u8], peer: &[u8]) -> Result<()> {
         let peer = endpoint_id(peer).context("an iroh key")?;
-        self.inner.lock().out.push(Out::Frame { peer, frame: Frame::State { group: Bytes(gid.to_vec()), link: None } });
+        self.inner.lock().emit(gid, peer, Frame::State { group: Bytes(gid.to_vec()), link: None });
         Ok(())
     }
 
@@ -1372,10 +1438,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let Some(net) = self.net.get() else { continue };
             for out in out {
                 match out {
-                    Out::Push { group, ciphertext } => drop(net.send(&group, ciphertext)),
                     Out::Frame { peer, frame } => drop(net.frame(peer, frame)),
-                    Out::Changed(group) => net.changed(&group),
-                    Out::Served { peer, group } => net.served(peer, &group),
+                    Out::WantFiles { peer, group } => net.want_files(peer, &group),
                 }
             }
         }
@@ -1533,7 +1597,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         self.follow(&gid);
         self.refresh_all().await;
-        self.lock().out.push(Out::Changed(gid.clone()));
         self.dial_all();
         if let Some(link) = admitted.doc {
             self.state_from(&gid, link, by);
@@ -1694,12 +1757,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
             return Ok(());
         }
         let log = KeyLog::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
-        let peers = self.net().connected();
-        let before = st.served(&peers);
         st.keys.insert(id.to_vec(), log);
-        for (group, peer) in st.served(&peers).into_iter().filter(|served| !before.contains(served)) {
-            st.out.push(Out::Served { peer, group });
-        }
+        st.gate = true;
         self.revoke(st);
         self.events.send(Event::Keys { identity: Bytes(id.to_vec()) }).ok();
         Ok(())
@@ -1720,13 +1779,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for position in g.rec.kind.iter().flat_map(|kind| &kind.kept) {
             st.provider.delete(&kind::kept_key(gid, *position))?;
         }
+        peering::forget_heard(&st.provider, gid, g.heard.keys())?;
+        st.peers.forget(&Bytes(gid.to_vec()));
+        st.gate = true;
         st.provider.delete(&rec_key(gid))?;
         st.provider.delete(&device_key_key(gid))?;
         st.device_keys.remove(gid);
         g.mls.delete(&st.provider)?;
         st.save_groups()?;
         st.scrub = true;
-        st.out.push(Out::Changed(gid.to_vec()));
         self.advanced.notify_waiters();
         Ok(())
     }
@@ -1805,21 +1866,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                         });
                     }
                 }
-                Work::Wait(gid) => {
-                    let inner = self.clone();
-                    self.spawn(async move {
-                        loop {
-                            sleep(Duration::from_secs(1)).await;
-                            let mut st = inner.lock();
-                            match inner.wait_over(&mut st, &gid) {
-                                Ok(false) => {}
-                                Ok(true) => return,
-                                Err(error) => return inner.warn(Some(&gid), format!("{error:#}")),
-                            }
-                        }
-                    });
-                }
-                Work::Net(event) => self.net_event(event),
+                Work::Fetched(hash) => self.fetched_file(hash),
             }
         }
     }
@@ -1906,86 +1953,19 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    fn net_event(self: &Arc<Self>, event: lmk_net::Event) {
-        match event {
-            lmk_net::Event::Contradiction { log, peer, ours, theirs } => {
-                let st = self.lock();
-                self.contradicted(&st, &log, &Contradiction { ours, theirs }, &peer.fmt_short().to_string());
-            }
-            lmk_net::Event::Fetched(hash) => {
-                let mut st = self.lock();
-                let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
-                for gid in gids {
-                    let g = st.groups.get_mut(&gid).unwrap();
-                    let before = g.rec.pending.len();
-                    g.rec.pending.retain(|pending| pending.id.0 != hash);
-                    if g.rec.pending.len() != before {
-                        st.save(&gid).ok();
-                    }
-                }
-                self.events.send(Event::File(hash)).ok();
-            }
-            lmk_net::Event::Synced { group, peer } => {
-                self.events.send(Event::Synced { group: Bytes(group.clone()) }).ok();
-                let mut st = self.lock();
-                if let Err(error) = self.leavers(&st, &group) {
-                    self.warn(Some(&group), format!("{error:#}"));
-                }
-                if let Err(error) = self.progress(&mut st, &group, reading::Progress::Synced(peer)) {
-                    self.warn(Some(&group), format!("{error:#}"));
-                }
-                drop(st);
-                // A file only this session held may have reached the peer since.
-                let pending: Vec<[u8; 32]> = {
-                    let st = self.lock();
-                    let Ok(g) = st.group(&group) else { return };
-                    g.rec
-                        .pending
-                        .iter()
-                        .filter(|p| p.what == "file")
-                        .filter_map(|p| p.id.0.as_slice().try_into().ok())
-                        .collect()
-                };
-                for hash in pending {
-                    let (net, inner, group) = (self.net().clone(), self.clone(), group.clone());
-                    spawn(async move {
-                        if net.holders(&group, hash).await.contains(&peer) {
-                            let mut st = inner.lock();
-                            if let Ok(g) = st.group_mut(&group) {
-                                g.rec.pending.retain(|pending| pending.id.0 != hash);
-                                st.save(&group).ok();
-                            }
-                        }
-                    });
-                }
-            }
-            lmk_net::Event::InStep { group, peer } => {
-                let mut st = self.lock();
-                if st.group(&group).is_ok_and(|g| g.rec.kind.as_ref().is_some_and(|kind| kind.behind)) {
-                    self.ask_state(&mut st, &group, Some(peer));
-                }
-                let member = st.by_iroh(&group, &peer);
-                self.events.send(Event::InStep { group: Bytes(group), member }).ok();
-            }
-            lmk_net::Event::Connected(peer) => {
-                let mut st = self.lock();
-                let gids: Vec<Vec<u8>> = st.groups.keys().filter(|gid| st.serves(gid, &peer)).cloned().collect();
-                for gid in gids {
-                    if let Err(error) = self.progress(&mut st, &gid, reading::Progress::Connected(peer)) {
-                        self.warn(Some(&gid), format!("{error:#}"));
-                    }
-                }
-            }
-            lmk_net::Event::Disconnected(peer) => {
-                let mut st = self.lock();
-                let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
-                for gid in gids {
-                    if let Err(error) = self.progress(&mut st, &gid, reading::Progress::Disconnected(peer)) {
-                        self.warn(Some(&gid), format!("{error:#}"));
-                    }
-                }
+    /// A file is held whole: it is no longer held only here.
+    fn fetched_file(&self, hash: [u8; 32]) {
+        let mut st = self.lock();
+        let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
+        for gid in gids {
+            let g = st.groups.get_mut(&gid).unwrap();
+            let before = g.rec.pending.len();
+            g.rec.pending.retain(|pending| pending.id.0 != hash);
+            if g.rec.pending.len() != before {
+                st.save(&gid).ok();
             }
         }
+        self.events.send(Event::File(hash)).ok();
     }
 }
 

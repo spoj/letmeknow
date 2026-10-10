@@ -439,6 +439,14 @@ impl Group {
         self.mls.members().filter_map(|member| Member::of(&self.mls, member.index)).collect()
     }
 
+    /// Whether a member's leaf is still the one this KeyPackage brought: it has not updated since its Add.
+    pub fn unchanged<P: Provider>(&self, provider: &P, key_package: &[u8]) -> Result<bool> {
+        let key_package = key_package_in(provider, key_package)?;
+        let leaf = key_package.leaf_node();
+        let Some(member) = self.mls.members().find(|m| m.signature_key == leaf.signature_key().as_slice()) else { return Ok(false) };
+        Ok(self.mls.public_group().leaf(member.index).is_some_and(|ours| ours.encryption_key() == leaf.encryption_key()))
+    }
+
     /// Who added whom, as the log showed it since this session joined.
     pub fn added(&self) -> &[Added] {
         &self.state.added

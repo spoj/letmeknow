@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use lmk_proto::{
     Bytes,
     head::Head,
-    peer2::{Frame, Item, Summary},
+    peer::{Frame, Item, Summary},
     ranges::Ranges,
 };
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,7 @@ pub enum Decision {
 }
 
 pub struct Peers {
+    /// When the member came online: it started, or got its first connection after none.
     online: u64,
     /// When every summary last went to every peer.
     full: u64,
@@ -159,6 +160,9 @@ impl Peers {
 
     /// A connection to the peer opened, replacing any other, with the groups the gate admits it to.
     pub fn connect(&mut self, peer: Key, served: BTreeSet<Bytes>, now: u64) {
+        if self.conns.is_empty() {
+            self.online = now;
+        }
         self.disconnect(&peer);
         let conn = Conn {
             last: now,
@@ -249,6 +253,11 @@ impl Peers {
     /// This member's summary of a group.
     pub fn summary(&self, group: &Bytes) -> Summary {
         summary(group, &self.groups[group])
+    }
+
+    /// The positions of a group this member lacks and is fetching now.
+    pub fn fetching(&self, group: &Bytes) -> Ranges {
+        fetching(group, &self.groups[group], &self.conns)
     }
 
     /// What is due: entries peers lack, then `hello`s, then requests.

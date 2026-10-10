@@ -693,12 +693,14 @@ impl World {
         let Some((i, client)) = sender else { return };
         let node = client.node();
         let groups: Vec<(&str, Bytes)> = match &frame {
-            Frame::Hello { groups, .. } => groups.iter().map(|hello| ("hello", hello.group.clone())).collect(),
+            Frame::Hello { groups, .. } => groups.iter().map(|summary| ("hello", summary.group.clone())).collect(),
             Frame::Entries { log, .. } if node.groups().contains(log) => vec![("entries", log.clone())],
-            Frame::Reconcile { group, .. } => vec![("reconcile", group.clone())],
-            Frame::Messages { group, .. } => vec![("messages", group.clone())],
+            // A `want` from a peer the gate does not admit is answered, with nothing.
+            Frame::Messages { group, items, .. } if !items.is_empty() => vec![("messages", group.clone())],
             Frame::State { group, .. } => vec![("state", group.clone())],
+            Frame::Live { group, .. } => vec![("live", group.clone())],
             Frame::Want { group, .. } => vec![("want", group.clone())],
+            Frame::WantFiles { group, .. } => vec![("want_files", group.clone())],
             Frame::Have { group, files } if !files.is_empty() => vec![("have", group.clone())],
             _ => Vec::new(),
         };

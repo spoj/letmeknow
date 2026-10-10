@@ -1,29 +1,24 @@
 //! Reading a group's log strictly in order: each position's epoch and verdict is recorded in the step that applies it.
 //! A message entry counts once per id per epoch; its ciphertext, which may come before or after it, is carried for H
 //! and opened in position order within its epoch. Before a commit that deletes an epoch's keys while this session lacks
-//! some of its messages, it syncs with the members online.
+//! some of its messages, it waits as `Peers::wait` decides, fetching them from the members that hold them.
 
-use std::collections::{BTreeSet, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 use iroh::EndpointId;
 use lmk_core::group::{self as core, Verdict};
 use lmk_core::provider::Provider;
+use lmk_net::peers::{Decision, HOLD_OFF};
 use lmk_proto::Bytes;
 use lmk_proto::group::{Control, type_of};
-use n0_future::time::{Duration, sleep};
+use lmk_proto::ranges::Ranges;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Event, Inner, Message, Out, State, Work, days, get, message_key, now, put};
+use crate::{Event, Inner, Message, State, Work, days, get, message_key, now, put};
 
-/// How long a missing counted position holds up the later ones of its epoch before they open past it, in
-/// milliseconds; it still opens if it comes later.
-const PASS: u64 = 10 * 1000;
-/// How long the wait before a commit that deletes an epoch's keys goes on without progress, in milliseconds.
-const STALL: u64 = 10 * 1000;
-/// The bytes of ciphertexts a group keeps that came before their entries were read.
+/// The bytes of ciphertexts a group keeps from one peer that came before their entries were read.
 const EARLY: usize = 4 << 20;
 
 /// A position of a group's log, as this session judged it.
@@ -62,32 +57,6 @@ pub(crate) fn ciphertext_key(gid: &[u8], position: u64) -> Vec<u8> {
     [b"node/ciphertext/".as_slice(), gid, b"/", &position.to_be_bytes()].concat()
 }
 
-/// The wait before applying the commit at `position`, which deletes the keys of an epoch whose counted positions this
-/// session lacks: a sync with each member online, as 0.12's sync carries ciphertexts.
-pub(crate) struct Wait {
-    position: u64,
-    /// The members online whose sync has not ended yet.
-    peers: BTreeSet<EndpointId>,
-    /// A member's sync ended.
-    synced: bool,
-    /// When it last made progress: a sync ended, a member came online, or a ciphertext came.
-    progress: u64,
-}
-
-/// What moves a wait on.
-pub(crate) enum Progress {
-    Synced(EndpointId),
-    Connected(EndpointId),
-    Disconnected(EndpointId),
-    Ciphertext,
-}
-
-/// The wait's rule, apart from how ciphertexts move: it ends once every member online synced, or after `STALL` without
-/// progress, as when none is online, while this session may still connect to some.
-fn waited(wait: &Wait, now: u64) -> bool {
-    wait.synced && wait.peers.is_empty() || now >= wait.progress + STALL
-}
-
 impl<P: Provider> State<P> {
     pub(crate) fn pos(&self, gid: &[u8], position: u64) -> Result<Option<Pos>> {
         get(&self.provider, &pos_key(gid, position))
@@ -114,30 +83,6 @@ impl<P: Provider> State<P> {
             }
         }
         Ok(messages)
-    }
-
-    /// The held ciphertexts of counted positions, from epoch `from`: their epochs and ids.
-    pub(crate) fn carried(&self, gid: &[u8], from: u64) -> Result<Vec<(u64, [u8; 32])>> {
-        let rec = &self.group(gid)?.rec;
-        let mut carried = Vec::new();
-        for position in rec.expired + 1..=rec.position {
-            if let Some(Pos { epoch, judged: Judged::Counted { id }, .. }) = self.pos(gid, position)?
-                && epoch >= from
-                && self.held(gid, position)?
-            {
-                carried.push((epoch, id.0.as_slice().try_into()?));
-            }
-        }
-        Ok(carried)
-    }
-
-    /// A carried ciphertext, by its epoch and id.
-    pub(crate) fn ciphertext(&self, gid: &[u8], epoch: u64, id: &[u8]) -> Result<Option<Vec<u8>>> {
-        let Some(position) = self.position_of(gid, id)? else { return Ok(None) };
-        if self.pos(gid, position)?.is_none_or(|pos| pos.epoch != epoch) {
-            return Ok(None);
-        }
-        self.provider.get(&ciphertext_key(gid, position))
     }
 
     /// Drops what this session kept of the positions read longer than H ago, and the invites and file links as old.
@@ -172,21 +117,20 @@ impl<P: Provider> State<P> {
         let rec = &mut self.group_mut(gid)?.rec;
         rec.expired = rec.expired.max(to);
         rec.unopened.retain(|position, _| *position > to);
+        let gone = Ranges::range(0, rec.expired);
+        for kept in [&mut rec.messages, &mut rec.own, &mut rec.lacking, &mut rec.lost, &mut rec.read] {
+            *kept = kept.difference(&gone);
+        }
         self.save(gid)
     }
 
     /// The counted positions of the epoch before the current one, whose keys the next commit deletes, that this
     /// session lacks.
-    fn lacking(&self, gid: &[u8]) -> Result<Vec<u64>> {
+    fn lacking(&self, gid: &[u8]) -> Result<Ranges> {
         let g = self.group(gid)?;
         let prior = g.mls.epoch().checked_sub(1);
-        let mut lacking = Vec::new();
-        for (position, (epoch, _)) in &g.rec.unopened {
-            if Some(*epoch) == prior && !self.held(gid, *position)? {
-                lacking.push(*position);
-            }
-        }
-        Ok(lacking)
+        let unopened = g.rec.unopened.iter().filter(|(_, (epoch, _))| Some(*epoch) == prior).map(|(position, _)| *position);
+        Ok(unopened.collect::<Ranges>().intersection(&g.rec.lacking))
     }
 }
 
@@ -246,16 +190,18 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 self.before_commit(st, gid, removes)?;
                 let g = st.groups.get_mut(gid).unwrap();
                 let applied = g.mls.apply(&st.provider, entry)?;
-                g.wait = None;
                 let current = g.mls.epoch();
-                g.early.retain(|early| core::header(early).is_ok_and(|(epoch, _)| epoch >= current));
+                g.early.retain(|(_, early)| core::header(early).is_ok_and(|(epoch, _)| epoch >= current));
                 let members = g.mls.members();
                 g.rec.leaves.retain(|(key, _)| members.iter().any(|m| m.key == key.0));
                 let by = members.into_iter().find(|m| m.index == applied.by);
                 let own = applied.own;
                 let gone = applied.gone;
                 st.scrub = true;
-                st.out.push(Out::Changed(gid.to_vec()));
+                st.gate = true;
+                for leaf in applied.removed.iter().filter_map(|m| m.leaf.as_ref()) {
+                    st.unhear(gid, &leaf.key.0)?;
+                }
                 let core::Applied { added, how, invite, removed, settings, .. } = applied;
                 self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, invite, removed, settings, gone }).ok();
                 let pos = Pos { epoch, at: now, judged: Judged::Commit { own }, lost: false };
@@ -272,48 +218,53 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// A message entry counts: its ciphertext is this session's own send, one that came early, or yet to come.
     fn count(&self, st: &mut State<P>, gid: &[u8], position: u64, epoch: u64, id: [u8; 32], now: u64) -> Result<()> {
         put(&st.provider, &id_key(gid, &id), &position)?;
-        st.group_mut(gid)?.rec.unopened.insert(position, (epoch, now));
+        let rec = &mut st.group_mut(gid)?.rec;
+        rec.unopened.insert(position, (epoch, now));
+        rec.messages.insert(position);
         if let Some((handle, send)) = st.own_send(gid, &id)? {
             return self.counted(st, gid, position, handle, send);
         }
         let g = st.group_mut(gid)?;
-        let early = g.early.iter().position(|ciphertext| <[u8; 32]>::from(Sha256::digest(ciphertext)) == id);
-        if let Some(early) = early.filter(|early| core::header(&g.early[*early]).is_ok_and(|(sealed, _)| sealed == epoch)) {
-            let ciphertext = g.early.remove(early);
-            st.provider.put(&ciphertext_key(gid, position), &ciphertext)?;
+        let early = g.early.iter().position(|(_, ciphertext)| <[u8; 32]>::from(Sha256::digest(ciphertext)) == id);
+        match early.filter(|early| core::header(&g.early[*early].1).is_ok_and(|(sealed, _)| sealed == epoch)) {
+            Some(early) => {
+                let (_, ciphertext) = g.early.remove(early);
+                st.provider.put(&ciphertext_key(gid, position), &ciphertext)?;
+            }
+            None => g.rec.lacking.insert(position),
         }
         Ok(())
     }
 
     /// Takes a held ciphertext from a peer, if it fills a counted position: one whose epoch, in its clear header, is the
-    /// position's. One that comes before its entry is kept a while if it is for the current epoch or the next. A live
-    /// one goes to the kind.
-    pub(crate) fn take(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8]) -> Result<()> {
-        let Ok(g) = st.group(gid) else { return Ok(()) };
-        let Ok((epoch, live)) = core::header(ciphertext) else { return Ok(()) };
+    /// position's. One that comes before its entry, from a peer the gate admits, is kept a while if it is for the
+    /// current epoch or the next, within `EARLY` per peer.
+    pub(crate) fn take(&self, st: &mut State<P>, gid: &[u8], peer: EndpointId, ciphertext: &[u8], admitted: bool) -> Result<()> {
+        let g = st.group(gid)?;
+        let Ok((epoch, false)) = core::header(ciphertext) else { return Ok(()) };
         if ciphertext.len() > core::MAX_MESSAGE {
             return Ok(());
-        }
-        if live {
-            return self.live(st, gid, ciphertext);
         }
         let current = g.mls.epoch();
         let id: [u8; 32] = Sha256::digest(ciphertext).into();
         match st.position_of(gid, &id)? {
             Some(position) => {
-                let fills = st.pos(gid, position)?.is_some_and(|pos| pos.epoch == epoch) && g.rec.unopened.contains_key(&position);
-                if fills && !st.held(gid, position)? {
+                if st.pos(gid, position)?.is_some_and(|pos| pos.epoch == epoch) && g.rec.lacking.contains(position) {
                     st.provider.put(&ciphertext_key(gid, position), ciphertext)?;
-                    self.progress(st, gid, Progress::Ciphertext)?;
+                    let g = st.group_mut(gid)?;
+                    g.rec.lacking.remove(position);
+                    if g.waiting {
+                        return self.advance(st, gid);
+                    }
                     self.open_ready(st, gid)?;
                     self.kind_advance(st, gid)?;
                 }
             }
-            None if epoch == current || epoch == current + 1 => {
+            None if admitted && (epoch == current || epoch == current + 1) => {
                 let g = st.group_mut(gid)?;
-                let size: usize = g.early.iter().map(Vec::len).sum();
-                if size + ciphertext.len() <= EARLY && !g.early.iter().any(|early| early == ciphertext) {
-                    g.early.push(ciphertext.to_vec());
+                let size: usize = g.early.iter().filter(|(from, _)| *from == peer).map(|(_, early)| early.len()).sum();
+                if size + ciphertext.len() <= EARLY && !g.early.iter().any(|(_, early)| early == ciphertext) {
+                    g.early.push((peer, ciphertext.to_vec()));
                 }
             }
             None => {}
@@ -321,12 +272,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    /// A live payload: taken only once this session applied its log to its head as last read, and only from a sender
-    /// in its current epoch, by leaf index and key.
-    fn live(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8]) -> Result<()> {
-        let logged = st.log(gid)?.logged;
+    /// A live payload, which the gate let in once this session applied its log to its head as last read: taken only
+    /// from a sender in its current epoch, by leaf index and key.
+    pub(crate) fn live(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8]) -> Result<()> {
         let g = st.groups.get_mut(gid).context("this session is not in that group")?;
-        if g.rec.position < logged || g.wait.is_some() {
+        if !core::header(ciphertext).is_ok_and(|(_, live)| live) {
             return Ok(());
         }
         let opened = match g.mls.open(&st.provider, ciphertext) {
@@ -343,10 +293,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    /// Opens the held counted positions in position order within each epoch; one missing holds up the later ones of its
-    /// epoch for `PASS` after its entry was read.
+    /// Opens the held counted positions in position order within each epoch. One missing holds up the later ones of its
+    /// epoch while it is being fetched, or its push is likely on the way (its entry was read under `HOLD_OFF` ago);
+    /// then they open past it, and it opens still if it comes while its epoch's keys are kept.
     pub(crate) fn open_ready(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
         let now = now();
+        let fetching = st.peers.fetching(&Bytes(gid.to_vec()));
         let mut blocked = HashSet::new();
         for (position, (epoch, at)) in st.group(gid)?.rec.unopened.clone() {
             if blocked.contains(&epoch) {
@@ -354,25 +306,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             if st.held(gid, position)? {
                 self.open(st, gid, position, epoch)?;
-            } else if now < at + PASS {
+            } else if fetching.contains(position) || now < at + HOLD_OFF {
                 blocked.insert(epoch);
             }
         }
         st.save(gid)
-    }
-
-    /// Opens, every `PASS`, the held positions that waited on missing ones.
-    pub(crate) async fn passing(self: Arc<Self>) {
-        loop {
-            sleep(Duration::from_millis(PASS)).await;
-            let mut st = self.lock();
-            let waiting: Vec<Vec<u8>> = st.groups.iter().filter(|(_, g)| !g.rec.unopened.is_empty()).map(|(gid, _)| gid.clone()).collect();
-            for gid in waiting {
-                if let Err(error) = self.open_ready(&mut st, &gid).and_then(|()| self.kind_advance(&mut st, &gid)) {
-                    self.warn(Some(&gid), format!("{error:#}"));
-                }
-            }
-        }
     }
 
     /// Before a commit applies, which deletes the prior epoch's keys: opens what this session holds of that epoch,
@@ -418,7 +356,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     fn lose(&self, st: &mut State<P>, gid: &[u8], position: u64) -> Result<()> {
-        st.group_mut(gid)?.rec.unopened.remove(&position);
+        let rec = &mut st.group_mut(gid)?.rec;
+        rec.unopened.remove(&position);
+        rec.lacking.remove(position);
+        rec.lost.insert(position);
         let mut pos = st.pos(gid, position)?.context("a counted position has its record")?;
         pos.lost = true;
         put(&st.provider, &pos_key(gid, position), &pos)
@@ -458,66 +399,16 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Whether the commit at `position` may apply now. It deletes the keys of the epoch before the current one: while
-    /// this session lacks counted positions of that epoch, it first syncs with each member online.
+    /// this session lacks counted positions of that epoch, it waits as `Peers::wait` decides, fetching them meanwhile;
+    /// what it lacks once it applies the commit is lost (`before_commit`).
     fn cleared(&self, st: &mut State<P>, gid: &[u8], position: u64) -> Result<bool> {
-        if st.lacking(gid)?.is_empty() {
-            return Ok(true);
+        let lacking = st.lacking(gid)?;
+        let now = st.tick();
+        let waiting = st.peers.wait(&Bytes(gid.to_vec()), &lacking, now) == Decision::Wait;
+        if waiting {
+            tracing::debug!("waiting at position {position} for {:?}", lacking.ranges());
         }
-        let now = now();
-        if let Some(wait) = st.group(gid)?.wait.as_ref().filter(|wait| wait.position == position) {
-            return Ok(waited(wait, now));
-        }
-        let connected = self.net.get().map(|net| net.connected()).unwrap_or_default();
-        let peers: BTreeSet<EndpointId> = connected.into_iter().filter(|peer| st.serves(gid, peer)).collect();
-        for peer in &peers {
-            st.out.push(Out::Served { peer: *peer, group: gid.to_vec() });
-        }
-        let wait = Wait { position, peers, synced: false, progress: now };
-        let over = waited(&wait, now);
-        st.group_mut(gid)?.wait = Some(wait);
-        if !over {
-            self.work.send(Work::Wait(gid.to_vec())).ok();
-        }
-        Ok(over)
-    }
-
-    /// Moves a group's wait on, and reads on once it is over.
-    pub(crate) fn progress(&self, st: &mut State<P>, gid: &[u8], progress: Progress) -> Result<()> {
-        let now = now();
-        let Some(wait) = st.groups.get_mut(gid).and_then(|g| g.wait.as_mut()) else { return Ok(()) };
-        let moved = match progress {
-            Progress::Synced(peer) => {
-                let removed = wait.peers.remove(&peer);
-                wait.synced |= removed;
-                removed
-            }
-            Progress::Disconnected(peer) => {
-                wait.peers.remove(&peer);
-                false
-            }
-            Progress::Connected(peer) => wait.peers.insert(peer),
-            Progress::Ciphertext => true,
-        };
-        if moved {
-            wait.progress = now;
-        }
-        let over = waited(wait, now);
-        if let (Progress::Connected(peer), true) = (progress, moved) {
-            st.out.push(Out::Served { peer, group: gid.to_vec() });
-        }
-        if over {
-            self.advance(st, gid)?;
-        }
-        Ok(())
-    }
-
-    /// Reads on once a group's wait is over without progress.
-    pub(crate) fn wait_over(&self, st: &mut State<P>, gid: &[u8]) -> Result<bool> {
-        let Some(wait) = st.groups.get(gid).and_then(|g| g.wait.as_ref()) else { return Ok(true) };
-        if !waited(wait, now()) {
-            return Ok(false);
-        }
-        self.advance(st, gid)?;
-        Ok(true)
+        st.group_mut(gid)?.waiting = waiting;
+        Ok(!waiting)
     }
 }
