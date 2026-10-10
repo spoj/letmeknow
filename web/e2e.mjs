@@ -26,6 +26,7 @@ function native(name) {
   const env = { ...process.env, LETMEKNOW_HOME: join(tmp, name) };
   const proc = spawn(BIN, ["--session", name, "listen", "--name", name[0].toUpperCase() + name.slice(1), "--hold", "0"], { env, stdio: ["ignore", "pipe", "inherit"] });
   natives.push(proc);
+  const exited = new Promise(resolve => proc.once("exit", resolve));
   const events = [];
   const waiters = new Set();
   createInterface({ input: proc.stdout }).on("line", line => {
@@ -33,7 +34,8 @@ function native(name) {
     for (const wake of waiters) wake();
   });
   return {
-    proc,
+    /** Stops it; resolves once its process has ended, so that another may start on its home. */
+    stop: () => (proc.kill(), exited),
     run: (...args) => JSON.parse(execFileSync(BIN, ["--session", name, ...args], { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })),
     /** As `run`, while the test goes on watching the pages. */
     start: (...args) =>
@@ -400,7 +402,7 @@ try {
   const ideas = tablet.run("groups").find(g => g.name === "Ideas");
   check(JSON.stringify(ideas.membership).includes(LETMEKNOW_RELAY), "on the membership service of the server that served the browser");
   await laptop.locator(".people", { hasText: "Matt · " }).waitFor();
-  tablet.proc.kill();
+  await tablet.stop();
 
   // Ann adds Carl, whom she made an invite for: her word on who Carl is reaches the laptop, which accepts it.
   const carl = native("carl");
@@ -455,10 +457,10 @@ try {
   await failed.getByRole("button", { name: "Drop" }).click();
   await until(() => failed.count(), n => n === 0);
   check(true, "and drops it when asked");
-  carl.proc.kill();
+  await carl.stop();
 
   // With Ann gone, what the laptop sends to her chat still counts on the group's log, held only by the laptop.
-  ann.proc.kill();
+  await ann.stop();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.locator("textarea:visible").fill("anyone there?");
   await laptop.locator("textarea:visible").press("Enter");
@@ -495,7 +497,7 @@ try {
   const carlBack = native("carl");
   await lost.locator(".ticks", { hasText: "✓✓" }).waitFor({ timeout: 60_000 });
   check(true, "and two ticks once Carl, back, holds it");
-  carlBack.proc.kill();
+  await carlBack.stop();
 
   // The tab that took over loaded no file; it loads the doc's file from IndexedDB when a new member wants it.
   await laptop.locator(".group-list button", { hasText: "Notes" }).click();

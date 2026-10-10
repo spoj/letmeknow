@@ -423,8 +423,10 @@ fn a_message_printed_is_read_and_one_waiting_only_held() {
         assert_eq!(read[0]["read_by"], json!(["Alice"]), "printed, so read");
         // Alice's next message carries what she read.
         let answer = alice.cmd(&["send", "seen both"]).await.unwrap();
-        let shown = until(|| async { bob.cmd(&["read", answer["id"].as_str().unwrap(), "--ancestors", "5"]).await.unwrap() }, |shown| shown.as_array().unwrap().len() == 3).await;
-        let shown: Vec<&Value> = shown.as_array().unwrap().iter().map(|m| &m["id"]).collect();
+        // Unknown to Bob until her message reaches him.
+        let ask = || async { bob.cmd(&["read", answer["id"].as_str().unwrap(), "--ancestors", "5"]).await.unwrap_or_default() };
+        let shown = until(ask, |shown| shown.as_array().is_some_and(|shown| shown.len() == 3)).await;
+        let shown: Vec<&Value> = shown.as_array().expect("Bob knows Alice's message by the id send answered").iter().map(|m| &m["id"]).collect();
         assert_eq!(shown, [&quiet["id"], &look["id"], &answer["id"]]);
     });
 }

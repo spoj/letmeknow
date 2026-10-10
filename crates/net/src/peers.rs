@@ -70,7 +70,8 @@ pub enum Decision {
 }
 
 pub struct Peers {
-    /// When the member came online: it started, or got its first connection after none.
+    /// When the member came online: its first connection after none. Until then, and while it has none, its wait
+    /// before a commit ends only after `QUIET`, as no dial has landed yet.
     online: u64,
     /// When every summary last went to every peer.
     full: u64,
@@ -119,7 +120,7 @@ struct Conn {
 impl Peers {
     /// For a member that came online `now`.
     pub fn new(now: u64) -> Self {
-        Self { online: now, full: now, changed: None, groups: BTreeMap::new(), conns: BTreeMap::new() }
+        Self { online: 0, full: now, changed: None, groups: BTreeMap::new(), conns: BTreeMap::new() }
     }
 
     /// This member's state of a group, new or changed.
@@ -254,7 +255,8 @@ impl Peers {
         let g = self.groups.get_mut(group).expect("a group of ours");
         let counted = |(k, c): &(&Key, &Conn)| c.served.contains(group) || undecided.contains(*k);
         let peers: Vec<&Summary> = self.conns.iter().filter(counted).filter_map(|(_, c)| c.heard.get(group)).collect();
-        let decision = wait(lacking, &peers, now - self.online.max(g.since), now - g.progress);
+        let online = if self.conns.is_empty() { 0 } else { now - self.online.max(g.since) };
+        let decision = wait(lacking, &peers, online, now - g.progress);
         g.urgent = if decision == Decision::Wait { lacking.clone() } else { Ranges::default() };
         decision
     }
@@ -367,8 +369,8 @@ fn choose(id: &Bytes, g: &Group, conns: &BTreeMap<Key, Conn>) -> Option<(Key, Ra
 }
 
 /// The wait before a commit that deletes an epoch's keys, given the epoch's counted positions the member lacks, the
-/// current-connection summaries of the connected peers the gate admits, and the time since it came online and since
-/// its last progress.
+/// current-connection summaries of the connected peers the gate admits, and the time since it came online (0 while it
+/// has no connection) and since its last progress.
 pub fn wait(lacking: &Ranges, peers: &[&Summary], online: u64, quiet: u64) -> Decision {
     if lacking.is_empty() {
         return Decision::Apply;
