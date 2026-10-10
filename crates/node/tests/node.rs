@@ -939,13 +939,23 @@ fn log_dir(logs: &Path, gid: &Bytes) -> PathBuf {
 }
 
 /// Makes a folder's log unreachable, even to root, by a file in its place; or reachable again.
+/// Windows refuses to move a folder while a file in it is open, as the folder service may have one for a moment.
 fn reachable(dir: &Path, reachable: bool) {
     let aside = dir.with_extension("aside");
+    let moved = |from: &Path, to: &Path| {
+        for _ in 0..50 {
+            if std::fs::rename(from, to).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::fs::rename(from, to).unwrap();
+    };
     if reachable {
         std::fs::remove_file(dir).unwrap();
-        std::fs::rename(&aside, dir).unwrap();
+        moved(&aside, dir);
     } else {
-        std::fs::rename(dir, &aside).unwrap();
+        moved(dir, &aside);
         std::fs::write(dir, b"").unwrap();
     }
 }

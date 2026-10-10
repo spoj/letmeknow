@@ -1442,6 +1442,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 if let Err(error) = self.read(gid).await {
                     tracing::debug!("catching up on {}: {error:#}", hex(gid));
                 }
+                // Entries stored before a stop that had not applied yet, as while waiting before a commit.
+                if let Err(error) = self.advance(&mut self.lock(), gid) {
+                    tracing::debug!("applying the stored log of {}: {error:#}", hex(gid));
+                }
                 self.work.send(Work::Duties(gid.clone())).ok();
             }
             sleep(duties::TIMER).await;
