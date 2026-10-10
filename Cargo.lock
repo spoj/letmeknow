@@ -3078,7 +3078,6 @@ dependencies = [
  "n0-future",
  "openmls_memory_storage",
  "openmls_traits",
- "rustc-hash",
  "serde",
  "serde_json",
  "tokio",

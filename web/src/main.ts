@@ -3,7 +3,7 @@
 // click, so link scanners that open it join nothing.
 import "./app.css";
 import * as client from "./client";
-import type { Attachment, Group, Item, Me, Person, Reason } from "./client";
+import type { Attachment, Group, Item, Me, Person } from "./client";
 
 const { lmk, request } = client;
 
@@ -937,9 +937,6 @@ class ChatView extends View {
         const parent = item.reply_to ? (items.find(i => i.type === "message" && i.id === item.reply_to) as Message | undefined) : undefined;
         const to = item.to?.map(fp => this.members.find(m => m.fp === fp)).filter(m => m != null);
         const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent"];
-        const status = item.refused
-          ? this.refusedView(item, item.refused)
-          : item.pending && h("p", { className: "status warn" }, "Pending: no other member holds it yet. It goes out when one is online while this browser is open.");
         return h(
           "li",
           { className: classes.filter(Boolean).join(" "), tabIndex: -1 },
@@ -956,7 +953,6 @@ class ChatView extends View {
             h("blockquote", {}, parent ? [h("b", {}, label(parent.from)), " ", (parent.content || parent.attachment?.name || "").slice(0, 160)] : "a message this browser does not hold"),
           item.content && h("div", { className: "text" }, item.content),
           item.attachment && this.attachmentView(item.attachment),
-          status,
           h("div", { className: "actions" }, h("button", { className: "quiet", onclick: () => this.reply(item) }, "Reply"))
         );
       }
@@ -1059,22 +1055,6 @@ class ChatView extends View {
     );
   }
 
-  /** Who refused a message of this browser's and why, and, where sending it again can help, a button that does, as a new message replying to it. */
-  private refusedView(item: Message, refused: { name: string; reason: Reason }[]): HTMLElement {
-    const why = { size: "too large for them", old: "too old for them to open", removed: "from a removed member", unreadable: "it did not open" };
-    const said = `Not taken by ${refused.map(r => `${r.name} (${why[r.reason]})`).join(", ")} `;
-    if (!refused.some(r => r.reason === "old" || r.reason === "unreadable")) return h("p", { className: "status warn" }, said);
-    const resend = h("button", { className: "quiet" }, "Resend");
-    resend.onclick = () =>
-      busy(resend, "Sending…", async () => {
-        const { attachment } = item;
-        const bytes = attachment && (await client.file(this.gid, attachment.link));
-        await lmk.send(this.gid, item.content, item.id, item.to ?? [], !!item.urgent, attachment?.name, attachment?.type, bytes);
-        render();
-      });
-    return h("p", { className: "status warn" }, said, resend);
-  }
-
   private reply(item: Message) {
     this.replyTo = item;
     this.drawContext();
@@ -1112,6 +1092,7 @@ class ChatView extends View {
       const sent = lmk.send(this.gid, content, replyTo?.id, to, urgent, attachment?.name, attachment?.type, bytes);
       setTimeout(render, 50);
       const answer = JSON.parse(await sent);
+      if (answer.pending) toast("Pending: the group's log has not taken it yet. It is sent while this browser is open.");
       if (answer.attachment?.pending) toast(`No other member holds ${attachment!.name} yet: it is available only while this browser is open.`);
     } catch (error) {
       toast(error);
