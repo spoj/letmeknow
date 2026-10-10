@@ -26,9 +26,27 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Takes a connection an endpoint accepts.
 pub type Accept = Arc<dyn Fn(Conn) + Send + Sync>;
-/// Sees every frame written but those that open streams: sender, receiver, whether the stream is a `peer` one, and the
-/// frame's JSON.
-pub type Inspect = Arc<dyn Fn(EndpointId, EndpointId, bool, &[u8]) + Send + Sync>;
+/// Sees every frame written but those that open streams, with its JSON.
+pub type Inspect = Arc<dyn Fn(&Wire, &[u8]) + Send + Sync>;
+
+/// Where a frame goes: its sender and receiver, its connection, whether its stream is a `peer` one, and how long after
+/// it is written it arrives, if its connection's path holds.
+#[derive(Clone, Copy, Debug)]
+pub struct Wire {
+    pub from: EndpointId,
+    pub to: EndpointId,
+    pub conn: usize,
+    pub peer: bool,
+    pub delay: Duration,
+}
+
+/// What became of a connection, and when.
+#[derive(Clone, Copy, Debug)]
+pub enum Change {
+    Opened,
+    Cut,
+    Closed,
+}
 
 #[derive(Clone)]
 pub struct Net(Arc<Mutex<State>>);
@@ -41,6 +59,10 @@ struct State {
     next: usize,
     inspect: Option<Inspect>,
     trace: Sha256,
+    /// Connections' changes since they were last taken.
+    changes: Vec<(Instant, usize, [EndpointId; 2], Change)>,
+    /// Pairs of a service and a client whose next append the service takes and whose answer is lost.
+    lose: Vec<(EndpointId, EndpointId)>,
 }
 
 struct Endpoint {
@@ -69,6 +91,10 @@ struct Pipe {
     from: EndpointId,
     to: EndpointId,
     conn: usize,
+    /// The opener's pipe of its stream.
+    stream: usize,
+    /// It answers an append whose answer is lost: its next write closes the connection instead.
+    doomed: bool,
     queue: VecDeque<(Instant, Vec<u8>)>,
     offset: usize,
     last: Instant,
@@ -90,11 +116,23 @@ impl Net {
             next: 0,
             inspect: None,
             trace: Sha256::new(),
+            changes: Vec::new(),
+            lose: Vec::new(),
         })))
     }
 
     pub fn inspect(&self, inspect: Inspect) {
         self.0.lock().unwrap().inspect = Some(inspect);
+    }
+
+    /// The changes to connections since this was last called.
+    pub fn changes(&self) -> Vec<(Instant, usize, [EndpointId; 2], Change)> {
+        std::mem::take(&mut self.0.lock().unwrap().changes)
+    }
+
+    /// The service takes the client's next append, and its answer is lost with its connection.
+    pub fn lose_answer(&self, service: EndpointId, client: EndpointId) {
+        self.0.lock().unwrap().lose.push((service, client));
     }
 
     /// A hash of every write so far: when, between whom, and what.
@@ -160,7 +198,9 @@ impl Net {
             let timeout = Duration::from_millis(5_000 + st.rng.below(IDLE_TIMEOUT.as_millis() as u64 - 5_000));
             let conn = st.conns.get_mut(&id).unwrap();
             conn.cut = true;
-            for pipe in conn.pipes.clone() {
+            let (ends, pipes) = (conn.ends, conn.pipes.clone());
+            st.changes.push((now, id, ends, Change::Cut));
+            for pipe in pipes {
                 st.pipes.get_mut(&pipe).unwrap().queue.retain(|(at, _)| *at <= now);
             }
             let net = self.clone();
@@ -210,7 +250,9 @@ impl State {
         }
         conn.closed = true;
         conn.notify.notify_waiters();
-        for pipe in conn.pipes.clone() {
+        let (ends, pipes) = (conn.ends, conn.pipes.clone());
+        self.changes.push((Instant::now(), id, ends, Change::Closed));
+        for pipe in pipes {
             let pipe = self.pipes.get_mut(&pipe).unwrap();
             pipe.reset = true;
             if let Some(reader) = pipe.reader.take() {
@@ -219,18 +261,21 @@ impl State {
         }
     }
 
-    fn pipe(&mut self, conn: usize, from: EndpointId, to: EndpointId, first: Instant) -> usize {
+    /// A pipe of a stream; `stream` is its opener's pipe, or none for the opener's.
+    fn pipe(&mut self, conn: usize, stream: Option<usize>, from: EndpointId, to: EndpointId, first: Instant) -> usize {
         let id = self.next;
         self.next += 1;
-        let pipe = Pipe { from, to, conn, queue: VecDeque::new(), offset: 0, last: first, fin: None, reset: false, reader: None, unframed: Vec::new(), peer: None };
+        let stream = stream.unwrap_or(id);
+        let queue = VecDeque::new();
+        let pipe = Pipe { from, to, conn, stream, doomed: false, queue, offset: 0, last: first, fin: None, reset: false, reader: None, unframed: Vec::new(), peer: None };
         self.pipes.insert(id, pipe);
         self.conns.get_mut(&conn).unwrap().pipes.push(id);
         id
     }
 
     /// Writes to a pipe: lost if its connection's path is, else delivered after a latency, in order. Returns the
-    /// frames it completed but one that opens the stream, and whether the stream is a `peer` one.
-    fn write(&mut self, id: usize, bytes: &[u8]) -> io::Result<(bool, Vec<Vec<u8>>)> {
+    /// frames it completed but one that opens the stream, and where they go.
+    fn write(&mut self, id: usize, bytes: &[u8]) -> io::Result<(Wire, Vec<Vec<u8>>)> {
         let pipe = &self.pipes[&id];
         let (conn, from, to) = (pipe.conn, pipe.from, pipe.to);
         if pipe.reset || pipe.fin.is_some() {
@@ -238,11 +283,21 @@ impl State {
         }
         let now = Instant::now();
         self.trace.update([&(id as u64).to_le_bytes()[..], &lmk_proto::clock::now().to_le_bytes(), bytes].concat());
+        let mut wire = Wire { from, to, conn, peer: false, delay: Duration::ZERO };
         if self.conns[&conn].cut {
-            return Ok((false, Vec::new()));
+            return Ok((wire, Vec::new()));
+        }
+        if pipe.doomed {
+            self.close(conn);
+            return Ok((wire, Vec::new()));
         }
         let at = (now + self.latency(from, to) + Duration::from_micros(bytes.len() as u64 / 10)).max(self.pipes[&id].last);
+        // The answering side's pipe is of the kind its opener's first frame named.
+        let opened = self.pipes[&self.pipes[&id].stream].peer;
         let pipe = self.pipes.get_mut(&id).unwrap();
+        if pipe.stream != id {
+            pipe.peer = opened;
+        }
         pipe.last = at;
         pipe.queue.push_back((at, bytes.to_vec()));
         if let Some(reader) = pipe.reader.take() {
@@ -265,7 +320,17 @@ impl State {
                 Some(_) => frames.push(frame),
             }
         }
-        Ok((pipe.peer == Some(true), frames))
+        wire.peer = pipe.peer == Some(true);
+        wire.delay = at - now;
+        let stream = pipe.stream;
+        if let Some(lose) = self.lose.iter().position(|pair| *pair == (to, from))
+            && frames.iter().any(|frame| frame.starts_with(br#"{"append""#))
+        {
+            self.lose.remove(lose);
+            let answer = self.conns[&conn].pipes.iter().copied().find(|p| *p != id && self.pipes[p].stream == stream);
+            self.pipes.get_mut(&answer.expect("a stream answers")).unwrap().doomed = true;
+        }
+        Ok((wire, frames))
     }
 }
 
@@ -306,6 +371,7 @@ impl Transport for SimTransport {
             let notify = Arc::new(Notify::new());
             let conn = ConnState { ends: [from, to], generations, closed: false, cut: false, incoming: Default::default(), notify, pipes: Vec::new() };
             st.conns.insert(id, conn);
+            st.changes.push((Instant::now(), id, [from, to], Change::Opened));
             drop(st);
             accept(Arc::new(SimConn { net: net.clone(), id, side: 1 }));
             Ok(Arc::new(SimConn { net, id, side: 0 }) as Conn)
@@ -335,8 +401,8 @@ impl Connection for SimConn {
             }
             let [me, peer] = [conn.ends[side], conn.ends[1 - side]];
             let first = Instant::now() + st.latency(me, peer);
-            let out = st.pipe(id, me, peer, first);
-            let back = st.pipe(id, peer, me, Instant::now());
+            let out = st.pipe(id, None, me, peer, first);
+            let back = st.pipe(id, Some(out), peer, me, Instant::now());
             let conn = st.conns.get_mut(&id).unwrap();
             conn.incoming[1 - side].push_back((first, out, back));
             conn.notify.notify_waiters();
@@ -397,16 +463,14 @@ struct Writer {
 
 impl AsyncWrite for Writer {
     fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let (frames, inspect, ends) = {
+        let (frames, inspect) = {
             let mut st = self.net.0.lock().unwrap();
-            let frames = st.write(self.pipe, buf);
-            let pipe = &st.pipes[&self.pipe];
-            (frames, st.inspect.clone(), (pipe.from, pipe.to))
+            (st.write(self.pipe, buf), st.inspect.clone())
         };
-        let (peer, frames) = frames?;
+        let (wire, frames) = frames?;
         if let Some(inspect) = inspect {
             for frame in frames {
-                inspect(ends.0, ends.1, peer, &frame);
+                inspect(&wire, &frame);
             }
         }
         Poll::Ready(Ok(buf.len()))
