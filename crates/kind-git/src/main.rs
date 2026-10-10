@@ -27,7 +27,7 @@ enum Waiting {
     /// message once another member online holds the bundle, or else refused; answered once its entry counts.
     Add { command: Value, group: String, push: Push },
     Spread { command: Value, group: String, push: Push },
-    Send { command: Value },
+    Send { command: Value, group: String },
     /// A pushed bundle, to check.
     Check { group: String, position: u64 },
     /// The bundle of a state this session hands a member.
@@ -40,15 +40,17 @@ struct Plugin {
     dir: PathBuf,
     groups: HashMap<String, Group>,
     waiting: HashMap<u64, Waiting>,
-    /// Whether this session's own pushes counted when their entries were taken, by position.
-    won: HashMap<u64, bool>,
+    /// Whether this session's own pushes counted when their entries were taken, by group and position.
+    won: HashMap<(String, u64), bool>,
+    /// The commands of this session's pushes whose entries counted but were not taken yet, by group and position.
+    answering: HashMap<(String, u64), Value>,
     requests: u64,
     out: Vec<Value>,
 }
 
 fn main() -> Result<()> {
     let mut plugin =
-        Plugin { dir: PathBuf::new(), groups: HashMap::new(), waiting: HashMap::new(), won: HashMap::new(), requests: 0, out: Vec::new() };
+        Plugin { dir: PathBuf::new(), groups: HashMap::new(), waiting: HashMap::new(), won: HashMap::new(), answering: HashMap::new(), requests: 0, out: Vec::new() };
     for line in std::io::stdin().lock().lines() {
         plugin.host(&line?);
         let mut stdout = std::io::stdout().lock();
@@ -58,6 +60,14 @@ fn main() -> Result<()> {
         stdout.flush()?;
     }
     Ok(())
+}
+
+/// The answer to a push whose entry counted at `position`.
+fn verdict(position: u64, counts: bool) -> Result<Value> {
+    match counts {
+        true => Ok(json!({ "position": position })),
+        false => Err(anyhow::anyhow!("fetch first")),
+    }
 }
 
 fn warning(group: &str, text: String) -> Value {
@@ -224,7 +234,10 @@ impl Plugin {
                 self.out.push(json!({ "type": "hold", "group": group, "links": [link] }));
             }
             if from["you"] == true {
-                self.won.insert(position, counts);
+                match self.answering.remove(&(group.to_owned(), position)) {
+                    Some(command) => self.out.push(answer(&command, verdict(position, counts))),
+                    None => drop(self.won.insert((group.to_owned(), position), counts)),
+                }
             } else if counts {
                 let event = json!({ "type": "pushed", "by": from, "ref": push.branch, "old": push.old, "new": push.new, "subjects": push.subjects });
                 self.out.push(json!({ "type": "event", "group": group, "event": event }));
@@ -244,6 +257,11 @@ impl Plugin {
         branches.lose(position, true);
         self.save(group)?;
         let text = format!("this session lost the message at log position {position}; it takes no push until a member hands it the branches past it");
+        let stopped: Vec<(String, u64)> = self.answering.keys().filter(|(of, _)| of == group).cloned().collect();
+        for key in stopped {
+            let command = self.answering.remove(&key).unwrap();
+            self.out.push(answer(&command, Err(anyhow::anyhow!("{text}"))));
+        }
         self.out.push(warning(group, text));
         self.out.push(json!({ "type": "log", "group": group }));
         Ok(())
@@ -388,17 +406,16 @@ impl Plugin {
         let mut payload = serde_json::to_value(&push).expect("JSON");
         payload["type"] = json!("push");
         let send = json!({ "type": "send", "group": group, "payload": payload, "held": true });
-        self.request(send, Waiting::Send { command });
+        self.request(send, Waiting::Send { command, group: group.to_owned() });
     }
 
-    /// Answers a push whose entry counted at `position`: whether it counted as a branch update.
-    fn pushed(&mut self, command: Value, position: u64) {
-        let answered = match self.won.remove(&position) {
-            Some(true) => Ok(json!({ "position": position })),
-            Some(false) => Err(anyhow::anyhow!("fetch first")),
-            None => Err(anyhow::anyhow!("the log did not take the push; push again")),
-        };
-        self.out.push(answer(&command, answered));
+    /// Answers a push whose entry counted at `position`, once its entry is taken: whether it counted as a branch
+    /// update.
+    fn pushed(&mut self, command: Value, group: String, position: u64) {
+        match self.won.remove(&(group.clone(), position)) {
+            Some(counts) => self.out.push(answer(&command, verdict(position, counts))),
+            None => drop(self.answering.insert((group, position), command)),
+        }
     }
 
     fn answered(&mut self, message: &Value) -> Result<()> {
@@ -422,14 +439,14 @@ impl Plugin {
                     self.out.push(answer(&command, Err(error)));
                 }
             }
-            (Waiting::Send { command }, Ok(sent)) => match sent["position"].as_u64() {
-                Some(position) => self.pushed(command, position),
+            (Waiting::Send { command, group }, Ok(sent)) => match sent["position"].as_u64() {
+                Some(position) => self.pushed(command, group, position),
                 None => {
                     let error = anyhow::anyhow!("the push is pending, as the group's log did not answer in time: fetch later to see whether it counted");
                     self.out.push(answer(&command, Err(error)));
                 }
             },
-            (Waiting::Add { command, .. } | Waiting::Send { command }, Err(error)) => {
+            (Waiting::Add { command, .. } | Waiting::Send { command, .. }, Err(error)) => {
                 self.out.push(answer(&command, Err(error)));
             }
             (Waiting::Check { group, position }, fetched) => {
