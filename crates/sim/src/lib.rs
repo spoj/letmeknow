@@ -104,8 +104,9 @@ pub enum Forgery {
     Replay,
     /// Another log's last entry.
     Foreign,
-    /// From a copy of `m`'s state: a message with a valid AEAD, signed by another key.
-    Message,
+    /// From a copy of `m`'s state: a message with a valid AEAD, signed by another key, pushed to the members as `m`
+    /// would; its entry with a MAC that verifies, as a member could append, or not.
+    Message { mac: bool },
     /// From a copy of `m`'s state: a commit signed by another key.
     Commit,
     /// From a copy of `m`'s state: a commit as `m` signs it, the state copied.
@@ -136,13 +137,11 @@ pub(crate) fn clock(ms: u64) -> String {
 pub struct Options {
     pub members: usize,
     pub actions: usize,
-    /// Whether the pending properties are checked too, and the actions that need 0.13 made.
-    pub pending: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { members: 5, actions: 60, pending: false }
+        Options { members: 5, actions: 60 }
     }
 }
 
@@ -224,9 +223,8 @@ pub fn generate(seed: u64, options: Options) -> Vec<Action> {
                 725..740 => Act::LoseAnswer { m },
                 740..760 => Act::CrashAfter { m, what: [Output::Append, Output::Frame, Output::Admitted][rng.index(3)] },
                 760..780 => {
-                    // A forged message or commit, and a copied state, break 0.12 and need 0.13's entries: pending too.
-                    let kinds = if options.pending { 6 } else { 3 };
-                    let what = [Forgery::Junk, Forgery::Replay, Forgery::Foreign, Forgery::Message, Forgery::Commit, Forgery::Copy][rng.index(kinds)];
+                    let mac = rng.below(2) == 0;
+                    let what = [Forgery::Junk, Forgery::Replay, Forgery::Foreign, Forgery::Message { mac }, Forgery::Commit, Forgery::Copy][rng.index(6)];
                     Act::Forge { m, group, what }
                 }
                 780..785 => Act::PushState { m, group },

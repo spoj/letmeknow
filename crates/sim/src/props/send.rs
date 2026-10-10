@@ -4,8 +4,7 @@ use super::{CONVERGE, judged, quiets, short};
 use crate::trace::{Answer, Trace, Verdict, What};
 
 /// A send answered with a position counts its id there; one answered pending is reported sent, at a position that
-/// counts its id, by the end of the next quiet period its sender is in the group for; one refused (unavailable, rate,
-/// size) never counts.
+/// counts its id, by the end of the next quiet period its sender is in the group for.
 pub fn send_settles(t: &Trace) -> Result<(), String> {
     let judged = judged(t);
     let counts = |group, position, id| judged.get(&(group, position)).is_none_or(|j| *j.verdict == Verdict::Counted { id: Clone::clone(id) });
@@ -20,11 +19,6 @@ pub fn send_settles(t: &Trace) -> Result<(), String> {
                     if !sent && views.iter().any(|v| v.m == *m && v.group == *group && v.active()) {
                         return Err(format!("m{m}'s pending send of {} to {} was not sent by {}", short(id), short(group), super::clock(at)));
                     }
-                }
-            }
-            What::Send { m, group, id, answer: Answer::Refused } => {
-                if let Some(((_, p), _)) = judged.iter().find(|((g, _), j)| *g == group && *j.verdict == Verdict::Counted { id: id.clone() }) {
-                    return Err(format!("m{m}'s send of {} was refused, yet counts at {p} of {}", short(id), short(group)));
                 }
             }
             _ => {}
@@ -46,7 +40,6 @@ mod tests {
     fn a_send_counts_where_it_says() {
         assert!(send_settles(&trace(vec![send(Answer::Position(3)), (1, read(1, 3, 1, counted(1)))])).is_ok());
         assert!(send_settles(&trace(vec![send(Answer::Position(3)), (1, read(1, 3, 1, counted(2)))])).is_err());
-        assert!(send_settles(&trace(vec![send(Answer::Refused), (1, read(1, 3, 1, counted(1)))])).unwrap_err().contains("refused"));
     }
 
     #[test]

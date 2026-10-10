@@ -6,14 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use lmk_proto::Bytes;
 
 use super::{inside, judged, quiets, removed, short};
-use crate::trace::{Frame, Hash, Key, Obs, Positions, Trace, Verdict, What};
+use crate::trace::{Frame, Hash, Positions, Trace, Verdict, What};
 
 /// How long a member waits, without progress, before it applies a commit that deletes keys of positions it lacks.
 pub const STALL: u64 = 10_000;
 /// How long after coming online a member waits at the earliest before such a commit, so that dials can land.
 pub const ONLINE_WAIT: u64 = 3_000;
-/// openmls's out-of-order window: how far behind its sender's newest opened message a message still opens.
-pub const WINDOW: u32 = 1_000;
 
 /// Members that opened a position opened the same plaintext. At the end of a quiet period, of a group's active members
 /// at its latest epoch, each holds, has opened or has lost every position since its start that another holds.
@@ -47,16 +45,17 @@ pub fn convergence(t: &Trace) -> Result<(), String> {
 /// - by applying the commit that deletes the keys of the position's epoch, no sooner than 3 seconds after it came online,
 ///   while no connected member's latest summary on the current connection held the position or was fetching it, or after
 ///   10 seconds without progress (no summary or ciphertext of the group, no new connection);
-/// - beyond openmls's out-of-order window: it had opened a message, or taken a live payload, of the same sender and epoch
-///   more than 1,000 generations later;
 /// - or because no member could open the position at all.
+///
+/// Not checked: a loss beyond openmls's out-of-order window, as openmls tells no generations, and the simulator sends
+/// far fewer than 1,000 messages per sender and epoch.
 pub fn loss_allowed(t: &Trace) -> Result<(), String> {
     let judged = judged(t);
-    let mut opened: BTreeMap<(&Bytes, u64), (&Key, u32)> = BTreeMap::new();
+    let mut opened: BTreeSet<(&Bytes, u64)> = BTreeSet::new();
     let mut own: BTreeSet<(usize, &Bytes, &Bytes)> = BTreeSet::new();
     for o in &t.0 {
         match &o.what {
-            What::Opened { group, position, sender, generation, .. } => drop(opened.entry((group, *position)).or_insert((sender, *generation))),
+            What::Opened { group, position, .. } => drop(opened.insert((group, *position))),
             What::Send { m, group, id, .. } => drop(own.insert((*m, group, id))),
             _ => {}
         }
@@ -74,11 +73,7 @@ pub fn loss_allowed(t: &Trace) -> Result<(), String> {
             if own.contains(&(*m, group, id)) {
                 return Err(format!("m{m} lost its own message at {p} of {}", short(group)));
             }
-            let sent = opened.get(&(group, p));
-            let allowed = removed(earlier, *m, group, j.epoch)
-                || deletion(t, *m, group, p, j.epoch)
-                || sent.is_some_and(|(sender, generation)| window(earlier, &judged, *m, group, j.epoch, sender, *generation))
-                || sent.is_none();
+            let allowed = removed(earlier, *m, group, j.epoch) || deletion(t, *m, group, p, j.epoch) || !opened.contains(&(group, p));
             if !allowed {
                 return Err(format!("m{m} lost position {p} of {} at {}, which the design does not allow", short(group), super::clock(o.at)));
             }
@@ -132,17 +127,6 @@ fn stalled(t: &Trace, m: usize, group: &Bytes, at: u64) -> bool {
     })
 }
 
-/// Whether a member had opened a message, or taken a live payload, of this sender and epoch more than the window ahead.
-fn window(earlier: &[Obs], judged: &BTreeMap<(&Bytes, u64), super::Judged>, m: usize, group: &Bytes, epoch: u64, sender: &Key, generation: u32) -> bool {
-    earlier.iter().any(|o| match &o.what {
-        What::Opened { m: j, group: g, position, sender: s, generation: n, .. } => {
-            *j == m && g == group && s == sender && judged.get(&(g, *position)).is_some_and(|p| p.epoch == epoch) && *n > generation + WINDOW
-        }
-        What::Live { m: j, group: g, sender: s, epoch: e, generation: n } => *j == m && g == group && s == sender && *e == epoch && *n > generation + WINDOW,
-        _ => false,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,18 +149,18 @@ mod tests {
 
     #[test]
     fn convergence_needs_one_plaintext_per_position() {
-        let opened = |m, plaintext| What::Opened { m, group: g(), position: 2, kind: "chat".into(), sender: key(2), generation: 0, plaintext };
+        let opened = |m, plaintext| What::Opened { m, group: g(), position: 2, kind: "chat".into(), sender: key(2), plaintext };
         assert!(convergence(&trace(vec![(1, opened(0, [1; 32])), (2, opened(1, [1; 32]))])).is_ok());
         assert!(convergence(&trace(vec![(1, opened(0, [1; 32])), (2, opened(1, [2; 32]))])).is_err());
     }
 
     /// m1 counted position 2 in epoch 1, which m0 opened; it then applies commits to epochs 2 and 3 at 5 s, losing it.
-    fn base(sender_generation: u32) -> Vec<(u64, What)> {
+    fn base() -> Vec<(u64, What)> {
         vec![
             (0, What::Up { m: 1 }),
             (0, roster(1, 1, &[0, 1])),
             (1_000, read(1, 2, 1, counted(1))),
-            (1_000, What::Opened { m: 0, group: g(), position: 2, kind: "chat".into(), sender: key(0), generation: sender_generation, plaintext: [0; 32] }),
+            (1_000, What::Opened { m: 0, group: g(), position: 2, kind: "chat".into(), sender: key(0), plaintext: [0; 32] }),
             (1_100, read(1, 3, 1, commit(0))),
         ]
     }
@@ -191,47 +175,43 @@ mod tests {
 
     #[test]
     fn a_loss_at_a_commit_is_allowed_when_no_connected_summary_holds_it() {
-        let ok = [base(0), lose(5_000)].concat();
+        let ok = [base(), lose(5_000)].concat();
         assert!(loss_allowed(&trace(ok)).is_ok());
-        let held = [base(0), vec![hello(4_000, 1, &[2])], lose(5_000)].concat();
+        let held = [base(), vec![hello(4_000, 1, &[2])], lose(5_000)].concat();
         assert!(loss_allowed(&trace(held)).unwrap_err().contains("does not allow"));
-        let cut = [base(0), vec![(3_000, What::Cut { conn: 1 }), hello(4_000, 1, &[2])], lose(5_000)].concat();
+        let cut = [base(), vec![(3_000, What::Cut { conn: 1 }), hello(4_000, 1, &[2])], lose(5_000)].concat();
         assert!(loss_allowed(&trace(cut)).is_ok(), "the summary never arrived");
-        let closed = [base(0), vec![hello(4_000, 1, &[2]), (4_500, What::Closed { conn: 1 })], lose(5_000)].concat();
+        let closed = [base(), vec![hello(4_000, 1, &[2]), (4_500, What::Closed { conn: 1 })], lose(5_000)].concat();
         assert!(loss_allowed(&trace(closed)).is_ok(), "no longer connected");
-        let stalled = [base(0), vec![hello(4_000, 1, &[2])], lose(14_001)].concat();
+        let stalled = [base(), vec![hello(4_000, 1, &[2])], lose(14_001)].concat();
         assert!(loss_allowed(&trace(stalled)).is_ok(), "10 seconds without progress");
-        let fetching = [base(0), vec![(4_000, What::In { m: 1, from: 0, conn: 1, group: g(), frame: Frame::Hello { head: 9, held: ps(&[]), fetching: ps(&[2]) } })], lose(5_000)].concat();
+        let fetching = [base(), vec![(4_000, What::In { m: 1, from: 0, conn: 1, group: g(), frame: Frame::Hello { head: 9, held: ps(&[]), fetching: ps(&[2]) } })], lose(5_000)].concat();
         assert!(loss_allowed(&trace(fetching)).is_err(), "a carrier still fetching it");
     }
 
     #[test]
     fn a_loss_waits_for_dials_after_coming_online() {
-        let soon = [base(0), vec![(3_000, What::Up { m: 1 })], lose(5_000)].concat();
+        let soon = [base(), vec![(3_000, What::Up { m: 1 })], lose(5_000)].concat();
         assert!(loss_allowed(&trace(soon)).is_err());
     }
 
     #[test]
     fn own_messages_are_never_lost() {
-        let own = [base(0), vec![(900, What::Send { m: 1, group: g(), id: id(1), answer: Answer::Pending })], lose(5_000)].concat();
+        let own = [base(), vec![(900, What::Send { m: 1, group: g(), id: id(1), answer: Answer::Pending })], lose(5_000)].concat();
         assert!(loss_allowed(&trace(own)).unwrap_err().contains("its own message"));
     }
 
     #[test]
-    fn a_loss_at_removal_or_past_the_window_is_allowed() {
+    fn a_loss_at_removal_is_allowed() {
         let removal = Verdict::Commit { committer: key(0), added: vec![], removed: vec![key(1)] };
-        let mut held = [base(0), vec![hello(4_000, 1, &[2])]].concat();
+        let mut held = [base(), vec![hello(4_000, 1, &[2])]].concat();
         held.extend([(5_000, read(1, 4, 2, removal)), (5_000, What::Lost { m: 1, group: g(), positions: ps(&[2]) })]);
         assert!(loss_allowed(&trace(held)).is_ok());
-        let later = What::Live { m: 1, group: g(), sender: key(0), epoch: 1, generation: 1_200 };
-        let window = |generation| [base(generation), vec![hello(4_000, 1, &[2]), (4_100, later.clone())], lose(5_000)].concat();
-        assert!(loss_allowed(&trace(window(100))).is_ok());
-        assert!(loss_allowed(&trace(window(300))).is_err());
     }
 
     #[test]
     fn a_position_no_member_opened_may_be_lost() {
-        let mut never = base(0);
+        let mut never = base();
         never.remove(3);
         never.extend([hello(4_000, 1, &[2])]);
         never.extend(lose(5_000));

@@ -122,7 +122,7 @@ mod tests {
         assert!(strict_entries(&trace(skipping)).unwrap_err().contains("read 4 of 07 after 2"));
         let twice = [ok.clone(), vec![(3, read(0, 3, 1, counted(1)))]].concat();
         assert!(strict_entries(&trace(twice)).unwrap_err().contains("counted at 2 and 3"));
-        let opened = |m, position| What::Opened { m, group: g(), position, kind: "chat".into(), sender: key(0), generation: 0, plaintext: [0; 32] };
+        let opened = |m, position| What::Opened { m, group: g(), position, kind: "chat".into(), sender: key(0), plaintext: [0; 32] };
         assert!(strict_entries(&trace([ok.clone(), vec![(3, opened(1, 2))]].concat())).is_ok());
         assert!(strict_entries(&trace([ok, vec![(3, opened(1, 3))]].concat())).is_err());
     }
@@ -133,7 +133,7 @@ mod tests {
         let ok = vec![(0, forged(2, false)), (1, read(0, 2, 1, Verdict::Skipped)), (1, forged(3, true)), (2, read(0, 3, 1, counted(3)))];
         assert!(forgery(&trace(ok.clone())).is_ok());
         assert!(forgery(&trace(vec![(0, forged(2, false)), (1, read(0, 2, 1, commit(1)))])).unwrap_err().contains("took the forged entry"));
-        let opened = What::Opened { m: 0, group: g(), position: 3, kind: "chat".into(), sender: key(1), generation: 0, plaintext: [0; 32] };
+        let opened = What::Opened { m: 0, group: g(), position: 3, kind: "chat".into(), sender: key(1), plaintext: [0; 32] };
         assert!(forgery(&trace([ok, vec![(3, opened)]].concat())).is_err());
         let dropped = What::Dropped { m: 0, group: g(), reason: Dropped::Copied };
         assert!(forgery(&trace(vec![(1, dropped.clone())])).unwrap_err().contains("which it was not"));

@@ -13,9 +13,9 @@ fn replay(seed: u64, options: Options, actions: &[Action]) -> Outcome {
     run(seed, actions, options)
 }
 
-/// The run passes, checking every property but the pending ones.
+/// The run passes, checking every property.
 fn passes(seed: u64, members: usize, actions: Vec<(u64, Act)>) {
-    let options = Options { members, actions: actions.len(), pending: false };
+    let options = Options { members, actions: actions.len() };
     let actions: Vec<Action> = actions.into_iter().map(|(at, act)| Action { at, act }).collect();
     let outcome = replay(seed, options, &actions);
     assert!(outcome.failure.is_none(), "{}", outcome.log.join("\n"));
@@ -48,7 +48,7 @@ fn the_world_s_own_actions_replay_exactly() {
     .into_iter()
     .map(|(at, act)| Action { at, act })
     .collect();
-    let options = Options { members: 3, actions: actions.len(), pending: false };
+    let options = Options { members: 3, actions: actions.len() };
     let first = replay(3, options, &actions);
     assert!(first.failure.is_none(), "{}", first.log.join("\n"));
     assert_eq!(first.trace, replay(3, options, &actions).trace);

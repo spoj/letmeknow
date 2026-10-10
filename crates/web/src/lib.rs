@@ -345,6 +345,7 @@ impl App {
             file_limit: FILE_LIMIT,
             kinds: vec![CHAT.into(), DOC.into(), GIT.into(), DEVICES.into()],
             durable: Some(durable),
+            observe: None,
         };
         let (node, mut events) = Node::start(store.clone(), node_config).await?;
         let saved = store.clone();

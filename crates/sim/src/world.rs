@@ -3,7 +3,8 @@
 //! properties check at the end of each quiet period.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -18,8 +19,9 @@ use lmk_node::devices::Devices;
 use lmk_node::lmk_core::crypto::{Crypto, Rand};
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
-use lmk_node::{Event, Node};
+use lmk_node::{Event, Judgement, Node, Observation};
 use lmk_proto::Bytes;
+use lmk_proto::entry::{Entry, signed};
 use lmk_proto::group::{CHAT, DEVICES, Service as Membership};
 use n0_future::boxed::BoxFuture;
 use openmls_memory_storage::MemoryStorage;
@@ -32,14 +34,12 @@ use tokio::time::{Instant, sleep, timeout};
 
 use crate::net::{Change, Net, Wire};
 use crate::props::{self, CONVERGE};
-use crate::trace::{Frame, Leaf, Obs, Trace, View, What};
+use crate::trace::{Answer, Dropped, Frame, Leaf, Obs, Saved, Trace, Verdict, View, What};
 use crate::{Act, Action, Forgery, Options, Outcome, Output, clock};
 
 const RELAY: &str = "https://relay.sim.invalid";
 /// When simulated time starts: 2026-01-01, in milliseconds since the Unix epoch.
 const BASE: u64 = 1_767_225_600_000;
-/// How often a 0.12 member reads its logs again, and syncs with its peers anew.
-const RESYNC: Duration = Duration::from_secs(5 * 60);
 /// How long an action may take.
 const ACTION_WAIT: Duration = Duration::from_secs(300);
 
@@ -79,14 +79,16 @@ impl std::fmt::Display for Failure {
     }
 }
 
-/// A member's storage, which outlives its crashes: a browser's records.
+/// A member's storage, which outlives its crashes: a browser's records; and whether a step is under way on it.
 #[derive(Clone, Default)]
-struct Store(Arc<MemoryProvider>);
+struct Store(Arc<MemoryProvider>, Arc<AtomicBool>);
 
 impl Store {
-    /// A copy, as storage stands when a session crashes, for the next one to start from.
+    /// A copy, as storage stands when a session crashes, for the next one to start from: as of its last committed step,
+    /// which a crash never interrupts, as steps hold the node's lock and do not wait.
     fn snapshot(&self) -> Store {
-        Store(Arc::new(MemoryProvider::load(self.0.records())))
+        assert!(!self.1.load(Ordering::Relaxed), "a snapshot of storage within a step");
+        Store(Arc::new(MemoryProvider::load(self.0.records())), Arc::default())
     }
 }
 
@@ -122,10 +124,12 @@ impl Provider for Store {
     }
 
     fn begin(&self) -> Result<()> {
+        self.1.store(true, Ordering::Relaxed);
         self.0.begin()
     }
 
     fn commit(&self) -> Result<()> {
+        self.1.store(false, Ordering::Relaxed);
         self.0.commit()
     }
 
@@ -191,6 +195,8 @@ struct Book {
     rosters: BTreeMap<(usize, Bytes), (u64, Vec<Leaf>, String)>,
     /// Members to crash after they next write this.
     crash: BTreeMap<usize, Output>,
+    /// The positions of forged messages the world pushed.
+    forged: BTreeSet<(Bytes, u64)>,
 }
 
 struct World {
@@ -207,7 +213,6 @@ struct World {
     running: Mutex<Vec<JoinHandle<()>>>,
     /// Restarts and crashes to come, of members down or woken.
     later: Mutex<Vec<JoinHandle<()>>>,
-    options: Options,
 }
 
 pub(crate) fn run(seed: u64, actions: &[Action], options: Options) -> Outcome {
@@ -276,7 +281,6 @@ impl World {
             book: Mutex::default(),
             running: Mutex::default(),
             later: Mutex::default(),
-            options,
         });
         let inspecting = Arc::downgrade(&world);
         world.net.inspect(Arc::new(move |wire, frame| {
@@ -335,7 +339,9 @@ impl World {
                     }
                     sleep(Duration::from_millis(ms)).await;
                     for i in 0..self.size() {
-                        self.start_again(i).await;
+                        if self.members.lock().unwrap()[i].client.is_none() {
+                            self.start_again(i).await;
+                        }
                     }
                 }
                 Act::Forge { m, group, what } => {
@@ -444,6 +450,12 @@ impl World {
         let fetch = Arc::new(Fetcher { world: Arc::downgrade(self), me: id });
         let network = Network::Other { transport: Arc::new(transport), fetch };
         let name = format!("m{i}");
+        let observing = Arc::downgrade(self);
+        let observe: lmk_node::Observe = Arc::new(move |observation| {
+            if let Some(world) = observing.upgrade() {
+                world.observe(observed(i, observation));
+            }
+        });
         let config = lmk_node::Config {
             name: name.clone(),
             device: Some(device.clone()),
@@ -455,8 +467,15 @@ impl World {
             file_limit: 25 << 20,
             kinds: vec![CHAT.into(), DEVICES.into()],
             durable: None,
+            observe: Some(observe),
         };
         self.observe(What::Up { m: i });
+        let held: Vec<Bytes> = self.book.lock().unwrap().rosters.keys().filter(|(m, _)| *m == i).map(|(_, gid)| gid.clone()).collect();
+        for gid in held {
+            if let Some(saved) = lmk_node::saved(&store, &gid.0)? {
+                self.observe(What::Restored { m: i, group: gid, saved: restored(saved) });
+            }
+        }
         let (node, mut events) = Node::start_on(store, config, network).await?;
         let peers = node.net().clone();
         self.peers.lock().unwrap().insert(id, peers.clone());
@@ -588,10 +607,8 @@ impl World {
         let mut leaves: Vec<Leaf> = members
             .into_iter()
             .map(|member| {
-                // A 0.12 session's key is its device's; a claim counts as shown unless its certificate is unknown yet.
-                let shown = member.identity.as_ref().filter(|claim| {
-                    !matches!(claim.error.as_deref(), Some("it has shown no certificate of its identity" | "its identity's key could not be read yet"))
-                });
+                // In a devices group, a member's key is its device's; a claim counts as shown once its key log is read.
+                let shown = member.identity.as_ref().filter(|claim| claim.error.as_deref() != Some("its identity's key log could not be read yet"));
                 let identity = shown.map(|claim| claim.identity.id.clone());
                 let device = shown.map(|_| member.key.clone());
                 Leaf { key: member.key, iroh: member.iroh, identity, device }
@@ -606,20 +623,26 @@ impl World {
         }
         book.rosters.insert((i, gid.clone()), state.clone());
         let (epoch, leaves, settings) = state;
-        book.trace.0.push(Obs { at: elapsed(), what: What::Roster { m: i, key: node.key(), group: gid.clone(), epoch, leaves, settings } });
+        book.trace.0.push(Obs { at: elapsed(), what: What::Roster { m: i, key: node.key_in(&gid.0), group: gid.clone(), epoch, leaves, settings } });
     }
 
     fn event(&self, i: usize, node: &Node<Store>, event: &Event) {
         if let Some(gid) = event.group() {
             self.sample(i, node, gid);
         }
-        if let Event::Live { group, sender, .. } = event {
-            self.observe(What::Live { m: i, group: group.clone(), sender: sender.key.clone(), epoch: 0, generation: 0 });
-        }
     }
 
     fn told(&self, i: usize, node: &Node<Store>, event: ClientEvent) {
         self.note(format!("m{i} {}", serde_json::to_string(&event).unwrap()));
+        match &event {
+            ClientEvent::Message { group, position, missing, .. } => {
+                self.observe(What::Shown { m: i, group: group.clone(), position: *position, missing: missing.iter().copied().collect() })
+            }
+            ClientEvent::Sent { group, id, position } => {
+                self.observe(What::Sent { m: i, group: group.clone(), id: Bytes(hex::decode(id).unwrap()), position: *position })
+            }
+            _ => {}
+        }
         for gid in node.groups() {
             self.sample(i, node, &gid);
         }
@@ -646,6 +669,11 @@ impl World {
         {
             let to = self.member_at(wire.to);
             for (gid, frame) in frames(node, &frame) {
+                if let Frame::Messages { positions } = &frame
+                    && positions.iter().all(|p| self.book.lock().unwrap().forged.contains(&(gid.clone(), *p)))
+                {
+                    continue;
+                }
                 self.sample(i, node, &gid);
                 self.observe(What::Out { m: i, to: Some(Bytes(wire.to.as_bytes().to_vec())), group: gid.clone(), frame: frame.clone() });
                 if let Some(to) = to {
@@ -653,8 +681,15 @@ impl World {
                 }
                 output = Some(Output::Frame);
             }
-        }
-        if bytes.windows(10).any(|w| w == br#""admitted""#) {
+        } else if let Ok(admitted) = serde_json::from_slice::<lmk_proto::peer::Admitted>(bytes) {
+            let adds = |gid: &Bytes| {
+                let page = self.outsider.read(&gid.0, admitted.position - 1, 1).ok().flatten();
+                let entry = page.and_then(|page| page.entries.into_iter().next());
+                entry.is_some_and(|entry| matches!(Entry::parse(&entry.0), Ok(Entry::Commit { welcome: Some(welcome), .. }) if welcome == admitted.welcome.0))
+            };
+            if let Some(gid) = node.groups().into_iter().find(adds) {
+                self.observe(What::Out { m: i, to: Some(Bytes(wire.to.as_bytes().to_vec())), group: gid, frame: Frame::Admitted { position: admitted.position } });
+            }
             output = Some(Output::Admitted);
         }
         let armed = self.book.lock().unwrap().crash.get(&i).copied();
@@ -774,9 +809,9 @@ impl World {
                 sleep(Duration::from_millis(wait)).await;
                 let racing = race.map(|r| {
                     let (world, link) = (self.clone(), link.clone());
-                    tokio::spawn(async move { world.request(r, json!({ "cmd": "join", "target": link })).await })
+                    tokio::spawn(async move { world.join(r, &link).await })
                 });
-                let joined = self.request(n, json!({ "cmd": "join", "target": link })).await;
+                let joined = self.join(n, &link).await;
                 if let (Some(racing), Some(r)) = (racing, race) {
                     let raced = racing.await?;
                     self.note(format!("m{} raced: {}", self.index(r), raced.as_ref().map_or_else(|e| format!("{e:#}"), Value::to_string)));
@@ -785,7 +820,7 @@ impl World {
             }
             Act::JoinOpen { n, group } => {
                 let gid = self.group(group)?;
-                Ok(self.request(n, json!({ "cmd": "join", "target": b64(&gid.0) })).await?["group"].to_string())
+                Ok(self.join(n, &b64(&gid.0)).await?["group"].to_string())
             }
             Act::Send { m, group } => {
                 let gid = self.group(group)?;
@@ -793,8 +828,16 @@ impl World {
                 let client = self.client(m)?;
                 let after = client.tips(&gid, |_| true)?;
                 let chat = Chat { text: format!("from m{m} at {}", elapsed()), to: Vec::new(), reply_to: None, urgent: false, attachment: None };
-                let (_, answer) = client.send(&gid, chat, after).await?;
-                Ok(answer.to_string())
+                let sent = client.send(&gid, chat, after).await;
+                let (id, answer) = match &sent {
+                    Ok((_, answer)) => {
+                        let id = Bytes(hex::decode(answer["id"].as_str().context("no id")?)?);
+                        (id, answer["position"].as_u64().map_or(Answer::Pending, Answer::Position))
+                    }
+                    Err(error) => (Bytes::default(), Answer::Failed(format!("{error:#}"))),
+                };
+                self.observe(What::Send { m, group: gid, id, answer });
+                Ok(sent?.1.to_string())
             }
             Act::Live { m, group } => {
                 let gid = self.group(group)?;
@@ -857,36 +900,57 @@ impl World {
         }
     }
 
-    /// An attacker's entry in a group's log, by the service's store directly.
+    /// `m` joins by a link or an opening, answered with the group, where it starts.
+    async fn join(&self, m: usize, target: &str) -> Result<Value> {
+        let joined = self.request(m, json!({ "cmd": "join", "target": target })).await?;
+        let gid = Bytes(URL_SAFE_NO_PAD.decode(joined["group"].as_str().context("no group")?)?);
+        let node = self.client(m)?.node().clone();
+        let start = node.positions(&gid.0)?.start;
+        self.observe(What::Join { m: self.index(m), key: node.key_in(&gid.0), group: gid, answer: Answer::Position(start) });
+        Ok(joined)
+    }
+
+    /// An attacker's entry in a group's log, by the service's store directly; a forged message's ciphertext pushed to
+    /// the members, as the member whose state it copied would.
     fn forge(&self, m: usize, g: usize, what: Forgery) -> Result<String> {
         let gid = self.group(g)?;
-        let entry = match what {
-            Forgery::Junk => lmk_proto::random::random::<64>().to_vec(),
+        let (entry, push) = match what {
+            Forgery::Junk => (lmk_proto::random::random::<64>().to_vec(), None),
             Forgery::Replay => {
                 let page = self.outsider.read(&gid.0, 0, usize::MAX)?.context("no log")?;
-                page.entries.get(m % page.entries.len().max(1)).context("an empty log")?.0.clone()
+                (page.entries.get(m % page.entries.len().max(1)).context("an empty log")?.0.clone(), None)
             }
             Forgery::Foreign => {
                 let groups = self.book.lock().unwrap().groups.clone();
                 let other = groups.iter().find(|other| **other != gid).context("one group")?;
                 let page = self.outsider.read(&other.0, 0, usize::MAX)?.context("no log")?;
-                page.entries.last().context("an empty log")?.0.clone()
+                (page.entries.last().context("an empty log")?.0.clone(), None)
             }
-            Forgery::Message | Forgery::Commit | Forgery::Copy => {
+            Forgery::Message { .. } | Forgery::Commit | Forgery::Copy => {
                 let m = self.holder(&gid, m)?;
                 let copy = self.members.lock().unwrap()[m].store.snapshot();
-                let entry = forged(&copy, &gid, what)?;
                 if matches!(what, Forgery::Copy) {
                     self.observe(What::Copied { m, group: gid.clone() });
                 }
-                entry
+                let (entry, ciphertext) = forged(&copy, &gid, what)?;
+                (entry, ciphertext.map(|ciphertext| (m, ciphertext)))
             }
         };
-        let appended = self.outsider.append(&gid.0, &[Bytes(entry)])?;
+        let position = self.outsider.append(&gid.0, &[Bytes(entry)])?.position;
         if !matches!(what, Forgery::Copy) {
-            self.observe(What::Forged { group: gid, position: appended.position, mac: false });
+            let mac = matches!(what, Forgery::Message { mac: true });
+            self.observe(What::Forged { group: gid.clone(), position, mac });
         }
-        Ok(format!("at {}", appended.position))
+        if let Some((m, ciphertext)) = push {
+            self.book.lock().unwrap().forged.insert((gid.clone(), position));
+            let net = self.peers.lock().unwrap().get(&self.iroh(m)).cloned();
+            let item = lmk_proto::peer::Item { position, ciphertext: Bytes(ciphertext) };
+            for j in (0..self.size()).filter(|j| *j != m) {
+                let frame = lmk_proto::peer::Frame::Messages { group: gid.clone(), items: vec![item.clone()], answers: None };
+                net.as_ref().map(|net| net.frame(self.iroh(j), frame));
+            }
+        }
+        Ok(format!("at {position}"))
     }
 
     /// Every member online and reachable, then after a while the properties are checked.
@@ -900,14 +964,9 @@ impl World {
             self.online(m, true);
         }
         sleep(Duration::from_millis(CONVERGE)).await;
-        // A 0.12 member learns of its removal from no peer, but by reading its log within 5 minutes.
-        let views = self.views();
-        if props::inside(&views).len() < views.len() {
-            sleep(RESYNC).await;
-        }
         self.observe(What::Quiet { views: self.views() });
         self.connections();
-        let failure = props::check(&self.book.lock().unwrap().trace, self.options.pending);
+        let failure = props::check(&self.book.lock().unwrap().trace);
         if let Some((name, text)) = failure {
             self.fail(name, text);
         }
@@ -925,11 +984,60 @@ impl World {
                 self.sample(m, node, &gid);
                 let book = self.book.lock().unwrap();
                 let Some((epoch, leaves, _)) = book.rosters.get(&(m, gid.clone())).cloned() else { continue };
-                let empty = Default::default;
-                views.push(View { m, key: node.key(), group: gid, epoch, leaves, start: 0, head: 0, held: empty(), opened: empty(), lost: empty() });
+                drop(book);
+                let Ok(p) = node.positions(&gid.0) else { continue };
+                let set = |ranges: lmk_proto::ranges::Ranges| ranges.iter().collect();
+                views.push(View { m, key: node.key_in(&gid.0), group: gid, epoch, leaves, start: p.start, head: p.head, held: set(p.held), opened: set(p.opened), lost: set(p.lost) });
             }
         }
         views
+    }
+}
+
+/// A node's observation, as the trace records it.
+fn observed(m: usize, observation: Observation) -> What {
+    match observation {
+        Observation::Read { group, position, entry, epoch, verdict } => {
+            let verdict = match verdict {
+                Judgement::Commit { committer, added, removed } => Verdict::Commit { committer, added, removed },
+                Judgement::Counted { id } => Verdict::Counted { id },
+                Judgement::Skipped => Verdict::Skipped,
+            };
+            What::Read { m, group, position, entry, epoch, verdict }
+        }
+        Observation::Joined { group, start } => What::Joined { m, group, start },
+        Observation::Head { group, head } => What::Head { m, group, head },
+        Observation::Opened { group, position, kind, sender, plaintext } => What::Opened { m, group, position, kind, sender, plaintext },
+        Observation::Lost { group, position } => What::Lost { m, group, positions: [position].into() },
+        Observation::Announced { group, position, positions } => What::Announced { m, group, position, positions: positions.into_iter().collect() },
+        Observation::Handed { group, kind, position } => What::Handed { m, group, kind, position },
+        Observation::Live { group, sender, epoch } => What::Live { m, group, sender, epoch },
+        Observation::State { group, from } => What::StateTaken { m, group, from },
+        Observation::Dropped { group, reason } => {
+            let reason = match reason {
+                lmk_node::Dropped::Retention => Dropped::Retention,
+                lmk_node::Dropped::Copied => Dropped::Copied,
+                lmk_node::Dropped::Forgotten => Dropped::Forgotten,
+            };
+            What::Dropped { m, group, reason }
+        }
+    }
+}
+
+fn restored(saved: lmk_node::Saved) -> Saved {
+    Saved {
+        epoch: saved.epoch,
+        start: saved.start,
+        expired: saved.expired,
+        head: saved.head,
+        logged: saved.logged,
+        judged: saved.judged.into_iter().collect(),
+        commits: saved.commits,
+        held: saved.held.iter().collect(),
+        entries: saved.entries,
+        sends: saved.sends,
+        summaries: saved.summaries,
+        roster: saved.roster,
     }
 }
 
@@ -953,26 +1061,35 @@ fn frames(node: &Node<Store>, frame: &lmk_proto::peer::Frame) -> Vec<(Bytes, Fra
     }
 }
 
-/// From a copy of a member's state: a message with a valid AEAD signed by another key, a commit signed by another key,
-/// or a commit as the member signs it.
-fn forged(copy: &Store, gid: &Bytes, what: Forgery) -> Result<Vec<u8>> {
+/// From a copy of a member's state, in 0.13's entries: a message with a valid AEAD signed by another key, with its
+/// ciphertext, under a MAC that verifies or not; a commit signed by another key; or a commit as the member signs it.
+fn forged(copy: &Store, gid: &Bytes, what: Forgery) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    use lmk_node::lmk_core::group::{Change, Group, Session};
     use openmls::prelude::{GroupId, LeafNodeParameters, MlsGroup};
     use openmls_basic_credential::SignatureKeyPair;
+    use openmls_traits::signatures::Signer;
     use openmls_traits::types::SignatureScheme;
     if matches!(what, Forgery::Copy) {
-        use lmk_node::lmk_core::group::{Change, Group, Session};
         let session = Session::load(copy)?;
         let mut group = Group::load(copy, &gid.0)?;
-        return Ok(group.commit(copy, &session, Change::default())?.entry);
+        return Ok((group.commit(copy, &session, Change::default())?.entry, None));
     }
     let key = ed25519_dalek::SigningKey::from_bytes(&lmk_proto::random::random());
     let stranger = SignatureKeyPair::from_raw(SignatureScheme::ED25519, key.to_bytes().to_vec(), key.verifying_key().to_bytes().to_vec());
-    let mut group = MlsGroup::load(copy.storage(), &GroupId::from_slice(&gid.0))?.context("no such group")?;
-    let message = match what {
-        Forgery::Message => group.create_message(copy, &stranger, b"forged")?,
-        _ => group.self_update(copy, &stranger, LeafNodeParameters::default())?.into_commit(),
-    };
-    Ok(message.to_bytes()?)
+    let mut mls = MlsGroup::load(copy.storage(), &GroupId::from_slice(&gid.0))?.context("no such group")?;
+    if let Forgery::Message { mac } = what {
+        let payload = serde_json::to_vec(&json!({ "type": "message", "content": "forged" }))?;
+        let ciphertext = mls.create_message(copy, &stranger, &payload)?.to_bytes()?;
+        let id = sha(&ciphertext);
+        let entry = match mac {
+            true => Group::load(copy, &gid.0)?.entry(copy, &id)?,
+            false => Entry::Message { id, mac: lmk_proto::random::random() }.encode(),
+        };
+        return Ok((entry, Some(ciphertext)));
+    }
+    let commit = mls.self_update(copy, &stranger, LeafNodeParameters::default())?.into_commit().to_bytes()?;
+    let sig = stranger.sign(&signed(&commit, None)).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    Ok((Entry::Commit { commit, welcome: None, sig }.encode(), None))
 }
 
 /// Files over the simulated network: whole, from a holder reachable now, by its rules.

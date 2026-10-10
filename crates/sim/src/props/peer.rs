@@ -37,12 +37,16 @@ impl<'a> Seen<'a> {
 }
 
 /// A member writes a group's frames to a peer only while the peer's iroh key is in a leaf of the member's current
-/// epoch, and `state` and live payloads only once it has read its log to the head as last read.
+/// epoch, but the answer that admits a joiner; and `state` and live payloads only once it has read its log to the head
+/// as last read.
 pub fn gate(t: &Trace) -> Result<(), String> {
     let mut seen = Seen::default();
     for o in &t.0 {
         seen.take(&o.what);
         let What::Out { m, to: Some(to), group, frame } = &o.what else { continue };
+        if matches!(frame, Frame::Admitted { .. }) {
+            continue;
+        }
         if !seen.has(*m, group, |leaf| leaf.iroh == *to) {
             return Err(format!("m{m} wrote {frame:?} of {} to {}, not in its current epoch, at {}", short(group), short(to), super::clock(o.at)));
         }
@@ -114,7 +118,7 @@ mod tests {
 
     #[test]
     fn live_payloads_only_from_current_members() {
-        let live = |sender| What::Live { m: 0, group: g(), sender: key(sender), epoch: 1, generation: 0 };
+        let live = |sender| What::Live { m: 0, group: g(), sender: key(sender), epoch: 1 };
         assert!(live_current(&trace(vec![(1, roster(0, 1, &[0, 1])), (2, live(1))])).is_ok());
         let removed = trace(vec![(1, roster(0, 1, &[0, 1])), (2, roster(0, 2, &[0])), (3, live(1))]);
         assert!(live_current(&removed).unwrap_err().contains("not in its current epoch"));

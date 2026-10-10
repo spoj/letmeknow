@@ -100,6 +100,7 @@ fn node_config(network: &Network, home: &Path, name: &str, device: Option<Device
         file_limit: 100 << 20,
         kinds,
         durable: None,
+        observe: None,
     }
 }
 

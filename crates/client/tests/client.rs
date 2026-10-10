@@ -73,6 +73,7 @@ impl Member {
             disk: None,
             file_limit: 100 << 20,
             durable: None,
+            observe: None,
             kinds: vec![CHAT.into(), DEVICES.into(), KIND.into()],
         };
         let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();

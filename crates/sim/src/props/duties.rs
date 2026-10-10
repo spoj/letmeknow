@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use lmk_proto::Bytes;
 
-use super::{CONVERGE, UPDATE, inside, judged, key_of, quiets, removed, short};
+use super::{CONVERGE, UPDATE, inside, judged, quiets, removed, short};
 use crate::trace::{Trace, Verdict, What};
 
 /// By the end of a quiet period: a member that asked to leave a group before it began holds the group no more, if
@@ -55,8 +55,8 @@ pub fn duties(t: &Trace) -> Result<(), String> {
 }
 
 /// Every known loss but those at one's own removal is announced by the end of the next quiet period the member is in
-/// the group for; and each announcement reaches, by then, every member of the group whose start is before it: its
-/// kinds and client are told, or it lost the announcement too.
+/// the group for; and each announcement reaches, by then, every member of the group whose start is before it: it opened
+/// the announcement, which its kinds and client learn from, or lost it too.
 pub fn losses_announced(t: &Trace) -> Result<(), String> {
     let judged = judged(t);
     for (i, o) in t.0.iter().enumerate() {
@@ -82,15 +82,15 @@ pub fn losses_announced(t: &Trace) -> Result<(), String> {
                 }
             }
             What::Announced { m, group, position, positions } => {
-                let Some(key) = key_of(&t.0[..=i], *m, group) else { continue };
                 for (at, views) in after {
-                    for v in views.iter().filter(|v| v.m != *m && v.group == *group && v.active() && v.start < *position && !v.lost.contains(position)) {
-                        let told: BTreeSet<u64> = t.0.iter().take_while(|o| o.at <= at).flat_map(|o| match &o.what {
-                            What::ToldLost { m: j, group: g, member, positions } if *j == v.m && g == group && member == key => positions.iter().copied().collect(),
-                            _ => Vec::new(),
-                        }).collect();
-                        if !positions.is_subset(&told) {
-                            return Err(format!("m{} was not told that m{m} lost {positions:?} of {}, announced at {position}, by {}", v.m, short(group), super::clock(at)));
+                    for v in views.iter().filter(|v| v.m != *m && v.group == *group && v.active() && v.start < *position) {
+                        let learnt = t.0.iter().take_while(|o| o.at <= at).any(|o| match &o.what {
+                            What::Opened { m: j, group: g, position: p, .. } => *j == v.m && g == group && p == position,
+                            What::Lost { m: j, group: g, positions } => *j == v.m && g == group && positions.contains(position),
+                            _ => false,
+                        });
+                        if !learnt {
+                            return Err(format!("m{} did not learn that m{m} lost {positions:?} of {}, announced at {position}, by {}", v.m, short(group), super::clock(at)));
                         }
                     }
                 }
@@ -151,8 +151,8 @@ mod tests {
         assert!(losses_announced(&trace(unannounced.clone())).unwrap_err().contains("had not announced"));
         let announced = (2_000, What::Announced { m: 0, group: g(), position: 7, positions: ps(&[2]) });
         let untold = [unannounced.clone(), vec![announced.clone()]].concat();
-        assert!(losses_announced(&trace(untold)).unwrap_err().contains("m1 was not told"));
-        let told = (3_000, What::ToldLost { m: 1, group: g(), member: key(0), positions: ps(&[2]) });
+        assert!(losses_announced(&trace(untold)).unwrap_err().contains("m1 did not learn"));
+        let told = (3_000, What::Opened { m: 1, group: g(), position: 7, kind: "lost".into(), sender: key(0), plaintext: [0; 32] });
         assert!(losses_announced(&trace([unannounced.clone(), vec![announced.clone(), told]].concat())).is_ok());
         v1.start = 8;
         let later = vec![(0, roster(0, 1, &[0, 1])), (0, read(0, 2, 1, counted(2))), lost, announced, quiet(200_000, views(&v1))];

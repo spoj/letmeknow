@@ -93,6 +93,7 @@ fn config(relay: &Relay, name: &str, device: Option<Device>, kinds: &[&str]) -> 
         file_limit: 100 << 20,
         kinds: kinds.iter().map(|kind| kind.to_string()).collect(),
         durable: None,
+        observe: None,
     }
 }
 

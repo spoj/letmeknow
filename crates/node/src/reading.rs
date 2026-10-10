@@ -16,7 +16,7 @@ use lmk_proto::ranges::Ranges;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Event, Inner, Message, State, Work, days, get, message_key, now, put};
+use crate::{Dropped, Event, Inner, Judgement, Message, Observation, State, Work, days, get, message_key, now, put};
 
 /// The bytes of ciphertexts a group keeps from one peer that came before their entries were read.
 const EARLY: usize = 4 << 20;
@@ -44,7 +44,7 @@ pub(crate) enum Judged {
     Counted { id: Bytes },
 }
 
-fn pos_key(gid: &[u8], position: u64) -> Vec<u8> {
+pub(crate) fn pos_key(gid: &[u8], position: u64) -> Vec<u8> {
     [b"node/pos/".as_slice(), gid, b"/", &position.to_be_bytes()].concat()
 }
 
@@ -167,6 +167,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let now = now();
         let g = st.groups.get_mut(gid).unwrap();
         let epoch = g.mls.epoch();
+        let read = |verdict| Observation::Read { group: Bytes(gid.to_vec()), position, entry: Sha256::digest(entry).into(), epoch, verdict };
         let judged = match g.mls.judge(&st.provider, entry)? {
             Verdict::Message { id } => {
                 let counted = match st.position_of(gid, &id)? {
@@ -176,6 +177,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 if counted {
                     Judged::Skipped
                 } else {
+                    st.observe(|| read(Judgement::Counted { id: Bytes(id.to_vec()) }));
                     self.count(st, gid, position, epoch, id, now)?;
                     Judged::Counted { id: Bytes(id.to_vec()) }
                 }
@@ -184,6 +186,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Verdict::Copied => {
                 let text = "a copy of this session's state committed in the group, so this session stops using it: join it again, or revoke this device if it may be stolen";
                 self.warn(Some(gid), text.into());
+                st.observe(|| Observation::Dropped { group: Bytes(gid.to_vec()), reason: Dropped::Copied });
                 self.work.send(Work::Gone(gid.to_vec())).ok();
                 return Ok(false);
             }
@@ -210,6 +213,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     st.unhear(gid, &leaf.key.0)?;
                 }
                 let core::Applied { added, how, invite, removed, settings, .. } = applied;
+                let keys = |members: &[core::Member]| members.iter().map(|m| Bytes(m.key.clone())).collect();
+                let verdict = Judgement::Commit { committer: Bytes(by.as_ref().map(|by| by.key.clone()).unwrap_or_default()), added: keys(&added), removed: keys(&removed) };
+                st.observe(|| read(verdict));
                 self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, invite, removed, settings, gone }).ok();
                 let pos = Pos { epoch, at: now, judged: Judged::Commit { own }, lost: false };
                 put(&st.provider, &pos_key(gid, position), &pos)?;
@@ -217,6 +223,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 return Ok(!gone);
             }
         };
+        if judged == Judged::Skipped {
+            st.observe(|| read(Judgement::Skipped));
+        }
         put(&st.provider, &pos_key(gid, position), &Pos { epoch, at: now, judged, lost: false })?;
         st.group_mut(gid)?.rec.position = position;
         Ok(true)
@@ -296,6 +305,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         };
         let sender = g.mls.members().into_iter().find(|m| Some(m.index) == opened.current).context("a current member")?;
         let sender = st.member(gid, &sender).context("the sender has no letmeknow credential")?;
+        st.observe(|| Observation::Live { group: Bytes(gid.to_vec()), sender: sender.key.clone(), epoch: opened.epoch });
         self.events.send(Event::Live { group: Bytes(gid.to_vec()), sender, payload: opened.payload }).ok();
         Ok(())
     }
@@ -369,6 +379,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         rec.unopened.remove(&position);
         rec.lacking.remove(position);
         rec.lost.insert(position);
+        st.observe(|| Observation::Lost { group: Bytes(gid.to_vec()), position });
         self.work.send(Work::Duties(gid.to_vec())).ok();
         let mut pos = st.pos(gid, position)?.context("a counted position has its record")?;
         pos.lost = true;
@@ -381,6 +392,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
     pub(crate) fn deliver(&self, st: &mut State<P>, gid: &[u8], message: Message, own: bool) -> Result<()> {
         put(&st.provider, &message_key(&message.id.0), &message)?;
         let group = Bytes(gid.to_vec());
+        let kind = match type_of(&message.payload) {
+            core if Control::TYPES.contains(&core) => core.to_owned(),
+            _ => st.group(gid)?.mls.settings().kind,
+        };
+        let plaintext = Sha256::digest(serde_json::to_vec(&message.payload)?).into();
+        st.observe(|| Observation::Opened { group: group.clone(), position: message.position, kind, sender: message.sender.key.clone(), plaintext });
         if !Control::TYPES.contains(&type_of(&message.payload)) {
             let rec = &mut st.group_mut(gid)?.rec;
             if !own && message.position <= rec.shown {

@@ -1,6 +1,5 @@
 //! The 0.13 properties, a module per area, each a pure check over a run's trace (`crate::trace`), named in failures.
-//! A property whose observations the node cannot record yet is pending: skipped in runs unless `--pending`, and listed
-//! with what it needs. `LMK_SIM_SKIP` names properties to leave unchecked while a bug is triaged.
+//! `LMK_SIM_SKIP` names properties to leave unchecked while a bug is triaged.
 
 mod convergence;
 mod crash;
@@ -18,8 +17,7 @@ use lmk_proto::Bytes;
 
 use crate::trace::{Key, Obs, Trace, Verdict, View, What};
 
-/// How long members stay connected and undisturbed in a quiet period before they must agree: well under the 5-minute
-/// resync.
+/// How long members stay connected and undisturbed in a quiet period before they must agree.
 pub const CONVERGE: u64 = 90_000;
 /// How long after a device is taken off every member holding its sessions' certificates has read the key log entry
 /// that names it: a copy of a key log is fresh for 10 minutes.
@@ -30,47 +28,36 @@ pub const UPDATE: u64 = 86_400_000 + 3_600_000;
 pub struct Property {
     pub name: &'static str,
     pub check: fn(&Trace) -> Result<(), String>,
-    /// For a pending property, what the node must record first.
-    pub needs: Option<&'static str>,
 }
 
 pub const PROPERTIES: &[Property] = &[
-    Property { name: "agreement", check: membership::agreement, needs: None },
-    Property { name: "caught-up", check: membership::caught_up, needs: None },
-    Property { name: "gate", check: peer::gate, needs: None },
-    Property { name: "revocation", check: identity::revocation, needs: None },
-    Property { name: "live-current", check: peer::live_current, needs: None },
-    Property { name: "convergence", check: convergence::convergence, needs: Some("Node::positions; Event::Opened") },
-    Property {
-        name: "loss-allowed",
-        check: convergence::loss_allowed,
-        needs: Some("Event::Read, Event::Lost, Event::Opened, Event::Live {epoch, generation}; 0.13 hello and messages frames"),
-    },
-    Property { name: "kind-order", check: order::kind_order, needs: Some("Event::Read, Event::Opened, Event::Handed; ClientEvent::Message {position, missing}") },
-    Property { name: "strict-entries", check: entries::strict_entries, needs: Some("Event::Joined, Event::Read, Event::Opened") },
-    Property { name: "forgery", check: entries::forgery, needs: Some("Event::Read, Event::Opened, Event::Dropped; forged entries in 0.13's format") },
-    Property { name: "admission-retry", check: entries::admission, needs: Some("Event::Joined, Event::Read; join's answer with its start") },
-    Property { name: "duties", check: duties::duties, needs: Some("Event::Read, Event::Announced; Node::positions") },
-    Property { name: "losses-announced", check: duties::losses_announced, needs: Some("Event::Lost, Event::Announced, ClientEvent::Lost; Node::positions") },
-    Property { name: "crash-consistency", check: crash::crash_consistency, needs: Some("lmk_node::saved; Event::Read; 0.13 frames; storage snapshots of committed steps") },
-    Property { name: "send-settles", check: send::send_settles, needs: Some("send's answer {id, position | pending}; ClientEvent::Sent; Event::Read") },
-    Property { name: "state-from-members", check: peer::state_from_members, needs: Some("Event::State {from}; Event::Read, Event::Head") },
+    Property { name: "agreement", check: membership::agreement },
+    Property { name: "caught-up", check: membership::caught_up },
+    Property { name: "gate", check: peer::gate },
+    Property { name: "revocation", check: identity::revocation },
+    Property { name: "live-current", check: peer::live_current },
+    Property { name: "convergence", check: convergence::convergence },
+    Property { name: "loss-allowed", check: convergence::loss_allowed },
+    Property { name: "kind-order", check: order::kind_order },
+    Property { name: "strict-entries", check: entries::strict_entries },
+    Property { name: "forgery", check: entries::forgery },
+    Property { name: "admission-retry", check: entries::admission },
+    Property { name: "duties", check: duties::duties },
+    Property { name: "losses-announced", check: duties::losses_announced },
+    Property { name: "crash-consistency", check: crash::crash_consistency },
+    Property { name: "send-settles", check: send::send_settles },
+    Property { name: "state-from-members", check: peer::state_from_members },
 ];
 
-/// The first property a trace breaks, of those checked: all, with `pending`, else those the node can feed, either way
-/// but those `LMK_SIM_SKIP` names.
-pub fn check(trace: &Trace, pending: bool) -> Option<(&'static str, String)> {
+/// The first property a trace breaks, of all but those `LMK_SIM_SKIP` names.
+pub fn check(trace: &Trace) -> Option<(&'static str, String)> {
     let skip = std::env::var("LMK_SIM_SKIP").unwrap_or_default();
     let mut sorted = trace.clone();
     sorted.0.sort_by_key(|o| o.at);
     PROPERTIES
         .iter()
-        .filter(|p| (pending || p.needs.is_none()) && !skip.split(',').any(|s| s == p.name))
+        .filter(|p| !skip.split(',').any(|s| s == p.name))
         .find_map(|p| (p.check)(&sorted).err().map(|text| (p.name, text)))
-}
-
-pub fn pending() -> impl Iterator<Item = &'static Property> {
-    PROPERTIES.iter().filter(|p| p.needs.is_some())
 }
 
 /// How each position of each group was judged, as the first member to judge it did.
