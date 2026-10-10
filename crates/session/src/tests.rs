@@ -608,7 +608,7 @@ fn identities_are_created_listed_and_lose_devices() {
 }
 
 /// A session that does not act for its device renames the device and takes it off its identity, through the session
-/// that does: the device's certificates and credential name it anew, and the identity, whose only device it was, ends.
+/// that does: its credential and its identity's key log name it anew, and the identity, whose only device it was, ends.
 #[test]
 fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
     local(async {
@@ -632,7 +632,7 @@ fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        assert!(device().await, "the desk session renews its certificate with the device's new name");
+        assert!(device().await, "carol sees the device's new name, as the identity's key log lists it");
 
         let left = desk.cmd(&["identity", "leave", "Alice"]).await.unwrap();
         assert_eq!((&left["left"][0], &left["ended"]), (&invite["group"], &json!(true)));

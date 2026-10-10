@@ -1,6 +1,6 @@
 //! The session process: the client core on this session's node, and, holding the device's lock, the device's node with
 //! the devices kind; the plugins of its groups' kinds as executables; and what concerns the agent, printed. Chat is its
-//! built-in kind. The session process that holds the lock publishes the device's identities, their current keys,
+//! built-in kind. The session process that holds the lock publishes the device's identities, its key on each,
 //! contacts and openings to `device-state.json`, and answers the requests only the device's node can on the command
 //! channel `device-endpoint`, both in `LETMEKNOW_HOME`; the device's other session processes read the one and send such
 //! requests to the other, among them for the certificates their credentials carry.

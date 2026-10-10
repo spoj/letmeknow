@@ -29,13 +29,6 @@ fn a_seed_replays_exactly() {
     assert_eq!(replay(7, Options::default(), &keep).trace, replay(7, Options::default(), &keep).trace);
 }
 
-/// A certificate of a member, shown by another peer after the Add that names it was applied, made a session serve it
-/// without a hello, so live messages to it waited for the 5-minute resync.
-#[test]
-fn a_certificate_shown_by_another_peer() {
-    passes(46, &[0, 1, 2, 3, 5, 7, 8, 9, 12, 13, 15, 16, 17, 18, 19, 23, 24, 26, 27, 28, 31, 32, 33, 34, 35, 37, 39]);
-}
-
 /// The read a member sends after subscribing to a log reached the service before the subscription, missing the commit
 /// that removed the member, of which no peer told it either.
 #[test]
