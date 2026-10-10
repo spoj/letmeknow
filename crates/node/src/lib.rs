@@ -1708,43 +1708,49 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Commits a change built on the group's current epoch, posts its entry, and reads the log until it is known whether
     /// it won its epoch; if another commit won, builds it again. Returns the Welcome, if it adds, and the position; none
     /// once the change has no effect (`None`), and it commits nothing. An entry posted before, which the log may or may
-    /// not have taken, is posted again first: only the service's refusal drops it.
+    /// not have taken, as when the service's answer was lost, is posted again first: only the service's refusal drops it.
+    /// This call's own entry is found in the log by its bytes.
     async fn commit(&self, gid: &[u8], change: impl Fn(&State<P>, &G) -> Result<Option<Change>>) -> Result<Option<(Option<Vec<u8>>, u64)>> {
         let _committing = self.committing.lock().await;
+        let mut built: Option<(Vec<u8>, Option<Vec<u8>>)> = None;
         for _ in 0..COMMIT_TRIES {
             self.caught_up(gid).await?;
-            let (entry, welcome, ours, service) = {
+            let (entry, service, before) = {
                 let mut st = self.lock();
                 let st = &mut *st;
                 let g = st.group(gid)?;
-                let service = g.mls.settings().membership;
+                let (service, before) = (g.mls.settings().membership, g.rec.position);
                 match g.mls.posted() {
-                    Some(posted) => (posted.to_vec(), None, false, service),
+                    Some(posted) => (posted.to_vec(), service, before),
                     None => {
                         let Some(change) = change(st, g)? else { return Ok(None) };
                         let g = st.groups.get_mut(gid).unwrap();
                         let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
                         let commit = g.mls.commit(&st.provider, session, change)?;
-                        (commit.entry, commit.welcome, true, service)
+                        built = Some((commit.entry.clone(), commit.welcome));
+                        (commit.entry, service, before)
                     }
                 }
             };
             self.durable().await?;
-            let position = match self.clients.client(&service)?.append(gid, std::slice::from_ref(&entry)).await {
-                Ok(appended) => appended.position,
+            match self.clients.client(&service)?.append(gid, std::slice::from_ref(&entry)).await {
+                Ok(_) => {}
                 Err(error) if error.is::<Refused>() => {
                     let mut st = self.lock();
                     let st = &mut *st;
                     st.groups.get_mut(gid).context("left the group")?.mls.cancel(&st.provider)?;
                     return Err(error);
                 }
-                Err(error) => return Err(error),
-            };
+                Err(error) => tracing::debug!("appending a commit, which the log may show: {error:#}"),
+            }
             self.caught_up(gid).await?;
+            let Some((ours, welcome)) = built.as_ref().filter(|(ours, _)| *ours == entry) else { continue };
             let st = self.lock();
-            ensure!(st.group(gid)?.rec.position >= position, "the log did not show the commit it took");
-            if ours && st.pos(gid, position)?.is_some_and(|pos| pos.judged == reading::Judged::Commit { own: true }) {
-                return Ok(Some((welcome, position)));
+            for position in before + 1..=st.group(gid)?.rec.position {
+                let own = st.pos(gid, position)?.is_some_and(|pos| pos.judged == reading::Judged::Commit { own: true });
+                if own && st.provider.get(&logs::entry_key(gid, position))?.as_deref() == Some(ours.as_slice()) {
+                    return Ok(Some((welcome.clone(), position)));
+                }
             }
         }
         bail!("the group kept changing over {COMMIT_TRIES} tries; try again")

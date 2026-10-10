@@ -127,3 +127,42 @@ fn a_first_read_that_takes_no_entry() {
         ],
     );
 }
+
+/// A member removed while offline sent its summary when it came back, before it read its removal; a member took it and
+/// kept it, of a peer no longer in the group, for good.
+#[test]
+fn a_removed_member_s_summary_is_not_kept() {
+    passes(
+        33,
+        5,
+        vec![
+            (1378, Act::CreateIdentity { m: 0 }),
+            (2990, Act::CreateIdentity { m: 4 }),
+            (6655, Act::Invite { m: 4, group: None, n: 1, label: true, to: None, wait: 0, race: None }),
+            (7825, Act::Invite { m: 4, group: Some(0), n: 3, label: true, to: None, wait: 0, race: None }),
+            (20034, Act::Drop { m: 4, n: 1 }),
+            (30345, Act::Settle { ms: 48072 }),
+            (8764656, Act::Offline { m: 4 }),
+            (8772488, Act::Remove { m: 1, group: 0, n: 0 }),
+            (8810996, Act::Quiesce),
+            (8822160, Act::Down { m: 3, ms: 60000 }),
+        ],
+    );
+}
+
+/// The service took an Add, and its answer was lost: the admitting member refused the joiner, which gave up its
+/// KeyPackage, leaving its leaf stranded, instead of reading the log for the entry it posted.
+#[test]
+fn an_add_whose_answer_was_lost_admits_its_joiner() {
+    passes(
+        58,
+        5,
+        vec![
+            (1855, Act::CreateIdentity { m: 0 }),
+            (22367, Act::Invite { m: 0, group: None, n: 1, label: false, to: None, wait: 273899, race: None }),
+            (48211, Act::LoseAnswer { m: 0 }),
+            (2480581, Act::Invite { m: 4, group: Some(1), n: 1, label: true, to: None, wait: 0, race: None }),
+            (2480581, Act::Remove { m: 2, group: 1, n: 2 }),
+        ],
+    );
+}
