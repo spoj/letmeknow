@@ -120,7 +120,7 @@ impl<P: Provider> State<P> {
 
     /// Works out again, once the rosters or the key logs changed, which groups the gate admits each connected peer to,
     /// and which key logs each group follows.
-    fn gate(&mut self) {
+    pub(crate) fn gate(&mut self) {
         if !std::mem::take(&mut self.gate) {
             return;
         }

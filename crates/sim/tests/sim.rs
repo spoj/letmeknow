@@ -244,3 +244,12 @@ fn a_joiner_reads_its_members_key_logs_before_it_applies_their_commits() {
         ],
     );
 }
+
+/// A member catching up applied a commit that added a member, and then, in the same step, the commit deleting the keys
+/// of the messages that member held for it, its gate not yet admitting the member whose summary held them.
+#[test]
+fn a_member_a_commit_just_added_counts_in_the_wait_before_the_next() {
+    let actions = generate(183, Options::default());
+    let outcome = replay(183, Options::default(), &actions);
+    assert!(outcome.failure.is_none(), "{}", outcome.log.join("\n"));
+}

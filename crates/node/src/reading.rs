@@ -434,6 +434,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// what it lacks once it applies the commit is lost (`before_commit`).
     fn cleared(&self, st: &mut State<P>, gid: &[u8], position: u64) -> Result<bool> {
         let lacking = st.lacking(gid)?;
+        // The gate as the commits applied so far in this step left it: a member they added may hold what this one lacks.
+        st.gate();
         let now = st.tick();
         let waiting = st.peers.wait(&Bytes(gid.to_vec()), &lacking, now) == Decision::Wait;
         if waiting {
