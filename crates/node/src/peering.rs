@@ -156,6 +156,33 @@ impl<P: Provider> State<P> {
         }
     }
 
+    /// What a step produced, less the frames of a group the gate no longer admits their peer to, as when the step
+    /// applied the peer's removal after it queued them.
+    pub(crate) fn admissible(&mut self, out: Vec<Out>) -> Vec<Out> {
+        out.into_iter()
+            .filter_map(|out| match out {
+                Out::Frame { peer, frame: Frame::Hello { groups, heads } } => {
+                    let groups = groups.into_iter().filter(|summary| self.admitted(&summary.group.0, &peer)).collect();
+                    Some(Out::Frame { peer, frame: Frame::Hello { groups, heads } })
+                }
+                Out::Frame { peer, frame } => {
+                    let group = match &frame {
+                        Frame::Hello { .. } => None,
+                        Frame::Entries { log, .. } => Some(log).filter(|log| self.groups.contains_key(&log.0)),
+                        Frame::Messages { group, .. }
+                        | Frame::Want { group, .. }
+                        | Frame::WantFiles { group, .. }
+                        | Frame::Have { group, .. }
+                        | Frame::State { group, .. }
+                        | Frame::Live { group, .. } => Some(group),
+                    };
+                    group.is_none_or(|group| self.admitted(&group.0.clone(), &peer)).then_some(Out::Frame { peer, frame })
+                }
+                out => Some(out),
+            })
+            .collect()
+    }
+
     /// Sends a frame of a group to every connected peer the gate lets it go to.
     pub(crate) fn broadcast(&mut self, gid: &[u8], frame: Frame) {
         let peers: Vec<EndpointId> = self.served.keys().copied().collect();

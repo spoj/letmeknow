@@ -505,6 +505,7 @@ impl<P: Provider + Send + 'static> Drop for Step<'_, P> {
             self.inner.warn(None, format!("{error:#}"));
         }
         let out = std::mem::take(&mut self.guard.out);
+        let out = self.guard.admissible(out);
         if !out.is_empty() {
             self.inner.outbox.send(out).ok();
         }
