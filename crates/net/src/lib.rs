@@ -134,6 +134,9 @@ pub(crate) struct Inner {
     files: Arc<Files>,
     links: Mutex<BTreeMap<EndpointId, Link>>,
     events: mpsc::UnboundedSender<Event>,
+    /// The task that publishes this session's addresses in its home, as they change.
+    #[cfg(not(target_family = "wasm"))]
+    publishing: Mutex<Option<n0_future::task::JoinHandle<()>>>,
 }
 
 struct Link {
@@ -155,11 +158,22 @@ impl Net {
         };
         let files = Arc::new(Files::new(blobs, config.files.clone(), config.disk.clone(), groups.clone(), config.collect).await?);
         #[cfg(not(target_family = "wasm"))]
-        if let (Network::Iroh(endpoint), Some(home)) = (&network, &config.home) {
-            addresses::publish(endpoint, home)?;
-        }
+        let publishing = match (&network, &config.home) {
+            (Network::Iroh(endpoint), Some(home)) => Some(addresses::publish(endpoint, home)?),
+            _ => None,
+        };
         let (events, rx) = mpsc::unbounded_channel();
-        let inner = Arc::new(Inner { transport, config, groups, admit, files, links: Mutex::default(), events });
+        let inner = Arc::new(Inner {
+            transport,
+            config,
+            groups,
+            admit,
+            files,
+            links: Mutex::default(),
+            events,
+            #[cfg(not(target_family = "wasm"))]
+            publishing: Mutex::new(publishing),
+        });
         let router = match network {
             Network::Iroh(endpoint) => {
                 let blobs = inner.files.protocol(inner.groups.clone());
@@ -280,8 +294,16 @@ impl Net {
             router.shutdown().await?;
         }
         #[cfg(not(target_family = "wasm"))]
-        if let Some(home) = &self.inner.config.home {
-            std::fs::remove_file(addresses::path(home, &self.id()))?;
+        let publishing = self.inner.publishing.lock().unwrap().take();
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(publishing) = publishing {
+            publishing.abort();
+            publishing.await.ok();
+            let home = self.inner.config.home.as_ref().expect("published in a home");
+            match std::fs::remove_file(addresses::path(home, &self.id())) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                removed => removed?,
+            }
         }
         Ok(())
     }
@@ -452,11 +474,11 @@ mod addresses {
         home.join("addresses").join(format!("{key}.json"))
     }
 
-    pub fn publish(endpoint: &Endpoint, home: &Path) -> anyhow::Result<()> {
+    pub fn publish(endpoint: &Endpoint, home: &Path) -> anyhow::Result<n0_future::task::JoinHandle<()>> {
         std::fs::create_dir_all(home.join("addresses"))?;
         let path = path(home, &endpoint.id());
         let mut updates = endpoint.watch_addr().stream();
-        n0_future::task::spawn(async move {
+        Ok(n0_future::task::spawn(async move {
             while let Some(addr) = updates.next().await {
                 let addrs = Addresses { addrs: addr.ip_addrs().copied().collect() };
                 let temp = path.with_extension("tmp");
@@ -465,8 +487,7 @@ mod addresses {
                     tracing::warn!("cannot publish addresses at {}: {e}", path.display());
                 }
             }
-        });
-        Ok(())
+        }))
     }
 
     pub fn read(home: &Path, key: &EndpointId) -> Vec<SocketAddr> {

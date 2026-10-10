@@ -574,12 +574,19 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(answer)
     }
 
-    /// Whether another member's summary holds a `leave` of this client's in the group.
+    /// Whether another member's summary holds a `leave` of this client's in the group, or the session is out of the
+    /// group already: removed, as its `leave` asked.
     fn leave_held(&self, gid: &Bytes) -> Result<bool> {
         let node = &self.inner.node;
-        let (only_here, me) = (node.only_here(&gid.0)?, node.key());
-        let mut leaves = node.messages(&gid.0)?.into_iter().filter(|m| m.sender.key == me && m.payload["type"] == "leave");
-        Ok(leaves.any(|leave| !only_here.contains(leave.position)))
+        let held = || -> Result<bool> {
+            let (only_here, me) = (node.only_here(&gid.0)?, node.key());
+            let mut leaves = node.messages(&gid.0)?.into_iter().filter(|m| m.sender.key == me && m.payload["type"] == "leave");
+            Ok(leaves.any(|leave| !only_here.contains(leave.position)))
+        };
+        match held() {
+            Err(_) if !node.groups().contains(gid) => Ok(true),
+            held => held,
+        }
     }
 
     /// Lets go of a group the node has left: tells its kind's plugin, and the shell.
