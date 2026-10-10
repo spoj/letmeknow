@@ -916,7 +916,9 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
         // Once the first stops, the second acts for the device, from its next command on.
         first.stop().await;
         assert_eq!(second.cmd(&["identity", "list"]).await.unwrap()["identities"][0]["name"], "Alice");
-        assert!(second.printed().await.iter().all(|e| e["type"] != "warning"));
+        // Work the second sent the first in the background may fail as the first stops; taking over may not.
+        let warnings: Vec<Value> = second.printed().await.into_iter().filter(|e| e["type"] == "warning").collect();
+        assert!(warnings.iter().all(|w| !w["text"].as_str().unwrap_or_default().contains("acting for this device")), "{warnings:?}");
     });
 }
 

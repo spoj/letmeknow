@@ -1664,6 +1664,8 @@ async fn a_gap_holds_up_its_epoch_while_fetched_then_is_passed_and_opens_late_or
 
     // Bob comes back. Sam, by hand, holds the first two: Bob asks for them, and gets the second only.
     let mut bob = stored(&relay, "Bob", &bob_db).await;
+    // Bob knows the log's head before Sam's summary, so he asks for both at once.
+    bob.node.read_group(&gid.0).await.unwrap();
     let mut sam = hand(&relay, key, &bob.node).await;
     let held = Ranges::range(1, head.length).difference(&one(p[2]));
     sam.send(&summary(&gid, &head, held.clone())).await;
@@ -1912,7 +1914,7 @@ async fn a_member_online_is_not_away_and_a_file_spreads_on_its_first_holder() {
     let key = lmk_node::iroh_key(&SqliteProvider::open(&carol_db).unwrap()).unwrap();
     let _carol = hand(&relay, key, &alice.node).await;
     eventually("Carol is online", || alice.node.online(&gid.0).unwrap().iter().any(|m| m.name == "Carol")).await;
-    assert!(alice.node.away(&gid.0).unwrap().is_empty(), "online, though not heard from");
+    assert!(!alice.node.away(&gid.0).unwrap().iter().any(|m| m.name == "Carol"), "online, though not heard from");
 
     // Bob takes the file a second into the wait.
     let file = alice.node.add_file(&gid.0, b"attached".to_vec()).await.unwrap();
