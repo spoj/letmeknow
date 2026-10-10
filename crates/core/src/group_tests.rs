@@ -12,6 +12,7 @@ pub(crate) fn settings(name: &str) -> Settings {
         name: name.into(),
         open: vec![],
         carry: 7,
+        update: lmk_proto::group::UPDATE,
         membership: Service::Folder("/tmp/lmk".into()),
         rest: Default::default(),
     }

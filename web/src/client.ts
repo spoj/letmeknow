@@ -36,7 +36,16 @@ export type Item =
       reply_to?: string;
       urgent?: boolean;
       attachment?: Attachment;
+      /** Its position in the group's log; none while its send is pending. */
+      position?: number;
+      pending?: boolean;
+      /** A send that failed, kept with its text until sent again or dropped. */
+      failed?: { error: string; retry: () => void; drop: () => void };
+      /** Members that lost this message of this browser's. */
+      lost_by?: Person[];
     }
+  | { type: "missing"; at: number; positions: number[] }
+  | { type: "lost"; at: number; member: Person; positions: number[]; ids: string[] }
   | { type: "leave"; id: string; at: number; from: Person }
   | { type: "joined"; at: number; member: Person; by: Person; how: string }
   | { type: "left"; at: number; member: Person; by: Person }

@@ -512,7 +512,16 @@ impl App {
                 self.remember(&group.0, &json!({ "type": "introduced", "at": now(), "by": by, "identity": identity, "how": how }))?;
                 self.emit(json!({ "type": "introduced", "group": group }));
             }
-            ClientEvent::Message { group, id, .. } => self.emit(json!({ "type": "message", "group": group, "id": id })),
+            ClientEvent::Message { group, id, missing, .. } => {
+                if !missing.is_empty() {
+                    self.remember(&group.0, &json!({ "type": "missing", "at": now(), "positions": missing }))?;
+                }
+                self.emit(json!({ "type": "message", "group": group, "id": id }));
+            }
+            ClientEvent::Lost { group, member, positions, ids } => {
+                self.remember(&group.0, &json!({ "type": "lost", "at": now(), "member": member, "positions": positions, "ids": ids }))?;
+                self.emit(json!({ "type": "lost", "group": group }));
+            }
             ClientEvent::Sent { group, id, .. } => self.emit(json!({ "type": "sent", "group": group, "id": id })),
             ClientEvent::File { hash } => self.emit(json!({ "type": "file", "hash": hash })),
             ClientEvent::Plugin { group, kind, mut event, .. } => {
@@ -564,21 +573,35 @@ impl App {
         Ok(Value::Array(groups))
     }
 
-    /// A group's timeline: its held messages, and the changes this session saw, oldest first.
+    /// A group's timeline: its held messages, the changes and losses this session saw, oldest first; then its sends
+    /// pending. Its own messages that other members lost name them in `lost_by`.
     fn items(&self, gid: &Bytes) -> Result<Value> {
         let node = self.client.node();
         let describer = self.client.describer(gid)?;
         let mut items: Vec<Value> = get(&self.store, &key("timeline", &gid.0))?.unwrap_or_default();
-        for message in node.messages(&gid.0)? {
-            let from = describer.describe(&message.sender);
-            let id = hex::encode(&message.id.0);
-            if message.payload["type"] == "leave" {
-                items.push(json!({ "type": "leave", "id": id, "at": message.at, "from": from }));
+        let losses: Vec<Value> = items.iter().filter(|item| item["type"] == "lost" && item["member"]["you"] != true).cloned().collect();
+        items.retain(|item| item["type"] != "lost" || item["member"]["you"] == true);
+        let held = node.messages(&gid.0)?.into_iter().map(|message| (message.id, message.at, Some(message.position), message.sender, message.payload));
+        let me = node.members(&gid.0)?.into_iter().find(|m| m.key == node.key());
+        let pending = node.sending(&gid.0)?.into_iter().filter_map(|(id, payload)| Some((id, now(), None, me.clone()?, payload)));
+        for (id, at, position, sender, payload) in held.chain(pending) {
+            let from = describer.describe(&sender);
+            let id = hex::encode(&id.0);
+            if payload["type"] == "leave" {
+                items.push(json!({ "type": "leave", "id": id, "at": at, "from": from }));
             }
-            let Ok(lmk_proto::group::ChatMessage { content, to, reply_to, urgent, attachment, .. }) = serde_json::from_value(message.payload) else {
+            let Ok(lmk_proto::group::ChatMessage { content, to, reply_to, urgent, attachment, .. }) = serde_json::from_value(payload) else {
                 continue;
             };
-            let mut item = json!({ "type": "message", "id": id, "at": message.at, "from": from, "content": content });
+            let mut item = json!({ "type": "message", "id": id, "at": at, "from": from, "content": content });
+            match position {
+                Some(position) => item["position"] = json!(position),
+                None => item["pending"] = json!(true),
+            }
+            let lost_by: Vec<&Value> = losses.iter().filter(|lost| lost["ids"].as_array().is_some_and(|ids| ids.contains(&json!(id)))).map(|lost| &lost["member"]).collect();
+            if !lost_by.is_empty() {
+                item["lost_by"] = json!(lost_by);
+            }
             if !to.is_empty() {
                 item["to"] = json!(to.iter().map(|fp| hex::encode(&fp.0)).collect::<Vec<_>>());
             }
@@ -645,7 +668,7 @@ impl Lmk {
     /// A new chat, doc or git repository, speaking as this browser's first identity; returns its id.
     pub async fn create(&self, kind: String, name: String) -> R<String> {
         let app = &self.app;
-        let settings = Settings { protocol: PROTOCOL, kind, name, open: Vec::new(), carry: 7, membership: app.membership.clone(), rest: Default::default() };
+        let settings = Settings { protocol: PROTOCOL, kind, name, open: Vec::new(), carry: 7, update: lmk_proto::group::UPDATE, membership: app.membership.clone(), rest: Default::default() };
         let (gid, _) = app.client.create(settings, None, (Vec::new(), String::new())).await.map_err(js)?;
         app.remember_settings(&gid.0).map_err(js)?;
         app.flush();

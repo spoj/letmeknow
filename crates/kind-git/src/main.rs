@@ -23,11 +23,11 @@ struct Group {
 
 /// A request of ours waiting for the session's answer.
 enum Waiting {
-    /// A push's bundle being added; then the push is sent as a held message, answered once its entry counts and, with
-    /// a bundle, another member online holds that, or fails to.
+    /// A push's bundle being added. It goes to the members online in a live message, and the push is sent as a held
+    /// message once another member online holds the bundle, or else refused; answered once its entry counts.
     Add { command: Value, group: String, push: Push },
-    Send { command: Value, group: String, bundle: Option<String> },
-    Spread { command: Value, position: u64 },
+    Spread { command: Value, group: String, push: Push },
+    Send { command: Value },
     /// A pushed bundle, to check.
     Check { group: String, position: u64 },
     /// The bundle of a state this session hands a member.
@@ -169,9 +169,10 @@ impl Plugin {
                 self.out.push(answer(&message["id"], Ok(json!({}))));
             }
             "entry" => self.entry(&group, message)?,
-            "message" if message["payload"]["type"] == "push" && message["payload"]["bundle"].is_string() => {
-                // A push's bundle, ahead of its entry: held, and so fetched, within this session's limit.
-                self.out.push(json!({ "type": "hold", "group": group, "links": [message["payload"]["bundle"]] }));
+            "lost" => self.lost(&group, message)?,
+            "message" if message["held"] == false && message["payload"]["type"] == "bundle" => {
+                // A push's bundle, ahead of the push: held, and so fetched, within this session's limit.
+                self.out.push(json!({ "type": "hold", "group": group, "links": [message["payload"]["link"]] }));
             }
             "message" => {}
             "state" => self.state(&group, serde_json::from_slice(&bytes(&message["data"])?)?)?,
@@ -200,8 +201,8 @@ impl Plugin {
             Err(_) => None,
         };
         let follow = match &kept {
-            Some(branches) => json!({ "type": "log", "group": group, "after": branches.position }),
-            None => json!({ "type": "log", "group": group }),
+            Some(branches) if branches.stopped.is_none() => json!({ "type": "log", "group": group, "after": branches.position }),
+            _ => json!({ "type": "log", "group": group }),
         };
         let name = message["settings"]["name"].as_str().unwrap_or_default().to_owned();
         self.groups.insert(group.to_owned(), Group { name, branches: kept, checking: false });
@@ -231,6 +232,21 @@ impl Plugin {
         }
         self.save(group)?;
         self.check_next(group)
+    }
+
+    /// A loss of the log: one of this session's own stops the group's branches, and it asks a member for a state.
+    fn lost(&mut self, group: &str, message: &Value) -> Result<()> {
+        let branches = self.groups.get_mut(group).and_then(|g| g.branches.as_mut()).context("a loss before the group's state")?;
+        if branches.stopped.is_some() || message["member"]["you"] != true {
+            return Ok(());
+        }
+        let position = message["position"].as_u64().context("no position")?;
+        branches.lose(position, true);
+        self.save(group)?;
+        let text = format!("this session lost the message at log position {position}; it takes no push until a member hands it the branches past it");
+        self.out.push(warning(group, text));
+        self.out.push(json!({ "type": "log", "group": group }));
+        Ok(())
     }
 
     /// Checks the next push not checked yet, fetching its bundle; one without a bundle at once.
@@ -273,7 +289,7 @@ impl Plugin {
     /// A state a member handed this session: taken if it is no older than what this session has.
     fn state(&mut self, group: &str, state: State) -> Result<()> {
         let g = self.groups.get(group).context("not a group of this session")?;
-        if g.branches.as_ref().is_some_and(|branches| state.position < branches.position) {
+        if g.branches.as_ref().is_some_and(|branches| !branches.takes(state.position)) {
             return Ok(());
         }
         match state.bundle.clone() {
@@ -290,7 +306,7 @@ impl Plugin {
     /// Takes a state, unless this session took an entry after it meanwhile, as while fetching its bundle.
     fn restore(&mut self, group: &str, state: State, bundle: Option<&Path>) -> Result<()> {
         let g = self.groups.get(group).context("not a group of this session")?;
-        if g.branches.as_ref().is_some_and(|branches| state.position < branches.position) {
+        if g.branches.as_ref().is_some_and(|branches| !branches.takes(state.position)) {
             return Ok(());
         }
         let repo = self.repo(group);
@@ -306,9 +322,10 @@ impl Plugin {
         Ok(())
     }
 
-    /// The group's state, to hand a member: its branches as far as every push is checked, with a bundle of them.
+    /// The group's state, to hand a member: its branches as far as every push is checked, with a bundle of them; none
+    /// while stopped at a loss.
     fn snapshot(&mut self, group: &str, asked: &Value) -> Result<()> {
-        let Some(branches) = self.groups.get(group).and_then(|g| g.branches.as_ref()) else {
+        let Some(branches) = self.groups.get(group).and_then(|g| g.branches.as_ref()).filter(|branches| branches.stopped.is_none()) else {
             self.out.push(answer(asked, Ok(json!({}))));
             return Ok(());
         };
@@ -344,6 +361,9 @@ impl Plugin {
             ["push", group, branch, old, new, bundle, ref subjects @ ..] => {
                 let group = self.resolve(group)?;
                 let branches = self.groups[&group].branches.as_ref().context("this session has not caught up on the group yet")?;
+                if let Some(lost) = branches.stopped {
+                    bail!("this session lost the message at log position {lost}; it takes no push until a member hands it the branches past it");
+                }
                 let (old, new) = (none(old), none(new));
                 ensure!(branches.tips().get(branch) == old.as_ref(), "fetch first");
                 let subjects = subjects.iter().map(|s| s.to_string()).collect();
@@ -368,7 +388,7 @@ impl Plugin {
         let mut payload = serde_json::to_value(&push).expect("JSON");
         payload["type"] = json!("push");
         let send = json!({ "type": "send", "group": group, "payload": payload, "held": true });
-        self.request(send, Waiting::Send { command, group: group.to_owned(), bundle: push.bundle });
+        self.request(send, Waiting::Send { command });
     }
 
     /// Answers a push whose entry counted at `position`: whether it counted as a branch update.
@@ -389,30 +409,27 @@ impl Plugin {
         };
         match (waiting, answered) {
             (Waiting::Add { command, group, mut push }, Ok(added)) => {
-                push.bundle = Some(added["link"].as_str().context("no link")?.to_owned());
-                self.send(command, &group, push);
+                let link = added["link"].as_str().context("no link")?.to_owned();
+                self.out.push(json!({ "type": "send", "group": group, "payload": { "type": "bundle", "link": link }, "held": false }));
+                push.bundle = Some(link.clone());
+                self.request(json!({ "type": "spread", "group": group, "link": link }), Waiting::Spread { command, group, push });
             }
-            (Waiting::Send { command, group, bundle }, Ok(sent)) => {
-                let Some(position) = sent["position"].as_u64() else {
+            (Waiting::Spread { command, group, push }, spread) => {
+                if spread.is_ok_and(|spread| spread["held_by"].as_array().is_some_and(|held| !held.is_empty())) {
+                    self.send(command, &group, push);
+                } else {
+                    let error = anyhow::anyhow!("no other member online took the push's bundle, so the push is not sent: push again once one is online");
+                    self.out.push(answer(&command, Err(error)));
+                }
+            }
+            (Waiting::Send { command }, Ok(sent)) => match sent["position"].as_u64() {
+                Some(position) => self.pushed(command, position),
+                None => {
                     let error = anyhow::anyhow!("the push is pending, as the group's log did not answer in time: fetch later to see whether it counted");
                     self.out.push(answer(&command, Err(error)));
-                    return Ok(());
-                };
-                match bundle {
-                    Some(link) => self.request(json!({ "type": "spread", "group": group, "link": link }), Waiting::Spread { command, position }),
-                    None => self.pushed(command, position),
                 }
-            }
-            (Waiting::Spread { command, position }, spread) => {
-                if spread.is_ok_and(|spread| spread["held_by"].as_array().is_some_and(|held| !held.is_empty())) {
-                    self.pushed(command, position);
-                } else {
-                    self.won.remove(&position);
-                    let error = anyhow::anyhow!("the push counted, but no other member is online to take its bundle: keep this session running until one is");
-                    self.out.push(answer(&command, Err(error)));
-                }
-            }
-            (Waiting::Add { command, .. } | Waiting::Send { command, .. }, Err(error)) => {
+            },
+            (Waiting::Add { command, .. } | Waiting::Send { command }, Err(error)) => {
                 self.out.push(answer(&command, Err(error)));
             }
             (Waiting::Check { group, position }, fetched) => {

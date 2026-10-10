@@ -29,8 +29,6 @@ use crate::cli::{Request, private_file};
 use crate::kinds::Plugins;
 use crate::policy::{Outbox, mentions, wakes};
 
-/// How long a message waits for those it comes after.
-pub const CAUSAL_WAIT: Duration = Duration::from_secs(300);
 /// How long after starting what arrives counts as catching up.
 const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
 /// How often a session process that does not act for the device tries its lock.
@@ -45,8 +43,6 @@ pub struct Config {
     pub dir: PathBuf,
     pub name: String,
     pub hold: Duration,
-    /// How long a message waits for those it comes after: `CAUSAL_WAIT`, but in tests.
-    pub causal_wait: Duration,
     pub keep_log: bool,
     /// For groups and identities this session creates.
     pub membership: Service,
@@ -79,15 +75,6 @@ impl Remote for Published {
     }
 }
 
-/// A message waiting for the messages it comes after.
-struct Waiting {
-    deadline: Instant,
-    gid: Bytes,
-    id: [u8; 32],
-    sender: Value,
-    payload: Value,
-}
-
 pub struct Session {
     db: Connection,
     client: Client<SqliteProvider>,
@@ -105,7 +92,6 @@ pub struct Session {
     network: Network,
     config: Config,
     outbox: Outbox,
-    waiting: Vec<Waiting>,
     catching_up: Option<Instant>,
     inbound: mpsc::UnboundedSender<Inbound>,
 }
@@ -175,7 +161,6 @@ impl Session {
             network,
             config,
             outbox: Outbox::default(),
-            waiting: Vec::new(),
             catching_up: Some(Instant::now() + CATCH_UP_WINDOW),
             inbound,
         };
@@ -195,7 +180,7 @@ impl Session {
                 if message.payload["type"] == "message" && !session.taken(&message.id.0)? && message.sender.key != session.client.node().key() {
                     let sender = serde_json::to_value(session.client.describe(&gid, &message.sender)?)?;
                     let id = message.id.0.as_slice().try_into()?;
-                    session.received(gid.clone(), id, sender, message.payload).await?;
+                    session.received(gid.clone(), id, message.position, Vec::new(), sender, message.payload).await?;
                 }
             }
         }
@@ -278,10 +263,9 @@ impl Session {
     /// When something is next due without anything arriving.
     pub fn next_due(&self) -> Instant {
         let held = self.outbox.deadline(self.config.hold);
-        let waiting = self.waiting.iter().map(|w| w.deadline);
         let device = self.device.is_none().then_some(self.device_retry);
         let later = Instant::now() + Duration::from_secs(3600);
-        let due = held.into_iter().chain(waiting).chain(device).chain([self.identities_at]);
+        let due = held.into_iter().chain(device).chain([self.identities_at]);
         due.chain(self.catching_up).fold(later, Instant::min)
     }
 
@@ -305,13 +289,6 @@ impl Session {
         if self.catching_up.is_some_and(|at| at <= now) {
             self.catching_up = None;
             self.outbox.caught_up();
-        }
-        let (late, waiting) = std::mem::take(&mut self.waiting).into_iter().partition(|w| w.deadline <= now);
-        self.waiting = waiting;
-        for w in late {
-            if let Err(error) = self.take_message(&w.gid, w.id, w.sender, w.payload).await {
-                self.warn(Some(&w.gid), format!("{error:#}"));
-            }
         }
     }
 
@@ -394,6 +371,7 @@ impl Session {
             | ClientEvent::Removed { .. }
             | ClientEvent::Settings { .. } => Some(true),
             ClientEvent::Introduced { .. } => Some(false),
+            ClientEvent::Lost { .. } => Some(true),
             _ => None,
         };
         if let Some(wake) = wake {
@@ -403,16 +381,10 @@ impl Session {
         match event {
             ClientEvent::Warning { .. } => self.outbox.print(serde_json::to_value(&event)?),
             ClientEvent::Gone { group } => self.forget(&group)?,
-            ClientEvent::Message { group, id, from, payload } => self.received(group, message_id(&id)?, serde_json::to_value(from)?, payload).await?,
+            ClientEvent::Message { group, id, position, missing, from, payload } => {
+                self.received(group, message_id(&id)?, position, missing, serde_json::to_value(from)?, payload).await?
+            }
             ClientEvent::Sent { .. } => self.outbox.deliver(serde_json::to_value(&event)?, false),
-            // What a sync did not bring will not come from that member: a message waiting only for such shows the gap.
-            ClientEvent::Synced { group } => loop {
-                let waiting: Vec<[u8; 32]> = self.waiting.iter().map(|w| w.id).collect();
-                let unblocked = |w: &Waiting| self.missing(&w.payload).is_ok_and(|missing| missing.iter().all(|id| !waiting.contains(id)));
-                let Some(i) = self.waiting.iter().position(|w| w.gid == group && unblocked(w)) else { break };
-                let w = self.waiting.remove(i);
-                self.take_message(&w.gid, w.id, w.sender, w.payload).await?;
-            },
             ClientEvent::File { hash } => self.arrived(hex::decode(hash)?.try_into().ok().context("a hash is 32 bytes")?).await?,
             ClientEvent::Plugin { group, kind, event, wake, key } => {
                 let mut item = json!({ "group": group });
@@ -470,43 +442,16 @@ impl Session {
         Ok(answer)
     }
 
-    /// A chat message the client took in: it waits for those it comes after.
-    async fn received(&mut self, gid: Bytes, id: [u8; 32], sender: Value, payload: Value) -> Result<()> {
-        if self.taken(&id)? || self.waiting.iter().any(|w| w.id == id) {
+    /// Takes in a chat message, as the client hands them on in position order: `missing`, the counted positions before
+    /// it that were passed over unopened.
+    async fn received(&mut self, gid: Bytes, id: [u8; 32], position: u64, missing: Vec<u64>, sender: Value, payload: Value) -> Result<()> {
+        if self.taken(&id)? {
             return Ok(());
         }
-        // A message waits for those it comes after, unless this session lost them: then it shows the gap.
-        if self.missing(&payload)?.iter().all(|missing| self.client.node().lost(&gid.0, missing)) {
-            self.take_message(&gid, id, sender, payload).await
-        } else {
-            self.waiting.push(Waiting { deadline: Instant::now() + self.config.causal_wait, gid, id, sender, payload });
-            Ok(())
-        }
-    }
-
-    fn taken(&self, id: &[u8]) -> Result<bool> {
-        Ok(self.db.query_row("SELECT 1 FROM taken WHERE id = ?", [id], |_| Ok(())).optional()?.is_some())
-    }
-
-    /// The messages a message comes after that this session has not taken in.
-    fn missing(&self, payload: &Value) -> Result<Vec<[u8; 32]>> {
-        let after: Vec<Bytes> = serde_json::from_value(payload["after"].clone())?;
-        let mut missing = Vec::new();
-        for id in after {
-            if !self.taken(&id.0)? {
-                missing.push(id.0.try_into().ok().context("a message id is 32 bytes")?);
-            }
-        }
-        Ok(missing)
-    }
-
-    /// Takes in a chat message, then those that waited for it.
-    async fn take_message(&mut self, gid: &Bytes, id: [u8; 32], sender: Value, payload: Value) -> Result<()> {
-        let missing = self.missing(&payload)?;
         self.db.execute("INSERT OR IGNORE INTO taken (id, gid) VALUES (?, ?)", params![id, gid.0])?;
-        let mut item = self.message_json(gid, id, sender, &payload, true)?;
+        let mut item = self.message_json(&gid, id, position, sender, &payload, true)?;
         if !missing.is_empty() {
-            item["missing"] = json!(missing.iter().map(hex::encode).collect::<Vec<_>>());
+            item["missing"] = json!(missing);
         }
         let wakes = wakes(&item, |id| self.mine(id));
         if let Some(attachment) = payload.get("attachment").filter(|a| a.is_object()) {
@@ -518,7 +463,7 @@ impl Session {
             )?;
             match self.client.node().file(&link).await? {
                 Some(bytes) => {
-                    let path = save(&self.attachments_dir(gid), &link, Some(&name), &bytes)?;
+                    let path = save(&self.attachments_dir(&gid), &link, Some(&name), &bytes)?;
                     self.db.execute("UPDATE attachments SET path = ? WHERE hash = ? AND message = ?", params![path.to_str(), link.hash, id])?;
                     item["attachment"]["path"] = json!(path);
                 }
@@ -526,14 +471,11 @@ impl Session {
             }
         }
         self.outbox.deliver(item, wakes);
-        let ready: Vec<usize> = (0..self.waiting.len())
-            .filter(|&i| self.waiting[i].gid == *gid && self.missing(&self.waiting[i].payload).is_ok_and(|m| m.is_empty()))
-            .collect();
-        for i in ready.into_iter().rev() {
-            let w = self.waiting.remove(i);
-            Box::pin(self.take_message(&w.gid, w.id, w.sender, w.payload)).await?;
-        }
         Ok(())
+    }
+
+    fn taken(&self, id: &[u8]) -> Result<bool> {
+        Ok(self.db.query_row("SELECT 1 FROM taken WHERE id = ?", [id], |_| Ok(())).optional()?.is_some())
     }
 
     fn mine(&self, id: &str) -> bool {
@@ -541,14 +483,14 @@ impl Session {
         message_id(id).is_ok_and(|id| node.message(&id).ok().flatten().is_some_and(|m| m.sender.key == node.key()))
     }
 
-    fn message_json(&self, gid: &Bytes, id: [u8; 32], from: Value, payload: &Value, fresh: bool) -> Result<Value> {
+    fn message_json(&self, gid: &Bytes, id: [u8; 32], position: u64, from: Value, payload: &Value, fresh: bool) -> Result<Value> {
         let me = serde_json::to_value(self.client.describe_key(gid, &self.client.node().key())?)?;
         let to: Vec<Bytes> = serde_json::from_value(payload.get("to").cloned().unwrap_or(json!([])))?;
         let to: Vec<String> = to.iter().map(|fp| hex::encode(&fp.0)).collect();
         let forgotten = !fresh && !self.config.keep_log && self.seen(&id)?;
         let content = if forgotten { Value::Null } else { payload.get("content").cloned().unwrap_or(Value::Null) };
         let direct = to.iter().any(|fp| me["fp"] == fp.as_str()) || content.as_str().is_some_and(|text| mentions(text, &me));
-        let mut item = json!({ "type": "message", "group": b64(&gid.0), "id": hex::encode(id), "from": from, "direct": direct, "content": content });
+        let mut item = json!({ "type": "message", "group": b64(&gid.0), "id": hex::encode(id), "position": position, "from": from, "direct": direct, "content": content });
         if !to.is_empty() {
             item["to"] = json!(to);
         }
@@ -599,7 +541,7 @@ impl Session {
                 };
                 let Ok(chat) = serde_json::from_value::<ChatMessage>(message.payload.clone()) else { continue };
                 let from = serde_json::to_value(self.client.describe(&message.group, &message.sender)?)?;
-                found.push(self.message_json(&message.group, id, from, &message.payload, false)?);
+                found.push(self.message_json(&message.group, id, message.position, from, &message.payload, false)?);
                 self.mark_seen(&id)?;
                 for after in chat.after {
                     next.push(after.0.as_slice().try_into().ok().context("a message id is 32 bytes")?);

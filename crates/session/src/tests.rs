@@ -24,8 +24,6 @@ struct World {
     _relay: Server,
     network: crate::Network,
     root: PathBuf,
-    /// For the sessions started from now on.
-    causal_wait: Duration,
     plugins: Vec<PathBuf>,
 }
 
@@ -62,7 +60,7 @@ async fn world(test: &str) -> World {
     let root = std::env::temp_dir().join(format!("lmk-session-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let network = crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) };
-    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT, plugins: vec![built()] }
+    World { _relay: server, network, root, plugins: vec![built()] }
 }
 
 struct Agent {
@@ -91,7 +89,6 @@ impl World {
             dir: session_dir(&home, handle).unwrap(),
             name: handle[..1].to_uppercase() + &handle[1..],
             hold,
-            causal_wait: self.causal_wait,
             keep_log: false,
             membership: self.membership(),
             plugins: self.plugins.clone(),
@@ -465,7 +462,7 @@ fn the_command_channel_needs_its_token_and_a_running_session() {
 }
 
 #[test]
-fn a_restarted_session_takes_in_what_it_missed_in_causal_order() {
+fn a_restarted_session_takes_in_what_it_missed_in_position_order() {
     local(async {
         let world = world("causal").await;
         let (mut alice, bob, group) = pair(&world, HOUR).await;
@@ -480,9 +477,9 @@ fn a_restarted_session_takes_in_what_it_missed_in_causal_order() {
         while got.len() < 2 {
             let message = alice.expect("message").await;
             assert!(message.get("missing").is_none());
-            got.push(message["id"].as_str().unwrap().to_owned());
+            got.push((message["id"].clone(), message["position"].clone()));
         }
-        assert_eq!(got, [first["id"].as_str().unwrap(), second["id"].as_str().unwrap()]);
+        assert_eq!(got, [(first["id"].clone(), first["position"].clone()), (second["id"].clone(), second["position"].clone())]);
         let groups = alice.cmd(&["groups"]).await.unwrap();
         assert_eq!((groups[0]["group"].as_str(), groups[0]["name"].as_str()), (Some(group.as_str()), Some("Later")));
     });
@@ -752,42 +749,25 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
     });
 }
 
+/// A message whose holders are all away holds up the later ones a while, then they show it missing, by position.
 #[test]
-fn a_message_after_some_from_before_its_reader_joined_shows_them_missing_at_once() {
-    local(async {
-        let world = world("before").await;
-        let (alice, mut bob, group) = pair(&world, HOUR).await;
-        let before = alice.cmd(&["send", "@bob before carol"]).await.unwrap();
-        bob.expect("message").await;
-        let mut carol = world.start("carol", HOUR).await;
-        carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
-        // Alice's Welcome named her message, so Bob's, which comes after it, does not wait for it.
-        bob.cmd(&["send", "@carol see above"]).await.unwrap();
-        let got = carol.expect("message").await;
-        assert_eq!(got["content"], "@carol see above");
-        assert_eq!(got["missing"], json!([before["id"]]));
-    });
-}
-
-#[test]
-fn a_message_after_one_that_cannot_come_shows_the_gap_once_a_sync_ends() {
+fn a_message_no_member_online_holds_is_passed_and_shown_missing() {
     local(async {
         let world = world("gap").await;
         let (mut alice, mut bob, group) = pair(&world, HOUR).await;
+        let mut carol = world.start("carol", HOUR).await;
+        carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        bob.expect("joined").await;
         alice.stop().await;
-        let unseen = bob.cmd(&["send", "while alice is away"]).await.unwrap();
+        carol.stop().await;
+        let unseen = bob.cmd(&["send", "while they are away"]).await.unwrap();
         bob.stop().await;
         let alice = world.start("alice", HOUR).await;
         let mut carol = world.start("carol", HOUR).await;
-        carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
-        carol.stop().await;
-        let bob = world.start("bob", HOUR).await;
-        bob.cmd(&["send", "@carol see above"]).await.unwrap();
-        // Back, Carol syncs; that cannot bring Bob's first message, from before she joined, so she does not wait 5 minutes.
-        let mut carol = world.start("carol", HOUR).await;
+        let sent = alice.cmd(&["send", "@carol after the gap"]).await.unwrap();
         let got = carol.expect("message").await;
-        assert_eq!(got["content"], "@carol see above");
-        assert_eq!(got["missing"], json!([unseen["id"]]));
+        assert_eq!((&got["content"], &got["position"]), (&json!("@carol after the gap"), &sent["position"]));
+        assert_eq!(got["missing"], json!([unseen["position"]]));
     });
 }
 

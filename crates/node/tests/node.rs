@@ -124,6 +124,7 @@ fn settings(kind: &str, folder: &Path) -> Settings {
         name: "Plan".into(),
         open: vec![],
         carry: 7,
+        update: lmk_proto::group::UPDATE,
         membership: Service::Folder(folder.to_str().unwrap().into()),
         rest: Default::default(),
     }
@@ -425,11 +426,20 @@ async fn a_contradiction_is_reported_once() {
     assert_eq!(warnings, 1);
 }
 
+/// The kind's held messages taken after position `after`.
+fn entries<P: Provider + Send + 'static>(node: &Node<P>, gid: &Bytes, after: u64) -> Vec<lmk_node::Entry> {
+    let items = node.entries(&gid.0, after).unwrap().into_iter();
+    items.filter_map(|item| match item {
+        lmk_node::Item::Entry(entry) => Some(entry),
+        lmk_node::Item::Lost(_) => None,
+    }).collect()
+}
+
 impl Session {
     /// Waits for the kind's held messages after position `after`; returns them.
     async fn logged(&mut self, gid: &Bytes, after: u64) -> Vec<lmk_node::Entry> {
         loop {
-            let entries = self.node.entries(&gid.0, after).unwrap();
+            let entries = entries(&self.node, gid, after);
             if !entries.is_empty() {
                 return entries;
             }
@@ -476,7 +486,7 @@ async fn a_kind_takes_held_messages_in_log_order_and_a_member_without_state_asks
     assert_eq!(positions, [p + 1, p + 2]);
     let order = |entries: Vec<lmk_node::Entry>| entries.iter().map(|e| (e.position, e.payload["n"].as_u64().unwrap())).collect::<Vec<_>>();
     let seen = order(alice.logged(&gid, p + 1).await);
-    let seen = if seen.len() == 2 { seen } else { order(alice.node.entries(&gid.0, p).unwrap()) };
+    let seen = if seen.len() == 2 { seen } else { order(entries(&alice.node, &gid, p)) };
     assert_eq!(seen.len(), 2);
     assert_eq!(order(bob.logged(&gid, p + 1).await), seen[1..]);
     bob.node.follow_log(&gid.0, Some(p + 1)).unwrap();

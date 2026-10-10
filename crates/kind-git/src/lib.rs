@@ -3,7 +3,9 @@
 //! group's log orders the pushes. Every member applies the log in order: an update counts only if `old` is
 //! the branch's tip at that point. A member checks each bundle once
 //! it has it; one whose `new` does not follow `old` voids its update for every member, since a file's content is fixed
-//! by its hash. The group's state is its branches as of a log position, with a full bundle.
+//! by its hash. The group's state is its branches as of a log position, with a full bundle. A member that loses a push,
+//! or any message of the log, stops there: it takes no later entry, refuses pushes and hands out no state, until it
+//! takes a state past the loss.
 //!
 //! `Branches` is what every host of the kind keeps alike: the session's plugin `letmeknow-kind-git` (src/main.rs),
 //! which keeps a bare repository, with `git-remote-lmk` (src/helper.rs) for git; and the browser's display-only in-page
@@ -80,15 +82,34 @@ pub struct Branches {
     pub settled: u64,
     /// The pushes after `settled`, in log order.
     pub pushes: Vec<Taken>,
+    /// The position of a message this member lost, where it stopped.
+    #[serde(default)]
+    pub stopped: Option<u64>,
 }
 
 impl Branches {
     pub fn from_state(state: &State) -> Self {
-        Branches { position: state.position, refs: state.refs.clone(), settled: state.position, pushes: Vec::new() }
+        Branches { position: state.position, refs: state.refs.clone(), settled: state.position, pushes: Vec::new(), stopped: None }
     }
 
-    /// Takes an entry of the log. Returns its push, if it is one.
+    /// Whether a state as of `position` is one to take: not older than these branches, nor than the loss they stopped
+    /// at.
+    pub fn takes(&self, position: u64) -> bool {
+        position >= self.position && self.stopped.is_none_or(|lost| position >= lost)
+    }
+
+    /// Takes a loss of the log: one of this member's own stops it, unless it stopped already.
+    pub fn lose(&mut self, position: u64, own: bool) {
+        if own && self.stopped.is_none() {
+            self.stopped = Some(position);
+        }
+    }
+
+    /// Takes an entry of the log, unless stopped. Returns its push, if it is one.
     pub fn take(&mut self, position: u64, from: Value, payload: &Value) -> Option<&Taken> {
+        if self.stopped.is_some() {
+            return None;
+        }
         let before = std::mem::replace(&mut self.position, position);
         let push = (payload["type"] == "push").then(|| serde_json::from_value::<Push>(payload.clone()).ok()).flatten();
         let Some(push) = push else {
@@ -201,6 +222,10 @@ impl<S: Store> Page<S> {
             "group" => {
                 let kept = self.store.get(&format!("kind/git/{group}")).map(|kept| serde_json::from_slice::<Branches>(&kept)).transpose()?;
                 match kept {
+                    Some(branches) if branches.stopped.is_some() => {
+                        out.push(json!({ "type": "log", "group": group }));
+                        self.groups.insert(group, branches);
+                    }
                     Some(branches) => {
                         out.push(json!({ "type": "log", "group": group, "after": branches.position }));
                         self.groups.insert(group, branches);
@@ -219,7 +244,7 @@ impl<S: Store> Page<S> {
             }
             "state" => {
                 let state: State = serde_json::from_slice(&bytes(&message["data"])?)?;
-                if self.groups.get(&group).is_none_or(|branches| state.position >= branches.position) {
+                if self.groups.get(&group).is_none_or(|branches| branches.takes(state.position)) {
                     out.push(json!({ "type": "log", "group": group, "after": state.position }));
                     self.groups.insert(group.clone(), Branches::from_state(&state));
                     self.save(&group)?;
@@ -236,6 +261,14 @@ impl<S: Store> Page<S> {
                         let event = json!({ "type": "pushed", "by": message["from"], "ref": push.branch, "old": push.old, "new": push.new, "subjects": push.subjects });
                         out.push(json!({ "type": "event", "group": group, "event": event }));
                     }
+                }
+                self.save(&group)?;
+            }
+            "lost" => {
+                let branches = self.groups.get_mut(&group).context("a loss in a log not followed")?;
+                branches.lose(message["position"].as_u64().unwrap_or_default(), message["member"]["you"] == true);
+                if branches.stopped.is_some() {
+                    out.push(json!({ "type": "log", "group": group }));
                 }
                 self.save(&group)?;
             }
@@ -313,5 +346,15 @@ mod tests {
         let mut page = Page::new(&memory);
         let out = page.input(&json!({ "type": "group", "group": "g" }));
         assert_eq!(out[0], json!({ "type": "log", "group": "g", "after": 5 }), "it resumes where it was");
+
+        // Another member's loss changes nothing; its own stops it until a state past the loss.
+        let lost = |position, you| json!({ "type": "lost", "group": "g", "position": position, "member": { "you": you }, "positions": [position] });
+        assert!(page.input(&lost(6, false)).is_empty());
+        assert_eq!(page.input(&lost(7, true))[0], json!({ "type": "log", "group": "g" }));
+        assert!(page.input(&entry(8, push("refs/heads/main", Some("b"), Some("c")))).is_empty(), "nothing after the loss");
+        let state = |position| json!({ "type": "state", "group": "g", "data": Bytes(serde_json::to_vec(&State { position, refs: [("refs/heads/main".into(), "c".into())].into(), bundle: None }).unwrap()) });
+        assert!(page.input(&state(6)).is_empty(), "a state before the loss is not taken");
+        assert_eq!(page.input(&state(8))[0], json!({ "type": "log", "group": "g", "after": 8 }));
+        assert_eq!(page.input(&entry(9, push("refs/heads/main", Some("c"), Some("d"))))[0]["event"]["type"], "pushed");
     }
 }

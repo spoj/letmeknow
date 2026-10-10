@@ -1,6 +1,8 @@
 //! The devices kind, built in: an identity's devices group, whose members are its devices, each with its own device key
 //! there. Its state is the identity, its private keys, its contacts and the groups open to it, kept in step through the
-//! group's held messages, in log order, and handed to a new device as any kind's state. A device certifies its sessions
+//! group's held messages, in log order, and handed to a new device as any kind's state. At a loss of its own it stops:
+//! it takes no later message, appends nothing to the key log and hands out no state, until it takes a state past the
+//! loss. A device certifies its sessions
 //! with its device key, and keeps the identity's key log in step with the group: its list of devices follows the
 //! group's members, and its key is replaced when a device leaves, and monthly.
 
@@ -13,7 +15,7 @@ use lmk_core::device::Device;
 use lmk_core::identity::{self, DAY, KeyLog, public};
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
-use lmk_proto::group::{Certificate, DEVICES, IdentityRef, Opening, PROTOCOL, Service, Settings};
+use lmk_proto::group::{Certificate, DEVICES, IdentityRef, Opening, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::identity::{Listed, certified};
 use lmk_proto::links::Invite;
 use n0_future::task::spawn;
@@ -21,7 +23,7 @@ use n0_future::time::{Duration, sleep};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::{Event, Member, Node, hex, now};
+use crate::{Event, Item, Member, Node, hex, now};
 
 /// How long an identity keeps a key before a device replaces it, in milliseconds.
 const ROTATE: u64 = 30 * DAY;
@@ -68,6 +70,8 @@ impl Book {
 #[derive(Default, Serialize, Deserialize)]
 struct Record {
     book: Option<Book>,
+    /// The position of a message this device lost, where its state stopped.
+    stopped: Option<u64>,
     /// When this device made or joined the group, which orders its identities.
     since: u64,
 }
@@ -205,7 +209,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
 
     /// Starts an identity, with this device its first, and its devices group.
     pub async fn create(&self, name: &str, membership: Service) -> Result<IdentityRef> {
-        let settings = Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), open: Vec::new(), carry: 7, membership: membership.clone(), rest: Default::default() };
+        let settings = Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), open: Vec::new(), carry: 7, update: UPDATE, membership: membership.clone(), rest: Default::default() };
         let gid = self.node.create(settings, None)?;
         let seed = lmk_core::random::<32>();
         let device = Listed { key: self.node.key_in(&gid.0), name: self.device_name() };
@@ -224,7 +228,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
             openings: Vec::new(),
             rest: Map::new(),
         };
-        self.save(&gid.0, &Record { book: Some(book), since: now() })?;
+        self.save(&gid.0, &Record { book: Some(book), since: now(), stopped: None })?;
         self.node.follow_log(&gid.0, Some(0))?;
         Ok(identity)
     }
@@ -345,7 +349,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
             }
             return Ok(());
         }
-        let Some(book) = self.record(gid).book else { return Ok(()) };
+        let Some(book) = self.record(gid).book.filter(|_| self.record(gid).stopped.is_none()) else { return Ok(()) };
         let Some((seed, at)) = book.seed(log.current()) else { return self.missing(gid, &log) };
         self.asked.lock().unwrap().remove(gid);
         let mut listed: Vec<Listed> = members.into_iter().map(|m| Listed { key: m.key, name: m.name }).collect();
@@ -435,7 +439,8 @@ impl<P: Provider + Send + 'static> Devices<P> {
             Event::State { data, from, .. } => self.take_state(&gid.0, &from, &data),
             Event::Logged { .. } => self.logged(&gid.0),
             Event::Snapshot { reply, .. } => {
-                let book = self.record(&gid.0).book.map(|book| serde_json::to_vec(&book).expect("JSON"));
+                let record = self.record(&gid.0);
+                let book = record.book.filter(|_| record.stopped.is_none()).map(|book| serde_json::to_vec(&book).expect("JSON"));
                 reply.send(book).ok();
                 Ok(())
             }
@@ -457,16 +462,18 @@ impl<P: Provider + Send + 'static> Devices<P> {
         taken.err().map(|error| Event::Warning { group: Some(gid), text: format!("{error:#}") })
     }
 
-    /// Takes a state another device handed this one, unless it is older than its own; the keys it carries this device
-    /// takes whatever its age.
+    /// Takes a state another device handed this one, unless it is older than its own, or than the loss it stopped at;
+    /// the keys it carries this device takes whatever its age.
     fn take_state(&self, gid: &[u8], from: &Member, data: &[u8]) -> Result<()> {
         let mut handed: Book = serde_json::from_slice(data)?;
         {
             let _lock = self.lock.lock().unwrap();
             let mut record = self.record(gid);
+            let stopped = record.stopped.is_some_and(|lost| handed.position < lost);
             match &mut record.book {
-                Some(held) if held.position > handed.position => held.take_keys(handed.keys),
+                Some(held) if held.position > handed.position || stopped => held.take_keys(handed.keys),
                 held => {
+                    record.stopped = None;
                     if let Some(held) = held.take() {
                         handed.take_keys(held.keys);
                     }
@@ -484,12 +491,25 @@ impl<P: Provider + Send + 'static> Devices<P> {
         Ok(())
     }
 
-    /// Applies the group's held messages taken since the state.
+    /// Applies the group's held messages taken since the state, up to a loss of this device's own, where it stops and
+    /// asks for a state.
     fn logged(&self, gid: &[u8]) -> Result<()> {
         let _lock = self.lock.lock().unwrap();
         let mut record = self.record(gid);
-        let Some(book) = &mut record.book else { return Ok(()) };
-        for entry in self.node.entries(gid, book.position)? {
+        let Some(book) = record.book.as_mut().filter(|_| record.stopped.is_none()) else { return Ok(()) };
+        let me = self.node.key_in(gid);
+        for item in self.node.entries(gid, book.position)? {
+            let entry = match item {
+                Item::Lost(lost) if lost.member.key == me => {
+                    record.stopped = Some(lost.position);
+                    break;
+                }
+                Item::Lost(lost) => {
+                    book.position = lost.position;
+                    continue;
+                }
+                Item::Entry(entry) => entry,
+            };
             book.position = entry.position;
             match serde_json::from_value(entry.payload) {
                 Ok(Entry::Key { key, at, epoch }) => book.take_keys(vec![(key, at, epoch)]),
@@ -506,6 +526,10 @@ impl<P: Provider + Send + 'static> Devices<P> {
         }
         let position = book.position;
         self.save(gid, &record)?;
-        self.node.follow_log(gid, Some(position))
+        self.node.follow_log(gid, Some(position))?;
+        match record.stopped {
+            Some(_) => self.node.follow_log(gid, None),
+            None => Ok(()),
+        }
     }
 }
