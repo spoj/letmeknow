@@ -49,6 +49,8 @@ pub use lmk_proto::clock::now;
 
 /// How often a session replaces its keys in each group.
 const KEY_UPDATE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Why a send's outcome never came.
+const UNFINISHED: &str = "the send ended unfinished, as this session stopped or left the group";
 /// How long `send` waits for its entry to count before it answers that the send is pending.
 const SEND_WAIT: Duration = Duration::from_secs(5);
 /// How long some waits for other members last: for those online to hold a file, for added members' certificates.
@@ -1037,7 +1039,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub async fn send(&self, gid: &[u8], payload: &Value) -> Result<Sent> {
         let (id, mut counted) = self.inner.held_send(gid, payload)?;
         let position = match timeout(SEND_WAIT, &mut counted).await {
-            Ok(counted) => Some(counted.context("this session stopped")?.map_err(|error| anyhow::anyhow!(error))?),
+            Ok(counted) => Some(counted.context(UNFINISHED)?.map_err(|error| anyhow::anyhow!(error))?),
             Err(_) => self.inner.pending(&id, &mut counted)?,
         };
         Ok(match position {
@@ -1049,7 +1051,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Sends a held payload and waits as long as it takes for its entry to count; answers its position.
     pub async fn send_counted(&self, gid: &[u8], payload: &Value) -> Result<u64> {
         let (_, counted) = self.inner.held_send(gid, payload)?;
-        counted.await.context("this session stopped")?.map_err(|error| anyhow::anyhow!(error))
+        counted.await.context(UNFINISHED)?.map_err(|error| anyhow::anyhow!(error))
     }
 
     /// Seals a live payload, not held, and sends it to the members online, or to the one with fingerprint `to`.
@@ -1449,7 +1451,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     async fn commit(&self, gid: &[u8], change: impl Fn(&Group) -> Result<Option<Change>>) -> Result<Option<(Option<Vec<u8>>, u64)>> {
         let _committing = self.committing.lock().await;
         for _ in 0..COMMIT_TRIES {
-            self.read(gid).await?;
+            self.caught_up(gid).await?;
             let (entry, welcome, ours, service) = {
                 let mut st = self.lock();
                 let st = &mut *st;
@@ -1475,15 +1477,31 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
                 Err(error) => return Err(error),
             };
-            self.read(gid).await?;
+            self.caught_up(gid).await?;
             let st = self.lock();
-            let g = st.group(gid)?;
-            ensure!(g.rec.position >= position, "the log did not show the commit it took");
+            ensure!(st.group(gid)?.rec.position >= position, "the log did not show the commit it took");
             if ours && st.pos(gid, position)?.is_some_and(|pos| pos.judged == reading::Judged::Commit { own: true }) {
                 return Ok(Some((welcome, position)));
             }
         }
         bail!("the group kept changing over {COMMIT_TRIES} tries; try again")
+    }
+
+    /// Reads the group's log, and waits until this session applied it to the head it read.
+    async fn caught_up(&self, gid: &[u8]) -> Result<()> {
+        self.read(gid).await?;
+        loop {
+            let advanced = self.advanced.notified();
+            {
+                let st = self.lock();
+                let g = st.group(gid)?;
+                ensure!(g.mls.active(), "this session was removed from the group");
+                if g.rec.position >= st.log(gid)?.logged {
+                    return Ok(());
+                }
+            }
+            advanced.await;
+        }
     }
 
     /// Joins a group from the Welcome a member at `by` sent.
@@ -1709,6 +1727,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         st.drop_log(gid)?;
         for id in &g.rec.sends {
             st.provider.delete(&sending::send_key(&id.0))?;
+            st.waiters.remove(&id.0);
         }
         for position in g.rec.kind.iter().flat_map(|kind| &kind.kept) {
             st.provider.delete(&kind::kept_key(gid, *position))?;
@@ -1718,6 +1737,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         st.save_groups()?;
         st.scrub = true;
         st.out.push(Out::Changed(gid.to_vec()));
+        self.advanced.notify_waiters();
         Ok(())
     }
 

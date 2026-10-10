@@ -1,6 +1,6 @@
-//! The git kind: a repository's branches, which members push to through the group's kind log. A push is a held message
-//! naming the branch, its old and new commit, the bundle that brings the commits (a file), and their subjects; the log
-//! orders the pushes by their messages' ids. Every member applies the log in order: an update counts only if `old` is
+//! The git kind: a repository's branches, which members push to through the group's log. A push is a held message
+//! naming the branch, its old and new commit, the bundle that brings the commits (a file), and their subjects; the
+//! group's log orders the pushes. Every member applies the log in order: an update counts only if `old` is
 //! the branch's tip at that point. A member checks each bundle once
 //! it has it; one whose `new` does not follow `old` voids its update for every member, since a file's content is fixed
 //! by its hash. The group's state is its branches as of a log position, with a full bundle.

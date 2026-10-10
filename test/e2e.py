@@ -167,7 +167,7 @@ def git_kind(alice, bob, dave, listeners):
     run("alice", "send", f"--group={made['group']}", "@bob the build is green")
     check(bob.expect("message", lambda e: e["content"] == "@bob the build is green")["group"] == made["group"], "a git group carries chat")
 
-    # With no other member online, a push fails and says so.
+    # With no other member online, a push says so.
     tip = git(loser, "rev-parse", "HEAD", cwd=repo).stdout.strip()
     head = lambda: (git("alice", "pull", "-q", "--ff-only", "team", "main", cwd=ours, ok=False), git("alice", "rev-parse", "HEAD", cwd=ours).stdout.strip())[1]
     check(until(head, lambda h: h == tip) == tip, "both members end at the same tip")
@@ -177,7 +177,7 @@ def git_kind(alice, bob, dave, listeners):
     git("alice", "add", "late.txt", cwd=ours)
     git("alice", "commit", "-qm", "while bob is away", cwd=ours)
     failed = git("alice", "push", "team", "main", cwd=ours, ok=False)
-    check(failed.returncode != 0 and "no other member is online" in failed.stderr, "a push with no other member online fails and says so")
+    check(failed.returncode != 0 and "no other member is online" in failed.stderr, "a push with no other member online says so")
     bob = Listener("bob")
     listeners.append(bob)
     until(lambda: git("alice", "push", "-q", "team", "main", cwd=ours, ok=False).returncode, lambda code: code == 0, timeout=60)
