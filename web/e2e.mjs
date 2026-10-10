@@ -156,6 +156,12 @@ try {
   await laptop.getByPlaceholder("Message").press("Enter");
   const reply = await ann.printed(e => e.type === "message" && e.content === "hello from the browser");
   check(reply.reply_to === hello && reply.from.name === "Matt", "a native session gets the browser's reply");
+  const ticks = laptop.locator(".messages li", { hasText: "hello from the browser" }).locator(".ticks");
+  const receipt = await until(
+    () => ticks.textContent(),
+    t => t.includes("read by Ann")
+  );
+  check(receipt.startsWith("✓✓") && receipt.includes("read by Ann"), "the browser shows that another member holds its message, and who read it");
 
   // Members: Ann's identity is only her own claim to the laptop.
   await laptop.locator(".people").click();
@@ -451,13 +457,45 @@ try {
   check(true, "and drops it when asked");
   carl.proc.kill();
 
-  // With Ann gone, what the laptop sends to her chat still counts on the group's log.
+  // With Ann gone, what the laptop sends to her chat still counts on the group's log, held only by the laptop.
   ann.proc.kill();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.locator("textarea:visible").fill("anyone there?");
   await laptop.locator("textarea:visible").press("Enter");
-  await laptop.locator(".messages li", { hasText: "anyone there?" }).waitFor();
+  const lone = laptop.locator(".messages li", { hasText: "anyone there?" });
+  await lone.waitFor();
   check(true, "a message sent with no other member online is listed once the group's log takes it");
+  await lone.locator(".ticks", { hasText: /^✓$/ }).waitFor();
+  check(true, "with a single tick, as no other member holds it");
+
+  // Two renames move the chat two epochs on, and the laptop closes: Ann, back, cannot read the message, and says so.
+  for (const name of ["Plans 2", "Plans 3"]) {
+    await laptop.getByRole("button", { name: "Settings" }).click();
+    await laptop.locator("dialog").getByLabel("Name").fill(name);
+    await laptop.locator("dialog").getByRole("button", { name: "Rename" }).click();
+    await laptop.locator(".group-list button", { hasText: name }).waitFor();
+    await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
+  }
+  const context = laptop.context();
+  const asked = new Promise(resolve => laptop.once("dialog", dialog => (resolve(dialog.type()), dialog.accept())));
+  const closed = laptop.waitForEvent("close");
+  await laptop.close({ runBeforeUnload: true });
+  check((await asked) === "beforeunload", "closing the page while a message is held only there asks first");
+  await closed;
+  delete pages["second tab"];
+  const annBack = native("ann");
+  await annBack.printed(e => e.type === "lost" && e.member.you, 60_000);
+  laptop = watch("laptop", await context.newPage());
+  laptop.on("dialog", dialog => dialog.accept());
+  await laptop.goto(SITE);
+  await laptop.locator(".group-list button", { hasText: "Plans" }).click();
+  const lost = laptop.locator(".messages li", { hasText: "anyone there?" });
+  await lost.locator(".tag", { hasText: "could not read this" }).waitFor({ timeout: 60_000 });
+  check((await lost.locator(".tag").textContent()).startsWith("Ann"), "the laptop shows who lost its message");
+  const carlBack = native("carl");
+  await lost.locator(".ticks", { hasText: "✓✓" }).waitFor({ timeout: 60_000 });
+  check(true, "and two ticks once Carl, back, holds it");
+  carlBack.proc.kill();
 
   // The tab that took over loaded no file; it loads the doc's file from IndexedDB when a new member wants it.
   await laptop.locator(".group-list button", { hasText: "Notes" }).click();
