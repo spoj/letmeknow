@@ -298,3 +298,29 @@ fn an_answer_is_taken_whole_before_reading_on() {
         ],
     );
 }
+
+/// Chat passed two positions with no message after them to name them; when the second came, it went out naming neither,
+/// so the first was passed over silently.
+#[test]
+fn a_late_message_names_the_positions_passed_before_it() {
+    use lmk_sim::Forgery;
+    passes(
+        290,
+        5,
+        vec![
+            (4729, Act::CreateIdentity { m: 4 }),
+            (6321, Act::Invite { m: 4, group: None, n: 0, label: true, to: None, wait: 0, race: None }),
+            (3225765, Act::Send { m: 4, group: 1 }),
+            (3244269, Act::CrashAfter { m: 0, what: Output::Frame }),
+            (3250753, Act::Send { m: 1, group: 0 }),
+            (3338462, Act::Send { m: 0, group: 0 }),
+            (4795565, Act::Leave { m: 2, group: 1 }),
+            (49264521, Act::Settle { ms: 35409 }),
+            (49694653, Act::Settle { ms: 53914 }),
+            (49703864, Act::Invite { m: 4, group: Some(1), n: 0, label: false, to: None, wait: 0, race: None }),
+            (49724706, Act::Offline { m: 0 }),
+            (49751369, Act::Forge { m: 4, group: 1, what: Forgery::Message { mac: true } }),
+            (49759766, Act::Send { m: 0, group: 1 }),
+        ],
+    );
+}

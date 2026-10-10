@@ -399,7 +399,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Hands a held message's plaintext to its consumer, in this step: the core takes its own payloads as records; the
     /// kind's go out as events in position order (`show`), but this session's own, and to the kind in log order
-    /// (`kind_advance`). One that opens after later ones were shown goes out now.
+    /// (`kind_advance`). One that opens after later ones were shown goes out now, naming those passed before it that
+    /// no message named yet.
     pub(crate) fn deliver(&self, st: &mut State<P>, gid: &[u8], message: Message, own: bool) -> Result<()> {
         put(&st.provider, &message_key(&message.id.0), &message)?;
         let group = Bytes(gid.to_vec());
@@ -412,7 +413,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if !Control::TYPES.contains(&type_of(&message.payload)) {
             let rec = &mut st.group_mut(gid)?.rec;
             if !own && message.position <= rec.shown {
-                rec.missing.retain(|missing| *missing != message.position);
+                // It goes out as the next message handed on, naming the positions passed before it not named yet.
+                let position = message.position;
+                rec.missing.retain(|missing| *missing != position);
+                let (before, after) = std::mem::take(&mut rec.missing).into_iter().partition(|missing| *missing < position);
+                rec.missing = after;
+                let mut message = message;
+                message.missing = before;
                 self.events.send(Event::Message(message)).ok();
             }
             return Ok(());
