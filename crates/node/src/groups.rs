@@ -6,12 +6,11 @@ use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
 use lmk_core::group::{self as core, Change, Removed, Unheld, key_package_credential, key_package_leaf};
-use lmk_core::identity::{certified, check};
+use lmk_core::identity::Verdict;
 use lmk_core::provider::Provider;
 use lmk_net::{Admit, Groups, Taken};
 use lmk_proto::group::{CHAT, Control, Credential, How, Reason, Refusal, Service, type_of};
 use lmk_proto::head::Head;
-use lmk_proto::identity::Envelope;
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::{Admitted, Hello, Join};
 use lmk_proto::{Answer, Bytes};
@@ -35,7 +34,7 @@ const NOT_OPEN: &str = "it speaks as no identity the group is open to";
 fn admits(g: &core::Group, joiner: &Credential, invite: &Option<(Bytes, u64)>) -> Result<()> {
     match invite {
         Some((hash, expires)) => ensure!(now() < *expires && !g.used(&hash.0), UNKNOWN),
-        None => ensure!(joiner.identity.as_ref().is_some_and(|identity| g.settings().open.iter().any(|named| named.id == identity.id)), NOT_OPEN),
+        None => ensure!(joiner.identity().is_some_and(|identity| g.settings().open.iter().any(|named| named.id == identity.id)), NOT_OPEN),
     }
     ensure!(g.members().iter().all(|member| member.key != joiner.key.0), "this session is a member already");
     Ok(())
@@ -126,7 +125,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                         let held = Message { id: Bytes(id.to_vec()), group: group.clone(), epoch, at: now(), sender: sender.clone(), payload };
                         hold(st, gid, held, ciphertext)?;
                     }
-                    let me = Bytes(Sha256::digest(st.session.key())[..8].to_vec());
+                    let me = Bytes(Sha256::digest(st.me(gid))[..8].to_vec());
                     if to.is_empty() || to.contains(&me) {
                         self.events.send(Event::Introduced { group, by: sender, identity, name, how }).ok();
                     }
@@ -147,7 +146,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                         let Ok(sent) = <[u8; 32]>::try_from(&refusal.id.0[..]) else { continue };
                         if let (Some(waiter), Some(peer)) = (st.waiters.get(&sent), peer) {
                             waiter.send((peer, Some(refusal.reason))).ok();
-                        } else if get::<Message>(&st.provider, &message_key(&sent))?.is_some_and(|m| m.sender.key.0 == st.session.key()) {
+                        } else if get::<Message>(&st.provider, &message_key(&sent))?.is_some_and(|m| m.sender.key.0 == st.me(gid)) {
                             own.push(refusal);
                         }
                     }
@@ -169,7 +168,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Answers a joiner's request: it brings an invite's secret, or speaks as an identity the group is open to.
     async fn admit_join(self: &Arc<Self>, join: Join) -> Result<Admitted> {
-        let Join { secret, group, key_package, certificate } = join;
+        let Join { secret, group, key_package } = join;
         let joiner = key_package_credential(&self.state.lock().unwrap().provider, &key_package.0)?;
         let (gid, how, invite, to) = match (secret, group) {
             (Some(secret), _) => {
@@ -179,28 +178,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 let (gid, rule) = found.context(UNKNOWN)?;
                 (gid, How::Invite, Some((hash, rule.expires)), rule.to)
             }
-            (None, Some(gid)) => (gid.0, How::Open, None, Some(joiner.identity.as_ref().context(NOT_OPEN)?.id.clone())),
+            (None, Some(gid)) => (gid.0, How::Open, None, Some(joiner.identity().context(NOT_OPEN)?.id.clone())),
             (None, None) => bail!("a request names an invite's secret or a group"),
         };
         admits(&self.state.lock().unwrap().group(&gid)?.mls, &joiner, &invite)?;
+        // Its identity's key log, read afresh, must list the device that certified it.
         if let Some(to) = to {
-            let identity = joiner.identity.clone().filter(|identity| identity.id == to).context("this invite is for another identity")?;
-            let log = self.read_keys(&identity).await?;
-            if let Err(error) = check(certificate.as_ref(), &joiner, &log, now()) {
-                bail!("{error}");
+            let identity = joiner.identity().filter(|identity| identity.id == to).context("this invite is for another identity")?;
+            match self.read_keys(identity).await?.verify(&joiner) {
+                Verdict::Verified { .. } => {}
+                Verdict::Unverified => bail!("its device is not on its identity's list"),
+                Verdict::Dropped => bail!("its device was taken off its identity"),
             }
         }
-        if let Some(certificate) = certificate {
-            self.certified(&joiner, certificate);
-        }
         self.admit(&gid, key_package.0, &joiner, how, invite).await
-    }
-
-    /// Holds a joiner's certificate.
-    fn certified(&self, joiner: &Credential, certificate: Envelope) {
-        if let Some(identity) = &joiner.identity {
-            self.state.lock().unwrap().certificates.insert((joiner.key.0.clone(), identity.id.0.clone()), certificate);
-        }
     }
 
     /// Commits the Add, naming the invite the joiner came in by, and answers with the Welcome and the state of the group's
@@ -241,8 +232,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Some(state) => Some(self.state_file(gid, state).await?),
             None => None,
         };
-        let certificates = lmk_net::Groups::certificates(&**self, &[gid.to_vec()]);
-        Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc, before, certificates, logs })
+        Ok(Admitted { welcome: Bytes(welcome.context("an add makes a Welcome")?), position, doc, before, logs })
     }
 
 }
@@ -250,10 +240,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
 impl<P: Provider + Send + 'static> Groups for Inner<P> {
     fn groups(&self) -> Vec<Vec<u8>> {
         self.state.lock().unwrap().groups.keys().cloned().collect()
-    }
-
-    fn in_leaf(&self, group: &[u8], peer: &EndpointId) -> bool {
-        self.state.lock().unwrap().in_leaf(group, peer).is_some()
     }
 
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
@@ -365,57 +351,6 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
             return Vec::new();
         };
         g.rec.held(g.mls.settings().keep)
-    }
-
-    fn certificates(&self, groups: &[Vec<u8>]) -> Vec<Envelope> {
-        let st = self.state.lock().unwrap();
-        let mut certificates: Vec<Envelope> = Vec::new();
-        for member in groups.iter().filter_map(|gid| st.groups.get(gid)).flat_map(|g| g.mls.members()) {
-            let Some(credential) = &member.credential else { continue };
-            let Some(identity) = &credential.identity else { continue };
-            if let Some(certificate) = st.certificate(credential, &identity.id.0)
-                && !certificates.contains(certificate)
-            {
-                certificates.push(certificate.clone());
-            }
-        }
-        certificates
-    }
-
-    /// A certificate may be of a member other than the peer that showed it, and make this session serve that one.
-    fn certificate(&self, certificate: Envelope) {
-        let peers = self.net().connected();
-        let mut st = self.state.lock().unwrap();
-        let before = st.served(&peers);
-        take_certificate(&mut st, certificate);
-        for (gid, peer) in st.served(&peers).into_iter().filter(|served| !before.contains(served)) {
-            self.net().served(peer, &gid);
-        }
-    }
-}
-
-/// Holds a certificate a peer showed, even of a session not yet a member here, as one whose Add is still on its way.
-/// A valid certificate beats one that is not, and else the later one wins.
-pub(crate) fn take_certificate<P: Provider>(st: &mut State<P>, certificate: Envelope) {
-    let Some(certified) = certified(&certificate) else { return };
-    let members = st.groups.values().flat_map(|g| g.mls.members());
-    let credential = members.filter_map(|m| m.credential).find(|c| c.key == certified.key && c.identity.as_ref().is_some_and(|i| i.id == certified.identity));
-    let log = st.keys.get(&certified.identity.0);
-    let valid = |c: &Envelope| matches!((&credential, log), (Some(credential), Some(log)) if check(Some(c), credential, log, now()).is_ok());
-    let key = (certified.key.0.clone(), certified.identity.0.clone());
-    let fresh = valid(&certificate);
-    let newer = st.certificates.get(&key).is_none_or(|held| match (fresh, valid(held)) {
-        (true, false) => true,
-        (false, true) => false,
-        _ => certified.expires > lmk_core::identity::certified(held).map_or(0, |held| held.expires),
-    });
-    if newer {
-        st.certificates.insert(key, certificate);
-        if let Err(error) = st.save_certificates() {
-            tracing::warn!("saving certificates: {error:#}");
-        }
-    } else if credential.is_some() && !fresh {
-        st.ahead.insert(key, certificate);
     }
 }
 

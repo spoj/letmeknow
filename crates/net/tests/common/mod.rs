@@ -22,7 +22,6 @@ use lmk_net::{Admit, Config, Disk, Event, Groups, Net, Taken};
 use lmk_proto::{
     Answer, Bytes,
     head::{self, Head},
-    identity::Envelope,
     links::FileLink,
     peer::{Admitted, Hello, Join},
 };
@@ -146,7 +145,7 @@ pub struct Inviter;
 
 impl Admit for Inviter {
     fn join(&self, _: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>> {
-        let admitted = |welcome: &[u8]| Answer::Ok(Admitted { welcome: Bytes(welcome.to_vec()), position: 1, doc: None, before: Vec::new(), certificates: Vec::new(), logs: Vec::new() });
+        let admitted = |welcome: &[u8]| Answer::Ok(Admitted { welcome: Bytes(welcome.to_vec()), position: 1, doc: None, before: Vec::new(), logs: Vec::new() });
         Box::pin(async move {
             match (join.secret, join.group) {
                 (Some(secret), _) if secret.0 == SECRET => admitted(b"invited"),
@@ -198,11 +197,8 @@ pub struct Fake {
     pub groups: Mutex<HashMap<Vec<u8>, Group>>,
     /// After this many more membership checks, the peer is no longer a member.
     pub cut: Mutex<Option<(EndpointId, usize)>>,
-    /// Members in a leaf it does not serve, for want of a valid certificate.
-    pub uncertified: Mutex<Vec<EndpointId>>,
-    /// The certificates it presents, and those peers presented to it.
-    pub certificates: Mutex<Vec<Envelope>>,
-    pub certified: Mutex<Vec<Envelope>>,
+    /// Members in a leaf it does not serve, for want of their devices on their identities' lists.
+    pub unlisted: Mutex<Vec<EndpointId>>,
     /// State links from peers.
     pub states: Mutex<Vec<StateLink>>,
 }
@@ -216,9 +212,7 @@ impl Fake {
             service: service.clone(),
             groups: Mutex::default(),
             cut: Mutex::default(),
-            uncertified: Mutex::default(),
-            certificates: Mutex::default(),
-            certified: Mutex::default(),
+            unlisted: Mutex::default(),
             states: Mutex::default(),
         })
     }
@@ -256,12 +250,8 @@ impl Groups for Fake {
         self.groups.lock().unwrap().keys().cloned().collect()
     }
 
-    fn in_leaf(&self, group: &[u8], peer: &EndpointId) -> bool {
-        self.groups.lock().unwrap().get(group).is_some_and(|g| g.members.contains(peer))
-    }
-
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
-        if self.uncertified.lock().unwrap().contains(peer) {
+        if self.unlisted.lock().unwrap().contains(peer) {
             return false;
         }
         let mut cut = self.cut.lock().unwrap();
@@ -368,13 +358,5 @@ impl Groups for Fake {
 
     fn files(&self, group: &[u8]) -> Vec<FileLink> {
         self.groups.lock().unwrap()[group].files.clone()
-    }
-
-    fn certificates(&self, _: &[Vec<u8>]) -> Vec<Envelope> {
-        self.certificates.lock().unwrap().clone()
-    }
-
-    fn certificate(&self, certificate: Envelope) {
-        self.certified.lock().unwrap().push(certificate);
     }
 }

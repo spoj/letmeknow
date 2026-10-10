@@ -1,4 +1,4 @@
-//! An identity's key log, where it lives, and the certificates its key signs for sessions.
+//! An identity's key log, where it lives, and what a device's key signs for a session that speaks as it.
 
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use crate::{Bytes, group::Service};
 pub const ENTRY_CONTEXT: &[u8] = b"letmeknow identity key v1\0";
 pub const CERTIFICATE_CONTEXT: &[u8] = b"letmeknow certificate v1\0";
 
-/// Signed bytes: a key log entry before sealing, or a certificate. `sig` is over the context ‖ `body`.
+/// A key log entry before sealing. `sig` is over `ENTRY_CONTEXT` ‖ `body`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Envelope {
     /// JSON, as signed.
@@ -22,36 +22,28 @@ pub struct Envelope {
 pub struct Body {
     /// SHA-256 of the previous entry's body; none in the first.
     pub prev: Option<Bytes>,
-    /// The identity's new public key.
+    /// The identity's key from this entry on.
     pub key: Bytes,
+    /// The identity's devices.
+    pub devices: Vec<Listed>,
     /// In the first entry only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// In the first entry only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub membership: Option<Service>,
-    /// The key of the device taken off the identity, in an entry that replaces the key because of it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revoked: Option<Bytes>,
 }
 
-/// A certificate's body: an identity's key vouches that a session of one of its devices speaks for it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Certified {
-    pub identity: Bytes,
-    /// The session's MLS signature key.
+/// A device on an identity's list: its key in the identity's devices group, and its name.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Listed {
     pub key: Bytes,
     pub name: String,
-    /// The name of the device that certified it.
-    pub device: String,
-    /// That device's key in the identity's devices group.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_key: Option<Bytes>,
-    /// The name of the device that added that device to the identity; none for its first.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub added_by: Option<String>,
-    /// Milliseconds since the Unix epoch.
-    pub expires: u64,
+}
+
+/// What a device's key signs, after `CERTIFICATE_CONTEXT`, for a session that speaks as the identity.
+pub fn certified(session: &[u8], identity: &[u8]) -> Vec<u8> {
+    [CERTIFICATE_CONTEXT, session, identity].concat()
 }
 
 /// An identity's id: SHA-256 of its first entry's body.

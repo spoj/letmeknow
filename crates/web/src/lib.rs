@@ -1,5 +1,6 @@
-//! The browser client: the client core on one lmk-node session whose MLS key is the browser's device key, reaching its
-//! peers only through the relay, with the devices kind on the same node. Chat is built in; the doc kind
+//! The browser client: the client core on one lmk-node session, which is the browser's device too, with a device key of
+//! its own in each identity's devices group, reaching its peers only through the relay, with the devices kind on the
+//! same node. Chat is built in; the doc kind
 //! (`lmk_kind_doc::Page`) and the git kind, display-only (`lmk_kind_git::Page`), are in-page plugins, whose messages go
 //! to and from the core as calls. The page persists the session's records in IndexedDB, one record per key, and the
 //! ciphertext of the files it holds, which the session loads when it needs one. Results that are not bytes are JSON
@@ -41,8 +42,6 @@ const DOC: &str = "doc";
 const GIT: &str = "git";
 /// How often the files no group links any longer are deleted.
 const COLLECT: Duration = Duration::from_secs(60 * 60);
-/// How often the session checks that its certificates are by its identities' current keys and last another half day.
-const RENEW_CHECK: Duration = Duration::from_secs(10);
 
 type R<T> = Result<T, JsError>;
 
@@ -379,16 +378,6 @@ impl App {
                 sleep(Duration::from_secs(1)).await;
             }
         });
-        let renewing = Rc::downgrade(&app);
-        spawn_local(async move {
-            while let Some(app) = renewing.upgrade() {
-                for e in app.client.renew().await {
-                    error(&format!("renewing this session's certificate: {e:#}"));
-                }
-                drop(app);
-                sleep(RENEW_CHECK).await;
-            }
-        });
         let collecting = Rc::downgrade(&app);
         spawn_local(async move {
             while let Some(app) = collecting.upgrade() {
@@ -650,7 +639,8 @@ impl Lmk {
         self.app.flush();
     }
 
-    /// This browser: `{"name", "fp", "device": {"key", "name"}, "identities": [{"id", "name"}]}`.
+    /// This browser: `{"name", "fp", "device": {"name"}, "identities": [{"id", "name", "device"}]}`, `device` its key on
+    /// the identity.
     pub fn me(&self) -> R<String> {
         Ok(self.app.client.me().map_err(js)?.to_string())
     }

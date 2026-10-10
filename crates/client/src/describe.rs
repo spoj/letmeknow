@@ -63,10 +63,10 @@ pub struct Known {
     /// Who in this client's groups vouched for it, and as whom.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub introduced: Vec<Introduced>,
-    /// Why its certificate does not check out.
+    /// Why it is not verified: its device is not on the identity's list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Another identity's newly added device: "added by laptop".
+    /// Another identity's device, added to it after its first devices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_device: Option<String>,
 }
@@ -152,7 +152,7 @@ impl Describer {
             warning: None,
             introduced: Vec::new(),
             error: claim.error.clone(),
-            new_device: claim.added_by_device.as_ref().filter(|_| own.is_none()).map(|device| format!("added by {device}")),
+            new_device: (claim.added && own.is_none()).then(|| "a device added to the identity after its first".into()),
         };
         if let Some((_, name)) = own {
             (known.name, known.how) = (name.clone(), Standing::Own);
@@ -213,7 +213,7 @@ mod tests {
             identity: IdentityRef { id: Bytes(vec![id]), membership: Service::Folder("/logs".into()) },
             name: claimed.into(),
             error: None,
-            added_by_device: None,
+            added: false,
         });
         Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, name: name.into(), device_name: "laptop".into(), identity, added: None }
     }

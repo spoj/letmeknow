@@ -24,7 +24,6 @@ use lmk_proto::{
     Answer, Bytes,
     frame::{self, ALPN, Open, Stream},
     head::Head,
-    identity::Envelope,
     links::FileLink,
     peer::{Admitted, Frame, Hello, Join},
 };
@@ -48,10 +47,8 @@ const ANSWER_WAIT: Duration = Duration::from_secs(5);
 pub trait Groups: Send + Sync + 'static {
     /// The groups this session is in.
     fn groups(&self) -> Vec<Vec<u8>>;
-    /// Whether `peer` is in a leaf of the group's current epoch.
-    fn in_leaf(&self, group: &[u8], peer: &EndpointId) -> bool;
-    /// Whether this session serves `peer` the group: it is in a leaf and, speaking as an identity, has shown a valid
-    /// certificate of it.
+    /// Whether this session serves `peer` the group: it is in a leaf and, speaking as an identity, its device is on the
+    /// identity's list.
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool;
     /// The protocol revision `peer`'s leaf in the group names; 0 if it names none.
     fn revision(&self, group: &[u8], peer: &EndpointId) -> u32;
@@ -84,10 +81,6 @@ pub trait Groups: Send + Sync + 'static {
     fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>);
     /// The files the group links now.
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
-    /// The certificates this session holds of these groups' members.
-    fn certificates(&self, groups: &[Vec<u8>]) -> Vec<Envelope>;
-    /// A certificate a peer presented, of itself or of a member of a group it is in.
-    fn certificate(&self, certificate: Envelope);
 }
 
 /// A browser's own storage of the files it holds, since iroh-blobs keeps only memory there. With one, a session keeps

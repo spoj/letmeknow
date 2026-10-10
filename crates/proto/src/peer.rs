@@ -2,19 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Bytes, head::Head, identity::Envelope};
+use crate::{Bytes, head::Head};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Frame {
-    /// The sender's state of the groups both are in, the newest signed heads it holds of their logs, and the
-    /// certificates it holds of their members.
-    Hello {
-        groups: Vec<Hello>,
-        heads: Vec<Head>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        certificates: Vec<Envelope>,
-    },
+    /// The sender's state of the groups both are in, and the newest signed heads it holds of their logs.
+    Hello { groups: Vec<Hello>, heads: Vec<Head> },
     /// Entries of a log the other lacks, ending at `head`.
     Entries { log: Bytes, entries: Vec<Bytes>, head: Head },
     /// A negentropy message.
@@ -68,7 +62,7 @@ pub struct Hello {
     pub anew: bool,
 }
 
-/// A joiner's request: an invite's secret, or the group open to the identity its certificate proves it speaks as.
+/// A joiner's request: an invite's secret, or the group open to the identity its KeyPackage's credential speaks as.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Join {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,9 +70,6 @@ pub struct Join {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<Bytes>,
     pub key_package: Bytes,
-    /// The certificate of the identity the joiner speaks as, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub certificate: Option<Envelope>,
 }
 
 /// The answer to a join.
@@ -93,9 +84,6 @@ pub struct Admitted {
     /// The ids of the messages from before the joiner's epoch that the admitting member holds, which the joiner never gets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub before: Vec<Bytes>,
-    /// The certificates the admitting member holds of the group's members.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub certificates: Vec<Envelope>,
     /// The logs of the kind's order the admitting member reads from where it is, the current one last.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logs: Vec<KindLog>,
@@ -114,14 +102,14 @@ mod tests {
 
     #[test]
     fn shapes() {
-        let hello = Frame::Hello { groups: vec![], heads: vec![], certificates: vec![] };
+        let hello = Frame::Hello { groups: vec![], heads: vec![] };
         assert_eq!(serde_json::to_string(&hello).unwrap(), r#"{"hello":{"groups":[],"heads":[]}}"#);
         let messages = Frame::Messages { group: Bytes(vec![1]), items: vec![], below: vec![] };
         assert_eq!(serde_json::to_string(&messages).unwrap(), r#"{"messages":{"group":"AQ","items":[],"below":[]}}"#);
         let state: Frame = serde_json::from_str(r#"{"state":{"group":"AQ","link":"lmk:x"}}"#).unwrap();
         assert!(matches!(state, Frame::State { .. }));
         assert!(serde_json::from_str::<Frame>(r#"{"doc":{"group":"AQ"}}"#).is_err(), "a kind has no frames");
-        let join = Frame::Join { id: 7, join: Join { secret: Some(Bytes(vec![2])), group: None, key_package: Bytes(vec![3]), certificate: None } };
+        let join = Frame::Join { id: 7, join: Join { secret: Some(Bytes(vec![2])), group: None, key_package: Bytes(vec![3]) } };
         let text = serde_json::to_string(&join).unwrap();
         assert_eq!(text, r#"{"join":{"id":7,"secret":"Ag","key_package":"Aw"}}"#);
         assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), join);

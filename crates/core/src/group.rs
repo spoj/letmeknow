@@ -103,16 +103,17 @@ impl Session {
     pub fn create<P: Provider>(provider: &P, name: &str, leaf: Leaf) -> Result<Self> {
         let key = ed25519_dalek::SigningKey::from_bytes(&crate::random());
         let signer = SignatureKeyPair::from_raw(SignatureScheme::ED25519, key.to_bytes().to_vec(), key.verifying_key().to_bytes().to_vec());
-        Self::create_with(provider, signer, name, leaf)
-    }
-
-    /// A session with the given MLS key: a device's own (`Device::signer`).
-    pub fn create_with<P: Provider>(provider: &P, signer: SignatureKeyPair, name: &str, leaf: Leaf) -> Result<Self> {
-        signer.store(provider.storage())?;
-        let credential = Credential { name: name.into(), key: signer.public().into(), identity: None };
-        let session = Session { credential, signer, leaf };
+        let session = Self::with_signer(provider, signer, name, leaf)?;
         session.save(provider)?;
         Ok(session)
+    }
+
+    /// A member with the given MLS key beside the provider's own session, which it does not replace: a device's key in
+    /// one identity's devices group.
+    pub fn with_signer<P: Provider>(provider: &P, signer: SignatureKeyPair, name: &str, leaf: Leaf) -> Result<Self> {
+        signer.store(provider.storage())?;
+        let credential = Credential { name: name.into(), key: signer.public().into(), certificate: None };
+        Ok(Session { credential, signer, leaf })
     }
 
     pub fn load<P: Provider>(provider: &P) -> Result<Self> {

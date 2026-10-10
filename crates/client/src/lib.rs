@@ -1,7 +1,7 @@
 //! The client core: what one member does on top of its lmk-node session, alike in every client. It answers requests,
 //! turns the node's events into `ClientEvent`s with members described as this client knows them, introduces joiners and
-//! records the contact an invite was made for, records groups' openings in the devices groups, renews its certificates,
-//! and hosts kinds' plugins. A shell gives it storage (the node's provider), a network, the device's node, the plugins'
+//! records the contact an invite was made for, records groups' openings in the devices groups, has its device certify
+//! it for the identities it speaks as, and hosts kinds' plugins. A shell gives it storage (the node's provider), a network, the device's node, the plugins'
 //! transport, and shows or prints what it tells.
 
 mod describe;
@@ -19,10 +19,12 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use lmk_core::contacts::{self, Contact};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
-use lmk_node::devices::{Devices, renewal_due};
+use lmk_node::devices::Devices;
 use lmk_node::{Event, Member, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, DEVICES, How, IdentityRef, Named, Opening, PROTOCOL, Refusal, Service, Settings};
+use lmk_proto::group::{
+    Attachment, CHAT, Certificate, ChatMessage, Control, DEVICES, How, IdentityRef, Named, Opening, PROTOCOL, Refusal, Service, Settings,
+};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::time::{Duration, Instant, timeout};
 use n0_future::{Either, FutureExt};
@@ -124,7 +126,7 @@ pub struct DeviceState {
     #[serde(default)]
     pub device: Option<String>,
     pub identities: Vec<(IdentityRef, String)>,
-    /// Each identity's current public key, by identity id.
+    /// This device's key on each identity, by identity id.
     pub keys: Vec<(Bytes, Bytes)>,
     pub contacts: Vec<(Bytes, Contact)>,
     pub openings: Vec<Opening>,
@@ -135,7 +137,7 @@ impl DeviceState {
         DeviceState {
             device: devices.name(),
             identities: devices.identities(),
-            keys: devices.keys(),
+            keys: devices.identities().into_iter().filter_map(|(identity, _)| Some((identity.id.clone(), devices.key(&identity.id.0).ok()?))).collect(),
             contacts: devices.contacts(),
             openings: devices.openings(),
         }
@@ -162,6 +164,9 @@ pub trait Plugins: Send + Sync {
 pub enum ClientEvent {
     Joined { group: Bytes, member: Described, by: Described, how: How },
     Left { group: Bytes, member: Described, by: Described },
+    /// This client's commit removed members whose devices were taken off their identities; `added`, the members they
+    /// added or let in by their invites, stay until removed by hand.
+    Revoked { group: Bytes, removed: Vec<Described>, added: Vec<Described> },
     /// This client was removed from a group.
     Removed { group: Bytes, by: Option<Described> },
     /// The client let go of a group, removed or leaving: the shell drops what it keeps of it.
@@ -319,14 +324,16 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// This client: its name and fingerprint, its device, and the device's identities.
+    /// This client: its name and fingerprint, its device, and the device's identities, each with the device's key on it.
     pub fn me(&self) -> Result<Value> {
         let device = &self.inner.config.device;
         let state = self.device_state()?;
-        let identities: Vec<Value> = state.identities.into_iter().map(|(identity, name)| json!({ "id": identity.id, "name": name })).collect();
+        let key = |id: &Bytes| state.keys.iter().find(|(of, _)| of == id).map(|(_, key)| key.clone());
+        let identities: Vec<Value> =
+            state.identities.iter().map(|(identity, name)| json!({ "id": identity.id, "name": name, "device": key(&identity.id) })).collect();
         let fp = fp(&self.inner.node.key().0);
-        let name = state.device.unwrap_or_else(|| device.name.clone());
-        Ok(json!({ "name": self.inner.config.name, "fp": fp, "device": { "key": Bytes(device.public().to_vec()), "name": name }, "identities": identities }))
+        let name = state.device.clone().unwrap_or_else(|| device.name.clone());
+        Ok(json!({ "name": self.inner.config.name, "fp": fp, "device": { "name": name }, "identities": identities }))
     }
 
     /// Answers a request; one only the device's node answers goes to it where it runs elsewhere.
@@ -393,7 +400,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                 self.devices()?.set_opening(&identity.0, opening).await?;
                 Ok(json!({}))
             }
-            Request::Certify { identity, key, name } => Ok(json!(self.devices()?.certify(&identity.0, key, name).await?)),
+            Request::Certify { identity, key } => Ok(json!(self.devices()?.certify(&identity.0, &key.0)?)),
         }
     }
 
@@ -807,6 +814,12 @@ impl<P: Provider + Send + 'static> Client<P> {
                 self.emit(ClientEvent::Left { group: group.clone(), member: describer.describe(&member), by: describer.describe(&by) });
                 self.refresh_opening(&group).await?;
             }
+            Event::Revoked { group, removed, added } => {
+                let describer = self.describer(&group)?;
+                let (removed, added) = (removed.iter().map(|m| describer.describe(m)).collect(), added.iter().map(|m| describer.describe(m)).collect());
+                self.emit(ClientEvent::Revoked { group, removed, added });
+            }
+            Event::Keys { .. } => {}
             Event::Removed { group, by } => {
                 let by = by.map(|by| self.describe(&group, &by)).transpose()?;
                 self.drop_group(&group).await?;
@@ -977,26 +990,15 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// Renews this client's certificate of each identity it speaks as that is not by the identity's current key, names
-    /// another device name, or lasts less than another half day; leaves the groups it speaks as an identity in that its
-    /// device is no longer on. Returns what failed.
-    pub async fn renew(&self) -> Vec<anyhow::Error> {
+    /// Leaves the groups it speaks as an identity in that its device is no longer on. Returns what failed.
+    pub async fn leave_identities_left(&self) -> Vec<anyhow::Error> {
         let Ok(state) = self.device_state() else { return Vec::new() };
         let mut failed = Vec::new();
         for identity in self.inner.node.spoken() {
-            // A state that names the device was published by a device that leaves identities so; none is published
-            // before a device's node first runs, or by 0.12.1.
-            if state.device.is_some() && !state.identities.iter().any(|(own, _)| own.id == identity.id) {
-                if let Err(error) = self.leave_as(&identity.id).await {
-                    failed.push(error);
-                }
-                continue;
-            }
-            let current = state.keys.iter().find(|(id, _)| *id == identity.id).map(|(_, key)| key);
-            let certificate = self.inner.node.certificate(&identity.id.0);
-            let renamed = certificate.as_ref().and_then(lmk_core::identity::certified).is_some_and(|c| state.device.as_ref().is_some_and(|d| *d != c.device));
-            if (renamed || renewal_due(certificate.as_ref(), current))
-                && let Err(error) = self.certify(&identity).await
+            // A state that names the device was published by a device's node; none is published before one first runs.
+            if state.device.is_some()
+                && !state.identities.iter().any(|(own, _)| own.id == identity.id)
+                && let Err(error) = self.leave_as(&identity.id).await
             {
                 failed.push(error);
             }
@@ -1033,31 +1035,19 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(left)
     }
 
-    /// Has the device certify this client as speaking for an identity.
-    async fn certify(&self, identity: &IdentityRef) -> Result<()> {
-        let (key, name) = (self.inner.node.key(), self.inner.config.name.clone());
-        let certificate = match self.access() {
-            Access::Here(devices) => devices.certify(&identity.id.0, key, name).await?,
-            Access::Elsewhere(remote) => serde_json::from_value(remote.request(Request::Certify { identity: identity.id.clone(), key, name }).await?)?,
-        };
-        // So that it shows its peers the key log its certificate needs.
-        self.inner.node.read_key_log(identity).await?;
-        self.inner.node.set_certificate(certificate)
-    }
-
-    /// The identity a new membership speaks as, the one named or else the device's first, with this client's
-    /// certificate of it.
-    async fn speaking_as(&self, as_: Option<String>) -> Result<Option<IdentityRef>> {
+    /// The identity a new membership speaks as, the one named or else the device's first, with the device's certificate
+    /// of this client.
+    async fn speaking_as(&self, as_: Option<String>) -> Result<Option<Certificate>> {
         let identity = match as_ {
             Some(as_) => Some(self.own_identity(&as_)?.0),
             None => self.device_state()?.identities.into_iter().next().map(|(identity, _)| identity),
         };
-        if let Some(identity) = &identity
-            && self.inner.node.certificate(&identity.id.0).is_none()
-        {
-            self.certify(identity).await?;
-        }
-        Ok(identity)
+        let Some(identity) = identity else { return Ok(None) };
+        let key = self.inner.node.key();
+        Ok(Some(match self.access() {
+            Access::Here(devices) => devices.certify(&identity.id.0, &key.0)?,
+            Access::Elsewhere(remote) => serde_json::from_value(remote.request(Request::Certify { identity: identity.id, key }).await?)?,
+        }))
     }
 
     /// An identity this device is on, by id or name.
@@ -1094,22 +1084,18 @@ impl<P: Provider + Send + 'static> Client<P> {
                 Ok(json!({ "identity": identity.id, "name": name }))
             }
             IdentityOp::List => {
-                let me = self.inner.config.device.public();
                 let mut identities = Vec::new();
                 for (identity, name) in devices.identities() {
+                    let me = devices.key(&identity.id.0)?;
                     let listed = devices.devices(&identity.id.0)?;
-                    let listed: Vec<Value> = listed.iter().map(|(key, name)| json!({ "key": key, "name": name, "you": key.0 == me })).collect();
+                    let listed: Vec<Value> = listed.iter().map(|(key, name)| json!({ "key": key, "name": name, "you": *key == me })).collect();
                     identities.push(json!({ "identity": identity.id, "name": name, "devices": listed }));
                 }
                 Ok(json!({ "identities": identities }))
             }
             IdentityOp::Rename { name } => {
                 devices.rename(&name).await?;
-                // So that members see the new name at once.
-                for error in self.renew().await {
-                    self.warn(None, format!("renewing this session's certificate: {error:#}"));
-                }
-                Ok(json!({ "device": { "key": Bytes(self.inner.config.device.public().to_vec()), "name": name } }))
+                Ok(json!({ "device": { "name": name } }))
             }
             IdentityOp::Leave { .. } => unreachable!("a client leaves an identity itself"),
             IdentityOp::Remove { identity, device: removed } => {

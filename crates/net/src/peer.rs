@@ -1,14 +1,14 @@
 //! A `peer` stream: hello and head swap, log entries, negentropy message sync, live messages, want
 //! and have, joiners' requests, and kinds' state links. Every group frame is served only to a member
-//! with a valid certificate of the identity it speaks as, and every log's entries only to such a
-//! member of a group that follows it; certificates go to every member.
+//! whose device, if it speaks as an identity, is on the identity's list, and every log's entries
+//! only to such a member of a group that follows it.
 //!
 //! Negentropy tells only its initiator what each side lacks, so a sync runs two rounds: the
 //! dialer initiates and pushes what the acceptor lacks, then ends its round with an empty
 //! `reconcile`; the acceptor then does the same the other way.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     sync::Arc,
 };
 
@@ -17,7 +17,6 @@ use iroh::EndpointId;
 use lmk_proto::{
     Answer, Bytes, frame,
     head::Head,
-    identity::Envelope,
     peer::{Admitted, Below, Frame, Hello, Join},
 };
 use lmk_transport::{Conn, RecvStream, SendStream};
@@ -61,8 +60,6 @@ struct Session {
     /// Our requests to be admitted awaiting their answer, by id.
     joins: HashMap<u64, oneshot::Sender<Answer<Admitted>>>,
     logs: HashMap<Bytes, Log>,
-    /// The certificates shown the peer since the last resync, by signature.
-    shown: HashSet<Bytes>,
     /// Messages of groups the peer has not shown in a `hello` yet, so would drop: sent once it does.
     waiting: HashMap<Bytes, VecDeque<Frame>>,
 }
@@ -137,7 +134,6 @@ pub(crate) async fn run(
         wants: HashMap::new(),
         joins: HashMap::new(),
         logs: HashMap::new(),
-        shown: HashSet::new(),
         waiting: HashMap::new(),
     };
     let result = async {
@@ -211,11 +207,6 @@ impl Session {
         self.inner.groups.is_member(group, &self.peer)
     }
 
-    /// The groups the peer is in a leaf of, whether or not this session serves it.
-    fn leaves(&self) -> Vec<Vec<u8>> {
-        self.inner.groups.groups().into_iter().filter(|g| self.inner.groups.in_leaf(g, &self.peer)).collect()
-    }
-
     /// The groups both are in.
     fn shared(&self) -> Vec<Vec<u8>> {
         self.inner.groups.groups().into_iter().filter(|g| self.member(g)).collect()
@@ -234,8 +225,7 @@ impl Session {
         self.send_hello(&shared).await
     }
 
-    /// Sends our state of these groups, and the certificates of the members of every group the peer is in that it has
-    /// not been shown: a peer this session does not serve still learns of the certificates it needs to serve this one.
+    /// Sends our state of these groups.
     async fn send_hello(&mut self, groups: &[Vec<u8>]) -> Result<()> {
         let hellos: Vec<Hello> = groups
             .iter()
@@ -245,21 +235,15 @@ impl Session {
             })
             .collect();
         let heads: Vec<Head> = self.logs(groups).iter().map(|log| self.inner.groups.head(log)).collect();
-        let certificates: Vec<Envelope> = self.inner.groups.certificates(&self.leaves()).into_iter().filter(|c| self.shown.insert(c.sig.clone())).collect();
-        if hellos.is_empty() && certificates.is_empty() {
+        if hellos.is_empty() {
             return Ok(());
         }
-        self.write(&Frame::Hello { groups: hellos, heads, certificates }).await
+        self.write(&Frame::Hello { groups: hellos, heads }).await
     }
 
     async fn frame(&mut self, frame: Frame) -> Result<()> {
         match frame {
-            Frame::Hello { groups, heads, certificates } => {
-                if !self.leaves().is_empty() {
-                    for certificate in certificates {
-                        self.inner.groups.certificate(certificate);
-                    }
-                }
+            Frame::Hello { groups, heads } => {
                 let shared = self.shared();
                 let logs = self.logs(&shared);
                 // A session ignores what a hello shows of a group it does not serve the peer yet or a log it does not
@@ -510,7 +494,6 @@ impl Session {
 
     /// Swaps heads again and syncs every group anew, whatever it has synced already.
     async fn resync(&mut self) -> Result<()> {
-        self.shown.clear();
         for state in self.groups.values_mut() {
             if state.busy && state.stale {
                 *state = Group { theirs: state.theirs.take(), ..Group::default() };

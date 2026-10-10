@@ -3,7 +3,7 @@
 //! built-in kind. The session process that holds the lock publishes the device's identities, their current keys,
 //! contacts and openings to `device-state.json`, and answers the requests only the device's node can on the command
 //! channel `device-endpoint`, both in `LETMEKNOW_HOME`; the device's other session processes read the one and send such
-//! requests to the other, among them for the certificates they show of their identities.
+//! requests to the other, among them for the certificates their credentials carry.
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
@@ -35,8 +35,8 @@ pub const CAUSAL_WAIT: Duration = Duration::from_secs(300);
 const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
 /// How often a session process that does not act for the device tries its lock.
 const DEVICE_RETRY: Duration = Duration::from_secs(10);
-/// How often a session checks that its certificates are by its identities' current keys and last another half day.
-const RENEW_CHECK: Duration = Duration::from_secs(10);
+/// How often a session checks that its device is still on the identities it speaks as.
+const IDENTITIES_CHECK: Duration = Duration::from_secs(10);
 
 pub type SessionNode = Node<SqliteProvider>;
 
@@ -99,8 +99,8 @@ pub struct Session {
     device: Option<SessionNode>,
     lock: std::fs::File,
     device_retry: Instant,
-    /// When this session next checks its certificates.
-    renew_at: Instant,
+    /// When this session next checks its device's identities.
+    identities_at: Instant,
     /// The device's state as last published.
     published: String,
     home: PathBuf,
@@ -171,7 +171,7 @@ impl Session {
             device: None,
             lock,
             device_retry: Instant::now(),
-            renew_at: Instant::now(),
+            identities_at: Instant::now(),
             published: String::new(),
             home: home.to_path_buf(),
             network,
@@ -283,7 +283,7 @@ impl Session {
         let waiting = self.waiting.iter().map(|w| w.deadline);
         let device = self.device.is_none().then_some(self.device_retry);
         let later = Instant::now() + Duration::from_secs(3600);
-        let due = held.into_iter().chain(waiting).chain(device).chain([self.renew_at]);
+        let due = held.into_iter().chain(waiting).chain(device).chain([self.identities_at]);
         due.chain(self.catching_up).fold(later, Instant::min)
     }
 
@@ -295,10 +295,10 @@ impl Session {
         {
             self.warn(None, format!("acting for this device: {error:#}"));
         }
-        if self.renew_at <= now {
-            self.renew_at = now + RENEW_CHECK;
-            for error in self.client.renew().await {
-                eprintln!("letmeknow: renewing this session's certificate: {error:#}");
+        if self.identities_at <= now {
+            self.identities_at = now + IDENTITIES_CHECK;
+            for error in self.client.leave_identities_left().await {
+                eprintln!("letmeknow: leaving the groups of an identity this device left: {error:#}");
             }
         }
         if self.outbox.deadline(self.config.hold).is_some_and(|at| at <= now) {

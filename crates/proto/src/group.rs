@@ -90,13 +90,28 @@ pub struct Leaf {
     pub revision: u32,
 }
 
-/// The identity bytes of a member's basic credential: its name, its MLS signature key, and the identity it speaks as,
-/// which a certificate proves.
+/// The identity bytes of a member's basic credential: its name, its MLS signature key, and the certificate of the
+/// identity it speaks as.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credential {
     pub name: String,
     pub key: Bytes,
-    pub identity: Option<IdentityRef>,
+    pub certificate: Option<Box<Certificate>>,
+}
+
+impl Credential {
+    pub fn identity(&self) -> Option<&IdentityRef> {
+        self.certificate.as_ref().map(|certificate| &certificate.identity)
+    }
+}
+
+/// That a session speaks as an identity: its device's key on the identity's list, and that key's signature over
+/// `identity::certified(session key, identity id)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Certificate {
+    pub identity: IdentityRef,
+    pub device: Bytes,
+    pub sig: Bytes,
 }
 
 /// An identity, by id and the service that keeps its key log.

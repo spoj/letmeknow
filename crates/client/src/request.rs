@@ -139,9 +139,9 @@ pub enum Request {
     /// Records an opening in an identity's devices group: for the device.
     #[cfg_attr(feature = "clap", command(skip))]
     SetOpening { identity: Bytes, opening: Opening },
-    /// A certificate of a session of this device, by an identity's key: for the device.
+    /// A certificate of a session of this device, with MLS key `key`, by the device's key on an identity: for the device.
     #[cfg_attr(feature = "clap", command(skip))]
-    Certify { identity: Bytes, key: Bytes, name: String },
+    Certify { identity: Bytes, key: Bytes },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

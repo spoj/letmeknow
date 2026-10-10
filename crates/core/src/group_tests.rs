@@ -449,7 +449,7 @@ fn rules_bind_everyone() {
 
     // An update that changes the committer's credential beyond its name: C claims an identity.
     let identity = lmk_proto::group::IdentityRef { id: Bytes(vec![1; 32]), membership: Service::Folder("/tmp/lmk".into()) };
-    w.m[2].session.credential.identity = Some(identity);
+    w.m[2].session.credential.certificate = Some(lmk_proto::group::Certificate { identity, device: Bytes(vec![2; 32]), sig: Bytes(vec![3; 64]) }.into());
     let c = &mut w.m[2];
     let group = c.group.as_mut().unwrap();
     let mut leaf = LeafNodeParameters::builder().with_credential_with_key(c.session.with_key()).build();
@@ -504,27 +504,25 @@ fn rules_bind_everyone() {
 
 #[test]
 fn credentials_are_checked_not_enforced() {
-    use crate::identity::{DAY, KeyLog, certify, check, create};
-    use lmk_proto::group::IdentityRef;
-    use lmk_proto::identity::Certified;
+    use crate::identity::{KeyLog, Verdict, create, public, sign};
+    use lmk_proto::group::{Certificate, IdentityRef};
+    use lmk_proto::identity::{Listed, certified};
     let mut w = World::new(&["A", "M"]);
-    let seed = crate::random();
-    let (id, first) = create(&seed, "Alice", Service::Folder("/tmp/lmk".into()));
+    let (seed, laptop) = (crate::random(), crate::random());
+    let (id, first) = create(&seed, "Alice", Service::Folder("/tmp/lmk".into()), Listed { key: public(&laptop).into(), name: "laptop".into() });
     let log = KeyLog::replay(&id, [first.as_slice()]).unwrap();
     let identity = IdentityRef { id: id.into(), membership: Service::Folder("/tmp/lmk".into()) };
-    // A speaks as Alice, with a certificate; M claims her identity without one.
-    w.m[0].session.credential.identity = Some(identity.clone());
-    w.m[1].session.credential.identity = Some(identity);
-    let a = &w.m[0].session.credential;
-    let certified = Certified { identity: id.into(), key: a.key.clone(), name: a.name.clone(), device: "laptop".into(), device_key: None, added_by: None, expires: DAY };
-    let certificate = certify(&seed, &certified);
+    // A speaks as Alice, certified by her laptop; M claims her identity with A's certificate.
+    let sig = Bytes(sign(&laptop, &certified(&w.m[0].session.credential.key.0, &id)));
+    let certificate = Certificate { identity, device: public(&laptop).into(), sig };
+    w.m[0].session.credential.certificate = Some(certificate.clone().into());
+    w.m[1].session.credential.certificate = Some(certificate.into());
     let m = key_package_credential(&w.m[0].provider, &w.key_package(1)).unwrap();
-    assert!(check(Some(&certificate), &m, &log, 0).is_err());
+    assert_eq!(log.verify(&m), Verdict::Unverified);
     w.found(0, &[1]);
     w.agree(&[0, 1]);
-    let checked: Vec<bool> =
-        w.m[1].g().members().iter().map(|member| check(Some(&certificate), member.credential.as_ref().unwrap(), &log, 0).is_ok()).collect();
-    assert_eq!(checked, [true, false]);
+    let checked: Vec<Verdict> = w.m[1].g().members().iter().map(|member| log.verify(member.credential.as_ref().unwrap())).collect();
+    assert_eq!(checked, [Verdict::Verified { device: "laptop".into(), added: false }, Verdict::Unverified]);
     let hi = w.m[1].send("hi from M");
     let opened = w.m[0].open(&hi, 0).unwrap();
     assert_eq!((opened.key, opened.sender.name), (w.m[1].session.key().to_vec(), "M".to_owned()));
