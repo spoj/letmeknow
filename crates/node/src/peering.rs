@@ -321,9 +321,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
                 match frame {
                     Frame::Messages { items, .. } => {
-                        for item in items {
-                            self.take(st, &gid, peer, &item.ciphertext.0, admitted)?;
-                        }
+                        let ciphertexts: Vec<&[u8]> = items.iter().map(|item| item.ciphertext.0.as_slice()).collect();
+                        self.take_all(st, &gid, peer, &ciphertexts, admitted)?;
                     }
                     Frame::Live { items, .. } => {
                         for item in items {

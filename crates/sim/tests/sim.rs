@@ -253,3 +253,48 @@ fn a_member_a_commit_just_added_counts_in_the_wait_before_the_next() {
     let outcome = replay(183, Options::default(), &actions);
     assert!(outcome.failure.is_none(), "{}", outcome.log.join("\n"));
 }
+
+/// A member waiting before a key-deleting commit took the first ciphertext of an answer, applied the commit at once as
+/// its summaries had shown no progress for a while, and dropped the rest of the answer, losing what it brought.
+#[test]
+fn an_answer_is_taken_whole_before_reading_on() {
+    passes(
+        659,
+        5,
+        vec![
+            (462, Act::CreateIdentity { m: 0 }),
+            (1221, Act::CreateIdentity { m: 4 }),
+            (2793, Act::Invite { m: 4, group: None, n: 3, label: true, to: None, wait: 0, race: Some(2) }),
+            (4125, Act::Invite { m: 0, group: None, n: 3, label: false, to: None, wait: 0, race: None }),
+            (42198, Act::Offline { m: 4 }),
+            (42198, Act::Offline { m: 3 }),
+            (42198, Act::Offline { m: 0 }),
+            (43569, Act::Send { m: 2, group: 0 }),
+            (60589, Act::Down { m: 2, ms: 149732524 }),
+            (82682, Act::Online { m: 4 }),
+            (97648, Act::Online { m: 3 }),
+            (230117, Act::Offline { m: 4 }),
+            (230117, Act::Offline { m: 3 }),
+            (233338, Act::Send { m: 0, group: 1 }),
+            (235583, Act::Leave { m: 0, group: 1 }),
+            (254360, Act::Down { m: 0, ms: 96431414 }),
+            (263707, Act::Online { m: 4 }),
+            (304838, Act::Online { m: 3 }),
+            (353104, Act::Rename { m: 2, group: 0 }),
+            (461170, Act::Leave { m: 0, group: 1 }),
+            (461170, Act::Remove { m: 0, group: 1, n: 3 }),
+            (472616, Act::Settle { ms: 48714 }),
+            (472791, Act::Partition { mask: 2147483648 }),
+            (475914, Act::Settle { ms: 75289 }),
+            (1551625, Act::Leave { m: 3, group: 0 }),
+            (1554605, Act::Quiesce),
+            (1559597, Act::Invite { m: 2, group: Some(0), n: 0, label: false, to: None, wait: 0, race: None }),
+            (1559597, Act::Invite { m: 2, group: Some(0), n: 0, label: false, to: None, wait: 0, race: Some(1) }),
+            (1559597, Act::Leave { m: 1, group: 0 }),
+            (1559597, Act::Invite { m: 0, group: Some(0), n: 0, label: true, to: None, wait: 0, race: None }),
+            (4540823, Act::Invite { m: 1, group: Some(0), n: 1, label: false, to: None, wait: 281784, race: None }),
+            (4544064, Act::CreateIdentity { m: 1 }),
+            (4548487, Act::CreateIdentity { m: 1 }),
+        ],
+    );
+}

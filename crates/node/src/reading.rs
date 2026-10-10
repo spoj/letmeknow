@@ -252,14 +252,30 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    /// Takes a held ciphertext from a peer, if it fills a counted position: one whose epoch, in its clear header, is the
-    /// position's. One that comes before its entry, from a peer the gate admits, is kept a while if it is for the
-    /// current epoch or the next, within `EARLY` per peer.
-    pub(crate) fn take(&self, st: &mut State<P>, gid: &[u8], peer: EndpointId, ciphertext: &[u8], admitted: bool) -> Result<()> {
-        let g = st.group(gid)?;
-        let Ok((epoch, false)) = core::header(ciphertext) else { return Ok(()) };
-        if ciphertext.len() > core::MAX_MESSAGE {
+    /// Takes held ciphertexts from a peer, each if it fills a counted position: one whose epoch, in its clear header, is
+    /// the position's. One that comes before its entry, from a peer the gate admits, is kept a while if it is for the
+    /// current epoch or the next, within `EARLY` per peer. Then reads on, if reading waited for them, or opens them.
+    pub(crate) fn take_all(&self, st: &mut State<P>, gid: &[u8], peer: EndpointId, ciphertexts: &[&[u8]], admitted: bool) -> Result<()> {
+        let mut filled = false;
+        for ciphertext in ciphertexts {
+            filled |= self.take(st, gid, peer, ciphertext, admitted)?;
+        }
+        if !filled {
             return Ok(());
+        }
+        if st.group(gid)?.waiting {
+            return self.advance(st, gid);
+        }
+        self.open_ready(st, gid)?;
+        self.kind_advance(st, gid)
+    }
+
+    /// Takes one held ciphertext; whether it filled a counted position.
+    fn take(&self, st: &mut State<P>, gid: &[u8], peer: EndpointId, ciphertext: &[u8], admitted: bool) -> Result<bool> {
+        let g = st.group(gid)?;
+        let Ok((epoch, false)) = core::header(ciphertext) else { return Ok(false) };
+        if ciphertext.len() > core::MAX_MESSAGE {
+            return Ok(false);
         }
         let current = g.mls.epoch();
         let id: [u8; 32] = Sha256::digest(ciphertext).into();
@@ -267,13 +283,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Some(position) => {
                 if st.pos(gid, position)?.is_some_and(|pos| pos.epoch == epoch) && g.rec.lacking.contains(position) {
                     st.provider.put(&ciphertext_key(gid, position), ciphertext)?;
-                    let g = st.group_mut(gid)?;
-                    g.rec.lacking.remove(position);
-                    if g.waiting {
-                        return self.advance(st, gid);
-                    }
-                    self.open_ready(st, gid)?;
-                    self.kind_advance(st, gid)?;
+                    st.group_mut(gid)?.rec.lacking.remove(position);
+                    return Ok(true);
                 }
             }
             None if admitted && (epoch == current || epoch == current + 1) => {
@@ -285,7 +296,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             None => {}
         }
-        Ok(())
+        Ok(false)
     }
 
     /// A live payload, which the gate let in once this session applied its log to its head as last read: taken only
@@ -434,8 +445,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// what it lacks once it applies the commit is lost (`before_commit`).
     fn cleared(&self, st: &mut State<P>, gid: &[u8], position: u64) -> Result<bool> {
         let lacking = st.lacking(gid)?;
-        // The gate as the commits applied so far in this step left it: a member they added may hold what this one lacks.
+        // The gate and this session's state as the step so far left them: a member a commit added may hold what this one
+        // lacks, and a ciphertext taken is progress.
         st.gate();
+        st.refresh(gid);
         let now = st.tick();
         let waiting = st.peers.wait(&Bytes(gid.to_vec()), &lacking, now) == Decision::Wait;
         if waiting {
