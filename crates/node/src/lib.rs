@@ -454,6 +454,7 @@ impl<P: Provider + Send + 'static> DerefMut for Step<'_, P> {
 
 impl<P: Provider + Send + 'static> Drop for Step<'_, P> {
     fn drop(&mut self) {
+        self.guard.tell_peers();
         if let Err(error) = self.guard.provider.commit() {
             tracing::error!("committing a step: {error:#}");
         }
@@ -727,7 +728,6 @@ impl<P: Provider> State<P> {
         self.save(&gid)?;
         self.save_groups()?;
         self.gate = true;
-        self.refresh(&gid);
         Ok(gid)
     }
 }

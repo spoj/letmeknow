@@ -105,6 +105,15 @@ impl<P: Provider> State<P> {
         self.peers.group(Bytes(gid.to_vec()), own, now);
     }
 
+    /// Hands `Peers` what a step changed: the gate, and this session's state of each group.
+    pub(crate) fn tell_peers(&mut self) {
+        self.gate();
+        let gids: Vec<Vec<u8>> = self.groups.keys().cloned().collect();
+        for gid in gids {
+            self.refresh(&gid);
+        }
+    }
+
     fn served_to(&self, peer: &EndpointId) -> BTreeSet<Bytes> {
         self.groups.keys().filter(|gid| self.serves(gid, peer)).map(|gid| Bytes(gid.clone())).collect()
     }
@@ -189,14 +198,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Hands `Peers` this session's state, and sends what is due; reads on in groups that wait before a commit, and
-    /// opens what no longer waits on a missing position.
+    /// Sends what `Peers` has due; reads on in groups that wait before a commit, and opens what no longer waits on a
+    /// missing position.
     fn poll(&self, st: &mut State<P>) -> Result<()> {
-        st.gate();
         let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
-        for gid in &gids {
-            st.refresh(gid);
-        }
         let now = st.tick();
         for out in st.peers.poll(now) {
             match out {
