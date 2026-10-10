@@ -24,8 +24,6 @@ struct World {
     _relay: Server,
     network: crate::Network,
     root: PathBuf,
-    /// For the sessions started from now on.
-    causal_wait: Duration,
     plugins: Vec<PathBuf>,
 }
 
@@ -62,7 +60,7 @@ async fn world(test: &str) -> World {
     let root = std::env::temp_dir().join(format!("lmk-session-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let network = crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) };
-    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT, plugins: vec![built()] }
+    World { _relay: server, network, root, plugins: vec![built()] }
 }
 
 struct Agent {
@@ -91,7 +89,6 @@ impl World {
             dir: session_dir(&home, handle).unwrap(),
             name: handle[..1].to_uppercase() + &handle[1..],
             hold,
-            causal_wait: self.causal_wait,
             keep_log: false,
             membership: self.membership(),
             plugins: self.plugins.clone(),
