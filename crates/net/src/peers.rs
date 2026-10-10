@@ -110,7 +110,7 @@ struct Conn {
     theirs: BTreeMap<Bytes, u64>,
     /// Every served group's summary goes at the next poll, as after connecting.
     full: bool,
-    /// Groups whose summary goes at the next poll, as the gate opened.
+    /// Groups whose summary goes at the next poll, as the gate opened, or the peer's first summary of it came.
     opened: BTreeSet<Bytes>,
 }
 
@@ -223,6 +223,10 @@ impl Peers {
                     g.struck.remove(peer);
                     if c.served.contains(&summary.group) && c.heard.get(&summary.group) != Some(summary) {
                         g.progress = now;
+                    }
+                    // The peer may have taken none of ours, as one that joined since we sent it.
+                    if c.served.contains(&summary.group) && !c.heard.contains_key(&summary.group) {
+                        c.opened.insert(summary.group.clone());
                     }
                     c.heard.insert(summary.group.clone(), summary.clone());
                     heard.push(Heard { peer: Bytes::from(*peer), summary: summary.clone(), at: now });

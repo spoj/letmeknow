@@ -126,6 +126,20 @@ fn a_gate_opening_sends_the_group_at_once() {
     assert_eq!(hellos(&p.poll(1_500)), vec![(key(1), vec![2])]);
 }
 
+/// A joiner takes none of the summaries members send it as they apply its Add, before its Welcome comes: its own first
+/// summary of the group draws theirs again, once.
+#[test]
+fn a_peer_s_first_summary_of_a_group_is_answered_with_ours() {
+    let mut p = member(Ranges::default());
+    p.connect(key(1), served(&[G]), DEBOUNCE);
+    assert_eq!(hellos(&p.poll(DEBOUNCE)), vec![(key(1), vec![G])]);
+    let theirs = summary(G, 10, Ranges::default(), Ranges::default());
+    p.frame(&key(1), &hello(vec![theirs.clone()]), 1_500);
+    assert_eq!(hellos(&p.poll(1_500)), vec![(key(1), vec![G])]);
+    p.frame(&key(1), &hello(vec![theirs]), 1_600);
+    assert!(hellos(&p.poll(1_600)).is_empty());
+}
+
 #[test]
 fn summaries_are_saved_whatever_the_gate_but_used_only_while_it_admits() {
     let mut p = member(r(&[(4, 4)]));
