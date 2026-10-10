@@ -206,3 +206,41 @@ fn a_push_leaves_only_to_peers_still_admitted() {
         ],
     );
 }
+
+/// A joiner read its group's log before its members' key logs, so its gate admitted no member whose summary held the
+/// message counted as it joined, and it applied the commit deleting that epoch's keys as soon as it could, losing it.
+#[test]
+fn a_joiner_reads_its_members_key_logs_before_it_applies_their_commits() {
+    passes(
+        611,
+        5,
+        vec![
+            (1655, Act::CreateIdentity { m: 0 }),
+            (2691, Act::CreateIdentity { m: 1 }),
+            (4013, Act::CreateIdentity { m: 2 }),
+            (5752, Act::CreateIdentity { m: 3 }),
+            (7738, Act::Invite { m: 1, group: None, n: 0, label: false, to: None, wait: 0, race: None }),
+            (11105, Act::Settle { ms: 89908 }),
+            (1406584, Act::Send { m: 2, group: 0 }),
+            (1406808, Act::Send { m: 4, group: 0 }),
+            (1420249, Act::Down { m: 2, ms: 33142946 }),
+            (4143961, Act::Wake { m: 2, ms: 3607 }),
+            (9574188, Act::Wake { m: 2, ms: 3332 }),
+            (9576142, Act::Invite { m: 2, group: None, n: 1, label: false, to: None, wait: 0, race: None }),
+            (9576204, Act::Leave { m: 3, group: 0 }),
+            (11101561, Act::Send { m: 3, group: 0 }),
+            (11137792, Act::Send { m: 2, group: 2 }),
+            (11141255, Act::Leave { m: 0, group: 0 }),
+            (11165410, Act::Quiesce),
+            (11170122, Act::Partition { mask: 2147483648 }),
+            (11305136, Act::Heal),
+            (13224236, Act::Down { m: 3, ms: 607486767 }),
+            (13459727, Act::Quiesce),
+            (45951748, Act::Invite { m: 4, group: Some(1), n: 4, label: true, to: None, wait: 0, race: None }),
+            (45954390, Act::Remove { m: 3, group: 1, n: 4 }),
+            (45954390, Act::Open { m: 0, group: 1, n: 2, close: false }),
+            (45954390, Act::Send { m: 4, group: 1 }),
+            (45975745, Act::Restart { m: 0 }),
+        ],
+    );
+}

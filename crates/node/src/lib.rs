@@ -1793,12 +1793,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             gid
         };
+        // The members' key logs first, which the gate needs to take their summaries, before the log's commits apply.
+        self.refresh_all().await;
+        self.dial_all();
         if let Err(error) = self.read(&gid).await {
             self.warn(Some(&gid), format!("reading the group's log: {error:#}"));
         }
         self.follow(&gid);
-        self.refresh_all().await;
-        self.dial_all();
         if let Some(link) = admitted.doc {
             self.state_from(&gid, link, by);
         }
