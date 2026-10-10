@@ -5,7 +5,7 @@ use crate::trace::{Answer, Trace, Verdict, What};
 
 /// A send answered with a position counts its id there; one answered pending is reported sent, by the id it was
 /// answered with, at a position that counts its message, sealed again if a commit came first, by the end of the next
-/// quiet period its sender is in the group for.
+/// quiet period its sender is in the group for, in the same membership.
 pub fn send_settles(t: &Trace) -> Result<(), String> {
     let judged = judged(t);
     let counts = |group, position, id| judged.get(&(group, position)).is_none_or(|j| *j.verdict == Verdict::Counted { id: Clone::clone(id) });
@@ -21,7 +21,8 @@ pub fn send_settles(t: &Trace) -> Result<(), String> {
             What::Send { m, group, id, answer: Answer::Pending } => {
                 for (at, views) in quiets(t).filter(|(at, _)| *at >= o.at + CONVERGE) {
                     let sent = t.0.iter().take_while(|n| n.at <= at).any(|n| matches!(&n.what, What::Sent { m: j, group: g, id: i, .. } if j == m && g == group && i == id));
-                    if !sent && views.iter().any(|v| v.m == *m && v.group == *group && v.active()) {
+                    let again = t.0.iter().any(|n| n.at > o.at && n.at <= at && matches!(&n.what, What::Joined { m: j, group: g, .. } if j == m && g == group));
+                    if !sent && !again && views.iter().any(|v| v.m == *m && v.group == *group && v.active()) {
                         return Err(format!("m{m}'s pending send of {} to {} was not sent by {}", short(id), short(group), super::clock(at)));
                     }
                 }

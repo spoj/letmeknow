@@ -82,6 +82,8 @@ pub struct Peers {
 
 struct Group {
     own: Own,
+    /// When the member came to hold it: it joined, or started.
+    since: u64,
     fetching: Ranges,
     dirty: bool,
     /// The last new summary, connection or ciphertext.
@@ -125,6 +127,7 @@ impl Peers {
         let Some(g) = self.groups.get_mut(&group) else {
             let g = Group {
                 own,
+                since: now,
                 fetching: Ranges::default(),
                 dirty: true,
                 progress: now,
@@ -249,7 +252,7 @@ impl Peers {
     pub fn wait(&mut self, group: &Bytes, lacking: &Ranges, now: u64) -> Decision {
         let g = self.groups.get_mut(group).expect("a group of ours");
         let peers: Vec<&Summary> = self.conns.values().filter(|c| c.served.contains(group)).filter_map(|c| c.heard.get(group)).collect();
-        let decision = wait(lacking, &peers, now - self.online, now - g.progress);
+        let decision = wait(lacking, &peers, now - self.online.max(g.since), now - g.progress);
         g.urgent = if decision == Decision::Wait { lacking.clone() } else { Ranges::default() };
         decision
     }

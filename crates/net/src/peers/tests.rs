@@ -126,6 +126,16 @@ fn a_gate_opening_sends_the_group_at_once() {
     assert_eq!(hellos(&p.poll(1_500)), vec![(key(1), vec![2])]);
 }
 
+/// A member that just joined a group has dialed its members only now: it waits as one that just came online.
+#[test]
+fn a_group_just_joined_waits_for_dials_before_a_loss() {
+    let mut p = Peers::new(0);
+    p.connect(key(1), served(&[]), 0);
+    p.group(id(G), own(G, 10, r(&[(1, 9)]), r(&[(10, 10)])), 60_000);
+    assert_eq!(p.wait(&id(G), &r(&[(10, 10)]), 60_000 + ONLINE - 1), Decision::Wait);
+    assert_eq!(p.wait(&id(G), &r(&[(10, 10)]), 60_000 + ONLINE), Decision::Lose(r(&[(10, 10)])));
+}
+
 /// A joiner takes none of the summaries members send it as they apply its Add, before its Welcome comes: its own first
 /// summary of the group draws theirs again, once.
 #[test]

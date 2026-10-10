@@ -48,7 +48,8 @@ pub fn convergence(t: &Trace) -> Result<(), String> {
 
 /// A member loses a counted position, never one of its own messages, only:
 /// - at its own removal, of its current or prior epoch;
-/// - by applying the commit that deletes the keys of the position's epoch, no sooner than 3 seconds after it came online,
+/// - by applying the commit that deletes the keys of the position's epoch, no sooner than 3 seconds after it came online
+///   or joined,
 ///   while no connected member's latest summary on the current connection held the position or was fetching it, or after
 ///   10 seconds without progress (no summary or ciphertext of the group, no new connection);
 /// - or because no member could open the position at all.
@@ -95,7 +96,12 @@ fn deletion(t: &Trace, m: usize, group: &Bytes, p: u64, epoch: u64) -> bool {
         _ => None,
     });
     let Some(at) = applied else { return false };
-    let up = t.0.iter().take_while(|o| o.at <= at).filter(|o| matches!(o.what, What::Up { m: j } if j == m)).map(|o| o.at).last().unwrap_or(0);
+    let online = |o: &&crate::trace::Obs| match &o.what {
+        What::Up { m: j } => *j == m,
+        What::Joined { m: j, group: g, .. } => *j == m && g == group,
+        _ => false,
+    };
+    let up = t.0.iter().take_while(|o| o.at <= at).filter(online).map(|o| o.at).last().unwrap_or(0);
     at >= up + ONLINE_WAIT && (!covered(t, m, group, p, at) || stalled(t, m, group, at))
 }
 
