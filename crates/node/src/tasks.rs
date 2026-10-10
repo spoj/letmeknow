@@ -38,6 +38,44 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub async fn start_on(provider: P, config: Config, network: Network) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let transport = network.transport();
         let leaf = Leaf { key: Bytes(transport.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone(), revision: REVISION };
+        let clients = logs::Clients::new(transport);
+        let state = State::open(provider, &config, leaf, &clients)?;
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let (work, work_rx) = mpsc::unbounded_channel();
+        let (outbox, outbox_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(Inner {
+            state: Mutex::new(state),
+            net: OnceLock::new(),
+            clients,
+            follows: Mutex::default(),
+            relay: config.relay.clone(),
+            file_limit: config.file_limit,
+            kinds: config.kinds,
+            events,
+            work,
+            outbox,
+            durable: config.durable,
+            observe: config.observe,
+            committing: tokio::sync::Mutex::new(()),
+            advanced: tokio::sync::Notify::new(),
+            reading: Mutex::default(),
+            sending: Mutex::default(),
+            passing: Mutex::default(),
+            timers: Mutex::default(),
+            tasks: Mutex::default(),
+            contradictions: Mutex::default(),
+        });
+        let net_config = lmk_net::Config { home: config.home, files: config.files, disk: config.disk, file_limit: config.file_limit, collect: COLLECT };
+        let (net, net_events) = Net::spawn(network, net_config, inner.clone(), Arc::new(admission::Admitter(inner.clone()))).await?;
+        inner.net.set(net).ok();
+        inner.run(net_events, work_rx, outbox_rx);
+        Ok((Node { inner }, events_rx))
+    }
+}
+
+impl<P: Provider> State<P> {
+    /// The session in `provider`, created on first use, with its leaf as `leaf`; its logs, groups and device keys.
+    fn open(provider: P, config: &Config, leaf: Leaf, clients: &logs::Clients) -> Result<Self> {
         let mut session = match provider.get(b"session")? {
             Some(_) => Session::load(&provider)?,
             None => Session::create(&provider, &config.name, leaf.clone())?,
@@ -45,7 +83,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         if session.leaf != leaf {
             session.set_leaf(&provider, leaf)?;
         }
-        let clients = logs::Clients::new(transport);
         let logs = State::load_logs(&provider)?;
         for log in logs.values() {
             if let Some(chain) = &log.chain {
@@ -59,9 +96,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             let heard = peering::load_heard(&provider, &gid.0)?;
             groups.insert(gid.0, G::new(mls, rec, heard));
         }
-        let (events, events_rx) = mpsc::unbounded_channel();
-        let (work, work_rx) = mpsc::unbounded_channel();
-        let (outbox, outbox_rx) = mpsc::unbounded_channel();
         let mut state = State {
             provider,
             out: Vec::new(),
@@ -89,40 +123,21 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
             state.refresh(&gid);
         }
-        let inner = Arc::new(Inner {
-            state: Mutex::new(state),
-            net: OnceLock::new(),
-            clients,
-            follows: Mutex::default(),
-            relay: config.relay.clone(),
-            file_limit: config.file_limit,
-            kinds: config.kinds,
-            events,
-            work: work.clone(),
-            outbox,
-            durable: config.durable,
-            observe: config.observe,
-            committing: tokio::sync::Mutex::new(()),
-            advanced: tokio::sync::Notify::new(),
-            reading: Mutex::default(),
-            sending: Mutex::default(),
-            passing: Mutex::default(),
-            timers: Mutex::default(),
-            tasks: Mutex::default(),
-            contradictions: Mutex::default(),
-        });
-        let net_config = lmk_net::Config {
-            home: config.home,
-            files: config.files,
-            disk: config.disk,
-            file_limit: config.file_limit,
-            collect: COLLECT,
-        };
-        let (net, mut net_events) =
-            Net::spawn(network, net_config, inner.clone(), Arc::new(admission::Admitter(inner.clone()))).await?;
-        inner.net.set(net).ok();
-        let peering = inner.clone();
-        inner.spawn(async move {
+        Ok(state)
+    }
+}
+
+impl<P: Provider + Send + 'static> Inner<P> {
+    /// Starts the tasks, follows the logs, and picks up where the session stopped: its key logs replayed, its groups
+    /// it was removed from told, its pending sends appended.
+    fn run(
+        self: &Arc<Self>,
+        mut net_events: mpsc::UnboundedReceiver<lmk_net::Event>,
+        work: mpsc::UnboundedReceiver<Work>,
+        outbox: mpsc::UnboundedReceiver<Vec<Out>>,
+    ) {
+        let peering = self.clone();
+        self.spawn(async move {
             while let Some(event) = net_events.recv().await {
                 match event {
                     lmk_net::Event::Fetched(hash) => peering.fetched_file(hash),
@@ -130,45 +145,36 @@ impl<P: Provider + Send + 'static> Node<P> {
                 }
             }
         });
-        inner.spawn(inner.clone().drive(work_rx));
-        inner.spawn(inner.clone().send_out(outbox_rx));
-        let followed: Vec<Vec<u8>> = inner.lock().logs.keys().cloned().collect();
+        self.spawn(self.clone().drive(work));
+        self.spawn(self.clone().send_out(outbox));
+        let followed: Vec<Vec<u8>> = self.lock().logs.keys().cloned().collect();
         for log in &followed {
-            inner.follow(log);
+            self.follow(log);
         }
-        {
-            let mut st = inner.lock();
-            let identities: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
-                logs::Of::Identity(id) => Some(id.clone()),
-                _ => None,
-            }).collect();
-            for id in identities {
-                if let Err(error) = inner.keyed(&mut st, &id.0) {
-                    inner.warn(None, format!("the key log of {}: {error:#}", hex(&id.0)));
-                }
+        let mut st = self.lock();
+        let identities: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
+            logs::Of::Identity(id) => Some(id.clone()),
+            _ => None,
+        }).collect();
+        for id in identities {
+            if let Err(error) = self.keyed(&mut st, &id.0) {
+                self.warn(None, format!("the key log of {}: {error:#}", hex(&id.0)));
             }
         }
-        {
-            // A session removed by a commit it applied before it stopped is told so now; its sends go on. A group its
-            // log's reading dropped meanwhile is gone already.
-            let st = inner.lock();
-            for (gid, g) in &st.groups {
-                if !g.mls.active() {
-                    inner.work.send(Work::Gone(gid.clone())).ok();
-                    continue;
-                }
-                if !g.rec.sends.is_empty() {
-                    inner.work.send(Work::Send(gid.clone())).ok();
-                }
+        // A session removed by a commit it applied before it stopped is told so now; its sends go on. A group its log's
+        // reading dropped meanwhile is gone already.
+        for (gid, g) in &st.groups {
+            if !g.mls.active() {
+                self.work.send(Work::Gone(gid.clone())).ok();
+            } else if !g.rec.sends.is_empty() {
+                self.work.send(Work::Send(gid.clone())).ok();
             }
         }
-        inner.spawn(inner.clone().resume());
-        inner.spawn(inner.clone().polling());
-        Ok((Node { inner }, events_rx))
+        drop(st);
+        self.spawn(self.clone().resume());
+        self.spawn(self.clone().polling());
     }
-}
 
-impl<P: Provider + Send + 'static> Inner<P> {
     /// Sends what steps produced, in order, once it is durable.
     async fn send_out(self: Arc<Self>, mut outbox: mpsc::UnboundedReceiver<Vec<Out>>) {
         while let Some(out) = outbox.recv().await {
