@@ -126,17 +126,24 @@ fn covered(t: &Trace, m: usize, group: &Bytes, p: u64, at: u64) -> bool {
     latest.iter().any(|((_, conn), (held, fetching))| open(*conn) && (held.contains(&p) || fetching.contains(&p)))
 }
 
-/// Whether nothing of the group reached a member, and no connection opened to it, in the 10 seconds before `at`.
+/// Whether no ciphertext of the group and no summary unlike the one before on its connection reached a member, and no
+/// connection opened to it, in the 10 seconds before `at`.
 fn stalled(t: &Trace, m: usize, group: &Bytes, at: u64) -> bool {
-    !t.0.iter().any(|o| {
-        o.at > at.saturating_sub(STALL)
-            && o.at <= at
-            && match &o.what {
-                What::In { m: j, conn, group: g, frame: Frame::Hello { .. } | Frame::Messages { .. }, .. } => *j == m && g == group && delivered(t, *conn, o.at),
-                What::Connected { a, b, .. } => *a == m || *b == m,
-                _ => false,
+    let mut last: BTreeMap<usize, &Frame> = BTreeMap::new();
+    let mut progress = false;
+    for o in t.0.iter().take_while(|o| o.at <= at) {
+        let recent = o.at > at.saturating_sub(STALL);
+        match &o.what {
+            What::In { m: j, conn, group: g, frame: frame @ Frame::Hello { .. }, .. } if *j == m && g == group && delivered(t, *conn, o.at) => {
+                let changed = last.insert(*conn, frame) != Some(frame);
+                progress |= recent && changed;
             }
-    })
+            What::In { m: j, conn, group: g, frame: Frame::Messages { .. }, .. } => progress |= recent && *j == m && g == group && delivered(t, *conn, o.at),
+            What::Connected { a, b, .. } => progress |= recent && (*a == m || *b == m),
+            _ => {}
+        }
+    }
+    !progress
 }
 
 #[cfg(test)]
@@ -197,6 +204,10 @@ mod tests {
         assert!(loss_allowed(&trace(closed)).is_ok(), "no longer connected");
         let stalled = [base(), vec![hello(4_000, 1, &[2])], lose(14_001)].concat();
         assert!(loss_allowed(&trace(stalled)).is_ok(), "10 seconds without progress");
+        let again = [base(), vec![hello(4_000, 1, &[2]), hello(5_000, 1, &[2])], lose(14_500)].concat();
+        assert!(loss_allowed(&trace(again)).is_ok(), "the same summary again is no progress");
+        let changed = [base(), vec![hello(4_000, 1, &[2]), hello(5_000, 1, &[2, 3])], lose(14_500)].concat();
+        assert!(loss_allowed(&trace(changed)).is_err());
         let fetching = [base(), vec![(4_000, What::In { m: 1, from: 0, conn: 1, group: g(), frame: Frame::Hello { head: 9, held: ps(&[]), fetching: ps(&[2]) } })], lose(5_000)].concat();
         assert!(loss_allowed(&trace(fetching)).is_err(), "a carrier still fetching it");
     }
