@@ -2,7 +2,6 @@
 //! certificate; their logs are in a folder. The CLI talks to them over their command channels.
 
 use anyhow::Result;
-use clap::Parser;
 use iroh::tls::CaTlsConfig;
 use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
 use lmk_proto::group::Service;
@@ -15,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::cli::{Cli, Command, Request, session_dir};
+use crate::cli::{Command, Request, session_dir};
 use crate::session::Config;
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -89,24 +88,45 @@ impl World {
 
     /// A session process in the home `device`.
     async fn start_in(&self, device: &str, handle: &str, hold: Duration) -> Agent {
-        let home = self.root.join(device);
-        let config = Config {
+        let name = handle[..1].to_uppercase() + &handle[1..];
+        self.launch(Config { hold, ..self.config(device, handle, Some(&name)) }, usize::MAX).await
+    }
+
+    /// A session's configuration, in the home `device`, with `listen --name name`.
+    fn config(&self, device: &str, handle: &str, name: Option<&str>) -> Config {
+        Config {
             handle: handle.into(),
-            dir: session_dir(&home, handle).unwrap(),
-            name: handle[..1].to_uppercase() + &handle[1..],
-            hold,
+            dir: session_dir(&self.root.join(device), handle).unwrap(),
+            name: name.map(str::to_owned),
+            hold: HOUR,
             keep_log: false,
             membership: self.membership(),
             plugins: self.plugins.clone(),
-        };
+        }
+    }
+
+    /// A session process; writing the message after its first `messages` fails, as when its reader is gone.
+    async fn launch(&self, config: Config, messages: usize) -> Agent {
+        let home = config.dir.parent().unwrap().parent().unwrap().to_path_buf();
+        let handle = config.handle.clone();
         let (out, events) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel::<()>();
         let (network, at) = (self.network.clone(), home.clone());
         let done = tokio::task::spawn_local(async move {
-            let print = move |line: String| drop(out.send(line));
+            let mut written = 0;
+            let print = move |line: String| {
+                if serde_json::from_str::<Value>(&line).unwrap()["type"] == "message" {
+                    written += 1;
+                    if written > messages {
+                        return Err(std::io::ErrorKind::BrokenPipe.into());
+                    }
+                }
+                drop(out.send(line));
+                Ok(())
+            };
             crate::listen(config, &at, network, print, async { drop(stopped.await) }).await.unwrap();
         });
-        let mut agent = Agent { handle: handle.into(), home, events, stop: Some(stop), done: Some(done) };
+        let mut agent = Agent { handle, home, events, stop: Some(stop), done: Some(done) };
         let ready = agent.expect("ready").await;
         assert_eq!(keys(&ready), keys(&json!({ "type": 0, "session": 0, "member": 0, "state": 0 })));
         agent
@@ -117,7 +137,7 @@ impl Agent {
     async fn cmd(&self, args: &[&str]) -> Result<Value> {
         let home = self.home.to_str().unwrap();
         let base = ["letmeknow", "--home", home, "--session", self.handle.as_str()];
-        let cli = Cli::try_parse_from(base.iter().chain(args))?;
+        let cli = crate::cli::parse(base.iter().chain(args))?;
         let request = match cli.command {
             Command::Request(request) => request,
             Command::Kind(mut args) => Request::Kind { kind: args.remove(0), args, cwd: String::new() },
@@ -168,7 +188,8 @@ fn keys(value: &Value) -> BTreeSet<String> {
 }
 
 fn local<F: std::future::Future>(test: F) -> F::Output {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    // As main runs them: the sessions' own work on this thread, the rest on others.
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
     tokio::task::LocalSet::new().block_on(&runtime, test)
 }
 
@@ -359,6 +380,14 @@ fn membership_changes_wake_and_a_removed_session_is_told() {
         let names: Vec<&str> = members["members"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["Alice", "Bob"]);
         assert_eq!(members["members"][1]["you"], true);
+        let other = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
+        assert_eq!(alice.cmd(&["status"]).await.unwrap()["groups"].as_array().unwrap().len(), 2);
+        for named in ["Release", group.as_str()] {
+            let status = alice.cmd(&["status", &format!("--group={named}")]).await.unwrap();
+            assert_eq!(status["groups"].as_array().unwrap().iter().map(|g| &g["group"]).collect::<Vec<_>>(), [group.as_str()]);
+        }
+        assert!(alice.cmd(&["status", "--group", "nope"]).await.unwrap_err().to_string().contains("unknown group nope"));
+        alice.cmd(&["leave", &format!("--group={other}")]).await.unwrap();
         assert!(alice.cmd(&["remove", "Carol"]).await.is_err());
         alice.cmd(&["remove", "Bob"]).await.unwrap();
         let left = alice.expect("left").await;
@@ -583,7 +612,15 @@ fn the_command_channel_needs_its_token_and_a_running_session() {
         let mut line = String::new();
         tokio::io::BufReader::new(read).read_line(&mut line).await.unwrap();
         assert!(line.contains("bad token"));
+        // Sessions killed long ago left their endpoints; on Windows each refused connection takes seconds.
+        for i in 0..5 {
+            let dir = session_dir(&alice.home, &format!("fake{i}")).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("endpoint"), r#"{"port":1,"token":"x"}"#).unwrap();
+        }
+        let finding = std::time::Instant::now();
         assert_eq!(crate::cli::running_session(&alice.home).await.unwrap(), "alice");
+        assert!(finding.elapsed() < Duration::from_secs(1), "{:?}", finding.elapsed());
         let missing = Agent { handle: "nobody".into(), home: alice.home.clone(), events: mpsc::unbounded_channel().1, stop: None, done: None };
         let error = missing.cmd(&["groups"]).await.unwrap_err().to_string();
         assert!(error.contains("not running"), "{error}");
@@ -622,7 +659,7 @@ fn a_session_of_an_identity_joins_a_group_open_to_it() {
         let tablet = world.start("tablet", HOUR).await;
         let link = bob.cmd(&["invite", "--identity", "Robert"]).await.unwrap();
         assert!(link["link"].as_str().unwrap().contains("#3.d."));
-        assert!(tablet.cmd(&["join", link["link"].as_str().unwrap()]).await.unwrap()["device"].is_string());
+        assert!(tablet.cmd(&["identity", "join", link["link"].as_str().unwrap()]).await.unwrap()["device"].is_string());
         let opened = alice.cmd(&["open", "Bob (Acme)"]).await.unwrap();
         assert_eq!(opened["settings"]["open"][0]["name"], "Bob (Acme)");
         let mut groups = tablet.cmd(&["groups"]).await.unwrap();
@@ -675,7 +712,12 @@ fn identities_are_created_listed_and_lose_devices() {
         let invite = alice.cmd(&["invite", "--identity", "Alice Smith"]).await.unwrap();
         assert!(invite["link"].as_str().unwrap().contains("#3.d."));
         let phone = world.start("phone", HOUR).await;
-        let joined = phone.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        let refused = phone.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap_err().to_string();
+        assert!(refused.contains("letmeknow identity join <link>"), "{refused}");
+        let group = alice.cmd(&["invite"]).await.unwrap();
+        let refused = phone.cmd(&["identity", "join", group["link"].as_str().unwrap()]).await.unwrap_err().to_string();
+        assert!(refused.contains("not a device link"), "{refused}");
+        let joined = phone.cmd(&["identity", "join", invite["link"].as_str().unwrap()]).await.unwrap();
         assert!(joined["device"].is_string());
         assert_eq!(phone.cmd(&["identity", "list"]).await.unwrap()["identities"][0]["name"], "Alice Smith");
         let listed = alice.cmd(&["identity", "list"]).await.unwrap();
@@ -765,7 +807,10 @@ fn a_kinds_commands_pass_through_and_a_session_without_its_plugin_is_refused() {
         let alice = world.start("alice", HOUR).await;
         world.plugins = Vec::new();
         let bob = world.start("bob", HOUR).await;
-        let invite = alice.cmd(&["invite", "--kind", "doc"]).await.unwrap();
+        // Both find the doc plugin stopped; it starts once.
+        let (invite, other) = tokio::join!(alice.cmd(&["invite", "--kind", "doc"]), alice.cmd(&["invite", "--kind", "doc"]));
+        let (invite, other) = (invite.unwrap(), other.unwrap());
+        alice.cmd(&["leave", &format!("--group={}", other["group"].as_str().unwrap())]).await.unwrap();
         let error = bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap_err();
         assert!(format!("{error:#}").contains("does not support doc groups"), "{error:#}");
         let error = bob.cmd(&["invite", "--kind", "doc"]).await.unwrap_err();
@@ -863,17 +908,9 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
         second.cmd(&["open", "Alice"]).await.unwrap();
         let groups = first.cmd(&["groups"]).await.unwrap();
         assert_eq!((groups[0]["group"].as_str(), groups[0]["joined"].as_bool()), (invite["group"].as_str(), Some(false)));
-        // Once the first stops, the second acts for the device.
+        // Once the first stops, the second acts for the device, from its next command on.
         first.stop().await;
-        let mut listed = second.cmd(&["identity", "list"]).await;
-        for _ in 0..60 {
-            if listed.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            listed = second.cmd(&["identity", "list"]).await;
-        }
-        assert_eq!(listed.unwrap()["identities"][0]["name"], "Alice");
+        assert_eq!(second.cmd(&["identity", "list"]).await.unwrap()["identities"][0]["name"], "Alice");
         assert!(second.printed().await.iter().all(|e| e["type"] != "warning"));
     });
 }
@@ -960,5 +997,70 @@ fn git_pushes_count_in_the_groups_log_in_order() {
         assert!(refused.contains("no other member online took the push's bundle"), "{refused}");
         let tips = alice.cmd(&["git", "list", &group, "--push"]).await.unwrap();
         assert_eq!(tips["refs"]["refs/heads/main"], second.as_str(), "the push did not count");
+    });
+}
+
+/// A session whose reader is gone stops at the first line it cannot write; started again, it prints the messages after
+/// the last it printed, once, and not those catch-up left out.
+#[test]
+fn a_session_stops_once_it_cannot_print_and_prints_the_rest_when_started_again() {
+    local(async {
+        let world = world("output").await;
+        let (mut alice, bob, _) = pair(&world, HOUR).await;
+        alice.stop().await;
+        let mut sent = Vec::new();
+        for i in 0..25 {
+            sent.push(bob.cmd(&["send", "--urgent", &format!("m{i}")]).await.unwrap()["id"].clone());
+        }
+        let mut alice = world.launch(world.config("alice", "alice", None), 1).await;
+        assert_eq!(alice.expect("omitted").await["count"], 5);
+        assert_eq!(alice.expect("message").await["id"], sent[5]);
+        tokio::time::timeout(Duration::from_secs(30), alice.done.take().unwrap()).await.unwrap().unwrap();
+        let mut alice = world.start("alice", HOUR).await;
+        for id in &sent[6..] {
+            assert_eq!(alice.expect("message").await["id"], *id);
+        }
+        alice.stop().await;
+        let mut alice = world.start("alice", HOUR).await;
+        assert!(alice.printed().await.iter().all(|e| e["type"] != "message" && e["type"] != "omitted"));
+    });
+}
+
+/// A session resumes with the name it was created with; another name is refused.
+#[test]
+fn a_session_resumes_with_its_name() {
+    local(async {
+        let world = world("name").await;
+        let mut alice = world.start("alice", HOUR).await;
+        alice.stop().await;
+        let mut alice = world.launch(world.config("alice", "alice", None), usize::MAX).await;
+        alice.cmd(&["invite"]).await.unwrap();
+        assert_eq!(alice.cmd(&["members"]).await.unwrap()["members"][0]["name"], "Alice");
+        alice.stop().await;
+        let renamed = world.config("alice", "alice", Some("Other"));
+        let error = crate::listen(renamed, &alice.home, world.network.clone(), |_| Ok(()), async {}).await.unwrap_err();
+        assert!(error.to_string().contains("this session is named \"Alice\""), "{error}");
+    });
+}
+
+/// A join that waits on a member who never answers holds up none of the session's other work.
+#[test]
+fn a_session_goes_on_while_a_join_waits() {
+    local(async {
+        let world = world("busy").await;
+        let (alice, mut bob, group) = pair(&world, HOUR).await;
+        let link = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap().to_owned();
+        let mut invite = lmk_proto::links::Invite::parse(&link).unwrap();
+        invite.members[0].key = *iroh::SecretKey::generate().public().as_bytes();
+        let (home, handle) = (bob.home.clone(), bob.handle.clone());
+        let join = lmk_client::Request::Join { target: invite.link(), args: Vec::new(), cwd: String::new(), as_: None };
+        let joining = tokio::task::spawn_local(async move { crate::cli::call(&home, &handle, Request::Client(join)).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let started = std::time::Instant::now();
+        bob.cmd(&["status"]).await.unwrap();
+        alice.cmd(&["send", "@bob still there?"]).await.unwrap();
+        assert_eq!(bob.expect("message").await["content"], "@bob still there?");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(!joining.is_finished(), "the join still waits");
     });
 }

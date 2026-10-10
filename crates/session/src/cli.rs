@@ -1,19 +1,22 @@
 //! The `letmeknow` command line: `listen` runs a session process; most other commands are requests to it, over a
 //! localhost port guarded by a token.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::session::Inbound;
 use lmk_client::{IdentityOp, is_folder};
+use lmk_proto::links::Invite;
 
 /// End-to-end encrypted chats and documents for agents and their people.
 #[derive(Parser)]
@@ -137,6 +140,14 @@ pub enum Request {
     /// A command of a kind's plugin, from `letmeknow <kind> <args>...`.
     #[command(skip)]
     Kind { kind: String, args: Vec<String>, cwd: String },
+    /// `identity join <link>`: sent as the client's `join`.
+    #[command(skip)]
+    #[serde(skip)]
+    IdentityJoin { link: String },
+    /// `status --group <group>`: the client's `status`, of that group only.
+    #[command(skip)]
+    #[serde(skip)]
+    Status { group: String },
     #[command(flatten)]
     #[serde(untagged)]
     Client(lmk_client::Request),
@@ -153,6 +164,34 @@ struct Endpoint {
 struct Call {
     token: String,
     request: Request,
+}
+
+/// Parses a command line. `identity join` and `status --group` are this command line's, beside the client core's
+/// commands.
+pub fn parse<T: Into<OsString> + Clone>(args: impl IntoIterator<Item = T>) -> Result<Cli, clap::Error> {
+    let join = clap::Command::new("join")
+        .about("Add this device to an identity, through a device link (`invite --identity` makes them)")
+        .arg(clap::Arg::new("link").value_name("LINK").required(true));
+    let group = clap::Arg::new("group").long("group").value_name("GROUP").help("Only this group");
+    let mut matches = Cli::command()
+        .mut_subcommand("identity", |identity| identity.subcommand(join))
+        .mut_subcommand("status", |status| status.arg(group))
+        .try_get_matches_from(args)?;
+    let request = match matches.subcommand() {
+        Some(("identity", identity)) => {
+            identity.subcommand_matches("join").and_then(|join| join.get_one::<String>("link")).map(|link| Request::IdentityJoin { link: link.clone() })
+        }
+        Some(("status", status)) => status.get_one::<String>("group").map(|group| Request::Status { group: group.clone() }),
+        _ => None,
+    };
+    match request {
+        Some(request) => Ok(Cli {
+            session: matches.get_one::<String>("session").cloned(),
+            home: matches.get_one::<PathBuf>("home").cloned(),
+            command: Command::Request(request),
+        }),
+        None => Cli::from_arg_matches_mut(&mut matches),
+    }
 }
 
 pub fn home_dir(home: Option<PathBuf>) -> Result<PathBuf> {
@@ -191,13 +230,19 @@ pub fn new_handle(home: &Path) -> Result<String> {
     }
 }
 
+/// How long finding the running session waits for each to answer: on Windows a refused connection takes seconds.
+const PROBE: Duration = Duration::from_millis(200);
+
 pub async fn running_session(home: &Path) -> Result<String> {
-    let mut running = Vec::new();
+    let mut probes = tokio::task::JoinSet::new();
     for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
-        if connect(&entry.path().join("endpoint")).await.is_ok() {
-            running.push(entry.file_name().to_string_lossy().into_owned());
-        }
+        probes.spawn(async move {
+            let answered = tokio::time::timeout(PROBE, connect(&entry.path().join("endpoint"))).await;
+            matches!(answered, Ok(Ok(_))).then(|| entry.file_name().to_string_lossy().into_owned())
+        });
     }
+    let mut running: Vec<String> = probes.join_all().await.into_iter().flatten().collect();
+    running.sort();
     match running.as_slice() {
         [session] => Ok(session.clone()),
         [] => bail!("no session is running; start one with `letmeknow listen`"),
@@ -248,6 +293,24 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
 /// Sends a request to the running session and returns its answer. Files the request names are read, or made absolute,
 /// here, and a kind's arguments go with this directory: the session process runs elsewhere.
 pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Value> {
+    if let Request::Client(lmk_client::Request::Join { target, .. }) = &request {
+        ensure!(
+            !Invite::parse(target.trim()).is_ok_and(|invite| invite.device),
+            "that is a device link, which adds this device to an identity: to do that, run `letmeknow identity join <link>`"
+        );
+    }
+    let mut only = None;
+    match request {
+        Request::IdentityJoin { link } => {
+            ensure!(Invite::parse(link.trim())?.device, "that is not a device link; `invite --identity` makes them");
+            request = Request::Client(lmk_client::Request::Join { target: link, args: Vec::new(), cwd: String::new(), as_: None })
+        }
+        Request::Status { group } => {
+            only = Some(group);
+            request = Request::Client(lmk_client::Request::Status);
+        }
+        _ => {}
+    }
     if let Request::Send { text, attach, attach_name, .. } = &mut request {
         if let Some(file) = attach {
             let (bytes, name) = match file.as_str() {
@@ -286,7 +349,21 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     let channel = connect(&session_dir(home, session)?.join("endpoint"))
         .await
         .with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen`"))?;
-    exchange(channel, request).await
+    let mut answer = exchange(channel, request).await?;
+    if let Some(group) = only {
+        let groups = answer["groups"].as_array_mut().context("status lists groups")?;
+        groups.retain(|g| g["group"] == group.as_str() || g["name"] == group.as_str());
+        match groups.len() {
+            0 => bail!("unknown group {group}"),
+            1 => {}
+            _ => bail!("several groups are named {group}; pass its id"),
+        }
+        // The warning counts the sends held only here in every group.
+        if groups[0]["only_here"] == json!([]) {
+            answer.as_object_mut().context("status is an object")?.remove("warning");
+        }
+    }
+    Ok(answer)
 }
 
 /// Sends a request over a command channel and returns its answer.
