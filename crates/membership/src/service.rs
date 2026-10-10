@@ -1,7 +1,7 @@
 //! The membership service over iroh: `membership` streams on the `letmeknow/1` ALPN.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -17,7 +17,7 @@ use lmk_proto::{
 };
 use lmk_transport::{Conn, IrohConnection, RecvStream, SendStream};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::store::Store;
@@ -50,7 +50,52 @@ pub struct Service(Arc<Inner>);
 struct Inner {
     store: Store,
     policy: Policy,
-    notices: broadcast::Sender<Arc<Notice>>,
+    subscribers: Mutex<Subscribers>,
+}
+
+/// How many notices a subscription may fall behind before it is dropped; its client subscribes again and reads.
+const LAG: usize = 1024;
+
+/// The subscriptions, by id, and the ids subscribed to each log: an append wakes only its log's.
+#[derive(Default)]
+struct Subscribers {
+    next: u64,
+    senders: HashMap<u64, mpsc::Sender<Arc<Notice>>>,
+    logs: HashMap<Bytes, HashSet<u64>>,
+}
+
+impl Subscribers {
+    fn add(&mut self, sender: mpsc::Sender<Arc<Notice>>) -> u64 {
+        self.next += 1;
+        self.senders.insert(self.next, sender);
+        self.next
+    }
+
+    fn set(&mut self, id: u64, logs: Vec<Bytes>) {
+        for subscribed in self.logs.values_mut() {
+            subscribed.remove(&id);
+        }
+        if self.senders.contains_key(&id) {
+            for log in logs {
+                self.logs.entry(log).or_default().insert(id);
+            }
+        }
+        self.logs.retain(|_, subscribed| !subscribed.is_empty());
+    }
+
+    fn remove(&mut self, id: u64) {
+        self.senders.remove(&id);
+        self.set(id, Vec::new());
+    }
+
+    fn notify(&mut self, notice: Arc<Notice>) {
+        let ids: Vec<u64> = self.logs.get(&notice.log).into_iter().flatten().copied().collect();
+        for id in ids {
+            if self.senders[&id].try_send(notice.clone()).is_err() {
+                self.remove(id);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Service {
@@ -65,7 +110,7 @@ impl Service {
         let service = Service(Arc::new(Inner {
             store,
             policy,
-            notices: broadcast::channel(1024).0,
+            subscribers: Mutex::default(),
         }));
         let weak = Arc::downgrade(&service.0);
         tokio::spawn(async move {
@@ -94,22 +139,22 @@ impl Service {
             return Ok(());
         };
         match request {
-            Request::Append { log, entry } => {
-                let answer = if entry.0.len() > policy.max_entry {
+            Request::Append { log, entries } => {
+                let answer = if entries.iter().any(|entry| entry.0.len() > policy.max_entry) {
                     refused("size")
-                } else if log.0.len() > policy.max_log_id {
+                } else if log.0.len() > policy.max_log_id || entries.is_empty() {
                     refused("policy")
                 } else if !appends.lock().unwrap().take(policy.appends_per_minute) {
                     refused("rate")
                 } else {
-                    let appended = store.append(&log.0, &entry.0)?;
-                    let notice = Notice {
-                        log,
-                        position: appended.position,
-                        entry,
-                        head: appended.head.clone(),
-                    };
-                    let _ = self.0.notices.send(Arc::new(notice));
+                    let appended = store.append(&log.0, &entries)?;
+                    let last = appended.position + entries.len() as u64 - 1;
+                    let mut subscribers = self.0.subscribers.lock().unwrap();
+                    for (position, entry) in (appended.position..).zip(entries) {
+                        // Each notice's head covers its own entry, as a read of it would.
+                        let head = if position == last { appended.head.clone() } else { store.head_at(&log.0, position)? };
+                        subscribers.notify(Arc::new(Notice { log: log.clone(), position, entry, head }));
+                    }
                     Answer::Ok(appended)
                 };
                 frame::write(&mut send, &answer).await?;
@@ -136,26 +181,41 @@ impl Service {
         Ok(())
     }
 
-    async fn subscribe(&self, mut send: SendStream, mut recv: RecvStream, logs: Vec<Bytes>) -> Result<()> {
-        let mut notices = self.0.notices.subscribe();
-        let mut logs: HashSet<Bytes> = logs.into_iter().collect();
-        let (requests, mut changes) = mpsc::channel(1);
+    async fn subscribe(&self, send: SendStream, mut recv: RecvStream, logs: Vec<Bytes>) -> Result<()> {
+        let (sender, notices) = mpsc::channel(LAG);
+        let id = {
+            let mut subscribers = self.0.subscribers.lock().unwrap();
+            let id = subscribers.add(sender);
+            subscribers.set(id, logs);
+            id
+        };
+        let (requests, changes) = mpsc::channel(1);
         tokio::spawn(async move {
             while let Ok(request) = frame::read_known::<Request, _>(&mut recv).await
                 && requests.send(request).await.is_ok()
             {}
         });
+        let served = self.notices(id, send, notices, changes).await;
+        self.0.subscribers.lock().unwrap().remove(id);
+        served
+    }
+
+    async fn notices(
+        &self,
+        id: u64,
+        mut send: SendStream,
+        mut notices: mpsc::Receiver<Arc<Notice>>,
+        mut changes: mpsc::Receiver<Request>,
+    ) -> Result<()> {
         loop {
             tokio::select! {
                 biased;
-                notice = notices.recv() => {
-                    let notice = notice?;
-                    if logs.contains(&notice.log) {
-                        frame::write(&mut send, &*notice).await?;
-                    }
-                }
+                notice = notices.recv() => match notice {
+                    Some(notice) => frame::write(&mut send, &*notice).await?,
+                    None => anyhow::bail!("the subscription fell behind"),
+                },
                 request = changes.recv() => match request {
-                    Some(Request::Subscribe { logs: new }) => logs = new.into_iter().collect(),
+                    Some(Request::Subscribe { logs }) => self.0.subscribers.lock().unwrap().set(id, logs),
                     Some(_) => anyhow::bail!("only subscribe on a subscription"),
                     None => return Ok(()),
                 },

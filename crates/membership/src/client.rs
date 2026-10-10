@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{Chain, Membership, Refused, Subscription, chain::Chains};
+use crate::{Chain, Membership, Refused, Subscription, Unreached, chain::Chains};
 
 #[derive(Clone)]
 pub struct ServeClient(Arc<Inner>);
@@ -70,7 +70,8 @@ impl ServeClient {
     }
 
     async fn request<T: DeserializeOwned>(&self, request: Request) -> Result<T> {
-        let (mut send, mut recv) = self.connection().await?.open_bi().await?;
+        let connection = self.connection().await.map_err(|error| Unreached(format!("{error:#}")))?;
+        let (mut send, mut recv) = connection.open_bi().await?;
         frame::write(
             &mut send,
             &Open {
@@ -123,15 +124,11 @@ impl ServeClient {
 
 #[async_trait]
 impl Membership for ServeClient {
-    async fn append(&self, log: &[u8], entry: &[u8]) -> Result<Appended> {
-        let appended: Appended = self
-            .request(Request::Append {
-                log: log.into(),
-                entry: entry.into(),
-            })
-            .await?;
+    async fn append(&self, log: &[u8], entries: &[Vec<u8>]) -> Result<Appended> {
+        let entries: Vec<Bytes> = entries.iter().map(|entry| Bytes(entry.clone())).collect();
+        let appended: Appended = self.request(Request::Append { log: log.into(), entries: entries.clone() }).await?;
         let after = appended.position.checked_sub(1).context("appended at position 0")?;
-        self.0.chains.page(log, after, &[entry.into()], &appended.head)?;
+        self.0.chains.page(log, after, &entries, &appended.head)?;
         Ok(appended)
     }
 

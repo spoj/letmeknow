@@ -126,32 +126,30 @@ impl FolderClient {
 
 #[async_trait]
 impl Membership for FolderClient {
-    async fn append(&self, log: &[u8], entry: &[u8]) -> Result<Appended> {
+    /// Appends each entry in turn: another writer's may come between them. Answers the first one's position.
+    async fn append(&self, log: &[u8], entries: &[Vec<u8>]) -> Result<Appended> {
         let dir = self.log_dir(log);
         std::fs::create_dir_all(&dir)?;
-        let tmp = dir.join(format!(".{:016x}.tmp", rand::random::<u64>()));
-        std::fs::write(&tmp, entry)?;
-        let mut position = last(&dir)? + 1;
-        // A hard link is an exclusive create that also makes the whole entry appear at once.
-        let linked = loop {
-            match std::fs::hard_link(&tmp, entry_path(&dir, position)) {
-                Err(err) if err.kind() == ErrorKind::AlreadyExists => position += 1,
-                linked => break linked,
-            }
-        };
-        std::fs::remove_file(&tmp)?;
-        linked?;
-        self.page(log, position - 1)?;
-        let hash = self
-            .0
-            .chains
-            .get(log)
-            .and_then(|c| c.hash_at(position))
-            .expect("read back");
-        Ok(Appended {
-            position,
-            head: unsigned(log, position, hash),
-        })
+        let mut positions = Vec::new();
+        for entry in entries {
+            let tmp = dir.join(format!(".{:016x}.tmp", rand::random::<u64>()));
+            std::fs::write(&tmp, entry)?;
+            let mut position = last(&dir)? + 1;
+            // A hard link is an exclusive create that also makes the whole entry appear at once.
+            let linked = loop {
+                match std::fs::hard_link(&tmp, entry_path(&dir, position)) {
+                    Err(err) if err.kind() == ErrorKind::AlreadyExists => position += 1,
+                    linked => break linked,
+                }
+            };
+            std::fs::remove_file(&tmp)?;
+            linked?;
+            positions.push(position);
+        }
+        let (first, last) = (positions[0], positions[positions.len() - 1]);
+        self.page(log, last - 1)?;
+        let hash = self.0.chains.get(log).and_then(|c| c.hash_at(last)).expect("read back");
+        Ok(Appended { position: first, head: unsigned(log, last, hash) })
     }
 
     async fn read(&self, log: &[u8], after: u64) -> Result<Page> {
@@ -169,8 +167,8 @@ impl Membership for FolderClient {
 
     async fn subscribe(&self, logs: Vec<Bytes>) -> Result<Subscription> {
         let (wake, mut woken) = mpsc::unbounded_channel();
-        let mut watcher = notify::recommended_watcher(move |_| {
-            let _ = wake.send(());
+        let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            let _ = wake.send(event.map(|event| event.paths).unwrap_or_default());
         })?;
         let mut next = HashMap::new();
         for log in logs {
@@ -189,11 +187,17 @@ impl Membership for FolderClient {
             let _watcher = watcher;
             let mut poll = tokio::time::interval(Duration::from_secs(2));
             loop {
-                tokio::select! {
-                    _ = poll.tick() => {}
-                    Some(()) = woken.recv() => {}
-                }
-                for (log, after) in &mut next {
+                // A change wakes only the logs whose folders it touched; the poll, every log.
+                let touched: Option<Vec<PathBuf>> = tokio::select! {
+                    _ = poll.tick() => None,
+                    Some(paths) = woken.recv() => Some(paths),
+                };
+                let woke = |log: &Bytes| {
+                    let name = hex::encode(&log.0);
+                    let in_folder = |path: &PathBuf| path.parent().and_then(|dir| dir.file_name()).is_some_and(|dir| *dir == *name);
+                    touched.as_ref().is_none_or(|paths| paths.iter().any(in_folder))
+                };
+                for (log, after) in next.iter_mut().filter(|(log, _)| woke(log)) {
                     loop {
                         let page = match client.page(&log.0, *after) {
                             Ok(page) if page.entries.is_empty() => break,

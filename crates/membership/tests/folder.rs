@@ -34,7 +34,7 @@ async fn concurrent_writers() {
                 let mut positions = Vec::new();
                 for i in 0..25 {
                     let entry = format!("{w}-{i}");
-                    positions.push((client.append(b"g", entry.as_bytes()).await.unwrap().position, entry));
+                    positions.push((client.append(b"g", &[entry.as_bytes().to_vec()]).await.unwrap().position, entry));
                 }
                 positions
             })
@@ -61,10 +61,10 @@ async fn concurrent_writers() {
 async fn subscribe_and_tamper() {
     let dir = folder("subscribe");
     let (alice, bob) = (FolderClient::new(&dir), FolderClient::new(&dir));
-    bob.append(b"g", b"before").await.unwrap();
+    bob.append(b"g", &[b"before".to_vec()]).await.unwrap();
     let mut notices = alice.subscribe(vec![Bytes(b"g".to_vec())]).await.unwrap();
-    bob.append(b"g", b"one").await.unwrap();
-    bob.append(b"g", b"two").await.unwrap();
+    bob.append(b"g", &[b"one".to_vec()]).await.unwrap();
+    bob.append(b"g", &[b"two".to_vec()]).await.unwrap();
     for (position, entry) in [(2, b"one"), (3, b"two")] {
         let notice = tokio::time::timeout(Duration::from_secs(5), notices.next())
             .await
