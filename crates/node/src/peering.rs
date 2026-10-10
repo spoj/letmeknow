@@ -286,7 +286,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let ours = |s: &Summary| s.head.log == s.group && st.groups.contains_key(&s.group.0);
             let groups: Vec<Summary> = groups.into_iter().filter(|s| ours(s) && self.vouched(st, &s.head, &peer)).collect();
             for heard in st.peers.frame(&key, &Frame::Hello { groups: groups.clone(), heads }, now) {
+                let group = heard.summary.group.clone();
                 st.hear(heard)?;
+                self.events.send(Event::Heard { group }).ok();
             }
             for summary in groups {
                 let gid = summary.group.0;
@@ -407,11 +409,28 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(self.members(gid)?.into_iter().filter(away).collect())
     }
 
-    /// This session's own counted positions within H that no other member's summary shows held, but an away one's.
+    /// This session's own counted positions within H that no other member's summary shows held, but an away one's;
+    /// less those before every other member's start, which none of them can hold.
     pub fn only_here(&self, gid: &[u8]) -> Result<Ranges> {
-        let since = self.carried_since(gid)?;
-        let held = self.heard(gid)?.iter().filter(|h| h.at >= since).fold(Ranges::default(), |held, h| held.union(&h.held));
-        Ok(self.inner.lock().group(gid)?.rec.own.difference(&held))
+        let (since, others) = (self.carried_since(gid)?, self.members(gid)?.len() - 1);
+        let st = self.inner.lock();
+        let g = st.group(gid)?;
+        let summaries: Vec<&peers::Heard> = g.heard.values().filter(|h| endpoint_id(&h.peer.0).is_some_and(|peer| st.in_leaf(gid, &peer).is_some())).collect();
+        let start = |h: &&peers::Heard| {
+            let covered = h.summary.held.union(&h.summary.read).union(&h.summary.fetching);
+            covered.first().unwrap_or(h.summary.head.length + 1)
+        };
+        let first = summaries.iter().map(start).min().filter(|first| *first > 0 && summaries.len() == others);
+        let before = first.map_or_else(Ranges::default, |first| Ranges::range(0, first - 1));
+        let held = summaries.iter().filter(|h| h.at >= since).fold(Ranges::default(), |held, h| held.union(&h.summary.held));
+        Ok(g.rec.own.difference(&held).difference(&before))
+    }
+
+    /// The positions of the group this session read, as its summaries carry them.
+    pub fn read(&self, gid: &[u8]) -> Result<Ranges> {
+        let st = self.inner.lock();
+        st.group(gid)?;
+        Ok(st.own(gid).read)
     }
 
     /// Marks positions of the group read, as its client showed or printed them: its summaries carry them.

@@ -143,6 +143,8 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 .who { font-weight: 600; }
 .meta .who { font-size: var(--t-md); }
 .tag { color: var(--warn); font-weight: 600; }
+.ticks { color: var(--muted); display: block; text-align: right; }
+.event .ticks { display: inline; }
 .level { font-weight: 400; }
 .level.verified { color: var(--accent); }
 .status { font-size: var(--t-sm); }

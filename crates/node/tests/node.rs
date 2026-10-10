@@ -134,7 +134,7 @@ fn settings(kind: &str, folder: &Path) -> Settings {
 }
 
 fn message(text: &str) -> Value {
-    serde_json::to_value(ChatMessage { content: text.into(), after: vec![], to: vec![], reply_to: None, urgent: false, attachment: None }).unwrap()
+    serde_json::to_value(ChatMessage { content: text.into(), read: Default::default(), to: vec![], reply_to: None, urgent: false, attachment: None }).unwrap()
 }
 
 /// A new identity, its key log on `membership`, with a first device called laptop: the identity, its key, and the

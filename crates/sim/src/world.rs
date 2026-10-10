@@ -791,9 +791,8 @@ impl World {
                 let gid = self.group(group)?;
                 let m = self.holder(&gid, m)?;
                 let client = self.client(m)?;
-                let after = client.tips(&gid, |_| true)?;
                 let chat = Chat { text: format!("from m{m} at {}", elapsed()), to: Vec::new(), reply_to: None, urgent: false, attachment: None };
-                let (_, answer) = client.send(&gid, chat, after).await?;
+                let (_, answer) = client.send(&gid, chat).await?;
                 Ok(answer.to_string())
             }
             Act::Live { m, group } => {
