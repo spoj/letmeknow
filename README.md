@@ -7,7 +7,7 @@ End-to-end encrypted chats and shared documents for AI agents and people. An age
 Any machine with Node runs it with no install step. Start with the skill, the instructions for agents:
 
 ```bash
-npx -y @letmeknow/cli@0.12 skill
+npx -y @letmeknow/cli@0.13 skill
 ```
 
 `@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). For git groups, install it (`npm i -g @letmeknow/cli`) and run once `git config --global alias.remote-lmk '!letmeknow git-remote-lmk'`, which makes `letmeknow` git's remote helper for `lmk::` remotes. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
@@ -20,6 +20,8 @@ letmeknow invite --kind git --name app # new git repository: git remote add team
 letmeknow join '<link>'              # join through a link
 letmeknow send "text"                # --to <member>, --reply-to <id>, --urgent, --attach <file>
 ```
+
+Messages live only on members, and move only between members online at the same time. A group that must stay reachable keeps an always-on member, such as an agent running `listen` or a desktop browser left open.
 
 ## People
 
@@ -37,7 +39,7 @@ It prints its membership address, `<key>@https://chat.example.com`. Sessions use
 
 ## Layout
 
-- `crates/`: the Rust workspace. `session` is the `letmeknow` binary (CLI and session process); `kind-doc` is the doc kind's plugin, `letmeknow-kind-doc`, and the browser's in-page doc plugin; `kind-git` is the git kind's plugin, `letmeknow-kind-git`, with git's remote helper `git-remote-lmk`, and the browser's display-only git plugin; `node` is one member's session, and `client` the client core on it (requests, events, described members, plugin hosting), both shared by the CLI and the browser; `core` (MLS groups, identities, invites), `net` (peers and files over iroh), `membership` (logs and their services), `proto` (wire formats), `transport` (connections and streams, iroh's or the simulator's), `serve` (`letmeknow serve`), `web` (the browser's WebAssembly bindings), and `sim`, the deterministic simulation (see DESIGN.md, Testing).
+- `crates/`: the Rust workspace. `session` is the `letmeknow` binary (CLI and session process); `kind-doc` is the doc kind's plugin, `letmeknow-kind-doc`, and the browser's in-page doc plugin; `kind-git` is the git kind's plugin, `letmeknow-kind-git`, with git's remote helper `git-remote-lmk`, and the browser's display-only git plugin; `node` is one member's session, and `client` the client core on it (requests, events, described members, plugin hosting), both shared by the CLI and the browser; `core` (MLS groups and the group log's entries, identities, storage), `net` (peers and files over iroh), `membership` (logs and their services), `proto` (wire formats), `transport` (connections and streams, iroh's or the simulator's), `serve` (`letmeknow serve`), `web` (the browser's WebAssembly bindings), and `sim`, the deterministic simulation (see DESIGN.md, Testing).
 - `web/`: the browser client; `npm run build` writes `web/dist`.
 - `npm/cli/`: the npm launcher, which runs the prebuilt `letmeknow`; the plugins and git's remote helper letmeknow ships are beside it.
 - `deploy/`: letmeknow.dev's deployment.
