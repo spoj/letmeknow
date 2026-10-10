@@ -115,10 +115,32 @@ impl<P: Provider + Send + 'static> Session<P> {
     }
 }
 
-fn folder(test: &str) -> PathBuf {
+/// A test's folder, deleted when the test ends.
+struct Folder(PathBuf);
+
+impl std::ops::Deref for Folder {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Folder {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Folder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn folder(test: &str) -> Folder {
     let dir = std::env::temp_dir().join(format!("lmk-node-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    dir
+    Folder(dir)
 }
 
 fn settings(kind: &str, folder: &Path) -> Settings {

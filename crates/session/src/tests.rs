@@ -27,6 +27,12 @@ struct World {
     plugins: Vec<PathBuf>,
 }
 
+impl Drop for World {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 /// Where cargo builds the workspace's binaries, the doc and git plugins among them: beside this test's own directory.
 fn built() -> PathBuf {
     let dir = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
@@ -225,10 +231,14 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
 fn held_messages_print_once_the_hold_runs_out() {
     local(async {
         let world = world("hold").await;
-        let (mut alice, bob, _) = pair(&world, Duration::from_secs(2)).await;
+        let hold = Duration::from_secs(2);
+        let (mut alice, bob, _) = pair(&world, hold).await;
+        // A command of Alice's prints what she holds, so that her hold starts at Bob's message.
+        alice.cmd(&["status"]).await.unwrap();
+        let sending = std::time::Instant::now();
         bob.cmd(&["send", "fyi"]).await.unwrap();
-        assert!(alice.printed().await.iter().all(|e| e["type"] != "message"));
         assert_eq!(alice.expect("message").await["content"], "fyi");
+        assert!(sending.elapsed() >= hold, "printed after {:?}", sending.elapsed());
     });
 }
 

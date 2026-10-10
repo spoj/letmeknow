@@ -36,6 +36,12 @@ struct Net {
     dir: PathBuf,
 }
 
+impl Drop for Net {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 async fn net(name: &str) -> Net {
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert = ck.cert.der().clone();
