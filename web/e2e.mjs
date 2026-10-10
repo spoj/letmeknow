@@ -21,6 +21,7 @@ const check = (condition, message) => {
 const local = link => SITE + new URL(link).pathname + new URL(link).hash;
 
 const natives = [];
+let passed = false;
 /** A native session in a home of its own: its own device. */
 function native(name) {
   const env = { ...process.env, LETMEKNOW_HOME: join(tmp, name) };
@@ -323,6 +324,23 @@ try {
     doc.group
   );
   check(recorded, "the browser keeps its doc as the doc plugin's record");
+  const stored = await laptop.evaluate(
+    id =>
+      new Promise((resolve, reject) => {
+        const open = indexedDB.open("lmk");
+        open.onsuccess = () => {
+          const records = open.result.transaction("records").objectStore("records");
+          const bytes = id.match(/../g).map(byte => parseInt(byte, 16));
+          const at = prefix => records.get(new Uint8Array([...new TextEncoder().encode(prefix), ...bytes]));
+          const [timeline, node] = [at("lmk/web/message/"), at("lmk/node/message/")];
+          const content = record => record.result && JSON.parse(new TextDecoder().decode(record.result)).payload.content;
+          node.onsuccess = () => resolve([content(timeline), content(node)]);
+          node.onerror = () => reject(node.error);
+        };
+      }),
+    hello
+  );
+  check(stored[0] === "hello from the terminal" && stored[1] === "", "the browser's timeline keeps the messages it showed, and the session forgets their text");
   await laptop.reload();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.getByText("hello from the terminal", { exact: true }).waitFor();
@@ -544,6 +562,7 @@ try {
   await laptop.locator(".group-list button", { hasText: "Plans" }).waitFor();
   check(true, "and opens the app offline, groups and all");
   console.log("browser ok");
+  passed = true;
 } catch (error) {
   for (const [name, page] of Object.entries(pages)) await page.screenshot({ path: join(tmp, `${name}.png`) });
   console.log(`screenshots in ${tmp}`);
@@ -551,4 +570,6 @@ try {
 } finally {
   await browser.close();
   for (const proc of natives) proc.kill();
+  // A failed run keeps its homes and screenshots.
+  if (passed) rmSync(tmp, { recursive: true, force: true, maxRetries: 10 });
 }

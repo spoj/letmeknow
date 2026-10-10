@@ -86,4 +86,5 @@ fn a_doc_in_a_file_its_commands_and_its_comparisons() {
     assert!(!dir.join("state").join("g1.yjs").exists());
     drop(plugin.stdin);
     assert!(plugin.child.wait().unwrap().success());
+    std::fs::remove_dir_all(dir).unwrap();
 }

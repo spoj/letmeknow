@@ -72,6 +72,8 @@ struct Record {
     stopped: Option<u64>,
     /// When this device made or joined the group, which orders its identities.
     since: u64,
+    /// A new key this device sent the group, by its public key, and its message's position, until the key log names it.
+    sent: Option<(Bytes, u64)>,
 }
 
 /// A held message of a devices group.
@@ -214,7 +216,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
             openings: Vec::new(),
             rest: Map::new(),
         };
-        self.save(&gid.0, &Record { book: Some(book), since: now(), stopped: None })?;
+        self.save(&gid.0, &Record { book: Some(book), since: now(), stopped: None, sent: None })?;
         self.node.follow_log(&gid.0, Some(0))?;
         Ok(identity)
     }
@@ -326,6 +328,12 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let _passing = self.passing.lock().await;
         let Some(book) = self.record(gid).book else { return Ok(()) };
         let log = self.node.read_key_log(&book.identity).await?;
+        if self.record(gid).sent.is_some_and(|(key, _)| log.keys.iter().any(|named| named[..] == key.0[..])) {
+            let _lock = self.lock.lock().unwrap();
+            let mut record = self.record(gid);
+            record.sent = None;
+            self.save(gid, &record)?;
+        }
         self.node.read_group(gid).await?;
         let members = self.node.members(gid)?;
         if members.iter().any(|m| log.dropped(&m.key.0)) {
@@ -343,25 +351,38 @@ impl<P: Provider + Send + 'static> Devices<P> {
         if listed == current && !due {
             return Ok(());
         }
-        let next = if left || due { self.new_key(gid, &book, &log).await? } else { *log.current() };
-        // The design appends an entry naming a new key only once another device's summary holds its key message, or at
-        // once when no other device is listed. Until the peer protocol brings summaries, it does once the message's entry
-        // counts, as `new_key` returns.
+        let (next, sent) = if left || due { self.new_key(gid, &book, &log).await? } else { (*log.current(), None) };
+        // A new key this device made is named only once another device holds it, unless no other device is listed.
+        let me = self.node.key_in(gid);
+        let sent = sent.or_else(|| self.record(gid).sent.filter(|(key, _)| key.0[..] == next[..]).map(|(_, position)| position));
+        if let Some(position) = sent
+            && listed.iter().any(|device| device.key != me)
+            && !self.held(gid, position)?
+        {
+            return Ok(());
+        }
         self.node.append_identity(&book.identity, &log.next(&seed, &next, listed)).await?;
         Ok(())
     }
 
     /// A key the key log has not taken, made in the group's current epoch, so that no device removed before it holds
-    /// it: one this device or another made already, or else a new one, sent to the group first.
-    async fn new_key(&self, gid: &[u8], book: &Book, log: &KeyLog) -> Result<[u8; 32]> {
+    /// it: one this device or another made already, or else a new one, sent to the group first, with its message's
+    /// position.
+    async fn new_key(&self, gid: &[u8], book: &Book, log: &KeyLog) -> Result<([u8; 32], Option<u64>)> {
         let epoch = self.node.epoch(gid)?;
         let made = book.keys.iter().filter(|(_, _, made)| *made == epoch).filter_map(|(seed, ..)| Some(public(seed.0.as_slice().try_into().ok()?)));
         if let Some(key) = made.into_iter().find(|key| !log.keys.contains(key)) {
-            return Ok(key);
+            return Ok((key, None));
         }
         let seed = lmk_core::random::<32>();
-        self.enter(gid, Entry::Key { key: Bytes(seed.to_vec()), at: now(), epoch }).await?;
-        Ok(public(&seed))
+        let position = self.node.send_counted(gid, &serde_json::to_value(Entry::Key { key: Bytes(seed.to_vec()), at: now(), epoch })?).await?;
+        Ok((public(&seed), Some(position)))
+    }
+
+    /// Whether another device's summary holds the message at `position`.
+    fn held(&self, gid: &[u8], position: u64) -> Result<bool> {
+        let me = self.node.key_in(gid);
+        Ok(self.node.heard(gid)?.iter().any(|heard| heard.member.key != me && heard.held.contains(position)))
     }
 
     /// This device lacks the key the key log names: it asks each device online for the group's state, which carries the
@@ -434,6 +455,12 @@ impl<P: Provider + Send + 'static> Devices<P> {
                 self.due(&gid.0);
                 Ok(())
             }
+            Event::Heard { .. } => {
+                if self.record(&gid.0).sent.is_some_and(|(_, position)| self.held(&gid.0, position).unwrap_or(false)) {
+                    self.due(&gid.0);
+                }
+                Ok(())
+            }
             Event::Joined { .. } | Event::Left { .. } | Event::Warning { .. } => return Some(event),
             _ => Ok(()),
         };
@@ -490,7 +517,14 @@ impl<P: Provider + Send + 'static> Devices<P> {
             };
             book.position = entry.position;
             match serde_json::from_value(entry.payload) {
-                Ok(Entry::Key { key, at, epoch }) => book.take_keys(vec![(key, at, epoch)]),
+                Ok(Entry::Key { key, at, epoch }) => {
+                    if entry.from.key == me
+                        && let Ok(seed) = key.0.as_slice().try_into()
+                    {
+                        record.sent = Some((Bytes(public(&seed).to_vec()), entry.position));
+                    }
+                    book.take_keys(vec![(key, at, epoch)]);
+                }
                 Ok(Entry::Contact { identity, contact }) => {
                     book.contacts.retain(|(id, _)| *id != identity);
                     book.contacts.push((identity, contact));

@@ -18,6 +18,7 @@ fn its_groups_carry_chat() {
     assert_eq!(answer, json!({ "type": "answer", "id": 0, "answer": { "chat": true } }));
     drop(stdin);
     child.wait().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A state whose bundle arrives after this session took a newer state is not taken.

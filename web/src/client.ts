@@ -16,8 +16,8 @@ export type Identity = {
   warning?: string;
   error?: string;
   new_device?: string;
-  /** Who vouched for it, and as whom; letmeknow 0.12 recorded one, its introducer's label. */
-  introduced?: { by: Person; name: string }[] | { by: string; name: string };
+  /** Who vouched for it, and as whom. */
+  introduced?: { by: Person; name: string }[];
 };
 export type Person = { fp: string; name: string; device: string; you?: boolean; identity?: Identity; added_by?: { name?: string; how: string }; away?: boolean };
 export type Named = { id: string; name: string };

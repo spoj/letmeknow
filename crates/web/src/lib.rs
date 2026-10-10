@@ -9,13 +9,13 @@
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use js_sys::{Array, Function, Promise, Uint8Array};
-use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Introduction, Request, fp, message_id, service};
+use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Request, fp, message_id, service};
 use lmk_node::devices::Devices;
 use lmk_node::lmk_core::crypto::{Crypto, Rand};
 use lmk_node::lmk_core::device::Device;
@@ -36,6 +36,8 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 /// Others' files larger than this are fetched only when asked, and kept only in memory, until the page closes.
 const FILE_LIMIT: u64 = 25 << 20;
+/// How long the browser's timeline keeps a message, in milliseconds.
+const HISTORY: u64 = 90 * 24 * 3600 * 1000;
 /// The kinds the browser supports: chat, and those of its in-page plugins.
 const DOC: &str = "doc";
 const GIT: &str = "git";
@@ -256,15 +258,6 @@ struct Config {
     membership: String,
 }
 
-/// An introduction as letmeknow 0.12 kept it, in the record `web/introductions`, by identity id.
-#[derive(Deserialize)]
-struct Kept012 {
-    name: String,
-    /// The introducer's label.
-    by: String,
-    by_id: Bytes,
-}
-
 struct App {
     client: Client<Store>,
     store: Store,
@@ -360,7 +353,6 @@ impl App {
         let (client, mut told) = Client::new(node, client_config, Access::Here(devices), Arc::new(plugins), written);
         let (tried, failed) = Default::default();
         let app = Rc::new(App { client, store, membership, idb, kept, on_event, tried, failed });
-        app.take_introductions()?;
         let told_app = app.clone();
         spawn_local(async move {
             while let Some(event) = told.recv().await {
@@ -378,6 +370,9 @@ impl App {
             }
         });
         app.client.start().await;
+        for gid in app.client.node().groups() {
+            app.keep(&gid.0)?;
+        }
         app.flush();
         app.join_openings();
         let io_app = app.clone();
@@ -417,16 +412,6 @@ impl App {
             }
         });
         Ok(app)
-    }
-
-    /// Hands the client the introductions that letmeknow 0.12 kept in this browser's own record.
-    fn take_introductions(&self) -> Result<()> {
-        let Some(kept) = get::<HashMap<String, Kept012>>(&self.store, b"web/introductions")? else { return Ok(()) };
-        for (id, introduction) in kept {
-            let by = Described { name: Some(introduction.by), ..Described::default() };
-            self.client.add_introduction(Introduction { identity: Bytes(unb64(&id)?), name: introduction.name, by, by_id: introduction.by_id })?;
-        }
-        self.store.delete(b"web/introductions")
     }
 
     /// Joins, once each, the groups open to this browser's identities; one that fails waits for a click.
@@ -496,7 +481,11 @@ impl App {
             }
             ClientEvent::Removed { group, by } => self.emit(json!({ "type": "removed", "group": group, "by": by.and_then(|by| by.name) })),
             ClientEvent::Gone { group } => {
-                for kind in ["timeline", "settings"] {
+                let stored: Vec<(Bytes, u64)> = get(&self.store, &key("messages", &group.0))?.unwrap_or_default();
+                for (id, _) in stored {
+                    self.store.delete(&key("message", &id.0))?;
+                }
+                for kind in ["timeline", "settings", "messages"] {
                     self.store.delete(&key(kind, &group.0))?;
                 }
             }
@@ -512,6 +501,7 @@ impl App {
                 self.emit(json!({ "type": "introduced", "group": group }));
             }
             ClientEvent::Message { group, id, missing, .. } => {
+                self.keep(&group.0)?;
                 if !missing.is_empty() {
                     self.remember(&group.0, &json!({ "type": "missing", "at": now(), "positions": missing }))?;
                 }
@@ -521,7 +511,10 @@ impl App {
                 self.remember(&group.0, &json!({ "type": "lost", "at": now(), "member": member, "positions": positions, "ids": ids }))?;
                 self.emit(json!({ "type": "lost", "group": group }));
             }
-            ClientEvent::Sent { group, id, .. } => self.emit(json!({ "type": "sent", "group": group, "id": id })),
+            ClientEvent::Sent { group, id, answered, .. } => {
+                self.keep(&group.0)?;
+                self.emit(json!({ "type": "sent", "group": group, "id": id, "answered": answered }));
+            }
             ClientEvent::Heard { group } => self.emit(json!({ "type": "heard", "group": group })),
             ClientEvent::File { hash } => self.emit(json!({ "type": "file", "hash": hash })),
             ClientEvent::Plugin { group, kind, mut event, .. } => {
@@ -546,6 +539,32 @@ impl App {
         let mut timeline: Vec<Value> = get(&self.store, &key("timeline", gid))?.unwrap_or_default();
         timeline.push(item.clone());
         put(&self.store, &key("timeline", gid), &timeline)
+    }
+
+    /// Stores in a group's timeline the chat messages and leaves the node holds that it lacks, and drops those older
+    /// than `HISTORY`. The node then forgets the text of others' chat messages, which only the timeline keeps.
+    fn keep(&self, gid: &[u8]) -> Result<()> {
+        let node = self.client.node();
+        let mut stored: Vec<(Bytes, u64)> = get(&self.store, &key("messages", gid))?.unwrap_or_default();
+        let before = now().saturating_sub(HISTORY);
+        for (id, _) in stored.iter().filter(|(_, at)| *at < before) {
+            self.store.delete(&key("message", &id.0))?;
+        }
+        stored.retain(|(_, at)| *at >= before);
+        let ids: HashSet<Bytes> = stored.iter().map(|(id, _)| id.clone()).collect();
+        for mut message in node.messages(gid)? {
+            let chat = message.payload["type"] == "message";
+            if ids.contains(&message.id) || !(chat || message.payload["type"] == "leave") {
+                continue;
+            }
+            put(&self.store, &key("message", &message.id.0), &message)?;
+            stored.push((message.id.clone(), message.at));
+            if chat && message.sender.key != node.key() {
+                message.payload["content"] = json!("");
+                node.redact(&message.id.0, message.payload)?;
+            }
+        }
+        put(&self.store, &key("messages", gid), &stored)
     }
 
     fn remember_settings(&self, gid: &[u8]) -> Result<()> {
@@ -579,7 +598,7 @@ impl App {
         Ok(Value::Array(groups))
     }
 
-    /// A group's timeline: its held messages, the changes and losses this session saw, oldest first; then its sends
+    /// A group's timeline: the messages it stored, the changes and losses this session saw, oldest first; then its sends
     /// pending. Its own messages say which other members hold them (`held_by`), read them (`read_by`) or lost them
     /// (`lost_by`), and whether no other member's summary shows them held (`only_here`). `shown`: the page shows them,
     /// so they are read.
@@ -591,7 +610,13 @@ impl App {
         let mut items: Vec<Value> = get(&self.store, &key("timeline", &gid.0))?.unwrap_or_default();
         let losses: Vec<Value> = items.iter().filter(|item| item["type"] == "lost" && item["member"]["you"] != true).cloned().collect();
         items.retain(|item| item["type"] != "lost" || item["member"]["you"] == true);
-        let held = node.messages(&gid.0)?.into_iter().map(|message| (message.id, message.at, Some(message.position), message.sender, message.payload));
+        self.keep(&gid.0)?;
+        let stored: Vec<(Bytes, u64)> = get(&self.store, &key("messages", &gid.0))?.unwrap_or_default();
+        let mut messages = Vec::new();
+        for (id, _) in stored {
+            messages.extend(get::<lmk_node::Message>(&self.store, &key("message", &id.0))?);
+        }
+        let held = messages.into_iter().map(|message| (message.id, message.at, Some(message.position), message.sender, message.payload));
         let me = node.members(&gid.0)?.into_iter().find(|m| m.key == node.key());
         let pending = node.sending(&gid.0)?.into_iter().filter_map(|(id, payload)| Some((id, now(), None, me.clone()?, payload)));
         for (id, at, position, sender, payload) in held.chain(pending) {
@@ -734,6 +759,7 @@ impl Lmk {
         let attachment = file.map(|data| File { name: file_name.unwrap_or_default(), media_type: file_type.unwrap_or_default(), data });
         let reply_to = reply_to.map(|id| message_id(&id)).transpose().map_err(js)?;
         let (_, sent) = self.app.client.send(&gid, Chat { text: content, to, reply_to, urgent, attachment }).await.map_err(js)?;
+        self.app.keep(&gid.0).map_err(js)?;
         self.app.flush();
         Ok(sent.to_string())
     }

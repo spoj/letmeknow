@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, DeviceState, File, Introduction, Remote, message_id};
+use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, DeviceState, File, Remote, message_id};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::devices::Devices;
@@ -167,7 +167,6 @@ impl Session {
             catching_up: Some(Instant::now() + CATCH_UP_WINDOW),
             inbound,
         };
-        session.take_introductions()?;
         session.take_device().await?;
         let groups = session.client.node().groups();
         for gid in &groups {
@@ -188,25 +187,6 @@ impl Session {
             }
         }
         Ok(session)
-    }
-
-    /// Hands the client the introductions that letmeknow 0.12 kept in this session's own table.
-    fn take_introductions(&self) -> Result<()> {
-        let kept = self.db.query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'introductions'", [], |_| Ok(()));
-        if kept.optional()?.is_none() {
-            return Ok(());
-        }
-        let rows: Vec<(Vec<u8>, String, String, String)> = self
-            .db
-            .prepare("SELECT identity, by, name, ref FROM introductions")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-            .collect::<Result<_, _>>()?;
-        for (identity, by, name, reference) in rows {
-            let by_id = serde_json::from_value(serde_json::from_str::<Value>(&reference)?["by"].clone())?;
-            self.client.add_introduction(Introduction { identity: Bytes(identity), name, by: serde_json::from_str(&by)?, by_id })?;
-        }
-        self.db.execute("DROP TABLE introductions", [])?;
-        Ok(())
     }
 
     /// This session as the agent sees it in `ready`.

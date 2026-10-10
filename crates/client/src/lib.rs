@@ -128,8 +128,7 @@ pub trait Remote: Send + Sync {
 /// What a device's node publishes of its state.
 #[derive(Default, Serialize, Deserialize)]
 pub struct DeviceState {
-    /// The device's name; none as 0.12.1 published it.
-    #[serde(default)]
+    /// The device's name; none until a device's node publishes its state.
     pub device: Option<String>,
     pub identities: Vec<(IdentityRef, String)>,
     /// This device's key on each identity, by identity id.
@@ -185,8 +184,9 @@ pub enum ClientEvent {
     Message { group: Bytes, id: String, position: u64, missing: Vec<u64>, from: Described, payload: Value },
     /// Counted positions a member can no longer open: this client's own, or another member's of this client's messages.
     Lost { group: Bytes, member: Described, positions: Vec<u64>, ids: Vec<String> },
-    /// A send that `send` answered as pending counts now, at `position` in the group's log.
-    Sent { group: Bytes, id: String, position: u64 },
+    /// A send that `send` answered as pending, as `answered`, counts now, at `position` in the group's log, by its
+    /// final id, `id`.
+    Sent { group: Bytes, id: String, answered: String, position: u64 },
     /// A sync of the group's held messages with a member ended.
     Synced { group: Bytes },
     /// A member's summary of the group came: who holds and read what may have changed (`Client::receipts`).
@@ -938,7 +938,9 @@ impl<P: Provider + Send + 'static> Client<P> {
                 }
             }
             Event::Introduced { group, by, identity, name, how } => self.introduced(&group, &by, identity, name, how)?,
-            Event::Sent { group, id, position } => self.emit(ClientEvent::Sent { group, id: hex::encode(&id.0), position }),
+            Event::Sent { group, id, answered, position } => {
+                self.emit(ClientEvent::Sent { group, id: hex::encode(&id.0), answered: hex::encode(&answered.0), position })
+            }
             Event::File(hash) => {
                 let arrived: Vec<oneshot::Sender<()>> = {
                     let mut st = self.state();
@@ -1000,7 +1002,7 @@ impl<P: Provider + Send + 'static> Client<P> {
     }
 
     /// Records an introduction, in place of the introducer's earlier one of the same identity.
-    pub fn add_introduction(&self, introduction: Introduction) -> Result<()> {
+    fn add_introduction(&self, introduction: Introduction) -> Result<()> {
         self.change_introductions(|introductions| {
             introductions.retain(|i| i.identity != introduction.identity || i.by.fp != introduction.by.fp);
             introductions.push(introduction);
@@ -1064,7 +1066,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         let Ok(state) = self.device_state() else { return Vec::new() };
         let mut failed = Vec::new();
         for identity in self.inner.node.spoken() {
-            // A state that names the device was published by a device's node; none is published before one first runs.
+            // None is published before the device's node first runs.
             if state.device.is_some()
                 && !state.identities.iter().any(|(own, _)| own.id == identity.id)
                 && let Err(error) = self.leave_as(&identity.id).await

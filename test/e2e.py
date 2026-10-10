@@ -213,6 +213,7 @@ def main():
         subprocess.run([shutil.which("npm"), "run", "build"], cwd=WEB, check=True)
     server = serve()
     listeners = []
+    passed = False
     try:
         alice, bob, carol = (Listener(s) for s in ("alice", "bob", "carol"))
         listeners += [alice, bob, carol]
@@ -345,10 +346,17 @@ def main():
         if BROWSER and subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=WEB, env={**ENV, "URL": ENV["LETMEKNOW_RELAY"], "BIN": BIN}).returncode:
             sys.exit("FAIL: the browser test")
         print("all ok")
+        passed = True
     finally:
         for listener in listeners:
             listener.proc.kill()
         server.kill()
+        # A failed run keeps its sessions' logs.
+        if passed:
+            for listener in listeners:
+                listener.proc.wait()
+            server.wait()
+            shutil.rmtree(TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

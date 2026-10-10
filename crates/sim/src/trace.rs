@@ -80,8 +80,8 @@ pub enum What {
     Handed { m: usize, group: Bytes, kind: String, position: u64 },
     /// A chat message shown or printed, with the positions passed over before it.
     Shown { m: usize, group: Bytes, position: u64, missing: Positions },
-    /// A send that answered pending counted (the client's `sent`).
-    Sent { m: usize, group: Bytes, id: Bytes, position: u64 },
+    /// A send that answered pending, as `answered`, counted by its final id (the client's `sent`).
+    Sent { m: usize, group: Bytes, id: Bytes, answered: Bytes, position: u64 },
     /// A live payload taken, from a sender in an epoch.
     Live { m: usize, group: Bytes, sender: Key, epoch: u64 },
     /// A kind's state taken from a peer.

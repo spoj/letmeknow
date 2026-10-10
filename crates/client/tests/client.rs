@@ -137,10 +137,26 @@ async fn relay() -> (Server, CertificateDer<'static>) {
     (Server::spawn(config).await.unwrap(), cert)
 }
 
-fn logs(test: &str) -> std::path::PathBuf {
+/// A test's folder, deleted when the test ends.
+struct Folder(std::path::PathBuf);
+
+impl std::ops::Deref for Folder {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for Folder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn logs(test: &str) -> Folder {
     let dir = std::env::temp_dir().join(format!("lmk-client-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    dir
+    Folder(dir)
 }
 
 #[tokio::test(flavor = "multi_thread")]

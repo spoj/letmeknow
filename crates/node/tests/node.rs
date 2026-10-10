@@ -115,10 +115,32 @@ impl<P: Provider + Send + 'static> Session<P> {
     }
 }
 
-fn folder(test: &str) -> PathBuf {
+/// A test's folder, deleted when the test ends.
+struct Folder(PathBuf);
+
+impl std::ops::Deref for Folder {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Folder {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Folder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn folder(test: &str) -> Folder {
     let dir = std::env::temp_dir().join(format!("lmk-node-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    dir
+    Folder(dir)
 }
 
 fn settings(kind: &str, folder: &Path) -> Settings {
@@ -253,6 +275,36 @@ async fn any_member_admits_an_invite_once() {
     assert_eq!((member.name.as_str(), how, introduces), ("Erin", lmk_proto::group::How::Invite, false));
 }
 
+/// An invite dies when its inviter leaves the group, removed or by `leave`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invite_dies_when_its_inviter_leaves() {
+    use lmk_proto::links::Invite;
+    let relay = relay().await;
+    let dir = folder("inviter-left");
+    let mut alice = session(&relay, "Alice").await;
+    let (bob, carol) = (session(&relay, "Bob").await, session(&relay, "Carol").await);
+    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    let (by_bob, by_carol) = (bob.node.invite(&gid.0, None, None).await.unwrap(), carol.node.invite(&gid.0, None, None).await.unwrap());
+    let invites = || alice.node.messages(&gid.0).unwrap().iter().filter(|m| m.payload["type"] == "invite").count();
+    eventually("Alice holds both invites", || invites() == 4).await;
+
+    alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
+    carol.node.leave(&gid.0).await.unwrap();
+    eventually("Bob and Carol are out", || alice.node.members(&gid.0).unwrap().len() == 1).await;
+    let dave = session(&relay, "Dave").await;
+    let at_alice = lmk_proto::links::Address { key: alice.node.address().0, relay: Some(relay.url.to_string()) };
+    let ask_alice = |link: &Invite| Invite { members: vec![at_alice.clone()], ..link.clone() };
+    for link in [&by_bob, &by_carol] {
+        let refused = dave.node.join(&ask_alice(link), None).await.unwrap_err();
+        assert!(format!("{refused:#}").contains("its inviter left the group"), "{refused:#}");
+    }
+    alice.node.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() {
     let relay = relay().await;
@@ -336,6 +388,8 @@ async fn served<H: iroh::protocol::ProtocolHandler>(relay: &Relay, dir: &Path, s
 #[derive(Debug)]
 struct Gate {
     open: tokio::sync::watch::Sender<bool>,
+    /// The endpoints let through while it is shut.
+    spared: std::sync::Mutex<Vec<[u8; 32]>>,
     conns: std::sync::Mutex<Vec<iroh::endpoint::Connection>>,
     reached: tokio::sync::mpsc::UnboundedSender<Bytes>,
 }
@@ -343,7 +397,7 @@ struct Gate {
 impl Gate {
     fn new() -> (Arc<Gate>, UnboundedReceiver<Bytes>) {
         let (reached, reaching) = tokio::sync::mpsc::unbounded_channel();
-        (Arc::new(Gate { open: tokio::sync::watch::Sender::new(true), conns: Default::default(), reached }), reaching)
+        (Arc::new(Gate { open: tokio::sync::watch::Sender::new(true), spared: Default::default(), conns: Default::default(), reached }), reaching)
     }
 
     fn set(&self, open: bool) {
@@ -365,6 +419,9 @@ struct Gated {
 
 impl iroh::protocol::ProtocolHandler for Gated {
     async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
+        if self.gate.spared.lock().unwrap().contains(connection.remote_id().as_bytes()) {
+            return iroh::protocol::ProtocolHandler::accept(&self.service, connection).await;
+        }
         let mut open = self.gate.open.subscribe();
         {
             let mut conns = self.gate.conns.lock().unwrap();
@@ -806,12 +863,11 @@ async fn the_list_does_not_drop_a_device_just_linked() {
     assert_eq!(laptop.node.members(&gid.0).unwrap().len(), 3);
 }
 
-/// A device that missed the key message of the identity's current key reports the key lost while no device online has
-/// it, and gets it once one that has it is online.
+/// A new key reaches the key log only once another device's summary holds its key message.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_device_missing_the_current_key_asks_for_it_and_reports_it_lost() {
+async fn a_new_key_is_named_once_another_device_holds_it() {
     let relay = relay().await;
-    let dir = folder("missing-key");
+    let dir = folder("key-held");
     std::fs::create_dir_all(&dir).unwrap();
     let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
     let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
@@ -829,31 +885,66 @@ async fn a_device_missing_the_current_key_asks_for_it_and_reports_it_lost() {
     phone.node.shutdown().await.unwrap();
     drop((phone, phone_devices));
 
-    // Only the laptop sees the key message of the key that replaces the tablet's, then stops.
     laptop_devices.remove(&bob.id.0, &tablet_key.0).await.unwrap();
-    assert!(lists(&laptop.node, &bob, &["laptop", "phone"]).await.current() != &first);
-    laptop.node.shutdown().await.unwrap();
-    drop((laptop, laptop_devices));
+    let log = laptop.node.read_key_log(&bob).await.unwrap();
+    assert!(log.current() == &first && !log.dropped(&tablet_key.0), "no other device holds the new key yet");
 
-    let (mut phone, phone_devices) = stored_device(&relay, "phone", &dir.join("phone.db")).await;
-    let gid = devices_group(&phone.node);
-    phone_devices.duties(&gid.0).await.unwrap();
-    phone_devices.duties(&gid.0).await.unwrap();
-    phone.until(|e| matches!(e, Event::Warning { text, .. } if text.contains("does not hold its identity's current key")).then_some(())).await;
+    let (_phone, _phone_devices) = stored_device(&relay, "phone", &dir.join("phone.db")).await;
+    let log = lists(&laptop.node, &bob, &["laptop", "phone"]).await;
+    assert!(log.current() != &first && log.dropped(&tablet_key.0));
+}
 
-    // The laptop comes back: the phone asks it, holds the key, and so restates the list with its new name.
+/// A device that missed the key message of the identity's current key reports the key lost while no device online has
+/// it, and gets it once one that has it is online.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_missing_the_current_key_asks_for_it_and_reports_it_lost() {
+    let relay = relay().await;
+    let dir = folder("missing-key");
+    std::fs::create_dir_all(&dir).unwrap();
+    let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
+    let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
+    let (phone, phone_devices) = stored_device(&relay, "phone", &dir.join("phone.db")).await;
+    let (tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
+    let (desk, desk_devices) = stored_device(&relay, "desk", &dir.join("desk.db")).await;
+    let bob = laptop_devices.create("Bob", membership).await.unwrap();
+    for devices in [&phone_devices, &tablet_devices, &desk_devices] {
+        let link = lmk_proto::links::Invite::parse(&laptop_devices.invite(&bob.id.0).await.unwrap()).unwrap();
+        devices.join(&link).await.unwrap();
+        identified(devices).await;
+    }
+    let first = *lists(&laptop.node, &bob, &["desk", "laptop", "phone", "tablet"]).await.current();
+    let tablet_key = tablet_devices.key(&bob.id.0).unwrap();
+    tablet.node.shutdown().await.unwrap();
+    desk.node.shutdown().await.unwrap();
+    drop((desk, desk_devices));
+
+    // Only the laptop and the phone hold the key message of the key that replaces the tablet's, then stop.
+    laptop_devices.remove(&bob.id.0, &tablet_key.0).await.unwrap();
+    assert!(lists(&laptop.node, &bob, &["desk", "laptop", "phone"]).await.current() != &first);
+    for node in [&laptop.node, &phone.node] {
+        node.shutdown().await.unwrap();
+    }
+    drop((laptop, laptop_devices, phone, phone_devices));
+
+    let (mut desk, desk_devices) = stored_device(&relay, "desk", &dir.join("desk.db")).await;
+    let gid = devices_group(&desk.node);
+    desk_devices.duties(&gid.0).await.unwrap();
+    desk_devices.duties(&gid.0).await.unwrap();
+    desk.until(|e| matches!(e, Event::Warning { text, .. } if text.contains("does not hold its identity's current key")).then_some(())).await;
+
+    // The laptop comes back: the desk asks it, holds the key, and so restates the list with its new name.
     let (_laptop, _laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
-    phone_devices.rename("desk").await.unwrap();
+    desk_devices.rename("study").await.unwrap();
     tokio::time::timeout(WAIT, async {
         loop {
-            phone_devices.duties(&gid.0).await.unwrap();
-            let log = phone.node.read_key_log(&bob).await.unwrap();
-            if log.devices.iter().any(|device| device.name == "desk") {
+            desk_devices.duties(&gid.0).await.unwrap();
+            let log = desk.node.read_key_log(&bob).await.unwrap();
+            if log.devices.iter().any(|device| device.name == "study") {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-    }).await.expect("the phone takes the key and lists itself anew");
+    }).await.expect("the desk takes the key and lists itself anew");
 }
 
 /// A session whose leaf names an older revision writes its own as it starts.
@@ -1009,11 +1100,11 @@ async fn held_leave(test: &str, restart_leaver: bool) {
     } else {
         gate.set(true);
     }
-    let counted = bob.until(|e| match e {
-        Event::Sent { id, position, .. } => Some((id, position)),
+    let answered = bob.until(|e| match e {
+        Event::Sent { answered, .. } => Some(answered),
         _ => None,
     }).await;
-    assert_eq!(counted.0, sent.id, "Sent names the send as `leave` answered it");
+    assert_eq!(answered, sent.id, "Sent names the send as `leave` answered it");
     alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "Bob").then_some(())).await;
     assert_eq!(alice.node.members(&gid.0).unwrap().len(), 1);
     alice.node.shutdown().await.unwrap();
@@ -1065,6 +1156,37 @@ async fn a_pending_leave_is_finished_after_a_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pending_leave_is_finished_once_the_log_is_reachable() {
     held_leave("leave-reachable", false).await;
+}
+
+/// A pending send sealed again after a commit is reported sent by the id its members know it by.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_send_sealed_again_is_reported_by_its_final_id() {
+    let relay = relay().await;
+    let dir = folder("sealed-again");
+    let (gate, _reaching) = Gate::new();
+    let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
+    let (mut alice, mut bob) = (session(&relay, "Alice").await, session(&relay, "Bob").await);
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+
+    // Only Bob is kept from the log: his send is pending while Alice renames the group.
+    gate.spared.lock().unwrap().push(alice.node.address().0);
+    gate.set(false);
+    let sent = bob.node.send(&gid.0, &message("before the rename")).await.unwrap();
+    assert_eq!(sent.position, None, "the send is pending");
+    alice.node.change_settings(&gid.0, |s| Settings { name: "Release".into(), ..s }).await.unwrap();
+    gate.set(true);
+    let (id, answered) = bob.until(|e| match e {
+        Event::Sent { id, answered, .. } => Some((id, answered)),
+        _ => None,
+    }).await;
+    assert!(answered == sent.id && id != sent.id, "sealed again after the rename");
+    let got = alice.until(|e| match e {
+        Event::Message(message) => Some(message.id),
+        _ => None,
+    }).await;
+    assert_eq!(got, id);
 }
 
 /// Two members that leave at once: one's removal of the other wins, and the one left alone forgets the group.

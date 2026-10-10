@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, RelayUrl};
-use lmk_core::group::{self as core, Change, Group, key_package_credential, key_package_leaf};
+use lmk_core::group::{Change, Group, key_package_credential, key_package_leaf};
 use lmk_core::identity::Verdict;
 use lmk_core::provider::Provider;
 use lmk_net::Admit;
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::reading::Judged;
-use crate::{Event, INVITE_VALID, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, SNAPSHOT_WAIT, State, device_key_key, endpoint_id, get, now, put};
+use crate::{Event, G, INVITE_VALID, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, SNAPSHOT_WAIT, State, device_key_key, endpoint_id, get, now, put};
 
 /// How many members besides the inviter a link names, of those online that hold the invite's message.
 const LINK_MEMBERS: usize = 3;
@@ -209,14 +209,18 @@ fn address(key: [u8; 32], relay: &str) -> Address {
 const UNKNOWN: &str = "unknown, used or expired invite";
 const NOT_OPEN: &str = "it speaks as no identity the group is open to";
 
-/// Whether `g`, as it stands, admits a joiner by the invite with this hash and expiry, or else by an opening: checked
-/// when its request comes, and each time the commit that adds it is built.
-fn admits(g: &core::Group, joiner: &Credential, invite: &Option<(Bytes, u64)>) -> Result<()> {
+/// Whether `g`, as it stands, admits a joiner by an invite, or else by an opening: checked when its request comes, and
+/// each time the commit that adds it is built. An invite dies when its inviter leaves the group.
+fn admits(g: &G, joiner: &Credential, invite: &Option<Rule>) -> Result<()> {
+    let members = g.mls.members();
     match invite {
-        Some((hash, expires)) => ensure!(now() < *expires && !g.used(&hash.0), UNKNOWN),
-        None => ensure!(joiner.identity().is_some_and(|identity| g.settings().open.iter().any(|named| named.id == identity.id)), NOT_OPEN),
+        Some(rule) => {
+            ensure!(now() < rule.expires && !g.mls.used(&rule.hash.0), UNKNOWN);
+            ensure!(members.iter().any(|m| m.key == rule.by.0) && !g.left(&rule.by.0), "its inviter left the group");
+        }
+        None => ensure!(joiner.identity().is_some_and(|identity| g.mls.settings().open.iter().any(|named| named.id == identity.id)), NOT_OPEN),
     }
-    ensure!(g.members().iter().all(|member| member.key != joiner.key.0), "this session is a member already");
+    ensure!(members.iter().all(|member| member.key != joiner.key.0), "this session is a member already");
     Ok(())
 }
 
@@ -231,7 +235,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 let st = self.lock();
                 let found = st.groups.iter().find_map(|(gid, g)| Some((gid.clone(), g.rec.invites.iter().find(|rule| rule.hash == hash)?.clone())));
                 let (gid, rule) = found.context(UNKNOWN)?;
-                (gid, How::Invite, Some((hash, rule.expires)), rule.to)
+                let to = rule.to.clone();
+                (gid, How::Invite, Some(rule), to)
             }
             (None, Some(gid)) => (gid.0, How::Open, None, Some(joiner.identity().context(NOT_OPEN)?.id.clone())),
             (None, None) => bail!("a request names an invite's secret or a group"),
@@ -242,7 +247,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if let Some((welcome, position)) = logged {
             return self.admitted(&gid, welcome, position).await;
         }
-        admits(&self.lock().group(&gid)?.mls, &joiner, &invite)?;
+        admits(self.lock().group(&gid)?, &joiner, &invite)?;
         // Its identity's key log, read afresh, must list the device that certified it.
         if let Some(to) = to {
             let identity = joiner.identity().filter(|identity| identity.id == to).context("this invite is for another identity")?;
@@ -258,17 +263,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Commits the Add, naming the invite the joiner came in by, and answers with the Welcome and the state of the group's
     /// kind, as a file. Each build of the commit checks the joiner's rule again. A joiner whose session does not support
     /// the group's kind is refused.
-    async fn admit(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, joiner: &Credential, how: How, invite: Option<(Bytes, u64)>) -> Result<Admitted> {
+    async fn admit(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, joiner: &Credential, how: How, invite: Option<Rule>) -> Result<Admitted> {
         {
             let st = self.lock();
             let kind = st.group(gid)?.mls.settings().kind;
             let leaf = key_package_leaf(&st.provider, &key_package)?;
             ensure!(leaf.kinds.contains(&kind), "its session does not support {kind} groups");
         }
-        let add = Change { add: vec![key_package], how: Some(how), invite: invite.as_ref().map(|(hash, _)| hash.clone()), ..Change::default() };
+        let add = Change { add: vec![key_package], how: Some(how), invite: invite.as_ref().map(|rule| rule.hash.clone()), ..Change::default() };
         let (welcome, position) = self
             .commit(gid, |_, g| {
-                admits(&g.mls, joiner, &invite)?;
+                admits(g, joiner, &invite)?;
                 Ok(Some(add.clone()))
             })
             .await?
