@@ -156,33 +156,26 @@ impl<P: Provider> State<P> {
         }
     }
 
-    /// What a step produced, less the frames of a group the gate no longer admits their peer to, as when the step
-    /// applied the peer's removal after it queued them.
-    pub(crate) fn admissible(&mut self, out: Vec<Out>) -> Vec<Out> {
-        out.into_iter()
-            .filter_map(|out| match out {
-                Out::Frame { peer, frame: Frame::Hello { groups, heads } } => {
-                    let groups = groups.into_iter().filter(|summary| self.admitted(&summary.group.0, &peer)).collect();
-                    Some(Out::Frame { peer, frame: Frame::Hello { groups, heads } })
-                }
-                Out::Frame { peer, frame } => {
-                    let group = match &frame {
-                        Frame::Hello { .. } => None,
-                        // Every `want` is answered, with nothing if the gate refuses it.
-                        Frame::Messages { items, .. } if items.is_empty() => None,
-                        Frame::Entries { log, .. } => Some(log).filter(|log| self.groups.contains_key(&log.0)),
-                        Frame::Messages { group, .. }
-                        | Frame::Want { group, .. }
-                        | Frame::WantFiles { group, .. }
-                        | Frame::Have { group, .. }
-                        | Frame::State { group, .. }
-                        | Frame::Live { group, .. } => Some(group),
-                    };
-                    group.is_none_or(|group| self.admitted(&group.0.clone(), &peer)).then_some(Out::Frame { peer, frame })
-                }
-                out => Some(out),
-            })
-            .collect()
+    /// What of a frame goes to a peer as it is written, by the gate as it is then: a step may have removed the peer
+    /// since another queued the frame.
+    pub(crate) fn admissible(&mut self, peer: &EndpointId, frame: Frame) -> Option<Frame> {
+        let group = match &frame {
+            Frame::Hello { groups, heads } => {
+                let groups = groups.iter().filter(|summary| self.admitted(&summary.group.0, peer)).cloned().collect();
+                return Some(Frame::Hello { groups, heads: heads.clone() });
+            }
+            // Every `want` is answered, with nothing if the gate refuses it.
+            Frame::Messages { items, .. } if items.is_empty() => None,
+            Frame::Entries { log, .. } => Some(log).filter(|log| self.groups.contains_key(&log.0)),
+            Frame::Messages { group, .. }
+            | Frame::Want { group, .. }
+            | Frame::WantFiles { group, .. }
+            | Frame::Have { group, .. }
+            | Frame::State { group, .. }
+            | Frame::Live { group, .. } => Some(group),
+        };
+        let Some(gid) = group.map(|group| group.0.clone()) else { return Some(frame) };
+        peers::sends(&frame, self.admitted(&gid, peer), self.at_head(&gid)).then_some(frame)
     }
 
     /// Sends a frame of a group to every connected peer the gate lets it go to.
