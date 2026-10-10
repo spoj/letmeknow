@@ -890,10 +890,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         });
         inner.spawn(inner.clone().drive(work_rx));
         inner.spawn(inner.clone().send_out(outbox_rx));
-        let (gids, followed): (Vec<Vec<u8>>, Vec<Vec<u8>>) = {
-            let st = inner.lock();
-            (st.groups.keys().cloned().collect(), st.logs.keys().cloned().collect())
-        };
+        let followed: Vec<Vec<u8>> = inner.lock().logs.keys().cloned().collect();
         for log in &followed {
             inner.follow(log);
         }
@@ -910,10 +907,10 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
         }
         {
-            // A session removed by a commit it applied before it stopped is told so now; its sends go on.
+            // A session removed by a commit it applied before it stopped is told so now; its sends go on. A group its
+            // log's reading dropped meanwhile is gone already.
             let st = inner.lock();
-            for gid in &gids {
-                let g = st.group(gid)?;
+            for (gid, g) in &st.groups {
                 if !g.mls.active() {
                     inner.work.send(Work::Gone(gid.clone())).ok();
                     continue;
@@ -1536,9 +1533,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             sleep(duties::TIMER).await;
             let mut st = self.lock();
-            for gid in &gids {
-                if let Err(error) = st.expire(gid) {
-                    self.warn(Some(gid), format!("{error:#}"));
+            for gid in st.groups.keys().cloned().collect::<Vec<_>>() {
+                if let Err(error) = st.expire(&gid) {
+                    self.warn(Some(&gid), format!("{error:#}"));
                 }
             }
             st.scrub = true;
