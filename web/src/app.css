@@ -136,6 +136,7 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 .messages li.message { margin-top: var(--s3); }
 .messages li.follows { margin-top: 0; }
 .messages li.message:hover { background: var(--hover); }
+.messages li.unsent { opacity: 0.7; }
 .messages li.direct { box-shadow: inset 3px 0 var(--accent); }
 .messages li.urgent { box-shadow: inset 3px 0 var(--warn); }
 .meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--s2); font-size: var(--t-sm); }

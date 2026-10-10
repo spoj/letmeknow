@@ -16,6 +16,8 @@ pub const LEAF_EXTENSION: u16 = 0xff02;
 pub const CHAT: &str = "chat";
 /// The built-in kind of an identity's devices group, which devices join and sessions do not.
 pub const DEVICES: &str = "devices";
+/// T's default: daily.
+pub const UPDATE: u32 = 24 * 60 * 60;
 
 /// Where a log lives.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +45,8 @@ pub struct Settings {
     pub open: Vec<Named>,
     /// H: how many days members carry the group's messages, and the files they link, for others.
     pub carry: u32,
+    /// T: how many seconds a member's leaf goes between updates.
+    pub update: u32,
     pub membership: Service,
     /// Fields a newer letmeknow added, kept when this one rewrites the settings.
     #[serde(flatten)]
@@ -143,10 +147,12 @@ pub enum Control {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to: Option<Bytes>,
     },
+    /// Counted positions of the group's log the sender can no longer open.
+    Lost { positions: Vec<u64> },
 }
 
 impl Control {
-    pub const TYPES: [&str; 3] = ["leave", "introduce", "invite"];
+    pub const TYPES: [&str; 4] = ["leave", "introduce", "invite", "lost"];
 }
 
 /// A payload's `type`.
@@ -226,7 +232,7 @@ mod tests {
 
     #[test]
     fn records_keep_fields_this_version_does_not_know() {
-        let text = r#"{"protocol":3,"kind":"chat","name":"Plan","open":[{"id":"AQ","name":"Bob","since":1}],"carry":7,"membership":{"serve":{"key":"Ag","relay":"r","addrs":[],"ticket":"t"}},"color":"red"}"#;
+        let text = r#"{"protocol":3,"kind":"chat","name":"Plan","open":[{"id":"AQ","name":"Bob","since":1}],"carry":7,"update":86400,"membership":{"serve":{"key":"Ag","relay":"r","addrs":[],"ticket":"t"}},"color":"red"}"#;
         let settings: Settings = serde_json::from_str(text).unwrap();
         let renamed = Settings { name: "Release".into(), ..settings };
         assert_eq!(serde_json::to_string(&renamed).unwrap(), text.replace("Plan", "Release"));

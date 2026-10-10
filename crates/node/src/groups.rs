@@ -78,8 +78,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         let add = Change { add: vec![key_package], how: Some(how), invite: invite.as_ref().map(|(hash, _)| hash.clone()), ..Change::default() };
         let (welcome, position) = self
-            .commit(gid, |g| {
-                admits(g, joiner, &invite)?;
+            .commit(gid, |_, g| {
+                admits(&g.mls, joiner, &invite)?;
                 Ok(Some(add.clone()))
             })
             .await?

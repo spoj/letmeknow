@@ -843,6 +843,8 @@ class ChatView extends View {
   private to = new Set<string>();
   private replyTo?: Message;
   private attachment?: File;
+  /** Sends that failed, with their text, until sent again or dropped. */
+  private failed: Message[] = [];
 
   constructor(gid: string) {
     super(gid);
@@ -903,7 +905,7 @@ class ChatView extends View {
 
   async update() {
     await super.update();
-    const items: Item[] = JSON.parse(await lmk.items(this.gid));
+    const items: Item[] = [...JSON.parse(await lmk.items(this.gid)), ...this.failed];
     const keep = new Set<string>();
     let added = false;
     let previous: Item | undefined;
@@ -911,7 +913,7 @@ class ChatView extends View {
     for (const item of items) {
       const key = "id" in item ? item.id : `${item.type} ${item.at}`;
       const follows = item.type === "message" && previous?.type === "message" && previous.from.fp === item.from.fp && item.at - previous.at < 300_000 && !item.reply_to;
-      const json = JSON.stringify([item, follows]);
+      const json = JSON.stringify([item, follows, item.type === "message" && item.failed?.error]);
       previous = item;
       keep.add(key);
       let line = this.lines.get(key);
@@ -936,7 +938,8 @@ class ChatView extends View {
       case "message": {
         const parent = item.reply_to ? (items.find(i => i.type === "message" && i.id === item.reply_to) as Message | undefined) : undefined;
         const to = item.to?.map(fp => this.members.find(m => m.fp === fp)).filter(m => m != null);
-        const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent"];
+        const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent", (item.pending || item.failed) && "unsent"];
+        const lostBy = item.lost_by?.length && h("p", { className: "tag" }, item.lost_by.map(label).join(", "), " could not read this; send it again if it matters");
         return h(
           "li",
           { className: classes.filter(Boolean).join(" "), tabIndex: -1 },
@@ -947,15 +950,29 @@ class ChatView extends View {
               who(item.from),
               to?.length && h("span", { className: "muted" }, "to ", to.map(label).join(", ")),
               item.urgent && h("span", { className: "tag" }, "Urgent"),
+              item.pending && h("span", { className: "muted" }, "Pending: sent while this browser is open"),
               at
             ),
           item.reply_to &&
             h("blockquote", {}, parent ? [h("b", {}, label(parent.from)), " ", (parent.content || parent.attachment?.name || "").slice(0, 160)] : "a message this browser does not hold"),
           item.content && h("div", { className: "text" }, item.content),
           item.attachment && this.attachmentView(item.attachment),
-          h("div", { className: "actions" }, h("button", { className: "quiet", onclick: () => this.reply(item) }, "Reply"))
+          lostBy,
+          item.failed
+            ? h(
+                "p",
+                { className: "tag" },
+                `Not sent: ${item.failed.error} `,
+                h("button", { className: "quiet", onclick: item.failed.retry }, "Retry"),
+                h("button", { className: "quiet", onclick: item.failed.drop }, "Drop")
+              )
+            : item.position !== undefined && h("div", { className: "actions" }, h("button", { className: "quiet", onclick: () => this.reply(item) }, "Reply"))
         );
       }
+      case "missing":
+        return h("li", { className: "event warn" }, `${item.positions.length === 1 ? "A message" : `${item.positions.length} messages`} before this could not be fetched`, at);
+      case "lost":
+        return h("li", { className: "event warn" }, `You could not read ${item.positions.length === 1 ? "a message" : `${item.positions.length} messages`}: no member online held them in time`, at);
       case "leave":
         return h("li", { className: "event" }, who(item.from), " asked to leave", at);
       case "joined":
@@ -1092,22 +1109,28 @@ class ChatView extends View {
     this.drawChips();
     this.drawContext();
     this.stuck = true;
+    await this.send(content, replyTo, to, urgent, attachment);
+  }
+
+  /** Sends a message; one that fails stays in the timeline with its text, to retry. */
+  private async send(content: string, replyTo: Message | undefined, to: string[], urgent: boolean, attachment: File | undefined) {
     try {
       const bytes = attachment && new Uint8Array(await attachment.arrayBuffer());
       const sent = lmk.send(this.gid, content, replyTo?.id, to, urgent, attachment?.name, attachment?.type, bytes);
       setTimeout(render, 50);
       const answer = JSON.parse(await sent);
-      if (answer.pending) toast("Pending: the group's log has not taken it yet. It is sent while this browser is open.");
       if (answer.attachment?.pending) toast(`No other member holds ${attachment!.name} yet: it is available only while this browser is open.`);
     } catch (error) {
-      toast(error);
-      if (!this.input.value) this.input.value = content;
-      this.attachment ??= attachment;
-      this.grow();
-      this.drawContext();
+      const from = this.members.find(m => m.you)!;
+      const drop = () => ((this.failed = this.failed.filter(f => f !== item)), render());
+      const retry = () => (drop(), this.send(content, replyTo, to, urgent, attachment));
+      const item: Message = { type: "message", id: `failed ${Date.now()} ${this.failed.length}`, at: Date.now(), from, content, to, reply_to: replyTo?.id, urgent, failed: { error: error instanceof Error ? error.message : String(error), retry, drop } };
+      if (attachment) item.content ||= attachment.name;
+      this.failed.push(item);
     }
     render();
   }
+
 }
 
 /** A doc: one text that everyone in it edits at once, in CodeMirror bound to the doc's Yjs text. */

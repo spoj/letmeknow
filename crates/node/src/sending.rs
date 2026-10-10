@@ -56,6 +56,16 @@ impl<P: Provider> State<P> {
         Ok(None)
     }
 
+    /// This session's held sends whose entries have not counted yet: the ids they started with, and their payloads.
+    pub(crate) fn sending(&self, gid: &[u8]) -> Result<Vec<(Bytes, Value)>> {
+        let mut sends = Vec::new();
+        for handle in &self.group(gid)?.rec.sends {
+            let send: Held = get(&self.provider, &send_key(&handle.0))?.context("a send without its record")?;
+            sends.push((handle.clone(), send.payload));
+        }
+        Ok(sends)
+    }
+
     /// Seals a send's payload in the current epoch.
     fn seal(&mut self, gid: &[u8], send: &mut Held) -> Result<()> {
         let st = &mut *self;
@@ -68,14 +78,26 @@ impl<P: Provider> State<P> {
     }
 }
 
+impl<P: Provider + Send + 'static> crate::Node<P> {
+    /// This session's held sends whose entries have not counted yet, oldest first: the ids `send` answered, and their
+    /// payloads.
+    pub fn sending(&self, gid: &[u8]) -> Result<Vec<(Bytes, Value)>> {
+        self.inner.lock().sending(gid)
+    }
+}
+
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Starts a held send: seals it, and saves it, in one step. Answers the id it starts with, and its outcome.
     pub(crate) fn held_send(&self, gid: &[u8], payload: &Value) -> Result<(Bytes, Counted)> {
+        self.start_send(&mut self.lock(), gid, payload)
+    }
+
+    /// Starts a held send in a step.
+    pub(crate) fn start_send(&self, st: &mut State<P>, gid: &[u8], payload: &Value) -> Result<(Bytes, Counted)> {
         let size = serde_json::to_vec(payload)?.len() + FRAMING;
         if size > MAX_MESSAGE {
             return Err(SendError::Size(format!("the message is {size} bytes, over the 1 MiB members take")).into());
         }
-        let mut st = self.lock();
         let mut send = Held {
             payload: payload.clone(),
             epoch: 0,
@@ -128,7 +150,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         g.rec.sends.retain(|sent| *sent != handle);
         let me = g.mls.members().into_iter().find(|m| m.index == g.mls.own_index()).context("a member of its group")?;
         let sender = st.member(gid, &me).context("this session has a letmeknow credential")?;
-        let message = Message { id: send.id, group: Bytes(gid.to_vec()), epoch: send.epoch, position, at: now(), sender, payload: send.payload };
+        let message = Message { id: send.id, group: Bytes(gid.to_vec()), epoch: send.epoch, position, at: now(), sender, payload: send.payload, missing: Vec::new() };
         self.deliver(st, gid, message, true)?;
         st.out.push(Out::Push { group: gid.to_vec(), ciphertext: send.ciphertext.0 });
         for waiter in st.waiters.remove(&handle.0).unwrap_or_default() {

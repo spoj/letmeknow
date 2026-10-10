@@ -7,6 +7,7 @@
 //! one transaction per step (`Step`): nothing a step produces leaves the node before its transaction commits.
 
 pub mod devices;
+mod duties;
 mod groups;
 mod kind;
 mod logs;
@@ -46,8 +47,6 @@ pub use lmk_core;
 pub use lmk_net::{Disk, Fetch};
 pub use lmk_proto::clock::now;
 
-/// How often a session replaces its keys in each group.
-const KEY_UPDATE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Why a send's outcome never came.
 const UNFINISHED: &str = "the send ended unfinished, as this session stopped or left the group";
 /// How long `send` waits for its entry to count before it answers that the send is pending.
@@ -143,6 +142,37 @@ pub struct Message {
     pub at: u64,
     pub sender: Member,
     pub payload: Value,
+    /// The counted positions before it that were passed over unopened, as it is handed on in position order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<u64>,
+}
+
+/// Counted positions a member can no longer open: as it announced them, or this session's own as it learns them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Lost {
+    pub group: Bytes,
+    /// Where it is told in log order: the announcement's position, or this session's own lost position.
+    pub position: u64,
+    pub member: Member,
+    pub positions: Vec<u64>,
+    /// The ids of the lost messages, those this session knows.
+    pub ids: Vec<Bytes>,
+}
+
+/// What the kind takes in log order: its held messages, and the losses.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Item {
+    Entry(Entry),
+    Lost(Lost),
+}
+
+impl Item {
+    pub fn position(&self) -> u64 {
+        match self {
+            Item::Entry(entry) => entry.position,
+            Item::Lost(lost) => lost.position,
+        }
+    }
 }
 
 /// A held message of the kind, at its position in the group's log.
@@ -219,8 +249,11 @@ pub enum Event {
         settings: Settings,
         by: Member,
     },
-    /// A held payload of the group's kind, opened; never one of this session's own.
+    /// A held payload of the group's kind, opened, in position order; never one of this session's own. One opened after
+    /// later ones were handed on comes when it opens.
     Message(Message),
+    /// Losses that concern this session's user: its own, as it announced them, and other members' of its messages.
+    Lost(Lost),
     /// A live payload of the group's kind: not held.
     Live {
         group: Bytes,
@@ -291,6 +324,7 @@ impl Event {
             | Event::Introduced { group, .. }
             | Event::Sent { group, .. } => Some(group),
             Event::Message(message) => Some(&message.group),
+            Event::Lost(lost) => Some(&lost.group),
             Event::Warning { group, .. } => group.as_ref(),
             Event::File(_) | Event::Keys { .. } => None,
         }
@@ -314,8 +348,6 @@ struct Rec {
     /// File links, with when they were linked: those the kind holds (its files added, and those its held messages
     /// link) and states handed to or by this session. Each is held for the group's H.
     files: Vec<(String, u64)>,
-    /// The state handed to or by this session last, held however old.
-    state: Option<String>,
     /// The files the kind links now, held while it does.
     links: Vec<String>,
     /// What the kind took of the group's held messages, once it follows them.
@@ -324,6 +356,18 @@ struct Rec {
     invites: Vec<Rule>,
     /// Counted `leave`s: each sender's key, and the epoch it was sealed in; kept until moot.
     leaves: Vec<(Bytes, u64)>,
+    /// This session asked to leave: it asks the others to remove it until one does.
+    leaving: bool,
+    /// When this session's leaf was last updated, in milliseconds.
+    updated: u64,
+    /// This session's known losses: counted positions it can no longer open.
+    lost: BTreeSet<u64>,
+    /// Counted `lost`s, by position: the sender's key, and the positions it lost.
+    losses: BTreeMap<u64, (Bytes, Vec<u64>)>,
+    /// The last position handed on as events in position order, and the counted ones passed over unopened since the
+    /// last message handed on.
+    shown: u64,
+    missing: Vec<u64>,
 }
 
 /// An invite, as its inviter shared it with the group.
@@ -343,11 +387,10 @@ impl Rec {
         self.files.push((link, now()));
     }
 
-    /// The files this session holds for the group: those linked within H, the latest state, and those the kind links
-    /// now.
+    /// The files this session holds for the group: those linked within H, and those the kind links now.
     fn held(&self, carry: u32) -> Vec<FileLink> {
         let since = now().saturating_sub(days(carry));
-        let linked = self.files.iter().filter(|(_, at)| *at >= since).map(|(link, _)| link).chain(&self.state);
+        let linked = self.files.iter().filter(|(_, at)| *at >= since).map(|(link, _)| link);
         linked.chain(&self.links).filter_map(|link| FileLink::parse(link).ok()).collect()
     }
 }
@@ -455,12 +498,8 @@ pub(crate) enum Work {
     Read(Vec<u8>),
     /// A log to follow.
     Follow(Vec<u8>),
-    Remove {
-        group: Vec<u8>,
-        key: Vec<u8>,
-    },
-    /// A group with members whose devices their identities' key logs dropped.
-    Revoke(Vec<u8>),
+    /// A group's duties to run.
+    Duties(Vec<u8>),
     /// A group this session is out of, by no one's commit.
     Gone(Vec<u8>),
     Fetch {
@@ -508,10 +547,10 @@ pub(crate) struct Inner<P> {
     reading: Mutex<HashSet<Vec<u8>>>,
     /// The groups whose held sends are being appended.
     sending: Mutex<HashSet<Vec<u8>>>,
-    /// The removals under way, by group and member key.
-    removing: Mutex<HashSet<(Vec<u8>, Vec<u8>)>>,
-    /// The groups whose dropped devices' members are being removed.
-    revoking: Mutex<HashSet<Vec<u8>>>,
+    /// The groups whose duties run, each with whether another pass is due once it ends.
+    passing: Mutex<HashMap<Vec<u8>, bool>>,
+    /// The groups with a timer for their next update.
+    timers: Mutex<HashSet<Vec<u8>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// The contradictions reported, each once.
     contradictions: Mutex<HashSet<Contradicted>>,
@@ -698,8 +737,9 @@ impl<P: Provider> State<P> {
     }
 
     /// A new group's records, its MLS state, and its log, read after `rec.position`.
-    fn add_group(&mut self, mls: Group, rec: Rec) -> Result<Vec<u8>> {
+    fn add_group(&mut self, mls: Group, mut rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
+        (rec.updated, rec.shown) = (now(), rec.position);
         self.add_log(&gid, logs::Log::new(logs::Of::Group, mls.settings().membership, rec.position))?;
         self.groups.insert(gid.clone(), G { mls, rec, early: Vec::new(), asked: 0, wait: None });
         self.save(&gid)?;
@@ -792,8 +832,8 @@ impl<P: Provider + Send + 'static> Node<P> {
             advanced: tokio::sync::Notify::new(),
             reading: Mutex::default(),
             sending: Mutex::default(),
-            removing: Mutex::default(),
-            revoking: Mutex::default(),
+            passing: Mutex::default(),
+            timers: Mutex::default(),
             tasks: Mutex::default(),
             contradictions: Mutex::default(),
         });
@@ -843,15 +883,12 @@ impl<P: Provider + Send + 'static> Node<P> {
                     inner.work.send(Work::Gone(gid.clone())).ok();
                     continue;
                 }
-                if let Err(error) = inner.leavers(&st, gid) {
-                    inner.warn(Some(gid), format!("{error:#}"));
-                }
                 if !g.rec.sends.is_empty() {
                     inner.work.send(Work::Send(gid.clone())).ok();
                 }
             }
         }
-        inner.spawn(inner.clone().resume(gids));
+        inner.spawn(inner.clone().resume());
         inner.spawn(inner.clone().redial());
         inner.spawn(inner.clone().passing());
         Ok((Node { inner }, events_rx))
@@ -1024,28 +1061,37 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Removes a member. Returns whether this session's commit removed it, which it need not once another's did.
     pub async fn remove(&self, gid: &[u8], key: &[u8]) -> Result<bool> {
         ensure!(self.inner.lock().group(gid)?.mls.members().iter().any(|m| m.key == key), "not a member");
-        let remove = |g: &Group| Ok(g.members().into_iter().find(|m| m.key == key).map(|member| Change { remove: vec![member.index], ..Change::default() }));
+        let remove = |_: &State<P>, g: &G| Ok(g.mls.members().into_iter().find(|m| m.key == key).map(|member| Change { remove: vec![member.index], ..Change::default() }));
         Ok(self.inner.commit(gid, remove).await?.is_some())
     }
 
     /// Changes the group's settings, from the current ones.
     pub async fn change_settings(&self, gid: &[u8], change: impl Fn(Settings) -> Settings) -> Result<Settings> {
         self.inner
-            .commit(gid, |g| {
-                let settings = change(g.settings());
-                Ok((settings != g.settings()).then(|| Change { settings: Some(settings), ..Change::default() }))
+            .commit(gid, |_, g| {
+                let settings = change(g.mls.settings());
+                Ok((settings != g.mls.settings()).then(|| Change { settings: Some(settings), ..Change::default() }))
             })
             .await?;
         self.settings(gid)
     }
 
-    /// Asks the others to remove this session, or forgets a group it is alone in.
+    /// Marks the group as one this session leaves, and asks the others to remove it; or forgets a group it is alone
+    /// in. Until a member removes it, its duties ask again (`duties`).
     pub async fn leave(&self, gid: &[u8]) -> Result<Option<Sent>> {
-        if self.members(gid)?.len() == 1 {
-            self.inner.forget(gid)?;
-            return Ok(None);
-        }
-        Ok(Some(self.send(gid, &json!({ "type": "leave" })).await?))
+        let (id, counted) = {
+            let mut st = self.inner.lock();
+            st.group_mut(gid)?.rec.leaving = true;
+            st.save(gid)?;
+            if st.group(gid)?.mls.members().len() > 1 {
+                self.inner.start_send(&mut st, gid, &json!({ "type": "leave" }))?
+            } else {
+                drop(st);
+                self.inner.forget(gid)?;
+                return Ok(None);
+            }
+        };
+        Ok(Some(self.answered(gid, id, counted).await?))
     }
 
     /// Sends a held payload: the node seals it, appends its entry to the group's log, and pushes it to the members
@@ -1053,7 +1099,12 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// answer, that it is pending: the node finishes the send, after a restart too, and tells `Event::Sent`. Fails only
     /// when the service certainly did not take it (`SendError`).
     pub async fn send(&self, gid: &[u8], payload: &Value) -> Result<Sent> {
-        let (id, mut counted) = self.inner.held_send(gid, payload)?;
+        let (id, counted) = self.inner.held_send(gid, payload)?;
+        self.answered(gid, id, counted).await
+    }
+
+    /// What `send` answers: a send's position once it counts, or that it is pending after a few seconds.
+    async fn answered(&self, gid: &[u8], id: Bytes, mut counted: sending::Counted) -> Result<Sent> {
         let position = match timeout(SEND_WAIT, &mut counted).await {
             Ok(counted) => Some(counted.context(UNFINISHED)?.map_err(|error| anyhow::anyhow!(error))?),
             Err(_) => self.inner.pending(&id, &mut counted)?,
@@ -1301,7 +1352,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub async fn rename_device(&self, name: &str) -> Result<()> {
         self.inner.lock().device = Some(name.into());
         for gid in self.groups() {
-            self.inner.commit(&gid.0, |g| Ok(renaming(g, Some(name)).map(|name| Change { name: Some(name), ..Change::default() }))).await?;
+            self.inner.commit(&gid.0, |_, g| Ok(renaming(&g.mls, Some(name)).map(|name| Change { name: Some(name), ..Change::default() }))).await?;
         }
         Ok(())
     }
@@ -1381,32 +1432,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Catches up on each group, replaces this session's keys, then again daily.
-    async fn resume(self: Arc<Self>, gids: Vec<Vec<u8>>) {
+    /// Catches up on each group, and runs its duties then and every while; drops what each kept past H.
+    async fn resume(self: Arc<Self>) {
         self.refresh_all().await;
         self.dial_all();
-        let mut gids = gids;
         loop {
+            let gids: Vec<Vec<u8>> = self.lock().groups.keys().cloned().collect();
             for gid in &gids {
-                let (leaf, device) = {
-                    let st = self.lock();
-                    (st.session.leaf.clone(), st.device.clone())
-                };
-                let change = |g: &Group| Ok(Some(Change { leaf: Some(leaf.clone()), name: renaming(g, device.as_deref()), ..Change::default() }));
-                let updated = async {
-                    self.read(gid).await.context("catching up")?;
-                    self.commit(gid, change).await.context("key update")
-                };
-                // Unless the group was left meanwhile, as when a device leaves its identity as it starts.
-                if let Err(error) = updated.await
-                    && self.lock().groups.contains_key(gid)
-                {
-                    self.warn(Some(gid), format!("{error:#}"));
+                if let Err(error) = self.read(gid).await {
+                    tracing::debug!("catching up on {}: {error:#}", hex(gid));
                 }
+                self.work.send(Work::Duties(gid.clone())).ok();
             }
-            sleep(KEY_UPDATE).await;
+            sleep(duties::TIMER).await;
             let mut st = self.lock();
-            gids = st.groups.keys().cloned().collect();
             for gid in &gids {
                 if let Err(error) = st.expire(gid) {
                     self.warn(Some(gid), format!("{error:#}"));
@@ -1452,19 +1491,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// it won its epoch; if another commit won, builds it again. Returns the Welcome, if it adds, and the position; none
     /// once the change has no effect (`None`), and it commits nothing. An entry posted before, which the log may or may
     /// not have taken, is posted again first: only the service's refusal drops it.
-    async fn commit(&self, gid: &[u8], change: impl Fn(&Group) -> Result<Option<Change>>) -> Result<Option<(Option<Vec<u8>>, u64)>> {
+    async fn commit(&self, gid: &[u8], change: impl Fn(&State<P>, &G) -> Result<Option<Change>>) -> Result<Option<(Option<Vec<u8>>, u64)>> {
         let _committing = self.committing.lock().await;
         for _ in 0..COMMIT_TRIES {
             self.caught_up(gid).await?;
             let (entry, welcome, ours, service) = {
                 let mut st = self.lock();
                 let st = &mut *st;
-                let g = st.groups.get_mut(gid).context("this session is not in that group")?;
+                let g = st.group(gid)?;
                 let service = g.mls.settings().membership;
                 match g.mls.posted() {
                     Some(posted) => (posted.to_vec(), None, false, service),
                     None => {
-                        let Some(change) = change(&g.mls)? else { return Ok(None) };
+                        let Some(change) = change(st, g)? else { return Ok(None) };
+                        let g = st.groups.get_mut(gid).unwrap();
                         let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
                         let commit = g.mls.commit(&st.provider, session, change)?;
                         (commit.entry, commit.welcome, true, service)
@@ -1549,9 +1589,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 let file = FileLink::parse(&link)?;
                 {
                     let mut st = inner.lock();
-                    let rec = &mut st.group_mut(&gid)?.rec;
-                    rec.link(link.clone());
-                    rec.state = Some(link);
+                    st.group_mut(&gid)?.rec.link(link.clone());
                     st.save(&gid)?;
                 }
                 inner.fetched(&gid, &file).await?;
@@ -1571,9 +1609,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     pub(crate) async fn state_file(&self, gid: &[u8], data: Vec<u8>) -> Result<String> {
         let link = self.net().add_file(std::io::Cursor::new(data)).await?.link();
         let mut st = self.lock();
-        let rec = &mut st.group_mut(gid)?.rec;
-        rec.link(link.clone());
-        rec.state = Some(link.clone());
+        st.group_mut(gid)?.rec.link(link.clone());
         st.save(gid)?;
         Ok(link)
     }
@@ -1624,52 +1660,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 tracing::debug!("the key log of {}: {error:#}", hex(&identity.id.0));
             }
         }
-        self.revoke(&self.lock());
-    }
-
-    /// Has the members removed whose devices their identities' key logs dropped: an earlier entry listed it, the current
-    /// one does not.
-    fn revoke(&self, st: &State<P>) {
-        for (gid, g) in &st.groups {
-            if g.mls.members().iter().any(|m| m.key != st.me(gid) && m.credential.as_ref().is_some_and(|c| dropped(&st.keys, c))) {
-                self.work.send(Work::Revoke(gid.clone())).ok();
-            }
-        }
-    }
-
-    /// Removes, in one commit, every member whose device its identity's key log dropped, as the log stands for the
-    /// epoch it builds on; if this session's commit removed them, tells which members they added or let in.
-    async fn revoke_dropped(&self, gid: &[u8]) -> Result<()> {
-        let removing = Mutex::new(Vec::new());
-        let (keys, me) = {
-            let st = self.lock();
-            (st.keys.clone(), st.me(gid).to_vec())
-        };
-        let committed = self
-            .commit(gid, |g| {
-                let dropped: Vec<core::Member> =
-                    g.members().into_iter().filter(|m| m.key != me && m.credential.as_ref().is_some_and(|c| dropped(&keys, c))).collect();
-                let change = (!dropped.is_empty()).then(|| Change { remove: dropped.iter().map(|m| m.index).collect(), ..Change::default() });
-                *removing.lock().unwrap() = dropped;
-                Ok(change)
-            })
-            .await?;
-        if committed.is_none() {
-            return Ok(());
-        }
-        let removed = removing.into_inner().unwrap();
-        let st = self.lock();
-        let g = st.group(gid)?;
-        let by_them = |key: &[u8]| removed.iter().any(|m| m.key == key);
-        let invites: Vec<&Bytes> = g.rec.invites.iter().filter(|rule| by_them(&rule.by.0)).map(|rule| &rule.hash).collect();
-        let let_in = |m: &core::Member| {
-            let added = g.mls.added().iter().rev().find(|added| added.member.key.0 == m.key);
-            added.is_some_and(|added| by_them(&added.by.key.0) || added.invite.as_ref().is_some_and(|invite| invites.contains(&invite)))
-        };
-        let added = g.mls.members().into_iter().filter(let_in).filter_map(|m| st.member(gid, &m)).collect();
-        let removed = removed.iter().filter_map(|m| st.member(gid, m)).collect();
-        self.events.send(Event::Revoked { group: Bytes(gid.to_vec()), removed, added }).ok();
-        Ok(())
     }
 
     /// Reads an identity's key log from its service; a log not held yet is followed from then on.
@@ -1700,7 +1690,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for (group, peer) in st.served(&peers).into_iter().filter(|served| !before.contains(served)) {
             st.out.push(Out::Served { peer, group });
         }
-        self.revoke(st);
+        for gid in st.groups_of(&lmk_proto::identity::address(id)) {
+            self.work.send(Work::Duties(gid)).ok();
+        }
         self.events.send(Event::Keys { identity: Bytes(id.to_vec()) }).ok();
         Ok(())
     }
@@ -1749,37 +1741,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                         });
                     }
                 }
-                Work::Remove { group, key } => {
-                    if self.removing.lock().unwrap().insert((group.clone(), key.clone())) {
-                        let inner = self.clone();
-                        self.spawn(async move {
-                            if let Err(error) = (Node { inner: inner.clone() }).remove(&group, &key).await
-                                && inner
-                                    .state
-                                    .lock()
-                                    .unwrap()
-                                    .group(&group)
-                                    .is_ok_and(|g| g.mls.members().iter().any(|m| m.key == key))
-                            {
-                                inner.warn(Some(&group), format!("removing a member: {error:#}"));
-                            }
-                            inner.removing.lock().unwrap().remove(&(group, key));
-                        });
-                    }
-                }
-                Work::Revoke(group) => {
-                    if self.revoking.lock().unwrap().insert(group.clone()) {
-                        let inner = self.clone();
-                        self.spawn(async move {
-                            if let Err(error) = inner.revoke_dropped(&group).await
-                                && inner.state.lock().unwrap().groups.contains_key(&group)
-                            {
-                                inner.warn(Some(&group), format!("removing the members of a device taken off its identity: {error:#}"));
-                            }
-                            inner.revoking.lock().unwrap().remove(&group);
-                        });
-                    }
-                }
+                Work::Duties(gid) => self.duties(&gid),
                 Work::Follow(log) => self.follow(&log),
                 Work::Gone(group) => self.gone(&group, None),
                 Work::Fetch { group, link } => {
@@ -1871,11 +1833,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if settings && let Ok(g) = st.group(gid) {
             self.events.send(Event::Settings { group, settings: g.mls.settings(), by }).ok();
         }
-        if !removed.is_empty()
-            && let Err(error) = self.leavers(&st, gid)
-        {
-            self.warn(Some(gid), format!("{error:#}"));
-        }
     }
 
     /// Tells that this session is out of a group, then forgets it, unless it did so already.
@@ -1887,23 +1844,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if let Err(error) = self.forget(gid) {
             self.warn(Some(gid), format!("{error:#}"));
         }
-    }
-
-    /// Has the members removed whose counted `leave`, sealed since the Add that brought them in last, this session holds;
-    /// has the group gone once this session's own counted and it is the only member left.
-    fn leavers(&self, st: &State<P>, gid: &[u8]) -> Result<()> {
-        let Ok(g) = st.group(gid) else { return Ok(()) };
-        let added = |key: &[u8]| g.mls.added().iter().rev().find(|added| added.member.key.0 == key).map_or(0, |added| added.epoch);
-        let leaving: HashSet<&[u8]> = g.rec.leaves.iter().filter(|(key, epoch)| *epoch >= added(&key.0)).map(|(key, _)| key.0.as_slice()).collect();
-        let me = st.me(gid);
-        let members = g.mls.members();
-        if members.len() == 1 && leaving.contains(me) {
-            self.work.send(Work::Gone(gid.to_vec())).ok();
-        }
-        for member in members.into_iter().filter(|m| m.key != me && leaving.contains(m.key.as_slice())) {
-            self.work.send(Work::Remove { group: gid.to_vec(), key: member.key }).ok();
-        }
-        Ok(())
     }
 
     fn net_event(self: &Arc<Self>, event: lmk_net::Event) {
@@ -1928,9 +1868,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
             lmk_net::Event::Synced { group, peer } => {
                 self.events.send(Event::Synced { group: Bytes(group.clone()) }).ok();
                 let mut st = self.lock();
-                if let Err(error) = self.leavers(&st, &group) {
-                    self.warn(Some(&group), format!("{error:#}"));
-                }
                 if let Err(error) = self.progress(&mut st, &group, reading::Progress::Synced(peer)) {
                     self.warn(Some(&group), format!("{error:#}"));
                 }
@@ -2048,12 +1985,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_group_holds_files_linked_within_h_its_state_and_its_kinds_links() {
+    fn a_group_holds_files_linked_within_h_and_its_kinds_links() {
         let link = |n: u8| FileLink { hash: [n; 32], size: 1, key: [0; 32] }.link();
         let old = now() - 3 * 24 * 3600 * 1000;
-        let files = vec![(link(1), old), (link(2), now()), (link(3), old)];
-        let rec = Rec { files, state: Some(link(3)), links: vec![link(4)], ..Rec::default() };
+        let files = vec![(link(1), old), (link(2), now())];
+        let rec = Rec { files, links: vec![link(3)], ..Rec::default() };
         let held: Vec<u8> = rec.held(2).iter().map(|file| file.hash[0]).collect();
-        assert_eq!(held, [2, 3, 4]);
+        assert_eq!(held, [2, 3]);
     }
 }

@@ -24,8 +24,6 @@ struct World {
     _relay: Server,
     network: crate::Network,
     root: PathBuf,
-    /// For the sessions started from now on.
-    causal_wait: Duration,
     plugins: Vec<PathBuf>,
 }
 
@@ -62,7 +60,7 @@ async fn world(test: &str) -> World {
     let root = std::env::temp_dir().join(format!("lmk-session-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let network = crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) };
-    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT, plugins: vec![built()] }
+    World { _relay: server, network, root, plugins: vec![built()] }
 }
 
 struct Agent {
@@ -91,7 +89,6 @@ impl World {
             dir: session_dir(&home, handle).unwrap(),
             name: handle[..1].to_uppercase() + &handle[1..],
             hold,
-            causal_wait: self.causal_wait,
             keep_log: false,
             membership: self.membership(),
             plugins: self.plugins.clone(),
@@ -197,7 +194,8 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         let second = alice.expect("message").await;
         assert_eq!((first["content"].as_str(), first["direct"].as_bool()), (Some("the build is green"), Some(false)));
         assert_eq!((second["content"].as_str(), second["direct"].as_bool()), (Some("@alice can you deploy?"), Some(true)));
-        assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "from": 0, "direct": 0, "content": 0 })));
+        assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "position": 0, "from": 0, "direct": 0, "content": 0 })));
+        assert_eq!(second["position"].as_u64(), first["position"].as_u64().map(|p| p + 1), "in position order");
         assert_eq!(second["group"], group.as_str());
         // Bob is Alice's contact under the name the link was for, verified; his own name for himself is only a claim.
         assert_eq!(second["from"]["identity"]["name"], "Bob (Acme)");
@@ -465,7 +463,7 @@ fn the_command_channel_needs_its_token_and_a_running_session() {
 }
 
 #[test]
-fn a_restarted_session_takes_in_what_it_missed_in_causal_order() {
+fn a_restarted_session_takes_in_what_it_missed_in_position_order() {
     local(async {
         let world = world("causal").await;
         let (mut alice, bob, group) = pair(&world, HOUR).await;
@@ -480,9 +478,9 @@ fn a_restarted_session_takes_in_what_it_missed_in_causal_order() {
         while got.len() < 2 {
             let message = alice.expect("message").await;
             assert!(message.get("missing").is_none());
-            got.push(message["id"].as_str().unwrap().to_owned());
+            got.push((message["id"].clone(), message["position"].clone()));
         }
-        assert_eq!(got, [first["id"].as_str().unwrap(), second["id"].as_str().unwrap()]);
+        assert_eq!(got, [(first["id"].clone(), first["position"].clone()), (second["id"].clone(), second["position"].clone())]);
         let groups = alice.cmd(&["groups"]).await.unwrap();
         assert_eq!((groups[0]["group"].as_str(), groups[0]["name"].as_str()), (Some(group.as_str()), Some("Later")));
     });
@@ -752,42 +750,25 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
     });
 }
 
+/// A message whose holders are all away holds up the later ones a while, then they show it missing, by position.
 #[test]
-fn a_message_after_some_from_before_its_reader_joined_shows_them_missing_at_once() {
-    local(async {
-        let world = world("before").await;
-        let (alice, mut bob, group) = pair(&world, HOUR).await;
-        let before = alice.cmd(&["send", "@bob before carol"]).await.unwrap();
-        bob.expect("message").await;
-        let mut carol = world.start("carol", HOUR).await;
-        carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
-        // Alice's Welcome named her message, so Bob's, which comes after it, does not wait for it.
-        bob.cmd(&["send", "@carol see above"]).await.unwrap();
-        let got = carol.expect("message").await;
-        assert_eq!(got["content"], "@carol see above");
-        assert_eq!(got["missing"], json!([before["id"]]));
-    });
-}
-
-#[test]
-fn a_message_after_one_that_cannot_come_shows_the_gap_once_a_sync_ends() {
+fn a_message_no_member_online_holds_is_passed_and_shown_missing() {
     local(async {
         let world = world("gap").await;
         let (mut alice, mut bob, group) = pair(&world, HOUR).await;
+        let mut carol = world.start("carol", HOUR).await;
+        carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
+        bob.expect("joined").await;
         alice.stop().await;
-        let unseen = bob.cmd(&["send", "while alice is away"]).await.unwrap();
+        carol.stop().await;
+        let unseen = bob.cmd(&["send", "while they are away"]).await.unwrap();
         bob.stop().await;
         let alice = world.start("alice", HOUR).await;
         let mut carol = world.start("carol", HOUR).await;
-        carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
-        carol.stop().await;
-        let bob = world.start("bob", HOUR).await;
-        bob.cmd(&["send", "@carol see above"]).await.unwrap();
-        // Back, Carol syncs; that cannot bring Bob's first message, from before she joined, so she does not wait 5 minutes.
-        let mut carol = world.start("carol", HOUR).await;
+        let sent = alice.cmd(&["send", "@carol after the gap"]).await.unwrap();
         let got = carol.expect("message").await;
-        assert_eq!(got["content"], "@carol see above");
-        assert_eq!(got["missing"], json!([unseen["id"]]));
+        assert_eq!((&got["content"], &got["position"]), (&json!("@carol after the gap"), &sent["position"]));
+        assert_eq!(got["missing"], json!([unseen["position"]]));
     });
 }
 
@@ -804,7 +785,7 @@ fn git_pushes_count_in_the_groups_log_in_order() {
     local(async {
         let world = world("git").await;
         let mut alice = world.start("alice", HOUR).await;
-        let bob = world.start("bob", HOUR).await;
+        let mut bob = world.start("bob", HOUR).await;
         let mut carol = world.start("carol", HOUR).await;
         let group = alice.cmd(&["invite", "--kind", "git", "--name", "Repo"]).await.unwrap()["group"].as_str().unwrap().to_owned();
         for joiner in [&bob, &carol] {
@@ -838,7 +819,18 @@ fn git_pushes_count_in_the_groups_log_in_order() {
         let fp = members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Carol").unwrap()["fp"].as_str().unwrap().to_owned();
         alice.cmd(&["remove", &fp]).await.unwrap();
         carol.expect("removed").await;
-        let (_, position) = push(&first, 2).await;
+        let (second, position) = push(&first, 2).await;
         assert_eq!(position.as_u64(), Some(first_position + 2), "after the removal's commit");
+
+        // With no other member online to take its bundle, a push is refused, and nothing counts.
+        bob.stop().await;
+        std::fs::write(repo.join("file.txt"), "3").unwrap();
+        git(&repo, &["commit", "-qam", "change 3"]);
+        let (new, bundle) = (git(&repo, &["rev-parse", "HEAD"]), world.root.join("3.bundle"));
+        git(&repo, &["bundle", "create", bundle.to_str().unwrap(), &format!("{second}..main")]);
+        let refused = alice.cmd(&["git", "push", &group, "refs/heads/main", &second, &new, bundle.to_str().unwrap()]).await.unwrap_err().to_string();
+        assert!(refused.contains("no other member online took the push's bundle"), "{refused}");
+        let tips = alice.cmd(&["git", "list", &group, "--push"]).await.unwrap();
+        assert_eq!(tips["refs"]["refs/heads/main"], second.as_str(), "the push did not count");
     });
 }

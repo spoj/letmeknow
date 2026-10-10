@@ -98,7 +98,7 @@ impl<P: Provider> State<P> {
         get(&self.provider, &id_key(gid, id))
     }
 
-    fn held(&self, gid: &[u8], position: u64) -> Result<bool> {
+    pub(crate) fn held(&self, gid: &[u8], position: u64) -> Result<bool> {
         Ok(self.provider.get(&ciphertext_key(gid, position))?.is_some())
     }
 
@@ -172,6 +172,8 @@ impl<P: Provider> State<P> {
         let rec = &mut self.group_mut(gid)?.rec;
         rec.expired = rec.expired.max(to);
         rec.unopened.retain(|position, _| *position > to);
+        rec.lost.retain(|position| *position > to);
+        rec.losses.retain(|position, _| *position > to);
         self.save(gid)
     }
 
@@ -209,6 +211,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
             st.save(gid)?;
             self.open_ready(st, gid)?;
             self.kind_advance(st, gid)?;
+            if st.group(gid)?.rec.position == logged {
+                self.work.send(Work::Duties(gid.to_vec())).ok();
+            }
         }
         self.advanced.notify_waiters();
         Ok(())
@@ -254,6 +259,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 let by = members.into_iter().find(|m| m.index == applied.by);
                 let own = applied.own;
                 let gone = applied.gone;
+                if own {
+                    g.rec.updated = now;
+                }
                 st.scrub = true;
                 st.out.push(Out::Changed(gid.to_vec()));
                 let core::Applied { added, how, invite, removed, settings, .. } = applied;
@@ -344,9 +352,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Opens the held counted positions in position order within each epoch; one missing holds up the later ones of its
-    /// epoch for `PASS` after its entry was read.
+    /// epoch while `holds_up`.
     pub(crate) fn open_ready(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
-        let now = now();
         let mut blocked = HashSet::new();
         for (position, (epoch, at)) in st.group(gid)?.rec.unopened.clone() {
             if blocked.contains(&epoch) {
@@ -354,11 +361,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             if st.held(gid, position)? {
                 self.open(st, gid, position, epoch)?;
-            } else if now < at + PASS {
+            } else if self.holds_up(st, gid, position, at) {
                 blocked.insert(epoch);
             }
         }
         st.save(gid)
+    }
+
+    /// Whether a counted position missing here, whose entry was read at `at`, holds up the later ones of its epoch: for
+    /// `PASS`.
+    pub(crate) fn holds_up(&self, _: &State<P>, _: &[u8], _: u64, at: u64) -> bool {
+        now() < at + PASS
     }
 
     /// Opens, every `PASS`, the held positions that waited on missing ones.
@@ -413,24 +426,30 @@ impl<P: Provider + Send + 'static> Inner<P> {
             leaf: None,
         });
         let sender = st.member(gid, &sender).context("the sender has no letmeknow credential")?;
-        let message = Message { id: Bytes(opened.id.to_vec()), group: Bytes(gid.to_vec()), epoch, position, at: now(), sender, payload: opened.payload };
+        let message = Message { id: Bytes(opened.id.to_vec()), group: Bytes(gid.to_vec()), epoch, position, at: now(), sender, payload: opened.payload, missing: Vec::new() };
         self.deliver(st, gid, message, false)
     }
 
     fn lose(&self, st: &mut State<P>, gid: &[u8], position: u64) -> Result<()> {
-        st.group_mut(gid)?.rec.unopened.remove(&position);
+        let rec = &mut st.group_mut(gid)?.rec;
+        rec.unopened.remove(&position);
+        rec.lost.insert(position);
+        self.work.send(Work::Duties(gid.to_vec())).ok();
         let mut pos = st.pos(gid, position)?.context("a counted position has its record")?;
         pos.lost = true;
         put(&st.provider, &pos_key(gid, position), &pos)
     }
 
     /// Hands a held message's plaintext to its consumer, in this step: the core takes its own payloads as records; the
-    /// kind's go out as events, but this session's own, and to the kind in log order (`kind_advance`).
+    /// kind's go out as events in position order (`show`), but this session's own, and to the kind in log order
+    /// (`kind_advance`). One that opens after later ones were shown goes out now.
     pub(crate) fn deliver(&self, st: &mut State<P>, gid: &[u8], message: Message, own: bool) -> Result<()> {
         put(&st.provider, &message_key(&message.id.0), &message)?;
         let group = Bytes(gid.to_vec());
         if !Control::TYPES.contains(&type_of(&message.payload)) {
-            if !own {
+            let rec = &mut st.group_mut(gid)?.rec;
+            if !own && message.position <= rec.shown {
+                rec.missing.retain(|missing| *missing != message.position);
                 self.events.send(Event::Message(message)).ok();
             }
             return Ok(());
@@ -439,8 +458,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Control::Leave => {
                 st.group_mut(gid)?.rec.leaves.push((message.sender.key, message.epoch));
                 st.save(gid)?;
-                self.leavers(st, gid)?;
+                self.work.send(Work::Duties(gid.to_vec())).ok();
             }
+            Control::Lost { positions } => self.announced(st, gid, message.position, message.sender, positions)?,
             Control::Introduce { identity, name, how, to } => {
                 let me = Bytes(Sha256::digest(st.me(gid))[..8].to_vec());
                 if !own && (to.is_empty() || to.contains(&me)) {

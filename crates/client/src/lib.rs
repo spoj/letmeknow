@@ -20,9 +20,9 @@ use lmk_core::contacts::{self, Contact};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
 use lmk_node::devices::Devices;
-use lmk_node::{Event, Member, Node};
+use lmk_node::{Event, Item, Member, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, Control, DEVICES, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings};
+use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, Control, DEVICES, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::time::{Duration, Instant, timeout};
 use n0_future::{Either, FutureExt};
@@ -179,8 +179,11 @@ pub enum ClientEvent {
     Gone { group: Bytes },
     Settings { group: Bytes, settings: Settings, by: Described },
     Introduced { group: Bytes, by: Described, identity: Named, how: How },
-    /// A chat message, in a group that carries chat.
-    Message { group: Bytes, id: String, from: Described, payload: Value },
+    /// A chat message, in a group that carries chat, in position order: `missing`, the counted positions before it that
+    /// were passed over unopened. One that opens after later ones were shown comes when it opens, with no `missing`.
+    Message { group: Bytes, id: String, position: u64, missing: Vec<u64>, from: Described, payload: Value },
+    /// Counted positions a member can no longer open: this client's own, or another member's of this client's messages.
+    Lost { group: Bytes, member: Described, positions: Vec<u64>, ids: Vec<String> },
     /// A send that `send` answered as pending counts now, at `position` in the group's log.
     Sent { group: Bytes, id: String, position: u64 },
     /// A sync of the group's held messages with a member ended.
@@ -442,7 +445,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                     None => {
                         let membership = membership.map(|m| service(&m)).transpose()?.unwrap_or(self.inner.config.membership.clone());
                         let settings =
-                            Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), open: Vec::new(), carry, membership, rest: Default::default() };
+                            Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), open: Vec::new(), carry, update: UPDATE, membership, rest: Default::default() };
                         let (gid, opened) = self.create(settings, as_, args).await?;
                         merge(&mut answer, opened);
                         gid
@@ -832,16 +835,22 @@ impl<P: Provider + Send + 'static> Client<P> {
                     node.hold(&message.group.0, &[link.to_owned()])?;
                 }
                 let from = self.describe(&message.group, &message.sender)?;
-                self.emit(ClientEvent::Message { group: message.group, id: hex::encode(&message.id.0), from, payload: message.payload });
+                let (id, position, missing) = (hex::encode(&message.id.0), message.position, message.missing);
+                self.emit(ClientEvent::Message { group: message.group, id, position, missing, from, payload: message.payload });
             }
             Event::Message(message) => {
                 let from = self.describe(&message.group, &message.sender)?;
-                let item = json!({ "type": "message", "id": hex::encode(&message.id.0), "from": from, "payload": message.payload, "held": true });
+                let item = json!({ "type": "message", "id": hex::encode(&message.id.0), "position": message.position, "from": from, "payload": message.payload, "held": true });
                 self.tell_plugin(&message.group, item)?;
             }
             Event::Live { group, sender, payload } => {
                 let item = json!({ "type": "message", "from": self.describe(&group, &sender)?, "payload": payload, "held": false });
                 self.tell_plugin(&group, item)?;
+            }
+            Event::Lost(lost) => {
+                let member = self.describe(&lost.group, &lost.member)?;
+                let ids = lost.ids.iter().map(|id| hex::encode(&id.0)).collect();
+                self.emit(ClientEvent::Lost { group: lost.group, member, positions: lost.positions, ids });
             }
             Event::Synced { group } => self.emit(ClientEvent::Synced { group }),
             Event::InStep { group, member } => {
@@ -1182,7 +1191,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(())
     }
 
-    /// Hands a group's plugin its held messages, in log order, that it has not had.
+    /// Hands a group's plugin its held messages and the losses, in log order, that it has not had.
     fn hand_entries(&self, gid: &Bytes) -> Result<()> {
         let mut st = self.state();
         let (Some(&after), Some(kind)) = (st.handed.get(gid), st.kind_of.get(gid).cloned()) else { return Ok(()) };
@@ -1191,10 +1200,19 @@ impl<P: Provider + Send + 'static> Client<P> {
             return Ok(());
         }
         let describer = self.describer(gid)?;
-        for entry in entries {
-            let item = json!({ "type": "entry", "group": b64(&gid.0), "position": entry.position, "id": hex::encode(&entry.id.0), "from": describer.describe(&entry.from), "payload": entry.payload });
+        for item in entries {
+            let position = item.position();
+            let item = match item {
+                Item::Entry(entry) => {
+                    json!({ "type": "entry", "group": b64(&gid.0), "position": position, "id": hex::encode(&entry.id.0), "from": describer.describe(&entry.from), "payload": entry.payload })
+                }
+                Item::Lost(lost) => {
+                    let ids: Vec<String> = lost.ids.iter().map(|id| hex::encode(&id.0)).collect();
+                    json!({ "type": "lost", "group": b64(&gid.0), "position": position, "member": describer.describe(&lost.member), "positions": lost.positions, "ids": ids })
+                }
+            };
             self.inner.plugins.send(&kind, &item)?;
-            st.handed.insert(gid.clone(), entry.position);
+            st.handed.insert(gid.clone(), position);
         }
         Ok(())
     }
