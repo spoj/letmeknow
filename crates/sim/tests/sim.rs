@@ -294,7 +294,7 @@ fn an_answer_is_taken_whole_before_reading_on() {
 /// so the first was passed over silently.
 #[test]
 fn a_late_message_names_the_positions_passed_before_it() {
-    use lmk_sim::Forgery;
+    use lmk_sim::{Forgery, Output};
     passes(
         290,
         5,
