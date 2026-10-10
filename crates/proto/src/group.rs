@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::Bytes;
+use crate::ranges::Ranges;
 
 pub const PROTOCOL: u32 = 3;
 /// This release's protocol revision, which grows with each compatible addition; a leaf without one is revision 0.
@@ -165,8 +166,8 @@ pub fn type_of(payload: &serde_json::Value) -> &str {
 #[serde(tag = "type", rename = "message")]
 pub struct ChatMessage {
     pub content: String,
-    /// Tips of what the sender had read: message ids.
-    pub after: Vec<Bytes>,
+    /// The positions of the group's log the sender had read when it sent this.
+    pub read: Ranges,
     /// Fingerprints; empty addresses the group.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub to: Vec<Bytes>,
@@ -209,13 +210,13 @@ mod tests {
         assert_eq!(leave, r#"{"type":"leave"}"#);
         let message = ChatMessage {
             content: "hi".into(),
-            after: vec![],
+            read: Ranges::range(1, 3),
             to: vec![],
             reply_to: None,
             urgent: false,
             attachment: None,
         };
-        assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","after":[]}"#);
+        assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","read":[[1,3]]}"#);
         let folder = serde_json::to_string(&Service::Folder("/tmp/x".into())).unwrap();
         assert_eq!(folder, r#"{"folder":"/tmp/x"}"#);
     }

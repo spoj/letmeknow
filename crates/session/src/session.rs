@@ -5,19 +5,19 @@
 //! channel `device-endpoint`, both in `LETMEKNOW_HOME`; the device's other session processes read the one and send such
 //! requests to the other, among them for the certificates their credentials carry.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, DeviceState, File, Introduction, Remote, message_id};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::devices::Devices;
-use lmk_node::{Event, Node};
+use lmk_node::{Event, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::group::{ChatMessage, DEVICES, Service};
+use lmk_proto::ranges::Ranges;
 use lmk_proto::links::FileLink;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,6 +78,7 @@ impl Remote for Published {
 pub struct Session {
     db: Connection,
     client: Client<SqliteProvider>,
+    plugins: Arc<Plugins>,
     /// What the client tells.
     told: mpsc::UnboundedReceiver<ClientEvent>,
     /// The device's node, when this process holds the device's lock.
@@ -146,11 +147,13 @@ impl Session {
         let device = Device::load(&home.join("device.json"))?;
         let client_config = lmk_client::Config { name: config.name.clone(), device, membership: config.membership.clone() };
         let access = Access::Elsewhere(Arc::new(Published(home.to_path_buf())));
-        let (client, told) = Client::new(node, client_config, access, Arc::new(plugins), lines);
+        let plugins = Arc::new(plugins);
+        let (client, told) = Client::new(node, client_config, access, plugins.clone(), lines);
         let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("device.lock"))?;
         let mut session = Self {
             db,
             client,
+            plugins,
             told,
             device: None,
             lock,
@@ -371,11 +374,21 @@ impl Session {
             | ClientEvent::Removed { .. }
             | ClientEvent::Settings { .. } => Some(true),
             ClientEvent::Introduced { .. } => Some(false),
-            ClientEvent::Lost { .. } => Some(true),
+            ClientEvent::Lost { .. } | ClientEvent::LeaveHeld { .. } => Some(true),
             _ => None,
         };
         if let Some(wake) = wake {
-            self.outbox.deliver(serde_json::to_value(&event)?, wake);
+            let mut item = serde_json::to_value(&event)?;
+            if let ClientEvent::Lost { member, ids, .. } = &event
+                && !member.you
+            {
+                item["text"] = json!(format!(
+                    "{} could not read {} of your messages; send again, with --reply-to <id>, any that still matters",
+                    member.name.as_deref().unwrap_or("a member"),
+                    ids.len()
+                ));
+            }
+            self.outbox.deliver(item, wake);
             return Ok(());
         }
         match event {
@@ -436,8 +449,7 @@ impl Session {
             }
             None => None,
         };
-        let after = self.client.tips(&gid, |id| self.seen(id).unwrap_or(false))?;
-        let (id, answer) = self.client.send(&gid, Chat { text, to, reply_to, urgent, attachment }, after).await?;
+        let (id, answer) = self.client.send(&gid, Chat { text, to, reply_to, urgent, attachment }).await?;
         self.db.execute("INSERT OR IGNORE INTO taken (id, gid, seen) VALUES (?, ?, 1)", params![id.0, gid.0])?;
         Ok(answer)
     }
@@ -517,6 +529,7 @@ impl Session {
         let Some(message) = node.message(id)? else { return Ok(()) };
         self.db.execute("INSERT OR IGNORE INTO taken (id, gid) VALUES (?, ?)", params![id, message.group.0])?;
         self.db.execute("UPDATE taken SET seen = 1 WHERE id = ?", [id])?;
+        self.client.mark_read(&message.group, &Ranges::range(message.position, message.position))?;
         if !self.config.keep_log && message.payload["type"] == "message" && message.sender.key != node.key() {
             let mut payload = message.payload;
             payload["content"] = json!("");
@@ -525,31 +538,38 @@ impl Session {
         Ok(())
     }
 
+    /// A chat message, after the last `ancestors` chat messages before it that its sender had read; this session's own
+    /// say who holds and who read them.
     fn read(&mut self, id: &str, ancestors: usize) -> Result<Value> {
+        let id = message_id(id)?;
+        let node = self.client.node();
+        let message = node.message(&id)?.with_context(|| format!("unknown message {}", hex::encode(id)))?;
+        let chat: ChatMessage = serde_json::from_value(message.payload.clone()).context("not a chat message")?;
+        let gid = message.group.clone();
+        let mut shown: Vec<Message> = node
+            .messages(&gid.0)?
+            .into_iter()
+            .filter(|m| m.position < message.position && chat.read.contains(m.position) && m.payload["type"] == "message")
+            .collect();
+        shown.drain(..shown.len().saturating_sub(ancestors));
+        shown.push(message);
+        let (receipts, me) = (self.client.receipts(&gid)?, node.key());
+        let describer = self.client.describer(&gid)?;
+        let names = |of: &dyn Fn(&lmk_client::Receipt) -> bool| -> Vec<Value> {
+            receipts.iter().filter(|r| of(r)).map(|r| json!(describer.describe(&r.member).name)).collect()
+        };
         let mut found = Vec::new();
-        let mut visited = HashSet::new();
-        let mut level = vec![message_id(id)?];
-        for depth in 0..=ancestors {
-            let mut next = Vec::new();
-            for id in level {
-                if !visited.insert(id) {
-                    continue;
-                }
-                let Some(message) = self.client.node().message(&id)? else {
-                    ensure!(depth > 0, "unknown message {}", hex::encode(id));
-                    continue;
-                };
-                let Ok(chat) = serde_json::from_value::<ChatMessage>(message.payload.clone()) else { continue };
-                let from = serde_json::to_value(self.client.describe(&message.group, &message.sender)?)?;
-                found.push(self.message_json(&message.group, id, message.position, from, &message.payload, false)?);
-                self.mark_seen(&id)?;
-                for after in chat.after {
-                    next.push(after.0.as_slice().try_into().ok().context("a message id is 32 bytes")?);
-                }
+        for m in shown {
+            let from = serde_json::to_value(describer.describe(&m.sender))?;
+            let id: [u8; 32] = m.id.0.as_slice().try_into()?;
+            let mut item = self.message_json(&gid, id, m.position, from, &m.payload, false)?;
+            if m.sender.key == me {
+                item["held_by"] = json!(names(&|r| r.held.contains(m.position)));
+                item["read_by"] = json!(names(&|r| r.read.contains(m.position)));
             }
-            level = next;
+            self.mark_seen(&id)?;
+            found.push(item);
         }
-        found.reverse();
         Ok(Value::Array(found))
     }
 
@@ -625,7 +645,7 @@ impl Session {
     }
 
     pub async fn shutdown(&self) {
-        // Plugins stop with the session: their stdin closes when it ends.
+        self.plugins.stop().await;
         let _ = self.client.node().shutdown().await;
         if let Some(device) = &self.device {
             let _ = device.shutdown().await;

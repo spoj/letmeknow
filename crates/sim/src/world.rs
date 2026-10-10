@@ -853,10 +853,9 @@ impl World {
                 let gid = self.group(group)?;
                 let m = self.holder(&gid, m)?;
                 let client = self.client(m)?;
-                let after = client.tips(&gid, |_| true)?;
                 let chat = Chat { text: format!("from m{m} at {}", elapsed()), to: Vec::new(), reply_to: None, urgent: false, attachment: None };
                 let starts = self.starts(m);
-                let sent = client.send(&gid, chat, after).await;
+                let sent = client.send(&gid, chat).await;
                 ensure!(self.starts(m) == starts, "m{m} stopped before it answered");
                 let (id, answer) = match &sent {
                     Ok((_, answer)) => {

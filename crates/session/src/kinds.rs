@@ -42,12 +42,14 @@ pub fn dirs() -> Vec<PathBuf> {
 }
 
 struct Running {
-    _child: Child,
+    child: Child,
     /// Lines for its stdin.
     stdin: mpsc::UnboundedSender<String>,
     started: Instant,
 }
 
+/// How long a plugin has to end once its stdin closes, as the session stops.
+const STOP_WAIT: Duration = Duration::from_secs(5);
 /// A plugin that stops within this long of its start is not started again by itself.
 const STEADY: Duration = Duration::from_secs(60);
 
@@ -65,6 +67,17 @@ impl Plugins {
     pub fn new(found: BTreeMap<String, PathBuf>, dir: PathBuf) -> (Self, mpsc::UnboundedReceiver<(String, Option<Value>)>) {
         let (lines, rx) = mpsc::unbounded_channel();
         (Plugins { found, dir, running: Mutex::default(), lines }, rx)
+    }
+}
+
+impl Plugins {
+    /// Stops every plugin: its stdin closes, and it is killed unless it ended within `STOP_WAIT`.
+    pub async fn stop(&self) {
+        let running: Vec<Running> = self.running.lock().unwrap().drain().map(|(_, running)| running).collect();
+        for Running { mut child, stdin, .. } in running {
+            drop(stdin);
+            tokio::time::timeout(STOP_WAIT, child.wait()).await.ok();
+        }
     }
 }
 
@@ -96,7 +109,7 @@ impl lmk_client::Plugins for Plugins {
                 }
             }
         });
-        let running = Running { _child: child, stdin: writer, started: Instant::now() };
+        let running = Running { child, stdin: writer, started: Instant::now() };
         self.running.lock().unwrap().insert(kind.to_owned(), running);
         Ok(json!({ "dir": self.dir.join(kind) }))
     }

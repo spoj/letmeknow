@@ -58,7 +58,11 @@ pub(crate) async fn run(
             match input {
                 Input::Frame(frame) => session.frame(frame).await?,
                 Input::Closed => break,
-                Input::Send(frame) => frame::write(&mut session.send, &frame).await?,
+                Input::Send(frame) => {
+                    if let Some(frame) = session.inner.groups.admit(&session.peer, frame) {
+                        frame::write(&mut session.send, &frame).await?;
+                    }
+                }
                 Input::Want { group, files, reply } => {
                     session.wants.entry(group.clone()).or_default().push_back(reply);
                     let files = files.into_iter().map(Bytes::from).collect();

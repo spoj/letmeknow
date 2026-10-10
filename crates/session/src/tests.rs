@@ -122,13 +122,18 @@ impl Agent {
 
     /// The next event of `kind`, skipping others.
     async fn expect(&mut self, kind: &str) -> Value {
+        self.expect_any(&[kind]).await
+    }
+
+    /// The next event of any of `kinds`, skipping others.
+    async fn expect_any(&mut self, kinds: &[&str]) -> Value {
         loop {
             let line = tokio::time::timeout(Duration::from_secs(30), self.events.recv())
                 .await
-                .unwrap_or_else(|_| panic!("{}: no {kind} event", self.handle))
+                .unwrap_or_else(|_| panic!("{}: no {kinds:?} event", self.handle))
                 .unwrap();
             let event: Value = serde_json::from_str(&line).unwrap();
-            if event["type"] == kind {
+            if kinds.iter().any(|kind| event["type"] == *kind) {
                 return event;
             }
             eprintln!("{}: {event}", self.handle);
@@ -386,6 +391,117 @@ fn a_leaving_member_is_removed_by_another() {
         assert_eq!(left["left"], true);
         assert_eq!(alice.expect("left").await["member"]["name"], "Bob");
         bob.expect("removed").await;
+    });
+}
+
+/// Asks again, a quarter of a second apart, until `accept` takes what `ask` answers or 30 seconds pass; returns the last
+/// answer.
+async fn until(ask: impl AsyncFn() -> Value, accept: impl Fn(&Value) -> bool) -> Value {
+    for _ in 0..120 {
+        let answer = ask().await;
+        if accept(&answer) {
+            return answer;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    ask().await
+}
+
+#[test]
+fn a_message_printed_is_read_and_one_waiting_only_held() {
+    local(async {
+        let world = world("read").await;
+        let (mut alice, bob, _) = pair(&world, HOUR).await;
+        let quiet = bob.cmd(&["send", "fyi"]).await.unwrap();
+        let id = quiet["id"].as_str().unwrap();
+        let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| read[0]["held_by"] == json!(["Alice"])).await;
+        assert_eq!((&read[0]["held_by"], &read[0]["read_by"]), (&json!(["Alice"]), &json!([])), "Alice holds it, unprinted");
+        let look = bob.cmd(&["send", "@alice look"]).await.unwrap();
+        assert_eq!(alice.expect("message").await["id"], id);
+        alice.expect("message").await;
+        let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| read[0]["read_by"] == json!(["Alice"])).await;
+        assert_eq!(read[0]["read_by"], json!(["Alice"]), "printed, so read");
+        // Alice's next message carries what she read.
+        let answer = alice.cmd(&["send", "seen both"]).await.unwrap();
+        let shown = until(|| async { bob.cmd(&["read", answer["id"].as_str().unwrap(), "--ancestors", "5"]).await.unwrap() }, |shown| shown.as_array().unwrap().len() == 3).await;
+        let shown: Vec<&Value> = shown.as_array().unwrap().iter().map(|m| &m["id"]).collect();
+        assert_eq!(shown, [&quiet["id"], &look["id"], &answer["id"]]);
+    });
+}
+
+static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The system's clock, moved on by `SHIFT`.
+fn shifted() -> u64 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    now + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[test]
+fn status_lists_sends_held_only_here_and_members_away() {
+    local(async {
+        lmk_proto::clock::set(shifted);
+        let world = world("only-here").await;
+        let (alice, mut bob, _) = pair(&world, HOUR).await;
+        // Alice's invite came before Bob's start, so it is not only hers; her introduction of Bob he holds.
+        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"] == json!([])).await;
+        assert_eq!(status["groups"][0]["only_here"], json!([]));
+        bob.stop().await;
+        let sent = alice.cmd(&["send", "anyone?"]).await.unwrap();
+        let status = alice.cmd(&["status"]).await.unwrap();
+        assert_eq!(status["groups"][0]["only_here"], json!([{ "what": "message", "id": sent["id"], "position": sent["position"] }]));
+        assert!(status["warning"].is_string());
+        assert_eq!(status["groups"][0]["away"], json!([]), "Bob was heard from just now");
+        let mut bob = world.start("bob", HOUR).await;
+        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"] == json!([])).await;
+        assert_eq!(status["groups"][0]["only_here"], json!([]), "Bob holds it");
+        assert!(status.get("warning").is_none());
+        bob.stop().await;
+        SHIFT.store(8 * 24 * 3600 * 1000, std::sync::atomic::Ordering::Relaxed);
+        let status = alice.cmd(&["status"]).await.unwrap();
+        assert_eq!(status["groups"][0]["away"][0]["name"], "Bob", "not heard from for longer than members carry messages");
+        assert_eq!(alice.cmd(&["members"]).await.unwrap()["members"].as_array().unwrap().len(), 2, "away, not removed");
+    });
+}
+
+#[test]
+fn a_leave_is_pending_until_another_member_holds_it() {
+    local(async {
+        let world = world("leave-pending").await;
+        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
+        alice.stop().await;
+        let left = bob.cmd(&["leave"]).await.unwrap();
+        assert_eq!((&left["left"], &left["pending"]), (&json!(true), &json!(true)), "{left}");
+        let _alice = world.start("alice", HOUR).await;
+        // Bob is told once Alice holds his leave, unless her removal of him reaches him first.
+        let mut told = bob.expect_any(&["leave_held", "removed"]).await;
+        if told["type"] == "leave_held" {
+            told = bob.expect("removed").await;
+        }
+        assert_eq!(told["type"], "removed");
+    });
+}
+
+/// Bob is away while Alice sends, and two commits pass before he is back with no member online holding it: he loses
+/// it, and Alice is told, with what to do.
+#[test]
+fn a_sender_is_told_who_lost_its_message() {
+    local(async {
+        let world = world("lost").await;
+        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
+        bob.stop().await;
+        let sent = alice.cmd(&["send", "while you were out"]).await.unwrap();
+        alice.cmd(&["name", "Once"]).await.unwrap();
+        alice.cmd(&["name", "Twice"]).await.unwrap();
+        alice.stop().await;
+        let mut bob = world.start("bob", HOUR).await;
+        let own = bob.expect("lost").await;
+        assert!(own["member"]["you"] == true && own["positions"].as_array().unwrap().contains(&sent["position"]), "{own}");
+        assert!(own.get("text").is_none());
+        let mut alice = world.start("alice", HOUR).await;
+        let lost = alice.expect("lost").await;
+        assert!(lost["member"]["name"] == "Bob" && lost["ids"].as_array().unwrap().contains(&sent["id"]), "{lost}");
+        assert!(lost["text"].as_str().unwrap().contains("--reply-to"), "{lost}");
     });
 }
 

@@ -19,7 +19,7 @@ export type Identity = {
   /** Who vouched for it, and as whom; letmeknow 0.12 recorded one, its introducer's label. */
   introduced?: { by: Person; name: string }[] | { by: string; name: string };
 };
-export type Person = { fp: string; name: string; device: string; you?: boolean; identity?: Identity; added_by?: { name?: string; how: string } };
+export type Person = { fp: string; name: string; device: string; you?: boolean; identity?: Identity; added_by?: { name?: string; how: string }; away?: boolean };
 export type Named = { id: string; name: string };
 export type Settings = { kind: "chat" | "doc" | "git"; name: string; open?: Named[]; carry?: number };
 export type Group = { group: string; settings: Settings; members: Person[]; joined: boolean; failed?: boolean };
@@ -41,12 +41,17 @@ export type Item =
       pending?: boolean;
       /** A send that failed, kept with its text until sent again or dropped. */
       failed?: { error: string; retry: () => void; drop: () => void };
+      /** Of this browser's own: no other member's summary shows it held. */
+      only_here?: boolean;
+      /** Of this browser's own: the other members that hold it, and those that read it. */
+      held_by?: Person[];
+      read_by?: Person[];
       /** Members that lost this message of this browser's. */
       lost_by?: Person[];
     }
   | { type: "missing"; at: number; positions: number[] }
   | { type: "lost"; at: number; member: Person; positions: number[]; ids: string[] }
-  | { type: "leave"; id: string; at: number; from: Person }
+  | { type: "leave"; id: string; at: number; from: Person; only_here: boolean }
   | { type: "joined"; at: number; member: Person; by: Person; how: string }
   | { type: "left"; at: number; member: Person; by: Person }
   | { type: "revoked"; at: number; removed: Person[]; added: Person[] }

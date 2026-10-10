@@ -42,7 +42,7 @@ use crate::{
 /// How long to wait for a peer's `have`.
 const ANSWER_WAIT: Duration = Duration::from_secs(5);
 
-/// What this crate needs from the group logic to serve files. Calls are quick and local.
+/// What this crate needs from the group logic to serve files and gate frames. Calls are quick and local.
 pub trait Groups: Send + Sync + 'static {
     /// The groups this session is in.
     fn groups(&self) -> Vec<Vec<u8>>;
@@ -51,6 +51,8 @@ pub trait Groups: Send + Sync + 'static {
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool;
     /// The files the group links now.
     fn files(&self, group: &[u8]) -> Vec<FileLink>;
+    /// What of a frame goes to `peer` as it is written, by the gate as it is then: none if nothing.
+    fn admit(&self, peer: &EndpointId, frame: Frame) -> Option<Frame>;
 }
 
 /// A browser's own storage of the files it holds, since iroh-blobs keeps only memory there. With one, a session keeps

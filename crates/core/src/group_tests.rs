@@ -103,7 +103,7 @@ impl Member<MemoryProvider> {
 }
 
 pub(crate) fn message(text: &str) -> serde_json::Value {
-    let message = ChatMessage { content: text.into(), after: vec![], to: vec![], reply_to: None, urgent: false, attachment: None };
+    let message = ChatMessage { content: text.into(), read: Default::default(), to: vec![], reply_to: None, urgent: false, attachment: None };
     serde_json::to_value(message).unwrap()
 }
 
