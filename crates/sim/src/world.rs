@@ -213,6 +213,8 @@ struct World {
     running: Mutex<Vec<JoinHandle<()>>>,
     /// Restarts and crashes to come, of members down or woken.
     later: Mutex<Vec<JoinHandle<()>>>,
+    /// Every member is stopped for a while: those down start when it ends, not before.
+    asleep: AtomicBool,
 }
 
 pub(crate) fn run(seed: u64, actions: &[Action], options: Options) -> Outcome {
@@ -281,6 +283,7 @@ impl World {
             book: Mutex::default(),
             running: Mutex::default(),
             later: Mutex::default(),
+            asleep: AtomicBool::new(false),
         });
         let inspecting = Arc::downgrade(&world);
         world.net.inspect(Arc::new(move |wire, frame| {
@@ -337,10 +340,12 @@ impl World {
                 }
                 Act::CrashAfter { m, what } => drop(self.book.lock().unwrap().crash.insert(self.index(m), what)),
                 Act::Sleep { ms } => {
+                    self.asleep.store(true, Ordering::Relaxed);
                     for i in 0..self.size() {
                         self.crash(i).await;
                     }
                     sleep(Duration::from_millis(ms)).await;
+                    self.asleep.store(false, Ordering::Relaxed);
                     for i in 0..self.size() {
                         if self.members.lock().unwrap()[i].client.is_none() {
                             self.start_again(i).await;
@@ -571,13 +576,13 @@ impl World {
         }
     }
 
-    /// Crashes a member now, and starts it again later if it is down then.
+    /// Crashes a member now, and starts it again later if it is down then, or as every member wakes if all sleep.
     async fn down(self: &Arc<Self>, i: usize, ms: u64) {
         self.crash(i).await;
         let world = self.clone();
         let task = tokio::spawn(async move {
             sleep(Duration::from_millis(ms)).await;
-            if world.members.lock().unwrap()[i].client.is_none() {
+            if world.members.lock().unwrap()[i].client.is_none() && !world.asleep.load(Ordering::Relaxed) {
                 world.start_again(i).await;
             }
         });
