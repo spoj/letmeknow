@@ -395,7 +395,8 @@ impl Plugin {
             (Waiting::Send { command, group, bundle }, Ok(sent)) => {
                 let Some(position) = sent["position"].as_u64() else {
                     let error = anyhow::anyhow!("the push is pending, as the group's log did not answer in time: fetch later to see whether it counted");
-                    return Ok(self.out.push(answer(&command, Err(error))));
+                    self.out.push(answer(&command, Err(error)));
+                    return Ok(());
                 };
                 match bundle {
                     Some(link) => self.request(json!({ "type": "spread", "group": group, "link": link }), Waiting::Spread { command, position }),
