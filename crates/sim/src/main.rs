@@ -2,13 +2,18 @@
 //!
 //! `lmk-sim [--seeds A..B] [--jobs J] [--members N] [--actions N]` runs each seed in a process of its own, as the
 //! simulation's randomness is the process's; `lmk-sim --check S` runs one and shrinks it if it fails, and every eighth
-//! seed runs twice to check that it replays exactly; `lmk-sim --seed S [--keep I,J,...] [--list]` replays one, printing
-//! its log, or lists its actions. `lmk-sim --properties` lists the properties.
+//! seed runs twice to check that it replays exactly; a seed fails as slow when its runs take over `SLOW`, and shrinking
+//! stops after `SHRINKING`. `lmk-sim --seed S [--keep I,J,...] [--list]` replays one, printing its log, or lists its
+//! actions. `lmk-sim --properties` lists the properties.
 
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use lmk_sim::{Options, generate, run, shrink};
+
+const SLOW: Duration = Duration::from_secs(60);
+const SHRINKING: Duration = Duration::from_secs(300);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -49,6 +54,18 @@ fn main() {
     }
     if let Some(seed) = value("--check") {
         let seed: u64 = seed.parse().expect("--check S");
+        let watch = Arc::new(Mutex::new((Instant::now() + SLOW, format!("seed {seed}: slow (no outcome within {}s)", SLOW.as_secs()))));
+        let watched = watch.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                let (at, said) = &*watched.lock().unwrap();
+                if Instant::now() > *at {
+                    println!("{said}");
+                    std::process::exit(1);
+                }
+            }
+        });
         let actions = generate(seed, options);
         let outcome = run(seed, &actions, options);
         let failure = match outcome.failure {
@@ -60,11 +77,13 @@ fn main() {
             None => return,
             Some(failure) => failure,
         };
+        println!("seed {seed}: {failure}");
+        println!("  replay: cargo run -p lmk-sim --release -- {} --check {seed}", flags.join(" "));
+        *watch.lock().unwrap() = (Instant::now() + SHRINKING, format!("  shrinking stopped after {}s", SHRINKING.as_secs()));
         let kept = shrink(seed, &actions, options, &failure);
         let shrunk: Vec<_> = kept.iter().map(|i| actions[*i].clone()).collect();
         let keep: Vec<String> = kept.iter().map(usize::to_string).collect();
-        println!("seed {seed}: {failure}");
-        println!("  replay: cargo run -p lmk-sim --release -- {} --seed {seed} --keep {}", flags.join(" "), keep.join(","));
+        println!("  shrunk: cargo run -p lmk-sim --release -- {} --seed {seed} --keep {}", flags.join(" "), keep.join(","));
         if let Some(failure) = run(seed, &shrunk, options).failure {
             println!("  shrunk to {} actions: {failure}", kept.len());
         }
