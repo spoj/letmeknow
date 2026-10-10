@@ -779,7 +779,7 @@ async fn the_list_does_not_drop_a_device_just_linked() {
 }
 
 /// A device that missed the key message of the identity's current key reports the key lost while no device online has
-/// it, and takes it from another device's state once one is online.
+/// it, and gets it once one that has it is online.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_missing_the_current_key_asks_for_it_and_reports_it_lost() {
     let relay = relay().await;

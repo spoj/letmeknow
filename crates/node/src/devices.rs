@@ -83,10 +83,11 @@ enum Entry {
     Opening { opening: Opening },
 }
 
-/// A device that lacks its identity's current key asked the devices online for the group's state: the key it lacks,
-/// the devices that have not answered, and whether it reported the key lost.
+/// A device that lacks its identity's current key asks the devices online for the group's state: the key it lacks, the
+/// devices it asked, by iroh key, those of them that have not answered, and whether it reported the key lost.
 struct Asked {
     key: [u8; 32],
+    asked: Vec<Bytes>,
     waiting: Vec<Bytes>,
     reported: bool,
 }
@@ -378,26 +379,28 @@ impl<P: Provider + Send + 'static> Devices<P> {
         Ok(public(&seed))
     }
 
-    /// This device lacks the key the key log names: it asks the devices online for the group's state, which carries the
-    /// keys; once all of them answered without it, or none was online, it reports the key lost or taken.
+    /// This device lacks the key the key log names: it asks each device online for the group's state, which carries the
+    /// keys; once, after its first pass for that key, every device it asked answered without it, or it asked none, it
+    /// reports the key lost or taken.
     fn missing(&self, gid: &[u8], log: &KeyLog) -> Result<()> {
-        let mut asked = self.asked.lock().unwrap();
-        match asked.get_mut(gid) {
-            Some(asked) if asked.key == *log.current() => {
-                if asked.waiting.is_empty() && !asked.reported {
-                    asked.reported = true;
-                    let text = "this device does not hold its identity's current key, and no device online has it: it was lost, or \
-                                someone took the identity over; start a new identity";
-                    self.node.warn(gid, text.into());
-                }
-            }
-            _ => {
-                let online: Vec<Bytes> = self.node.online(gid)?.into_iter().map(|m| m.iroh).collect();
-                for peer in &online {
-                    self.node.ask_state(gid, &peer.0)?;
-                }
-                asked.insert(gid.to_vec(), Asked { key: *log.current(), waiting: online, reported: false });
-            }
+        let online: Vec<Bytes> = self.node.online(gid)?.into_iter().map(|m| m.iroh).collect();
+        let mut all = self.asked.lock().unwrap();
+        let first = all.get(gid).is_none_or(|asked| asked.key != *log.current());
+        if first {
+            all.insert(gid.to_vec(), Asked { key: *log.current(), asked: Vec::new(), waiting: Vec::new(), reported: false });
+        }
+        let asked = all.get_mut(gid).unwrap();
+        let new: Vec<Bytes> = online.into_iter().filter(|peer| !asked.asked.contains(peer)).collect();
+        for peer in new {
+            self.node.ask_state(gid, &peer.0)?;
+            asked.asked.push(peer.clone());
+            asked.waiting.push(peer);
+        }
+        if !first && asked.waiting.is_empty() && !asked.reported {
+            asked.reported = true;
+            let text = "this device does not hold its identity's current key, and no device online has it: it was lost, or someone \
+                        took the identity over; start a new identity";
+            self.node.warn(gid, text.into());
         }
         Ok(())
     }

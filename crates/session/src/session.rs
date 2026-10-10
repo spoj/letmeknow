@@ -390,7 +390,11 @@ impl Session {
 
     async fn on(&mut self, event: ClientEvent) -> Result<()> {
         let wake = match &event {
-            ClientEvent::Joined { .. } | ClientEvent::Left { .. } | ClientEvent::Removed { .. } | ClientEvent::Settings { .. } => Some(true),
+            ClientEvent::Joined { .. }
+            | ClientEvent::Left { .. }
+            | ClientEvent::Revoked { .. }
+            | ClientEvent::Removed { .. }
+            | ClientEvent::Settings { .. } => Some(true),
             ClientEvent::Introduced { .. } => Some(false),
             _ => None,
         };

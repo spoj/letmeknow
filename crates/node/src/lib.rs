@@ -1189,11 +1189,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.read_keys(identity).await
     }
 
-    /// The key log held of an identity, as its service last told this session of it.
-    pub fn held_key_log(&self, identity: &[u8]) -> Option<KeyLog> {
-        self.inner.state.lock().unwrap().keys.get(identity).cloned()
-    }
-
     /// Appends a sealed entry to an identity's key log, and reads the log.
     pub async fn append_identity(&self, identity: &IdentityRef, entry: &[u8]) -> Result<KeyLog> {
         let log = lmk_proto::identity::address(&identity.id.0);
