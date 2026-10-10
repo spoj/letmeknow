@@ -38,7 +38,7 @@ pub struct Own {
     /// Within H, as in its summary.
     pub held: Ranges,
     pub read: Ranges,
-    /// The counted positions since its start, within H, that it lacks and could still open.
+    /// The counted positions since its start, within H, that it lacks.
     pub lacking: Ranges,
     /// The heads of the key logs of the group's members' identities.
     pub keys: Vec<Head>,

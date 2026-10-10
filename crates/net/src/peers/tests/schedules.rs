@@ -18,6 +18,8 @@ struct Member {
     head: u64,
     held: BTreeSet<u64>,
     lost: BTreeSet<u64>,
+    /// Positions past its H, which it dropped.
+    expired: BTreeSet<u64>,
     /// The commit that deletes keys it has yet to apply.
     commit: Option<u64>,
     /// When it applied its commit.
@@ -55,6 +57,7 @@ impl Net {
                 head: log.len() as u64,
                 held,
                 lost: BTreeSet::new(),
+                expired: BTreeSet::new(),
                 commit: None,
                 applied: None,
                 views: BTreeMap::new(),
@@ -87,7 +90,8 @@ impl Net {
         let positions = || (1..=me.head).filter(|p| self.log[*p as usize - 1]);
         let commits: Ranges = (1..=me.head).filter(|p| !self.log[*p as usize - 1]).collect();
         let held = commits.union(&me.held.iter().copied().filter(|&p| p <= me.head).collect());
-        let lacking = positions().collect::<Ranges>().difference(&held).difference(&me.lost.iter().copied().collect());
+        let gone: Ranges = me.lost.union(&me.expired).copied().collect();
+        let lacking = positions().collect::<Ranges>().difference(&held).difference(&gone);
         Own { head: head(G, me.head), held, read: Ranges::default(), lacking, keys: vec![] }
     }
 
@@ -138,7 +142,7 @@ impl Net {
             }
             Frame::Messages { items, answers, .. } => {
                 for item in items {
-                    if !me.lost.contains(&item.position) && me.held.insert(item.position) && lacking.contains(item.position) {
+                    if !me.lost.contains(&item.position) && !me.expired.contains(&item.position) && me.held.insert(item.position) && lacking.contains(item.position) {
                         me.progress = self.now;
                     }
                 }
@@ -255,7 +259,15 @@ fn random_schedules_converge_without_livelock_or_duplicate_asks_and_the_wait_hol
                         }
                     }
                 }
-                6..16 => {
+                6..8 => {
+                    let m = net.rng.below(n as u64) as usize;
+                    let me = &mut net.members[m];
+                    if let Some(&p) = me.held.iter().nth(net.rng.below(me.held.len() as u64 + 1) as usize) {
+                        me.held.remove(&p);
+                        me.expired.insert(p);
+                    }
+                }
+                8..18 => {
                     let m = net.rng.below(n as u64) as usize;
                     net.members[m].head = net.log.len() as u64;
                 }
@@ -276,12 +288,11 @@ fn random_schedules_converge_without_livelock_or_duplicate_asks_and_the_wait_hol
         for p in messages(&log) {
             if net.members.iter().any(|m| m.held.contains(&p)) {
                 for (i, m) in net.members.iter().enumerate() {
-                    assert!(m.held.contains(&p) || m.lost.contains(&p), "seed {seed}: member {i} lacks {p}, which a connected member holds");
+                    assert!(m.held.contains(&p) || m.lost.contains(&p) || m.expired.contains(&p), "seed {seed}: member {i} lacks {p}, which a connected member holds");
                 }
             }
         }
         let wants = net.wants;
-        eprintln!("seed {seed}: n {n} log {} wants {wants} lost {:?} held {:?}", net.log.len(), net.members.iter().map(|m| m.lost.len()).collect::<Vec<_>>(), net.members.iter().map(|m| m.held.len()).collect::<Vec<_>>());
         net.run_until(150_000);
         assert_eq!(net.wants, wants, "seed {seed}: asks go on after convergence");
         assert!(net.members.iter().all(|m| m.asking.is_none()));
