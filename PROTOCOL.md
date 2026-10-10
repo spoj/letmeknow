@@ -208,7 +208,7 @@ A chat `message`'s fields: `content`, its text, which may be empty with an attac
 
 - A message's id is SHA-256 of its MLS ciphertext.
 - A sender seals no message whose payload and authenticated data, with 1 KiB for MLS's framing, are over 1 MiB: `send` fails with `size` before the message uses a key. A member takes no ciphertext over 1 MiB.
-- A held send is kept at `node/send/<first id>` as `{"payload", "epoch", "id", "ciphertext", "entry", "appended", "pending"}` until its entry counts or the service refuses it, and sealed again, under a new id, when a commit comes first. `appended` marks that its entry may have reached the service: then it is appended again after a failure, 5 seconds later, rather than failed as `unavailable`.
+- A held send is kept at `node/send/<first id>` as `{"payload", "epoch", "id", "ciphertext", "entry", "appended", "pending"}` until its entry counts or the service refuses it, and sealed again, under a new id, when a commit comes first. `appended` marks that its entry may have reached the service. After an append fails without a refusal, a send whose entry may have reached the service, or that `send` answered as pending, is appended again 5 seconds later; any other fails as `unavailable` if the service was not reached.
 - A member keeps the ciphertext of each counted position from its start, its own included, and its opened message, for H after reading the entry.
 - A lost position is announced by a duty in a held `lost` naming every known loss of the member's own that no counted or pending `lost` of its own names.
 
