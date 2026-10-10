@@ -20,8 +20,9 @@ use lmk_core::contacts::{self, Contact};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
 use lmk_node::devices::Devices;
-use lmk_node::{Event, Item, Member, Node};
+use lmk_node::{Event, Heard, Item, Member, Message, Node};
 use lmk_proto::Bytes;
+use lmk_proto::ranges::Ranges;
 use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, Control, DEVICES, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::time::{Duration, Instant, timeout};
@@ -188,6 +189,10 @@ pub enum ClientEvent {
     Sent { group: Bytes, id: String, position: u64 },
     /// A sync of the group's held messages with a member ended.
     Synced { group: Bytes },
+    /// A member's summary of the group came: who holds and read what may have changed (`Client::receipts`).
+    Heard { group: Bytes },
+    /// Another member's summary holds the `leave` that `leave` answered as pending.
+    LeaveHeld { group: Bytes },
     /// A file is held whole.
     File { hash: String },
     /// An event of a kind's plugin: by the delivery policy, waking with `wake`; with `key`, it replaces a held one with
@@ -235,6 +240,35 @@ struct State {
     chat_kinds: HashSet<String>,
     /// The last position of each group's log handed to its plugin, once the plugin follows the log.
     handed: HashMap<Bytes, u64>,
+    /// The groups whose `leave` was answered pending, until another member's summary holds it.
+    leaving: HashSet<Bytes>,
+}
+
+/// What another member holds and read of a group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Receipt {
+    pub member: Member,
+    pub held: Ranges,
+    pub read: Ranges,
+}
+
+/// What each member but `me` holds and read: as its latest summary shows, unless it is away, and as the read ranges of
+/// its chat messages show; what it read it holds.
+pub fn receipts(members: &[Member], me: &Bytes, heard: &[Heard], away: &[Member], messages: &[Message]) -> Vec<Receipt> {
+    let others = members.iter().filter(|member| member.key != *me);
+    others
+        .map(|member| {
+            let summary = heard.iter().find(|heard| heard.member.key == member.key);
+            let chats = messages.iter().filter(|message| message.sender.key == member.key);
+            let said = chats.filter_map(|message| serde_json::from_value::<ChatMessage>(message.payload.clone()).ok());
+            let read = said.fold(summary.map(|heard| heard.read.clone()).unwrap_or_default(), |read, chat| read.union(&chat.read));
+            let held = match summary {
+                Some(heard) if !away.contains(member) => heard.held.union(&read),
+                _ => read.clone(),
+            };
+            Receipt { member: member.clone(), held, read }
+        })
+        .collect()
 }
 
 struct Inner<P> {
@@ -533,11 +567,19 @@ impl<P: Provider + Send + 'static> Client<P> {
             return Ok(json!({ "group": b64(&gid.0), "left": true }));
         };
         let mut answer = json!({ "group": b64(&gid.0), "left": true, "status": "another member commits the removal" });
-        // Until a later release's summaries show another member holding it: no member was online to take it.
-        if sent.position.is_none() || self.inner.node.online(&gid.0)?.is_empty() {
+        if sent.position.is_none() || !self.leave_held(&gid)? {
+            self.state().leaving.insert(gid);
             answer["pending"] = json!(true);
         }
         Ok(answer)
+    }
+
+    /// Whether another member's summary holds a `leave` of this client's in the group.
+    fn leave_held(&self, gid: &Bytes) -> Result<bool> {
+        let node = &self.inner.node;
+        let (only_here, me) = (node.only_here(&gid.0)?, node.key());
+        let mut leaves = node.messages(&gid.0)?.into_iter().filter(|m| m.sender.key == me && m.payload["type"] == "leave");
+        Ok(leaves.any(|leave| !only_here.contains(leave.position)))
     }
 
     /// Lets go of a group the node has left: tells its kind's plugin, and the shell.
@@ -546,6 +588,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             let mut st = self.state();
             st.infos.remove(gid);
             st.handed.remove(gid);
+            st.leaving.remove(gid);
             st.kind_of.remove(gid)
         };
         if let Some(kind) = kind {
@@ -592,9 +635,19 @@ impl<P: Provider + Send + 'static> Client<P> {
         for gid in node.groups() {
             let describer = self.describer(&gid)?;
             let online: Vec<Described> = node.online(&gid.0)?.iter().map(|m| describer.describe(m)).collect();
-            let only_here: Vec<Value> = node.pending_files(&gid.0)?.iter().map(|p| json!({ "id": hex::encode(&p.id.0), "what": p.what })).collect();
+            let away: Vec<Described> = node.away(&gid.0)?.iter().map(|m| describer.describe(m)).collect();
+            let positions = node.only_here(&gid.0)?;
+            let messages: HashMap<u64, Message> = node.messages(&gid.0)?.into_iter().map(|m| (m.position, m)).collect();
+            let mut only_here: Vec<Value> = positions
+                .iter()
+                .map(|position| match messages.get(&position) {
+                    Some(m) => json!({ "what": m.payload["type"], "id": hex::encode(&m.id.0), "position": position }),
+                    None => json!({ "position": position }),
+                })
+                .collect();
+            only_here.extend(node.pending_files(&gid.0)?.iter().map(|p| json!({ "what": p.what, "id": hex::encode(&p.id.0) })));
             only_here_count += only_here.len();
-            let mut group = json!({ "group": b64(&gid.0), "online": online, "only_here": only_here });
+            let mut group = json!({ "group": b64(&gid.0), "online": online, "away": away, "only_here": only_here });
             if let Some(name) = Some(node.settings(&gid.0)?.name).filter(|n| !n.is_empty()) {
                 group["name"] = json!(name);
             }
@@ -652,8 +705,8 @@ impl<P: Provider + Send + 'static> Client<P> {
 
     // Messages.
 
-    /// Sends a chat message that comes after `after`; returns its id and the answer to `send`.
-    pub async fn send(&self, gid: &Bytes, chat: Chat, after: Vec<Bytes>) -> Result<(Bytes, Value)> {
+    /// Sends a chat message, with the positions this client read; returns its id and the answer to `send`.
+    pub async fn send(&self, gid: &Bytes, chat: Chat) -> Result<(Bytes, Value)> {
         let node = &self.inner.node;
         let mut addressed: Vec<Member> = Vec::new();
         for to in &chat.to {
@@ -676,7 +729,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         };
         let payload = ChatMessage {
             content: chat.text,
-            after,
+            read: node.read(&gid.0)?,
             to: addressed.iter().map(|m| Bytes(Sha256::digest(&m.key.0)[..8].to_vec())).collect(),
             reply_to: chat.reply_to.map(|id| Bytes(id.to_vec())),
             urgent: chat.urgent,
@@ -700,19 +753,20 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok((id, answer))
     }
 
-    /// The chat messages of a group that were read, by `read`, and that no other read one comes after: what a new
-    /// message names in `after`.
-    pub fn tips(&self, gid: &Bytes, read: impl Fn(&[u8]) -> bool) -> Result<Vec<Bytes>> {
-        let messages: Vec<(Bytes, ChatMessage)> = self
-            .inner
-            .node
-            .messages(&gid.0)?
-            .into_iter()
-            .filter(|m| read(&m.id.0))
-            .filter_map(|m| Some((m.id, serde_json::from_value(m.payload).ok()?)))
-            .collect();
-        let covered: HashSet<&Bytes> = messages.iter().flat_map(|(_, chat)| &chat.after).collect();
-        Ok(messages.iter().filter(|(id, _)| !covered.contains(id)).map(|(id, _)| id.clone()).collect())
+    /// Marks positions of a group read, as this client showed or printed them.
+    pub fn mark_read(&self, gid: &Bytes, positions: &Ranges) -> Result<()> {
+        let node = &self.inner.node;
+        if positions.difference(&node.read(&gid.0)?).is_empty() {
+            return Ok(());
+        }
+        node.mark_read(&gid.0, positions)
+    }
+
+    /// What each other member of a group holds and read (see `receipts`).
+    pub fn receipts(&self, gid: &Bytes) -> Result<Vec<Receipt>> {
+        let node = &self.inner.node;
+        let (members, heard, away, messages) = (node.members(&gid.0)?, node.heard(&gid.0)?, node.away(&gid.0)?, node.messages(&gid.0)?);
+        Ok(receipts(&members, &node.key(), &heard, &away, &messages))
     }
 
     /// The members `to` addresses: a fingerprint, or a name they answer to, as long as they speak for one identity.
@@ -856,6 +910,13 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let item = json!({ "type": "synced", "member": self.describe(&group, &member)? });
                 self.tell_plugin(&group, item)?;
                 self.emit(ClientEvent::Synced { group });
+            }
+            Event::Heard { group } => {
+                if self.state().leaving.contains(&group) && self.leave_held(&group)? {
+                    self.state().leaving.remove(&group);
+                    self.emit(ClientEvent::LeaveHeld { group: group.clone() });
+                }
+                self.emit(ClientEvent::Heard { group });
             }
             Event::State { group, from, data } => {
                 let item = json!({ "type": "state", "from": self.describe(&group, &from)?, "data": Bytes(data) });
@@ -1435,5 +1496,56 @@ impl<P: Provider + Send + 'static> Client<P> {
             other => bail!("unknown request {other:?}"),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(key: u8) -> Member {
+        Member {
+            key: Bytes(vec![key]),
+            iroh: Bytes(vec![key]),
+            revision: 0,
+            name: format!("m{key}"),
+            device_name: String::new(),
+            identity: None,
+            added: None,
+        }
+    }
+
+    fn chat(sender: u8, position: u64, read: Ranges) -> Message {
+        let payload = serde_json::to_value(ChatMessage { content: String::new(), read, to: Vec::new(), reply_to: None, urgent: false, attachment: None });
+        Message {
+            id: Bytes(vec![sender, position as u8]),
+            group: Bytes::default(),
+            epoch: 0,
+            position,
+            at: 0,
+            sender: member(sender),
+            payload: payload.unwrap(),
+            missing: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_member_holds_what_its_summary_shows_but_away_and_read_what_its_messages_say_too() {
+        let members = [member(1), member(2), member(3), member(4)];
+        let heard = [
+            Heard { member: member(2), held: Ranges::range(1, 10), read: Ranges::range(1, 4), at: 0 },
+            Heard { member: member(3), held: Ranges::range(1, 10), read: Ranges::range(1, 2), at: 0 },
+        ];
+        let messages = [chat(2, 11, Ranges::range(1, 6)), chat(4, 12, Ranges::range(1, 3))];
+        let got = receipts(&members, &Bytes(vec![1]), &heard, &[member(3)], &messages);
+        let got: Vec<(u8, Ranges, Ranges)> = got.into_iter().map(|r| (r.member.key.0[0], r.held, r.read)).collect();
+        assert_eq!(
+            got,
+            [
+                (2, Ranges::range(1, 10), Ranges::range(1, 6)),
+                (3, Ranges::range(1, 2), Ranges::range(1, 2)),
+                (4, Ranges::range(1, 3), Ranges::range(1, 3)),
+            ]
+        );
     }
 }

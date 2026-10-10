@@ -91,6 +91,9 @@ let groups: Group[] = [];
 let page: "group" | "devices" | "start" = "start";
 let selected: string | undefined;
 let entered: Promise<void> | undefined;
+/** How many of this browser's sends no other member holds yet: closing the page while any is loses them. */
+let onlyHere = 0;
+addEventListener("beforeunload", event => onlyHere && event.preventDefault());
 const group = (gid: string) => groups.find(g => g.group === gid && g.joined);
 const unread = (gid: string) => Number(localStorage.getItem(`unread ${gid}`) ?? 0);
 
@@ -433,6 +436,7 @@ function render() {
 async function draw() {
   me = JSON.parse(await lmk.me());
   groups = JSON.parse(await lmk.groups());
+  onlyHere = await lmk.only_here();
   for (const [gid, view] of views) {
     if (group(gid)) continue;
     view.el.remove();
@@ -759,7 +763,8 @@ class View {
   protected drawPeople() {
     const others = this.members.filter(m => !m.you);
     const warned = others.some(m => m.identity?.error || m.identity?.warning);
-    this.people.replaceChildren(...(others.length ? [warned ? "⚠ " : "", [...new Set(others.map(label))].join(", "), " and you"] : ["Only you so far"]));
+    const names = [...new Set(others.map(m => (m.away ? `${label(m)} (away)` : label(m))))];
+    this.people.replaceChildren(...(others.length ? [warned ? "⚠ " : "", names.join(", "), " and you"] : ["Only you so far"]));
     this.people.classList.toggle("warn", warned);
   }
 
@@ -804,6 +809,7 @@ class View {
               {},
               who(m),
               m.you && h("small", { className: "muted" }, " you"),
+              m.away && h("small", { className: "muted" }, " away: not heard from for as long as members carry messages"),
               h("p", { className: m.identity?.error ? "warn" : "muted" }, standing(m)),
               m.added_by && h("p", { className: "muted" }, `added by ${m.added_by.name ?? "a former member"} (${m.added_by.how})`)
             ),
@@ -817,7 +823,9 @@ class View {
         "div",
         { className: "buttons leave" },
         confirmed(`Leave ${kind}`, "Leave for good?", async () => {
-          if ((await request({ cmd: "leave", group: gid })).status) toast("Asked the others to remove you; you leave once one of them is online.");
+          const left = await request({ cmd: "leave", group: gid });
+          if (left.pending) toast("Asked the others to remove you; keep this page open until one of them has your request.");
+          else if (left.status) toast("Asked the others to remove you; one of them removes you.");
           render();
           dialog.close();
         })
@@ -905,7 +913,7 @@ class ChatView extends View {
 
   async update() {
     await super.update();
-    const items: Item[] = [...JSON.parse(await lmk.items(this.gid)), ...this.failed];
+    const items: Item[] = [...JSON.parse(await lmk.items(this.gid, document.visibilityState === "visible")), ...this.failed];
     const keep = new Set<string>();
     let added = false;
     let previous: Item | undefined;
@@ -940,6 +948,12 @@ class ChatView extends View {
         const to = item.to?.map(fp => this.members.find(m => m.fp === fp)).filter(m => m != null);
         const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent", (item.pending || item.failed) && "unsent"];
         const lostBy = item.lost_by?.length && h("p", { className: "tag" }, item.lost_by.map(label).join(", "), " could not read this; send it again if it matters");
+        const readBy = item.read_by?.length ? ` · read by ${item.read_by.map(label).join(", ")}` : "";
+        const ticks =
+          item.only_here !== undefined &&
+          (item.only_here
+            ? h("small", { className: "ticks", title: "Only on this device: keep this page open until another member has it" }, "✓")
+            : h("small", { className: "ticks", title: `Held by ${item.held_by!.map(label).join(", ")}` }, "✓✓", readBy));
         return h(
           "li",
           { className: classes.filter(Boolean).join(" "), tabIndex: -1 },
@@ -958,6 +972,7 @@ class ChatView extends View {
           item.content && h("div", { className: "text" }, item.content),
           item.attachment && this.attachmentView(item.attachment),
           lostBy,
+          ticks,
           item.failed
             ? h(
                 "p",
@@ -974,7 +989,7 @@ class ChatView extends View {
       case "lost":
         return h("li", { className: "event warn" }, `You could not read ${item.positions.length === 1 ? "a message" : `${item.positions.length} messages`}: no member online held them in time`, at);
       case "leave":
-        return h("li", { className: "event" }, who(item.from), " asked to leave", at);
+        return h("li", { className: "event" }, who(item.from), " asked to leave", item.only_here && h("small", { className: "ticks", title: "Only on this device: keep this page open until another member has it" }, " ✓"), at);
       case "joined":
       case "left": {
         const self = item.by.fp === item.member.fp;

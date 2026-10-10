@@ -270,6 +270,10 @@ pub enum Event {
         group: Bytes,
         member: Member,
     },
+    /// A member's summary of the group was heard: who holds and read what may have changed (`Node::heard`).
+    Heard {
+        group: Bytes,
+    },
     /// The state of the group's kind that `from` handed this session: beside the Welcome that admitted it, or later.
     State {
         group: Bytes,
@@ -319,6 +323,7 @@ impl Event {
             | Event::Settings { group, .. }
             | Event::Live { group, .. }
             | Event::Synced { group, .. }
+            | Event::Heard { group }
             | Event::State { group, .. }
             | Event::Logged { group }
             | Event::Snapshot { group, .. }

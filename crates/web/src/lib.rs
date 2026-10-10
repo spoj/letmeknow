@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use js_sys::{Array, Function, Promise, Uint8Array};
-use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Introduction, Request, message_id, service};
+use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Introduction, Request, fp, message_id, service};
 use lmk_node::devices::Devices;
 use lmk_node::lmk_core::crypto::{Crypto, Rand};
 use lmk_node::lmk_core::device::Device;
@@ -523,6 +523,7 @@ impl App {
                 self.emit(json!({ "type": "lost", "group": group }));
             }
             ClientEvent::Sent { group, id, .. } => self.emit(json!({ "type": "sent", "group": group, "id": id })),
+            ClientEvent::Heard { group } => self.emit(json!({ "type": "heard", "group": group })),
             ClientEvent::File { hash } => self.emit(json!({ "type": "file", "hash": hash })),
             ClientEvent::Plugin { group, kind, mut event, .. } => {
                 if event.get("type") == Some(&json!("pushed")) {
@@ -535,8 +536,8 @@ impl App {
             }
             ClientEvent::Devices { identity } => self.emit(json!({ "type": "devices", "identity": identity })),
             ClientEvent::Warning { group, text } => self.emit(json!({ "type": "warning", "group": group, "text": text })),
-            // The page shows messages as they come, waiting for none.
-            ClientEvent::Synced { .. } => {}
+            // The page shows messages as they come, waiting for none; a held leave shows as its tick.
+            ClientEvent::Synced { .. } | ClientEvent::LeaveHeld { .. } => {}
         }
         Ok(())
     }
@@ -560,7 +561,13 @@ impl App {
             if settings.kind == DEVICES {
                 continue;
             }
-            let members = self.client.described_members(&gid)?;
+            let away: Vec<String> = node.away(&gid.0)?.iter().map(|m| fp(&m.key.0)).collect();
+            let mut members = serde_json::to_value(self.client.described_members(&gid)?)?;
+            for member in members.as_array_mut().expect("a list") {
+                if member["fp"].as_str().is_some_and(|fp| away.iter().any(|away| away == fp)) {
+                    member["away"] = json!(true);
+                }
+            }
             groups.push(json!({ "group": gid, "settings": settings, "members": members, "joined": true }));
         }
         let joined = node.groups();
@@ -574,10 +581,14 @@ impl App {
     }
 
     /// A group's timeline: its held messages, the changes and losses this session saw, oldest first; then its sends
-    /// pending. Its own messages that other members lost name them in `lost_by`.
-    fn items(&self, gid: &Bytes) -> Result<Value> {
+    /// pending. Its own messages say which other members hold them (`held_by`), read them (`read_by`) or lost them
+    /// (`lost_by`), and whether no other member's summary shows them held (`only_here`). `shown`: the page shows them,
+    /// so they are read.
+    fn items(&self, gid: &Bytes, shown: bool) -> Result<Value> {
         let node = self.client.node();
         let describer = self.client.describer(gid)?;
+        let (receipts, only_here) = (self.client.receipts(gid)?, node.only_here(&gid.0)?);
+        let mut read = Vec::new();
         let mut items: Vec<Value> = get(&self.store, &key("timeline", &gid.0))?.unwrap_or_default();
         let losses: Vec<Value> = items.iter().filter(|item| item["type"] == "lost" && item["member"]["you"] != true).cloned().collect();
         items.retain(|item| item["type"] != "lost" || item["member"]["you"] == true);
@@ -587,15 +598,30 @@ impl App {
         for (id, at, position, sender, payload) in held.chain(pending) {
             let from = describer.describe(&sender);
             let id = hex::encode(&id.0);
+            let mine = sender.key == node.key();
             if payload["type"] == "leave" {
-                items.push(json!({ "type": "leave", "id": id, "at": at, "from": from }));
+                let only_here = mine && position.is_some_and(|position| only_here.contains(position));
+                items.push(json!({ "type": "leave", "id": id, "at": at, "from": from, "only_here": only_here }));
             }
             let Ok(lmk_proto::group::ChatMessage { content, to, reply_to, urgent, attachment, .. }) = serde_json::from_value(payload) else {
                 continue;
             };
             let mut item = json!({ "type": "message", "id": id, "at": at, "from": from, "content": content });
             match position {
-                Some(position) => item["position"] = json!(position),
+                Some(position) if mine => {
+                    let by = |of: &dyn Fn(&lmk_client::Receipt) -> bool| -> Vec<Described> {
+                        receipts.iter().filter(|r| of(r)).map(|r| describer.describe(&r.member)).collect()
+                    };
+                    item["position"] = json!(position);
+                    item["only_here"] = json!(only_here.contains(position));
+                    item["held_by"] = json!(by(&|r| r.held.contains(position)));
+                    item["read_by"] = json!(by(&|r| r.read.contains(position)));
+                    read.push(position);
+                }
+                Some(position) => {
+                    item["position"] = json!(position);
+                    read.push(position);
+                }
                 None => item["pending"] = json!(true),
             }
             let lost_by: Vec<&Value> = losses.iter().filter(|lost| lost["ids"].as_array().is_some_and(|ids| ids.contains(&json!(id)))).map(|lost| &lost["member"]).collect();
@@ -619,13 +645,23 @@ impl App {
             items.push(item);
         }
         items.sort_by_key(|item| item["at"].as_u64());
+        if shown {
+            self.client.mark_read(gid, &read.into_iter().collect())?;
+        }
         Ok(Value::Array(items))
     }
 
-    async fn send(&self, gid: &Bytes, chat: Chat) -> Result<Value> {
-        // The page shows every message it holds, so it has read them all.
-        let after = self.client.tips(gid, |_| true)?;
-        Ok(self.client.send(gid, chat, after).await?.1)
+    /// How many of this session's sends no other member's summary shows held, in its groups but devices groups, its
+    /// pending sends among them.
+    fn only_here(&self) -> Result<u32> {
+        let node = self.client.node();
+        let mut count = 0;
+        for gid in node.groups() {
+            if node.settings(&gid.0)?.kind != DEVICES {
+                count += node.only_here(&gid.0)?.len() as u32 + node.sending(&gid.0)?.len() as u32;
+            }
+        }
+        Ok(count)
     }
 }
 
@@ -661,8 +697,14 @@ impl Lmk {
         Ok(self.app.groups().map_err(js)?.to_string())
     }
 
-    pub fn items(&self, gid: &str) -> R<String> {
-        Ok(self.app.items(&Bytes(unb64(gid).map_err(js)?)).map_err(js)?.to_string())
+    /// A group's timeline; `shown`: the page shows it, so its messages are read.
+    pub fn items(&self, gid: &str, shown: bool) -> R<String> {
+        Ok(self.app.items(&Bytes(unb64(gid).map_err(js)?), shown).map_err(js)?.to_string())
+    }
+
+    /// How many of this browser's sends no other member holds yet: closing it while any is loses them.
+    pub fn only_here(&self) -> R<u32> {
+        self.app.only_here().map_err(js)
     }
 
     /// A new chat, doc or git repository, speaking as this browser's first identity; returns its id.
@@ -692,7 +734,7 @@ impl Lmk {
         let gid = Bytes(unb64(&gid).map_err(js)?);
         let attachment = file.map(|data| File { name: file_name.unwrap_or_default(), media_type: file_type.unwrap_or_default(), data });
         let reply_to = reply_to.map(|id| message_id(&id)).transpose().map_err(js)?;
-        let sent = self.app.send(&gid, Chat { text: content, to, reply_to, urgent, attachment }).await.map_err(js)?;
+        let (_, sent) = self.app.client.send(&gid, Chat { text: content, to, reply_to, urgent, attachment }).await.map_err(js)?;
         self.app.flush();
         Ok(sent.to_string())
     }

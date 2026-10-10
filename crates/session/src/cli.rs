@@ -123,10 +123,11 @@ pub enum Request {
         attach_name: String,
         text: String,
     },
-    /// Show a message and its causal history
+    /// Show a chat message: of your own, who holds and who read it
     #[command(display_order = 13)]
     Read {
         id: String,
+        /// Show first this many of the chat messages before it that its sender had read
         #[arg(long, default_value_t = 0)]
         ancestors: usize,
     },

@@ -286,7 +286,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let ours = |s: &Summary| s.head.log == s.group && st.groups.contains_key(&s.group.0);
             let groups: Vec<Summary> = groups.into_iter().filter(|s| ours(s) && self.vouched(st, &s.head, &peer)).collect();
             for heard in st.peers.frame(&key, &Frame::Hello { groups: groups.clone(), heads }, now) {
+                let group = heard.summary.group.clone();
                 st.hear(heard)?;
+                self.events.send(Event::Heard { group }).ok();
             }
             for summary in groups {
                 let gid = summary.group.0;
@@ -412,6 +414,13 @@ impl<P: Provider + Send + 'static> Node<P> {
         let since = self.carried_since(gid)?;
         let held = self.heard(gid)?.iter().filter(|h| h.at >= since).fold(Ranges::default(), |held, h| held.union(&h.held));
         Ok(self.inner.lock().group(gid)?.rec.own.difference(&held))
+    }
+
+    /// The positions of the group this session read, as its summaries carry them.
+    pub fn read(&self, gid: &[u8]) -> Result<Ranges> {
+        let st = self.inner.lock();
+        st.group(gid)?;
+        Ok(st.own(gid).read)
     }
 
     /// Marks positions of the group read, as its client showed or printed them: its summaries carry them.
