@@ -33,7 +33,7 @@ use lmk_core::identity::{KeyLog, Verdict};
 use lmk_core::provider::Provider;
 use lmk_net::peers::{self, Peers};
 use lmk_net::Net;
-use lmk_proto::group::{Certificate, Credential, How, IdentityRef, Settings};
+use lmk_proto::group::{Certificate, Credential, DEVICES, How, IdentityRef, Settings};
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::Frame;
 use lmk_proto::ranges::Ranges;
@@ -786,6 +786,17 @@ impl<P: Provider> State<P> {
     fn undecided(&self, gid: &[u8]) -> BTreeSet<[u8; 32]> {
         let unread = |member: core::Member| member.credential?.identity().is_some_and(|identity| !self.keys.contains_key(&identity.id.0)).then_some(());
         self.served.keys().filter(|peer| self.in_leaf(gid, peer).and_then(unread).is_some()).map(|peer| *peer.as_bytes()).collect()
+    }
+
+    /// The key log of the identity a devices group is of, once it lists this node's device key there or dropped it: device
+    /// keys are made anew for each identity, so no other key log names it.
+    fn devices_log(&self, gid: &[u8]) -> Option<&KeyLog> {
+        let g = self.groups.get(gid)?;
+        if g.mls.settings().kind != DEVICES {
+            return None;
+        }
+        let me = self.me(gid);
+        self.keys.values().find(|log| log.devices.iter().any(|device| device.key.0 == me) || log.dropped(me))
     }
 
     /// The identities a group's members speak as.

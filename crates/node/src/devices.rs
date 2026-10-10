@@ -318,8 +318,8 @@ impl<P: Provider + Send + 'static> Devices<P> {
     }
 
     /// The duties of a devices group, as its log and the identity's key log stand, each read afresh from its service:
-    /// the key log first, since a device's Add is in the group's log before any entry lists it. Devices the key log took
-    /// off leave the group. A device that holds the identity's current key appends, chained to the key log's last entry,
+    /// the key log first, since a device's Add is in the group's log before any entry lists it. While devices the key log
+    /// took off are in the group, it waits for the group's duties to remove them, in one commit. A device that holds the identity's current key appends, chained to the key log's last entry,
     /// one restating the list of devices when it differs from the group's members, with a new key when a device left;
     /// and one with a new key when the current one is a month old. One that lacks the key asks for it.
     pub async fn duties(&self, gid: &[u8]) -> Result<()> {
@@ -328,11 +328,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let log = self.node.read_key_log(&book.identity).await?;
         self.node.read_group(gid).await?;
         let members = self.node.members(gid)?;
-        let dropped: Vec<&Member> = members.iter().filter(|m| log.dropped(&m.key.0)).collect();
-        if !dropped.is_empty() {
-            for member in dropped {
-                self.node.remove(gid, &member.key.0).await?;
-            }
+        if members.iter().any(|m| log.dropped(&m.key.0)) {
             return Ok(());
         }
         let Some(book) = self.record(gid).book.filter(|_| self.record(gid).stopped.is_none()) else { return Ok(()) };

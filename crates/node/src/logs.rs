@@ -147,7 +147,8 @@ impl<P: Provider> State<P> {
         match self.logs.get(id).map(|log| &log.of) {
             Some(Of::Group) => vec![id.to_vec()],
             Some(Of::Identity(identity)) => {
-                self.groups.keys().filter(|gid| self.identities(gid).iter().any(|i| i.id == *identity)).cloned().collect()
+                let of = |gid: &Vec<u8>| self.identities(gid).iter().any(|i| i.id == *identity) || self.devices_log(gid).is_some_and(|log| log.id[..] == identity.0[..]);
+                self.groups.keys().filter(|gid| of(gid)).cloned().collect()
             }
             None => Vec::new(),
         }
