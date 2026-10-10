@@ -21,7 +21,6 @@ js-sys = "0.3"
 n0-future = "0.3"
 openmls_memory_storage.workspace = true
 openmls_traits.workspace = true
-rustc-hash = "2"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }

@@ -9,7 +9,6 @@ use iroh::tls::CaTlsConfig;
 use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
 use lmk_client::{Access, Client, ClientEvent, Config, Plugins, Request, Standing};
 use lmk_core::device::Device;
-use lmk_core::group::Window;
 use lmk_core::provider::MemoryProvider;
 use lmk_node::Node;
 use lmk_node::devices::Devices;
@@ -73,7 +72,7 @@ impl Member {
             files: None,
             disk: None,
             file_limit: 100 << 20,
-            window: Window::default(),
+            durable: None,
             kinds: vec![CHAT.into(), DEVICES.into(), KIND.into()],
         };
         let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();

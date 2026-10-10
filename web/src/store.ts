@@ -1,9 +1,9 @@
 // IndexedDB: "records" holds the session's records, one per key, as the WebAssembly hands them over; "files" the
 // ciphertext of the files it keeps, by hash (hex), which the session loads one at a time when it needs one.
 const db: Promise<IDBDatabase> = new Promise((resolve, reject) => {
-  const request = indexedDB.open("lmk", 2);
+  const request = indexedDB.open("lmk", 3);
   request.onupgradeneeded = () => {
-    // Version 1 held the session of a letmeknow before 0.12, which this one cannot read.
+    // Versions 1 and 2 held the session of a letmeknow before 0.13, which this one cannot read.
     for (const store of [...request.result.objectStoreNames]) request.result.deleteObjectStore(store);
     request.result.createObjectStore("records");
     request.result.createObjectStore("files");
@@ -32,11 +32,17 @@ export async function load(): Promise<{ records: [Uint8Array, Uint8Array][]; kep
   return { records: keys.map((key, i) => [new Uint8Array(key as ArrayBuffer), values[i]]), kept: kept as string[] };
 }
 
+/** Resolves once the records are durable: the session sends nothing a step produced before. */
 export async function save(puts: [Uint8Array, Uint8Array][], deletes: Uint8Array[]) {
-  const tx = (await db).transaction("records", "readwrite");
+  const tx = (await db).transaction("records", "readwrite", { durability: "strict" });
   const records = tx.objectStore("records");
   for (const [key, value] of puts) records.put(value, key as Uint8Array<ArrayBuffer>);
   for (const key of deletes) records.delete(key as Uint8Array<ArrayBuffer>);
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
 }
 
 export async function saveFile(hash: string, ciphertext: Uint8Array) {

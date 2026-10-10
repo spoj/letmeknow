@@ -25,11 +25,17 @@ pub use chain::{Chain, Contradiction, Forged};
 #[error("the membership service refused: {0}")]
 pub struct Refused(pub String);
 
+/// The request certainly did not reach the service: it could not be reached.
+#[derive(Debug, thiserror::Error)]
+#[error("the membership service is unavailable: {0}")]
+pub struct Unreached(pub String);
+
 /// A membership service, as a client sees it. Every head it returns has been checked against the client's chain:
 /// a bad signature is a [`Forged`] error, a head that contradicts the chain a [`Contradiction`].
 #[async_trait]
 pub trait Membership: Send + Sync {
-    async fn append(&self, log: &[u8], entry: &[u8]) -> Result<Appended>;
+    /// Appends entries one after another, as one append against the service's rate limit.
+    async fn append(&self, log: &[u8], entries: &[Vec<u8>]) -> Result<Appended>;
     /// One page of the entries after `after`.
     async fn read(&self, log: &[u8], after: u64) -> Result<Page>;
     async fn head(&self, log: &[u8]) -> Result<Head>;

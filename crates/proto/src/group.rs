@@ -5,16 +5,9 @@ use serde_json::{Map, Value};
 
 use crate::Bytes;
 
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 /// This release's protocol revision, which grows with each compatible addition; a leaf without one is revision 0.
 pub const REVISION: u32 = 1;
-/// The revision from which a member's update may rename it: every member must name it or a later one.
-pub const RENAME_REVISION: u32 = 1;
-/// The revision from which an `introduce` is held: every member must name it or a later one.
-pub const INTRODUCE_REVISION: u32 = 1;
-/// The revision from which a commit that removes members in a group with a kind's log must end that log: every member
-/// must name it or a later one.
-pub const END_REVISION: u32 = 1;
 /// The private-use extension types: settings in the group context, and leaf data.
 pub const SETTINGS_EXTENSION: u16 = 0xff01;
 pub const LEAF_EXTENSION: u16 = 0xff02;
@@ -48,7 +41,8 @@ pub struct Settings {
     pub kind: String,
     pub name: String,
     pub open: Vec<Named>,
-    pub keep: u32,
+    /// H: how many days members carry the group's messages, and the files they link, for others.
+    pub carry: u32,
     pub membership: Service,
     /// Fields a newer letmeknow added, kept when this one rewrites the settings.
     #[serde(flatten)]
@@ -122,8 +116,6 @@ pub enum Control {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         to: Vec<Bytes>,
     },
-    /// The messages the sender gave up since it last said so.
-    Refused { messages: Vec<Refusal> },
     /// An invite, which any member admits a joiner by once: SHA-256 of its secret, when it expires (milliseconds), and
     /// whom it is for.
     Invite {
@@ -139,40 +131,12 @@ pub enum Control {
 }
 
 impl Control {
-    pub const TYPES: [&str; 4] = ["leave", "introduce", "refused", "invite"];
-}
-
-/// A message a member gave up, and why.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Refusal {
-    pub id: Bytes,
-    pub reason: Reason,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Reason {
-    /// Larger than the member takes.
-    Size,
-    /// Sealed under an epoch whose keys the member no longer holds, or below its floor.
-    Old,
-    /// From a member removed more than 5 minutes before it arrived.
-    Removed,
-    /// It did not open.
-    Unreadable,
-    /// A reason a newer letmeknow gave.
-    #[serde(untagged)]
-    Other(String),
+    pub const TYPES: [&str; 3] = ["leave", "introduce", "invite"];
 }
 
 /// A payload's `type`.
 pub fn type_of(payload: &serde_json::Value) -> &str {
     payload["type"].as_str().unwrap_or_default()
-}
-
-/// Whether members hold a payload: those of these types always, and others when their sender marks them so.
-pub fn held_by_type(payload: &serde_json::Value) -> bool {
-    matches!(type_of(payload), "message" | "leave" | "refused" | "invite")
 }
 
 /// A chat message, the payload of the built-in kind.
@@ -237,9 +201,6 @@ mod tests {
 
     #[test]
     fn unknown_values_parse_to_the_catch_all() {
-        let refused: Control = serde_json::from_str(r#"{"type":"refused","messages":[{"id":"AQ","reason":"quota"},{"id":"Ag","reason":"old"}]}"#).unwrap();
-        let Control::Refused { messages } = refused else { panic!() };
-        assert_eq!(messages.iter().map(|m| m.reason.clone()).collect::<Vec<_>>(), [Reason::Other("quota".into()), Reason::Old]);
         let introduce = r#"{"type":"introduce","identity":{"id":"AQ","membership":{"folder":"/x"}},"name":"Bob","how":"met"}"#;
         let Control::Introduce { how, .. } = serde_json::from_str(introduce).unwrap() else { panic!() };
         assert_eq!(how, How::Other("met".into()));
@@ -250,11 +211,11 @@ mod tests {
 
     #[test]
     fn records_keep_fields_this_version_does_not_know() {
-        let text = r#"{"protocol":2,"kind":"chat","name":"Plan","open":[{"id":"AQ","name":"Bob","since":1}],"keep":90,"membership":{"serve":{"key":"Ag","relay":"r","addrs":[],"ticket":"t"}},"color":"red"}"#;
+        let text = r#"{"protocol":3,"kind":"chat","name":"Plan","open":[{"id":"AQ","name":"Bob","since":1}],"carry":7,"membership":{"serve":{"key":"Ag","relay":"r","addrs":[],"ticket":"t"}},"color":"red"}"#;
         let settings: Settings = serde_json::from_str(text).unwrap();
         let renamed = Settings { name: "Release".into(), ..settings };
         assert_eq!(serde_json::to_string(&renamed).unwrap(), text.replace("Plan", "Release"));
         let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ","relay":"r","kinds":["chat"]}"#).unwrap();
-        assert_eq!(leaf.revision, 0, "a leaf without a revision is 0.12.1's");
+        assert_eq!(leaf.revision, 0);
     }
 }

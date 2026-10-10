@@ -5,7 +5,6 @@ use anyhow::Result;
 use clap::Parser;
 use iroh::tls::CaTlsConfig;
 use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
-use lmk_core::group::Window;
 use lmk_proto::group::Service;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
@@ -27,7 +26,6 @@ struct World {
     root: PathBuf,
     /// For the sessions started from now on.
     causal_wait: Duration,
-    window: Window,
     plugins: Vec<PathBuf>,
 }
 
@@ -64,7 +62,7 @@ async fn world(test: &str) -> World {
     let root = std::env::temp_dir().join(format!("lmk-session-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let network = crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) };
-    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT, window: Window::default(), plugins: vec![built()] }
+    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT, plugins: vec![built()] }
 }
 
 struct Agent {
@@ -94,7 +92,6 @@ impl World {
             name: handle[..1].to_uppercase() + &handle[1..],
             hold,
             causal_wait: self.causal_wait,
-            window: self.window,
             keep_log: false,
             membership: self.membership(),
             plugins: self.plugins.clone(),
@@ -176,7 +173,7 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let invite = alice.cmd(&["invite", "--for", "Bob (Acme)"]).await.unwrap();
     assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "kind": 0, "expires_in": 0, "for": 0 })));
     let link = invite["link"].as_str().unwrap();
-    assert!(link.starts_with("https://letmeknow.dev/i#2.g."));
+    assert!(link.starts_with("https://letmeknow.dev/i#3.g."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len(), 2);
@@ -193,8 +190,7 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         let world = world("steer").await;
         let (mut alice, mut bob, group) = pair(&world, HOUR).await;
         let sent = bob.cmd(&["send", "the build is green"]).await.unwrap();
-        assert_eq!(sent["held_by"][0]["name"], "Alice");
-        assert!(sent.get("pending").is_none());
+        assert!(sent["position"].is_u64() && sent.get("pending").is_none(), "{sent}");
         assert!(alice.printed().await.iter().all(|e| e["type"] != "message"));
         bob.cmd(&["send", "@alice can you deploy?"]).await.unwrap();
         let first = alice.expect("message").await;
@@ -234,7 +230,7 @@ fn held_messages_print_once_the_hold_runs_out() {
 }
 
 #[test]
-fn send_reports_who_holds_a_message_or_that_it_is_pending_and_refuses_one_too_large() {
+fn send_answers_the_position_and_refuses_a_message_too_large() {
     local(async {
         let world = world("pending").await;
         let (alice, mut bob, _) = pair(&world, HOUR).await;
@@ -243,23 +239,13 @@ fn send_reports_who_holds_a_message_or_that_it_is_pending_and_refuses_one_too_la
         assert!(refused.contains("members take"), "{refused}");
         bob.stop().await;
         let sent = alice.cmd(&["send", "--urgent", "anyone?"]).await.unwrap();
-        assert_eq!(sent["pending"], true);
+        assert!(sent["position"].is_u64(), "{sent}");
         let status = alice.cmd(&["status"]).await.unwrap();
         assert_eq!(status["groups"][0]["online"], json!([]));
-        assert_eq!(status["groups"][0]["only_here"].as_array().unwrap().iter().map(|p| &p["id"]).collect::<Vec<_>>(), [&sent["id"]]);
-        assert!(status["warning"].is_string());
-        // Once Bob is back, he takes it, and it is held here no more.
+        // Once Bob is back, he takes it.
         let mut bob = world.start("bob", HOUR).await;
         let message = bob.expect("message").await;
-        assert_eq!(message["content"], "anyone?");
-        let only_here = || async { alice.cmd(&["status"]).await.unwrap()["groups"][0]["only_here"].clone() };
-        for _ in 0..20 {
-            if only_here().await.as_array().unwrap().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        assert_eq!(only_here().await, json!([]));
+        assert_eq!((message["id"].as_str(), message["content"].as_str()), (sent["id"].as_str(), Some("anyone?")));
     });
 }
 
@@ -485,7 +471,7 @@ fn a_restarted_session_takes_in_what_it_missed_in_causal_order() {
         let (mut alice, bob, group) = pair(&world, HOUR).await;
         alice.stop().await;
         let first = bob.cmd(&["send", "--urgent", "first"]).await.unwrap();
-        assert_eq!(first["pending"], true);
+        assert!(first["position"].is_u64(), "the log takes it with Alice away");
         let second = bob.cmd(&["send", "--urgent", "second"]).await.unwrap();
         let bob_renamed = bob.cmd(&["name", "Later"]).await.unwrap();
         assert_eq!(bob_renamed["settings"]["name"], "Later");
@@ -503,44 +489,13 @@ fn a_restarted_session_takes_in_what_it_missed_in_causal_order() {
 }
 
 #[test]
-fn a_member_back_past_its_key_window_reports_what_it_missed_and_the_sender_resends_it() {
-    local(async {
-        let mut world = world("old").await;
-        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
-        bob.stop().await;
-        let file = world.root.join("notes.txt");
-        std::fs::write(&file, "the notes").unwrap();
-        let sent = alice.cmd(&["send", "--attach", file.to_str().unwrap(), "while you were away"]).await.unwrap();
-        assert_eq!(sent["pending"], true);
-        for name in ["one", "two", "three"] {
-            alice.cmd(&["name", name]).await.unwrap();
-        }
-        // Bob keeps the keys of one ended epoch: Alice's message is below his floor when he is back.
-        world.window = Window { epochs: 1, ..Window::default() };
-        let mut bob = world.start("bob", HOUR).await;
-        let refused = alice.expect("refused").await;
-        assert_eq!(refused["member"]["name"], "Bob");
-        let id = sent["id"].as_str().unwrap();
-        let message = &refused["messages"][0];
-        assert_eq!((message["id"].as_str(), message["reason"].as_str(), message["content"].as_str()), (Some(id), Some("old"), Some("while you were away")));
-        let path = message["attachment"]["path"].as_str().unwrap();
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "the notes");
-        let resent = alice.cmd(&["send", "--reply-to", id, "--attach", path, "while you were away"]).await.unwrap();
-        assert_eq!(resent["held_by"][0]["name"], "Bob");
-        let message = bob.expect("message").await;
-        assert_eq!((message["reply_to"].as_str(), message["content"].as_str()), (Some(id), Some("while you were away")));
-        assert_eq!(message["missing"], json!([id]), "a known gap, not a wait");
-    });
-}
-
-#[test]
 fn a_session_of_an_identity_joins_a_group_open_to_it() {
     local(async {
         let world = world("open").await;
         let (mut alice, bob, group) = pair(&world, HOUR).await;
         let tablet = world.start("tablet", HOUR).await;
         let link = bob.cmd(&["invite", "--identity", "Robert"]).await.unwrap();
-        assert!(link["link"].as_str().unwrap().contains("#2.d."));
+        assert!(link["link"].as_str().unwrap().contains("#3.d."));
         assert!(tablet.cmd(&["join", link["link"].as_str().unwrap()]).await.unwrap()["device"].is_string());
         let opened = alice.cmd(&["open", "Bob (Acme)"]).await.unwrap();
         assert_eq!(opened["settings"]["open"][0]["name"], "Bob (Acme)");
@@ -592,7 +547,7 @@ fn identities_are_created_listed_and_lose_devices() {
         assert_eq!(listed["identities"][0]["devices"][0]["you"], true);
         assert_eq!(listed["identities"][0]["name"], "Alice Smith");
         let invite = alice.cmd(&["invite", "--identity", "Alice Smith"]).await.unwrap();
-        assert!(invite["link"].as_str().unwrap().contains("#2.d."));
+        assert!(invite["link"].as_str().unwrap().contains("#3.d."));
         let phone = world.start("phone", HOUR).await;
         let joined = phone.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         assert!(joined["device"].is_string());
@@ -815,39 +770,6 @@ fn a_message_after_some_from_before_its_reader_joined_shows_them_missing_at_once
 }
 
 #[test]
-fn a_message_waits_for_those_it_comes_after_then_shows_them_missing() {
-    local(async {
-        let mut world = world("wait").await;
-        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
-        // Bob writes while Alice is away, and leaves before she is back, so her Welcome to Carol cannot name it.
-        alice.stop().await;
-        let unseen = bob.cmd(&["send", "while alice is away"]).await.unwrap();
-        bob.stop().await;
-        let alice = world.start("alice", HOUR).await;
-        world.causal_wait = Duration::from_secs(2);
-        let mut carol = world.start("carol", HOUR).await;
-        carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
-        let bob = world.start("bob", HOUR).await;
-        // Once Bob and Carol have synced, and the syncs that Bob's key update on resuming starts have ended, no sync
-        // ends before the wait does.
-        for _ in 0..40 {
-            let online = bob.cmd(&["status"]).await.unwrap()["groups"][0]["online"].clone();
-            if online.as_array().unwrap().iter().any(|member| member["name"] == "Carol") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let sent = std::time::Instant::now();
-        bob.cmd(&["send", "@carol see above"]).await.unwrap();
-        let got = carol.expect("message").await;
-        assert!(sent.elapsed() >= Duration::from_millis(1500), "{:?}", sent.elapsed());
-        assert_eq!(got["content"], "@carol see above");
-        assert_eq!(got["missing"], json!([unseen["id"]]));
-    });
-}
-
-#[test]
 fn a_message_after_one_that_cannot_come_shows_the_gap_once_a_sync_ends() {
     local(async {
         let world = world("gap").await;
@@ -878,7 +800,7 @@ fn git(repo: &Path, args: &[&str]) -> String {
 }
 
 #[test]
-fn a_removed_member_cannot_stall_a_git_groups_log() {
+fn git_pushes_count_in_the_groups_log_in_order() {
     local(async {
         let world = world("git").await;
         let mut alice = world.start("alice", HOUR).await;
@@ -909,21 +831,14 @@ fn a_removed_member_cannot_stall_a_git_groups_log() {
             panic!("bob did not take push {n}");
         };
         let (first, position) = push("-", 1).await;
-        assert_eq!(position, 1);
+        let first_position = position.as_u64().unwrap();
 
-        // Alice removes Carol, who still knows the id of the log the group's pushes were ordered in, and appends to it an
-        // id of a message no member holds. The order went on in a new log, after the last push.
+        // Once Alice removes Carol, the next push counts after the removal.
         let members = alice.cmd(&["members"]).await.unwrap();
         let fp = members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Carol").unwrap()["fp"].as_str().unwrap().to_owned();
         alice.cmd(&["remove", &fp]).await.unwrap();
         carol.expect("removed").await;
-        let entries = |dir: &Path| std::fs::read_dir(dir).unwrap().flatten().map(|entry| std::fs::read(entry.path()).unwrap()).collect::<Vec<_>>();
-        let logs = std::fs::read_dir(world.root.join("logs")).unwrap().flatten().map(|dir| dir.path());
-        let old = logs.filter(|dir| entries(dir).iter().any(|entry| entry == b"end")).collect::<Vec<_>>();
-        assert_eq!(old.len(), 1, "the removal ended the old log");
-        let next = entries(&old[0]).len() + 1;
-        std::fs::write(old[0].join(format!("{next}.entry")), [9; 32]).unwrap();
         let (_, position) = push(&first, 2).await;
-        assert_eq!(position, 2, "the order goes on where the old log ended");
+        assert_eq!(position.as_u64(), Some(first_position + 2), "after the removal's commit");
     });
 }

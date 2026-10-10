@@ -157,7 +157,7 @@ async fn a_message_waits_until_the_peer_shows_the_group() {
     b.fake.uncertified.lock().unwrap().push(members[0]);
     a.net.dial(members[1], relay.url.clone()).await.unwrap();
     let live = [&1u64.to_be_bytes()[..], &[1], b"introduce"].concat();
-    assert!(a.net.send_to(members[1], G, live.clone()));
+    assert!(a.net.frame(members[1], Frame::Messages { group: Bytes(G.to_vec()), items: vec![Bytes(live.clone())] }));
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     b.fake.uncertified.lock().unwrap().clear();
     b.net.served(members[0], G);
@@ -180,7 +180,7 @@ async fn an_unknown_frame_is_skipped() {
     let (mut send, _recv) = conn.open_bi().await.unwrap();
     frame::write(&mut send, &frame::Open { stream: frame::Stream::Peer }).await.unwrap();
     let (first, second) = (message(0, "first"), message(0, "second"));
-    let messages = |m: &[u8]| Frame::Messages { group: Bytes(G.to_vec()), items: vec![Bytes(m.to_vec())], below: Vec::new() };
+    let messages = |m: &[u8]| Frame::Messages { group: Bytes(G.to_vec()), items: vec![Bytes(m.to_vec())] };
     frame::write(&mut send, &messages(&first)).await.unwrap();
     frame::write(&mut send, &serde_json::json!({"newer": {"group": "Zw"}})).await.unwrap();
     frame::write(&mut send, &messages(&second)).await.unwrap();
@@ -225,8 +225,6 @@ async fn messages_sync_after_both_were_offline() {
     }
     assert!(!b.fake.holds(G, &before_b_joined), "nothing from before B joined");
     assert!(!b.fake.holds(G, &below_b_floor), "nothing below B's floor");
-    let given_up = b.fake.groups.lock().unwrap()[G].given_up.clone();
-    assert_eq!(given_up.into_iter().collect::<Vec<_>>(), [(id(&below_b_floor), 2)], "B learns, with its epoch, what it lacks below its floor");
     assert_eq!(b.fake.groups.lock().unwrap()[G].held.len(), 5);
 
     let live = message(5, "live");
@@ -254,7 +252,7 @@ async fn live_messages_and_state_links_reach_one_member() {
     let live = [&1u64.to_be_bytes()[..], &[1], b"edit"].concat();
     for peer in [members[1], members[2]] {
         assert!(a.net.frame(peer, Frame::State { group: Bytes(G.to_vec()), link: Some("lmk:state".into()) }));
-        assert!(a.net.send_to(peer, G, live.clone()));
+        assert!(a.net.frame(peer, Frame::Messages { group: Bytes(G.to_vec()), items: vec![Bytes(live.clone())] }));
     }
     eventually("the state link and live message reach B", || {
         !b.fake.states.lock().unwrap().is_empty() && !b.fake.groups.lock().unwrap()[G].live.is_empty()

@@ -156,8 +156,6 @@ try {
   await laptop.getByPlaceholder("Message").press("Enter");
   const reply = await ann.printed(e => e.type === "message" && e.content === "hello from the browser");
   check(reply.reply_to === hello && reply.from.name === "Matt", "a native session gets the browser's reply");
-  await laptop.locator(".messages li", { hasText: "hello from the browser" }).locator(".status").waitFor({ state: "detached" });
-  check(true, "and the browser shows it held, not pending, once the receipt arrives");
 
   // Members: Ann's identity is only her own claim to the laptop.
   await laptop.locator(".people").click();
@@ -369,7 +367,7 @@ try {
   await laptop.locator(".devices li", { hasText: "this browser" }).waitFor();
   await laptop.getByRole("button", { name: "Add a device" }).click();
   const link = await laptop.locator("dialog .copy code").first().textContent();
-  check(link.includes("#2.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
+  check(link.includes("#3.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
   const tablet = native("tablet");
   await tablet.printed(e => e.type === "ready");
   const joining = tablet.start("join", link);
@@ -450,13 +448,13 @@ try {
   check((await laptop.locator(".messages li", { hasText: "too long" }).count()) === 0, "and it is not listed");
   carl.proc.kill();
 
-  // With Ann gone, what the laptop sends to her chat is pending.
+  // With Ann gone, what the laptop sends to her chat still counts on the group's log.
   ann.proc.kill();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.locator("textarea:visible").fill("anyone there?");
   await laptop.locator("textarea:visible").press("Enter");
-  await laptop.locator(".messages li", { hasText: "anyone there?" }).locator(".status", { hasText: "Pending" }).waitFor();
-  check(true, "a message no other member holds shows as pending");
+  await laptop.locator(".messages li", { hasText: "anyone there?" }).waitFor();
+  check(true, "a message sent with no other member online is listed once the group's log takes it");
 
   // The tab that took over loaded no file; it loads the doc's file from IndexedDB when a new member wants it.
   await laptop.locator(".group-list button", { hasText: "Notes" }).click();

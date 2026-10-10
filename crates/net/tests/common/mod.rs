@@ -18,7 +18,7 @@ use iroh_relay::{
     RelayQuicConfig,
     server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig},
 };
-use lmk_net::{Admit, Config, Disk, Event, Groups, Net, Taken};
+use lmk_net::{Admit, Config, Disk, Event, Groups, Net};
 use lmk_proto::{
     Answer, Bytes,
     head::{self, Head},
@@ -146,7 +146,7 @@ pub struct Inviter;
 
 impl Admit for Inviter {
     fn join(&self, _: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>> {
-        let admitted = |welcome: &[u8]| Answer::Ok(Admitted { welcome: Bytes(welcome.to_vec()), position: 1, doc: None, before: Vec::new(), certificates: Vec::new(), logs: Vec::new() });
+        let admitted = |welcome: &[u8]| Answer::Ok(Admitted { welcome: Bytes(welcome.to_vec()), position: 1, doc: None, certificates: Vec::new() });
         Box::pin(async move {
             match (join.secret, join.group) {
                 (Some(secret), _) if secret.0 == SECRET => admitted(b"invited"),
@@ -164,7 +164,6 @@ pub struct Group {
     pub floor: u64,
     pub joined: u64,
     pub held: BTreeMap<[u8; 32], (u64, Vec<u8>)>,
-    pub given_up: BTreeMap<[u8; 32], u64>,
     pub live: Vec<Vec<u8>>,
     pub files: Vec<FileLink>,
     /// Takes no entries from peers, as when they reach it only from the service; counts those offered.
@@ -328,24 +327,19 @@ impl Groups for Fake {
     fn items(&self, group: &[u8], from: u64) -> Vec<(u64, [u8; 32])> {
         let groups = self.groups.lock().unwrap();
         let g = &groups[group];
-        let held = g.held.iter().map(|(id, (epoch, _))| (*epoch, *id));
-        held.chain(g.given_up.iter().map(|(id, epoch)| (*epoch, *id))).filter(|(epoch, _)| *epoch >= from).collect()
+        g.held.iter().map(|(id, (epoch, _))| (*epoch, *id)).filter(|(epoch, _)| *epoch >= from).collect()
     }
 
-    fn message(&self, group: &[u8], id: &[u8; 32]) -> Option<Vec<u8>> {
+    fn message(&self, group: &[u8], _: u64, id: &[u8; 32]) -> Option<Vec<u8>> {
         self.groups.lock().unwrap()[group].held.get(id).map(|(_, ciphertext)| ciphertext.clone())
     }
 
-    fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Taken {
+    fn receive(&self, group: &[u8], ciphertext: &[u8]) {
         let epoch = u64::from_be_bytes(ciphertext[..8].try_into().unwrap());
         let mut groups = self.groups.lock().unwrap();
         let g = groups.get_mut(group).unwrap();
-        if epoch < g.floor {
-            g.given_up.insert(id(ciphertext), epoch);
-            return Taken::Refused;
-        }
-        if epoch > g.log.len() as u64 {
-            return Taken::Waiting;
+        if epoch < g.floor || epoch > g.log.len() as u64 {
+            return;
         }
         match ciphertext[8] {
             0 => {
@@ -353,13 +347,6 @@ impl Groups for Fake {
             }
             _ => g.live.push(ciphertext.to_vec()),
         }
-        Taken::Held
-    }
-
-    fn below(&self, group: &[u8], items: Vec<(u64, [u8; 32])>) {
-        let mut groups = self.groups.lock().unwrap();
-        let g = groups.get_mut(group).unwrap();
-        g.given_up.extend(items.into_iter().map(|(epoch, id)| (id, epoch)));
     }
 
     fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>) {

@@ -1,14 +1,14 @@
 //! The browser client: the client core on one lmk-node session whose MLS key is the browser's device key, reaching its
 //! peers only through the relay, with the devices kind on the same node. Chat is built in; the doc kind
 //! (`lmk_kind_doc::Page`) and the git kind, display-only (`lmk_kind_git::Page`), are in-page plugins, whose messages go
-//! to and from the core as calls. The page persists the session's records in IndexedDB, one record per key, and the
-//! ciphertext of the files it holds, which the session loads when it needs one. Results that are not bytes are JSON
+//! to and from the core as calls. The page persists the session's records in IndexedDB, one record per key, each step's
+//! before what the step produced leaves the session, and the ciphertext of the files it holds, which the session loads
+//! when it needs one. Results that are not bytes are JSON
 //! strings; message ids and fingerprints are hex, other bytes base64url.
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::hash::Hasher;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +18,6 @@ use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Introductio
 use lmk_node::devices::Devices;
 use lmk_node::lmk_core::crypto::{Crypto, Rand};
 use lmk_node::lmk_core::device::Device;
-use lmk_node::lmk_core::group::Window;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
 use lmk_node::{Disk, Node, now};
 use lmk_proto::Bytes;
@@ -57,9 +56,9 @@ extern "C" {
 
     /// The page's IndexedDB.
     pub type Idb;
-    /// Persists records: `[key, value]` pairs, and keys to delete.
+    /// Persists records: `[key, value]` pairs, and keys to delete; resolves once they are durable.
     #[wasm_bindgen(method)]
-    fn save(this: &Idb, puts: Array, deletes: Array);
+    fn save(this: &Idb, puts: Array, deletes: Array) -> Promise;
     #[wasm_bindgen(method, js_name = saveFile)]
     fn save_file(this: &Idb, hash: &str, ciphertext: Vec<u8>);
     /// Resolves to a kept file's ciphertext.
@@ -97,7 +96,7 @@ impl Disk for Kept {
     }
 }
 
-/// The session's provider, shared with `App::flush`, which persists it.
+/// The session's provider, shared with `flush`, which persists it.
 #[derive(Clone, Default)]
 struct Store(Arc<MemoryProvider>);
 
@@ -131,6 +130,38 @@ impl Provider for Store {
     fn delete(&self, key: &[u8]) -> Result<()> {
         self.0.delete(key)
     }
+
+    fn begin(&self) -> Result<()> {
+        self.0.begin()
+    }
+
+    fn commit(&self) -> Result<()> {
+        self.0.commit()
+    }
+
+    fn savepoint(&self) -> Result<()> {
+        self.0.savepoint()
+    }
+
+    fn rollback_to(&self) -> Result<()> {
+        self.0.rollback_to()
+    }
+
+    fn release(&self) -> Result<()> {
+        self.0.release()
+    }
+}
+
+/// Hands the records that changed since the last flush to the page; resolves once they are durable.
+fn flush(store: &Store, idb: &Idb) -> Promise {
+    let (puts, deletes) = (Array::new(), Array::new());
+    for (key, value) in store.0.changes() {
+        match value {
+            Some(value) => drop(puts.push(&Array::of2(&Uint8Array::from(&key[..]), &Uint8Array::from(&value[..])))),
+            None => drop(deletes.push(&Uint8Array::from(&key[..]))),
+        }
+    }
+    idb.save(puts, deletes)
 }
 
 /// The in-page plugins' records, among the session's.
@@ -219,13 +250,6 @@ fn unb64(text: &str) -> Result<Vec<u8>> {
     Ok(serde_json::from_value::<Bytes>(json!(text))?.0)
 }
 
-fn digest(value: &[u8]) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
-    hasher.write(value);
-    hasher.write_usize(value.len());
-    hasher.finish()
-}
-
 #[derive(Deserialize)]
 struct Config {
     /// The person's name and this device's: used only when the browser has no session yet.
@@ -248,8 +272,6 @@ struct App {
     client: Client<Store>,
     store: Store,
     membership: lmk_proto::group::Service,
-    /// A digest of each record as last persisted.
-    shadow: RefCell<HashMap<Vec<u8>, u64>>,
     idb: Idb,
     kept: Arc<Kept>,
     on_event: Function,
@@ -282,18 +304,28 @@ pub fn invite_kind(link: &str) -> R<String> {
 impl App {
     async fn start(records: Array, kept: Vec<String>, config: &str, idb: Idb, on_event: Function) -> Result<Rc<Self>> {
         let config: Config = serde_json::from_str(config)?;
-        let store = Store::default();
-        let mut shadow = HashMap::new();
-        {
-            let mut values = store.0.storage.values.write().unwrap();
-            for record in records.iter() {
-                let record = Array::from(&record);
-                let value = Uint8Array::from(record.get(1)).to_vec();
-                let key = Uint8Array::from(record.get(0)).to_vec();
-                shadow.insert(key.clone(), digest(&value));
-                values.insert(key, value);
+        let records = records.iter().map(|record| {
+            let record = Array::from(&record);
+            (Uint8Array::from(record.get(0)).to_vec(), Uint8Array::from(record.get(1)).to_vec())
+        });
+        let store = Store(Arc::new(MemoryProvider::load(records.collect::<Vec<_>>())));
+        // Each step's records are durable before what it produced leaves the session.
+        let (durable_tx, mut durable_rx) = mpsc::unbounded_channel::<oneshot::Sender<Result<()>>>();
+        let (saving, saving_idb): (_, Idb) = (store.clone(), idb.clone().unchecked_into());
+        spawn_local(async move {
+            while let Some(reply) = durable_rx.recv().await {
+                let saved = JsFuture::from(flush(&saving, &saving_idb)).await;
+                reply.send(saved.map(drop).map_err(|e| anyhow!("saving to IndexedDB: {e:?}"))).ok();
             }
-        }
+        });
+        let durable: lmk_node::Durable = Arc::new(move || {
+            let (reply, saved) = oneshot::channel();
+            let asked = durable_tx.send(reply);
+            Box::pin(async move {
+                asked.map_err(|_| anyhow!("the page stopped saving"))?;
+                saved.await?
+            })
+        });
         if store.get(b"web/name")?.is_none() {
             put(&store, b"web/name", &config.name)?;
         }
@@ -312,8 +344,8 @@ impl App {
             files: None,
             disk: Some(kept.clone()),
             file_limit: FILE_LIMIT,
-            window: Window::default(),
             kinds: vec![CHAT.into(), DOC.into(), GIT.into(), DEVICES.into()],
+            durable: Some(durable),
         };
         let (node, mut events) = Node::start(store.clone(), node_config).await?;
         let saved = store.clone();
@@ -329,8 +361,7 @@ impl App {
         let client_config = lmk_client::Config { name, device, membership: membership.clone() };
         let (client, mut told) = Client::new(node, client_config, Access::Here(devices), Arc::new(plugins), written);
         let (tried, failed) = Default::default();
-        let shadow = RefCell::new(shadow);
-        let app = Rc::new(App { client, store, membership, shadow, idb, kept, on_event, tried, failed });
+        let app = Rc::new(App { client, store, membership, idb, kept, on_event, tried, failed });
         app.take_introductions()?;
         let told_app = app.clone();
         spawn_local(async move {
@@ -443,29 +474,7 @@ impl App {
 
     /// Hands the records that changed since the last flush to the page.
     fn flush(&self) {
-        let values = self.store.0.storage.values.read().unwrap();
-        let mut shadow = self.shadow.borrow_mut();
-        let puts = Array::new();
-        for (key, value) in values.iter() {
-            let digest = digest(value);
-            match shadow.get_mut(key) {
-                Some(known) if *known == digest => continue,
-                Some(known) => *known = digest,
-                None => drop(shadow.insert(key.clone(), digest)),
-            }
-            puts.push(&Array::of2(&Uint8Array::from(&key[..]), &Uint8Array::from(&value[..])));
-        }
-        let deletes = Array::new();
-        shadow.retain(|key, _| {
-            let kept = values.contains_key(key);
-            if !kept {
-                deletes.push(&Uint8Array::from(&key[..]));
-            }
-            kept
-        });
-        if puts.length() > 0 || deletes.length() > 0 {
-            self.idb.save(puts, deletes);
-        }
+        drop(flush(&self.store, &self.idb));
     }
 
     fn emit(&self, event: Value) {
@@ -495,7 +504,7 @@ impl App {
             }
             ClientEvent::Removed { group, by } => self.emit(json!({ "type": "removed", "group": group, "by": by.and_then(|by| by.name) })),
             ClientEvent::Gone { group } => {
-                for kind in ["timeline", "settings", "refused"] {
+                for kind in ["timeline", "settings"] {
                     self.store.delete(&key(kind, &group.0))?;
                 }
             }
@@ -511,12 +520,7 @@ impl App {
                 self.emit(json!({ "type": "introduced", "group": group }));
             }
             ClientEvent::Message { group, id, .. } => self.emit(json!({ "type": "message", "group": group, "id": id })),
-            ClientEvent::Held { group, id } => self.emit(json!({ "type": "held", "group": group, "id": id })),
-            ClientEvent::Refused { group, member, messages } => {
-                let by = label(&serde_json::to_value(member)?);
-                self.refused(&group.0, messages.into_iter().map(|refusal| (hex::encode(&refusal.id.0), by.clone(), json!(refusal.reason))))?;
-                self.emit(json!({ "type": "refused", "group": group }));
-            }
+            ClientEvent::Sent { group, id, .. } => self.emit(json!({ "type": "sent", "group": group, "id": id })),
             ClientEvent::File { hash } => self.emit(json!({ "type": "file", "hash": hash })),
             ClientEvent::Plugin { group, kind, mut event, .. } => {
                 if event.get("type") == Some(&json!("pushed")) {
@@ -540,15 +544,6 @@ impl App {
         let mut timeline: Vec<Value> = get(&self.store, &key("timeline", gid))?.unwrap_or_default();
         timeline.push(item.clone());
         put(&self.store, &key("timeline", gid), &timeline)
-    }
-
-    /// Records which members refused this session's messages, and why: by message id, the member's label and the reason.
-    fn refused(&self, gid: &[u8], refusals: impl Iterator<Item = (String, String, Value)>) -> Result<()> {
-        let mut refused: HashMap<String, Vec<Value>> = get(&self.store, &key("refused", gid))?.unwrap_or_default();
-        for (id, name, reason) in refusals {
-            refused.entry(id).or_default().push(json!({ "name": name, "reason": reason }));
-        }
-        put(&self.store, &key("refused", gid), &refused)
     }
 
     fn remember_settings(&self, gid: &[u8]) -> Result<()> {
@@ -581,8 +576,6 @@ impl App {
         let node = self.client.node();
         let describer = self.client.describer(gid)?;
         let mut items: Vec<Value> = get(&self.store, &key("timeline", &gid.0))?.unwrap_or_default();
-        let pending: HashSet<Vec<u8>> = node.only_here(&gid.0)?.into_iter().map(|p| p.id.0).collect();
-        let refused: HashMap<String, Value> = get(&self.store, &key("refused", &gid.0))?.unwrap_or_default();
         for message in node.messages(&gid.0)? {
             let from = describer.describe(&message.sender);
             let id = hex::encode(&message.id.0);
@@ -607,12 +600,6 @@ impl App {
                 item["attachment"] = json!(attachment);
                 item["attachment"]["kept"] = json!(kept);
             }
-            if pending.contains(&message.id.0) {
-                item["pending"] = json!(true);
-            }
-            if let Some(refused) = refused.get(&id) {
-                item["refused"] = refused.clone();
-            }
             items.push(item);
         }
         items.sort_by_key(|item| item["at"].as_u64());
@@ -622,10 +609,7 @@ impl App {
     async fn send(&self, gid: &Bytes, chat: Chat) -> Result<Value> {
         // The page shows every message it holds, so it has read them all.
         let after = self.client.tips(gid, |_| true)?;
-        let (id, answer) = self.client.send(gid, chat, after).await?;
-        let refusals = answer["refused"].as_array().into_iter().flatten();
-        self.refused(&gid.0, refusals.map(|r| (hex::encode(&id.0), label(&r["member"]), r["reason"].clone())))?;
-        Ok(answer)
+        Ok(self.client.send(gid, chat, after).await?.1)
     }
 }
 
@@ -633,14 +617,6 @@ impl App {
 fn join(gid: &Bytes) -> Request {
     let target = json!(gid).as_str().expect("base64url").to_owned();
     Request::Join { target, args: Vec::new(), cwd: String::new(), as_: None }
-}
-
-/// A member's label: the name its identity goes by here, and its device; else its own name.
-fn label(described: &Value) -> String {
-    match described["identity"]["name"].as_str() {
-        Some(name) if described["identity"]["error"].is_null() => format!("{name} · {}", described["device"].as_str().unwrap_or_default()),
-        _ => described["name"].as_str().unwrap_or_default().to_owned(),
-    }
 }
 
 #[wasm_bindgen]
@@ -675,14 +651,14 @@ impl Lmk {
     /// A new chat, doc or git repository, speaking as this browser's first identity; returns its id.
     pub async fn create(&self, kind: String, name: String) -> R<String> {
         let app = &self.app;
-        let settings = Settings { protocol: PROTOCOL, kind, name, open: Vec::new(), keep: 90, membership: app.membership.clone(), rest: Default::default() };
+        let settings = Settings { protocol: PROTOCOL, kind, name, open: Vec::new(), carry: 7, membership: app.membership.clone(), rest: Default::default() };
         let (gid, _) = app.client.create(settings, None, (Vec::new(), String::new())).await.map_err(js)?;
         app.remember_settings(&gid.0).map_err(js)?;
         app.flush();
         Ok(json!(gid).as_str().expect("base64url").to_owned())
     }
 
-    /// Sends a chat message, with an optional file, as `letmeknow send` does: `{"id", "held_by" | "pending", "refused",
+    /// Sends a chat message, with an optional file, as `letmeknow send` does: `{"id", "position" | "pending",
     /// "attachment": {"held_by"} | {"pending"}}`.
     #[allow(clippy::too_many_arguments)]
     pub async fn send(

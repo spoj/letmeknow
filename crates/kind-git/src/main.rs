@@ -23,13 +23,11 @@ struct Group {
 
 /// A request of ours waiting for the session's answer.
 enum Waiting {
-    /// A push's bundle being added; then the push is sent as a held message, its bundle spread, and its message's id
-    /// appended.
+    /// A push's bundle being added; then the push is sent as a held message, answered once its entry counts and, with
+    /// a bundle, another member online holds that, or fails to.
     Add { command: Value, group: String, push: Push },
-    Send { command: Value, group: String, push: Push },
-    /// The bundle spreading, and the members that hold the push's message.
-    Spread { command: Value, group: String, message: String, held_by: Vec<Value> },
-    Append { command: Value },
+    Send { command: Value, group: String, bundle: Option<String> },
+    Spread { command: Value, position: u64 },
     /// A pushed bundle, to check.
     Check { group: String, position: u64 },
     /// The bundle of a state this session hands a member.
@@ -365,21 +363,22 @@ impl Plugin {
         Ok(())
     }
 
-    /// Sends a push as a held message, which members hold, and fetch its bundle, ahead of its entry.
+    /// Sends a push as a held message, which the session answers once its entry counts.
     fn send(&mut self, command: Value, group: &str, push: Push) {
         let mut payload = serde_json::to_value(&push).expect("JSON");
         payload["type"] = json!("push");
         let send = json!({ "type": "send", "group": group, "payload": payload, "held": true });
-        self.request(send, Waiting::Send { command, group: group.to_owned(), push });
+        self.request(send, Waiting::Send { command, group: group.to_owned(), bundle: push.bundle });
     }
 
-    /// Appends a push's message to the log, once another member holds it and its bundle.
-    fn append(&mut self, command: Value, group: &str, message: &str, held: bool) {
-        if !held {
-            let error = anyhow::anyhow!("no other member is online to take the push, so it was not made; push again once one is");
-            return self.out.push(answer(&command, Err(error)));
-        }
-        self.request(json!({ "type": "append", "group": group, "message": message }), Waiting::Append { command });
+    /// Answers a push whose entry counted at `position`: whether it counted as a branch update.
+    fn pushed(&mut self, command: Value, position: u64) {
+        let answered = match self.won.remove(&position) {
+            Some(true) => Ok(json!({ "position": position })),
+            Some(false) => Err(anyhow::anyhow!("fetch first")),
+            None => Err(anyhow::anyhow!("the log did not take the push; push again")),
+        };
+        self.out.push(answer(&command, answered));
     }
 
     fn answered(&mut self, message: &Value) -> Result<()> {
@@ -393,35 +392,27 @@ impl Plugin {
                 push.bundle = Some(added["link"].as_str().context("no link")?.to_owned());
                 self.send(command, &group, push);
             }
-            (Waiting::Send { command, group, push }, Ok(sent)) => {
-                let message = sent["id"].as_str().context("no id")?.to_owned();
-                let held_by = sent["held_by"].as_array().cloned().unwrap_or_default();
-                match push.bundle {
-                    Some(link) => {
-                        let spread = json!({ "type": "spread", "group": group, "link": link });
-                        self.request(spread, Waiting::Spread { command, group, message, held_by });
-                    }
-                    None => self.append(command, &group, &message, !held_by.is_empty()),
+            (Waiting::Send { command, group, bundle }, Ok(sent)) => {
+                let Some(position) = sent["position"].as_u64() else {
+                    let error = anyhow::anyhow!("the push is pending, as the group's log did not answer in time: fetch later to see whether it counted");
+                    self.out.push(answer(&command, Err(error)));
+                    return Ok(());
+                };
+                match bundle {
+                    Some(link) => self.request(json!({ "type": "spread", "group": group, "link": link }), Waiting::Spread { command, position }),
+                    None => self.pushed(command, position),
                 }
             }
-            (Waiting::Spread { command, group, message, held_by }, Ok(spread)) => {
-                let holds_both = |member: &Value| held_by.iter().any(|held| held["fp"] == member["fp"]);
-                let both = spread["held_by"].as_array().is_some_and(|holders| holders.iter().any(holds_both));
-                self.append(command, &group, &message, both);
+            (Waiting::Spread { command, position }, spread) => {
+                if spread.is_ok_and(|spread| spread["held_by"].as_array().is_some_and(|held| !held.is_empty())) {
+                    self.pushed(command, position);
+                } else {
+                    self.won.remove(&position);
+                    let error = anyhow::anyhow!("the push counted, but no other member is online to take its bundle: keep this session running until one is");
+                    self.out.push(answer(&command, Err(error)));
+                }
             }
-            (Waiting::Append { command }, Ok(appended)) => {
-                let position = appended["position"].as_u64().context("no position")?;
-                let answered = match self.won.remove(&position) {
-                    Some(true) => Ok(json!({ "position": position })),
-                    Some(false) => Err(anyhow::anyhow!("fetch first")),
-                    None => Err(anyhow::anyhow!("the log did not take the push; push again")),
-                };
-                self.out.push(answer(&command, answered));
-            }
-            (
-                Waiting::Add { command, .. } | Waiting::Send { command, .. } | Waiting::Spread { command, .. } | Waiting::Append { command },
-                Err(error),
-            ) => {
+            (Waiting::Add { command, .. } | Waiting::Send { command, .. }, Err(error)) => {
                 self.out.push(answer(&command, Err(error)));
             }
             (Waiting::Check { group, position }, fetched) => {

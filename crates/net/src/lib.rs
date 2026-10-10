@@ -1,4 +1,4 @@
-//! Everything a session says to its peers over iroh: one `letmeknow/1` connection per pair of
+//! Everything a session says to its peers over iroh: one `letmeknow/2` connection per pair of
 //! sessions, its `peer` stream, and files over iroh-blobs. MLS stays outside, behind
 //! [`Groups`]: this crate moves ciphertexts and holds no keys. A simulator runs it over its own transport instead.
 
@@ -72,14 +72,12 @@ pub trait Groups: Send + Sync + 'static {
     /// Takes entries that directly follow this session's copy of a log and end at `head`, already checked against its
     /// chain.
     fn apply(&self, log: &[u8], entries: Vec<Bytes>, head: Head) -> Result<()>;
-    /// (epoch, message id) of every message held or given up on, from epoch `from`, in the order this session took them.
+    /// (epoch, message id) of every message held, from epoch `from`, in log order.
     fn items(&self, group: &[u8], from: u64) -> Vec<(u64, [u8; 32])>;
     /// A held message's MLS ciphertext.
-    fn message(&self, group: &[u8], id: &[u8; 32]) -> Option<Vec<u8>>;
-    /// An MLS ciphertext from a peer: decrypt, verify, and hold or apply it, or give it up.
-    fn receive(&self, group: &[u8], ciphertext: &[u8]) -> Taken;
-    /// (epoch, message id) of messages a peer holds that this session lacks, below its floor: given up.
-    fn below(&self, group: &[u8], items: Vec<(u64, [u8; 32])>);
+    fn message(&self, group: &[u8], epoch: u64, id: &[u8; 32]) -> Option<Vec<u8>>;
+    /// An MLS ciphertext from a peer: held if it fills a counted position, or a live payload.
+    fn receive(&self, group: &[u8], ciphertext: &[u8]);
     /// A link to the state of the group's kind, which `peer`, a member, hands this session; without one, `peer` asks
     /// for the kind's state.
     fn state(&self, group: &[u8], peer: EndpointId, link: Option<String>);
@@ -122,16 +120,6 @@ pub trait Fetch: Send + Sync + 'static {
     fn fetch(&self, holder: EndpointId, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>>;
 }
 
-/// What became of a ciphertext a peer sent; a receipt tells the peer what was held.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Taken {
-    Held,
-    /// Given up.
-    Refused,
-    /// Kept until a commit it follows is applied.
-    Waiting,
-}
-
 /// A member's decision on a joiner's request; it may commit an Add before it answers.
 pub trait Admit: Send + Sync + 'static {
     fn join(&self, peer: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>>;
@@ -143,8 +131,6 @@ pub enum Event {
     Disconnected(EndpointId),
     /// Two incompatible signed heads of a log: its membership service showed members different logs.
     Contradiction { log: Vec<u8>, peer: EndpointId, ours: Head, theirs: Head },
-    /// Messages this session sent that `peer` holds.
-    Receipt { group: Vec<u8>, peer: EndpointId, held: Vec<[u8; 32]> },
     /// This session and `peer` hold the same log of the group: a time to compare the state of its kind.
     InStep { group: Vec<u8>, peer: EndpointId },
     /// Message sync with `peer` finished.
@@ -252,13 +238,8 @@ impl Net {
 
     /// Sends a new MLS message to the members online; returns whom it went to.
     pub fn send(&self, group: &[u8], ciphertext: Vec<u8>) -> Vec<EndpointId> {
-        let frame = Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)], below: Vec::new() };
+        let frame = Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)] };
         self.inner.members(group).into_iter().filter(|(_, input)| input.send(Input::Send(frame.clone())).is_ok()).map(|(peer, _)| peer).collect()
-    }
-
-    /// Sends a new MLS message to one member online, if it is connected.
-    pub fn send_to(&self, peer: EndpointId, group: &[u8], ciphertext: Vec<u8>) -> bool {
-        self.frame(peer, Frame::Messages { group: group.into(), items: vec![Bytes(ciphertext)], below: Vec::new() })
     }
 
     /// Sends a frame to one member online, if it is connected.

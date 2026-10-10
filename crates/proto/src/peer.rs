@@ -19,14 +19,8 @@ pub enum Frame {
     Entries { log: Bytes, entries: Vec<Bytes>, head: Head },
     /// A negentropy message.
     Reconcile { group: Bytes, msg: Bytes },
-    /// MLS ciphertexts, and the messages the receiver lacks below its floor, which it gives up.
-    Messages {
-        group: Bytes,
-        items: Vec<Bytes>,
-        below: Vec<Below>,
-    },
-    /// The answer to `messages`: the ids of the items the receiver took.
-    Receipt { group: Bytes, held: Vec<Bytes> },
+    /// MLS ciphertexts.
+    Messages { group: Bytes, items: Vec<Bytes> },
     /// BLAKE3 hashes of files.
     Want { group: Bytes, files: Vec<Bytes> },
     Have { group: Bytes, files: Vec<Bytes> },
@@ -45,13 +39,6 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         link: Option<String>,
     },
-}
-
-/// A message the receiver lacks that is older than its floor, so that it records it as given up.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Below {
-    pub epoch: u64,
-    pub id: Bytes,
 }
 
 /// One group's state, in `hello`.
@@ -85,27 +72,14 @@ pub struct Join {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Admitted {
     pub welcome: Bytes,
-    /// The log position the joiner reads from.
+    /// The Add's position in the group's log: the joiner reads on from there.
     pub position: u64,
     /// A file link to the state of the group's kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// The ids of the messages from before the joiner's epoch that the admitting member holds, which the joiner never gets.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub before: Vec<Bytes>,
     /// The certificates the admitting member holds of the group's members.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub certificates: Vec<Envelope>,
-    /// The logs of the kind's order the admitting member reads from where it is, the current one last.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub logs: Vec<KindLog>,
-}
-
-/// A log of a group's kind: its id, and the position in the kind's order that its first entry follows.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KindLog {
-    pub id: Bytes,
-    pub after: u64,
 }
 
 #[cfg(test)]
@@ -116,8 +90,8 @@ mod tests {
     fn shapes() {
         let hello = Frame::Hello { groups: vec![], heads: vec![], certificates: vec![] };
         assert_eq!(serde_json::to_string(&hello).unwrap(), r#"{"hello":{"groups":[],"heads":[]}}"#);
-        let messages = Frame::Messages { group: Bytes(vec![1]), items: vec![], below: vec![] };
-        assert_eq!(serde_json::to_string(&messages).unwrap(), r#"{"messages":{"group":"AQ","items":[],"below":[]}}"#);
+        let messages = Frame::Messages { group: Bytes(vec![1]), items: vec![] };
+        assert_eq!(serde_json::to_string(&messages).unwrap(), r#"{"messages":{"group":"AQ","items":[]}}"#);
         let state: Frame = serde_json::from_str(r#"{"state":{"group":"AQ","link":"lmk:x"}}"#).unwrap();
         assert!(matches!(state, Frame::State { .. }));
         assert!(serde_json::from_str::<Frame>(r#"{"doc":{"group":"AQ"}}"#).is_err(), "a kind has no frames");

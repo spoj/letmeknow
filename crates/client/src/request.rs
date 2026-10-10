@@ -29,10 +29,10 @@ pub enum Request {
         #[cfg_attr(feature = "clap", arg(skip))]
         #[serde(default)]
         cwd: String,
-        /// Days members hold a new group's messages and files for one another
-        #[cfg_attr(feature = "clap", arg(long, default_value_t = 90, conflicts_with = "group"))]
-        #[serde(default = "keep")]
-        keep: u32,
+        /// Days members carry a new group's messages and files for one another
+        #[cfg_attr(feature = "clap", arg(long, default_value_t = 7, conflicts_with = "group"))]
+        #[serde(default = "carry")]
+        carry: u32,
         /// The new group's membership service [default: listen's]
         #[cfg_attr(feature = "clap", arg(long, conflicts_with = "group"))]
         membership: Option<String>,
@@ -186,8 +186,8 @@ fn chat() -> String {
     lmk_proto::group::CHAT.into()
 }
 
-fn keep() -> u32 {
-    90
+fn carry() -> u32 {
+    7
 }
 
 impl Request {

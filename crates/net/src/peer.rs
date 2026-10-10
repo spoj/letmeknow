@@ -18,15 +18,14 @@ use lmk_proto::{
     Answer, Bytes, frame,
     head::Head,
     identity::Envelope,
-    peer::{Admitted, Below, Frame, Hello, Join},
+    peer::{Admitted, Frame, Hello, Join},
 };
 use lmk_transport::{Conn, RecvStream, SendStream};
-use sha2::{Digest, Sha256};
 use n0_future::{task::spawn, time::sleep};
 use negentropy::{Negentropy, NegentropyStorageVector};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{Event, Inner, Taken, sync};
+use crate::{Event, Inner, sync};
 
 /// Raw ciphertext bytes per `messages` frame, well under a frame's limit once in base64.
 const BATCH: usize = 8 << 20;
@@ -302,24 +301,10 @@ impl Session {
             }
             Frame::Entries { log, entries, head } => self.on_entries(log, entries, head).await?,
             Frame::Reconcile { group, msg } if self.member(&group.0) => self.on_reconcile(group, msg).await?,
-            Frame::Messages { group, items, below } if self.member(&group.0) => {
-                if !below.is_empty() {
-                    let below = below.iter().filter_map(|b| Some((b.epoch, b.id.0.as_slice().try_into().ok()?))).collect();
-                    self.inner.groups.below(&group.0, below);
-                }
-                let mut held = Vec::new();
+            Frame::Messages { group, items } if self.member(&group.0) => {
                 for item in items {
-                    if self.inner.groups.receive(&group.0, &item.0) == Taken::Held {
-                        held.push(Bytes::from(<[u8; 32]>::from(Sha256::digest(&item.0))));
-                    }
+                    self.inner.groups.receive(&group.0, &item.0);
                 }
-                if !held.is_empty() {
-                    self.write(&Frame::Receipt { group, held }).await?;
-                }
-            }
-            Frame::Receipt { group, held } => {
-                let held = held.iter().filter_map(|id| <[u8; 32]>::try_from(&id.0[..]).ok()).collect();
-                self.inner.events.send(Event::Receipt { group: group.0, peer: self.peer, held }).ok();
             }
             Frame::State { group, link } if self.member(&group.0) => self.inner.groups.state(&group.0, self.peer, link),
             Frame::Want { group, files } => {
@@ -584,25 +569,21 @@ impl Session {
         self.write(&Frame::Reconcile { group, msg: Bytes(reply) }).await
     }
 
-    /// Sends held messages the peer lacks; of those below its floor, only their epochs and ids.
+    /// Sends held messages the peer lacks.
     async fn push(&mut self, group: &Bytes, have: Vec<(u64, [u8; 32])>) -> Result<()> {
-        let floor = self.groups[group].theirs.as_ref().map_or(0, |theirs| theirs.floor);
-        let (have, below): (Vec<_>, Vec<_>) = have.into_iter().partition(|&(epoch, _)| epoch >= floor);
-        let mut below: Vec<Below> = below.into_iter().map(|(epoch, id)| Below { epoch, id: Bytes::from(id) }).collect();
         let mut items = Vec::new();
         let mut size = 0;
-        for (_, id) in have {
-            let Some(message) = self.inner.groups.message(&group.0, &id) else { continue };
+        for (epoch, id) in have {
+            let Some(message) = self.inner.groups.message(&group.0, epoch, &id) else { continue };
             size += message.len();
             items.push(Bytes(message));
             if size >= BATCH {
-                let below = std::mem::take(&mut below);
-                self.write(&Frame::Messages { group: group.clone(), items: std::mem::take(&mut items), below }).await?;
+                self.write(&Frame::Messages { group: group.clone(), items: std::mem::take(&mut items) }).await?;
                 size = 0;
             }
         }
-        if !items.is_empty() || !below.is_empty() {
-            self.write(&Frame::Messages { group: group.clone(), items, below }).await?;
+        if !items.is_empty() {
+            self.write(&Frame::Messages { group: group.clone(), items }).await?;
         }
         Ok(())
     }

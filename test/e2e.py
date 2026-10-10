@@ -167,7 +167,7 @@ def git_kind(alice, bob, dave, listeners):
     run("alice", "send", f"--group={made['group']}", "@bob the build is green")
     check(bob.expect("message", lambda e: e["content"] == "@bob the build is green")["group"] == made["group"], "a git group carries chat")
 
-    # With no other member online, a push fails and says so.
+    # With no other member online, a push says so.
     tip = git(loser, "rev-parse", "HEAD", cwd=repo).stdout.strip()
     head = lambda: (git("alice", "pull", "-q", "--ff-only", "team", "main", cwd=ours, ok=False), git("alice", "rev-parse", "HEAD", cwd=ours).stdout.strip())[1]
     check(until(head, lambda h: h == tip) == tip, "both members end at the same tip")
@@ -177,7 +177,7 @@ def git_kind(alice, bob, dave, listeners):
     git("alice", "add", "late.txt", cwd=ours)
     git("alice", "commit", "-qm", "while bob is away", cwd=ours)
     failed = git("alice", "push", "team", "main", cwd=ours, ok=False)
-    check(failed.returncode != 0 and "no other member is online" in failed.stderr, "a push with no other member online fails and says so")
+    check(failed.returncode != 0 and "no other member is online" in failed.stderr, "a push with no other member online says so")
     bob = Listener("bob")
     listeners.append(bob)
     until(lambda: git("alice", "push", "-q", "team", "main", cwd=ours, ok=False).returncode, lambda code: code == 0, timeout=60)
@@ -222,7 +222,7 @@ def main():
 
         # An invite, and chat.
         invite = run("alice", "invite", "--name", "Plans", "--for", "Bob (Acme)")
-        check(invite["link"].startswith("https://letmeknow.dev/i#2.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
+        check(invite["link"].startswith("https://letmeknow.dev/i#3.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
         group = invite["group"]
         check("serve" in run("alice", "groups")[0]["membership"], "its log is on the local letmeknow serve")
         joined = run("bob", "join", invite["link"])
@@ -236,7 +236,7 @@ def main():
         bob.expect("introduced", lambda e: e["identity"]["name"] == "Bob (Acme)")
 
         sent = run("alice", "send", "hello bob")
-        check(sent["held_by"][0]["name"] == "Bob", "send reports who holds the message")
+        check(isinstance(sent.get("position"), int), "send answers the message's position in the group's log")
         got = bob.expect("message")
         check(got["content"] == "hello bob" and got["from"]["identity"]["how"] == "unknown", "bob receives it; alice is only her own claim to him")
         reply = run("bob", "send", "--reply-to", got["id"], "hi alice")["id"]
@@ -289,7 +289,7 @@ def main():
 
         # A device link: bob's tablet joins his identity, and his contacts reach it.
         link = run("bob", "invite", "--identity", "Bob")["link"]
-        check("#2.d." in link, "invite --identity gives a device link")
+        check("#3.d." in link, "invite --identity gives a device link")
         tablet = Listener("tablet")
         listeners.append(tablet)
         check("device" in run("tablet", "join", link), "the tablet joins bob's identity")
@@ -327,7 +327,7 @@ def main():
         check(alice.expect("joined", lambda e: e["member"]["name"] == "Erin")["by"]["name"] != "Bob", "admitted by another member")
         run("alice", "name", f"--group={group}", "Release")
         missed = run("alice", "send", f"--group={group}", "while you were away")
-        check("held_by" in missed, "the tablet holds what bob misses")
+        check(isinstance(missed.get("position"), int), "the group's log takes what bob misses")
         bob = Listener("bob")
         listeners.append(bob)
         got = bob.expect("message", lambda e: e["content"] == "while you were away", timeout=60)

@@ -8,7 +8,6 @@ mod tests;
 
 use anyhow::{Context, Result, ensure};
 use lmk_core::device::Device;
-use lmk_core::group::Window;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::Node;
 use lmk_proto::group::Service;
@@ -67,13 +66,14 @@ pub async fn listen(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let format = home.join("format");
+    let found = std::fs::read_to_string(&format).ok();
     ensure!(
-        format.exists() || !home.join("device.json").exists(),
-        "{} holds the state of a letmeknow before 0.12, which this one cannot read: move it away, or use another --home",
+        found.as_deref().map(str::trim) == Some("3") || found.is_none() && !home.join("device.json").exists(),
+        "{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home",
         home.display()
     );
     cli::private_dir(&config.dir)?;
-    std::fs::write(&format, "2\n")?;
+    std::fs::write(&format, "3\n")?;
     let (inbound, queue) = tokio::sync::mpsc::unbounded_channel();
     cli::open_channel(&config.dir.join("endpoint"), inbound.clone()).await?;
     let device_file = home.join("device.json");
@@ -83,7 +83,6 @@ pub async fn listen(
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
     let kinds = [lmk_proto::group::CHAT.to_owned()].into_iter().chain(kinds::discover(&config.plugins).into_keys()).collect();
     let node_config = node_config(&network, home, &config.name, None, config.dir.join("files"), kinds);
-    let node_config = lmk_node::Config { window: config.window, ..node_config };
     let (node, events) = Node::start(provider, node_config).await?;
     let session = session::Session::open(config, node, home, network, inbound).await?;
     session::run(session, queue, events, print, shutdown).await
@@ -99,8 +98,8 @@ fn node_config(network: &Network, home: &Path, name: &str, device: Option<Device
         files: Some(files),
         disk: None,
         file_limit: 100 << 20,
-        window: Window::default(),
         kinds,
+        durable: None,
     }
 }
 

@@ -47,16 +47,19 @@ impl Store {
         Ok(row.unwrap_or((0, head::start(log))))
     }
 
-    /// Appends `entry`, creating the log if it is new.
-    pub fn append(&self, log: &[u8], entry: &[u8]) -> Result<Appended> {
+    /// Appends entries one after another, creating the log if it is new; answers the first one's position.
+    pub fn append(&self, log: &[u8], entries: &[Bytes]) -> Result<Appended> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
-        let (length, hash) = Self::latest(&tx, log)?;
-        let (position, hash) = (length + 1, head::next(&hash, entry));
-        tx.execute(
-            "INSERT INTO entries (log, position, entry, hash, time) VALUES (?, ?, ?, ?, ?)",
-            params![log, position, entry, hash, now()],
-        )?;
+        let (length, mut hash) = Self::latest(&tx, log)?;
+        let mut position = length;
+        for entry in entries {
+            (position, hash) = (position + 1, head::next(&hash, &entry.0));
+            tx.execute(
+                "INSERT INTO entries (log, position, entry, hash, time) VALUES (?, ?, ?, ?, ?)",
+                params![log, position, entry.0, hash, now()],
+            )?;
+        }
         tx.execute(
             "INSERT INTO logs (id, length, hash) VALUES (?1, ?2, ?3)
              ON CONFLICT (id) DO UPDATE SET length = ?2, hash = ?3",
@@ -64,7 +67,7 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(Appended {
-            position,
+            position: length + 1,
             head: self.sign(log, position, hash),
         })
     }
@@ -99,6 +102,13 @@ impl Store {
         }))
     }
 
+    /// The signed head after `position` entries of a log.
+    pub fn head_at(&self, log: &[u8], position: u64) -> Result<Head> {
+        let db = self.db.lock().unwrap();
+        let hash: [u8; 32] = db.query_row("SELECT hash FROM entries WHERE log = ? AND position = ?", params![log, position], |r| r.get(0))?;
+        Ok(self.sign(log, position, hash))
+    }
+
     pub fn head(&self, log: &[u8]) -> Result<Head> {
         let (length, hash) = Self::latest(&self.db.lock().unwrap(), log)?;
         Ok(self.sign(log, length, hash))
@@ -125,8 +135,8 @@ mod tests {
         let key = SigningKey::from_bytes(&[3; 32]);
         let store = Store::open(&dir.join("store.db"), key.clone()).unwrap();
         assert_eq!(store.head(b"g").unwrap().length, 0);
-        assert_eq!(store.append(b"g", b"one").unwrap().position, 1);
-        let two = store.append(b"g", b"two").unwrap();
+        assert_eq!(store.append(b"g", &[Bytes(b"one".to_vec())]).unwrap().position, 1);
+        let two = store.append(b"g", &[Bytes(b"two".to_vec())]).unwrap();
         assert_eq!(two.position, 2);
         assert!(two.head.verify(&key.verifying_key()));
         let expected = head::next(&head::next(&head::start(b"g"), b"one"), b"two");
@@ -142,8 +152,9 @@ mod tests {
         assert_eq!(store.expire(now() + 1).unwrap(), 2);
         assert!(store.read(b"g", 0, 1 << 20).unwrap().is_none());
         assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().head.length, 2);
-        assert_eq!(store.append(b"g", b"three").unwrap().position, 3);
-        assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().entries.len(), 1);
+        let batch = store.append(b"g", &[Bytes(b"three".to_vec()), Bytes(b"four".to_vec())]).unwrap();
+        assert_eq!((batch.position, batch.head.length), (3, 4));
+        assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().entries.len(), 2);
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
