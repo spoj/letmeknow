@@ -226,10 +226,11 @@ fn repair_and_the_wait_use_only_summaries_heard_on_the_current_connection() {
 }
 
 #[test]
-fn a_member_comes_online_as_it_starts_or_connects_after_none() {
+fn a_member_comes_online_as_it_connects_after_none() {
     let lacking = r(&[(4, 4)]);
     let mut p = member(lacking.clone());
-    assert_eq!(p.wait(&id(G), &lacking, ONLINE - 1), Decision::Wait);
+    assert_eq!(p.wait(&id(G), &lacking, QUIET - 1), Decision::Wait, "no dial landed yet");
+    assert_eq!(p.wait(&id(G), &lacking, QUIET), Decision::Lose(lacking.clone()));
     p.connect(key(1), served(&[G]), 10_000);
     assert_eq!(p.wait(&id(G), &lacking, 10_000 + ONLINE - 1), Decision::Wait, "its first connection after none");
     p.connect(key(2), served(&[G]), 20_000);

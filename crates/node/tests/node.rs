@@ -1045,6 +1045,8 @@ async fn an_old_leave_does_not_remove_a_member_added_again() {
     bob.node.leave(&gid.0).await.unwrap();
     bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     bob.node.join(&carol.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    // Only Carol holds the leave: were Bob online, Alice's wait could end at her connection to him before Carol's lands.
+    bob.node.shutdown().await.unwrap();
     let alice = start().await;
     let leaves = || alice.node.messages(&gid.0).unwrap().iter().filter(|m| m.payload["type"] == "leave").count();
     eventually("Alice holds Bob's old leave", || leaves() == 1).await;
