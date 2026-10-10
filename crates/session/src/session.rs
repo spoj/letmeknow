@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::Network;
@@ -41,7 +42,8 @@ pub type SessionNode = Node<SqliteProvider>;
 pub struct Config {
     pub handle: String,
     pub dir: PathBuf,
-    pub name: String,
+    /// Fixed when the session is created [default: <user>/<handle>]; a session resumes with its own.
+    pub name: Option<String>,
     pub hold: Duration,
     pub keep_log: bool,
     /// For groups and identities this session creates.
@@ -52,6 +54,16 @@ pub struct Config {
 
 /// A request on a command channel, and where its answer goes.
 pub type Inbound = (Request, oneshot::Sender<Value>);
+
+/// Work the session loop started, finished.
+pub enum Done {
+    /// A request's answer, and where it goes.
+    Answered(Result<Value>, oneshot::Sender<Value>),
+    /// A message this session sent in a group: its id and the answer, and where that goes.
+    Sent(Bytes, Result<(Bytes, Value)>, oneshot::Sender<Value>),
+    /// What failed of leaving the groups of identities this device left.
+    Left(Vec<anyhow::Error>),
+}
 
 /// The device's node, as another session process runs it: its state as published in `LETMEKNOW_HOME`, and its command
 /// channel.
@@ -69,7 +81,9 @@ impl Remote for Published {
     fn request(&self, request: lmk_client::Request) -> BoxFuture<Result<Value>> {
         let endpoint = self.0.join("device-endpoint");
         Box::pin(async move {
-            let channel = crate::cli::connect(&endpoint).await.context("no session process acts for this device")?;
+            let channel = crate::cli::connect(&endpoint)
+                .await
+                .context("no session process acts for this device just now; another is taking over: retry in a moment")?;
             crate::cli::exchange(channel, Request::Client(request)).await
         })
     }
@@ -95,6 +109,8 @@ pub struct Session {
     outbox: Outbox,
     catching_up: Option<Instant>,
     inbound: mpsc::UnboundedSender<Inbound>,
+    /// Work in flight: the loop takes each as it finishes, and never waits on one.
+    running: JoinSet<Done>,
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -127,25 +143,34 @@ fn save(dir: &Path, link: &FileLink, name: Option<&str>, bytes: &[u8]) -> Result
 }
 
 impl Session {
+    /// The session's name, kept in `db`: for a new session, `config`'s.
+    pub fn name(db: &Connection, config: &Config) -> Result<String> {
+        let stored: Option<String> = db.query_row("SELECT name FROM session", [], |r| r.get(0)).optional()?;
+        match (stored, &config.name) {
+            (Some(stored), Some(name)) if stored != *name => {
+                bail!("this session is named {stored:?}; names are fixed when a session is created")
+            }
+            (Some(stored), _) => Ok(stored),
+            (None, name) => {
+                let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "agent".into());
+                let name = name.clone().unwrap_or_else(|| format!("{user}/{}", config.handle));
+                db.execute("INSERT INTO session (name) VALUES (?)", [&name])?;
+                Ok(name)
+            }
+        }
+    }
+
     pub async fn open(
         config: Config,
+        (db, name): (Connection, String),
         node: SessionNode,
         home: &Path,
         network: Network,
         inbound: mpsc::UnboundedSender<Inbound>,
     ) -> Result<Self> {
-        let db = crate::store::open(&config.dir.join("session.db"))?;
-        let stored: Option<String> = db.query_row("SELECT name FROM session", [], |r| r.get(0)).optional()?;
-        match stored {
-            Some(stored) if stored != config.name => {
-                bail!("this session is named {stored:?}; names are fixed when a session is created")
-            }
-            Some(_) => {}
-            None => _ = db.execute("INSERT INTO session (name) VALUES (?)", [&config.name])?,
-        }
         let (plugins, lines) = Plugins::new(crate::kinds::discover(&config.plugins), config.dir.join("kinds"));
         let device = Device::load(&home.join("device.json"))?;
-        let client_config = lmk_client::Config { name: config.name.clone(), device, membership: config.membership.clone() };
+        let client_config = lmk_client::Config { name, device, membership: config.membership.clone() };
         let access = Access::Elsewhere(Arc::new(Published(home.to_path_buf())));
         let plugins = Arc::new(plugins);
         let (client, told) = Client::new(node, client_config, access, plugins.clone(), lines);
@@ -166,6 +191,7 @@ impl Session {
             outbox: Outbox::default(),
             catching_up: Some(Instant::now() + CATCH_UP_WINDOW),
             inbound,
+            running: JoinSet::new(),
         };
         session.take_device().await?;
         let groups = session.client.node().groups();
@@ -177,13 +203,23 @@ impl Session {
             if !session.client.chats(&gid) {
                 continue;
             }
-            // Messages that arrived but were never taken in, as when the session stopped while they waited.
-            for message in session.client.node().messages(&gid.0)? {
-                if message.payload["type"] == "message" && !session.taken(&message.id.0)? && message.sender.key != session.client.node().key() {
-                    let sender = serde_json::to_value(session.client.describe(&gid, &message.sender)?)?;
-                    let id = message.id.0.as_slice().try_into()?;
-                    session.received(gid.clone(), id, message.position, Vec::new(), sender, message.payload).await?;
+            // Messages that arrived after the last one printed, as when the session stopped while they waited or could
+            // not print them. Those catch-up left out, before it, stay out.
+            let me = session.client.node().key();
+            let mut unprinted = Vec::new();
+            for message in session.client.node().messages(&gid.0)?.into_iter().rev() {
+                if message.payload["type"] != "message" || message.sender.key == me {
+                    continue;
                 }
+                if session.seen(&message.id.0)? {
+                    break;
+                }
+                unprinted.push(message);
+            }
+            for message in unprinted.into_iter().rev() {
+                let sender = serde_json::to_value(session.client.describe(&gid, &message.sender)?)?;
+                let id = message.id.0.as_slice().try_into()?;
+                session.received(gid.clone(), id, message.position, Vec::new(), sender, message.payload).await?;
             }
         }
         Ok(session)
@@ -261,10 +297,10 @@ impl Session {
             self.warn(None, format!("acting for this device: {error:#}"));
         }
         if self.identities_at <= now {
-            self.identities_at = now + IDENTITIES_CHECK;
-            for error in self.client.leave_identities_left().await {
-                eprintln!("letmeknow: leaving the groups of an identity this device left: {error:#}");
-            }
+            // Not due again until this check finishes.
+            self.identities_at = now + Duration::from_secs(3600);
+            let client = self.client.clone();
+            self.running.spawn_local(async move { Done::Left(client.leave_identities_left().await) });
         }
         if self.outbox.deadline(self.config.hold).is_some_and(|at| at <= now) {
             self.outbox.flush_held();
@@ -276,25 +312,26 @@ impl Session {
     }
 
     /// Prints what is waiting, once the plugins are in step (a doc's file with its doc): whatever wakes the agent, it
-    /// acts on current state.
-    pub async fn emit(&mut self, print: &mut impl FnMut(String)) {
+    /// acts on current state. A message is seen once its line is written.
+    pub async fn emit(&mut self, print: &mut impl FnMut(String) -> std::io::Result<()>) -> std::io::Result<()> {
         if self.outbox.is_empty() {
-            return;
+            return Ok(());
         }
         self.sync_kinds().await;
         for mut item in self.outbox.take() {
+            let printed = item.as_object_mut().and_then(|item| item.remove("printed"));
+            print(item.to_string())?;
             if item["type"] == "message"
                 && let Some(id) = item["id"].as_str().and_then(|id| message_id(id).ok())
             {
                 let _ = self.mark_seen(&id);
             }
-            let printed = item.as_object_mut().and_then(|item| item.remove("printed"));
-            print(item.to_string());
             if let Some(printed) = printed {
                 let (kind, key) = (printed["kind"].as_str().unwrap_or_default(), printed["key"].as_str().unwrap_or_default());
                 self.client.printed(kind, item["group"].as_str().unwrap_or_default(), key);
             }
         }
+        Ok(())
     }
 
     /// Brings the plugins into step, and takes in what they told meanwhile.
@@ -305,37 +342,79 @@ impl Session {
         }
     }
 
+    /// Takes a request: what may wait on the network goes on in `running`, and is answered once done.
     pub async fn handle(&mut self, (request, reply): Inbound) {
+        if self.device.is_none()
+            && let Err(error) = self.take_device().await
+        {
+            self.warn(None, format!("acting for this device: {error:#}"));
+        }
         // The agent may have just changed a file.
         self.sync_kinds().await;
-        let answer = match request {
-            Request::Fetch { link } => return self.fetch(link, reply),
-            // A plugin's command may take a while, and may need this session meanwhile: it is answered when the plugin
-            // answers.
-            Request::Kind { kind, args, cwd } => return self.command(kind, args, cwd, reply).await,
-            Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
-                self.send(group, to, reply_to, urgent, attach.map(|data| (data, attach_name)), text).await
+        let client = self.client.clone();
+        match request {
+            Request::Read { id, ancestors } => {
+                let answer = self.read(&id, ancestors);
+                self.answer(answer, reply);
             }
-            Request::Read { id, ancestors } => self.read(&id, ancestors),
-            Request::Client(request) => self.client.request(request).await,
-        };
+            Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
+                match self.message(group, to, reply_to, urgent, attach.map(|data| (data, attach_name)), text) {
+                    Ok((gid, chat)) => _ = self.running.spawn_local(async move { Done::Sent(gid.clone(), client.send(&gid, chat).await, reply) }),
+                    Err(error) => self.answer(Err(error), reply),
+                }
+            }
+            Request::Fetch { link } => match self.fetching(&link) {
+                Ok((link, gid, name)) => {
+                    let dir = self.attachments_dir(&gid);
+                    self.running.spawn_local(async move {
+                        let fetched = async {
+                            let bytes = client.fetched(&gid, &link).await?;
+                            anyhow::Ok(json!({ "path": save(&dir, &link, name.as_deref(), &bytes)?, "bytes": bytes.len() }))
+                        };
+                        Done::Answered(fetched.await, reply)
+                    });
+                }
+                Err(error) => self.answer(Err(error), reply),
+            },
+            // A plugin's command may take a while, and may need this session meanwhile.
+            Request::Kind { kind, args, cwd } => {
+                self.running.spawn_local(async move {
+                    let answered = async {
+                        let answer = client.command(&kind, args, cwd).await?;
+                        answer.await.unwrap_or_else(|_| Err(anyhow::anyhow!("the {kind} plugin stopped")))
+                    };
+                    Done::Answered(answered.await, reply)
+                });
+            }
+            Request::Client(request) => _ = self.running.spawn_local(async move { Done::Answered(client.request(request).await, reply) }),
+            Request::IdentityJoin { .. } | Request::Status { .. } => unreachable!("the CLI sends these as the client's requests"),
+        }
+    }
+
+    /// Takes work in `running` that finished.
+    pub fn done(&mut self, done: Done) {
+        match done {
+            Done::Answered(answer, reply) => self.answer(answer, reply),
+            Done::Sent(gid, sent, reply) => {
+                let answer = sent.and_then(|(id, answer)| {
+                    self.db.execute("INSERT OR IGNORE INTO taken (id, gid, seen) VALUES (?, ?, 1)", params![id.0, gid.0])?;
+                    Ok(answer)
+                });
+                self.answer(answer, reply);
+            }
+            Done::Left(failed) => {
+                self.identities_at = Instant::now() + IDENTITIES_CHECK;
+                for error in failed {
+                    eprintln!("letmeknow: leaving the groups of an identity this device left: {error:#}");
+                }
+            }
+        }
+    }
+
+    fn answer(&mut self, answer: Result<Value>, reply: oneshot::Sender<Value>) {
         // Before the answer, so that the device's other session processes read what the request changed.
         self.publish();
         let _ = reply.send(answer.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
-        self.outbox.flush_held();
-    }
-
-    /// Passes `letmeknow <kind> <args>...` to the kind's plugin; `reply` gets its answer.
-    async fn command(&mut self, kind: String, args: Vec<String>, cwd: String, reply: oneshot::Sender<Value>) {
-        match self.client.command(&kind, args, cwd).await {
-            Ok(answered) => {
-                tokio::spawn(async move {
-                    let answer = answered.await.unwrap_or_else(|_| Err(anyhow::anyhow!("the {kind} plugin stopped")));
-                    let _ = reply.send(answer.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
-                });
-            }
-            Err(error) => _ = reply.send(json!({ "error": format!("{error:#}") })),
-        }
         self.outbox.flush_held();
     }
 
@@ -375,7 +454,10 @@ impl Session {
             ClientEvent::Warning { .. } => self.outbox.print(serde_json::to_value(&event)?),
             ClientEvent::Gone { group } => self.forget(&group)?,
             ClientEvent::Message { group, id, position, missing, from, payload } => {
-                self.received(group, message_id(&id)?, position, missing, serde_json::to_value(from)?, payload).await?
+                let id = message_id(&id)?;
+                if !self.taken(&id)? {
+                    self.received(group, id, position, missing, serde_json::to_value(from)?, payload).await?
+                }
             }
             ClientEvent::Sent { .. } => self.outbox.deliver(serde_json::to_value(&event)?, false),
             ClientEvent::File { hash } => self.arrived(hex::decode(hash)?.try_into().ok().context("a hash is 32 bytes")?).await?,
@@ -407,7 +489,8 @@ impl Session {
 
     // Messages.
 
-    async fn send(
+    /// A chat message to send, and the group it goes to.
+    fn message(
         &mut self,
         group: Option<String>,
         to: Vec<String>,
@@ -415,7 +498,7 @@ impl Session {
         urgent: bool,
         attach: Option<(String, String)>,
         text: String,
-    ) -> Result<Value> {
+    ) -> Result<(Bytes, Chat)> {
         let gid = self.client.chat(group)?;
         let reply_to = reply_to.map(|id| message_id(&id)).transpose()?;
         if let Some(id) = &reply_to {
@@ -429,17 +512,12 @@ impl Session {
             }
             None => None,
         };
-        let (id, answer) = self.client.send(&gid, Chat { text, to, reply_to, urgent, attachment }).await?;
-        self.db.execute("INSERT OR IGNORE INTO taken (id, gid, seen) VALUES (?, ?, 1)", params![id.0, gid.0])?;
-        Ok(answer)
+        Ok((gid, Chat { text, to, reply_to, urgent, attachment }))
     }
 
     /// Takes in a chat message, as the client hands them on in position order: `missing`, the counted positions before
     /// it that were passed over unopened.
     async fn received(&mut self, gid: Bytes, id: [u8; 32], position: u64, missing: Vec<u64>, sender: Value, payload: Value) -> Result<()> {
-        if self.taken(&id)? {
-            return Ok(());
-        }
         self.db.execute("INSERT OR IGNORE INTO taken (id, gid) VALUES (?, ?)", params![id, gid.0])?;
         let mut item = self.message_json(&gid, id, position, sender, &payload, true)?;
         if !missing.is_empty() {
@@ -578,30 +656,12 @@ impl Session {
         Ok(())
     }
 
-    /// The file a message's attachment or a doc's text links, decrypted into a file only this user can read. The answer
-    /// waits for the file if no copy is here yet.
-    fn fetch(&mut self, link: String, reply: oneshot::Sender<Value>) {
-        let found = (|| -> Result<_> {
-            let parsed = FileLink::parse(link.trim())?;
-            let (gid, name) = self.linking(&parsed.link())?.context("no message or doc here links that")?;
-            Ok((parsed, gid, name))
-        })();
-        let (link, gid, name) = match found {
-            Ok(found) => found,
-            Err(error) => {
-                let _ = reply.send(json!({ "error": format!("{error:#}") }));
-                return;
-            }
-        };
-        let (client, dir) = (self.client.clone(), self.attachments_dir(&gid));
-        tokio::spawn(async move {
-            let fetched = async {
-                let bytes = client.fetched(&gid, &link).await?;
-                anyhow::Ok(json!({ "path": save(&dir, &link, name.as_deref(), &bytes)?, "bytes": bytes.len() }))
-            };
-            let _ = reply.send(fetched.await.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
-        });
-        self.outbox.flush_held();
+    /// The file a message's attachment or a doc's text links, the group that links it, and the file's name if a message
+    /// attached it.
+    fn fetching(&self, link: &str) -> Result<(FileLink, Bytes, Option<String>)> {
+        let parsed = FileLink::parse(link.trim())?;
+        let (gid, name) = self.linking(&parsed.link())?.context("no message or doc here links that")?;
+        Ok((parsed, gid, name))
     }
 
     /// The group whose chat messages or kind link `link`, and the file's name if a message attached it.
@@ -635,32 +695,37 @@ impl Session {
     }
 }
 
-/// Runs a session until `shutdown`: prints `ready`, then handles what arrives and prints what concerns the agent, one
-/// JSON object per line.
+/// Runs a session until `shutdown`, or until a line it prints cannot be written: prints `ready`, then handles what
+/// arrives and prints what concerns the agent, one JSON object per line.
 pub async fn run(
     mut session: Session,
     mut inbound: mpsc::UnboundedReceiver<Inbound>,
     mut events: mpsc::UnboundedReceiver<Event>,
-    mut print: impl FnMut(String),
+    mut print: impl FnMut(String) -> std::io::Result<()>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let ready = json!({ "type": "ready", "session": session.config.handle, "member": session.me()?, "state": session.config.dir });
-    print(ready.to_string());
     let mut shutdown = std::pin::pin!(shutdown);
     let client = session.client.clone();
-    loop {
-        session.publish();
-        session.emit(&mut print).await;
-        let due = session.next_due();
-        tokio::select! {
-            Some(item) = inbound.recv() => session.handle(item).await,
-            Some(event) = events.recv() => client.event(event).await,
-            Some(event) = session.told.recv() => session.client_event(event).await,
-            (kind, line) = client.next_line() => client.plugin_line(kind, line).await,
-            _ = tokio::time::sleep_until(due) => session.tick().await,
-            _ = &mut shutdown => break,
+    if print(ready.to_string()).is_ok() {
+        loop {
+            session.publish();
+            if session.emit(&mut print).await.is_err() {
+                break;
+            }
+            let due = session.next_due();
+            tokio::select! {
+                Some(item) = inbound.recv() => session.handle(item).await,
+                Some(done) = session.running.join_next() => session.done(done.expect("work in flight runs until shutdown")),
+                Some(event) = events.recv() => client.event(event).await,
+                Some(event) = session.told.recv() => session.client_event(event).await,
+                (kind, line) = client.next_line() => client.plugin_line(kind, line).await,
+                _ = tokio::time::sleep_until(due) => session.tick().await,
+                _ = &mut shutdown => break,
+            }
         }
     }
+    session.running.shutdown().await;
     session.shutdown().await;
     Ok(())
 }
