@@ -18,6 +18,7 @@ use lmk_proto::group::Service;
 use lmk_proto::head::Head;
 use lmk_proto::peer::{Frame, Summary};
 use lmk_proto::ranges::Ranges;
+use n0_future::StreamExt;
 use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep};
 
@@ -234,8 +235,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Sends what `Peers` has due; reads on in groups that wait before a commit, and opens what no longer waits on a
-    /// missing position.
+    /// Sends what `Peers` has due; reads on in groups that wait before a commit, opens what no longer waits on a missing
+    /// position, and asks for the kind's state where the kind has none.
     fn poll(&self, st: &mut State<P>) -> Result<()> {
         let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
         let now = st.tick();
@@ -258,6 +259,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
             } else if !g.rec.unopened.is_empty() {
                 self.open_ready(st, gid)?;
                 self.kind_advance(st, gid)?;
+            }
+            if st.groups.get(gid).and_then(|g| g.rec.kind.as_ref()).is_some_and(|kind| kind.behind) {
+                self.ask_state(st, gid);
             }
         }
         Ok(())
@@ -295,7 +299,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             for heard in st.peers.frame(&key, &Frame::Hello { groups: groups.clone(), heads }, now) {
                 let group = heard.summary.group.clone();
                 st.hear(heard)?;
-                self.events.send(Event::Heard { group }).ok();
+                st.events.push(Event::Heard { group });
                 self.heard.notify_waiters();
             }
             for summary in groups {
@@ -374,17 +378,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// A connected member's `hello` shows this session's head of the group's log.
     fn synced(self: &Arc<Self>, st: &mut State<P>, gid: &[u8], peer: EndpointId) -> Result<()> {
         let member = st.by_iroh(gid, &peer);
-        self.events.send(Event::Synced { group: Bytes(gid.to_vec()), member }).ok();
+        st.events.push(Event::Synced { group: Bytes(gid.to_vec()), member });
         st.out.push(Out::WantFiles { peer, group: gid.to_vec() });
-        if st.group(gid)?.rec.kind.as_ref().is_some_and(|kind| kind.behind) {
-            self.ask_state(st, gid, Some(peer));
-        }
         // A file only this session held may have reached the peer since.
         let pending = st.group(gid)?.rec.pending.clone();
         for hash in pending {
             let (inner, gid) = (self.clone(), gid.to_vec());
             spawn(async move {
-                if inner.net().holders(&gid, hash).await.contains(&peer) {
+                if inner.net().holders(&gid, hash).any(|holder| holder == peer).await {
                     let mut st = inner.lock();
                     if let Ok(g) = st.group_mut(&gid) {
                         g.rec.pending.retain(|pending| *pending != hash);
@@ -409,10 +410,11 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(heard.collect())
     }
 
-    /// The other members no summary was heard from for H: away, and their summaries no longer count as holding.
+    /// The other members not online that no summary was heard from for H: away, and their summaries no longer count as
+    /// holding.
     pub fn away(&self, gid: &[u8]) -> Result<Vec<Member>> {
-        let (heard, since, me) = (self.heard(gid)?, self.carried_since(gid)?, self.key_in(gid));
-        let away = |m: &Member| m.key != me && !heard.iter().any(|h| h.member.key == m.key && h.at >= since);
+        let (heard, since, me, online) = (self.heard(gid)?, self.carried_since(gid)?, self.key_in(gid), self.online(gid)?);
+        let away = |m: &Member| m.key != me && !online.iter().any(|o| o.key == m.key) && !heard.iter().any(|h| h.member.key == m.key && h.at >= since);
         Ok(self.members(gid)?.into_iter().filter(away).collect())
     }
 

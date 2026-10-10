@@ -308,7 +308,9 @@ mod native {
         }
 
         fn begin(&self) -> Result<()> {
-            Ok(self.db.execute_batch("BEGIN")?)
+            // A deferred transaction that reads and then writes after the session's other connection wrote fails at
+            // once, without waiting.
+            Ok(self.db.execute_batch("BEGIN IMMEDIATE")?)
         }
 
         fn commit(&self) -> Result<()> {

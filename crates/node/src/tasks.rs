@@ -101,6 +101,7 @@ impl<P: Provider> State<P> {
             scrub: false,
             observed: Vec::new(),
             observing: config.observe.is_some(),
+            events: Vec::new(),
             device: config.device.as_ref().map(|device| device.name.clone()),
             session,
             groups,
@@ -311,6 +312,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 st.save(&gid).ok();
             }
         }
-        self.events.send(Event::File(hash)).ok();
+        st.events.push(Event::File(hash));
     }
 }

@@ -23,6 +23,8 @@ use lmk_proto::group::IdentityRef;
 
 use crate::{Dropped, Event, Inner, MEMBER_WAIT, Observation, REREAD, State, Work, get, hex, put};
 
+pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
+
 /// One membership client per service, sharing the session's transport.
 pub(crate) struct Clients {
     transport: Arc<dyn Transport>,
@@ -109,7 +111,7 @@ impl<P: Provider> State<P> {
     }
 
     pub(crate) fn log(&self, id: &[u8]) -> Result<&Log> {
-        self.logs.get(id).context("this session does not follow that log")
+        self.logs.get(id).context(NOT_FOLLOWED)
     }
 
     pub(crate) fn save_log(&self, id: &[u8]) -> Result<()> {
@@ -277,7 +279,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Takes entries of a log from a peer, those ending at `head`, a head its service signed: the new ones, if they
     /// chain on to this session's copy.
     pub(crate) fn take_entries(&self, st: &mut State<P>, id: &[u8], entries: Vec<Bytes>, head: Head) -> Result<()> {
-        let log = st.logs.get_mut(id).context("this session does not follow that log")?;
+        let log = st.logs.get_mut(id).context(NOT_FOLLOWED)?;
         let Some(mut chain) = log.chain.clone() else { return Ok(()) };
         let (after, start) = (chain.length(), head.length.saturating_sub(entries.len() as u64));
         if head.length <= after || chain.hash_at(start).is_none() {
@@ -349,7 +351,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for gid in st.groups_of(&lmk_proto::identity::address(id)) {
             self.work.send(Work::Duties(gid)).ok();
         }
-        self.events.send(Event::Keys { identity: Bytes(id.to_vec()) }).ok();
+        st.events.push(Event::Keys { identity: Bytes(id.to_vec()) });
         Ok(())
     }
 

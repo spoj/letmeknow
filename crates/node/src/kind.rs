@@ -1,8 +1,8 @@
 //! A group's kind takes the group's held messages in log order, and the losses: the core hands it the next positions as
 //! it opens them, or as this session loses them, keeping what it took until the kind asks to read past it. A kind with
 //! no state to follow the log from, as a joiner's before its state comes, one older than what this session kept, or one
-//! stopped at a loss, asks a member for the kind's state. The kind's payloads also go out as events in position order,
-//! passing a position once it no longer holds up later ones (`show`).
+//! stopped at a loss, asks the members online for the kind's state. The kind's payloads also go out as events in
+//! position order, passing a position once it no longer holds up later ones (`show`).
 
 use std::sync::Arc;
 
@@ -39,9 +39,9 @@ pub(crate) fn kept_key(gid: &[u8], position: u64) -> Vec<u8> {
 
 impl<P: Provider + Send + 'static> Node<P> {
     /// Follows the group's held messages after position `after`, as the kind's own state stands; with none, the kind
-    /// has no state it can follow the log from, as before its first or once it stopped at a loss, and this session asks a
-    /// member for one. A state from before this session's start is as of its start. What was kept for the kind up to
-    /// `after` goes. Taken items come as `Event::Logged`.
+    /// has no state it can follow the log from, as before its first or once it stopped at a loss, and this session asks
+    /// the members online for one. A state from before this session's start is as of its start. What was kept for the
+    /// kind up to `after` goes. Taken items come as `Event::Logged`.
     pub fn follow_log(&self, gid: &[u8], after: Option<u64>) -> Result<()> {
         let mut st = self.inner.lock();
         let st = &mut *st;
@@ -62,7 +62,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let behind = kind.behind;
         st.save(gid)?;
         if behind {
-            self.inner.ask_state(st, gid, None);
+            self.inner.ask_state(st, gid);
             return Ok(());
         }
         self.inner.kind_advance(st, gid)
@@ -162,7 +162,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         kind.kept.extend(taken);
         st.save(gid)?;
         if took {
-            self.events.send(Event::Logged { group: Bytes(gid.to_vec()) }).ok();
+            st.events.push(Event::Logged { group: Bytes(gid.to_vec()) });
         }
         Ok(())
     }
@@ -174,6 +174,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let g = st.group(gid)?;
         let (mut shown, mut missing) = (g.rec.shown, g.rec.missing.clone());
         let me = st.me(gid).to_vec();
+        let mut messages = Vec::new();
         while shown < g.rec.position {
             let position = shown + 1;
             if let Some(Pos { judged: Judged::Counted { id }, lost, .. }) = st.pos(gid, position)? {
@@ -189,11 +190,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     && !Control::TYPES.contains(&type_of(&message.payload))
                 {
                     message.missing = std::mem::take(&mut missing);
-                    self.events.send(Event::Message(message)).ok();
+                    messages.push(Event::Message(message));
                 }
             }
             shown = position;
         }
+        st.events.extend(messages);
         let rec = &mut st.group_mut(gid)?.rec;
         (rec.shown, rec.missing) = (shown, missing);
         st.save(gid)
@@ -224,24 +226,23 @@ impl<P: Provider + Send + 'static> Inner<P> {
         };
         if !positions.is_empty() {
             let ids = st.ids(gid, &positions)?;
-            self.events.send(Event::Lost(Lost { group: Bytes(gid.to_vec()), position, member: by, positions, ids })).ok();
+            st.events.push(Event::Lost(Lost { group: Bytes(gid.to_vec()), position, member: by, positions, ids }));
         }
         Ok(())
     }
 
-    /// Asks a member online, `peer` or else any, for the kind's state, unless this session asked or was handed one in
-    /// the last minute.
-    pub(crate) fn ask_state(&self, st: &mut State<P>, gid: &[u8], peer: Option<EndpointId>) {
-        if !st.at_head(gid) || st.group(gid).is_ok_and(|g| g.asked + STATE_ASK > now()) {
+    /// Asks every member online for the kind's state, unless this session asked or was handed one in the last minute:
+    /// some, as browsers for git, give none.
+    pub(crate) fn ask_state(&self, st: &mut State<P>, gid: &[u8]) {
+        let group = Bytes(gid.to_vec());
+        let none = !st.served.values().any(|served| served.contains(&group));
+        if none || !st.at_head(gid) || st.group(gid).is_ok_and(|g| g.asked + STATE_ASK > now()) {
             return;
         }
-        let group = Bytes(gid.to_vec());
-        let mut connected = st.served.iter().filter(|(_, served)| served.contains(&group)).map(|(key, _)| *key);
-        let Some(peer) = connected.find(|key| peer.is_none_or(|peer| peer == *key)) else { return };
         if let Ok(g) = st.group_mut(gid) {
             g.asked = now();
         }
-        st.emit(gid, peer, Frame::State { group, link: None });
+        st.broadcast(gid, Frame::State { group, link: None });
     }
 
     /// Hands a member that asked for it the kind's state, if the kind gives one.

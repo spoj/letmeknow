@@ -12,11 +12,12 @@ use lmk_proto::links::FileLink;
 use lmk_proto::peer::Frame;
 use lmk_proto::ranges::Ranges;
 use lmk_proto::Bytes;
+use n0_future::{FutureExt, MergeUnbounded, StreamExt};
 use n0_future::time::{Duration, sleep, timeout};
 use serde_json::{Value, json};
 
 use crate::groups::renaming;
-use crate::{Dropped, G, MEMBER_WAIT, Member, Message, Node, Observation, Positions, Rec, SEND_WAIT, Sent, State, UNFINISHED, Work, device_key_key, endpoint_id, get, kind_key, message_key, now, put, sending};
+use crate::{Dropped, G, MEMBER_WAIT, Member, Message, Node, Observation, Positions, Rec, SEND_WAIT, Sent, State, UNFINISHED, Work, device_key_key, endpoint_id, get, kind_key, message_key, put, sending};
 
 impl<P: Provider + Send + 'static> Node<P> {
     /// Stops the peers and every task.
@@ -316,18 +317,34 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.work.send(Work::Fetch { group: gid.to_vec(), link }).ok();
     }
 
-    /// The members online that hold a file whole, as soon as one does, waiting up to `wait`; none at once if no member
-    /// is online.
+    /// The first member online found to hold a file whole, waiting up to `wait`; none at once if no member is online.
     pub async fn holders(&self, gid: &[u8], link: &FileLink, wait: Duration) -> Vec<Member> {
-        let deadline = now() + wait.as_millis() as u64;
-        loop {
-            let holders = self.inner.net().holders(gid, link.hash).await;
-            if !holders.is_empty() || now() >= deadline || self.online(gid).is_ok_and(|online| online.is_empty()) {
-                let st = self.inner.lock();
-                return holders.iter().map(|peer| st.by_iroh(gid, peer)).collect();
+        // Asks again every half second, as a member may take the file meanwhile, keeping the earlier asks' answers.
+        let first = async {
+            let mut asks = MergeUnbounded::default();
+            loop {
+                if self.online(gid).is_ok_and(|online| online.is_empty()) {
+                    return None;
+                }
+                asks.push(self.inner.net().holders(gid, link.hash));
+                let answered = async {
+                    match asks.next().await {
+                        Some(holder) => Some(holder),
+                        None => std::future::pending().await,
+                    }
+                };
+                let tick = async {
+                    sleep(Duration::from_millis(500)).await;
+                    None
+                };
+                if let Some(holder) = answered.or(tick).await {
+                    return Some(holder);
+                }
             }
-            sleep(Duration::from_millis(500)).await;
-        }
+        };
+        let holder = timeout(wait, first).await.ok().flatten();
+        let st = self.inner.lock();
+        holder.iter().map(|peer| st.by_iroh(gid, peer)).collect()
     }
 
     /// Waits until another member online holds a file this session added, or a few seconds; returns them. If none does,
