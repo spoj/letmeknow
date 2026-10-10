@@ -155,6 +155,13 @@ impl Peers {
         g.own = own;
     }
 
+    /// The peer's Remove applied: its summary is of a membership that ended, and it took none of ours to a later one.
+    pub fn removed(&mut self, group: &Bytes, peer: &[u8]) {
+        if let Some(c) = self.conns.get_mut(peer) {
+            c.heard.remove(group);
+        }
+    }
+
     pub fn forget(&mut self, group: &Bytes) {
         self.groups.remove(group);
         for c in self.conns.values_mut() {
@@ -228,7 +235,7 @@ impl Peers {
                     if c.served.contains(&summary.group) && c.heard.get(&summary.group) != Some(summary) {
                         g.progress = now;
                     }
-                    // The peer may have taken none of ours, as one that joined since we sent it.
+                    // The peer may have taken none of ours, as one that joined, or joined again, since we sent it.
                     if c.served.contains(&summary.group) && !c.heard.contains_key(&summary.group) {
                         c.opened.insert(summary.group.clone());
                     }

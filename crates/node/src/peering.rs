@@ -209,6 +209,7 @@ impl<P: Provider> State<P> {
 
     /// Deletes a peer's summary of a group, as its Remove applies.
     pub(crate) fn unhear(&mut self, gid: &[u8], peer: &[u8]) -> Result<()> {
+        self.peers.removed(&Bytes(gid.to_vec()), peer);
         let g = self.groups.get_mut(gid).context("this session is not in that group")?;
         if g.heard.remove(&Bytes(peer.to_vec())).is_none() {
             return Ok(());
