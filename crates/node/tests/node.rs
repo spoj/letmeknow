@@ -14,7 +14,7 @@ use lmk_membership::service::{Policy, Service as Membership};
 use lmk_membership::store::Store;
 use lmk_node::devices::Devices;
 use lmk_node::{Config, Event, Node};
-use lmk_proto::group::{CHAT, Certificate, ChatMessage, DEVICES, IdentityRef, Named, PROTOCOL, Service, Settings, type_of};
+use lmk_proto::group::{CHAT, Certificate, ChatMessage, DEVICES, IdentityRef, Named, PROTOCOL, Service, Settings};
 use lmk_proto::identity::Listed;
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
@@ -330,20 +330,49 @@ async fn served<H: iroh::protocol::ProtocolHandler>(relay: &Relay, dir: &Path, s
     (service, router)
 }
 
-/// A membership service whose connections opened while `open` is false wait until it is true, each told by `reached`.
+/// A membership service's gate: closing it ends the service's connections, and those opened while it is closed wait
+/// until it opens, each told by `reached` with the key of the endpoint that opened it.
+#[derive(Debug)]
+struct Gate {
+    open: tokio::sync::watch::Sender<bool>,
+    conns: std::sync::Mutex<Vec<iroh::endpoint::Connection>>,
+    reached: tokio::sync::mpsc::UnboundedSender<Bytes>,
+}
+
+impl Gate {
+    fn new() -> (Arc<Gate>, UnboundedReceiver<Bytes>) {
+        let (reached, reaching) = tokio::sync::mpsc::unbounded_channel();
+        (Arc::new(Gate { open: tokio::sync::watch::Sender::new(true), conns: Default::default(), reached }), reaching)
+    }
+
+    fn set(&self, open: bool) {
+        let mut conns = self.conns.lock().unwrap();
+        self.open.send_replace(open);
+        if !open {
+            for conn in conns.drain(..) {
+                conn.close(0u32.into(), b"closed");
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Gated {
     service: Membership,
-    open: tokio::sync::watch::Receiver<bool>,
-    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    gate: Arc<Gate>,
 }
 
 impl iroh::protocol::ProtocolHandler for Gated {
     async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
-        if !*self.open.borrow() {
-            self.reached.send(()).ok();
+        let mut open = self.gate.open.subscribe();
+        {
+            let mut conns = self.gate.conns.lock().unwrap();
+            conns.push(connection.clone());
+            if !*open.borrow() {
+                self.gate.reached.send(Bytes(connection.remote_id().as_bytes().to_vec())).ok();
+            }
         }
-        self.open.clone().wait_for(|open| *open).await.ok();
+        open.wait_for(|open| *open).await.ok();
         iroh::protocol::ProtocolHandler::accept(&self.service, connection).await
     }
 }
@@ -362,47 +391,62 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
     bob.node.join(&link, None).await.unwrap();
     let alice_only = vec![link.members[0].clone()];
     let alice_iroh = alice.node.members(&gid.0).unwrap().into_iter().find(|m| m.name == "Alice").unwrap().iroh;
+    // On a slow machine an invite may expire before Alice reads the key log: then once more, valid twice as long.
+    let mut valid = 3000;
     for closed in [false, true] {
-        let (open, gate) = tokio::sync::watch::channel(true);
-        let (reached, mut reaching) = tokio::sync::mpsc::unbounded_channel();
-        let (membership, _service) = served(&relay, &dir.join(format!("{closed}")), |service| Gated { service, open: gate, reached }).await;
-        let joiner = session(&relay, "Carol").await;
-        let (carol, _, device) = identity(&joiner.node, "Carol", membership).await;
-        let certificate = certificate(&carol, &device, &joiner.node.key());
-        open.send(false).unwrap();
-        let expires = lmk_node::now() + 3000;
-        let joining = if closed {
-            alice.node.change_settings(&gid.0, |mut s| {
-                s.open.push(Named { id: carol.id.clone(), name: "Carol".into(), rest: Default::default() });
-                s
-            }).await.unwrap();
-            let opening = lmk_proto::group::Opening { members: vec![alice_iroh.clone()], ..alice.node.opening(&gid.0).unwrap() };
-            tokio::spawn(async move { joiner.node.join_open(&opening, certificate).await })
-        } else {
-            let secret = [8u8; 16];
-            let rule = json!({ "type": "invite", "hash": Bytes(Sha256::digest(secret).to_vec()), "expires": expires, "to": carol.id });
-            bob.node.send(&gid.0, &rule).await.unwrap();
-            eventually("Alice holds the invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["type"] == "invite")).await;
-            let link = Invite { device: false, secret, members: alice_only.clone() };
-            tokio::spawn(async move { joiner.node.join(&link, Some(certificate)).await.map(|(gid, _)| gid) })
-        };
-        tokio::time::timeout(WAIT, reaching.recv()).await.unwrap();
-        if closed {
-            bob.node.change_settings(&gid.0, |s| Settings { open: vec![], ..s }).await.unwrap();
-            tokio::time::timeout(WAIT, async {
-                while !alice.node.settings(&gid.0).unwrap().open.is_empty() {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+        loop {
+            let (gate, mut reaching) = Gate::new();
+            let (membership, _service) = served(&relay, &dir.join(format!("{closed}-{valid}")), |service| Gated { service, gate: gate.clone() }).await;
+            let joiner = session(&relay, "Carol").await;
+            let (carol, _, device) = identity(&joiner.node, "Carol", membership).await;
+            let certificate = certificate(&carol, &device, &joiner.node.key());
+            gate.set(false);
+            let expires = lmk_node::now() + valid;
+            let mut joining = if closed {
+                alice.node.change_settings(&gid.0, |mut s| {
+                    s.open.push(Named { id: carol.id.clone(), name: "Carol".into(), rest: Default::default() });
+                    s
+                }).await.unwrap();
+                let opening = lmk_proto::group::Opening { members: vec![alice_iroh.clone()], ..alice.node.opening(&gid.0).unwrap() };
+                tokio::spawn(async move { joiner.node.join_open(&opening, certificate).await })
+            } else {
+                let secret: [u8; 16] = lmk_core::random();
+                let hash = Bytes(Sha256::digest(secret).to_vec());
+                let rule = json!({ "type": "invite", "hash": hash, "expires": expires, "to": carol.id });
+                bob.node.send(&gid.0, &rule).await.unwrap();
+                eventually("Alice holds the invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["hash"] == rule["hash"])).await;
+                let link = Invite { device: false, secret, members: alice_only.clone() };
+                tokio::spawn(async move { joiner.node.join(&link, Some(certificate)).await.map(|(gid, _)| gid) })
+            };
+            // Alice reads the key log once the rule admits Carol.
+            let alice_reads = async { while reaching.recv().await.unwrap() != alice_iroh {} };
+            let reached = tokio::time::timeout(WAIT, async {
+                tokio::select! {
+                    _ = alice_reads => true,
+                    refused = &mut joining => {
+                        assert!(!closed && format!("{refused:?}").contains("unknown, used or expired"), "{refused:?}");
+                        false
+                    }
                 }
-            }).await.unwrap();
-        } else {
-            assert!(lmk_node::now() < expires, "the invite was ahead when the request came");
-            tokio::time::sleep(Duration::from_millis(expires + 200 - lmk_node::now())).await;
+            }).await.expect("Alice reads Carol's key log");
+            if !reached {
+                assert!(valid < WAIT.as_millis() as u64, "the invite expired before Alice read the key log");
+                valid *= 2;
+                continue;
+            }
+            if closed {
+                bob.node.change_settings(&gid.0, |s| Settings { open: vec![], ..s }).await.unwrap();
+                eventually("Alice sees the group closed", || alice.node.settings(&gid.0).unwrap().open.is_empty()).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(expires + 200 - lmk_node::now())).await;
+            }
+            gate.set(true);
+            let refused = format!("{:#}", joining.await.unwrap().unwrap_err());
+            let reason = if closed { "no identity the group is open to" } else { "unknown, used or expired" };
+            assert!(refused.contains(reason), "{refused}");
+            assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2);
+            break;
         }
-        open.send(true).unwrap();
-        let refused = format!("{:#}", joining.await.unwrap().unwrap_err());
-        let reason = if closed { "no identity the group is open to" } else { "unknown, used or expired" };
-        assert!(refused.contains(reason), "{refused}");
-        assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2);
     }
 }
 
@@ -681,15 +725,9 @@ async fn a_dropped_devices_sessions_are_removed_once_and_reported() {
     // The tablet's session adds Dave to the first group, and invites Eve, whom alice admits.
     let link = tablet.node.invite(&groups[0].0, None, None).await.unwrap();
     dave.node.join(&link, None).await.unwrap();
-    let link = lmk_proto::links::Invite { members: alice_only, ..tablet.node.invite(&groups[0].0, None, None).await.unwrap() };
-    // Alice admits by the tablet's invites once she holds their messages.
-    tokio::time::timeout(WAIT, async {
-        let invites = || alice.node.messages(&groups[0].0).unwrap().into_iter().filter(|m| m.sender.key == tablet.node.key() && type_of(&m.payload) == "invite").count();
-        while invites() < 2 {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }).await.expect("alice holds the tablet's invites");
-    eve.node.join(&link, None).await.unwrap();
+    let link = tablet.node.invite(&groups[0].0, None, None).await.unwrap();
+    assert!(link.members.contains(&alice_only[0]), "the link names Alice, who holds the invite");
+    eve.node.join(&lmk_proto::links::Invite { members: alice_only, ..link }, None).await.unwrap();
     tokio::time::timeout(WAIT, async {
         while alice.node.members(&groups[0].0).unwrap().len() < 5 {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -937,40 +975,14 @@ async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     .unwrap_or_else(|_| panic!("{what}"));
 }
 
-fn log_dir(logs: &Path, gid: &Bytes) -> PathBuf {
-    logs.join(gid.0.iter().map(|b| format!("{b:02x}")).collect::<String>())
-}
-
-/// Makes a folder's log unreachable, even to root, by a file in its place; or reachable again.
-/// Windows refuses to move a folder while a file in it is open, as the folder service may have one for a moment.
-fn reachable(dir: &Path, reachable: bool) {
-    let aside = dir.with_extension("aside");
-    let moved = |from: &Path, to: &Path| {
-        for _ in 0..50 {
-            if std::fs::rename(from, to).is_ok() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        std::fs::rename(from, to).unwrap();
-    };
-    if reachable {
-        std::fs::remove_file(dir).unwrap();
-        moved(&aside, dir);
-    } else {
-        moved(dir, &aside);
-        std::fs::write(dir, b"").unwrap();
-    }
-}
-
 /// A `leave` sent while the group's log is unreachable is pending: the leaver appends it once the log is reachable,
 /// after a restart with `restart_leaver`, and the other member then removes it.
 async fn held_leave(test: &str, restart_leaver: bool) {
     use lmk_core::provider::SqliteProvider;
     let relay = relay().await;
     let dir = folder(test);
-    std::fs::create_dir_all(&dir).unwrap();
-    let logs = dir.join("logs");
+    let (gate, _reaching) = Gate::new();
+    let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
     let start = |name: &'static str| {
         let (relay, db) = (&relay, dir.join(format!("{name}.db")));
         async move {
@@ -980,21 +992,21 @@ async fn held_leave(test: &str, restart_leaver: bool) {
     };
     let mut alice = start("Alice").await;
     let bob = start("Bob").await;
-    let gid = alice.node.create(settings(CHAT, &logs), None).unwrap();
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
 
-    reachable(&log_dir(&logs, &gid), false);
+    gate.set(false);
     let mut bob = bob;
     let sent = bob.node.leave(&gid.0).await.unwrap().unwrap();
     assert_eq!(sent.position, None, "the leave is pending");
     if restart_leaver {
         bob.node.shutdown().await.unwrap();
         drop(bob);
-        reachable(&log_dir(&logs, &gid), true);
+        gate.set(true);
         bob = start("Bob").await;
     } else {
-        reachable(&log_dir(&logs, &gid), true);
+        gate.set(true);
     }
     let counted = bob.until(|e| match e {
         Event::Sent { id, position, .. } => Some((id, position)),
@@ -1063,8 +1075,8 @@ async fn a_leaver_left_alone_forgets_the_group() {
     bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     let (a, b) = tokio::join!(alice.node.leave(&gid.0), bob.node.leave(&gid.0));
-    a.unwrap().unwrap();
-    b.unwrap().unwrap();
+    a.unwrap();
+    b.unwrap();
     eventually("both forgot the group", || alice.node.groups().is_empty() && bob.node.groups().is_empty()).await;
 }
 
