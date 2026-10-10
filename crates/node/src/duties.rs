@@ -17,7 +17,13 @@ use n0_future::time::{Duration, sleep};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::{Dropped, Event, G, Inner, Observation, State, Work, dropped, now, renaming};
+use std::collections::BTreeMap;
+
+use lmk_core::identity::{KeyLog, Verdict};
+use lmk_proto::group::Credential;
+
+use crate::groups::renaming;
+use crate::{Dropped, Event, G, Inner, Observation, State, Work, now};
 
 /// How often every group's duties run, besides as its log moves.
 pub(crate) const TIMER: Duration = Duration::from_secs(10 * 60);
@@ -178,6 +184,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.events.send(Event::Revoked { group: Bytes(gid.to_vec()), removed, added }).ok();
         Ok(())
     }
+}
+
+/// Whether a member's device was dropped from its identity's list, as the key logs held show it.
+fn dropped(keys: &BTreeMap<Vec<u8>, KeyLog>, credential: &Credential) -> bool {
+    let log = credential.identity().and_then(|identity| keys.get(&identity.id.0));
+    log.is_some_and(|log| log.verify(credential) == Verdict::Dropped)
 }
 
 #[cfg(test)]

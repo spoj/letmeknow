@@ -10,7 +10,9 @@ use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
 use lmk_core::provider::Provider;
 use lmk_membership::Contradiction;
+use lmk_net::Groups;
 use lmk_net::peers::{self, Own};
+use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use lmk_proto::head::Head;
@@ -448,5 +450,27 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// H ago.
     fn carried_since(&self, gid: &[u8]) -> Result<u64> {
         Ok(now().saturating_sub(days(self.settings(gid)?.carry)))
+    }
+}
+
+impl<P: Provider + Send + 'static> Groups for Inner<P> {
+    fn groups(&self) -> Vec<Vec<u8>> {
+        self.lock().groups.keys().cloned().collect()
+    }
+
+    fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
+        self.lock().serves(group, peer)
+    }
+
+    fn files(&self, group: &[u8]) -> Vec<FileLink> {
+        let st = self.lock();
+        let Some(g) = st.groups.get(group) else {
+            return Vec::new();
+        };
+        g.rec.held(g.mls.settings().carry)
+    }
+
+    fn admit(&self, peer: &EndpointId, frame: Frame) -> Option<Frame> {
+        self.lock().admissible(peer, frame)
     }
 }
