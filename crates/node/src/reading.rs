@@ -450,7 +450,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         st.gate();
         st.refresh(gid);
         let now = st.tick();
-        let waiting = st.peers.wait(&Bytes(gid.to_vec()), &lacking, now) == Decision::Wait;
+        let undecided = st.undecided(gid);
+        let waiting = st.peers.wait(&Bytes(gid.to_vec()), &lacking, &undecided, now) == Decision::Wait;
         if waiting {
             tracing::debug!("waiting at position {position} for {:?}", lacking.ranges());
         }

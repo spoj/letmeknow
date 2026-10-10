@@ -178,7 +178,7 @@ impl Net {
                 && me.head >= commit
             {
                 let lacking = own.lacking.through(commit);
-                let decision = me.peers.wait(&id(G), &lacking, now);
+                let decision = me.peers.wait(&id(G), &lacking, &BTreeSet::new(), now);
                 if decision != Decision::Wait {
                     let pending = me.views.values().any(|s| !lacking.intersection(&s.held.union(&s.fetching)).is_empty());
                     assert!(!pending || now - me.progress >= QUIET, "member {m} applied at {now} while a connected peer holds or fetches {lacking:?}");

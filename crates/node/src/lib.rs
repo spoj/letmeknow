@@ -809,6 +809,12 @@ impl<P: Provider> State<P> {
         log.is_some_and(|log| matches!(log.verify(credential), Verdict::Verified { .. }))
     }
 
+    /// The connected peers in a leaf of the group the gate cannot check yet: their identities' key logs are unread.
+    fn undecided(&self, gid: &[u8]) -> BTreeSet<[u8; 32]> {
+        let unread = |member: core::Member| member.credential?.identity().is_some_and(|identity| !self.keys.contains_key(&identity.id.0)).then_some(());
+        self.served.keys().filter(|peer| self.in_leaf(gid, peer).and_then(unread).is_some()).map(|peer| *peer.as_bytes()).collect()
+    }
+
     /// The identities a group's members speak as.
     fn identities(&self, gid: &[u8]) -> Vec<IdentityRef> {
         let Some(g) = self.groups.get(gid) else { return Vec::new() };

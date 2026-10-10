@@ -248,10 +248,12 @@ impl Peers {
     }
 
     /// Whether to apply a commit that would delete the keys of an epoch whose counted positions in `lacking` this
-    /// member lacks. While it waits, those positions are asked without the hold-off.
-    pub fn wait(&mut self, group: &Bytes, lacking: &Ranges, now: u64) -> Decision {
+    /// member lacks. While it waits, those positions are asked without the hold-off. The summaries of `undecided` peers,
+    /// whom the gate may admit once it can check them, hold the wait too.
+    pub fn wait(&mut self, group: &Bytes, lacking: &Ranges, undecided: &BTreeSet<Key>, now: u64) -> Decision {
         let g = self.groups.get_mut(group).expect("a group of ours");
-        let peers: Vec<&Summary> = self.conns.values().filter(|c| c.served.contains(group)).filter_map(|c| c.heard.get(group)).collect();
+        let counted = |(k, c): &(&Key, &Conn)| c.served.contains(group) || undecided.contains(*k);
+        let peers: Vec<&Summary> = self.conns.iter().filter(counted).filter_map(|(_, c)| c.heard.get(group)).collect();
         let decision = wait(lacking, &peers, now - self.online.max(g.since), now - g.progress);
         g.urgent = if decision == Decision::Wait { lacking.clone() } else { Ranges::default() };
         decision

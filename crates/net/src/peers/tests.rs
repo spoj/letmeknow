@@ -132,8 +132,8 @@ fn a_group_just_joined_waits_for_dials_before_a_loss() {
     let mut p = Peers::new(0);
     p.connect(key(1), served(&[]), 0);
     p.group(id(G), own(G, 10, r(&[(1, 9)]), r(&[(10, 10)])), 60_000);
-    assert_eq!(p.wait(&id(G), &r(&[(10, 10)]), 60_000 + ONLINE - 1), Decision::Wait);
-    assert_eq!(p.wait(&id(G), &r(&[(10, 10)]), 60_000 + ONLINE), Decision::Lose(r(&[(10, 10)])));
+    assert_eq!(p.wait(&id(G), &r(&[(10, 10)]), &BTreeSet::new(), 60_000 + ONLINE - 1), Decision::Wait);
+    assert_eq!(p.wait(&id(G), &r(&[(10, 10)]), &BTreeSet::new(), 60_000 + ONLINE), Decision::Lose(r(&[(10, 10)])));
 }
 
 /// A joiner takes none of the summaries members send it as they apply its Add, before its Welcome comes: its own first
@@ -158,7 +158,8 @@ fn summaries_are_saved_whatever_the_gate_but_used_only_while_it_admits() {
     let heard = p.frame(&key(1), &hello(vec![theirs.clone()]), 1_100);
     assert_eq!(heard, vec![Heard { peer: Bytes::from(key(1)), summary: theirs, at: 1_100 }]);
     assert!(wants(&p.poll(1_100)).is_empty());
-    assert_eq!(p.wait(&id(G), &r(&[(4, 4)]), 4_000), Decision::Lose(r(&[(4, 4)])), "an unadmitted holder does not hold the wait");
+    assert_eq!(p.wait(&id(G), &r(&[(4, 4)]), &BTreeSet::new(), 4_000), Decision::Lose(r(&[(4, 4)])), "an unadmitted holder does not hold the wait");
+    assert_eq!(p.wait(&id(G), &r(&[(4, 4)]), &BTreeSet::from([key(1)]), 4_000), Decision::Wait, "one the gate cannot check yet does");
     p.served(&key(1), served(&[G]), 4_000);
     assert_eq!(wants(&p.poll(4_000)), vec![(key(1), r(&[(4, 4)]))]);
     p.served(&key(1), served(&[]), 4_100);
@@ -230,7 +231,7 @@ fn a_position_read_under_two_seconds_ago_waits_except_before_a_commit() {
     p.group(id(G), own(G, 12, r(&[(1, 11)]), r(&[(12, 12)])), 8_000);
     p.frame(&key(1), &answered(&[11], r(&[(11, 11)])), 8_000);
     assert!(wants(&p.poll(8_000)).is_empty());
-    assert_eq!(p.wait(&id(G), &r(&[(12, 12)]), 8_000), Decision::Wait);
+    assert_eq!(p.wait(&id(G), &r(&[(12, 12)]), &BTreeSet::new(), 8_000), Decision::Wait);
     assert_eq!(wants(&p.poll(8_000)), vec![(key(1), r(&[(12, 12)]))]);
 }
 
@@ -242,7 +243,7 @@ fn repair_and_the_wait_use_only_summaries_heard_on_the_current_connection() {
     assert_eq!(wants(&p.poll(DEBOUNCE)), vec![(key(1), r(&[(4, 4)]))]);
     p.connect(key(1), served(&[G]), 1_500);
     assert!(wants(&p.poll(1_500)).is_empty());
-    assert_eq!(p.wait(&id(G), &r(&[(4, 4)]), 4_000), Decision::Lose(r(&[(4, 4)])));
+    assert_eq!(p.wait(&id(G), &r(&[(4, 4)]), &BTreeSet::new(), 4_000), Decision::Lose(r(&[(4, 4)])));
     p.frame(&key(1), &hello(vec![summary(G, 10, r(&[(1, 10)]), Ranges::default())]), 4_000);
     assert_eq!(wants(&p.poll(4_000)), vec![(key(1), r(&[(4, 4)]))]);
     p.disconnect(&key(1));
@@ -253,16 +254,16 @@ fn repair_and_the_wait_use_only_summaries_heard_on_the_current_connection() {
 fn a_member_comes_online_as_it_starts_or_connects_after_none() {
     let lacking = r(&[(4, 4)]);
     let mut p = member(lacking.clone());
-    assert_eq!(p.wait(&id(G), &lacking, ONLINE - 1), Decision::Wait);
+    assert_eq!(p.wait(&id(G), &lacking, &BTreeSet::new(), ONLINE - 1), Decision::Wait);
     p.connect(key(1), served(&[G]), 10_000);
-    assert_eq!(p.wait(&id(G), &lacking, 10_000 + ONLINE - 1), Decision::Wait, "its first connection after none");
+    assert_eq!(p.wait(&id(G), &lacking, &BTreeSet::new(), 10_000 + ONLINE - 1), Decision::Wait, "its first connection after none");
     p.connect(key(2), served(&[G]), 20_000);
     p.connect(key(1), served(&[G]), 20_000);
-    assert_eq!(p.wait(&id(G), &lacking, 20_000), Decision::Lose(lacking.clone()), "another, or one replaced, is not");
+    assert_eq!(p.wait(&id(G), &lacking, &BTreeSet::new(), 20_000), Decision::Lose(lacking.clone()), "another, or one replaced, is not");
     p.disconnect(&key(1));
     p.disconnect(&key(2));
     p.connect(key(1), served(&[G]), 30_000);
-    assert_eq!(p.wait(&id(G), &lacking, 30_000), Decision::Wait);
+    assert_eq!(p.wait(&id(G), &lacking, &BTreeSet::new(), 30_000), Decision::Wait);
 }
 
 #[test]
@@ -301,13 +302,13 @@ fn progress_is_a_new_summary_a_connection_or_a_ciphertext() {
     p.connect(key(1), served(&[G]), DEBOUNCE);
     let holds = hello(vec![summary(G, 10, r(&[(1, 10)]), Ranges::default())]);
     p.frame(&key(1), &holds, 2_000);
-    assert_eq!(p.wait(&id(G), &lacking, 2_000 + QUIET - 1), Decision::Wait);
+    assert_eq!(p.wait(&id(G), &lacking, &BTreeSet::new(), 2_000 + QUIET - 1), Decision::Wait);
     p.frame(&key(1), &holds, 11_000);
-    assert_eq!(p.wait(&id(G), &lacking, 2_000 + QUIET), Decision::Lose(lacking.clone()), "the same summary again is no progress");
+    assert_eq!(p.wait(&id(G), &lacking, &BTreeSet::new(), 2_000 + QUIET), Decision::Lose(lacking.clone()), "the same summary again is no progress");
     p.group(id(G), own(G, 10, r(&[(1, 4), (6, 10)]), r(&[(5, 5)])), 12_500);
-    assert_eq!(p.wait(&id(G), &r(&[(5, 5)]), 22_499), Decision::Wait);
+    assert_eq!(p.wait(&id(G), &r(&[(5, 5)]), &BTreeSet::new(), 22_499), Decision::Wait);
     p.connect(key(1), served(&[G]), 22_600);
-    assert_eq!(p.wait(&id(G), &r(&[(5, 5)]), 31_000), Decision::Lose(r(&[(5, 5)])), "1's summary went with its connection");
+    assert_eq!(p.wait(&id(G), &r(&[(5, 5)]), &BTreeSet::new(), 31_000), Decision::Lose(r(&[(5, 5)])), "1's summary went with its connection");
 }
 
 #[test]
