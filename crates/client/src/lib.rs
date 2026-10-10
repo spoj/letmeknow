@@ -185,8 +185,9 @@ pub enum ClientEvent {
     Message { group: Bytes, id: String, position: u64, missing: Vec<u64>, from: Described, payload: Value },
     /// Counted positions a member can no longer open: this client's own, or another member's of this client's messages.
     Lost { group: Bytes, member: Described, positions: Vec<u64>, ids: Vec<String> },
-    /// A send that `send` answered as pending counts now, at `position` in the group's log.
-    Sent { group: Bytes, id: String, position: u64 },
+    /// A send that `send` answered as pending, as `answered`, counts now, at `position` in the group's log, by its
+    /// final id, `id`.
+    Sent { group: Bytes, id: String, answered: String, position: u64 },
     /// A sync of the group's held messages with a member ended.
     Synced { group: Bytes },
     /// A member's summary of the group came: who holds and read what may have changed (`Client::receipts`).
@@ -938,7 +939,9 @@ impl<P: Provider + Send + 'static> Client<P> {
                 }
             }
             Event::Introduced { group, by, identity, name, how } => self.introduced(&group, &by, identity, name, how)?,
-            Event::Sent { group, id, position } => self.emit(ClientEvent::Sent { group, id: hex::encode(&id.0), position }),
+            Event::Sent { group, id, answered, position } => {
+                self.emit(ClientEvent::Sent { group, id: hex::encode(&id.0), answered: hex::encode(&answered.0), position })
+            }
             Event::File(hash) => {
                 let arrived: Vec<oneshot::Sender<()>> = {
                     let mut st = self.state();

@@ -521,7 +521,7 @@ impl App {
                 self.remember(&group.0, &json!({ "type": "lost", "at": now(), "member": member, "positions": positions, "ids": ids }))?;
                 self.emit(json!({ "type": "lost", "group": group }));
             }
-            ClientEvent::Sent { group, id, .. } => self.emit(json!({ "type": "sent", "group": group, "id": id })),
+            ClientEvent::Sent { group, id, answered, .. } => self.emit(json!({ "type": "sent", "group": group, "id": id, "answered": answered })),
             ClientEvent::Heard { group } => self.emit(json!({ "type": "heard", "group": group })),
             ClientEvent::File { hash } => self.emit(json!({ "type": "file", "hash": hash })),
             ClientEvent::Plugin { group, kind, mut event, .. } => {

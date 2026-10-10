@@ -322,10 +322,12 @@ pub enum Event {
         name: String,
         how: How,
     },
-    /// A send that `send` answered as pending counts now: `id` as `send` answered it.
+    /// A send that `send` answered as pending, as `answered`, counts now: `id`, its final id, differs from `answered` when
+    /// a commit came first and it was sealed again.
     Sent {
         group: Bytes,
         id: Bytes,
+        answered: Bytes,
         position: u64,
     },
     /// A file is held whole.

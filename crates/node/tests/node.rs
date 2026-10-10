@@ -366,6 +366,8 @@ async fn served<H: iroh::protocol::ProtocolHandler>(relay: &Relay, dir: &Path, s
 #[derive(Debug)]
 struct Gate {
     open: tokio::sync::watch::Sender<bool>,
+    /// The endpoints let through while it is shut.
+    spared: std::sync::Mutex<Vec<[u8; 32]>>,
     conns: std::sync::Mutex<Vec<iroh::endpoint::Connection>>,
     reached: tokio::sync::mpsc::UnboundedSender<Bytes>,
 }
@@ -373,7 +375,7 @@ struct Gate {
 impl Gate {
     fn new() -> (Arc<Gate>, UnboundedReceiver<Bytes>) {
         let (reached, reaching) = tokio::sync::mpsc::unbounded_channel();
-        (Arc::new(Gate { open: tokio::sync::watch::Sender::new(true), conns: Default::default(), reached }), reaching)
+        (Arc::new(Gate { open: tokio::sync::watch::Sender::new(true), spared: Default::default(), conns: Default::default(), reached }), reaching)
     }
 
     fn set(&self, open: bool) {
@@ -395,6 +397,9 @@ struct Gated {
 
 impl iroh::protocol::ProtocolHandler for Gated {
     async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
+        if self.gate.spared.lock().unwrap().contains(connection.remote_id().as_bytes()) {
+            return iroh::protocol::ProtocolHandler::accept(&self.service, connection).await;
+        }
         let mut open = self.gate.open.subscribe();
         {
             let mut conns = self.gate.conns.lock().unwrap();
@@ -1073,11 +1078,11 @@ async fn held_leave(test: &str, restart_leaver: bool) {
     } else {
         gate.set(true);
     }
-    let counted = bob.until(|e| match e {
-        Event::Sent { id, position, .. } => Some((id, position)),
+    let answered = bob.until(|e| match e {
+        Event::Sent { answered, .. } => Some(answered),
         _ => None,
     }).await;
-    assert_eq!(counted.0, sent.id, "Sent names the send as `leave` answered it");
+    assert_eq!(answered, sent.id, "Sent names the send as `leave` answered it");
     alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "Bob").then_some(())).await;
     assert_eq!(alice.node.members(&gid.0).unwrap().len(), 1);
     alice.node.shutdown().await.unwrap();
@@ -1129,6 +1134,37 @@ async fn a_pending_leave_is_finished_after_a_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pending_leave_is_finished_once_the_log_is_reachable() {
     held_leave("leave-reachable", false).await;
+}
+
+/// A pending send sealed again after a commit is reported sent by the id its members know it by.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_send_sealed_again_is_reported_by_its_final_id() {
+    let relay = relay().await;
+    let dir = folder("sealed-again");
+    let (gate, _reaching) = Gate::new();
+    let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
+    let (mut alice, mut bob) = (session(&relay, "Alice").await, session(&relay, "Bob").await);
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+
+    // Only Bob is kept from the log: his send is pending while Alice renames the group.
+    gate.spared.lock().unwrap().push(alice.node.address().0);
+    gate.set(false);
+    let sent = bob.node.send(&gid.0, &message("before the rename")).await.unwrap();
+    assert_eq!(sent.position, None, "the send is pending");
+    alice.node.change_settings(&gid.0, |s| Settings { name: "Release".into(), ..s }).await.unwrap();
+    gate.set(true);
+    let (id, answered) = bob.until(|e| match e {
+        Event::Sent { id, answered, .. } => Some((id, answered)),
+        _ => None,
+    }).await;
+    assert!(answered == sent.id && id != sent.id, "sealed again after the rename");
+    let got = alice.until(|e| match e {
+        Event::Message(message) => Some(message.id),
+        _ => None,
+    }).await;
+    assert_eq!(got, id);
 }
 
 /// Two members that leave at once: one's removal of the other wins, and the one left alone forgets the group.

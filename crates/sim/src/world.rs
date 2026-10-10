@@ -670,9 +670,13 @@ impl World {
             ClientEvent::Message { group, position, missing, .. } => {
                 self.observe(What::Shown { m: i, group: group.clone(), position: *position, missing: missing.iter().copied().collect() })
             }
-            ClientEvent::Sent { group, id, position } => {
-                self.observe(What::Sent { m: i, group: group.clone(), id: Bytes(hex::decode(id).unwrap()), position: *position })
-            }
+            ClientEvent::Sent { group, id, answered, position } => self.observe(What::Sent {
+                m: i,
+                group: group.clone(),
+                id: Bytes(hex::decode(id).unwrap()),
+                answered: Bytes(hex::decode(answered).unwrap()),
+                position: *position,
+            }),
             _ => {}
         }
         for gid in node.groups() {
