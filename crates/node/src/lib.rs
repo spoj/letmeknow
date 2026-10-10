@@ -52,6 +52,10 @@ pub use lmk_net::{Disk, Fetch};
 pub use peering::Heard;
 pub use lmk_proto::clock::now;
 
+/// How long an invite is valid, in milliseconds.
+pub const INVITE_VALID: u64 = 10 * 60 * 1000;
+/// How often files no group holds any longer are deleted.
+pub const COLLECT: Duration = Duration::from_secs(60 * 60);
 /// Why a send's outcome never came.
 const UNFINISHED: &str = "the send ended unfinished, as this session stopped or left the group";
 /// How long `send` waits for its entry to count before it answers that the send is pending.

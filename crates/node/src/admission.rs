@@ -22,10 +22,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::reading::Judged;
-use crate::{Event, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, SNAPSHOT_WAIT, State, device_key_key, endpoint_id, get, now, put};
+use crate::{Event, INVITE_VALID, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, SNAPSHOT_WAIT, State, device_key_key, endpoint_id, get, now, put};
 
-/// How long an invite is valid, in milliseconds.
-const INVITE_VALID: u64 = 10 * 60 * 1000;
 /// How many members besides the inviter a link names, of those online that hold the invite's message.
 const LINK_MEMBERS: usize = 3;
 /// How long a joiner waits to reach the members it asks, all at once, and then for each one's answer.

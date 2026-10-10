@@ -15,13 +15,11 @@ use lmk_proto::group::{Leaf, REVISION};
 use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
 use n0_future::task::spawn;
-use n0_future::time::{Duration, sleep};
+use n0_future::time::sleep;
 use tokio::sync::mpsc;
 
-use crate::{Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, device_key_key, duties, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
+use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, device_key_key, duties, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
 
-/// How often files no group holds any longer are deleted.
-const COLLECT: Duration = Duration::from_secs(60 * 60);
 /// How long a fetch keeps looking for a member that holds the file.
 const FETCH_TRIES: u32 = 12;
 

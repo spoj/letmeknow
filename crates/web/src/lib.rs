@@ -20,7 +20,7 @@ use lmk_node::devices::Devices;
 use lmk_node::lmk_core::crypto::{Crypto, Rand};
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
-use lmk_node::{Disk, Node, now};
+use lmk_node::{COLLECT, Disk, Node, now};
 use lmk_proto::Bytes;
 use lmk_proto::group::{CHAT, DEVICES, PROTOCOL, Settings};
 use lmk_proto::links::{FileLink, Invite};
@@ -39,8 +39,6 @@ const FILE_LIMIT: u64 = 25 << 20;
 /// The kinds the browser supports: chat, and those of its in-page plugins.
 const DOC: &str = "doc";
 const GIT: &str = "git";
-/// How often the files no group links any longer are deleted.
-const COLLECT: Duration = Duration::from_secs(60 * 60);
 
 type R<T> = Result<T, JsError>;
 

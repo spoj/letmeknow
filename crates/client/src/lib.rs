@@ -20,7 +20,7 @@ use lmk_core::contacts::{self, Contact};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
 use lmk_node::devices::Devices;
-use lmk_node::{Event, Heard, Item, Member, Message, Node};
+use lmk_node::{Event, Heard, INVITE_VALID, Item, Member, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::ranges::Ranges;
 use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, Control, DEVICES, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings, UPDATE};
@@ -32,7 +32,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
-const INVITE_TTL: u64 = 600;
 /// How long the client waits for a plugin's answer, but to a command.
 const ASK_WAIT: Duration = Duration::from_secs(60);
 /// How long a plugin's `spread` waits for a member online to hold its file.
@@ -467,7 +466,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             for_.is_none() || !self.device_state()?.identities.is_empty(),
             "contacts belong to an identity: create one with `identity create`"
         );
-        let mut answer = json!({ "expires_in": INVITE_TTL });
+        let mut answer = json!({ "expires_in": INVITE_VALID / 1000 });
         let link = match identity {
             Some(identity) => {
                 let (identity, name) = self.own_identity(&identity)?;
