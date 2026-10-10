@@ -194,7 +194,8 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         let second = alice.expect("message").await;
         assert_eq!((first["content"].as_str(), first["direct"].as_bool()), (Some("the build is green"), Some(false)));
         assert_eq!((second["content"].as_str(), second["direct"].as_bool()), (Some("@alice can you deploy?"), Some(true)));
-        assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "from": 0, "direct": 0, "content": 0 })));
+        assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "position": 0, "from": 0, "direct": 0, "content": 0 })));
+        assert_eq!(second["position"].as_u64(), first["position"].as_u64().map(|p| p + 1), "in position order");
         assert_eq!(second["group"], group.as_str());
         // Bob is Alice's contact under the name the link was for, verified; his own name for himself is only a claim.
         assert_eq!(second["from"]["identity"]["name"], "Bob (Acme)");
