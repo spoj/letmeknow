@@ -8,7 +8,6 @@
 //! strings; message ids and fingerprints are hex, other bytes base64url.
 #![cfg(target_arch = "wasm32")]
 
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -20,7 +19,7 @@ use lmk_node::devices::Devices;
 use lmk_node::lmk_core::crypto::{Crypto, Rand};
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
-use lmk_node::{COLLECT, Disk, Node, now};
+use lmk_node::{COLLECT, Disk, Event, Node, now};
 use lmk_proto::Bytes;
 use lmk_proto::group::{CHAT, DEVICES, PROTOCOL, Settings};
 use lmk_proto::links::{FileLink, Invite};
@@ -265,9 +264,6 @@ struct App {
     idb: Idb,
     kept: Arc<Kept>,
     on_event: Function,
-    /// Open groups this session tried to join by itself, and those it failed to join.
-    tried: RefCell<HashSet<Bytes>>,
-    failed: RefCell<HashSet<Bytes>>,
 }
 
 /// The browser's session.
@@ -351,8 +347,7 @@ impl App {
         };
         let client_config = lmk_client::Config { name, device, membership: membership.clone() };
         let (client, mut told) = Client::new(node, client_config, Access::Here(devices), Arc::new(plugins), written);
-        let (tried, failed) = Default::default();
-        let app = Rc::new(App { client, store, membership, idb, kept, on_event, tried, failed });
+        let app = Rc::new(App { client, store, membership, idb, kept, on_event });
         let told_app = app.clone();
         spawn_local(async move {
             while let Some(event) = told.recv().await {
@@ -374,7 +369,6 @@ impl App {
             app.keep(&gid.0)?;
         }
         app.flush();
-        app.join_openings();
         let io_app = app.clone();
         spawn_local(async move {
             while let Some(io) = io_rx.recv().await {
@@ -390,9 +384,14 @@ impl App {
         let events_app = app.clone();
         spawn_local(async move {
             while let Some(event) = events.recv().await {
+                // The page lists the groups open to this browser's identities, which its devices groups record.
+                let devices = matches!(event, Event::Logged { .. } | Event::State { .. })
+                    && event.group().is_some_and(|gid| events_app.client.node().settings(&gid.0).is_ok_and(|s| s.kind == DEVICES));
                 events_app.client.event(event).await;
                 events_app.flush();
-                events_app.join_openings();
+                if devices {
+                    events_app.emit(json!({ "type": "opening" }));
+                }
             }
         });
         let flushing = Rc::downgrade(&app);
@@ -412,25 +411,6 @@ impl App {
             }
         });
         Ok(app)
-    }
-
-    /// Joins, once each, the groups open to this browser's identities; one that fails waits for a click.
-    fn join_openings(self: &Rc<Self>) {
-        let joined = self.client.node().groups();
-        let Ok(state) = self.client.device_state() else { return };
-        for opening in state.openings {
-            if joined.contains(&opening.group) || !self.tried.borrow_mut().insert(opening.group.clone()) {
-                continue;
-            }
-            let app = self.clone();
-            spawn_local(async move {
-                if app.request(join(&opening.group)).await.is_err() {
-                    app.failed.borrow_mut().insert(opening.group.clone());
-                }
-                app.flush();
-                app.emit(json!({ "type": "opening", "group": opening.group }));
-            });
-        }
     }
 
     /// Deletes the kept files no group links any longer, by the rule lmk-node holds files by.
@@ -591,8 +571,7 @@ impl App {
         let joined = node.groups();
         for opening in self.client.device_state()?.openings {
             if !joined.contains(&opening.group) && !groups.iter().any(|g| g["group"] == json!(opening.group)) {
-                let failed = self.failed.borrow().contains(&opening.group);
-                groups.push(json!({ "group": opening.group, "settings": { "kind": opening.kind, "name": opening.name }, "joined": false, "failed": failed }));
+                groups.push(json!({ "group": opening.group, "settings": { "kind": opening.kind, "name": opening.name }, "joined": false }));
             }
         }
         Ok(Value::Array(groups))
@@ -687,12 +666,6 @@ impl App {
         }
         Ok(count)
     }
-}
-
-/// A request to join a group open to this browser's identity.
-fn join(gid: &Bytes) -> Request {
-    let target = json!(gid).as_str().expect("base64url").to_owned();
-    Request::Join { target, args: Vec::new(), cwd: String::new(), as_: None }
 }
 
 #[wasm_bindgen]

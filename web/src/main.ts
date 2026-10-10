@@ -173,7 +173,7 @@ function introduction(i: client.Identity): { by: string; name: string } | undefi
 
 function who(p: Person): HTMLElement {
   const i = p.identity;
-  const warning = i?.error ?? i?.warning ?? i?.new_device;
+  const warning = i?.error ?? i?.warning ?? p.warning ?? i?.new_device;
   const level = p.you ? "self" : i && !i.error ? i.how : "unknown";
   return h(
     "span",
@@ -249,7 +249,7 @@ function welcome(kind: string | undefined) {
     device.autofocus = true;
     body = [
       h("h1", {}, "Add this browser to your devices"),
-      h("p", {}, "This link comes from one of your other devices. Once added, this browser joins your groups and speaks for you there."),
+      h("p", {}, "This link comes from one of your other devices. Once added, this browser can join your groups and speaks for you there."),
       form(
         () =>
           device.reportValidity() &&
@@ -329,7 +329,7 @@ function offer(kind: string | undefined) {
       {},
       kind === "group"
         ? "Join to share a chat or a document with whoever sent you the link, and perhaps their agents."
-        : "This browser becomes one of the devices of whoever made this link: it joins their chats and documents and speaks for them."
+        : "This browser becomes one of the devices of whoever made this link: it can join their chats and documents and speaks for them."
     ),
     h("div", { className: "buttons" }, go)
   );
@@ -478,11 +478,10 @@ function drawNav() {
     entry.button.classList.toggle("on", page === "group" && g.group === selected);
   }
   const open = groups.filter(g => !g.joined);
-  update(openList, JSON.stringify(open.map(o => [o.group, o.settings.name, o.failed])), () => [
+  update(openList, JSON.stringify(open.map(o => [o.group, o.settings.name])), () => [
     open.length > 0 && h("h3", {}, "Open to you"),
     ...open.map(o => {
       const name = `${KINDS[o.settings.kind].mark} ${o.settings.name || `Unnamed ${KINDS[o.settings.kind].name}`}`;
-      if (!o.failed) return h("div", { className: "opening" }, h("span", {}, name), h("small", {}, "joining…"));
       const join = h("button", {}, "Join");
       join.onclick = () => busy(join, "…", async () => select((await request({ cmd: "join", target: o.group })).group));
       return h("div", { className: "opening" }, h("span", {}, name), join);
@@ -687,13 +686,13 @@ async function inviteDialog(target: { gid: string } | { identity: string }) {
       h("div", { className: "qr" }, svg),
       copyable(link),
       h("p", {}, device ? "On a computer, an agent's session adds it with:" : "An agent joins with:"),
-      copyable(`letmeknow join '${link}'`),
+      copyable(`letmeknow ${device ? "identity join" : "join"} '${link}'`),
       h("p", { className: "expiry" }, "It works once, within 10 minutes, while this browser is open.")
     );
     const joined = (event: client.Event) => {
       const added = device ? event.type === "devices" && event.identity === target.identity : event.type === "joined" && event.group === target.gid;
       if (!added || !dialog.open) return;
-      body.replaceChildren(h("p", { className: "done" }, device ? "Added. The device now joins your chats and documents." : `They joined the ${kind}.`));
+      body.replaceChildren(h("p", { className: "done" }, device ? "Added. The device can now join your chats and documents." : `They joined the ${kind}.`));
       setTimeout(() => dialog.close(), 1_500);
     };
     client.listen(joined);
@@ -760,7 +759,7 @@ class View {
 
   protected drawPeople() {
     const others = this.members.filter(m => !m.you);
-    const warned = others.some(m => m.identity?.error || m.identity?.warning);
+    const warned = others.some(m => m.identity?.error || m.identity?.warning || m.warning);
     const names = [...new Set(others.map(m => (m.away ? `${label(m)} (away)` : label(m))))];
     this.people.replaceChildren(...(others.length ? [warned ? "⚠ " : "", names.join(", "), " and you"] : ["Only you so far"]));
     this.people.classList.toggle("warn", warned);

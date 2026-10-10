@@ -2,7 +2,7 @@
 // binary (BIN): Matt's laptop, which takes its relay and membership service from the server that served it, joins Ann's
 // chat from a link, becoming his identity's first device as it does, and they talk and pass files both ways; it joins
 // her doc and they edit it both ways; Matthew's desk adds his phone by a device link, the phone joins a chat open to that
-// identity by itself and is renamed, and a kiosk on an identity of its own moves to his; the laptop keeps everything
+// identity with a click and is renamed, and a kiosk on an identity of its own moves to his; the laptop keeps everything
 // across a reload, a second tab works through the first and takes over when it closes; introductions, refusals, files
 // kept and deleted, a git group's pushes and chat, and the service worker's updates.
 import { execFile, execFileSync, spawn } from "node:child_process";
@@ -235,8 +235,10 @@ try {
   check(devices.length === 2 && devices.some(d => d.name === "phone"), "a device link adds the browser to the identity's devices");
   const team = desk.run("invite", "--name", "Team");
   desk.run("open", `--group=${team.group}`, "Matthew");
+  await phone.locator(".back:visible").click();
+  await phone.locator(".open-list .opening", { hasText: "Team" }).getByRole("button", { name: "Join" }).click();
   const opened = await desk.printed(e => e.type === "joined" && e.member.device === "phone", 60_000);
-  check(opened.how === "open" && opened.member.identity.name === "Matthew", "the phone joins a chat open to its identity by itself");
+  check(opened.how === "open" && opened.member.identity.name === "Matthew", "the phone joins a chat open to its identity, with a click");
   await phone.locator(".back:visible").click();
   await phone.locator(".group-list button", { hasText: "Team" }).waitFor();
   check(true, "and lists it");
@@ -396,8 +398,8 @@ try {
   check(link.includes("#3.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
   const tablet = native("tablet");
   await tablet.printed(e => e.type === "ready");
-  const joining = tablet.start("join", link);
-  await laptop.getByText("Added. The device now joins your chats and documents.").waitFor();
+  const joining = tablet.start("identity", "join", link);
+  await laptop.getByText("Added. The device can now join your chats and documents.").waitFor();
   await joining;
   await until(
     () => laptop.locator(".devices li").count(),
