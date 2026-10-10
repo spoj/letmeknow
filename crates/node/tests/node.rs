@@ -1438,7 +1438,6 @@ async fn a_gap_holds_up_its_epoch_while_fetched_then_is_passed_and_opens_late_or
     for text in ["one", "two", "three"] {
         sent.push(sam.node.send(&gid.0, &message(text)).await.unwrap());
     }
-    let epoch = sam.node.epoch(&gid.0).unwrap();
     sam.node.shutdown().await.unwrap();
     drop(sam);
     let p: Vec<u64> = sent.iter().map(|s| s.position.unwrap()).collect();
@@ -1472,9 +1471,10 @@ async fn a_gap_holds_up_its_epoch_while_fetched_then_is_passed_and_opens_late_or
     }).await;
     assert_eq!((got.id, got.position), (sent[0].id.clone(), p[0]));
 
-    // No member holds the third: once its epoch's keys go, it is lost.
-    eventually("Bob updated his leaf as he started", || bob.node.epoch(&gid.0).unwrap() == epoch + 1).await;
-    bob.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
+    // No member holds the third: once its epoch's keys go, two commits on, it is lost.
+    for name in ["Later", "Later still"] {
+        bob.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
+    }
     assert!(bob.node.lost(&gid.0, &sent[2].id.0));
     assert!(!bob.node.lost(&gid.0, &sent[0].id.0));
     bob.node.shutdown().await.unwrap();
