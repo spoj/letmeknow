@@ -1,8 +1,10 @@
 //! Runs seeds of the simulation, and prints each failing one with the command that replays it and its shrunk trace.
 //!
-//! `lmk-sim [--seeds A..B] [--jobs J] [--members N] [--actions N]` runs each seed in a process of its own, as the
-//! simulation's randomness is the process's; `lmk-sim --check S` runs one and shrinks it if it fails; `lmk-sim --seed S
-//! [--keep I,J,...] [--list]` replays one, printing its log, or lists its actions.
+//! `lmk-sim [--seeds A..B] [--jobs J] [--members N] [--actions N] [--pending]` runs each seed in a process of its own,
+//! as the simulation's randomness is the process's; `lmk-sim --check S` runs one and shrinks it if it fails, and every
+//! eighth seed runs twice to check that it replays exactly; `lmk-sim --seed S [--keep I,J,...] [--list]` replays one,
+//! printing its log, or lists its actions. `--pending` checks the pending properties too, those the node cannot feed
+//! yet; `lmk-sim --properties` lists every property, and what each pending one needs.
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -19,7 +21,17 @@ fn main() {
     if let Some(actions) = value("--actions") {
         options.actions = actions.parse().expect("--actions N");
     }
-    let flags = ["--members".to_owned(), options.members.to_string(), "--actions".to_owned(), options.actions.to_string()];
+    options.pending = args.iter().any(|a| a == "--pending");
+    if args.iter().any(|a| a == "--properties") {
+        for property in lmk_sim::props::PROPERTIES {
+            println!("{}{}", property.name, property.needs.map_or(String::new(), |needs| format!(" (pending: {needs})")));
+        }
+        return;
+    }
+    let mut flags = vec!["--members".to_owned(), options.members.to_string(), "--actions".to_owned(), options.actions.to_string()];
+    if options.pending {
+        flags.push("--pending".into());
+    }
     if let Some(seed) = value("--seed") {
         let seed: u64 = seed.parse().expect("--seed S");
         let mut actions = generate(seed, options);
@@ -43,7 +55,16 @@ fn main() {
     if let Some(seed) = value("--check") {
         let seed: u64 = seed.parse().expect("--check S");
         let actions = generate(seed, options);
-        let Some(failure) = run(seed, &actions, options).failure else { return };
+        let outcome = run(seed, &actions, options);
+        let failure = match outcome.failure {
+            None if seed.is_multiple_of(8) && run(seed, &actions, options).trace != outcome.trace => {
+                println!("seed {seed}: replay-deterministic: a second run in this process left another trace");
+                println!("  replay: cargo run -p lmk-sim --release -- {} --check {seed}", flags.join(" "));
+                std::process::exit(1);
+            }
+            None => return,
+            Some(failure) => failure,
+        };
         let kept = shrink(seed, &actions, options, &failure);
         let shrunk: Vec<_> = kept.iter().map(|i| actions[*i].clone()).collect();
         let keep: Vec<String> = kept.iter().map(usize::to_string).collect();
@@ -65,6 +86,7 @@ fn main() {
     let exe = std::env::current_exe().unwrap();
     let mut running: Vec<(u64, Child)> = Vec::new();
     let mut failed = Vec::new();
+    let mut failed_by: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut seeds = from..to;
     loop {
         while running.len() < jobs
@@ -87,11 +109,21 @@ fn main() {
                 true => println!("seed {seed}: {}\n", output.status),
                 false => println!("{}", String::from_utf8_lossy(&output.stdout)),
             }
+            let text = String::from_utf8_lossy(&output.stdout);
+            let property = text.split_once(": ").and_then(|(_, rest)| rest.split(' ').next()).unwrap_or("crash").to_owned();
+            failed_by.entry(property).or_insert(seed);
             failed.push(seed);
         }
     }
     failed.sort();
     println!("{} of {} seeds failed: {failed:?}", failed.len(), to - from);
+    for (property, seed) in failed_by {
+        println!("  {property}: first seed {seed}");
+    }
+    if !options.pending {
+        let pending: Vec<&str> = lmk_sim::props::pending().map(|p| p.name).collect();
+        println!("pending, not checked: {}", pending.join(", "));
+    }
     std::process::exit(i32::from(!failed.is_empty()));
 }
 

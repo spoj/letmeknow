@@ -1,8 +1,9 @@
 //! The world: members on the client core with the devices kind on their own node, as a browser runs it, one in-memory
-//! membership service, the simulated network between them, and the properties checked as they act.
+//! membership service, the simulated network between them, and the record of what they do (`trace`), which the
+//! properties check at the end of each quiet period.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -20,7 +21,6 @@ use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
 use lmk_node::{Event, Node};
 use lmk_proto::Bytes;
 use lmk_proto::group::{CHAT, DEVICES, Service as Membership};
-use lmk_proto::peer::Frame;
 use n0_future::boxed::BoxFuture;
 use openmls_memory_storage::MemoryStorage;
 use openmls_traits::OpenMlsProvider;
@@ -30,38 +30,39 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
 
-use crate::net::{IDLE_TIMEOUT, Net};
-use crate::{Act, Action, Options, Outcome, clock};
+use crate::net::{Change, Net, Wire};
+use crate::props::{self, CONVERGE};
+use crate::trace::{Frame, Leaf, Obs, Trace, View, What};
+use crate::{Act, Action, Forgery, Options, Outcome, Output, clock};
 
 const RELAY: &str = "https://relay.sim.invalid";
 /// When simulated time starts: 2026-01-01, in milliseconds since the Unix epoch.
 const BASE: u64 = 1_767_225_600_000;
-/// How long members stay connected and undisturbed before they must agree: well under the 5-minute resync.
-const CONVERGE: Duration = Duration::from_secs(90);
-/// How often a member reads its logs again, and syncs with its peers anew.
+/// How often a 0.12 member reads its logs again, and syncs with its peers anew.
 const RESYNC: Duration = Duration::from_secs(5 * 60);
-/// How long a live message may take to arrive.
-const LIVE_WAIT: Duration = Duration::from_secs(10);
 /// How long an action may take.
 const ACTION_WAIT: Duration = Duration::from_secs(300);
-/// How long after a device is taken off every member has read the key log entry that drops it, which it follows.
-const KEYS_READ: u64 = 11 * 60 * 1000;
 
 thread_local! {
     static START: Cell<Option<Instant>> = const { Cell::new(None) };
     static PANICS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
-fn now() -> u64 {
-    BASE + START.get().expect("a simulation runs").elapsed().as_millis() as u64
+/// The simulated clock, in milliseconds since the Unix epoch, in a run.
+pub(crate) fn now() -> Option<u64> {
+    START.get().map(|start| BASE + start.elapsed().as_millis() as u64)
 }
 
 fn elapsed() -> u64 {
-    now() - BASE
+    now().expect("a simulation runs") - BASE
 }
 
 fn b64(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn sha(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
 
 /// A property a run broke, and when.
@@ -77,11 +78,6 @@ impl std::fmt::Display for Failure {
         write!(f, "{} at {}: {}", self.kind, clock(self.at), self.text)
     }
 }
-
-/// Members of a group, with their nodes.
-type Holders = Vec<(usize, Node<Store>)>;
-/// Members that hold a group whose latest epoch they are not in, with the group and that epoch.
-type Stale = Vec<(usize, Bytes, u64)>;
 
 /// A member's storage, which outlives its crashes: a browser's records.
 #[derive(Clone, Default)]
@@ -177,39 +173,41 @@ struct Member {
     iroh: EndpointId,
     client: Option<Client<Store>>,
     tasks: Vec<JoinHandle<()>>,
+    /// Its storage as it stood when it crashed, if it crashed before it stopped.
+    frozen: Option<Store>,
+    /// How many times it started.
+    starts: u64,
 }
 
-/// What the properties keep track of, and the trace.
+/// What the world keeps of a run: the groups made, the trace, the log and its hash, and the first failure.
 #[derive(Default)]
 struct Book {
     groups: Vec<Bytes>,
-    trace: Sha256,
+    hash: Sha256,
     log: Vec<String>,
     failure: Option<Failure>,
-    /// The held chat messages each member was told of.
-    seen: BTreeMap<usize, BTreeSet<String>>,
-    /// Live messages each member took: by member and nonce.
-    live: BTreeSet<(usize, String)>,
-    /// When an action last disrupted the network or the members on it, as a crash, which a peer notices only once its
-    /// connection times out.
-    disrupted: u64,
-    /// Members each member saw join verified: by member, group and the joiner's fingerprint.
-    vouched: BTreeSet<(usize, Bytes, String)>,
-    /// Introductions each member was told of: by member, group, and the introducer's fingerprint.
-    introduced: BTreeSet<(usize, Bytes, String)>,
-    /// Devices taken off identities, until they join them again: the identity, the member whose device it was, and when.
-    revoked: Vec<(Bytes, usize, u64)>,
+    trace: Trace,
+    /// Each member's roster of each group as last recorded.
+    rosters: BTreeMap<(usize, Bytes), (u64, Vec<Leaf>, String)>,
+    /// Members to crash after they next write this.
+    crash: BTreeMap<usize, Output>,
 }
 
 struct World {
     net: Net,
     membership: Membership,
+    service: EndpointId,
+    /// The service's store, as an attacker writing to it directly.
+    outsider: lmk_membership::store::Store,
     members: Mutex<Vec<Member>>,
     /// Each member's peers, to which another member's fetch of a file goes.
     peers: Mutex<BTreeMap<EndpointId, lmk_net::Net>>,
     book: Mutex<Book>,
     /// Actions under way.
     running: Mutex<Vec<JoinHandle<()>>>,
+    /// Restarts and crashes to come, of members down or woken.
+    later: Mutex<Vec<JoinHandle<()>>>,
+    options: Options,
 }
 
 pub(crate) fn run(seed: u64, actions: &[Action], options: Options) -> Outcome {
@@ -225,26 +223,31 @@ pub(crate) fn run(seed: u64, actions: &[Action], options: Options) -> Outcome {
     });
     PANICS.with_borrow_mut(Vec::clear);
     lmk_proto::random::seed(seed);
-    lmk_proto::clock::set(now);
+    lmk_proto::clock::set(|| now().expect("a simulation runs"));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
     let outcome = runtime.block_on(async {
         START.set(Some(Instant::now()));
         let world = World::new(seed, options);
         world.drive(actions).await;
         let book = std::mem::take(&mut *world.book.lock().unwrap());
-        let mut trace = book.trace;
-        trace.update(world.net.trace());
-        Outcome { trace: trace.finalize().into(), failure: book.failure, log: book.log }
+        let mut hash = book.hash;
+        hash.update(world.net.trace());
+        Outcome { trace: hash.finalize().into(), failure: book.failure, log: book.log }
     });
     drop(runtime);
+    START.set(None);
     outcome
 }
 
 impl World {
     fn new(seed: u64, options: Options) -> Arc<Self> {
+        static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let net = Net::new(seed);
         let secret = iroh::SecretKey::from_bytes(&lmk_proto::random::random());
-        let store = lmk_membership::store::Store::open(std::path::Path::new(":memory:"), ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes())).unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes());
+        let path = format!("file:lmk-sim-{}-{}?mode=memory&cache=shared", std::process::id(), RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let store = lmk_membership::store::Store::open(std::path::Path::new(&path), signing.clone()).unwrap();
+        let outsider = lmk_membership::store::Store::open(std::path::Path::new(&path), signing).unwrap();
         let service = Service::new(store, Policy::default());
         let membership = Membership::Serve { key: Bytes(secret.public().as_bytes().to_vec()), relay: RELAY.into(), addrs: Vec::new(), rest: Default::default() };
         drop(net.bind(secret.public()));
@@ -260,14 +263,25 @@ impl World {
                 let device = Device::new(&format!("device{i}"));
                 let store = Store::default();
                 let iroh = lmk_node::iroh_key(&store).unwrap().public();
-                Member { device, store, iroh, client: None, tasks: Vec::new() }
+                Member { device, store, iroh, client: None, tasks: Vec::new(), frozen: None, starts: 0 }
             })
             .collect();
-        let world = Arc::new(World { net, membership, members: Mutex::new(members), peers: Mutex::default(), book: Mutex::default(), running: Mutex::default() });
+        let world = Arc::new(World {
+            net,
+            membership,
+            service: secret.public(),
+            outsider,
+            members: Mutex::new(members),
+            peers: Mutex::default(),
+            book: Mutex::default(),
+            running: Mutex::default(),
+            later: Mutex::default(),
+            options,
+        });
         let inspecting = Arc::downgrade(&world);
-        world.net.inspect(Arc::new(move |from, to, peer, frame| {
+        world.net.inspect(Arc::new(move |wire, frame| {
             if let Some(world) = inspecting.upgrade() {
-                world.inspect(from, to, peer, frame);
+                world.inspect(wire, frame);
             }
         }));
         world
@@ -275,9 +289,7 @@ impl World {
 
     async fn drive(self: &Arc<Self>, actions: &[Action]) {
         for i in 0..self.size() {
-            if let Err(error) = self.start(i).await {
-                self.fail("start", format!("m{i} did not start: {error:#}"));
-            }
+            self.start_again(i).await;
         }
         let mut last = 0;
         for (i, action) in actions.iter().enumerate() {
@@ -287,31 +299,50 @@ impl World {
                 break;
             }
             self.note(format!("#{i} {:?}", action.act));
-            if !matches!(action.act, Act::Send { .. } | Act::Live { .. } | Act::Rename { .. } | Act::Online { .. } | Act::Quiesce) {
-                self.book.lock().unwrap().disrupted = elapsed();
-            }
-            match &action.act {
+            match action.act {
                 Act::Quiesce => self.quiesce().await,
-                Act::Offline { m } => self.online(*m, false),
-                Act::Online { m } => self.online(*m, true),
-                Act::Restart { m } => self.restart(*m).await,
-                Act::Partition { mask } => self.partition(*mask),
+                Act::Settle { ms } => sleep(Duration::from_millis(ms)).await,
+                Act::Offline { m } => {
+                    self.disrupt(&[m]);
+                    self.online(m, false);
+                }
+                Act::Online { m } => self.online(m, true),
+                Act::Restart { m } => {
+                    let i = self.index(m);
+                    self.crash(i).await;
+                    self.start_again(i).await;
+                }
+                Act::Down { m, ms } => self.down(self.index(m), ms).await,
+                Act::Wake { m, ms } => self.wake(self.index(m), ms).await,
+                Act::Partition { mask } => {
+                    self.disrupt(&(0..self.size()).collect::<Vec<_>>());
+                    self.partition(mask);
+                }
                 Act::Heal => self.partition(0),
+                Act::Drop { m, n } => {
+                    self.disrupt(&[m, n]);
+                    let (a, b) = (self.iroh(m), self.iroh(n));
+                    self.net.drop_connection(a, b);
+                }
+                Act::LoseAnswer { m } => {
+                    self.disrupt(&[m]);
+                    self.net.lose_answer(self.service, self.iroh(m));
+                }
+                Act::CrashAfter { m, what } => drop(self.book.lock().unwrap().crash.insert(self.index(m), what)),
                 Act::Sleep { ms } => {
                     for i in 0..self.size() {
                         self.crash(i).await;
                     }
-                    sleep(Duration::from_millis(*ms)).await;
+                    sleep(Duration::from_millis(ms)).await;
                     for i in 0..self.size() {
                         self.start_again(i).await;
                     }
                 }
-                Act::Drop { m, n } => {
-                    let members = self.members.lock().unwrap();
-                    let (a, b) = (members[m % members.len()].iroh, members[n % members.len()].iroh);
-                    self.net.drop_connection(a, b);
+                Act::Forge { m, group, what } => {
+                    let done = self.forge(m, group, what).map_or_else(|error| format!("failed: {error:#}"), |done| format!("ok {done}"));
+                    self.note(format!("#{i} {done}"));
                 }
-                act => {
+                ref act => {
                     let (world, act) = (self.clone(), act.clone());
                     let task = tokio::spawn(async move {
                         let done = match timeout(ACTION_WAIT, world.act(&act)).await {
@@ -325,8 +356,16 @@ impl World {
                 }
             }
         }
+        for task in std::mem::take(&mut *self.later.lock().unwrap()) {
+            task.abort();
+        }
         if self.book.lock().unwrap().failure.is_none() {
             self.note("end".into());
+            for i in 0..self.size() {
+                if self.members.lock().unwrap()[i].client.is_none() {
+                    self.start_again(i).await;
+                }
+            }
             self.quiesce().await;
         }
         for i in 0..self.size() {
@@ -340,7 +379,7 @@ impl World {
             eprintln!("{line}");
         }
         let mut book = self.book.lock().unwrap();
-        book.trace.update(line.as_bytes());
+        book.hash.update(line.as_bytes());
         book.log.push(line);
     }
 
@@ -350,6 +389,20 @@ impl World {
             let failure = Failure { kind, at: elapsed(), text };
             book.log.push(format!("{} FAILED {failure}", clock(elapsed())));
             book.failure = Some(failure);
+        }
+    }
+
+    fn observe(&self, what: What) {
+        self.observe_at(elapsed(), what);
+    }
+
+    fn observe_at(&self, at: u64, what: What) {
+        self.book.lock().unwrap().trace.0.push(Obs { at, what });
+    }
+
+    fn disrupt(&self, members: &[usize]) {
+        for m in members {
+            self.observe(What::Disrupted { m: self.index(*m) });
         }
     }
 
@@ -369,6 +422,15 @@ impl World {
 
     fn index(&self, m: usize) -> usize {
         m % self.size()
+    }
+
+    fn iroh(&self, m: usize) -> EndpointId {
+        let members = self.members.lock().unwrap();
+        members[m % members.len()].iroh
+    }
+
+    fn member_at(&self, id: EndpointId) -> Option<usize> {
+        self.members.lock().unwrap().iter().position(|m| m.iroh == id)
     }
 
     // Members' lives.
@@ -394,6 +456,7 @@ impl World {
             kinds: vec![CHAT.into(), DEVICES.into()],
             durable: None,
         };
+        self.observe(What::Up { m: i });
         let (node, mut events) = Node::start_on(store, config, network).await?;
         let peers = node.net().clone();
         self.peers.lock().unwrap().insert(id, peers.clone());
@@ -419,25 +482,24 @@ impl World {
         let (world, taking) = (Arc::downgrade(self), client.clone());
         let events = tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                if let (Event::Live { payload, .. }, Some(world)) = (&event, world.upgrade())
-                    && let Some(nonce) = payload["nonce"].as_str()
-                {
-                    world.book.lock().unwrap().live.insert((i, nonce.to_owned()));
+                if let Some(world) = world.upgrade() {
+                    world.event(i, taking.node(), &event);
                 }
                 taking.event(event).await;
             }
         });
-        let world = Arc::downgrade(self);
+        let (world, telling) = (Arc::downgrade(self), client.clone());
         let told = tokio::spawn(async move {
             while let Some(event) = told.recv().await {
                 let Some(world) = world.upgrade() else { return };
-                world.told(i, event);
+                world.told(i, telling.node(), event);
             }
         });
         self.note(format!("m{i} up as {}", id.fmt_short()));
         let mut members = self.members.lock().unwrap();
         members[i].client = Some(client);
         members[i].tasks = vec![events, told];
+        members[i].starts += 1;
         Ok(())
     }
 
@@ -454,43 +516,189 @@ impl World {
         }
     }
 
-    /// Stops a member as a crash does, leaving its storage as it stood.
+    /// Stops a member as a crash does, leaving its storage as it stood, or as it stood when it was frozen.
     async fn crash(&self, i: usize) {
+        if self.members.lock().unwrap()[i].client.is_none() {
+            return;
+        }
         self.stop(i).await;
         let id = {
             let mut members = self.members.lock().unwrap();
-            members[i].store = members[i].store.snapshot();
-            members[i].iroh
+            let member = &mut members[i];
+            member.store = member.frozen.take().unwrap_or_else(|| member.store.snapshot());
+            member.iroh
         };
         self.net.kill(id);
         self.peers.lock().unwrap().remove(&id);
+        self.observe(What::Down { m: i });
     }
 
     async fn start_again(self: &Arc<Self>, i: usize) {
         if let Err(error) = self.start(i).await {
-            self.fail("start", format!("m{i} did not start again: {error:#}"));
+            self.fail("start", format!("m{i} did not start: {error:#}"));
         }
     }
 
-    async fn restart(self: &Arc<Self>, m: usize) {
-        let i = self.index(m);
+    /// Crashes a member now, and starts it again later if it is down then.
+    async fn down(self: &Arc<Self>, i: usize, ms: u64) {
         self.crash(i).await;
+        let world = self.clone();
+        let task = tokio::spawn(async move {
+            sleep(Duration::from_millis(ms)).await;
+            if world.members.lock().unwrap()[i].client.is_none() {
+                world.start_again(i).await;
+            }
+        });
+        self.later.lock().unwrap().push(task);
+    }
+
+    /// Starts a member that is down, and crashes it again later unless it started since.
+    async fn wake(self: &Arc<Self>, i: usize, ms: u64) {
+        if self.members.lock().unwrap()[i].client.is_some() {
+            return;
+        }
         self.start_again(i).await;
+        let starts = self.members.lock().unwrap()[i].starts;
+        let world = self.clone();
+        let task = tokio::spawn(async move {
+            sleep(Duration::from_millis(ms)).await;
+            if world.members.lock().unwrap()[i].starts == starts {
+                world.crash(i).await;
+            }
+        });
+        self.later.lock().unwrap().push(task);
     }
 
     fn online(&self, m: usize, online: bool) {
-        let i = self.index(m);
-        let id = self.members.lock().unwrap()[i].iroh;
-        self.net.set_online(id, online);
+        self.net.set_online(self.iroh(m), online);
     }
 
     fn partition(&self, mask: u32) {
         let members = self.members.lock().unwrap();
         let mut sides: BTreeMap<EndpointId, u8> = members.iter().enumerate().map(|(i, m)| (m.iroh, (mask >> i & 1) as u8)).collect();
-        if let Membership::Serve { key, .. } = &self.membership {
-            sides.insert(EndpointId::from_bytes(key.0.as_slice().try_into().unwrap()).unwrap(), (mask >> 31) as u8);
-        }
+        sides.insert(self.service, (mask >> 31) as u8);
         self.net.partition(&sides);
+    }
+
+    // Observations.
+
+    /// Records a member's roster of a group if it changed since it was last recorded.
+    fn sample(&self, i: usize, node: &Node<Store>, gid: &Bytes) {
+        let (Ok(epoch), Ok(members), Ok(settings)) = (node.epoch(&gid.0), node.members(&gid.0), node.settings(&gid.0)) else { return };
+        let mut leaves: Vec<Leaf> = members
+            .into_iter()
+            .map(|member| {
+                // A 0.12 session's key is its device's; a claim counts as shown unless its certificate is unknown yet.
+                let shown = member.identity.as_ref().filter(|claim| {
+                    !matches!(claim.error.as_deref(), Some("it has shown no certificate of its identity" | "its identity's key could not be read yet"))
+                });
+                let identity = shown.map(|claim| claim.identity.id.clone());
+                let device = shown.map(|_| member.key.clone());
+                Leaf { key: member.key, iroh: member.iroh, identity, device }
+            })
+            .collect();
+        leaves.sort();
+        let settings = serde_json::to_string(&settings).unwrap();
+        let mut book = self.book.lock().unwrap();
+        let state = (epoch, leaves, settings);
+        if book.rosters.get(&(i, gid.clone())) == Some(&state) {
+            return;
+        }
+        book.rosters.insert((i, gid.clone()), state.clone());
+        let (epoch, leaves, settings) = state;
+        book.trace.0.push(Obs { at: elapsed(), what: What::Roster { m: i, key: node.key(), group: gid.clone(), epoch, leaves, settings } });
+    }
+
+    fn event(&self, i: usize, node: &Node<Store>, event: &Event) {
+        if let Some(gid) = event.group() {
+            self.sample(i, node, gid);
+        }
+        if let Event::Live { group, sender, .. } = event {
+            self.observe(What::Live { m: i, group: group.clone(), sender: sender.key.clone(), epoch: 0, generation: 0 });
+        }
+    }
+
+    fn told(&self, i: usize, node: &Node<Store>, event: ClientEvent) {
+        self.note(format!("m{i} {}", serde_json::to_string(&event).unwrap()));
+        for gid in node.groups() {
+            self.sample(i, node, &gid);
+        }
+    }
+
+    /// Every frame written: what it says of a group, from whom to whom; and a member to crash after it.
+    fn inspect(self: &Arc<Self>, wire: &Wire, bytes: &[u8]) {
+        let name = |id: EndpointId| self.member_at(id).map_or_else(|| "service".into(), |j| format!("m{j}"));
+        if std::env::var_os("LMK_SIM_FRAMES").is_some() {
+            let text: String = String::from_utf8_lossy(bytes).chars().take(300).collect();
+            self.book.lock().unwrap().log.push(format!("{} {} -> {} {text}", clock(elapsed()), name(wire.from), name(wire.to)));
+        }
+        let Some(i) = self.member_at(wire.from) else { return };
+        let Some(client) = self.members.lock().unwrap()[i].client.clone() else { return };
+        let node = client.node();
+        let mut output = None;
+        if wire.to == self.service {
+            if let Ok(lmk_proto::membership::Request::Append { log, entries }) = serde_json::from_slice(bytes) {
+                self.observe(What::Out { m: i, to: None, group: log, frame: Frame::Append { entries: entries.iter().map(|entry| sha(&entry.0)).collect() } });
+                output = Some(Output::Append);
+            }
+        } else if wire.peer
+            && let Ok(frame) = serde_json::from_slice::<lmk_proto::peer::Frame>(bytes)
+        {
+            let to = self.member_at(wire.to);
+            for (gid, frame) in frames(node, &frame) {
+                self.sample(i, node, &gid);
+                self.observe(What::Out { m: i, to: Some(Bytes(wire.to.as_bytes().to_vec())), group: gid.clone(), frame: frame.clone() });
+                if let Some(to) = to {
+                    self.observe_at(elapsed() + wire.delay.as_millis() as u64, What::In { m: to, from: i, conn: wire.conn, group: gid, frame });
+                }
+                output = Some(Output::Frame);
+            }
+        }
+        if bytes.windows(10).any(|w| w == br#""admitted""#) {
+            output = Some(Output::Admitted);
+        }
+        let armed = self.book.lock().unwrap().crash.get(&i).copied();
+        if let (Some(what), Some(wrote)) = (armed, output)
+            && std::mem::discriminant(&what) == std::mem::discriminant(&wrote)
+        {
+            self.book.lock().unwrap().crash.remove(&i);
+            self.freeze(i);
+        }
+    }
+
+    /// Crashes a member now, as it writes: its storage as it stands and its endpoint dead; it stops and starts again
+    /// after.
+    fn freeze(self: &Arc<Self>, i: usize) {
+        let id = {
+            let mut members = self.members.lock().unwrap();
+            let member = &mut members[i];
+            member.frozen = Some(member.store.snapshot());
+            member.iroh
+        };
+        self.net.kill(id);
+        self.note(format!("m{i} crashes as it writes"));
+        let world = self.clone();
+        tokio::spawn(async move {
+            world.crash(i).await;
+            world.start_again(i).await;
+        });
+    }
+
+    /// The connections' changes so far, into the trace.
+    fn connections(&self) {
+        let now = Instant::now();
+        for (at, conn, [a, b], change) in self.net.changes() {
+            let at = elapsed() - (now - at).as_millis() as u64;
+            let what = match change {
+                Change::Opened => {
+                    let (Some(a), Some(b)) = (self.member_at(a), self.member_at(b)) else { continue };
+                    What::Connected { conn, a, b }
+                }
+                Change::Cut => What::Cut { conn },
+                Change::Closed => What::Closed { conn },
+            };
+            self.observe_at(at, what);
+        }
     }
 
     // Actions.
@@ -510,16 +718,12 @@ impl World {
         Ok(self.client(m)?.device_state()?.identities.first().context("on no identity")?.0.id.clone())
     }
 
-    fn device(&self, m: usize) -> Device {
-        let i = self.index(m);
-        self.members.lock().unwrap()[i].device.clone()
-    }
-
-    /// Of the members running and in a group, the one `m` picks.
+    /// `m` if it runs and holds the group, else the running member that holds it that `m` picks.
     fn holder(&self, gid: &Bytes, m: usize) -> Result<usize> {
         let holders: Vec<usize> = self.clients().into_iter().filter(|(_, c)| c.node().groups().contains(gid)).map(|(i, _)| i).collect();
         ensure!(!holders.is_empty(), "no one running holds the group");
-        Ok(holders[m % holders.len()])
+        let m = self.index(m);
+        Ok(if holders.contains(&m) { m } else { holders[m % holders.len()] })
     }
 
     async fn act(self: &Arc<Self>, act: &Act) -> Result<String> {
@@ -534,11 +738,12 @@ impl World {
                 let link = self.request(m, json!({ "cmd": "invite", "identity": b64(&identity.0) })).await?;
                 let link = link["link"].as_str().context("no link")?;
                 let joined = self.request(n, json!({ "cmd": "join", "target": link })).await?;
-                let n = self.index(n);
-                self.book.lock().unwrap().revoked.retain(|(id, j, _)| *id != identity || *j != n);
+                let keys = self.client(n)?.device_state()?.keys;
+                let device = keys.into_iter().find(|(id, _)| *id == identity).context("no key on the identity")?.1;
+                self.observe(What::Device { identity, device, listed: true });
                 Ok(joined.to_string())
             }
-            Act::Invite { m, group, n, label, to } => {
+            Act::Invite { m, group, n, label, to, wait, race } => {
                 let mut invite = json!({ "cmd": "invite" });
                 let m = match group {
                     Some(g) => {
@@ -554,8 +759,8 @@ impl World {
                 if label {
                     invite["for"] = json!(format!("friend{}", self.index(n)));
                 }
-                if to {
-                    invite["to"] = json!(b64(&self.identity(n)?.0));
+                if let Some(to) = to {
+                    invite["to"] = json!(b64(&self.identity(to)?.0));
                 }
                 let answer = self.request(m, invite).await?;
                 let gid = Bytes(URL_SAFE_NO_PAD.decode(answer["group"].as_str().context("no group")?)?);
@@ -565,11 +770,18 @@ impl World {
                         book.groups.push(gid.clone());
                     }
                 }
-                let link = answer["link"].as_str().context("no link")?;
-                let since = elapsed();
-                let joined = self.request(n, json!({ "cmd": "join", "target": link })).await?;
-                self.introduces(m, n, gid, since).await;
-                Ok(joined["group"].to_string())
+                let link = answer["link"].as_str().context("no link")?.to_owned();
+                sleep(Duration::from_millis(wait)).await;
+                let racing = race.map(|r| {
+                    let (world, link) = (self.clone(), link.clone());
+                    tokio::spawn(async move { world.request(r, json!({ "cmd": "join", "target": link })).await })
+                });
+                let joined = self.request(n, json!({ "cmd": "join", "target": link })).await;
+                if let (Some(racing), Some(r)) = (racing, race) {
+                    let raced = racing.await?;
+                    self.note(format!("m{} raced: {}", self.index(r), raced.as_ref().map_or_else(|e| format!("{e:#}"), Value::to_string)));
+                }
+                Ok(joined?["group"].to_string())
             }
             Act::JoinOpen { n, group } => {
                 let gid = self.group(group)?;
@@ -604,7 +816,9 @@ impl World {
             Act::Leave { m, group } => {
                 let gid = self.group(group)?;
                 let m = self.holder(&gid, m)?;
-                Ok(self.request(m, json!({ "cmd": "leave", "group": b64(&gid.0) })).await?.to_string())
+                let answer = self.request(m, json!({ "cmd": "leave", "group": b64(&gid.0) })).await?;
+                self.observe(What::Leaving { m, group: gid });
+                Ok(answer.to_string())
             }
             Act::Remove { m, group, n } => {
                 let gid = self.group(group)?;
@@ -621,237 +835,140 @@ impl World {
                 let others: Vec<usize> = (0..self.size()).filter(|j| *j != m && self.identity(*j).is_ok_and(|id| id == identity)).collect();
                 ensure!(!others.is_empty(), "the only device of its identity");
                 let n = others[n % others.len()];
-                let device = self.device(n).name;
-                let answer = self.request(m, json!({ "cmd": "identity", "op": { "remove": { "identity": b64(&identity.0), "device": device } } })).await?;
-                self.book.lock().unwrap().revoked.push((identity, n, elapsed()));
+                let keys = self.client(n)?.device_state()?.keys;
+                let device = keys.into_iter().find(|(id, _)| *id == identity).context("no key on the identity")?.1;
+                let answer = self.request(m, json!({ "cmd": "identity", "op": { "remove": { "identity": b64(&identity.0), "device": b64(&device.0) } } })).await?;
+                self.observe(What::Device { identity, device, listed: false });
                 Ok(answer.to_string())
+            }
+            Act::PushState { m, group } => {
+                let gid = self.group(group)?;
+                let clients = self.clients();
+                let current: Vec<Bytes> = clients.iter().filter_map(|(_, c)| c.node().members(&gid.0).ok()).max_by_key(Vec::len).unwrap_or_default().into_iter().map(|member| member.key).collect();
+                let removed: Vec<&(usize, Client<Store>)> = clients.iter().filter(|(_, c)| c.node().groups().contains(&gid) && !current.contains(&c.node().key())).collect();
+                ensure!(!removed.is_empty(), "no member removed holds the group");
+                let (j, client) = removed[m % removed.len()];
+                for key in &current {
+                    client.node().hand_state(&gid.0, &fp(&key.0), b"pushed by a removed member".to_vec()).await.ok();
+                }
+                Ok(format!("by m{j}"))
             }
             _ => unreachable!("the world's own"),
         }
     }
 
-    // Properties.
-
-    /// A member that joins by an invite, as an identity that lists its device as its inviter sees it join, is
-    /// introduced to the group by its inviter, in a message, unless an action since a connection's idle timeout
-    /// before the invite may have kept it away, or it does not serve the inviter.
-    async fn introduces(&self, m: usize, n: usize, gid: Bytes, since: u64) {
-        sleep(LIVE_WAIT).await;
-        let (Ok(inviter), Ok(joiner)) = (self.client(m), self.client(n)) else { return };
-        if !joiner.node().serves(&gid.0, &inviter.node().net().id()) {
-            return;
-        }
-        let (inviter, joiner) = (fp(&inviter.node().key().0), fp(&joiner.node().key().0));
-        let book = self.book.lock().unwrap();
-        if book.disrupted + IDLE_TIMEOUT.as_millis() as u64 >= since
-            || !book.vouched.contains(&(m, gid.clone(), joiner))
-            || book.introduced.contains(&(self.index(n), gid.clone(), inviter))
-        {
-            return;
-        }
-        drop(book);
-        self.fail("introduce", format!("m{} was not introduced to {} by m{m}, who invited it", self.index(n), b64(&gid.0)));
-    }
-
-    /// What a member was told; with what changes a group, members at one epoch are checked to agree.
-    fn told(&self, i: usize, event: ClientEvent) {
-        let text = serde_json::to_string(&event).unwrap();
-        self.note(format!("m{i} {text}"));
-        if !matches!(event, ClientEvent::Synced { .. }) {
-            self.agreement();
-        }
-        match event {
-            ClientEvent::Message { id, .. } => {
-                if !self.book.lock().unwrap().seen.entry(i).or_default().insert(id.clone()) {
-                    self.fail("duplicate", format!("m{i} was told of {id} twice"));
+    /// An attacker's entry in a group's log, by the service's store directly.
+    fn forge(&self, m: usize, g: usize, what: Forgery) -> Result<String> {
+        let gid = self.group(g)?;
+        let entry = match what {
+            Forgery::Junk => lmk_proto::random::random::<64>().to_vec(),
+            Forgery::Replay => {
+                let page = self.outsider.read(&gid.0, 0, usize::MAX)?.context("no log")?;
+                page.entries.get(m % page.entries.len().max(1)).context("an empty log")?.0.clone()
+            }
+            Forgery::Foreign => {
+                let groups = self.book.lock().unwrap().groups.clone();
+                let other = groups.iter().find(|other| **other != gid).context("one group")?;
+                let page = self.outsider.read(&other.0, 0, usize::MAX)?.context("no log")?;
+                page.entries.last().context("an empty log")?.0.clone()
+            }
+            Forgery::Message | Forgery::Commit | Forgery::Copy => {
+                let m = self.holder(&gid, m)?;
+                let copy = self.members.lock().unwrap()[m].store.snapshot();
+                let entry = forged(&copy, &gid, what)?;
+                if matches!(what, Forgery::Copy) {
+                    self.observe(What::Copied { m, group: gid.clone() });
                 }
+                entry
             }
-            ClientEvent::Joined { group, member, .. } => {
-                if member.identity.is_some_and(|known| known.error.is_none()) {
-                    self.book.lock().unwrap().vouched.insert((i, group, member.fp.unwrap_or_default()));
-                }
-            }
-            ClientEvent::Introduced { group, by, .. } => {
-                self.book.lock().unwrap().introduced.insert((i, group, by.fp.unwrap_or_default()));
-            }
-            _ => {}
-        }
-    }
-
-    /// Checks a frame on a `peer` stream against the serving rules, as its sender sees them as it sends it.
-    fn inspect(&self, from: EndpointId, to: EndpointId, peer: bool, bytes: &[u8]) {
-        let name = |id: EndpointId| self.members.lock().unwrap().iter().position(|m| m.iroh == id).map_or_else(|| "service".into(), |j| format!("m{j}"));
-        if std::env::var_os("LMK_SIM_FRAMES").is_some() {
-            let text: String = String::from_utf8_lossy(bytes).chars().take(300).collect();
-            self.book.lock().unwrap().log.push(format!("{} {} -> {} {text}", clock(elapsed()), name(from), name(to)));
-        }
-        let Some(frame) = serde_json::from_slice::<Frame>(bytes).ok().filter(|_| peer) else { return };
-        let sender = {
-            let members = self.members.lock().unwrap();
-            members.iter().position(|m| m.iroh == from).and_then(|i| Some((i, members[i].client.clone()?)))
         };
-        let Some((i, client)) = sender else { return };
-        let node = client.node();
-        let groups: Vec<(&str, Bytes)> = match &frame {
-            Frame::Hello { groups, .. } => groups.iter().map(|hello| ("hello", hello.group.clone())).collect(),
-            Frame::Entries { log, .. } if node.groups().contains(log) => vec![("entries", log.clone())],
-            Frame::Reconcile { group, .. } => vec![("reconcile", group.clone())],
-            Frame::Messages { group, .. } => vec![("messages", group.clone())],
-            Frame::State { group, .. } => vec![("state", group.clone())],
-            Frame::Want { group, .. } => vec![("want", group.clone())],
-            Frame::Have { group, files } if !files.is_empty() => vec![("have", group.clone())],
-            _ => Vec::new(),
-        };
-        for (what, gid) in groups {
-            if !node.serves(&gid.0, &to) {
-                self.fail("served", format!("m{i} sent {} {what} of {}, which it does not serve it", name(to), b64(&gid.0)));
-            }
+        let appended = self.outsider.append(&gid.0, &[Bytes(entry)])?;
+        if !matches!(what, Forgery::Copy) {
+            self.observe(What::Forged { group: gid, position: appended.position, mac: false });
         }
+        Ok(format!("at {}", appended.position))
     }
 
-    /// Members at one epoch of a group agree on its members and settings.
-    fn agreement(&self) {
-        let mut seen: BTreeMap<(Bytes, u64), (usize, Vec<Bytes>, String)> = BTreeMap::new();
-        for (i, client) in self.clients() {
-            let node = client.node();
-            for gid in node.groups() {
-                let (Ok(epoch), Ok(members), Ok(settings)) = (node.epoch(&gid.0), node.members(&gid.0), node.settings(&gid.0)) else { continue };
-                let mut keys: Vec<Bytes> = members.into_iter().map(|m| m.key).collect();
-                keys.sort();
-                let settings = serde_json::to_string(&settings).unwrap();
-                match seen.get(&(gid.clone(), epoch)) {
-                    Some((j, theirs, their_settings)) if *theirs != keys || *their_settings != settings => {
-                        self.fail("agreement", format!("m{i} and m{j} disagree on {} at epoch {epoch}", b64(&gid.0)));
-                    }
-                    Some(_) => {}
-                    None => drop(seen.insert((gid, epoch), (i, keys, settings))),
-                }
-            }
-        }
-    }
-
-    /// Every member online and reachable, then after a while: members of a group agree on it, hold the same messages,
-    /// and get each other's live messages; devices taken off have left.
+    /// Every member online and reachable, then after a while the properties are checked.
     async fn quiesce(self: &Arc<Self>) {
         let running = std::mem::take(&mut *self.running.lock().unwrap());
         for task in running {
             task.await.ok();
         }
-        let start = elapsed();
         self.partition(0);
         for m in 0..self.size() {
             self.online(m, true);
         }
-        sleep(CONVERGE).await;
-        self.agreement();
-        let (groups, stale) = self.converged();
-        self.revoked(start);
-        self.live(&groups).await;
-        if !stale.is_empty() {
+        sleep(Duration::from_millis(CONVERGE)).await;
+        // A 0.12 member learns of its removal from no peer, but by reading its log within 5 minutes.
+        let views = self.views();
+        if props::inside(&views).len() < views.len() {
             sleep(RESYNC).await;
         }
-        for (i, gid, latest) in stale {
-            if self.client(i).is_ok_and(|client| client.node().epoch(&gid.0).is_ok_and(|epoch| epoch < latest)) {
-                self.fail("convergence", format!("m{i} still holds {}, whose epoch {latest} it is not in", b64(&gid.0)));
-            }
+        self.observe(What::Quiet { views: self.views() });
+        self.connections();
+        let failure = props::check(&self.book.lock().unwrap().trace, self.options.pending);
+        if let Some((name, text)) = failure {
+            self.fail(name, text);
         }
         if let Some(panic) = PANICS.with_borrow(|panics| panics.first().cloned()) {
             self.fail("panic", panic);
         }
     }
 
-    /// Each group's members, as its latest epoch shows them, checked to have converged, with each one's node; and those
-    /// that hold a group whose latest epoch they are not in, with that epoch, which they learn of from no peer, as none
-    /// serves them the group any more, but by reading its log within 5 minutes.
-    fn converged(&self) -> (Vec<(Bytes, Holders)>, Stale) {
-        let clients = self.clients();
-        let gids: BTreeSet<Bytes> = clients.iter().flat_map(|(_, c)| c.node().groups()).collect();
-        let (mut groups, mut stale_holders) = (Vec::new(), Vec::new());
-        for gid in gids {
-            let holders: Vec<(usize, Node<Store>)> = clients.iter().filter(|(_, c)| c.node().groups().contains(&gid)).map(|(i, c)| (*i, c.node().clone())).collect();
-            let Some((latest, keys)) = holders
-                .iter()
-                .filter_map(|(_, node)| Some((node.epoch(&gid.0).ok()?, node.members(&gid.0).ok()?.into_iter().map(|m| m.key).collect::<Vec<_>>())))
-                .max_by_key(|(epoch, _)| *epoch)
-            else {
-                continue;
-            };
-            let group = b64(&gid.0);
-            let (inside, stale): (Vec<_>, Vec<_>) = holders.into_iter().partition(|(_, node)| keys.contains(&node.key()));
-            stale_holders.extend(stale.into_iter().map(|(i, _)| (i, gid.clone(), latest)));
-            for (i, node) in &inside {
-                if node.epoch(&gid.0).ok() != Some(latest) {
-                    self.fail("convergence", format!("m{i} is at epoch {:?} of {group}, not {latest}", node.epoch(&gid.0).ok()));
-                }
+    /// Each running member's view of each group it holds.
+    fn views(&self) -> Vec<View> {
+        let mut views = Vec::new();
+        for (m, client) in self.clients() {
+            let node = client.node();
+            for gid in node.groups() {
+                self.sample(m, node, &gid);
+                let book = self.book.lock().unwrap();
+                let Some((epoch, leaves, _)) = book.rosters.get(&(m, gid.clone())).cloned() else { continue };
+                let empty = Default::default;
+                views.push(View { m, key: node.key(), group: gid, epoch, leaves, start: 0, head: 0, held: empty(), opened: empty(), lost: empty() });
             }
-            for (a, x) in &inside {
-                for (b, y) in &inside {
-                    if a == b || !x.serves(&gid.0, &y.net().id()) || !y.serves(&gid.0, &x.net().id()) {
-                        continue;
-                    }
-                    let floor = x.joined(&gid.0).unwrap_or(0).max(y.joined(&gid.0).unwrap_or(0));
-                    for message in x.messages(&gid.0).unwrap_or_default().into_iter().filter(|m| m.epoch >= floor) {
-                        if y.message(&message.id.0).ok().flatten().is_none() && !y.lost(&gid.0, &message.id.0) {
-                            self.fail("convergence", format!("m{b} lacks {} of {group}, which m{a} holds", hex::encode(&message.id.0)));
-                        }
-                    }
-                }
-            }
-            groups.push((gid, inside));
         }
-        (groups, stale_holders)
+        views
     }
+}
 
-    /// A device taken off its identity long enough ago that every member has read the key log entry that drops it: no
-    /// member sees a session of a dropped device of that identity in its groups.
-    fn revoked(&self, start: u64) {
-        let revoked: Vec<(Bytes, usize, u64)> = self.book.lock().unwrap().revoked.clone();
-        let clients = self.clients();
-        for (identity, n, at) in revoked.into_iter().filter(|(_, _, at)| at + KEYS_READ <= start) {
-            for (i, client) in &clients {
-                let node = client.node();
-                for gid in node.groups() {
-                    let members = node.members(&gid.0).unwrap_or_default();
-                    let held = members.iter().filter(|m| m.key != node.key()).filter_map(|m| m.identity.as_ref()).find(|claim| {
-                        claim.identity.id == identity && claim.error.as_deref() == Some("its device was taken off its identity")
-                    });
-                    if held.is_some() {
-                        self.fail("revocation", format!("m{n}, taken off {} at {}, is still in {} as m{i} sees it", b64(&identity.0), clock(at), b64(&gid.0)));
-                    }
-                }
-            }
-        }
+/// What a 0.12 peer frame says of each group, as the properties look; `entries` only of a group's own log.
+fn frames(node: &Node<Store>, frame: &lmk_proto::peer::Frame) -> Vec<(Bytes, Frame)> {
+    use lmk_proto::peer::Frame as F;
+    let none = || Frame::Hello { head: 0, held: Default::default(), fetching: Default::default() };
+    match frame {
+        F::Hello { groups, .. } => groups.iter().map(|hello| (hello.group.clone(), none())).collect(),
+        F::Entries { log, .. } if node.groups().contains(log) => vec![(log.clone(), Frame::Entries)],
+        F::Reconcile { group, .. } => vec![(group.clone(), Frame::Other("reconcile"))],
+        F::Messages { group, .. } => vec![(group.clone(), Frame::Messages { positions: Default::default() })],
+        F::State { group, .. } => vec![(group.clone(), Frame::State)],
+        F::Want { group, .. } => vec![(group.clone(), Frame::Want { positions: Default::default() })],
+        F::Have { group, files } if !files.is_empty() => vec![(group.clone(), Frame::Files)],
+        _ => Vec::new(),
     }
+}
 
-    /// Each member of a group sends a live message; every other that both sides serve takes it.
-    async fn live(&self, groups: &[(Bytes, Holders)]) {
-        let mut expected = Vec::new();
-        for (gid, inside) in groups {
-            for (s, sender) in inside {
-                let nonce = format!("{}-m{s}-{}", elapsed(), b64(&gid.0));
-                if sender.send_live(&gid.0, &json!({ "type": "sim", "nonce": nonce }), None).is_err() {
-                    continue;
-                }
-                for (r, receiver) in inside {
-                    if r != s && sender.serves(&gid.0, &receiver.net().id()) && receiver.serves(&gid.0, &sender.net().id()) {
-                        let connected = sender.net().connected().contains(&receiver.net().id());
-                        expected.push((*s, *r, nonce.clone(), connected));
-                    }
-                }
-            }
-        }
-        sleep(LIVE_WAIT).await;
-        let book = self.book.lock().unwrap();
-        let lost: Vec<String> = expected
-            .into_iter()
-            .filter(|(_, r, nonce, _)| !book.live.contains(&(*r, nonce.clone())))
-            .map(|(s, r, nonce, connected)| format!("m{r} did not take m{s}'s live message {nonce}, sent {}connected", if connected { "" } else { "not " }))
-            .collect();
-        drop(book);
-        for text in lost {
-            self.fail("live", text);
-        }
+/// From a copy of a member's state: a message with a valid AEAD signed by another key, a commit signed by another key,
+/// or a commit as the member signs it.
+fn forged(copy: &Store, gid: &Bytes, what: Forgery) -> Result<Vec<u8>> {
+    use openmls::prelude::{GroupId, LeafNodeParameters, MlsGroup};
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_traits::types::SignatureScheme;
+    if matches!(what, Forgery::Copy) {
+        use lmk_node::lmk_core::group::{Change, Group, Session};
+        let session = Session::load(copy)?;
+        let mut group = Group::load(copy, &gid.0)?;
+        return Ok(group.commit(copy, &session, Change::default())?.entry);
     }
+    let key = ed25519_dalek::SigningKey::from_bytes(&lmk_proto::random::random());
+    let stranger = SignatureKeyPair::from_raw(SignatureScheme::ED25519, key.to_bytes().to_vec(), key.verifying_key().to_bytes().to_vec());
+    let mut group = MlsGroup::load(copy.storage(), &GroupId::from_slice(&gid.0))?.context("no such group")?;
+    let message = match what {
+        Forgery::Message => group.create_message(copy, &stranger, b"forged")?,
+        _ => group.self_update(copy, &stranger, LeafNodeParameters::default())?.into_commit(),
+    };
+    Ok(message.to_bytes()?)
 }
 
 /// Files over the simulated network: whole, from a holder reachable now, by its rules.
