@@ -336,9 +336,10 @@ def main():
         check(any(g.get("name") == "Release" for g in renamed), "and on the commits it missed")
 
         # Bob takes his tablet off his identity while it is stopped: its session leaves his groups all the same.
+        key = next(d["key"] for d in run("tablet", "identity", "list")["identities"][0]["devices"] if d["you"])
         tablet.stop()
         listeners.remove(tablet)
-        run("bob", "identity", "remove", "--", tablet.ready["member"]["device"]["key"])
+        run("bob", "identity", "remove", "--", key)
         left = alice.expect("left", lambda e: e["member"]["name"] == "Tablet", timeout=60)
         check(left["group"] == group, "a device taken off its identity while it is stopped leaves its groups")
         if BROWSER and subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=WEB, env={**ENV, "URL": ENV["LETMEKNOW_RELAY"], "BIN": BIN}).returncode:

@@ -965,6 +965,11 @@ class ChatView extends View {
           item.type === "joined" ? [who(item.by), item.how === "open" ? " let in " : " added ", who(item.member)] : self ? [who(item.member), " left"] : [who(item.by), " removed ", who(item.member)];
         return h("li", { className: "event" }, ...said, at);
       }
+      case "revoked": {
+        const list = (people: Person[]) => people.flatMap((p, i) => (i ? [", ", who(p)] : [who(p)]));
+        const added = item.added.length ? [". They added ", ...list(item.added), ", who stay until removed"] : [];
+        return h("li", { className: "event warn" }, "You removed ", ...list(item.removed), ": their device was taken off its identity", ...added, at);
+      }
       case "settings": {
         const { before, settings: after } = item;
         const ids = (s?: { open?: { id: string }[] }) => (s?.open ?? []).map(o => o.id);

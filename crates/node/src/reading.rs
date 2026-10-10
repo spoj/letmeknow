@@ -442,7 +442,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 self.leavers(st, gid)?;
             }
             Control::Introduce { identity, name, how, to } => {
-                let me = Bytes(Sha256::digest(st.session.key())[..8].to_vec());
+                let me = Bytes(Sha256::digest(st.me(gid))[..8].to_vec());
                 if !own && (to.is_empty() || to.contains(&me)) {
                     self.events.send(Event::Introduced { group, by: message.sender, identity, name, how }).ok();
                 }

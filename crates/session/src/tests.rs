@@ -512,7 +512,7 @@ fn a_session_of_an_identity_joins_a_group_open_to_it() {
         assert_eq!(joined["members"].as_array().unwrap().len(), 3);
         let event = alice.expect("joined").await;
         assert_eq!((event["member"]["identity"]["name"].as_str(), event["how"].as_str()), (Some("Bob (Acme)"), Some("open")));
-        assert!(event["member"]["identity"]["new_device"].as_str().unwrap().starts_with("added by "));
+        assert!(event["member"]["identity"]["new_device"].is_string(), "the tablet was added to Bob after his first device");
         // A session of another identity cannot see the group, so it cannot join it.
         let carol = world.start("carol", HOUR).await;
         let refused = carol.cmd(&["join", "--", &group]).await.unwrap_err().to_string();
@@ -563,7 +563,7 @@ fn identities_are_created_listed_and_lose_devices() {
 }
 
 /// A session that does not act for its device renames the device and takes it off its identity, through the session
-/// that does: the device's certificates and credential name it anew, and the identity, whose only device it was, ends.
+/// that does: its credential and its identity's key log name it anew, and the identity, whose only device it was, ends.
 #[test]
 fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
     local(async {
@@ -587,7 +587,7 @@ fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        assert!(device().await, "the desk session renews its certificate with the device's new name");
+        assert!(device().await, "carol sees the device's new name, as the identity's key log lists it");
 
         let left = desk.cmd(&["identity", "leave", "Alice"]).await.unwrap();
         assert_eq!((&left["left"][0], &left["ended"]), (&invite["group"], &json!(true)));

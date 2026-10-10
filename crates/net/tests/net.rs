@@ -9,7 +9,6 @@ use iroh::RelayUrl;
 use lmk_net::Event;
 use lmk_proto::{
     Answer, Bytes, frame,
-    identity::Envelope,
     peer::{Frame, Join},
 };
 
@@ -88,37 +87,6 @@ async fn every_log_of_a_group_is_caught_up_from_peers() {
     b.net.shutdown().await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn certificates_are_shown_once_even_to_a_member_not_served() {
-    let relay = relay().await;
-    let keys = keys(2);
-    let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
-    let group = || Group { members: members.clone(), log: vec![b"e1".to_vec()], ..Group::default() };
-    let service = service();
-    let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
-    let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
-    a.fake.uncertified.lock().unwrap().push(members[1]);
-    let certificate = |n: u8| Envelope { body: Bytes(vec![n]), sig: Bytes(vec![n]) };
-    a.fake.certificates.lock().unwrap().push(certificate(1));
-    b.fake.certificates.lock().unwrap().push(certificate(2));
-    a.fake.hold(G, b"\0\0\0\0\0\0\0\x01a's".to_vec());
-    b.fake.hold(G, b"\0\0\0\0\0\0\0\x01b's".to_vec());
-    let certified = |node: &Node| node.fake.certified.lock().unwrap().iter().map(|c| c.sig.0[0]).collect::<Vec<_>>();
-    a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    eventually("each shows the other its certificates", || certified(&a) == [2] && certified(&b) == [1]).await;
-    a.fake.certificates.lock().unwrap().push(certificate(3));
-    a.net.changed(G);
-    eventually("a member not served is shown a new one", || certified(&b) == [1, 3]).await;
-    b.net.changed(G);
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert_eq!((certified(&a), certified(&b)), (vec![2], vec![1, 3]), "nothing is shown twice");
-    let held = |node: &Node| node.fake.groups.lock().unwrap()[G].held.len();
-    assert_eq!((held(&a), held(&b)), (1, 1), "no messages pass between members one of which does not serve the other");
-    for node in [&a, &b] {
-        node.net.shutdown().await.unwrap();
-    }
-}
-
 /// A session that served a peer nothing for a while asks it to sync anew once it serves it again, so what it held
 /// meanwhile arrives at once, not at the next resync.
 #[tokio::test(flavor = "multi_thread")]
@@ -133,18 +101,18 @@ async fn a_peer_served_again_syncs_at_once() {
     a.net.dial(members[1], relay.url.clone()).await.unwrap();
     a.synced(G, members[1]).await;
     b.synced(G, members[0]).await;
-    a.fake.uncertified.lock().unwrap().push(members[1]);
+    a.fake.unlisted.lock().unwrap().push(members[1]);
     let meanwhile = message(1, "meanwhile");
     a.fake.hold(G, meanwhile.clone());
-    a.fake.uncertified.lock().unwrap().clear();
+    a.fake.unlisted.lock().unwrap().clear();
     a.net.served(members[1], G);
     eventually("what A held meanwhile reaches B", || b.fake.holds(G, &meanwhile)).await;
     a.net.shutdown().await.unwrap();
     b.net.shutdown().await.unwrap();
 }
 
-/// A message sent to a peer that does not serve this session the group yet, as a joiner checking the inviter's
-/// certificate, waits for the peer's hello of the group, which it would otherwise drop, live ones for good.
+/// A message sent to a peer that does not serve this session the group yet, as a joiner reading the inviter's
+/// key log, waits for the peer's hello of the group, which it would otherwise drop, live ones for good.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_message_waits_until_the_peer_shows_the_group() {
     let relay = relay().await;
@@ -154,12 +122,12 @@ async fn a_message_waits_until_the_peer_shows_the_group() {
     let service = service();
     let a = node(&relay, keys[0].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
     let b = node(&relay, keys[1].clone(), Fake::new(&service).with(G, group()), Options::default()).await;
-    b.fake.uncertified.lock().unwrap().push(members[0]);
+    b.fake.unlisted.lock().unwrap().push(members[0]);
     a.net.dial(members[1], relay.url.clone()).await.unwrap();
     let live = [&1u64.to_be_bytes()[..], &[1], b"introduce"].concat();
     assert!(a.net.frame(members[1], Frame::Messages { group: Bytes(G.to_vec()), items: vec![Bytes(live.clone())] }));
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    b.fake.uncertified.lock().unwrap().clear();
+    b.fake.unlisted.lock().unwrap().clear();
     b.net.served(members[0], G);
     eventually("the live message reaches B once B serves A", || !b.fake.groups.lock().unwrap()[G].live.is_empty()).await;
     a.net.shutdown().await.unwrap();
@@ -385,7 +353,6 @@ async fn requests_to_be_admitted_are_answered_by_id() {
         secret: secret.map(Bytes::from),
         group: group.map(Bytes::from),
         key_package: Bytes(b"kp".to_vec()),
-        certificate: None,
     };
     let ask = |join| joiner.net.join(keys[0].public(), relay.url.clone(), join);
 

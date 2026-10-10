@@ -60,7 +60,8 @@ impl<P: Provider> State<P> {
     fn seal(&mut self, gid: &[u8], send: &mut Held) -> Result<()> {
         let st = &mut *self;
         let g = st.groups.get_mut(gid).context("this session is not in that group")?;
-        let (id, ciphertext) = g.mls.seal(&st.provider, &st.session, &send.payload, false)?;
+        let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
+        let (id, ciphertext) = g.mls.seal(&st.provider, session, &send.payload, false)?;
         send.entry = Bytes(g.mls.entry(&st.provider, &id)?);
         (send.epoch, send.id, send.ciphertext, send.appended) = (g.mls.epoch(), Bytes(id.to_vec()), Bytes(ciphertext), false);
         Ok(())

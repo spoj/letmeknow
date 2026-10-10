@@ -44,8 +44,7 @@ const RESYNC: Duration = Duration::from_secs(5 * 60);
 const LIVE_WAIT: Duration = Duration::from_secs(10);
 /// How long an action may take.
 const ACTION_WAIT: Duration = Duration::from_secs(300);
-/// How long after a device is taken off every member holding its sessions' certificates has read the key log entry
-/// that names it: a copy of a key log is fresh for 10 minutes.
+/// How long after a device is taken off every member has read the key log entry that drops it, which it follows.
 const KEYS_READ: u64 = 11 * 60 * 1000;
 
 thread_local! {
@@ -194,7 +193,7 @@ struct Book {
     /// When an action last disrupted the network or the members on it, as a crash, which a peer notices only once its
     /// connection times out.
     disrupted: u64,
-    /// Members each member saw join with a valid certificate: by member, group and the joiner's fingerprint.
+    /// Members each member saw join verified: by member, group and the joiner's fingerprint.
     vouched: BTreeSet<(usize, Bytes, String)>,
     /// Introductions each member was told of: by member, group, and the introducer's fingerprint.
     introduced: BTreeSet<(usize, Bytes, String)>,
@@ -435,17 +434,10 @@ impl World {
                 world.told(i, event);
             }
         });
-        let renewing = client.clone();
-        let renew = tokio::spawn(async move {
-            loop {
-                renewing.renew().await;
-                sleep(Duration::from_secs(10)).await;
-            }
-        });
         self.note(format!("m{i} up as {}", id.fmt_short()));
         let mut members = self.members.lock().unwrap();
         members[i].client = Some(client);
-        members[i].tasks = vec![events, told, renew];
+        members[i].tasks = vec![events, told];
         Ok(())
     }
 
@@ -629,7 +621,7 @@ impl World {
                 let others: Vec<usize> = (0..self.size()).filter(|j| *j != m && self.identity(*j).is_ok_and(|id| id == identity)).collect();
                 ensure!(!others.is_empty(), "the only device of its identity");
                 let n = others[n % others.len()];
-                let device = b64(&self.device(n).public());
+                let device = self.device(n).name;
                 let answer = self.request(m, json!({ "cmd": "identity", "op": { "remove": { "identity": b64(&identity.0), "device": device } } })).await?;
                 self.book.lock().unwrap().revoked.push((identity, n, elapsed()));
                 Ok(answer.to_string())
@@ -640,7 +632,7 @@ impl World {
 
     // Properties.
 
-    /// A member that joins by an invite, as an identity its inviter holds a valid certificate of as it sees it join, is
+    /// A member that joins by an invite, as an identity that lists its device as its inviter sees it join, is
     /// introduced to the group by its inviter, in a message, unless an action since a connection's idle timeout
     /// before the invite may have kept it away, or it does not serve the inviter.
     async fn introduces(&self, m: usize, n: usize, gid: Bytes, since: u64) {
@@ -810,22 +802,20 @@ impl World {
         (groups, stale_holders)
     }
 
-    /// A device taken off its identity long enough ago that every member holding its sessions' certificates has read
-    /// the key log entry naming it: its sessions are in no group with such a member.
+    /// A device taken off its identity long enough ago that every member has read the key log entry that drops it: no
+    /// member sees a session of a dropped device of that identity in its groups.
     fn revoked(&self, start: u64) {
         let revoked: Vec<(Bytes, usize, u64)> = self.book.lock().unwrap().revoked.clone();
         let clients = self.clients();
         for (identity, n, at) in revoked.into_iter().filter(|(_, _, at)| at + KEYS_READ <= start) {
-            let key = Bytes(self.device(n).public().to_vec());
             for (i, client) in &clients {
                 let node = client.node();
                 for gid in node.groups() {
                     let members = node.members(&gid.0).unwrap_or_default();
-                    let held = members.iter().find(|m| m.key == key).and_then(|m| m.identity.as_ref()).filter(|claim| {
-                        claim.identity.id == identity
-                            && !matches!(claim.error.as_deref(), Some("it has shown no certificate of its identity" | "its identity's key could not be read yet"))
+                    let held = members.iter().filter(|m| m.key != node.key()).filter_map(|m| m.identity.as_ref()).find(|claim| {
+                        claim.identity.id == identity && claim.error.as_deref() == Some("its device was taken off its identity")
                     });
-                    if held.is_some() && *i != n {
+                    if held.is_some() {
                         self.fail("revocation", format!("m{n}, taken off {} at {}, is still in {} as m{i} sees it", b64(&identity.0), clock(at), b64(&gid.0)));
                     }
                 }
@@ -833,7 +823,7 @@ impl World {
         }
     }
 
-    /// Each member of a group sends a live message; every other that both sides hold valid certificates of takes it.
+    /// Each member of a group sends a live message; every other that both sides serve takes it.
     async fn live(&self, groups: &[(Bytes, Holders)]) {
         let mut expected = Vec::new();
         for (gid, inside) in groups {
