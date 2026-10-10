@@ -995,7 +995,7 @@ fn git_pushes_count_in_the_groups_log_in_order() {
         let (new, bundle) = (git(&repo, &["rev-parse", "HEAD"]), world.root.join("3.bundle"));
         git(&repo, &["bundle", "create", bundle.to_str().unwrap(), &format!("{second}..main")]);
         let refused = alice.cmd(&["git", "push", &group, "refs/heads/main", &second, &new, bundle.to_str().unwrap()]).await.unwrap_err().to_string();
-        assert!(refused.contains("online"), "{refused}");
+        assert!(refused.contains("no other member online took the push's bundle") && refused.contains("agent session"), "{refused}");
         let tips = alice.cmd(&["git", "list", &group, "--push"]).await.unwrap();
         assert_eq!(tips["refs"]["refs/heads/main"], second.as_str(), "the push did not count");
     });

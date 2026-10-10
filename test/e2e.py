@@ -177,7 +177,7 @@ def git_kind(alice, bob, dave, listeners):
     git("alice", "add", "late.txt", cwd=ours)
     git("alice", "commit", "-qm", "while bob is away", cwd=ours)
     failed = git("alice", "push", "team", "main", cwd=ours, ok=False)
-    check(failed.returncode != 0 and "online" in failed.stderr, "a push with no other member online is refused")
+    check(failed.returncode != 0 and "no other member online took the push's bundle" in failed.stderr and "agent session" in failed.stderr, "a push with no other member online is refused, naming agent sessions")
     bob = Listener("bob")
     listeners.append(bob)
     until(lambda: git("alice", "push", "-q", "team", "main", cwd=ours, ok=False).returncode, lambda code: code == 0, timeout=60)
