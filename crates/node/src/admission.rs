@@ -16,7 +16,7 @@ use lmk_proto::links::{Address, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Join};
 use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
-use n0_future::time::{Duration, sleep, timeout};
+use n0_future::time::{Duration, timeout};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
@@ -66,10 +66,13 @@ impl<P: Provider + Send + 'static> Node<P> {
         };
         if position.is_some() {
             let all = async {
-                while holding()?.len() < online.len() {
-                    sleep(Duration::from_millis(100)).await;
+                loop {
+                    let heard = self.inner.heard.notified();
+                    if holding()?.len() == online.len() {
+                        return anyhow::Ok(());
+                    }
+                    heard.await;
                 }
-                anyhow::Ok(())
             };
             timeout(MEMBER_WAIT, all).await.unwrap_or(Ok(()))?;
         }

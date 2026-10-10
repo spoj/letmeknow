@@ -58,6 +58,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             observe: config.observe,
             committing: tokio::sync::Mutex::new(()),
             advanced: tokio::sync::Notify::new(),
+            heard: tokio::sync::Notify::new(),
             reading: Mutex::default(),
             sending: Mutex::default(),
             passing: Mutex::default(),

@@ -296,6 +296,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 let group = heard.summary.group.clone();
                 st.hear(heard)?;
                 self.events.send(Event::Heard { group }).ok();
+                self.heard.notify_waiters();
             }
             for summary in groups {
                 let gid = summary.group.0;

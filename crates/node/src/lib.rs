@@ -595,6 +595,8 @@ pub(crate) struct Inner<P> {
     committing: tokio::sync::Mutex<()>,
     /// Woken whenever a group's log is read further, for sends waiting to reach its head.
     advanced: tokio::sync::Notify,
+    /// Woken whenever a peer's summary is heard.
+    heard: tokio::sync::Notify,
     reading: Mutex<HashSet<Vec<u8>>>,
     /// The groups whose held sends are being appended.
     sending: Mutex<HashSet<Vec<u8>>>,
