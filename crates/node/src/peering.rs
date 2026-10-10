@@ -168,6 +168,8 @@ impl<P: Provider> State<P> {
                 Out::Frame { peer, frame } => {
                     let group = match &frame {
                         Frame::Hello { .. } => None,
+                        // Every `want` is answered, with nothing if the gate refuses it.
+                        Frame::Messages { items, .. } if items.is_empty() => None,
                         Frame::Entries { log, .. } => Some(log).filter(|log| self.groups.contains_key(&log.0)),
                         Frame::Messages { group, .. }
                         | Frame::Want { group, .. }
