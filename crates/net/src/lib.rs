@@ -28,7 +28,7 @@ use lmk_proto::{
     peer::{Admitted, Frame, Join},
 };
 use lmk_transport::{Conn, IrohConnection, Iroh, RecvStream, SendStream, Transport};
-use n0_future::{boxed::BoxFuture, join_all, task::spawn, time::timeout};
+use n0_future::{FuturesUnordered, StreamExt, boxed::BoxFuture, task::spawn, time::timeout};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{mpsc, oneshot},
@@ -246,14 +246,19 @@ impl Net {
         self.inner.files.add(plain).await
     }
 
-    /// The members online that hold a file whole.
-    pub async fn holders(&self, group: &[u8], hash: [u8; 32]) -> Vec<EndpointId> {
-        let asked = self.inner.members(group).into_iter().filter_map(|(peer, input)| {
-            let (reply, answer) = oneshot::channel();
-            input.send(Input::Want { group: group.into(), files: vec![hash], reply: Some(reply) }).ok()?;
-            Some(async move { timeout(ANSWER_WAIT, answer).await.ok()?.ok()?.contains(&hash).then_some(peer) })
-        });
-        join_all(asked).await.into_iter().flatten().collect()
+    /// The members online that hold a file whole, as they answer.
+    pub fn holders(&self, group: &[u8], hash: [u8; 32]) -> impl n0_future::Stream<Item = EndpointId> + 'static {
+        let asked: FuturesUnordered<_> = self
+            .inner
+            .members(group)
+            .into_iter()
+            .filter_map(|(peer, input)| {
+                let (reply, answer) = oneshot::channel();
+                input.send(Input::Want { group: group.into(), files: vec![hash], reply: Some(reply) }).ok()?;
+                Some(async move { timeout(ANSWER_WAIT, answer).await.ok()?.ok()?.contains(&hash).then_some(peer) })
+            })
+            .collect();
+        asked.filter_map(|holder| holder)
     }
 
     /// Fetches a file from every member online that holds it, whatever its size.
@@ -261,7 +266,7 @@ impl Net {
         if self.inner.files.has(&link.hash).await? {
             return Ok(());
         }
-        let holders = self.holders(group, link.hash).await;
+        let holders: Vec<_> = self.holders(group, link.hash).collect().await;
         if holders.is_empty() {
             bail!("no member online holds {}", link.link());
         }

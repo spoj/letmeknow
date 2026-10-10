@@ -5,6 +5,7 @@ use std::sync::Arc;
 use common::*;
 use iroh::RelayUrl;
 use lmk_net::{Disk, Event};
+use n0_future::StreamExt;
 use lmk_proto::{
     Answer, Bytes, frame,
     peer::{Frame, Join},
@@ -123,7 +124,7 @@ async fn small_files_are_fetched_when_wanted() {
     let mut out = Vec::new();
     b.net.read_file(&link, &mut out).await.unwrap();
     assert_eq!(out, b"attachment");
-    assert_eq!(a.net.holders(G, link.hash).await, vec![members[1]]);
+    assert_eq!(a.net.holders(G, link.hash).collect::<Vec<_>>().await, vec![members[1]]);
     a.net.shutdown().await.unwrap();
     b.net.shutdown().await.unwrap();
 }
@@ -156,13 +157,13 @@ async fn a_disk_holds_and_serves_only_what_it_keeps() {
     a.net.read_file(&fetched, &mut out).await.unwrap();
     assert_eq!(out, b"fetched");
     b.net.dial(members[0], relay.url.clone()).await.unwrap();
-    assert_eq!(b.net.holders(G, kept.hash).await, vec![members[0]], "A loads a kept file to serve it");
+    assert_eq!(b.net.holders(G, kept.hash).collect::<Vec<_>>().await, vec![members[0]], "A loads a kept file to serve it");
     b.net.fetch(G, &kept).await.unwrap();
     out.clear();
     b.net.read_file(&kept, &mut out).await.unwrap();
     assert_eq!(out, b"kept");
-    assert!(!disk.has(&fetched.hash) && b.net.holders(G, fetched.hash).await.is_empty(), "A keeps and serves no file over its limit that it fetched");
-    assert_eq!(b.net.holders(G, own.hash).await, vec![members[0]], "A serves a file it added, whatever its size");
+    assert!(!disk.has(&fetched.hash) && b.net.holders(G, fetched.hash).collect::<Vec<_>>().await.is_empty(), "A keeps and serves no file over its limit that it fetched");
+    assert_eq!(b.net.holders(G, own.hash).collect::<Vec<_>>().await, vec![members[0]], "A serves a file it added, whatever its size");
     for node in [&a, &b, &c] {
         node.net.shutdown().await.unwrap();
     }

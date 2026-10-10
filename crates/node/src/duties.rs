@@ -101,7 +101,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.leaving(&mut st, gid)?;
             self.announce(&mut st, gid)?;
             if st.group(gid)?.mls.settings().kind == DEVICES {
-                self.events.send(Event::Duties { group: Bytes(gid.to_vec()) }).ok();
+                st.events.push(Event::Duties { group: Bytes(gid.to_vec()) });
             }
             let g = st.group(gid)?;
             (due(&st, g).is_some(), next_update(g.rec.updated, g.mls.settings().update, st.me(gid)))
@@ -171,7 +171,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Tells that this session's commit removed members whose devices were dropped, and which members they added or
     /// let in by their invites.
     fn revoked(&self, gid: &[u8], removed: Vec<core::Member>) -> Result<()> {
-        let st = self.lock();
+        let mut st = self.lock();
         let g = st.group(gid)?;
         let by_them = |key: &[u8]| removed.iter().any(|m| m.key == key);
         let invites: Vec<&Bytes> = g.rec.invites.iter().filter(|rule| by_them(&rule.by.0)).map(|rule| &rule.hash).collect();
@@ -181,7 +181,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         };
         let added = g.mls.members().into_iter().filter(let_in).filter_map(|m| st.member(gid, &m)).collect();
         let removed = removed.iter().filter_map(|m| st.member(gid, m)).collect();
-        self.events.send(Event::Revoked { group: Bytes(gid.to_vec()), removed, added }).ok();
+        st.events.push(Event::Revoked { group: Bytes(gid.to_vec()), removed, added });
         Ok(())
     }
 }

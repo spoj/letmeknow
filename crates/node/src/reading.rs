@@ -322,7 +322,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let sender = g.mls.members().into_iter().find(|m| Some(m.index) == opened.current).context("a current member")?;
         let sender = st.member(gid, &sender).context("the sender has no letmeknow credential")?;
         st.observe(|| Observation::Live { group: Bytes(gid.to_vec()), sender: sender.key.clone(), epoch: opened.epoch });
-        self.events.send(Event::Live { group: Bytes(gid.to_vec()), sender, payload: opened.payload }).ok();
+        st.events.push(Event::Live { group: Bytes(gid.to_vec()), sender, payload: opened.payload });
         Ok(())
     }
 
@@ -425,7 +425,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 rec.missing = after;
                 let mut message = message;
                 message.missing = before;
-                self.events.send(Event::Message(message)).ok();
+                st.events.push(Event::Message(message));
             }
             return Ok(());
         }
@@ -439,7 +439,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Control::Introduce { identity, name, how, to } => {
                 let me = Bytes(Sha256::digest(st.me(gid))[..8].to_vec());
                 if !own && (to.is_empty() || to.contains(&me)) {
-                    self.events.send(Event::Introduced { group, by: message.sender, identity, name, how }).ok();
+                    st.events.push(Event::Introduced { group, by: message.sender, identity, name, how });
                 }
             }
             Control::Invite { hash, expires, label, to } => {
