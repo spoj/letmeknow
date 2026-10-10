@@ -32,7 +32,7 @@ pub fn duties(t: &Trace) -> Result<(), String> {
                 return Err(format!("m{m} asked to leave {} at {}, and still holds it at {}", short(group), super::clock(o.at), super::clock(at)));
             }
         }
-        let since = at.saturating_sub(UPDATE);
+        let Some(since) = at.checked_sub(UPDATE) else { continue };
         for v in inside(views) {
             let unsettled = t.0.iter().take_while(before).any(|o| match &o.what {
                 What::Up { m } | What::Down { m } | What::Disrupted { m } => *m == v.m && o.at > since,
@@ -130,6 +130,7 @@ mod tests {
         let base = vec![(0, What::Up { m: 0 }), (0, What::Up { m: 1 }), (0, What::Joined { m: 0, group: g(), start: 0 })];
         assert!(duties(&trace([base.clone(), vec![update(day - 100, 0), update(day - 50, 1), quiet(day)]].concat())).is_ok());
         assert!(duties(&trace([base.clone(), vec![update(day - 50, 1), quiet(day)]].concat())).unwrap_err().contains("m0 has not updated"));
+        assert!(duties(&trace([base.clone(), vec![quiet(day - 20)]].concat())).is_ok(), "not running for T yet");
         let restarted = vec![(day - 1_000, What::Down { m: 0 }), (day - 900, What::Up { m: 0 }), update(day - 50, 1), quiet(day)];
         assert!(duties(&trace([base, restarted].concat())).is_ok(), "the slow timer may not have run since");
     }

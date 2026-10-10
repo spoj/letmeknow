@@ -39,11 +39,7 @@ pub const PROPERTIES: &[Property] = &[
     Property { name: "caught-up", check: membership::caught_up, needs: None },
     Property { name: "gate", check: peer::gate, needs: None },
     Property { name: "revocation", check: identity::revocation, needs: None },
-    Property {
-        name: "live-current",
-        check: peer::live_current,
-        needs: Some("0.12 takes a removed sender's live payloads for 5 minutes; Event::Live {epoch, generation}"),
-    },
+    Property { name: "live-current", check: peer::live_current, needs: None },
     Property { name: "convergence", check: convergence::convergence, needs: Some("Node::positions; Event::Opened") },
     Property {
         name: "loss-allowed",

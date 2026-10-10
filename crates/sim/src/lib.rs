@@ -235,9 +235,9 @@ pub fn generate(seed: u64, options: Options) -> Vec<Action> {
                 855..930 => Act::Drop { m, n: other },
                 _ => Act::Settle {
                     ms: match rng.below(100) {
-                        0..70 => 30 * SECOND + rng.below(60 * SECOND),
-                        70..90 => 6 * MINUTE + rng.below(6 * MINUTE),
-                        90..97 => HOUR + 31 * MINUTE,
+                        0..72 => 30 * SECOND + rng.below(60 * SECOND),
+                        72..92 => 6 * MINUTE + rng.below(6 * MINUTE),
+                        92..99 => HOUR + 31 * MINUTE,
                         _ => DAY + rng.below(2 * HOUR),
                     },
                 },
