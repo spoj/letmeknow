@@ -388,6 +388,8 @@ struct Rec {
     kind: Option<kind::Kind>,
     /// The invites shared with the group, kept for H after they expire.
     invites: Vec<Rule>,
+    /// The current members added since this session's start: each one's key, and its start, the position of its Add.
+    starts: Vec<(Bytes, u64)>,
     /// Counted `leave`s: each sender's key, and the epoch it was sealed in; kept until moot.
     leaves: Vec<(Bytes, u64)>,
     /// This session asked to leave: it asks the others to remove it until one does.

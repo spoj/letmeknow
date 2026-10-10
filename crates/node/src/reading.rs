@@ -212,6 +212,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         g.early.retain(|(_, early)| core::header(early).is_ok_and(|(epoch, _)| epoch >= current));
         let members = g.mls.members();
         g.rec.leaves.retain(|(key, _)| members.iter().any(|m| m.key == key.0));
+        g.rec.starts.retain(|(key, _)| members.iter().any(|m| m.key == key.0) && !applied.added.iter().any(|m| m.key == key.0));
+        g.rec.starts.extend(applied.added.iter().map(|m| (Bytes(m.key.clone()), position)));
         let by = members.into_iter().find(|m| m.index == applied.by);
         let own = applied.own;
         let gone = applied.gone;

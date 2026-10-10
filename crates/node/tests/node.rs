@@ -1410,10 +1410,12 @@ async fn summaries_are_kept_shown_and_dropped_with_their_member() {
     let bob = session(&relay, "Bob").await;
     let carol = session(&relay, "Carol").await;
     let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    let first = alice.node.send(&gid.0, &message("before anyone")).await.unwrap().position.unwrap();
     for joiner in [&bob, &carol] {
         joiner.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
+    assert!(!alice.node.only_here(&gid.0).unwrap().contains(first), "before every other member's start, whether or not heard yet");
     let p = alice.node.send(&gid.0, &message("hello")).await.unwrap().position.unwrap();
     eventually("both hold Alice's message", || !alice.node.only_here(&gid.0).unwrap().contains(p)).await;
     bob.node.mark_read(&gid.0, &one(p)).unwrap();
@@ -1435,7 +1437,7 @@ async fn summaries_are_kept_shown_and_dropped_with_their_member() {
     bob.node.shutdown().await.unwrap();
     let q = alice.node.send(&gid.0, &message("alone")).await.unwrap().position.unwrap();
     let only_here = alice.node.only_here(&gid.0).unwrap();
-    assert!(only_here.contains(q) && !only_here.contains(p), "Bob's saved summary holds the first, not the second");
+    assert!(only_here.contains(q) && !only_here.contains(p) && !only_here.contains(first), "Bob's saved summary holds the first, not the second");
     alice.node.shutdown().await.unwrap();
 }
 
