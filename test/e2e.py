@@ -289,7 +289,7 @@ def main():
 
         # A device link: bob's tablet joins his identity, and his contacts reach it.
         link = run("bob", "invite", "--identity", "Bob")["link"]
-        check("#2.d." in link, "invite --identity gives a device link")
+        check("#3.d." in link, "invite --identity gives a device link")
         tablet = Listener("tablet")
         listeners.append(tablet)
         check("device" in run("tablet", "join", link), "the tablet joins bob's identity")

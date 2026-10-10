@@ -412,7 +412,6 @@ async fn a_contradiction_is_reported_once() {
 }
 
 impl Session {
-    /// Waits for entriesimpl Session {
     /// Waits for the kind's held messages after position `after`; returns them.
     async fn logged(&mut self, gid: &Bytes, after: u64) -> Vec<lmk_node::Entry> {
         loop {
@@ -493,7 +492,6 @@ async fn a_kind_takes_held_messages_in_log_order_and_a_member_without_state_asks
 }
 
 impl<P: Provider + Send + 'static> Session<P> {
-    /// Waits until a member's identity checks outimpl<P: Provider + Send + 'static> Session<P> {
     /// Waits until a member's identity checks out, or not.
     async fn checked(&self, gid: &Bytes, name: &str, valid: bool) -> lmk_node::Member {
         tokio::time::timeout(WAIT, async {

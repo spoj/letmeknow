@@ -5,7 +5,6 @@ use anyhow::Result;
 use clap::Parser;
 use iroh::tls::CaTlsConfig;
 use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
-use lmk_core::group::Window;
 use lmk_proto::group::Service;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
@@ -27,7 +26,6 @@ struct World {
     root: PathBuf,
     /// For the sessions started from now on.
     causal_wait: Duration,
-    window: Window,
     plugins: Vec<PathBuf>,
 }
 
@@ -64,7 +62,7 @@ async fn world(test: &str) -> World {
     let root = std::env::temp_dir().join(format!("lmk-session-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let network = crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) };
-    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT, window: Window::default(), plugins: vec![built()] }
+    World { _relay: server, network, root, causal_wait: crate::session::CAUSAL_WAIT, plugins: vec![built()] }
 }
 
 struct Agent {
@@ -94,7 +92,6 @@ impl World {
             name: handle[..1].to_uppercase() + &handle[1..],
             hold,
             causal_wait: self.causal_wait,
-            window: self.window,
             keep_log: false,
             membership: self.membership(),
             plugins: self.plugins.clone(),
@@ -503,44 +500,13 @@ fn a_restarted_session_takes_in_what_it_missed_in_causal_order() {
 }
 
 #[test]
-fn a_member_back_past_its_key_window_reports_what_it_missed_and_the_sender_resends_it() {
-    local(async {
-        let mut world = world("old").await;
-        let (mut alice, mut bob, _) = pair(&world, HOUR).await;
-        bob.stop().await;
-        let file = world.root.join("notes.txt");
-        std::fs::write(&file, "the notes").unwrap();
-        let sent = alice.cmd(&["send", "--attach", file.to_str().unwrap(), "while you were away"]).await.unwrap();
-        assert_eq!(sent["pending"], true);
-        for name in ["one", "two", "three"] {
-            alice.cmd(&["name", name]).await.unwrap();
-        }
-        // Bob keeps the keys of one ended epoch: Alice's message is below his floor when he is back.
-        world.window = Window { epochs: 1, ..Window::default() };
-        let mut bob = world.start("bob", HOUR).await;
-        let refused = alice.expect("refused").await;
-        assert_eq!(refused["member"]["name"], "Bob");
-        let id = sent["id"].as_str().unwrap();
-        let message = &refused["messages"][0];
-        assert_eq!((message["id"].as_str(), message["reason"].as_str(), message["content"].as_str()), (Some(id), Some("old"), Some("while you were away")));
-        let path = message["attachment"]["path"].as_str().unwrap();
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "the notes");
-        let resent = alice.cmd(&["send", "--reply-to", id, "--attach", path, "while you were away"]).await.unwrap();
-        assert_eq!(resent["held_by"][0]["name"], "Bob");
-        let message = bob.expect("message").await;
-        assert_eq!((message["reply_to"].as_str(), message["content"].as_str()), (Some(id), Some("while you were away")));
-        assert_eq!(message["missing"], json!([id]), "a known gap, not a wait");
-    });
-}
-
-#[test]
 fn a_session_of_an_identity_joins_a_group_open_to_it() {
     local(async {
         let world = world("open").await;
         let (mut alice, bob, group) = pair(&world, HOUR).await;
         let tablet = world.start("tablet", HOUR).await;
         let link = bob.cmd(&["invite", "--identity", "Robert"]).await.unwrap();
-        assert!(link["link"].as_str().unwrap().contains("#2.d."));
+        assert!(link["link"].as_str().unwrap().contains("#3.d."));
         assert!(tablet.cmd(&["join", link["link"].as_str().unwrap()]).await.unwrap()["device"].is_string());
         let opened = alice.cmd(&["open", "Bob (Acme)"]).await.unwrap();
         assert_eq!(opened["settings"]["open"][0]["name"], "Bob (Acme)");
@@ -592,7 +558,7 @@ fn identities_are_created_listed_and_lose_devices() {
         assert_eq!(listed["identities"][0]["devices"][0]["you"], true);
         assert_eq!(listed["identities"][0]["name"], "Alice Smith");
         let invite = alice.cmd(&["invite", "--identity", "Alice Smith"]).await.unwrap();
-        assert!(invite["link"].as_str().unwrap().contains("#2.d."));
+        assert!(invite["link"].as_str().unwrap().contains("#3.d."));
         let phone = world.start("phone", HOUR).await;
         let joined = phone.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         assert!(joined["device"].is_string());
