@@ -21,6 +21,7 @@ const check = (condition, message) => {
 const local = link => SITE + new URL(link).pathname + new URL(link).hash;
 
 const natives = [];
+let passed = false;
 /** A native session in a home of its own: its own device. */
 function native(name) {
   const env = { ...process.env, LETMEKNOW_HOME: join(tmp, name) };
@@ -561,6 +562,7 @@ try {
   await laptop.locator(".group-list button", { hasText: "Plans" }).waitFor();
   check(true, "and opens the app offline, groups and all");
   console.log("browser ok");
+  passed = true;
 } catch (error) {
   for (const [name, page] of Object.entries(pages)) await page.screenshot({ path: join(tmp, `${name}.png`) });
   console.log(`screenshots in ${tmp}`);
@@ -568,4 +570,6 @@ try {
 } finally {
   await browser.close();
   for (const proc of natives) proc.kill();
+  // A failed run keeps its homes and screenshots.
+  if (passed) rmSync(tmp, { recursive: true, force: true, maxRetries: 10 });
 }
