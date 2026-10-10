@@ -2,22 +2,8 @@
 //! simulated wire, and what each member's node reported. Members are the world's indices; sessions are their MLS
 //! signature keys; times are milliseconds since the start; positions are a group log's.
 //!
-//! What the 0.13 node must provide for the pending properties (`props::pending`), each event sent once its step's
-//! transaction commits:
-//! - `Event::Read { group, position, entry (SHA-256), epoch, verdict }`, its own commits included; `Event::Joined
-//!   { group, start }`, at create too; `Event::Head { group, head }` on each head read from the service;
-//! - `Event::Opened { group, position, kind, sender, generation, plaintext (SHA-256) }`; `Event::Lost { group,
-//!   positions }`; `Event::Announced { group, position, positions }` when its own `lost` counts; `Event::Handed { group,
-//!   kind, position }` for kinds but chat; `Event::Live` with `epoch` and `generation`; `Event::State` with `from`;
-//!   `Event::Dropped { group, reason }`;
-//! - `Node::positions(group) -> { start, head, held, opened, lost }`, for the views at quiet periods; and
-//!   `lmk_node::saved(&provider, group) -> Saved`, read from storage alone as a member starts again, with storage
-//!   snapshots taking committed steps only;
-//! - `ClientEvent::Message { position, missing }`, `ClientEvent::Lost { group, member, positions }`, `ClientEvent::Sent
-//!   { group, id, position }`; `send` answering `{id, position}`, `{id, pending}` or `unavailable`, `rate`, `size`; and
-//!   `join` answering with the joiner's start;
-//! - on the wire, 0.13's `hello` (per group: head, held, fetching), `messages` and `want` with positions, `admitted`
-//!   with the start, and appends of several entries.
+//! The node's observations come through `lmk_node::Config::observe`, each once its step's transaction commits; the
+//! views at quiet periods from `Node::positions`; what a member's storage held as it started from `lmk_node::saved`.
 
 use std::collections::BTreeSet;
 
@@ -47,6 +33,8 @@ pub enum What {
     Down { m: usize },
     /// An action cut a member's paths: offline, a partition, a dropped connection, a lost answer.
     Disrupted { m: usize },
+    /// A member's paths are whole again: online, partitions healed.
+    Reconnected { m: usize },
     /// A device was put on its identity's list, or taken off it.
     Device { identity: Bytes, device: Bytes, listed: bool },
     /// A join was answered.
@@ -78,26 +66,24 @@ pub enum What {
     Roster { m: usize, key: Key, group: Bytes, epoch: u64, leaves: Vec<Leaf>, settings: String },
     /// The log's head, as the member last read it from the service.
     Head { m: usize, group: Bytes, head: u64 },
-    /// A member joined a group: its Add's position, where it starts.
-    Joined { m: usize, group: Bytes, start: u64 },
+    /// A member joined a group with a key: its Add's position, where it starts.
+    Joined { m: usize, key: Key, group: Bytes, start: u64 },
     /// A member judged a log position, in the epoch it was at: a commit it applied, an entry that counts, or one skipped.
     Read { m: usize, group: Bytes, position: u64, entry: Hash, epoch: u64, verdict: Verdict },
-    /// A member opened a counted position.
-    Opened { m: usize, group: Bytes, position: u64, kind: String, sender: Key, generation: u32, plaintext: Hash },
+    /// A member opened a counted position, or counted one of its own: of the group's kind, or a core payload's type.
+    Opened { m: usize, group: Bytes, position: u64, kind: String, sender: Key, plaintext: Hash },
     /// Known losses a member recorded.
     Lost { m: usize, group: Bytes, positions: Positions },
     /// A member's own `lost` message counted, at a position, announcing these positions.
     Announced { m: usize, group: Bytes, position: u64, positions: Positions },
-    /// A member's kinds or client were told that a member lost positions.
-    ToldLost { m: usize, group: Bytes, member: Key, positions: Positions },
     /// A position handed to a kind other than chat.
     Handed { m: usize, group: Bytes, kind: String, position: u64 },
     /// A chat message shown or printed, with the positions passed over before it.
     Shown { m: usize, group: Bytes, position: u64, missing: Positions },
     /// A send that answered pending counted (the client's `sent`).
     Sent { m: usize, group: Bytes, id: Bytes, position: u64 },
-    /// A live payload taken, from a sender in an epoch at a generation.
-    Live { m: usize, group: Bytes, sender: Key, epoch: u64, generation: u32 },
+    /// A live payload taken, from a sender in an epoch.
+    Live { m: usize, group: Bytes, sender: Key, epoch: u64 },
     /// A kind's state taken from a peer.
     StateTaken { m: usize, group: Bytes, from: Key },
     /// A member let go of a group other than by its removal.
@@ -111,7 +97,6 @@ pub enum Answer {
     /// Ok, at a position (a join's start, a send's).
     Position(u64),
     Pending,
-    Refused,
     Failed(String),
 }
 
@@ -156,8 +141,6 @@ pub enum Frame {
     Admitted { position: u64 },
     /// Entries appended to the service, by their hashes.
     Append { entries: Vec<Hash> },
-    /// The service refused an append.
-    Refused,
     Other(&'static str),
 }
 
@@ -189,18 +172,22 @@ pub struct Saved {
     /// openmls's epoch.
     pub epoch: u64,
     pub start: u64,
-    /// The cursor: the last position judged.
+    /// What it kept of positions up to here is gone, read longer than H ago.
+    pub expired: u64,
+    /// The cursor: the last position judged; and the last position of the log held.
     pub head: u64,
+    pub logged: u64,
     /// Positions with a stored verdict.
     pub judged: Positions,
     /// The commits applied, by position, with the epoch each was judged in.
     pub commits: Vec<(u64, u64)>,
+    /// As its summary shows them: kept positions, less those it lacks or lost.
     pub held: Positions,
     /// The entries saved for posting: a staged commit's, and pending sends'.
     pub entries: Vec<Hash>,
     /// The epochs pending sends were sealed in.
     pub sends: Vec<u64>,
-    /// The peers whose summaries are kept, and the current epoch's leaves.
+    /// The iroh keys of the peers whose summaries are kept, and of the current epoch's leaves.
     pub summaries: Vec<Key>,
     pub roster: Vec<Key>,
 }

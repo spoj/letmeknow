@@ -5,12 +5,14 @@ use std::collections::BTreeSet;
 
 use lmk_proto::Bytes;
 
-use super::{CONVERGE, UPDATE, inside, judged, key_of, quiets, removed, short};
+use super::{CONVERGE, TIMER, UPDATE, inside, judged, quiets, removed, short, through};
 use crate::trace::{Trace, Verdict, What};
 
-/// By the end of a quiet period: a member that asked to leave a group before it began holds the group no more, if
-/// another member of it runs; every member that ran undisturbed, in the group, for T and the slow timer updated its
-/// leaf in that time; and no member announced the loss of one position twice.
+/// By the end of a quiet period: a member that asked to leave a group holds it no more, if another member of it runs that
+/// opened its `leave` (one added after it counted cannot tell, and the leaver sends it again only once it counts in
+/// neither the current nor the prior epoch), and every member running had whole paths for the slow timer's period
+/// before, after the leave was asked (a pass that fails to commit runs again on the timer); every member that ran with whole paths, in the group, for T and the slow
+/// timer updated its leaf in that time; and no member announced the loss of one position twice.
 pub fn duties(t: &Trace) -> Result<(), String> {
     let mut announced: BTreeSet<(usize, &Bytes, u64)> = BTreeSet::new();
     for o in &t.0 {
@@ -21,26 +23,28 @@ pub fn duties(t: &Trace) -> Result<(), String> {
         }
     }
     for (at, views) in quiets(t) {
-        let began = at.saturating_sub(CONVERGE);
         let before = |o: &&crate::trace::Obs| o.at <= at;
-        for o in t.0.iter().take_while(|o| o.at < began) {
+        let since = at.saturating_sub(TIMER);
+        for o in t.0.iter().take_while(|o| o.at < since) {
             let What::Leaving { m, group } = &o.what else { continue };
             let back = t.0.iter().take_while(before).any(|j| j.at > o.at && matches!(&j.what, What::Joined { m: n, group: g, .. } if n == m && g == group));
             let holds = views.iter().any(|v| v.m == *m && v.group == *group);
-            let others = views.iter().any(|v| v.m != *m && v.group == *group && v.active());
-            if !back && holds && others {
+            let key = super::key_of(&t.0, *m, group);
+            let opened = |j: usize| {
+                t.0.iter().take_while(before).any(|n| {
+                    n.at > o.at && matches!(&n.what, What::Opened { m: k, group: g, kind, sender, .. } if *k == j && g == group && kind == "leave" && Some(sender) == key)
+                })
+            };
+            let others = views.iter().any(|v| v.m != *m && v.group == *group && v.active() && opened(v.m));
+            let settled = views.iter().filter(|v| v.group == *group).all(|v| whole(t, v.m, since, at));
+            if !back && holds && others && settled {
                 return Err(format!("m{m} asked to leave {} at {}, and still holds it at {}", short(group), super::clock(o.at), super::clock(at)));
             }
         }
         let Some(since) = at.checked_sub(UPDATE) else { continue };
         for v in inside(views) {
-            let unsettled = t.0.iter().take_while(before).any(|o| match &o.what {
-                What::Up { m } | What::Down { m } | What::Disrupted { m } => *m == v.m && o.at > since,
-                What::Joined { m, group, .. } => *m == v.m && *group == v.group && o.at > since,
-                _ => false,
-            });
-            let up = t.0.iter().any(|o| o.at <= since && matches!(o.what, What::Up { m } if m == v.m));
-            if unsettled || !up {
+            let joined = t.0.iter().take_while(before).any(|o| o.at > since && matches!(&o.what, What::Joined { m, group, .. } if *m == v.m && *group == v.group));
+            if joined || !whole(t, v.m, since, at) {
                 continue;
             }
             let updated = t.0.iter().take_while(before).any(|o| {
@@ -54,22 +58,40 @@ pub fn duties(t: &Trace) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a member ran with whole paths from `from` to `to`: up and not cut off at `from`, and neither stopped,
+/// started nor disrupted since.
+fn whole(t: &Trace, m: usize, from: u64, to: u64) -> bool {
+    let (mut up, mut cut) = (false, false);
+    for o in t.0.iter().take_while(|o| o.at <= to) {
+        match o.what {
+            What::Up { m: j } | What::Down { m: j } | What::Disrupted { m: j } if j == m && o.at > from => return false,
+            What::Up { m: j } if j == m => up = true,
+            What::Down { m: j } if j == m => up = false,
+            What::Disrupted { m: j } if j == m => cut = true,
+            What::Reconnected { m: j } if j == m && o.at <= from => cut = false,
+            _ => {}
+        }
+    }
+    up && !cut
+}
+
 /// Every known loss but those at one's own removal is announced by the end of the next quiet period the member is in
-/// the group for; and each announcement reaches, by then, every member of the group whose start is before it: its
-/// kinds and client are told, or it lost the announcement too.
+/// the group for, in the same membership; and each announcement reaches, by then, every member of the group whose start is before it: it opened
+/// the announcement, which its kinds and client learn from, or lost it too.
 pub fn losses_announced(t: &Trace) -> Result<(), String> {
     let judged = judged(t);
     for (i, o) in t.0.iter().enumerate() {
         let after = quiets(t).filter(|(at, _)| *at >= o.at + CONVERGE);
         match &o.what {
             What::Lost { m, group, positions } => {
-                let earlier = &t.0[..=i];
+                let earlier = through(t, i);
                 let epoch = |p: &u64| judged.get(&(group, *p)).map_or(0, |j| j.epoch);
                 if positions.iter().all(|p| removed(earlier, *m, group, epoch(p))) {
                     continue;
                 }
                 for (at, views) in after {
-                    if !views.iter().any(|v| v.m == *m && v.group == *group && v.active()) {
+                    let again = t.0.iter().any(|j| j.at > o.at && j.at <= at && matches!(&j.what, What::Joined { m: n, group: g, .. } if n == m && g == group));
+                    if again || !views.iter().any(|v| v.m == *m && v.group == *group && v.active()) {
                         continue;
                     }
                     let told: BTreeSet<u64> = t.0.iter().take_while(|o| o.at <= at).flat_map(|o| match &o.what {
@@ -82,15 +104,15 @@ pub fn losses_announced(t: &Trace) -> Result<(), String> {
                 }
             }
             What::Announced { m, group, position, positions } => {
-                let Some(key) = key_of(&t.0[..=i], *m, group) else { continue };
                 for (at, views) in after {
-                    for v in views.iter().filter(|v| v.m != *m && v.group == *group && v.active() && v.start < *position && !v.lost.contains(position)) {
-                        let told: BTreeSet<u64> = t.0.iter().take_while(|o| o.at <= at).flat_map(|o| match &o.what {
-                            What::ToldLost { m: j, group: g, member, positions } if *j == v.m && g == group && member == key => positions.iter().copied().collect(),
-                            _ => Vec::new(),
-                        }).collect();
-                        if !positions.is_subset(&told) {
-                            return Err(format!("m{} was not told that m{m} lost {positions:?} of {}, announced at {position}, by {}", v.m, short(group), super::clock(at)));
+                    for v in views.iter().filter(|v| v.m != *m && v.group == *group && v.active() && v.start < *position) {
+                        let learnt = t.0.iter().take_while(|o| o.at <= at).any(|o| match &o.what {
+                            What::Opened { m: j, group: g, position: p, .. } => *j == v.m && g == group && p == position,
+                            What::Lost { m: j, group: g, positions } => *j == v.m && g == group && positions.contains(position),
+                            _ => false,
+                        });
+                        if !learnt {
+                            return Err(format!("m{} did not learn that m{m} lost {positions:?} of {}, announced at {position}, by {}", v.m, short(group), super::clock(at)));
                         }
                     }
                 }
@@ -112,14 +134,21 @@ mod tests {
     }
 
     #[test]
-    fn a_leaver_is_gone_by_the_next_quiet_period() {
-        let leaving = (1_000, What::Leaving { m: 1, group: g() });
-        let still = vec![leaving.clone(), quiet(200_000, vec![view(0, 2, &[0, 1]), view(1, 2, &[0, 1])])];
+    fn a_leaver_is_gone_once_its_members_ran_whole_for_the_slow_timer() {
+        let leave = What::Opened { m: 0, group: g(), position: 3, kind: "leave".into(), sender: key(1), plaintext: [0; 32] };
+        let base = vec![(0, What::Up { m: 0 }), (0, What::Up { m: 1 }), (0, roster(1, 1, &[0, 1])), (1_000, What::Leaving { m: 1, group: g() }), (1_100, leave)];
+        let at = TIMER + 2_000;
+        let still = [base.clone(), vec![quiet(at, vec![view(0, 2, &[0, 1]), view(1, 2, &[0, 1])])]].concat();
         assert!(duties(&trace(still)).unwrap_err().contains("still holds it"));
-        let gone = vec![leaving.clone(), quiet(200_000, vec![view(0, 3, &[0])])];
+        let gone = [base.clone(), vec![quiet(at, vec![view(0, 3, &[0])])]].concat();
         assert!(duties(&trace(gone)).is_ok());
-        let alone = vec![leaving, quiet(200_000, vec![view(1, 2, &[0, 1])])];
+        let alone = [base.clone(), vec![quiet(at, vec![view(1, 2, &[0, 1])])]].concat();
         assert!(duties(&trace(alone)).is_ok(), "no other member runs to commit its removal");
+        let cut = [base, vec![(at - 5_000, What::Disrupted { m: 0 }), quiet(at, vec![view(0, 2, &[0, 1]), view(1, 2, &[0, 1])])]].concat();
+        assert!(duties(&trace(cut)).is_ok(), "the pass may have failed, and the timer not run since");
+        let unseen = vec![(0, What::Up { m: 0 }), (0, What::Up { m: 1 }), (1_000, What::Leaving { m: 1, group: g() })];
+        let unseen = [unseen, vec![quiet(at, vec![view(0, 2, &[0, 1]), view(1, 2, &[0, 1])])]].concat();
+        assert!(duties(&trace(unseen)).is_ok(), "no other member running opened the leave");
     }
 
     #[test]
@@ -127,7 +156,7 @@ mod tests {
         let day = UPDATE + 10;
         let update = |at, by| (at, read(1, 5, 2, commit(by)));
         let quiet = |at| quiet(at, vec![view(0, 3, &[0, 1]), view(1, 3, &[0, 1])]);
-        let base = vec![(0, What::Up { m: 0 }), (0, What::Up { m: 1 }), (0, What::Joined { m: 0, group: g(), start: 0 })];
+        let base = vec![(0, What::Up { m: 0 }), (0, What::Up { m: 1 }), (0, What::Joined { m: 0, key: key(0), group: g(), start: 0 })];
         assert!(duties(&trace([base.clone(), vec![update(day - 100, 0), update(day - 50, 1), quiet(day)]].concat())).is_ok());
         assert!(duties(&trace([base.clone(), vec![update(day - 50, 1), quiet(day)]].concat())).unwrap_err().contains("m0 has not updated"));
         assert!(duties(&trace([base.clone(), vec![quiet(day - 20)]].concat())).is_ok(), "not running for T yet");
@@ -151,8 +180,8 @@ mod tests {
         assert!(losses_announced(&trace(unannounced.clone())).unwrap_err().contains("had not announced"));
         let announced = (2_000, What::Announced { m: 0, group: g(), position: 7, positions: ps(&[2]) });
         let untold = [unannounced.clone(), vec![announced.clone()]].concat();
-        assert!(losses_announced(&trace(untold)).unwrap_err().contains("m1 was not told"));
-        let told = (3_000, What::ToldLost { m: 1, group: g(), member: key(0), positions: ps(&[2]) });
+        assert!(losses_announced(&trace(untold)).unwrap_err().contains("m1 did not learn"));
+        let told = (3_000, What::Opened { m: 1, group: g(), position: 7, kind: "lost".into(), sender: key(0), plaintext: [0; 32] });
         assert!(losses_announced(&trace([unannounced.clone(), vec![announced.clone(), told]].concat())).is_ok());
         v1.start = 8;
         let later = vec![(0, roster(0, 1, &[0, 1])), (0, read(0, 2, 1, counted(2))), lost, announced, quiet(200_000, views(&v1))];

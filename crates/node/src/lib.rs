@@ -99,10 +99,53 @@ pub struct Config {
     /// Where committed steps are not durable yet when they commit, as in the browser: makes them so, before anything
     /// they produced leaves the node.
     pub durable: Option<Durable>,
+    /// Told what each step did once it commits, as a simulator checks it. It must not call the node.
+    pub observe: Option<Observe>,
 }
 
 /// Makes the steps committed so far durable.
 pub type Durable = Arc<dyn Fn() -> BoxFuture<Result<()>> + Send + Sync>;
+
+pub type Observe = Arc<dyn Fn(Observation) + Send + Sync>;
+
+/// What a step did to a group, for `Config::observe`.
+#[derive(Clone, Debug)]
+pub enum Observation {
+    /// A position of the group's log judged, in the epoch current then; `entry` is SHA-256 of its bytes.
+    Read { group: Bytes, position: u64, entry: [u8; 32], epoch: u64, verdict: Judgement },
+    /// This session is in the group with `key` from after `start`: its Add, or 0 for the group's creator.
+    Joined { group: Bytes, key: Bytes, start: u64 },
+    /// The last position of the group's log held.
+    Head { group: Bytes, head: u64 },
+    /// A counted position opened, or one of this session's own: of the group's kind or a core payload's type, with
+    /// SHA-256 of its payload.
+    Opened { group: Bytes, position: u64, kind: String, sender: Bytes, plaintext: [u8; 32] },
+    Lost { group: Bytes, position: u64 },
+    /// This session's own `lost` counted at `position`.
+    Announced { group: Bytes, position: u64, positions: Vec<u64> },
+    /// A position kept for a kind other than chat.
+    Handed { group: Bytes, kind: String, position: u64 },
+    Live { group: Bytes, sender: Bytes, epoch: u64 },
+    /// A state of the group's kind taken from the member with key `from`.
+    State { group: Bytes, from: Bytes },
+    /// This session let go of the group other than by its removal.
+    Dropped { group: Bytes, reason: Dropped },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Judgement {
+    Commit { committer: Bytes, added: Vec<Bytes>, removed: Vec<Bytes> },
+    Counted { id: Bytes },
+    Skipped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dropped {
+    Retention,
+    Copied,
+    /// It asked to leave, and its leaf was the group's only one.
+    Forgotten,
+}
 
 /// A group member, from its leaf and credential, and its credential's certificate checked against its identity's key
 /// log.
@@ -447,6 +490,9 @@ pub(crate) struct State<P> {
     out: Vec<Out>,
     /// The current step deleted what should leave no copy: scrub once it commits.
     scrub: bool,
+    /// What the current step did, told `Config::observe` once it commits; kept only while there is one.
+    observed: Vec<Observation>,
+    observing: bool,
     session: Session,
     /// The device's name, which its credential names in its devices groups, where this is a device's node.
     device: Option<String>,
@@ -512,6 +558,11 @@ impl<P: Provider + Send + 'static> Drop for Step<'_, P> {
         {
             self.inner.warn(None, format!("{error:#}"));
         }
+        if let Some(observe) = &self.inner.observe {
+            for observation in std::mem::take(&mut self.guard.observed) {
+                observe(observation);
+            }
+        }
         let out = std::mem::take(&mut self.guard.out);
         if !out.is_empty() {
             self.inner.outbox.send(out).ok();
@@ -576,6 +627,7 @@ pub(crate) struct Inner<P> {
     /// What steps produced for the peers, in order, sent once durable.
     outbox: mpsc::UnboundedSender<Vec<Out>>,
     durable: Option<Durable>,
+    observe: Option<Observe>,
     committing: tokio::sync::Mutex<()>,
     /// Woken whenever a group's log is read further, for sends waiting to reach its head.
     advanced: tokio::sync::Notify,
@@ -631,6 +683,12 @@ fn endpoint_id(key: &[u8]) -> Option<EndpointId> {
 }
 
 impl<P: Provider> State<P> {
+    pub(crate) fn observe(&mut self, observation: impl FnOnce() -> Observation) {
+        if self.observing {
+            self.observed.push(observation());
+        }
+    }
+
     /// What the credential of the group this session makes or joins next names: the certificate of its identity.
     fn speak(&mut self, identity: Option<Certificate>) {
         self.session.credential.certificate = identity.map(Box::new);
@@ -759,6 +817,12 @@ impl<P: Provider> State<P> {
         log.is_some_and(|log| matches!(log.verify(credential), Verdict::Verified { .. }))
     }
 
+    /// The connected peers in a leaf of the group the gate cannot check yet: their identities' key logs are unread.
+    fn undecided(&self, gid: &[u8]) -> BTreeSet<[u8; 32]> {
+        let unread = |member: core::Member| member.credential?.identity().is_some_and(|identity| !self.keys.contains_key(&identity.id.0)).then_some(());
+        self.served.keys().filter(|peer| self.in_leaf(gid, peer).and_then(unread).is_some()).map(|peer| *peer.as_bytes()).collect()
+    }
+
     /// The identities a group's members speak as.
     fn identities(&self, gid: &[u8]) -> Vec<IdentityRef> {
         let Some(g) = self.groups.get(gid) else { return Vec::new() };
@@ -769,6 +833,9 @@ impl<P: Provider> State<P> {
     fn add_group(&mut self, mls: Group, mut rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
         (rec.updated, rec.shown) = (now(), rec.position);
+        let own = mls.members().into_iter().find(|m| m.index == mls.own_index()).context("a member of its group")?;
+        let (key, start) = (Bytes(own.key), rec.start);
+        self.observe(|| Observation::Joined { group: Bytes(gid.clone()), key, start });
         self.add_log(&gid, logs::Log::new(logs::Of::Group, mls.settings().membership, rec.position))?;
         self.groups.insert(gid.clone(), G::new(mls, rec, BTreeMap::new()));
         self.save(&gid)?;
@@ -776,6 +843,78 @@ impl<P: Provider> State<P> {
         self.gate = true;
         Ok(gid)
     }
+}
+
+/// A group's counted positions, of those kept: those whose ciphertext this session holds, those it opened or sent, and
+/// its known losses; with its start, and the last position it judged.
+#[derive(Clone, Debug)]
+pub struct Positions {
+    pub start: u64,
+    pub head: u64,
+    pub held: Ranges,
+    pub opened: Ranges,
+    pub lost: Ranges,
+}
+
+/// A group's records as storage holds them, which a session starts from.
+#[derive(Clone, Debug)]
+pub struct Saved {
+    /// openmls's.
+    pub epoch: u64,
+    pub start: u64,
+    /// What this session kept of positions up to here is gone, read longer than H ago.
+    pub expired: u64,
+    /// The last position judged, and the last held.
+    pub head: u64,
+    pub logged: u64,
+    /// The kept positions with a verdict, and the commits among them with the epoch each was judged in.
+    pub judged: Vec<u64>,
+    pub commits: Vec<(u64, u64)>,
+    /// As the summary shows it.
+    pub held: Ranges,
+    /// SHA-256 of the entries saved for posting: a staged commit's, and pending sends'.
+    pub entries: Vec<[u8; 32]>,
+    /// The epochs pending sends are sealed in.
+    pub sends: Vec<u64>,
+    /// The iroh keys of the peers whose summaries are kept, and of the current epoch's leaves.
+    pub summaries: Vec<Bytes>,
+    pub roster: Vec<Bytes>,
+}
+
+/// A group's records, read from storage alone; none if this session holds none of it.
+pub fn saved(provider: &impl Provider, gid: &[u8]) -> Result<Option<Saved>> {
+    let Some(rec) = get::<Rec>(provider, &rec_key(gid))? else { return Ok(None) };
+    let mls = Group::load(provider, gid)?;
+    let log: logs::Log = get(provider, &logs::log_key(gid))?.context("a group without its log")?;
+    let (mut judged, mut commits) = (Vec::new(), Vec::new());
+    for position in rec.expired + 1..=rec.position {
+        let Some(pos) = get::<reading::Pos>(provider, &reading::pos_key(gid, position))? else { continue };
+        judged.push(position);
+        if let reading::Judged::Commit { .. } = pos.judged {
+            commits.push((position, pos.epoch));
+        }
+    }
+    let mut entries: Vec<[u8; 32]> = mls.posted().map(|posted| Sha256::digest(posted).into()).into_iter().collect();
+    let mut sends = Vec::new();
+    for handle in &rec.sends {
+        let (epoch, entry) = sending::sealed(provider, &handle.0)?;
+        entries.push(Sha256::digest(entry).into());
+        sends.push(epoch);
+    }
+    Ok(Some(Saved {
+        epoch: mls.epoch(),
+        start: rec.start,
+        expired: rec.expired,
+        head: rec.position,
+        logged: log.logged,
+        judged,
+        commits,
+        held: Ranges::range(rec.expired + 1, rec.position).difference(&rec.lacking).difference(&rec.lost),
+        entries,
+        sends,
+        summaries: peering::load_heard(provider, gid)?.into_keys().collect(),
+        roster: mls.members().into_iter().filter_map(|m| Some(m.leaf?.key)).collect(),
+    }))
 }
 
 /// The session's iroh key, made on first use.
@@ -831,6 +970,8 @@ impl<P: Provider + Send + 'static> Node<P> {
             provider,
             out: Vec::new(),
             scrub: false,
+            observed: Vec::new(),
+            observing: config.observe.is_some(),
             device: config.device.as_ref().map(|device| device.name.clone()),
             session,
             groups,
@@ -864,6 +1005,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             work: work.clone(),
             outbox,
             durable: config.durable,
+            observe: config.observe,
             committing: tokio::sync::Mutex::new(()),
             advanced: tokio::sync::Notify::new(),
             reading: Mutex::default(),
@@ -1167,6 +1309,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             if st.group(gid)?.mls.members().len() > 1 {
                 self.inner.start_send(&mut st, gid, &json!({ "type": "leave" }))?
             } else {
+                st.observe(|| Observation::Dropped { group: Bytes(gid.to_vec()), reason: Dropped::Forgotten });
                 drop(st);
                 self.inner.forget(gid)?;
                 return Ok(None);
@@ -1273,6 +1416,20 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub fn lost(&self, gid: &[u8], id: &[u8]) -> bool {
         let st = self.inner.lock();
         st.position_of(gid, id).ok().flatten().and_then(|position| st.pos(gid, position).ok().flatten()).is_some_and(|pos| pos.lost)
+    }
+
+    /// The group's counted positions as this session stands, as a simulator checks them.
+    pub fn positions(&self, gid: &[u8]) -> Result<Positions> {
+        let st = self.inner.lock();
+        let rec = &st.group(gid)?.rec;
+        let unopened: Ranges = rec.unopened.keys().copied().collect();
+        Ok(Positions {
+            start: rec.start,
+            head: rec.position,
+            held: rec.messages.difference(&rec.lacking).difference(&rec.lost),
+            opened: rec.messages.difference(&unopened).difference(&rec.lost),
+            lost: rec.lost.clone(),
+        })
     }
 
     /// A held message, opened.
@@ -1581,43 +1738,49 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Commits a change built on the group's current epoch, posts its entry, and reads the log until it is known whether
     /// it won its epoch; if another commit won, builds it again. Returns the Welcome, if it adds, and the position; none
     /// once the change has no effect (`None`), and it commits nothing. An entry posted before, which the log may or may
-    /// not have taken, is posted again first: only the service's refusal drops it.
+    /// not have taken, as when the service's answer was lost, is posted again first: only the service's refusal drops it.
+    /// This call's own entry is found in the log by its bytes.
     async fn commit(&self, gid: &[u8], change: impl Fn(&State<P>, &G) -> Result<Option<Change>>) -> Result<Option<(Option<Vec<u8>>, u64)>> {
         let _committing = self.committing.lock().await;
+        let mut built: Option<(Vec<u8>, Option<Vec<u8>>)> = None;
         for _ in 0..COMMIT_TRIES {
             self.caught_up(gid).await?;
-            let (entry, welcome, ours, service) = {
+            let (entry, service, before) = {
                 let mut st = self.lock();
                 let st = &mut *st;
                 let g = st.group(gid)?;
-                let service = g.mls.settings().membership;
+                let (service, before) = (g.mls.settings().membership, g.rec.position);
                 match g.mls.posted() {
-                    Some(posted) => (posted.to_vec(), None, false, service),
+                    Some(posted) => (posted.to_vec(), service, before),
                     None => {
                         let Some(change) = change(st, g)? else { return Ok(None) };
                         let g = st.groups.get_mut(gid).unwrap();
                         let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
                         let commit = g.mls.commit(&st.provider, session, change)?;
-                        (commit.entry, commit.welcome, true, service)
+                        built = Some((commit.entry.clone(), commit.welcome));
+                        (commit.entry, service, before)
                     }
                 }
             };
             self.durable().await?;
-            let position = match self.clients.client(&service)?.append(gid, std::slice::from_ref(&entry)).await {
-                Ok(appended) => appended.position,
+            match self.clients.client(&service)?.append(gid, std::slice::from_ref(&entry)).await {
+                Ok(_) => {}
                 Err(error) if error.is::<Refused>() => {
                     let mut st = self.lock();
                     let st = &mut *st;
                     st.groups.get_mut(gid).context("left the group")?.mls.cancel(&st.provider)?;
                     return Err(error);
                 }
-                Err(error) => return Err(error),
-            };
+                Err(error) => tracing::debug!("appending a commit, which the log may show: {error:#}"),
+            }
             self.caught_up(gid).await?;
+            let Some((ours, welcome)) = built.as_ref().filter(|(ours, _)| *ours == entry) else { continue };
             let st = self.lock();
-            ensure!(st.group(gid)?.rec.position >= position, "the log did not show the commit it took");
-            if ours && st.pos(gid, position)?.is_some_and(|pos| pos.judged == reading::Judged::Commit { own: true }) {
-                return Ok(Some((welcome, position)));
+            for position in before + 1..=st.group(gid)?.rec.position {
+                let own = st.pos(gid, position)?.is_some_and(|pos| pos.judged == reading::Judged::Commit { own: true });
+                if own && st.provider.get(&logs::entry_key(gid, position))?.as_deref() == Some(ours.as_slice()) {
+                    return Ok(Some((welcome.clone(), position)));
+                }
             }
         }
         bail!("the group kept changing over {COMMIT_TRIES} tries; try again")
@@ -1659,12 +1822,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             gid
         };
+        // The members' key logs first, which the gate needs to take their summaries, before the log's commits apply.
+        self.refresh_all().await;
+        self.dial_all();
         if let Err(error) = self.read(&gid).await {
             self.warn(Some(&gid), format!("reading the group's log: {error:#}"));
         }
         self.follow(&gid);
-        self.refresh_all().await;
-        self.dial_all();
         if let Some(link) = admitted.doc {
             self.state_from(&gid, link, by);
         }
@@ -1685,7 +1849,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 inner.fetched(&gid, &file).await?;
                 let mut data = Vec::new();
                 inner.net().read_file(&file, &mut data).await?;
-                let from = inner.lock().by_iroh(&gid, &by);
+                let from = {
+                    let mut st = inner.lock();
+                    let from = st.by_iroh(&gid, &by);
+                    st.observe(|| Observation::State { group: Bytes(gid.clone()), from: from.key.clone() });
+                    from
+                };
                 inner.events.send(Event::State { group: Bytes(gid.clone()), from, data }).ok();
                 anyhow::Ok(())
             };

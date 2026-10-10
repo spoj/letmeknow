@@ -9,8 +9,9 @@ use crate::trace::{Frame, Positions, Saved, Trace, What};
 
 /// What a member's storage held of each group as it started again after a crash covers everything it wrote before
 /// the crash: each entry it appended is saved for posting, or it had read it, or a commit or a refusal made it moot; its
-/// head and held positions are at least those its summaries, pushes and admissions showed. And each restored group's
-/// records agree: a verdict for every position from its start to its head, openmls's epoch one past its last commit's,
+/// log's head, the positions it judged and those it holds (but those read longer than H ago) are at least those its
+/// summaries, pushes and admissions showed. And each restored group's records agree: a verdict for every position kept
+/// from its start to its cursor, openmls's epoch one past its last commit's,
 /// held positions among those judged, pending sends sealed in no later epoch, and summaries kept only of its leaves.
 pub fn crash_consistency(t: &Trace) -> Result<(), String> {
     for o in &t.0 {
@@ -42,9 +43,10 @@ pub fn crash_consistency(t: &Trace) -> Result<(), String> {
 }
 
 fn consistent(saved: &Saved) -> Result<(), String> {
-    let expected: Positions = (saved.start + 1..=saved.head).collect();
+    let from = saved.start.max(saved.expired) + 1;
+    let expected: Positions = (from..=saved.head).collect();
     if saved.judged != expected {
-        return Err(format!("verdicts for {:?}, not {}..={}", saved.judged, saved.start + 1, saved.head));
+        return Err(format!("verdicts for {:?}, not {from}..={}", saved.judged, saved.head));
     }
     if let Some((p, e)) = saved.commits.last()
         && e + 1 != saved.epoch
@@ -69,12 +71,12 @@ fn covered(session: &[crate::trace::Obs], m: usize, restored: &BTreeMap<&Bytes, 
         let What::Out { m: j, group, frame, .. } = &o.what else { continue };
         let Some(saved) = restored.get(group).filter(|_| *j == m) else { continue };
         let g = short(group);
+        let kept = |positions: &Positions| positions.range(saved.expired + 1..).copied().collect::<Positions>();
         match frame {
             Frame::Append { entries } => {
                 let rest = &session[i..];
                 let moot = rest.iter().any(|n| match &n.what {
                     What::Read { m: j, group: h, verdict: crate::trace::Verdict::Commit { .. }, .. } => *j == m && h == group,
-                    What::In { m: j, group: h, frame: Frame::Refused, .. } => *j == m && h == group,
                     _ => false,
                 });
                 let read = |e: &crate::trace::Hash| session.iter().any(|n| matches!(&n.what, What::Read { m: j, group: h, entry, .. } if *j == m && h == group && entry == e));
@@ -82,10 +84,10 @@ fn covered(session: &[crate::trace::Obs], m: usize, restored: &BTreeMap<&Bytes, 
                     return Err(format!("it appended {} to {g}, which it had not saved", hex::encode(&e[..4])));
                 }
             }
-            Frame::Hello { head, held, .. } if *head > saved.head || !held.is_subset(&saved.held) => {
-                return Err(format!("its summary of {g} showed head {head} and {held:?}, its storage {} and {:?}", saved.head, saved.held));
+            Frame::Hello { head, held, .. } if *head > saved.logged || !kept(held).is_subset(&saved.held) => {
+                return Err(format!("its summary of {g} showed head {head} and {held:?}, its storage {} and {:?}", saved.logged, saved.held));
             }
-            Frame::Messages { positions } if !positions.is_subset(&saved.held) => {
+            Frame::Messages { positions } if !kept(positions).is_subset(&saved.held) => {
                 return Err(format!("it pushed {positions:?} of {g}, its storage held {:?}", saved.held));
             }
             Frame::Admitted { position } if *position > saved.head => {
@@ -103,7 +105,7 @@ mod tests {
     use crate::props::build::*;
 
     fn saved(head: u64, held: &[u64]) -> Saved {
-        Saved { epoch: 2, start: 0, head, judged: (1..=head).collect(), commits: vec![(1, 1)], held: ps(held), ..Saved::default() }
+        Saved { epoch: 2, start: 0, head, logged: head, judged: (1..=head).collect(), commits: vec![(1, 1)], held: ps(held), ..Saved::default() }
     }
 
     fn crash(out: Frame, after: Saved) -> Trace {

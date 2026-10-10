@@ -120,7 +120,7 @@ impl<P: Provider> State<P> {
 
     /// Works out again, once the rosters or the key logs changed, which groups the gate admits each connected peer to,
     /// and which key logs each group follows.
-    fn gate(&mut self) {
+    pub(crate) fn gate(&mut self) {
         if !std::mem::take(&mut self.gate) {
             return;
         }
@@ -187,9 +187,12 @@ impl<P: Provider> State<P> {
         }
     }
 
-    /// Saves a peer's summary of a group, over the last.
+    /// Saves a peer's summary of a group, over the last, while the peer is in a leaf of its current epoch.
     fn hear(&mut self, heard: peers::Heard) -> Result<()> {
         let gid = heard.summary.group.0.clone();
+        if endpoint_id(&heard.peer.0).and_then(|peer| self.in_leaf(&gid, &peer)).is_none() {
+            return Ok(());
+        }
         let g = self.groups.get_mut(&gid).context("this session is not in that group")?;
         let new = g.heard.insert(heard.peer.clone(), heard.clone()).is_none();
         put(&self.provider, &heard_key(&gid, &heard.peer.0), &heard)?;
@@ -314,9 +317,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
                 match frame {
                     Frame::Messages { items, .. } => {
-                        for item in items {
-                            self.take(st, &gid, peer, &item.ciphertext.0, admitted)?;
-                        }
+                        let ciphertexts: Vec<&[u8]> = items.iter().map(|item| item.ciphertext.0.as_slice()).collect();
+                        self.take_all(st, &gid, peer, &ciphertexts, admitted)?;
                     }
                     Frame::Live { items, .. } => {
                         for item in items {

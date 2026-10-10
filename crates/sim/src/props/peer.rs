@@ -8,21 +8,26 @@ use lmk_proto::Bytes;
 use super::short;
 use crate::trace::{Frame, Key, Leaf, Trace, What};
 
-/// What the checks track of each member's groups as the trace goes: its current leaves, the head it last read from the
-/// service, and the last position it judged.
+/// What the checks track of each member's groups as the trace goes: its current leaves, and those before with when they
+/// changed, the head it last read from the service, and the last position it judged.
 #[derive(Default)]
 struct Seen<'a> {
     leaves: BTreeMap<(usize, &'a Bytes), &'a [Leaf]>,
+    before: BTreeMap<(usize, &'a Bytes), (&'a [Leaf], u64)>,
     heads: BTreeMap<(usize, &'a Bytes), u64>,
     read: BTreeMap<(usize, &'a Bytes), u64>,
 }
 
 impl<'a> Seen<'a> {
-    fn take(&mut self, what: &'a What) {
-        match what {
-            What::Roster { m, group, leaves, .. } => drop(self.leaves.insert((*m, group), leaves)),
+    fn take(&mut self, o: &'a crate::trace::Obs) {
+        match &o.what {
+            What::Roster { m, group, leaves, .. } => {
+                if let Some(before) = self.leaves.insert((*m, group), leaves) {
+                    self.before.insert((*m, group), (before, o.at));
+                }
+            }
             What::Head { m, group, head } => drop(self.heads.insert((*m, group), *head)),
-            What::Joined { m, group, start: position } | What::Read { m, group, position, .. } => drop(self.read.insert((*m, group), *position)),
+            What::Joined { m, group, start: position, .. } | What::Read { m, group, position, .. } => drop(self.read.insert((*m, group), *position)),
             _ => {}
         }
     }
@@ -37,13 +42,19 @@ impl<'a> Seen<'a> {
 }
 
 /// A member writes a group's frames to a peer only while the peer's iroh key is in a leaf of the member's current
-/// epoch, and `state` and live payloads only once it has read its log to the head as last read.
+/// epoch, but the answer that admits a joiner; and `state` and live payloads only once it has read its log to the head
+/// as last read.
 pub fn gate(t: &Trace) -> Result<(), String> {
     let mut seen = Seen::default();
     for o in &t.0 {
-        seen.take(&o.what);
+        seen.take(o);
         let What::Out { m, to: Some(to), group, frame } = &o.what else { continue };
-        if !seen.has(*m, group, |leaf| leaf.iroh == *to) {
+        if matches!(frame, Frame::Admitted { .. }) {
+            continue;
+        }
+        // A frame handed to the transport before a step applied the peer's removal may be written just after it.
+        let just = seen.before.get(&(*m, group)).is_some_and(|(leaves, at)| *at == o.at && leaves.iter().any(|leaf| leaf.iroh == *to));
+        if !seen.has(*m, group, |leaf| leaf.iroh == *to) && !just {
             return Err(format!("m{m} wrote {frame:?} of {} to {}, not in its current epoch, at {}", short(group), short(to), super::clock(o.at)));
         }
         if matches!(frame, Frame::State | Frame::Live) && seen.behind(*m, group) {
@@ -56,7 +67,7 @@ pub fn gate(t: &Trace) -> Result<(), String> {
 fn taken_from_current(t: &Trace, what: &str, taken: impl Fn(&What) -> Option<(usize, &Bytes, &Key)>) -> Result<(), String> {
     let mut seen = Seen::default();
     for o in &t.0 {
-        seen.take(&o.what);
+        seen.take(o);
         let Some((m, group, sender)) = taken(&o.what) else { continue };
         if !seen.has(m, group, |leaf| leaf.key == *sender) {
             return Err(format!("m{m} took {what} of {} from {}, not in its current epoch, at {}", short(group), short(sender), super::clock(o.at)));
@@ -114,7 +125,7 @@ mod tests {
 
     #[test]
     fn live_payloads_only_from_current_members() {
-        let live = |sender| What::Live { m: 0, group: g(), sender: key(sender), epoch: 1, generation: 0 };
+        let live = |sender| What::Live { m: 0, group: g(), sender: key(sender), epoch: 1 };
         assert!(live_current(&trace(vec![(1, roster(0, 1, &[0, 1])), (2, live(1))])).is_ok());
         let removed = trace(vec![(1, roster(0, 1, &[0, 1])), (2, roster(0, 2, &[0])), (3, live(1))]);
         assert!(live_current(&removed).unwrap_err().contains("not in its current epoch"));

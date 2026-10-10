@@ -42,6 +42,12 @@ pub(crate) fn send_key(handle: &[u8]) -> Vec<u8> {
     [b"node/send/".as_slice(), handle].concat()
 }
 
+/// The epoch a pending send is sealed in, and its entry.
+pub(crate) fn sealed(provider: &impl Provider, handle: &[u8]) -> Result<(u64, Vec<u8>)> {
+    let send: Held = get(provider, &send_key(handle))?.context("a send without its record")?;
+    Ok((send.epoch, send.entry.0))
+}
+
 /// A send's position and final id once its entry counts, or why it failed.
 pub(crate) type Outcome = Result<(u64, Bytes), Arc<SendError>>;
 pub(crate) type Counted = oneshot::Receiver<Outcome>;

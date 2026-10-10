@@ -82,6 +82,8 @@ pub struct Peers {
 
 struct Group {
     own: Own,
+    /// When the member came to hold it: it joined, or started.
+    since: u64,
     fetching: Ranges,
     dirty: bool,
     /// The last new summary, connection or ciphertext.
@@ -110,7 +112,7 @@ struct Conn {
     theirs: BTreeMap<Bytes, u64>,
     /// Every served group's summary goes at the next poll, as after connecting.
     full: bool,
-    /// Groups whose summary goes at the next poll, as the gate opened.
+    /// Groups whose summary goes at the next poll, as the gate opened, or the peer's first summary of it came.
     opened: BTreeSet<Bytes>,
 }
 
@@ -125,6 +127,7 @@ impl Peers {
         let Some(g) = self.groups.get_mut(&group) else {
             let g = Group {
                 own,
+                since: now,
                 fetching: Ranges::default(),
                 dirty: true,
                 progress: now,
@@ -224,6 +227,10 @@ impl Peers {
                     if c.served.contains(&summary.group) && c.heard.get(&summary.group) != Some(summary) {
                         g.progress = now;
                     }
+                    // The peer may have taken none of ours, as one that joined since we sent it.
+                    if c.served.contains(&summary.group) && !c.heard.contains_key(&summary.group) {
+                        c.opened.insert(summary.group.clone());
+                    }
                     c.heard.insert(summary.group.clone(), summary.clone());
                     heard.push(Heard { peer: Bytes::from(*peer), summary: summary.clone(), at: now });
                 }
@@ -241,11 +248,13 @@ impl Peers {
     }
 
     /// Whether to apply a commit that would delete the keys of an epoch whose counted positions in `lacking` this
-    /// member lacks. While it waits, those positions are asked without the hold-off.
-    pub fn wait(&mut self, group: &Bytes, lacking: &Ranges, now: u64) -> Decision {
+    /// member lacks. While it waits, those positions are asked without the hold-off. The summaries of `undecided` peers,
+    /// whom the gate may admit once it can check them, hold the wait too.
+    pub fn wait(&mut self, group: &Bytes, lacking: &Ranges, undecided: &BTreeSet<Key>, now: u64) -> Decision {
         let g = self.groups.get_mut(group).expect("a group of ours");
-        let peers: Vec<&Summary> = self.conns.values().filter(|c| c.served.contains(group)).filter_map(|c| c.heard.get(group)).collect();
-        let decision = wait(lacking, &peers, now - self.online, now - g.progress);
+        let counted = |(k, c): &(&Key, &Conn)| c.served.contains(group) || undecided.contains(*k);
+        let peers: Vec<&Summary> = self.conns.iter().filter(counted).filter_map(|(_, c)| c.heard.get(group)).collect();
+        let decision = wait(lacking, &peers, now - self.online.max(g.since), now - g.progress);
         g.urgent = if decision == Decision::Wait { lacking.clone() } else { Ranges::default() };
         decision
     }

@@ -8,10 +8,12 @@ use super::short;
 use crate::trace::{Trace, Verdict, What};
 
 const CHAT: &str = lmk_proto::group::CHAT;
+const OWN: &str = "own chat";
 
-/// What a member has counted, opened (with its kind) and lost.
+/// What a member has counted, opened (with its kind, its own chat messages apart, which chat does not show) and lost.
 #[derive(Default)]
 struct Member<'a> {
+    keys: BTreeMap<&'a Bytes, &'a Bytes>,
     counted: BTreeSet<(&'a Bytes, u64)>,
     opened: BTreeMap<(&'a Bytes, u64), &'a str>,
     lost: BTreeSet<(&'a Bytes, u64)>,
@@ -35,7 +37,7 @@ impl Member<'_> {
 
 /// Within a session, a kind other than chat is handed positions in increasing order, each after every counted position
 /// before it was opened as another kind or lost; chat shows each position once, in increasing order but for those it
-/// passed over (`missing`) before, and passes over nothing it does not name.
+/// passed over (`missing`) before, and passes over nothing it does not name but the member's own messages.
 pub fn kind_order(t: &Trace) -> Result<(), String> {
     let mut members: BTreeMap<usize, Member> = BTreeMap::new();
     for o in &t.0 {
@@ -48,7 +50,12 @@ pub fn kind_order(t: &Trace) -> Result<(), String> {
                 s.top.clear();
             }
             What::Read { m, group, position, verdict: Verdict::Counted { .. }, .. } => drop(members.entry(*m).or_default().counted.insert((group, *position))),
-            What::Opened { m, group, position, kind, .. } => drop(members.entry(*m).or_default().opened.insert((group, *position), kind)),
+            What::Roster { m, key, group, .. } => drop(members.entry(*m).or_default().keys.insert(group, key)),
+            What::Opened { m, group, position, kind, sender, .. } => {
+                let s = members.entry(*m).or_default();
+                let own = kind == CHAT && s.keys.get(group) == Some(&sender);
+                s.opened.insert((group, *position), if own { OWN } else { kind });
+            }
             What::Lost { m, group, positions } => members.entry(*m).or_default().lost.extend(positions.iter().map(|p| (group, *p))),
             What::Handed { m, group, kind, position } => {
                 let s = members.entry(*m).or_default();
@@ -94,7 +101,7 @@ mod tests {
     use crate::props::build::*;
 
     fn opened(position: u64, kind: &str) -> What {
-        What::Opened { m: 0, group: g(), position, kind: kind.into(), sender: key(1), generation: 0, plaintext: [0; 32] }
+        What::Opened { m: 0, group: g(), position, kind: kind.into(), sender: key(1), plaintext: [0; 32] }
     }
 
     fn handed(position: u64) -> What {
@@ -135,5 +142,8 @@ mod tests {
         assert!(kind_order(&trace(unpassed)).unwrap_err().contains("not having passed it over"));
         let other = [counted_at(&[1, 2, 3]), vec![(1, shown(1, &[])), (1, opened(2, "lost")), (2, shown(3, &[]))]].concat();
         assert!(kind_order(&trace(other)).is_ok(), "a core payload is not chat's");
+        let mine = What::Opened { m: 0, group: g(), position: 2, kind: CHAT.into(), sender: key(0), plaintext: [0; 32] };
+        let own = [vec![(0, roster(0, 1, &[0, 1]))], counted_at(&[1, 2, 3]), vec![(1, shown(1, &[])), (1, mine), (2, shown(3, &[]))]].concat();
+        assert!(kind_order(&trace(own)).is_ok(), "chat does not show the member's own messages");
     }
 }

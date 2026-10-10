@@ -18,7 +18,7 @@ pub fn strict_entries(t: &Trace) -> Result<(), String> {
     let mut counted: BTreeSet<(usize, &Bytes, u64)> = BTreeSet::new();
     for o in &t.0 {
         match &o.what {
-            What::Joined { m, group, start } => drop(cursor.insert((*m, group), *start)),
+            What::Joined { m, group, start, .. } => drop(cursor.insert((*m, group), *start)),
             What::Read { m, group, position, entry, epoch, verdict } => {
                 let g = short(group);
                 match cursor.get(&(*m, group)) {
@@ -77,25 +77,31 @@ pub fn forgery(t: &Trace) -> Result<(), String> {
 }
 
 /// A join answered ok starts at the only Add of the joiner's key since its last membership of the group, however
-/// many answers were lost on the way.
+/// many answers were lost on the way: since its last join, or the last Remove of its key, as of a leaf a join left
+/// stranded when it gave up.
 pub fn admission(t: &Trace) -> Result<(), String> {
     let mut adds: BTreeMap<(&Bytes, &Bytes), BTreeSet<u64>> = BTreeMap::new();
+    let mut removes: BTreeMap<(&Bytes, &Bytes), BTreeSet<u64>> = BTreeMap::new();
     for ((group, position), j) in judged(t) {
-        if let Verdict::Commit { added, .. } = j.verdict {
+        if let Verdict::Commit { added, removed, .. } = j.verdict {
             for key in added {
                 adds.entry((group, key)).or_default().insert(position);
+            }
+            for key in removed {
+                removes.entry((group, key)).or_default().insert(position);
             }
         }
     }
     let mut last: BTreeMap<(usize, &Bytes), u64> = BTreeMap::new();
     for o in &t.0 {
         let What::Join { m, key, group, answer: Answer::Position(start) } = &o.what else { continue };
-        let since = last.insert((*m, group), *start).unwrap_or(0);
+        let removed = removes.get(&(group, key)).and_then(|removes| removes.range(..*start).next_back()).copied().unwrap_or(0);
+        let since = last.insert((*m, group), *start).unwrap_or(0).max(removed);
         let ours: Vec<u64> = adds.get(&(group, key)).into_iter().flatten().copied().filter(|p| *p > since && *p <= *start).collect();
         if ours != [*start] {
             return Err(format!("m{m} joined {} at {start}, its key added at {ours:?}", short(group)));
         }
-        let joined = t.0.iter().any(|j| matches!(&j.what, What::Joined { m: n, group: g, start: s } if n == m && g == group && s == start));
+        let joined = t.0.iter().any(|j| matches!(&j.what, What::Joined { m: n, group: g, start: s, .. } if n == m && g == group && s == start));
         if !joined {
             return Err(format!("m{m} was answered it joined {} at {start}, but never did", short(group)));
         }
@@ -109,7 +115,7 @@ mod tests {
     use crate::props::build::*;
 
     fn joined(m: usize, start: u64) -> What {
-        What::Joined { m, group: g(), start }
+        What::Joined { m, key: key(m), group: g(), start }
     }
 
     #[test]
@@ -122,7 +128,7 @@ mod tests {
         assert!(strict_entries(&trace(skipping)).unwrap_err().contains("read 4 of 07 after 2"));
         let twice = [ok.clone(), vec![(3, read(0, 3, 1, counted(1)))]].concat();
         assert!(strict_entries(&trace(twice)).unwrap_err().contains("counted at 2 and 3"));
-        let opened = |m, position| What::Opened { m, group: g(), position, kind: "chat".into(), sender: key(0), generation: 0, plaintext: [0; 32] };
+        let opened = |m, position| What::Opened { m, group: g(), position, kind: "chat".into(), sender: key(0), plaintext: [0; 32] };
         assert!(strict_entries(&trace([ok.clone(), vec![(3, opened(1, 2))]].concat())).is_ok());
         assert!(strict_entries(&trace([ok, vec![(3, opened(1, 3))]].concat())).is_err());
     }
@@ -133,7 +139,7 @@ mod tests {
         let ok = vec![(0, forged(2, false)), (1, read(0, 2, 1, Verdict::Skipped)), (1, forged(3, true)), (2, read(0, 3, 1, counted(3)))];
         assert!(forgery(&trace(ok.clone())).is_ok());
         assert!(forgery(&trace(vec![(0, forged(2, false)), (1, read(0, 2, 1, commit(1)))])).unwrap_err().contains("took the forged entry"));
-        let opened = What::Opened { m: 0, group: g(), position: 3, kind: "chat".into(), sender: key(1), generation: 0, plaintext: [0; 32] };
+        let opened = What::Opened { m: 0, group: g(), position: 3, kind: "chat".into(), sender: key(1), plaintext: [0; 32] };
         assert!(forgery(&trace([ok, vec![(3, opened)]].concat())).is_err());
         let dropped = What::Dropped { m: 0, group: g(), reason: Dropped::Copied };
         assert!(forgery(&trace(vec![(1, dropped.clone())])).unwrap_err().contains("which it was not"));
@@ -150,5 +156,8 @@ mod tests {
         assert!(admission(&trace(twice)).unwrap_err().contains("added at [3, 4]"), "a stranded leaf at 3");
         let never = vec![(1, add(3, key(1))), (2, join(3))];
         assert!(admission(&trace(never)).unwrap_err().contains("never did"));
+        let remove = read(0, 4, 2, Verdict::Commit { committer: key(0), added: vec![], removed: vec![key(1)] });
+        let removed = vec![(1, add(3, key(1))), (1, remove), (1, add(5, key(1))), (2, joined(1, 5)), (2, join(5))];
+        assert!(admission(&trace(removed)).is_ok(), "the leaf a join gave up on was removed");
     }
 }

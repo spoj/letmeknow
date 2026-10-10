@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::reading::{Judged, Pos};
-use crate::{Entry, Event, Inner, Item, Lost, Member, Message, Node, SNAPSHOT_WAIT, STATE_ASK, State, get, message_key, now, put};
+use crate::{Entry, Event, Inner, Item, Lost, Member, Message, Node, Observation, SNAPSHOT_WAIT, STATE_ASK, State, get, message_key, now, put};
 
 /// What a group's kind took of its held messages, once it follows them.
 #[derive(Default, Serialize, Deserialize)]
@@ -149,6 +149,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
             put(&st.provider, &kept_key(gid, read), &item)?;
             taken.push(read);
         }
+        let kind = st.group(gid)?.mls.settings().kind;
+        if kind != lmk_proto::group::CHAT {
+            for position in &taken {
+                st.observe(|| Observation::Handed { group: Bytes(gid.to_vec()), kind: kind.clone(), position: *position });
+            }
+        }
         let kind = st.group_mut(gid)?.rec.kind.as_mut().unwrap();
         kind.read = read;
         let took = !taken.is_empty();
@@ -196,6 +202,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// member's, the positions of this session's messages.
     pub(crate) fn announced(&self, st: &mut State<P>, gid: &[u8], position: u64, by: Member, positions: Vec<u64>) -> Result<()> {
         let me = st.me(gid).to_vec();
+        if by.key.0 == me {
+            let positions = positions.clone();
+            st.observe(|| Observation::Announced { group: Bytes(gid.to_vec()), position, positions });
+        }
         st.group_mut(gid)?.rec.losses.insert(position, (by.key.clone(), positions.clone()));
         st.save(gid)?;
         let positions = if by.key.0 == me {

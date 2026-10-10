@@ -18,7 +18,7 @@ use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Inner, REREAD, State, Work, get, hex, put};
+use crate::{Dropped, Inner, Observation, REREAD, State, Work, get, hex, put};
 
 /// One membership client per service, sharing the session's transport.
 pub(crate) struct Clients {
@@ -90,7 +90,7 @@ pub(crate) fn empty(log: &[u8]) -> Head {
     Head { log: log.into(), length: 0, hash: head::start(log).into(), time: 0, sig: Bytes::default() }
 }
 
-fn log_key(id: &[u8]) -> Vec<u8> {
+pub(crate) fn log_key(id: &[u8]) -> Vec<u8> {
     [b"node/log/".as_slice(), id].concat()
 }
 
@@ -210,6 +210,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     if error.downcast_ref::<Refused>().is_some_and(|refused| refused.0 == "expired")
                         && self.lock().log(id).is_ok_and(|log| log.of == Of::Group)
                     {
+                        self.lock().observe(|| Observation::Dropped { group: Bytes(id.to_vec()), reason: Dropped::Retention });
                         self.work.send(Work::Gone(id.to_vec())).ok();
                     }
                     return Err(error);
@@ -252,6 +253,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         st.save_log(id)?;
         if !fresh.is_empty() {
+            if st.log(id)?.of == Of::Group {
+                let head = st.log(id)?.logged;
+                st.observe(|| Observation::Head { group: Bytes(id.to_vec()), head });
+            }
             self.check(st, id)?;
         }
         Ok(())

@@ -16,7 +16,7 @@ use n0_future::time::{Duration, sleep};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::{Event, G, Inner, State, Work, dropped, now, renaming};
+use crate::{Dropped, Event, G, Inner, Observation, State, Work, dropped, now, renaming};
 
 /// How often every group's duties run, besides as its log moves.
 pub(crate) const TIMER: Duration = Duration::from_secs(10 * 60);
@@ -83,6 +83,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 return Ok(());
             }
             if g.rec.leaving && g.mls.members().len() == 1 {
+                st.observe(|| Observation::Dropped { group: Bytes(gid.to_vec()), reason: Dropped::Forgotten });
                 drop(st);
                 self.gone(gid, None);
                 return Ok(());

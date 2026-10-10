@@ -181,7 +181,8 @@ pub enum ClientEvent {
     Settings { group: Bytes, settings: Settings, by: Described },
     Introduced { group: Bytes, by: Described, identity: Named, how: How },
     /// A chat message, in a group that carries chat, in position order: `missing`, the counted positions before it that
-    /// were passed over unopened. One that opens after later ones were shown comes when it opens, with no `missing`.
+    /// were passed over unopened. One that opens after later ones were shown comes when it opens, naming those passed
+    /// before it that no message named yet.
     Message { group: Bytes, id: String, position: u64, missing: Vec<u64>, from: Described, payload: Value },
     /// Counted positions a member can no longer open: this client's own, or another member's of this client's messages.
     Lost { group: Bytes, member: Described, positions: Vec<u64>, ids: Vec<String> },
