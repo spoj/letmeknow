@@ -836,12 +836,11 @@ async fn the_list_does_not_drop_a_device_just_linked() {
     assert_eq!(laptop.node.members(&gid.0).unwrap().len(), 3);
 }
 
-/// A device that missed the key message of the identity's current key reports the key lost while no device online has
-/// it, and gets it once one that has it is online.
+/// A new key reaches the key log only once another device's summary holds its key message.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_device_missing_the_current_key_asks_for_it_and_reports_it_lost() {
+async fn a_new_key_is_named_once_another_device_holds_it() {
     let relay = relay().await;
-    let dir = folder("missing-key");
+    let dir = folder("key-held");
     std::fs::create_dir_all(&dir).unwrap();
     let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
     let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
@@ -859,31 +858,66 @@ async fn a_device_missing_the_current_key_asks_for_it_and_reports_it_lost() {
     phone.node.shutdown().await.unwrap();
     drop((phone, phone_devices));
 
-    // Only the laptop sees the key message of the key that replaces the tablet's, then stops.
     laptop_devices.remove(&bob.id.0, &tablet_key.0).await.unwrap();
-    assert!(lists(&laptop.node, &bob, &["laptop", "phone"]).await.current() != &first);
-    laptop.node.shutdown().await.unwrap();
-    drop((laptop, laptop_devices));
+    let log = laptop.node.read_key_log(&bob).await.unwrap();
+    assert!(log.current() == &first && !log.dropped(&tablet_key.0), "no other device holds the new key yet");
 
-    let (mut phone, phone_devices) = stored_device(&relay, "phone", &dir.join("phone.db")).await;
-    let gid = devices_group(&phone.node);
-    phone_devices.duties(&gid.0).await.unwrap();
-    phone_devices.duties(&gid.0).await.unwrap();
-    phone.until(|e| matches!(e, Event::Warning { text, .. } if text.contains("does not hold its identity's current key")).then_some(())).await;
+    let (_phone, _phone_devices) = stored_device(&relay, "phone", &dir.join("phone.db")).await;
+    let log = lists(&laptop.node, &bob, &["laptop", "phone"]).await;
+    assert!(log.current() != &first && log.dropped(&tablet_key.0));
+}
 
-    // The laptop comes back: the phone asks it, holds the key, and so restates the list with its new name.
+/// A device that missed the key message of the identity's current key reports the key lost while no device online has
+/// it, and gets it once one that has it is online.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_missing_the_current_key_asks_for_it_and_reports_it_lost() {
+    let relay = relay().await;
+    let dir = folder("missing-key");
+    std::fs::create_dir_all(&dir).unwrap();
+    let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
+    let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
+    let (phone, phone_devices) = stored_device(&relay, "phone", &dir.join("phone.db")).await;
+    let (tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
+    let (desk, desk_devices) = stored_device(&relay, "desk", &dir.join("desk.db")).await;
+    let bob = laptop_devices.create("Bob", membership).await.unwrap();
+    for devices in [&phone_devices, &tablet_devices, &desk_devices] {
+        let link = lmk_proto::links::Invite::parse(&laptop_devices.invite(&bob.id.0).await.unwrap()).unwrap();
+        devices.join(&link).await.unwrap();
+        identified(devices).await;
+    }
+    let first = *lists(&laptop.node, &bob, &["desk", "laptop", "phone", "tablet"]).await.current();
+    let tablet_key = tablet_devices.key(&bob.id.0).unwrap();
+    tablet.node.shutdown().await.unwrap();
+    desk.node.shutdown().await.unwrap();
+    drop((desk, desk_devices));
+
+    // Only the laptop and the phone hold the key message of the key that replaces the tablet's, then stop.
+    laptop_devices.remove(&bob.id.0, &tablet_key.0).await.unwrap();
+    assert!(lists(&laptop.node, &bob, &["desk", "laptop", "phone"]).await.current() != &first);
+    for node in [&laptop.node, &phone.node] {
+        node.shutdown().await.unwrap();
+    }
+    drop((laptop, laptop_devices, phone, phone_devices));
+
+    let (mut desk, desk_devices) = stored_device(&relay, "desk", &dir.join("desk.db")).await;
+    let gid = devices_group(&desk.node);
+    desk_devices.duties(&gid.0).await.unwrap();
+    desk_devices.duties(&gid.0).await.unwrap();
+    desk.until(|e| matches!(e, Event::Warning { text, .. } if text.contains("does not hold its identity's current key")).then_some(())).await;
+
+    // The laptop comes back: the desk asks it, holds the key, and so restates the list with its new name.
     let (_laptop, _laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
-    phone_devices.rename("desk").await.unwrap();
+    desk_devices.rename("study").await.unwrap();
     tokio::time::timeout(WAIT, async {
         loop {
-            phone_devices.duties(&gid.0).await.unwrap();
-            let log = phone.node.read_key_log(&bob).await.unwrap();
-            if log.devices.iter().any(|device| device.name == "desk") {
+            desk_devices.duties(&gid.0).await.unwrap();
+            let log = desk.node.read_key_log(&bob).await.unwrap();
+            if log.devices.iter().any(|device| device.name == "study") {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-    }).await.expect("the phone takes the key and lists itself anew");
+    }).await.expect("the desk takes the key and lists itself anew");
 }
 
 /// A session whose leaf names an older revision writes its own as it starts.
