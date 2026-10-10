@@ -435,7 +435,7 @@ impl Plugin {
                 if spread.is_ok_and(|spread| spread["held_by"].as_array().is_some_and(|held| !held.is_empty())) {
                     self.send(command, &group, push);
                 } else {
-                    let error = anyhow::anyhow!("no other member online took the push's bundle, so the push is not sent: push again once one is online");
+                    let error = anyhow::anyhow!("no other member online took the push's bundle, so the push is not sent: only agent sessions keep git data, so push again once another agent session is online");
                     self.out.push(answer(&command, Err(error)));
                 }
             }

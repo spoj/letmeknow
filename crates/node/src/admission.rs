@@ -16,19 +16,25 @@ use lmk_proto::links::{Address, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Join};
 use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
-use n0_future::time::{Duration, timeout};
+use n0_future::task::spawn;
+use n0_future::{FuturesUnordered, StreamExt};
+use n0_future::time::{Duration, Instant, sleep_until, timeout};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
+use crate::logs::NOT_FOLLOWED;
 use crate::reading::Judged;
 use crate::{Event, G, INVITE_VALID, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, SNAPSHOT_WAIT, State, device_key_key, endpoint_id, get, now, put};
 
 /// How many members besides the inviter a link names, of those online that hold the invite's message.
 const LINK_MEMBERS: usize = 3;
-/// How long a joiner waits to reach the members it asks, all at once, and then for each one's answer.
+/// How long a joiner waits to reach each member it asks, all at once, and then for each one's answer.
 const DIAL_WAIT: Duration = Duration::from_secs(30);
 const JOIN_WAIT: Duration = Duration::from_secs(30);
+/// How long the inviter, whom a link names first, has to be reached before the other members it names are asked: so the
+/// inviter admits whom it invited when it is online.
+const INVITER_FIRST: Duration = Duration::from_secs(3);
 
 /// A joiner's KeyPackage, whose private keys openmls keeps, and the device key it is made with for a devices group.
 #[derive(Serialize, Deserialize)]
@@ -103,7 +109,8 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(self.ask(members, None, Some(opening.group.clone()), Some(identity), false).await?.0)
     }
 
-    /// Asks members in turn to admit this session, by an invite's secret or a group open to `identity`.
+    /// Asks members in turn, as each is reached, to admit this session, by an invite's secret or a group open to
+    /// `identity`.
     async fn ask(
         &self,
         members: Vec<(EndpointId, RelayUrl)>,
@@ -119,9 +126,11 @@ impl<P: Provider + Send + 'static> Node<P> {
         let (join, device_key) = {
             let mut st = self.inner.lock();
             st.speak(identity);
+            // One kept for the link read as the other kind, as altered, is not this join's: the Welcome is checked against
+            // the kind this join asks for.
             let kept = match get::<Joining>(&st.provider, &joining)? {
-                Some(kept) => kept,
-                None => {
+                Some(kept) if kept.device.is_some() == devices => kept,
+                _ => {
                     let device_key = devices.then(|| st.device_key()).transpose()?;
                     let session = device_key.as_ref().map_or(&st.session, |(_, session)| session);
                     let kept = Joining { key_package: Bytes(session.key_package(&st.provider)?), device: device_key.map(|(seed, _)| Bytes(seed.to_vec())) };
@@ -132,10 +141,26 @@ impl<P: Provider + Send + 'static> Node<P> {
             let device_key = kept.device.map(|seed| seed.0.try_into()).transpose().ok().context("a device key is 32 bytes")?;
             (Join { secret, group, key_package: kept.key_package }, device_key)
         };
-        let dialed = n0_future::join_all(members.iter().map(|(peer, relay)| timeout(DIAL_WAIT, self.inner.net().dial(*peer, relay.clone())))).await;
+        // Each dial is a task of its own, so it goes on, and times out, while a member reached earlier is asked.
+        let inviter_first = Instant::now() + if join.secret.is_some() { INVITER_FIRST } else { Duration::ZERO };
+        let mut dials: FuturesUnordered<_> = members
+            .into_iter()
+            .enumerate()
+            .map(|(i, (peer, relay))| {
+                let net = self.inner.net().clone();
+                spawn(async move {
+                    let dialed = timeout(DIAL_WAIT, net.dial(peer, relay.clone())).await;
+                    if i > 0 {
+                        sleep_until(inviter_first).await;
+                    }
+                    (peer, relay, dialed)
+                })
+            })
+            .collect();
         let mut refusal = anyhow::anyhow!("no member the invite names is online");
         let mut refused_by_all = true;
-        for ((peer, relay), dialed) in members.into_iter().zip(dialed) {
+        while let Some(dialed) = dials.next().await {
+            let (peer, relay, dialed) = dialed?;
             if !matches!(dialed, Ok(Ok(()))) {
                 tracing::debug!("{} is not online", peer.fmt_short());
                 refused_by_all = false;
@@ -166,13 +191,18 @@ impl<P: Provider + Send + 'static> Node<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Joins a group from the Welcome a member at `by` sent: a devices group with the device key `device_key`.
+    /// Joins a group from the Welcome a member at `by` sent: a devices group with the device key `device_key`, and only
+    /// then, as a link's kind is not authenticated.
     async fn welcomed(self: &Arc<Self>, admitted: Admitted, by: EndpointId, device_key: Option<[u8; 32]>) -> Result<Bytes> {
         let gid = {
             let mut st = self.lock();
             let st = &mut *st;
             let mls = Group::join(&st.provider, &admitted.welcome.0)?;
             ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
+            if (mls.settings().kind == DEVICES) != device_key.is_some() {
+                mls.delete(&st.provider)?;
+                bail!("the link was altered: it admits to a group of another kind than it says");
+            }
             let rec = Rec { position: admitted.position, start: admitted.position, expired: admitted.position, ..Rec::default() };
             let gid = st.add_group(mls, rec)?;
             if let Some(seed) = device_key {
@@ -208,6 +238,8 @@ fn address(key: [u8; 32], relay: &str) -> Address {
 /// The answer to a secret no rule admits by: whether it is unknown, used or expired is not told.
 const UNKNOWN: &str = "unknown, used or expired invite";
 const NOT_OPEN: &str = "it speaks as no identity the group is open to";
+const INVITER_LEFT: &str = "its inviter left the group";
+const FOR_ANOTHER: &str = "this invite is for another identity";
 
 /// Whether `g`, as it stands, admits a joiner by an invite, or else by an opening: checked when its request comes, and
 /// each time the commit that adds it is built. An invite dies when its inviter leaves the group.
@@ -216,7 +248,7 @@ fn admits(g: &G, joiner: &Credential, invite: &Option<Rule>) -> Result<()> {
     match invite {
         Some(rule) => {
             ensure!(now() < rule.expires && !g.mls.used(&rule.hash.0), UNKNOWN);
-            ensure!(members.iter().any(|m| m.key == rule.by.0) && !g.left(&rule.by.0), "its inviter left the group");
+            ensure!(members.iter().any(|m| m.key == rule.by.0) && !g.left(&rule.by.0), INVITER_LEFT);
         }
         None => ensure!(joiner.identity().is_some_and(|identity| g.mls.settings().open.iter().any(|named| named.id == identity.id)), NOT_OPEN),
     }
@@ -250,7 +282,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         admits(self.lock().group(&gid)?, &joiner, &invite)?;
         // Its identity's key log, read afresh, must list the device that certified it.
         if let Some(to) = to {
-            let identity = joiner.identity().filter(|identity| identity.id == to).context("this invite is for another identity")?;
+            let identity = joiner.identity().filter(|identity| identity.id == to).context(FOR_ANOTHER)?;
             match self.read_keys(identity).await?.verify(&joiner) {
                 Verdict::Verified { .. } => {}
                 Verdict::Unverified => bail!("its device is not on its identity's list"),
@@ -296,11 +328,21 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Some(asked) => timeout(SNAPSHOT_WAIT, asked).await.ok().and_then(Result::ok).flatten(),
             None => None,
         };
+        // The joiner is added, by an entry in the log: refusing it now would strand it, and it asks members for the state
+        // later.
         let doc = match state {
-            Some(state) => Some(self.state_file(gid, state).await?),
+            Some(state) => match self.state_file(gid, state).await {
+                Ok(link) => Some(link),
+                Err(error) => {
+                    self.warn(Some(gid), format!("admitting a member without the group's state: {error:#}"));
+                    None
+                }
+            },
             None => None,
         };
-        self.durable().await?;
+        if let Err(error) = self.durable().await {
+            self.warn(None, format!("saving this session's state: {error:#}"));
+        }
         Ok(Admitted { welcome: Bytes(welcome), position, doc })
     }
 }
@@ -336,8 +378,14 @@ impl<P: Provider + Send + 'static> Admit for Admitter<P> {
             match inner.admit_join(join).await {
                 Ok(admitted) => Answer::Ok(admitted),
                 Err(error) => {
-                    inner.warn(None, format!("refused a join: {error:#}"));
-                    Answer::Refused { refused: format!("{error:#}") }
+                    let refused = format!("{error:#}");
+                    // A joiner asks every member a link names, so routine refusals are many and no one's concern.
+                    if [UNKNOWN, NOT_OPEN, INVITER_LEFT, FOR_ANOTHER, NOT_FOLLOWED].contains(&refused.as_str()) {
+                        tracing::debug!("refused a join: {refused}");
+                    } else {
+                        inner.warn(None, format!("refused a join: {refused}"));
+                    }
+                    Answer::Refused { refused }
                 }
             }
         })

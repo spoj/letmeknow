@@ -150,6 +150,23 @@ fn a_peer_s_first_summary_of_a_group_is_answered_with_ours() {
     assert!(hellos(&p.poll(1_600)).is_empty());
 }
 
+/// A peer removed and added again on the same connection forgot the group between: its first summary of the new
+/// membership draws ours again too.
+#[test]
+fn a_peer_s_first_summary_after_its_removal_is_answered_with_ours() {
+    let mut p = member(Ranges::default());
+    p.connect(key(1), served(&[G]), DEBOUNCE);
+    p.poll(DEBOUNCE);
+    p.frame(&key(1), &hello(vec![summary(G, 10, r(&[(1, 10)]), Ranges::default())]), 1_100);
+    p.poll(1_100);
+    p.removed(&id(G), &key(1));
+    p.served(&key(1), served(&[]), 1_200);
+    p.served(&key(1), served(&[G]), 2_000);
+    assert_eq!(hellos(&p.poll(2_000)), vec![(key(1), vec![G])]);
+    p.frame(&key(1), &hello(vec![summary(G, 10, Ranges::default(), Ranges::default())]), 2_500);
+    assert_eq!(hellos(&p.poll(2_500)), vec![(key(1), vec![G])]);
+}
+
 #[test]
 fn summaries_are_saved_whatever_the_gate_but_used_only_while_it_admits() {
     let mut p = member(r(&[(4, 4)]));

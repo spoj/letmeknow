@@ -21,6 +21,9 @@ pub struct Described {
     pub device: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub you: bool,
+    /// Its name is a contact's, whom it does not speak as: "not your Bob".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<Known>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,11 +119,20 @@ impl Describer {
             how: how.clone(),
             name: self.members.iter().find(|m| &m.key == by).map(|adder| adder.name.clone()),
         });
+        // Speaking as no identity, it answers to the name all the same.
+        let speaks = member.identity.as_ref().filter(|claim| claim.error.is_none()).map(|claim| &claim.identity.id);
+        let own = speaks.is_some_and(|id| self.identities.iter().any(|(identity, _)| &identity.id == id));
+        let named: Vec<_> = self.contacts.iter().filter(|(_, c)| c.name.eq_ignore_ascii_case(&member.name)).collect();
+        let warning = named
+            .first()
+            .filter(|_| !own && !named.iter().any(|(id, _)| Some(id) == speaks))
+            .map(|(_, c)| format!("not your {}", c.name));
         Described {
             name: Some(member.name.clone()),
             fp: Some(fp(&member.key.0)),
             device: Some(member.device_name.clone()),
             you: member.key == self.me,
+            warning,
             identity: member.identity.as_ref().map(|claim| self.known(claim)),
             added_by,
             iroh: None,
@@ -182,11 +194,6 @@ impl Describer {
         known
     }
 
-    /// The name this identity gives another: its contact name, else the other's own claim.
-    pub(crate) fn display_name(&self, claim: &Claim) -> String {
-        let contact = self.contacts.iter().find(|(id, _)| *id == claim.identity.id);
-        contact.map_or_else(|| claim.name.clone(), |(_, c)| c.name.clone())
-    }
 }
 
 /// Whether a described member answers to `name`, in any case: its name, the first word of it, or its identity's name
@@ -234,8 +241,20 @@ mod tests {
         };
         let shown = serde_json::to_value(describer.describe(&bob)).unwrap();
         let identity = json!({ "id": "FA", "name": "Bob", "how": "unknown", "claim": true, "warning": "not your Bob", "introduced": [{ "by": { "name": "Ann" }, "name": "Robert (Acme)" }] });
-        assert_eq!(shown, json!({ "name": "Bob", "fp": crate::fp(&[2]), "device": "laptop", "identity": identity }));
+        assert_eq!(shown, json!({ "name": "Bob", "fp": crate::fp(&[2]), "device": "laptop", "warning": "not your Bob", "identity": identity }));
+        // A session name copying a contact's is flagged too, speaking as no identity; the contact's own session is not.
+        let anonymous = serde_json::to_value(describer.describe(&member("bob", 4, None))).unwrap();
+        assert_eq!(anonymous["warning"], "not your Bob");
+        let real = serde_json::to_value(describer.describe(&member("Bob", 5, Some((30, "Robert"))))).unwrap();
+        assert!(real.get("warning").is_none() && real["identity"]["how"] == "verified", "{real}");
+        let mut failing = member("Bob", 6, Some((30, "Robert")));
+        failing.identity.as_mut().unwrap().error = Some("a bad certificate".into());
+        assert_eq!(serde_json::to_value(describer.describe(&failing)).unwrap()["warning"], "not your Bob", "a claim that fails proves nothing");
         let peer = Member { key: Bytes::default(), ..member("", 3, None) };
         assert_eq!(serde_json::to_value(describer.describe(&peer)).unwrap(), json!({ "iroh": "Aw" }));
+        // Of two contacts named alike, either's session is theirs.
+        let other = Contact { name: "bob".into(), how: contacts::How::Verified, by: None, at: 0, rest: Default::default() };
+        let alike = Describer { contacts: vec![(Bytes(vec![40]), other), describer.contacts[0].clone()], ..describer };
+        assert!(serde_json::to_value(alike.describe(&member("Bob", 5, Some((30, "Robert"))))).unwrap().get("warning").is_none());
     }
 }

@@ -67,7 +67,8 @@ const MEMBER_WAIT: Duration = Duration::from_secs(5);
 const REREAD: Duration = Duration::from_secs(5 * 60);
 /// How long a member admitting a joiner waits for the state of the group's kind.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
-/// How long a session whose kind is behind waits before it asks a member for the kind's state again, in milliseconds.
+/// How long a session whose kind is behind waits before it asks the members online for the kind's state again, in
+/// milliseconds.
 const STATE_ASK: u64 = 60 * 1000;
 
 pub struct Config {
@@ -484,6 +485,8 @@ pub(crate) struct State<P> {
     /// What the current step did, told `Config::observe` once it commits; kept only while there is one.
     observed: Vec<Observation>,
     observing: bool,
+    /// What the current step tells the session, sent once it commits.
+    events: Vec<Event>,
     session: Session,
     /// The device's name, which its credential names in its devices groups, where this is a device's node.
     device: Option<String>,
@@ -541,8 +544,10 @@ impl<P: Provider + Send + 'static> DerefMut for Step<'_, P> {
 impl<P: Provider + Send + 'static> Drop for Step<'_, P> {
     fn drop(&mut self) {
         self.guard.tell_peers();
+        // Nothing a step produced may leave unless it committed, and its state in memory no longer matches storage.
         if let Err(error) = self.guard.provider.commit() {
-            tracing::error!("committing a step: {error:#}");
+            tracing::error!("committing a step: {error:#}; stopping");
+            std::process::abort();
         }
         if std::mem::take(&mut self.guard.scrub)
             && let Err(error) = self.guard.provider.scrub()
@@ -553,6 +558,9 @@ impl<P: Provider + Send + 'static> Drop for Step<'_, P> {
             for observation in std::mem::take(&mut self.guard.observed) {
                 observe(observation);
             }
+        }
+        for event in std::mem::take(&mut self.guard.events) {
+            self.inner.events.send(event).ok();
         }
         let out = std::mem::take(&mut self.guard.out);
         if !out.is_empty() {
@@ -722,8 +730,7 @@ impl<P: Provider> State<P> {
         let g = self.groups.get(gid);
         let added = g.and_then(|g| {
             let added = g.mls.added().iter().rev().find(|added| added.member.key == credential.key)?;
-            let by = g.mls.members().into_iter().find(|m| m.key == added.by.key.0);
-            Some((Bytes(by.map(|by| by.key).unwrap_or_default()), added.how.clone().unwrap_or(How::Invite)))
+            Some((added.by.key.clone(), added.how.clone().unwrap_or(How::Invite)))
         });
         let claim = credential.identity().map(|identity| self.claim(&credential, identity));
         let device_name = claim.as_ref().and_then(|(_, device)| device.clone()).unwrap_or_default();
@@ -943,8 +950,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Starts a step.
     pub(crate) fn lock(&self) -> Step<'_, P> {
         let guard = self.state.lock().unwrap();
+        // A step outside a transaction could commit half of what it does.
         if let Err(error) = guard.provider.begin() {
-            tracing::error!("starting a step: {error:#}");
+            tracing::error!("starting a step: {error:#}; stopping");
+            std::process::abort();
         }
         Step { guard, inner: self }
     }

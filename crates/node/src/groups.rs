@@ -128,7 +128,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.dial_all();
         }
         let group = Bytes(gid.to_vec());
-        let st = self.lock();
+        let mut st = self.lock();
         let by = by.and_then(|by| st.member(gid, &by));
         if gone {
             drop(st);
@@ -147,16 +147,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for member in &added {
             if let Some(member) = st.member(gid, member) {
                 let event = Event::Joined { group: group.clone(), member, by: by.clone(), how: how.clone(), introduces, label: label.clone() };
-                self.events.send(event).ok();
+                st.events.push(event);
             }
         }
         for member in &removed {
             if let Some(member) = st.member(gid, member) {
-                self.events.send(Event::Left { group: group.clone(), member, by: by.clone() }).ok();
+                st.events.push(Event::Left { group: group.clone(), member, by: by.clone() });
             }
         }
         if settings && let Ok(g) = st.group(gid) {
-            self.events.send(Event::Settings { group, settings: g.mls.settings(), by }).ok();
+            let settings = g.mls.settings();
+            st.events.push(Event::Settings { group, settings, by });
         }
     }
 

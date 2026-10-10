@@ -62,7 +62,7 @@ pub async fn listen(
     config: session::Config,
     home: &Path,
     network: Network,
-    print: impl FnMut(String),
+    print: impl FnMut(String) -> std::io::Result<()>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let format = home.join("format");
@@ -80,11 +80,13 @@ pub async fn listen(
     if !device_file.exists() {
         Device::new(&gethostname::gethostname().to_string_lossy()).save(&device_file)?;
     }
+    let db = store::open(&config.dir.join("session.db"))?;
+    let name = session::Session::name(&db, &config)?;
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
     let kinds = [lmk_proto::group::CHAT.to_owned()].into_iter().chain(kinds::discover(&config.plugins).into_keys()).collect();
-    let node_config = node_config(&network, home, &config.name, None, config.dir.join("files"), kinds);
+    let node_config = node_config(&network, home, &name, None, config.dir.join("files"), kinds);
     let (node, events) = Node::start(provider, node_config).await?;
-    let session = session::Session::open(config, node, home, network, inbound).await?;
+    let session = session::Session::open(config, (db, name), node, home, network, inbound).await?;
     session::run(session, queue, events, print, shutdown).await
 }
 

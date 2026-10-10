@@ -37,7 +37,7 @@ impl Default for Policy {
         Policy {
             max_entry: 1 << 20,
             max_log_id: 64,
-            appends_per_minute: 60,
+            appends_per_minute: 600,
             page_bytes: 4 << 20,
             retention: Duration::from_secs(365 * 24 * 3600),
         }
