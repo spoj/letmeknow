@@ -1,38 +1,40 @@
 //! One member's session over lmk-core, lmk-net and lmk-membership: its groups and their logs, its held messages and
-//! files, the invites it shares and the joiners it admits, and its members' identities: their key logs and certificates. A group's kind sees its
-//! content through the channels here (held and live messages, files, its log, and a state link for
-//! joiners), and nothing of the rest; the core reads only its own payloads (`Control`). The devices kind (`devices`) is
-//! built on those channels. It stores everything through the core's `Provider`, so the same code runs natively (SQLite)
-//! and in the browser (memory the web client persists).
+//! files, the invites it shares and the joiners it admits, and its members' identities: their key logs and certificates.
+//! A group's kind sees its content through the channels here (held messages in log order, live ones, files, and a state
+//! link for joiners), and nothing of the rest; the core reads only its own payloads (`Control`). The devices kind
+//! (`devices`) is built on those channels. It stores everything through the core's `Provider`, so the same code runs
+//! natively (SQLite) and in the browser (memory the web client persists), one transaction per step (`Step`): nothing a
+//! step produces leaves the node before its transaction commits.
 
 pub mod devices;
 mod groups;
-mod kindlog;
+mod kind;
 mod logs;
+mod reading;
+mod sending;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::tls::CaTlsConfig;
 use iroh::{EndpointId, RelayMap, RelayUrl, SecretKey};
 use lmk_core::device::Device;
-use lmk_core::group::{self as core, Change, Group, Session, Window};
+use lmk_core::group::{self as core, Change, Group, Session};
 use lmk_core::identity::{KeyLog, certified, check};
 use lmk_membership::Contradiction;
 use lmk_core::provider::Provider;
 use lmk_membership::Refused;
 use lmk_net::{Net, Network};
-use lmk_proto::group::{
-    CHAT, Control, Credential, DEVICES, How, INTRODUCE_REVISION, IdentityRef, Leaf, Opening, RENAME_REVISION, REVISION, Reason, Refusal, Settings, held_by_type,
-    type_of,
-};
+use lmk_proto::group::{Control, Credential, DEVICES, How, IdentityRef, Leaf, Opening, REVISION, Settings};
 use lmk_proto::identity::Envelope;
 use lmk_proto::links::{Address, FileLink, Invite, RELAY};
-use lmk_proto::peer::{Admitted, Frame, Join, KindLog as LogRef};
+use lmk_proto::peer::{Admitted, Frame, Join};
 use lmk_proto::{Answer, Bytes};
+use n0_future::boxed::BoxFuture;
 use n0_future::task::{JoinHandle, spawn};
 use n0_future::time::{Duration, sleep, timeout};
 use serde::de::DeserializeOwned;
@@ -47,10 +49,10 @@ pub use lmk_proto::clock::now;
 
 /// How often a session replaces its keys in each group.
 const KEY_UPDATE: Duration = Duration::from_secs(24 * 60 * 60);
-/// How long `send` waits for the members it wrote to.
-const RECEIPT_WAIT: Duration = Duration::from_secs(5);
-/// How long a member gathers the messages it gives up before it reports them.
-const REPORT_WAIT: Duration = Duration::from_secs(1);
+/// How long `send` waits for its entry to count before it answers that the send is pending.
+const SEND_WAIT: Duration = Duration::from_secs(5);
+/// How long some waits for other members last: for those online to hold a file, for added members' certificates.
+const MEMBER_WAIT: Duration = Duration::from_secs(5);
 /// How often members not connected are dialed again.
 const REDIAL: Duration = Duration::from_secs(10);
 /// How often connected members sync their groups again.
@@ -66,8 +68,7 @@ const CERTIFICATE_GRACE: u64 = 60 * 1000;
 const FETCH_TRIES: u32 = 12;
 /// How long a member admitting a joiner waits for the state of the group's kind.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
-/// How long a session behind its group's kind log waits before it asks a member for the kind's state again, in
-/// milliseconds.
+/// How long a session whose kind is behind waits before it asks a member for the kind's state again, in milliseconds.
 const STATE_ASK: u64 = 60 * 1000;
 const COMMIT_TRIES: u32 = 5;
 /// How long an invite is valid, in milliseconds.
@@ -92,10 +93,15 @@ pub struct Config {
     pub disk: Option<Arc<dyn Disk>>,
     /// The largest file fetched without being asked.
     pub file_limit: u64,
-    pub window: Window,
     /// The kinds this session supports, `chat` among them.
     pub kinds: Vec<String>,
+    /// Where committed steps are not durable yet when they commit, as in the browser: makes them so, before anything
+    /// they produced leaves the node.
+    pub durable: Option<Durable>,
 }
+
+/// Makes the steps committed so far durable.
+pub type Durable = Arc<dyn Fn() -> BoxFuture<Result<()>> + Send + Sync>;
 
 /// A group member, from its leaf and credential, and its certificate checked against its identity's key log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,19 +133,21 @@ pub struct Claim {
     pub added_by_device: Option<String>,
 }
 
-/// A message held for the group: a held payload of its kind, or a request to leave.
+/// A held message of the group, opened: a payload of its kind, or one of the core's.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     pub id: Bytes,
     pub group: Bytes,
     pub epoch: u64,
+    /// Its entry's position in the group's log.
+    pub position: u64,
     /// When it reached this session, in milliseconds since the Unix epoch.
     pub at: u64,
     pub sender: Member,
     pub payload: Value,
 }
 
-/// An entry of the kind's log, taken: its position, and the held message it names.
+/// A held message of the kind, at its position in the group's log.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
     pub position: u64,
@@ -148,11 +156,25 @@ pub struct Entry {
     pub payload: Value,
 }
 
-/// Who held a message, and who refused it, as `send` waited.
-#[derive(Clone, Debug, Default)]
-pub struct Delivery {
-    pub held: Vec<Member>,
-    pub refused: Vec<(Member, Reason)>,
+/// A held send: its message's id, and its entry's position once that counts; none while the send is pending.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sent {
+    pub id: Bytes,
+    pub position: Option<u64>,
+}
+
+/// Why a held send failed: the membership service certainly did not take it.
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    /// Nothing reached the service.
+    #[error("unavailable: the group's membership service could not be reached")]
+    Unavailable,
+    #[error("rate: the group's membership service refused more appends for now")]
+    Rate,
+    #[error("size: {0}")]
+    Size(String),
+    #[error("the group's membership service refused: {0}")]
+    Refused(String),
 }
 
 /// What this session sent that no other member holds yet.
@@ -192,7 +214,7 @@ pub enum Event {
         settings: Settings,
         by: Member,
     },
-    /// A held payload of the group's kind.
+    /// A held payload of the group's kind, opened; never one of this session's own.
     Message(Message),
     /// A live payload of the group's kind: not held.
     Live {
@@ -214,7 +236,7 @@ pub enum Event {
         from: Member,
         data: Vec<u8>,
     },
-    /// Entries of the kind's log were taken (see `Node::entries`).
+    /// Held messages were kept for the kind, in log order (see `Node::entries`).
     Logged {
         group: Bytes,
     },
@@ -230,17 +252,11 @@ pub enum Event {
         name: String,
         how: How,
     },
-    /// A member took a message this session sent, after `send` stopped waiting.
-    Held {
+    /// A send that `send` answered as pending counts now: `id` as `send` answered it.
+    Sent {
         group: Bytes,
         id: Bytes,
-        by: Member,
-    },
-    /// A member reports that it gave up messages this session sent, after `send` stopped waiting.
-    Refused {
-        group: Bytes,
-        by: Member,
-        messages: Vec<Refusal>,
+        position: u64,
     },
     /// A file is held whole.
     File([u8; 32]),
@@ -265,8 +281,7 @@ impl Event {
             | Event::Logged { group }
             | Event::Snapshot { group, .. }
             | Event::Introduced { group, .. }
-            | Event::Held { group, .. }
-            | Event::Refused { group, .. } => Some(group),
+            | Event::Sent { group, .. } => Some(group),
             Event::Message(message) => Some(&message.group),
             Event::Warning { group, .. } => group.as_ref(),
             Event::File(_) => None,
@@ -274,38 +289,33 @@ impl Event {
     }
 }
 
-/// A group's own record, beside its MLS state and its logs.
+/// A group's own record, beside its MLS state and its log.
 #[derive(Default, Serialize, Deserialize)]
 struct Rec {
-    /// The last position of its log applied.
+    /// The last position of its log read and judged.
     position: u64,
-    items: Vec<Item>,
-    /// Messages this session could not open, so that sync does not offer them again, and those from before it joined
-    /// that the member that admitted it held, as of epoch 0.
-    given_up: Vec<(u64, Bytes)>,
-    /// Those it gave up and has not reported to the group yet.
-    unreported: Vec<Refusal>,
-    /// The newest epoch of the messages it dropped after `keep`: what it lacks up to there, it may have had, and does
-    /// not report.
+    /// The position this session started after: the Add that brought it in, or 0 for the group's creator.
+    start: u64,
+    /// Positions up to here were read longer than H ago, and what this session kept of them is gone.
     expired: u64,
+    /// Counted positions not opened yet, nor lost: their epoch, and when their entry was read.
+    unopened: BTreeMap<u64, (u64, u64)>,
+    /// This session's held sends whose entries have not counted yet, oldest first.
+    sends: Vec<Bytes>,
     pending: Vec<Pending>,
     /// File links, with when they were linked: those the kind holds (its files added, and those its held messages
-    /// link) and states handed to or by this session. Each is held for the group's `keep`.
+    /// link) and states handed to or by this session. Each is held for the group's H.
     files: Vec<(String, u64)>,
     /// The state handed to or by this session last, held however old.
     state: Option<String>,
     /// The files the kind links now, held while it does.
     links: Vec<String>,
-    /// The kind's log, once the kind follows it.
-    log: Option<kindlog::KindLog>,
-    /// The logs of the kind's order this session reads from where it is, in order; the last is current.
-    kind_logs: Vec<LogRef>,
-    /// The invites shared with the group, kept for `keep` after they expire.
+    /// What the kind took of the group's held messages, once it follows them.
+    kind: Option<kind::Kind>,
+    /// The invites shared with the group, kept for H after they expire.
     invites: Vec<Rule>,
-    /// The session keys of the members this session ended the kind's log to remove, until it applies a commit that
-    /// removes them: it removes them again as it starts and at each resync, as after a crash before posting the commit.
-    #[serde(default)]
-    removing: Vec<Bytes>,
+    /// Counted `leave`s: each sender's key, and the epoch it was sealed in; kept until moot.
+    leaves: Vec<(Bytes, u64)>,
 }
 
 /// An invite, as its inviter shared it with the group.
@@ -325,37 +335,37 @@ impl Rec {
         self.files.push((link, now()));
     }
 
-    /// The files this session holds for the group: those linked within `keep`, the latest state, and those the kind
-    /// links now.
-    fn held(&self, keep: u32) -> Vec<FileLink> {
-        let since = now().saturating_sub(keep as u64 * 24 * 3600 * 1000);
+    /// The files this session holds for the group: those linked within H, the latest state, and those the kind links
+    /// now.
+    fn held(&self, carry: u32) -> Vec<FileLink> {
+        let since = now().saturating_sub(days(carry));
         let linked = self.files.iter().filter(|(_, at)| *at >= since).map(|(link, _)| link).chain(&self.state);
         linked.chain(&self.links).filter_map(|link| FileLink::parse(link).ok()).collect()
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct Item {
-    epoch: u64,
-    id: Bytes,
-    at: u64,
-    /// Its place in the kind's log, once an entry there named it.
-    position: Option<u64>,
+/// H, in milliseconds.
+fn days(days: u32) -> u64 {
+    days as u64 * 24 * 3600 * 1000
 }
 
 pub(crate) struct G {
     mls: Group,
     rec: Rec,
-    /// Ciphertexts from epochs this session has not reached.
-    future: Vec<Vec<u8>>,
-    /// The position at which this session's own commit was last applied.
-    own_at: Option<u64>,
+    /// Ciphertexts that came before their entries were read: of the current epoch or the next.
+    early: Vec<Vec<u8>>,
     /// When this session last asked a member for the kind's state, or was handed one, in milliseconds.
     asked: u64,
+    /// The wait before the commit that deletes an epoch's keys while this session lacks some of its messages.
+    wait: Option<reading::Wait>,
 }
 
 pub(crate) struct State<P> {
     provider: P,
+    /// What the current step produced for the peers, sent once it commits.
+    out: Vec<Out>,
+    /// The current step deleted what should leave no copy: scrub once it commits.
+    scrub: bool,
     session: Session,
     /// The session's own name, which its credential names in its groups.
     name: String,
@@ -373,8 +383,57 @@ pub(crate) struct State<P> {
     ahead: BTreeMap<(Vec<u8>, Vec<u8>), Envelope>,
     /// Members connected to this session without a valid certificate, by session key: since when.
     uncertified: BTreeMap<Vec<u8>, u64>,
-    /// `send`s waiting for receipts.
-    waiters: HashMap<[u8; 32], mpsc::UnboundedSender<(EndpointId, Option<Reason>)>>,
+    /// `send`s waiting for their entries to count, by the id they started with.
+    waiters: HashMap<Vec<u8>, Vec<oneshot::Sender<sending::Outcome>>>,
+}
+
+/// What a step produced for the peers.
+pub(crate) enum Out {
+    /// A held message whose entry counts, or a live one, to the members online.
+    Push { group: Vec<u8>, ciphertext: Vec<u8> },
+    Frame { peer: EndpointId, frame: Frame },
+    /// This session's state of a group changed: its peers hear.
+    Changed(Vec<u8>),
+    /// This session serves a peer a group anew: they sync it again.
+    Served { peer: EndpointId, group: Vec<u8> },
+}
+
+/// One step: the state, locked, with a transaction open on its storage; committed when the step ends, and only then
+/// what it produced goes out.
+pub(crate) struct Step<'a, P: Provider + Send + 'static> {
+    guard: MutexGuard<'a, State<P>>,
+    inner: &'a Inner<P>,
+}
+
+impl<P: Provider + Send + 'static> Deref for Step<'_, P> {
+    type Target = State<P>;
+
+    fn deref(&self) -> &State<P> {
+        &self.guard
+    }
+}
+
+impl<P: Provider + Send + 'static> DerefMut for Step<'_, P> {
+    fn deref_mut(&mut self) -> &mut State<P> {
+        &mut self.guard
+    }
+}
+
+impl<P: Provider + Send + 'static> Drop for Step<'_, P> {
+    fn drop(&mut self) {
+        if let Err(error) = self.guard.provider.commit() {
+            tracing::error!("committing a step: {error:#}");
+        }
+        if std::mem::take(&mut self.guard.scrub)
+            && let Err(error) = self.guard.provider.scrub()
+        {
+            self.inner.warn(None, format!("{error:#}"));
+        }
+        let out = std::mem::take(&mut self.guard.out);
+        if !out.is_empty() {
+            self.inner.outbox.send(out).ok();
+        }
+    }
 }
 
 pub(crate) enum Work {
@@ -390,8 +449,6 @@ pub(crate) enum Work {
     },
     /// A log to read from its service.
     Read(Vec<u8>),
-    /// A log to follow at its service.
-    Follow(Vec<u8>),
     Remove {
         group: Vec<u8>,
         key: Vec<u8>,
@@ -413,8 +470,10 @@ pub(crate) enum Work {
         group: Vec<u8>,
         by: EndpointId,
     },
-    /// Messages were given up: report them in a moment.
-    Report(Vec<u8>),
+    /// Held sends of a group to append.
+    Send(Vec<u8>),
+    /// A group waits before a commit: read on once the wait is over.
+    Wait(Vec<u8>),
     Net(lmk_net::Event),
 }
 
@@ -429,14 +488,18 @@ pub(crate) struct Inner<P> {
     follows: Mutex<HashMap<Vec<u8>, JoinHandle<()>>>,
     relay: RelayUrl,
     file_limit: u64,
-    window: Window,
     kinds: Vec<String>,
     events: mpsc::UnboundedSender<Event>,
     work: mpsc::UnboundedSender<Work>,
+    /// What steps produced for the peers, in order, sent once durable.
+    outbox: mpsc::UnboundedSender<Vec<Out>>,
+    durable: Option<Durable>,
     committing: tokio::sync::Mutex<()>,
-    /// Woken whenever a kind's log is applied further, for appends waiting to catch up.
+    /// Woken whenever a group's log is read further, for sends waiting to reach its head.
     advanced: tokio::sync::Notify,
     reading: Mutex<HashSet<Vec<u8>>>,
+    /// The groups whose held sends are being appended.
+    sending: Mutex<HashSet<Vec<u8>>>,
     /// The removals under way, by group and member key.
     removing: Mutex<HashSet<(Vec<u8>, Vec<u8>)>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -473,10 +536,6 @@ fn kind_key(key: &str) -> Vec<u8> {
 
 fn message_key(id: &[u8]) -> Vec<u8> {
     [b"node/message/".as_slice(), id].concat()
-}
-
-fn ciphertext_key(id: &[u8]) -> Vec<u8> {
-    [b"node/ciphertext/".as_slice(), id].concat()
 }
 
 fn endpoint_id(key: &[u8]) -> Option<EndpointId> {
@@ -626,7 +685,7 @@ impl<P: Provider> State<P> {
     fn add_group(&mut self, mls: Group, rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
         self.add_log(&gid, logs::Log::new(logs::Of::Group, mls.settings().membership, rec.position))?;
-        self.groups.insert(gid.clone(), G { mls, rec, future: Vec::new(), own_at: None, asked: 0 });
+        self.groups.insert(gid.clone(), G { mls, rec, early: Vec::new(), asked: 0, wait: None });
         self.save(&gid)?;
         self.save_groups()?;
         Ok(gid)
@@ -677,10 +736,11 @@ impl<P: Provider + Send + 'static> Node<P> {
         for gid in get::<Vec<Bytes>>(&provider, b"node/groups")?.unwrap_or_default() {
             let mls = Group::load(&provider, &gid.0)?;
             let rec: Rec = get(&provider, &rec_key(&gid.0))?.context("a group without its record")?;
-            groups.insert(gid.0, G { mls, rec, future: Vec::new(), own_at: None, asked: 0 });
+            groups.insert(gid.0, G { mls, rec, early: Vec::new(), asked: 0, wait: None });
         }
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
+        let (outbox, outbox_rx) = mpsc::unbounded_channel();
         let mut held: Vec<Envelope> = get(&provider, b"node/certificates")?.unwrap_or_default();
         held.extend(get::<Vec<Envelope>>(&provider, b"node/member-certificates")?.unwrap_or_default());
         let certificates = held
@@ -692,6 +752,8 @@ impl<P: Provider + Send + 'static> Node<P> {
             .collect();
         let state = State {
             provider,
+            out: Vec::new(),
+            scrub: false,
             name: session.credential.name.clone(),
             device: config.device.as_ref().map(|device| device.name.clone()),
             session,
@@ -710,13 +772,15 @@ impl<P: Provider + Send + 'static> Node<P> {
             follows: Mutex::default(),
             relay: config.relay.clone(),
             file_limit: config.file_limit,
-            window: config.window,
             kinds: config.kinds,
             events,
             work: work.clone(),
+            outbox,
+            durable: config.durable,
             committing: tokio::sync::Mutex::new(()),
             advanced: tokio::sync::Notify::new(),
             reading: Mutex::default(),
+            sending: Mutex::default(),
             removing: Mutex::default(),
             tasks: Mutex::default(),
             contradictions: Mutex::default(),
@@ -738,8 +802,9 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
         });
         inner.spawn(inner.clone().drive(work_rx));
+        inner.spawn(inner.clone().send_out(outbox_rx));
         let (gids, followed): (Vec<Vec<u8>>, Vec<Vec<u8>>) = {
-            let st = inner.state.lock().unwrap();
+            let st = inner.lock();
             let followed = st.logs.iter().filter(|(_, log)| !matches!(log.of, logs::Of::Identity(_))).map(|(id, _)| id.clone());
             (st.groups.keys().cloned().collect(), followed.collect())
         };
@@ -747,7 +812,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             inner.follow(log);
         }
         {
-            let mut st = inner.state.lock().unwrap();
+            let mut st = inner.lock();
             let identities: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
                 logs::Of::Identity(id) => Some(id.clone()),
                 _ => None,
@@ -759,18 +824,23 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
         }
         {
-            // A session removed by a commit it applied before it stopped is told so now.
-            let st = inner.state.lock().unwrap();
+            // A session removed by a commit it applied before it stopped is told so now; its sends go on.
+            let st = inner.lock();
             for gid in &gids {
-                if !st.group(gid)?.mls.active() {
+                let g = st.group(gid)?;
+                if !g.mls.active() {
                     inner.work.send(Work::Gone(gid.clone())).ok();
-                } else if let Err(error) = inner.leavers(&st, gid) {
+                    continue;
+                }
+                if let Err(error) = inner.leavers(&st, gid) {
                     inner.warn(Some(gid), format!("{error:#}"));
+                }
+                if !g.rec.sends.is_empty() {
+                    inner.work.send(Work::Send(gid.clone())).ok();
                 }
             }
         }
         inner.spawn(inner.clone().resume(gids));
-        inner.spawn(inner.clone().finish_removals());
         inner.spawn(inner.clone().redial());
         Ok((Node { inner }, events_rx))
     }
@@ -788,7 +858,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// This session's key: its MLS signature key.
     pub fn key(&self) -> Bytes {
-        Bytes(self.inner.state.lock().unwrap().session.key().to_vec())
+        Bytes(self.inner.lock().session.key().to_vec())
     }
 
     /// Its peers: what a transport of the caller's hands the connections peers open, and the files they fetch.
@@ -802,24 +872,24 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 
     pub fn groups(&self) -> Vec<Bytes> {
-        self.inner.state.lock().unwrap().groups.keys().map(|gid| Bytes(gid.clone())).collect()
+        self.inner.lock().groups.keys().map(|gid| Bytes(gid.clone())).collect()
     }
 
     pub fn settings(&self, gid: &[u8]) -> Result<Settings> {
-        Ok(self.inner.state.lock().unwrap().group(gid)?.mls.settings())
+        Ok(self.inner.lock().group(gid)?.mls.settings())
     }
 
     pub fn epoch(&self, gid: &[u8]) -> Result<u64> {
-        Ok(self.inner.state.lock().unwrap().group(gid)?.mls.epoch())
+        Ok(self.inner.lock().group(gid)?.mls.epoch())
     }
 
     /// The epoch this session joined the group at.
     pub fn joined(&self, gid: &[u8]) -> Result<u64> {
-        Ok(self.inner.state.lock().unwrap().group(gid)?.mls.joined())
+        Ok(self.inner.lock().group(gid)?.mls.joined())
     }
 
     pub fn members(&self, gid: &[u8]) -> Result<Vec<Member>> {
-        self.inner.state.lock().unwrap().members(gid)
+        self.inner.lock().members(gid)
     }
 
     /// The members connected now.
@@ -831,7 +901,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// What this session sent to a group that no other member holds yet.
     pub fn only_here(&self, gid: &[u8]) -> Result<Vec<Pending>> {
-        Ok(self.inner.state.lock().unwrap().group(gid)?.rec.pending.clone())
+        Ok(self.inner.lock().group(gid)?.rec.pending.clone())
     }
 
     /// The kinds this session supports.
@@ -839,18 +909,15 @@ impl<P: Provider + Send + 'static> Node<P> {
         &self.inner.kinds
     }
 
-    /// A new group with this session its only member, speaking as `identity`. A group of any kind but chat gets a log
-    /// of its own.
+    /// A new group with this session its only member, speaking as `identity`.
     pub fn create(&self, settings: Settings, identity: Option<IdentityRef>) -> Result<Bytes> {
         ensure!(self.inner.kinds.contains(&settings.kind), "this session does not support {} groups", settings.kind);
         let gid = {
-            let mut st = self.inner.state.lock().unwrap();
+            let mut st = self.inner.lock();
             let st = &mut *st;
             st.speak(identity, settings.kind == DEVICES);
-            let mls = Group::create(&st.provider, &st.session, &settings, self.inner.window)?;
-            let id = Bytes(mls.exported(&st.provider, kindlog::LOG_LABEL)?.to_vec());
-            let kind_logs = if settings.kind == CHAT { Vec::new() } else { vec![LogRef { id, after: 0 }] };
-            st.add_group(mls, Rec { kind_logs, ..Rec::default() })?
+            let mls = Group::create(&st.provider, &st.session, &settings)?;
+            st.add_group(mls, Rec::default())?
         };
         self.inner.follow(&gid);
         Ok(Bytes(gid))
@@ -863,7 +930,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let hash = Bytes(Sha256::digest(secret).to_vec());
         let expires = now() + INVITE_VALID;
         let device = {
-            let mut st = self.inner.state.lock().unwrap();
+            let mut st = self.inner.lock();
             let by = Bytes(st.session.key().to_vec());
             let g = st.group_mut(gid)?;
             g.rec.invites.push(Rule { hash: hash.clone(), expires, label: label.clone(), to: to.clone(), by });
@@ -871,13 +938,12 @@ impl<P: Provider + Send + 'static> Node<P> {
             st.group(gid)?.mls.settings().kind == DEVICES
         };
         let rule = serde_json::to_value(Control::Invite { hash, expires, label, to })?;
-        let (id, delivery) = self.send(gid, &rule, true).await?;
-        // Members that take it later can admit by it too, but nothing waits for them: it is not pending here.
-        let mut st = self.inner.state.lock().unwrap();
-        st.group_mut(gid)?.rec.pending.retain(|pending| pending.id != id);
-        st.save(gid)?;
+        self.send(gid, &rule).await?;
+        // The members online, which took the invite once it counted, admit by it too.
+        let online = self.online(gid)?;
+        let st = self.inner.lock();
         let mut members = vec![address(*self.inner.net().id().as_bytes(), self.inner.relay.as_str())];
-        for member in delivery.held.iter().take(LINK_MEMBERS) {
+        for member in online.iter().take(LINK_MEMBERS) {
             let Some(leaf) = endpoint_id(&member.iroh.0).and_then(|peer| st.in_leaf(gid, &peer)?.leaf) else { continue };
             members.push(address(*endpoint_id(&leaf.key.0).context("an iroh key")?.as_bytes(), &leaf.relay));
         }
@@ -914,7 +980,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         devices: bool,
     ) -> Result<(Bytes, [u8; 32])> {
         let join = {
-            let mut st = self.inner.state.lock().unwrap();
+            let mut st = self.inner.lock();
             let certificate = identity.as_ref().and_then(|identity| st.certificate(&st.session.credential, &identity.id.0).cloned());
             st.speak(identity, devices);
             Join { secret, group, key_package: Bytes(st.session.key_package(&st.provider)?), certificate }
@@ -938,7 +1004,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// Removes a member. Returns whether this session's commit removed it, which it need not once another's did.
     pub async fn remove(&self, gid: &[u8], key: &[u8]) -> Result<bool> {
-        ensure!(self.inner.state.lock().unwrap().group(gid)?.mls.members().iter().any(|m| m.key == key), "not a member");
+        ensure!(self.inner.lock().group(gid)?.mls.members().iter().any(|m| m.key == key), "not a member");
         let remove = |g: &Group| Ok(g.members().into_iter().find(|m| m.key == key).map(|member| Change { remove: vec![member.index], ..Change::default() }));
         Ok(self.inner.commit(gid, remove).await?.is_some())
     }
@@ -955,72 +1021,55 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 
     /// Asks the others to remove this session, or forgets a group it is alone in.
-    pub async fn leave(&self, gid: &[u8]) -> Result<Option<Delivery>> {
+    pub async fn leave(&self, gid: &[u8]) -> Result<Option<Sent>> {
         if self.members(gid)?.len() == 1 {
             self.inner.forget(gid)?;
             return Ok(None);
         }
-        Ok(Some(self.send(gid, &json!({ "type": "leave" }), true).await?.1))
+        Ok(Some(self.send(gid, &json!({ "type": "leave" })).await?))
     }
 
-    /// Seals a payload, sends it to the members online, and waits a while for their receipts. A held payload (always
-    /// one held by its type, and an `introduce` where every leaf takes it) members hold for the group's `keep`, and sync.
-    pub async fn send(&self, gid: &[u8], payload: &Value, held: bool) -> Result<(Bytes, Delivery)> {
-        let (id, ciphertext, receipts) = {
-            let mut st = self.inner.state.lock().unwrap();
-            let st = &mut *st;
-            let g = st.groups.get_mut(gid).context("this session is not in that group")?;
-            let held = held || held_by_type(payload) || type_of(payload) == "introduce" && g.mls.revised(INTRODUCE_REVISION);
-            let (id, ciphertext) = g.mls.seal(&st.provider, &st.session, payload, held)?;
-            if held {
-                let epoch = g.mls.epoch();
-                let me = g.mls.members().into_iter().find(|m| m.key == st.session.key());
-                let g = st.groups.get_mut(gid).unwrap();
-                g.rec.items.push(Item { epoch, id: Bytes(id.to_vec()), at: now(), position: None });
-                g.rec.pending.push(Pending { id: Bytes(id.to_vec()), what: "message".into() });
-                st.provider.put(&ciphertext_key(&id), &ciphertext)?;
-                let sender = me.and_then(|me| st.member(gid, &me)).context("this session is not in the group")?;
-                let message = Message {
-                    id: Bytes(id.to_vec()),
-                    group: Bytes(gid.to_vec()),
-                    epoch,
-                    at: now(),
-                    sender,
-                    payload: payload.clone(),
-                };
-                put(&st.provider, &message_key(&id), &message)?;
-                st.save(gid)?;
-            }
-            let (tx, rx) = mpsc::unbounded_channel();
-            st.waiters.insert(id, tx);
-            (id, ciphertext, rx)
+    /// Sends a held payload: the node seals it, appends its entry to the group's log, and pushes it to the members
+    /// online once the entry counts. Answers its position once it counts; or after a few seconds without the service's
+    /// answer, that it is pending: the node finishes the send, after a restart too, and tells `Event::Sent`. Fails only
+    /// when the service certainly did not take it (`SendError`).
+    pub async fn send(&self, gid: &[u8], payload: &Value) -> Result<Sent> {
+        let (id, mut counted) = self.inner.held_send(gid, payload)?;
+        let position = match timeout(SEND_WAIT, &mut counted).await {
+            Ok(counted) => Some(counted.context("this session stopped")?.map_err(|error| anyhow::anyhow!(error))?),
+            Err(_) => self.inner.pending(&id, &mut counted)?,
         };
-        let delivery = self.inner.deliver(gid, id, ciphertext, receipts).await;
-        Ok((Bytes(id.to_vec()), delivery))
+        Ok(match position {
+            Some(position) => Sent { id: self.inner.sent_id(gid, position)?, position: Some(position) },
+            None => Sent { id, position: None },
+        })
+    }
+
+    /// Sends a held payload and waits as long as it takes for its entry to count; answers its position.
+    pub async fn send_counted(&self, gid: &[u8], payload: &Value) -> Result<u64> {
+        let (_, counted) = self.inner.held_send(gid, payload)?;
+        counted.await.context("this session stopped")?.map_err(|error| anyhow::anyhow!(error))
     }
 
     /// Seals a live payload, not held, and sends it to the members online, or to the one with fingerprint `to`.
     pub fn send_live(&self, gid: &[u8], payload: &Value, to: Option<&str>) -> Result<()> {
-        ensure!(!held_by_type(payload), "a {} is held", lmk_proto::group::type_of(payload));
-        let (ciphertext, peer) = {
-            let mut st = self.inner.state.lock().unwrap();
-            let st = &mut *st;
-            let peer = to.map(|fp| st.by_fp(gid, fp)).transpose()?;
-            let g = st.groups.get_mut(gid).context("this session is not in that group")?;
-            (g.mls.seal(&st.provider, &st.session, payload, false)?.1, peer)
-        };
-        match peer {
-            Some(peer) => _ = self.inner.net().send_to(peer, gid, ciphertext),
-            None => _ = self.inner.net().send(gid, ciphertext),
-        }
+        let mut st = self.inner.lock();
+        let st = &mut *st;
+        let peer = to.map(|fp| st.by_fp(gid, fp)).transpose()?;
+        let g = st.groups.get_mut(gid).context("this session is not in that group")?;
+        let ciphertext = g.mls.seal(&st.provider, &st.session, payload, true)?.1;
+        st.out.push(match peer {
+            Some(peer) => Out::Frame { peer, frame: Frame::Messages { group: Bytes(gid.to_vec()), items: vec![Bytes(ciphertext)] } },
+            None => Out::Push { group: gid.to_vec(), ciphertext },
+        });
         Ok(())
     }
 
-    /// Holds files for the group's `keep` from now, as those a held message links, unless it holds them already; fetches
+    /// Holds files for the group's H from now, as those a held message links, unless it holds them already; fetches
     /// those within this session's limit.
     pub fn hold(&self, gid: &[u8], links: &[String]) -> Result<()> {
         let parsed = links.iter().map(|link| FileLink::parse(link)).collect::<Result<Vec<_>>>()?;
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.inner.lock();
         let rec = &mut st.group_mut(gid)?.rec;
         for link in links {
             if !rec.files.iter().any(|(held, _)| held == link) {
@@ -1034,7 +1083,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// The files the group's kind links now, held while it does; fetches those new within this session's limit.
     pub fn set_links(&self, gid: &[u8], links: Vec<String>) -> Result<()> {
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.inner.lock();
         let rec = &mut st.group_mut(gid)?.rec;
         let new = links.iter().filter(|link| !rec.links.contains(link)).map(|link| FileLink::parse(link)).collect::<Result<Vec<_>>>()?;
         rec.links = links;
@@ -1045,9 +1094,9 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// Hands the member with fingerprint `to` a state of the group's kind, as a file it fetches.
     pub async fn hand_state(&self, gid: &[u8], to: &str, data: Vec<u8>) -> Result<()> {
-        let peer = self.inner.state.lock().unwrap().by_fp(gid, to)?;
+        let peer = self.inner.lock().by_fp(gid, to)?;
         let link = self.inner.state_file(gid, data).await?;
-        self.inner.net().frame(peer, Frame::State { group: Bytes(gid.to_vec()), link: Some(link) });
+        self.inner.lock().out.push(Out::Frame { peer, frame: Frame::State { group: Bytes(gid.to_vec()), link: Some(link) } });
         Ok(())
     }
 
@@ -1061,57 +1110,57 @@ impl<P: Provider + Send + 'static> Node<P> {
         lmk_net::Groups::is_member(&*self.inner, gid, peer)
     }
 
-    /// Whether this session gave a message up: it refused it, or could not open it.
-    pub fn given_up(&self, gid: &[u8], id: &[u8]) -> bool {
-        let st = self.inner.state.lock().unwrap();
-        st.group(gid).is_ok_and(|g| g.rec.given_up.iter().any(|(_, given)| given.0 == id))
+    /// Whether this session lost a held message: its entry counted, and it can no longer open it.
+    pub fn lost(&self, gid: &[u8], id: &[u8]) -> bool {
+        let st = self.inner.lock();
+        st.position_of(gid, id).ok().flatten().and_then(|position| st.pos(gid, position).ok().flatten()).is_some_and(|pos| pos.lost)
     }
 
-    /// A held message.
+    /// A held message, opened.
     pub fn message(&self, id: &[u8]) -> Result<Option<Message>> {
-        get(&self.inner.state.lock().unwrap().provider, &message_key(id))
+        get(&self.inner.lock().provider, &message_key(id))
     }
 
-    /// The group's held messages, oldest first.
+    /// The group's held messages this session opened and holds, in log order.
     pub fn messages(&self, gid: &[u8]) -> Result<Vec<Message>> {
-        let st = self.inner.state.lock().unwrap();
-        let items = st.group(gid)?.rec.items.clone();
-        Ok(items.iter().filter_map(|item| get(&st.provider, &message_key(&item.id.0)).ok().flatten()).collect())
+        self.inner.lock().messages(gid)
     }
 
     /// Replaces a held message's payload, as when its text is forgotten; it is still served to members as ciphertext.
     pub fn redact(&self, id: &[u8], payload: Value) -> Result<()> {
-        let st = self.inner.state.lock().unwrap();
+        let mut st = self.inner.lock();
         let Some(mut message) = get::<Message>(&st.provider, &message_key(id))? else {
             return Ok(());
         };
         message.payload = payload;
         put(&st.provider, &message_key(id), &message)?;
-        st.provider.scrub()
+        st.scrub = true;
+        Ok(())
     }
 
     /// A record of a kind built into the client, kept with the session's own.
     pub fn record(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        self.inner.state.lock().unwrap().provider.get(&kind_key(key))
+        self.inner.lock().provider.get(&kind_key(key))
     }
 
     pub fn put_record(&self, key: &str, value: &[u8]) -> Result<()> {
-        self.inner.state.lock().unwrap().provider.put(&kind_key(key), value)
+        self.inner.lock().provider.put(&kind_key(key), value)
     }
 
     pub fn delete_record(&self, key: &str) -> Result<()> {
-        self.inner.state.lock().unwrap().provider.delete(&kind_key(key))
+        self.inner.lock().provider.delete(&kind_key(key))
     }
 
     /// Leaves in this session's files no copy of what it deleted.
     pub fn scrub(&self) -> Result<()> {
-        self.inner.state.lock().unwrap().provider.scrub()
+        self.inner.lock().scrub = true;
+        Ok(())
     }
 
     /// Seals a file and holds it for a group.
     pub async fn add_file(&self, gid: &[u8], bytes: Vec<u8>) -> Result<FileLink> {
         let link = self.inner.net().add_file(std::io::Cursor::new(bytes)).await?;
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.inner.lock();
         st.group_mut(gid)?.rec.link(link.link());
         st.save(gid)?;
         Ok(link)
@@ -1144,7 +1193,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         loop {
             let holders = self.inner.net().holders(gid, link.hash).await;
             if !holders.is_empty() || now() >= deadline || self.online(gid).is_ok_and(|online| online.is_empty()) {
-                let st = self.inner.state.lock().unwrap();
+                let st = self.inner.lock();
                 return holders.iter().map(|peer| st.by_iroh(gid, peer)).collect();
             }
             sleep(Duration::from_millis(500)).await;
@@ -1154,8 +1203,8 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Waits until another member online holds a file this session added, or a few seconds; returns them. If none does,
     /// the file is pending until one fetches it.
     pub async fn spread(&self, gid: &[u8], link: &FileLink) -> Vec<Member> {
-        let holders = self.holders(gid, link, RECEIPT_WAIT).await;
-        let mut st = self.inner.state.lock().unwrap();
+        let holders = self.holders(gid, link, MEMBER_WAIT).await;
+        let mut st = self.inner.lock();
         if holders.is_empty()
             && let Ok(g) = st.group_mut(gid)
         {
@@ -1170,7 +1219,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// The newest copy of an identity's key log, read from its service unless a copy is fresh.
     pub async fn key_log(&self, identity: &IdentityRef) -> Result<KeyLog> {
         let fresh = {
-            let st = self.inner.state.lock().unwrap();
+            let st = self.inner.lock();
             let read = st.logs.get(&lmk_proto::identity::address(&identity.id.0)[..]).is_some_and(|log| log.at + KEYS_FRESH >= now());
             st.keys.get(&identity.id.0).filter(|_| read).cloned()
         };
@@ -1187,19 +1236,19 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// The key log held of an identity, however old.
     pub fn held_key_log(&self, identity: &[u8]) -> Option<KeyLog> {
-        self.inner.state.lock().unwrap().keys.get(identity).cloned()
+        self.inner.lock().keys.get(identity).cloned()
     }
 
     /// Appends a sealed entry to an identity's key log, and reads the log.
     pub async fn append_identity(&self, identity: &IdentityRef, entry: &[u8]) -> Result<KeyLog> {
         let log = lmk_proto::identity::address(&identity.id.0);
-        self.inner.clients.client(&identity.membership)?.append(&log, entry).await?;
+        self.inner.clients.client(&identity.membership)?.append(&log, &[entry.to_vec()]).await?;
         self.inner.read_keys(identity).await
     }
 
     /// The identities this session speaks as in its groups.
     pub fn spoken(&self) -> Vec<IdentityRef> {
-        let st = self.inner.state.lock().unwrap();
+        let st = self.inner.lock();
         let mut spoken: Vec<IdentityRef> = Vec::new();
         for g in st.groups.values() {
             let me = g.mls.members().into_iter().find(|m| m.key == st.session.key());
@@ -1214,7 +1263,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// This session's certificate of an identity, if it holds one.
     pub fn certificate(&self, identity: &[u8]) -> Option<Envelope> {
-        let st = self.inner.state.lock().unwrap();
+        let st = self.inner.lock();
         st.certificate(&st.session.credential, identity).cloned()
     }
 
@@ -1222,7 +1271,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// new key is why, its peers take the new entries from this session.
     pub fn set_certificate(&self, certificate: Envelope) -> Result<()> {
         let certified = certified(&certificate).context("a certificate that does not parse")?;
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.inner.lock();
         ensure!(certified.key.0 == st.session.key(), "a certificate of another session");
         let address = lmk_proto::identity::address(&certified.identity.0);
         if st.logs.contains_key(&address[..]) {
@@ -1231,21 +1280,19 @@ impl<P: Provider + Send + 'static> Node<P> {
         let key = (certified.key.0, certified.identity.0);
         st.certificates.insert(key, certificate);
         st.save_certificates()?;
-        for gid in st.groups.keys() {
-            self.inner.net().changed(gid);
-        }
+        let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
+        st.out.extend(gids.into_iter().map(Out::Changed));
         Ok(())
     }
 
     /// The device's name, where this is a device's node.
     pub fn device_name(&self) -> Option<String> {
-        self.inner.state.lock().unwrap().device.clone()
+        self.inner.lock().device.clone()
     }
 
-    /// Renames the device, in its credential in each devices group whose members' leaves take a rename; the others
-    /// take it once they do, at this node's next key update.
+    /// Renames the device, in its credential in each devices group.
     pub async fn rename_device(&self, name: &str) -> Result<()> {
-        self.inner.state.lock().unwrap().device = Some(name.into());
+        self.inner.lock().device = Some(name.into());
         for gid in self.groups() {
             self.inner.commit(&gid.0, |g| Ok(renaming(g, Some(name)).map(|name| Change { name: Some(name), ..Change::default() }))).await?;
         }
@@ -1254,7 +1301,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// What a group this session is in looks like as an opening.
     pub fn opening(&self, gid: &[u8]) -> Result<Opening> {
-        let st = self.inner.state.lock().unwrap();
+        let st = self.inner.lock();
         let g = st.group(gid)?;
         let settings = g.mls.settings();
         let members = g.mls.members().into_iter().filter_map(|m| Some(m.leaf?.key)).collect();
@@ -1292,17 +1339,38 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.events.send(Event::Warning { group: group.map(|gid| Bytes(gid.to_vec())), text }).ok();
     }
 
-    /// Removes again, as it starts and then at each resync, the members this session ended a kind's log to remove.
-    async fn finish_removals(self: Arc<Self>) {
-        loop {
-            let removing: Vec<(Vec<u8>, Vec<u8>)> = {
-                let st = self.state.lock().unwrap();
-                st.groups.iter().flat_map(|(gid, g)| g.rec.removing.iter().map(|key| (gid.clone(), key.0.clone()))).collect()
-            };
-            for (group, key) in removing {
-                self.work.send(Work::Remove { group, key }).ok();
+    /// Starts a step.
+    pub(crate) fn lock(&self) -> Step<'_, P> {
+        let guard = self.state.lock().unwrap();
+        if let Err(error) = guard.provider.begin() {
+            tracing::error!("starting a step: {error:#}");
+        }
+        Step { guard, inner: self }
+    }
+
+    /// Makes the steps committed so far durable, before what they produced leaves the node.
+    async fn durable(&self) -> Result<()> {
+        match &self.durable {
+            Some(durable) => durable().await,
+            None => Ok(()),
+        }
+    }
+
+    /// Sends what steps produced for the peers, in order, once it is durable.
+    async fn send_out(self: Arc<Self>, mut outbox: mpsc::UnboundedReceiver<Vec<Out>>) {
+        while let Some(out) = outbox.recv().await {
+            if let Err(error) = self.durable().await {
+                self.warn(None, format!("saving this session's state: {error:#}"));
             }
-            sleep(RESYNC).await;
+            let Some(net) = self.net.get() else { continue };
+            for out in out {
+                match out {
+                    Out::Push { group, ciphertext } => drop(net.send(&group, ciphertext)),
+                    Out::Frame { peer, frame } => drop(net.frame(peer, frame)),
+                    Out::Changed(group) => net.changed(&group),
+                    Out::Served { peer, group } => net.served(peer, &group),
+                }
+            }
         }
     }
 
@@ -1314,7 +1382,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         loop {
             for gid in &gids {
                 let (leaf, device) = {
-                    let st = self.state.lock().unwrap();
+                    let st = self.lock();
                     (st.session.leaf.clone(), st.device.clone())
                 };
                 let change = |g: &Group| Ok(Some(Change { leaf: Some(leaf.clone()), name: renaming(g, device.as_deref()), ..Change::default() }));
@@ -1324,42 +1392,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 };
                 // Unless the group was left meanwhile, as when a device leaves its identity as it starts.
                 if let Err(error) = updated.await
-                    && self.state.lock().unwrap().groups.contains_key(gid)
+                    && self.lock().groups.contains_key(gid)
                 {
                     self.warn(Some(gid), format!("{error:#}"));
                 }
             }
             sleep(KEY_UPDATE).await;
-            let mut st = self.state.lock().unwrap();
-            let st = &mut *st;
+            let mut st = self.lock();
             gids = st.groups.keys().cloned().collect();
             for gid in &gids {
-                st.groups.get_mut(gid).unwrap().mls.expire(&st.provider).ok();
+                if let Err(error) = st.expire(gid) {
+                    self.warn(Some(gid), format!("{error:#}"));
+                }
             }
-            self.expire(st);
-            if let Err(error) = st.provider.scrub() {
-                self.warn(None, format!("{error:#}"));
-            }
-        }
-    }
-
-    /// Drops held messages and file links older than each group's `keep`; the files go at the next collection.
-    fn expire(&self, st: &mut State<P>) {
-        let now = now();
-        let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
-        for gid in gids {
-            let g = st.groups.get_mut(&gid).unwrap();
-            let before = now.saturating_sub(g.mls.settings().keep as u64 * 24 * 3600 * 1000);
-            let (old, kept): (Vec<Item>, Vec<Item>) = g.rec.items.drain(..).partition(|item| item.at < before);
-            g.rec.items = kept;
-            g.rec.expired = old.iter().map(|item| item.epoch).fold(g.rec.expired, u64::max);
-            g.rec.files.retain(|(_, at)| *at >= before);
-            g.rec.invites.retain(|rule| rule.expires >= before);
-            for item in old {
-                st.provider.delete(&message_key(&item.id.0)).ok();
-                st.provider.delete(&ciphertext_key(&item.id.0)).ok();
-            }
-            st.save(&gid).ok();
+            st.scrub = true;
         }
     }
 
@@ -1376,7 +1422,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let connected = self.net().connected();
         let me = self.net().id();
         let leaves: BTreeSet<(EndpointId, String)> = {
-            let st = self.state.lock().unwrap();
+            let st = self.lock();
             st.groups
                 .values()
                 .flat_map(|g| g.mls.members())
@@ -1395,110 +1441,33 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Applies the stored entries this session has not applied yet, then the messages that waited for them.
-    fn advance(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
-        let mut changed = false;
-        let logged = st.log(gid)?.logged;
-        loop {
-            let g = st.groups.get_mut(gid).unwrap();
-            if g.rec.position >= logged {
-                break;
-            }
-            let position = g.rec.position + 1;
-            let entry = st.provider.get(&logs::entry_key(gid, position))?.context("a stored entry is missing")?;
-            let applied = g.mls.apply(&st.provider, &entry, now())?;
-            g.rec.position = position;
-            let core::Applied::Commit { by, own, added, how, invite, end, removed, settings, gone, .. } = applied else {
-                continue;
-            };
-            changed = true;
-            if own {
-                g.own_at = Some(position);
-            }
-            let by = g.mls.members().into_iter().find(|m| m.index == by);
-            let end = end.filter(|_| !removed.is_empty());
-            g.rec.removing.retain(|key| !removed.iter().any(|m| m.key == key.0));
-            self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, invite, removed, settings, gone }).ok();
-            if gone {
-                break;
-            }
-            if let Some(end) = end {
-                self.moved(st, gid, end)?;
-            }
-        }
-        st.save(gid)?;
-        if changed {
-            // Applying a commit deletes the secrets of epochs beyond the key window.
-            if let Err(error) = st.provider.scrub() {
-                self.warn(Some(gid), format!("{error:#}"));
-            }
-            let g = st.groups.get_mut(gid).unwrap();
-            let epoch = g.mls.epoch();
-            let (ready, later): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
-                std::mem::take(&mut g.future).into_iter().partition(|c| core::epoch_of(c).is_ok_and(|e| e <= epoch));
-            g.future = later;
-            for ciphertext in ready {
-                self.take(st, gid, &ciphertext);
-            }
-        }
-        Ok(())
-    }
-
-    /// Commits a change built on the group's current epoch, posts it, and reads the log until it is known whether it
-    /// won its epoch; if another commit won, builds it again. Returns the Welcome, if it adds, and the position; none
-    /// once the change has no effect (`None`), and it commits nothing. A removal in a group with a kind's log first ends
-    /// that log, and names where.
+    /// Commits a change built on the group's current epoch, posts its entry, and reads the log until it is known whether
+    /// it won its epoch; if another commit won, builds it again. Returns the Welcome, if it adds, and the position; none
+    /// once the change has no effect (`None`), and it commits nothing. An entry posted before, which the log may or may
+    /// not have taken, is posted again first: only the service's refusal drops it.
     async fn commit(&self, gid: &[u8], change: impl Fn(&Group) -> Result<Option<Change>>) -> Result<Option<(Option<Vec<u8>>, u64)>> {
         let _committing = self.committing.lock().await;
-        let mut ended: Option<LogRef> = None;
         for _ in 0..COMMIT_TRIES {
             self.read(gid).await?;
-            let (ending, service) = {
-                let st = self.state.lock().unwrap();
-                let g = st.group(gid)?;
-                let removes = g.mls.posted().is_none() && change(&g.mls)?.is_some_and(|change| !change.remove.is_empty());
-                (g.rec.kind_logs.last().filter(|_| removes).cloned(), g.mls.settings().membership)
-            };
-            let client = self.clients.client(&service)?;
-            if let Some(log) = ending.filter(|log| ended.as_ref().is_none_or(|ended| ended.id != log.id)) {
-                let position = client.append(&log.id.0, kindlog::END).await?.position;
-                ended = Some(LogRef { id: log.id, after: log.after + position - 1 });
-                let mut st = self.state.lock().unwrap();
-                let g = st.group_mut(gid)?;
-                let remove = change(&g.mls)?.map(|change| change.remove).unwrap_or_default();
-                for member in g.mls.members().into_iter().filter(|m| remove.contains(&m.index)) {
-                    if !g.rec.removing.iter().any(|key| key.0 == member.key) {
-                        g.rec.removing.push(Bytes(member.key));
-                    }
-                }
-                st.save(gid)?;
-            }
-            let (bytes, welcome, ours) = {
-                let mut st = self.state.lock().unwrap();
+            let (entry, welcome, ours, service) = {
+                let mut st = self.lock();
                 let st = &mut *st;
                 let g = st.groups.get_mut(gid).context("this session is not in that group")?;
-                g.own_at = None;
-                // A commit posted before, which the log may or may not have taken: post it again.
+                let service = g.mls.settings().membership;
                 match g.mls.posted() {
-                    Some(posted) => (posted.to_vec(), None, false),
+                    Some(posted) => (posted.to_vec(), None, false, service),
                     None => {
-                        let Some(mut change) = change(&g.mls)? else { return Ok(None) };
-                        if !change.remove.is_empty() {
-                            change.end = ended.as_ref().filter(|ended| g.rec.kind_logs.last().is_some_and(|log| log.id == ended.id)).map(|ended| ended.after);
-                            // The kind's order moved to another log since this session ended its own: it ends that one.
-                            if change.end.is_none() && !g.rec.kind_logs.is_empty() {
-                                continue;
-                            }
-                        }
+                        let Some(change) = change(&g.mls)? else { return Ok(None) };
                         let commit = g.mls.commit(&st.provider, &st.session, change)?;
-                        (commit.commit, commit.welcome, true)
+                        (commit.entry, commit.welcome, true, service)
                     }
                 }
             };
-            let position = match client.append(gid, &bytes).await {
+            self.durable().await?;
+            let position = match self.clients.client(&service)?.append(gid, std::slice::from_ref(&entry)).await {
                 Ok(appended) => appended.position,
                 Err(error) if error.is::<Refused>() => {
-                    let mut st = self.state.lock().unwrap();
+                    let mut st = self.lock();
                     let st = &mut *st;
                     st.groups.get_mut(gid).context("left the group")?.mls.cancel(&st.provider)?;
                     return Err(error);
@@ -1506,10 +1475,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 Err(error) => return Err(error),
             };
             self.read(gid).await?;
-            let st = self.state.lock().unwrap();
+            let st = self.lock();
             let g = st.group(gid)?;
             ensure!(g.rec.position >= position, "the log did not show the commit it took");
-            if ours && g.own_at == Some(position) {
+            if ours && st.pos(gid, position)?.is_some_and(|pos| pos.judged == reading::Judged::Commit { own: true }) {
                 return Ok(Some((welcome, position)));
             }
         }
@@ -1519,12 +1488,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Joins a group from the Welcome a member at `by` sent.
     async fn welcomed(self: &Arc<Self>, admitted: Admitted, by: EndpointId) -> Result<Bytes> {
         let gid = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.lock();
             let st = &mut *st;
-            let mls = Group::join(&st.provider, &admitted.welcome.0, self.window)?;
+            let mls = Group::join(&st.provider, &admitted.welcome.0)?;
             ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
-            let given_up = admitted.before.iter().map(|id| (0, id.clone())).collect();
-            let rec = Rec { position: admitted.position, given_up, kind_logs: admitted.logs, ..Rec::default() };
+            let rec = Rec { position: admitted.position, start: admitted.position, expired: admitted.position, ..Rec::default() };
             let gid = st.add_group(mls, rec)?;
             for certificate in admitted.certificates {
                 groups::take_certificate(st, certificate);
@@ -1539,7 +1507,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         self.follow(&gid);
         self.refresh_all().await;
-        self.net().changed(&gid);
+        self.lock().out.push(Out::Changed(gid.clone()));
         self.dial_all();
         if let Some(link) = admitted.doc {
             self.state_from(&gid, link, by);
@@ -1554,7 +1522,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let taken = async {
                 let file = FileLink::parse(&link)?;
                 {
-                    let mut st = inner.state.lock().unwrap();
+                    let mut st = inner.lock();
                     let rec = &mut st.group_mut(&gid)?.rec;
                     rec.link(link.clone());
                     rec.state = Some(link);
@@ -1563,7 +1531,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 inner.fetched(&gid, &file).await?;
                 let mut data = Vec::new();
                 inner.net().read_file(&file, &mut data).await?;
-                let from = inner.state.lock().unwrap().by_iroh(&gid, &by);
+                let from = inner.lock().by_iroh(&gid, &by);
                 inner.events.send(Event::State { group: Bytes(gid.clone()), from, data }).ok();
                 anyhow::Ok(())
             };
@@ -1576,7 +1544,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Seals a state of the group's kind as a file to hand a member; holds it.
     pub(crate) async fn state_file(&self, gid: &[u8], data: Vec<u8>) -> Result<String> {
         let link = self.net().add_file(std::io::Cursor::new(data)).await?.link();
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock();
         let rec = &mut st.group_mut(gid)?.rec;
         rec.link(link.clone());
         rec.state = Some(link.clone());
@@ -1599,54 +1567,16 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 Ok(()) => return Ok(()),
                 Err(error) => last = error,
             }
-            sleep(RECEIPT_WAIT).await;
+            sleep(MEMBER_WAIT).await;
         }
         Err(last)
-    }
-
-    /// Sends a sealed message and waits for the receipts of the members it went to.
-    async fn deliver(
-        &self,
-        gid: &[u8],
-        id: [u8; 32],
-        ciphertext: Vec<u8>,
-        mut receipts: mpsc::UnboundedReceiver<(EndpointId, Option<Reason>)>,
-    ) -> Delivery {
-        let mut waiting = self.net().send(gid, ciphertext);
-        let mut answers = Vec::new();
-        let _ = timeout(RECEIPT_WAIT, async {
-            while !waiting.is_empty()
-                && let Some((peer, refused)) = receipts.recv().await
-            {
-                waiting.retain(|waited| *waited != peer);
-                answers.push((peer, refused));
-            }
-        })
-        .await;
-        let mut st = self.state.lock().unwrap();
-        st.waiters.remove(&id);
-        let mut delivery = Delivery::default();
-        for (peer, refused) in answers {
-            let member = st.by_iroh(gid, &peer);
-            match refused {
-                None => delivery.held.push(member),
-                Some(reason) => delivery.refused.push((member, reason)),
-            }
-        }
-        if !delivery.held.is_empty()
-            && let Ok(g) = st.group_mut(gid)
-        {
-            g.rec.pending.retain(|pending| pending.id.0 != id);
-            st.save(gid).ok();
-        }
-        delivery
     }
 
     /// Reads the key logs of the identities in this session's groups that are not fresh, or that a member's
     /// certificate needs read anew, then has the members removed that went too long without a valid certificate.
     async fn refresh_all(&self) {
         let stale: Vec<IdentityRef> = {
-            let st = self.state.lock().unwrap();
+            let st = self.lock();
             let mut identities: Vec<IdentityRef> = st.groups.keys().flat_map(|gid| st.identities(gid)).collect();
             identities.dedup();
             let since = |id: &[u8]| {
@@ -1665,7 +1595,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let mut read = HashSet::new();
         for identity in stale {
             if read.insert(identity.id.clone())
-                && let Err(error) = timeout(RECEIPT_WAIT, self.read_keys(&identity)).await.map_err(anyhow::Error::from).and_then(|r| r)
+                && let Err(error) = timeout(MEMBER_WAIT, self.read_keys(&identity)).await.map_err(anyhow::Error::from).and_then(|r| r)
             {
                 tracing::debug!("the key log of {}: {error:#}", hex(&identity.id.0));
             }
@@ -1675,13 +1605,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Waits a while for the certificates of added members that speak as identities, which the member that admitted them and they show.
     async fn await_certificates(&self, gid: &[u8], added: &[core::Member]) {
-        let deadline = now() + RECEIPT_WAIT.as_millis() as u64;
+        let deadline = now() + MEMBER_WAIT.as_millis() as u64;
         let missing = || {
-            let st = self.state.lock().unwrap();
+            let st = self.lock();
             let speaking = added.iter().filter_map(|m| Some((m.credential.as_ref()?, m.credential.as_ref()?.identity.as_ref()?)));
             speaking.into_iter().any(|(credential, identity)| st.certificate(credential, &identity.id.0).is_none())
         };
-        while missing() && now() < deadline && self.state.lock().unwrap().groups.contains_key(gid) {
+        while missing() && now() < deadline && self.lock().groups.contains_key(gid) {
             sleep(Duration::from_millis(200)).await;
         }
     }
@@ -1691,7 +1621,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// key log read since.
     fn revoke(&self) {
         let connected = self.net().connected();
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock();
         let st = &mut *st;
         self.remove_revoked(st);
         let now = now();
@@ -1737,14 +1667,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
     async fn read_keys(&self, identity: &IdentityRef) -> Result<KeyLog> {
         let address = lmk_proto::identity::address(&identity.id.0);
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.lock();
             if !st.logs.contains_key(&address[..]) {
                 let of = logs::Of::Identity(identity.id.clone());
                 st.add_log(&address, logs::Log::new(of, identity.membership.clone(), 0))?;
             }
         }
         self.read(&address).await?;
-        self.state.lock().unwrap().keys.get(&identity.id.0).cloned().context("the key log has no valid first entry")
+        self.lock().keys.get(&identity.id.0).cloned().context("the key log has no valid first entry")
     }
 
     /// Replays an identity's key log, against which its members' certificates are checked.
@@ -1761,8 +1691,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for certificate in ahead {
             groups::take_certificate(st, certificate);
         }
-        for (gid, peer) in st.served(&peers).into_iter().filter(|served| !before.contains(served)) {
-            self.net().served(peer, &gid);
+        for (group, peer) in st.served(&peers).into_iter().filter(|served| !before.contains(served)) {
+            st.out.push(Out::Served { peer, group });
         }
         self.remove_revoked(st);
         Ok(())
@@ -1770,27 +1700,23 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Leaves a group behind: its state and records go.
     fn forget(&self, gid: &[u8]) -> Result<()> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock();
+        st.expire_to(gid, u64::MAX)?;
         let st = &mut *st;
         let g = st.groups.remove(gid).context("this session is not in that group")?;
-        for log in [Bytes(gid.to_vec())].into_iter().chain(g.rec.kind_logs.iter().map(|log| log.id.clone())) {
-            self.unfollow(&log.0);
-            st.drop_log(&log.0)?;
+        self.unfollow(gid);
+        st.drop_log(gid)?;
+        for id in &g.rec.sends {
+            st.provider.delete(&sending::send_key(&id.0))?;
         }
-        for position in g.rec.log.iter().flat_map(|log| &log.kept) {
-            st.provider.delete(&kindlog::kept_key(gid, *position))?;
-        }
-        for item in &g.rec.items {
-            st.provider.delete(&message_key(&item.id.0))?;
-            st.provider.delete(&ciphertext_key(&item.id.0))?;
+        for position in g.rec.kind.iter().flat_map(|kind| &kind.kept) {
+            st.provider.delete(&kind::kept_key(gid, *position))?;
         }
         st.provider.delete(&rec_key(gid))?;
         g.mls.delete(&st.provider)?;
         st.save_groups()?;
-        st.provider.scrub()?;
-        if let Some(net) = self.net.get() {
-            net.changed(gid);
-        }
+        st.scrub = true;
+        st.out.push(Out::Changed(gid.to_vec()));
         Ok(())
     }
 
@@ -1801,7 +1727,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 Work::Applied { group, by, added, how, invite, removed, settings, gone } => {
                     self.applied(&group, by, added, how, invite, removed, settings, gone).await
                 }
-                Work::Follow(log) => self.follow(&log),
                 Work::Read(log) => {
                     if self.reading.lock().unwrap().insert(log.clone()) {
                         let inner = self.clone();
@@ -1846,11 +1771,27 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
                 Work::State { group, link, by } => self.state_from(&group, link, by),
                 Work::StateWanted { group, by } => self.hand_snapshot(&group, by),
-                Work::Report(gid) => {
+                Work::Send(gid) => {
+                    if self.sending.lock().unwrap().insert(gid.clone()) {
+                        let inner = self.clone();
+                        self.spawn(async move {
+                            inner.sends(&gid).await;
+                            inner.sending.lock().unwrap().remove(&gid);
+                        });
+                    }
+                }
+                Work::Wait(gid) => {
                     let inner = self.clone();
                     self.spawn(async move {
-                        sleep(REPORT_WAIT).await;
-                        inner.report(&gid);
+                        loop {
+                            sleep(Duration::from_secs(1)).await;
+                            let mut st = inner.lock();
+                            match inner.wait_over(&mut st, &gid) {
+                                Ok(false) => {}
+                                Ok(true) => return,
+                                Err(error) => return inner.warn(Some(&gid), format!("{error:#}")),
+                            }
+                        }
                     });
                 }
                 Work::Net(event) => self.net_event(event),
@@ -1876,7 +1817,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.await_certificates(gid, &added).await;
         }
         let group = Bytes(gid.to_vec());
-        let st = self.state.lock().unwrap();
+        let st = self.lock();
         if !added.is_empty()
             && let Err(error) = st.save_certificates()
         {
@@ -1920,7 +1861,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Tells that this session is out of a group, then forgets it, unless it did so already.
     fn gone(&self, gid: &[u8], by: Option<Member>) {
-        if !self.state.lock().unwrap().groups.contains_key(gid) {
+        if !self.lock().groups.contains_key(gid) {
             return;
         }
         self.events.send(Event::Removed { group: Bytes(gid.to_vec()), by }).ok();
@@ -1929,82 +1870,31 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Has the members removed whose `leave` this session holds, sealed since the Add that brought them in last; has the
-    /// group gone once this session holds its own and is the only member left.
+    /// Has the members removed whose counted `leave`, sealed since the Add that brought them in last, this session holds;
+    /// has the group gone once this session's own counted and it is the only member left.
     fn leavers(&self, st: &State<P>, gid: &[u8]) -> Result<()> {
         let Ok(g) = st.group(gid) else { return Ok(()) };
         let added = |key: &[u8]| g.mls.added().iter().rev().find(|added| added.member.key.0 == key).map_or(0, |added| added.epoch);
-        let mut leaving = HashSet::new();
-        for item in &g.rec.items {
-            let message: Message = get(&st.provider, &message_key(&item.id.0))?.context("a held message is missing")?;
-            if type_of(&message.payload) == "leave" && message.epoch >= added(&message.sender.key.0) {
-                leaving.insert(message.sender.key.0);
-            }
-        }
+        let leaving: HashSet<&[u8]> = g.rec.leaves.iter().filter(|(key, epoch)| *epoch >= added(&key.0)).map(|(key, _)| key.0.as_slice()).collect();
         let me = st.session.key();
         let members = g.mls.members();
         if members.len() == 1 && leaving.contains(me) {
             self.work.send(Work::Gone(gid.to_vec())).ok();
         }
-        for member in members.into_iter().filter(|m| m.key != me && leaving.contains(&m.key)) {
+        for member in members.into_iter().filter(|m| m.key != me && leaving.contains(m.key.as_slice())) {
             self.work.send(Work::Remove { group: gid.to_vec(), key: member.key }).ok();
         }
         Ok(())
     }
 
-    /// Tells the group, in one held notice, the messages this session gave up since it last did.
-    fn report(self: &Arc<Self>, gid: &[u8]) {
-        let messages = {
-            let mut st = self.state.lock().unwrap();
-            let Ok(g) = st.group_mut(gid) else { return };
-            let messages = std::mem::take(&mut g.rec.unreported);
-            if messages.is_empty() {
-                return;
-            }
-            if let Err(error) = st.save(gid) {
-                self.warn(Some(gid), format!("{error:#}"));
-            }
-            messages
-        };
-        let (node, gid) = (Node { inner: self.clone() }, gid.to_vec());
-        self.spawn(async move {
-            let payload = serde_json::to_value(Control::Refused { messages }).expect("JSON");
-            if let Err(error) = node.send(&gid, &payload, true).await {
-                node.inner.warn(Some(&gid), format!("reporting the messages this session refused: {error:#}"));
-            }
-        });
-    }
-
     fn net_event(self: &Arc<Self>, event: lmk_net::Event) {
         match event {
-            lmk_net::Event::Receipt { group, peer, held } => {
-                let mut st = self.state.lock().unwrap();
-                let mut changed = false;
-                for id in held {
-                    if let Some(waiter) = st.waiters.get(&id) {
-                        waiter.send((peer, None)).ok();
-                        continue;
-                    }
-                    let Ok(g) = st.group_mut(&group) else { return };
-                    if !g.rec.pending.iter().any(|pending| pending.id.0 == id) {
-                        continue;
-                    }
-                    let by = st.by_iroh(&group, &peer);
-                    let (group, id) = (Bytes(group.clone()), Bytes(id.to_vec()));
-                    st.group_mut(&group.0).unwrap().rec.pending.retain(|pending| pending.id != id);
-                    changed = true;
-                    self.events.send(Event::Held { group, id, by }).ok();
-                }
-                if changed {
-                    st.save(&group).ok();
-                }
-            }
             lmk_net::Event::Contradiction { log, peer, ours, theirs } => {
-                let st = self.state.lock().unwrap();
+                let st = self.lock();
                 self.contradicted(&st, &log, &Contradiction { ours, theirs }, &peer.fmt_short().to_string());
             }
             lmk_net::Event::Fetched(hash) => {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.lock();
                 let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
                 for gid in gids {
                     let g = st.groups.get_mut(&gid).unwrap();
@@ -2018,19 +1908,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             lmk_net::Event::Synced { group, peer } => {
                 self.events.send(Event::Synced { group: Bytes(group.clone()) }).ok();
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.lock();
                 if let Err(error) = self.leavers(&st, &group) {
                     self.warn(Some(&group), format!("{error:#}"));
                 }
-                // A message the kind's log names that this sync did not bring will not come from this peer.
-                if self.waits(&st, &group) {
-                    self.ask_state(&mut st, &group, Some(peer));
+                if let Err(error) = self.progress(&mut st, &group, reading::Progress::Synced(peer)) {
+                    self.warn(Some(&group), format!("{error:#}"));
                 }
                 drop(st);
-                self.report(&group);
                 // A file only this session held may have reached the peer since.
                 let pending: Vec<[u8; 32]> = {
-                    let st = self.state.lock().unwrap();
+                    let st = self.lock();
                     let Ok(g) = st.group(&group) else { return };
                     g.rec
                         .pending
@@ -2043,7 +1931,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     let (net, inner, group) = (self.net().clone(), self.clone(), group.clone());
                     spawn(async move {
                         if net.holders(&group, hash).await.contains(&peer) {
-                            let mut st = inner.state.lock().unwrap();
+                            let mut st = inner.lock();
                             if let Ok(g) = st.group_mut(&group) {
                                 g.rec.pending.retain(|pending| pending.id.0 != hash);
                                 st.save(&group).ok();
@@ -2053,14 +1941,31 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
             }
             lmk_net::Event::InStep { group, peer } => {
-                let mut st = self.state.lock().unwrap();
-                if st.group(&group).is_ok_and(|g| g.rec.log.as_ref().is_some_and(|log| log.behind)) {
+                let mut st = self.lock();
+                if st.group(&group).is_ok_and(|g| g.rec.kind.as_ref().is_some_and(|kind| kind.behind)) {
                     self.ask_state(&mut st, &group, Some(peer));
                 }
                 let member = st.by_iroh(&group, &peer);
                 self.events.send(Event::InStep { group: Bytes(group), member }).ok();
             }
-            lmk_net::Event::Connected(_) | lmk_net::Event::Disconnected(_) => {}
+            lmk_net::Event::Connected(peer) => {
+                let mut st = self.lock();
+                let gids: Vec<Vec<u8>> = st.groups.keys().filter(|gid| st.serves(gid, &peer)).cloned().collect();
+                for gid in gids {
+                    if let Err(error) = self.progress(&mut st, &gid, reading::Progress::Connected(peer)) {
+                        self.warn(Some(&gid), format!("{error:#}"));
+                    }
+                }
+            }
+            lmk_net::Event::Disconnected(peer) => {
+                let mut st = self.lock();
+                let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
+                for gid in gids {
+                    if let Err(error) = self.progress(&mut st, &gid, reading::Progress::Disconnected(peer)) {
+                        self.warn(Some(&gid), format!("{error:#}"));
+                    }
+                }
+            }
         }
     }
 }
@@ -2076,7 +1981,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
             return;
         }
         let what = match st.logs.get(log).map(|l| &l.of) {
-            Some(logs::Of::Kind(_)) => "the log of the group's kind",
             Some(logs::Of::Identity(_)) => "a key log",
             _ => "the group's log",
         };
@@ -2097,11 +2001,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 }
 
-/// The name this session takes in a group: in a devices group, the device's, where its credential names another and
-/// every member's leaf takes a rename.
+/// The name this session takes in a group: in a devices group, the device's, where its credential names another.
 fn renaming(g: &Group, device: Option<&str>) -> Option<String> {
     let own = g.members().into_iter().find(|m| m.index == g.own_index())?.credential?;
-    let device = device.filter(|device| g.settings().kind == DEVICES && own.name != *device && g.revised(RENAME_REVISION))?;
+    let device = device.filter(|device| g.settings().kind == DEVICES && own.name != *device)?;
     Some(device.to_owned())
 }
 
@@ -2120,7 +2023,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_group_holds_files_linked_within_keep_its_state_and_its_kinds_links() {
+    fn a_group_holds_files_linked_within_h_its_state_and_its_kinds_links() {
         let link = |n: u8| FileLink { hash: [n; 32], size: 1, key: [0; 32] }.link();
         let old = now() - 3 * 24 * 3600 * 1000;
         let files = vec![(link(1), old), (link(2), now()), (link(3), old)];

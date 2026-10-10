@@ -7,13 +7,13 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, Described, DeviceState, File, Introduction, Remote, message_id};
+use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, DeviceState, File, Introduction, Remote, message_id};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::devices::Devices;
 use lmk_node::{Event, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::{ChatMessage, DEVICES, Refusal, Service};
+use lmk_proto::group::{ChatMessage, DEVICES, Service};
 use lmk_proto::links::FileLink;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -47,8 +47,6 @@ pub struct Config {
     pub hold: Duration,
     /// How long a message waits for those it comes after: `CAUSAL_WAIT`, but in tests.
     pub causal_wait: Duration,
-    /// How long it keeps ended epochs' keys: `Window::default()`, but in tests.
-    pub window: lmk_core::group::Window,
     pub keep_log: bool,
     /// For groups and identities this session creates.
     pub membership: Service,
@@ -402,7 +400,7 @@ impl Session {
             ClientEvent::Warning { .. } => self.outbox.print(serde_json::to_value(&event)?),
             ClientEvent::Gone { group } => self.forget(&group)?,
             ClientEvent::Message { group, id, from, payload } => self.received(group, message_id(&id)?, serde_json::to_value(from)?, payload).await?,
-            ClientEvent::Refused { group, member, messages } => self.refused(&group, &member, &messages).await?,
+            ClientEvent::Sent { .. } => self.outbox.deliver(serde_json::to_value(&event)?, false),
             // What a sync did not bring will not come from that member: a message waiting only for such shows the gap.
             ClientEvent::Synced { group } => loop {
                 let waiting: Vec<[u8; 32]> = self.waiting.iter().map(|w| w.id).collect();
@@ -422,39 +420,6 @@ impl Session {
                 self.outbox.deliver(item, wake);
             }
             _ => {}
-        }
-        Ok(())
-    }
-
-    /// A member refused messages this session sent: its chat messages print, with the reason, their text and a copy
-    /// of their attachment while this session holds them, so that the agent can send them again.
-    async fn refused(&mut self, gid: &Bytes, by: &Described, refusals: &[Refusal]) -> Result<()> {
-        let mut messages = Vec::new();
-        for Refusal { id, reason } in refusals {
-            let Some(message) = self.client.node().message(&id.0)? else { continue };
-            if message.payload["type"] != "message" {
-                continue;
-            }
-            let chat: ChatMessage = serde_json::from_value(message.payload)?;
-            let mut item = json!({ "id": hex::encode(&id.0), "reason": reason, "content": chat.content });
-            if !chat.to.is_empty() {
-                item["to"] = json!(chat.to.iter().map(|fp| hex::encode(&fp.0)).collect::<Vec<_>>());
-            }
-            if chat.urgent {
-                item["urgent"] = json!(true);
-            }
-            if let Some(attachment) = chat.attachment {
-                let link = FileLink::parse(&attachment.link)?;
-                item["attachment"] = json!(attachment);
-                if let Some(bytes) = self.client.node().file(&link).await? {
-                    item["attachment"]["path"] = json!(save(&self.attachments_dir(gid), &link, Some(&attachment.name), &bytes)?);
-                }
-            }
-            messages.push(item);
-        }
-        if !messages.is_empty() {
-            let item = json!({ "type": "refused", "group": b64(&gid.0), "member": by, "messages": messages });
-            self.outbox.deliver(item, true);
         }
         Ok(())
     }
@@ -506,8 +471,8 @@ impl Session {
         if self.taken(&id)? || self.waiting.iter().any(|w| w.id == id) {
             return Ok(());
         }
-        // A message waits for those it comes after, unless this session gave them up: then it shows the gap.
-        if self.missing(&payload)?.iter().all(|missing| self.client.node().given_up(&gid.0, missing)) {
+        // A message waits for those it comes after, unless this session lost them: then it shows the gap.
+        if self.missing(&payload)?.iter().all(|missing| self.client.node().lost(&gid.0, missing)) {
             self.take_message(&gid, id, sender, payload).await
         } else {
             self.waiting.push(Waiting { deadline: Instant::now() + self.config.causal_wait, gid, id, sender, payload });

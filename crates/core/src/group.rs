@@ -20,7 +20,7 @@ pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_
 /// The largest message ciphertext taken, and sent.
 pub const MAX_MESSAGE: usize = 1 << 20;
 /// More than an application message's ciphertext adds to its payload and authenticated data.
-const FRAMING: usize = 1024;
+pub const FRAMING: usize = 1024;
 /// The exporter label of the key that MACs an epoch's message entries.
 const ENTRY_LABEL: &str = "letmeknow entry";
 

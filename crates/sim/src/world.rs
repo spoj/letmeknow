@@ -16,7 +16,6 @@ use lmk_net::{Fetch, Network};
 use lmk_node::devices::Devices;
 use lmk_node::lmk_core::crypto::{Crypto, Rand};
 use lmk_node::lmk_core::device::Device;
-use lmk_node::lmk_core::group::Window;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
 use lmk_node::{Event, Node};
 use lmk_proto::Bytes;
@@ -48,8 +47,6 @@ const ACTION_WAIT: Duration = Duration::from_secs(300);
 /// How long after a device is taken off every member holding its sessions' certificates has read the key log entry
 /// that names it: a copy of a key log is fresh for 10 minutes.
 const KEYS_READ: u64 = 11 * 60 * 1000;
-/// A removed member's messages are taken for 5 minutes after its removal is applied.
-const REMOVED_GRACE: u64 = 5 * 60 * 1000;
 
 thread_local! {
     static START: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -94,9 +91,7 @@ struct Store(Arc<MemoryProvider>);
 impl Store {
     /// A copy, as storage stands when a session crashes, for the next one to start from.
     fn snapshot(&self) -> Store {
-        let provider = MemoryProvider::default();
-        *provider.storage.values.write().unwrap() = self.0.storage.values.read().unwrap().clone();
-        Store(Arc::new(provider))
+        Store(Arc::new(MemoryProvider::load(self.0.records())))
     }
 }
 
@@ -129,6 +124,26 @@ impl Provider for Store {
 
     fn delete(&self, key: &[u8]) -> Result<()> {
         self.0.delete(key)
+    }
+
+    fn begin(&self) -> Result<()> {
+        self.0.begin()
+    }
+
+    fn commit(&self) -> Result<()> {
+        self.0.commit()
+    }
+
+    fn savepoint(&self) -> Result<()> {
+        self.0.savepoint()
+    }
+
+    fn rollback_to(&self) -> Result<()> {
+        self.0.rollback_to()
+    }
+
+    fn release(&self) -> Result<()> {
+        self.0.release()
     }
 }
 
@@ -165,14 +180,6 @@ struct Member {
     tasks: Vec<JoinHandle<()>>,
 }
 
-/// A held chat message an action sent.
-struct Sent {
-    by: usize,
-    group: Bytes,
-    id: Bytes,
-    epoch: u64,
-}
-
 /// What the properties keep track of, and the trace.
 #[derive(Default)]
 struct Book {
@@ -182,12 +189,6 @@ struct Book {
     failure: Option<Failure>,
     /// The held chat messages each member was told of.
     seen: BTreeMap<usize, BTreeSet<String>>,
-    /// When each member was told a member left a group: by member, group and fingerprint.
-    left: BTreeMap<(usize, Bytes, String), u64>,
-    sent: Vec<Sent>,
-    /// Refusals senders were told of, in `send`'s answer or later: sender, message id (hex), and the fingerprint of the
-    /// member that refused it.
-    refusals: BTreeSet<(usize, String, String)>,
     /// Live messages each member took: by member and nonce.
     live: BTreeSet<(usize, String)>,
     /// When an action last disrupted the network or the members on it, as a crash, which a peer notices only once its
@@ -391,8 +392,8 @@ impl World {
             files: None,
             disk: None,
             file_limit: 25 << 20,
-            window: Window::default(),
             kinds: vec![CHAT.into(), DEVICES.into()],
+            durable: None,
         };
         let (node, mut events) = Node::start_on(store, config, network).await?;
         let peers = node.net().clone();
@@ -588,14 +589,7 @@ impl World {
                 let client = self.client(m)?;
                 let after = client.tips(&gid, |_| true)?;
                 let chat = Chat { text: format!("from m{m} at {}", elapsed()), to: Vec::new(), reply_to: None, urgent: false, attachment: None };
-                let (id, answer) = client.send(&gid, chat, after).await?;
-                let epoch = client.node().message(&id.0)?.context("a sent message is held")?.epoch;
-                let mut book = self.book.lock().unwrap();
-                for refusal in answer["refused"].as_array().into_iter().flatten() {
-                    let refuser = refusal["member"]["fp"].as_str().unwrap_or_default().to_owned();
-                    book.refusals.insert((m, hex::encode(&id.0), refuser));
-                }
-                book.sent.push(Sent { by: m, group: gid, id, epoch });
+                let (_, answer) = client.send(&gid, chat, after).await?;
                 Ok(answer.to_string())
             }
             Act::Live { m, group } => {
@@ -675,43 +669,18 @@ impl World {
             self.agreement();
         }
         match event {
-            ClientEvent::Message { group, id, from, .. } => {
-                let from = from.fp.unwrap_or_default();
-                let left = self.book.lock().unwrap().left.get(&(i, group.clone(), from.clone())).copied();
-                // A sender added again is a member, though its client may hear of the message before of the Add.
-                let member = self.client(i).is_ok_and(|client| client.node().members(&group.0).unwrap_or_default().iter().any(|m| fp(&m.key.0) == from));
-                if let Some(left) = left
-                    && elapsed() > left + REMOVED_GRACE
-                    && !member
-                {
-                    self.fail("late", format!("m{i} took {id} from {from}, who left {} at {}", b64(&group.0), clock(left)));
-                }
+            ClientEvent::Message { id, .. } => {
                 if !self.book.lock().unwrap().seen.entry(i).or_default().insert(id.clone()) {
                     self.fail("duplicate", format!("m{i} was told of {id} twice"));
                 }
             }
-            ClientEvent::Left { group, member, .. } => {
-                self.book.lock().unwrap().left.insert((i, group, member.fp.unwrap_or_default()), elapsed());
-            }
             ClientEvent::Joined { group, member, .. } => {
-                let mut book = self.book.lock().unwrap();
-                let fp = member.fp.unwrap_or_default();
                 if member.identity.is_some_and(|known| known.error.is_none()) {
-                    book.vouched.insert((i, group.clone(), fp.clone()));
+                    self.book.lock().unwrap().vouched.insert((i, group, member.fp.unwrap_or_default()));
                 }
-                book.left.remove(&(i, group, fp));
-            }
-            ClientEvent::Gone { group } => {
-                self.book.lock().unwrap().left.retain(|(j, gid, _), _| *j != i || *gid != group);
             }
             ClientEvent::Introduced { group, by, .. } => {
                 self.book.lock().unwrap().introduced.insert((i, group, by.fp.unwrap_or_default()));
-            }
-            ClientEvent::Refused { member, messages, .. } => {
-                let mut book = self.book.lock().unwrap();
-                for refusal in messages {
-                    book.refusals.insert((i, hex::encode(&refusal.id.0), member.fp.clone().unwrap_or_default()));
-                }
             }
             _ => {}
         }
@@ -736,7 +705,6 @@ impl World {
             Frame::Entries { log, .. } if node.groups().contains(log) => vec![("entries", log.clone())],
             Frame::Reconcile { group, .. } => vec![("reconcile", group.clone())],
             Frame::Messages { group, .. } => vec![("messages", group.clone())],
-            Frame::Receipt { group, .. } => vec![("receipt", group.clone())],
             Frame::State { group, .. } => vec![("state", group.clone())],
             Frame::Want { group, .. } => vec![("want", group.clone())],
             Frame::Have { group, files } if !files.is_empty() => vec![("have", group.clone())],
@@ -771,7 +739,7 @@ impl World {
     }
 
     /// Every member online and reachable, then after a while: members of a group agree on it, hold the same messages,
-    /// and get each other's live messages; senders are told of refusals; devices taken off have left.
+    /// and get each other's live messages; devices taken off have left.
     async fn quiesce(self: &Arc<Self>) {
         let running = std::mem::take(&mut *self.running.lock().unwrap());
         for task in running {
@@ -831,37 +799,15 @@ impl World {
                     }
                     let floor = x.joined(&gid.0).unwrap_or(0).max(y.joined(&gid.0).unwrap_or(0));
                     for message in x.messages(&gid.0).unwrap_or_default().into_iter().filter(|m| m.epoch >= floor) {
-                        if y.message(&message.id.0).ok().flatten().is_none() && !y.given_up(&gid.0, &message.id.0) {
+                        if y.message(&message.id.0).ok().flatten().is_none() && !y.lost(&gid.0, &message.id.0) {
                             self.fail("convergence", format!("m{b} lacks {} of {group}, which m{a} holds", hex::encode(&message.id.0)));
                         }
                     }
                 }
             }
-            self.delivered(&gid, &inside);
             groups.push((gid, inside));
         }
         (groups, stale_holders)
-    }
-
-    /// A member that gave up a message an action sent told its sender, if the sender is still in the group.
-    fn delivered(&self, gid: &Bytes, inside: &[(usize, Node<Store>)]) {
-        let book = self.book.lock().unwrap();
-        let sent: Vec<&Sent> = book.sent.iter().filter(|s| s.group == *gid && inside.iter().any(|(i, _)| *i == s.by)).collect();
-        let mut missing = Vec::new();
-        for s in sent {
-            for (r, node) in inside.iter().filter(|(r, _)| *r != s.by) {
-                if node.joined(&gid.0).is_ok_and(|joined| joined <= s.epoch) && node.given_up(&gid.0, &s.id.0) {
-                    let refuser = fp(&node.key().0);
-                    if !book.refusals.contains(&(s.by, hex::encode(&s.id.0), refuser)) {
-                        missing.push(format!("m{} was not told that m{r} refused {}", s.by, hex::encode(&s.id.0)));
-                    }
-                }
-            }
-        }
-        drop(book);
-        for text in missing {
-            self.fail("delivery", text);
-        }
     }
 
     /// A device taken off its identity long enough ago that every member holding its sessions' certificates has read

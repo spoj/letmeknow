@@ -1,6 +1,6 @@
 //! The devices kind, built in: an identity's devices group, whose members are its devices. Its state is the identity,
-//! its private keys, its contacts and the groups open to it, kept in step through the group's kind log and handed to a
-//! new device as any kind's state. A device certifies its sessions with the identity's newest key, and replaces the key
+//! its private keys, its contacts and the groups open to it, kept in step through the group's held messages, in log
+//! order, and handed to a new device as any kind's state. A device certifies its sessions with the identity's newest key, and replaces the key
 //! when it commits the removal of a device, and monthly.
 
 use std::collections::HashSet;
@@ -39,7 +39,7 @@ pub fn renewal_due(certificate: Option<&Envelope>, current: Option<&Bytes>) -> b
     })
 }
 
-/// A devices group's state, as the kind's log stands at `position`.
+/// A devices group's state, as the group's log stands at `position`.
 #[derive(Clone, Serialize, Deserialize)]
 struct Book {
     identity: IdentityRef,
@@ -74,7 +74,7 @@ struct Record {
     since: u64,
 }
 
-/// An entry of a devices group's log.
+/// A held message of a devices group.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Entry {
@@ -195,7 +195,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let (id, entry) = identity::create(&seed, name, membership.clone());
         let identity = IdentityRef { id: id.into(), membership: membership.clone() };
         self.node.append_identity(&identity, &entry).await?;
-        let settings = Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), open: Vec::new(), keep: 90, membership, rest: Default::default() };
+        let settings = Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), open: Vec::new(), carry: 7, membership, rest: Default::default() };
         let gid = self.node.create(settings, None)?;
         let book = Book {
             identity: identity.clone(),
@@ -308,10 +308,9 @@ impl<P: Provider + Send + 'static> Devices<P> {
         self.node.rename_device(name).await
     }
 
-    /// Holds an entry as a message of the group, and appends it to the group's log.
+    /// Sends a held message of the group, and waits until its entry counts.
     async fn enter(&self, gid: &[u8], entry: Entry) -> Result<()> {
-        let (id, _) = self.node.send(gid, &serde_json::to_value(entry)?, true).await?;
-        self.node.append(gid, &id.0).await.map(drop)
+        self.node.send_counted(gid, &serde_json::to_value(entry)?).await.map(drop)
     }
 
     async fn rotate_if_due(&self, gid: &[u8]) -> Result<()> {
@@ -403,7 +402,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
         self.node.follow_log(gid, Some(position))
     }
 
-    /// Applies the entries of the log taken since the state.
+    /// Applies the group's held messages taken since the state.
     fn logged(&self, gid: &[u8]) -> Result<()> {
         let _lock = self.lock.lock().unwrap();
         let mut record = self.record(gid);

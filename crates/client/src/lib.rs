@@ -22,7 +22,7 @@ use lmk_core::provider::Provider;
 use lmk_node::devices::{Devices, renewal_due};
 use lmk_node::{Event, Member, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, DEVICES, How, IdentityRef, Named, Opening, PROTOCOL, Refusal, Service, Settings};
+use lmk_proto::group::{Attachment, CHAT, ChatMessage, Control, DEVICES, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::time::{Duration, Instant, timeout};
 use n0_future::{Either, FutureExt};
@@ -51,6 +51,14 @@ pub(crate) fn b64(bytes: &[u8]) -> String {
 
 pub fn message_id(hex_id: &str) -> Result<[u8; 32]> {
     hex::decode(hex_id).ok().and_then(|id| id.try_into().ok()).with_context(|| format!("{hex_id} is not a message id"))
+}
+
+/// What `send` answers: the message's id, and its entry's position once it counts, or that the send is pending.
+fn sent_answer(sent: &lmk_node::Sent) -> Value {
+    match sent.position {
+        Some(position) => json!({ "id": hex::encode(&sent.id.0), "position": position }),
+        None => json!({ "id": hex::encode(&sent.id.0), "pending": true }),
+    }
 }
 
 /// Adds an object's fields to another.
@@ -170,10 +178,8 @@ pub enum ClientEvent {
     Introduced { group: Bytes, by: Described, identity: Named, how: How },
     /// A chat message, in a group that carries chat.
     Message { group: Bytes, id: String, from: Described, payload: Value },
-    /// A member gave up messages this client sent.
-    Refused { group: Bytes, member: Described, messages: Vec<Refusal> },
-    /// A member took a message this client sent, after `send` stopped waiting.
-    Held { group: Bytes, id: String },
+    /// A send that `send` answered as pending counts now, at `position` in the group's log.
+    Sent { group: Bytes, id: String, position: u64 },
     /// A sync of the group's held messages with a member ended.
     Synced { group: Bytes },
     /// A file is held whole.
@@ -221,7 +227,7 @@ struct State {
     infos: HashMap<Bytes, Value>,
     /// The kinds whose groups carry chat too, as their plugins said when they started.
     chat_kinds: HashSet<String>,
-    /// The last position of each group's kind log handed to its plugin, once the plugin follows the log.
+    /// The last position of each group's log handed to its plugin, once the plugin follows the log.
     handed: HashMap<Bytes, u64>,
 }
 
@@ -337,8 +343,8 @@ impl<P: Provider + Send + 'static> Client<P> {
             return remote.request(request).await;
         }
         match request {
-            Request::Invite { group, kind, name, args, cwd, keep, membership, as_, for_, to, qr: _, identity } => {
-                self.invite(group, kind, name, (args, cwd), keep, membership, as_, for_, to, identity).await
+            Request::Invite { group, kind, name, args, cwd, carry, membership, as_, for_, to, qr: _, identity } => {
+                self.invite(group, kind, name, (args, cwd), carry, membership, as_, for_, to, identity).await
             }
             Request::Join { target, args, cwd, as_ } => self.join(target, (args, cwd), as_).await,
             Request::Members { group } => {
@@ -406,7 +412,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         kind: String,
         name: Option<String>,
         args: (Vec<String>, String),
-        keep: u32,
+        carry: u32,
         membership: Option<String>,
         as_: Option<String>,
         for_: Option<String>,
@@ -431,7 +437,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                     None => {
                         let membership = membership.map(|m| service(&m)).transpose()?.unwrap_or(self.inner.config.membership.clone());
                         let settings =
-                            Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), open: Vec::new(), keep, membership, rest: Default::default() };
+                            Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), open: Vec::new(), carry, membership, rest: Default::default() };
                         let (gid, opened) = self.create(settings, as_, args).await?;
                         merge(&mut answer, opened);
                         gid
@@ -514,12 +520,13 @@ impl<P: Provider + Send + 'static> Client<P> {
 
     async fn leave(&self, gid: &Bytes) -> Result<Value> {
         let gid = gid.clone();
-        let Some(delivery) = self.inner.node.leave(&gid.0).await? else {
+        let Some(sent) = self.inner.node.leave(&gid.0).await? else {
             self.drop_group(&gid).await?;
             return Ok(json!({ "group": b64(&gid.0), "left": true }));
         };
         let mut answer = json!({ "group": b64(&gid.0), "left": true, "status": "another member commits the removal" });
-        if delivery.held.is_empty() {
+        // Until a later release's summaries show another member holding it: no member was online to take it.
+        if sent.position.is_none() || self.inner.node.online(&gid.0)?.is_empty() {
             answer["pending"] = json!(true);
         }
         Ok(answer)
@@ -547,7 +554,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         for gid in node.groups() {
             let settings = node.settings(&gid.0)?;
             let mut group = json!({
-                "group": b64(&gid.0), "kind": settings.kind, "members": node.members(&gid.0)?.len(), "keep": settings.keep,
+                "group": b64(&gid.0), "kind": settings.kind, "members": node.members(&gid.0)?.len(), "carry": settings.carry,
                 "membership": settings.membership, "epoch": node.epoch(&gid.0)?,
             });
             if !settings.name.is_empty() {
@@ -667,21 +674,12 @@ impl<P: Provider + Send + 'static> Client<P> {
             urgent: chat.urgent,
             attachment: attachment.as_ref().map(|(_, a)| a.clone()),
         };
-        let (id, delivery) = node.send(&gid.0, &serde_json::to_value(payload)?, true).await?;
+        let sent = node.send(&gid.0, &serde_json::to_value(payload)?).await?;
+        let id = sent.id.clone();
         let describer = self.describer(gid)?;
-        let mut answer = json!({ "id": hex::encode(&id.0) });
+        let mut answer = sent_answer(&sent);
         if !addressed.is_empty() {
             answer["to"] = json!(addressed.iter().map(|m| fp(&m.key.0)).collect::<Vec<_>>());
-        }
-        if delivery.held.is_empty() {
-            answer["pending"] = json!(true);
-        } else {
-            answer["held_by"] = json!(delivery.held.iter().map(|m| describer.describe(m)).collect::<Vec<_>>());
-        }
-        if !delivery.refused.is_empty() {
-            let refused: Vec<Value> =
-                delivery.refused.iter().map(|(member, reason)| json!({ "member": describer.describe(member), "reason": reason })).collect();
-            answer["refused"] = json!(refused);
         }
         if let Some((link, _)) = attachment {
             let holders = node.spread(&gid.0, &link).await;
@@ -852,11 +850,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                 }
             }
             Event::Introduced { group, by, identity, name, how } => self.introduced(&group, &by, identity, name, how)?,
-            Event::Held { group, id, .. } => self.emit(ClientEvent::Held { group, id: hex::encode(&id.0) }),
-            Event::Refused { group, by, messages } => {
-                let member = self.describe(&group, &by)?;
-                self.emit(ClientEvent::Refused { group, member, messages });
-            }
+            Event::Sent { group, id, position } => self.emit(ClientEvent::Sent { group, id: hex::encode(&id.0), position }),
             Event::File(hash) => {
                 let arrived: Vec<oneshot::Sender<()>> = {
                     let mut st = self.state();
@@ -951,7 +945,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             None => self.describer(gid)?.display_name(&claim),
         };
         let introduce = Control::Introduce { identity: claim.identity, name, how, to: Vec::new() };
-        self.inner.node.send(&gid.0, &serde_json::to_value(introduce)?, false).await?;
+        self.inner.node.send(&gid.0, &serde_json::to_value(introduce)?).await?;
         Ok(())
     }
 
@@ -1166,8 +1160,8 @@ impl<P: Provider + Send + 'static> Client<P> {
         ensure!(known.how != Standing::Unknown, "you can introduce only your contacts and your own identities");
         let to_fp = Bytes(Sha256::digest(&to.key.0)[..8].to_vec());
         let payload = Control::Introduce { identity: claim.identity.clone(), name: known.name.clone(), how: How::Introduce, to: vec![to_fp] };
-        let (id, _) = self.inner.node.send(&gid.0, &serde_json::to_value(payload)?, false).await?;
-        Ok(json!({ "id": hex::encode(&id.0), "group": b64(&gid.0), "identity": { "id": claim.identity.id, "name": known.name }, "to": self.describe(&gid, &to)? }))
+        let sent = self.inner.node.send(&gid.0, &serde_json::to_value(payload)?).await?;
+        Ok(json!({ "id": hex::encode(&sent.id.0), "group": b64(&gid.0), "identity": { "id": claim.identity.id, "name": known.name }, "to": self.describe(&gid, &to)? }))
     }
 
     // Kinds' plugins.
@@ -1204,7 +1198,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(())
     }
 
-    /// Hands a group's plugin the entries of its kind's log it has not had.
+    /// Hands a group's plugin its held messages, in log order, that it has not had.
     fn hand_entries(&self, gid: &Bytes) -> Result<()> {
         let mut st = self.state();
         let (Some(&after), Some(kind)) = (st.handed.get(gid), st.kind_of.get(gid).cloned()) else { return Ok(()) };
@@ -1347,17 +1341,24 @@ impl<P: Provider + Send + 'static> Client<P> {
         let to = message["to"].as_str();
         let id = message["id"].clone();
         match message["type"].as_str().unwrap_or_default() {
+            // The core orders a held send, and answers with its position once it counts, the plugin handed its
+            // messages up to there: this takes a while, answered without holding up the client.
             "send" if message["held"] == true => {
-                let gid = group()?;
-                let (sent, delivery) = node.send(&gid.0, &message["payload"], true).await?;
-                if !id.is_null() {
-                    let describer = self.describer(&gid)?;
-                    let held_by: Vec<Described> = delivery.held.iter().map(|m| describer.describe(m)).collect();
-                    let refused: Vec<Value> =
-                        delivery.refused.iter().map(|(member, reason)| json!({ "member": describer.describe(member), "reason": reason })).collect();
-                    let answer = json!({ "id": hex::encode(&sent.0), "held_by": held_by, "refused": refused, "pending": delivery.held.is_empty() });
-                    self.answer(kind, id, Ok(answer));
-                }
+                let (client, gid, kind, payload) = (self.clone(), group()?, kind.to_owned(), message["payload"].clone());
+                n0_future::task::spawn(async move {
+                    let sent = async {
+                        let sent = client.inner.node.send(&gid.0, &payload).await?;
+                        client.hand_entries(&gid)?;
+                        Ok(sent_answer(&sent))
+                    };
+                    let sent = sent.await;
+                    match sent {
+                        Ok(sent) if !id.is_null() => client.answer(&kind, id, Ok(sent)),
+                        Err(error) if !id.is_null() => client.answer(&kind, id, Err(error)),
+                        Err(error) => client.warn(Some(&gid), format!("the {kind} plugin's send: {error:#}")),
+                        Ok(_) => {}
+                    }
+                });
             }
             "send" => node.send_live(&group()?.0, &message["payload"], to)?,
             "log" => {
@@ -1370,18 +1371,6 @@ impl<P: Provider + Send + 'static> Client<P> {
                 }
             }
             // These take a while: they are answered without holding up the client.
-            "append" => {
-                let (client, gid, kind) = (self.clone(), group()?, kind.to_owned());
-                let appended = message_id(message["message"].as_str().context("no message")?)?;
-                n0_future::task::spawn(async move {
-                    let appended = async {
-                        let position = client.inner.node.append(&gid.0, &appended).await?;
-                        client.hand_entries(&gid)?;
-                        Ok(json!({ "position": position }))
-                    };
-                    client.answer(&kind, id, appended.await);
-                });
-            }
             "spread" => {
                 let (client, gid, kind) = (self.clone(), group()?, kind.to_owned());
                 let link = FileLink::parse(message["link"].as_str().context("no link")?)?;

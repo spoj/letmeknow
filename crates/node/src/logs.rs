@@ -1,5 +1,5 @@
-//! Every log this session follows, alike: a group's log of commits, its kind's log of held messages' ids, and the key
-//! logs of the identities its groups' members speak as. Each is read from its membership service, chained, held entry
+//! Every log this session follows, alike: a group's log of commits and held messages' entries, and the key logs of the
+//! identities its groups' members speak as. Each is read from its membership service, chained, held entry
 //! by entry, shown to peers by its newest signed head and caught up from them; what its entries mean is its log type's
 //! (`Of`), to which `Inner::check` hands them once held.
 
@@ -18,7 +18,7 @@ use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Inner, RESYNC, State, Work, get, hex, put};
+use crate::{Inner, Out, RESYNC, State, Work, get, hex, put};
 
 /// One membership client per service, sharing the session's transport.
 pub(crate) struct Clients {
@@ -53,10 +53,8 @@ impl Clients {
 /// What a log is, which decides what its entries mean.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Of {
-    /// A group's commits; the log's id is the group's.
+    /// A group's commits and held messages' entries; the log's id is the group's.
     Group,
-    /// The log of a group's kind, which orders held messages by id.
-    Kind(Bytes),
     /// An identity's key log.
     Identity(Bytes),
 }
@@ -126,16 +124,6 @@ impl<P: Provider> State<P> {
         self.save_logs()
     }
 
-    /// Drops a log's entries; the next are held from position `start + 1`.
-    pub(crate) fn restart_log(&mut self, id: &[u8], start: u64) -> Result<()> {
-        let log = self.logs.get_mut(id).context("this session does not follow that log")?;
-        for position in log.start + 1..=log.logged {
-            self.provider.delete(&entry_key(id, position))?;
-        }
-        (log.start, log.logged, log.chain) = (start, start, None);
-        self.save_log(id)
-    }
-
     pub(crate) fn drop_log(&mut self, id: &[u8]) -> Result<()> {
         let Some(log) = self.logs.remove(id) else { return Ok(()) };
         for position in log.start + 1..=log.logged {
@@ -155,7 +143,6 @@ impl<P: Provider> State<P> {
     pub(crate) fn groups_of(&self, id: &[u8]) -> Vec<Vec<u8>> {
         match self.logs.get(id).map(|log| &log.of) {
             Some(Of::Group) => vec![id.to_vec()],
-            Some(Of::Kind(gid)) => vec![gid.0.clone()],
             Some(Of::Identity(identity)) => {
                 self.groups.keys().filter(|gid| self.identities(gid).iter().any(|i| i.id == *identity)).cloned().collect()
             }
@@ -173,7 +160,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let (inner, id) = (self.clone(), log.to_vec());
         let task = spawn(async move {
             loop {
-                let Ok(service) = inner.state.lock().unwrap().log(&id).map(|log| log.service.clone()) else { return };
+                let Ok(service) = inner.lock().log(&id).map(|log| log.service.clone()) else { return };
                 let followed = async {
                     let client = inner.clients.client(&service)?;
                     let mut subscription = client.subscribe(vec![Bytes(id.clone())]).await?;
@@ -209,19 +196,19 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Reads a log from its service, through its end.
     pub(crate) async fn read(&self, id: &[u8]) -> Result<()> {
-        let service = self.state.lock().unwrap().log(id)?.service.clone();
+        let service = self.lock().log(id)?.service.clone();
         let client = self.clients.client(&service)?;
         loop {
-            let after = self.state.lock().unwrap().log(id)?.logged;
+            let after = self.lock().log(id)?.logged;
             let page = match client.read(id, after).await {
                 Ok(page) => page,
                 Err(error) => {
                     if let Some(contradiction) = error.downcast_ref::<Contradiction>() {
-                        self.contradicted(&self.state.lock().unwrap(), id, contradiction, "this session");
+                        self.contradicted(&self.lock(), id, contradiction, "this session");
                     }
                     // Past its retention, a member can no longer apply the commits it missed, and must be added again.
                     if error.downcast_ref::<Refused>().is_some_and(|refused| refused.0 == "expired")
-                        && self.state.lock().unwrap().log(id).is_ok_and(|log| log.of == Of::Group)
+                        && self.lock().log(id).is_ok_and(|log| log.of == Of::Group)
                     {
                         self.work.send(Work::Gone(id.to_vec())).ok();
                     }
@@ -234,7 +221,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let more = !page.entries.is_empty();
             self.stored(id, after, page.entries, client.chain(id))?;
             if !more {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.lock();
                 st.logs.get_mut(id).context("dropped the log")?.at = crate::now();
                 return st.save_log(id);
             }
@@ -245,7 +232,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// client's, recorded when it covers just what is held, so that the head this session shows its peers matches its
     /// entries.
     pub(crate) fn stored(&self, id: &[u8], after: u64, entries: Vec<Bytes>, chain: Option<Chain>) -> Result<()> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock();
         let st = &mut *st;
         let logged = st.log(id)?.logged;
         if after > logged {
@@ -270,10 +257,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         } else if !anchored {
             return Ok(());
         }
-        if let Some(net) = self.net.get() {
-            for gid in st.groups_of(id) {
-                net.changed(&gid);
-            }
+        for gid in st.groups_of(id) {
+            st.out.push(Out::Changed(gid));
         }
         Ok(())
     }
@@ -282,7 +267,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
     fn check(&self, st: &mut State<P>, id: &[u8]) -> Result<()> {
         match st.log(id)?.of.clone() {
             Of::Group => self.advance(st, id),
-            Of::Kind(gid) => self.kind_advance(st, &gid.0),
             Of::Identity(identity) => self.keyed(st, &identity.0),
         }
     }
@@ -290,7 +274,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Takes entries of a log from a peer: they directly follow this session's copy and end at `head`.
     pub(crate) fn take_entries(&self, id: &[u8], entries: Vec<Bytes>, head: Head) -> Result<()> {
         let (after, chain) = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.lock();
             let log = st.logs.get_mut(id).context("this session does not follow that log")?;
             let mut chain = log.chain.clone().context("no chain of the log yet")?;
             let after = chain.length();
