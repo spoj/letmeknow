@@ -10,21 +10,26 @@ use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConf
 use lmk_client::{Access, Client, ClientEvent, Config, Plugins, Request, Standing};
 use lmk_core::device::Device;
 use lmk_core::provider::MemoryProvider;
-use lmk_node::Node;
+use lmk_node::{Event, Node};
 use lmk_node::devices::Devices;
 use lmk_proto::group::{CHAT, DEVICES, Service};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 const WAIT: Duration = Duration::from_secs(60);
 const KIND: &str = "test";
+/// "state", in base64url.
+const STATE: &str = "c3RhdGU";
 
-/// A plugin of the kind `test` that answers every request at once, and keeps what it was sent.
+/// A plugin of the kind `test` that answers every request at once, but `start` while a gate is set, and keeps what it
+/// was sent. Its groups' state is "state".
 struct Recorder {
     started: Mutex<Vec<String>>,
     sent: Mutex<Vec<Value>>,
     lines: mpsc::UnboundedSender<(String, Option<Value>)>,
+    /// Opened once to let `start` be answered.
+    gate: Mutex<Option<Arc<Notify>>>,
 }
 
 impl Plugins for Recorder {
@@ -44,7 +49,18 @@ impl Plugins for Recorder {
     fn send(&self, kind: &str, message: &Value) -> anyhow::Result<()> {
         self.sent.lock().unwrap().push(message.clone());
         if let Some(id) = message.get("id") {
-            self.lines.send((kind.into(), Some(json!({ "type": "answer", "id": id, "answer": { "told": message["type"] } })))).unwrap();
+            let answer = match message["type"].as_str() {
+                Some("snapshot") => json!({ "data": STATE }),
+                told => json!({ "told": told }),
+            };
+            let (lines, line) = (self.lines.clone(), (kind.to_owned(), Some(json!({ "type": "answer", "id": id, "answer": answer }))));
+            let gate = self.gate.lock().unwrap().clone().filter(|_| message["type"] == "start");
+            tokio::spawn(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                lines.send(line).unwrap();
+            });
         }
         Ok(())
     }
@@ -58,6 +74,8 @@ struct Member {
     client: Client<MemoryProvider>,
     told: mpsc::UnboundedReceiver<ClientEvent>,
     plugin: Arc<Recorder>,
+    /// Told whenever the client took a state handed to it.
+    stated: Arc<Notify>,
 }
 
 impl Member {
@@ -79,14 +97,19 @@ impl Member {
         let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();
         let devices = Devices::new(node.clone(), device.clone(), Arc::new(|_: &Device| Ok(())));
         let (lines, written) = mpsc::unbounded_channel();
-        let plugin = Arc::new(Recorder { started: Mutex::default(), sent: Mutex::default(), lines });
+        let plugin = Arc::new(Recorder { started: Mutex::default(), sent: Mutex::default(), lines, gate: Mutex::default() });
         let membership = Service::Folder(logs.to_str().unwrap().into());
         let config = Config { name: name.into(), device, membership };
         let (client, told) = Client::new(node, config, Access::Here(devices), plugin.clone(), written);
-        let (taking, pumping) = (client.clone(), client.clone());
+        let (taking, pumping, stated) = (client.clone(), client.clone(), Arc::new(Notify::new()));
+        let state = stated.clone();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
+                let handed = matches!(event, Event::State { .. });
                 taking.event(event).await;
+                if handed {
+                    state.notify_one();
+                }
             }
         });
         tokio::spawn(async move {
@@ -95,7 +118,7 @@ impl Member {
                 pumping.plugin_line(kind, line).await;
             }
         });
-        Member { client, told, plugin }
+        Member { client, told, plugin, stated }
     }
 
     async fn request(&self, request: Value) -> Value {
@@ -170,16 +193,32 @@ async fn an_invite_made_for_someone_makes_its_joiner_that_contact_and_describes_
     assert_eq!((invite["kind"].as_str(), invite["for"].as_str()), (Some(CHAT), Some("Bob (Acme)")));
     bob.request(json!({ "cmd": "join", "target": invite["link"] })).await;
     let ClientEvent::Joined { member, .. } = alice.until(|e| matches!(e, ClientEvent::Joined { .. })).await else { unreachable!() };
-    assert_eq!(member.identity.unwrap().name, "Robert", "a stranger's own claim, until the contact is recorded");
-    // Whom the invite was for becomes a contact, and the group is told who they are.
-    let ClientEvent::Introduced { identity, by, .. } = bob.until(|e| matches!(e, ClientEvent::Introduced { .. })).await else { unreachable!() };
-    assert_eq!((identity.name.as_str(), by.name.as_deref()), ("Bob (Acme)", Some("Alice's laptop")));
-    // Every leaf names revision 1, so the introduce is held, by its sender and by those it reaches.
+    let known = member.identity.unwrap();
+    assert_eq!((known.name.as_str(), known.how), ("Bob (Acme)", Standing::Verified), "whom the invite was for, at once");
+    // Whom the invite was for becomes a contact, and the group is told who they are. Every leaf names revision 1, so
+    // the introduce is held, by its sender and by those it reaches.
     let holds_introduce = |m: &Member| {
         let node = m.client.node();
         node.groups().iter().any(|g| node.messages(&g.0).unwrap().iter().any(|message| message.payload["type"] == "introduce"))
     };
-    assert!(holds_introduce(&alice) && holds_introduce(&bob));
+    // A shutdown lets the work the join caused end.
+    alice.client.shutdown().await;
+    assert!(holds_introduce(&alice));
+    tokio::time::timeout(WAIT, async {
+        while !holds_introduce(&bob) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the introduce is held");
+    // Bob is not told who he is himself.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    while let Ok(event) = bob.told.try_recv() {
+        assert!(!matches!(event, ClientEvent::Introduced { .. }), "{event:?}");
+    }
+    let me = alice.client.me().unwrap()["fp"].as_str().unwrap().to_owned();
+    let introduced = alice.client.request(serde_json::from_value(json!({ "cmd": "introduce", "group": invite["group"], "member": me, "to": "Bob" })).unwrap()).await;
+    assert_eq!(introduced.unwrap_err().to_string(), "you can introduce only your contacts");
     // The contact is the identity's once its devices group's log takes it.
     let mut contacts = alice.request(json!({ "cmd": "contacts" })).await;
     for _ in 0..200 {
@@ -214,6 +253,51 @@ async fn a_kinds_plugin_hears_of_its_groups_and_lets_go_of_one_left() {
     assert_eq!(left["left"], true);
     assert_eq!(alice.plugin.sent.lock().unwrap().last().unwrap()["type"], "gone");
     alice.until(|e| matches!(e, ClientEvent::Gone { .. })).await;
+}
+
+/// A link to a new group of the kind `test`, which the second member is joining, its plugin starting until the gate opens.
+async fn joining(alice: &Member, bob: &Member) -> (Value, Arc<Notify>, tokio::task::JoinHandle<anyhow::Result<Value>>) {
+    let invite = alice.request(json!({ "cmd": "invite", "kind": KIND })).await;
+    let gate = Arc::new(Notify::new());
+    *bob.plugin.gate.lock().unwrap() = Some(gate.clone());
+    let (client, join) = (bob.client.clone(), serde_json::from_value(json!({ "cmd": "join", "target": invite["link"] })).unwrap());
+    (invite, gate, tokio::spawn(async move { client.request(join).await }))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joiner_keeps_the_state_handed_before_its_kind_opened_and_joins_once() {
+    let (relay, logs) = (relay().await, logs("state"));
+    let alice = Member::start(&relay, &logs, "Alice").await;
+    let bob = Member::start(&relay, &logs, "Bob").await;
+    let (invite, gate, joined) = joining(&alice, &bob).await;
+    tokio::time::timeout(WAIT, bob.stated.notified()).await.expect("the state came with the Welcome");
+    let again = invite["link"].as_str().unwrap().replace("https://letmeknow.dev/i", "https://example.com/x");
+    let refused = bob.client.request(serde_json::from_value(json!({ "cmd": "join", "target": again })).unwrap()).await;
+    assert_eq!(refused.unwrap_err().to_string(), "this session is joining that already: wait for that join to end");
+    gate.notify_one();
+    joined.await.unwrap().unwrap();
+    let sent = bob.plugin.sent.lock().unwrap().clone();
+    let told = sent.iter().position(|m| m["type"] == "group").unwrap();
+    let state = sent.iter().position(|m| m["type"] == "state").expect("the plugin is handed the state");
+    assert!(told < state, "after the group");
+    assert_eq!((sent[state]["group"].clone(), sent[state]["data"].as_str()), (invite["group"].clone(), Some(STATE)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_left_while_its_kind_starts_is_never_told_of() {
+    let (relay, logs) = (relay().await, logs("gone"));
+    let alice = Member::start(&relay, &logs, "Alice").await;
+    let mut bob = Member::start(&relay, &logs, "Bob").await;
+    let (invite, gate, joined) = joining(&alice, &bob).await;
+    tokio::time::timeout(WAIT, bob.stated.notified()).await.expect("bob is in the group");
+    bob.request(json!({ "cmd": "leave", "group": invite["group"] })).await;
+    bob.until(|e| matches!(e, ClientEvent::Gone { .. })).await;
+    gate.notify_one();
+    let error = joined.await.unwrap().unwrap_err().to_string();
+    assert_eq!(error, format!("{} is gone", invite["group"].as_str().unwrap()));
+    let sent = bob.plugin.sent.lock().unwrap().clone();
+    assert!(sent.iter().all(|m| m["type"] == "start"), "{sent:?}");
+    assert!(bob.client.node().groups().is_empty());
 }
 
 /// Asks a member again until its answer is as wanted.

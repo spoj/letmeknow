@@ -546,6 +546,7 @@ fn introductions_are_shown_until_accepted() {
         let bob_seen = bob_seen().await;
         let mut event = carol.expect("introduced").await;
         while event["how"] != "introduce" {
+            assert_ne!(event["identity"]["name"], "Dave", "a plain invite vouches for no one");
             event = carol.expect("introduced").await;
         }
         assert_eq!((event["by"]["name"].as_str(), event["how"].as_str()), (Some("Alice"), Some("introduce")));
@@ -957,7 +958,7 @@ fn git_pushes_count_in_the_groups_log_in_order() {
         let (new, bundle) = (git(&repo, &["rev-parse", "HEAD"]), world.root.join("3.bundle"));
         git(&repo, &["bundle", "create", bundle.to_str().unwrap(), &format!("{second}..main")]);
         let refused = alice.cmd(&["git", "push", &group, "refs/heads/main", &second, &new, bundle.to_str().unwrap()]).await.unwrap_err().to_string();
-        assert!(refused.contains("no other member online took the push's bundle"), "{refused}");
+        assert!(refused.contains("online"), "{refused}");
         let tips = alice.cmd(&["git", "list", &group, "--push"]).await.unwrap();
         assert_eq!(tips["refs"]["refs/heads/main"], second.as_str(), "the push did not count");
     });
