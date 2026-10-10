@@ -14,7 +14,7 @@ use lmk_membership::service::{Policy, Service as Membership};
 use lmk_membership::store::Store;
 use lmk_node::devices::Devices;
 use lmk_node::{Config, Event, Node};
-use lmk_proto::group::{CHAT, Certificate, ChatMessage, DEVICES, IdentityRef, Named, PROTOCOL, Service, Settings};
+use lmk_proto::group::{CHAT, Certificate, ChatMessage, DEVICES, IdentityRef, Named, PROTOCOL, Service, Settings, type_of};
 use lmk_proto::identity::Listed;
 use lmk_proto::Bytes;
 use lmk_proto::frame::ALPN;
@@ -679,6 +679,13 @@ async fn a_dropped_devices_sessions_are_removed_once_and_reported() {
     let link = tablet.node.invite(&groups[0].0, None, None).await.unwrap();
     dave.node.join(&link, None).await.unwrap();
     let link = lmk_proto::links::Invite { members: alice_only, ..tablet.node.invite(&groups[0].0, None, None).await.unwrap() };
+    // Alice admits by the tablet's invites once she holds their messages.
+    tokio::time::timeout(WAIT, async {
+        let invites = || alice.node.messages(&groups[0].0).unwrap().into_iter().filter(|m| m.sender.key == tablet.node.key() && type_of(&m.payload) == "invite").count();
+        while invites() < 2 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }).await.expect("alice holds the tablet's invites");
     eve.node.join(&link, None).await.unwrap();
     tokio::time::timeout(WAIT, async {
         while alice.node.members(&groups[0].0).unwrap().len() < 5 {
