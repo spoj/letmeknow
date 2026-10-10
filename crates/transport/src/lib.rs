@@ -1,4 +1,4 @@
-//! What our protocols run over: connections between endpoints, named by their keys, on the `letmeknow/1` ALPN, each
+//! What our protocols run over: connections between endpoints, named by their keys, on the `letmeknow/2` ALPN, each
 //! carrying bidirectional streams. iroh carries them in production, and a simulator in its tests.
 
 use std::{future::Future, pin::Pin, sync::Arc};

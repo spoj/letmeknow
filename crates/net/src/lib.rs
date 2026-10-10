@@ -1,4 +1,4 @@
-//! Everything a session says to its peers over iroh: one `letmeknow/1` connection per pair of
+//! Everything a session says to its peers over iroh: one `letmeknow/2` connection per pair of
 //! sessions, its `peer` stream, and files over iroh-blobs. MLS stays outside, behind
 //! [`Groups`]: this crate moves ciphertexts and holds no keys. A simulator runs it over its own transport instead.
 

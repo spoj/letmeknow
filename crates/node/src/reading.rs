@@ -3,7 +3,7 @@
 //! and opened in position order within its epoch. Before a commit that deletes an epoch's keys while this session lacks
 //! some of its messages, it syncs with the members online.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -67,7 +67,7 @@ pub(crate) fn ciphertext_key(gid: &[u8], position: u64) -> Vec<u8> {
 pub(crate) struct Wait {
     position: u64,
     /// The members online whose sync has not ended yet.
-    peers: HashSet<EndpointId>,
+    peers: BTreeSet<EndpointId>,
     /// A member's sync ended.
     synced: bool,
     /// When it last made progress: a sync ended, a member came online, or a ciphertext came.
@@ -468,7 +468,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             return Ok(waited(wait, now));
         }
         let connected = self.net.get().map(|net| net.connected()).unwrap_or_default();
-        let peers: HashSet<EndpointId> = connected.into_iter().filter(|peer| st.serves(gid, peer)).collect();
+        let peers: BTreeSet<EndpointId> = connected.into_iter().filter(|peer| st.serves(gid, peer)).collect();
         for peer in &peers {
             st.out.push(Out::Served { peer: *peer, group: gid.to_vec() });
         }

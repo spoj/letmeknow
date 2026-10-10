@@ -208,14 +208,16 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Records that these sends' entries may have reached the service, unless it certainly was not reached; returns
-    /// those that never may have.
+    /// those that never may have, and that `send` has not answered as pending: those go on.
     fn appended(&self, gid: &[u8], sends: &[(Bytes, Vec<u8>)], unreached: bool) -> Vec<Bytes> {
         let st = self.lock();
         let mut never = Vec::new();
         for (handle, _) in sends {
             let Ok(Some(mut send)) = get::<Held>(&st.provider, &send_key(&handle.0)) else { continue };
             if unreached && !send.appended {
-                never.push(handle.clone());
+                if !send.pending {
+                    never.push(handle.clone());
+                }
             } else if !send.appended {
                 send.appended = true;
                 if let Err(error) = put(&st.provider, &send_key(&handle.0), &send) {

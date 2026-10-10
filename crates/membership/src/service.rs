@@ -1,7 +1,7 @@
-//! The membership service over iroh: `membership` streams on the `letmeknow/1` ALPN.
+//! The membership service over iroh: `membership` streams on the `letmeknow/2` ALPN.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -60,8 +60,8 @@ const LAG: usize = 1024;
 #[derive(Default)]
 struct Subscribers {
     next: u64,
-    senders: HashMap<u64, mpsc::Sender<Arc<Notice>>>,
-    logs: HashMap<Bytes, HashSet<u64>>,
+    senders: BTreeMap<u64, mpsc::Sender<Arc<Notice>>>,
+    logs: BTreeMap<Bytes, BTreeSet<u64>>,
 }
 
 impl Subscribers {
