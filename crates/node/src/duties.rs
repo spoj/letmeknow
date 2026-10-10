@@ -42,13 +42,11 @@ pub(crate) fn next_update(updated: u64, update: u32, key: &[u8]) -> u64 {
 fn due<P: Provider>(st: &State<P>, g: &G) -> Option<(Change, Vec<core::Member>)> {
     let me = st.me(g.mls.id());
     let members = g.mls.members();
-    let added = |key: &[u8]| g.mls.added().iter().rev().find(|added| added.member.key.0 == key).map_or(0, |added| added.epoch);
-    let left = |m: &core::Member| g.rec.leaves.iter().any(|(key, epoch)| key.0 == m.key && *epoch >= added(&m.key));
     let others = members.iter().filter(|m| m.key != me);
     let devices = st.devices_log(g.mls.id());
     let dropped = |m: &&core::Member| m.credential.as_ref().is_some_and(|c| dropped(&st.keys, c)) || devices.is_some_and(|log| log.dropped(&m.key));
     let dropped: Vec<core::Member> = others.clone().filter(dropped).cloned().collect();
-    let remove: Vec<u32> = others.filter(|m| left(m) || dropped.iter().any(|d| d.index == m.index)).map(|m| m.index).collect();
+    let remove: Vec<u32> = others.filter(|m| g.left(&m.key) || dropped.iter().any(|d| d.index == m.index)).map(|m| m.index).collect();
     let own = members.iter().find(|m| m.index == g.mls.own_index())?;
     let name = renaming(&g.mls, st.device.as_deref());
     let leaf = &st.session.leaf;

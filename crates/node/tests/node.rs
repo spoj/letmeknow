@@ -253,6 +253,36 @@ async fn any_member_admits_an_invite_once() {
     assert_eq!((member.name.as_str(), how, introduces), ("Erin", lmk_proto::group::How::Invite, false));
 }
 
+/// An invite dies when its inviter leaves the group, removed or by `leave`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invite_dies_when_its_inviter_leaves() {
+    use lmk_proto::links::Invite;
+    let relay = relay().await;
+    let dir = folder("inviter-left");
+    let mut alice = session(&relay, "Alice").await;
+    let (bob, carol) = (session(&relay, "Bob").await, session(&relay, "Carol").await);
+    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    let (by_bob, by_carol) = (bob.node.invite(&gid.0, None, None).await.unwrap(), carol.node.invite(&gid.0, None, None).await.unwrap());
+    let invites = || alice.node.messages(&gid.0).unwrap().iter().filter(|m| m.payload["type"] == "invite").count();
+    eventually("Alice holds both invites", || invites() == 4).await;
+
+    alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
+    carol.node.leave(&gid.0).await.unwrap();
+    eventually("Bob and Carol are out", || alice.node.members(&gid.0).unwrap().len() == 1).await;
+    let dave = session(&relay, "Dave").await;
+    let at_alice = lmk_proto::links::Address { key: alice.node.address().0, relay: Some(relay.url.to_string()) };
+    let ask_alice = |link: &Invite| Invite { members: vec![at_alice.clone()], ..link.clone() };
+    for link in [&by_bob, &by_carol] {
+        let refused = dave.node.join(&ask_alice(link), None).await.unwrap_err();
+        assert!(format!("{refused:#}").contains("its inviter left the group"), "{refused:#}");
+    }
+    alice.node.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() {
     let relay = relay().await;

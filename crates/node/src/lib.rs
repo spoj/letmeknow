@@ -465,6 +465,12 @@ impl G {
     fn new(mls: Group, rec: Rec, heard: BTreeMap<Bytes, peers::Heard>) -> Self {
         G { mls, rec, early: Vec::new(), asked: 0, waiting: false, heard, keys: Vec::new() }
     }
+
+    /// Whether the member with key `key` asked to leave: a `leave` of its counts, sealed since its Add.
+    fn left(&self, key: &[u8]) -> bool {
+        let added = self.mls.added().iter().rev().find(|added| added.member.key.0 == key).map_or(0, |added| added.epoch);
+        self.rec.leaves.iter().any(|(by, epoch)| by.0 == key && *epoch >= added)
+    }
 }
 
 pub(crate) struct State<P> {
