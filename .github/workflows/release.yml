@@ -88,10 +88,12 @@ jobs:
           for dir in dist/npm-*; do
             platform=${dir#dist/npm-}
             os=${platform%-*} cpu=${platform#*-}
+            # Termux's node says android; the static Linux binaries run there.
+            oses="\"$os\""; [ "$os" = linux ] && oses='"linux","android"'
             chmod +x "$dir"/bin/*
             cp LICENSE "$dir/"
             cat > "$dir/package.json" <<EOF
-          {"name":"@letmeknow/$platform","version":"$version","description":"letmeknow binary for $platform","license":"MIT","repository":{"type":"git","url":"git+https://github.com/spoj/letmeknow.git"},"os":["$os"],"cpu":["$cpu"],"files":["bin"]}
+          {"name":"@letmeknow/$platform","version":"$version","description":"letmeknow binary for $platform","license":"MIT","repository":{"type":"git","url":"git+https://github.com/spoj/letmeknow.git"},"os":[$oses],"cpu":["$cpu"],"files":["bin"]}
           EOF
             (cd "$dir" && publish "@letmeknow/$platform")
             (cd npm/cli && npm pkg set "optionalDependencies.@letmeknow/$platform=$version")
