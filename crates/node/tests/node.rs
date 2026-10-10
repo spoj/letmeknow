@@ -268,11 +268,12 @@ async fn any_member_admits_an_invite_once() {
     let expired = Invite { secret, members: vec![link.members[0].clone()], ..link.clone() };
     assert!(format!("{:#}", erin.node.join(&expired, None).await.unwrap_err()).contains("unknown, used or expired"));
 
-    // With the inviter offline, the other member it named admits the joiner; the inviter, not it, introduces them.
+    // With the inviter offline, another member it named admits the joiner; the inviter, not it, introduces them.
     alice.node.shutdown().await.unwrap();
     drop(alice);
     let (joined, by) = erin.node.join(&link, None).await.unwrap();
-    assert_eq!((joined, by), (gid.clone(), link.members[1].key));
+    assert_eq!(joined, gid);
+    assert!(link.members[1..].iter().any(|m| m.key == by), "another member admits");
     let (member, how, introduces) = bob.until(|e| match e {
         Event::Joined { member, how, introduces, .. } if member.name == "Erin" => Some((member, how, introduces)),
         _ => None,

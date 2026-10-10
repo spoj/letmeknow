@@ -18,7 +18,7 @@ use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
 use n0_future::task::spawn;
 use n0_future::{FuturesUnordered, StreamExt};
-use n0_future::time::{Duration, timeout};
+use n0_future::time::{Duration, Instant, sleep_until, timeout};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
@@ -32,6 +32,9 @@ const LINK_MEMBERS: usize = 3;
 /// How long a joiner waits to reach each member it asks, all at once, and then for each one's answer.
 const DIAL_WAIT: Duration = Duration::from_secs(30);
 const JOIN_WAIT: Duration = Duration::from_secs(30);
+/// How long the inviter, whom a link names first, has to be reached before the other members it names are asked: so the
+/// inviter admits whom it invited when it is online.
+const INVITER_FIRST: Duration = Duration::from_secs(3);
 
 /// A joiner's KeyPackage, whose private keys openmls keeps, and the device key it is made with for a devices group.
 #[derive(Serialize, Deserialize)]
@@ -139,11 +142,19 @@ impl<P: Provider + Send + 'static> Node<P> {
             (Join { secret, group, key_package: kept.key_package }, device_key)
         };
         // Each dial is a task of its own, so it goes on, and times out, while a member reached earlier is asked.
+        let inviter_first = Instant::now() + if join.secret.is_some() { INVITER_FIRST } else { Duration::ZERO };
         let mut dials: FuturesUnordered<_> = members
             .into_iter()
-            .map(|(peer, relay)| {
+            .enumerate()
+            .map(|(i, (peer, relay))| {
                 let net = self.inner.net().clone();
-                spawn(async move { (peer, relay.clone(), timeout(DIAL_WAIT, net.dial(peer, relay)).await) })
+                spawn(async move {
+                    let dialed = timeout(DIAL_WAIT, net.dial(peer, relay.clone())).await;
+                    if i > 0 {
+                        sleep_until(inviter_first).await;
+                    }
+                    (peer, relay, dialed)
+                })
             })
             .collect();
         let mut refusal = anyhow::anyhow!("no member the invite names is online");
