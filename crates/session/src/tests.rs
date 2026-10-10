@@ -176,7 +176,7 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let invite = alice.cmd(&["invite", "--for", "Bob (Acme)"]).await.unwrap();
     assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "kind": 0, "expires_in": 0, "for": 0 })));
     let link = invite["link"].as_str().unwrap();
-    assert!(link.starts_with("https://letmeknow.dev/i#2.g."));
+    assert!(link.starts_with("https://letmeknow.dev/i#3.g."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len(), 2);

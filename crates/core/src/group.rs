@@ -1,39 +1,28 @@
-//! Sessions and groups on openmls, protocol version 2 (PROTOCOL.md, Commits).
-
-use std::time::Duration;
+//! Sessions and groups on openmls, protocol version 3: a group's log of commits and held messages' entries
+//! (`lmk_proto::entry`), judged strictly in order, and the messages its members seal and open.
 
 use anyhow::{Context, Result, bail, ensure};
 use lmk_proto::Bytes;
 use lmk_proto::clock::now;
-use lmk_proto::group::{CHAT, Control, Credential, END_REVISION, How, LEAF_EXTENSION, Leaf, PROTOCOL, RENAME_REVISION, SETTINGS_EXTENSION, Settings, held_by_type};
+use lmk_proto::entry::{Entry, signed};
+use lmk_proto::group::{Control, Credential, How, LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Settings};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::signatures::Signer;
+use openmls_traits::types::HashType;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::provider::Provider;
 
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
-/// How long a removed member's messages are still taken after its removal was applied, in milliseconds.
-pub const REMOVED_GRACE: u64 = 5 * 60 * 1000;
 /// The largest message ciphertext taken, and sent.
 pub const MAX_MESSAGE: usize = 1 << 20;
 /// More than an application message's ciphertext adds to its payload and authenticated data.
 const FRAMING: usize = 1024;
-
-/// How long this client keeps ended epochs' keys: a count cap, and an age from when it applied the commit that began each.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Window {
-    pub epochs: usize,
-    pub age: Duration,
-}
-
-impl Default for Window {
-    fn default() -> Self {
-        Window { epochs: 256, age: Duration::from_secs(7 * 24 * 3600) }
-    }
-}
+/// The exporter label of the key that MACs an epoch's message entries.
+const ENTRY_LABEL: &str = "letmeknow entry";
 
 fn capabilities() -> Capabilities {
     let ours = [ExtensionType::Unknown(SETTINGS_EXTENSION), ExtensionType::Unknown(LEAF_EXTENSION)];
@@ -60,11 +49,12 @@ fn settings_of(extensions: &Extensions<GroupContext>) -> Result<Settings> {
     Ok(serde_json::from_slice(&extensions.unknown(SETTINGS_EXTENSION).context("no settings")?.0)?)
 }
 
-fn join_config(window: Window) -> MlsGroupJoinConfig {
+/// Keys of the current and the prior epoch only.
+fn join_config() -> MlsGroupJoinConfig {
     MlsGroupJoinConfig::builder()
         .use_ratchet_tree_extension(true)
         .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
-        .max_past_epochs(window.epochs)
+        .max_past_epochs(1)
         .sender_ratchet_configuration(SenderRatchetConfiguration::new(1000, 100_000))
         .build()
 }
@@ -75,9 +65,12 @@ pub fn credential_of(credential: &openmls::prelude::Credential) -> Option<Creden
     serde_json::from_slice(basic.identity()).ok()
 }
 
-/// The epoch an MLS message was sent in, which its header shows.
-pub fn epoch_of(bytes: &[u8]) -> Result<u64> {
-    Ok(parse::<MlsMessageIn>(bytes)?.try_into_protocol_message()?.epoch().as_u64())
+/// What an application message's clear header shows: the epoch it was sealed in, and whether its sender marked it
+/// live.
+pub fn header(bytes: &[u8]) -> Result<(u64, bool)> {
+    let MlsMessageBodyIn::PrivateMessage(message) = parse::<MlsMessageIn>(bytes)?.extract() else { bail!("not a private message") };
+    let marks = serde_json::from_slice::<Marks>(message.aad()).unwrap_or_default();
+    Ok((message.epoch().as_u64(), marks.live))
 }
 
 fn parse<T: tls_codec::DeserializeBytes>(bytes: &[u8]) -> Result<T> {
@@ -193,33 +186,28 @@ pub struct Change {
     pub how: Option<How>,
     /// SHA-256 of the secret of the invite the added member came in by, carried in the commit's authenticated data.
     pub invite: Option<Bytes>,
-    /// For a removal in a group with a kind's log: the position in the kind's order where the log ends, carried in the
-    /// commit's authenticated data.
-    pub end: Option<u64>,
     /// Leaf indices.
     pub remove: Vec<u32>,
     pub settings: Option<Settings>,
     pub leaf: Option<Leaf>,
-    /// A new name in the committer's credential, which only `Group::renames` allows.
+    /// A new name in the committer's credential.
     pub name: Option<String>,
 }
 
-/// A commit's authenticated data: how the members it adds came in, and where the kind's log ends.
+/// A commit's authenticated data: how the members it adds came in.
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Aad {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     how: Option<How>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     invite: Option<Bytes>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    end: Option<u64>,
 }
 
-/// An application message's authenticated data: a payload its sender marks as held.
+/// An application message's authenticated data, in the clear: a live payload is marked so; a held one has an entry.
 #[derive(Default, Serialize, Deserialize)]
 struct Marks {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    held: bool,
+    live: bool,
 }
 
 /// A message sealed under an epoch whose keys this session does not hold: one it never was in, or one past its key
@@ -235,21 +223,9 @@ impl std::fmt::Display for Unheld {
 
 impl std::error::Error for Unheld {}
 
-/// A message from a member removed more than 5 minutes before it first reached this session.
-#[derive(Debug)]
-pub struct Removed;
-
-impl std::fmt::Display for Removed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("from a member removed more than 5 minutes before")
-    }
-}
-
-impl std::error::Error for Removed {}
-
-/// A commit to post, and for an add, the Welcome to send once the log has taken it.
+/// A commit's log entry, to post, with the Welcome it carries if it adds members.
 pub struct Commit {
-    pub commit: Vec<u8>,
+    pub entry: Vec<u8>,
     pub welcome: Option<Vec<u8>>,
 }
 
@@ -279,34 +255,43 @@ fn leaf_of(extensions: &Extensions<LeafNode>) -> Option<Leaf> {
     serde_json::from_slice(&extensions.unknown(LEAF_EXTENSION)?.0).ok()
 }
 
-/// What a log entry did.
-#[derive(Clone, Debug)]
-pub enum Applied {
-    /// The first valid commit for this group's epoch: it is now applied.
+/// A log entry as judged in the current epoch, before anything of it is applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// The first valid commit for this epoch: apply it next.
     Commit {
-        /// The committer's leaf index, in the epoch it committed in.
-        by: u32,
-        /// This session's own commit.
-        own: bool,
-        /// This session's pending commit lost the race and was cleared: redo its change.
-        lost: bool,
-        /// As their KeyPackages show them; `index` is their new leaf.
-        added: Vec<Member>,
-        how: Option<How>,
-        /// SHA-256 of the secret of the invite the added member came in by.
-        invite: Option<Bytes>,
-        /// Where the kind's log ends, as the commit says.
-        end: Option<u64>,
-        removed: Vec<Member>,
-        settings: bool,
-        /// This session was removed.
-        gone: bool,
+        /// It removes this session.
+        removes: bool,
     },
+    /// A message entry whose MAC verifies under this epoch.
+    Message { id: [u8; 32] },
+    /// A commit from this session's own leaf, signed with its key, that this session did not make: its state was copied.
+    Copied,
     Skipped {
         reason: String,
         /// This session's own commit was invalid and was cleared.
         lost: bool,
     },
+}
+
+/// What a commit did.
+#[derive(Clone, Debug)]
+pub struct Applied {
+    /// The committer's leaf index, in the epoch it committed in.
+    pub by: u32,
+    /// This session's own commit.
+    pub own: bool,
+    /// This session's pending commit lost the race and was cleared: redo its change.
+    pub lost: bool,
+    /// As their KeyPackages show them; `index` is their new leaf.
+    pub added: Vec<Member>,
+    pub how: Option<How>,
+    /// SHA-256 of the secret of the invite the added member came in by.
+    pub invite: Option<Bytes>,
+    pub removed: Vec<Member>,
+    pub settings: bool,
+    /// This session was removed.
+    pub gone: bool,
 }
 
 /// A member's message, decrypted and verified.
@@ -319,12 +304,10 @@ pub struct Opened {
     pub index: u32,
     /// The sender's leaf index now, if it is still a member.
     pub current: Option<u32>,
-    /// The sender's signature key.
-    pub key: Vec<u8>,
     pub sender: Credential,
     pub payload: serde_json::Value,
-    /// Whether members hold it (see `seal`).
-    pub held: bool,
+    /// A live payload, not held.
+    pub live: bool,
 }
 
 /// Who added whom, as the log showed it.
@@ -341,19 +324,12 @@ pub struct Added {
 
 #[derive(Default, Serialize, Deserialize)]
 struct State {
-    /// The bytes of this session's pending commit, as posted.
+    /// This session's pending commit's whole entry, as posted.
     posted: Option<Bytes>,
     /// Its authenticated data.
     aad: Aad,
-    window: Window,
     joined: u64,
-    /// Removed members' keys, with when their removal was applied.
-    removed: Vec<(Bytes, u64)>,
     added: Vec<Added>,
-    /// When the current epoch began here, and the ended epochs before it, oldest first, in milliseconds, as far back as
-    /// this client recorded them.
-    #[serde(default)]
-    began: Vec<u64>,
 }
 
 pub struct Group {
@@ -368,7 +344,7 @@ fn creator_lifetime() -> Lifetime {
 }
 
 impl Group {
-    pub fn create<P: Provider>(provider: &P, session: &Session, settings: &Settings, window: Window) -> Result<Self> {
+    pub fn create<P: Provider>(provider: &P, session: &Session, settings: &Settings) -> Result<Self> {
         ensure!(settings.protocol == PROTOCOL, "settings name protocol {}", settings.protocol);
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(CIPHERSUITE)
@@ -377,23 +353,23 @@ impl Group {
             .with_leaf_node_extensions(leaf_extensions(&session.leaf)?)?
             .use_ratchet_tree_extension(true)
             .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
-            .max_past_epochs(window.epochs)
+            .max_past_epochs(1)
             .sender_ratchet_configuration(SenderRatchetConfiguration::new(1000, 100_000))
             .lifetime(creator_lifetime())
             .build();
         let id = GroupId::from_slice(&crate::random::<16>());
         let mls = MlsGroup::new_with_group_id(provider, &session.signer, &config, id, session.with_key())?;
-        let group = Group { state: State { window, joined: mls.epoch().as_u64(), began: vec![now()], ..State::default() }, mls };
+        let group = Group { state: State { joined: mls.epoch().as_u64(), ..State::default() }, mls };
         group.save(provider)?;
         Ok(group)
     }
 
     /// Joins from a Welcome; refuses a group that runs another protocol version.
-    pub fn join<P: Provider>(provider: &P, welcome: &[u8], window: Window) -> Result<Self> {
+    pub fn join<P: Provider>(provider: &P, welcome: &[u8]) -> Result<Self> {
         let MlsMessageBodyIn::Welcome(welcome) = parse::<MlsMessageIn>(welcome)?.extract() else {
             bail!("not a Welcome")
         };
-        let staged = StagedWelcome::build_from_welcome(provider, &join_config(window), welcome)?
+        let staged = StagedWelcome::build_from_welcome(provider, &join_config(), welcome)?
             .skip_lifetime_validation()
             .build()?;
         let settings = settings_of(staged.group_context().extensions())?;
@@ -403,7 +379,7 @@ impl Group {
             settings.protocol
         );
         let mls = staged.into_group(provider)?;
-        let group = Group { state: State { window, joined: mls.epoch().as_u64(), began: vec![now()], ..State::default() }, mls };
+        let group = Group { state: State { joined: mls.epoch().as_u64(), ..State::default() }, mls };
         group.save(provider)?;
         Ok(group)
     }
@@ -449,11 +425,7 @@ impl Group {
         self.mls.own_leaf_index().u32()
     }
 
-    pub fn pending(&self) -> bool {
-        self.state.posted.is_some()
-    }
-
-    /// The bytes of the pending commit, to post again when it is not known whether the log took them.
+    /// The entry of the pending commit, to post again until the log shows it or another commit wins.
     pub fn posted(&self) -> Option<&[u8]> {
         self.state.posted.as_ref().map(|posted| posted.0.as_slice())
     }
@@ -466,11 +438,6 @@ impl Group {
         self.mls.members().filter_map(|member| Member::of(&self.mls, member.index)).collect()
     }
 
-    /// Whether every member's leaf names `revision` or a later one.
-    pub fn revised(&self, revision: u32) -> bool {
-        revised(&self.mls, revision)
-    }
-
     /// Who added whom, as the log showed it since this session joined.
     pub fn added(&self) -> &[Added] {
         &self.state.added
@@ -481,21 +448,40 @@ impl Group {
         self.state.added.iter().any(|added| added.invite.as_ref().is_some_and(|invite| invite.0 == hash))
     }
 
-    /// 16 bytes the current epoch's exporter secret derives under `label`: the same for every member of the epoch, and
-    /// unknown to all others.
-    pub fn exported<P: Provider>(&self, provider: &P, label: &str) -> Result<[u8; 16]> {
-        let secret = self.mls.export_secret(provider.crypto(), label, &[], 16)?;
-        Ok(secret.try_into().expect("16 bytes"))
+    /// The MAC of a message entry naming `id` in the current epoch.
+    fn mac<P: Provider>(&self, provider: &P, id: &[u8]) -> Result<[u8; 32]> {
+        let key = self.mls.export_secret(provider.crypto(), ENTRY_LABEL, &[], 32)?;
+        Ok(provider.crypto().hmac(HashType::Sha2_256, &key, id)?.as_slice().try_into()?)
     }
 
-    /// Builds a commit and keeps it pending, with its bytes saved: post them next, then read the log.
+    /// The log entry of a message sealed in the current epoch.
+    pub fn entry<P: Provider>(&self, provider: &P, id: &[u8; 32]) -> Result<Vec<u8>> {
+        Ok(Entry::Message { id: *id, mac: self.mac(provider, id)? }.encode())
+    }
+
+    /// Runs `f` under a savepoint, kept if `keep` says so of its result; else rolled back, and the group reloaded from
+    /// storage, so that nothing of it is left.
+    fn guarded<P: Provider, T>(&mut self, provider: &P, keep: impl FnOnce(&Result<T>) -> bool, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        provider.savepoint()?;
+        let result = f(self);
+        if keep(&result) {
+            provider.release()?;
+        } else {
+            provider.rollback_to()?;
+            let id = self.mls.group_id().clone();
+            self.mls = MlsGroup::load(provider.storage(), &id)?.context("the group is gone from storage")?;
+        }
+        result
+    }
+
+    /// Builds a commit and keeps it pending, with its whole entry saved: post that next, then read the log.
     pub fn commit<P: Provider>(&mut self, provider: &P, session: &Session, change: Change) -> Result<Commit> {
         ensure!(self.state.posted.is_none(), "a commit is already pending");
         // One staged but never saved, so never posted.
         self.mls.clear_pending_commit(provider.storage())?;
         let adds = change.add.iter().map(|bytes| key_package_in(provider, bytes)).collect::<Result<Vec<_>>>()?;
-        let aad = Aad { how: change.how, invite: change.invite, end: change.end };
-        if aad.how.is_some() || aad.end.is_some() {
+        let aad = Aad { how: change.how, invite: change.invite };
+        if aad.how.is_some() {
             self.mls.set_aad(serde_json::to_vec(&aad)?);
         }
         let mut parameters = LeafNodeParameters::builder();
@@ -531,10 +517,13 @@ impl Group {
         }
         let (commit, welcome, _) = bundle.into_messages();
         let commit = commit.to_bytes()?;
-        self.state.posted = Some(Bytes(commit.clone()));
+        let welcome = welcome.map(|welcome| welcome.to_bytes()).transpose()?;
+        let sig = session.signer.sign(&signed(&commit, welcome.as_deref())).map_err(|error| anyhow::anyhow!("signing: {error:?}"))?;
+        let entry = Entry::Commit { commit, welcome: welcome.clone(), sig }.encode();
+        self.state.posted = Some(Bytes(entry.clone()));
         self.state.aad = aad;
         self.save(provider)?;
-        Ok(Commit { commit, welcome: welcome.map(|welcome| welcome.to_bytes()).transpose()? })
+        Ok(Commit { entry, welcome })
     }
 
     /// Drops the pending commit, when the log refused it.
@@ -544,104 +533,98 @@ impl Group {
         self.save(provider)
     }
 
-    /// Applies the next log entry: the first valid commit for this epoch; any other entry is skipped.
-    /// `now` is milliseconds since the Unix epoch.
-    pub fn apply<P: Provider>(&mut self, provider: &P, entry: &[u8], now: u64) -> Result<Applied> {
+    /// Judges the next log entry in the current epoch: the first valid commit for it, whose signature verifies under its
+    /// committer's leaf key, is to be applied (`apply`); a message entry counts if its MAC verifies. What openmls does
+    /// as it stages a commit leaves no trace.
+    pub fn judge<P: Provider>(&mut self, provider: &P, entry: &[u8]) -> Result<Verdict> {
         if !self.mls.is_active() {
-            return Ok(Applied::Skipped { reason: "removed from the group".into(), lost: false });
+            return Ok(Verdict::Skipped { reason: "removed from the group".into(), lost: false });
         }
+        if self.state.posted.as_ref().is_some_and(|posted| posted.0 == entry) {
+            let staged = self.mls.pending_commit().expect("a posted commit is pending");
+            if let Err(error) = rules(&self.mls, staged, self.mls.own_leaf_index(), &self.state.aad) {
+                self.state.posted = None;
+                self.mls.clear_pending_commit(provider.storage())?;
+                self.save(provider)?;
+                return Ok(Verdict::Skipped { reason: error.to_string(), lost: true });
+            }
+            return Ok(Verdict::Commit { removes: false });
+        }
+        let skipped = |error: anyhow::Error| Verdict::Skipped { reason: format!("{error:#}"), lost: false };
+        match Entry::parse(entry) {
+            Err(error) => Ok(skipped(error)),
+            Ok(Entry::Message { id, mac }) if mac == self.mac(provider, &id)? => Ok(Verdict::Message { id }),
+            Ok(Entry::Message { .. }) => Ok(skipped(anyhow::anyhow!("a MAC that does not verify in this epoch"))),
+            Ok(Entry::Commit { commit, welcome, sig }) => {
+                let staged = self.guarded(provider, |_| false, |g| g.stage(provider, &commit, welcome.as_deref(), &sig));
+                Ok(match staged {
+                    Ok(Staged::Copied) => Verdict::Copied,
+                    Ok(Staged::Commit(staged, ..)) => Verdict::Commit { removes: staged.self_removed() },
+                    Err(error) => skipped(error),
+                })
+            }
+        }
+    }
+
+    /// Applies a commit `judge` found valid.
+    pub fn apply<P: Provider>(&mut self, provider: &P, entry: &[u8]) -> Result<Applied> {
         if self.state.posted.as_ref().is_some_and(|posted| posted.0 == entry) {
             self.state.posted = None;
             let by = self.mls.own_leaf_index();
             let staged = self.mls.pending_commit().expect("a posted commit is pending");
-            if let Err(error) = rules(&self.mls, staged, by, &self.state.aad) {
-                self.mls.clear_pending_commit(provider.storage())?;
-                self.save(provider)?;
-                return Ok(Applied::Skipped { reason: error.to_string(), lost: true });
-            }
             let aad = self.state.aad.clone();
-            let applied = observe(&self.mls, &mut self.state, staged, by, aad, true, false, now);
+            let applied = observe(&self.mls, &mut self.state, staged, by, aad, true, false);
             self.mls.merge_pending_commit(provider)?;
             return self.merged(provider, applied);
         }
-        let (staged, by, aad) = match self.stage(provider, entry) {
-            Ok(staged) => staged,
-            Err(error) => return Ok(Applied::Skipped { reason: format!("{error:#}"), lost: false }),
-        };
+        let Entry::Commit { commit, welcome, sig } = Entry::parse(entry)? else { bail!("not a commit") };
+        let Staged::Commit(staged, by, aad) = self.stage(provider, &commit, welcome.as_deref(), &sig)? else { bail!("not a commit to apply") };
         let lost = self.state.posted.take().is_some();
         self.mls.clear_pending_commit(provider.storage())?;
-        let applied = observe(&self.mls, &mut self.state, &staged, by, aad, false, lost, now);
-        self.mls.merge_staged_commit(provider, staged)?;
+        let applied = observe(&self.mls, &mut self.state, &staged, by, aad, false, lost);
+        self.mls.merge_staged_commit(provider, *staged)?;
         self.merged(provider, applied)
     }
 
-    fn stage<P: Provider>(
-        &mut self,
-        provider: &P,
-        entry: &[u8],
-    ) -> Result<(StagedCommit, LeafNodeIndex, Aad)> {
-        let message = parse::<MlsMessageIn>(entry)?.try_into_protocol_message()?;
+    fn stage<P: Provider>(&mut self, provider: &P, commit: &[u8], welcome: Option<&[u8]>, sig: &[u8]) -> Result<Staged> {
+        let message = parse::<MlsMessageIn>(commit)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Commit, "not a commit");
         let processed = self.mls.process_message(provider, message)?;
         let aad = serde_json::from_slice::<Aad>(processed.aad()).unwrap_or_default();
         let Sender::Member(by) = *processed.sender() else { bail!("not from a member") };
-        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
-            bail!("not a commit from another member")
+        let key = self.mls.member_at(by).context("from no member")?.signature_key;
+        let signed = provider.crypto().verify_signature(SignatureScheme::ED25519, &signed(commit, welcome), &key, sig).is_ok();
+        let staged = match processed.into_content() {
+            ProcessedMessageContent::OwnPrivateMessage if signed => return Ok(Staged::Copied),
+            ProcessedMessageContent::OwnPrivateMessage => bail!("from this session's leaf, not signed by its key"),
+            ProcessedMessageContent::StagedCommitMessage(staged) => staged,
+            _ => bail!("not a commit"),
         };
+        ensure!(signed, "a commit entry its committer did not sign");
         rules(&self.mls, &staged, by, &aad)?;
-        Ok((*staged, by, aad))
+        Ok(Staged::Commit(staged, by, aad))
     }
 
     fn merged<P: Provider>(&mut self, provider: &P, mut applied: Applied) -> Result<Applied> {
-        if let Applied::Commit { added, .. } = &mut applied {
-            let members = self.members();
-            for member in added {
-                member.index = members.iter().find(|m| m.key == member.key).map_or(0, |m| m.index);
-            }
+        let members = self.members();
+        for member in &mut applied.added {
+            member.index = members.iter().find(|m| m.key == member.key).map_or(0, |m| m.index);
         }
-        self.state.began.push(now());
-        self.expire(provider)?;
         self.save(provider)?;
         Ok(applied)
     }
 
-    /// Drops ended epochs' keys beyond this client's window. Applying a commit does this too; call it now and then.
-    /// openmls dates epochs by the system clock, so the epochs within the window are also counted by the dates
-    /// recorded here, which a simulator's clock decides.
-    pub fn expire<P: Provider>(&mut self, provider: &P) -> Result<()> {
-        let window = self.state.window;
-        let since = now().saturating_sub(window.age.as_millis() as u64);
-        let kept = match self.state.began.split_last() {
-            Some((current, _)) if *current < since => 0,
-            Some((_, ended)) => ended.iter().rev().position(|began| *began < since).unwrap_or(window.epochs),
-            None => window.epochs,
-        }
-        .min(window.epochs);
-        self.mls.delete_past_epoch_secrets(provider, PastEpochDeletion::older_than_duration(window.age).max_past_epochs(kept))?;
-        let began = &mut self.state.began;
-        began.drain(..began.len().saturating_sub(kept + 1));
-        Ok(())
-    }
-
-    pub fn set_window<P: Provider>(&mut self, provider: &P, window: Window) -> Result<()> {
-        self.state.window = window;
-        // First: openmls's own resize, on a smaller cap, keeps the oldest epochs rather than the newest.
-        self.expire(provider)?;
-        self.mls.set_configuration(provider.storage(), &join_config(window))?;
-        self.save(provider)
-    }
-
-    /// Seals a payload as an application message; returns its id and ciphertext. A payload members hold that is not
-    /// held by its type is marked so in the message's authenticated data. One whose ciphertext could be over
-    /// `MAX_MESSAGE` fails before it uses any of the sender's keys.
+    /// Seals a payload as an application message; returns its id and ciphertext. A live payload is marked so in the
+    /// message's authenticated data. One whose ciphertext could be over `MAX_MESSAGE` fails before it uses any of the
+    /// sender's keys.
     pub fn seal<P: Provider>(
         &mut self,
         provider: &P,
         session: &Session,
         payload: &serde_json::Value,
-        held: bool,
+        live: bool,
     ) -> Result<([u8; 32], Vec<u8>)> {
-        let aad = if held && !held_by_type(payload) { serde_json::to_vec(&Marks { held })? } else { Vec::new() };
+        let aad = if live { serde_json::to_vec(&Marks { live })? } else { Vec::new() };
         let payload = serde_json::to_vec(payload)?;
         let size = payload.len() + aad.len() + FRAMING;
         ensure!(size <= MAX_MESSAGE, "the message is {size} bytes, over the 1 MiB members take");
@@ -652,20 +635,21 @@ impl Group {
 
     /// Asks the others to commit this session's removal.
     pub fn leave<P: Provider>(&mut self, provider: &P, session: &Session) -> Result<([u8; 32], Vec<u8>)> {
-        self.seal(provider, session, &serde_json::to_value(Control::Leave)?, true)
+        self.seal(provider, session, &serde_json::to_value(Control::Leave)?, false)
     }
 
-    /// Decrypts and verifies a member's message. `now` (milliseconds) is when it first reached this session; a removed
-    /// member's message that first reached it more than 5 minutes after the removal fails with `Removed`. A message
-    /// under an epoch whose keys this session does not hold fails with `Unheld`.
-    pub fn open<P: Provider>(&mut self, provider: &P, bytes: &[u8], now: u64) -> Result<Opened> {
+    /// Decrypts and verifies a member's message. One under an epoch whose keys this session does not hold fails with
+    /// `Unheld`. What openmls does with one it rejects leaves no trace: it advances the claimed sender's keys before it
+    /// checks the signature.
+    pub fn open<P: Provider>(&mut self, provider: &P, bytes: &[u8]) -> Result<Opened> {
         let message = parse::<MlsMessageIn>(bytes)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Application, "not an application message");
         let unheld = message.epoch() < self.mls.epoch();
-        let processed = match self.mls.process_message(provider, message) {
-            Err(ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(
-                MessageDecryptionError::SecretTreeError(SecretTreeError::TooDistantInThePast),
-            ))) if unheld => return Err(Unheld.into()),
+        let processed = self.guarded(provider, |result| matches!(result, Ok(Ok(_))), |g| Ok(g.mls.process_message(provider, message)))?;
+        let processed = match processed {
+            Err(ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(MessageDecryptionError::SecretTreeError(
+                SecretTreeError::TooDistantInThePast,
+            )))) if unheld => return Err(Unheld.into()),
             processed => processed?,
         };
         let epoch = processed.epoch().as_u64();
@@ -675,33 +659,20 @@ impl Group {
         let ProcessedMessageContent::ApplicationMessage(message) = processed.into_content() else {
             bail!("not an application message")
         };
-        let current = self.members().into_iter().find(|member| member.key == sender.key.0);
-        let mut key = current.as_ref().map(|member| member.key.clone()).unwrap_or_default();
-        if current.is_none()
-            && let Some((removed, at)) = self.state.removed.iter().rev().find(|(key, _)| *key == sender.key)
-        {
-            if now > at + REMOVED_GRACE {
-                return Err(Removed.into());
-            }
-            key = removed.0.clone();
-        }
+        let current = self.members().into_iter().find(|member| member.key == sender.key.0).map(|member| member.index);
         let payload: serde_json::Value = serde_json::from_slice(&message.into_bytes())?;
         ensure!(payload["type"].is_string(), "a payload without a type");
-        Ok(Opened {
-            held: marks.held || held_by_type(&payload),
-            id: Sha256::digest(bytes).into(),
-            epoch,
-            index: index.u32(),
-            current: current.map(|member| member.index),
-            key,
-            sender,
-            payload,
-        })
+        Ok(Opened { id: Sha256::digest(bytes).into(), epoch, index: index.u32(), current, sender, payload, live: marks.live })
     }
 }
 
+/// A commit entry staged, or found to be from a copy of this session's state.
+enum Staged {
+    Commit(Box<StagedCommit>, LeafNodeIndex, Aad),
+    Copied,
+}
+
 /// Records what a commit does, before it is merged.
-#[allow(clippy::too_many_arguments)]
 fn observe(
     group: &MlsGroup,
     state: &mut State,
@@ -710,7 +681,6 @@ fn observe(
     aad: Aad,
     own: bool,
     lost: bool,
-    now: u64,
 ) -> Applied {
     let committer = group.member_at(by).and_then(|member| credential_of(&member.credential));
     let removed: Vec<Member> =
@@ -733,15 +703,13 @@ fn observe(
         let credentials = added.iter().filter_map(|member| member.credential.clone());
         state.added.extend(credentials.map(|member| Added { member, by: committer.clone(), how: aad.how.clone(), invite: aad.invite.clone(), epoch }));
     }
-    state.removed.extend(removed.iter().map(|member| (Bytes(member.key.clone()), now)));
-    Applied::Commit {
+    Applied {
         by: by.u32(),
         own,
         lost,
         added,
         how: aad.how,
         invite: aad.invite,
-        end: aad.end,
         removed,
         settings: staged.queued_proposals().any(|p| matches!(p.proposal(), Proposal::GroupContextExtensions(_))),
         gone: staged.self_removed(),
@@ -753,9 +721,8 @@ fn state_key(id: &[u8]) -> Vec<u8> {
 }
 
 /// The app's rules on a commit, from MLS state alone, binding the committer too: changes inline only, of the kinds we
-/// make; added members whose credentials name their own keys; settings that parse, at protocol 1, with the kind
-/// unchanged; no update of the committer's leaf that changes its credential, but its name where `renames` allows; and,
-/// where every leaf names `END_REVISION`, no removal in a group with a kind's log that names no `end`.
+/// make; added members whose credentials name their own keys; settings that parse, at this protocol, with the kind
+/// unchanged; and no update of the committer's leaf that changes its credential but its name.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad) -> Result<()> {
     for proposal in staged.queued_proposals() {
         ensure!(proposal.proposal_or_ref_type() == ProposalOrRefType::Proposal, "a proposal by reference");
@@ -765,24 +732,17 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad) 
             other => bail!("a {:?} proposal", other.proposal_type()),
         }
     }
+    ensure!(aad.how.is_some() || staged.add_proposals().next().is_none(), "an Add that does not say how its members came in");
     let old = settings_of(group.extensions())?;
     let new = settings_of(staged.group_context().extensions())?;
     ensure!(new.protocol == PROTOCOL, "settings name protocol {}", new.protocol);
     ensure!(new.kind == old.kind, "the kind changed");
-    let ends = aad.end.is_some() || old.kind == CHAT || !revised(group, END_REVISION);
-    ensure!(ends || staged.remove_proposals().next().is_none(), "a removal that does not end the kind's log");
     if let Some(leaf) = staged.update_path_leaf_node() {
         let before = group.member_at(by).and_then(|member| credential_of(&member.credential));
-        let after = credential_of(leaf.credential());
-        let renamed = before.clone().zip(after.clone()).is_some_and(|(before, after)| Credential { name: after.name.clone(), ..before } == after);
-        ensure!(before == after || renamed && revised(group, RENAME_REVISION), "an update changed the member's credential");
+        let after = leaf_credential(leaf)?;
+        ensure!(before.is_some_and(|before| Credential { name: after.name.clone(), ..before } == after), "an update changed the member's credential");
     }
     Ok(())
-}
-
-/// Whether every member's leaf names `revision` or a later one.
-fn revised(group: &MlsGroup, revision: u32) -> bool {
-    group.members().all(|member| Member::of(group, member.index).and_then(|m| m.leaf).is_some_and(|leaf| leaf.revision >= revision))
 }
 
 #[cfg(test)]

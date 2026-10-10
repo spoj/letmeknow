@@ -1,6 +1,7 @@
 //! The wire formats of PROTOCOL.md, shared by every crate.
 
 pub mod clock;
+pub mod entry;
 pub mod frame;
 pub mod group;
 pub mod head;
