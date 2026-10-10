@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lmk_proto::Bytes;
 
-use super::{inside, judged, quiets, removed, short, through};
+use super::{CARRY, inside, judged, quiets, removed, short, through};
 use crate::trace::{Frame, Hash, Positions, Trace, Verdict, What};
 
 /// How long a member waits, without progress, before it applies a commit that deletes keys of positions it lacks.
@@ -14,10 +14,15 @@ pub const STALL: u64 = 10_000;
 pub const ONLINE_WAIT: u64 = 3_000;
 
 /// Members that opened a position opened the same plaintext. At the end of a quiet period, of a group's active members
-/// at its latest epoch, each holds, has opened or has lost every position since its start that another holds.
+/// at its latest epoch, each holds, has opened or has lost every position since its start that another holds, but those
+/// it read longer than H ago, which it may have let go.
 pub fn convergence(t: &Trace) -> Result<(), String> {
     let mut plain: BTreeMap<(&Bytes, u64), (usize, &Hash)> = BTreeMap::new();
+    let mut read: BTreeMap<(usize, &Bytes, u64), u64> = BTreeMap::new();
     for o in &t.0 {
+        if let What::Read { m, group, position, .. } = &o.what {
+            read.insert((*m, group, *position), o.at);
+        }
         let What::Opened { m, group, position, plaintext, .. } = &o.what else { continue };
         match plain.get(&(group, *position)) {
             Some((j, theirs)) if *theirs != plaintext => {
@@ -31,7 +36,8 @@ pub fn convergence(t: &Trace) -> Result<(), String> {
         let inside = inside(views);
         for a in &inside {
             for b in inside.iter().filter(|b| b.m != a.m && b.group == a.group) {
-                if let Some(p) = b.held.range(a.start + 1..).find(|p| !a.held.contains(p) && !a.opened.contains(p) && !a.lost.contains(p)) {
+                let kept = |p: &u64| read.get(&(a.m, &a.group, *p)).is_none_or(|read| read + CARRY > at);
+                if let Some(p) = b.held.range(a.start + 1..).find(|p| !a.held.contains(p) && !a.opened.contains(p) && !a.lost.contains(p) && kept(p)) {
                     return Err(format!("m{} lacks position {p} of {}, which m{} holds, at {}", a.m, short(&a.group), b.m, super::clock(at)));
                 }
             }

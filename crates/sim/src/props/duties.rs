@@ -69,7 +69,7 @@ fn whole(t: &Trace, m: usize, from: u64, to: u64) -> bool {
 }
 
 /// Every known loss but those at one's own removal is announced by the end of the next quiet period the member is in
-/// the group for; and each announcement reaches, by then, every member of the group whose start is before it: it opened
+/// the group for, in the same membership; and each announcement reaches, by then, every member of the group whose start is before it: it opened
 /// the announcement, which its kinds and client learn from, or lost it too.
 pub fn losses_announced(t: &Trace) -> Result<(), String> {
     let judged = judged(t);
@@ -83,7 +83,8 @@ pub fn losses_announced(t: &Trace) -> Result<(), String> {
                     continue;
                 }
                 for (at, views) in after {
-                    if !views.iter().any(|v| v.m == *m && v.group == *group && v.active()) {
+                    let again = t.0.iter().any(|j| j.at > o.at && j.at <= at && matches!(&j.what, What::Joined { m: n, group: g, .. } if n == m && g == group));
+                    if again || !views.iter().any(|v| v.m == *m && v.group == *group && v.active()) {
                         continue;
                     }
                     let told: BTreeSet<u64> = t.0.iter().take_while(|o| o.at <= at).flat_map(|o| match &o.what {

@@ -166,3 +166,43 @@ fn an_add_whose_answer_was_lost_admits_its_joiner() {
         ],
     );
 }
+
+/// A member pushed its message as it counted, in a step before the one that applied a peer's removal; the push left
+/// after that step, to a peer no longer in its current epoch.
+#[test]
+fn a_push_leaves_only_to_peers_still_admitted() {
+    use lmk_sim::Forgery;
+    passes(
+        121,
+        5,
+        vec![
+            (985, Act::CreateIdentity { m: 0 }),
+            (2583, Act::CreateIdentity { m: 1 }),
+            (3167, Act::CreateIdentity { m: 2 }),
+            (3712, Act::CreateIdentity { m: 3 }),
+            (4542, Act::CreateIdentity { m: 4 }),
+            (25300, Act::Invite { m: 2, group: None, n: 0, label: true, to: None, wait: 126164, race: None }),
+            (64316, Act::Invite { m: 3, group: None, n: 4, label: true, to: None, wait: 74966, race: None }),
+            (87372, Act::Send { m: 1, group: 1 }),
+            (1235802, Act::Down { m: 1, ms: 40453974 }),
+            (2757252, Act::Wake { m: 1, ms: 4047 }),
+            (5763909, Act::Wake { m: 1, ms: 3421 }),
+            (6934591, Act::Partition { mask: 627417265 }),
+            (6943076, Act::Down { m: 2, ms: 1800000 }),
+            (51934058, Act::Offline { m: 2 }),
+            (51934058, Act::Offline { m: 3 }),
+            (51936895, Act::Send { m: 1, group: 0 }),
+            (51936977, Act::Send { m: 1, group: 0 }),
+            (51938283, Act::Leave { m: 1, group: 0 }),
+            (51953221, Act::Down { m: 1, ms: 106031036 }),
+            (52080802, Act::Online { m: 2 }),
+            (52123651, Act::Online { m: 3 }),
+            (52168604, Act::Offline { m: 3 }),
+            (52171862, Act::Send { m: 4, group: 0 }),
+            (52172420, Act::Forge { m: 4, group: 1, what: Forgery::Copy }),
+            (52631072, Act::Rename { m: 2, group: 1 }),
+            (52631072, Act::Invite { m: 4, group: Some(1), n: 3, label: false, to: None, wait: 0, race: None }),
+            (96457598, Act::Quiesce),
+        ],
+    );
+}

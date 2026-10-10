@@ -156,8 +156,8 @@ impl<P: Provider> State<P> {
         }
     }
 
-    /// What a step produced, less the frames of a group the gate no longer admits their peer to, as when the step
-    /// applied the peer's removal after it queued them.
+    /// What steps produced, less the frames of a group the gate no longer admits their peer to, as when a step applied
+    /// the peer's removal after one queued them.
     pub(crate) fn admissible(&mut self, out: Vec<Out>) -> Vec<Out> {
         out.into_iter()
             .filter_map(|out| match out {

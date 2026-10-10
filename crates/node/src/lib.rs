@@ -556,7 +556,6 @@ impl<P: Provider + Send + 'static> Drop for Step<'_, P> {
             }
         }
         let out = std::mem::take(&mut self.guard.out);
-        let out = self.guard.admissible(out);
         if !out.is_empty() {
             self.inner.outbox.send(out).ok();
         }
@@ -1630,13 +1629,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Sends what steps produced for the peers, in order, once it is durable.
+    /// Sends what steps produced for the peers, in order, once it is durable, but frames of a group to peers the gate no
+    /// longer admits to it, as when a later step applied their removal.
     async fn send_out(self: Arc<Self>, mut outbox: mpsc::UnboundedReceiver<Vec<Out>>) {
         while let Some(out) = outbox.recv().await {
             if let Err(error) = self.durable().await {
                 self.warn(None, format!("saving this session's state: {error:#}"));
             }
             let Some(net) = self.net.get() else { continue };
+            let out = self.lock().admissible(out);
             for out in out {
                 match out {
                     Out::Frame { peer, frame } => drop(net.frame(peer, frame)),

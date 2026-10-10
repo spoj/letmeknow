@@ -22,6 +22,8 @@ pub const CONVERGE: u64 = 90_000;
 /// How long after a device is taken off every member holding its sessions' certificates has read the key log entry
 /// that names it: a copy of a key log is fresh for 10 minutes.
 pub const KEYS_READ: u64 = 11 * 60_000;
+/// H, how long members carry messages, by default.
+pub const CARRY: u64 = 7 * 86_400_000;
 /// The slow timer duties run on, besides at the log's head.
 pub const TIMER: u64 = 10 * 60_000;
 /// T, the leaf update period, by default, and the slow timer that may run a due update late.

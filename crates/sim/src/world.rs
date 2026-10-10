@@ -406,6 +406,9 @@ impl World {
     }
 
     fn observe_at(&self, at: u64, what: What) {
+        if std::env::var_os("LMK_SIM_TRACE").is_some() {
+            eprintln!("{} {what:?}", clock(at));
+        }
         self.book.lock().unwrap().trace.0.push(Obs { at, what });
     }
 
