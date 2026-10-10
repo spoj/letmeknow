@@ -4,6 +4,7 @@
 //! some of its messages, it syncs with the members online.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use iroh::EndpointId;
@@ -11,6 +12,7 @@ use lmk_core::group::{self as core, Verdict};
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
 use lmk_proto::group::{Control, type_of};
+use n0_future::time::{Duration, sleep};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -66,6 +68,8 @@ pub(crate) struct Wait {
     position: u64,
     /// The members online whose sync has not ended yet.
     peers: HashSet<EndpointId>,
+    /// A member's sync ended.
+    synced: bool,
     /// When it last made progress: a sync ended, a member came online, or a ciphertext came.
     progress: u64,
 }
@@ -78,10 +82,10 @@ pub(crate) enum Progress {
     Ciphertext,
 }
 
-/// The wait's rule, apart from how ciphertexts move: it ends once no member online is left to sync with, or after
-/// `STALL` without progress.
+/// The wait's rule, apart from how ciphertexts move: it ends once every member online synced, or after `STALL` without
+/// progress, as when none is online, while this session may still connect to some.
 fn waited(wait: &Wait, now: u64) -> bool {
-    wait.peers.is_empty() || now >= wait.progress + STALL
+    wait.synced && wait.peers.is_empty() || now >= wait.progress + STALL
 }
 
 impl<P: Provider> State<P> {
@@ -357,6 +361,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
         st.save(gid)
     }
 
+    /// Opens, every `PASS`, the held positions that waited on missing ones.
+    pub(crate) async fn passing(self: Arc<Self>) {
+        loop {
+            sleep(Duration::from_millis(PASS)).await;
+            let mut st = self.lock();
+            let waiting: Vec<Vec<u8>> = st.groups.iter().filter(|(_, g)| !g.rec.unopened.is_empty()).map(|(gid, _)| gid.clone()).collect();
+            for gid in waiting {
+                if let Err(error) = self.open_ready(&mut st, &gid).and_then(|()| self.kind_advance(&mut st, &gid)) {
+                    self.warn(Some(&gid), format!("{error:#}"));
+                }
+            }
+        }
+    }
+
     /// Before a commit applies, which deletes the prior epoch's keys: opens what this session holds of that epoch,
     /// and of the current one too if the commit removes it; what it lacks of them is lost to it.
     fn before_commit(&self, st: &mut State<P>, gid: &[u8], removes: bool) -> Result<()> {
@@ -454,7 +472,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for peer in &peers {
             st.out.push(Out::Served { peer: *peer, group: gid.to_vec() });
         }
-        let wait = Wait { position, peers, progress: now };
+        let wait = Wait { position, peers, synced: false, progress: now };
         let over = waited(&wait, now);
         st.group_mut(gid)?.wait = Some(wait);
         if !over {
@@ -468,7 +486,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let now = now();
         let Some(wait) = st.groups.get_mut(gid).and_then(|g| g.wait.as_mut()) else { return Ok(()) };
         let moved = match progress {
-            Progress::Synced(peer) => wait.peers.remove(&peer),
+            Progress::Synced(peer) => {
+                let removed = wait.peers.remove(&peer);
+                wait.synced |= removed;
+                removed
+            }
             Progress::Disconnected(peer) => {
                 wait.peers.remove(&peer);
                 false

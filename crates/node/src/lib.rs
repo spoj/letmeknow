@@ -842,6 +842,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         }
         inner.spawn(inner.clone().resume(gids));
         inner.spawn(inner.clone().redial());
+        inner.spawn(inner.clone().passing());
         Ok((Node { inner }, events_rx))
     }
 
