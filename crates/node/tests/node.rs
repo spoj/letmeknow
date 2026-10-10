@@ -1107,10 +1107,16 @@ async fn a_change_made_moot_commits_nothing() {
     let carol_key = carol.node.key();
     let remove = |node: &Node<MemoryProvider>| {
         let (node, gid, key) = (node.clone(), gid.clone(), carol_key.clone());
-        tokio::spawn(async move { node.remove(&gid.0, &key.0).await.unwrap() })
+        tokio::spawn(async move { node.remove(&gid.0, &key.0).await })
     };
+    // One commits the removal; the other finds it moot, or, if it starts once the removal applied, not a member.
     let (a, b) = (remove(&alice.node), remove(&bob.node));
-    assert!(a.await.unwrap() != b.await.unwrap(), "one of them committed the removal");
+    let mut answers = [a.await.unwrap(), b.await.unwrap()].map(|answer| answer.map_err(|error| format!("{error:#}")));
+    answers.sort();
+    assert!(matches!(&answers, [Ok(false), Ok(true)] | [Ok(true), Err(_)]), "{answers:?}");
+    if let Err(error) = &answers[1] {
+        assert!(error.contains("not a member"), "{error}");
+    }
     let epochs = (alice.node.epoch(&gid.0).unwrap(), bob.node.epoch(&gid.0).unwrap());
     assert!(epochs.0.max(epochs.1) == epoch + 2, "one removal committed: {epochs:?} after {}", epoch + 1);
     bob.until(|e| matches!(e, Event::Left { .. }).then_some(())).await;
@@ -1529,11 +1535,14 @@ async fn a_member_waits_while_the_member_between_it_and_the_holder_fetches() {
     sam.settle(&gid).await;
     assert!(!quinn.node.linked(&gid.0).contains(&file), "no state while behind");
 
-    // R comes back too, reaching only Q, whose summary shows p fetching: R waits.
+    // R comes back too, reaching only Q, whose summary shows p fetching: R waits past the 3 seconds after it came online
+    // (its first connection), and within the 10 without progress. S keeps Q's request alive.
     let mut rita = stored(&relay, "Rita", &dbs[2]).await;
+    eventually("R reaches Q", || rita.node.online(&gid.0).unwrap().iter().any(|m| m.name == "Quinn")).await;
+    let online = std::time::Instant::now();
     eventually("R reached the second rename", || rita.node.epoch(&gid.0).unwrap() == epoch + 1).await;
-    for _ in 0..4 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    while online.elapsed() < Duration::from_secs(4) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
         sam.send(&summary(&gid, &head, Ranges::range(1, head.length))).await;
     }
     assert_eq!(rita.node.epoch(&gid.0).unwrap(), epoch + 1, "R waits past the 3 seconds after it came online");
