@@ -656,7 +656,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         let mut status = json!({ "groups": groups });
         if only_here_count > 0 {
             status["warning"] =
-                json!(format!("{only_here_count} sends are held only by this session; keep it running until a member is online"));
+                json!(format!("{only_here_count} sends are held only by this session; keep it running until another member holds them"));
         }
         Ok(status)
     }
