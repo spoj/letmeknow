@@ -154,7 +154,6 @@ pub struct Member {
     /// The iroh key its leaf names.
     pub iroh: Bytes,
     /// The protocol revision its leaf names.
-    #[serde(default)]
     pub revision: u32,
     pub name: String,
     /// The name of its device, as its identity's key log lists it.
@@ -249,14 +248,6 @@ pub enum SendError {
     Size(String),
     #[error("the group's membership service refused: {0}")]
     Refused(String),
-}
-
-/// What this session sent that no other member holds yet.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Pending {
-    pub id: Bytes,
-    /// `message` or `file`.
-    pub what: String,
 }
 
 #[derive(Debug)]
@@ -397,7 +388,8 @@ struct Rec {
     unopened: BTreeMap<u64, (u64, u64)>,
     /// This session's held sends whose entries have not counted yet, oldest first.
     sends: Vec<Bytes>,
-    pending: Vec<Pending>,
+    /// The files this session added that no other member held yet.
+    pending: Vec<[u8; 32]>,
     /// File links, with when they were linked: those the kind holds (its files added, and those its held messages
     /// link) and states handed to or by this session. Each is held for the group's H.
     files: Vec<(String, u64)>,
@@ -586,8 +578,6 @@ pub(crate) enum Work {
     },
     /// A log to read from its service.
     Read(Vec<u8>),
-    /// A log to follow.
-    Follow(Vec<u8>),
     /// A group's duties to run.
     Duties(Vec<u8>),
     /// A group this session is out of, by no one's commit.
@@ -596,21 +586,8 @@ pub(crate) enum Work {
         group: Vec<u8>,
         link: FileLink,
     },
-    /// A state a member handed this session.
-    State {
-        group: Vec<u8>,
-        link: String,
-        by: EndpointId,
-    },
-    /// A member asks for the state of the group's kind.
-    StateWanted {
-        group: Vec<u8>,
-        by: EndpointId,
-    },
     /// Held sends of a group to append.
     Send(Vec<u8>),
-    /// A file is held whole.
-    Fetched([u8; 32]),
 }
 
 /// A log, and the lengths and hashes of two heads of it that contradict each other.
@@ -1032,7 +1009,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         inner.spawn(async move {
             while let Some(event) = net_events.recv().await {
                 match event {
-                    lmk_net::Event::Fetched(hash) => drop(work.send(Work::Fetched(hash))),
+                    lmk_net::Event::Fetched(hash) => peering.fetched_file(hash),
                     event => peering.peer_event(event),
                 }
             }
@@ -1112,11 +1089,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(self.inner.lock().group(gid)?.mls.epoch())
     }
 
-    /// The epoch this session joined the group at.
-    pub fn joined(&self, gid: &[u8]) -> Result<u64> {
-        Ok(self.inner.lock().group(gid)?.mls.joined())
-    }
-
     pub fn members(&self, gid: &[u8]) -> Result<Vec<Member>> {
         self.inner.lock().members(gid)
     }
@@ -1129,7 +1101,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     }
 
     /// The files this session added to a group that no other member held yet.
-    pub fn pending_files(&self, gid: &[u8]) -> Result<Vec<Pending>> {
+    pub fn pending_files(&self, gid: &[u8]) -> Result<Vec<[u8; 32]>> {
         Ok(self.inner.lock().group(gid)?.rec.pending.clone())
     }
 
@@ -1409,11 +1381,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         lmk_net::Groups::files(&*self.inner, gid)
     }
 
-    /// Whether this session serves a peer a group, by the serving rules.
-    pub fn serves(&self, gid: &[u8], peer: &EndpointId) -> bool {
-        self.inner.lock().serves(gid, peer)
-    }
-
     /// Whether this session lost a held message: its entry counted, and it can no longer open it.
     pub fn lost(&self, gid: &[u8], id: &[u8]) -> bool {
         let st = self.inner.lock();
@@ -1526,7 +1493,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         if holders.is_empty()
             && let Ok(g) = st.group_mut(gid)
         {
-            g.rec.pending.push(Pending { id: Bytes(link.hash.to_vec()), what: "file".into() });
+            g.rec.pending.push(link.hash);
             st.save(gid).ok();
         }
         holders
@@ -1881,7 +1848,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Reads the key logs of the identities in this session's groups that it holds none of, and once more for each
     /// device a member's certificate names that its identity does not list. A log read is followed from then on.
-    async fn refresh_all(&self) {
+    async fn refresh_all(self: &Arc<Self>) {
         let unread: Vec<IdentityRef> = {
             let mut st = self.lock();
             let st = &mut *st;
@@ -1907,14 +1874,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Reads an identity's key log from its service; a log not held yet is followed from then on.
-    async fn read_keys(&self, identity: &IdentityRef) -> Result<KeyLog> {
+    async fn read_keys(self: &Arc<Self>, identity: &IdentityRef) -> Result<KeyLog> {
         let address = lmk_proto::identity::address(&identity.id.0);
         {
             let mut st = self.lock();
             if !st.logs.contains_key(&address[..]) {
                 let of = logs::Of::Identity(identity.id.clone());
                 st.add_log(&address, logs::Log::new(of, identity.membership.clone(), 0))?;
-                self.work.send(Work::Follow(address.to_vec())).ok();
+                self.follow(&address);
             }
         }
         self.read(&address).await?;
@@ -1984,7 +1951,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     }
                 }
                 Work::Duties(gid) => self.duties(&gid),
-                Work::Follow(log) => self.follow(&log),
                 Work::Gone(group) => self.gone(&group, None),
                 Work::Fetch { group, link } => {
                     if self.net().has(link.hash).await.unwrap_or(false) {
@@ -1998,8 +1964,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                         }
                     });
                 }
-                Work::State { group, link, by } => self.state_from(&group, link, by),
-                Work::StateWanted { group, by } => self.hand_snapshot(&group, by),
                 Work::Send(gid) => {
                     if self.sending.lock().unwrap().insert(gid.clone()) {
                         let inner = self.clone();
@@ -2009,7 +1973,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                         });
                     }
                 }
-                Work::Fetched(hash) => self.fetched_file(hash),
             }
         }
     }
@@ -2081,7 +2044,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for gid in gids {
             let g = st.groups.get_mut(&gid).unwrap();
             let before = g.rec.pending.len();
-            g.rec.pending.retain(|pending| pending.id.0 != hash);
+            g.rec.pending.retain(|pending| *pending != hash);
             if g.rec.pending.len() != before {
                 st.save(&gid).ok();
             }

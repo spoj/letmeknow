@@ -21,7 +21,7 @@ use n0_future::time::{Duration, sleep};
 
 use crate::logs::empty;
 use crate::reading::ciphertext_key;
-use crate::{Event, Inner, Member, Node, Out, State, Work, days, endpoint_id, get, now, put};
+use crate::{Event, Inner, Member, Node, Out, State, days, endpoint_id, get, now, put};
 
 /// How often `Peers` is polled.
 const POLL: Duration = Duration::from_millis(250);
@@ -333,8 +333,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
                             self.live(st, &gid, &item.0)?;
                         }
                     }
-                    Frame::State { link: Some(link), .. } => drop(self.work.send(Work::State { group: gid, link, by: peer })),
-                    Frame::State { link: None, .. } => drop(self.work.send(Work::StateWanted { group: gid, by: peer })),
+                    Frame::State { link: Some(link), .. } => self.state_from(&gid, link, peer),
+                    Frame::State { link: None, .. } => self.hand_snapshot(&gid, peer),
                     _ => {}
                 }
             }
@@ -377,14 +377,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.ask_state(st, gid, Some(peer));
         }
         // A file only this session held may have reached the peer since.
-        let pending = st.group(gid)?.rec.pending.iter().filter_map(|p| <[u8; 32]>::try_from(p.id.0.as_slice()).ok()).collect::<Vec<_>>();
+        let pending = st.group(gid)?.rec.pending.clone();
         for hash in pending {
             let (inner, gid) = (self.clone(), gid.to_vec());
             spawn(async move {
                 if inner.net().holders(&gid, hash).await.contains(&peer) {
                     let mut st = inner.lock();
                     if let Ok(g) = st.group_mut(&gid) {
-                        g.rec.pending.retain(|pending| pending.id.0 != hash);
+                        g.rec.pending.retain(|pending| *pending != hash);
                         st.save(&gid).ok();
                     }
                 }

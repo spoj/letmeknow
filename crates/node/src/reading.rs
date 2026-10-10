@@ -30,7 +30,6 @@ pub(crate) struct Pos {
     pub at: u64,
     pub judged: Judged,
     /// A counted position this session can no longer open.
-    #[serde(default)]
     pub lost: bool,
 }
 

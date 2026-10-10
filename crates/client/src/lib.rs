@@ -653,7 +653,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                     None => json!({ "position": position }),
                 })
                 .collect();
-            only_here.extend(node.pending_files(&gid.0)?.iter().map(|p| json!({ "what": p.what, "id": hex::encode(&p.id.0) })));
+            only_here.extend(node.pending_files(&gid.0)?.iter().map(|hash| json!({ "what": "file", "id": hex::encode(hash) })));
             only_here_count += only_here.len();
             let mut group = json!({ "group": b64(&gid.0), "online": online, "away": away, "only_here": only_here });
             if let Some(name) = Some(node.settings(&gid.0)?.name).filter(|n| !n.is_empty()) {
