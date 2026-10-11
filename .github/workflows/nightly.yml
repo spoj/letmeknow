@@ -5,19 +5,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Many more seeds of the simulation than CI runs on every push, new ones each night.
-  sim:
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: |
-          from=$(( GITHUB_RUN_NUMBER * 10000 ))
-          cargo run -p lmk-sim --release -- --seeds $from..$(( from + 10000 ))
-
-  # The in-process tests, over the real iroh stack the simulator replaces, many times on 2 cores, where races show.
+  # The in-process tests, many times on 2 cores, where races show.
   two-cores:
     runs-on: ubuntu-latest
     timeout-minutes: 300

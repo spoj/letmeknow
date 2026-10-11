@@ -3028,33 +3028,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lmk-sim"
-version = "0.13.2"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "ed25519-dalek 3.0.0",
- "hex",
- "iroh",
- "libc",
- "lmk-client",
- "lmk-membership",
- "lmk-net",
- "lmk-node",
- "lmk-proto",
- "lmk-transport",
- "n0-future",
- "openmls",
- "openmls_basic_credential",
- "openmls_memory_storage",
- "openmls_traits",
- "rayon",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
-]
-
-[[package]]
 name = "lmk-transport"
 version = "0.13.2"
 dependencies = [

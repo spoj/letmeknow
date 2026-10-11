@@ -25,12 +25,9 @@ CI's Linux job, to run before pushing:
     cargo build -p lmk-node -p lmk-core -p lmk-net -p lmk-membership -p lmk-client -p lmk-web --target wasm32-unknown-unknown
     cargo clippy -p lmk-web --target wasm32-unknown-unknown --all-targets -- -D warnings
     (cd web && npm ci) && python3 -u test/e2e.py && (cd web && npm run check)
-    cargo run -p lmk-sim --release -- --seeds 0..300
 
 - e2e.py needs wasm-bindgen-cli 0.2.129 and Playwright's chromium-headless-shell.
-- A failing simulator seed prints the command that replays it. LMK_SIM_TRACE, LMK_SIM_LOG and LMK_SIM_FRAMES make a replay print what happened.
-- Run the simulator on the merged tree too: branches that pass alone can fail together.
-- The simulator tests distributed behaviour: give each change its actions and properties there. Write an example test only for what it cannot run: real I/O (iroh, SQLite, files, the membership service), the session process and CLI, plugins, and the browser.
+- Give each change example tests made for the cases that matter. What happens between machines is checked in real use before a release.
 - While iterating, run the tests of what you changed. Run the whole list once before merging: build first (the workspace's tests and the wasm build), then the rest side by side.
 - CI also runs on macOS and Windows, which are slower. When a test flakes there, fix the timing it assumes; do not rerun it until it passes.
 

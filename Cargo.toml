@@ -16,7 +16,6 @@ lmk-net = { path = "crates/net" }
 lmk-node = { path = "crates/node" }
 lmk-client = { path = "crates/client" }
 lmk-serve = { path = "crates/serve" }
-lmk-sim = { path = "crates/sim" }
 letmeknow-kind-doc = { path = "crates/kind-doc" }
 letmeknow-kind-git = { path = "crates/kind-git" }
 anyhow = "1"
@@ -54,6 +53,6 @@ lto = true
 codegen-units = 1
 strip = true
 
-# Dependencies optimized in tests: the simulator's members do real cryptography.
+# Dependencies optimized in tests, which do real cryptography.
 [profile.dev.package."*"]
 opt-level = 2
