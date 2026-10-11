@@ -229,10 +229,13 @@ async fn any_member_admits_an_invite_once() {
     let used = erin.node.join(&link, None).await.unwrap_err();
     assert!(format!("{used:#}").contains("unknown, used or expired"), "a used secret is refused");
 
-    // A member that redeems a link is refused, and the link stays unused.
+    // A member that redeems a link is refused, routinely, and the link stays unused.
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
     let member = bob.node.join(&link, None).await.unwrap_err();
     assert!(format!("{member:#}").contains("a member already"), "{member:#}");
+    while let Ok(event) = alice.events.try_recv().or_else(|_| bob.events.try_recv()) {
+        assert!(!matches!(&event, Event::Warning { text, .. } if text.contains("refused a join")), "a routine refusal is no warning: {event:?}");
+    }
 
     // An expired one too.
     let secret = [7u8; 16];

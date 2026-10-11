@@ -221,6 +221,7 @@ fn address(key: [u8; 32], relay: &str) -> Address {
 const UNKNOWN: &str = "unknown, used or expired invite";
 const INVITER_LEFT: &str = "its inviter left the group";
 const FOR_ANOTHER: &str = "this invite is for another identity, or another device";
+const MEMBER_ALREADY: &str = "this session is a member already";
 
 /// Whether `g`, as it stands, admits a joiner by an invite: checked when its request comes, and each time the commit
 /// that adds it is built. An invite dies when its inviter leaves the group.
@@ -228,7 +229,7 @@ fn admits(g: &G, joiner: &Credential, rule: &Rule) -> Result<()> {
     let members = g.mls.members();
     ensure!(now() < rule.expires && !g.mls.used(&rule.hash.0), UNKNOWN);
     ensure!(members.iter().any(|m| m.key == rule.by.0) && !g.left(&rule.by.0), INVITER_LEFT);
-    ensure!(members.iter().all(|member| member.key != joiner.key.0), "this session is a member already");
+    ensure!(members.iter().all(|member| member.key != joiner.key.0), MEMBER_ALREADY);
     Ok(())
 }
 
@@ -347,7 +348,7 @@ impl<P: Provider + Send + 'static> Admit for Admitter<P> {
                 Err(error) => {
                     let refused = format!("{error:#}");
                     // A joiner asks every member a link names, so routine refusals are many and no one's concern.
-                    if [UNKNOWN, INVITER_LEFT, FOR_ANOTHER, NOT_FOLLOWED].contains(&refused.as_str()) {
+                    if [UNKNOWN, INVITER_LEFT, FOR_ANOTHER, NOT_FOLLOWED, MEMBER_ALREADY].contains(&refused.as_str()) {
                         tracing::debug!("refused a join: {refused}");
                     } else {
                         inner.warn(None, format!("refused a join: {refused}"));
