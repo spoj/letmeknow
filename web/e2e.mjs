@@ -456,7 +456,7 @@ try {
   await laptop.locator("dialog").getByLabel("Invite link").fill(ann.run("invite", `--group=${code.group}`).link);
   await laptop.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
   await laptop.locator(".group-list button.on", { hasText: "Code" }).waitFor();
-  check(true, "the browser joins a git group");
+  check((await laptop.locator(".group-head").textContent()).includes("lives with agent sessions"), "the browser joins a git group, which says where its repository lives");
   annGit("push", "-q", "team", "main");
   await laptop.locator(".messages li.pushed", { hasText: "first commit" }).waitFor();
   check((await laptop.locator(".messages li.pushed").textContent()).includes("pushed to main"), "and shows a push to it, with its commits' subjects");

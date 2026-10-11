@@ -29,6 +29,7 @@ const form = (submit: () => unknown, ...children: Child[]) => h("form", { onsubm
 const field = (label: string, input: HTMLElement, hint?: string) => h("label", { className: "field" }, h("span", {}, label), input, hint && h("small", {}, hint));
 const megabytes = (bytes: number) => (bytes < 1e6 ? `${Math.ceil(bytes / 1000)} KB` : `${(bytes / 1e6).toFixed(1)} MB`);
 const KINDS = { chat: { name: "chat", mark: "💬" }, doc: { name: "document", mark: "📄" }, git: { name: "repository", mark: "🌿" } };
+const GIT_NOTE = "The repository lives with agent sessions; this browser shows its chat and pushes.";
 /** Files up to this size every member fetches; larger ones only on request. */
 const FILE_LIMIT = 25 << 20;
 const INVITE_PREFIX = "https://letmeknow.dev/i";
@@ -480,7 +481,7 @@ function drawNav() {
       const name = `${KINDS[o.settings.kind].mark} ${o.settings.name || `Unnamed ${KINDS[o.settings.kind].name}`}`;
       const join = h("button", {}, "Join");
       join.onclick = () => busy(join, "…", async () => select((await request({ cmd: "join", target: o.group })).group));
-      return h("div", { className: "opening" }, h("span", {}, name), join);
+      return h("div", { className: "opening" }, h("span", {}, name, o.settings.kind === "git" && h("small", { className: "note" }, GIT_NOTE)), join);
     })
   ]);
   set(meName, me.identities[0]?.name ?? me.name);
@@ -707,7 +708,7 @@ class View {
         "header",
         { className: "group-head" },
         back(),
-        h("div", { className: "title" }, this.heading, this.people),
+        h("div", { className: "title" }, this.heading, this.people, group(gid)?.settings.kind === "git" && h("small", { className: "note" }, GIT_NOTE)),
         h(
           "div",
           { className: "head-actions" },
