@@ -465,7 +465,8 @@ impl<P: Provider + Send + 'static> Client<P> {
     /// Adds a session of one of this identity's devices to a group: by an invite that admits only that device's
     /// sessions, valid for `ADD_VALID`, which the device's node hands that device in the identity group. `target` is a
     /// running session's handle, or a device, by its name or key, whose session is the one it runs, or with none the one
-    /// that next acts for it, as a browser.
+    /// that next acts for it, as a browser. It is refused while the group has a member of this identity on a device of
+    /// that name, with that session's handle if it names one.
     async fn add(&self, target: &str, group: Option<String>) -> Result<Value> {
         let gid = self.resolve(group)?;
         let listed = Box::pin(self.request(Request::Identity { op: IdentityOp::List })).await?;
@@ -481,6 +482,12 @@ impl<P: Provider + Send + 'static> Client<P> {
                 (device, running.first().and_then(Value::as_str).unwrap_or_default().to_owned())
             }
         };
+        let present = self.described_members(&gid)?.iter().any(|m| {
+            m.identity.as_ref().is_some_and(|known| known.how == Standing::Own && known.error.is_none())
+                && m.device.as_deref() == device["name"].as_str()
+                && (session.is_empty() || m.handle.as_deref() == Some(session.as_str()))
+        });
+        ensure!(!present, "{target} is in this group already");
         let key: Bytes = serde_json::from_value(device["key"].clone())?;
         let settings = self.inner.node.settings(&gid.0)?;
         let expires = lmk_proto::clock::now() + ADD_VALID;
@@ -490,8 +497,12 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(json!({ "group": b64(&gid.0), "device": device["name"], "session": session, "link": link, "expires_in": ADD_VALID / 1000 }))
     }
 
-    /// Joins a group by an add that `device`, another of this identity's devices, sent, and tells so.
-    pub async fn added(&self, link: &str, device: &str) -> Result<Value> {
+    /// Joins `group` by an add that `device`, another of this identity's devices, sent, and tells so; unless this session
+    /// is in it already, having joined it otherwise meanwhile.
+    pub async fn added(&self, link: &str, group: &Bytes, device: &str) -> Result<Value> {
+        if self.inner.node.groups().contains(group) {
+            return Ok(Value::Null);
+        }
         let joined = self.join(link.to_owned(), (Vec::new(), String::new())).await?;
         self.emit(ClientEvent::Added { device: device.to_owned(), joined: joined.clone() });
         Ok(joined)
@@ -507,7 +518,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             Err(error) => return self.warn(None, format!("reading the adds for this device: {error:#}")),
         };
         for Pending { position, by, add } in pending {
-            let taken = self.added(&add.link, &by).await.and_then(|_| devices.take(position));
+            let taken = self.added(&add.link, &add.group, &by).await.and_then(|_| devices.take(position));
             if let Err(error) = taken {
                 self.warn(None, format!("joining a group your device {by} added this one to: {error:#}"));
             }

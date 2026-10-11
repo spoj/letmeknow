@@ -404,7 +404,9 @@ impl Session {
             Request::Client(request) => _ = self.running.spawn_local(async move { Done::Answered(client.request(request).await, reply) }),
             Request::IdentityJoin { .. } | Request::Status { .. } => unreachable!("the CLI sends these as the client's requests"),
             Request::Stop => unreachable!("`run` stops on it"),
-            Request::Added { link, device } => _ = self.running.spawn_local(async move { Done::Answered(client.added(&link, &device).await, reply) }),
+            Request::Added { link, group, device } => {
+                _ = self.running.spawn_local(async move { Done::Answered(client.added(&link, &group, &device).await, reply) })
+            }
         }
     }
 
@@ -454,7 +456,7 @@ impl Session {
             self.handed.insert(position, session.clone());
             let home = self.home.clone();
             self.running.spawn_local(async move {
-                let request = Request::Added { link: add.link, device: by };
+                let request = Request::Added { link: add.link, group: add.group, device: by };
                 Done::Handed(position, crate::cli::call(&home, &session, request).await)
             });
         }

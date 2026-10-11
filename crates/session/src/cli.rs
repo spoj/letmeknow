@@ -164,10 +164,10 @@ pub enum Request {
     /// `sessions remove`: stops the session, answered once it stopped.
     #[command(skip)]
     Stop,
-    /// An add for this session, which the session acting for the device hands it: joins the group as `join` does, and
-    /// prints `joined`, naming `device`, which sent the add.
+    /// An add for this session, which the session acting for the device hands it: joins `group` as `join` does, unless
+    /// it is in it already, and prints `joined`, naming `device`, which sent the add.
     #[command(skip)]
-    Added { link: String, device: String },
+    Added { link: String, group: lmk_proto::Bytes, device: String },
     #[command(flatten)]
     #[serde(untagged)]
     Client(lmk_client::Request),

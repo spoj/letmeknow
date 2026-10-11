@@ -1037,6 +1037,12 @@ fn an_add_brings_a_session_of_another_device_into_a_group_once() {
         let other = world.start_in("desk", "other", HOUR).await;
         let refused = other.cmd(&["join", link]).await.unwrap_err().to_string();
         assert!(refused.contains("used"), "{refused}");
+
+        // In the group, it is refused another add, and an add it is handed anyway, made before it joined, is done.
+        let again = bob.cmd(&["add", "desk", &format!("--group={group}")]).await.unwrap_err().to_string();
+        assert!(again.contains("desk is in this group already"), "{again}");
+        let stale = Request::Added { link: link.to_owned(), group: serde_json::from_value(json!(group)).unwrap(), device: "laptop".into() };
+        assert_eq!(crate::cli::call(&desk.home, &desk.handle, stale).await.unwrap(), Value::Null);
     });
 }
 
