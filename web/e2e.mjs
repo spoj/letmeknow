@@ -408,18 +408,16 @@ try {
   );
   check(tablet.run("identity", "list").identities[0].name === "Matt", "a native device joins the browser's identity by its link");
 
-  // The laptop opens a new chat to its identity, and the tablet, a device of it, joins without an invite.
+  // The laptop starts a chat, and the tablet joins it by the link the laptop shows.
   await laptop.getByRole("button", { name: "New chat" }).click();
   await laptop.locator("dialog").getByLabel("Name").fill("Ideas");
   await laptop.locator("dialog").getByRole("button", { name: "Start" }).click();
   await laptop.locator(".group-list button.on", { hasText: "Ideas" }).waitFor();
-  await laptop.getByRole("button", { name: "Settings" }).click();
-  await laptop.getByText("Your other devices can join").click();
-  await laptop.locator("dialog input[type=checkbox]:checked:enabled").waitFor();
-  await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
-  const offered = await until(() => tablet.run("groups"), groups => groups.some(g => g.name === "Ideas" && g.joined === false));
-  check(offered.some(g => g.name === "Ideas"), "a chat the browser opens to its identity reaches that identity's other devices");
-  check(tablet.run("join", "Ideas").members.length === 2, "and the browser admits one that asks");
+  await laptop.getByRole("button", { name: "Invite someone" }).click();
+  const ideasLink = await laptop.locator("dialog .copy code").first().textContent();
+  check(tablet.run("join", ideasLink).members.length === 2, "a native session joins a chat the browser started, by its link");
+  await laptop.getByText("They joined the chat.").waitFor();
+  await laptop.locator("dialog").waitFor({ state: "detached" });
   const ideas = tablet.run("groups").find(g => g.name === "Ideas");
   check(JSON.stringify(ideas.membership).includes(LETMEKNOW_RELAY), "on the membership service of the server that served the browser");
   await laptop.locator(".people", { hasText: "Matt · " }).waitFor();
