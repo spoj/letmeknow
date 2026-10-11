@@ -551,8 +551,8 @@ async fn a_kind_takes_held_messages_in_log_order_and_a_member_without_state_asks
     assert_eq!((first[0].position, first[0].from.name.as_str(), &first[0].payload), (p, "Alice", &json!({ "type": "push", "n": 1 })));
     assert_eq!(first[0].id, one.id);
     let (two, three) = (json!({ "type": "push", "n": 2 }), json!({ "type": "push", "n": 3 }));
-    let (a, b) = tokio::join!(alice.node.send(&gid.0, &two), bob.node.send(&gid.0, &three));
-    let mut positions = [a.unwrap().position.unwrap(), b.unwrap().position.unwrap()];
+    let (a, b) = tokio::join!(alice.node.send_counted(&gid.0, &two), bob.node.send_counted(&gid.0, &three));
+    let mut positions = [a.unwrap(), b.unwrap()];
     positions.sort();
     assert_eq!(positions, [p + 1, p + 2]);
     let order = |entries: Vec<lmk_node::Entry>| entries.iter().map(|e| (e.position, e.payload["n"].as_u64().unwrap())).collect::<Vec<_>>();
@@ -586,9 +586,9 @@ async fn a_kind_takes_held_messages_in_log_order_and_a_member_without_state_asks
     }).await;
     assert_eq!(data, b"through 3");
     carol.node.follow_log(&gid.0, Some(p + 2)).unwrap();
-    let four = carol.node.send(&gid.0, &json!({ "type": "push", "n": 4 })).await.unwrap();
+    let four = carol.node.send_counted(&gid.0, &json!({ "type": "push", "n": 4 })).await.unwrap();
     let after = alice.logged(&gid, p + 2).await;
-    assert_eq!((after[0].position, after[0].from.name.as_str()), (four.position.unwrap(), "Carol"));
+    assert_eq!((after[0].position, after[0].from.name.as_str()), (four, "Carol"));
     assert_eq!(carol.logged(&gid, 0).await[0].from.name, "Carol");
 }
 
@@ -1494,13 +1494,13 @@ async fn summaries_are_kept_shown_and_dropped_with_their_member() {
     let bob = session(&relay, "Bob").await;
     let carol = session(&relay, "Carol").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
-    let first = alice.node.send(&gid.0, &message("before anyone")).await.unwrap().position.unwrap();
+    let first = alice.node.send_counted(&gid.0, &message("before anyone")).await.unwrap();
     for joiner in [&bob, &carol] {
         joiner.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
     assert!(!alice.node.only_here(&gid.0).unwrap().contains(first), "before every other member's start, whether or not heard yet");
-    let p = alice.node.send(&gid.0, &message("hello")).await.unwrap().position.unwrap();
+    let p = alice.node.send_counted(&gid.0, &message("hello")).await.unwrap();
     eventually("both hold Alice's message", || !alice.node.only_here(&gid.0).unwrap().contains(p)).await;
     bob.node.mark_read(&gid.0, &one(p)).unwrap();
     eventually("Bob's summary shows it read", || {
@@ -1519,7 +1519,7 @@ async fn summaries_are_kept_shown_and_dropped_with_their_member() {
     alice.node.remove(&gid.0, &carol.node.key().0).await.unwrap();
     assert!(alice.node.heard(&gid.0).unwrap().iter().all(|h| h.member.name != "Carol"), "gone with its member");
     bob.node.shutdown().await.unwrap();
-    let q = alice.node.send(&gid.0, &message("alone")).await.unwrap().position.unwrap();
+    let q = alice.node.send_counted(&gid.0, &message("alone")).await.unwrap();
     let only_here = alice.node.only_here(&gid.0).unwrap();
     assert!(only_here.contains(q) && !only_here.contains(p) && !only_here.contains(first), "Bob's saved summary holds the first, not the second");
     alice.node.shutdown().await.unwrap();
