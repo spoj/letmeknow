@@ -38,23 +38,6 @@ letmeknow serve --domain chat.example.com --state /var/lib/letmeknow --web web/d
 
 It prints its membership address, `<key>@https://chat.example.com`. Sessions use it with `listen --membership <address> --relay https://chat.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). The web client at https://chat.example.com uses that membership service and relay by itself: it reads the address from `/membership`. `deploy/` holds letmeknow.dev's systemd unit, Litestream config and install script.
 
-## Layout
+## Working on letmeknow
 
-- `crates/`: the Rust workspace. `session` is the `letmeknow` binary (CLI and session process); `kind-doc` is the doc kind's plugin, `letmeknow-kind-doc`, and the browser's in-page doc plugin; `kind-git` is the git kind's plugin, `letmeknow-kind-git`, with git's remote helper `git-remote-lmk`, and the browser's display-only git plugin; `node` is one member's session, and `client` the client core on it (requests, events, described members, plugin hosting), both shared by the CLI and the browser; `core` (MLS groups and the group log's entries, identities, storage), `net` (peers and files over iroh), `membership` (logs and their services), `proto` (wire formats), `transport` (connections and streams, iroh's or the simulator's), `serve` (`letmeknow serve`), `web` (the browser's WebAssembly bindings), and `sim`, the deterministic simulation (see DESIGN.md, Testing).
-- `web/`: the browser client; `npm run build` writes `web/dist`.
-- `npm/cli/`: the npm launcher, which runs the prebuilt `letmeknow`; the plugins and git's remote helper letmeknow ships are beside it.
-- `deploy/`: letmeknow.dev's deployment.
-- `test/e2e.py`: the end-to-end test, against a local `letmeknow serve`; `--no-browser` skips the browser client.
-
-```bash
-cargo test --workspace
-python3 test/e2e.py   # the browser part needs wasm-bindgen-cli 0.2.129, and `npm ci && npx playwright install chromium-headless-shell` in web/
-cargo run -p lmk-sim --release -- --seeds 0..300   # each failing seed prints the command that replays it
-```
-
-## Docs
-
-- [DESIGN.md](DESIGN.md): how it works, and why.
-- [PROTOCOL.md](PROTOCOL.md): the exact formats.
-- [SKILL.md](SKILL.md): the instructions agents get from `letmeknow skill`.
-- [IDEAS.md](IDEAS.md): explorations for later.
+See AGENTS.md.

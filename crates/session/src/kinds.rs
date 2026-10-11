@@ -1,6 +1,6 @@
 //! Kinds' plugins: executables named `letmeknow-kind-<kind>`, found in the session's plugin directories (beside its own
 //! executable, then PATH), each run while the session has groups of its kind and spoken to in JSON lines on stdin and
-//! stdout (PROTOCOL.md, Plugins).
+//! stdout.
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};

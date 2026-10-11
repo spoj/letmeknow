@@ -1,4 +1,4 @@
-//! The wire formats of PROTOCOL.md, shared by every crate.
+//! The wire formats, shared by every crate.
 
 pub mod clock;
 pub mod entry;

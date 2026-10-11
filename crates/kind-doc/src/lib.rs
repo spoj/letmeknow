@@ -4,7 +4,7 @@
 //! member alone. Whoever admits a joiner hands it the doc's state. The doc links files as `lmk:` links, which members hold
 //! while it does.
 //!
-//! `Docs` is what every host of the kind does alike, in the plugin protocol (PROTOCOL.md): the session's plugin
+//! `Docs` is what every host of the kind does alike, in the plugin protocol: the session's plugin
 //! `letmeknow-kind-doc` (src/main.rs), which keeps each doc in a file, and the browser's in-page plugin (`Page`),
 //! which an editor binds to.
 

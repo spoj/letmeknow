@@ -1,4 +1,4 @@
-//! `letmeknow-kind-git`: the git kind's plugin for the session process, in the plugin protocol (PROTOCOL.md) on stdin and
+//! `letmeknow-kind-git`: the git kind's plugin for the session process, in the plugin protocol on stdin and
 //! stdout. It keeps each group's repository bare in its directory (`repos/<group>.git`), with the branches as far as
 //! every push is checked, and its branches and the pushes not yet checked in `<group>.json`. git reaches it through
 //! `git-remote-lmk`, which runs `letmeknow git list` and `letmeknow git push`.

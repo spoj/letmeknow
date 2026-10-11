@@ -1,4 +1,4 @@
-//! `letmeknow-kind-doc`: the doc kind's plugin for the session process, in the plugin protocol (PROTOCOL.md) on stdin
+//! `letmeknow-kind-doc`: the doc kind's plugin for the session process, in the plugin protocol on stdin
 //! and stdout. It keeps each doc in a file, named on `invite` or `join` or else in its own directory, and brings file
 //! and doc into step from their base, the text both last had: once the file is quiet for 1 second or the doc for 2,
 //! and whenever the session asks (`sync`), before it prints anything and before each command. Others' edits it tells

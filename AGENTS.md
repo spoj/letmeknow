@@ -1,12 +1,20 @@
 # Agents working on letmeknow
 
-DESIGN.md says how it works, PROTOCOL.md what goes over the wire and into files, SKILL.md what agents using letmeknow read, and IDEAS.md what is being explored. Change them in the same commit as the code they describe.
+The code and its comments are the documentation. SKILL.md, compiled into the binary as `letmeknow skill`, is what agents using letmeknow read, and README.md what people read first: keep both true in the same change as the code.
 
 ## Branches
 
-- `rewrite` is the integration branch, and `main` follows it: push both.
-- Work on `wNN/<topic>` branches, in worktrees beside this checkout, merged into `rewrite` as `Merge wNN/<topic>: …`.
+- `main` is the 0.13 line. `0.14` develops the next minor version, which may break compatibility: merge `main` into it after each 0.13.x change.
+- Work on short-lived branches, in worktrees beside this checkout when working in parallel. Merge them, then delete them.
 - Commit subjects read `Area: what changed`.
+
+## Compatibility
+
+Releases of one minor version run side by side in the same groups:
+- A reader ignores what it does not know. A member that rewrites a shared record keeps the fields it does not know.
+- An addition that other members must understand raises the protocol revision (`REVISION` in crates/proto/src/group.rs), and is used only toward members whose leaves name that revision.
+- Anything else waits for a new minor version, behind its switches: the ALPN, a group's protocol version, the invite link version, the home's format, and the browser's database version.
+- Browsers load the page from letmeknow.dev, so they update when they reload. Agents pin `@letmeknow/cli@0.13`, so they get the latest 0.13.x when they restart.
 
 ## Checks
 
@@ -26,10 +34,6 @@ CI's Linux job, to run before pushing:
 
 ## Releases
 
-1. Set `version` in Cargo.toml, run `cargo update -w --offline`, and commit as `X.Y.Z`. Push `rewrite` and `main`, and wait for CI on all three systems.
+1. Set `version` in Cargo.toml, run `cargo update -w --offline`, and commit as `X.Y.Z`. Push, and wait for CI on all three systems.
 2. Tag `vX.Y.Z` (annotated, `letmeknow X.Y.Z`) and push the tag. .github/workflows/release.yml tests, builds five platforms, then publishes the GitHub release and the npm packages. Replace the generated release notes with `gh release edit vX.Y.Z --notes-file <file>`. Move a tag only if `publish` never ran.
 3. Once `npm view @letmeknow/cli version` shows the version (a minute or two), deploy letmeknow.dev: `deploy/deploy.sh root@129.212.227.207 letmeknow.dev` (see deploy/README.md). Not before: the page tells agents to run the new CLI's commands. Deploying restarts the service.
-
-## Compatibility
-
-Releases of one minor version run side by side (DESIGN.md, Compatibility). Browsers load the page from letmeknow.dev, so they update when they reload. Agents pin `@letmeknow/cli@0.13`, so they get the latest 0.13.x when they restart.
