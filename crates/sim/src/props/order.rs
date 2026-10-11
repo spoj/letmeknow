@@ -50,7 +50,7 @@ pub fn kind_order(t: &Trace) -> Result<(), String> {
                 s.top.clear();
             }
             What::Read { m, group, position, verdict: Verdict::Counted { .. }, .. } => drop(members.entry(*m).or_default().counted.insert((group, *position))),
-            What::Roster { m, key, group, .. } => drop(members.entry(*m).or_default().keys.insert(group, key)),
+            What::Roster { m, key, group, .. } | What::Joined { m, key, group, .. } => drop(members.entry(*m).or_default().keys.insert(group, key)),
             What::Opened { m, group, position, kind, sender, .. } => {
                 let s = members.entry(*m).or_default();
                 let own = kind == CHAT && s.keys.get(group) == Some(&sender);

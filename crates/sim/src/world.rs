@@ -453,6 +453,12 @@ impl World {
         members[m % members.len()].iroh
     }
 
+    /// Whether a member crashed as it wrote, and runs on until it stops: what it does meanwhile does not last, so the
+    /// trace leaves it out.
+    fn frozen(&self, i: usize) -> bool {
+        self.members.lock().unwrap()[i].frozen.is_some()
+    }
+
     fn member_at(&self, id: EndpointId) -> Option<usize> {
         self.members.lock().unwrap().iter().position(|m| m.iroh == id)
     }
@@ -470,7 +476,9 @@ impl World {
         let name = format!("m{i}");
         let observing = Arc::downgrade(self);
         let observe: lmk_node::Observe = Arc::new(move |observation| {
-            if let Some(world) = observing.upgrade() {
+            if let Some(world) = observing.upgrade()
+                && !world.frozen(i)
+            {
                 world.observe(observed(i, observation));
             }
         });
@@ -659,12 +667,17 @@ impl World {
     }
 
     fn event(&self, i: usize, node: &Node<Store>, event: &Event) {
-        if let Some(gid) = event.group() {
+        if let Some(gid) = event.group()
+            && !self.frozen(i)
+        {
             self.sample(i, node, gid);
         }
     }
 
     fn told(&self, i: usize, node: &Node<Store>, event: ClientEvent) {
+        if self.frozen(i) {
+            return;
+        }
         self.note(format!("m{i} {}", serde_json::to_string(&event).unwrap()));
         match &event {
             ClientEvent::Message { group, position, missing, .. } => {
