@@ -1007,6 +1007,39 @@ fn a_session_is_listed_and_removed_running_or_stopped() {
     });
 }
 
+/// `add` brings a session of another of your devices into a group: `identity list` shows the sessions each device runs,
+/// and the session the add names joins once it runs, by an invite that admits only a session of its device, once.
+#[test]
+fn an_add_brings_a_session_of_another_device_into_a_group_once() {
+    local(async {
+        let world = world("add").await;
+        let (_alice, bob, group) = pair(&world, HOUR).await;
+        let mut desk = world.start("desk", HOUR).await;
+        let invite = bob.cmd(&["identity", "invite"]).await.unwrap();
+        desk.cmd(&["identity", "join", invite["link"].as_str().unwrap()]).await.unwrap();
+        let runs = |listed: &Value, you: bool| listed["devices"].as_array().unwrap().iter().find(|d| d["you"] == you).unwrap().clone();
+        let listed = until(|| async { bob.cmd(&["identity", "list"]).await.unwrap() }, |listed| runs(listed, false)["sessions"] == json!(["desk"])).await;
+        assert_eq!(runs(&listed, false)["sessions"], json!(["desk"]), "the laptop hears which sessions the desk runs");
+        assert_eq!(runs(&listed, true)["sessions"], json!(["bob"]));
+
+        // Added while it is stopped, the desk's session joins once it runs again.
+        desk.stop().await;
+        let added = bob.cmd(&["add", "desk", &format!("--group={group}")]).await.unwrap();
+        assert_eq!((added["group"].as_str(), added["session"].as_str()), (Some(group.as_str()), Some("desk")));
+        let link = added["link"].as_str().unwrap();
+        let laptop = world.start_in("bob", "laptop", HOUR).await;
+        let refused = laptop.cmd(&["join", link]).await.unwrap_err().to_string();
+        assert!(refused.contains("another device"), "{refused}");
+        let mut desk = world.start("desk", HOUR).await;
+        let joined = desk.expect("joined").await;
+        assert_eq!((joined["how"].as_str(), joined["group"].as_str()), (Some("add"), Some(group.as_str())));
+        assert_eq!(joined["device"], runs(&listed, true)["name"]);
+        let other = world.start_in("desk", "other", HOUR).await;
+        let refused = other.cmd(&["join", link]).await.unwrap_err().to_string();
+        assert!(refused.contains("used"), "{refused}");
+    });
+}
+
 /// A join that waits on a member who never answers holds up none of the session's other work.
 #[test]
 fn a_session_goes_on_while_a_join_waits() {

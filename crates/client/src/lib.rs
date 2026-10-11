@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
-use lmk_node::identity::Identity;
+use lmk_node::identity::{ADD_VALID, Add, Identity, Pending};
 use lmk_node::{Event, Heard, INVITE_VALID, Item, Member, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::ranges::Ranges;
@@ -187,6 +187,8 @@ pub enum ClientEvent {
     Plugin { group: Bytes, kind: String, event: serde_json::Map<String, Value>, wake: bool, key: Option<String> },
     /// The devices of this device's identity changed.
     Identity { identity: Bytes },
+    /// This client joined a group by an add that `device`, another of its identity's devices, sent: what `join` answered.
+    Added { device: String, joined: Value },
     Warning { group: Option<Bytes>, text: String },
 }
 
@@ -279,6 +281,8 @@ struct Inner<P> {
     lines: tokio::sync::Mutex<mpsc::UnboundedReceiver<(String, Option<Value>)>>,
     state: Mutex<State>,
     events: mpsc::UnboundedSender<ClientEvent>,
+    /// Held while a pass takes the adds for this device.
+    taking: tokio::sync::Mutex<()>,
 }
 
 /// One member's client, on its node. Its methods may run at once.
@@ -309,6 +313,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             lines: tokio::sync::Mutex::new(lines),
             state: Mutex::default(),
             events,
+            taking: tokio::sync::Mutex::new(()),
         };
         (Client { inner: Arc::new(inner) }, told)
     }
@@ -322,7 +327,8 @@ impl<P: Provider + Send + 'static> Client<P> {
         *self.inner.access.lock().unwrap() = access;
     }
 
-    fn access(&self) -> Access<P> {
+    /// The device's node, as it runs here or elsewhere.
+    pub fn access(&self) -> Access<P> {
         self.inner.access.lock().unwrap().clone()
     }
 
@@ -386,6 +392,11 @@ impl<P: Provider + Send + 'static> Client<P> {
                 self.invite(group, kind, name, (args, cwd), carry, membership, to).await
             }
             Request::Join { target, args, cwd } => self.join(target, (args, cwd)).await,
+            Request::Add { target, group } => self.add(&target, group).await,
+            Request::Deliver { add } => {
+                self.devices()?.deliver(&add).await?;
+                Ok(json!({}))
+            }
             Request::Members { group } => {
                 let gid = self.resolve(group)?;
                 Ok(json!({ "group": b64(&gid.0), "kind": self.inner.node.settings(&gid.0)?.kind, "members": self.described_members(&gid)? }))
@@ -447,8 +458,60 @@ impl<P: Provider + Send + 'static> Client<P> {
         if let Some(to) = &to {
             answer["to"] = json!(to);
         }
-        answer["link"] = json!(self.inner.node.invite(&gid.0, to).await?.link());
+        answer["link"] = json!(self.inner.node.invite(&gid.0, to, INVITE_VALID).await?.link());
         Ok(answer)
+    }
+
+    /// Adds a session of one of this identity's devices to a group: by an invite that admits only that device's
+    /// sessions, valid for `ADD_VALID`, which the device's node hands that device in the identity group. `target` is a
+    /// running session's handle, or a device, by its name or key, whose session is the one it runs, or with none the one
+    /// that next acts for it, as a browser.
+    async fn add(&self, target: &str, group: Option<String>) -> Result<Value> {
+        let gid = self.resolve(group)?;
+        let listed = Box::pin(self.request(Request::Identity { op: IdentityOp::List })).await?;
+        let devices = listed["devices"].as_array().context(NO_IDENTITY)?;
+        let sessions = |device: &Value| device["sessions"].as_array().cloned().unwrap_or_default();
+        let (device, session) = match devices.iter().find(|device| sessions(device).iter().any(|session| session == target)) {
+            Some(device) => (device, target.to_owned()),
+            None => {
+                let device = devices.iter().find(|device| device["name"] == target || device["key"] == target);
+                let device = device.with_context(|| format!("none of your devices is {target}, nor runs a session {target}: see `identity list`"))?;
+                let running = sessions(device);
+                ensure!(running.len() < 2, "{target} runs several sessions: add one by its handle, as `identity list` shows them");
+                (device, running.first().and_then(Value::as_str).unwrap_or_default().to_owned())
+            }
+        };
+        let key: Bytes = serde_json::from_value(device["key"].clone())?;
+        let settings = self.inner.node.settings(&gid.0)?;
+        let expires = lmk_proto::clock::now() + ADD_VALID;
+        let link = self.inner.node.invite(&gid.0, Some(key.clone()), ADD_VALID).await?.link();
+        let add = Add { device: key, session: session.clone(), group: gid.clone(), kind: settings.kind, name: settings.name, link: link.clone(), expires };
+        Box::pin(self.request(Request::Deliver { add })).await?;
+        Ok(json!({ "group": b64(&gid.0), "device": device["name"], "session": session, "link": link, "expires_in": ADD_VALID / 1000 }))
+    }
+
+    /// Joins a group by an add that `device`, another of this identity's devices, sent, and tells so.
+    pub async fn added(&self, link: &str, device: &str) -> Result<Value> {
+        let joined = self.join(link.to_owned(), (Vec::new(), String::new())).await?;
+        self.emit(ClientEvent::Added { device: device.to_owned(), joined: joined.clone() });
+        Ok(joined)
+    }
+
+    /// Joins the groups of the adds for this device, where this client's node is the device's own, as in a browser: as
+    /// they come, and as it starts, one pass at a time. An add that fails stays, until it expires.
+    pub async fn take_adds(&self) {
+        let _taking = self.inner.taking.lock().await;
+        let Access::Here(devices) = self.access() else { return };
+        let pending = match devices.adds() {
+            Ok(pending) => pending,
+            Err(error) => return self.warn(None, format!("reading the adds for this device: {error:#}")),
+        };
+        for Pending { position, by, add } in pending {
+            let taken = self.added(&add.link, &by).await.and_then(|_| devices.take(position));
+            if let Err(error) = taken {
+                self.warn(None, format!("joining a group your device {by} added this one to: {error:#}"));
+            }
+        }
     }
 
     /// Makes a group, speaking as the device's identity if it has one, and tells its kind's plugin, with the arguments
@@ -782,6 +845,14 @@ impl<P: Provider + Send + 'static> Client<P> {
                 if let Some(changed) = Self::devices_changed(&devices, &event) {
                     return self.emit(changed);
                 }
+                if let Event::Logged { group } = &event
+                    && devices.identity_of(&group.0).is_some()
+                {
+                    // A join waits on events, as a doc's state.
+                    let client = self.clone();
+                    n0_future::task::spawn(async move { client.take_adds().await });
+                    return;
+                }
                 event
             }
             Access::Elsewhere(_) => event,
@@ -998,7 +1069,8 @@ impl<P: Provider + Send + 'static> Client<P> {
             IdentityOp::List => {
                 let Some((identity, name)) = devices.identity() else { return Ok(json!({ "identity": null })) };
                 let me = devices.key()?;
-                let listed: Vec<Value> = devices.devices()?.iter().map(|(key, name)| json!({ "key": key, "name": name, "you": *key == me })).collect();
+                let listed = devices.devices()?.into_iter().map(|(key, name)| json!({ "you": key == me, "sessions": devices.sessions_of(&key), "key": key, "name": name }));
+                let listed: Vec<Value> = listed.collect();
                 Ok(json!({ "identity": identity.id, "name": name, "devices": listed }))
             }
             IdentityOp::Rename { name, device: true } => {

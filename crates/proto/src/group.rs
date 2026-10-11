@@ -112,7 +112,7 @@ pub enum Control {
     Invite {
         hash: Bytes,
         expires: u64,
-        /// `--to`: the only identity that may join by it.
+        /// The only identity that may join by it (`invite --to`), or device whose sessions only may (`add`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to: Option<Bytes>,
     },

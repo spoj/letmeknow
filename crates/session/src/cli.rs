@@ -164,6 +164,10 @@ pub enum Request {
     /// `sessions remove`: stops the session, answered once it stopped.
     #[command(skip)]
     Stop,
+    /// An add for this session, which the session acting for the device hands it: joins the group as `join` does, and
+    /// prints `joined`, naming `device`, which sent the add.
+    #[command(skip)]
+    Added { link: String, device: String },
     #[command(flatten)]
     #[serde(untagged)]
     Client(lmk_client::Request),
@@ -252,9 +256,10 @@ pub fn new_handle(home: &Path) -> Result<String> {
 }
 
 /// How long finding the running session waits for each to answer: on Windows a refused connection takes seconds.
-pub const PROBE: Duration = Duration::from_millis(200);
+const PROBE: Duration = Duration::from_millis(200);
 
-pub async fn running_session(home: &Path) -> Result<String> {
+/// The handles of the sessions in `home` whose processes answer, in order.
+pub async fn running(home: &Path) -> Vec<String> {
     let mut probes = tokio::task::JoinSet::new();
     for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
         probes.spawn(async move {
@@ -264,6 +269,11 @@ pub async fn running_session(home: &Path) -> Result<String> {
     }
     let mut running: Vec<String> = probes.join_all().await.into_iter().flatten().collect();
     running.sort();
+    running
+}
+
+pub async fn running_session(home: &Path) -> Result<String> {
+    let running = running(home).await;
     match running.as_slice() {
         [session] => Ok(session.clone()),
         [] => bail!("no session is running; start one with `letmeknow listen`"),

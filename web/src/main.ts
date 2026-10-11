@@ -144,6 +144,7 @@ client.listen(event => {
   }
   if (event.type === "warning") toast(event.text);
   if (event.type === "removed") toast(`You were removed from ${title(event.group!)}${event.by ? ` by ${event.by}` : ""}.`);
+  if (event.type === "added") toast(`Your ${event.by} added this browser to ${title(event.group!)}.`);
   if (event.type === "edited") docs.get(event.group!)?.edited();
   if (entered) render();
 });
@@ -500,7 +501,9 @@ function joinDialog() {
   );
 }
 
-// Your devices: the identity this browser is a device of, and its devices.
+// Your devices: the identity this browser is a device of, and its devices, with the sessions each runs.
+
+type Listed = { devices: { key: string; name: string; you: boolean; sessions: string[] }[] };
 
 function showDevices() {
   show(devicesPage);
@@ -536,7 +539,7 @@ async function drawDevices() {
       ];
     });
   }
-  const listed: { devices: { key: string; name: string; you: boolean }[] } = await request({ cmd: "identity", op: "list" });
+  const listed: Listed = await request({ cmd: "identity", op: "list" });
   update(devicesBody, JSON.stringify([identity, listed]), () => [
     h("p", {}, `The browsers and computers that are you, ${identity.name}. They join your chats and documents, and others see them as yours.`),
     h(
@@ -546,7 +549,7 @@ async function drawDevices() {
         h(
           "li",
           {},
-          h("span", { title: `key ${d.key}` }, d.name, d.you && h("small", {}, " this browser")),
+          h("span", { title: `key ${d.key}` }, d.name, d.you && h("small", {}, " this browser"), d.sessions.length > 0 && h("small", {}, ` runs ${d.sessions.join(", ")}`)),
           d.you
             ? h("span", {}, h("button", { onclick: renameDialog }, "Rename"), h("button", { className: "danger", onclick: () => leaveDialog() }, "Leave"))
             : confirmed("Remove", `Remove ${d.name}?`, async () => {
@@ -718,6 +721,26 @@ class View {
 
   destroy() {}
 
+  /** Buttons that add another of this identity's devices to the group: each session it runs, or the device. */
+  private addDevices(gid: string): HTMLElement {
+    const buttons = h("div", { className: "buttons" }, h("p", { className: "muted" }, "…"));
+    request({ cmd: "identity", op: "list" }).then((listed: Listed) => {
+      const targets = listed.devices.filter(d => !d.you).flatMap(d => (d.sessions.length ? d.sessions.map(s => [`${d.name} · ${s}`, s]) : [[d.name, d.key]]));
+      const add = ([label, target]: string[]) => {
+        const button = h("button", { type: "button" }, label);
+        button.onclick = () =>
+          busy(button, "Adding…", async () => {
+            await request({ cmd: "add", target, group: gid });
+            toast(`${label} joins when it next runs, within a week.`);
+          });
+        return button;
+      };
+      const none = h("p", { className: "muted" }, "Your other devices show here, once you add them under Your devices.");
+      buttons.replaceChildren(...(targets.length ? targets.map(add) : [none]));
+    }, toast);
+    return buttons;
+  }
+
   private async settingsDialog() {
     const gid = this.gid;
     const settings = group(gid)!.settings;
@@ -748,6 +771,8 @@ class View {
           )
         )
       ),
+      me.identity && h("h3", {}, "Add my device"),
+      me.identity && this.addDevices(gid),
       h(
         "div",
         { className: "buttons leave" },

@@ -3,14 +3,15 @@
 //! built-in kind. The session process that holds the lock publishes the device's identity and its key on it to
 //! `device-state.json`, and answers the requests only the device's node can on the command channel `device-endpoint`,
 //! both in `LETMEKNOW_HOME`; the device's other session processes read the one and send such
-//! requests to the other, among them for the certificates their credentials carry.
+//! requests to the other, among them for the certificates their credentials carry. It also finds which of the device's
+//! sessions run, for the identity's other devices to hear, and hands each the adds for it.
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, Described, DeviceState, File, Remote, message_id};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
-use lmk_node::identity::Identity;
+use lmk_node::identity::{Identity, Pending};
 use lmk_node::{Event, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::group::{ChatMessage, IDENTITY, Service};
@@ -18,6 +19,7 @@ use lmk_proto::ranges::Ranges;
 use lmk_proto::links::FileLink;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +38,8 @@ const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
 const DEVICE_RETRY: Duration = Duration::from_secs(10);
 /// How often a session checks that its device is still on the identity it speaks as.
 const IDENTITY_CHECK: Duration = Duration::from_secs(10);
+/// How often the session acting for the device finds which of the device's sessions run.
+const PRESENCE: Duration = Duration::from_secs(2);
 
 pub type SessionNode = Node<SqliteProvider>;
 
@@ -61,6 +65,10 @@ pub enum Done {
     Sent(Bytes, Result<(Bytes, Value)>, oneshot::Sender<Value>),
     /// What failed of leaving the groups of identities this device left.
     Left(Vec<anyhow::Error>),
+    /// The handles of the device's sessions that run.
+    Found(Vec<String>),
+    /// How handing a session an add, at its position, went.
+    Handed(u64, Result<Value>),
 }
 
 /// The device's node, as another session process runs it: its state as published in `LETMEKNOW_HOME`, and its command
@@ -99,6 +107,10 @@ pub struct Session {
     device_retry: Instant,
     /// When this session next checks its device's identity.
     identity_at: Instant,
+    /// When the session acting for the device next finds which of the device's sessions run, and hands them their adds.
+    presence_at: Instant,
+    /// The adds handed to a session, by position, while it runs: one that failed goes again once the session starts again.
+    handed: HashMap<u64, String>,
     /// The device's state as last published.
     published: String,
     /// The groups as last written to `groups.json`.
@@ -167,6 +179,8 @@ impl Session {
             lock,
             device_retry: Instant::now(),
             identity_at: Instant::now(),
+            presence_at: Instant::now(),
+            handed: HashMap::new(),
             published: String::new(),
             groups: String::new(),
             home: home.to_path_buf(),
@@ -277,8 +291,9 @@ impl Session {
     pub fn next_due(&self) -> Instant {
         let held = self.outbox.deadline(self.config.hold);
         let device = self.device.is_none().then_some(self.device_retry);
+        let presence = self.device.is_some().then_some(self.presence_at);
         let later = Instant::now() + Duration::from_secs(3600);
-        let due = held.into_iter().chain(device).chain([self.identity_at]);
+        let due = held.into_iter().chain(device).chain(presence).chain([self.identity_at]);
         due.chain(self.catching_up).fold(later, Instant::min)
     }
 
@@ -289,6 +304,12 @@ impl Session {
             && let Err(error) = self.take_device().await
         {
             self.warn(None, format!("acting for this device: {error:#}"));
+        }
+        if self.device.is_some() && self.presence_at <= now {
+            // Not due again until this pass finishes.
+            self.presence_at = now + Duration::from_secs(3600);
+            let home = self.home.clone();
+            self.running.spawn_local(async move { Done::Found(crate::cli::running(&home).await) });
         }
         if self.identity_at <= now {
             // Not due again until this check finishes.
@@ -383,6 +404,7 @@ impl Session {
             Request::Client(request) => _ = self.running.spawn_local(async move { Done::Answered(client.request(request).await, reply) }),
             Request::IdentityJoin { .. } | Request::Status { .. } => unreachable!("the CLI sends these as the client's requests"),
             Request::Stop => unreachable!("`run` stops on it"),
+            Request::Added { link, device } => _ = self.running.spawn_local(async move { Done::Answered(client.added(&link, &device).await, reply) }),
         }
     }
 
@@ -403,7 +425,40 @@ impl Session {
                     eprintln!("letmeknow: leaving the groups of an identity this device left: {error:#}");
                 }
             }
+            Done::Found(running) => {
+                self.presence_at = Instant::now() + PRESENCE;
+                if let Err(error) = self.hand_adds(running) {
+                    self.warn(None, format!("handing this device's sessions their adds: {error:#}"));
+                }
+            }
+            Done::Handed(position, handed) => {
+                let Access::Here(devices) = self.client.access() else { return };
+                if let Err(error) = handed.and_then(|_| devices.take(position)) {
+                    self.warn(None, format!("handing a session of this device an add: {error:#}"));
+                }
+            }
         }
+    }
+
+    /// Tells the identity's other devices which of this device's sessions run, and hands each running session the adds
+    /// for it it was not handed while it runs; an add for no session in particular goes to this one.
+    fn hand_adds(&mut self, running: Vec<String>) -> Result<()> {
+        let Access::Here(devices) = self.client.access() else { return Ok(()) };
+        devices.set_sessions(running.clone());
+        self.handed.retain(|_, session| running.contains(session));
+        for Pending { position, by, add } in devices.adds()? {
+            let session = if add.session.is_empty() { self.config.handle.clone() } else { add.session };
+            if !running.contains(&session) || self.handed.contains_key(&position) {
+                continue;
+            }
+            self.handed.insert(position, session.clone());
+            let home = self.home.clone();
+            self.running.spawn_local(async move {
+                let request = Request::Added { link: add.link, device: by };
+                Done::Handed(position, crate::cli::call(&home, &session, request).await)
+            });
+        }
+        Ok(())
     }
 
     fn answer(&mut self, answer: Result<Value>, reply: oneshot::Sender<Value>) {
@@ -454,6 +509,12 @@ impl Session {
                 }
             }
             ClientEvent::Sent { .. } => self.outbox.deliver(serde_json::to_value(&event)?, false),
+            ClientEvent::Added { device, mut joined } => {
+                joined["type"] = json!("joined");
+                joined["how"] = json!("add");
+                joined["device"] = json!(device);
+                self.outbox.deliver(joined, true);
+            }
             ClientEvent::File { hash } => self.arrived(hex::decode(hash)?.try_into().ok().context("a hash is 32 bytes")?).await?,
             ClientEvent::Plugin { group, kind, event, wake, key } => {
                 let mut item = json!({ "group": group });

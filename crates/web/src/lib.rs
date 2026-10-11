@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use js_sys::{Array, Function, Promise, Uint8Array};
 use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Request, fp, message_id, service};
 use lmk_node::identity::Identity;
@@ -359,6 +359,7 @@ impl App {
             }
         });
         app.client.start().await;
+        app.client.take_adds().await;
         for gid in app.client.node().groups() {
             app.keep(&gid.0)?;
         }
@@ -491,6 +492,11 @@ impl App {
                 self.emit(Value::Object(event));
             }
             ClientEvent::Identity { identity } => self.emit(json!({ "type": "devices", "identity": identity })),
+            ClientEvent::Added { device, joined } => {
+                let group = joined["group"].as_str().context("a joined group has an id")?;
+                self.remember_settings(&unb64(group)?)?;
+                self.emit(json!({ "type": "added", "group": group, "by": device }));
+            }
             ClientEvent::Warning { group, text } => self.emit(json!({ "type": "warning", "group": group, "text": text })),
             // The page shows messages as they come, waiting for none; a held leave shows as its tick.
             ClientEvent::Synced { .. } | ClientEvent::LeaveHeld { .. } => {}

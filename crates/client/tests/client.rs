@@ -273,6 +273,20 @@ async fn a_renamed_device_shows_its_new_name_to_its_other_devices_and_its_groups
     polled(&alice, json!({ "cmd": "members", "group": chat["group"] }), |m| m["members"].as_array().unwrap().iter().any(|m| m["identity"]["name"] == "Robert")).await;
 }
 
+/// A browser joins at once a group that another of its identity's devices adds it to.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_browser_joins_a_group_another_of_its_devices_adds_it_to() {
+    let relay = relay().await;
+    let laptop = Member::start(&relay, "laptop").await;
+    let tablet = Member::start(&relay, "tablet").await;
+    devices_of_bob(&laptop, &tablet).await;
+    let chat = laptop.request(json!({ "cmd": "invite" })).await;
+    let added = laptop.request(json!({ "cmd": "add", "target": "tablet", "group": chat["group"] })).await;
+    assert_eq!((added["device"].as_str(), added["session"].as_str()), (Some("tablet"), Some("")));
+    let group = chat["group"].as_str().unwrap();
+    polled(&tablet, json!({ "cmd": "groups" }), |groups| groups.to_string().contains(group)).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_device() {
     let relay = relay().await;

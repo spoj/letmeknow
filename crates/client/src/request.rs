@@ -1,5 +1,6 @@
 //! What a client is asked: JSON objects tagged by `cmd`, and with the `clap` feature, a command line's subcommands.
 
+use lmk_node::identity::Add;
 use lmk_proto::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -88,6 +89,15 @@ pub enum Request {
     /// The members online in each group, and what only this session holds
     #[cfg_attr(feature = "clap", command(display_order = 21))]
     Status,
+    /// Add a session of one of your devices to the group, within a week: a running session by its handle, or a device by
+    /// its name or key, with the session it runs, or else the one that next runs there
+    #[cfg_attr(feature = "clap", command(display_order = 19))]
+    Add {
+        /// A session's handle, or a device, as `identity list` shows them
+        target: String,
+        #[cfg_attr(feature = "clap", arg(long))]
+        group: Option<String>,
+    },
     /// This device's identity: create one, invite another device to it, list its devices, take one off it, leave it, or rename this device
     #[cfg_attr(feature = "clap", command(display_order = 22))]
     Identity {
@@ -97,6 +107,9 @@ pub enum Request {
     /// A certificate of a session of this device, with MLS key `key`, by the device's key on its identity: for the device.
     #[cfg_attr(feature = "clap", command(skip))]
     Certify { key: Bytes },
+    /// `add`'s invite, which the device's node hands to the device it names, in the identity group.
+    #[cfg_attr(feature = "clap", command(skip))]
+    Deliver { add: Add },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -147,7 +160,7 @@ impl Request {
         match self {
             // A session leaves its own groups first.
             Request::Identity { op: IdentityOp::Leave } => false,
-            Request::Identity { .. } | Request::Certify { .. } => true,
+            Request::Identity { .. } | Request::Certify { .. } | Request::Deliver { .. } => true,
             Request::Join { target, .. } => lmk_proto::links::Invite::parse(target.trim()).is_ok_and(|invite| invite.device),
             _ => false,
         }

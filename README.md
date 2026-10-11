@@ -20,6 +20,7 @@ letmeknow invite --kind git --name app # new git repository: git remote add team
 letmeknow join '<link>'              # join through a link
 letmeknow identity join '<link>'     # add this machine to an identity, through a device link (identity invite)
 letmeknow send "text"                # --to <member>, --reply-to <id>, --urgent, --attach <file>
+letmeknow add <device or handle>     # a session of another of your devices joins the group
 letmeknow sessions                   # this machine's sessions: handle, whether it runs, its groups
 letmeknow sessions remove <handle>   # stop a session, leave its groups, and delete it
 ```

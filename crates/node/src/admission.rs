@@ -25,7 +25,7 @@ use tokio::sync::oneshot;
 
 use crate::logs::NOT_FOLLOWED;
 use crate::reading::Judged;
-use crate::{Event, G, INVITE_VALID, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, SNAPSHOT_WAIT, State, device_key_key, endpoint_id, get, now, put};
+use crate::{Event, G, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, SNAPSHOT_WAIT, State, device_key_key, endpoint_id, get, now, put};
 
 /// How many members besides the inviter a link names, of those online that hold the invite's message.
 const LINK_MEMBERS: usize = 3;
@@ -44,12 +44,13 @@ struct Joining {
 }
 
 impl<P: Provider + Send + 'static> Node<P> {
-    /// An invite into a group, for anyone or `--to` an identity: shared with the members as a held message, and a link
-    /// that names this session and up to three members online that hold it.
-    pub async fn invite(&self, gid: &[u8], to: Option<Bytes>) -> Result<Invite> {
+    /// An invite into a group, valid for `valid` milliseconds, for anyone or `to` an identity, or one of its devices:
+    /// shared with the members as a held message, and a link that names this session and up to three members online
+    /// that hold it.
+    pub async fn invite(&self, gid: &[u8], to: Option<Bytes>, valid: u64) -> Result<Invite> {
         let secret: [u8; 16] = lmk_core::random();
         let hash = Bytes(Sha256::digest(secret).to_vec());
-        let expires = now() + INVITE_VALID;
+        let expires = now() + valid;
         let device = {
             let mut st = self.inner.lock();
             let by = Bytes(st.me(gid).to_vec());
@@ -219,7 +220,7 @@ fn address(key: [u8; 32], relay: &str) -> Address {
 /// The answer to a secret no rule admits by: whether it is unknown, used or expired is not told.
 const UNKNOWN: &str = "unknown, used or expired invite";
 const INVITER_LEFT: &str = "its inviter left the group";
-const FOR_ANOTHER: &str = "this invite is for another identity";
+const FOR_ANOTHER: &str = "this invite is for another identity, or another device";
 
 /// Whether `g`, as it stands, admits a joiner by an invite: checked when its request comes, and each time the commit
 /// that adds it is built. An invite dies when its inviter leaves the group.
@@ -248,8 +249,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         admits(self.lock().group(&gid)?, &joiner, &rule)?;
         // Its identity's public log, read afresh, must list the device that certified it.
         if let Some(to) = &rule.to {
-            let identity = joiner.identity().filter(|identity| identity.id == *to).context(FOR_ANOTHER)?;
-            match self.read_public(identity).await?.verify(&joiner) {
+            let certificate = joiner.certificate.as_ref().filter(|c| c.identity.id == *to || c.device == *to).context(FOR_ANOTHER)?;
+            match self.read_public(&certificate.identity).await?.verify(&joiner) {
                 Verdict::Verified { .. } => {}
                 Verdict::Unverified => bail!("its device is not on its identity's list"),
                 Verdict::Dropped => bail!("its device was taken off its identity"),

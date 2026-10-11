@@ -93,12 +93,12 @@ pub async fn listen(
 
 /// This machine's sessions: each one's handle, whether its process answers, and its groups as it last wrote them.
 pub async fn sessions(home: &Path) -> Result<Value> {
+    let running = cli::running(home).await;
     let mut sessions = Vec::new();
     for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
-        let dir = entry.path();
-        let running = tokio::time::timeout(cli::PROBE, cli::connect(&dir.join("endpoint"))).await.is_ok_and(|connected| connected.is_ok());
+        let (dir, handle) = (entry.path(), entry.file_name().to_string_lossy().into_owned());
         let groups: Value = std::fs::read(dir.join("groups.json")).ok().and_then(|groups| serde_json::from_slice(&groups).ok()).unwrap_or(json!([]));
-        sessions.push(json!({ "handle": entry.file_name().to_string_lossy(), "running": running, "groups": groups }));
+        sessions.push(json!({ "running": running.contains(&handle), "handle": handle, "groups": groups }));
     }
     sessions.sort_by(|a, b| a["handle"].as_str().cmp(&b["handle"].as_str()));
     Ok(json!({ "sessions": sessions }))
