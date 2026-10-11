@@ -290,8 +290,13 @@ async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_de
     assert_eq!(tablet.client.me().unwrap()["identity"], json!(null));
     polled(&alice, json!({ "cmd": "members", "group": chat["group"] }), |m| m["members"].as_array().unwrap().len() == 1).await;
     polled(&laptop, json!({ "cmd": "identity", "op": "list" }), |listed| listed["devices"].as_array().unwrap().len() == 1).await;
-    let writers = alice.client.node().read_public(&bob).await.unwrap().writers;
-    assert_eq!(writers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["laptop"]);
+    // Listed when it left, the tablet lists the laptop alone; not yet listed, it leaves that to the laptop's duties.
+    let alone = async {
+        while alice.client.node().read_public(&bob).await.unwrap().writers.iter().map(|w| w.name.as_str()).ne(["laptop"]) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+    tokio::time::timeout(WAIT, alone).await.expect("Bob's public log lists the laptop alone");
 
     // Bob's only device leaves him: it closes his public log, and he ends.
     let left = laptop.request(json!({ "cmd": "identity", "op": "leave" })).await;
