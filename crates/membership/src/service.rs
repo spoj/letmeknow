@@ -141,7 +141,7 @@ impl Service {
             return Ok(());
         };
         match request {
-            Request::Append { log, entries } => {
+            Request::Append { log, entries, public } => {
                 let answer = if entries.iter().any(|entry| entry.0.len() > policy.max_entry) {
                     refused("size")
                 } else if log.0.len() > policy.max_log_id || entries.is_empty() {
@@ -149,7 +149,7 @@ impl Service {
                 } else if !appends.lock().unwrap().take(policy.appends_per_minute) {
                     refused("rate")
                 } else {
-                    let appended = store.append(&log.0, &entries)?;
+                    let appended = store.append(&log.0, &entries, public)?;
                     let last = appended.position + entries.len() as u64 - 1;
                     let mut subscribers = self.0.subscribers.lock().unwrap();
                     for (position, entry) in (appended.position..).zip(entries) {

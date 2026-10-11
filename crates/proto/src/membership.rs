@@ -7,8 +7,14 @@ use crate::{Bytes, head::Head};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Request {
-    /// Entries appended one after another, counted as one append.
-    Append { log: Bytes, entries: Vec<Bytes> },
+    /// Entries appended one after another, counted as one append. `public` makes a new log one the service keeps whole
+    /// while it is appended to.
+    Append {
+        log: Bytes,
+        entries: Vec<Bytes>,
+        #[serde(default)]
+        public: bool,
+    },
     Read { log: Bytes, after: u64 },
     Head { log: Bytes },
     Subscribe { logs: Vec<Bytes> },
@@ -50,8 +56,10 @@ mod tests {
 
     #[test]
     fn shapes() {
-        let append = Request::Append { log: Bytes(vec![1]), entries: vec![Bytes(vec![2])] };
-        assert_eq!(serde_json::to_string(&append).unwrap(), r#"{"append":{"log":"AQ","entries":["Ag"]}}"#);
+        let append = Request::Append { log: Bytes(vec![1]), entries: vec![Bytes(vec![2])], public: true };
+        assert_eq!(serde_json::to_string(&append).unwrap(), r#"{"append":{"log":"AQ","entries":["Ag"],"public":true}}"#);
+        let of_0_13: Request = serde_json::from_str(r#"{"append":{"log":"AQ","entries":["Ag"]}}"#).unwrap();
+        assert_eq!(of_0_13, Request::Append { log: Bytes(vec![1]), entries: vec![Bytes(vec![2])], public: false });
         let refused: Answer<Appended> = serde_json::from_str(r#"{"refused":"rate"}"#).unwrap();
         assert_eq!(refused, Answer::Refused { refused: "rate".into() });
     }

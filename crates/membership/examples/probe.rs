@@ -15,7 +15,7 @@ async fn main() -> Result<()> {
     let client = ServeClient::new(endpoint, &key, relay, &[])?;
     let log = lmk_proto::random::random::<16>();
     let started = std::time::Instant::now();
-    let appended = client.append(&log, &[b"probe".to_vec()]).await?;
+    let appended = client.append(&log, &[b"probe".to_vec()], false).await?;
     println!("appended at {} in {:?}", appended.position, started.elapsed());
     let page = client.read(&log, 0).await?;
     ensure!(page.entries.len() == 1 && page.head.length == 1, "read back {page:?}");

@@ -43,7 +43,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
             };
             self.durable().await?;
-            match self.clients.client(&service)?.append(gid, std::slice::from_ref(&entry)).await {
+            match self.clients.client(&service)?.append(gid, std::slice::from_ref(&entry), false).await {
                 Ok(_) => {}
                 Err(error) if error.is::<Refused>() => {
                     let mut st = self.lock();

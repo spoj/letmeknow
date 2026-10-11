@@ -124,9 +124,9 @@ impl ServeClient {
 
 impl ServeClient {
     /// Appends entries one after another, as one append against the service's rate limit.
-    pub async fn append(&self, log: &[u8], entries: &[Vec<u8>]) -> Result<Appended> {
+    pub async fn append(&self, log: &[u8], entries: &[Vec<u8>], public: bool) -> Result<Appended> {
         let entries: Vec<Bytes> = entries.iter().map(|entry| Bytes(entry.clone())).collect();
-        let appended: Appended = self.request(Request::Append { log: log.into(), entries: entries.clone() }).await?;
+        let appended: Appended = self.request(Request::Append { log: log.into(), entries: entries.clone(), public }).await?;
         let after = appended.position.checked_sub(1).context("appended at position 0")?;
         self.0.chains.page(log, after, &entries, &appended.head)?;
         Ok(appended)

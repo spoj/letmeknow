@@ -112,7 +112,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         };
         self.inner.follow(&gid);
         let address = lmk_proto::public::address(&identity.id.0);
-        if let Err(error) = self.inner.clients.client(&identity.membership)?.append(&address, &[first]).await {
+        if let Err(error) = self.inner.clients.client(&identity.membership)?.append(&address, &[first], true).await {
             self.leave(&gid).await?;
             return Err(error);
         }
@@ -384,7 +384,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             latest.next(seed, writers, name, now())
         };
         let address = lmk_proto::public::address(&identity.id.0);
-        self.inner.clients.client(&identity.membership)?.append(&address, &[entry]).await?;
+        self.inner.clients.client(&identity.membership)?.append(&address, &[entry], true).await?;
         self.inner.read_public(&identity).await
     }
 

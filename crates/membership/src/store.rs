@@ -22,12 +22,22 @@ impl Store {
         let db = Connection::open(path)?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "NORMAL")?;
+        // `public` marks a log kept whole while it is appended to; `appended`, in milliseconds, is its last append.
         db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS logs (id BLOB PRIMARY KEY, length INTEGER NOT NULL, hash BLOB NOT NULL) WITHOUT ROWID;
+            "CREATE TABLE IF NOT EXISTS logs (id BLOB PRIMARY KEY, length INTEGER NOT NULL, hash BLOB NOT NULL,
+                 public INTEGER NOT NULL DEFAULT 0, appended INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS entries (log BLOB NOT NULL, position INTEGER NOT NULL, entry BLOB NOT NULL,
                  hash BLOB NOT NULL, time INTEGER NOT NULL, PRIMARY KEY (log, position)) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS entries_time ON entries (time);",
         )?;
+        // A database of 0.13 has its logs, without these columns.
+        let public: bool = db.query_row("SELECT count(*) FROM pragma_table_info('logs') WHERE name = 'public'", [], |r| r.get(0))?;
+        if !public {
+            db.execute_batch(
+                "ALTER TABLE logs ADD COLUMN public INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE logs ADD COLUMN appended INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         Ok(Store {
             db: Mutex::new(db),
             key,
@@ -47,8 +57,9 @@ impl Store {
         Ok(row.unwrap_or((0, head::start(log))))
     }
 
-    /// Appends entries one after another, creating the log if it is new; answers the first one's position.
-    pub fn append(&self, log: &[u8], entries: &[Bytes]) -> Result<Appended> {
+    /// Appends entries one after another, creating the log if it is new, as a public one if `public`; answers the first
+    /// one's position.
+    pub fn append(&self, log: &[u8], entries: &[Bytes], public: bool) -> Result<Appended> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         let (length, mut hash) = Self::latest(&tx, log)?;
@@ -61,9 +72,9 @@ impl Store {
             )?;
         }
         tx.execute(
-            "INSERT INTO logs (id, length, hash) VALUES (?1, ?2, ?3)
-             ON CONFLICT (id) DO UPDATE SET length = ?2, hash = ?3",
-            params![log, position, hash],
+            "INSERT INTO logs (id, length, hash, public, appended) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (id) DO UPDATE SET length = ?2, hash = ?3, appended = ?5",
+            params![log, position, hash, public, now()],
         )?;
         tx.commit()?;
         Ok(Appended {
@@ -114,13 +125,13 @@ impl Store {
         Ok(self.sign(log, length, hash))
     }
 
-    /// Deletes entries appended before `time`; their logs keep their length and hash.
+    /// Deletes the entries appended before `time` of logs but public ones, and every entry of a public log last appended
+    /// to before then. Logs keep their length and hash, so that one deleted does not start again.
     pub fn expire(&self, time: u64) -> Result<usize> {
-        Ok(self
-            .db
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM entries WHERE time < ?", [time])?)
+        let db = self.db.lock().unwrap();
+        let entries = db.execute("DELETE FROM entries WHERE time < ?1 AND log IN (SELECT id FROM logs WHERE public = 0)", [time])?;
+        let public = db.execute("DELETE FROM entries WHERE log IN (SELECT id FROM logs WHERE public = 1 AND appended < ?1)", [time])?;
+        Ok(entries + public)
     }
 }
 
@@ -135,8 +146,8 @@ mod tests {
         let key = SigningKey::from_bytes(&[3; 32]);
         let store = Store::open(&dir.join("store.db"), key.clone()).unwrap();
         assert_eq!(store.head(b"g").unwrap().length, 0);
-        assert_eq!(store.append(b"g", &[Bytes(b"one".to_vec())]).unwrap().position, 1);
-        let two = store.append(b"g", &[Bytes(b"two".to_vec())]).unwrap();
+        assert_eq!(store.append(b"g", &[Bytes(b"one".to_vec())], false).unwrap().position, 1);
+        let two = store.append(b"g", &[Bytes(b"two".to_vec())], false).unwrap();
         assert_eq!(two.position, 2);
         assert!(two.head.verify(&key.verifying_key()));
         let expected = head::next(&head::next(&head::start(b"g"), b"one"), b"two");
@@ -152,9 +163,47 @@ mod tests {
         assert_eq!(store.expire(now() + 1).unwrap(), 2);
         assert!(store.read(b"g", 0, 1 << 20).unwrap().is_none());
         assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().head.length, 2);
-        let batch = store.append(b"g", &[Bytes(b"three".to_vec()), Bytes(b"four".to_vec())]).unwrap();
+        let batch = store.append(b"g", &[Bytes(b"three".to_vec()), Bytes(b"four".to_vec())], false).unwrap();
         assert_eq!((batch.position, batch.head.length), (3, 4));
         assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().entries.len(), 2);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_public_log_is_kept_whole_and_deleted_only_a_while_after_its_last_append() {
+        let dir = std::env::temp_dir().join(format!("lmk-store-public-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("store.db"), SigningKey::from_bytes(&[3; 32])).unwrap();
+        store.append(b"p", &[Bytes(b"first".to_vec())], true).unwrap();
+        store.append(b"g", &[Bytes(b"one".to_vec())], false).unwrap();
+        let before_second = now() + 1;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store.append(b"p", &[Bytes(b"second".to_vec())], false).unwrap();
+        assert_eq!(store.expire(before_second).unwrap(), 1, "the group log's entry, not the public log's first");
+        assert_eq!(store.read(b"p", 0, 1 << 20).unwrap().unwrap().entries.len(), 2);
+        assert_eq!(store.expire(now() + 1).unwrap(), 2, "once appended to before the time, the public log goes whole");
+        assert!(store.read(b"p", 0, 1 << 20).unwrap().is_none());
+        assert_eq!(store.append(b"p", &[Bytes(b"again".to_vec())], true).unwrap().position, 3, "and does not start again");
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_database_of_0_13_gains_the_columns() {
+        let dir = std::env::temp_dir().join(format!("lmk-store-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE logs (id BLOB PRIMARY KEY, length INTEGER NOT NULL, hash BLOB NOT NULL) WITHOUT ROWID;
+             INSERT INTO logs VALUES (x'67', 0, x'00');",
+        )
+        .unwrap();
+        drop(old);
+        let store = Store::open(&path, SigningKey::from_bytes(&[3; 32])).unwrap();
+        store.append(b"p", &[Bytes(b"first".to_vec())], true).unwrap();
+        assert_eq!(store.read(b"p", 0, 1 << 20).unwrap().unwrap().entries.len(), 1);
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -129,7 +129,7 @@ async fn serves_relay_membership_and_page() {
         .await
         .unwrap();
     let client = ServeClient::for_service(endpoint, &service).unwrap();
-    let appended = tokio::time::timeout(Duration::from_secs(10), client.append(b"g", &[b"commit".to_vec()]))
+    let appended = tokio::time::timeout(Duration::from_secs(10), client.append(b"g", &[b"commit".to_vec()], false))
         .await
         .unwrap()
         .unwrap();

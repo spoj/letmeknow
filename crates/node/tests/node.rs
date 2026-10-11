@@ -142,7 +142,7 @@ async fn identity<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, n
 async fn publish<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, identity: &IdentityRef, entry: Vec<u8>) {
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
     let log = lmk_proto::public::address(&identity.id.0);
-    lmk_membership::client::ServeClient::for_service(endpoint, &identity.membership).unwrap().append(&log, &[entry]).await.unwrap();
+    lmk_membership::client::ServeClient::for_service(endpoint, &identity.membership).unwrap().append(&log, &[entry], true).await.unwrap();
     node.read_public(identity).await.unwrap();
 }
 
@@ -907,7 +907,7 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
     let old = lmk_proto::group::Leaf { revision: 0, ..mls.leaf.clone() };
     let commit = Group::load(&provider, &gid.0).unwrap().commit(&provider, &mls, Change { leaf: Some(old), ..Change::default() }).unwrap();
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    lmk_membership::client::ServeClient::for_service(endpoint, &relay.service).unwrap().append(&gid.0, &[commit.entry]).await.unwrap();
+    lmk_membership::client::ServeClient::for_service(endpoint, &relay.service).unwrap().append(&gid.0, &[commit.entry], false).await.unwrap();
     drop(provider);
     revision(0).await.expect("Alice sees Bob's leaf of revision 0");
 
