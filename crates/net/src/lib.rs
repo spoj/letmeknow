@@ -295,9 +295,6 @@ impl Net {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        if let Some(router) = &self.router {
-            router.shutdown().await?;
-        }
         #[cfg(not(target_family = "wasm"))]
         let publishing = self.inner.publishing.lock().unwrap().take();
         #[cfg(not(target_family = "wasm"))]
@@ -309,6 +306,9 @@ impl Net {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 removed => removed?,
             }
+        }
+        if let Some(router) = &self.router {
+            router.shutdown().await?;
         }
         Ok(())
     }

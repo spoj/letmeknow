@@ -36,6 +36,9 @@ const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
 const DEVICE_RETRY: Duration = Duration::from_secs(10);
 /// How often a session checks that its device is still on the identities it speaks as.
 const IDENTITIES_CHECK: Duration = Duration::from_secs(10);
+/// How long a stopping session waits for peers to acknowledge that its connections closed, which takes three round
+/// trips' timeouts per connection. A peer told nothing yet finds out when the connection times out.
+const CLOSE_WAIT: Duration = Duration::from_millis(250);
 
 pub type SessionNode = Node<SqliteProvider>;
 
@@ -689,12 +692,16 @@ impl Session {
     pub async fn shutdown(&self) {
         self.client.shutdown().await;
         self.plugins.stop_all().await;
-        let _ = self.client.node().shutdown().await;
-        if let Some(device) = &self.device {
-            let _ = device.shutdown().await;
+        let _ = std::fs::remove_file(self.config.dir.join("endpoint"));
+        if self.device.is_some() {
             let _ = std::fs::remove_file(self.home.join("device-endpoint"));
         }
-        let _ = std::fs::remove_file(self.config.dir.join("endpoint"));
+        let device = async {
+            if let Some(device) = &self.device {
+                let _ = device.shutdown().await;
+            }
+        };
+        tokio::time::timeout(CLOSE_WAIT, async { tokio::join!(self.client.node().shutdown(), device) }).await.ok();
     }
 }
 

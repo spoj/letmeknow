@@ -317,7 +317,9 @@ def main():
         listeners.append(erin)
 
         # A restart: bob misses a message and a commit, and catches up when he is back.
+        stopping = time.time()
         bob.stop()
+        check(time.time() - stopping < 1.5, "a session in groups with peers online stops at once")
         listeners.remove(bob)
         joined = run("erin", "join", link)
         check(joined["group"] == group and len(joined["members"]) == 4, "a joiner gets in while the inviter is stopped")
