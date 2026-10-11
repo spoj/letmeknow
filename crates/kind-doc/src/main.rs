@@ -441,17 +441,14 @@ fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(std::fs::rename(&temp, path)?)
 }
 
-/// Whether a described member answers to `name`, in any case: its name, the first word of it, or its identity's name
-/// when the identity is this session's own (as the session's own `--to` and mentions do).
+/// Whether a described member answers to `name`, in any case: its identity's name, its device's or its handle, or the
+/// first word of one (as the session's own `--to` and mentions do).
 fn answers(member: &Value, name: &str) -> bool {
-    let (name, own) = (name.to_lowercase(), member["name"].as_str().unwrap_or_default().to_lowercase());
-    let first: String = own.chars().take_while(|c| c.is_alphanumeric()).collect();
-    let identity = &member["identity"];
-    own == name
-        || first == name
-        || identity["error"].is_null()
-            && identity["how"] == "self"
-            && identity["name"].as_str().is_some_and(|identity| identity.to_lowercase() == name)
+    let name = name.to_lowercase();
+    [&member["identity"]["name"], &member["device"], &member["handle"]].into_iter().filter_map(Value::as_str).any(|own| {
+        let own = own.to_lowercase();
+        own == name || own.split(|c: char| !c.is_alphanumeric()).next() == Some(name.as_str())
+    })
 }
 
 /// Whether `text` mentions `member`: "@" and a name it answers to.

@@ -8,7 +8,6 @@ const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA secure_delete = ON;
-CREATE TABLE IF NOT EXISTS session (name TEXT NOT NULL);
 -- Chat messages taken in: printed, or waiting to print; `seen` once printed or read: the read frontier.
 CREATE TABLE IF NOT EXISTS taken (id BLOB PRIMARY KEY, gid BLOB NOT NULL, seen INTEGER NOT NULL DEFAULT 0);
 -- Attachments of messages taken in; `path` once the file arrived.

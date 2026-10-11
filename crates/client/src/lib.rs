@@ -83,8 +83,6 @@ pub fn service(address: &str) -> Result<Service> {
 }
 
 pub struct Config {
-    /// This session's name, fixed when it is created.
-    pub name: String,
     pub device: Device,
     /// For the groups and identities it creates.
     pub membership: Service,
@@ -367,13 +365,13 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// This client: its name and fingerprint, its device, and the device's identity, with the device's key on it.
+    /// This client: its fingerprint, its device, and the device's identity, with the device's key on it.
     pub fn me(&self) -> Result<Value> {
         let state = self.device_state()?;
         let identity = state.identity.map(|(identity, name)| json!({ "id": identity.id, "name": name, "device": state.key }));
         let fp = fp(&self.inner.node.key().0);
         let name = state.device.unwrap_or_else(|| self.inner.config.device.name.clone());
-        Ok(json!({ "name": self.inner.config.name, "fp": fp, "device": { "name": name }, "identity": identity }))
+        Ok(json!({ "fp": fp, "device": { "name": name }, "identity": identity }))
     }
 
     /// Answers a request; one only the device's node answers goes to it where it runs elsewhere.
@@ -910,7 +908,6 @@ impl<P: Provider + Send + 'static> Client<P> {
     pub fn describer(&self, gid: &Bytes) -> Result<Describer> {
         Ok(Describer {
             me: self.inner.node.key(),
-            name: self.inner.config.name.clone(),
             identity: self.device_state()?.identity,
             members: self.inner.node.members(&gid.0).unwrap_or_default(),
         })

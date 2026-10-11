@@ -35,9 +35,6 @@ pub struct Cli {
 pub enum Command {
     /// Run the session process, which runs the plugins of its groups' kinds, and print what arrives as NDJSON
     Listen {
-        /// Display name, fixed when the session is created [default: <user>/<session>]
-        #[arg(long, env = "LETMEKNOW_NAME")]
-        name: Option<String>,
         /// Seconds a message or doc edit not addressed to this session may wait for something that wakes the agent anyway
         #[arg(long, env = "LETMEKNOW_HOLD", default_value_t = 3600)]
         hold: u64,
@@ -106,8 +103,9 @@ pub enum Request {
     Send {
         #[arg(long)]
         group: Option<String>,
-        /// A member to address: its fingerprint, or a name it answers to (its name, the first word of it, or the name of
-        /// your own identity, which addresses all its other sessions); repeat for several. "@name" in the text addresses too
+        /// A member to address: its fingerprint, or a name it answers to (its identity's name, which addresses all the
+        /// identity's sessions, its device's or its handle, or the first word of one); repeat for several. "@name" in the
+        /// text addresses too
         #[arg(long)]
         to: Vec<String>,
         /// Id of the message this answers

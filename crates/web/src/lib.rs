@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use js_sys::{Array, Function, Promise, Uint8Array};
 use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Request, fp, message_id, service};
 use lmk_node::devices::Devices;
@@ -250,8 +250,7 @@ fn unb64(text: &str) -> Result<Vec<u8>> {
 
 #[derive(Deserialize)]
 struct Config {
-    /// The person's name and this device's: used only when the browser has no session yet.
-    name: String,
+    /// This device's name: used only when the browser has no session yet.
     device: String,
     relay: String,
     membership: String,
@@ -312,17 +311,13 @@ impl App {
                 saved.await?
             })
         });
-        if store.get(b"web/name")?.is_none() {
-            put(&store, b"web/name", &config.name)?;
-        }
         let device: Device = get(&store, b"web/device")?.unwrap_or_else(|| Device::new(&config.device));
         put(&store, b"web/device", &device)?;
         let hashes = kept.iter().map(|hash| hex::decode(hash)?.try_into().map_err(|_| anyhow!("a hash is 32 bytes"))).collect::<Result<_>>()?;
         let (io, mut io_rx) = mpsc::unbounded_channel();
         let kept = Arc::new(Kept { hashes: Mutex::new(hashes), io });
-        let name: String = get(&store, b"web/name")?.context("no name")?;
         let node_config = lmk_node::Config {
-            name: name.clone(),
+            handle: String::new(),
             device: Some(device.clone()),
             relay: config.relay.parse()?,
             ca: Default::default(),
@@ -344,7 +339,7 @@ impl App {
             started: Mutex::default(),
             lines,
         };
-        let client_config = lmk_client::Config { name, device, membership: membership.clone() };
+        let client_config = lmk_client::Config { device, membership: membership.clone() };
         let (client, mut told) = Client::new(node, client_config, Access::Here(devices), Arc::new(plugins), written);
         let app = Rc::new(App { client, store, membership, idb, kept, on_event });
         let told_app = app.clone();

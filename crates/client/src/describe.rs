@@ -1,4 +1,4 @@
-//! Members as this client shows them: their names, their identities, and who added them.
+//! Members as this client shows them: by their identities and devices, and who added them.
 
 use lmk_node::{Claim, Member};
 use lmk_proto::Bytes;
@@ -11,11 +11,15 @@ use crate::fp;
 /// A member, or only the iroh key of an endpoint that is not one.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Described {
-    /// Its session name: its own claim.
+    /// How it shows: its identity's name and its device's, as "Ann · laptop", and its handle where another member of
+    /// the group shows so too; its fingerprint where it speaks for no identity, or for one that failed the check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fp: Option<String>,
+    /// Its session's handle; none for a browser, its device's only session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -55,14 +59,11 @@ pub struct Known {
 pub struct AddedBy {
     pub fp: String,
     pub how: How,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
 }
 
 /// What describing a group's members takes, gathered once.
 pub struct Describer {
     pub(crate) me: Bytes,
-    pub(crate) name: String,
     pub(crate) identity: Option<(IdentityRef, String)>,
     pub(crate) members: Vec<Member>,
 }
@@ -72,28 +73,37 @@ impl Describer {
         if member.key.0.is_empty() {
             return Described { iroh: Some(member.iroh.clone()), ..Described::default() };
         }
-        let added_by = member.added.as_ref().map(|(by, how)| AddedBy {
-            fp: fp(&by.0),
-            how: how.clone(),
-            name: self.members.iter().find(|m| &m.key == by).map(|adder| adder.name.clone()),
-        });
+        let identity = member.identity.as_ref().map(|claim| self.known(claim));
+        let name = match &identity {
+            Some(known) if known.error.is_none() => {
+                let twin = self.members.iter().any(|m| {
+                    m.key != member.key && m.device_name == member.device_name && m.identity.as_ref().is_some_and(|c| c.identity.id == known.id)
+                });
+                if twin && !member.name.is_empty() {
+                    format!("{} · {} ({})", known.name, member.device_name, member.name)
+                } else {
+                    format!("{} · {}", known.name, member.device_name)
+                }
+            }
+            _ => fp(&member.key.0),
+        };
         Described {
-            name: Some(member.name.clone()),
+            name: Some(name),
             fp: Some(fp(&member.key.0)),
+            handle: Some(member.name.clone()).filter(|handle| !handle.is_empty()),
             device: Some(member.device_name.clone()),
             you: member.key == self.me,
-            identity: member.identity.as_ref().map(|claim| self.known(claim)),
-            added_by,
+            identity,
+            added_by: member.added.as_ref().map(|(by, how)| AddedBy { fp: fp(&by.0), how: how.clone() }),
             iroh: None,
         }
     }
 
-    /// The member with this key, or this client itself before it is one.
+    /// The member with this key, or else its fingerprint: a former member's, or this client's before it is one.
     pub fn describe_key(&self, key: &Bytes) -> Described {
         match self.members.iter().find(|m| &m.key == key) {
             Some(member) => self.describe(member),
-            None if *key == self.me => Described { name: Some(self.name.clone()), fp: Some(fp(&key.0)), you: true, ..Described::default() },
-            None => Described { fp: Some(fp(&key.0)), ..Described::default() },
+            None => Described { name: Some(fp(&key.0)), fp: Some(fp(&key.0)), you: *key == self.me, ..Described::default() },
         }
     }
 
@@ -113,17 +123,14 @@ impl Describer {
     }
 }
 
-/// Whether a described member answers to `name`, in any case: its name, the first word of it, or its identity's name
-/// when the identity is this device's own.
+/// Whether a described member answers to `name`, in any case: its identity's name, its device's or its handle, or the
+/// first word of one.
 pub fn answers(member: &Value, name: &str) -> bool {
-    let (name, own) = (name.to_lowercase(), member["name"].as_str().unwrap_or_default().to_lowercase());
-    let first: String = own.chars().take_while(|c| c.is_alphanumeric()).collect();
-    let identity = &member["identity"];
-    own == name
-        || first == name
-        || identity["error"].is_null()
-            && identity["how"] == "self"
-            && identity["name"].as_str().is_some_and(|identity| identity.to_lowercase() == name)
+    let name = name.to_lowercase();
+    [&member["identity"]["name"], &member["device"], &member["handle"]].into_iter().filter_map(Value::as_str).any(|own| {
+        let own = own.to_lowercase();
+        own == name || own.split(|c: char| !c.is_alphanumeric()).next() == Some(name.as_str())
+    })
 }
 
 #[cfg(test)]
@@ -131,33 +138,42 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn member(name: &str, key: u8, identity: Option<(u8, &str)>) -> Member {
+    fn member(handle: &str, key: u8, identity: Option<(u8, &str)>) -> Member {
         let identity = identity.map(|(id, claimed)| Claim {
             identity: IdentityRef { id: Bytes(vec![id]), membership: crate::letmeknow_dev() },
             name: claimed.into(),
             error: None,
         });
-        Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, name: name.into(), device_name: "laptop".into(), identity, added: None }
+        Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, name: handle.into(), device_name: "laptop".into(), identity, added: None }
     }
 
     #[test]
-    fn an_identity_is_this_devices_own_or_known_by_its_own_claim() {
+    fn a_member_shows_as_its_identity_and_device_and_its_handle_where_another_shows_so_too() {
         let own = IdentityRef { id: Bytes(vec![10]), membership: crate::letmeknow_dev() };
+        let mut eve = member("eve", 5, Some((20, "Robert")));
+        eve.identity.as_mut().unwrap().error = Some("its device is not on the identity's list".into());
         let describer = Describer {
             me: Bytes(vec![1]),
-            name: "Ann".into(),
             identity: Some((own, "Ann".into())),
-            members: vec![member("Claude", 1, Some((10, "Ann Smith"))), member("Bob", 2, Some((20, "Robert")))],
+            members: vec![
+                member("claude", 1, Some((10, "Ann Smith"))),
+                member("", 2, Some((20, "Robert"))),
+                member("swift-koala", 3, Some((10, "Ann Smith"))),
+                member("dan", 4, None),
+                eve,
+            ],
         };
         let shown = |m: &Member| serde_json::to_value(describer.describe(m)).unwrap();
-        let ann = shown(&describer.members[0]);
-        assert_eq!(ann["identity"], json!({ "id": "Cg", "name": "Ann", "how": "self" }));
-        assert_eq!(ann["you"], true);
+        let claude = shown(&describer.members[0]);
+        assert_eq!(claude["identity"], json!({ "id": "Cg", "name": "Ann", "how": "self" }));
+        assert_eq!((&claude["name"], &claude["you"]), (&json!("Ann · laptop (claude)"), &json!(true)));
         let bob = shown(&describer.members[1]);
-        assert_eq!(bob, json!({ "name": "Bob", "fp": crate::fp(&[2]), "device": "laptop", "identity": { "id": "FA", "name": "Robert", "how": "unknown" } }));
-        // An identity's name addresses its sessions only when it is this device's own.
-        assert!(answers(&ann, "ANN") && answers(&ann, "claude") && answers(&bob, "bob") && !answers(&bob, "robert"));
-        let peer = Member { key: Bytes::default(), ..member("", 3, None) };
-        assert_eq!(shown(&peer), json!({ "iroh": "Aw" }));
+        assert_eq!(bob, json!({ "name": "Robert · laptop", "fp": crate::fp(&[2]), "device": "laptop", "identity": { "id": "FA", "name": "Robert", "how": "unknown" } }));
+        let (dan, eve) = (shown(&describer.members[3]), shown(&describer.members[4]));
+        assert_eq!((&dan["name"], &eve["name"]), (&dan["fp"], &eve["fp"]), "no identity, or one that failed the check: a fingerprint");
+        assert!(["ANN", "claude", "Laptop"].iter().all(|name| answers(&claude, name)) && answers(&bob, "robert") && answers(&dan, "dan"));
+        assert!(!answers(&claude, "smith") && !answers(&bob, "bob"));
+        let peer = Member { key: Bytes::default(), ..member("", 9, None) };
+        assert_eq!(shown(&peer), json!({ "iroh": "CQ" }));
     }
 }

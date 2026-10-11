@@ -70,7 +70,7 @@ impl<P: Provider> State<P> {
     fn open(provider: P, config: &Config, leaf: Leaf, clients: &logs::Clients) -> Result<Self> {
         let mut session = match provider.get(b"session")? {
             Some(_) => Session::load(&provider)?,
-            None => Session::create(&provider, &config.name, leaf.clone())?,
+            None => Session::create(&provider, &config.handle, leaf.clone())?,
         };
         if session.leaf != leaf {
             session.set_leaf(&provider, leaf)?;

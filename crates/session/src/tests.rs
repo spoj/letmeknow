@@ -51,6 +51,7 @@ async fn world(test: &str) -> World {
 struct Agent {
     handle: String,
     home: PathBuf,
+    fp: String,
     events: mpsc::UnboundedReceiver<String>,
     stop: Option<oneshot::Sender<()>>,
     done: Option<tokio::task::JoinHandle<()>>,
@@ -68,16 +69,14 @@ impl World {
 
     /// A session process in the home `device`.
     async fn start_in(&self, device: &str, handle: &str, hold: Duration) -> Agent {
-        let name = handle[..1].to_uppercase() + &handle[1..];
-        self.launch(Config { hold, ..self.config(device, handle, Some(&name)) }, usize::MAX).await
+        self.launch(Config { hold, ..self.config(device, handle) }, usize::MAX).await
     }
 
-    /// A session's configuration, in the home `device`, with `listen --name name`.
-    fn config(&self, device: &str, handle: &str, name: Option<&str>) -> Config {
+    /// A session's configuration, in the home `device`.
+    fn config(&self, device: &str, handle: &str) -> Config {
         Config {
             handle: handle.into(),
             dir: session_dir(&self.root.join(device), handle).unwrap(),
-            name: name.map(str::to_owned),
             hold: HOUR,
             keep_log: false,
             membership: self.membership(),
@@ -106,9 +105,10 @@ impl World {
             };
             crate::listen(config, &at, network, print, async { drop(stopped.await) }).await.unwrap();
         });
-        let mut agent = Agent { handle, home, events, stop: Some(stop), done: Some(done) };
+        let mut agent = Agent { handle, home, fp: String::new(), events, stop: Some(stop), done: Some(done) };
         let ready = agent.expect("ready").await;
         assert_eq!(keys(&ready), keys(&json!({ "type": 0, "session": 0, "member": 0, "state": 0 })));
+        agent.fp = ready["member"]["fp"].as_str().unwrap().into();
         agent
     }
 }
@@ -187,8 +187,8 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len(), 2);
     let event = alice.expect("joined").await;
-    assert_eq!(event["member"]["name"], "Bob");
-    assert_eq!(event["by"]["name"], "Alice");
+    assert_eq!(event["member"]["handle"], "bob");
+    assert_eq!(event["by"]["handle"], "alice");
     assert_eq!(event["how"], "invite");
     (alice, bob, invite["group"].as_str().unwrap().to_owned())
 }
@@ -217,7 +217,7 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         // Bob's identity is known only by its own claim.
         assert_eq!(second["from"]["identity"]["name"], "Robert");
         assert_eq!(second["from"]["identity"]["how"], "unknown");
-        assert_eq!(second["from"]["added_by"]["name"], "Alice");
+        assert_eq!(second["from"]["added_by"], json!({ "fp": alice.fp, "how": "invite" }));
         // The read frontier: Alice's answer comes after what she was shown, and a reply to Bob wakes him.
         let id = second["id"].as_str().unwrap();
         let answer = alice.cmd(&["send", "--reply-to", id, "on it"]).await.unwrap();
@@ -280,7 +280,7 @@ fn an_attachment_arrives_as_a_private_file() {
         let file = world.root.join("token.txt");
         std::fs::write(&file, "s3cret").unwrap();
         let sent = bob.cmd(&["send", "--to", "Alice", "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
-        assert_eq!(sent["attachment"]["held_by"][0]["name"], "Alice");
+        assert_eq!(handles(&sent["attachment"]["held_by"]), ["alice"]);
         let message = alice.expect("message").await;
         assert_eq!(message["attachment"]["name"], "token.txt");
         assert!(message["attachment"]["link"].as_str().unwrap().starts_with("lmk:"));
@@ -329,14 +329,14 @@ fn a_doc_is_a_file_that_others_edit_too() {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         let edited = bob.expect("edited").await;
-        assert_eq!(edited["by"][0]["name"], "Alice");
+        assert_eq!(handles(&edited["by"]), ["alice"]);
         assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "- [ ] alpha\n- [ ] beta\n");
         // Bob ticks a line and adds one that mentions Alice; Alice meanwhile changes another.
         std::fs::write(&theirs, "- [x] alpha\n- [ ] beta\n- [ ] gamma @alice\n").unwrap();
         std::fs::write(&plan, "- [ ] alpha\n- [ ] beta (Tuesday)\n").unwrap();
         let edited = alice.expect("edited").await;
         assert_eq!(keys(&edited), keys(&json!({ "type": 0, "group": 0, "file": 0, "by": 0, "lines": 0, "direct": 0 })));
-        assert_eq!(edited["by"][0]["name"], "Bob");
+        assert_eq!(handles(&edited["by"]), ["bob"]);
         assert_eq!(edited["direct"], true);
         assert_eq!(std::fs::read_to_string(&plan).unwrap(), "- [x] alpha\n- [ ] beta (Tuesday)\n- [ ] gamma @alice\n");
         // Bob's edit to a line was not to the line Alice changed, so nothing is lost; his file gets her change.
@@ -364,10 +364,9 @@ fn membership_changes_wake_and_a_removed_session_is_told() {
         let named = alice.cmd(&["name", "Release"]).await.unwrap();
         assert_eq!(named["settings"]["name"], "Release");
         let settings = bob.expect("settings").await;
-        assert_eq!((settings["settings"]["name"].as_str(), settings["by"]["name"].as_str()), (Some("Release"), Some("Alice")));
+        assert_eq!((settings["settings"]["name"].as_str(), settings["by"]["handle"].as_str()), (Some("Release"), Some("alice")));
         let members = bob.cmd(&["members", "--group", "Release"]).await.unwrap();
-        let names: Vec<&str> = members["members"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["Alice", "Bob"]);
+        assert_eq!(handles(&members["members"]), ["alice", "bob"]);
         assert_eq!(members["members"][1]["you"], true);
         let other = alice.cmd(&["invite"]).await.unwrap()["group"].as_str().unwrap().to_owned();
         assert_eq!(alice.cmd(&["status"]).await.unwrap()["groups"].as_array().unwrap().len(), 2);
@@ -380,9 +379,9 @@ fn membership_changes_wake_and_a_removed_session_is_told() {
         assert!(alice.cmd(&["remove", "Carol"]).await.is_err());
         alice.cmd(&["remove", "Bob"]).await.unwrap();
         let left = alice.expect("left").await;
-        assert_eq!(left["member"]["name"], "Bob");
+        assert_eq!(left["member"]["handle"], "bob");
         let removed = bob.expect("removed").await;
-        assert_eq!((removed["group"].as_str(), removed["by"]["name"].as_str()), (Some(group.as_str()), Some("Alice")));
+        assert_eq!((removed["group"].as_str(), removed["by"]["handle"].as_str()), (Some(group.as_str()), Some("alice")));
         assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!([]));
     });
 }
@@ -417,13 +416,18 @@ fn a_leaving_member_is_removed_by_another() {
         let (mut alice, mut bob, _) = pair(&world, HOUR).await;
         let left = bob.cmd(&["leave"]).await.unwrap();
         assert_eq!(left["left"], true);
-        assert_eq!(alice.expect("left").await["member"]["name"], "Bob");
+        assert_eq!(alice.expect("left").await["member"]["handle"], "bob");
         bob.expect("removed").await;
     });
 }
 
 /// Asks again, a quarter of a second apart, until `accept` takes what `ask` answers or 30 seconds pass; returns the last
 /// answer.
+/// The handles of a list of described members.
+fn handles(members: &Value) -> Vec<&str> {
+    members.as_array().unwrap().iter().map(|m| m["handle"].as_str().unwrap()).collect()
+}
+
 async fn until(ask: impl AsyncFn() -> Value, accept: impl Fn(&Value) -> bool) -> Value {
     for _ in 0..120 {
         let answer = ask().await;
@@ -442,13 +446,13 @@ fn a_message_printed_is_read_and_one_waiting_only_held() {
         let (mut alice, bob, _) = pair(&world, HOUR).await;
         let quiet = bob.cmd(&["send", "fyi"]).await.unwrap();
         let id = quiet["id"].as_str().unwrap();
-        let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| read[0]["held_by"] == json!(["Alice"])).await;
-        assert_eq!((&read[0]["held_by"], &read[0]["read_by"]), (&json!(["Alice"]), &json!([])), "Alice holds it, unprinted");
+        let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| handles(&read[0]["held_by"]) == ["alice"]).await;
+        assert_eq!((handles(&read[0]["held_by"]), &read[0]["read_by"]), (vec!["alice"], &json!([])), "Alice holds it, unprinted");
         let look = bob.cmd(&["send", "@alice look"]).await.unwrap();
         assert_eq!(alice.expect("message").await["id"], id);
         alice.expect("message").await;
-        let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| read[0]["read_by"] == json!(["Alice"])).await;
-        assert_eq!(read[0]["read_by"], json!(["Alice"]), "printed, so read");
+        let read = until(|| async { bob.cmd(&["read", id]).await.unwrap() }, |read| handles(&read[0]["read_by"]) == ["alice"]).await;
+        assert_eq!(handles(&read[0]["read_by"]), ["alice"], "printed, so read");
         // Alice's next message carries what she read.
         let answer = alice.cmd(&["send", "seen both"]).await.unwrap();
         // Unknown to Bob until her message reaches him.
@@ -491,8 +495,8 @@ fn status_lists_sends_held_only_here_and_members_away() {
         bob.stop().await;
         SHIFT.store(8 * 24 * 3600 * 1000, std::sync::atomic::Ordering::Relaxed);
         // Once Bob's close reaches Alice.
-        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["away"][0]["name"] == "Bob").await;
-        assert_eq!(status["groups"][0]["away"][0]["name"], "Bob", "not heard from for longer than members carry messages");
+        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["away"][0]["handle"] == "bob").await;
+        assert_eq!(status["groups"][0]["away"][0]["handle"], "bob", "not heard from for longer than members carry messages");
         assert_eq!(alice.cmd(&["members"]).await.unwrap()["members"].as_array().unwrap().len(), 2, "away, not removed");
     });
 }
@@ -533,7 +537,7 @@ fn a_sender_is_told_who_lost_its_message() {
         assert!(own.get("text").is_none());
         let mut alice = world.start("alice", HOUR).await;
         let lost = alice.expect("lost").await;
-        assert!(lost["member"]["name"] == "Bob" && lost["ids"].as_array().unwrap().contains(&sent["id"]), "{lost}");
+        assert!(lost["member"]["handle"] == "bob" && lost["ids"].as_array().unwrap().contains(&sent["id"]), "{lost}");
         assert!(lost["text"].as_str().unwrap().contains("--reply-to"), "{lost}");
     });
 }
@@ -562,7 +566,7 @@ fn the_command_channel_needs_its_token_and_a_running_session() {
         let finding = std::time::Instant::now();
         assert_eq!(crate::cli::running_session(&alice.home).await.unwrap(), "alice");
         assert!(finding.elapsed() < Duration::from_secs(1), "{:?}", finding.elapsed());
-        let missing = Agent { handle: "nobody".into(), home: alice.home.clone(), events: mpsc::unbounded_channel().1, stop: None, done: None };
+        let missing = Agent { handle: "nobody".into(), home: alice.home.clone(), fp: String::new(), events: mpsc::unbounded_channel().1, stop: None, done: None };
         let error = missing.cmd(&["groups"]).await.unwrap_err().to_string();
         assert!(error.contains("not running"), "{error}");
     });
@@ -600,7 +604,7 @@ fn a_group_ended_for_everyone_keeps_no_member() {
         let (alice, mut bob, _) = pair(&world, HOUR).await;
         let ended = alice.cmd(&["leave", "--end"]).await.unwrap();
         assert_eq!((ended["ended"].as_bool(), ended.get("pending")), (Some(true), None), "{ended}");
-        assert_eq!(bob.expect("removed").await["by"]["name"], "Alice");
+        assert_eq!(bob.expect("removed").await["by"]["handle"], "alice");
         assert_eq!(alice.cmd(&["groups"]).await.unwrap(), json!([]));
         assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!([]));
     });
@@ -658,6 +662,32 @@ fn a_device_is_on_one_identity_which_lists_and_loses_devices() {
     });
 }
 
+/// A member shows as its identity and its device, with its handle where another session of its device is in the group,
+/// and answers to any of them: another person's identity's name too.
+#[test]
+fn a_member_shows_as_its_identity_and_device_and_answers_to_them() {
+    local(async {
+        let world = world("shown").await;
+        let (alice, mut bob, group) = pair(&world, HOUR).await;
+        let mut desk = world.start_in("bob", "desk", HOUR).await;
+        let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
+        desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        let device = lmk_core::device::Device::load(&bob.home.join("device.json")).unwrap().name;
+        let shown = |members: &Value| {
+            let mut names: Vec<String> = members["members"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap().to_owned()).collect();
+            names.sort();
+            names
+        };
+        let expected = [format!("Alice · {device}"), format!("Robert · {device} (bob)"), format!("Robert · {device} (desk)")];
+        let members = until(|| async { alice.cmd(&["members"]).await.unwrap() }, |members| shown(members) == expected).await;
+        assert_eq!(shown(&members), expected);
+        alice.cmd(&["send", "@robert, a word"]).await.unwrap();
+        for robert in [&mut bob, &mut desk] {
+            assert_eq!(robert.expect("message").await["direct"], true);
+        }
+    });
+}
+
 /// A session that does not act for its device renames the device and takes it off its identity, through the session
 /// that does: its credential and its identity's key log name it anew, and the identity, whose only device it was, ends.
 #[test]
@@ -688,7 +718,7 @@ fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
         let left = desk.cmd(&["identity", "leave"]).await.unwrap();
         assert_eq!((&left["left"][0], &left["ended"]), (&invite["group"], &json!(true)));
         assert_eq!(alice.cmd(&["identity", "list"]).await.unwrap()["identity"], json!(null));
-        assert_eq!(carol.expect("left").await["member"]["name"], "Desk");
+        assert_eq!(carol.expect("left").await["member"]["handle"], "desk");
     });
 }
 
@@ -903,7 +933,7 @@ fn git_pushes_count_in_the_groups_log_in_order() {
 
         // Once Alice removes Carol, the next push counts after the removal.
         let members = alice.cmd(&["members"]).await.unwrap();
-        let fp = members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Carol").unwrap()["fp"].as_str().unwrap().to_owned();
+        let fp = members["members"].as_array().unwrap().iter().find(|m| m["handle"] == "carol").unwrap()["fp"].as_str().unwrap().to_owned();
         alice.cmd(&["remove", &fp]).await.unwrap();
         carol.expect("removed").await;
         let (second, position) = push(&first, 2).await;
@@ -934,7 +964,7 @@ fn a_session_stops_once_it_cannot_print_and_prints_the_rest_when_started_again()
         for i in 0..25 {
             sent.push(bob.cmd(&["send", "--urgent", &format!("m{i}")]).await.unwrap()["id"].clone());
         }
-        let mut alice = world.launch(world.config("alice", "alice", None), 1).await;
+        let mut alice = world.launch(world.config("alice", "alice"), 1).await;
         assert_eq!(alice.expect("omitted").await["count"], 5);
         assert_eq!(alice.expect("message").await["id"], sent[5]);
         tokio::time::timeout(Duration::from_secs(30), alice.done.take().unwrap()).await.unwrap().unwrap();
@@ -945,23 +975,6 @@ fn a_session_stops_once_it_cannot_print_and_prints_the_rest_when_started_again()
         alice.stop().await;
         let mut alice = world.start("alice", HOUR).await;
         assert!(alice.printed().await.iter().all(|e| e["type"] != "message" && e["type"] != "omitted"));
-    });
-}
-
-/// A session resumes with the name it was created with; another name is refused.
-#[test]
-fn a_session_resumes_with_its_name() {
-    local(async {
-        let world = world("name").await;
-        let mut alice = world.start("alice", HOUR).await;
-        alice.stop().await;
-        let mut alice = world.launch(world.config("alice", "alice", None), usize::MAX).await;
-        alice.cmd(&["invite"]).await.unwrap();
-        assert_eq!(alice.cmd(&["members"]).await.unwrap()["members"][0]["name"], "Alice");
-        alice.stop().await;
-        let renamed = world.config("alice", "alice", Some("Other"));
-        let error = crate::listen(renamed, &alice.home, world.network.clone(), |_| Ok(()), async {}).await.unwrap_err();
-        assert!(error.to_string().contains("this session is named \"Alice\""), "{error}");
     });
 }
 

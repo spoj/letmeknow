@@ -46,7 +46,7 @@ class Listener:
     def __init__(self, session, device=None, bin=BIN):
         self.session, self.lines = session, queue.Queue()
         env = {**ENV, "LETMEKNOW_HOME": home(device or session)}
-        args = [bin, "--session", session, "listen", "--name", session.title(), "--hold", "0"]
+        args = [bin, "--session", session, "listen", "--hold", "0"]
         self.log = open(os.path.join(TMP, f"{session}.log"), "a")
         self.proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8")
         threading.Thread(target=self.read, daemon=True).start()
@@ -130,7 +130,7 @@ def git_kind(alice, bob, dave, listeners):
     git("alice", "remote", "add", "team", "lmk::Repo", cwd=ours)
     git("alice", "push", "-q", "team", "main", cwd=ours)
     pushed = bob.expect("pushed", lambda e: e["group"] == made["group"])
-    check(pushed["ref"] == "refs/heads/main" and pushed["subjects"] == ["first commit"] and pushed["by"]["name"] == "Alice", "a push reaches the other member as a pushed event")
+    check(pushed["ref"] == "refs/heads/main" and pushed["subjects"] == ["first commit"] and pushed["by"]["handle"] == "alice", "a push reaches the other member as a pushed event")
     git("bob", "clone", "-q", "lmk::Repo", theirs, alias=True)
     check(content(os.path.join(theirs, "README.md")) == "hello\n", "the other member clones it with git, through the git alias")
     write("bob-repo/NOTES.md", "notes\n")
@@ -229,9 +229,9 @@ def main():
         joined = run("bob", "join", invite["link"])
         check(joined["group"] == group and len(joined["members"]) == 2, "bob joins through the link")
         event = alice.expect("joined")
-        check(event["member"]["name"] == "Bob" and event["how"] == "invite", "alice sees bob join by invite")
+        check(event["member"]["handle"] == "bob" and event["how"] == "invite", "alice sees bob join by invite")
         check("unknown, used or expired" in run("carol", "join", invite["link"], ok=False), "an invite link works once")
-        seen = next(m for m in run("alice", "members")["members"] if m["name"] == "Bob")
+        seen = next(m for m in run("alice", "members")["members"] if m["handle"] == "bob")
         check(seen["identity"]["name"] == "Bob" and seen["identity"]["how"] == "unknown", "another identity is known by its own name, a claim")
 
         sent = run("alice", "send", "hello bob")
@@ -247,7 +247,7 @@ def main():
         # An attachment.
         token = write("token.txt", "s3cret")
         sent = run("alice", "send", "--attach", token, "the token")
-        check(sent["attachment"]["held_by"][0]["name"] == "Bob", "an attachment is held by another member before send returns")
+        check(sent["attachment"]["held_by"][0]["handle"] == "bob", "an attachment is held by another member before send returns")
         message = bob.expect("message", lambda e: e["content"] == "the token")
         arrived = bob.expect("attachment") if "path" not in message["attachment"] else message["attachment"]
         check(content(arrived["path"]) == "s3cret", "the attachment arrives as a private file")
@@ -262,7 +262,7 @@ def main():
         with open(bob_notes, "ab") as f:
             f.write(b"- [ ] gamma @alice\n")
         edited = alice.expect("edited", lambda e: e["group"] == doc["group"])
-        check(edited["by"][0]["name"] == "Bob" and edited["direct"], "alice is told bob edited, mentioning her")
+        check(edited["by"][0]["handle"] == "bob" and edited["direct"], "alice is told bob edited, mentioning her")
         check(content(notes) == "- [ ] alpha\n- [ ] beta\n- [ ] gamma @alice\n", "and her file has his line")
         write("notes.md", "- [x] alpha\n- [ ] beta\n- [ ] gamma @alice\n")
         check(until(lambda: content(bob_notes), lambda text: text.startswith("- [x] alpha")) == "- [x] alpha\n- [ ] beta\n- [ ] gamma @alice\n", "her edit reaches his file")
@@ -280,7 +280,7 @@ def main():
         # Carol joins through bob; the chat is then opened to bob's identity.
         joined = run("carol", "join", run("bob", "invite", f"--group={group}")["link"])
         check(len(joined["members"]) == 3, "a member invites another")
-        alice.expect("joined", lambda e: e["member"]["name"] == "Carol" and e["by"]["name"] == "Bob")
+        alice.expect("joined", lambda e: e["member"]["handle"] == "carol" and e["by"]["handle"] == "bob")
         desk = Listener("desk", device="bob")
         check(run("desk", "identity", "list", device="bob")["name"] == "Bob", "another session on bob's machine shares his identity")
         desk.stop()
@@ -297,14 +297,14 @@ def main():
         # Bob's tablet joins the chat by a link, as a device of his identity.
         joined = run("tablet", "join", run("bob", "invite", f"--group={group}")["link"])
         check(len(joined["members"]) == 4, "the tablet joins the chat")
-        event = alice.expect("joined", lambda e: e["member"]["name"] == "Tablet")
+        event = alice.expect("joined", lambda e: e["member"]["handle"] == "tablet")
         check(event["member"]["identity"]["id"] == bob_id, "as a device of bob's identity")
 
         # A removal.
-        carol_fp = next(m["fp"] for m in run("alice", "members", f"--group={group}")["members"] if m["name"] == "Carol")
+        carol_fp = next(m["fp"] for m in run("alice", "members", f"--group={group}")["members"] if m["handle"] == "carol")
         run("alice", "remove", f"--group={group}", carol_fp)
-        check(carol.expect("removed")["by"]["name"] == "Alice", "carol is told alice removed her")
-        alice.expect("left", lambda e: e["member"]["name"] == "Carol")
+        check(carol.expect("removed")["by"]["handle"] == "alice", "carol is told alice removed her")
+        alice.expect("left", lambda e: e["member"]["handle"] == "carol")
         check(run("carol", "groups") == [], "and is in no group")
 
         # Any member that holds an invite admits by it: erin gets in while bob, who made her link, is stopped.
@@ -319,7 +319,7 @@ def main():
         listeners.remove(bob)
         joined = run("erin", "join", link)
         check(joined["group"] == group and len(joined["members"]) == 4, "a joiner gets in while the inviter is stopped")
-        check(alice.expect("joined", lambda e: e["member"]["name"] == "Erin")["by"]["name"] != "Bob", "admitted by another member")
+        check(alice.expect("joined", lambda e: e["member"]["handle"] == "erin")["by"]["handle"] != "bob", "admitted by another member")
         run("alice", "name", f"--group={group}", "Release")
         missed = run("alice", "send", f"--group={group}", "while you were away")
         check(isinstance(missed.get("position"), int), "the group's log takes what bob misses")
@@ -335,7 +335,7 @@ def main():
         tablet.stop()
         listeners.remove(tablet)
         run("bob", "identity", "remove", "--", key)
-        left = alice.expect("left", lambda e: e["member"]["name"] == "Tablet", timeout=60)
+        left = alice.expect("left", lambda e: e["member"]["handle"] == "tablet", timeout=60)
         check(left["group"] == group, "a device taken off its identity while it is stopped leaves its groups")
         if BROWSER and subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=WEB, env={**ENV, "URL": ENV["LETMEKNOW_RELAY"], "BIN": BIN}).returncode:
             sys.exit("FAIL: the browser test")

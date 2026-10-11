@@ -81,18 +81,17 @@ pub async fn listen(
         Device::new(&gethostname::gethostname().to_string_lossy()).save(&device_file)?;
     }
     let db = store::open(&config.dir.join("session.db"))?;
-    let name = session::Session::name(&db, &config)?;
     let provider = SqliteProvider::open(&config.dir.join("session.db"))?;
     let kinds = [lmk_proto::group::CHAT.to_owned()].into_iter().chain(kinds::discover(&config.plugins).into_keys()).collect();
-    let node_config = node_config(&network, home, &name, None, config.dir.join("files"), kinds);
+    let node_config = node_config(&network, home, &config.handle, None, config.dir.join("files"), kinds);
     let (node, events) = Node::start(provider, node_config).await?;
-    let session = session::Session::open(config, (db, name), node, home, network, inbound).await?;
+    let session = session::Session::open(config, db, node, home, network, inbound).await?;
     session::run(session, queue, events, print, shutdown).await
 }
 
-fn node_config(network: &Network, home: &Path, name: &str, device: Option<Device>, files: PathBuf, kinds: Vec<String>) -> lmk_node::Config {
+fn node_config(network: &Network, home: &Path, handle: &str, device: Option<Device>, files: PathBuf, kinds: Vec<String>) -> lmk_node::Config {
     lmk_node::Config {
-        name: name.into(),
+        handle: handle.into(),
         device,
         relay: network.relay.clone(),
         ca: network.ca.clone(),

@@ -5,9 +5,9 @@
 //! both in `LETMEKNOW_HOME`; the device's other session processes read the one and send such
 //! requests to the other, among them for the certificates their credentials carry.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, DeviceState, File, Remote, message_id};
+use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, Described, DeviceState, File, Remote, message_id};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::devices::Devices;
@@ -42,8 +42,6 @@ pub type SessionNode = Node<SqliteProvider>;
 pub struct Config {
     pub handle: String,
     pub dir: PathBuf,
-    /// Fixed when the session is created [default: <user>/<handle>]; a session resumes with its own.
-    pub name: Option<String>,
     pub hold: Duration,
     pub keep_log: bool,
     /// For groups and identities this session creates.
@@ -143,26 +141,9 @@ fn save(dir: &Path, link: &FileLink, name: Option<&str>, bytes: &[u8]) -> Result
 }
 
 impl Session {
-    /// The session's name, kept in `db`: for a new session, `config`'s.
-    pub fn name(db: &Connection, config: &Config) -> Result<String> {
-        let stored: Option<String> = db.query_row("SELECT name FROM session", [], |r| r.get(0)).optional()?;
-        match (stored, &config.name) {
-            (Some(stored), Some(name)) if stored != *name => {
-                bail!("this session is named {stored:?}; names are fixed when a session is created")
-            }
-            (Some(stored), _) => Ok(stored),
-            (None, name) => {
-                let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "agent".into());
-                let name = name.clone().unwrap_or_else(|| format!("{user}/{}", config.handle));
-                db.execute("INSERT INTO session (name) VALUES (?)", [&name])?;
-                Ok(name)
-            }
-        }
-    }
-
     pub async fn open(
         config: Config,
-        (db, name): (Connection, String),
+        db: Connection,
         node: SessionNode,
         home: &Path,
         network: Network,
@@ -170,7 +151,7 @@ impl Session {
     ) -> Result<Self> {
         let (plugins, lines) = Plugins::new(crate::kinds::discover(&config.plugins), config.dir.join("kinds"));
         let device = Device::load(&home.join("device.json"))?;
-        let client_config = lmk_client::Config { name, device, membership: config.membership.clone() };
+        let client_config = lmk_client::Config { device, membership: config.membership.clone() };
         let access = Access::Elsewhere(Arc::new(Published(home.to_path_buf())));
         let plugins = Arc::new(plugins);
         let (client, told) = Client::new(node, client_config, access, plugins.clone(), lines);
@@ -241,7 +222,7 @@ impl Session {
         let device = Device::load(&self.home.join("device.json"))?;
         let provider = SqliteProvider::open(&self.home.join("device.db"))?;
         let kinds = vec![lmk_proto::group::CHAT.into(), DEVICES.into()];
-        let config = crate::node_config(&self.network, &self.home, &device.name, Some(device.clone()), self.home.join("device-files"), kinds);
+        let config = crate::node_config(&self.network, &self.home, "", Some(device.clone()), self.home.join("device-files"), kinds);
         let (node, mut events) = Node::start(provider, config).await?;
         let path = self.home.join("device.json");
         let devices = Devices::new(node.clone(), device, Arc::new(move |device: &Device| device.save(&path)));
@@ -615,8 +596,8 @@ impl Session {
         shown.push(message);
         let (receipts, me) = (self.client.receipts(&gid)?, node.key());
         let describer = self.client.describer(&gid)?;
-        let names = |of: &dyn Fn(&lmk_client::Receipt) -> bool| -> Vec<Value> {
-            receipts.iter().filter(|r| of(r)).map(|r| json!(describer.describe(&r.member).name)).collect()
+        let described = |of: &dyn Fn(&lmk_client::Receipt) -> bool| -> Vec<Described> {
+            receipts.iter().filter(|r| of(r)).map(|r| describer.describe(&r.member)).collect()
         };
         let mut found = Vec::new();
         for m in shown {
@@ -624,8 +605,8 @@ impl Session {
             let id: [u8; 32] = m.id.0.as_slice().try_into()?;
             let mut item = self.message_json(&gid, id, m.position, from, &m.payload, false)?;
             if m.sender.key == me {
-                item["held_by"] = json!(names(&|r| r.held.contains(m.position)));
-                item["read_by"] = json!(names(&|r| r.read.contains(m.position)));
+                item["held_by"] = json!(described(&|r| r.held.contains(m.position)));
+                item["read_by"] = json!(described(&|r| r.read.contains(m.position)));
             }
             self.mark_seen(&id)?;
             found.push(item);

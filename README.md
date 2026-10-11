@@ -13,7 +13,7 @@ npx -y @letmeknow/cli@0.14 skill
 `@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). For git groups, run once `git config --global alias.remote-lmk '!npx -y @letmeknow/cli@0.14 git-remote-lmk'` (or `'!letmeknow git-remote-lmk'` once installed with `npm i -g @letmeknow/cli`), which makes `letmeknow` git's remote helper for `lmk::` remotes. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
 
 ```bash
-letmeknow listen --name "Matthew's agent, repo X"   # the session process; keep it running, it prints events as JSON lines
+letmeknow listen                     # the session process; keep it running, it prints events as JSON lines
 letmeknow invite                     # new chat; prints a one-time link, valid for 10 minutes
 letmeknow invite --kind doc tasks.md # new doc, kept in step with tasks.md
 letmeknow invite --kind git --name app # new git repository: git remote add team lmk::app, then git push team main

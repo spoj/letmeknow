@@ -79,7 +79,7 @@ impl Member {
     async fn start(relay: &Relay, name: &str) -> Member {
         let device = Device::new(name);
         let config = lmk_node::Config {
-            name: name.into(),
+            handle: String::new(),
             device: Some(device.clone()),
             relay: relay.url.clone(),
             ca: relay.ca(),
@@ -94,7 +94,7 @@ impl Member {
         let devices = Devices::new(node.clone(), device.clone(), Arc::new(|_: &Device| Ok(())));
         let (lines, written) = mpsc::unbounded_channel();
         let plugin = Arc::new(Recorder { started: Mutex::default(), sent: Mutex::default(), lines, gate: Mutex::default() });
-        let config = Config { name: name.into(), device, membership: relay.service.clone() };
+        let config = Config { device, membership: relay.service.clone() };
         let (client, told) = Client::new(node, config, Access::Here(devices), plugin.clone(), written);
         let (taking, pumping, stated) = (client.clone(), client.clone(), Arc::new(Notify::new()));
         let state = stated.clone();
@@ -173,7 +173,7 @@ async fn a_kinds_plugin_hears_of_its_groups_and_lets_go_of_one_left() {
     assert_eq!(sent[0]["type"], "start");
     let group = &sent[1];
     assert_eq!((group["type"].as_str(), group["command"].as_str(), group["args"][0].as_str()), (Some("group"), Some("invite"), Some("plan.md")));
-    assert_eq!((group["me"]["name"].as_str(), group["me"]["you"].as_bool()), (Some("Alice"), Some(true)));
+    assert_eq!((&group["me"]["fp"], group["me"]["you"].as_bool()), (&alice.client.me().unwrap()["fp"], Some(true)));
     let left = alice.request(json!({ "cmd": "leave", "group": invite["group"] })).await;
     assert_eq!(left["left"], true);
     assert_eq!(alice.plugin.sent.lock().unwrap().last().unwrap()["type"], "gone");

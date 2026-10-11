@@ -52,7 +52,7 @@ async fn device(relay: &Relay, name: &str) -> (Session, Devices<MemoryProvider>)
 
 fn config(relay: &Relay, name: &str, device: Option<Device>, kinds: &[&str]) -> Config {
     Config {
-        name: name.into(),
+        handle: name.into(),
         device,
         relay: relay.url.clone(),
         ca: relay.ca(),

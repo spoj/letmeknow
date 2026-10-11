@@ -10,7 +10,7 @@ use tokio::time::Instant;
 /// How many items that arrived while catching up are printed; older ones are counted as `omitted`.
 const CATCH_UP: usize = 20;
 
-/// Whether `text` mentions `member`: "@" and a name it answers to, as "@claude" does "Claude, Matthew's coding agent".
+/// Whether `text` mentions `member`: "@" and a name it answers to, as "@ann" does a member of the identity "Ann Lee".
 pub fn mentions(text: &str, member: &Value) -> bool {
     text.match_indices('@').any(|(at, _)| {
         let name: String = text[at + 1..].chars().take_while(|c| c.is_alphanumeric() || "-_".contains(*c)).collect();
@@ -103,20 +103,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn a_member_answers_to_its_name_the_first_word_of_it_and_its_identitys_name() {
-        let member = json!({ "name": "Claude, Matthew's coding agent", "identity": { "id": "e", "name": "Matthew", "how": "self" } });
-        assert!(["claude, matthew's coding agent", "Claude", "MATTHEW"].iter().all(|name| answers(&member, name)));
-        assert!(!answers(&member, "Matt"));
-        let unverified = json!({ "name": "Claude", "identity": { "id": "e", "name": "Matthew", "how": "self", "error": "not on its list" } });
-        assert!(!answers(&unverified, "Matthew"));
-        let stranger = json!({ "name": "Claude", "identity": { "id": "e", "name": "Matthew", "how": "unknown" } });
-        assert!(!answers(&stranger, "Matthew"));
+    fn text_mentions_a_member_by_at_and_a_name_it_answers_to() {
+        let member = json!({ "handle": "claude", "device": "laptop", "identity": { "id": "e", "name": "Matthew Lee", "how": "unknown" } });
         assert!(mentions("@Claude please check", &member));
-        assert!(mentions("ok, @claude.", &member));
+        assert!(mentions("ok, @matthew.", &member));
         assert!(!mentions("@Claudette, look", &member));
         assert!(!mentions("Claude, look", &member));
         assert!(!mentions("mail claude@example.com", &member));
-        assert!(!mentions("@ (", &json!({ "name": "(bot)" })));
+        assert!(!mentions("@ (", &json!({ "handle": "(bot)" })));
     }
 
     #[test]

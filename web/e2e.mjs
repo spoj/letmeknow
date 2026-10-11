@@ -25,7 +25,7 @@ let passed = false;
 /** A native session in a home of its own: its own device. */
 function native(name) {
   const env = { ...process.env, LETMEKNOW_HOME: join(tmp, name) };
-  const proc = spawn(BIN, ["--session", name, "listen", "--name", name[0].toUpperCase() + name.slice(1), "--hold", "0"], { env, stdio: ["ignore", "pipe", "inherit"] });
+  const proc = spawn(BIN, ["--session", name, "listen", "--hold", "0"], { env, stdio: ["ignore", "pipe", "inherit"] });
   natives.push(proc);
   const exited = new Promise(resolve => proc.once("exit", resolve));
   const events = [];
@@ -141,10 +141,10 @@ try {
   await laptop.locator(".people", { hasText: "Ann" }).waitFor();
   check(new URL(laptop.url()).pathname === "/", "a browser joins from an invite link, with a click");
   check(!(await kept(laptop)).includes("00"), "a profile that a letmeknow before 0.12 used starts afresh");
-  await ann.printed(e => e.type === "joined" && e.member.name === "Matt");
+  await ann.printed(e => e.type === "joined");
   check(true, "the native session sees the browser join");
   const matt = await until(
-    () => ann.run("members", `--group=${invite.group}`).members.find(m => m.name === "Matt"),
+    () => ann.run("members", `--group=${invite.group}`).members.find(m => !m.you),
     m => m?.identity?.name === "Matt"
   );
   check(matt.identity.how === "unknown" && matt.device === "laptop", "the welcome screen makes the browser its identity's first device, which others know by its own name");
@@ -158,7 +158,7 @@ try {
   await laptop.getByPlaceholder("Message").fill("hello from the browser");
   await laptop.getByPlaceholder("Message").press("Enter");
   const reply = await ann.printed(e => e.type === "message" && e.content === "hello from the browser");
-  check(reply.reply_to === hello && reply.from.name === "Matt", "a native session gets the browser's reply");
+  check(reply.reply_to === hello && reply.from.identity?.name === "Matt", "a native session gets the browser's reply");
   const ticks = laptop.locator(".messages li", { hasText: "hello from the browser" }).locator(".ticks");
   const receipt = await until(
     () => ticks.textContent(),
@@ -425,7 +425,7 @@ try {
   await laptop.getByRole("button", { name: "End for everyone" }).click();
   await laptop.getByRole("button", { name: "Remove everyone and end this chat?" }).click();
   await laptop.locator(".group-list button", { hasText: "Ideas" }).waitFor({ state: "detached" });
-  await tablet.printed(e => e.type === "removed" && e.by?.name === "Matt");
+  await tablet.printed(e => e.type === "removed" && e.by?.identity?.name === "Matt");
   check(!tablet.run("groups").some(g => g.name === "Ideas"), "the browser ends a chat for everyone");
   await tablet.stop();
 

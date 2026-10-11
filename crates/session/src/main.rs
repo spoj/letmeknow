@@ -24,14 +24,13 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let home = home_dir(cli.home)?;
     match cli.command {
-        Command::Listen { name, hold, keep_log, membership, relay } => {
+        Command::Listen { hold, keep_log, membership, relay } => {
             let handle = match cli.session {
                 Some(session) => session,
                 None => new_handle(&home)?,
             };
             let config = Config {
                 dir: session_dir(&home, &handle)?,
-                name,
                 handle,
                 hold: Duration::from_secs(hold),
                 keep_log,

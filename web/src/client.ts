@@ -9,7 +9,8 @@ import * as store from "./store";
 
 /** A member as the client core describes it; an endpoint that is not one has only its `iroh` key. */
 export type Identity = { id: string; name: string; how: "self" | "unknown"; error?: string };
-export type Person = { fp: string; name: string; device: string; you?: boolean; identity?: Identity; added_by?: { name?: string; how: string }; away?: boolean };
+/** A member; `name` is how it shows: "Matthew · phone", or its fingerprint where it speaks for no identity this browser could check. */
+export type Person = { fp: string; name: string; handle?: string; device: string; you?: boolean; identity?: Identity; added_by?: { fp: string; how: string }; away?: boolean };
 export type Named = { id: string; name: string };
 export type Settings = { kind: "chat" | "doc" | "git"; name: string; carry?: number };
 export type Group = { group: string; settings: Settings; members: Person[] };
@@ -51,7 +52,7 @@ export type Item =
   | { type: "settings"; at: number; by: Person; before?: Settings; settings: Settings }
   | { type: "pushed"; at: number; by: Person; ref: string; subjects: string[] };
 export type Event = { type: string; group?: string; identity?: string; id?: string; hash?: string; text?: string; by?: string };
-export type Me = { fp: string; name: string; device: { name: string }; identity: (Named & { device?: string }) | null };
+export type Me = { fp: string; device: { name: string }; identity: (Named & { device?: string }) | null };
 
 
 /** The session's methods, as every tab calls them: asynchronously, wherever it runs. */
@@ -106,7 +107,7 @@ export const lmk = new Proxy({} as Session, { get: (_, method: string) => (...ar
 export const request = async (request: { cmd: string } & Record<string, unknown>): Promise<any> => JSON.parse(await lmk.request(JSON.stringify(request)));
 
 /** Starts the session in another tab, or in this one if it holds the lock, as `name` on device `device` if new. */
-export const open = (name: string, device: string) => call("open", [name, device]) as Promise<void>;
+export const open = (device: string) => call("open", [device]) as Promise<void>;
 
 async function answer({ id, method, args }: Call) {
   try {
@@ -136,12 +137,12 @@ channel.onmessage = ({ data }: MessageEvent<Message>) => {
 
 let running: Promise<void> | undefined;
 /** Runs the session in this tab, from what IndexedDB keeps, creating it as `name` on `device` if there is none. */
-function run(name = "", device = ""): Promise<void> {
+function run(device = ""): Promise<void> {
   running ??= (async () => {
     const { records, kept } = await store.load();
     const membership = localStorage.getItem("lmk membership") ?? (await (await fetch("/membership")).text());
     const relay = localStorage.getItem("lmk relay") ?? membership.slice(membership.indexOf("@") + 1);
-    const config = { name, device, relay, membership };
+    const config = { device, relay, membership };
     local = await start(records, kept, JSON.stringify(config), store, (json: string) => {
       const event = JSON.parse(json) as Event;
       dispatch(event);

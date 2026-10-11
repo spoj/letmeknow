@@ -75,8 +75,9 @@ const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 const STATE_ASK: u64 = 60 * 1000;
 
 pub struct Config {
-    /// The session's name, fixed when it is created.
-    pub name: String,
+    /// The name its credential gives it in groups but devices groups, fixed when it is created: a session process's
+    /// handle, or empty for a device's node.
+    pub handle: String,
     /// The device, where this is a device's node or a browser's one session: its name is its credential's in its
     /// devices groups, each of which this node joins with a key of its own, the device's key on that identity.
     pub device: Option<Device>,
@@ -109,6 +110,7 @@ pub struct Member {
     pub iroh: Bytes,
     /// The protocol revision its leaf names.
     pub revision: u32,
+    /// Its credential's name: its device's name in a devices group, and in any other its session's handle.
     pub name: String,
     /// The name of its device, as its identity's key log lists it.
     pub device_name: String,

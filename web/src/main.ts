@@ -129,11 +129,11 @@ async function boot() {
   if (invite && had) offer(kind);
 }
 
-/** Starts this browser's session, and unless it is to join an identity by a device link, makes it the first device of an identity of `name`. */
-async function start(name: string, device: string, identity = true) {
-  await client.open(name, device);
+/** Starts this browser's session, and given `name`, makes it the first device of an identity of that name; without, it is to join one by a device link. */
+async function start(device: string, name?: string) {
+  await client.open(device);
   navigator.storage?.persist?.();
-  if (identity) await request({ cmd: "identity", op: { create: { name } } });
+  if (name) await request({ cmd: "identity", op: { create: { name } } });
   await (entered ??= enter());
 }
 
@@ -147,12 +147,6 @@ client.listen(event => {
   if (event.type === "edited") docs.get(event.group!)?.edited();
   if (entered) render();
 });
-
-// Names: a member's identity first, as this browser knows it ("Matthew · phone"), else its own name.
-
-function label(p: Person): string {
-  return p.identity && !p.identity.error ? `${p.identity.name} · ${p.device}` : (p.name ?? "");
-}
 
 /** What a member's name rests on: this browser's own identity, or only its own word. */
 function standing(p: Person): string | undefined {
@@ -170,7 +164,7 @@ function who(p: Person): HTMLElement {
     "span",
     { className: warning ? "who warn" : "who", title: [standing(p), warning, `key ${p.fp}`].filter(Boolean).join("\n") },
     warning && "⚠ ",
-    label(p),
+    p.name,
     !own && h("small", { className: "level" }, " (unverified)")
   );
 }
@@ -179,7 +173,7 @@ function who(p: Person): HTMLElement {
 function title(gid: string): string {
   const g = group(gid);
   if (!g) return "a group";
-  const others = (g.members ?? []).filter(m => !m.you).map(label);
+  const others = (g.members ?? []).filter(m => !m.you).map(p => p.name);
   return g.settings.name || [...new Set(others)].join(", ") || `New ${KINDS[g.settings.kind].name}`;
 }
 
@@ -226,7 +220,7 @@ function welcome(kind: string | undefined) {
         () =>
           ready() &&
           busy(join, "Joining…", async () => {
-            await start(name.value.trim(), device.value.trim());
+            await start(device.value.trim(), name.value.trim());
             await redeem(invite!);
           }),
         field("Your name", name, "Everyone you share with sees it."),
@@ -245,7 +239,7 @@ function welcome(kind: string | undefined) {
         () =>
           device.reportValidity() &&
           busy(add, "Adding…", async () => {
-            await start(device.value.trim(), device.value.trim(), false);
+            await start(device.value.trim());
             await redeem(invite!);
           }),
         field("Name this device", device, "Shown next to your name, as in “Matthew · phone”."),
@@ -262,7 +256,7 @@ function welcome(kind: string | undefined) {
       elsewhere,
       ...starters(async () => {
         if (!ready()) return false;
-        await start(name.value.trim(), device.value.trim());
+        await start(device.value.trim(), name.value.trim());
         return true;
       }),
       h("details", { className: "agents" }, h("summary", {}, "For agents"), agentsHelp)
@@ -466,7 +460,7 @@ function drawNav() {
     set(entry.badge, unread(g.group) ? String(unread(g.group)) : "");
     entry.button.classList.toggle("on", page === "group" && g.group === selected);
   }
-  set(meName, me.identity?.name ?? me.name);
+  set(meName, me.identity?.name ?? me.device.name);
   meButton.classList.toggle("on", page === "devices");
 }
 
@@ -522,7 +516,7 @@ async function drawDevices() {
   const identity = me.identity;
   if (!identity) {
     return update(devicesBody, "none", () => {
-      const name = h("input", { value: me.name, required: true });
+      const name = h("input", { required: true });
       const device = h("input", { value: me.device.name, required: true });
       const create = h("button", { className: "primary" }, "Start");
       const started = async () => {
@@ -711,7 +705,7 @@ class View {
   protected drawPeople() {
     const others = this.members.filter(m => !m.you);
     const warned = others.some(m => m.identity?.error);
-    const names = [...new Set(others.map(m => (m.away ? `${label(m)} (away)` : label(m))))];
+    const names = [...new Set(others.map(m => (m.away ? `${m.name} (away)` : m.name)))];
     this.people.replaceChildren(...(others.length ? [warned ? "⚠ " : "", names.join(", "), " and you"] : ["Only you so far"]));
     this.people.classList.toggle("warn", warned);
   }
@@ -744,9 +738,9 @@ class View {
               m.you && h("small", { className: "muted" }, " you"),
               m.away && h("small", { className: "muted" }, " away: not heard from for as long as members carry messages"),
               h("p", { className: m.identity?.error ? "warn" : "muted" }, standing(m)),
-              m.added_by && h("p", { className: "muted" }, `added by ${m.added_by.name ?? "a former member"} (${m.added_by.how})`)
+              m.added_by && h("p", { className: "muted" }, `added by ${this.members.find(a => a.fp === m.added_by!.fp)?.name ?? "a former member"} (${m.added_by.how})`)
             ),
-            !m.you && confirmed("Remove", `Remove ${label(m)}?`, () => request({ cmd: "remove", group: gid, member: m.fp }))
+            !m.you && confirmed("Remove", `Remove ${m.name}?`, () => request({ cmd: "remove", group: gid, member: m.fp }))
           )
         )
       ),
@@ -884,13 +878,13 @@ class ChatView extends View {
         const parent = item.reply_to ? (items.find(i => i.type === "message" && i.id === item.reply_to) as Message | undefined) : undefined;
         const to = item.to?.map(fp => this.members.find(m => m.fp === fp)).filter(m => m != null);
         const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent", (item.pending || item.failed) && "unsent"];
-        const lostBy = item.lost_by?.length && h("p", { className: "tag" }, item.lost_by.map(label).join(", "), " could not read this; send it again if it matters");
-        const readBy = item.read_by?.length ? ` · read by ${item.read_by.map(label).join(", ")}` : "";
+        const lostBy = item.lost_by?.length && h("p", { className: "tag" }, item.lost_by.map(p => p.name).join(", "), " could not read this; send it again if it matters");
+        const readBy = item.read_by?.length ? ` · read by ${item.read_by.map(p => p.name).join(", ")}` : "";
         const ticks =
           item.only_here !== undefined &&
           (item.only_here
             ? h("small", { className: "ticks", title: "Only on this device: keep this page open until another member has it" }, "✓")
-            : h("small", { className: "ticks", title: `Held by ${item.held_by!.map(label).join(", ")}` }, "✓✓", readBy));
+            : h("small", { className: "ticks", title: `Held by ${item.held_by!.map(p => p.name).join(", ")}` }, "✓✓", readBy));
         return h(
           "li",
           { className: classes.filter(Boolean).join(" "), tabIndex: -1 },
@@ -899,13 +893,13 @@ class ChatView extends View {
               "div",
               { className: "meta" },
               who(item.from),
-              to?.length && h("span", { className: "muted" }, "to ", to.map(label).join(", ")),
+              to?.length && h("span", { className: "muted" }, "to ", to.map(p => p.name).join(", ")),
               item.urgent && h("span", { className: "tag" }, "Urgent"),
               item.pending && h("span", { className: "muted" }, "Pending: sent while this browser is open"),
               at
             ),
           item.reply_to &&
-            h("blockquote", {}, parent ? [h("b", {}, label(parent.from)), " ", (parent.content || parent.attachment?.name || "").slice(0, 160)] : "a message this browser does not hold"),
+            h("blockquote", {}, parent ? [h("b", {}, parent.from.name), " ", (parent.content || parent.attachment?.name || "").slice(0, 160)] : "a message this browser does not hold"),
           item.content && h("div", { className: "text" }, item.content),
           item.attachment && this.attachmentView(item.attachment),
           lostBy,
@@ -987,7 +981,7 @@ class ChatView extends View {
     const everyone = h("button", { type: "button", onclick: () => (this.to.clear(), this.drawChips()) }, "Everyone");
     this.chipButtons = new Map([["", everyone]]);
     for (const m of others) {
-      const chip = h("button", { type: "button", title: `key ${m.fp}`, onclick: () => (this.to.has(m.fp) ? this.to.delete(m.fp) : this.to.add(m.fp), this.drawChips()) }, label(m));
+      const chip = h("button", { type: "button", title: `key ${m.fp}`, onclick: () => (this.to.has(m.fp) ? this.to.delete(m.fp) : this.to.add(m.fp), this.drawChips()) }, m.name);
       this.chipButtons.set(m.fp, chip);
     }
     this.chips.replaceChildren(...this.chipButtons.values());
@@ -1011,7 +1005,7 @@ class ChatView extends View {
           h(
             "div",
             {},
-            h("span", {}, "Replying to ", h("b", {}, label(replyTo.from)), ": ", (replyTo.content || replyTo.attachment?.name || "").slice(0, 80)),
+            h("span", {}, "Replying to ", h("b", {}, replyTo.from.name), ": ", (replyTo.content || replyTo.attachment?.name || "").slice(0, 80)),
             close(() => (this.replyTo = undefined))
           ),
         attachment &&
