@@ -294,15 +294,11 @@ def main():
         check(len(run("bob", "identity", "list")["identities"][0]["devices"]) == 2, "bob's identity lists two devices")
         bob_id = run("tablet", "identity", "list")["identities"][0]["identity"]
 
-        # An open group: the chat is opened to bob's identity, by its id, and his tablet joins it without an invite.
-        opened = run("alice", "open", f"--group={group}", bob_id)
-        check(opened["settings"]["open"] == [{"id": bob_id, "name": "Bob"}], "alice opens the chat to bob's identity")
-        listed = until(lambda: run("tablet", "groups"), lambda groups: any(g["group"] == group for g in groups))
-        check(any(g["group"] == group and g.get("joined") is False for g in listed), "the tablet sees the chat open to it")
-        joined = run("tablet", "join", "--", group)
-        check(len(joined["members"]) == 4, "the tablet joins the open chat")
+        # Bob's tablet joins the chat by a link, as a device of his identity.
+        joined = run("tablet", "join", run("bob", "invite", f"--group={group}")["link"])
+        check(len(joined["members"]) == 4, "the tablet joins the chat")
         event = alice.expect("joined", lambda e: e["member"]["name"] == "Tablet")
-        check(event["how"] == "open" and event["member"]["identity"]["id"] == bob_id, "as a device of the identity it is open to")
+        check(event["member"]["identity"]["id"] == bob_id, "as a device of bob's identity")
 
         # A removal.
         carol_fp = next(m["fp"] for m in run("alice", "members", f"--group={group}")["members"] if m["name"] == "Carol")

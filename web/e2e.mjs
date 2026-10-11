@@ -1,8 +1,8 @@
 // Browser end-to-end test, run by test/e2e.py against its local `letmeknow serve` (URL, serving dist/) with the native
 // binary (BIN): Matt's laptop, which takes its relay and membership service from the server that served it, joins Ann's
 // chat from a link, becoming his identity's first device as it does, and they talk and pass files both ways; it joins
-// her doc and they edit it both ways; Matthew's desk adds his phone by a device link, the phone joins a chat open to that
-// identity with a click and is renamed, and a kiosk on an identity of its own moves to his; the laptop keeps everything
+// her doc and they edit it both ways; Matthew's desk adds his phone by a device link, the phone joins a chat by a link
+// and is renamed, and a kiosk on an identity of its own moves to his; the laptop keeps everything
 // across a reload, a second tab works through the first and takes over when it closes; refusals, files kept and
 // deleted, a git group's pushes and chat, and the service worker's updates.
 import { execFile, execFileSync, spawn } from "node:child_process";
@@ -223,7 +223,7 @@ try {
   const specHash = attached.link.slice(4, 68);
   check((await until(() => kept(laptop), hashes => hashes.includes(specHash))).includes(specHash), "the browser keeps a file the doc links");
 
-  // A device link adds a phone to Matthew's identity, made on his desk; the phone then joins a chat open to it.
+  // A device link adds a phone to Matthew's identity, made on his desk; the phone then joins a chat by a link.
   const phone = await open("phone", { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
   const deviceLink = desk.run("invite", "--identity", "Matthew").link;
   await phone.goto(local(deviceLink));
@@ -234,11 +234,12 @@ try {
   const devices = desk.run("identity", "list").identities[0].devices;
   check(devices.length === 2 && devices.some(d => d.name === "phone"), "a device link adds the browser to the identity's devices");
   const team = desk.run("invite", "--name", "Team");
-  desk.run("open", `--group=${team.group}`, "Matthew");
   await phone.locator(".back:visible").click();
-  await phone.locator(".open-list .opening", { hasText: "Team" }).getByRole("button", { name: "Join" }).click();
-  const opened = await desk.printed(e => e.type === "joined" && e.member.device === "phone", 60_000);
-  check(opened.how === "open" && opened.member.identity.name === "Matthew", "the phone joins a chat open to its identity, with a click");
+  await phone.getByRole("button", { name: "Join", exact: true }).first().click();
+  await phone.locator("dialog").getByLabel("Invite link").fill(team.link);
+  await phone.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
+  const phoneJoined = await desk.printed(e => e.type === "joined" && e.member.device === "phone", 60_000);
+  check(phoneJoined.member.identity.name === "Matthew", "the phone joins a chat by a link, as a device of Matthew's");
   await phone.locator(".back:visible").click();
   await phone.locator(".group-list button", { hasText: "Team" }).waitFor();
   check(true, "and lists it");

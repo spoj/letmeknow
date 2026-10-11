@@ -131,7 +131,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let by = by.and_then(|by| st.member(gid, &by));
         if gone {
             drop(st);
-            self.gone(gid, by, false);
+            self.gone(gid, by);
             return;
         }
         let Some(by) = by else { return };
@@ -152,13 +152,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Tells that this session is out of a group, then forgets it, unless it did so already. `last`: it was the group's
-    /// last member.
-    pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>, last: bool) {
+    /// Tells that this session is out of a group, then forgets it, unless it did so already.
+    pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>) {
         if !self.lock().groups.contains_key(gid) {
             return;
         }
-        self.events.send(Event::Removed { group: Bytes(gid.to_vec()), by, last }).ok();
+        self.events.send(Event::Removed { group: Bytes(gid.to_vec()), by }).ok();
         if let Err(error) = self.forget(gid) {
             self.warn(Some(gid), format!("{error:#}"));
         }

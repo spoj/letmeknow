@@ -1,6 +1,6 @@
-//! Admission, both sides: a joiner asks the members an invite link names, or the members of a group open to its
-//! identity, keeping its KeyPackage until one admits it; a member answers by the invite's rule, checked again as the
-//! Add is built, or with the logged Welcome to a joiner it added before whose answer was lost.
+//! Admission, both sides: a joiner asks the members an invite link names, keeping its KeyPackage until one admits it; a
+//! member answers by the invite's rule, checked again as the Add is built, or with the logged Welcome to a joiner it
+//! added before whose answer was lost.
 
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use lmk_core::identity::Verdict;
 use lmk_core::provider::Provider;
 use lmk_net::Admit;
 use lmk_proto::entry::Entry;
-use lmk_proto::group::{CHAT, Certificate, Control, Credential, DEVICES, How, Opening};
+use lmk_proto::group::{CHAT, Certificate, Control, Credential, DEVICES, How};
 use lmk_proto::links::{Address, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Join};
 use lmk_proto::{Answer, Bytes};
@@ -90,8 +90,9 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(Invite { device, secret, members })
     }
 
-    /// Joins through an invite link, speaking as `identity`: asks the members it names in turn. A device link joins
-    /// with a new device key. Returns the group, and the iroh key of the member that admitted this session.
+    /// Joins through an invite link, speaking as `identity`: asks the members it names in turn, as each is reached. A
+    /// device link joins with a new device key. Returns the group, and the iroh key of the member that admitted this
+    /// session.
     pub async fn join(&self, link: &Invite, identity: Option<Certificate>) -> Result<(Bytes, [u8; 32])> {
         let ours: RelayUrl = RELAY.parse()?;
         let members = link
@@ -99,30 +100,10 @@ impl<P: Provider + Send + 'static> Node<P> {
             .iter()
             .map(|member| Ok((EndpointId::from_bytes(&member.key)?, member.relay.as_ref().map_or(Ok(ours.clone()), |relay| relay.parse())?)))
             .collect::<Result<Vec<_>>>()?;
-        self.ask(members, Some(Bytes(link.secret.to_vec())), None, identity, link.device).await
-    }
-
-    /// Asks the members of an open group to admit this session in turn, speaking as the identity `identity` certifies.
-    pub async fn join_open(&self, opening: &Opening, identity: Certificate) -> Result<Bytes> {
-        ensure!(self.inner.kinds.contains(&opening.kind), "this session does not support {} groups", opening.kind);
-        let members = opening.members.iter().filter_map(|key| endpoint_id(&key.0)).map(|peer| (peer, self.inner.relay.clone())).collect();
-        Ok(self.ask(members, None, Some(opening.group.clone()), Some(identity), false).await?.0)
-    }
-
-    /// Asks members in turn, as each is reached, to admit this session, by an invite's secret or a group open to
-    /// `identity`.
-    async fn ask(
-        &self,
-        members: Vec<(EndpointId, RelayUrl)>,
-        secret: Option<Bytes>,
-        group: Option<Bytes>,
-        identity: Option<Certificate>,
-        devices: bool,
-    ) -> Result<(Bytes, [u8; 32])> {
+        let (secret, devices) = (Bytes(link.secret.to_vec()), link.device);
         // The KeyPackage, its private keys and its device key are kept until this session joins or every member it asks
         // refuses it: a member that added it asks again answers with the Welcome its log holds.
-        let target = secret.as_ref().map_or_else(|| group.clone().unwrap_or_default().0, |secret| Sha256::digest(&secret.0).to_vec());
-        let joining = [b"node/joining/".as_slice(), &target].concat();
+        let joining = [b"node/joining/".as_slice(), &Sha256::digest(&secret.0)].concat();
         let (join, device_key) = {
             let mut st = self.inner.lock();
             st.speak(identity);
@@ -139,10 +120,10 @@ impl<P: Provider + Send + 'static> Node<P> {
                 }
             };
             let device_key = kept.device.map(|seed| seed.0.try_into()).transpose().ok().context("a device key is 32 bytes")?;
-            (Join { secret, group, key_package: kept.key_package }, device_key)
+            (Join { secret, key_package: kept.key_package }, device_key)
         };
         // Each dial is a task of its own, so it goes on, and times out, while a member reached earlier is asked.
-        let inviter_first = Instant::now() + if join.secret.is_some() { INVITER_FIRST } else { Duration::ZERO };
+        let inviter_first = Instant::now() + INVITER_FIRST;
         let mut dials: FuturesUnordered<_> = members
             .into_iter()
             .enumerate()
@@ -237,75 +218,60 @@ fn address(key: [u8; 32], relay: &str) -> Address {
 
 /// The answer to a secret no rule admits by: whether it is unknown, used or expired is not told.
 const UNKNOWN: &str = "unknown, used or expired invite";
-const NOT_OPEN: &str = "it speaks as no identity the group is open to";
 const INVITER_LEFT: &str = "its inviter left the group";
 const FOR_ANOTHER: &str = "this invite is for another identity";
 
-/// Whether `g`, as it stands, admits a joiner by an invite, or else by an opening: checked when its request comes, and
-/// each time the commit that adds it is built. An invite dies when its inviter leaves the group.
-fn admits(g: &G, joiner: &Credential, invite: &Option<Rule>) -> Result<()> {
+/// Whether `g`, as it stands, admits a joiner by an invite: checked when its request comes, and each time the commit
+/// that adds it is built. An invite dies when its inviter leaves the group.
+fn admits(g: &G, joiner: &Credential, rule: &Rule) -> Result<()> {
     let members = g.mls.members();
-    match invite {
-        Some(rule) => {
-            ensure!(now() < rule.expires && !g.mls.used(&rule.hash.0), UNKNOWN);
-            ensure!(members.iter().any(|m| m.key == rule.by.0) && !g.left(&rule.by.0), INVITER_LEFT);
-        }
-        None => ensure!(joiner.identity().is_some_and(|identity| g.mls.settings().open.iter().any(|named| named.id == identity.id)), NOT_OPEN),
-    }
+    ensure!(now() < rule.expires && !g.mls.used(&rule.hash.0), UNKNOWN);
+    ensure!(members.iter().any(|m| m.key == rule.by.0) && !g.left(&rule.by.0), INVITER_LEFT);
     ensure!(members.iter().all(|member| member.key != joiner.key.0), "this session is a member already");
     Ok(())
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Answers a joiner's request: it brings an invite's secret, or speaks as an identity the group is open to.
+    /// Answers a joiner's request, which brings an invite's secret.
     async fn admit_join(self: &Arc<Self>, join: Join) -> Result<Admitted> {
-        let Join { secret, group, key_package } = join;
+        let Join { secret, key_package } = join;
         let joiner = key_package_credential(&self.lock().provider, &key_package.0)?;
-        let (gid, how, invite, to) = match (secret, group) {
-            (Some(secret), _) => {
-                let hash = Bytes(Sha256::digest(&secret.0).to_vec());
-                let st = self.lock();
-                let found = st.groups.iter().find_map(|(gid, g)| Some((gid.clone(), g.rec.invites.iter().find(|rule| rule.hash == hash)?.clone())));
-                let (gid, rule) = found.context(UNKNOWN)?;
-                let to = rule.to.clone();
-                (gid, How::Invite, Some(rule), to)
-            }
-            (None, Some(gid)) => (gid.0, How::Open, None, Some(joiner.identity().context(NOT_OPEN)?.id.clone())),
-            (None, None) => bail!("a request names an invite's secret or a group"),
-        };
+        let hash = Bytes(Sha256::digest(&secret.0).to_vec());
+        let found = self.lock().groups.iter().find_map(|(gid, g)| Some((gid.clone(), g.rec.invites.iter().find(|rule| rule.hash == hash)?.clone())));
+        let (gid, rule) = found.context(UNKNOWN)?;
         // A joiner the log shows added, whose answer was lost, asks again with the same KeyPackage.
         self.caught_up(&gid).await?;
         let logged = self.lock().logged_welcome(&gid, &joiner, &key_package.0)?;
         if let Some((welcome, position)) = logged {
             return self.admitted(&gid, welcome, position).await;
         }
-        admits(self.lock().group(&gid)?, &joiner, &invite)?;
+        admits(self.lock().group(&gid)?, &joiner, &rule)?;
         // Its identity's key log, read afresh, must list the device that certified it.
-        if let Some(to) = to {
-            let identity = joiner.identity().filter(|identity| identity.id == to).context(FOR_ANOTHER)?;
+        if let Some(to) = &rule.to {
+            let identity = joiner.identity().filter(|identity| identity.id == *to).context(FOR_ANOTHER)?;
             match self.read_keys(identity).await?.verify(&joiner) {
                 Verdict::Verified { .. } => {}
                 Verdict::Unverified => bail!("its device is not on its identity's list"),
                 Verdict::Dropped => bail!("its device was taken off its identity"),
             }
         }
-        self.admit(&gid, key_package.0, &joiner, how, invite).await
+        self.admit(&gid, key_package.0, &joiner, rule).await
     }
 
     /// Commits the Add, naming the invite the joiner came in by, and answers with the Welcome and the state of the group's
     /// kind, as a file. Each build of the commit checks the joiner's rule again. A joiner whose session does not support
     /// the group's kind is refused.
-    async fn admit(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, joiner: &Credential, how: How, invite: Option<Rule>) -> Result<Admitted> {
+    async fn admit(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, joiner: &Credential, rule: Rule) -> Result<Admitted> {
         {
             let st = self.lock();
             let kind = st.group(gid)?.mls.settings().kind;
             let leaf = key_package_leaf(&st.provider, &key_package)?;
             ensure!(leaf.kinds.contains(&kind), "its session does not support {kind} groups");
         }
-        let add = Change { add: vec![key_package], how: Some(how), invite: invite.as_ref().map(|rule| rule.hash.clone()), ..Change::default() };
+        let add = Change { add: vec![key_package], how: Some(How::Invite), invite: Some(rule.hash.clone()), ..Change::default() };
         let (welcome, position) = self
             .commit(gid, |_, g| {
-                admits(g, joiner, &invite)?;
+                admits(g, joiner, &rule)?;
                 Ok(Some(add.clone()))
             })
             .await?
@@ -380,7 +346,7 @@ impl<P: Provider + Send + 'static> Admit for Admitter<P> {
                 Err(error) => {
                     let refused = format!("{error:#}");
                     // A joiner asks every member a link names, so routine refusals are many and no one's concern.
-                    if [UNKNOWN, NOT_OPEN, INVITER_LEFT, FOR_ANOTHER, NOT_FOLLOWED].contains(&refused.as_str()) {
+                    if [UNKNOWN, INVITER_LEFT, FOR_ANOTHER, NOT_FOLLOWED].contains(&refused.as_str()) {
                         tracing::debug!("refused a join: {refused}");
                     } else {
                         inner.warn(None, format!("refused a join: {refused}"));

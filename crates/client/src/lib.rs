@@ -1,6 +1,6 @@
 //! The client core: what one member does on top of its lmk-node session, alike in every client. It answers requests,
-//! turns the node's events into `ClientEvent`s with members described as this client knows them, records groups'
-//! openings in the devices groups, has its device certify it for the identities it speaks as, and hosts kinds' plugins.
+//! turns the node's events into `ClientEvent`s with members described as this client knows them, has its device certify
+//! it for the identities it speaks as, and hosts kinds' plugins.
 //! A shell gives it storage (the node's provider), a network, the device's node, the plugins' transport, and shows or
 //! prints what it tells.
 
@@ -22,7 +22,7 @@ use lmk_node::devices::Devices;
 use lmk_node::{Event, Heard, INVITE_VALID, Item, Member, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::ranges::Ranges;
-use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, DEVICES, How, IdentityRef, Named, Opening, PROTOCOL, Service, Settings, UPDATE};
+use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, DEVICES, How, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::time::{Duration, Instant, timeout};
 use n0_future::{Either, FutureExt};
@@ -37,8 +37,6 @@ const ASK_WAIT: Duration = Duration::from_secs(60);
 const SPREAD_WAIT: Duration = Duration::from_secs(30);
 /// How long a file asked for may take to arrive.
 const FETCH_WAIT: Duration = Duration::from_secs(60);
-/// How long a shutdown waits for the network work events caused, such as recording a group's opening.
-const SETTLE: Duration = Duration::from_secs(5);
 
 pub fn fp(key: &[u8]) -> String {
     hex::encode(&Sha256::digest(key)[..8])
@@ -99,7 +97,7 @@ pub struct Config {
     pub membership: Service,
 }
 
-/// The device's node, which keeps its identities and openings, and certifies its sessions.
+/// The device's node, which keeps its identities, and certifies its sessions.
 pub enum Access<P> {
     /// It runs here: the devices kind on it.
     Here(Devices<P>),
@@ -132,7 +130,6 @@ pub struct DeviceState {
     pub identities: Vec<(IdentityRef, String)>,
     /// This device's key on each identity, by identity id.
     pub keys: Vec<(Bytes, Bytes)>,
-    pub openings: Vec<Opening>,
 }
 
 impl DeviceState {
@@ -141,7 +138,6 @@ impl DeviceState {
             device: devices.name(),
             identities: devices.identities(),
             keys: devices.identities().into_iter().filter_map(|(identity, _)| Some((identity.id.clone(), devices.key(&identity.id.0).ok()?))).collect(),
-            openings: devices.openings(),
         }
     }
 }
@@ -244,7 +240,7 @@ struct State {
     /// What a group's kind is told before it opens, as a joiner's state may come: its latest state and synced of each
     /// member.
     held: HashMap<Bytes, Vec<Value>>,
-    /// The invite secrets and open groups this session is joining by.
+    /// The invite secrets this session is joining by.
     joining: HashSet<Vec<u8>>,
 }
 
@@ -291,9 +287,6 @@ struct Inner<P> {
     lines: tokio::sync::Mutex<mpsc::UnboundedReceiver<(String, Option<Value>)>>,
     state: Mutex<State>,
     events: mpsc::UnboundedSender<ClientEvent>,
-    /// The network work events cause, done in order in the background, so that no event waits for it.
-    work: mpsc::UnboundedSender<BoxFuture<()>>,
-    worker: n0_future::task::JoinHandle<()>,
 }
 
 /// One member's client, on its node. Its methods may run at once.
@@ -316,12 +309,6 @@ impl<P: Provider + Send + 'static> Client<P> {
         lines: mpsc::UnboundedReceiver<(String, Option<Value>)>,
     ) -> (Self, mpsc::UnboundedReceiver<ClientEvent>) {
         let (events, told) = mpsc::unbounded_channel();
-        let (work, mut queued) = mpsc::unbounded_channel::<BoxFuture<()>>();
-        let worker = n0_future::task::spawn(async move {
-            while let Some(work) = queued.recv().await {
-                work.await;
-            }
-        });
         let inner = Inner {
             node,
             config,
@@ -330,8 +317,6 @@ impl<P: Provider + Send + 'static> Client<P> {
             lines: tokio::sync::Mutex::new(lines),
             state: Mutex::default(),
             events,
-            work,
-            worker,
         };
         (Client { inner: Arc::new(inner) }, told)
     }
@@ -359,24 +344,6 @@ impl<P: Provider + Send + 'static> Client<P> {
 
     pub fn warn(&self, group: Option<&Bytes>, text: String) {
         self.emit(ClientEvent::Warning { group: group.cloned(), text });
-    }
-
-    fn later(&self, gid: &Bytes, work: BoxFuture<Result<()>>) {
-        let (gid, events) = (gid.clone(), self.inner.events.clone());
-        let work = async move {
-            if let Err(error) = work.await {
-                events.send(ClientEvent::Warning { group: Some(gid), text: format!("{error:#}") }).ok();
-            }
-        };
-        self.inner.work.send(Box::pin(work)).ok();
-    }
-
-    /// Lets the network work events caused end, for a while, and drops what is left: before the node stops.
-    pub async fn shutdown(&self) {
-        let (done, settled) = oneshot::channel();
-        self.inner.work.send(Box::pin(async move { done.send(()).ok(); })).ok();
-        timeout(SETTLE, settled).await.ok();
-        self.inner.worker.abort();
     }
 
     /// Tells the plugins of its groups' kinds of the groups, as when the client starts.
@@ -449,36 +416,9 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let settings = self.inner.node.change_settings(&gid.0, |settings| Settings { name: name.clone(), ..settings }).await?;
                 Ok(json!({ "group": b64(&gid.0), "settings": settings }))
             }
-            Request::Open { group, close, identity } => {
-                let gid = match self.resolve(group.clone()) {
-                    Err(unknown) if close => return self.unlist(&identity, group.as_deref(), unknown).await,
-                    gid => gid?,
-                };
-                let (id, name) = self.identity_named(&gid, &identity)?;
-                let settings = self
-                    .inner
-                    .node
-                    .change_settings(&gid.0, |mut settings| {
-                        if !close && settings.open.iter().any(|o| o.id == id && o.name == name) {
-                            return settings;
-                        }
-                        settings.open.retain(|o| o.id != id);
-                        if !close {
-                            settings.open.push(Named { id: id.clone(), name: name.clone(), rest: Default::default() });
-                        }
-                        settings
-                    })
-                    .await?;
-                self.refresh_opening(&gid, Some(settings.open.clone())).await?;
-                Ok(json!({ "group": b64(&gid.0), "settings": settings }))
-            }
             Request::Status => self.status(),
             Request::Identity { op: IdentityOp::Leave { identity } } => self.leave_identity(&identity).await,
             Request::Identity { op } => self.identity(op).await,
-            Request::SetOpening { identity, opening } => {
-                self.devices()?.set_opening(&identity.0, opening).await?;
-                Ok(json!({}))
-            }
             Request::Certify { identity, key } => Ok(json!(self.devices()?.certify(&identity.0, &key.0)?)),
         }
     }
@@ -513,7 +453,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                     None => {
                         let membership = membership.map(|m| service(&m)).transpose()?.unwrap_or(self.inner.config.membership.clone());
                         let settings =
-                            Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), open: Vec::new(), carry, update: UPDATE, membership, rest: Default::default() };
+                            Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), carry, update: UPDATE, membership, rest: Default::default() };
                         let (gid, opened) = self.create(settings, as_, args).await?;
                         merge(&mut answer, opened);
                         gid
@@ -554,48 +494,30 @@ impl<P: Provider + Send + 'static> Client<P> {
             Ok(opened) => Ok((gid, opened)),
             Err(error) => {
                 self.inner.node.leave(&gid.0).await?;
-                self.drop_group(&gid, true).await?;
+                self.drop_group(&gid).await?;
                 Err(error)
             }
         }
     }
 
-    async fn join(&self, target: String, args: (Vec<String>, String), as_: Option<String>) -> Result<Value> {
-        let target = target.trim();
-        let target = if target.contains('#') {
-            Either::Left(Invite::parse(target)?)
-        } else {
-            let mut openings = self.device_state()?.openings.into_iter();
-            let opening = openings.find(|o| !o.members.is_empty() && (b64(&o.group.0) == target || o.name == target));
-            Either::Right(opening.context("expected an invite link, or the id or name of a group open to your identity")?)
-        };
-        // As the node's, which share one KeyPackage per target.
-        let key = match &target {
-            Either::Left(invite) => invite.secret.to_vec(),
-            Either::Right(opening) => opening.group.0.clone(),
-        };
+    async fn join(&self, link: String, args: (Vec<String>, String), as_: Option<String>) -> Result<Value> {
+        let invite = Invite::parse(link.trim())?;
+        // As the node's, which share one KeyPackage per invite.
+        let key = invite.secret.to_vec();
         ensure!(self.state().joining.insert(key.clone()), "this session is joining that already: wait for that join to end");
-        let joined = self.join_target(target, args, as_).await;
+        let joined = self.join_by(invite, args, as_).await;
         self.state().joining.remove(&key);
         joined
     }
 
-    async fn join_target(&self, target: Either<Invite, Opening>, (args, cwd): (Vec<String>, String), as_: Option<String>) -> Result<Value> {
-        if let Either::Left(invite) = &target
-            && invite.device
-        {
-            self.devices()?.join(invite).await?;
+    async fn join_by(&self, invite: Invite, (args, cwd): (Vec<String>, String), as_: Option<String>) -> Result<Value> {
+        if invite.device {
+            self.devices()?.join(&invite).await?;
             return Ok(json!({ "device": "this device joined the identity" }));
         }
         let as_ = self.speaking_as(as_).await?;
         let node = &self.inner.node;
-        let gid = match target {
-            Either::Left(invite) => node.join(&invite, as_).await?.0,
-            Either::Right(opening) => {
-                let identity = as_.context("joining a group open to your identity needs one: this device is on none")?;
-                node.join_open(&opening, identity).await?
-            }
-        };
+        let gid = node.join(&invite, as_).await?.0;
         let settings = node.settings(&gid.0)?;
         let mut answer = json!({ "group": b64(&gid.0), "kind": settings.kind, "name": settings.name, "members": self.described_members(&gid)? });
         if settings.kind != CHAT {
@@ -616,7 +538,7 @@ impl<P: Provider + Send + 'static> Client<P> {
     async fn leave(&self, gid: &Bytes) -> Result<Value> {
         let gid = gid.clone();
         let Some(sent) = self.inner.node.leave(&gid.0).await? else {
-            self.drop_group(&gid, true).await?;
+            self.drop_group(&gid).await?;
             return Ok(json!({ "group": b64(&gid.0), "left": true }));
         };
         let mut answer = json!({ "group": b64(&gid.0), "left": true, "status": "another member commits the removal" });
@@ -627,12 +549,9 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(answer)
     }
 
-    /// Ends a group for everyone: closes it to every identity, which tells their devices to no longer list it, removes
-    /// the other members, and leaves it.
+    /// Ends a group for everyone: removes the other members, and leaves it.
     pub async fn end(&self, gid: &Bytes) -> Result<Value> {
-        let node = &self.inner.node;
-        node.change_settings(&gid.0, |settings| Settings { open: Vec::new(), ..settings }).await?;
-        node.remove_others(&gid.0).await?;
+        self.inner.node.remove_others(&gid.0).await?;
         let mut answer = self.leave(gid).await?;
         answer["ended"] = json!(true);
         Ok(answer)
@@ -653,9 +572,8 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// Lets go of a group the node has left: tells its kind's plugin, and the shell. A group that `ended`, as this session
-    /// was its last member, opens to no one any longer.
-    async fn drop_group(&self, gid: &Bytes, ended: bool) -> Result<()> {
+    /// Lets go of a group the node has left: tells its kind's plugin, and the shell.
+    async fn drop_group(&self, gid: &Bytes) -> Result<()> {
         let kind = {
             let mut st = self.state();
             st.infos.remove(gid);
@@ -670,10 +588,6 @@ impl<P: Provider + Send + 'static> Client<P> {
             if !self.state().kind_of.values().any(|k| *k == kind) {
                 self.inner.plugins.stop(&kind);
             }
-        }
-        if ended {
-            let (client, gid) = (self.clone(), gid.clone());
-            self.later(&gid.clone(), Box::pin(async move { client.refresh_opening(&gid, Some(Vec::new())).await }));
         }
         self.emit(ClientEvent::Gone { group: gid.clone() });
         self.inner.node.scrub()
@@ -691,19 +605,10 @@ impl<P: Provider + Send + 'static> Client<P> {
             if !settings.name.is_empty() {
                 group["name"] = json!(settings.name);
             }
-            if !settings.open.is_empty() {
-                group["open"] = json!(settings.open);
-            }
             if let Some(info) = self.state().infos.get(&gid) {
                 merge(&mut group, info.clone());
             }
             groups.push(group);
-        }
-        let joined = node.groups();
-        for opening in self.device_state()?.openings {
-            if !joined.contains(&opening.group) && node.kinds().contains(&opening.kind) && !opening.members.is_empty() {
-                groups.push(json!({ "group": b64(&opening.group.0), "kind": opening.kind, "name": opening.name, "joined": false }));
-            }
         }
         Ok(Value::Array(groups))
     }
@@ -936,15 +841,11 @@ impl<P: Provider + Send + 'static> Client<P> {
         match event {
             Event::Joined { group, member, by, how } => {
                 let describer = self.describer(&group)?;
-                self.emit(ClientEvent::Joined { group: group.clone(), member: describer.describe(&member), by: describer.describe(&by), how });
-                let client = self.clone();
-                self.later(&group.clone(), Box::pin(async move { client.refresh_opening(&group, None).await }));
+                self.emit(ClientEvent::Joined { group, member: describer.describe(&member), by: describer.describe(&by), how });
             }
             Event::Left { group, member, by } => {
                 let describer = self.describer(&group)?;
-                self.emit(ClientEvent::Left { group: group.clone(), member: describer.describe(&member), by: describer.describe(&by) });
-                let client = self.clone();
-                self.later(&group.clone(), Box::pin(async move { client.refresh_opening(&group, None).await }));
+                self.emit(ClientEvent::Left { group, member: describer.describe(&member), by: describer.describe(&by) });
             }
             Event::Revoked { group, removed, added } => {
                 let describer = self.describer(&group)?;
@@ -952,17 +853,14 @@ impl<P: Provider + Send + 'static> Client<P> {
                 self.emit(ClientEvent::Revoked { group, removed, added });
             }
             Event::Keys { .. } | Event::Duties { .. } => {}
-            Event::Removed { group, by, last } => {
+            Event::Removed { group, by } => {
                 let by = by.map(|by| self.describe(&group, &by)).transpose()?;
-                self.drop_group(&group, last).await?;
+                self.drop_group(&group).await?;
                 self.emit(ClientEvent::Removed { group, by });
             }
             Event::Settings { group, settings, by } => {
                 let by = self.describe(&group, &by)?;
-                let open = settings.open.clone();
-                self.emit(ClientEvent::Settings { group: group.clone(), settings, by });
-                let client = self.clone();
-                self.later(&group.clone(), Box::pin(async move { client.refresh_opening(&group, Some(open)).await }));
+                self.emit(ClientEvent::Settings { group, settings, by });
             }
             Event::Message(message) if message.payload["type"] == "message" && self.chats(&message.group) => {
                 // Chat holds the file a message attaches.
@@ -1058,47 +956,6 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(describer.members.iter().map(|m| describer.describe(m)).collect())
     }
 
-    /// Records the group's opening in the devices group of each of this device's identities: as it stands where the
-    /// group is open to the identity, and with no members where it is not. By `open`, the identities an event told it is
-    /// open to, as the group may be gone by now; or else by its settings.
-    async fn refresh_opening(&self, gid: &Bytes, open: Option<Vec<Named>>) -> Result<()> {
-        let Some(open) = open.or_else(|| self.inner.node.settings(&gid.0).ok().map(|settings| settings.open)) else { return Ok(()) };
-        let state = self.device_state()?;
-        let recorded = state.openings.into_iter().find(|o| o.group == *gid && !o.members.is_empty());
-        for (identity, _) in state.identities {
-            let opening = if open.iter().any(|named| named.id == identity.id) {
-                let Ok(opening) = self.inner.node.opening(&gid.0) else { return Ok(()) };
-                opening
-            } else if let Some(recorded) = &recorded {
-                Opening { members: Vec::new(), ..recorded.clone() }
-            } else {
-                continue;
-            };
-            self.record_opening(&identity.id, opening).await?;
-        }
-        Ok(())
-    }
-
-    /// Records with no members the opening of a group this session is not in, by the group's id or name, in one of this
-    /// device's identities' devices groups, so that its devices no longer list it; else fails with `unknown`, as naming
-    /// the group among this session's did.
-    async fn unlist(&self, identity: &str, group: Option<&str>, unknown: anyhow::Error) -> Result<Value> {
-        let joined = self.inner.node.groups();
-        let mut listed = self.device_state()?.openings.into_iter().filter(|o| !o.members.is_empty() && !joined.contains(&o.group));
-        let Some(opening) = listed.find(|o| group.is_some_and(|group| b64(&o.group.0) == group || o.name == group)) else { return Err(unknown) };
-        let (identity, _) = self.own_identity(identity)?;
-        self.record_opening(&identity.id, Opening { members: Vec::new(), ..opening.clone() }).await?;
-        Ok(json!({ "group": b64(&opening.group.0) }))
-    }
-
-    /// Records an opening in an identity's devices group, through the device's node.
-    async fn record_opening(&self, identity: &Bytes, opening: Opening) -> Result<()> {
-        match self.access() {
-            Access::Here(devices) => devices.set_opening(&identity.0, opening).await,
-            Access::Elsewhere(remote) => remote.request(Request::SetOpening { identity: identity.clone(), opening }).await.map(drop),
-        }
-    }
-
     /// Leaves the groups it speaks as an identity in that its device is no longer on. Returns what failed.
     pub async fn leave_identities_left(&self) -> Vec<anyhow::Error> {
         let Ok(state) = self.device_state() else { return Vec::new() };
@@ -1166,19 +1023,6 @@ impl<P: Provider + Send + 'static> Client<P> {
             .into_iter()
             .find(|(identity, own)| b64(&identity.id.0) == name || own == name)
             .with_context(|| format!("this device is on no identity {name}"))
-    }
-
-    /// An identity by name or id, and its name: one of this device's own, or another's by id, named as its key log names
-    /// it if a member of the group speaks as it, else not named.
-    fn identity_named(&self, gid: &Bytes, name: &str) -> Result<(Bytes, String)> {
-        if let Ok((identity, own)) = self.own_identity(name) {
-            return Ok((identity.id, own));
-        }
-        let id = URL_SAFE_NO_PAD.decode(name).ok().filter(|id| id.len() == 32).map(Bytes);
-        let id = id.with_context(|| format!("no identity {name}: name one of yours, or another by its id, as `members` shows it"))?;
-        let claims = self.inner.node.members(&gid.0)?.into_iter().filter_map(|member| member.identity);
-        let claimed = claims.into_iter().find(|claim| claim.error.is_none() && claim.identity.id == id);
-        Ok((id, claimed.map(|claim| claim.name).unwrap_or_default()))
     }
 
     async fn identity(&self, op: IdentityOp) -> Result<Value> {

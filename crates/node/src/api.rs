@@ -7,7 +7,7 @@ use lmk_core::group::{Change, Group};
 use lmk_core::identity::KeyLog;
 use lmk_core::provider::Provider;
 use lmk_net::Net;
-use lmk_proto::group::{Certificate, DEVICES, IdentityRef, Opening, Settings};
+use lmk_proto::group::{Certificate, DEVICES, IdentityRef, Settings};
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::Frame;
 use lmk_proto::ranges::Ranges;
@@ -439,21 +439,5 @@ impl<P: Provider + Send + 'static> Node<P> {
             self.inner.commit(&gid.0, |_, g| Ok(renaming(&g.mls, Some(name)).map(|name| Change { name: Some(name), ..Change::default() }))).await?;
         }
         Ok(())
-    }
-
-    /// What a group this session is in looks like as an opening.
-    pub fn opening(&self, gid: &[u8]) -> Result<Opening> {
-        let st = self.inner.lock();
-        let g = st.group(gid)?;
-        let settings = g.mls.settings();
-        let members = g.mls.members().into_iter().filter_map(|m| Some(m.leaf?.key)).collect();
-        Ok(Opening {
-            group: Bytes(gid.to_vec()),
-            kind: settings.kind,
-            name: settings.name,
-            membership: settings.membership,
-            members,
-            rest: Default::default(),
-        })
     }
 }

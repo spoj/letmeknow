@@ -1,6 +1,5 @@
 //! The devices kind, built in: an identity's devices group, whose members are its devices, each with its own device key
-//! there. Its state is the identity, its private keys and the groups open to it, kept in step through the
-//! group's held messages, in log order, and handed to a new device as any kind's state. At a loss of its own it stops:
+//! there. Its state is the identity and its private keys, kept in step through the group's held messages, in log order, and handed to a new device as any kind's state. At a loss of its own it stops:
 //! it takes no later message, appends nothing to the key log and hands out no state, until it takes a state past the
 //! loss. A device certifies its sessions
 //! with its device key, and keeps the identity's key log in step with the group: its list of devices follows the
@@ -14,7 +13,7 @@ use lmk_core::device::Device;
 use lmk_core::identity::{self, DAY, KeyLog, public};
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
-use lmk_proto::group::{Certificate, DEVICES, IdentityRef, Opening, PROTOCOL, Service, Settings, UPDATE};
+use lmk_proto::group::{Certificate, DEVICES, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::identity::{Listed, certified};
 use lmk_proto::links::Invite;
 use n0_future::task::spawn;
@@ -37,7 +36,6 @@ struct Book {
     position: u64,
     /// The identity's private keys, each with when it was made, in milliseconds, and the devices group's epoch then.
     keys: Vec<(Bytes, u64, u64)>,
-    openings: Vec<Opening>,
     /// Fields a newer letmeknow added, kept when this device hands the state on.
     #[serde(flatten)]
     rest: Map<String, Value>,
@@ -80,8 +78,6 @@ struct Record {
 enum Entry {
     /// A new key of the identity, made in the group's epoch `epoch`.
     Key { key: Bytes, at: u64, epoch: u64 },
-    /// A group open to the identity, replacing the opening of the same group.
-    Opening { opening: Opening },
 }
 
 /// A device that lacks its identity's current key asks the devices online for the group's state: the key it lacks, the
@@ -171,11 +167,6 @@ impl<P: Provider + Send + 'static> Devices<P> {
         self.books().into_iter().map(|(_, book)| (book.identity, book.name)).collect()
     }
 
-    /// The groups open to this device's identities.
-    pub fn openings(&self) -> Vec<Opening> {
-        self.books().into_iter().flat_map(|(_, book)| book.openings).collect()
-    }
-
     /// An identity's devices: their keys and names.
     pub fn devices(&self, identity: &[u8]) -> Result<Vec<(Bytes, String)>> {
         let (gid, _) = self.book(identity)?;
@@ -189,7 +180,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
 
     /// Starts an identity, with this device its first, and its devices group.
     pub async fn create(&self, name: &str, membership: Service) -> Result<IdentityRef> {
-        let settings = Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), open: Vec::new(), carry: 7, update: UPDATE, membership: membership.clone(), rest: Default::default() };
+        let settings = Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), carry: 7, update: UPDATE, membership: membership.clone(), rest: Default::default() };
         let gid = self.node.create(settings, None)?;
         let seed = lmk_core::random::<32>();
         let device = Listed { key: self.node.key_in(&gid.0), name: self.device_name() };
@@ -204,7 +195,6 @@ impl<P: Provider + Send + 'static> Devices<P> {
             name: name.into(),
             position: 0,
             keys: vec![(Bytes(seed.to_vec()), now(), self.node.epoch(&gid.0)?)],
-            openings: Vec::new(),
             rest: Map::new(),
         };
         self.save(&gid.0, &Record { book: Some(book), since: now(), stopped: None, sent: None })?;
@@ -244,23 +234,6 @@ impl<P: Provider + Send + 'static> Devices<P> {
         Ok(())
     }
 
-    /// Records a group open to an identity, keeping the fields a newer letmeknow added to its record, unless it is
-    /// recorded so already. One with no members, as a group that ended or closed to the identity leaves, is recorded
-    /// only over the group's opening.
-    pub async fn set_opening(&self, identity: &[u8], mut opening: Opening) -> Result<()> {
-        let (gid, book) = self.book(identity)?;
-        let held = book.openings.iter().find(|held| held.group == opening.group);
-        if let Some(held) = held {
-            for (field, value) in &held.rest {
-                opening.rest.entry(field.clone()).or_insert_with(|| value.clone());
-            }
-        }
-        if held.is_none() && opening.members.is_empty() || book.openings.contains(&opening) {
-            return Ok(());
-        }
-        self.enter(&gid.0, Entry::Opening { opening }).await
-    }
-
     /// Takes a device off an identity, then brings the identity's key log in step: a new key, and a list without it.
     pub async fn remove(&self, identity: &[u8], device: &[u8]) -> Result<()> {
         let (gid, _) = self.book(identity)?;
@@ -289,11 +262,6 @@ impl<P: Provider + Send + 'static> Devices<P> {
             self.duties(&gid.0).await?;
         }
         Ok(())
-    }
-
-    /// Sends a held message of the group, and waits until its entry counts.
-    async fn enter(&self, gid: &[u8], entry: Entry) -> Result<()> {
-        self.node.send_counted(gid, &serde_json::to_value(entry)?).await.map(drop)
     }
 
     /// Runs the duties of a devices group in the background.
@@ -511,10 +479,6 @@ impl<P: Provider + Send + 'static> Devices<P> {
                         record.sent = Some((Bytes(public(&seed).to_vec()), entry.position));
                     }
                     book.take_keys(vec![(key, at, epoch)]);
-                }
-                Ok(Entry::Opening { opening }) => {
-                    book.openings.retain(|held| held.group != opening.group);
-                    book.openings.push(opening);
                 }
                 Err(error) => tracing::debug!("skipped an entry of a devices group: {error:#}"),
             }

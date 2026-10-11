@@ -46,13 +46,9 @@ pub enum Act {
     /// `m` invites `n` into a group, a new one if none, or `--to` the identity of `to`'s device;
     /// `n` joins `wait` milliseconds later, and `race` by the same link at once.
     Invite { m: usize, group: Option<usize>, n: usize, to: Option<usize>, wait: u64, race: Option<usize> },
-    /// `n` joins a group open to its identity.
-    JoinOpen { n: usize, group: usize },
     Send { m: usize, group: usize },
     Live { m: usize, group: usize },
     Rename { m: usize, group: usize },
-    /// `m` opens a group to `n`'s identity, or closes it.
-    Open { m: usize, group: usize, n: usize, close: bool },
     Leave { m: usize, group: usize },
     /// `m` removes its `n`th other member.
     Remove { m: usize, group: usize, n: usize },
@@ -205,32 +201,30 @@ pub fn generate(seed: u64, options: Options) -> Vec<Action> {
             groups += usize::from(new);
             invite(&mut rng, n, m, (!new).then_some(group), other)
         } else {
-            match rng.below(1000) {
+            match rng.below(910) {
                 0..25 => Act::CreateIdentity { m },
                 25..70 => Act::LinkDevice { m, n: other },
-                70..110 => Act::JoinOpen { n: m, group },
-                110..330 => Act::Send { m, group },
-                330..370 => Act::Live { m, group },
-                370..400 => Act::Rename { m, group },
-                400..450 => Act::Open { m, group, n: other, close: rng.below(4) == 0 },
-                450..490 => Act::Leave { m, group },
-                490..530 => Act::Remove { m, group, n: rng.index(n) },
-                530..560 => Act::TakeOff { m, n: other },
-                560..610 => Act::Offline { m },
-                610..680 => Act::Online { m },
-                680..705 => Act::Restart { m },
-                705..725 => Act::Down { m, ms: [MINUTE, 30 * MINUTE, 25 * HOUR, 7 * DAY - HOUR + rng.below(2 * HOUR)][rng.index(4)] },
-                725..740 => Act::LoseAnswer { m },
-                740..760 => Act::CrashAfter { m, what: [Output::Append, Output::Frame, Output::Admitted][rng.index(3)] },
-                760..780 => {
+                70..290 => Act::Send { m, group },
+                290..330 => Act::Live { m, group },
+                330..360 => Act::Rename { m, group },
+                360..400 => Act::Leave { m, group },
+                400..440 => Act::Remove { m, group, n: rng.index(n) },
+                440..470 => Act::TakeOff { m, n: other },
+                470..520 => Act::Offline { m },
+                520..590 => Act::Online { m },
+                590..615 => Act::Restart { m },
+                615..635 => Act::Down { m, ms: [MINUTE, 30 * MINUTE, 25 * HOUR, 7 * DAY - HOUR + rng.below(2 * HOUR)][rng.index(4)] },
+                635..650 => Act::LoseAnswer { m },
+                650..670 => Act::CrashAfter { m, what: [Output::Append, Output::Frame, Output::Admitted][rng.index(3)] },
+                670..690 => {
                     let mac = rng.below(2) == 0;
                     let what = [Forgery::Junk, Forgery::Replay, Forgery::Foreign, Forgery::Message { mac }, Forgery::Commit, Forgery::Copy][rng.index(6)];
                     Act::Forge { m, group, what }
                 }
-                780..785 => Act::PushState { m, group },
-                785..820 => Act::Partition { mask: if rng.below(3) == 0 { 1 << 31 } else { rng.draw() as u32 } },
-                820..855 => Act::Heal,
-                855..930 => Act::Drop { m, n: other },
+                690..695 => Act::PushState { m, group },
+                695..730 => Act::Partition { mask: if rng.below(3) == 0 { 1 << 31 } else { rng.draw() as u32 } },
+                730..765 => Act::Heal,
+                765..840 => Act::Drop { m, n: other },
                 _ => Act::Settle {
                     ms: match rng.below(100) {
                         0..72 => 30 * SECOND + rng.below(60 * SECOND),
@@ -262,21 +256,19 @@ fn invite(rng: &mut Rng, members: usize, m: usize, group: Option<usize>, n: usiz
     Act::Invite { m, group, n, to, wait, race }
 }
 
-/// Several members acting on one group at the same millisecond: mostly commits (renames, opening and closing one
-/// identity, removing one member, leaving, inviting, joining by an opening), and sends among them.
+/// Several members acting on one group at the same millisecond: mostly commits (renames, removing one member, leaving,
+/// inviting), and sends among them.
 fn burst(rng: &mut Rng, members: usize, groups: usize) -> Vec<Act> {
     let group = rng.index(groups);
     let (target, other) = (rng.index(members), rng.index(members));
     (0..2 + rng.below(3))
         .map(|_| {
             let m = rng.index(members);
-            match rng.below(8) {
+            match rng.below(6) {
                 0 | 1 => Act::Rename { m, group },
-                2 => Act::Open { m, group, n: target, close: rng.below(2) == 0 },
-                3 => Act::Remove { m, group, n: other },
-                4 => Act::Leave { m, group },
-                5 => invite(rng, members, m, Some(group), target),
-                6 => Act::JoinOpen { n: target, group },
+                2 => Act::Remove { m, group, n: other },
+                3 => Act::Leave { m, group },
+                4 => invite(rng, members, m, Some(group), target),
                 _ => Act::Send { m, group },
             }
         })

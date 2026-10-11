@@ -176,17 +176,12 @@ async fn requests_to_be_admitted_are_answered_each_on_its_stream() {
     let keys = keys(2);
     let member = node(&relay, keys[0].clone(), Fake::new(), Options::default()).await;
     let joiner = node(&relay, keys[1].clone(), Fake::new(), Options { relay_only: true, ..Options::default() }).await;
-    let join = |secret: Option<[u8; 16]>, group: Option<&[u8]>| Join {
-        secret: secret.map(Bytes::from),
-        group: group.map(Bytes::from),
-        key_package: Bytes(b"kp".to_vec()),
-    };
+    let join = |secret: [u8; 16]| Join { secret: Bytes::from(secret), key_package: Bytes(b"kp".to_vec()) };
     let ask = |join| joiner.net.join(keys[0].public(), relay.url.clone(), join);
     joiner.net.dial(keys[0].public(), relay.url.clone()).await.unwrap();
-    let (invited, refused, opened) = tokio::join!(ask(join(Some(SECRET), None)), ask(join(Some([0; 16]), None)), ask(join(None, Some(b"open"))));
+    let (invited, refused) = tokio::join!(ask(join(SECRET)), ask(join([0; 16])));
     assert!(matches!(invited.unwrap(), Answer::Ok(admitted) if admitted.welcome.0 == b"invited"));
     assert_eq!(refused.unwrap(), Answer::Refused { refused: "unknown secret".into() });
-    assert!(matches!(opened.unwrap(), Answer::Ok(admitted) if admitted.welcome.0 == b"open"));
     member.net.shutdown().await.unwrap();
     joiner.net.shutdown().await.unwrap();
 }

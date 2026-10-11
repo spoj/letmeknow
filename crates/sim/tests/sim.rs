@@ -238,7 +238,7 @@ fn a_joiner_reads_its_members_key_logs_before_it_applies_their_commits() {
             (13459727, Act::Quiesce),
             (45951748, Act::Invite { m: 4, group: Some(1), n: 4, to: None, wait: 0, race: None }),
             (45954390, Act::Remove { m: 3, group: 1, n: 4 }),
-            (45954390, Act::Open { m: 0, group: 1, n: 2, close: false }),
+            (45954390, Act::Rename { m: 0, group: 1 }),
             (45954390, Act::Send { m: 4, group: 1 }),
             (45975745, Act::Restart { m: 0 }),
         ],

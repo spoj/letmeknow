@@ -3,14 +3,13 @@
 
 use super::*;
 use crate::provider::MemoryProvider;
-use lmk_proto::group::{CHAT, ChatMessage, Control, Named, REVISION, Service};
+use lmk_proto::group::{CHAT, ChatMessage, Control, REVISION, Service};
 
 pub(crate) fn settings(name: &str) -> Settings {
     Settings {
         protocol: PROTOCOL,
         kind: CHAT.into(),
         name: name.into(),
-        open: vec![],
         carry: 7,
         update: lmk_proto::group::UPDATE,
         membership: Service::Folder("/tmp/lmk".into()),
@@ -504,7 +503,6 @@ fn settings_in_the_welcome() {
     let mut changed = w.m[0].g().settings();
     changed.name = "Plan v2".into();
     changed.carry = 30;
-    changed.open.push(Named { id: Bytes(vec![1; 32]), name: "Alice".into(), rest: Default::default() });
     changed.membership = Service::Folder("/elsewhere".into());
     let commit = w.m[0].commit(Change { settings: Some(changed.clone()), ..Change::default() });
     w.post(commit.entry);

@@ -92,7 +92,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             if g.rec.leaving && g.mls.members().len() == 1 {
                 st.observe(|| Observation::Dropped { group: Bytes(gid.to_vec()), reason: Dropped::Forgotten });
                 drop(st);
-                self.gone(gid, None, true);
+                self.gone(gid, None);
                 return Ok(());
             }
             let expired = g.rec.expired;

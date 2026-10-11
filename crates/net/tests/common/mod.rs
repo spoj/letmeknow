@@ -123,17 +123,16 @@ pub fn keys(n: usize) -> Vec<SecretKey> {
 
 pub const SECRET: [u8; 16] = [5; 16];
 
-/// Admits whoever brings `SECRET`, and every request for a group, with a Welcome that is the group's id.
+/// Admits whoever brings `SECRET`.
 pub struct Inviter;
 
 impl Admit for Inviter {
     fn join(&self, _: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>> {
-        let admitted = |welcome: &[u8]| Answer::Ok(Admitted { welcome: Bytes(welcome.to_vec()), position: 1, doc: None });
         Box::pin(async move {
-            match (join.secret, join.group) {
-                (Some(secret), _) if secret.0 == SECRET => admitted(b"invited"),
-                (None, Some(group)) => admitted(&group.0),
-                _ => Answer::Refused { refused: "unknown secret".into() },
+            if join.secret.0 == SECRET {
+                Answer::Ok(Admitted { welcome: Bytes(b"invited".to_vec()), position: 1, doc: None })
+            } else {
+                Answer::Refused { refused: "unknown secret".into() }
             }
         })
     }

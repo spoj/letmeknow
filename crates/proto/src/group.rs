@@ -43,35 +43,12 @@ pub struct Settings {
     pub protocol: u32,
     pub kind: String,
     pub name: String,
-    pub open: Vec<Named>,
     /// H: how many days members carry the group's messages, and the files they link, for others.
     pub carry: u32,
     /// T: how many seconds a member's leaf goes between updates.
     pub update: u32,
     pub membership: Service,
     /// Fields a newer letmeknow added, kept when this one rewrites the settings.
-    #[serde(flatten)]
-    pub rest: Map<String, Value>,
-}
-
-/// An identity, by id, with the name its group knows it by.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Named {
-    pub id: Bytes,
-    pub name: String,
-    #[serde(flatten)]
-    pub rest: Map<String, Value>,
-}
-
-/// A group open to an identity, as its devices group keeps it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Opening {
-    pub group: Bytes,
-    pub kind: String,
-    pub name: String,
-    pub membership: Service,
-    /// The iroh keys of its members when last refreshed.
-    pub members: Vec<Bytes>,
     #[serde(flatten)]
     pub rest: Map<String, Value>,
 }
@@ -184,7 +161,6 @@ pub struct Attachment {
 #[serde(rename_all = "snake_case")]
 pub enum How {
     Invite,
-    Open,
     /// A way a newer letmeknow named.
     #[serde(untagged)]
     Other(String),
@@ -222,7 +198,7 @@ mod tests {
 
     #[test]
     fn records_keep_fields_this_version_does_not_know() {
-        let text = r#"{"protocol":4,"kind":"chat","name":"Plan","open":[{"id":"AQ","name":"Bob","since":1}],"carry":7,"update":86400,"membership":{"serve":{"key":"Ag","relay":"r","addrs":[],"ticket":"t"}},"color":"red"}"#;
+        let text = r#"{"protocol":4,"kind":"chat","name":"Plan","carry":7,"update":86400,"membership":{"serve":{"key":"Ag","relay":"r","addrs":[],"ticket":"t"}},"color":"red"}"#;
         let settings: Settings = serde_json::from_str(text).unwrap();
         let renamed = Settings { name: "Release".into(), ..settings };
         assert_eq!(serde_json::to_string(&renamed).unwrap(), text.replace("Plan", "Release"));

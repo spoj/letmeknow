@@ -610,97 +610,17 @@ fn a_restarted_session_takes_in_what_it_missed_in_position_order() {
     });
 }
 
+/// A member ends a group for everyone: the others are removed, and it leaves.
 #[test]
-fn a_session_of_an_identity_joins_a_group_open_to_it() {
-    local(async {
-        let world = world("open").await;
-        let (mut alice, bob, group) = pair(&world, HOUR).await;
-        let tablet = world.start("tablet", HOUR).await;
-        let link = bob.cmd(&["invite", "--identity", "Robert"]).await.unwrap();
-        assert!(link["link"].as_str().unwrap().contains("#4.d."));
-        assert!(tablet.cmd(&["identity", "join", link["link"].as_str().unwrap()]).await.unwrap()["device"].is_string());
-        assert!(alice.cmd(&["open", "Robert"]).await.unwrap_err().to_string().contains("by its id"));
-        let opened = alice.cmd(&["open", &identity_of(&bob).await]).await.unwrap();
-        assert_eq!(opened["settings"]["open"][0]["name"], "Robert", "named as its key log names it, as Bob speaks as it");
-        let mut groups = tablet.cmd(&["groups"]).await.unwrap();
-        for _ in 0..40 {
-            if groups.as_array().unwrap().iter().any(|g| g["group"] == group.as_str()) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            groups = tablet.cmd(&["groups"]).await.unwrap();
-        }
-        assert_eq!(groups[0]["joined"], false, "{groups}");
-        let joined = tablet.cmd(&["join", "--", &group]).await.unwrap();
-        assert_eq!(joined["members"].as_array().unwrap().len(), 3);
-        let event = alice.expect("joined").await;
-        assert_eq!((event["member"]["identity"]["name"].as_str(), event["how"].as_str()), (Some("Robert"), Some("open")));
-        assert!(event["member"]["identity"]["new_device"].is_string(), "the tablet was added to Bob after his first device");
-        // A session of another identity cannot see the group, so it cannot join it.
-        let carol = world.start("carol", HOUR).await;
-        let refused = carol.cmd(&["join", "--", &group]).await.unwrap_err().to_string();
-        assert!(refused.contains("open to your identity"), "{refused}");
-    });
-}
-
-/// A group open to an identity leaves its devices' lists once closed to it, once it ends, or once a device of the
-/// identity that is not in it takes it off.
-#[test]
-fn a_group_leaves_an_identitys_lists_closed_ended_or_taken_off() {
-    local(async {
-        let world = world("unlisted").await;
-        let alice = world.start("alice", HOUR).await;
-        alice.cmd(&["identity", "create", "Alice"]).await.unwrap();
-        let tablet = world.start("tablet", HOUR).await;
-        let link = alice.cmd(&["invite", "--identity", "Alice"]).await.unwrap();
-        tablet.cmd(&["identity", "join", link["link"].as_str().unwrap()]).await.unwrap();
-        for name in ["Closed", "Ended", "Taken off"] {
-            alice.cmd(&["invite", "--name", name]).await.unwrap();
-            alice.cmd(&["open", "--group", name, "Alice"]).await.unwrap();
-        }
-        // The names of the groups the tablet lists, none of which it is in.
-        let listed = async || {
-            let groups = tablet.cmd(&["groups"]).await.unwrap();
-            assert!(groups.as_array().unwrap().iter().all(|g| g["joined"] == false), "{groups}");
-            let mut names: Vec<String> = groups.as_array().unwrap().iter().map(|g| g["name"].as_str().unwrap().to_owned()).collect();
-            names.sort();
-            json!(names)
-        };
-        let all = json!(["Closed", "Ended", "Taken off"]);
-        assert_eq!(until(&listed, |names| *names == all).await, all);
-        alice.cmd(&["open", "--group", "Closed", "--close", "Alice"]).await.unwrap();
-        assert_eq!(until(&listed, |names| names.as_array().unwrap().len() < 3).await, json!(["Ended", "Taken off"]));
-        alice.cmd(&["leave", "--group", "Ended"]).await.unwrap();
-        assert_eq!(until(&listed, |names| names.as_array().unwrap().len() < 2).await, json!(["Taken off"]));
-        let refused = tablet.cmd(&["join", "Ended"]).await.unwrap_err().to_string();
-        assert!(refused.contains("open to your identity"), "{refused}");
-        let unlisted = tablet.cmd(&["open", "--group", "Taken off", "--close", "Alice"]).await.unwrap();
-        assert_eq!(keys(&unlisted), keys(&json!({ "group": 0 })));
-        assert_eq!(listed().await, json!([]));
-        let unknown = tablet.cmd(&["open", "--group", "Gone", "--close", "Alice"]).await.unwrap_err().to_string();
-        assert!(unknown.contains("unknown group Gone"), "{unknown}");
-    });
-}
-
-/// A member ends a group for everyone: the others are removed, and the devices of the identities it was open to no
-/// longer list it.
-#[test]
-fn a_group_ended_for_everyone_is_gone_from_every_list() {
+fn a_group_ended_for_everyone_keeps_no_member() {
     local(async {
         let world = world("end").await;
-        let (alice, mut bob, group) = pair(&world, HOUR).await;
-        let tablet = world.start("tablet", HOUR).await;
-        let link = bob.cmd(&["invite", "--identity", "Robert"]).await.unwrap();
-        tablet.cmd(&["identity", "join", link["link"].as_str().unwrap()]).await.unwrap();
-        alice.cmd(&["open", &identity_of(&bob).await]).await.unwrap();
-        let listed = until(async || tablet.cmd(&["groups"]).await.unwrap(), |groups| groups.as_array().unwrap().len() == 1).await;
-        assert_eq!(listed[0]["group"], group.as_str());
+        let (alice, mut bob, _) = pair(&world, HOUR).await;
         let ended = alice.cmd(&["leave", "--end"]).await.unwrap();
         assert_eq!((ended["ended"].as_bool(), ended.get("pending")), (Some(true), None), "{ended}");
         assert_eq!(bob.expect("removed").await["by"]["name"], "Alice");
         assert_eq!(alice.cmd(&["groups"]).await.unwrap(), json!([]));
         assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!([]));
-        assert_eq!(until(async || tablet.cmd(&["groups"]).await.unwrap(), |groups| *groups == json!([])).await, json!([]));
     });
 }
 
@@ -921,10 +841,6 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
         let members = second.cmd(&["members"]).await.unwrap();
         let alice_seen = members["members"].as_array().unwrap().iter().find(|m| m["you"] == true).unwrap().clone();
         assert_eq!((alice_seen["identity"]["name"].as_str(), alice_seen["identity"]["how"].as_str()), (Some("Alice"), Some("self")));
-        // An opening the second records reaches the first.
-        second.cmd(&["open", "Alice"]).await.unwrap();
-        let groups = first.cmd(&["groups"]).await.unwrap();
-        assert_eq!((groups[0]["group"].as_str(), groups[0]["joined"].as_bool()), (invite["group"].as_str(), Some(false)));
         // Once the first stops, the second acts for the device, from its next command on.
         first.stop().await;
         assert_eq!(second.cmd(&["identity", "list"]).await.unwrap()["identities"][0]["name"], "Alice");

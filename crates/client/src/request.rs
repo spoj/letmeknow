@@ -1,7 +1,6 @@
 //! What a client is asked: JSON objects tagged by `cmd`, and with the `clap` feature, a command line's subcommands.
 
 use lmk_proto::Bytes;
-use lmk_proto::group::Opening;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -50,7 +49,7 @@ pub enum Request {
         #[cfg_attr(feature = "clap", arg(long, conflicts_with_all = ["group", "as_", "name", "to"]))]
         identity: Option<String>,
     },
-    /// Join a group through an invite link, or a group open to your identity by its id
+    /// Join a group through an invite link
     #[cfg_attr(feature = "clap", command(display_order = 11))]
     Join {
         target: String,
@@ -71,7 +70,7 @@ pub enum Request {
         #[cfg_attr(feature = "clap", arg(long))]
         group: Option<String>,
     },
-    /// List this session's groups, and those open to its identities
+    /// List this session's groups
     #[cfg_attr(feature = "clap", command(display_order = 15))]
     Groups,
     /// Remove a member (by fingerprint or name) from a group
@@ -81,7 +80,7 @@ pub enum Request {
         group: Option<String>,
         member: String,
     },
-    /// Leave a group; with --end, end it for everyone: close it to every identity, remove the other members, and leave
+    /// Leave a group; with --end, end it for everyone: remove the other members, and leave
     #[cfg_attr(feature = "clap", command(display_order = 17))]
     Leave {
         #[cfg_attr(feature = "clap", arg(long))]
@@ -97,18 +96,6 @@ pub enum Request {
         group: Option<String>,
         name: String,
     },
-    /// Let sessions of an identity join the group without an invite (they run `join <group>`), or with --close, no longer;
-    /// with --close, a session not in the group takes it off the lists of its own identity's devices
-    #[cfg_attr(feature = "clap", command(display_order = 19))]
-    Open {
-        #[cfg_attr(feature = "clap", arg(long))]
-        group: Option<String>,
-        #[cfg_attr(feature = "clap", arg(long))]
-        #[serde(default)]
-        close: bool,
-        /// One of your identities, by name or id, or another by id, as `members` shows it
-        identity: String,
-    },
     /// The members online in each group, and what only this session holds
     #[cfg_attr(feature = "clap", command(display_order = 21))]
     Status,
@@ -118,9 +105,6 @@ pub enum Request {
         #[cfg_attr(feature = "clap", command(subcommand))]
         op: IdentityOp,
     },
-    /// Records an opening in an identity's devices group: for the device.
-    #[cfg_attr(feature = "clap", command(skip))]
-    SetOpening { identity: Bytes, opening: Opening },
     /// A certificate of a session of this device, with MLS key `key`, by the device's key on an identity: for the device.
     #[cfg_attr(feature = "clap", command(skip))]
     Certify { identity: Bytes, key: Bytes },
@@ -165,7 +149,7 @@ impl Request {
         match self {
             // A session leaves its own groups first.
             Request::Identity { op: IdentityOp::Leave { .. } } => false,
-            Request::Identity { .. } | Request::SetOpening { .. } | Request::Certify { .. } => true,
+            Request::Identity { .. } | Request::Certify { .. } => true,
             Request::Invite { identity, .. } => identity.is_some(),
             Request::Join { target, .. } => lmk_proto::links::Invite::parse(target.trim()).is_ok_and(|invite| invite.device),
             _ => false,

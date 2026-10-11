@@ -53,14 +53,11 @@ pub struct Item {
     pub ciphertext: Bytes,
 }
 
-/// A joiner's request, the one frame it writes on an `admission` stream: an invite's secret, or the group open to the
-/// identity its KeyPackage's credential speaks as. The member answers with an `Answer<Admitted>`.
+/// A joiner's request, the one frame it writes on an `admission` stream: an invite's secret, and its KeyPackage. The
+/// member answers with an `Answer<Admitted>`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Join {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub secret: Option<Bytes>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<Bytes>,
+    pub secret: Bytes,
     pub key_package: Bytes,
 }
 
@@ -90,7 +87,7 @@ mod tests {
         let files: Frame = serde_json::from_str(r#"{"want_files":{"group":"AQ","files":[]}}"#).unwrap();
         assert!(matches!(files, Frame::WantFiles { .. }));
         assert!(serde_json::from_str::<Frame>(r#"{"doc":{"group":"AQ"}}"#).is_err(), "a kind has no frames");
-        let join = Join { secret: Some(Bytes(vec![2])), group: None, key_package: Bytes(vec![3]) };
+        let join = Join { secret: Bytes(vec![2]), key_package: Bytes(vec![3]) };
         assert_eq!(serde_json::to_string(&join).unwrap(), r#"{"secret":"Ag","key_package":"Aw"}"#);
     }
 }

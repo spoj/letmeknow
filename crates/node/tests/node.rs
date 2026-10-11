@@ -14,7 +14,7 @@ use lmk_membership::service::{Policy, Service as Membership};
 use lmk_membership::store::Store;
 use lmk_node::devices::Devices;
 use lmk_node::{Config, Event, Node};
-use lmk_proto::group::{CHAT, Certificate, ChatMessage, DEVICES, IdentityRef, Named, Opening, PROTOCOL, Service, Settings};
+use lmk_proto::group::{CHAT, Certificate, ChatMessage, DEVICES, IdentityRef, PROTOCOL, Service, Settings};
 use lmk_proto::identity::Listed;
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
@@ -148,7 +148,6 @@ fn settings(kind: &str, folder: &Path) -> Settings {
         protocol: PROTOCOL,
         kind: kind.into(),
         name: "Plan".into(),
-        open: vec![],
         carry: 7,
         update: lmk_proto::group::UPDATE,
         membership: Service::Folder(folder.to_str().unwrap().into()),
@@ -463,8 +462,8 @@ impl iroh::protocol::ProtocolHandler for Gated {
     }
 }
 
-/// The rule a joiner comes by is checked again as the Add is built: an invite that expired, or an opening closed, while
-/// the admitter read the joiner's key log admits no one.
+/// The rule a joiner comes by is checked again as the Add is built: an invite that expired while the admitter read the
+/// joiner's key log admits no one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rule_is_checked_again_as_the_add_is_built() {
     use lmk_proto::links::Invite;
@@ -479,60 +478,43 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
     let alice_iroh = alice.node.members(&gid.0).unwrap().into_iter().find(|m| m.name == "Alice").unwrap().iroh;
     // On a slow machine an invite may expire before Alice reads the key log: then once more, valid twice as long.
     let mut valid = 3000;
-    for closed in [false, true] {
-        loop {
-            let (gate, mut reaching) = Gate::new();
-            let (membership, _service) = served(&relay, &dir.join(format!("{closed}-{valid}")), |service| Gated { service, gate: gate.clone() }).await;
-            let joiner = session(&relay, "Carol").await;
-            let (carol, _, device) = identity(&joiner.node, "Carol", membership).await;
-            let certificate = certificate(&carol, &device, &joiner.node.key());
-            gate.set(false);
-            let expires = lmk_node::now() + valid;
-            let mut joining = if closed {
-                alice.node.change_settings(&gid.0, |mut s| {
-                    s.open.push(Named { id: carol.id.clone(), name: "Carol".into(), rest: Default::default() });
-                    s
-                }).await.unwrap();
-                let opening = lmk_proto::group::Opening { members: vec![alice_iroh.clone()], ..alice.node.opening(&gid.0).unwrap() };
-                tokio::spawn(async move { joiner.node.join_open(&opening, certificate).await })
-            } else {
-                let secret: [u8; 16] = lmk_core::random();
-                let hash = Bytes(Sha256::digest(secret).to_vec());
-                let rule = json!({ "type": "invite", "hash": hash, "expires": expires, "to": carol.id });
-                bob.node.send(&gid.0, &rule).await.unwrap();
-                eventually("Alice holds the invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["hash"] == rule["hash"])).await;
-                let link = Invite { device: false, secret, members: alice_only.clone() };
-                tokio::spawn(async move { joiner.node.join(&link, Some(certificate)).await.map(|(gid, _)| gid) })
-            };
-            // Alice reads the key log once the rule admits Carol.
-            let alice_reads = async { while reaching.recv().await.unwrap() != alice_iroh {} };
-            let reached = tokio::time::timeout(WAIT, async {
-                tokio::select! {
-                    _ = alice_reads => true,
-                    refused = &mut joining => {
-                        assert!(!closed && format!("{refused:?}").contains("unknown, used or expired"), "{refused:?}");
-                        false
-                    }
+    loop {
+        let (gate, mut reaching) = Gate::new();
+        let (membership, _service) = served(&relay, &dir.join(valid.to_string()), |service| Gated { service, gate: gate.clone() }).await;
+        let joiner = session(&relay, "Carol").await;
+        let (carol, _, device) = identity(&joiner.node, "Carol", membership).await;
+        let certificate = certificate(&carol, &device, &joiner.node.key());
+        gate.set(false);
+        let expires = lmk_node::now() + valid;
+        let secret: [u8; 16] = lmk_core::random();
+        let hash = Bytes(Sha256::digest(secret).to_vec());
+        let rule = json!({ "type": "invite", "hash": hash, "expires": expires, "to": carol.id });
+        bob.node.send(&gid.0, &rule).await.unwrap();
+        eventually("Alice holds the invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["hash"] == rule["hash"])).await;
+        let link = Invite { device: false, secret, members: alice_only.clone() };
+        let mut joining = tokio::spawn(async move { joiner.node.join(&link, Some(certificate)).await.map(|(gid, _)| gid) });
+        // Alice reads the key log once the rule admits Carol.
+        let alice_reads = async { while reaching.recv().await.unwrap() != alice_iroh {} };
+        let reached = tokio::time::timeout(WAIT, async {
+            tokio::select! {
+                _ = alice_reads => true,
+                refused = &mut joining => {
+                    assert!(format!("{refused:?}").contains("unknown, used or expired"), "{refused:?}");
+                    false
                 }
-            }).await.expect("Alice reads Carol's key log");
-            if !reached {
-                assert!(valid < WAIT.as_millis() as u64, "the invite expired before Alice read the key log");
-                valid *= 2;
-                continue;
             }
-            if closed {
-                bob.node.change_settings(&gid.0, |s| Settings { open: vec![], ..s }).await.unwrap();
-                eventually("Alice sees the group closed", || alice.node.settings(&gid.0).unwrap().open.is_empty()).await;
-            } else {
-                tokio::time::sleep(Duration::from_millis(expires + 200 - lmk_node::now())).await;
-            }
-            gate.set(true);
-            let refused = format!("{:#}", joining.await.unwrap().unwrap_err());
-            let reason = if closed { "no identity the group is open to" } else { "unknown, used or expired" };
-            assert!(refused.contains(reason), "{refused}");
-            assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2);
-            break;
+        }).await.expect("Alice reads Carol's key log");
+        if !reached {
+            assert!(valid < WAIT.as_millis() as u64, "the invite expired before Alice read the key log");
+            valid *= 2;
+            continue;
         }
+        tokio::time::sleep(Duration::from_millis(expires + 200 - lmk_node::now())).await;
+        gate.set(true);
+        let refused = format!("{:#}", joining.await.unwrap().unwrap_err());
+        assert!(refused.contains("unknown, used or expired"), "{refused}");
+        assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2);
+        break;
     }
 }
 
@@ -777,38 +759,24 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     routed(&mut tablet, tablet_devices.clone());
     let bob = laptop_devices.create("Bob", membership.clone()).await.unwrap();
     let first = *lists(&laptop.node, &bob, &["laptop"]).await.current();
-    let plan = Opening { group: Bytes(vec![9; 32]), kind: CHAT.into(), name: "Plan".into(), membership: membership.clone(), members: vec![Bytes(vec![1; 32])], rest: Default::default() };
-    laptop_devices.set_opening(&bob.id.0, plan.clone()).await.unwrap();
 
-    // A device link: the tablet gets the identity's state, its key and openings among it, and joins with a key of its
-    // own, which the key log lists once a device restates the list.
+    // A device link: the tablet gets the identity's state, its key among it, and joins with a key of its own, which the
+    // key log lists once a device restates the list.
     let link = lmk_proto::links::Invite::parse(&laptop_devices.invite(&bob.id.0).await.unwrap()).unwrap();
     tablet_devices.join(&link).await.unwrap();
     identified(&tablet_devices).await;
     assert_eq!(tablet_devices.identities(), [(bob.clone(), "Bob".to_owned())]);
-    assert_eq!(tablet_devices.openings(), [plan]);
     let (laptop_key, tablet_key) = (laptop_devices.key(&bob.id.0).unwrap(), tablet_devices.key(&bob.id.0).unwrap());
     assert!(laptop_key != tablet_key && laptop_key != laptop.node.key() && tablet_key != tablet.node.key(), "a device key per identity");
     let log = lists(&laptop.node, &bob, &["laptop", "tablet"]).await;
     assert_eq!(log.current(), &first, "a link keeps the key");
 
-    // Each certifies its session; alice opens a chat to Bob, which the tablet joins without an invite, and invites the
-    // laptop.
+    // Each certifies its session, which joins a chat of Alice's by an invite.
     let chat = alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &dir) }, None).unwrap();
-    alice.node.change_settings(&chat.0, |mut s| {
-        s.open.push(Named { id: bob.id.clone(), name: "Bob".into(), rest: Default::default() });
-        s
-    }).await.unwrap();
-    let opening = alice.node.opening(&chat.0).unwrap();
-    tablet_devices.set_opening(&bob.id.0, opening.clone()).await.unwrap();
-    tokio::time::timeout(WAIT, async {
-        while !laptop_devices.openings().iter().any(|o| o.group == chat) {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }).await.expect("an opening reaches every device");
-    tablet.node.join_open(&opening, tablet_devices.certify(&bob.id.0, &tablet.node.key().0).unwrap()).await.unwrap();
-    let link = alice.node.invite(&chat.0, None).await.unwrap();
-    laptop.node.join(&link, Some(laptop_devices.certify(&bob.id.0, &laptop.node.key().0).unwrap())).await.unwrap();
+    for (node, devices) in [(&tablet.node, &tablet_devices), (&laptop.node, &laptop_devices)] {
+        let link = alice.node.invite(&chat.0, None).await.unwrap();
+        node.join(&link, Some(devices.certify(&bob.id.0, &node.key().0).unwrap())).await.unwrap();
+    }
     let seen = alice.checked(&chat, "tablet", true).await;
     assert_eq!((seen.device_name.as_str(), seen.identity.unwrap().added), ("tablet", true));
     let seen = alice.checked(&chat, "laptop", true).await;
@@ -1415,39 +1383,6 @@ async fn an_announced_loss_reaches_every_member() {
     for session in [&alice, &bob, &carol] {
         session.node.shutdown().await.unwrap();
     }
-}
-
-/// A device that loses a message of its devices group stops there, and takes the state of a device that has it.
-#[tokio::test(flavor = "multi_thread")]
-async fn devices_stop_at_a_loss_and_resume_from_a_state_past_it() {
-    let relay = relay().await;
-    let dir = folder("devices-lost");
-    std::fs::create_dir_all(&dir).unwrap();
-    let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
-    let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
-    let (tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
-    let bob = laptop_devices.create("Bob", membership.clone()).await.unwrap();
-    let link = lmk_proto::links::Invite::parse(&laptop_devices.invite(&bob.id.0).await.unwrap()).unwrap();
-    tablet_devices.join(&link).await.unwrap();
-    identified(&tablet_devices).await;
-    tablet.node.shutdown().await.unwrap();
-    drop((tablet, tablet_devices));
-    let plan = Opening { group: Bytes(vec![9; 32]), kind: CHAT.into(), name: "Plan".into(), membership, members: vec![Bytes(vec![1; 32])], rest: Default::default() };
-    laptop_devices.set_opening(&bob.id.0, plan).await.unwrap();
-    laptop.node.shutdown().await.unwrap();
-    drop((laptop, laptop_devices));
-
-    // The tablet, alone, commits twice and so loses the opening: it stops.
-    let (mut tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
-    for name in ["tab", "slate"] {
-        tablet_devices.rename(name).await.unwrap();
-    }
-    tablet.until(|e| matches!(e, Event::Warning { text, .. } if text.contains("waits for a device's state")).then_some(())).await;
-    assert!(tablet_devices.openings().is_empty());
-
-    // The laptop comes back and hands it the state, past the loss.
-    let (_laptop, _laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
-    eventually("the tablet takes the laptop's state", || tablet_devices.openings().iter().any(|o| o.name == "Plan")).await;
 }
 
 /// The members a key log entry drops are removed by one commit.

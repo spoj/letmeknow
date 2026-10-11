@@ -19,7 +19,7 @@ use lmk_node::devices::Devices;
 use lmk_node::lmk_core::crypto::{Crypto, Rand};
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
-use lmk_node::{COLLECT, Disk, Event, Node, now};
+use lmk_node::{COLLECT, Disk, Node, now};
 use lmk_proto::Bytes;
 use lmk_proto::group::{CHAT, DEVICES, PROTOCOL, Settings};
 use lmk_proto::links::{FileLink, Invite};
@@ -384,14 +384,8 @@ impl App {
         let events_app = app.clone();
         spawn_local(async move {
             while let Some(event) = events.recv().await {
-                // The page lists the groups open to this browser's identities, which its devices groups record.
-                let devices = matches!(event, Event::Logged { .. } | Event::State { .. })
-                    && event.group().is_some_and(|gid| events_app.client.node().settings(&gid.0).is_ok_and(|s| s.kind == DEVICES));
                 events_app.client.event(event).await;
                 events_app.flush();
-                if devices {
-                    events_app.emit(json!({ "type": "opening" }));
-                }
             }
         });
         let flushing = Rc::downgrade(&app);
@@ -562,13 +556,7 @@ impl App {
                     member["away"] = json!(true);
                 }
             }
-            groups.push(json!({ "group": gid, "settings": settings, "members": members, "joined": true }));
-        }
-        let joined = node.groups();
-        for opening in self.client.device_state()?.openings {
-            if !joined.contains(&opening.group) && !opening.members.is_empty() && !groups.iter().any(|g| g["group"] == json!(opening.group)) {
-                groups.push(json!({ "group": opening.group, "settings": { "kind": opening.kind, "name": opening.name }, "joined": false }));
-            }
+            groups.push(json!({ "group": gid, "settings": settings, "members": members }));
         }
         Ok(Value::Array(groups))
     }
@@ -706,7 +694,7 @@ impl Lmk {
     /// A new chat, doc or git repository, speaking as this browser's first identity; returns its id.
     pub async fn create(&self, kind: String, name: String) -> R<String> {
         let app = &self.app;
-        let settings = Settings { protocol: PROTOCOL, kind, name, open: Vec::new(), carry: 7, update: lmk_proto::group::UPDATE, membership: app.membership.clone(), rest: Default::default() };
+        let settings = Settings { protocol: PROTOCOL, kind, name, carry: 7, update: lmk_proto::group::UPDATE, membership: app.membership.clone(), rest: Default::default() };
         let (gid, _) = app.client.create(settings, None, (Vec::new(), String::new())).await.map_err(js)?;
         app.remember_settings(&gid.0).map_err(js)?;
         app.flush();

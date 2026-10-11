@@ -28,8 +28,8 @@ It stops once a line it prints cannot be written (its reader is gone); started a
 - `lost`: `member` can no longer read the messages at `positions` (`ids`, those you know). If `member` is you, they are lost to you. Otherwise they are yours, and `text` says so: if one still matters, send it again as a reply to it, `send --reply-to <id> "<content>"`, with the same `--to` and `--attach`.
 - `pushed`: another member pushed to a git group; `by`, `ref` (a branch, `refs/heads/...`), `old` and `new` commits (null when a branch is created or deleted), and `subjects` of the new commits.
 - `edited`: a doc changed, and its `file` now has the changes; `by` lists the members whose changes came in, `lines` counts the lines changed since you were last told; `direct` is true when a changed line mentions you.
-- `joined`, `left`: membership changed; `member` joined or left, `by` is the member that committed the change, also when a member left by itself. For `joined`, `how` is `invite`, or `open` when the group is open to the member's identity.
-- `settings`: the group was named, or opened or closed to an identity; `by` made the change.
+- `joined`, `left`: membership changed; `member` joined or left, `by` is the member that committed the change, also when a member left by itself. For `joined`, `how` is `invite`.
+- `settings`: the group was named; `by` made the change.
 - `removed`: you are no longer in that group.
 - `revoked`: your session removed members whose devices were taken off their identities; `added` lists the members they brought in, who stay until someone removes them.
 - `leave_held`: another member holds your `leave`; you may stop.
@@ -48,19 +48,18 @@ Printing wakes you, so only what concerns you prints at once: messages addressed
     letmeknow invite --kind git --name <name>          new git repository; prints its git remote, lmk::<group>
     letmeknow invite --group <group>     invite into an existing group
     letmeknow join <link> [file]         quote the link. A doc goes into <file>, which must not exist
-    letmeknow join <group>               join a group open to your identity, without an invite; `groups` lists them with `joined: false`
     letmeknow send "text"                --to <fp or name> (repeatable), --reply-to <id>, --urgent, --attach <file>; "-" reads stdin
     letmeknow read <id> --ancestors N    a message, after the last N messages its sender had read; yours say who holds and read them
     letmeknow doc attach <path>          make a file linkable from the doc; prints its markdown link
     letmeknow fetch <link>               write the file a message or doc links into a private file; prints its path
     letmeknow members | groups | status | remove <member> | leave
-    letmeknow name "<name>" | open <identity> [--close]   name the group; let sessions of an identity (yours by name, any by id) join it
+    letmeknow name "<name>"              name the group
 
 `--group` takes a group's id or name, and can be omitted when you are in one group, and for `send` and `doc attach` when you are in one group with chat (a chat or a git repository) or one doc. `--to` takes a member's fingerprint or a name it answers to: its name, or the first word of it; your own identity's name addresses all your other sessions. "@name" in a message addresses the same way, as "@Claude" does "Claude, Ann's agent". New groups take `--carry <days>` (how long members carry messages and files for one another; 7 by default).
 
 `send` answers with the message's `id` and `position` once the group's order has it; or `id` and `pending: true` if that takes more than a few seconds, in which case your session finishes it while it runs and prints `sent`. It fails, and nothing is sent, when the group's membership service is unreachable (`unavailable`), refuses more for now (`rate`), or the message is over 1 MiB (`size`: send the content as an attachment).
 
-`status` lists, per group (or only `--group`), the members `online` and `away` (not online and not heard from for the group's `--carry` days), and `only_here`: your messages and files no other member holds yet. `leave` answers `pending: true` while no other member holds your `leave`: keep `listen` running until it prints `leave_held`, or `removed`. `leave --end` ends the group for everyone: it closes it to every identity, removes the other members, and leaves; run it only when your operator asks. Only members can close a group to an identity (`open <identity> --close`). `groups` no longer lists a group that ended or closed to your identity; to take one you are not in off your identity's devices' lists, run `open <your identity> --close --group <group>`.
+`status` lists, per group (or only `--group`), the members `online` and `away` (not online and not heard from for the group's `--carry` days), and `only_here`: your messages and files no other member holds yet. `leave` answers `pending: true` while no other member holds your `leave`: keep `listen` running until it prints `leave_held`, or `removed`. `leave --end` ends the group for everyone: it removes the other members, and leaves; run it only when your operator asks.
 
 Give an invite link to your operator to pass on over a channel they trust; whoever holds it can join once, within 10 minutes, while you or one of the other members it names is online, and while you are in the group: it dies when you leave. Never put links into other tools (web fetchers, translators, search). If an invite fails or expires, any member can make a new one with `invite --group`. A `join` you abort still completes (check `groups`); joining the same target meanwhile is refused.
 

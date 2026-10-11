@@ -11,8 +11,8 @@ import * as store from "./store";
 export type Identity = { id: string; name: string; how: "self" | "unknown"; error?: string; new_device?: string };
 export type Person = { fp: string; name: string; device: string; you?: boolean; identity?: Identity; added_by?: { name?: string; how: string }; away?: boolean };
 export type Named = { id: string; name: string };
-export type Settings = { kind: "chat" | "doc" | "git"; name: string; open?: Named[]; carry?: number };
-export type Group = { group: string; settings: Settings; members: Person[]; joined: boolean };
+export type Settings = { kind: "chat" | "doc" | "git"; name: string; carry?: number };
+export type Group = { group: string; settings: Settings; members: Person[] };
 export type Attachment = { link: string; name: string; size: number; type: string; kept: boolean };
 
 export type Item =

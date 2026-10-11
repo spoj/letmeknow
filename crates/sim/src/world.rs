@@ -864,10 +864,6 @@ impl World {
                 }
                 Ok(joined?["group"].to_string())
             }
-            Act::JoinOpen { n, group } => {
-                let gid = self.group(group)?;
-                Ok(self.join(n, &b64(&gid.0)).await?["group"].to_string())
-            }
             Act::Send { m, group } => {
                 let gid = self.group(group)?;
                 let m = self.holder(&gid, m)?;
@@ -896,12 +892,6 @@ impl World {
                 let gid = self.group(group)?;
                 let m = self.holder(&gid, m)?;
                 Ok(self.request(m, json!({ "cmd": "name", "group": b64(&gid.0), "name": format!("named at {}", elapsed()) })).await?.to_string())
-            }
-            Act::Open { m, group, n, close } => {
-                let gid = self.group(group)?;
-                let m = self.holder(&gid, m)?;
-                let identity = self.identity(n)?;
-                Ok(self.request(m, json!({ "cmd": "open", "group": b64(&gid.0), "identity": b64(&identity.0), "close": close })).await?.to_string())
             }
             Act::Leave { m, group } => {
                 let gid = self.group(group)?;
@@ -947,7 +937,7 @@ impl World {
         }
     }
 
-    /// `m` joins by a link or an opening, answered with the group, where it starts.
+    /// `m` joins by a link, answered with the group, where it starts.
     async fn join(&self, m: usize, target: &str) -> Result<Value> {
         let starts = self.starts(m);
         let joined = self.request(m, json!({ "cmd": "join", "target": target })).await?;

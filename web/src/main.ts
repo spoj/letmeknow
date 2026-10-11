@@ -95,7 +95,7 @@ let entered: Promise<void> | undefined;
 /** How many of this browser's sends no other member holds yet: closing the page while any is loses them. */
 let onlyHere = 0;
 addEventListener("beforeunload", event => onlyHere && event.preventDefault());
-const group = (gid: string) => groups.find(g => g.group === gid && g.joined);
+const group = (gid: string) => groups.find(g => g.group === gid);
 const unread = (gid: string) => Number(localStorage.getItem(`unread ${gid}`) ?? 0);
 
 // The page is its own root of trust: a service worker serves this version until the person takes a new one.
@@ -175,15 +175,9 @@ function who(p: Person): HTMLElement {
   );
 }
 
-/** Whose devices an opening lets join: this browser's identity's, or another's, by its own name. */
-function devicesOf(o: client.Named): string {
-  if (me.identities.some(i => i.id === o.id)) return "your other devices";
-  return `the devices of ${o.name ? `${o.name} (unverified)` : "another identity"}`;
-}
-
 /** The group's name, or else who else is in it. */
 function title(gid: string): string {
-  const g = group(gid) ?? groups.find(g => g.group === gid);
+  const g = group(gid);
   if (!g) return "a group";
   const others = (g.members ?? []).filter(m => !m.you).map(label);
   return g.settings.name || [...new Set(others)].join(", ") || `New ${KINDS[g.settings.kind].name}`;
@@ -351,7 +345,6 @@ async function redeem(link: string) {
 
 const groupList = h("nav", { className: "group-list" });
 const navButtons = new Map<string, { button: HTMLButtonElement; name: HTMLElement; badge: HTMLElement }>();
-const openList = h("div", { className: "open-list" });
 const meName = h("b");
 const meButton = h("button", { className: "me quiet", onclick: () => showDevices() }, meName, h("small", {}, "Your devices"));
 const sidebar = h(
@@ -366,7 +359,6 @@ const sidebar = h(
     h("button", { onclick: joinDialog }, "Join")
   ),
   groupList,
-  openList,
   meButton
 );
 const main = h("main", { className: "main" });
@@ -381,7 +373,7 @@ async function enter() {
   groups = JSON.parse(await lmk.groups());
   root.replaceChildren(layout, toasts);
   const last = localStorage.getItem("group");
-  const shown = last && group(last) ? last : groups.filter(g => g.joined).at(-1)?.group;
+  const shown = last && group(last) ? last : groups.at(-1)?.group;
   if (!shown) return showStart();
   await select(shown);
   if (narrow.matches) layout.classList.remove("in-main");
@@ -441,7 +433,7 @@ async function draw() {
     if (gid === selected) selected = undefined;
   }
   if (page === "group" && !selected) {
-    const newest = groups.filter(g => g.joined).at(-1);
+    const newest = groups.at(-1);
     if (newest) await select(newest.group);
     else showStart();
   }
@@ -460,7 +452,7 @@ function drawNav() {
     entry.button.remove();
     navButtons.delete(gid);
   }
-  for (const g of groups.filter(g => g.joined)) {
+  for (const g of groups) {
     let entry = navButtons.get(g.group);
     if (!entry) {
       const name = h("span"),
@@ -474,16 +466,6 @@ function drawNav() {
     set(entry.badge, unread(g.group) ? String(unread(g.group)) : "");
     entry.button.classList.toggle("on", page === "group" && g.group === selected);
   }
-  const open = groups.filter(g => !g.joined);
-  update(openList, JSON.stringify(open.map(o => [o.group, o.settings.name])), () => [
-    open.length > 0 && h("h3", {}, "Open to you"),
-    ...open.map(o => {
-      const name = `${KINDS[o.settings.kind].mark} ${o.settings.name || `Unnamed ${KINDS[o.settings.kind].name}`}`;
-      const join = h("button", {}, "Join");
-      join.onclick = () => busy(join, "…", async () => select((await request({ cmd: "join", target: o.group })).group));
-      return h("div", { className: "opening" }, h("span", {}, name, o.settings.kind === "git" && h("small", { className: "note" }, GIT_NOTE)), join);
-    })
-  ]);
   set(meName, me.identities[0]?.name ?? me.name);
   meButton.classList.toggle("on", page === "devices");
 }
@@ -563,7 +545,7 @@ async function drawDevices() {
   const listed: { identities: { identity: string; devices: { key: string; name: string; you: boolean }[] }[] } = await request({ cmd: "identity", op: "list" });
   const list = listed.identities.find(i => i.identity === identity.id) ?? { devices: [] };
   update(devicesBody, JSON.stringify([identity, list]), () => [
-    h("p", {}, `The browsers and computers that are you, ${identity.name}. They join the chats and documents open to you, and others see them as yours.`),
+    h("p", {}, `The browsers and computers that are you, ${identity.name}. They join your chats and documents, and others see them as yours.`),
     h(
       "ul",
       { className: "devices" },
@@ -610,7 +592,7 @@ async function leaveDialog(link?: string) {
   const identity = me.identities[0];
   const listed: { identities: { identity: string; devices: unknown[] }[] } = await request({ cmd: "identity", op: "list" });
   const only = (listed.identities.find(i => i.identity === identity.id)?.devices.length ?? 1) === 1;
-  const speaking = groups.filter(g => g.joined && g.members.some(m => m.you && m.identity?.id === identity.id)).map(g => title(g.group));
+  const speaking = groups.filter(g => g.members.some(m => m.you && m.identity?.id === identity.id)).map(g => title(g.group));
   const go = h("button", { className: "danger", autofocus: true }, link ? "Move this browser" : `Leave ${identity.name}`);
   const dialog = modal(
     link ? "Move this browser to another identity" : `Leave ${identity.name}`,
@@ -746,15 +728,6 @@ class View {
     const kind = KINDS[settings.kind].name;
     const name = h("input", { value: settings.name, placeholder: title(gid), ariaLabel: "Name" });
     const save = h("button", {}, "Rename");
-    const toggle = (identity: client.Named) => {
-      const box = h("input", { type: "checkbox", checked: !!settings.open?.some(o => o.id === identity.id) });
-      box.onchange = async () => {
-        box.disabled = true;
-        await request({ cmd: "open", group: gid, close: !box.checked, identity: identity.id }).catch(error => ((box.checked = !box.checked), toast(error)));
-        box.disabled = false;
-      };
-      return h("label", { className: "switch" }, box, h("span", {}, h("b", {}, "Your other devices can join"), h("small", {}, `They list this ${kind} under "Open to you", to join without an invite.`)));
-    };
     const dialog = modal(
       kind[0].toUpperCase() + kind.slice(1),
       form(() => busy(save, "Renaming…", () => request({ cmd: "name", group: gid, name: name.value.trim() })), field("Name", h("div", { className: "row" }, name, save))),
@@ -779,7 +752,6 @@ class View {
           )
         )
       ),
-      me.identities.map(toggle),
       h(
         "div",
         { className: "buttons leave" },
@@ -961,7 +933,7 @@ class ChatView extends View {
       case "left": {
         const self = item.by.fp === item.member.fp;
         const said =
-          item.type === "joined" ? [who(item.by), item.how === "open" ? " let in " : " added ", who(item.member)] : self ? [who(item.member), " left"] : [who(item.by), " removed ", who(item.member)];
+          item.type === "joined" ? [who(item.by), " added ", who(item.member)] : self ? [who(item.member), " left"] : [who(item.by), " removed ", who(item.member)];
         return h("li", { className: "event" }, ...said, at);
       }
       case "revoked": {
@@ -971,13 +943,8 @@ class ChatView extends View {
       }
       case "settings": {
         const { before, settings: after } = item;
-        const ids = (s?: { open?: { id: string }[] }) => (s?.open ?? []).map(o => o.id);
-        const said = [
-          before && after.name !== before.name && (after.name ? `named it “${after.name}”` : "removed its name"),
-          ...(after.open ?? []).filter(o => !ids(before).includes(o.id)).map(o => `let ${devicesOf(o)} join`),
-          ...(before?.open ?? []).filter(o => !ids(after).includes(o.id)).map(o => `stopped letting ${devicesOf(o)} join`)
-        ].filter(Boolean);
-        return h("li", { className: "event" }, who(item.by), ` ${said.join(" and ") || "changed the settings"}`, at);
+        const said = before && after.name !== before.name && (after.name ? `named it “${after.name}”` : "removed its name");
+        return h("li", { className: "event" }, who(item.by), ` ${said || "changed the settings"}`, at);
       }
       case "pushed":
         return h(

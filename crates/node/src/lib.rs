@@ -268,12 +268,11 @@ pub enum Event {
         added: Vec<Member>,
     },
     /// This session was removed, by `by` as it applied the commit, or else with no `by`: by a commit applied before it
-    /// stopped, left the only member of a group it asked to leave (`last`: the group ended), or away past its log's
-    /// retention. The group is gone from it.
+    /// stopped, left the only member of a group it asked to leave, or away past its log's retention. The group is gone
+    /// from it.
     Removed {
         group: Bytes,
         by: Option<Member>,
-        last: bool,
     },
     Settings {
         group: Bytes,

@@ -272,7 +272,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     }
                 }
                 Work::Duties(gid) => self.duties(&gid),
-                Work::Gone(group) => self.gone(&group, None, false),
+                Work::Gone(group) => self.gone(&group, None),
                 Work::Fetch { group, link } => {
                     if self.net().has(link.hash).await.unwrap_or(false) {
                         self.events.send(Event::File(link.hash)).ok();
