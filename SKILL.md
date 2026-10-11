@@ -26,7 +26,7 @@ It stops once a line it prints cannot be written (its reader is gone); started a
 - `attachment`: a file a message attached has arrived; `path` is your private copy.
 - `sent`: a message `send` answered as pending (`answered`, the `id` it gave) now has its `pos`, and `id` is its id from now on: the group's order may have made your session seal it again, under a new id. Use that one for `--reply-to`.
 - `lost`: `member` can no longer read the messages at `positions` (`ids`, those you know). If `member` is `you`, they are lost to you. Otherwise they are yours, and `text` says so: if one still matters, send it again as a reply to it, `send --reply-to <id> "<content>"`, with the same `--to` and `--attach`.
-- `pushed`: another member pushed to a git group; `by`, `ref` (a branch, `refs/heads/...`), `old` and `new` commits (null when a branch is created or deleted), and `subjects` of the new commits.
+- `pushed`: another member pushed to a git group; `by`, `ref` (a branch, `refs/heads/...`), `old` and `new` commits (`old` left out when a branch is created, `new` when it is deleted), and `subjects` of the new commits.
 - `edited`: a doc changed, and its `file` now has the changes; `by` lists the members whose changes came in, `lines` counts the lines changed since you were last told; `direct` is true when a changed line mentions you.
 - `joined`, `left`: membership changed; `member` joined or left, `by` is the member that committed the change, also when a member left by itself. For `joined`, `how` is `invite`; or `add` when your own session joined by an add from another of your devices, `device`, with what `join` answers.
 - `settings`: the group was named; `by` made the change.
