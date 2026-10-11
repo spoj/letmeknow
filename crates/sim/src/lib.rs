@@ -1,7 +1,7 @@
 //! Deterministic simulation of letmeknow: members on the client core, as the browser runs it, over a simulated network
 //! and clock in one thread, where one seed decides every delay, reorder, loss, partition, crash and choice. They are
-//! driven through random actions while the world records what they observe (`trace`), and the properties of 0.13's
-//! design (`props`) are checked over that record; a failing run replays exactly from its seed, and shrinks to the
+//! driven through random actions while the world records what they observe (`trace`), and the design's properties
+//! (`props`) are checked over that record; a failing run replays exactly from its seed, and shrinks to the
 //! fewest actions that still fail.
 
 pub mod net;

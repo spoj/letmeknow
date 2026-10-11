@@ -1,4 +1,4 @@
-//! 0.13's peer protocol without I/O, across a member's connections: when `hello` goes, the summaries peers sent on
+//! The peer protocol without I/O, across a member's connections: when `hello` goes, the summaries peers sent on
 //! their current connection, the entries they lack, repair by pull, and the wait before a commit that deletes an
 //! epoch's keys. The node feeds it what it knows, polls it at least every quarter second, and sends what it returns.
 //! Times are milliseconds.

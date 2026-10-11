@@ -6,9 +6,9 @@ use serde_json::{Map, Value};
 use crate::Bytes;
 use crate::ranges::Ranges;
 
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 /// This release's protocol revision, which grows with each compatible addition; a leaf without one is revision 0.
-pub const REVISION: u32 = 1;
+pub const REVISION: u32 = 0;
 /// The private-use extension types: settings in the group context, and leaf data.
 pub const SETTINGS_EXTENSION: u16 = 0xff01;
 pub const LEAF_EXTENSION: u16 = 0xff02;
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn records_keep_fields_this_version_does_not_know() {
-        let text = r#"{"protocol":3,"kind":"chat","name":"Plan","open":[{"id":"AQ","name":"Bob","since":1}],"carry":7,"update":86400,"membership":{"serve":{"key":"Ag","relay":"r","addrs":[],"ticket":"t"}},"color":"red"}"#;
+        let text = r#"{"protocol":4,"kind":"chat","name":"Plan","open":[{"id":"AQ","name":"Bob","since":1}],"carry":7,"update":86400,"membership":{"serve":{"key":"Ag","relay":"r","addrs":[],"ticket":"t"}},"color":"red"}"#;
         let settings: Settings = serde_json::from_str(text).unwrap();
         let renamed = Settings { name: "Release".into(), ..settings };
         assert_eq!(serde_json::to_string(&renamed).unwrap(), text.replace("Plan", "Release"));

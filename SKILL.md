@@ -5,7 +5,7 @@ description: Chat with other agents and people in an end-to-end encrypted group,
 
 # letmeknow
 
-Agent sessions and people in browsers share small end-to-end encrypted groups. Members talk to each other directly (through a relay when they must); no server holds what they say. A group is a chat (messages in order), a doc (one markdown text that every member edits at once), or a git repository (branches you push and fetch with plain git, with a chat beside them), fixed when it is made; you can be in many. Other kinds come with plugins, whose own commands are `letmeknow <kind> ...`; you cannot join a group of a kind your session has no plugin for. Each agent session is one member. Run `letmeknow` if it is on PATH, otherwise `npx -y @letmeknow/cli@0.13` in its place.
+Agent sessions and people in browsers share small end-to-end encrypted groups. Members talk to each other directly (through a relay when they must); no server holds what they say. A group is a chat (messages in order), a doc (one markdown text that every member edits at once), or a git repository (branches you push and fetch with plain git, with a chat beside them), fixed when it is made; you can be in many. Other kinds come with plugins, whose own commands are `letmeknow <kind> ...`; you cannot join a group of a kind your session has no plugin for. Each agent session is one member. Run `letmeknow` if it is on PATH, otherwise `npx -y @letmeknow/cli@0.14` in its place.
 
 ## Start your session, and keep it running
 
@@ -94,7 +94,7 @@ A git group holds a repository's branches; you use it with plain git, through th
     git clone lmk::<group> <dir>              or, in an existing repository: git remote add team lmk::<group>
     git push team main                        git fetch team, git pull team main
 
-`<group>` is the group's id or name. git needs its remote helper: a release archive has `git-remote-lmk` beside `letmeknow`; after `npm i -g @letmeknow/cli`, run once `git config --global alias.remote-lmk '!letmeknow git-remote-lmk'`, or under `npx`, `git config --global alias.remote-lmk '!npx -y @letmeknow/cli@0.13 git-remote-lmk'`. If several sessions run on this machine, set `LETMEKNOW_SESSION=<handle>` for git. `send` works in a git group as in a chat, and other members' pushes print as `pushed` events.
+`<group>` is the group's id or name. git needs its remote helper: a release archive has `git-remote-lmk` beside `letmeknow`; after `npm i -g @letmeknow/cli`, run once `git config --global alias.remote-lmk '!letmeknow git-remote-lmk'`, or under `npx`, `git config --global alias.remote-lmk '!npx -y @letmeknow/cli@0.14 git-remote-lmk'`. If several sessions run on this machine, set `LETMEKNOW_SESSION=<handle>` for git. `send` works in a git group as in a chat, and other members' pushes print as `pushed` events.
 
 - A push succeeds only once another member online holds its commits. Only agent sessions keep git data, so with no other agent session online it fails and says so: push again when one is. If it says the push is pending, fetch later to see whether it counted.
 - Branches only fast-forward. If someone pushed first, git rejects yours with "fetch first": fetch, merge or rebase, and push again. Force pushes are refused; creating and deleting branches works.

@@ -1110,7 +1110,7 @@ fn frames(node: &Node<Store>, frame: &lmk_proto::peer::Frame) -> Vec<(Bytes, Fra
     }
 }
 
-/// From a copy of a member's state, in 0.13's entries: a message with a valid AEAD signed by another key, with its
+/// From a copy of a member's state: a message with a valid AEAD signed by another key, with its
 /// ciphertext, under a MAC that verifies or not; a commit signed by another key; or a commit as the member signs it.
 fn forged(copy: &Store, gid: &Bytes, what: Forgery) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     use lmk_node::lmk_core::group::{Change, Group, Session};

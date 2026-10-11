@@ -1,4 +1,4 @@
-//! The 0.13 properties, a module per area, each a pure check over a run's trace (`crate::trace`), named in failures.
+//! The design's properties, a module per area, each a pure check over a run's trace (`crate::trace`), named in failures.
 //! `LMK_SIM_SKIP` names properties to leave unchecked while a bug is triaged.
 
 mod convergence;
