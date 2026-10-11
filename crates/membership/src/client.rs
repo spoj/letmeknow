@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 use ed25519_dalek::VerifyingKey;
 use iroh::{Endpoint, EndpointAddr, PublicKey, endpoint::Connection};
 use lmk_proto::{
-    Answer, Bytes, frame,
+    Answer, Bytes, clock, frame,
     frame::{ALPN, Open, Stream},
     group::Service,
     head::Head,
@@ -126,22 +126,31 @@ impl ServeClient {
     /// Appends entries one after another, as one append against the service's rate limit.
     pub async fn append(&self, log: &[u8], entries: &[Vec<u8>], public: bool) -> Result<Appended> {
         let entries: Vec<Bytes> = entries.iter().map(|entry| Bytes(entry.clone())).collect();
+        let sent = clock::now();
         let appended: Appended = self.request(Request::Append { log: log.into(), entries: entries.clone(), public }).await?;
+        let received = clock::now();
         let after = appended.position.checked_sub(1).context("appended at position 0")?;
         self.0.chains.page(log, after, &entries, &appended.head)?;
+        clock::heard(sent, received, appended.head.time);
         Ok(appended)
     }
 
     /// One page of the entries after `after`.
     pub async fn read(&self, log: &[u8], after: u64) -> Result<Page> {
+        let sent = clock::now();
         let page: Page = self.request(Request::Read { log: log.into(), after }).await?;
+        let received = clock::now();
         self.0.chains.page(log, after, &page.entries, &page.head)?;
+        clock::heard(sent, received, page.head.time);
         Ok(page)
     }
 
     pub async fn head(&self, log: &[u8]) -> Result<Head> {
+        let sent = clock::now();
         let Latest { head } = self.request(Request::Head { log: log.into() }).await?;
+        let received = clock::now();
         self.0.chains.head(log, &head)?;
+        clock::heard(sent, received, head.time);
         Ok(head)
     }
 

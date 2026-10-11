@@ -804,7 +804,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             reply_to: chat.reply_to.map(|id| Bytes(id.to_vec())),
             urgent: chat.urgent,
             attachment: attachment.as_ref().map(|(_, a)| a.clone()),
-            sent_at: Some(lmk_node::now()),
+            sent_at: Some(lmk_proto::clock::corrected()),
         };
         let sent = node.send(&gid.0, &serde_json::to_value(payload)?).await?;
         let id = sent.id.clone();
