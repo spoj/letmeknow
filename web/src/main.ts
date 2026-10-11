@@ -785,7 +785,7 @@ class View {
         box.disabled = false;
       };
       const text = identity.own ? "Your other devices can join" : `${identity.name}'s devices can join`;
-      return h("label", { className: "switch" }, box, h("span", {}, h("b", {}, text), h("small", {}, `Their devices join this ${kind} on their own, without an invite.`)));
+      return h("label", { className: "switch" }, box, h("span", {}, h("b", {}, text), h("small", {}, `Their devices list this ${kind} under "Open to you", to join without an invite.`)));
     };
     const dialog = modal(
       kind[0].toUpperCase() + kind.slice(1),
