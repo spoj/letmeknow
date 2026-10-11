@@ -929,7 +929,7 @@ fn git_pushes_count_in_the_groups_log_in_order() {
             let pushed = alice.cmd(&["git", "push", &group, "refs/heads/main", old, &new, bundle.to_str().unwrap()]).await.unwrap();
             for _ in 0..80 {
                 if bob.cmd(&["git", "list", &group]).await.is_ok_and(|list| list["refs"]["refs/heads/main"] == new.as_str()) {
-                    return (new, pushed["pos"].clone());
+                    return (new, pushed["position"].clone());
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }

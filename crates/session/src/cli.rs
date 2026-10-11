@@ -322,9 +322,9 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
     let _ = write.write_all(format!("{response}\n").as_bytes()).await;
 }
 
-/// Sends a request to the running session and returns its answer, made short but for `members`. Files the request
-/// names are read, or made absolute, here, and a kind's arguments go with this directory: the session process runs
-/// elsewhere.
+/// Sends a request to the running session and returns its answer: made short, but for `members`, and for a kind's
+/// commands, which their plugin answers. Files the request names are read, or made absolute, here, and a kind's arguments
+/// go with this directory: the session process runs elsewhere.
 pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Value> {
     if let Request::Client(lmk_client::Request::Join { target, .. }) = &request {
         ensure!(
@@ -370,7 +370,7 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     {
         *cwd = absolute(".")?;
     }
-    let full = matches!(request, Request::Client(lmk_client::Request::Members { .. }));
+    let full = matches!(request, Request::Client(lmk_client::Request::Members { .. }) | Request::Kind { .. });
     let channel = connect(&session_dir(home, session)?.join("endpoint"))
         .await
         .with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen`"))?;
