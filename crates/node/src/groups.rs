@@ -154,10 +154,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Tells that this session is out of a group, then forgets it, unless it did so already.
     pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>) {
-        if !self.lock().groups.contains_key(gid) {
-            return;
-        }
-        self.events.send(Event::Removed { group: Bytes(gid.to_vec()), by }).ok();
+        let Some(kind) = self.lock().groups.get(gid).map(|g| g.mls.settings().kind) else { return };
+        self.events.send(Event::Removed { group: Bytes(gid.to_vec()), kind, by }).ok();
         if let Err(error) = self.forget(gid) {
             self.warn(Some(gid), format!("{error:#}"));
         }

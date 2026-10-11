@@ -279,25 +279,20 @@ async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_de
     let chat = alice.request(json!({ "cmd": "invite" })).await;
     tablet.request(json!({ "cmd": "join", "target": chat["link"] })).await;
     let bob = laptop.client.device_state().unwrap().identity.unwrap().0;
-    let before = *laptop.client.node().read_key_log(&bob).await.unwrap().current();
 
-    // The tablet leaves Bob: its session leaves the chat first, and the laptop, which removes it, replaces Bob's key.
+    // The tablet leaves Bob: its session leaves the chat first, and Bob's public log lists the laptop alone.
     let left = tablet.request(json!({ "cmd": "identity", "op": "leave" })).await;
     assert_eq!((left["left"][0].clone(), left["ended"].clone()), (chat["group"].clone(), json!(false)));
     assert_eq!(tablet.client.me().unwrap()["identity"], json!(null));
     polled(&alice, json!({ "cmd": "members", "group": chat["group"] }), |m| m["members"].as_array().unwrap().len() == 1).await;
     polled(&laptop, json!({ "cmd": "identity", "op": "list" }), |listed| listed["devices"].as_array().unwrap().len() == 1).await;
-    tokio::time::timeout(WAIT, async {
-        while *laptop.client.node().read_key_log(&bob).await.unwrap().current() == before {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    })
-    .await
-    .expect("the laptop replaces Bob's key");
+    let writers = alice.client.node().read_public(&bob).await.unwrap().writers;
+    assert_eq!(writers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["laptop"]);
 
-    // Bob's only device leaves him, and he ends.
+    // Bob's only device leaves him: it closes his public log, and he ends.
     let left = laptop.request(json!({ "cmd": "identity", "op": "leave" })).await;
     assert_eq!((left["left"].clone(), left["ended"].clone()), (json!([]), json!(true)));
     assert_eq!(laptop.client.me().unwrap()["identity"], json!(null));
     assert!(laptop.client.node().groups().is_empty(), "its devices group is gone");
+    assert!(alice.client.node().read_public(&bob).await.unwrap().closed(), "no session speaks for Bob any more");
 }

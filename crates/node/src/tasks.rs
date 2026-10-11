@@ -97,7 +97,7 @@ impl<P: Provider> State<P> {
             session,
             groups,
             logs,
-            keys: BTreeMap::new(),
+            public: BTreeMap::new(),
             unlisted: HashSet::new(),
             device_keys: BTreeMap::new(),
             waiters: HashMap::new(),
@@ -119,7 +119,7 @@ impl<P: Provider> State<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Starts the tasks, follows the logs, and picks up where the session stopped: its key logs replayed, its groups
+    /// Starts the tasks, follows the logs, and picks up where the session stopped: its public logs replayed, its groups
     /// it was removed from told, its pending sends appended.
     fn run(
         self: &Arc<Self>,
@@ -143,13 +143,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.follow(log);
         }
         let mut st = self.lock();
-        let identities: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
-            logs::Of::Identity(id) => Some(id.clone()),
+        let public: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
+            logs::Of::Public(id) => Some(id.clone()),
             _ => None,
         }).collect();
-        for id in identities {
-            if let Err(error) = self.keyed(&mut st, &id.0) {
-                self.warn(None, format!("the key log of {}: {error:#}", hex(&id.0)));
+        for id in public {
+            if let Err(error) = self.replayed(&mut st, &id.0) {
+                self.warn(None, format!("the public log {}: {error:#}", hex(&id.0)));
             }
         }
         // A session removed by a commit it applied before it stopped is told so now; its sends go on. A group its log's
@@ -183,7 +183,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Catches up as this session starts: the key logs it lacks, then the entries it stored and had not applied, as
+    /// Catches up as this session starts: the public logs it lacks, then the entries it stored and had not applied, as
     /// while waiting before a commit. Then runs every group's duties, now and every `duties::TIMER`, and scrubs.
     async fn resume(self: Arc<Self>) {
         self.refresh_all().await;

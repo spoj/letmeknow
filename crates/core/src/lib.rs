@@ -2,7 +2,7 @@
 
 pub mod device;
 pub mod group;
-pub mod identity;
+pub mod public;
 pub mod provider;
 
 pub use lmk_proto::random::random;

@@ -1,91 +1,25 @@
 //! The devices kind, built in: an identity's devices group, whose members are its devices, each with its own device key
-//! there. Its state is the identity and its private keys, kept in step through the group's held messages, in log order, and handed to a new device as any kind's state. At a loss of its own it stops:
-//! it takes no later message, appends nothing to the key log and hands out no state, until it takes a state past the
-//! loss. A device certifies its sessions
-//! with its device key, and keeps the identity's key log in step with the group: its list of devices follows the
-//! group's members, and its key is replaced when a device leaves, and monthly.
+//! there, and whose settings carry the id of the identity's public log. A device certifies its sessions with its device
+//! key, and keeps the public log in step with the group: a device the latest entry lists appends the next whenever the
+//! group's members, their names or the group's name differ from it, and the latest again once it is half a year old.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use lmk_core::device::Device;
-use lmk_core::identity::{self, DAY, KeyLog, public};
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
 use lmk_proto::group::{Certificate, DEVICES, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
-use lmk_proto::identity::{Listed, certified};
 use lmk_proto::links::Invite;
+use lmk_proto::public::{Listed, certified};
 use n0_future::task::spawn;
-use n0_future::time::{Duration, sleep};
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 
-use crate::{Event, Item, Member, Node, hex, now};
+use crate::{Event, Node, now};
 
-/// How long an identity keeps a key before a device replaces it, in milliseconds.
-const ROTATE: u64 = 30 * DAY;
-/// How many half seconds a new device waits for its identity's state.
-const STATE_WAIT: u32 = 60;
+/// How old the latest entry of an identity's public log grows before a device appends it again, in milliseconds.
+const RESTATE: u64 = 182 * 24 * 60 * 60 * 1000;
 
-/// A devices group's state, as the group's log stands at `position`.
-#[derive(Clone, Serialize, Deserialize)]
-struct Book {
-    identity: IdentityRef,
-    name: String,
-    position: u64,
-    /// The identity's private keys, each with when it was made, in milliseconds, and the devices group's epoch then.
-    keys: Vec<(Bytes, u64, u64)>,
-    /// Fields a newer letmeknow added, kept when this device hands the state on.
-    #[serde(flatten)]
-    rest: Map<String, Value>,
-}
-
-impl Book {
-    /// The private key whose public key is `key`, and when it was made.
-    fn seed(&self, key: &[u8; 32]) -> Option<([u8; 32], u64)> {
-        self.keys.iter().find_map(|(seed, at, _)| {
-            let seed: [u8; 32] = seed.0.as_slice().try_into().ok()?;
-            (public(&seed) == *key).then_some((seed, *at))
-        })
-    }
-
-    /// Takes the keys of another state that this one lacks.
-    fn take_keys(&mut self, keys: Vec<(Bytes, u64, u64)>) {
-        for key in keys {
-            if !self.keys.iter().any(|(seed, ..)| *seed == key.0) {
-                self.keys.push(key);
-            }
-        }
-    }
-}
-
-/// What this device keeps of a devices group: its state, once it has one.
-#[derive(Default, Serialize, Deserialize)]
-struct Record {
-    book: Option<Book>,
-    /// The position of a message this device lost, where its state stopped.
-    stopped: Option<u64>,
-    /// A new key this device sent the group, by its public key, and its message's position, until the key log names it.
-    sent: Option<(Bytes, u64)>,
-}
-
-/// A held message of a devices group.
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Entry {
-    /// A new key of the identity, made in the group's epoch `epoch`.
-    Key { key: Bytes, at: u64, epoch: u64 },
-}
-
-/// A device that lacks its identity's current key asks the devices online for the group's state: the key it lacks, the
-/// devices it asked, by iroh key, those of them that have not answered, and whether it reported the key lost.
-struct Asked {
-    key: [u8; 32],
-    asked: Vec<Bytes>,
-    waiting: Vec<Bytes>,
-    reported: bool,
-}
+const NO_IDENTITY: &str = "this device is on no identity";
 
 /// Keeps the device, as when it is renamed: its `device.json`, or a browser's record.
 pub type Save = Arc<dyn Fn(&Device) -> Result<()> + Send + Sync>;
@@ -95,56 +29,32 @@ pub struct Devices<P> {
     node: Node<P>,
     device: Device,
     save: Save,
-    /// Held while a record is read and written back.
-    lock: Arc<Mutex<()>>,
     /// Held while a pass of the duties runs.
     passing: Arc<tokio::sync::Mutex<()>>,
-    /// By devices group.
-    asked: Arc<Mutex<HashMap<Vec<u8>, Asked>>>,
 }
 
 impl<P> Clone for Devices<P> {
     fn clone(&self) -> Self {
-        Devices {
-            node: self.node.clone(),
-            device: self.device.clone(),
-            save: self.save.clone(),
-            lock: self.lock.clone(),
-            passing: self.passing.clone(),
-            asked: self.asked.clone(),
-        }
+        Devices { node: self.node.clone(), device: self.device.clone(), save: self.save.clone(), passing: self.passing.clone() }
     }
-}
-
-fn record_key(gid: &[u8]) -> String {
-    format!("devices/{}", hex(gid))
 }
 
 impl<P: Provider + Send + 'static> Devices<P> {
     /// The devices kind on `node`, kept by `save`. Its duties run as each devices group's do (`Event::Duties`).
     pub fn new(node: Node<P>, device: Device, save: Save) -> Self {
-        Devices { node, device, save, lock: Arc::default(), passing: Arc::default(), asked: Arc::default() }
+        Devices { node, device, save, passing: Arc::default() }
     }
 
-    fn record(&self, gid: &[u8]) -> Record {
-        let record = self.node.record(&record_key(gid)).ok().flatten();
-        record.and_then(|record| serde_json::from_slice(&record).ok()).unwrap_or_default()
-    }
-
-    fn save(&self, gid: &[u8], record: &Record) -> Result<()> {
-        self.node.put_record(&record_key(gid), &serde_json::to_vec(record)?)
-    }
-
-    /// The devices group of this device's identity, once it made or joined one.
+    /// The devices group of this device's identity, once it made or joined one, until it leaves it.
     fn group(&self) -> Option<Bytes> {
-        self.node.groups().into_iter().find(|gid| self.node.settings(&gid.0).is_ok_and(|s| s.kind == DEVICES))
+        self.node.groups().into_iter().find(|gid| self.node.settings(&gid.0).is_ok_and(|s| s.kind == DEVICES) && !self.node.leaving(&gid.0))
     }
 
-    /// The devices group, with its state.
-    fn book(&self) -> Result<(Bytes, Book)> {
-        let gid = self.group().context("this device is on no identity")?;
-        let book = self.record(&gid.0).book.context("this device waits for its identity's state")?;
-        Ok((gid, book))
+    /// The devices group, and the identity it is of.
+    fn own(&self) -> Result<(Bytes, IdentityRef)> {
+        let gid = self.group().context(NO_IDENTITY)?;
+        let identity = self.identity_of(&gid.0).context("a devices group without a public log")?;
+        Ok((gid, identity))
     }
 
     /// This device's name.
@@ -152,95 +62,69 @@ impl<P: Provider + Send + 'static> Devices<P> {
         self.node.device_name()
     }
 
-    /// This device's identity, with its name, once this device has its state.
+    /// This device's identity, with its name.
     pub fn identity(&self) -> Option<(IdentityRef, String)> {
-        let (_, book) = self.book().ok()?;
-        Some((book.identity, book.name))
+        let (gid, identity) = self.own().ok()?;
+        Some((identity, self.node.settings(&gid.0).ok()?.name))
     }
 
     /// The identity's devices: their keys and names.
     pub fn devices(&self) -> Result<Vec<(Bytes, String)>> {
-        let (gid, _) = self.book()?;
+        let gid = self.group().context(NO_IDENTITY)?;
         Ok(self.node.members(&gid.0)?.into_iter().map(|m| (m.key, m.name)).collect())
     }
 
     /// This device's key on its identity.
     pub fn key(&self) -> Result<Bytes> {
-        Ok(self.node.key_in(&self.book()?.0.0))
+        Ok(self.node.key_in(&self.group().context(NO_IDENTITY)?.0))
     }
 
     /// Starts an identity, with this device its first, and its devices group.
     pub async fn create(&self, name: &str, membership: Service) -> Result<IdentityRef> {
         ensure!(self.group().is_none(), "this device is on an identity already: leave it first");
-        let settings = Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), carry: 7, update: UPDATE, membership: membership.clone(), rest: Default::default() };
-        let gid = self.node.create(settings, None)?;
-        let seed = lmk_core::random::<32>();
-        let device = Listed { key: self.node.key_in(&gid.0), name: self.device_name() };
-        let (id, entry) = identity::create(&seed, name, membership.clone(), device);
-        let identity = IdentityRef { id: id.into(), membership };
-        if let Err(error) = self.node.append_identity(&identity, &entry).await {
-            self.node.leave(&gid.0).await?;
-            return Err(error);
-        }
-        let book = Book {
-            identity: identity.clone(),
-            name: name.into(),
-            position: 0,
-            keys: vec![(Bytes(seed.to_vec()), now(), self.node.epoch(&gid.0)?)],
-            rest: Map::new(),
-        };
-        self.save(&gid.0, &Record { book: Some(book), stopped: None, sent: None })?;
-        self.node.follow_log(&gid.0, Some(0))?;
-        Ok(identity)
-    }
-
-    fn device_name(&self) -> String {
-        self.node.device_name().unwrap_or_default()
+        let settings =
+            Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), carry: 7, update: UPDATE, membership, public: None, rest: Default::default() };
+        self.node.create_identity(settings).await
     }
 
     /// A device link: whoever opens it becomes a device of the identity.
     pub async fn invite(&self) -> Result<String> {
-        let (gid, _) = self.book()?;
+        let gid = self.group().context(NO_IDENTITY)?;
         Ok(self.node.invite(&gid.0, None).await?.link())
     }
 
-    /// Joins an identity through a device link, with a new device key, and waits a while for its state.
+    /// Joins an identity through a device link, with a new device key. The identity's public log lists the device once a
+    /// device it lists runs its duties.
     pub async fn join(&self, link: &Invite) -> Result<()> {
         ensure!(link.device, "not a device link");
         ensure!(self.group().is_none(), "this device is on an identity already: leave it first");
         let (gid, _) = self.node.join(link, None).await?;
         ensure!(self.node.settings(&gid.0)?.kind == DEVICES, "the link led to a group, not an identity");
-        if self.record(&gid.0).book.is_none() {
-            self.node.follow_log(&gid.0, None)?;
-        }
-        for _ in 0..STATE_WAIT {
-            if self.record(&gid.0).book.is_some() {
-                break;
-            }
-            sleep(Duration::from_millis(500)).await;
-        }
         Ok(())
     }
 
-    /// Takes a device off the identity, then brings the identity's key log in step: a new key, and a list without it.
+    /// Takes a device off the identity, then lists the identity's devices without it.
     pub async fn remove(&self, device: &[u8]) -> Result<()> {
-        let (gid, _) = self.book()?;
+        let gid = self.group().context(NO_IDENTITY)?;
         ensure!(device != self.node.key_in(&gid.0).0, "to take this device off its identity, leave it");
         self.node.remove(&gid.0, device).await?;
         self.duties(&gid.0).await
     }
 
-    /// Takes this device off its identity: it asks the other devices to remove it, or, the identity's only device, ends
-    /// the identity. Returns whether it ended.
+    /// Takes this device off its identity. Listed on the identity's public log, it first lists the other devices, or as
+    /// the only one closes the log; then it asks the others to remove it, or, the only device, ends the identity. Returns
+    /// whether it ended.
     pub async fn leave(&self) -> Result<bool> {
-        let gid = self.group().context("this device is on no identity")?;
-        let ended = self.node.leave(&gid.0).await?.is_none();
-        let _lock = self.lock.lock().unwrap();
-        self.node.delete_record(&record_key(&gid.0))?;
-        Ok(ended)
+        let (gid, identity) = self.own()?;
+        let me = self.node.key_in(&gid.0);
+        if self.node.read_public(&identity).await?.writers.iter().any(|writer| writer.key == me) {
+            let others = self.node.members(&gid.0)?.into_iter().filter(|m| m.key != me).map(|m| Listed { key: m.key, name: m.name }).collect();
+            self.node.publish(&gid.0, others, &self.node.settings(&gid.0)?.name).await?;
+        }
+        Ok(self.node.leave(&gid.0).await?.is_none())
     }
 
-    /// Renames this device: its record, and its credential in its devices group, whose key log then lists it so.
+    /// Renames this device: its record, and its credential in its devices group, whose public log then lists it so.
     pub async fn rename(&self, name: &str) -> Result<()> {
         let mut device = self.device.clone();
         device.name = name.into();
@@ -262,94 +146,25 @@ impl<P: Provider + Send + 'static> Devices<P> {
         });
     }
 
-    /// The duties of a devices group, as its log and the identity's key log stand, each read afresh from its service:
-    /// the key log first, since a device's Add is in the group's log before any entry lists it. While devices the key log
-    /// took off are in the group, it waits for the group's duties to remove them, in one commit. A device that holds the identity's current key appends, chained to the key log's last entry,
-    /// one restating the list of devices when it differs from the group's members, with a new key when a device left;
-    /// and one with a new key when the current one is a month old. One that lacks the key asks for it.
+    /// The duties of a devices group, as it and the identity's public log stand, each read afresh: a device the latest
+    /// entry lists appends the next, listing the group's members by their names under the group's name, when that
+    /// differs from the latest, and the latest again once it is `RESTATE` old.
     pub async fn duties(&self, gid: &[u8]) -> Result<()> {
         let _passing = self.passing.lock().await;
-        let Some(book) = self.record(gid).book else { return Ok(()) };
-        let log = self.node.read_key_log(&book.identity).await?;
-        if self.record(gid).sent.is_some_and(|(key, _)| log.keys.iter().any(|named| named[..] == key.0[..])) {
-            let _lock = self.lock.lock().unwrap();
-            let mut record = self.record(gid);
-            record.sent = None;
-            self.save(gid, &record)?;
-        }
+        let Some(identity) = self.identity_of(gid) else { return Ok(()) };
+        let latest = self.node.read_public(&identity).await?;
         self.node.read_group(gid).await?;
-        let members = self.node.members(gid)?;
-        if members.iter().any(|m| log.dropped(&m.key.0)) {
+        let me = self.node.key_in(gid);
+        if !latest.writers.iter().any(|writer| writer.key == me) {
             return Ok(());
         }
-        let Some(book) = self.record(gid).book.filter(|_| self.record(gid).stopped.is_none()) else { return Ok(()) };
-        let Some((seed, at)) = book.seed(log.current()) else { return self.missing(gid, &log) };
-        self.asked.lock().unwrap().remove(gid);
-        let mut listed: Vec<Listed> = members.into_iter().map(|m| Listed { key: m.key, name: m.name }).collect();
+        let mut writers: Vec<Listed> = self.node.members(gid)?.into_iter().map(|m| Listed { key: m.key, name: m.name }).collect();
+        writers.sort();
+        let mut listed = latest.writers.clone();
         listed.sort();
-        let mut current = log.devices.clone();
-        current.sort();
-        let left = current.iter().any(|device| !listed.iter().any(|member| member.key == device.key));
-        let due = at + ROTATE <= now();
-        if listed == current && !due {
-            return Ok(());
-        }
-        let (next, sent) = if left || due { self.new_key(gid, &book, &log).await? } else { (*log.current(), None) };
-        // A new key this device made is named only once another device holds it, unless no other device is listed.
-        let me = self.node.key_in(gid);
-        let sent = sent.or_else(|| self.record(gid).sent.filter(|(key, _)| key.0[..] == next[..]).map(|(_, position)| position));
-        if let Some(position) = sent
-            && listed.iter().any(|device| device.key != me)
-            && !self.held(gid, position)?
-        {
-            return Ok(());
-        }
-        self.node.append_identity(&book.identity, &log.next(&seed, &next, listed)).await?;
-        Ok(())
-    }
-
-    /// A key the key log has not taken, made in the group's current epoch, so that no device removed before it holds
-    /// it: one this device or another made already, or else a new one, sent to the group first, with its message's
-    /// position.
-    async fn new_key(&self, gid: &[u8], book: &Book, log: &KeyLog) -> Result<([u8; 32], Option<u64>)> {
-        let epoch = self.node.epoch(gid)?;
-        let made = book.keys.iter().filter(|(_, _, made)| *made == epoch).filter_map(|(seed, ..)| Some(public(seed.0.as_slice().try_into().ok()?)));
-        if let Some(key) = made.into_iter().find(|key| !log.keys.contains(key)) {
-            return Ok((key, None));
-        }
-        let seed = lmk_core::random::<32>();
-        let position = self.node.send_counted(gid, &serde_json::to_value(Entry::Key { key: Bytes(seed.to_vec()), at: now(), epoch })?).await?;
-        Ok((public(&seed), Some(position)))
-    }
-
-    /// Whether another device's summary holds the message at `position`.
-    fn held(&self, gid: &[u8], position: u64) -> Result<bool> {
-        let me = self.node.key_in(gid);
-        Ok(self.node.heard(gid)?.iter().any(|heard| heard.member.key != me && heard.held.contains(position)))
-    }
-
-    /// This device lacks the key the key log names: it asks each device online for the group's state, which carries the
-    /// keys; once, after its first pass for that key, every device it asked answered without it, or it asked none, it
-    /// reports the key lost or taken.
-    fn missing(&self, gid: &[u8], log: &KeyLog) -> Result<()> {
-        let online: Vec<Bytes> = self.node.online(gid)?.into_iter().map(|m| m.iroh).collect();
-        let mut all = self.asked.lock().unwrap();
-        let first = all.get(gid).is_none_or(|asked| asked.key != *log.current());
-        if first {
-            all.insert(gid.to_vec(), Asked { key: *log.current(), asked: Vec::new(), waiting: Vec::new(), reported: false });
-        }
-        let asked = all.get_mut(gid).unwrap();
-        let new: Vec<Bytes> = online.into_iter().filter(|peer| !asked.asked.contains(peer)).collect();
-        for peer in new {
-            self.node.ask_state(gid, &peer.0)?;
-            asked.asked.push(peer.clone());
-            asked.waiting.push(peer);
-        }
-        if !first && asked.waiting.is_empty() && !asked.reported {
-            asked.reported = true;
-            let text = "this device does not hold its identity's current key, and no device online has it: it was lost, or someone \
-                        took the identity over; start a new identity";
-            self.node.warn(gid, text.into());
+        let name = self.node.settings(gid)?.name;
+        if writers != listed || name != latest.name || latest.at + RESTATE <= now() {
+            self.node.publish(gid, writers, &name).await?;
         }
         Ok(())
     }
@@ -357,128 +172,41 @@ impl<P: Provider + Send + 'static> Devices<P> {
     /// A certificate that the session with MLS key `key` is one of this device's, speaking as the identity: by this
     /// device's key on it.
     pub fn certify(&self, key: &[u8]) -> Result<Certificate> {
-        let (gid, book) = self.book()?;
-        let sig = self.node.sign(&gid.0, &certified(key, &book.identity.id.0))?;
-        Ok(Certificate { identity: book.identity, device: self.node.key_in(&gid.0), sig: Bytes(sig) })
+        let (gid, identity) = self.own()?;
+        let sig = self.node.sign(&gid.0, &certified(key, &identity.id.0))?;
+        Ok(Certificate { identity, device: self.node.key_in(&gid.0), sig: Bytes(sig) })
     }
 
-    /// The identity whose devices group `gid` is, once this device has its state.
+    /// The identity whose devices group `gid` is.
     pub fn identity_of(&self, gid: &[u8]) -> Option<IdentityRef> {
-        Some(self.record(gid).book?.identity)
+        let settings = self.node.settings(gid).ok().filter(|settings| settings.kind == DEVICES)?;
+        Some(IdentityRef { id: settings.public?, membership: settings.membership })
     }
 
     /// Takes the events of devices groups, but for their members joining and leaving and warnings; returns every other
-    /// event. Its duties run as the group's do, and as the identity's key log moves.
+    /// event. Its duties run as the group's do, and as the identity's public log moves.
     pub fn on(&self, event: Event) -> Option<Event> {
-        if let Event::Keys { identity } = &event {
-            if let Ok((gid, book)) = self.book()
-                && book.identity.id == *identity
+        if let Event::Public { identity } = &event {
+            if let Ok((gid, own)) = self.own()
+                && own.id == *identity
             {
                 self.due(&gid.0);
             }
             return Some(event);
         }
+        if let Event::Removed { kind, .. } = &event {
+            return (kind != DEVICES).then_some(event);
+        }
         let Some(gid) = event.group().cloned() else { return Some(event) };
-        let ours = self.node.settings(&gid.0).is_ok_and(|s| s.kind == DEVICES) || self.node.record(&record_key(&gid.0)).ok().flatten().is_some();
-        if !ours {
+        if self.identity_of(&gid.0).is_none() {
             return Some(event);
         }
-        let taken = match event {
-            Event::State { data, from, .. } => self.take_state(&gid.0, &from, &data),
-            Event::Logged { .. } => self.logged(&gid.0),
-            Event::Snapshot { reply, .. } => {
-                let record = self.record(&gid.0);
-                let book = record.book.filter(|_| record.stopped.is_none()).map(|book| serde_json::to_vec(&book).expect("JSON"));
-                reply.send(book).ok();
-                Ok(())
-            }
-            Event::Removed { .. } => {
-                self.asked.lock().unwrap().remove(&gid.0);
-                self.node.delete_record(&record_key(&gid.0))
-            }
-            Event::Duties { .. } => {
-                self.due(&gid.0);
-                Ok(())
-            }
-            Event::Heard { .. } => {
-                if self.record(&gid.0).sent.is_some_and(|(_, position)| self.held(&gid.0, position).unwrap_or(false)) {
-                    self.due(&gid.0);
-                }
-                Ok(())
-            }
+        match event {
+            Event::Snapshot { reply, .. } => _ = reply.send(None),
+            Event::Duties { .. } => self.due(&gid.0),
             Event::Joined { .. } | Event::Left { .. } | Event::Warning { .. } => return Some(event),
-            _ => Ok(()),
-        };
-        taken.err().map(|error| Event::Warning { group: Some(gid), text: format!("{error:#}") })
-    }
-
-    /// Takes a state another device handed this one, unless it is older than its own, or than the loss it stopped at;
-    /// the keys it carries this device takes whatever its age.
-    fn take_state(&self, gid: &[u8], from: &Member, data: &[u8]) -> Result<()> {
-        let mut handed: Book = serde_json::from_slice(data)?;
-        {
-            let _lock = self.lock.lock().unwrap();
-            let mut record = self.record(gid);
-            let stopped = record.stopped.is_some_and(|lost| handed.position < lost);
-            match &mut record.book {
-                Some(held) if held.position > handed.position || stopped => held.take_keys(handed.keys),
-                held => {
-                    record.stopped = None;
-                    if let Some(held) = held.take() {
-                        handed.take_keys(held.keys);
-                    }
-                    let position = handed.position;
-                    record.book = Some(handed);
-                    self.node.follow_log(gid, Some(position))?;
-                }
-            }
-            self.save(gid, &record)?;
+            _ => {}
         }
-        if let Some(asked) = self.asked.lock().unwrap().get_mut(gid) {
-            asked.waiting.retain(|peer| *peer != from.iroh);
-        }
-        self.due(gid);
-        Ok(())
-    }
-
-    /// Applies the group's held messages taken since the state, up to a loss of this device's own, where it stops and
-    /// asks for a state.
-    fn logged(&self, gid: &[u8]) -> Result<()> {
-        let _lock = self.lock.lock().unwrap();
-        let mut record = self.record(gid);
-        let Some(book) = record.book.as_mut().filter(|_| record.stopped.is_none()) else { return Ok(()) };
-        let me = self.node.key_in(gid);
-        for item in self.node.entries(gid, book.position)? {
-            let entry = match item {
-                Item::Lost(lost) if lost.member.key == me => {
-                    record.stopped = Some(lost.position);
-                    break;
-                }
-                Item::Lost(lost) => {
-                    book.position = lost.position;
-                    continue;
-                }
-                Item::Entry(entry) => entry,
-            };
-            book.position = entry.position;
-            match serde_json::from_value(entry.payload) {
-                Ok(Entry::Key { key, at, epoch }) => {
-                    if entry.from.key == me
-                        && let Ok(seed) = key.0.as_slice().try_into()
-                    {
-                        record.sent = Some((Bytes(public(&seed).to_vec()), entry.position));
-                    }
-                    book.take_keys(vec![(key, at, epoch)]);
-                }
-                Err(error) => tracing::debug!("skipped an entry of a devices group: {error:#}"),
-            }
-        }
-        let position = book.position;
-        self.save(gid, &record)?;
-        self.node.follow_log(gid, Some(position))?;
-        let Some(lost) = record.stopped else { return Ok(()) };
-        let text = format!("this device lost the message at position {lost} of its identity's devices group: it waits for a device's state past it");
-        self.node.warn(gid, text);
-        self.node.follow_log(gid, None)
+        None
     }
 }

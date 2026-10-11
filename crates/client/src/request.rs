@@ -106,7 +106,7 @@ pub enum IdentityOp {
     /// Start an identity with this device as its first device; a device is on one identity at a time
     Create {
         name: String,
-        /// The membership service that keeps its key log [default: listen's]
+        /// The membership service that keeps its public log [default: listen's]
         #[cfg_attr(feature = "clap", arg(long))]
         membership: Option<String>,
     },
@@ -119,7 +119,7 @@ pub enum IdentityOp {
     },
     /// This device's identity, and its devices
     List,
-    /// Take another device, by key or name, off the identity, whose key is then replaced
+    /// Take another device, by key or name, off the identity, whose public log then lists the others
     Remove { device: String },
     /// Take this device off its identity: its sessions leave the groups they are in as it first; the identity ends if this is its only device
     Leave,

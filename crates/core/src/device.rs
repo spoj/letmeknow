@@ -1,6 +1,6 @@
 //! The device, kept in `device.json`: its name. Its key in each identity's devices group is that group's own.
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use openmls::prelude::SignatureScheme;
 use openmls_basic_credential::SignatureKeyPair;
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,17 @@ impl Device {
 
 /// A device key, a 32-byte Ed25519 seed, as an MLS signature key.
 pub fn signer(seed: &[u8; 32]) -> SignatureKeyPair {
-    SignatureKeyPair::from_raw(SignatureScheme::ED25519, seed.to_vec(), crate::identity::public(seed).to_vec())
+    SignatureKeyPair::from_raw(SignatureScheme::ED25519, seed.to_vec(), public(seed).to_vec())
+}
+
+/// An Ed25519 public key from its private one, a 32-byte seed.
+pub fn public(seed: &[u8; 32]) -> [u8; 32] {
+    SigningKey::from_bytes(seed).verifying_key().to_bytes()
+}
+
+/// A signature by `seed` over `bytes`.
+pub fn sign(seed: &[u8; 32], bytes: &[u8]) -> Vec<u8> {
+    SigningKey::from_bytes(seed).sign(bytes).to_bytes().to_vec()
 }
 
 /// Checks an Ed25519 signature by `key` over `context` ‖ `bytes`.

@@ -1,5 +1,5 @@
 //! One member's session over lmk-core, lmk-net and lmk-membership: its groups and their logs, its held messages and
-//! files, the invites it shares and the joiners it admits, and its members' identities: their key logs, against which
+//! files, the invites it shares and the joiners it admits, and its members' identities: their public logs, against which
 //! their credentials' certificates are checked. A group's kind sees its content through the channels here (held
 //! messages in log order, live ones, files, and a state link for joiners), and nothing of the rest; the core reads only
 //! its own payloads (`Control`). The devices kind (`devices`) is built on those channels. It stores everything through
@@ -29,11 +29,11 @@ use iroh::tls::CaTlsConfig;
 use iroh::{EndpointId, RelayUrl, SecretKey};
 use lmk_core::device::{Device, signer};
 use lmk_core::group::{self as core, Group, Session};
-use lmk_core::identity::{KeyLog, Verdict};
+use lmk_core::public::{PublicLog, Verdict};
 use lmk_core::provider::Provider;
 use lmk_net::peers::{self, Peers};
 use lmk_net::Net;
-use lmk_proto::group::{Certificate, Credential, DEVICES, How, IdentityRef, Settings};
+use lmk_proto::group::{Certificate, Credential, How, IdentityRef, Settings};
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::Frame;
 use lmk_proto::ranges::Ranges;
@@ -112,18 +112,18 @@ pub struct Member {
     pub revision: u32,
     /// Its credential's name: its device's name in a devices group, and in any other its session's handle.
     pub name: String,
-    /// The name of its device, as its identity's key log lists it.
+    /// The name of its device, as its identity's public log lists it.
     pub device_name: String,
     pub identity: Option<Claim>,
     /// Who added it, by session key, and how; none for the group's creator and this session.
     pub added: Option<(Bytes, How)>,
 }
 
-/// The identity a member speaks as, its certificate checked against the identity's key log.
+/// The identity a member speaks as, its certificate checked against the identity's public log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub identity: IdentityRef,
-    /// The identity's own name, from its key log: a claim.
+    /// The identity's own name, from its public log: a claim.
     pub name: String,
     /// Why it is not verified, if it is not: its device is not on the identity's list.
     pub error: Option<String>,
@@ -217,7 +217,7 @@ pub enum Event {
         member: Member,
         by: Member,
     },
-    /// This session's commit removed members whose devices their identities' key logs dropped. `added`: the members
+    /// This session's commit removed members whose devices their identities' public logs dropped. `added`: the members
     /// still in the group that they added, or that came in by invites they made, which only a member's `remove` takes out.
     Revoked {
         group: Bytes,
@@ -225,10 +225,11 @@ pub enum Event {
         added: Vec<Member>,
     },
     /// This session was removed, by `by` as it applied the commit, or else with no `by`: by a commit applied before it
-    /// stopped, left the only member of a group it asked to leave, or away past its log's retention. The group is gone
-    /// from it.
+    /// stopped, left the only member of a group it asked to leave, or away past its log's retention. The group, of kind
+    /// `kind`, is gone from it.
     Removed {
         group: Bytes,
+        kind: String,
         by: Option<Member>,
     },
     Settings {
@@ -282,8 +283,8 @@ pub enum Event {
     },
     /// A file is held whole.
     File([u8; 32]),
-    /// An identity's key log grew, as this session read it.
-    Keys { identity: Bytes },
+    /// An identity's public log grew, as this session read it.
+    Public { identity: Bytes },
     /// A pass of a devices group's duties ran: the devices kind runs its own.
     Duties {
         group: Bytes,
@@ -314,7 +315,7 @@ impl Event {
             Event::Message(message) => Some(&message.group),
             Event::Lost(lost) => Some(&lost.group),
             Event::Warning { group, .. } => group.as_ref(),
-            Event::File(_) | Event::Keys { .. } => None,
+            Event::File(_) | Event::Public { .. } => None,
         }
     }
 }
@@ -407,13 +408,13 @@ pub(crate) struct G {
     waiting: bool,
     /// Each peer's latest summary of the group, by its iroh key, as saved.
     heard: BTreeMap<Bytes, peers::Heard>,
-    /// The key logs this session follows of the identities the group's members speak as.
-    keys: Vec<Vec<u8>>,
+    /// The public logs this session follows of the identities the group's members speak as.
+    public: Vec<Vec<u8>>,
 }
 
 impl G {
     fn new(mls: Group, rec: Rec, heard: BTreeMap<Bytes, peers::Heard>) -> Self {
-        G { mls, rec, early: Vec::new(), asked: 0, waiting: false, heard, keys: Vec::new() }
+        G { mls, rec, early: Vec::new(), asked: 0, waiting: false, heard, public: Vec::new() }
     }
 
     /// Whether the member with key `key` asked to leave: a `leave` of its counts, sealed since its Add.
@@ -437,9 +438,9 @@ pub(crate) struct State<P> {
     groups: BTreeMap<Vec<u8>, G>,
     /// The logs this session follows, by id.
     logs: BTreeMap<Vec<u8>, logs::Log>,
-    /// Key logs, by identity id.
-    keys: BTreeMap<Vec<u8>, KeyLog>,
-    /// The identities and devices this session read a key log again for, as members' certificates named devices it
+    /// Public logs, by id.
+    public: BTreeMap<Vec<u8>, PublicLog>,
+    /// The identities and devices this session read a public log again for, as members' certificates named devices it
     /// did not list.
     unlisted: HashSet<(Vec<u8>, Vec<u8>)>,
     /// In each devices group, this node's own key there, the device's key on that identity: its seed, and the member.
@@ -449,7 +450,7 @@ pub(crate) struct State<P> {
     peers: Peers,
     /// The peers connected now, and the groups the gate admits each to.
     served: BTreeMap<EndpointId, BTreeSet<Bytes>>,
-    /// The rosters or the key logs changed since `served` was worked out.
+    /// The rosters or the public logs changed since `served` was worked out.
     gate: bool,
     /// The latest time a step saw, in milliseconds: `Peers` takes no time from before.
     time: u64,
@@ -589,10 +590,6 @@ fn rec_key(gid: &[u8]) -> Vec<u8> {
     [b"node/group/".as_slice(), gid].concat()
 }
 
-fn kind_key(key: &str) -> Vec<u8> {
-    [b"kind/", key.as_bytes()].concat()
-}
-
 fn message_key(id: &[u8]) -> Vec<u8> {
     [b"node/message/".as_slice(), id].concat()
 }
@@ -679,8 +676,8 @@ impl<P: Provider> State<P> {
     /// The identity a member speaks as, checked; and its device's name, if its identity lists the device.
     fn claim(&self, credential: &Credential, identity: &IdentityRef) -> (Claim, Option<String>) {
         let identity = identity.clone();
-        let Some(log) = self.keys.get(&identity.id.0) else {
-            let error = Some("its identity's key log could not be read yet".into());
+        let Some(log) = self.public.get(&identity.id.0) else {
+            let error = Some("its identity's public log could not be read yet".into());
             return (Claim { identity, name: String::new(), error }, None);
         };
         let name = log.name.clone();
@@ -728,25 +725,14 @@ impl<P: Provider> State<P> {
         let Some((credential, identity)) = member.credential.as_ref().and_then(|c| Some((c, c.identity()?))) else {
             return true;
         };
-        let log = self.keys.get(&identity.id.0);
+        let log = self.public.get(&identity.id.0);
         log.is_some_and(|log| matches!(log.verify(credential), Verdict::Verified { .. }))
     }
 
-    /// The connected peers in a leaf of the group the gate cannot check yet: their identities' key logs are unread.
+    /// The connected peers in a leaf of the group the gate cannot check yet: their identities' public logs are unread.
     fn undecided(&self, gid: &[u8]) -> BTreeSet<[u8; 32]> {
-        let unread = |member: core::Member| member.credential?.identity().is_some_and(|identity| !self.keys.contains_key(&identity.id.0)).then_some(());
+        let unread = |member: core::Member| member.credential?.identity().is_some_and(|identity| !self.public.contains_key(&identity.id.0)).then_some(());
         self.served.keys().filter(|peer| self.in_leaf(gid, peer).and_then(unread).is_some()).map(|peer| *peer.as_bytes()).collect()
-    }
-
-    /// The key log of the identity a devices group is of, once it lists this node's device key there or dropped it: device
-    /// keys are made anew for each identity, so no other key log names it.
-    fn devices_log(&self, gid: &[u8]) -> Option<&KeyLog> {
-        let g = self.groups.get(gid)?;
-        if g.mls.settings().kind != DEVICES {
-            return None;
-        }
-        let me = self.me(gid);
-        self.keys.values().find(|log| log.devices.iter().any(|device| device.key.0 == me) || log.dropped(me))
     }
 
     /// The identities a group's members speak as.

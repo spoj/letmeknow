@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, RelayUrl};
 use lmk_core::group::{Change, Group, key_package_credential, key_package_leaf};
-use lmk_core::identity::Verdict;
+use lmk_core::public::Verdict;
 use lmk_core::provider::Provider;
 use lmk_net::Admit;
 use lmk_proto::entry::Entry;
@@ -196,7 +196,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             gid
         };
-        // The members' key logs first, which the gate needs to take their summaries, before the log's commits apply.
+        // The members' public logs first, which the gate needs to take their summaries, before the log's commits apply.
         self.refresh_all().await;
         self.dial_all();
         if let Err(error) = self.read(&gid).await {
@@ -246,10 +246,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
             return self.admitted(&gid, welcome, position).await;
         }
         admits(self.lock().group(&gid)?, &joiner, &rule)?;
-        // Its identity's key log, read afresh, must list the device that certified it.
+        // Its identity's public log, read afresh, must list the device that certified it.
         if let Some(to) = &rule.to {
             let identity = joiner.identity().filter(|identity| identity.id == *to).context(FOR_ANOTHER)?;
-            match self.read_keys(identity).await?.verify(&joiner) {
+            match self.read_public(identity).await?.verify(&joiner) {
                 Verdict::Verified { .. } => {}
                 Verdict::Unverified => bail!("its device is not on its identity's list"),
                 Verdict::Dropped => bail!("its device was taken off its identity"),

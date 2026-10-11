@@ -40,8 +40,8 @@ pub struct Own {
     pub read: Ranges,
     /// The counted positions since its start, within H, that it lacks.
     pub lacking: Ranges,
-    /// The heads of the key logs of the group's members' identities.
-    pub keys: Vec<Head>,
+    /// The heads of the public logs of the group's members' identities.
+    pub public: Vec<Head>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,7 +148,7 @@ impl Peers {
             g.progress = now;
         }
         let o = &g.own;
-        if (o.head.length, &o.held, &o.read, &o.keys) != (own.head.length, &own.held, &own.read, &own.keys) {
+        if (o.head.length, &o.held, &o.read, &o.public) != (own.head.length, &own.held, &own.read, &own.public) {
             g.dirty = true;
             self.changed.get_or_insert(now);
         }
@@ -321,7 +321,7 @@ impl Peers {
         for (key, c) in &mut self.conns {
             let served: Vec<(&Bytes, &Group)> = c.served.iter().filter_map(|id| Some((id, self.groups.get(id)?))).collect();
             for (_, g) in &served {
-                for head in std::iter::once(&g.own.head).chain(&g.own.keys) {
+                for head in std::iter::once(&g.own.head).chain(&g.own.public) {
                     if let Some(theirs) = c.theirs.get_mut(&head.log)
                         && *theirs < head.length
                     {
@@ -332,7 +332,7 @@ impl Peers {
             }
             let send: Vec<&(&Bytes, &Group)> = served.iter().filter(|(id, g)| periodic || c.full || c.opened.contains(*id) || due && g.dirty).collect();
             if !send.is_empty() {
-                let mut heads: Vec<Head> = send.iter().flat_map(|(_, g)| g.own.keys.iter().cloned()).collect();
+                let mut heads: Vec<Head> = send.iter().flat_map(|(_, g)| g.own.public.iter().cloned()).collect();
                 heads.sort_by(|a, b| a.log.cmp(&b.log));
                 heads.dedup_by(|a, b| a.log == b.log);
                 let groups = send.iter().map(|(id, g)| summary(id, g)).collect();

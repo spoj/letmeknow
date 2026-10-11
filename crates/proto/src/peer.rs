@@ -8,7 +8,7 @@ use crate::{Bytes, head::Head, ranges::Ranges};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Frame {
-    /// The sender's summaries of groups, and the heads of the key logs their members follow.
+    /// The sender's summaries of groups, and the heads of the public logs their members follow.
     Hello { groups: Vec<Summary>, heads: Vec<Head> },
     /// Entries of a log the other lacks, ending at `head`.
     Entries { log: Bytes, entries: Vec<Bytes>, head: Head },

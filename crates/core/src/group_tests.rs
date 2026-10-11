@@ -18,6 +18,7 @@ pub(crate) fn settings(name: &str) -> Settings {
         carry: 7,
         update: lmk_proto::group::UPDATE,
         membership: service("https://lmk.example"),
+        public: None,
         rest: Default::default(),
     }
 }
@@ -668,13 +669,14 @@ fn rules_bind_everyone() {
 
 #[test]
 fn credentials_are_checked_not_enforced() {
-    use crate::identity::{KeyLog, Verdict, create, public, sign};
+    use crate::device::{public, sign};
+    use crate::public::{PublicLog, Verdict, create};
     use lmk_proto::group::{Certificate, IdentityRef};
-    use lmk_proto::identity::{Listed, certified};
+    use lmk_proto::public::{Listed, certified};
     let mut w = World::new(&["A", "M"]);
-    let (seed, laptop) = (crate::random(), crate::random());
-    let (id, first) = create(&seed, "Alice", service("https://lmk.example"), Listed { key: public(&laptop).into(), name: "laptop".into() });
-    let log = KeyLog::replay(&id, [first.as_slice()]).unwrap();
+    let laptop = crate::random();
+    let (id, first) = create(&laptop, "Alice", service("https://lmk.example"), Listed { key: public(&laptop).into(), name: "laptop".into() }, 1);
+    let log = PublicLog::replay(&id, [first.as_slice()]).unwrap();
     let identity = IdentityRef { id: id.into(), membership: service("https://lmk.example") };
     // A speaks as Alice, certified by her laptop; M claims her identity with A's certificate.
     let sig = Bytes(sign(&laptop, &certified(&w.m[0].session.credential.key.0, &id)));

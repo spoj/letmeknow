@@ -688,7 +688,7 @@ impl Lmk {
     /// A new chat, doc or git repository, speaking as this browser's identity; returns its id.
     pub async fn create(&self, kind: String, name: String) -> R<String> {
         let app = &self.app;
-        let settings = Settings { protocol: PROTOCOL, kind, name, carry: 7, update: lmk_proto::group::UPDATE, membership: app.membership.clone(), rest: Default::default() };
+        let settings = Settings { protocol: PROTOCOL, kind, name, carry: 7, update: lmk_proto::group::UPDATE, public: None, membership: app.membership.clone(), rest: Default::default() };
         let (gid, _) = app.client.create(settings, (Vec::new(), String::new())).await.map_err(js)?;
         app.remember_settings(&gid.0).map_err(js)?;
         app.flush();

@@ -432,7 +432,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             Some(group) => self.resolve(Some(group))?,
             None => {
                 let membership = membership.map(|m| service(&m)).transpose()?.unwrap_or(self.inner.config.membership.clone());
-                let settings = Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), carry, update: UPDATE, membership, rest: Default::default() };
+                let settings = Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), carry, update: UPDATE, membership, public: None, rest: Default::default() };
                 let (gid, opened) = self.create(settings, args).await?;
                 merge(&mut answer, opened);
                 gid
@@ -825,8 +825,8 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let (removed, added) = (removed.iter().map(|m| describer.describe(m)).collect(), added.iter().map(|m| describer.describe(m)).collect());
                 self.emit(ClientEvent::Revoked { group, removed, added });
             }
-            Event::Keys { .. } | Event::Duties { .. } => {}
-            Event::Removed { group, by } => {
+            Event::Public { .. } | Event::Duties { .. } => {}
+            Event::Removed { group, by, .. } => {
                 let by = by.map(|by| self.describe(&group, &by)).transpose()?;
                 self.drop_group(&group).await?;
                 self.emit(ClientEvent::Removed { group, by });
@@ -947,17 +947,13 @@ impl<P: Provider + Send + 'static> Client<P> {
     /// Takes this device off its identity, once this client left the groups it speaks as it in, as the device's node
     /// leaves those of its own client.
     async fn leave_identity(&self) -> Result<Value> {
-        // None while the device waits for its identity's state, when no session speaks as it.
-        let identity = self.device_state()?.identity.map(|(identity, _)| identity.id);
-        let left = match &identity {
-            Some(identity) => self.leave_as(identity).await?,
-            None => Vec::new(),
-        };
+        let (identity, _) = self.device_state()?.identity.context(NO_IDENTITY)?;
+        let left = self.leave_as(&identity.id).await?;
         let ended = match self.access() {
             Access::Here(devices) => devices.leave().await?,
             Access::Elsewhere(remote) => remote.request(Request::Identity { op: IdentityOp::Leave }).await?["ended"] == true,
         };
-        Ok(json!({ "identity": identity, "left": left, "ended": ended }))
+        Ok(json!({ "identity": identity.id, "left": left, "ended": ended }))
     }
 
     /// Leaves the groups this client speaks as an identity in; returns them.
@@ -1015,8 +1011,8 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let listed = devices.devices()?;
                 let (key, _) = listed.iter().find(|(key, name)| b64(&key.0) == removed || *name == removed).context("no such device")?;
                 devices.remove(&key.0).await?;
-                // This client's groups lose the device's sessions too, once it shows them the new key.
-                self.inner.node.read_key_log(&identity).await?;
+                // This client's groups lose the device's sessions too, once its node reads the log without the device.
+                self.inner.node.read_public(&identity).await?;
                 Ok(json!({ "identity": identity.id, "removed": key }))
             }
         }

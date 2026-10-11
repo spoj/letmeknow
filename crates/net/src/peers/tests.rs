@@ -23,7 +23,7 @@ fn served(groups: &[u8]) -> BTreeSet<Bytes> {
 }
 
 fn own(group: u8, length: u64, held: Ranges, lacking: Ranges) -> Own {
-    Own { head: head(group, length), held, read: Ranges::default(), lacking, keys: vec![] }
+    Own { head: head(group, length), held, read: Ranges::default(), lacking, public: vec![] }
 }
 
 fn summary(group: u8, length: u64, held: Ranges, fetching: Ranges) -> Summary {
@@ -68,8 +68,8 @@ fn member(lacking: Ranges) -> Peers {
 #[test]
 fn hello_on_connect_carries_every_served_group_and_their_key_heads() {
     let mut p = Peers::new(0);
-    for (g, keys) in [(1, vec![head(100, 3)]), (2, vec![head(100, 3), head(101, 1)]), (3, vec![head(102, 1)])] {
-        p.group(id(g), Own { keys, ..own(g, 5, r(&[(1, 5)]), Ranges::default()) }, 0);
+    for (g, public) in [(1, vec![head(100, 3)]), (2, vec![head(100, 3), head(101, 1)]), (3, vec![head(102, 1)])] {
+        p.group(id(g), Own { public, ..own(g, 5, r(&[(1, 5)]), Ranges::default()) }, 0);
     }
     p.poll(DEBOUNCE);
     p.connect(key(1), served(&[1, 2]), DEBOUNCE);
@@ -287,14 +287,14 @@ fn a_member_comes_online_as_it_connects_after_none() {
 #[test]
 fn entries_go_once_to_a_peer_whose_head_is_shorter() {
     let mut p = Peers::new(0);
-    p.group(id(G), Own { keys: vec![head(100, 4)], ..own(G, 10, r(&[(1, 10)]), Ranges::default()) }, 0);
+    p.group(id(G), Own { public: vec![head(100, 4)], ..own(G, 10, r(&[(1, 10)]), Ranges::default()) }, 0);
     p.connect(key(1), served(&[G]), 0);
     p.poll(0);
     p.frame(&key(1), &Frame::Hello { groups: vec![summary(G, 6, r(&[(1, 6)]), Ranges::default())], heads: vec![head(100, 2)] }, 100);
     let entries: Vec<Out> = p.poll(100).into_iter().filter(|o| matches!(o, Out::Entries { .. })).collect();
     assert_eq!(entries, vec![Out::Entries { peer: key(1), log: id(G), after: 6 }, Out::Entries { peer: key(1), log: id(100), after: 2 }]);
     assert!(p.poll(200).iter().all(|o| !matches!(o, Out::Entries { .. })));
-    p.group(id(G), Own { keys: vec![head(100, 4)], ..own(G, 11, r(&[(1, 11)]), Ranges::default()) }, 300);
+    p.group(id(G), Own { public: vec![head(100, 4)], ..own(G, 11, r(&[(1, 11)]), Ranges::default()) }, 300);
     assert_eq!(p.poll(300), vec![Out::Entries { peer: key(1), log: id(G), after: 10 }]);
 }
 

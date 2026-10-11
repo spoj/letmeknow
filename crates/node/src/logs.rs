@@ -1,5 +1,5 @@
-//! Every log this session follows, alike: a group's log of commits and held messages' entries, and the key logs of the
-//! identities its groups' members speak as. Each is read from its membership service, chained, held entry
+//! Every log this session follows, alike: a group's log of commits and held messages' entries, and the public logs of
+//! the identities its groups' members speak as. Each is read from its membership service, chained, held entry
 //! by entry, shown to peers by its newest signed head and caught up from them; what its entries mean is its log type's
 //! (`Of`), to which `Inner::check` hands them once held.
 
@@ -17,7 +17,7 @@ use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep, timeout};
 use serde::{Deserialize, Serialize};
 
-use lmk_core::identity::{KeyLog, Verdict};
+use lmk_core::public::{PublicLog, Verdict};
 use lmk_proto::group::IdentityRef;
 
 use crate::{Event, Inner, MEMBER_WAIT, REREAD, State, SUBSCRIBED, Work, get, hex, put};
@@ -52,8 +52,8 @@ impl Clients {
 pub(crate) enum Of {
     /// A group's commits and held messages' entries; the log's id is the group's.
     Group,
-    /// An identity's key log.
-    Identity(Bytes),
+    /// A public log, by its id: an identity's, by the identity's.
+    Public(Bytes),
 }
 
 /// What this session holds of a log.
@@ -140,8 +140,10 @@ impl<P: Provider> State<P> {
     pub(crate) fn groups_of(&self, id: &[u8]) -> Vec<Vec<u8>> {
         match self.logs.get(id).map(|log| &log.of) {
             Some(Of::Group) => vec![id.to_vec()],
-            Some(Of::Identity(identity)) => {
-                let of = |gid: &Vec<u8>| self.identities(gid).iter().any(|i| i.id == *identity) || self.devices_log(gid).is_some_and(|log| log.id[..] == identity.0[..]);
+            Some(Of::Public(public)) => {
+                let of = |gid: &Vec<u8>| {
+                    self.identities(gid).iter().any(|i| i.id == *public) || self.groups[gid].mls.settings().public.as_ref() == Some(public)
+                };
                 self.groups.keys().filter(|gid| of(gid)).cloned().collect()
             }
             None => Vec::new(),
@@ -262,7 +264,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     fn check(&self, st: &mut State<P>, id: &[u8]) -> Result<()> {
         match st.log(id)?.of.clone() {
             Of::Group => self.advance(st, id),
-            Of::Identity(identity) => self.keyed(st, &identity.0),
+            Of::Public(public) => self.replayed(st, &public.0),
         }
     }
 
@@ -287,7 +289,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Reads the key logs of the identities in this session's groups that it holds none of, and once more for each
+    /// Reads the public logs of the identities in this session's groups that it holds none of, and once more for each
     /// device a member's certificate names that its identity does not list. A log read is followed from then on.
     pub(crate) async fn refresh_all(self: &Arc<Self>) {
         let unread: Vec<IdentityRef> = {
@@ -297,7 +299,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             for credential in st.groups.values().flat_map(|g| g.mls.members()).filter_map(|m| m.credential) {
                 let Some(certificate) = &credential.certificate else { continue };
                 let identity = &certificate.identity;
-                let read = match st.keys.get(&identity.id.0) {
+                let read = match st.public.get(&identity.id.0) {
                     None => true,
                     Some(log) => log.verify(&credential) == Verdict::Unverified && st.unlisted.insert((identity.id.0.clone(), certificate.device.0.clone())),
                 };
@@ -308,40 +310,40 @@ impl<P: Provider + Send + 'static> Inner<P> {
             unread
         };
         for identity in unread {
-            if let Err(error) = timeout(MEMBER_WAIT, self.read_keys(&identity)).await.map_err(anyhow::Error::from).and_then(|r| r) {
-                tracing::debug!("the key log of {}: {error:#}", hex(&identity.id.0));
+            if let Err(error) = timeout(MEMBER_WAIT, self.read_public(&identity)).await.map_err(anyhow::Error::from).and_then(|r| r) {
+                tracing::debug!("the public log of {}: {error:#}", hex(&identity.id.0));
             }
         }
     }
 
-    /// Reads an identity's key log from its service; a log not held yet is followed from then on.
-    pub(crate) async fn read_keys(self: &Arc<Self>, identity: &IdentityRef) -> Result<KeyLog> {
-        let address = lmk_proto::identity::address(&identity.id.0);
+    /// Reads an identity's public log from its service; a log not held yet is followed from then on.
+    pub(crate) async fn read_public(self: &Arc<Self>, identity: &IdentityRef) -> Result<PublicLog> {
+        let address = lmk_proto::public::address(&identity.id.0);
         {
             let mut st = self.lock();
             if !st.logs.contains_key(&address[..]) {
-                let of = Of::Identity(identity.id.clone());
+                let of = Of::Public(identity.id.clone());
                 st.add_log(&address, Log::new(of, identity.membership.clone(), 0))?;
                 self.follow(&address);
             }
         }
         self.read(&address).await?;
-        self.lock().keys.get(&identity.id.0).cloned().context("the key log has no valid first entry")
+        self.lock().public.get(&identity.id.0).cloned().context("the public log has no valid first entry")
     }
 
-    /// Replays an identity's key log, against which its members' certificates are checked.
-    pub(crate) fn keyed(&self, st: &mut State<P>, id: &[u8]) -> Result<()> {
-        let entries = st.entries(&lmk_proto::identity::address(id), 0);
+    /// Replays a public log: an identity's, against which its sessions' certificates are checked.
+    pub(crate) fn replayed(&self, st: &mut State<P>, id: &[u8]) -> Result<()> {
+        let entries = st.entries(&lmk_proto::public::address(id), 0);
         if entries.is_empty() {
             return Ok(());
         }
-        let log = KeyLog::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
-        st.keys.insert(id.to_vec(), log);
+        let log = PublicLog::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
+        st.public.insert(id.to_vec(), log);
         st.gate = true;
-        for gid in st.groups_of(&lmk_proto::identity::address(id)) {
+        for gid in st.groups_of(&lmk_proto::public::address(id)) {
             self.work.send(Work::Duties(gid)).ok();
         }
-        st.events.push(Event::Keys { identity: Bytes(id.to_vec()) });
+        st.events.push(Event::Public { identity: Bytes(id.to_vec()) });
         Ok(())
     }
 
@@ -355,7 +357,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             return;
         }
         let what = match st.logs.get(log).map(|l| &l.of) {
-            Some(Of::Identity(_)) => "a key log",
+            Some(Of::Public(_)) => "a public log",
             _ => "the group's log",
         };
         let text = format!(

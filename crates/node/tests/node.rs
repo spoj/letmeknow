@@ -13,7 +13,7 @@ use lmk_testing::{Relay, relay};
 use lmk_node::devices::Devices;
 use lmk_node::{Config, Event, Node};
 use lmk_proto::group::{CHAT, Certificate, ChatMessage, DEVICES, IdentityRef, PROTOCOL, Service, Settings};
-use lmk_proto::identity::Listed;
+use lmk_proto::public::Listed;
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
 use lmk_proto::head::Head;
@@ -119,6 +119,7 @@ fn settings(kind: &str, relay: &Relay) -> Settings {
         carry: 7,
         update: lmk_proto::group::UPDATE,
         membership: relay.service.clone(),
+        public: None,
         rest: Default::default(),
     }
 }
@@ -127,24 +128,32 @@ fn message(text: &str) -> Value {
     serde_json::to_value(ChatMessage { content: text.into(), read: Default::default(), to: vec![], reply_to: None, urgent: false, attachment: None, sent_at: None }).unwrap()
 }
 
-/// A new identity, its key log on `membership`, with a first device called laptop: the identity, its key, and the
-/// laptop's key on it.
-async fn identity<P: Provider + Send + 'static>(node: &Node<P>, name: &str, membership: Service) -> (IdentityRef, [u8; 32], [u8; 32]) {
-    let (key, device): ([u8; 32], [u8; 32]) = (lmk_core::random(), lmk_core::random());
-    let (id, first) = lmk_core::identity::create(&key, name, membership.clone(), listed(&device, "laptop"));
+/// A new identity, its public log on `membership`, whose first writer is a device called laptop, read by `node`: the
+/// identity, and the laptop's key on it.
+async fn identity<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, name: &str, membership: Service) -> (IdentityRef, [u8; 32]) {
+    let laptop: [u8; 32] = lmk_core::random();
+    let (id, first) = lmk_core::public::create(&laptop, name, membership.clone(), listed(&laptop, "laptop"), lmk_node::now());
     let identity = IdentityRef { id: id.into(), membership };
-    node.append_identity(&identity, &first).await.unwrap();
-    (identity, key, device)
+    publish(relay, node, &identity, first).await;
+    (identity, laptop)
+}
+
+/// Appends a sealed entry to an identity's public log, as a device of it would, and has `node` read the log.
+async fn publish<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, identity: &IdentityRef, entry: Vec<u8>) {
+    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
+    let log = lmk_proto::public::address(&identity.id.0);
+    lmk_membership::client::ServeClient::for_service(endpoint, &identity.membership).unwrap().append(&log, &[entry]).await.unwrap();
+    node.read_public(identity).await.unwrap();
 }
 
 fn listed(device: &[u8; 32], name: &str) -> Listed {
-    Listed { key: lmk_core::identity::public(device).into(), name: name.into() }
+    Listed { key: lmk_core::device::public(device).into(), name: name.into() }
 }
 
 /// That the session with key `session` speaks as `identity`, by the device key `device`.
 fn certificate(identity: &IdentityRef, device: &[u8; 32], session: &Bytes) -> Certificate {
-    let sig = lmk_core::identity::sign(device, &lmk_proto::identity::certified(&session.0, &identity.id.0));
-    Certificate { identity: identity.clone(), device: lmk_core::identity::public(device).into(), sig: Bytes(sig) }
+    let sig = lmk_core::device::sign(device, &lmk_proto::public::certified(&session.0, &identity.id.0));
+    Certificate { identity: identity.clone(), device: lmk_core::device::public(device).into(), sig: Bytes(sig) }
 }
 
 fn fp(key: &Bytes) -> String {
@@ -419,7 +428,7 @@ impl iroh::protocol::ProtocolHandler for Gated {
 }
 
 /// The rule a joiner comes by is checked again as the Add is built: an invite that expired while the admitter read the
-/// joiner's key log admits no one.
+/// joiner's public log admits no one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rule_is_checked_again_as_the_add_is_built() {
     use lmk_proto::links::Invite;
@@ -432,13 +441,13 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
     bob.node.join(&link, None).await.unwrap();
     let alice_only = vec![link.members[0].clone()];
     let alice_iroh = alice.node.members(&gid.0).unwrap().into_iter().find(|m| m.name == "Alice").unwrap().iroh;
-    // On a slow machine an invite may expire before Alice reads the key log: then once more, valid twice as long.
+    // On a slow machine an invite may expire before Alice reads the public log: then once more, valid twice as long.
     let mut valid = 3000;
     loop {
         let (gate, mut reaching) = Gate::new();
         let (membership, _service) = served(&relay, &dir.join(valid.to_string()), |service| Gated { service, gate: gate.clone() }).await;
         let joiner = session(&relay, "Carol").await;
-        let (carol, _, device) = identity(&joiner.node, "Carol", membership).await;
+        let (carol, device) = identity(&relay, &joiner.node, "Carol", membership).await;
         let certificate = certificate(&carol, &device, &joiner.node.key());
         gate.set(false);
         let expires = lmk_node::now() + valid;
@@ -449,7 +458,7 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
         eventually("Alice holds the invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["hash"] == rule["hash"])).await;
         let link = Invite { device: false, secret, members: alice_only.clone() };
         let mut joining = tokio::spawn(async move { joiner.node.join(&link, Some(certificate)).await.map(|(gid, _)| gid) });
-        // Alice reads the key log once the rule admits Carol.
+        // Alice reads the public log once the rule admits Carol.
         let alice_reads = async { while reaching.recv().await.unwrap() != alice_iroh {} };
         let reached = tokio::time::timeout(WAIT, async {
             tokio::select! {
@@ -459,9 +468,9 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
                     false
                 }
             }
-        }).await.expect("Alice reads Carol's key log");
+        }).await.expect("Alice reads Carol's public log");
         if !reached {
-            assert!(valid < WAIT.as_millis() as u64, "the invite expired before Alice read the key log");
+            assert!(valid < WAIT.as_millis() as u64, "the invite expired before Alice read the public log");
             valid *= 2;
             continue;
         }
@@ -660,17 +669,6 @@ fn routed<P: Provider + Send + 'static>(session: &mut Session<P>, devices: Devic
     });
 }
 
-/// Waits until a device has its identity's state.
-async fn identified<P: Provider + Send + 'static>(devices: &Devices<P>) {
-    tokio::time::timeout(WAIT, async {
-        while devices.identity().is_none() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .expect("the identity's state came");
-}
-
 /// A device's own node on SQLite at `db`, which survives a restart, with the devices kind taking its events first.
 async fn stored_device(relay: &Relay, name: &str, db: &Path) -> (Session<SqliteProvider>, Devices<SqliteProvider>) {
     let device = Device::new(name);
@@ -681,12 +679,12 @@ async fn stored_device(relay: &Relay, name: &str, db: &Path) -> (Session<SqliteP
     (session, devices)
 }
 
-/// Waits until an identity's key log lists these devices, by name.
-async fn lists<P: Provider + Send + 'static>(node: &Node<P>, identity: &IdentityRef, names: &[&str]) -> lmk_core::identity::KeyLog {
+/// Waits until an identity's public log lists these devices, by name.
+async fn lists<P: Provider + Send + 'static>(node: &Node<P>, identity: &IdentityRef, names: &[&str]) -> lmk_core::public::PublicLog {
     tokio::time::timeout(WAIT, async {
         loop {
-            let log = node.read_key_log(identity).await.unwrap();
-            let mut listed: Vec<&str> = log.devices.iter().map(|device| device.name.as_str()).collect();
+            let log = node.read_public(identity).await.unwrap();
+            let mut listed: Vec<&str> = log.writers.iter().map(|device| device.name.as_str()).collect();
             listed.sort();
             if listed == names {
                 return log;
@@ -695,7 +693,7 @@ async fn lists<P: Provider + Send + 'static>(node: &Node<P>, identity: &Identity
         }
     })
     .await
-    .expect("the key log lists the devices")
+    .expect("the public log lists the devices")
 }
 
 /// The devices group of a device's only identity.
@@ -714,18 +712,16 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     routed(&mut laptop, laptop_devices.clone());
     routed(&mut tablet, tablet_devices.clone());
     let bob = laptop_devices.create("Bob", membership.clone()).await.unwrap();
-    let first = *lists(&laptop.node, &bob, &["laptop"]).await.current();
+    lists(&laptop.node, &bob, &["laptop"]).await;
 
-    // A device link: the tablet gets the identity's state, its key among it, and joins with a key of its own, which the
-    // key log lists once a device restates the list.
+    // A device link: the tablet joins with a key of its own, which the public log lists once the laptop restates the
+    // list.
     let link = lmk_proto::links::Invite::parse(&laptop_devices.invite().await.unwrap()).unwrap();
     tablet_devices.join(&link).await.unwrap();
-    identified(&tablet_devices).await;
     assert_eq!(tablet_devices.identity(), Some((bob.clone(), "Bob".to_owned())));
     let (laptop_key, tablet_key) = (laptop_devices.key().unwrap(), tablet_devices.key().unwrap());
     assert!(laptop_key != tablet_key && laptop_key != laptop.node.key() && tablet_key != tablet.node.key(), "a device key per identity");
-    let log = lists(&laptop.node, &bob, &["laptop", "tablet"]).await;
-    assert_eq!(log.current(), &first, "a link keeps the key");
+    lists(&laptop.node, &bob, &["laptop", "tablet"]).await;
 
     // Each certifies its session, which joins a chat of Alice's by an invite.
     let chat = alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &relay) }, None).unwrap();
@@ -736,12 +732,11 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     assert_eq!(alice.checked(&chat, "tablet", true).await.device_name, "tablet");
     assert_eq!(alice.checked(&chat, "laptop", true).await.device_name, "laptop");
 
-    // The tablet stops, and the laptop takes it off Bob: a new key, and a list without it. Alice removes its session
-    // from the chat without its coming back; the laptop's certificate still checks out, and alice serves it.
+    // The tablet stops, and the laptop takes it off Bob: a list without it. Alice removes its session from the chat
+    // without its coming back; the laptop's certificate still checks out, and alice serves it.
     tablet.node.shutdown().await.unwrap();
     laptop_devices.remove(&tablet_key.0).await.unwrap();
-    let log = lists(&laptop.node, &bob, &["laptop"]).await;
-    assert!(log.current() != &first && log.dropped(&tablet_key.0));
+    lists(&laptop.node, &bob, &["laptop"]).await;
     alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "tablet").then_some(())).await;
     alice.checked(&chat, "laptop", true).await;
     let id = alice.node.send(&chat.0, &message("after the tablet left")).await.unwrap().id;
@@ -752,19 +747,44 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     assert_eq!(got, id);
 }
 
-/// Once an identity's key log drops a device, its sessions leave every group, each by one commit, whose committer
+/// An identity's public log follows its group: its devices, their names and the group's name. The last device to leave
+/// closes it, and from then on no session speaks for the identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identitys_public_log_follows_its_group_until_its_last_device_closes_it() {
+    let relay = relay().await;
+    let mut alice = session(&relay, "Alice").await;
+    let (mut laptop, laptop_devices) = device(&relay, "laptop").await;
+    routed(&mut laptop, laptop_devices.clone());
+    let bob = laptop_devices.create("Bob", relay.service.clone()).await.unwrap();
+    let gid = devices_group(&laptop.node);
+    laptop.node.change_settings(&gid.0, |s| Settings { name: "Robert".into(), ..s }).await.unwrap();
+    laptop_devices.rename("desk").await.unwrap();
+    let log = lists(&laptop.node, &bob, &["desk"]).await;
+    assert_eq!(log.name, "Robert");
+
+    let chat = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    let agent = session(&relay, "agent").await;
+    let certificate = laptop_devices.certify(&agent.node.key().0).unwrap();
+    agent.node.join(&alice.node.invite(&chat.0, None).await.unwrap(), Some(certificate)).await.unwrap();
+    assert_eq!(alice.checked(&chat, "agent", true).await.device_name, "desk");
+    assert!(laptop_devices.leave().await.unwrap(), "the only device ends the identity");
+    assert!(alice.node.read_public(&bob).await.unwrap().closed());
+    alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "agent").then_some(())).await;
+}
+
+/// Once an identity's public log drops a device, its sessions leave every group, each by one commit, whose committer
 /// reports the members they added; a list that grows removes no one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_devices_sessions_are_removed_once_and_reported() {
-    use lmk_core::identity::public;
     let relay = relay().await;
     let dir = folder("revoke");
     let (membership, _service) = signing_service(&relay, &dir).await;
     let alice = session(&relay, "Alice").await;
-    let (carol, key, laptop) = identity(&alice.node, "Carol", membership.clone()).await;
+    let (carol, laptop) = identity(&relay, &alice.node, "Carol", membership.clone()).await;
     let tablet_key: [u8; 32] = lmk_core::random();
-    let log = alice.node.read_key_log(&carol).await.unwrap();
-    alice.node.append_identity(&carol, &log.next(&key, &public(&key), vec![listed(&laptop, "laptop"), listed(&tablet_key, "tablet")])).await.unwrap();
+    let log = alice.node.read_public(&carol).await.unwrap();
+    let both = vec![listed(&laptop, "laptop"), listed(&tablet_key, "tablet")];
+    publish(&relay, &alice.node, &carol, log.next(&laptop, both, "Carol", lmk_node::now())).await;
     let groups = [(); 2].map(|_| alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &relay) }, None).unwrap());
     let (tablet, desk, dave, eve) = (session(&relay, "tablet").await, session(&relay, "desk").await, session(&relay, "Dave").await, session(&relay, "Eve").await);
     let alice_only = vec![alice.node.invite(&groups[0].0, None).await.unwrap().members[0].clone()];
@@ -802,8 +822,8 @@ async fn a_dropped_devices_sessions_are_removed_once_and_reported() {
             }
         });
     }
-    let log = alice.node.read_key_log(&carol).await.unwrap();
-    alice.node.append_identity(&carol, &log.next(&key, &public(&lmk_core::random()), vec![listed(&laptop, "laptop")])).await.unwrap();
+    let log = alice.node.read_public(&carol).await.unwrap();
+    publish(&relay, &alice.node, &carol, log.next(&laptop, vec![listed(&laptop, "laptop")], "Carol", lmk_node::now())).await;
     let (mut left, mut revoked) = (Vec::new(), Vec::new());
     tokio::time::timeout(WAIT, async {
         while left.len() < 4 || revoked.len() < 2 {
@@ -827,8 +847,8 @@ async fn a_dropped_devices_sessions_are_removed_once_and_reported() {
     assert_eq!(names(&alice.node.members(&groups[0].0).unwrap()), ["Alice", "desk", "Dave", "Eve"], "the desk's device is still listed");
 }
 
-/// A device that read the key log entry listing a device just linked, before the Add of it, reads the devices group's
-/// log before it compares, and so does not drop the new device.
+/// A device that read the public log entry listing a device just linked, before the Add of it, reads the devices
+/// group's log before it compares, and so does not drop the new device.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_list_does_not_drop_a_device_just_linked() {
     let relay = relay().await;
@@ -841,107 +861,19 @@ async fn the_list_does_not_drop_a_device_just_linked() {
     let bob = laptop_devices.create("Bob", membership).await.unwrap();
     let link = lmk_proto::links::Invite::parse(&laptop_devices.invite().await.unwrap()).unwrap();
     phone_devices.join(&link).await.unwrap();
-    identified(&phone_devices).await;
     lists(&laptop.node, &bob, &["laptop", "phone"]).await;
     // While the laptop is stopped, the phone links the tablet.
     laptop.node.shutdown().await.unwrap();
     drop((laptop, laptop_devices));
     let link = lmk_proto::links::Invite::parse(&phone_devices.invite().await.unwrap()).unwrap();
     tablet_devices.join(&link).await.unwrap();
-    identified(&tablet_devices).await;
-    let tablet_key = tablet_devices.key().unwrap();
 
-    // The laptop starts with its devices group as it stopped, and the key log as it is now.
+    // The laptop starts with its devices group as it stopped, and the public log as it is now.
     let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
     let gid = devices_group(&laptop.node);
     laptop_devices.duties(&gid.0).await.unwrap();
-    let log = lists(&laptop.node, &bob, &["laptop", "phone", "tablet"]).await;
-    assert!(!log.dropped(&tablet_key.0));
+    lists(&laptop.node, &bob, &["laptop", "phone", "tablet"]).await;
     assert_eq!(laptop.node.members(&gid.0).unwrap().len(), 3);
-}
-
-/// A new key reaches the key log only once another device's summary holds its key message.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_new_key_is_named_once_another_device_holds_it() {
-    let relay = relay().await;
-    let dir = folder("key-held");
-    std::fs::create_dir_all(&dir).unwrap();
-    let membership = relay.service.clone();
-    let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
-    let (phone, phone_devices) = stored_device(&relay, "phone", &dir.join("phone.db")).await;
-    let (tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
-    let bob = laptop_devices.create("Bob", membership).await.unwrap();
-    for devices in [&phone_devices, &tablet_devices] {
-        let link = lmk_proto::links::Invite::parse(&laptop_devices.invite().await.unwrap()).unwrap();
-        devices.join(&link).await.unwrap();
-        identified(devices).await;
-    }
-    let first = *lists(&laptop.node, &bob, &["laptop", "phone", "tablet"]).await.current();
-    let tablet_key = tablet_devices.key().unwrap();
-    tablet.node.shutdown().await.unwrap();
-    phone.node.shutdown().await.unwrap();
-    drop((phone, phone_devices));
-
-    laptop_devices.remove(&tablet_key.0).await.unwrap();
-    let log = laptop.node.read_key_log(&bob).await.unwrap();
-    assert!(log.current() == &first && !log.dropped(&tablet_key.0), "no other device holds the new key yet");
-
-    let (_phone, _phone_devices) = stored_device(&relay, "phone", &dir.join("phone.db")).await;
-    let log = lists(&laptop.node, &bob, &["laptop", "phone"]).await;
-    assert!(log.current() != &first && log.dropped(&tablet_key.0));
-}
-
-/// A device that missed the key message of the identity's current key reports the key lost while no device online has
-/// it, and gets it once one that has it is online.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_device_missing_the_current_key_asks_for_it_and_reports_it_lost() {
-    let relay = relay().await;
-    let dir = folder("missing-key");
-    std::fs::create_dir_all(&dir).unwrap();
-    let membership = relay.service.clone();
-    let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
-    let (phone, phone_devices) = stored_device(&relay, "phone", &dir.join("phone.db")).await;
-    let (tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
-    let (desk, desk_devices) = stored_device(&relay, "desk", &dir.join("desk.db")).await;
-    let bob = laptop_devices.create("Bob", membership).await.unwrap();
-    for devices in [&phone_devices, &tablet_devices, &desk_devices] {
-        let link = lmk_proto::links::Invite::parse(&laptop_devices.invite().await.unwrap()).unwrap();
-        devices.join(&link).await.unwrap();
-        identified(devices).await;
-    }
-    let first = *lists(&laptop.node, &bob, &["desk", "laptop", "phone", "tablet"]).await.current();
-    let tablet_key = tablet_devices.key().unwrap();
-    tablet.node.shutdown().await.unwrap();
-    desk.node.shutdown().await.unwrap();
-    drop((desk, desk_devices));
-
-    // Only the laptop and the phone hold the key message of the key that replaces the tablet's, then stop.
-    laptop_devices.remove(&tablet_key.0).await.unwrap();
-    assert!(lists(&laptop.node, &bob, &["desk", "laptop", "phone"]).await.current() != &first);
-    for node in [&laptop.node, &phone.node] {
-        node.shutdown().await.unwrap();
-    }
-    drop((laptop, laptop_devices, phone, phone_devices));
-
-    let (mut desk, desk_devices) = stored_device(&relay, "desk", &dir.join("desk.db")).await;
-    let gid = devices_group(&desk.node);
-    desk_devices.duties(&gid.0).await.unwrap();
-    desk_devices.duties(&gid.0).await.unwrap();
-    desk.until(|e| matches!(e, Event::Warning { text, .. } if text.contains("does not hold its identity's current key")).then_some(())).await;
-
-    // The laptop comes back: the desk asks it, holds the key, and so restates the list with its new name.
-    let (_laptop, _laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
-    desk_devices.rename("study").await.unwrap();
-    tokio::time::timeout(WAIT, async {
-        loop {
-            desk_devices.duties(&gid.0).await.unwrap();
-            let log = desk.node.read_key_log(&bob).await.unwrap();
-            if log.devices.iter().any(|device| device.name == "study") {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    }).await.expect("the desk takes the key and lists itself anew");
 }
 
 /// A session whose leaf names an older revision writes its own as it starts.
@@ -1337,19 +1269,18 @@ async fn an_announced_loss_reaches_every_member() {
     }
 }
 
-/// The members a key log entry drops are removed by one commit.
+/// The members a public log entry drops are removed by one commit.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pass_removes_every_member_due_in_one_commit() {
-    use lmk_core::identity::public;
     let relay = relay().await;
     let dir = folder("one-commit");
     let (membership, _service) = signing_service(&relay, &dir).await;
     let mut alice = session(&relay, "Alice").await;
-    let (carol, key, laptop) = identity(&alice.node, "Carol", membership.clone()).await;
+    let (carol, laptop) = identity(&relay, &alice.node, "Carol", membership.clone()).await;
     let (tablet_key, phone_key): ([u8; 32], [u8; 32]) = (lmk_core::random(), lmk_core::random());
-    let log = alice.node.read_key_log(&carol).await.unwrap();
+    let log = alice.node.read_public(&carol).await.unwrap();
     let all = vec![listed(&laptop, "laptop"), listed(&tablet_key, "tablet"), listed(&phone_key, "phone")];
-    alice.node.append_identity(&carol, &log.next(&key, &public(&key), all)).await.unwrap();
+    publish(&relay, &alice.node, &carol, log.next(&laptop, all, "Carol", lmk_node::now())).await;
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     let (tablet, phone) = (session(&relay, "tablet").await, session(&relay, "phone").await);
     for (joiner, device, name) in [(&tablet, &tablet_key, "tablet"), (&phone, &phone_key, "phone")] {
@@ -1361,8 +1292,8 @@ async fn a_pass_removes_every_member_due_in_one_commit() {
         session.node.shutdown().await.unwrap();
     }
     let epoch = alice.node.epoch(&gid.0).unwrap();
-    let log = alice.node.read_key_log(&carol).await.unwrap();
-    alice.node.append_identity(&carol, &log.next(&key, &public(&lmk_core::random()), vec![listed(&laptop, "laptop")])).await.unwrap();
+    let log = alice.node.read_public(&carol).await.unwrap();
+    publish(&relay, &alice.node, &carol, log.next(&laptop, vec![listed(&laptop, "laptop")], "Carol", lmk_node::now())).await;
     let mut removed = alice.until(|e| match e {
         Event::Revoked { removed, .. } => Some(removed.into_iter().map(|m| m.name).collect::<Vec<_>>()),
         _ => None,

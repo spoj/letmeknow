@@ -4,10 +4,11 @@
 use anyhow::{Context, Result, ensure};
 use iroh::RelayUrl;
 use lmk_core::group::{Change, Group};
-use lmk_core::identity::KeyLog;
+use lmk_core::public::{self, PublicLog};
 use lmk_core::provider::Provider;
 use lmk_net::Net;
-use lmk_proto::group::{Certificate, DEVICES, IdentityRef, Settings};
+use lmk_proto::group::{Certificate, IdentityRef, Settings};
+use lmk_proto::public::Listed;
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::Frame;
 use lmk_proto::Bytes;
@@ -16,7 +17,7 @@ use n0_future::time::{Duration, sleep, timeout};
 use serde_json::{Value, json};
 
 use crate::groups::renaming;
-use crate::{G, MEMBER_WAIT, Member, Message, Node, Rec, SEND_WAIT, Sent, State, UNFINISHED, Work, device_key_key, endpoint_id, get, kind_key, message_key, put, sending};
+use crate::{G, MEMBER_WAIT, Member, Message, Node, Rec, SEND_WAIT, Sent, State, UNFINISHED, Work, device_key_key, endpoint_id, get, message_key, now, put, sending};
 
 impl<P: Provider + Send + 'static> Node<P> {
     /// Stops the peers and every task.
@@ -84,18 +85,38 @@ impl<P: Provider + Send + 'static> Node<P> {
             let mut st = self.inner.lock();
             let st = &mut *st;
             st.speak(identity);
-            let device_key = (settings.kind == DEVICES).then(|| st.device_key()).transpose()?;
-            let session = device_key.as_ref().map_or(&st.session, |(_, session)| session);
-            let mls = Group::create(&st.provider, session, &settings)?;
-            let gid = st.add_group(mls, Rec::default())?;
-            if let Some((seed, session)) = device_key {
-                put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
-                st.device_keys.insert(gid.clone(), (seed, session));
-            }
-            gid
+            let mls = Group::create(&st.provider, &st.session, &settings)?;
+            st.add_group(mls, Rec::default())?
         };
         self.inner.follow(&gid);
         Ok(Bytes(gid))
+    }
+
+    /// Creates an identity's devices group, with a new device key of this node's its first member, and the identity's
+    /// public log, whose first entry lists that key as its writer, and whose id the group's settings carry. Leaves the
+    /// group if the entry cannot be appended.
+    pub async fn create_identity(&self, mut settings: Settings) -> Result<IdentityRef> {
+        ensure!(self.inner.kinds.contains(&settings.kind), "this session does not support {} groups", settings.kind);
+        let (gid, identity, first) = {
+            let mut st = self.inner.lock();
+            let st = &mut *st;
+            let (seed, session) = st.device_key()?;
+            let writer = Listed { key: Bytes(session.key().to_vec()), name: st.device.clone().unwrap_or_default() };
+            let (id, first) = public::create(&seed, &settings.name, settings.membership.clone(), writer, now());
+            settings.public = Some(Bytes(id.to_vec()));
+            let mls = Group::create(&st.provider, &session, &settings)?;
+            let gid = st.add_group(mls, Rec::default())?;
+            put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
+            st.device_keys.insert(gid.clone(), (seed, session));
+            (gid, IdentityRef { id: Bytes(id.to_vec()), membership: settings.membership }, first)
+        };
+        self.inner.follow(&gid);
+        let address = lmk_proto::public::address(&identity.id.0);
+        if let Err(error) = self.inner.clients.client(&identity.membership)?.append(&address, &[first]).await {
+            self.leave(&gid).await?;
+            return Err(error);
+        }
+        Ok(identity)
     }
 
     /// Removes a member. Returns whether this session's commit removed it, which it need not once another's did.
@@ -124,6 +145,11 @@ impl<P: Provider + Send + 'static> Node<P> {
             })
             .await?;
         self.settings(gid)
+    }
+
+    /// Whether this session asked to leave the group, which it is in until a member removes it.
+    pub fn leaving(&self, gid: &[u8]) -> bool {
+        self.inner.lock().groups.get(gid).is_some_and(|g| g.rec.leaving)
     }
 
     /// Marks the group as one this session leaves, and asks the others to remove it; or forgets a group it is alone
@@ -262,19 +288,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(())
     }
 
-    /// A record of a kind built into the client, kept with the session's own.
-    pub fn record(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        self.inner.lock().provider.get(&kind_key(key))
-    }
-
-    pub fn put_record(&self, key: &str, value: &[u8]) -> Result<()> {
-        self.inner.lock().provider.put(&kind_key(key), value)
-    }
-
-    pub fn delete_record(&self, key: &str) -> Result<()> {
-        self.inner.lock().provider.delete(&kind_key(key))
-    }
-
     /// Leaves in this session's files no copy of what it deleted.
     pub fn scrub(&self) -> Result<()> {
         self.inner.lock().scrub = true;
@@ -354,16 +367,25 @@ impl<P: Provider + Send + 'static> Node<P> {
         holders
     }
 
-    /// An identity's key log, read from its service now.
-    pub async fn read_key_log(&self, identity: &IdentityRef) -> Result<KeyLog> {
-        self.inner.read_keys(identity).await
+    /// An identity's public log, read from its service now.
+    pub async fn read_public(&self, identity: &IdentityRef) -> Result<PublicLog> {
+        self.inner.read_public(identity).await
     }
 
-    /// Appends a sealed entry to an identity's key log, and reads the log.
-    pub async fn append_identity(&self, identity: &IdentityRef, entry: &[u8]) -> Result<KeyLog> {
-        let log = lmk_proto::identity::address(&identity.id.0);
-        self.inner.clients.client(&identity.membership)?.append(&log, &[entry.to_vec()]).await?;
-        self.inner.read_keys(identity).await
+    /// Appends to the public log of a devices group, by this node's device key there, the entry after the latest, read
+    /// afresh, listing `writers` and `name`; and reads the log.
+    pub async fn publish(&self, gid: &[u8], writers: Vec<Listed>, name: &str) -> Result<PublicLog> {
+        let settings = self.settings(gid)?;
+        let identity = IdentityRef { id: settings.public.context("a group without a public log")?, membership: settings.membership };
+        let latest = self.inner.read_public(&identity).await?;
+        let entry = {
+            let st = self.inner.lock();
+            let (seed, _) = st.device_keys.get(gid).context("not a devices group of this node")?;
+            latest.next(seed, writers, name, now())
+        };
+        let address = lmk_proto::public::address(&identity.id.0);
+        self.inner.clients.client(&identity.membership)?.append(&address, &[entry]).await?;
+        self.inner.read_public(&identity).await
     }
 
     /// The identities this session speaks as in its groups.
@@ -390,7 +412,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub fn sign(&self, gid: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
         let st = self.inner.lock();
         let (seed, _) = st.device_keys.get(gid).context("not a devices group of this node")?;
-        Ok(lmk_core::identity::sign(seed, bytes))
+        Ok(lmk_core::device::sign(seed, bytes))
     }
 
     /// Reads a group's log from its service through its end, applying what it holds.
@@ -403,11 +425,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         let peer = endpoint_id(peer).context("an iroh key")?;
         self.inner.lock().emit(gid, peer, Frame::State { group: Bytes(gid.to_vec()), link: None });
         Ok(())
-    }
-
-    /// Tells this session's user something about a group, as a warning.
-    pub fn warn(&self, gid: &[u8], text: String) {
-        self.inner.warn(Some(gid), text);
     }
 
     /// The device's name, where this is a device's node.

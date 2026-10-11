@@ -100,7 +100,7 @@ impl<P: Provider> State<P> {
             held: kept.difference(&g.rec.lacking).difference(&g.rec.lost),
             read: g.rec.read.union(&kept.difference(&g.rec.messages)),
             lacking: g.rec.lacking.clone(),
-            keys: g.keys.iter().filter_map(|log| Some(self.logs.get(log)?.head(log))).collect(),
+            public: g.public.iter().filter_map(|log| Some(self.logs.get(log)?.head(log))).collect(),
         }
     }
 
@@ -123,8 +123,8 @@ impl<P: Provider> State<P> {
         self.groups.keys().filter(|gid| self.serves(gid, peer)).map(|gid| Bytes(gid.clone())).collect()
     }
 
-    /// Works out again, once the rosters or the key logs changed, which groups the gate admits each connected peer to,
-    /// and which key logs each group follows.
+    /// Works out again, once the rosters or the public logs changed, which groups the gate admits each connected peer to,
+    /// and which public logs each group follows.
     pub(crate) fn gate(&mut self) {
         if !std::mem::take(&mut self.gate) {
             return;
@@ -132,11 +132,11 @@ impl<P: Provider> State<P> {
         let now = self.tick();
         let gids: Vec<Vec<u8>> = self.groups.keys().cloned().collect();
         for gid in &gids {
-            let mut keys: Vec<Vec<u8>> = self.identities(gid).iter().map(|identity| lmk_proto::identity::address(&identity.id.0).to_vec()).collect();
-            keys.retain(|log| self.logs.contains_key(log));
-            keys.sort();
-            keys.dedup();
-            self.groups.get_mut(gid).unwrap().keys = keys;
+            let mut public: Vec<Vec<u8>> = self.identities(gid).iter().map(|identity| lmk_proto::public::address(&identity.id.0).to_vec()).collect();
+            public.retain(|log| self.logs.contains_key(log));
+            public.sort();
+            public.dedup();
+            self.groups.get_mut(gid).unwrap().public = public;
         }
         let peers: Vec<EndpointId> = self.served.keys().copied().collect();
         for peer in peers {

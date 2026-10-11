@@ -1,7 +1,7 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
 //! advance, at start, and every `TIMER`. It drops what the group kept past H; commits at most once, with every Remove
 //! due (members whose counted `leave` was sealed in their current membership, and members whose devices their
-//! identities dropped, or in a devices group, devices its identity dropped) and this session's update if due (each T, at an offset of its own); asks the others to remove
+//! identities dropped) and this session's update if due (each T, at an offset of its own); asks the others to remove
 //! this session while it leaves; announces this session's known losses; and in a devices group, has the devices kind
 //! run its own (`Event::Duties`).
 
@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use std::collections::BTreeMap;
 
-use lmk_core::identity::{KeyLog, Verdict};
+use lmk_core::public::{PublicLog, Verdict};
 use lmk_proto::group::Credential;
 
 use crate::groups::renaming;
@@ -43,8 +43,7 @@ fn due<P: Provider>(st: &State<P>, g: &G) -> Option<(Change, Vec<core::Member>)>
     let me = st.me(g.mls.id());
     let members = g.mls.members();
     let others = members.iter().filter(|m| m.key != me);
-    let devices = st.devices_log(g.mls.id());
-    let dropped = |m: &&core::Member| m.credential.as_ref().is_some_and(|c| dropped(&st.keys, c)) || devices.is_some_and(|log| log.dropped(&m.key));
+    let dropped = |m: &&core::Member| m.credential.as_ref().is_some_and(|c| dropped(&st.public, c));
     let dropped: Vec<core::Member> = others.clone().filter(dropped).cloned().collect();
     let remove: Vec<u32> = others.filter(|m| g.left(&m.key) || dropped.iter().any(|d| d.index == m.index)).map(|m| m.index).collect();
     let own = members.iter().find(|m| m.index == g.mls.own_index())?;
@@ -185,10 +184,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 }
 
-/// Whether a member's device was dropped from its identity's list, as the key logs held show it. In a devices group,
-/// whose members are the devices themselves, see `State::devices_log`.
-fn dropped(keys: &BTreeMap<Vec<u8>, KeyLog>, credential: &Credential) -> bool {
-    let log = credential.identity().and_then(|identity| keys.get(&identity.id.0));
+/// Whether a member's device was dropped from its identity's list, as the public logs held show it.
+fn dropped(public: &BTreeMap<Vec<u8>, PublicLog>, credential: &Credential) -> bool {
+    let log = credential.identity().and_then(|identity| public.get(&identity.id.0));
     log.is_some_and(|log| log.verify(credential) == Verdict::Dropped)
 }
 

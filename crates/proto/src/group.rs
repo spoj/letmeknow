@@ -47,6 +47,10 @@ pub struct Settings {
     /// T: how many seconds a member's leaf goes between updates.
     pub update: u32,
     pub membership: Service,
+    /// The id of the group's public log, which its kind keeps: an identity's group's is the identity's id, on
+    /// `membership`. Fixed when the group is made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public: Option<Bytes>,
     /// Fields a newer letmeknow added, kept when this one rewrites the settings.
     #[serde(flatten)]
     pub rest: Map<String, Value>,
@@ -89,7 +93,7 @@ pub struct Certificate {
     pub sig: Bytes,
 }
 
-/// An identity, by id and the service that keeps its key log.
+/// An identity, by id and the service that keeps its public log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityRef {
     pub id: Bytes,

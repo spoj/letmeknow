@@ -721,8 +721,8 @@ fn state_key(id: &[u8]) -> Vec<u8> {
 }
 
 /// The app's rules on a commit, from MLS state alone, binding the committer too: changes inline only, of the kinds we
-/// make; added members whose credentials name their own keys; settings that parse, at this protocol, with the kind
-/// unchanged; and no update of the committer's leaf that changes its credential but its name.
+/// make; added members whose credentials name their own keys; settings that parse, at this protocol, with the kind and
+/// the public log unchanged; and no update of the committer's leaf that changes its credential but its name.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad) -> Result<()> {
     for proposal in staged.queued_proposals() {
         ensure!(proposal.proposal_or_ref_type() == ProposalOrRefType::Proposal, "a proposal by reference");
@@ -737,6 +737,7 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad) 
     let new = settings_of(staged.group_context().extensions())?;
     ensure!(new.protocol == PROTOCOL, "settings name protocol {}", new.protocol);
     ensure!(new.kind == old.kind, "the kind changed");
+    ensure!(new.public == old.public, "the public log changed");
     if let Some(leaf) = staged.update_path_leaf_node() {
         let before = group.member_at(by).and_then(|member| credential_of(&member.credential));
         let after = leaf_credential(leaf)?;
