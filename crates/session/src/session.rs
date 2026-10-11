@@ -101,6 +101,8 @@ pub struct Session {
     identity_at: Instant,
     /// The device's state as last published.
     published: String,
+    /// The groups as last written to `groups.json`.
+    groups: String,
     home: PathBuf,
     network: Network,
     config: Config,
@@ -166,6 +168,7 @@ impl Session {
             device_retry: Instant::now(),
             identity_at: Instant::now(),
             published: String::new(),
+            groups: String::new(),
             home: home.to_path_buf(),
             network,
             config,
@@ -238,25 +241,35 @@ impl Session {
         Ok(())
     }
 
-    /// Writes the device's state where its other session processes read it, if this process acts for the device and
-    /// the state changed.
+    /// Writes what changed of what other processes read: this session's groups, ids and names, to `groups.json` in its
+    /// directory, for `sessions`; and, if this process acts for the device, the device's state where its other session
+    /// processes read it.
     fn publish(&mut self) {
-        if self.device.is_none() {
-            return;
-        }
+        let replace = |path: PathBuf, text: &str| {
+            let new = path.with_extension("new");
+            private_file(&new, text.as_bytes())?;
+            anyhow::Ok(std::fs::rename(&new, &path)?)
+        };
         let written = (|| {
-            let state = serde_json::to_string(&self.client.device_state()?)?;
-            if state != self.published {
-                let path = self.home.join("device-state.json");
-                let new = path.with_extension("new");
-                private_file(&new, state.as_bytes())?;
-                std::fs::rename(&new, &path)?;
-                self.published = state;
+            let node = self.client.node();
+            let settings = node.groups().into_iter().filter_map(|gid| Some((node.settings(&gid.0).ok()?, gid)));
+            let groups: Vec<Value> = settings.filter(|(s, _)| s.kind != IDENTITY).map(|(s, gid)| json!({ "group": gid, "name": s.name })).collect();
+            let groups = serde_json::to_string(&groups)?;
+            if groups != self.groups {
+                replace(self.config.dir.join("groups.json"), &groups)?;
+                self.groups = groups;
+            }
+            if self.device.is_some() {
+                let state = serde_json::to_string(&self.client.device_state()?)?;
+                if state != self.published {
+                    replace(self.home.join("device-state.json"), &state)?;
+                    self.published = state;
+                }
             }
             anyhow::Ok(())
         })();
         if let Err(error) = written {
-            self.warn(None, format!("publishing this device's state: {error:#}"));
+            self.warn(None, format!("publishing this session's state: {error:#}"));
         }
     }
 
@@ -369,6 +382,7 @@ impl Session {
             }
             Request::Client(request) => _ = self.running.spawn_local(async move { Done::Answered(client.request(request).await, reply) }),
             Request::IdentityJoin { .. } | Request::Status { .. } => unreachable!("the CLI sends these as the client's requests"),
+            Request::Stop => unreachable!("`run` stops on it"),
         }
     }
 
@@ -682,8 +696,8 @@ impl Session {
     }
 }
 
-/// Runs a session until `shutdown`, or until a line it prints cannot be written: prints `ready`, then handles what
-/// arrives and prints what concerns the agent, one JSON object per line.
+/// Runs a session until `shutdown`, a `stop` request, which it answers once it stopped, or a line it prints that cannot
+/// be written: prints `ready`, then handles what arrives and prints what concerns the agent, one JSON object per line.
 pub async fn run(
     mut session: Session,
     mut inbound: mpsc::UnboundedReceiver<Inbound>,
@@ -694,6 +708,7 @@ pub async fn run(
     let ready = json!({ "type": "ready", "session": session.config.handle, "member": session.me()?, "state": session.config.dir });
     let mut shutdown = std::pin::pin!(shutdown);
     let client = session.client.clone();
+    let mut stopped = None;
     if print(ready.to_string()).is_ok() {
         loop {
             session.publish();
@@ -702,7 +717,13 @@ pub async fn run(
             }
             let due = session.next_due();
             tokio::select! {
-                Some(item) = inbound.recv() => session.handle(item).await,
+                Some(item) = inbound.recv() => match item {
+                    (Request::Stop, reply) => {
+                        stopped = Some(reply);
+                        break;
+                    }
+                    item => session.handle(item).await,
+                },
                 Some(done) = session.running.join_next() => session.done(done.expect("work in flight runs until shutdown")),
                 Some(event) = events.recv() => client.event(event).await,
                 Some(event) = session.told.recv() => session.client_event(event).await,
@@ -714,5 +735,8 @@ pub async fn run(
     }
     session.running.shutdown().await;
     session.shutdown().await;
+    if let Some(reply) = stopped {
+        reply.send(json!({ "stopped": true })).ok();
+    }
     Ok(())
 }

@@ -48,6 +48,11 @@ pub enum Command {
         #[arg(long, env = "LETMEKNOW_RELAY", default_value = crate::RELAY)]
         relay: String,
     },
+    /// This machine's sessions: each one's handle, whether it runs, and its groups
+    Sessions {
+        #[command(subcommand)]
+        op: Option<SessionsOp>,
+    },
     /// Print instructions for agents
     Skill,
     /// Run a membership service, an iroh relay and the web client (letmeknow.dev)
@@ -64,6 +69,17 @@ pub enum Command {
     /// A command of a kind's plugin: `letmeknow <kind> <args>...`, such as `letmeknow doc attach <path>`
     #[command(external_subcommand)]
     Kind(Vec<String>),
+}
+
+#[derive(Subcommand)]
+pub enum SessionsOp {
+    /// Stop a session if it runs, leave its groups, and delete it, once another member of each group holds its leave
+    Remove {
+        handle: String,
+        /// The relay the session is reached through
+        #[arg(long, env = "LETMEKNOW_RELAY", default_value = crate::RELAY)]
+        relay: String,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -145,6 +161,9 @@ pub enum Request {
     #[command(skip)]
     #[serde(skip)]
     Status { group: String },
+    /// `sessions remove`: stops the session, answered once it stopped.
+    #[command(skip)]
+    Stop,
     #[command(flatten)]
     #[serde(untagged)]
     Client(lmk_client::Request),
@@ -228,7 +247,7 @@ pub fn new_handle(home: &Path) -> Result<String> {
 }
 
 /// How long finding the running session waits for each to answer: on Windows a refused connection takes seconds.
-const PROBE: Duration = Duration::from_millis(200);
+pub const PROBE: Duration = Duration::from_millis(200);
 
 pub async fn running_session(home: &Path) -> Result<String> {
     let mut probes = tokio::task::JoinSet::new();

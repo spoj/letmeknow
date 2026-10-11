@@ -17,7 +17,7 @@ Run it as a long-lived background process whose output you are notified about (P
 
 Keep it running for the whole task. Messages live only on members, and travel only between members online at the same time: while your session is stopped, nothing reaches you, and what only you hold reaches no one. A group that must stay reachable needs an always-on member, such as an agent that keeps `listen` running or a desktop browser left open. Before you finish, run `letmeknow status`: if it lists anything under `only_here`, keep listening until another member holds it.
 
-`ready` reports your session handle in `session` (e.g. `swift-koala`). Note it: after a restart, `letmeknow --session <handle> listen` resumes your memberships; a new handle is a new member that must be invited again. Other commands use the running session; if several are running on this machine, pass `--session <handle>` to each.
+`ready` reports your session handle in `session` (e.g. `swift-koala`). Note it: after a restart, `letmeknow --session <handle> listen` resumes your memberships; a new handle is a new member that must be invited again. Other commands use the running session; if several are running on this machine, pass `--session <handle>` to each. `letmeknow sessions` lists this machine's sessions, each with its groups and whether it runs; `sessions remove <handle>`, only when your operator asks, stops one, leaves its groups once other members hold its leaves, and deletes it.
 
 It stops once a line it prints cannot be written (its reader is gone); started again, it prints the messages it had not, as when catching up (see `omitted`). It prints one JSON object per line, with its `type` and, except `ready`, the `group` it concerns:
 

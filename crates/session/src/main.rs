@@ -1,4 +1,4 @@
-use letmeknow::cli::{Cli, Command, Request, call, home_dir, new_handle, running_session, session_dir};
+use letmeknow::cli::{Cli, Command, Request, SessionsOp, call, home_dir, new_handle, running_session, session_dir};
 use letmeknow::kinds;
 use letmeknow::session::Config;
 use std::process::ExitCode;
@@ -44,6 +44,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             // Work in flight runs on the loop's thread: the client starts a plugin, and takes in its lines, a step at a time.
             let listen = letmeknow::listen(config, &home, letmeknow::Network::new(&relay)?, print, letmeknow::shutdown());
             tokio::task::LocalSet::new().run_until(listen).await
+        }
+        Command::Sessions { op: None } => {
+            println!("{}", letmeknow::sessions(&home).await?);
+            Ok(())
+        }
+        Command::Sessions { op: Some(SessionsOp::Remove { handle, relay }) } => {
+            let config = Config {
+                dir: session_dir(&home, &handle)?,
+                handle,
+                hold: Duration::from_secs(3600),
+                keep_log: false,
+                membership: lmk_client::service("letmeknow.dev")?,
+                plugins: kinds::dirs(),
+            };
+            let remove = letmeknow::remove(config, &home, letmeknow::Network::new(&relay)?);
+            println!("{}", tokio::task::LocalSet::new().run_until(remove).await?);
+            Ok(())
         }
         Command::Skill => {
             print!("{}", letmeknow::SKILL);

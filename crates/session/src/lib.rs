@@ -6,12 +6,14 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::Node;
 use lmk_proto::group::Service;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub use lmk_proto::links::RELAY;
 
@@ -87,6 +89,76 @@ pub async fn listen(
     let (node, events) = Node::start(provider, node_config).await?;
     let session = session::Session::open(config, db, node, home, network, inbound).await?;
     session::run(session, queue, events, print, shutdown).await
+}
+
+/// This machine's sessions: each one's handle, whether its process answers, and its groups as it last wrote them.
+pub async fn sessions(home: &Path) -> Result<Value> {
+    let mut sessions = Vec::new();
+    for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
+        let dir = entry.path();
+        let running = tokio::time::timeout(cli::PROBE, cli::connect(&dir.join("endpoint"))).await.is_ok_and(|connected| connected.is_ok());
+        let groups: Value = std::fs::read(dir.join("groups.json")).ok().and_then(|groups| serde_json::from_slice(&groups).ok()).unwrap_or(json!([]));
+        sessions.push(json!({ "handle": entry.file_name().to_string_lossy(), "running": running, "groups": groups }));
+    }
+    sessions.sort_by(|a, b| a["handle"].as_str().cmp(&b["handle"].as_str()));
+    Ok(json!({ "sessions": sessions }))
+}
+
+/// How long removing a session waits for another member of each of its groups to hold its leave.
+const LEAVE_WAIT: Duration = Duration::from_secs(60);
+
+/// Removes a session: stops its process if one runs, runs it here, printing nothing, until another member of each of its
+/// groups holds its leave, and deletes it. Fails, keeping the session, where a leave is not held within `LEAVE_WAIT`.
+/// Runs on a `LocalSet`, as `listen` does.
+pub async fn remove(config: session::Config, home: &Path, network: Network) -> Result<Value> {
+    let (handle, dir) = (config.handle.clone(), config.dir.clone());
+    ensure!(dir.join("session.db").exists(), "no session {handle} here");
+    if cli::connect(&dir.join("endpoint")).await.is_ok() {
+        // Answered once it stopped, or not at all as its process exits.
+        let _ = cli::call(home, &handle, cli::Request::Stop).await;
+    }
+    let (lines, mut printed) = tokio::sync::mpsc::unbounded_channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let at = home.to_path_buf();
+    let running = tokio::task::spawn_local(async move {
+        let print = move |line: String| {
+            lines.send(line).ok();
+            Ok(())
+        };
+        listen(config, &at, network, print, async { drop(stopped.await) }).await
+    });
+    let left = async {
+        while let Some(line) = printed.recv().await {
+            if serde_json::from_str::<Value>(&line)?["type"] == "ready" {
+                break;
+            }
+        }
+        let groups = cli::call(home, &handle, cli::Request::Client(lmk_client::Request::Groups)).await?;
+        let mut waiting = Vec::new();
+        for group in groups.as_array().context("groups are a list")? {
+            let leave = lmk_client::Request::Leave { group: group["group"].as_str().map(str::to_owned), end: false };
+            if cli::call(home, &handle, cli::Request::Client(leave)).await?["pending"] == true {
+                waiting.push(group["group"].clone());
+            }
+        }
+        let held = async {
+            while !waiting.is_empty() {
+                let line: Value = serde_json::from_str(&printed.recv().await.context("the session stopped")?)?;
+                if line["type"] == "leave_held" || line["type"] == "removed" {
+                    waiting.retain(|group| *group != line["group"]);
+                }
+            }
+            anyhow::Ok(())
+        };
+        tokio::time::timeout(LEAVE_WAIT, held).await.map_err(|_| anyhow!("no other member of a group it left held its leave: the session stays; remove it again once one is online"))??;
+        anyhow::Ok(groups)
+    };
+    let left = left.await;
+    stop.send(()).ok();
+    running.await??;
+    let groups = left?;
+    std::fs::remove_dir_all(&dir)?;
+    Ok(json!({ "removed": handle, "left": groups.as_array().unwrap().iter().map(|g| &g["group"]).collect::<Vec<_>>() }))
 }
 
 fn node_config(network: &Network, home: &Path, handle: &str, device: Option<Device>, files: PathBuf, kinds: Vec<String>) -> lmk_node::Config {

@@ -978,6 +978,35 @@ fn a_session_stops_once_it_cannot_print_and_prints_the_rest_when_started_again()
     });
 }
 
+/// `sessions` lists this machine's sessions, each with its groups and whether it runs. `sessions remove` stops one that
+/// runs, or runs one that does not, until another member holds its leave of each group, and deletes it.
+#[test]
+fn a_session_is_listed_and_removed_running_or_stopped() {
+    local(async {
+        let world = world("sessions").await;
+        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
+        let desk = world.start_in("bob", "desk", HOUR).await;
+        let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
+        desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
+        let groups = json!([{ "group": group, "name": "" }]);
+        let both = json!({ "sessions": [
+            { "handle": "bob", "running": true, "groups": groups },
+            { "handle": "desk", "running": true, "groups": groups },
+        ] });
+        let listed = until(|| async { crate::sessions(&bob.home).await.unwrap() }, |listed| *listed == both).await;
+        assert_eq!(listed, both);
+
+        let removed = crate::remove(world.config("bob", "desk"), &bob.home, world.network.clone()).await.unwrap();
+        assert_eq!(removed, json!({ "removed": "desk", "left": [group] }));
+        assert_eq!(alice.expect("left").await["member"]["handle"], "desk");
+        drop(desk);
+        bob.stop().await;
+        crate::remove(world.config("bob", "bob"), &bob.home, world.network.clone()).await.unwrap();
+        assert_eq!(alice.expect("left").await["member"]["handle"], "bob");
+        assert_eq!(crate::sessions(&bob.home).await.unwrap(), json!({ "sessions": [] }));
+    });
+}
+
 /// A join that waits on a member who never answers holds up none of the session's other work.
 #[test]
 fn a_session_goes_on_while_a_join_waits() {
