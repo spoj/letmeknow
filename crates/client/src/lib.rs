@@ -442,7 +442,8 @@ impl<P: Provider + Send + 'static> Client<P> {
                 self.inner.node.remove(&gid.0, &member.key.0).await?;
                 Ok(json!({ "group": b64(&gid.0), "members": self.described_members(&gid)? }))
             }
-            Request::Leave { group } => self.leave(&self.resolve(group)?).await,
+            Request::Leave { group, end: false } => self.leave(&self.resolve(group)?).await,
+            Request::Leave { group, end: true } => self.end(&self.resolve(group)?).await,
             Request::Name { group, name } => {
                 let gid = self.resolve(group)?;
                 let settings = self.inner.node.change_settings(&gid.0, |settings| Settings { name: name.clone(), ..settings }).await?;
@@ -623,6 +624,17 @@ impl<P: Provider + Send + 'static> Client<P> {
             self.state().leaving.insert(gid);
             answer["pending"] = json!(true);
         }
+        Ok(answer)
+    }
+
+    /// Ends a group for everyone: closes it to every identity, which tells their devices to no longer list it, removes
+    /// the other members, and leaves it.
+    pub async fn end(&self, gid: &Bytes) -> Result<Value> {
+        let node = &self.inner.node;
+        node.change_settings(&gid.0, |settings| Settings { open: Vec::new(), ..settings }).await?;
+        node.remove_others(&gid.0).await?;
+        let mut answer = self.leave(gid).await?;
+        answer["ended"] = json!(true);
         Ok(answer)
     }
 

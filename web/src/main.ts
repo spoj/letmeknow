@@ -788,7 +788,13 @@ class View {
           else if (left.status) toast("Asked the others to remove you; one of them removes you.");
           render();
           dialog.close();
-        })
+        }),
+        this.members.some(m => !m.you) &&
+          confirmed("End for everyone", `Remove everyone and end this ${kind}?`, async () => {
+            await request({ cmd: "leave", group: gid, end: true });
+            render();
+            dialog.close();
+          })
       )
     );
   }

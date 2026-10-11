@@ -422,6 +422,12 @@ try {
   const ideas = tablet.run("groups").find(g => g.name === "Ideas");
   check(JSON.stringify(ideas.membership).includes(LETMEKNOW_RELAY), "on the membership service of the server that served the browser");
   await laptop.locator(".people", { hasText: "Matt · " }).waitFor();
+  await laptop.getByRole("button", { name: "Settings" }).click();
+  await laptop.getByRole("button", { name: "End for everyone" }).click();
+  await laptop.getByRole("button", { name: "Remove everyone and end this chat?" }).click();
+  await laptop.locator(".group-list button", { hasText: "Ideas" }).waitFor({ state: "detached" });
+  await tablet.printed(e => e.type === "removed" && e.by?.name === "Matt");
+  check(!tablet.run("groups").some(g => g.name === "Ideas"), "the browser ends a chat for everyone");
   await tablet.stop();
 
   // Ann adds Carl, whom the laptop knows only by his identity's own name.

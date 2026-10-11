@@ -679,6 +679,28 @@ fn a_group_leaves_an_identitys_lists_closed_ended_or_taken_off() {
     });
 }
 
+/// A member ends a group for everyone: the others are removed, and the devices of the identities it was open to no
+/// longer list it.
+#[test]
+fn a_group_ended_for_everyone_is_gone_from_every_list() {
+    local(async {
+        let world = world("end").await;
+        let (alice, mut bob, group) = pair(&world, HOUR).await;
+        let tablet = world.start("tablet", HOUR).await;
+        let link = bob.cmd(&["invite", "--identity", "Robert"]).await.unwrap();
+        tablet.cmd(&["identity", "join", link["link"].as_str().unwrap()]).await.unwrap();
+        alice.cmd(&["open", &identity_of(&bob).await]).await.unwrap();
+        let listed = until(async || tablet.cmd(&["groups"]).await.unwrap(), |groups| groups.as_array().unwrap().len() == 1).await;
+        assert_eq!(listed[0]["group"], group.as_str());
+        let ended = alice.cmd(&["leave", "--end"]).await.unwrap();
+        assert_eq!((ended["ended"].as_bool(), ended.get("pending")), (Some(true), None), "{ended}");
+        assert_eq!(bob.expect("removed").await["by"]["name"], "Alice");
+        assert_eq!(alice.cmd(&["groups"]).await.unwrap(), json!([]));
+        assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!([]));
+        assert_eq!(until(async || tablet.cmd(&["groups"]).await.unwrap(), |groups| *groups == json!([])).await, json!([]));
+    });
+}
+
 #[test]
 fn a_link_for_one_identity_admits_no_other() {
     local(async {

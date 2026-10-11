@@ -81,11 +81,14 @@ pub enum Request {
         group: Option<String>,
         member: String,
     },
-    /// Leave a group
+    /// Leave a group; with --end, end it for everyone: close it to every identity, remove the other members, and leave
     #[cfg_attr(feature = "clap", command(display_order = 17))]
     Leave {
         #[cfg_attr(feature = "clap", arg(long))]
         group: Option<String>,
+        #[cfg_attr(feature = "clap", arg(long))]
+        #[serde(default)]
+        end: bool,
     },
     /// Name the group, for everyone in it
     #[cfg_attr(feature = "clap", command(display_order = 18))]
