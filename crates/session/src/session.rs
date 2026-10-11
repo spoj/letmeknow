@@ -1,7 +1,7 @@
 //! The session process: the client core on this session's node, and, holding the device's lock, the device's node with
 //! the devices kind; the plugins of its groups' kinds as executables; and what concerns the agent, printed. Chat is its
-//! built-in kind. The session process that holds the lock publishes the device's identities, its key on each,
-//! contacts and openings to `device-state.json`, and answers the requests only the device's node can on the command
+//! built-in kind. The session process that holds the lock publishes the device's identities, its key on each, and its
+//! openings to `device-state.json`, and answers the requests only the device's node can on the command
 //! channel `device-endpoint`, both in `LETMEKNOW_HOME`; the device's other session processes read the one and send such
 //! requests to the other, among them for the certificates their credentials carry.
 
@@ -36,6 +36,9 @@ const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
 const DEVICE_RETRY: Duration = Duration::from_secs(10);
 /// How often a session checks that its device is still on the identities it speaks as.
 const IDENTITIES_CHECK: Duration = Duration::from_secs(10);
+/// How long a stopping session waits for peers to acknowledge that its connections closed, which takes three round
+/// trips' timeouts per connection. A peer told nothing yet finds out when the connection times out.
+const CLOSE_WAIT: Duration = Duration::from_millis(250);
 
 pub type SessionNode = Node<SqliteProvider>;
 
@@ -432,7 +435,6 @@ impl Session {
             | ClientEvent::Revoked { .. }
             | ClientEvent::Removed { .. }
             | ClientEvent::Settings { .. } => Some(true),
-            ClientEvent::Introduced { .. } => Some(false),
             ClientEvent::Lost { .. } | ClientEvent::LeaveHeld { .. } => Some(true),
             _ => None,
         };
@@ -573,6 +575,9 @@ impl Session {
         if let Some(attachment) = payload.get("attachment") {
             item["attachment"] = attachment.clone();
         }
+        if let Some(sent_at) = payload.get("sent_at") {
+            item["sent_at"] = sent_at.clone();
+        }
         Ok(item)
     }
 
@@ -686,13 +691,17 @@ impl Session {
 
     pub async fn shutdown(&self) {
         self.client.shutdown().await;
-        self.plugins.stop().await;
-        let _ = self.client.node().shutdown().await;
-        if let Some(device) = &self.device {
-            let _ = device.shutdown().await;
+        self.plugins.stop_all().await;
+        let _ = std::fs::remove_file(self.config.dir.join("endpoint"));
+        if self.device.is_some() {
             let _ = std::fs::remove_file(self.home.join("device-endpoint"));
         }
-        let _ = std::fs::remove_file(self.config.dir.join("endpoint"));
+        let device = async {
+            if let Some(device) = &self.device {
+                let _ = device.shutdown().await;
+            }
+        };
+        tokio::time::timeout(CLOSE_WAIT, async { tokio::join!(self.client.node().shutdown(), device) }).await.ok();
     }
 }
 

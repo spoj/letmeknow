@@ -222,7 +222,7 @@ def main():
         check(run("bob", "identity", "list")["identities"][0]["devices"][0]["you"], "an identity starts with this device on its list")
 
         # An invite, and chat.
-        invite = run("alice", "invite", "--name", "Plans", "--for", "Bob (Acme)")
+        invite = run("alice", "invite", "--name", "Plans")
         check(invite["link"].startswith("https://letmeknow.dev/i#3.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
         group = invite["group"]
         check("serve" in run("alice", "groups")[0]["membership"], "its log is on the local letmeknow serve")
@@ -231,9 +231,8 @@ def main():
         event = alice.expect("joined")
         check(event["member"]["name"] == "Bob" and event["how"] == "invite", "alice sees bob join by invite")
         check("unknown, used or expired" in run("carol", "join", invite["link"], ok=False), "an invite link works once")
-        verified = lambda m: m["identity"]["name"] == "Bob (Acme)" and m["identity"]["how"] == "verified"
-        seen = until(lambda: next(m for m in run("alice", "members")["members"] if m["name"] == "Bob"), verified)
-        check(verified(seen), "whoever redeems a link --for a name becomes that contact, verified")
+        seen = next(m for m in run("alice", "members")["members"] if m["name"] == "Bob")
+        check(seen["identity"]["name"] == "Bob" and seen["identity"]["how"] == "unknown", "another identity is known by its own name, a claim")
 
         sent = run("alice", "send", "hello bob")
         check(isinstance(sent.get("position"), int), "send answers the message's position in the group's log")
@@ -278,34 +277,32 @@ def main():
         listeners.append(dave)
         bob = git_kind(alice, bob, dave, listeners)
 
-        # Carol joins through bob, who means the link for her; the chat is then opened to bob's identity.
-        joined = run("carol", "join", run("bob", "invite", f"--group={group}", "--for", "Carol")["link"])
+        # Carol joins through bob; the chat is then opened to bob's identity.
+        joined = run("carol", "join", run("bob", "invite", f"--group={group}")["link"])
         check(len(joined["members"]) == 3, "a member invites another")
         alice.expect("joined", lambda e: e["member"]["name"] == "Carol" and e["by"]["name"] == "Bob")
-        check(any(c["name"] == "Carol" for c in run("bob", "contacts")["contacts"]), "carol is bob's contact")
         desk = Listener("desk", device="bob")
-        check(any(c["name"] == "Carol" for c in run("desk", "contacts", device="bob")["contacts"]), "another session on bob's machine sees his contacts")
+        check(run("desk", "identity", "list", device="bob")["identities"][0]["name"] == "Bob", "another session on bob's machine shares his identity")
         desk.stop()
 
-        # A device link: bob's tablet joins his identity, and his contacts reach it.
+        # A device link: bob's tablet joins his identity.
         link = run("bob", "invite", "--identity", "Bob")["link"]
         check("#3.d." in link, "invite --identity gives a device link")
         tablet = Listener("tablet")
         listeners.append(tablet)
         check("device" in run("tablet", "identity", "join", link), "the tablet joins bob's identity")
         check(len(run("bob", "identity", "list")["identities"][0]["devices"]) == 2, "bob's identity lists two devices")
-        contacts = until(lambda: run("tablet", "contacts")["contacts"], lambda c: any(x["name"] == "Carol" for x in c))
-        check(any(c["name"] == "Carol" and c["how"] == "verified" for c in contacts), "bob's contacts reach his tablet")
+        bob_id = run("tablet", "identity", "list")["identities"][0]["identity"]
 
-        # An open group: the chat is opened to bob's identity, and his tablet joins it without an invite.
-        opened = run("alice", "open", f"--group={group}", "Bob (Acme)")
-        check(opened["settings"]["open"][0]["name"] == "Bob (Acme)", "alice opens the chat to bob's identity")
+        # An open group: the chat is opened to bob's identity, by its id, and his tablet joins it without an invite.
+        opened = run("alice", "open", f"--group={group}", bob_id)
+        check(opened["settings"]["open"] == [{"id": bob_id, "name": "Bob"}], "alice opens the chat to bob's identity")
         listed = until(lambda: run("tablet", "groups"), lambda groups: any(g["group"] == group for g in groups))
         check(any(g["group"] == group and g.get("joined") is False for g in listed), "the tablet sees the chat open to it")
         joined = run("tablet", "join", "--", group)
         check(len(joined["members"]) == 4, "the tablet joins the open chat")
         event = alice.expect("joined", lambda e: e["member"]["name"] == "Tablet")
-        check(event["how"] == "open" and event["member"]["identity"]["name"] == "Bob (Acme)", "as a device of the identity it is open to")
+        check(event["how"] == "open" and event["member"]["identity"]["id"] == bob_id, "as a device of the identity it is open to")
 
         # A removal.
         carol_fp = next(m["fp"] for m in run("alice", "members", f"--group={group}")["members"] if m["name"] == "Carol")
@@ -320,7 +317,9 @@ def main():
         listeners.append(erin)
 
         # A restart: bob misses a message and a commit, and catches up when he is back.
+        stopping = time.time()
         bob.stop()
+        check(time.time() - stopping < 1.5, "a session in groups with peers online stops at once")
         listeners.remove(bob)
         joined = run("erin", "join", link)
         check(joined["group"] == group and len(joined["members"]) == 4, "a joiner gets in while the inviter is stopped")

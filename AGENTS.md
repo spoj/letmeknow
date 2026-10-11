@@ -31,10 +31,11 @@ CI's Linux job, to run before pushing:
 - A failing simulator seed prints the command that replays it. LMK_SIM_TRACE, LMK_SIM_LOG and LMK_SIM_FRAMES make a replay print what happened.
 - Run the simulator on the merged tree too: branches that pass alone can fail together.
 - The simulator tests distributed behaviour: give each change its actions and properties there. Write an example test only for what it cannot run: real I/O (iroh, SQLite, files, the membership service), the session process and CLI, plugins, and the browser.
+- While iterating, run the tests of what you changed. Run the whole list once before merging: build first (the workspace's tests and the wasm build), then the rest side by side.
 - CI also runs on macOS and Windows, which are slower. When a test flakes there, fix the timing it assumes; do not rerun it until it passes.
 
 ## Releases
 
-1. Set `version` in Cargo.toml, run `cargo update -w --offline`, and commit as `X.Y.Z`. Push, and wait for CI on all three systems.
-2. Tag `vX.Y.Z` (annotated, `letmeknow X.Y.Z`) and push the tag. .github/workflows/release.yml tests, builds five platforms, then publishes the GitHub release and the npm packages. Replace the generated release notes with `gh release edit vX.Y.Z --notes-file <file>`. Move a tag only if `publish` never ran.
-3. Once `npm view @letmeknow/cli version` shows the version (a minute or two), deploy letmeknow.dev: `deploy/deploy.sh root@129.212.227.207 letmeknow.dev` (see deploy/README.md). Not before: the page tells agents to run the new CLI's commands. Deploying restarts the service.
+1. Write the release notes to a file, then run `deploy/release.sh X.Y.Z <notes file>` on a clean `main`. It sets `version` in Cargo.toml, runs `cargo update -w --offline`, commits as `X.Y.Z`, and pushes it with the annotated tag `vX.Y.Z`. .github/workflows/release.yml then runs CI on all three systems, builds five platforms, and publishes the GitHub release and the npm packages.
+2. The script waits for the workflow, replaces the generated release notes with yours, waits until `npm view @letmeknow/cli version` shows the version, and deploys letmeknow.dev (`deploy/deploy.sh`, see deploy/README.md), which restarts the service. Not before npm: the page tells agents to run the new CLI's commands.
+3. If the workflow fails, fix it on `main` and move the tag; move a tag only if `publish` never ran. Then finish the steps the script did not reach by hand.

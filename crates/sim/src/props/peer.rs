@@ -1,12 +1,12 @@
 //! The gate: what a member sends and takes of a group, other than what checks itself, it exchanges only with members of
 //! its current epoch, and `state` and live payloads only once it has read its log to the head.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use lmk_proto::Bytes;
 
 use super::short;
-use crate::trace::{Frame, Key, Leaf, Trace, What};
+use crate::trace::{Frame, Key, Leaf, Obs, Trace, Verdict, What};
 
 /// What the checks track of each member's groups as the trace goes: its current leaves, and those before with when they
 /// changed, the head it last read from the service, and the last position it judged.
@@ -16,18 +16,25 @@ struct Seen<'a> {
     before: BTreeMap<(usize, &'a Bytes), (&'a [Leaf], u64)>,
     heads: BTreeMap<(usize, &'a Bytes), u64>,
     read: BTreeMap<(usize, &'a Bytes), u64>,
+    /// Members that joined a group and sampled no roster of it since.
+    joined: BTreeSet<(usize, &'a Bytes)>,
 }
 
 impl<'a> Seen<'a> {
     fn take(&mut self, o: &'a crate::trace::Obs) {
         match &o.what {
             What::Roster { m, group, leaves, .. } => {
+                self.joined.remove(&(*m, group));
                 if let Some(before) = self.leaves.insert((*m, group), leaves) {
                     self.before.insert((*m, group), (before, o.at));
                 }
             }
             What::Head { m, group, head } => drop(self.heads.insert((*m, group), *head)),
-            What::Joined { m, group, start: position, .. } | What::Read { m, group, position, .. } => drop(self.read.insert((*m, group), *position)),
+            What::Joined { m, group, start, .. } => {
+                self.joined.insert((*m, group));
+                self.read.insert((*m, group), *start);
+            }
+            What::Read { m, group, position, .. } => drop(self.read.insert((*m, group), *position)),
             _ => {}
         }
     }
@@ -66,10 +73,17 @@ pub fn gate(t: &Trace) -> Result<(), String> {
 
 fn taken_from_current(t: &Trace, what: &str, taken: impl Fn(&What) -> Option<(usize, &Bytes, &Key)>) -> Result<(), String> {
     let mut seen = Seen::default();
-    for o in &t.0 {
+    for (i, o) in t.0.iter().enumerate() {
         seen.take(o);
         let Some((m, group, sender)) = taken(&o.what) else { continue };
-        if !seen.has(m, group, |leaf| leaf.key == *sender) {
+        // A member that just joined has its roster sampled at its next event: the first after is of the epoch it joined
+        // in, unless it applied a commit before.
+        let current = if seen.joined.contains(&(m, group)) {
+            joined_roster(&t.0[i..], m, group).is_some_and(|leaves| leaves.iter().any(|leaf| leaf.key == *sender))
+        } else {
+            seen.has(m, group, |leaf| leaf.key == *sender)
+        };
+        if !current {
             return Err(format!("m{m} took {what} of {} from {}, not in its current epoch, at {}", short(group), short(sender), super::clock(o.at)));
         }
         if seen.behind(m, group) {
@@ -77,6 +91,15 @@ fn taken_from_current(t: &Trace, what: &str, taken: impl Fn(&What) -> Option<(us
         }
     }
     Ok(())
+}
+
+/// The roster a member that joined a group samples first, unless it applies a commit of the group before.
+fn joined_roster<'a>(later: &'a [Obs], m: usize, group: &Bytes) -> Option<&'a [Leaf]> {
+    later.iter().find_map(|o| match &o.what {
+        What::Roster { m: j, group: g, leaves, .. } if *j == m && g == group => Some(Some(leaves.as_slice())),
+        What::Read { m: j, group: g, verdict: Verdict::Commit { .. }, .. } if *j == m && g == group => Some(None),
+        _ => None,
+    })?
 }
 
 /// A live payload is taken only from a sender (its session key) in the receiver's current epoch, and only once the

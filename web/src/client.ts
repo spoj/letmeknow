@@ -8,18 +8,8 @@ import wasm from "../pkg/lmk_web_bg.wasm";
 import * as store from "./store";
 
 /** A member as the client core describes it; an endpoint that is not one has only its `iroh` key. */
-export type Identity = {
-  id: string;
-  name: string;
-  how: "self" | "verified" | "introduced" | "unknown";
-  by?: string;
-  warning?: string;
-  error?: string;
-  new_device?: string;
-  /** Who vouched for it, and as whom. */
-  introduced?: { by: Person; name: string }[];
-};
-export type Person = { fp: string; name: string; device: string; you?: boolean; warning?: string; identity?: Identity; added_by?: { name?: string; how: string }; away?: boolean };
+export type Identity = { id: string; name: string; how: "self" | "unknown"; error?: string; new_device?: string };
+export type Person = { fp: string; name: string; device: string; you?: boolean; identity?: Identity; added_by?: { name?: string; how: string }; away?: boolean };
 export type Named = { id: string; name: string };
 export type Settings = { kind: "chat" | "doc" | "git"; name: string; open?: Named[]; carry?: number };
 export type Group = { group: string; settings: Settings; members: Person[]; joined: boolean };
@@ -29,7 +19,10 @@ export type Item =
   | {
       type: "message";
       id: string;
+      /** When it arrived; the timeline is in this order. */
       at: number;
+      /** When the sender sent it, by its clock. */
+      sent_at?: number;
       from: Person;
       content: string;
       to?: string[];
@@ -56,11 +49,10 @@ export type Item =
   | { type: "left"; at: number; member: Person; by: Person }
   | { type: "revoked"; at: number; removed: Person[]; added: Person[] }
   | { type: "settings"; at: number; by: Person; before?: Settings; settings: Settings }
-  | { type: "introduced"; at: number; by: Person; identity: Named; how: string }
   | { type: "pushed"; at: number; by: Person; ref: string; subjects: string[] };
 export type Event = { type: string; group?: string; identity?: string; id?: string; hash?: string; text?: string; by?: string };
 export type Me = { fp: string; name: string; device: { name: string }; identities: (Named & { device?: string })[] };
-export type Contacts = { contacts: { identity: string; name: string; how: string; by?: string }[]; introductions: { identity: string; name: string; by: Person }[] };
+
 
 /** The session's methods, as every tab calls them: asynchronously, wherever it runs. */
 type Methods = Exclude<keyof Lmk, "free" | symbol>;

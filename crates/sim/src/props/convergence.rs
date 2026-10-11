@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lmk_proto::Bytes;
 
-use super::{CARRY, inside, judged, quiets, removed, short, through};
-use crate::trace::{Frame, Hash, Positions, Trace, Verdict, What};
+use super::{CARRY, inside, judged, key_of, quiets, removed, short, through};
+use crate::trace::{Frame, Hash, Key, Positions, Trace, Verdict, What};
 
 /// How long a member waits, without progress, before it applies a commit that deletes keys of positions it lacks.
 pub const STALL: u64 = 10_000;
@@ -89,19 +89,20 @@ pub fn loss_allowed(t: &Trace) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a member applied the commit deleting the keys of `epoch` when it could give `p` up.
+/// Whether a member applied the commit deleting the keys of `epoch` when it could give `p` up. It came online as last
+/// before it read the commit: a crash later in the same instant starts it again.
 fn deletion(t: &Trace, m: usize, group: &Bytes, p: u64, epoch: u64) -> bool {
-    let applied = t.0.iter().find_map(|o| match &o.what {
-        What::Read { m: j, group: g, epoch: e, verdict: Verdict::Commit { .. }, .. } if *j == m && g == group && *e == epoch + 1 => Some(o.at),
-        _ => None,
+    let applied = t.0.iter().position(|o| {
+        matches!(&o.what, What::Read { m: j, group: g, epoch: e, verdict: Verdict::Commit { .. }, .. } if *j == m && g == group && *e == epoch + 1)
     });
-    let Some(at) = applied else { return false };
+    let Some(i) = applied else { return false };
+    let at = t.0[i].at;
     let online = |o: &&crate::trace::Obs| match &o.what {
         What::Up { m: j } => *j == m,
         What::Joined { m: j, group: g, .. } => *j == m && g == group,
         _ => false,
     };
-    let up = t.0.iter().take_while(|o| o.at <= at).filter(online).map(|o| o.at).last().unwrap_or(0);
+    let up = t.0[..i].iter().rev().find(online).map_or(0, |o| o.at);
     at >= up + ONLINE_WAIT && (!covered(t, m, group, p, at) || stalled(t, m, group, at))
 }
 
@@ -112,18 +113,29 @@ fn delivered(t: &Trace, conn: usize, at: u64) -> bool {
 
 /// Whether a connected member's latest summary on its connection showed `p` held or being fetched, as of `at`.
 fn covered(t: &Trace, m: usize, group: &Bytes, p: u64, at: u64) -> bool {
+    let earlier = &t.0[..t.0.iter().take_while(|o| o.at <= at).count()];
     let mut latest: BTreeMap<(usize, usize), (&Positions, &Positions)> = BTreeMap::new();
-    for o in t.0.iter().take_while(|o| o.at <= at) {
-        if let What::In { m: j, from, conn, group: g, frame: Frame::Hello { held, fetching, .. } } = &o.what
-            && *j == m
-            && g == group
-            && delivered(t, *conn, o.at)
-        {
-            latest.insert((*from, *conn), (held, fetching));
+    let mut former: BTreeSet<&Key> = BTreeSet::new();
+    for o in earlier {
+        match &o.what {
+            // A member that started again has no connection, whatever the network says yet of those it had.
+            What::Up { m: j } if *j == m && o.at < at => latest.clear(),
+            // A peer it removed is no member to it, until it adds it again.
+            What::Read { m: j, group: g, verdict: Verdict::Commit { added, removed, .. }, .. } if *j == m && g == group => {
+                former.extend(removed);
+                for key in added {
+                    former.remove(key);
+                }
+            }
+            What::In { m: j, from, conn, group: g, frame: Frame::Hello { held, fetching, .. } } if *j == m && g == group && delivered(t, *conn, o.at) => {
+                latest.insert((*from, *conn), (held, fetching));
+            }
+            _ => {}
         }
     }
     let open = |conn: usize| !t.0.iter().any(|o| o.at <= at && matches!(o.what, What::Closed { conn: c } if c == conn));
-    latest.iter().any(|((_, conn), (held, fetching))| open(*conn) && (held.contains(&p) || fetching.contains(&p)))
+    let member = |from: usize| key_of(earlier, from, group).is_none_or(|key| !former.contains(key));
+    latest.iter().any(|((from, conn), (held, fetching))| open(*conn) && member(*from) && (held.contains(&p) || fetching.contains(&p)))
 }
 
 /// Whether no ciphertext of the group and no summary unlike the one before on its connection reached a member, and no

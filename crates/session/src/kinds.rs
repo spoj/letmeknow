@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -46,6 +47,8 @@ struct Running {
     /// Lines for its stdin.
     stdin: mpsc::UnboundedSender<String>,
     started: Instant,
+    /// Set once the session stops it, which its lines ending then does not report.
+    stopping: Arc<AtomicBool>,
 }
 
 /// How long a plugin has to end once its stdin closes, as the session stops.
@@ -72,7 +75,7 @@ impl Plugins {
 
 impl Plugins {
     /// Stops every plugin: its stdin closes, and it is killed unless it ended within `STOP_WAIT`.
-    pub async fn stop(&self) {
+    pub async fn stop_all(&self) {
         let running: Vec<Running> = self.running.lock().unwrap().drain().map(|(_, running)| running).collect();
         for Running { mut child, stdin, .. } in running {
             drop(stdin);
@@ -90,7 +93,8 @@ impl lmk_client::Plugins for Plugins {
         let path = self.found.get(kind).with_context(|| format!("this session has no plugin for {kind} groups ({PREFIX}{kind})"))?;
         let mut child = Command::new(path).stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn()?;
         let (mut stdin, stdout) = (child.stdin.take().expect("piped"), child.stdout.take().expect("piped"));
-        let (lines, name) = (self.lines.clone(), kind.to_owned());
+        let (lines, name, stopping) = (self.lines.clone(), kind.to_owned(), Arc::new(AtomicBool::new(false)));
+        let stopped = stopping.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
@@ -99,7 +103,9 @@ impl lmk_client::Plugins for Plugins {
                     Err(error) => eprintln!("{PREFIX}{name} wrote {line:?}: {error}"),
                 }
             }
-            lines.send((name, None)).ok();
+            if !stopped.load(Ordering::Relaxed) {
+                lines.send((name, None)).ok();
+            }
         });
         let (writer, mut written) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
@@ -109,7 +115,7 @@ impl lmk_client::Plugins for Plugins {
                 }
             }
         });
-        let running = Running { child, stdin: writer, started: Instant::now() };
+        let running = Running { child, stdin: writer, started: Instant::now(), stopping };
         self.running.lock().unwrap().insert(kind.to_owned(), running);
         Ok(json!({ "dir": self.dir.join(kind) }))
     }
@@ -126,5 +132,32 @@ impl lmk_client::Plugins for Plugins {
 
     fn stopped(&self, kind: &str) -> bool {
         self.running.lock().unwrap().remove(kind).is_some_and(|running| running.started.elapsed() > STEADY)
+    }
+
+    /// Closes the plugin's stdin, and kills it unless it ended within `STOP_WAIT`.
+    fn stop(&self, kind: &str) {
+        let Some(Running { mut child, stdin, stopping, .. }) = self.running.lock().unwrap().remove(kind) else { return };
+        stopping.store(true, Ordering::Relaxed);
+        drop(stdin);
+        tokio::spawn(async move { tokio::time::timeout(STOP_WAIT, child.wait()).await.ok() });
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use lmk_client::Plugins as _;
+
+    #[tokio::test]
+    async fn a_plugin_stopped_ends_without_reporting_that_it_stopped() {
+        let (plugins, mut lines) = Plugins::new(BTreeMap::from([("echo".into(), "/bin/cat".into())]), std::env::temp_dir());
+        plugins.start("echo").unwrap();
+        plugins.send("echo", &json!({ "type": "ping" })).unwrap();
+        assert_eq!(lines.recv().await.unwrap(), ("echo".into(), Some(json!({ "type": "ping" }))));
+        plugins.stop("echo");
+        assert!(plugins.running().is_empty());
+        drop(plugins);
+        // The channel closes once the plugin's lines end, with no `None` before.
+        assert_eq!(tokio::time::timeout(STOP_WAIT, lines.recv()).await.unwrap(), None);
     }
 }

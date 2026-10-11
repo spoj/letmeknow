@@ -14,7 +14,7 @@ use lmk_membership::service::{Policy, Service as Membership};
 use lmk_membership::store::Store;
 use lmk_node::devices::Devices;
 use lmk_node::{Config, Event, Node};
-use lmk_proto::group::{CHAT, Certificate, ChatMessage, DEVICES, IdentityRef, Named, PROTOCOL, Service, Settings};
+use lmk_proto::group::{CHAT, Certificate, ChatMessage, DEVICES, IdentityRef, Named, Opening, PROTOCOL, Service, Settings};
 use lmk_proto::identity::Listed;
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
@@ -157,7 +157,7 @@ fn settings(kind: &str, folder: &Path) -> Settings {
 }
 
 fn message(text: &str) -> Value {
-    serde_json::to_value(ChatMessage { content: text.into(), read: Default::default(), to: vec![], reply_to: None, urgent: false, attachment: None }).unwrap()
+    serde_json::to_value(ChatMessage { content: text.into(), read: Default::default(), to: vec![], reply_to: None, urgent: false, attachment: None, sent_at: None }).unwrap()
 }
 
 /// A new identity, its key log on `membership`, with a first device called laptop: the identity, its key, and the
@@ -191,14 +191,14 @@ async fn chat_and_removal() {
     let mut alice = session(&relay, "Alice").await;
     let mut bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
-    let link = alice.node.invite(&gid.0, Some("Bob (Acme)".into()), None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     let (joined, _) = bob.node.join(&link, None).await.unwrap();
     assert_eq!(joined, gid);
-    let (member, label, introduces) = alice.until(|e| match e {
-        Event::Joined { member, label, introduces, .. } => Some((member, label, introduces)),
+    let member = alice.until(|e| match e {
+        Event::Joined { member, .. } => Some(member),
         _ => None,
     }).await;
-    assert_eq!((member.name.as_str(), label.as_deref(), introduces), ("Bob", Some("Bob (Acme)"), true));
+    assert_eq!(member.name, "Bob");
     assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
 
     let sent = bob.node.send(&gid.0, &message("hello")).await.unwrap();
@@ -234,7 +234,7 @@ async fn any_member_admits_an_invite_once() {
     let mut bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
     // A member named first that cannot be reached holds up nothing while another can.
-    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     let dead = lmk_proto::links::Address { key: *iroh::SecretKey::from_bytes(&lmk_core::random()).public().as_bytes(), relay: Some(relay.url.to_string()) };
     let started = std::time::Instant::now();
     bob.node.join(&Invite { members: vec![dead, link.members[0].clone()], ..link }, None).await.unwrap();
@@ -242,7 +242,7 @@ async fn any_member_admits_an_invite_once() {
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
 
     // Two joiners race with one secret, each asking another member: one gets in, and the other is refused.
-    let link = alice.node.invite(&gid.0, Some("Carol".into()), None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     assert_eq!(link.members.len(), 2, "the link names the inviter and the member that took the invite");
     let only = |n: usize| Invite { members: vec![link.members[n].clone()], ..link.clone() };
     let (carol, dave) = (session(&relay, "Carol").await, session(&relay, "Dave").await);
@@ -256,7 +256,7 @@ async fn any_member_admits_an_invite_once() {
     assert!(format!("{used:#}").contains("unknown, used or expired"), "a used secret is refused");
 
     // A member that redeems a link is refused, and the link stays unused.
-    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     let member = bob.node.join(&link, None).await.unwrap_err();
     assert!(format!("{member:#}").contains("a member already"), "{member:#}");
 
@@ -268,17 +268,17 @@ async fn any_member_admits_an_invite_once() {
     let expired = Invite { secret, members: vec![link.members[0].clone()], ..link.clone() };
     assert!(format!("{:#}", erin.node.join(&expired, None).await.unwrap_err()).contains("unknown, used or expired"));
 
-    // With the inviter offline, another member it named admits the joiner; the inviter, not it, introduces them.
+    // With the inviter offline, another member it named admits the joiner.
     alice.node.shutdown().await.unwrap();
     drop(alice);
     let (joined, by) = erin.node.join(&link, None).await.unwrap();
     assert_eq!(joined, gid);
     assert!(link.members[1..].iter().any(|m| m.key == by), "another member admits");
-    let (member, how, introduces) = bob.until(|e| match e {
-        Event::Joined { member, how, introduces, .. } if member.name == "Erin" => Some((member, how, introduces)),
+    let how = bob.until(|e| match e {
+        Event::Joined { member, how, .. } if member.name == "Erin" => Some(how),
         _ => None,
     }).await;
-    assert_eq!((member.name.as_str(), how, introduces), ("Erin", lmk_proto::group::How::Invite, false));
+    assert_eq!(how, lmk_proto::group::How::Invite);
 }
 
 /// A member reached first that never answers keeps the joiner from no other member it dials meanwhile.
@@ -290,7 +290,7 @@ async fn a_silent_member_reached_first_holds_up_no_other() {
     let alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
-    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     let key = iroh::SecretKey::from_bytes(&lmk_core::random());
     let silent = Address { key: *key.public().as_bytes(), relay: Some(relay.url.to_string()) };
     let _silent = hand(&relay, key.clone(), &bob.node).await;
@@ -310,10 +310,10 @@ async fn an_invite_dies_when_its_inviter_leaves() {
     let (bob, carol) = (session(&relay, "Bob").await, session(&relay, "Carol").await);
     let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
     for joiner in [&bob, &carol] {
-        joiner.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+        joiner.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
-    let (by_bob, by_carol) = (bob.node.invite(&gid.0, None, None).await.unwrap(), carol.node.invite(&gid.0, None, None).await.unwrap());
+    let (by_bob, by_carol) = (bob.node.invite(&gid.0, None).await.unwrap(), carol.node.invite(&gid.0, None).await.unwrap());
     let invites = || alice.node.messages(&gid.0).unwrap().iter().filter(|m| m.payload["type"] == "invite").count();
     eventually("Alice holds both invites", || invites() == 4).await;
 
@@ -342,12 +342,12 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
     let carol = node(&relay, "Carol", &[CHAT]).await;
     let gid = alice.node.create(settings(KIND, &dir), None).unwrap();
     assert!(carol.node.create(settings(KIND, &dir), None).is_err(), "a session makes no group of a kind it lacks");
-    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     let refused = carol.node.join(&link, None).await.unwrap_err();
     assert!(format!("{refused:#}").contains("does not support test groups"), "{refused:#}");
 
     // The inviter's kind hands the joiner its state.
-    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     let joining = tokio::spawn(async move { bob.node.join(&link, None).await.map(|_| bob) });
     let reply = alice.until(|e| match e {
         Event::Snapshot { reply, .. } => Some(reply),
@@ -473,7 +473,7 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
     let alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
-    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     bob.node.join(&link, None).await.unwrap();
     let alice_only = vec![link.members[0].clone()];
     let alice_iroh = alice.node.members(&gid.0).unwrap().into_iter().find(|m| m.name == "Alice").unwrap().iroh;
@@ -599,7 +599,7 @@ async fn a_kind_takes_held_messages_in_log_order_and_a_member_without_state_asks
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(Settings { membership, ..settings(KIND, &dir) }, None).unwrap();
     alice.node.follow_log(&gid.0, Some(0)).unwrap();
-    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     let joining = tokio::spawn(async move { bob.node.join(&link, None).await.map(|_| bob) });
     alice.snapshot(Some(b"empty")).await;
     let mut bob = joining.await.unwrap().unwrap();
@@ -628,7 +628,7 @@ async fn a_kind_takes_held_messages_in_log_order_and_a_member_without_state_asks
     // Carol joins with no state, admitted by whichever member she reaches first: she asks every member online for the
     // kind's state, gets none from Bob, as a browser gives none for git, and Alice's, and follows from her start.
     let carol = session(&relay, "Carol").await;
-    let link = bob.node.invite(&gid.0, None, None).await.unwrap();
+    let link = bob.node.invite(&gid.0, None).await.unwrap();
     let joining = tokio::spawn(async move { carol.node.join(&link, None).await.map(|_| carol) });
     tokio::select! {
         _ = alice.snapshot(None) => {}
@@ -673,7 +673,7 @@ async fn a_member_without_state_asks_for_one_once_members_are_online() {
         }
     };
     let carol = start().await;
-    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     let joining = tokio::spawn(async move { carol.node.join(&link, None).await.map(|_| carol) });
     alice.snapshot(None).await;
     let carol = joining.await.unwrap().unwrap();
@@ -777,15 +777,16 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     routed(&mut tablet, tablet_devices.clone());
     let bob = laptop_devices.create("Bob", membership.clone()).await.unwrap();
     let first = *lists(&laptop.node, &bob, &["laptop"]).await.current();
-    laptop_devices.set_contact(&[9; 32], lmk_core::contacts::Contact { name: "Carol".into(), how: lmk_core::contacts::How::Verified, by: None, at: 1, rest: Default::default() }).await.unwrap();
+    let plan = Opening { group: Bytes(vec![9; 32]), kind: CHAT.into(), name: "Plan".into(), membership: membership.clone(), members: vec![Bytes(vec![1; 32])], rest: Default::default() };
+    laptop_devices.set_opening(&bob.id.0, plan.clone()).await.unwrap();
 
-    // A device link: the tablet gets the identity's state, its key and contacts among it, and joins with a key of its
+    // A device link: the tablet gets the identity's state, its key and openings among it, and joins with a key of its
     // own, which the key log lists once a device restates the list.
     let link = lmk_proto::links::Invite::parse(&laptop_devices.invite(&bob.id.0).await.unwrap()).unwrap();
     tablet_devices.join(&link).await.unwrap();
     identified(&tablet_devices).await;
     assert_eq!(tablet_devices.identities(), [(bob.clone(), "Bob".to_owned())]);
-    assert_eq!(tablet_devices.contacts()[0].1.name, "Carol");
+    assert_eq!(tablet_devices.openings(), [plan]);
     let (laptop_key, tablet_key) = (laptop_devices.key(&bob.id.0).unwrap(), tablet_devices.key(&bob.id.0).unwrap());
     assert!(laptop_key != tablet_key && laptop_key != laptop.node.key() && tablet_key != tablet.node.key(), "a device key per identity");
     let log = lists(&laptop.node, &bob, &["laptop", "tablet"]).await;
@@ -801,12 +802,12 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     let opening = alice.node.opening(&chat.0).unwrap();
     tablet_devices.set_opening(&bob.id.0, opening.clone()).await.unwrap();
     tokio::time::timeout(WAIT, async {
-        while laptop_devices.openings().is_empty() {
+        while !laptop_devices.openings().iter().any(|o| o.group == chat) {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }).await.expect("an opening reaches every device");
     tablet.node.join_open(&opening, tablet_devices.certify(&bob.id.0, &tablet.node.key().0).unwrap()).await.unwrap();
-    let link = alice.node.invite(&chat.0, None, None).await.unwrap();
+    let link = alice.node.invite(&chat.0, None).await.unwrap();
     laptop.node.join(&link, Some(laptop_devices.certify(&bob.id.0, &laptop.node.key().0).unwrap())).await.unwrap();
     let seen = alice.checked(&chat, "tablet", true).await;
     assert_eq!((seen.device_name.as_str(), seen.identity.unwrap().added), ("tablet", true));
@@ -844,20 +845,20 @@ async fn a_dropped_devices_sessions_are_removed_once_and_reported() {
     alice.node.append_identity(&carol, &log.next(&key, &public(&key), vec![listed(&laptop, "laptop"), listed(&tablet_key, "tablet")])).await.unwrap();
     let groups = [(); 2].map(|_| alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &dir) }, None).unwrap());
     let (tablet, desk, dave, eve) = (session(&relay, "tablet").await, session(&relay, "desk").await, session(&relay, "Dave").await, session(&relay, "Eve").await);
-    let alice_only = vec![alice.node.invite(&groups[0].0, None, None).await.unwrap().members[0].clone()];
+    let alice_only = vec![alice.node.invite(&groups[0].0, None).await.unwrap().members[0].clone()];
     for gid in &groups {
         for (joiner, device) in [(&tablet, &tablet_key), (&desk, &laptop)] {
             // Alice admits each: a link that named the tablet too could have the tablet add the desk.
-            let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+            let link = alice.node.invite(&gid.0, None).await.unwrap();
             let link = lmk_proto::links::Invite { members: link.members[..1].to_vec(), ..link };
             joiner.node.join(&link, Some(certificate(&carol, device, &joiner.node.key()))).await.unwrap();
             alice.checked(gid, &joiner.node.members(&gid.0).unwrap().iter().find(|m| m.key == joiner.node.key()).unwrap().name, true).await;
         }
     }
     // The tablet's session adds Dave to the first group, and invites Eve, whom alice admits.
-    let link = tablet.node.invite(&groups[0].0, None, None).await.unwrap();
+    let link = tablet.node.invite(&groups[0].0, None).await.unwrap();
     dave.node.join(&link, None).await.unwrap();
-    let link = tablet.node.invite(&groups[0].0, None, None).await.unwrap();
+    let link = tablet.node.invite(&groups[0].0, None).await.unwrap();
     assert!(link.members.contains(&alice_only[0]), "the link names Alice, who holds the invite");
     eve.node.join(&lmk_proto::links::Invite { members: alice_only, ..link }, None).await.unwrap();
     tokio::time::timeout(WAIT, async {
@@ -1035,7 +1036,7 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
     let alice = session(&relay, "Alice").await;
     let gid = alice.node.create(settings(CHAT, &logs), None).unwrap();
     let bob = start().await;
-    bob.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    bob.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     let revision = |wanted: u32| {
         let (node, gid) = (&alice.node, &gid);
         tokio::time::timeout(WAIT, async move {
@@ -1100,10 +1101,10 @@ async fn a_member_catching_up_takes_more_than_a_thousand_messages_of_one_sender(
     let mut bob = session(&relay, "Bob").await;
     let (carol, _events) = Node::start(SqliteProvider::open(&carol_db).unwrap(), carol_config()).await.unwrap();
     let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
-    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     bob.node.join(&link, None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     carol.join(&link, None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     bob.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -1159,7 +1160,7 @@ async fn held_leave(test: &str, restart_leaver: bool) {
     let mut alice = start("Alice").await;
     let bob = start("Bob").await;
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
-    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
 
     gate.set(false);
@@ -1201,7 +1202,7 @@ async fn an_old_leave_does_not_remove_a_member_added_again() {
     let carol = session(&relay, "Carol").await;
     let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
     for joiner in [&bob, &carol] {
-        joiner.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+        joiner.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
     eventually("Carol has both Adds", || carol.node.members(&gid.0).unwrap().len() == 3).await;
@@ -1210,7 +1211,7 @@ async fn an_old_leave_does_not_remove_a_member_added_again() {
 
     bob.node.leave(&gid.0).await.unwrap();
     bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
-    bob.node.join(&carol.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    bob.node.join(&carol.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     // Only Carol holds the leave: were Bob online, Alice's wait could end at her connection to him before Carol's lands.
     bob.node.shutdown().await.unwrap();
     let alice = start().await;
@@ -1241,7 +1242,7 @@ async fn a_pending_send_sealed_again_is_reported_by_its_final_id() {
     let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
     let (mut alice, mut bob) = (session(&relay, "Alice").await, session(&relay, "Bob").await);
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
-    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
 
     // Only Bob is kept from the log: his send is pending while Alice renames the group.
@@ -1271,7 +1272,7 @@ async fn a_leaver_left_alone_forgets_the_group() {
     let mut alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
-    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     let (a, b) = tokio::join!(alice.node.leave(&gid.0), bob.node.leave(&gid.0));
     a.unwrap();
@@ -1289,7 +1290,7 @@ async fn a_change_made_moot_commits_nothing() {
     let carol = session(&relay, "Carol").await;
     let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
     for joiner in [&bob, &carol] {
-        joiner.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+        joiner.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
     eventually("Bob has both Adds", || bob.node.members(&gid.0).unwrap().len() == 3).await;
@@ -1339,7 +1340,7 @@ async fn a_member_away_past_the_retention_drops_the_group() {
     let mut alice = session(&relay, "Alice").await;
     let bob = start().await;
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
-    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     bob.node.shutdown().await.unwrap();
     drop(bob);
@@ -1374,7 +1375,7 @@ async fn an_announced_loss_reaches_every_member() {
     let carol = stored(&relay, "Carol", &db("carol")).await;
     let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
     for joiner in [&bob, &carol] {
-        joiner.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+        joiner.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
     eventually("Carol has both Adds", || carol.node.members(&gid.0).unwrap().len() == 3).await;
@@ -1425,28 +1426,28 @@ async fn devices_stop_at_a_loss_and_resume_from_a_state_past_it() {
     let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
     let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
     let (tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
-    let bob = laptop_devices.create("Bob", membership).await.unwrap();
+    let bob = laptop_devices.create("Bob", membership.clone()).await.unwrap();
     let link = lmk_proto::links::Invite::parse(&laptop_devices.invite(&bob.id.0).await.unwrap()).unwrap();
     tablet_devices.join(&link).await.unwrap();
     identified(&tablet_devices).await;
     tablet.node.shutdown().await.unwrap();
     drop((tablet, tablet_devices));
-    let carol = lmk_core::contacts::Contact { name: "Carol".into(), how: lmk_core::contacts::How::Verified, by: None, at: 1, rest: Default::default() };
-    laptop_devices.set_contact(&[9; 32], carol).await.unwrap();
+    let plan = Opening { group: Bytes(vec![9; 32]), kind: CHAT.into(), name: "Plan".into(), membership, members: vec![Bytes(vec![1; 32])], rest: Default::default() };
+    laptop_devices.set_opening(&bob.id.0, plan).await.unwrap();
     laptop.node.shutdown().await.unwrap();
     drop((laptop, laptop_devices));
 
-    // The tablet, alone, commits twice and so loses the contact: it stops.
+    // The tablet, alone, commits twice and so loses the opening: it stops.
     let (mut tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
     for name in ["tab", "slate"] {
         tablet_devices.rename(name).await.unwrap();
     }
     tablet.until(|e| matches!(e, Event::Warning { text, .. } if text.contains("waits for a device's state")).then_some(())).await;
-    assert!(tablet_devices.contacts().is_empty());
+    assert!(tablet_devices.openings().is_empty());
 
     // The laptop comes back and hands it the state, past the loss.
     let (_laptop, _laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
-    eventually("the tablet takes the laptop's state", || tablet_devices.contacts().iter().any(|(_, c)| c.name == "Carol")).await;
+    eventually("the tablet takes the laptop's state", || tablet_devices.openings().iter().any(|o| o.name == "Plan")).await;
 }
 
 /// The members a key log entry drops are removed by one commit.
@@ -1465,7 +1466,7 @@ async fn a_pass_removes_every_member_due_in_one_commit() {
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
     let (tablet, phone) = (session(&relay, "tablet").await, session(&relay, "phone").await);
     for (joiner, device, name) in [(&tablet, &tablet_key, "tablet"), (&phone, &phone_key, "phone")] {
-        let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+        let link = alice.node.invite(&gid.0, None).await.unwrap();
         joiner.node.join(&link, Some(certificate(&carol, device, &joiner.node.key()))).await.unwrap();
         alice.checked(&gid, name, true).await;
     }
@@ -1495,7 +1496,7 @@ async fn a_leaver_asks_again_while_it_updates_every_t() {
     let alice = stored(&relay, "Alice", &alice_db).await;
     let mut bob = session(&relay, "Bob").await;
     let gid = alice.node.create(Settings { update: 2, ..settings(CHAT, &dir.join("logs")) }, None).unwrap();
-    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     alice.node.shutdown().await.unwrap();
     drop(alice);
 
@@ -1608,7 +1609,7 @@ async fn summaries_are_kept_shown_and_dropped_with_their_member() {
     let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
     let first = alice.node.send(&gid.0, &message("before anyone")).await.unwrap().position.unwrap();
     for joiner in [&bob, &carol] {
-        joiner.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+        joiner.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
     assert!(!alice.node.only_here(&gid.0).unwrap().contains(first), "before every other member's start, whether or not heard yet");
@@ -1649,7 +1650,7 @@ async fn a_gap_holds_up_its_epoch_while_fetched_then_is_passed_and_opens_late_or
     let sam = stored(&relay, "Sam", &sam_db).await;
     let bob = stored(&relay, "Bob", &bob_db).await;
     let gid = sam.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
-    bob.node.join(&sam.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    bob.node.join(&sam.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     eventually("Bob is in", || sam.node.members(&gid.0).unwrap().len() == 2).await;
     bob.node.shutdown().await.unwrap();
     drop(bob);
@@ -1711,7 +1712,7 @@ async fn a_member_waits_while_the_member_between_it_and_the_holder_fetches() {
     let dbs = ["sam", "quinn", "rita"].map(|name| dir.join(format!("{name}.db")));
     let sam = stored(&relay, "Sam", &dbs[0]).await;
     let gid = sam.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
-    let links = [sam.node.invite(&gid.0, None, None).await.unwrap(), sam.node.invite(&gid.0, None, None).await.unwrap()];
+    let links = [sam.node.invite(&gid.0, None).await.unwrap(), sam.node.invite(&gid.0, None).await.unwrap()];
     for ((name, db), link) in [("Quinn", &dbs[1]), ("Rita", &dbs[2])].into_iter().zip(links) {
         let joiner = stored(&relay, name, db).await;
         joiner.node.join(&link, None).await.unwrap();
@@ -1793,7 +1794,7 @@ async fn a_peer_not_admitted_changes_nothing() {
     let mut alice = stored(&relay, "Alice", &alice_db).await;
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
-    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     let sent = bob.node.send(&gid.0, &message("real")).await.unwrap();
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     bob.node.shutdown().await.unwrap();
@@ -1837,7 +1838,7 @@ async fn a_joiner_whose_answer_was_lost_is_admitted_by_the_logged_welcome() {
     let mut alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(KIND, &dir), None).unwrap();
-    let link = alice.node.invite(&gid.0, None, None).await.unwrap();
+    let link = alice.node.invite(&gid.0, None).await.unwrap();
     let (node, first) = (bob.node.clone(), link.clone());
     let joining = tokio::spawn(async move { node.join(&first, None).await });
     // The Add is in: its answer waits for the kind's state, and the joiner stops waiting for it.
@@ -1880,7 +1881,7 @@ async fn a_link_altered_to_another_kind_admits_to_nothing() {
     assert!(mallory.node.groups().is_empty());
 
     let gid = laptop.node.create(settings(CHAT, &dir), None).unwrap();
-    let link = laptop.node.invite(&gid.0, None, None).await.unwrap();
+    let link = laptop.node.invite(&gid.0, None).await.unwrap();
     let refused = mallory.node.join(&Invite { device: true, ..link }, None).await.unwrap_err();
     assert!(format!("{refused:#}").contains("altered"), "{refused:#}");
     assert!(mallory.node.groups().is_empty());
@@ -1898,12 +1899,12 @@ async fn a_member_online_is_not_away_and_a_file_spreads_on_its_first_holder() {
     let alice = stored(&relay, "Alice", &alice_db).await;
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
-    bob.node.join(&alice.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     eventually("Alice has Bob's Add", || alice.node.members(&gid.0).unwrap().len() == 2).await;
     alice.node.shutdown().await.unwrap();
     drop(alice);
     let carol = stored(&relay, "Carol", &carol_db).await;
-    carol.node.join(&bob.node.invite(&gid.0, None, None).await.unwrap(), None).await.unwrap();
+    carol.node.join(&bob.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     carol.node.shutdown().await.unwrap();
     drop(carol);
 

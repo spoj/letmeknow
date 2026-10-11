@@ -104,6 +104,7 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 .open-list h3 { padding: var(--s1) var(--s3); }
 .opening { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); padding: 0 var(--s1) 0 var(--s3); min-height: 36px; }
 .opening button { min-height: 28px; font-size: var(--t-sm); }
+.note { display: block; }
 .me { flex-direction: column; align-items: flex-start; gap: 0; border-top: 1px solid var(--line); border-radius: 0 0 var(--radius) var(--radius); padding-top: var(--s3); }
 .me.on { color: inherit; background: var(--accent-soft); }
 .main { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
@@ -146,7 +147,6 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 .ticks { color: var(--muted); display: block; text-align: right; }
 .event .ticks { display: inline; }
 .level { font-weight: 400; }
-.level.verified { color: var(--accent); }
 .status { font-size: var(--t-sm); }
 time { font-size: 12px; color: var(--muted); }
 .text { white-space: pre-wrap; overflow-wrap: anywhere; }

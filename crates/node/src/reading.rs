@@ -225,11 +225,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for leaf in applied.removed.iter().filter_map(|m| m.leaf.as_ref()) {
             st.unhear(gid, &leaf.key.0)?;
         }
-        let core::Applied { added, how, invite, removed, settings, .. } = applied;
+        let core::Applied { added, how, removed, settings, .. } = applied;
         let keys = |members: &[core::Member]| members.iter().map(|m| Bytes(m.key.clone())).collect();
         let verdict = Judgement::Commit { committer: Bytes(by.as_ref().map(|by| by.key.clone()).unwrap_or_default()), added: keys(&added), removed: keys(&removed) };
         st.observe(|| Observation::Read { group: Bytes(gid.to_vec()), position, entry: Sha256::digest(entry).into(), epoch, verdict });
-        self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, invite, removed, settings, gone }).ok();
+        self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, removed, settings, gone }).ok();
         let pos = Pos { epoch, at: now, judged: Judged::Commit { own }, lost: false };
         put(&st.provider, &pos_key(gid, position), &pos)?;
         st.group_mut(gid)?.rec.position = position;
@@ -436,16 +436,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 self.work.send(Work::Duties(gid.to_vec())).ok();
             }
             Control::Lost { positions } => self.announced(st, gid, message.position, message.sender, positions)?,
-            Control::Introduce { identity, name, how, to } => {
-                let me = Bytes(Sha256::digest(st.me(gid))[..8].to_vec());
-                if !own && (to.is_empty() || to.contains(&me)) {
-                    st.events.push(Event::Introduced { group, by: message.sender, identity, name, how });
-                }
-            }
-            Control::Invite { hash, expires, label, to } => {
+            Control::Introduce => {}
+            Control::Invite { hash, expires, to } => {
                 let rec = &mut st.group_mut(gid)?.rec;
                 if !rec.invites.iter().any(|rule| rule.hash == hash) {
-                    rec.invites.push(crate::Rule { hash, expires, label, to, by: message.sender.key });
+                    rec.invites.push(crate::Rule { hash, expires, to, by: message.sender.key });
                 }
             }
         }

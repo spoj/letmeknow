@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use lmk_core::identity::{KeyLog, Verdict};
 use lmk_proto::group::IdentityRef;
 
-use crate::{Dropped, Event, Inner, MEMBER_WAIT, Observation, REREAD, State, Work, get, hex, put};
+use crate::{Dropped, Event, Inner, MEMBER_WAIT, Observation, REREAD, State, SUBSCRIBED, Work, get, hex, put};
 
 pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
@@ -159,9 +159,10 @@ impl<P: Provider> State<P> {
 
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Follows a log at its service: what is new as the service tells of it, and all of it whenever the subscription
-    /// restarts and every 5 minutes, until this session drops the log. The read after subscribing may reach the service
-    /// before the subscription does, missing an entry appended in between; a member removed by it learns of it from no
-    /// peer, as none serves it the group any more.
+    /// restarts, 10 seconds later, and every 5 minutes, until this session drops the log. The read after subscribing
+    /// may reach the service before the subscription does, missing an entry appended in between, which the service then
+    /// tells of to no one; a member removed by it learns of it from no peer either, as none serves it the group any
+    /// more, so it waits for the next read.
     pub(crate) fn follow(self: &Arc<Self>, log: &[u8]) {
         let (inner, id) = (self.clone(), log.to_vec());
         let task = spawn(async move {
@@ -171,8 +172,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     let client = inner.clients.client(&service)?;
                     let mut subscription = client.subscribe(vec![Bytes(id.clone())]).await?;
                     inner.read(&id).await?;
+                    let mut wait = SUBSCRIBED;
                     loop {
-                        match timeout(REREAD, subscription.next()).await {
+                        match timeout(wait, subscription.next()).await {
                             Ok(Some(notice)) => {
                                 let notice = notice?;
                                 inner.stored(&id, notice.position - 1, vec![notice.entry], client.chain(&id))?;
@@ -180,6 +182,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                             Ok(None) => break,
                             Err(_) => inner.read(&id).await?,
                         }
+                        wait = REREAD;
                     }
                     anyhow::Ok(())
                 };

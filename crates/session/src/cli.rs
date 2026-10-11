@@ -107,8 +107,8 @@ pub enum Request {
     Send {
         #[arg(long)]
         group: Option<String>,
-        /// A member to address: its fingerprint, or a name it answers to (its name, the first word of it, or its
-        /// identity's contact name, which addresses all that identity's sessions); repeat for several. "@name" in the text addresses too
+        /// A member to address: its fingerprint, or a name it answers to (its name, the first word of it, or the name of
+        /// your own identity, which addresses all its other sessions); repeat for several. "@name" in the text addresses too
         #[arg(long)]
         to: Vec<String>,
         /// Id of the message this answers

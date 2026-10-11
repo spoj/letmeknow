@@ -65,6 +65,9 @@ const SEND_WAIT: Duration = Duration::from_secs(5);
 const MEMBER_WAIT: Duration = Duration::from_secs(5);
 /// How often a followed log is read again whole.
 const REREAD: Duration = Duration::from_secs(5 * 60);
+/// How long after subscribing to a log it is read again, for what was appended before the subscription reached the
+/// service.
+const SUBSCRIBED: Duration = Duration::from_secs(10);
 /// How long a member admitting a joiner waits for the state of the group's kind.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 /// How long a session whose kind is behind waits before it asks the members online for the kind's state again, in
@@ -246,15 +249,11 @@ pub enum SendError {
 
 #[derive(Debug)]
 pub enum Event {
-    /// A member was added. `introduces`: this session made the invite it came in by, or admitted it by an opening, so it
-    /// tells the group who the member is to it; `label` is that invite's `--for`.
     Joined {
         group: Bytes,
         member: Member,
         by: Member,
         how: How,
-        introduces: bool,
-        label: Option<String>,
     },
     Left {
         group: Bytes,
@@ -269,11 +268,12 @@ pub enum Event {
         added: Vec<Member>,
     },
     /// This session was removed, by `by` as it applied the commit, or else with no `by`: by a commit applied before it
-    /// stopped, left the only member of a group it asked to leave, or away past its log's retention. The group is gone
-    /// from it.
+    /// stopped, left the only member of a group it asked to leave (`last`: the group ended), or away past its log's
+    /// retention. The group is gone from it.
     Removed {
         group: Bytes,
         by: Option<Member>,
+        last: bool,
     },
     Settings {
         group: Bytes,
@@ -316,13 +316,6 @@ pub enum Event {
         group: Bytes,
         reply: oneshot::Sender<Option<Vec<u8>>>,
     },
-    Introduced {
-        group: Bytes,
-        by: Member,
-        identity: IdentityRef,
-        name: String,
-        how: How,
-    },
     /// A send that `send` answered as pending, as `answered`, counts now: `id`, its final id, differs from `answered` when
     /// a commit came first and it was sealed again.
     Sent {
@@ -361,7 +354,6 @@ impl Event {
             | Event::State { group, .. }
             | Event::Logged { group }
             | Event::Snapshot { group, .. }
-            | Event::Introduced { group, .. }
             | Event::Sent { group, .. } => Some(group),
             Event::Message(message) => Some(&message.group),
             Event::Lost(lost) => Some(&lost.group),
@@ -424,7 +416,6 @@ struct Rule {
     /// SHA-256 of its secret.
     hash: Bytes,
     expires: u64,
-    label: Option<String>,
     to: Option<Bytes>,
     /// The inviter's session key.
     by: Bytes,
@@ -575,7 +566,6 @@ pub(crate) enum Work {
         by: Option<core::Member>,
         added: Vec<core::Member>,
         how: Option<How>,
-        invite: Option<Bytes>,
         removed: Vec<core::Member>,
         settings: bool,
         gone: bool,

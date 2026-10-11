@@ -1,6 +1,5 @@
-//! Groups, identities and contacts, with no network: MLS state through openmls's storage.
+//! Groups and identities, with no network: MLS state through openmls's storage.
 
-pub mod contacts;
 pub mod crypto;
 pub mod device;
 pub mod group;

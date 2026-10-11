@@ -107,6 +107,16 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(self.inner.commit(gid, remove).await?.is_some())
     }
 
+    /// Removes every other member, in one commit: the group is then this session's alone.
+    pub async fn remove_others(&self, gid: &[u8]) -> Result<()> {
+        let others = |_: &State<P>, g: &G| {
+            let remove: Vec<u32> = g.mls.members().into_iter().map(|m| m.index).filter(|index| *index != g.mls.own_index()).collect();
+            Ok((!remove.is_empty()).then(|| Change { remove, ..Change::default() }))
+        };
+        self.inner.commit(gid, others).await?;
+        Ok(())
+    }
+
     /// Changes the group's settings, from the current ones.
     pub async fn change_settings(&self, gid: &[u8], change: impl Fn(Settings) -> Settings) -> Result<Settings> {
         self.inner

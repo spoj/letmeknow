@@ -31,7 +31,7 @@ fn a_seed_replays_exactly() {
 #[test]
 fn the_world_s_own_actions_replay_exactly() {
     use lmk_sim::{Forgery, Output};
-    let invite = |m, group, n| Act::Invite { m, group, n, label: false, to: None, wait: 0, race: None };
+    let invite = |m, group, n| Act::Invite { m, group, n, to: None, wait: 0, race: None };
     let actions: Vec<Action> = [
         (0, Act::CreateIdentity { m: 0 }),
         (1_000, invite(0, None, 1)),
@@ -65,12 +65,12 @@ fn a_read_that_overtakes_its_subscription() {
             (78, Act::CreateIdentity { m: 0 }),
             (1772, Act::CreateIdentity { m: 2 }),
             (2439, Act::CreateIdentity { m: 3 }),
-            (7192, Act::Invite { m: 0, group: None, n: 4, label: false, to: None, wait: 0, race: None }),
-            (8053, Act::Invite { m: 2, group: None, n: 1, label: true, to: None, wait: 0, race: None }),
+            (7192, Act::Invite { m: 0, group: None, n: 4, to: None, wait: 0, race: None }),
+            (8053, Act::Invite { m: 2, group: None, n: 1, to: None, wait: 0, race: None }),
             (24186, Act::Offline { m: 2 }),
             (66354, Act::Offline { m: 1 }),
             (71026, Act::Leave { m: 1, group: 1 }),
-            (73546, Act::Invite { m: 0, group: Some(0), n: 3, label: false, to: None, wait: 0, race: None }),
+            (73546, Act::Invite { m: 0, group: Some(0), n: 3, to: None, wait: 0, race: None }),
             (77095, Act::Offline { m: 4 }),
             (87716, Act::Send { m: 1, group: 0 }),
             (92954, Act::Remove { m: 3, group: 1, n: 1 }),
@@ -81,7 +81,7 @@ fn a_read_that_overtakes_its_subscription() {
 }
 
 /// A joiner that dialed its inviter twice at once, for two invites, had the first connection replaced by the second,
-/// which dropped the introduction the first kept until the joiner's hello.
+/// which dropped the messages the first kept until the joiner's hello.
 #[test]
 fn a_replaced_connection_hands_on_what_it_kept() {
     passes(
@@ -96,8 +96,8 @@ fn a_replaced_connection_hands_on_what_it_kept() {
             (6238, Act::CreateIdentity { m: 5 }),
             (6595, Act::CreateIdentity { m: 6 }),
             (8544, Act::CreateIdentity { m: 7 }),
-            (13792, Act::Invite { m: 4, group: None, n: 6, label: true, to: None, wait: 0, race: None }),
-            (14917, Act::Invite { m: 5, group: Some(0), n: 6, label: false, to: None, wait: 0, race: None }),
+            (13792, Act::Invite { m: 4, group: None, n: 6, to: None, wait: 0, race: None }),
+            (14917, Act::Invite { m: 5, group: Some(0), n: 6, to: None, wait: 0, race: None }),
         ],
     );
 }
@@ -113,7 +113,7 @@ fn a_first_read_that_takes_no_entry() {
             (801, Act::CreateIdentity { m: 0 }),
             (1845, Act::CreateIdentity { m: 1 }),
             (3502, Act::CreateIdentity { m: 3 }),
-            (20919634, Act::Invite { m: 0, group: None, n: 1, label: true, to: None, wait: 0, race: None }),
+            (20919634, Act::Invite { m: 0, group: None, n: 1, to: None, wait: 0, race: None }),
             (27436155, Act::Send { m: 3, group: 1 }),
             (27437121, Act::Send { m: 2, group: 0 }),
             (27441883, Act::Leave { m: 2, group: 0 }),
@@ -121,7 +121,7 @@ fn a_first_read_that_takes_no_entry() {
             (27456770, Act::CreateIdentity { m: 2 }),
             (27851199, Act::Offline { m: 2 }),
             (27858313, Act::Quiesce),
-            (36967060, Act::Invite { m: 1, group: None, n: 0, label: false, to: None, wait: 0, race: None }),
+            (36967060, Act::Invite { m: 1, group: None, n: 0, to: None, wait: 0, race: None }),
             (36969354, Act::Offline { m: 0 }),
             (43013780, Act::Leave { m: 4, group: 1 }),
         ],
@@ -138,8 +138,8 @@ fn a_removed_member_s_summary_is_not_kept() {
         vec![
             (1378, Act::CreateIdentity { m: 0 }),
             (2990, Act::CreateIdentity { m: 4 }),
-            (6655, Act::Invite { m: 4, group: None, n: 1, label: true, to: None, wait: 0, race: None }),
-            (7825, Act::Invite { m: 4, group: Some(0), n: 3, label: true, to: None, wait: 0, race: None }),
+            (6655, Act::Invite { m: 4, group: None, n: 1, to: None, wait: 0, race: None }),
+            (7825, Act::Invite { m: 4, group: Some(0), n: 3, to: None, wait: 0, race: None }),
             (20034, Act::Drop { m: 4, n: 1 }),
             (30345, Act::Settle { ms: 48072 }),
             (8764656, Act::Offline { m: 4 }),
@@ -159,9 +159,9 @@ fn an_add_whose_answer_was_lost_admits_its_joiner() {
         5,
         vec![
             (1855, Act::CreateIdentity { m: 0 }),
-            (22367, Act::Invite { m: 0, group: None, n: 1, label: false, to: None, wait: 273899, race: None }),
+            (22367, Act::Invite { m: 0, group: None, n: 1, to: None, wait: 273899, race: None }),
             (48211, Act::LoseAnswer { m: 0 }),
-            (2480581, Act::Invite { m: 4, group: Some(1), n: 1, label: true, to: None, wait: 0, race: None }),
+            (2480581, Act::Invite { m: 4, group: Some(1), n: 1, to: None, wait: 0, race: None }),
             (2480581, Act::Remove { m: 2, group: 1, n: 2 }),
         ],
     );
@@ -181,8 +181,8 @@ fn a_push_leaves_only_to_peers_still_admitted() {
             (3167, Act::CreateIdentity { m: 2 }),
             (3712, Act::CreateIdentity { m: 3 }),
             (4542, Act::CreateIdentity { m: 4 }),
-            (25300, Act::Invite { m: 2, group: None, n: 0, label: true, to: None, wait: 126164, race: None }),
-            (64316, Act::Invite { m: 3, group: None, n: 4, label: true, to: None, wait: 74966, race: None }),
+            (25300, Act::Invite { m: 2, group: None, n: 0, to: None, wait: 126164, race: None }),
+            (64316, Act::Invite { m: 3, group: None, n: 4, to: None, wait: 74966, race: None }),
             (87372, Act::Send { m: 1, group: 1 }),
             (1235802, Act::Down { m: 1, ms: 40453974 }),
             (2757252, Act::Wake { m: 1, ms: 4047 }),
@@ -201,7 +201,7 @@ fn a_push_leaves_only_to_peers_still_admitted() {
             (52171862, Act::Send { m: 4, group: 0 }),
             (52172420, Act::Forge { m: 4, group: 1, what: Forgery::Copy }),
             (52631072, Act::Rename { m: 2, group: 1 }),
-            (52631072, Act::Invite { m: 4, group: Some(1), n: 3, label: false, to: None, wait: 0, race: None }),
+            (52631072, Act::Invite { m: 4, group: Some(1), n: 3, to: None, wait: 0, race: None }),
             (96457598, Act::Quiesce),
         ],
     );
@@ -219,14 +219,14 @@ fn a_joiner_reads_its_members_key_logs_before_it_applies_their_commits() {
             (2691, Act::CreateIdentity { m: 1 }),
             (4013, Act::CreateIdentity { m: 2 }),
             (5752, Act::CreateIdentity { m: 3 }),
-            (7738, Act::Invite { m: 1, group: None, n: 0, label: false, to: None, wait: 0, race: None }),
+            (7738, Act::Invite { m: 1, group: None, n: 0, to: None, wait: 0, race: None }),
             (11105, Act::Settle { ms: 89908 }),
             (1406584, Act::Send { m: 2, group: 0 }),
             (1406808, Act::Send { m: 4, group: 0 }),
             (1420249, Act::Down { m: 2, ms: 33142946 }),
             (4143961, Act::Wake { m: 2, ms: 3607 }),
             (9574188, Act::Wake { m: 2, ms: 3332 }),
-            (9576142, Act::Invite { m: 2, group: None, n: 1, label: false, to: None, wait: 0, race: None }),
+            (9576142, Act::Invite { m: 2, group: None, n: 1, to: None, wait: 0, race: None }),
             (9576204, Act::Leave { m: 3, group: 0 }),
             (11101561, Act::Send { m: 3, group: 0 }),
             (11137792, Act::Send { m: 2, group: 2 }),
@@ -236,7 +236,7 @@ fn a_joiner_reads_its_members_key_logs_before_it_applies_their_commits() {
             (11305136, Act::Heal),
             (13224236, Act::Down { m: 3, ms: 607486767 }),
             (13459727, Act::Quiesce),
-            (45951748, Act::Invite { m: 4, group: Some(1), n: 4, label: true, to: None, wait: 0, race: None }),
+            (45951748, Act::Invite { m: 4, group: Some(1), n: 4, to: None, wait: 0, race: None }),
             (45954390, Act::Remove { m: 3, group: 1, n: 4 }),
             (45954390, Act::Open { m: 0, group: 1, n: 2, close: false }),
             (45954390, Act::Send { m: 4, group: 1 }),
@@ -255,8 +255,8 @@ fn an_answer_is_taken_whole_before_reading_on() {
         vec![
             (462, Act::CreateIdentity { m: 0 }),
             (1221, Act::CreateIdentity { m: 4 }),
-            (2793, Act::Invite { m: 4, group: None, n: 3, label: true, to: None, wait: 0, race: Some(2) }),
-            (4125, Act::Invite { m: 0, group: None, n: 3, label: false, to: None, wait: 0, race: None }),
+            (2793, Act::Invite { m: 4, group: None, n: 3, to: None, wait: 0, race: Some(2) }),
+            (4125, Act::Invite { m: 0, group: None, n: 3, to: None, wait: 0, race: None }),
             (42198, Act::Offline { m: 4 }),
             (42198, Act::Offline { m: 3 }),
             (42198, Act::Offline { m: 0 }),
@@ -279,11 +279,11 @@ fn an_answer_is_taken_whole_before_reading_on() {
             (475914, Act::Settle { ms: 75289 }),
             (1551625, Act::Leave { m: 3, group: 0 }),
             (1554605, Act::Quiesce),
-            (1559597, Act::Invite { m: 2, group: Some(0), n: 0, label: false, to: None, wait: 0, race: None }),
-            (1559597, Act::Invite { m: 2, group: Some(0), n: 0, label: false, to: None, wait: 0, race: Some(1) }),
+            (1559597, Act::Invite { m: 2, group: Some(0), n: 0, to: None, wait: 0, race: None }),
+            (1559597, Act::Invite { m: 2, group: Some(0), n: 0, to: None, wait: 0, race: Some(1) }),
             (1559597, Act::Leave { m: 1, group: 0 }),
-            (1559597, Act::Invite { m: 0, group: Some(0), n: 0, label: true, to: None, wait: 0, race: None }),
-            (4540823, Act::Invite { m: 1, group: Some(0), n: 1, label: false, to: None, wait: 281784, race: None }),
+            (1559597, Act::Invite { m: 0, group: Some(0), n: 0, to: None, wait: 0, race: None }),
+            (4540823, Act::Invite { m: 1, group: Some(0), n: 1, to: None, wait: 281784, race: None }),
             (4544064, Act::CreateIdentity { m: 1 }),
             (4548487, Act::CreateIdentity { m: 1 }),
         ],
@@ -300,7 +300,7 @@ fn a_late_message_names_the_positions_passed_before_it() {
         5,
         vec![
             (4729, Act::CreateIdentity { m: 4 }),
-            (6321, Act::Invite { m: 4, group: None, n: 0, label: true, to: None, wait: 0, race: None }),
+            (6321, Act::Invite { m: 4, group: None, n: 0, to: None, wait: 0, race: None }),
             (3225765, Act::Send { m: 4, group: 1 }),
             (3244269, Act::CrashAfter { m: 0, what: Output::Frame }),
             (3250753, Act::Send { m: 1, group: 0 }),
@@ -308,7 +308,7 @@ fn a_late_message_names_the_positions_passed_before_it() {
             (4795565, Act::Leave { m: 2, group: 1 }),
             (49264521, Act::Settle { ms: 35409 }),
             (49694653, Act::Settle { ms: 53914 }),
-            (49703864, Act::Invite { m: 4, group: Some(1), n: 0, label: false, to: None, wait: 0, race: None }),
+            (49703864, Act::Invite { m: 4, group: Some(1), n: 0, to: None, wait: 0, race: None }),
             (49724706, Act::Offline { m: 0 }),
             (49751369, Act::Forge { m: 4, group: 1, what: Forgery::Message { mac: true } }),
             (49759766, Act::Send { m: 0, group: 1 }),

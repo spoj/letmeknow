@@ -127,23 +127,13 @@ pub struct IdentityRef {
 pub enum Control {
     /// The sender asks to be removed.
     Leave,
-    /// Who an identity is to the sender.
-    Introduce {
-        identity: IdentityRef,
-        name: String,
-        how: How,
-        /// Fingerprints of the members it is for; empty for the group.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        to: Vec<Bytes>,
-    },
+    /// Who an identity was to its sender, as 0.13.0 and 0.13.1 members still tell: ignored.
+    Introduce,
     /// An invite, which any member admits a joiner by once: SHA-256 of its secret, when it expires (milliseconds), and
     /// whom it is for.
     Invite {
         hash: Bytes,
         expires: u64,
-        /// `--for`: the inviter's name for whoever joins by it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        label: Option<String>,
         /// `--to`: the only identity that may join by it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to: Option<Bytes>,
@@ -177,6 +167,9 @@ pub struct ChatMessage {
     pub urgent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<Attachment>,
+    /// When the sender sent it, by its clock: milliseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,7 +187,6 @@ pub struct Attachment {
 pub enum How {
     Invite,
     Open,
-    Introduce,
     /// A way a newer letmeknow named.
     #[serde(untagged)]
     Other(String),
@@ -215,20 +207,27 @@ mod tests {
             reply_to: None,
             urgent: false,
             attachment: None,
+            sent_at: Some(5),
         };
-        assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","read":[[1,3]]}"#);
+        assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","read":[[1,3]],"sent_at":5}"#);
         let folder = serde_json::to_string(&Service::Folder("/tmp/x".into())).unwrap();
         assert_eq!(folder, r#"{"folder":"/tmp/x"}"#);
     }
 
     #[test]
     fn unknown_values_parse_to_the_catch_all() {
-        let introduce = r#"{"type":"introduce","identity":{"id":"AQ","membership":{"folder":"/x"}},"name":"Bob","how":"met"}"#;
-        let Control::Introduce { how, .. } = serde_json::from_str(introduce).unwrap() else { panic!() };
-        assert_eq!(how, How::Other("met".into()));
+        assert_eq!(serde_json::from_str::<How>(r#""introduce""#).unwrap(), How::Other("introduce".into()));
         let service: Service = serde_json::from_str(r#"{"s3":{"bucket":"b"}}"#).unwrap();
         assert!(matches!(service, Service::Newer(_)));
         assert_eq!(serde_json::to_string(&service).unwrap(), r#"{"s3":{"bucket":"b"}}"#);
+    }
+
+    #[test]
+    fn what_older_members_send_parses() {
+        let introduce = r#"{"type":"introduce","identity":{"id":"AQ","membership":{"folder":"/x"}},"name":"Bob","how":"invite","to":["AQ"]}"#;
+        assert_eq!(serde_json::from_str::<Control>(introduce).unwrap(), Control::Introduce);
+        let invite = r#"{"type":"invite","hash":"AQ","expires":5,"label":"Bob (Acme)"}"#;
+        assert_eq!(serde_json::from_str::<Control>(invite).unwrap(), Control::Invite { hash: Bytes(vec![1]), expires: 5, to: None });
     }
 
     #[test]

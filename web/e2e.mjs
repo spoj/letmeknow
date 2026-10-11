@@ -3,8 +3,8 @@
 // chat from a link, becoming his identity's first device as it does, and they talk and pass files both ways; it joins
 // her doc and they edit it both ways; Matthew's desk adds his phone by a device link, the phone joins a chat open to that
 // identity with a click and is renamed, and a kiosk on an identity of its own moves to his; the laptop keeps everything
-// across a reload, a second tab works through the first and takes over when it closes; introductions, refusals, files
-// kept and deleted, a git group's pushes and chat, and the service worker's updates.
+// across a reload, a second tab works through the first and takes over when it closes; refusals, files kept and
+// deleted, a git group's pushes and chat, and the service worker's updates.
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -133,7 +133,7 @@ try {
         request.onerror = () => reject(request.error);
       })
   );
-  const invite = ann.run("invite", "--name", "Plans", "--for", "Matt");
+  const invite = ann.run("invite", "--name", "Plans");
   await laptop.goto(local(invite.link));
   await laptop.getByRole("heading", { name: "You're invited" }).waitFor();
   await laptop.getByLabel("Your name").fill("Matt");
@@ -145,9 +145,9 @@ try {
   check(true, "the native session sees the browser join");
   const matt = await until(
     () => ann.run("members", `--group=${invite.group}`).members.find(m => m.name === "Matt"),
-    m => m?.identity?.how === "verified"
+    m => m?.identity?.name === "Matt"
   );
-  check(matt.identity.name === "Matt" && matt.device === "laptop", "the welcome screen makes the browser its identity's first device, which the inviter records as the contact the link was for");
+  check(matt.identity.how === "unknown" && matt.device === "laptop", "the welcome screen makes the browser its identity's first device, which others know by its own name");
 
   // Messages both ways, with a reply.
   const hello = ann.run("send", "hello from the terminal").id;
@@ -169,7 +169,7 @@ try {
   // Members: Ann's identity is only her own claim to the laptop.
   await laptop.locator(".people").click();
   const annRow = laptop.locator("dialog .people-list li", { hasText: "Ann" });
-  check((await annRow.textContent()).includes("their own name, not a contact"), "members show an identity claim and how this browser knows it");
+  check((await annRow.textContent()).includes("their own name"), "members show an identity's name as its own claim");
   await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
 
   // Attachments both ways.
@@ -422,21 +422,23 @@ try {
   const ideas = tablet.run("groups").find(g => g.name === "Ideas");
   check(JSON.stringify(ideas.membership).includes(LETMEKNOW_RELAY), "on the membership service of the server that served the browser");
   await laptop.locator(".people", { hasText: "Matt · " }).waitFor();
+  await laptop.getByRole("button", { name: "Settings" }).click();
+  await laptop.getByRole("button", { name: "End for everyone" }).click();
+  await laptop.getByRole("button", { name: "Remove everyone and end this chat?" }).click();
+  await laptop.locator(".group-list button", { hasText: "Ideas" }).waitFor({ state: "detached" });
+  await tablet.printed(e => e.type === "removed" && e.by?.name === "Matt");
+  check(!tablet.run("groups").some(g => g.name === "Ideas"), "the browser ends a chat for everyone");
   await tablet.stop();
 
-  // Ann adds Carl, whom she made an invite for: her word on who Carl is reaches the laptop, which accepts it.
+  // Ann adds Carl, whom the laptop knows only by his identity's own name.
   const carl = native("carl");
   await carl.printed(e => e.type === "ready");
   carl.run("identity", "create", "Carl");
-  carl.run("join", ann.run("invite", `--group=${invite.group}`, "--for", "Carl (Acme)").link);
+  carl.run("join", ann.run("invite", `--group=${invite.group}`).link);
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
-  await laptop.locator(".messages li", { hasText: "introduced Carl (Acme)" }).waitFor();
-  await laptop.locator(".people:visible").click();
-  await laptop.locator("dialog").getByRole("button", { name: "Accept as Carl (Acme)" }).click();
-  await laptop.locator("dialog").waitFor({ state: "detached" });
-  await laptop.locator(".me").click();
-  await laptop.locator(".devices li", { hasText: "Carl (Acme)" }).waitFor();
-  check(true, "the browser accepts an introduction, and the introduced identity becomes a contact");
+  const added = laptop.locator(".messages li.event", { hasText: "added Carl" });
+  await added.waitFor();
+  check((await added.locator(".who").last().textContent()).includes("Carl · ") && (await added.locator(".who").last().textContent()).endsWith("(unverified)"), "the browser shows another identity's name as unverified");
 
   // A git group: Ann pushes with git, Carl takes the bundle, and the browser shows the push beside the group's chat.
   const repo = join(tmp, "ann-repo");
@@ -454,7 +456,7 @@ try {
   await laptop.locator("dialog").getByLabel("Invite link").fill(ann.run("invite", `--group=${code.group}`).link);
   await laptop.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
   await laptop.locator(".group-list button.on", { hasText: "Code" }).waitFor();
-  check(true, "the browser joins a git group");
+  check((await laptop.locator(".group-head:visible").textContent()).includes("lives with agent sessions"), "the browser joins a git group, which says where its repository lives");
   annGit("push", "-q", "team", "main");
   await laptop.locator(".messages li.pushed", { hasText: "first commit" }).waitFor();
   check((await laptop.locator(".messages li.pushed").textContent()).includes("pushed to main"), "and shows a push to it, with its commits' subjects");
@@ -522,7 +524,6 @@ try {
   // The tab that took over loaded no file; it loads the doc's file from IndexedDB when a new member wants it.
   await laptop.locator(".group-list button", { hasText: "Notes" }).click();
   await laptop.getByRole("button", { name: "Invite" }).click();
-  await laptop.locator("dialog").getByRole("button", { name: "Make a link" }).click();
   const readerLink = await laptop.locator("dialog .copy code").first().textContent();
   const reader = native("reader");
   await reader.printed(e => e.type === "ready");
