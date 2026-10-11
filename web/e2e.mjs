@@ -526,7 +526,8 @@ try {
 
   // The tab that took over loaded no file; it loads the doc's file from IndexedDB when a new member wants it.
   await laptop.locator(".group-list button", { hasText: "Notes" }).click();
-  await laptop.getByRole("button", { name: "Invite" }).click();
+  await laptop.getByRole("button", { name: "Settings" }).click();
+  await laptop.locator("dialog").getByRole("button", { name: "Make a link" }).click();
   const readerLink = await laptop.locator("dialog .copy code").first().textContent();
   const reader = native("reader");
   await reader.printed(e => e.type === "ready");

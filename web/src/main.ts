@@ -560,7 +560,7 @@ async function drawDevices() {
         )
       )
     ),
-    h("button", { className: "primary", onclick: () => inviteDialog({ identity: identity.id }) }, "Add a device")
+    h("button", { className: "primary", onclick: () => inviteDialog(identity.id) }, "Add a device")
   ]);
 }
 
@@ -618,49 +618,52 @@ async function leaveDialog(link?: string) {
 
 // Invites: a link and its QR code, single use, within 10 minutes. A device link adds a device to an identity.
 
-async function inviteDialog(target: { gid: string } | { identity: string }) {
+/** Makes a link to `target` and shows it in `body`, with its QR code and the command an agent joins with; once they
+ * joined, says so and closes `dialog`. */
+async function showLink(target: { gid: string } | { identity: string }, body: HTMLElement, dialog: HTMLDialogElement) {
   const device = "identity" in target;
   const g = device ? undefined : group(target.gid);
   const kind = g ? KINDS[g.settings.kind].name : "";
-  const body = h("div", { className: "invite" });
-  const dialog = modal(device ? "Add a device" : "Invite someone", body);
-  const make = async () => {
-    // The link opens this server's app, which is letmeknow.dev's unless the person runs their own.
-    const made = new URL((await request(device ? { cmd: "identity", op: { invite: {} } } : { cmd: "invite", group: target.gid })).link);
-    const link = location.origin + made.pathname + made.hash;
-    const { encode } = await import("uqr");
-    const { data, size } = encode(link, { border: 0 });
-    const ns = "http://www.w3.org/2000/svg";
-    const svg = document.createElementNS(ns, "svg");
-    svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
-    svg.setAttribute("aria-label", "QR code of the link");
-    const path = document.createElementNS(ns, "path");
-    path.setAttribute("d", data.flatMap((row, y) => row.map((dark, x) => (dark ? `M${x} ${y}h1v1h-1z` : ""))).join(""));
-    svg.append(path);
-    body.replaceChildren(
-      h(
-        "p",
-        {},
-        device
-          ? "Open this link on your other device, or scan the QR code with its camera. Your chats and documents then reach it."
-          : `Send this link to a person or an agent. Whoever opens it first joins the ${kind}.`
-      ),
-      h("div", { className: "qr" }, svg),
-      copyable(link),
-      h("p", {}, device ? "On a computer, an agent's session adds it with:" : "An agent joins with:"),
-      copyable(`letmeknow ${device ? "identity join" : "join"} '${link}'`),
-      h("p", { className: "expiry" }, "It works once, within 10 minutes, while this browser is open.")
-    );
-    const joined = (event: client.Event) => {
-      const added = device ? event.type === "devices" && event.identity === target.identity : event.type === "joined" && event.group === target.gid;
-      if (!added || !dialog.open) return;
-      body.replaceChildren(h("p", { className: "done" }, device ? "Added. The device can now join your chats and documents." : `They joined the ${kind}.`));
-      setTimeout(() => dialog.close(), 1_500);
-    };
-    client.listen(joined);
-    dialog.addEventListener("close", () => client.unlisten(joined));
+  // The link opens this server's app, which is letmeknow.dev's unless the person runs their own.
+  const made = new URL((await request(device ? { cmd: "identity", op: { invite: {} } } : { cmd: "invite", group: target.gid })).link);
+  const link = location.origin + made.pathname + made.hash;
+  const { encode } = await import("uqr");
+  const { data, size } = encode(link, { border: 0 });
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
+  svg.setAttribute("aria-label", "QR code of the link");
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("d", data.flatMap((row, y) => row.map((dark, x) => (dark ? `M${x} ${y}h1v1h-1z` : ""))).join(""));
+  svg.append(path);
+  body.replaceChildren(
+    h(
+      "p",
+      {},
+      device
+        ? "Open this link on your other device, or scan the QR code with its camera. Your chats and documents then reach it."
+        : `Send this link to a person or an agent. Whoever opens it first joins the ${kind}.`
+    ),
+    h("div", { className: "qr" }, svg),
+    copyable(link),
+    h("p", {}, device ? "On a computer, an agent's session adds it with:" : "An agent joins with:"),
+    copyable(`letmeknow ${device ? "identity join" : "join"} '${link}'`),
+    h("p", { className: "expiry" }, "It works once, within 10 minutes, while this browser is open.")
+  );
+  const joined = (event: client.Event) => {
+    const added = device ? event.type === "devices" && event.identity === target.identity : event.type === "joined" && event.group === target.gid;
+    if (!added || !dialog.open) return;
+    body.replaceChildren(h("p", { className: "done" }, device ? "Added. The device can now join your chats and documents." : `They joined the ${kind}.`));
+    setTimeout(() => dialog.close(), 1_500);
   };
-  make().catch(toast);
+  client.listen(joined);
+  dialog.addEventListener("close", () => client.unlisten(joined));
+}
+
+/** Adds a device to the identity, by a device link. */
+function inviteDialog(identity: string) {
+  const body = h("div", { className: "invite" });
+  showLink({ identity }, body, modal("Add a device", body)).catch(toast);
 }
 
 function copyable(text: string) {
@@ -690,12 +693,7 @@ class View {
         { className: "group-head" },
         back(),
         h("div", { className: "title" }, this.heading, this.people, group(gid)?.settings.kind === "git" && h("small", { className: "note" }, GIT_NOTE)),
-        h(
-          "div",
-          { className: "head-actions" },
-          h("button", { onclick: () => inviteDialog({ gid }) }, "Invite"),
-          h("button", { className: "icon quiet", title: "Settings", ariaLabel: "Settings", onclick: () => this.settingsDialog() }, "⋯")
-        )
+        h("button", { className: "icon quiet", title: "Settings", ariaLabel: "Settings", onclick: () => this.settingsDialog() }, "⋯")
       )
     );
     this.people.onclick = () => this.settingsDialog();
@@ -742,21 +740,28 @@ class View {
         return h("li", {}, h("div", {}, label), button);
       };
       const none = others.length ? "All your other devices are in already." : "Your other devices show here, once you add them under Your devices.";
-      list.replaceChildren(...(targets.length ? targets.map(add) : [h("li", { className: "muted" }, none)]));
+      list.replaceChildren(...(targets.length ? targets.map(add) : [h("li", {}, h("p", { className: "muted" }, none))]));
     }, toast);
     return list;
   }
 
-  private async settingsDialog() {
+  /** The group's one screen: its name, its people and bringing in more, and leaving it. With `invite`, it makes a link at
+   * once. */
+  protected settingsDialog(invite = false) {
     const gid = this.gid;
     const settings = group(gid)!.settings;
     const kind = KINDS[settings.kind].name;
     const name = h("input", { value: settings.name, placeholder: title(gid), ariaLabel: "Name" });
     const save = h("button", {}, "Rename");
+    const make = h("button", { type: "button" }, "Make a link");
+    const link = h("div", { className: "invite" }, h("ul", { className: "people-list" }, h("li", {}, h("div", {}, "Invite someone else"), make)));
     const dialog = modal(
       kind[0].toUpperCase() + kind.slice(1),
       form(() => busy(save, "Renaming…", () => request({ cmd: "name", group: gid, name: name.value.trim() })), field("Name", h("div", { className: "row" }, name, save))),
-      h("h3", {}, "People"),
+      h("h3", {}, `People (${this.members.length})`),
+      link,
+      me.identity && h("small", {}, "Add one of your devices"),
+      me.identity && this.addDevices(gid),
       h(
         "ul",
         { className: "people-list" },
@@ -777,8 +782,6 @@ class View {
           )
         )
       ),
-      me.identity && h("h3", {}, "Add my device"),
-      me.identity && this.addDevices(gid),
       h(
         "div",
         { className: "buttons leave" },
@@ -797,6 +800,8 @@ class View {
           })
       )
     );
+    make.onclick = () => busy(make, "Making…", () => showLink({ gid }, link, dialog));
+    if (invite) make.click();
   }
 }
 
@@ -1010,7 +1015,7 @@ class ChatView extends View {
     this.empty.hidden = others.length > 0;
     this.empty.replaceChildren(
       h("p", {}, "Only you so far. Invite a person or an agent: they get a link that works once, within 10 minutes."),
-      h("button", { className: "primary", onclick: () => inviteDialog({ gid: this.gid }) }, "Invite someone")
+      h("button", { className: "primary", onclick: () => this.settingsDialog(true) }, "Invite someone")
     );
     for (const fp of this.to) if (!others.some(m => m.fp === fp)) this.to.delete(fp);
     const everyone = h("button", { type: "button", onclick: () => (this.to.clear(), this.drawChips()) }, "Everyone");
