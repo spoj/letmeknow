@@ -12,7 +12,11 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use bao_tree::{ChunkNum, ChunkRanges};
-use iroh::{Endpoint, EndpointId};
+use iroh::{
+    Endpoint, EndpointId,
+    endpoint::Connection,
+    protocol::{AcceptError, ProtocolHandler},
+};
 use iroh_blobs::{
     BlobsProtocol, Hash,
     api::{Store, TempTag},
@@ -36,6 +40,16 @@ use crate::{
 const PIECE: u64 = 1024;
 /// How long a download with no holder left waits for another.
 const HOLDER_WAIT: Duration = Duration::from_secs(30);
+
+/// iroh-blobs' protocol, but for its shutdown: the store closes by `Files::shutdown`, before the connections.
+#[derive(Debug)]
+pub(crate) struct Blobs(BlobsProtocol);
+
+impl ProtocolHandler for Blobs {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        self.0.accept(conn).await
+    }
+}
 
 pub(crate) struct Files {
     store: Store,
@@ -87,7 +101,7 @@ impl Files {
 
     /// Serves complete files to current members only: checked per connection, per request, and
     /// per 16 KiB sent.
-    pub fn protocol(&self, groups: Arc<dyn Groups>) -> BlobsProtocol {
+    pub fn protocol(&self, groups: Arc<dyn Groups>) -> Blobs {
         let mask = EventMask {
             connected: ConnectMode::Intercept,
             get: RequestMode::Intercept,
@@ -140,7 +154,7 @@ impl Files {
                 }
             }
         });
-        BlobsProtocol::new(&self.store, Some(events))
+        Blobs(BlobsProtocol::new(&self.store, Some(events)))
     }
 
     /// Seals plaintext under a new key and holds the ciphertext.
@@ -205,6 +219,11 @@ impl Files {
         let tag = self.store.add_bytes(disk.load(*hash).await?).temp_tag().await?;
         self.added.lock().unwrap().push(tag);
         Ok(true)
+    }
+
+    /// Closes the store. A session that starts again in this process opens it only once it is closed, on Windows.
+    pub async fn shutdown(&self) -> Result<()> {
+        Ok(self.store.shutdown().await?)
     }
 
     /// Verified ciphertext bytes held.
