@@ -17,9 +17,16 @@ ENV.pop("LETMEKNOW_SESSION", None)
 
 
 def free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind(("localhost", 0))
-        return s.getsockname()[1]
+    """A port free on every address for UDP and TCP alike, as `serve` binds them."""
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
+            udp.bind(("", 0))
+            port = udp.getsockname()[1]
+            try:
+                tcp.bind(("", port))
+                return port
+            except OSError:
+                pass
 
 
 def check(condition, message):
