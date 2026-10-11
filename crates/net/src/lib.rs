@@ -17,7 +17,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl,
-    endpoint::{Builder, presets},
+    endpoint::{Builder, Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use lmk_proto::{
@@ -26,7 +26,6 @@ use lmk_proto::{
     links::FileLink,
     peer::{Admitted, Frame, Join},
 };
-use lmk_transport::{Conn, IrohConnection, Iroh, RecvStream, SendStream, Transport};
 use n0_future::{FuturesUnordered, StreamExt, boxed::BoxFuture, task::spawn, time::timeout};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -105,7 +104,7 @@ pub struct Net {
 }
 
 pub(crate) struct Inner {
-    transport: Arc<dyn Transport>,
+    endpoint: Endpoint,
     config: Config,
     groups: Arc<dyn Groups>,
     admit: Arc<dyn Admit>,
@@ -118,7 +117,7 @@ pub(crate) struct Inner {
 }
 
 struct Link {
-    conn: Conn,
+    conn: Connection,
     dialer: EndpointId,
     input: mpsc::UnboundedSender<Input>,
 }
@@ -135,7 +134,7 @@ impl Net {
         let publishing = config.home.as_ref().map(|home| addresses::publish(&endpoint, home)).transpose()?;
         let (events, rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
-            transport: Arc::new(Iroh(endpoint.clone())),
+            endpoint: endpoint.clone(),
             config,
             groups,
             admit,
@@ -151,7 +150,7 @@ impl Net {
     }
 
     pub fn id(&self) -> EndpointId {
-        self.inner.transport.id()
+        self.inner.endpoint.id()
     }
 
     /// Connects to a member by the key and relay in its leaf, unless already connected.
@@ -266,7 +265,7 @@ impl Net {
 }
 
 impl Inner {
-    async fn connection(self: &Arc<Self>, key: EndpointId, relay: RelayUrl) -> Result<Conn> {
+    async fn connection(self: &Arc<Self>, key: EndpointId, relay: RelayUrl) -> Result<Connection> {
         if let Some(conn) = self.live(&key) {
             return Ok(conn);
         }
@@ -276,7 +275,7 @@ impl Inner {
         if let Some(home) = &self.config.home {
             addr = addresses::read(home, &key).into_iter().fold(addr, EndpointAddr::with_ip_addr);
         }
-        let conn = self.transport.connect(addr).await?;
+        let conn = self.endpoint.connect(addr, ALPN).await?;
         match self.register(&conn, true) {
             Some((input, rx)) => {
                 spawn(self.clone().serve(conn.clone(), true, input, rx));
@@ -286,16 +285,16 @@ impl Inner {
         }
     }
 
-    fn live(&self, key: &EndpointId) -> Option<Conn> {
+    fn live(&self, key: &EndpointId) -> Option<Connection> {
         let links = self.links.lock().unwrap();
-        links.get(key).map(|link| link.conn.clone()).filter(|conn| !conn.closed())
+        links.get(key).map(|link| link.conn.clone()).filter(|conn| conn.close_reason().is_none())
     }
 
     fn input(&self, peer: &EndpointId) -> Option<mpsc::UnboundedSender<Input>> {
         self.links.lock().unwrap().get(peer).map(|link| link.input.clone())
     }
 
-    async fn accept(self: Arc<Self>, conn: Conn) {
+    async fn accept(self: Arc<Self>, conn: Connection) {
         if let Some((input, rx)) = self.register(&conn, false) {
             self.serve(conn, false, input, rx).await;
         }
@@ -303,16 +302,16 @@ impl Inner {
 
     /// Keeps one connection per peer: of two live ones, the one dialed by the smaller key, which
     /// both sides pick alike; a redial replaces the old one.
-    fn register(&self, conn: &Conn, dialed: bool) -> Option<(mpsc::UnboundedSender<Input>, mpsc::UnboundedReceiver<Input>)> {
-        let (me, peer) = (self.transport.id(), conn.remote_id());
+    fn register(&self, conn: &Connection, dialed: bool) -> Option<(mpsc::UnboundedSender<Input>, mpsc::UnboundedReceiver<Input>)> {
+        let (me, peer) = (self.endpoint.id(), conn.remote_id());
         let dialer = if dialed { me } else { peer };
         let mut links = self.links.lock().unwrap();
-        match links.get(&peer).filter(|old| !old.conn.closed()) {
+        match links.get(&peer).filter(|old| old.conn.close_reason().is_none()) {
             Some(old) if old.dialer != dialer && old.dialer == me.min(peer) => {
-                conn.close(b"duplicate");
+                conn.close(0u32.into(), b"duplicate");
                 return None;
             }
-            Some(old) => old.conn.close(b"duplicate"),
+            Some(old) => old.conn.close(0u32.into(), b"duplicate"),
             None => {}
         }
         let (input, rx) = mpsc::unbounded_channel();
@@ -320,7 +319,7 @@ impl Inner {
         Some((input, rx))
     }
 
-    fn unregister(&self, conn: &Conn) {
+    fn unregister(&self, conn: &Connection) {
         let peer = conn.remote_id();
         let mut links = self.links.lock().unwrap();
         if links.get(&peer).is_some_and(|link| link.conn.stable_id() == conn.stable_id()) {
@@ -330,7 +329,7 @@ impl Inner {
     }
 
     /// Runs a connection's streams until it closes. The dialer opens the one `peer` stream.
-    async fn serve(self: Arc<Self>, conn: Conn, dialed: bool, input: mpsc::UnboundedSender<Input>, rx: mpsc::UnboundedReceiver<Input>) {
+    async fn serve(self: Arc<Self>, conn: Connection, dialed: bool, input: mpsc::UnboundedSender<Input>, rx: mpsc::UnboundedReceiver<Input>) {
         let peer = conn.remote_id();
         let mut rx = Some(rx);
         if dialed {
@@ -386,7 +385,7 @@ impl Inner {
     }
 }
 
-async fn open_peer(conn: &Conn) -> Result<(SendStream, RecvStream)> {
+async fn open_peer(conn: &Connection) -> Result<(SendStream, RecvStream)> {
     let (mut send, recv) = conn.open_bi().await?;
     frame::write(&mut send, &Open { stream: Stream::Peer }).await?;
     Ok((send, recv))
@@ -397,13 +396,13 @@ struct Handler(Arc<Inner>);
 
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Inner").field("id", &self.transport.id()).finish()
+        f.debug_struct("Inner").field("id", &self.endpoint.id()).finish()
     }
 }
 
 impl ProtocolHandler for Handler {
-    async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
-        self.0.clone().accept(Arc::new(IrohConnection(conn))).await;
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        self.0.clone().accept(conn).await;
         Ok(())
     }
 }

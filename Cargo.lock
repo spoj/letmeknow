@@ -2917,7 +2917,6 @@ dependencies = [
  "iroh",
  "iroh-relay",
  "lmk-proto",
- "lmk-transport",
  "n0-future",
  "notify",
  "rand 0.9.5",
@@ -2945,7 +2944,6 @@ dependencies = [
  "iroh-blobs",
  "iroh-relay",
  "lmk-proto",
- "lmk-transport",
  "n0-future",
  "rcgen",
  "rustls",
@@ -2969,7 +2967,6 @@ dependencies = [
  "lmk-membership",
  "lmk-net",
  "lmk-proto",
- "lmk-transport",
  "n0-future",
  "rcgen",
  "rusqlite",
@@ -3013,7 +3010,6 @@ dependencies = [
  "iroh-relay",
  "lmk-membership",
  "lmk-proto",
- "lmk-transport",
  "rcgen",
  "rustls",
  "socket2",
@@ -3022,16 +3018,6 @@ dependencies = [
  "tokio-rustls-acme",
  "tokio-stream",
  "tracing",
-]
-
-[[package]]
-name = "lmk-transport"
-version = "0.13.2"
-dependencies = [
- "anyhow",
- "iroh",
- "lmk-proto",
- "tokio",
 ]
 
 [[package]]

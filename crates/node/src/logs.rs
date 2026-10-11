@@ -13,7 +13,6 @@ use lmk_membership::{Chain, Contradiction, Membership, Refused};
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
-use lmk_transport::Transport;
 use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep, timeout};
 use serde::{Deserialize, Serialize};
@@ -25,15 +24,15 @@ use crate::{Event, Inner, MEMBER_WAIT, REREAD, State, SUBSCRIBED, Work, get, hex
 
 pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
-/// One membership client per service, sharing the session's transport.
+/// One membership client per service, sharing the session's endpoint.
 pub(crate) struct Clients {
-    transport: Arc<dyn Transport>,
+    endpoint: iroh::Endpoint,
     clients: Mutex<HashMap<String, Arc<dyn Membership>>>,
 }
 
 impl Clients {
-    pub fn new(transport: Arc<dyn Transport>) -> Self {
-        Clients { transport, clients: Mutex::default() }
+    pub fn new(endpoint: iroh::Endpoint) -> Self {
+        Clients { endpoint, clients: Mutex::default() }
     }
 
     pub fn client(&self, service: &Service) -> Result<Arc<dyn Membership>> {
@@ -43,7 +42,7 @@ impl Clients {
             return Ok(client.clone());
         }
         let client: Arc<dyn Membership> = match service {
-            Service::Serve { .. } => Arc::new(ServeClient::for_service(self.transport.clone(), service)?),
+            Service::Serve { .. } => Arc::new(ServeClient::for_service(self.endpoint.clone(), service)?),
             #[cfg(not(target_arch = "wasm32"))]
             Service::Folder(path) => Arc::new(lmk_membership::folder::FolderClient::new(path)),
             #[cfg(target_arch = "wasm32")]

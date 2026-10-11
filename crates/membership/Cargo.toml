@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 lmk-proto.workspace = true
-lmk-transport.workspace = true
 anyhow.workspace = true
 async-trait = "0.1"
 ed25519-dalek.workspace = true

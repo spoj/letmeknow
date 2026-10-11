@@ -7,9 +7,11 @@ use std::{
 };
 
 use anyhow::Result;
-use iroh::EndpointId;
+use iroh::{
+    EndpointId,
+    endpoint::{Connection, RecvStream, SendStream},
+};
 use lmk_proto::{Bytes, frame, peer::Frame};
-use lmk_transport::{Conn, RecvStream, SendStream};
 use n0_future::task::spawn;
 use tokio::sync::{mpsc, oneshot};
 
@@ -36,7 +38,7 @@ struct Session {
 /// Runs the connection's one peer stream; the connection closes with it.
 pub(crate) async fn run(
     inner: Arc<Inner>,
-    conn: Conn,
+    conn: Connection,
     send: SendStream,
     mut recv: RecvStream,
     input: mpsc::UnboundedSender<Input>,
@@ -76,7 +78,7 @@ pub(crate) async fn run(
     if let Err(e) = result {
         tracing::debug!("peer stream with {} ended: {e:#}", peer.fmt_short());
     }
-    conn.close(b"peer stream ended");
+    conn.close(0u32.into(), b"peer stream ended");
 }
 
 impl Session {

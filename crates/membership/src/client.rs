@@ -5,15 +5,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
-use iroh::{EndpointAddr, PublicKey};
+use iroh::{Endpoint, EndpointAddr, PublicKey, endpoint::Connection};
 use lmk_proto::{
     Answer, Bytes, frame,
-    frame::{Open, Stream},
+    frame::{ALPN, Open, Stream},
     group::Service,
     head::Head,
     membership::{Appended, Latest, Notice, Page, Request},
 };
-use lmk_transport::{Conn, Transport};
 use serde::de::DeserializeOwned;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, mpsc};
@@ -24,15 +23,15 @@ use crate::{Chain, Membership, Refused, Subscription, Unreached, chain::Chains};
 pub struct ServeClient(Arc<Inner>);
 
 struct Inner {
-    transport: Arc<dyn Transport>,
+    endpoint: Endpoint,
     addr: EndpointAddr,
     chains: Chains,
-    conn: Mutex<Option<Conn>>,
+    conn: Mutex<Option<Connection>>,
 }
 
 impl ServeClient {
     /// A client of the service at `key`, reached through its relay or direct addresses.
-    pub fn new(transport: Arc<dyn Transport>, key: &[u8], relay: &str, addrs: &[String]) -> Result<Self> {
+    pub fn new(endpoint: Endpoint, key: &[u8], relay: &str, addrs: &[String]) -> Result<Self> {
         let key: [u8; 32] = key.try_into().context("a service key is 32 bytes")?;
         let mut addr = EndpointAddr::new(PublicKey::from_bytes(&key)?);
         if !relay.is_empty() {
@@ -43,28 +42,28 @@ impl ServeClient {
         }
         let chains = Chains::new(Some(VerifyingKey::from_bytes(&key)?));
         Ok(ServeClient(Arc::new(Inner {
-            transport,
+            endpoint,
             addr,
             chains,
             conn: Mutex::default(),
         })))
     }
 
-    pub fn for_service(transport: Arc<dyn Transport>, service: &Service) -> Result<Self> {
+    pub fn for_service(endpoint: Endpoint, service: &Service) -> Result<Self> {
         let Service::Serve { key, relay, addrs, .. } = service else {
             anyhow::bail!("not a serve service")
         };
-        Self::new(transport, &key.0, relay, addrs)
+        Self::new(endpoint, &key.0, relay, addrs)
     }
 
-    async fn connection(&self) -> Result<Conn> {
+    async fn connection(&self) -> Result<Connection> {
         let mut conn = self.0.conn.lock().await;
         if let Some(c) = conn.as_ref()
-            && !c.closed()
+            && c.close_reason().is_none()
         {
             return Ok(c.clone());
         }
-        let c = self.0.transport.connect(self.0.addr.clone()).await?;
+        let c = self.0.endpoint.connect(self.0.addr.clone(), ALPN).await?;
         *conn = Some(c.clone());
         Ok(c)
     }

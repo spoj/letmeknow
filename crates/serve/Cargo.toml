@@ -24,5 +24,4 @@ tokio-stream = "0.1"
 tracing = "0.1"
 
 [dev-dependencies]
-lmk-transport.workspace = true
 rcgen = "0.14"

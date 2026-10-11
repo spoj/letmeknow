@@ -29,9 +29,8 @@ impl<P: Provider + Send + 'static> Node<P> {
         let relays = RelayMap::from(iroh::RelayConfig::new(config.relay.clone(), Some(Default::default())));
         let ca = std::mem::take(&mut config.ca);
         let endpoint = lmk_net::builder(relays).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
-        let transport = Arc::new(lmk_transport::Iroh(endpoint.clone()));
         let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone(), revision: REVISION };
-        let clients = logs::Clients::new(transport);
+        let clients = logs::Clients::new(endpoint.clone());
         let state = State::open(provider, &config, leaf, &clients)?;
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();

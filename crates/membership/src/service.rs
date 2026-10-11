@@ -7,7 +7,10 @@ use std::{
 };
 
 use anyhow::Result;
-use iroh::protocol::{AcceptError, ProtocolHandler};
+use iroh::{
+    endpoint::{Connection, RecvStream, SendStream},
+    protocol::{AcceptError, ProtocolHandler},
+};
 use lmk_proto::{
     Answer, Bytes,
     clock::now,
@@ -15,7 +18,6 @@ use lmk_proto::{
     frame::{Open, Stream},
     membership::{Latest, Notice, Request},
 };
-use lmk_transport::{Conn, IrohConnection, RecvStream, SendStream};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -247,9 +249,9 @@ impl Window {
     }
 }
 
-impl Service {
+impl ProtocolHandler for Service {
     /// Serves a connection's streams until it closes.
-    pub async fn accept(&self, conn: Conn) {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let appends = Arc::new(Mutex::new(Window {
             start: Instant::now(),
             count: 0,
@@ -262,12 +264,6 @@ impl Service {
                 }
             });
         }
-    }
-}
-
-impl ProtocolHandler for Service {
-    async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
-        Service::accept(self, Arc::new(IrohConnection(conn))).await;
         Ok(())
     }
 }
