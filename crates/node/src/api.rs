@@ -20,7 +20,7 @@ use crate::groups::renaming;
 use crate::{G, MEMBER_WAIT, Member, Message, Node, Rec, SEND_WAIT, Sent, State, UNFINISHED, Work, device_key_key, endpoint_id, get, message_key, now, put, sending};
 
 impl<P: Provider + Send + 'static> Node<P> {
-    /// Stops the peers and every task.
+    /// Stops the peers and every task, and closes the provider.
     pub async fn shutdown(&self) -> Result<()> {
         for task in self.inner.tasks.lock().unwrap().drain(..) {
             task.abort();
@@ -28,7 +28,9 @@ impl<P: Provider + Send + 'static> Node<P> {
         for (_, follow) in self.inner.follows.lock().unwrap().drain() {
             follow.abort();
         }
-        self.inner.net().shutdown().await
+        self.inner.net().shutdown().await?;
+        // Not a step (`lock`), which commits when it ends: after the close.
+        self.inner.state.lock().unwrap().provider.close()
     }
 
     /// This session's key: its MLS signature key.

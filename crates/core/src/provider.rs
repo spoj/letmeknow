@@ -30,6 +30,10 @@ pub trait Provider: OpenMlsProvider<StorageProvider: StorageProvider<1, Error: S
     fn scrub(&self) -> Result<()> {
         Ok(())
     }
+    /// Closes its files, at the node's shutdown: the node itself is not dropped then, as its peers hold it.
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The browser's provider: openmls's records in a `MemoryStorage`, ours beside them; the browser persists the changes
@@ -335,6 +339,14 @@ mod native {
         fn scrub(&self) -> Result<()> {
             let busy: i64 = self.db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
             anyhow::ensure!(busy == 0, "the database was busy, so deleted records stay in its WAL for now");
+            Ok(())
+        }
+
+        /// Both handles move to an empty database in memory, so the file closes, and can be deleted on Windows.
+        fn close(&mut self) -> Result<()> {
+            let memory = Rc::new(Connection::open_in_memory()?);
+            self.storage = SqliteStorageProvider::new(Db(memory.clone()));
+            self.db = memory;
             Ok(())
         }
     }
