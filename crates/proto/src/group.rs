@@ -127,8 +127,6 @@ pub struct IdentityRef {
 pub enum Control {
     /// The sender asks to be removed.
     Leave,
-    /// Who an identity was to its sender, as 0.13.0 and 0.13.1 members still tell: ignored.
-    Introduce,
     /// An invite, which any member admits a joiner by once: SHA-256 of its secret, when it expires (milliseconds), and
     /// whom it is for.
     Invite {
@@ -143,7 +141,7 @@ pub enum Control {
 }
 
 impl Control {
-    pub const TYPES: [&str; 4] = ["leave", "introduce", "invite", "lost"];
+    pub const TYPES: [&str; 3] = ["leave", "invite", "lost"];
 }
 
 /// A payload's `type`.
@@ -216,18 +214,10 @@ mod tests {
 
     #[test]
     fn unknown_values_parse_to_the_catch_all() {
-        assert_eq!(serde_json::from_str::<How>(r#""introduce""#).unwrap(), How::Other("introduce".into()));
+        assert_eq!(serde_json::from_str::<How>(r#""vouched""#).unwrap(), How::Other("vouched".into()));
         let service: Service = serde_json::from_str(r#"{"s3":{"bucket":"b"}}"#).unwrap();
         assert!(matches!(service, Service::Newer(_)));
         assert_eq!(serde_json::to_string(&service).unwrap(), r#"{"s3":{"bucket":"b"}}"#);
-    }
-
-    #[test]
-    fn what_older_members_send_parses() {
-        let introduce = r#"{"type":"introduce","identity":{"id":"AQ","membership":{"folder":"/x"}},"name":"Bob","how":"invite","to":["AQ"]}"#;
-        assert_eq!(serde_json::from_str::<Control>(introduce).unwrap(), Control::Introduce);
-        let invite = r#"{"type":"invite","hash":"AQ","expires":5,"label":"Bob (Acme)"}"#;
-        assert_eq!(serde_json::from_str::<Control>(invite).unwrap(), Control::Invite { hash: Bytes(vec![1]), expires: 5, to: None });
     }
 
     #[test]

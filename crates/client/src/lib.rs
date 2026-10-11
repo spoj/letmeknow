@@ -132,8 +132,6 @@ pub struct DeviceState {
     pub identities: Vec<(IdentityRef, String)>,
     /// This device's key on each identity, by identity id.
     pub keys: Vec<(Bytes, Bytes)>,
-    /// The contacts of 0.13.0 and 0.13.1, as their session processes on this device require.
-    pub contacts: Vec<Value>,
     pub openings: Vec<Opening>,
 }
 
@@ -143,7 +141,6 @@ impl DeviceState {
             device: devices.name(),
             identities: devices.identities(),
             keys: devices.identities().into_iter().filter_map(|(identity, _)| Some((identity.id.clone(), devices.key(&identity.id.0).ok()?))).collect(),
-            contacts: devices.contacts(),
             openings: devices.openings(),
         }
     }

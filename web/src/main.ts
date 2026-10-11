@@ -988,7 +988,7 @@ class ChatView extends View {
           at,
           h("ul", {}, ...item.subjects.map(subject => h("li", {}, subject)))
         );
-      // An item of a kind this page no longer shows, which the timeline kept, as 0.13.1's introductions.
+      // An item of a kind this page does not show, as a newer page may keep in the timeline.
       default:
         return h("li", { hidden: true });
     }

@@ -436,7 +436,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 self.work.send(Work::Duties(gid.to_vec())).ok();
             }
             Control::Lost { positions } => self.announced(st, gid, message.position, message.sender, positions)?,
-            Control::Introduce => {}
             Control::Invite { hash, expires, to } => {
                 let rec = &mut st.group_mut(gid)?.rec;
                 if !rec.invites.iter().any(|rule| rule.hash == hash) {

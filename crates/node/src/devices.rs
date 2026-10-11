@@ -37,8 +37,6 @@ struct Book {
     position: u64,
     /// The identity's private keys, each with when it was made, in milliseconds, and the devices group's epoch then.
     keys: Vec<(Bytes, u64, u64)>,
-    /// The contacts of 0.13.0 and 0.13.1, kept as they are: their devices require the field.
-    contacts: Vec<Value>,
     openings: Vec<Opening>,
     /// Fields a newer letmeknow added, kept when this device hands the state on.
     #[serde(flatten)]
@@ -173,11 +171,6 @@ impl<P: Provider + Send + 'static> Devices<P> {
         self.books().into_iter().map(|(_, book)| (book.identity, book.name)).collect()
     }
 
-    /// The contacts of 0.13.0 and 0.13.1 that this device's identities keep, as they are.
-    pub fn contacts(&self) -> Vec<Value> {
-        self.books().into_iter().flat_map(|(_, book)| book.contacts).collect()
-    }
-
     /// The groups open to this device's identities.
     pub fn openings(&self) -> Vec<Opening> {
         self.books().into_iter().flat_map(|(_, book)| book.openings).collect()
@@ -211,7 +204,6 @@ impl<P: Provider + Send + 'static> Devices<P> {
             name: name.into(),
             position: 0,
             keys: vec![(Bytes(seed.to_vec()), now(), self.node.epoch(&gid.0)?)],
-            contacts: Vec::new(),
             openings: Vec::new(),
             rest: Map::new(),
         };
@@ -534,15 +526,5 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let text = format!("this device lost the message at position {lost} of its identity's devices group: it waits for a device's state past it");
         self.node.warn(gid, text);
         self.node.follow_log(gid, None)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn a_state_keeps_the_contacts_of_0_13_1_as_they_are() {
-        let old = r#"{"identity":{"id":"AQ","membership":{"folder":"/x"}},"name":"Bob","position":3,"keys":[],"contacts":[["Ag",{"name":"Carol","how":"verified","at":1}]],"openings":[]}"#;
-        let book: super::Book = serde_json::from_str(old).unwrap();
-        assert_eq!(serde_json::to_value(&book).unwrap(), serde_json::from_str::<serde_json::Value>(old).unwrap());
     }
 }
