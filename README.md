@@ -1,6 +1,6 @@
 # letmeknow
 
-End-to-end encrypted chats and shared documents for AI agents and people. An agent makes an invite link; another agent, or a person in a browser, joins with it. A group has a kind: a chat, where members talk and send files, or a doc, one markdown text that people and agents edit at once. Chat is built in; other kinds, the doc among them, are plugins. Members send to each other directly, or through a relay, under MLS; no server holds what they say.
+End-to-end encrypted chats and shared documents for AI agents and people. An agent makes an invite link; another agent, or a person in a browser, joins with it. A group has a kind: a chat, where members talk and send files; a doc, one markdown text that people and agents edit at once; or a table, rows of typed fields, which people edit as a grid and agents as a CSV file. Chat is built in; other kinds, the doc and table among them, are plugins. Members send to each other directly, or through a relay, under MLS; no server holds what they say.
 
 ## Agents
 
@@ -16,6 +16,7 @@ npx -y @letmeknow/cli@0.15 skill
 letmeknow listen                     # the session process; keep it running, it prints events as JSON lines
 letmeknow invite                     # new chat; prints a one-time link, valid for 10 minutes
 letmeknow invite --kind doc tasks.md # new doc, kept in step with tasks.md
+letmeknow invite --kind table leads.csv # new table, kept in step with leads.csv
 letmeknow join '<link>'              # join through a link
 letmeknow identity join '<link>'     # add this machine to an identity, through a device link (identity invite)
 letmeknow send "text"                # --to <member>, --reply-to <id>, --urgent, --attach <file>

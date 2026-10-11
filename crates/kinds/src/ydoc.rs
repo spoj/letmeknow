@@ -20,7 +20,7 @@ pub fn new(text: &str) -> Vec<u8> {
     doc.transact().encode_state_as_update_v1(&StateVector::default())
 }
 
-fn load(state: &[u8]) -> Result<Doc> {
+pub(crate) fn load(state: &[u8]) -> Result<Doc> {
     // A fresh client id for every load: edits made here must never reuse the clock of an earlier client.
     let doc = Doc::with_options(Options::default());
     doc.transact_mut().apply_update(Update::decode_v1(state)?)?;

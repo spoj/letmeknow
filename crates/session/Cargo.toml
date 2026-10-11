@@ -37,4 +37,4 @@ qrcode = { version = "0.14", default-features = false }
 [dev-dependencies]
 lmk-testing.workspace = true
 rcgen = "0.14"
-letmeknow-kind-doc.workspace = true
+lmk-kinds.workspace = true

@@ -1,19 +1,12 @@
 [package]
-name = "letmeknow-kind-doc"
+name = "lmk-kinds"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[lib]
-name = "lmk_kind_doc"
-path = "src/lib.rs"
-
-[[bin]]
-name = "letmeknow-kind-doc"
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
+csv = "1"
 lmk-proto.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

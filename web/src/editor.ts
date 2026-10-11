@@ -1,5 +1,5 @@
 // A doc's editor: markdown in CodeMirror, bound to the doc's Yjs text, which edits here and the copy the doc kind's
-// in-page plugin keeps (lmk_kind_doc::Page, through its commands) keep in step. It reads as written text: headings by
+// in-page plugin keeps (lmk_kinds::Page, through its commands) keep in step. It reads as written text: headings by
 // size, emphasis, inline code and quotes as they look, fenced code as a block and `---` as a rule, with markdown's marks
 // hidden except where the cursor is; list items hang under their bullets, which show as dots, and "- [ ]" items show as
 // checkboxes that tick with a click. A toolbar (and Ctrl+B, I and K, Alt+↑/↓, Tab, Shift+Tab) makes text bold, italic

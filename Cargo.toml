@@ -16,7 +16,7 @@ lmk-node = { path = "crates/node" }
 lmk-client = { path = "crates/client" }
 lmk-serve = { path = "crates/serve" }
 lmk-testing = { path = "crates/testing" }
-letmeknow-kind-doc = { path = "crates/kind-doc" }
+lmk-kinds = { path = "crates/kinds" }
 anyhow = "1"
 base64 = "0.23"
 blake3 = "1.8.7"

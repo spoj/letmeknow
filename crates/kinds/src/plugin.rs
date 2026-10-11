@@ -1,11 +1,10 @@
-//! `letmeknow-kind-doc`: the doc kind's plugin for the session process, in the plugin protocol on stdin
-//! and stdout. It keeps each doc in a file, named on `invite` or `join` or else in its own directory, and brings file
-//! and doc into step from their base, the text both last had: once the file is quiet for 1 second or the doc for 2,
-//! and whenever the session asks (`sync`), before it prints anything and before each command. Others' edits it tells
-//! of as one `edited` event per doc. Its own state is in the directory `start` names: per group, the doc's Yjs state
-//! (`<group>.yjs`) and its file's binding (`<group>.json`).
-
-mod file;
+//! A kind's plugin for the session process, in the plugin protocol on stdin and stdout: `letmeknow-kind-doc` and
+//! `letmeknow-kind-table`. It keeps each group's document in a file, a doc as markdown and a table as CSV, named on
+//! `invite` or `join` or else in its own directory, and brings file and document into step from their base, the text
+//! both last had: once the file is quiet for 1 second or the document for 2, and whenever the session asks (`sync`),
+//! before it prints anything and before each command. Others' edits it tells of as one `edited` event per group. Its
+//! own state is in the directory `start` names: per group, the document's Yjs state (`<group>.yjs`) and its file's
+//! binding (`<group>.json`).
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -14,30 +13,30 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
-use lmk_kind_doc::{Docs, answer, bytes, str, ydoc};
 use lmk_proto::Bytes;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::{Value, json};
 
-use file::Quiet;
+use crate::file::{self, Quiet};
+use crate::{Kind, States, answer, bytes, str, table, ydoc};
 
 enum Input {
     Host(String),
-    /// A doc's file changed.
+    /// A group's file changed.
     File(String),
     Closed,
 }
 
-/// A doc's file, kept in step with the doc; what of it is saved.
+/// A group's file, kept in step with its document; what of it is saved.
 #[derive(Clone, Default)]
 struct Saved {
     path: PathBuf,
-    /// The text file and doc last had in common.
+    /// The text file and document last had in common.
     base: String,
     /// Whether this plugin made the file, which then goes with the group.
     made: bool,
-    /// A file's changes on their way onto the doc: the file's text, and the edit that carries them, until the base is
-    /// the result. A plugin that stopped meanwhile applies the edit again, which a doc takes at most once.
+    /// A file's changes on their way onto the document: the file's text, and the edit that carries them, until the
+    /// base is the result. A plugin that stopped meanwhile applies the edit again, which a document takes at most once.
     carrying: Option<(String, Vec<u8>)>,
 }
 
@@ -79,7 +78,7 @@ struct Attaching {
 
 struct Plugin {
     dir: PathBuf,
-    docs: Docs,
+    states: States,
     bindings: HashMap<String, Binding>,
     names: HashMap<String, String>,
     attaching: HashMap<u64, Attaching>,
@@ -88,7 +87,7 @@ struct Plugin {
     out: Vec<Value>,
 }
 
-fn main() -> Result<()> {
+pub fn run(kind: Kind) -> Result<()> {
     let (input, inputs) = mpsc::channel();
     let host = input.clone();
     std::thread::spawn(move || {
@@ -101,7 +100,7 @@ fn main() -> Result<()> {
         host.send(Input::Closed).ok();
     });
     let mut plugin =
-        Plugin { dir: PathBuf::new(), docs: Docs::default(), bindings: HashMap::new(), names: HashMap::new(), attaching: HashMap::new(), requests: 0, input, out: Vec::new() };
+        Plugin { dir: PathBuf::new(), states: States::new(kind), bindings: HashMap::new(), names: HashMap::new(), attaching: HashMap::new(), requests: 0, input, out: Vec::new() };
     loop {
         let next = match plugin.due() {
             Some(due) => inputs.recv_timeout(due.saturating_duration_since(Instant::now())),
@@ -145,7 +144,7 @@ impl Plugin {
     fn host(&mut self, line: &str) {
         let message: Value = match serde_json::from_str(line) {
             Ok(message) => message,
-            Err(error) => return eprintln!("letmeknow-kind-doc: {error}: {line}"),
+            Err(error) => return eprintln!("letmeknow-kind-{}: {error}: {line}", self.states.kind.name()),
         };
         if let Err(error) = self.take(&message) {
             let group = message["group"].as_str().unwrap_or_default();
@@ -189,7 +188,7 @@ impl Plugin {
             }
             "answer" => self.answered(message)?,
             "message" | "state" | "synced" | "snapshot" => {
-                if let Some((group, from)) = self.docs.handle(message, &mut self.out)? {
+                if let Some((group, from)) = self.states.handle(message, &mut self.out)? {
                     self.save_state(&group)?;
                     if let Some(binding) = self.bindings.get_mut(&group) {
                         binding.quiet.doc_changed(Instant::now());
@@ -214,7 +213,7 @@ impl Plugin {
     }
 
     fn save_state(&self, group: &str) -> Result<()> {
-        replace(&self.state_path(group), self.docs.state(group)?)
+        replace(&self.state_path(group), self.states.state(group)?)
     }
 
     fn save(&self, group: &str) -> Result<()> {
@@ -222,11 +221,12 @@ impl Plugin {
         replace(&self.saved_path(group), saved.to_string().as_bytes())
     }
 
-    /// A group of this session: its doc, and its file. With `args`, from `invite` or `join`, the file is `args[0]` (or a
-    /// new one in this plugin's directory). Returns the file's path.
+    /// A group of this session: its document, and its file. With `args`, from `invite` or `join`, the file is `args[0]`
+    /// (or a new one in this plugin's directory). Returns the file's path.
     fn open(&mut self, group: &str, message: &Value) -> Result<PathBuf> {
-        let state = std::fs::read(self.state_path(group)).unwrap_or_else(|_| ydoc::new(""));
-        self.docs.open(group, state, &mut self.out)?;
+        let kind = self.states.kind;
+        let state = std::fs::read(self.state_path(group)).unwrap_or_else(|_| kind.new_state());
+        self.states.open(group, state, &mut self.out)?;
         self.save_state(group)?;
         self.names.insert(group.to_owned(), message["settings"]["name"].as_str().unwrap_or_default().to_owned());
         let me = message["me"].clone();
@@ -246,17 +246,23 @@ impl Plugin {
         if let Some(path) = &named
             && self.bindings.values().any(|b| b.saved.path == *path)
         {
-            bail!("{} already holds another doc", path.display());
+            bail!("{} already holds another {}", path.display(), kind.name());
         }
         let path = match named {
             Some(path) => {
-                ensure!(message["command"] != "join" || !path.exists(), "{} exists; name a new file for the doc", path.display());
+                ensure!(message["command"] != "join" || !path.exists(), "{} exists; name a new file for the {}", path.display(), kind.name());
                 path
             }
-            None => self.dir.join("docs").join(format!("{}-{}.md", self.slug(group), &group[..group.len().min(8)])),
+            None => {
+                let extension = match kind {
+                    Kind::Doc => "md",
+                    Kind::Table => "csv",
+                };
+                self.dir.join(format!("{}s", kind.name())).join(format!("{}-{}.{extension}", self.slug(group), &group[..group.len().min(8)]))
+            }
         };
-        // A new group's file brings its text in; a joined group's file starts with the doc's.
-        let base = if message["command"] == "join" { self.docs.text(group)? } else { String::new() };
+        // A new group's file brings its text in; a joined group's file starts with the document's.
+        let base = if message["command"] == "join" { self.render(group)? } else { String::new() };
         if !path.exists() {
             file::write_file(&path, &base)?;
         }
@@ -269,18 +275,18 @@ impl Plugin {
 
     fn slug(&self, group: &str) -> String {
         let name: String = self.names[group].chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
-        Some(name.trim_matches('-').to_owned()).filter(|name| !name.is_empty()).unwrap_or("doc".into())
+        Some(name.trim_matches('-').to_owned()).filter(|name| !name.is_empty()).unwrap_or(self.states.kind.name().into())
     }
 
-    /// Where a binding was left: a plugin stopped while carrying a file's changes onto the doc finishes, and one stopped
-    /// after writing the file but before storing its base takes the file as the base.
+    /// Where a binding was left: a plugin stopped while carrying a file's changes onto the document finishes, and one
+    /// stopped after writing the file but before storing its base takes the file as the base.
     fn resume(&mut self, group: &str) -> Result<()> {
         if let Some((file, edit)) = self.bindings[group].saved.carrying.clone() {
-            self.docs.edit(group, edit, &mut self.out)?;
+            self.states.edit(group, edit, &mut self.out)?;
             self.save_state(group)?;
             self.set_base(group, file)?;
         }
-        let text = self.docs.text(group)?;
+        let text = self.render(group)?;
         let path = self.bindings[group].saved.path.clone();
         if std::fs::read_to_string(&path).is_ok_and(|file| file.replace("\r\n", "\n") == text) {
             self.set_base(group, text)?;
@@ -288,7 +294,7 @@ impl Plugin {
         Ok(())
     }
 
-    /// Watches a doc's file, which is brought into step once it has been quiet for a moment.
+    /// Watches a group's file, which is brought into step once it has been quiet for a moment.
     fn follow(&mut self, group: &str, saved: Saved, me: Value) {
         let (input, changed, name) = (self.input.clone(), group.to_owned(), saved.path.file_name().map(ToOwned::to_owned));
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -317,7 +323,7 @@ impl Plugin {
         {
             std::fs::remove_file(&binding.saved.path)?;
         }
-        self.docs.states.remove(group);
+        self.states.states.remove(group);
         for path in [self.state_path(group), self.saved_path(group)] {
             if path.exists() {
                 std::fs::remove_file(path)?;
@@ -332,11 +338,13 @@ impl Plugin {
         }
     }
 
-    /// Brings a doc and its file into step. What changed in the file since they last were (its base) is carried line by
-    /// line onto the doc as it is now and sent; the file then gets the doc's text. A line both changed keeps the doc's
-    /// version, with a warning. What others changed in the doc meanwhile is told as `edited`.
+    /// Brings a document and its file into step. What changed in the file since they last were (its base) is carried
+    /// onto the document as it is now and sent, a doc's line by line and a table's cell by cell; the file then gets the
+    /// document's text. A line or cell both changed keeps the document's version, with a warning. What others changed
+    /// in the document meanwhile is told as `edited`.
     fn sync(&mut self, group: &str) -> Result<()> {
-        let binding = self.bindings.get_mut(group).context("not a doc of this session")?;
+        let kind = self.states.kind;
+        let binding = self.bindings.get_mut(group).with_context(|| format!("not a {} of this session", kind.name()))?;
         binding.quiet = Quiet::default();
         let (path, base) = (binding.saved.path.clone(), binding.saved.base.clone());
         let editors = std::mem::take(&mut binding.editors);
@@ -345,25 +353,28 @@ impl Plugin {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => base.clone(),
             Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
         };
-        let current = self.docs.text(group)?;
-        let (text, lost) = if file == base { (current.clone(), Vec::new()) } else { file::rebase(&base, &file, &current) };
-        if text != current {
-            let edit = ydoc::edit(self.docs.state(group)?, &text)?;
+        let current = self.render(group)?;
+        let (edit, lost) = if file == base { (None, Vec::new()) } else { self.merge(group, &base, &file)? };
+        if let Some(edit) = edit {
             self.bindings.get_mut(group).unwrap().saved.carrying = Some((file.clone(), edit.clone()));
             self.save(group)?;
-            self.docs.edit(group, edit, &mut self.out)?;
+            self.states.edit(group, edit, &mut self.out)?;
             self.save_state(group)?;
         }
+        let text = self.render(group)?;
         if text != file {
             file::write_file(&path, &text)?;
         }
         self.set_base(group, text)?;
         if !lost.is_empty() {
-            let text = format!("others changed these lines of {} meanwhile, so your changes to them were not kept: {}", path.display(), lost.join(" | "));
+            let text = match kind {
+                Kind::Doc => format!("others changed these lines of {} meanwhile, so your changes to them were not kept: {}", path.display(), lost.join(" | ")),
+                Kind::Table => format!("these changes to {} were not kept: {}", path.display(), lost.join(" | ")),
+            };
             self.out.push(warning(group, text));
         }
         if current != base {
-            // One `edited` event per doc waits, telling of every change since the agent was last told.
+            // One `edited` event per group waits, telling of every change since the agent was last told.
             let binding = self.bindings.get_mut(group).unwrap();
             let (since, by) = binding.told.get_or_insert_with(|| (base.clone(), Vec::new()));
             for editor in editors {
@@ -379,7 +390,30 @@ impl Plugin {
         Ok(())
     }
 
-    /// Records the text a doc and its file have in common, once the file's changes are on the doc.
+    /// The group's document as its file reads.
+    fn render(&self, group: &str) -> Result<String> {
+        let state = self.states.state(group)?;
+        match self.states.kind {
+            Kind::Doc => ydoc::text(state),
+            Kind::Table => table::csv(state),
+        }
+    }
+
+    /// The edit that carries a file's changes since `base` onto the document as it is now, if they change it; and the
+    /// changes not kept.
+    fn merge(&self, group: &str, base: &str, file: &str) -> Result<(Option<Vec<u8>>, Vec<String>)> {
+        let state = self.states.state(group)?;
+        match self.states.kind {
+            Kind::Doc => {
+                let current = ydoc::text(state)?;
+                let (text, lost) = file::rebase(base, file, &current);
+                Ok(((text != current).then(|| ydoc::edit(state, &text)).transpose()?, lost))
+            }
+            Kind::Table => table::merge(state, base, file),
+        }
+    }
+
+    /// Records the text a document and its file have in common, once the file's changes are on the document.
     fn set_base(&mut self, group: &str, base: String) -> Result<()> {
         let saved = &mut self.bindings.get_mut(group).unwrap().saved;
         saved.base = base;
@@ -389,6 +423,7 @@ impl Plugin {
 
     /// `letmeknow doc attach [--group <group>] <path>`: makes a file linkable from a doc; answers with its markdown link.
     fn command(&mut self, message: &Value) -> Result<()> {
+        ensure!(self.states.kind == Kind::Doc, "the table kind has no commands");
         let args = message["args"].as_array().context("no args")?.iter().filter_map(Value::as_str);
         let args: Vec<&str> = args.flat_map(|arg| arg.strip_prefix("--group=").map_or(vec![arg], |group| vec!["--group", group])).collect();
         let (group, path) = match args[..] {

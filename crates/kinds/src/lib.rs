@@ -1,13 +1,18 @@
-//! The doc kind: one markdown text that every member edits at once, a Yjs document. Its payloads are live:
-//! edits go to the members online; two members that meet compare their docs by a hash of each one's snapshot
-//! (`snapshot`), and if they differ, each sends the other a `diff` against the other's state vector (`sv`), all to that
-//! member alone. Whoever admits a joiner hands it the doc's state. The doc links files as `lmk:` links, which members hold
-//! while it does.
+//! The kinds whose groups share one Yjs document: the doc kind, one markdown text that every member edits at once
+//! (`ydoc`), and the table kind, rows of typed fields (`table`). Their payloads are live: edits go to the members online;
+//! two members that meet compare their documents by a hash of each one's snapshot (`snapshot`), and if they differ, each
+//! sends the other a `diff` against the other's state vector (`sv`), all to that member alone. Whoever admits a joiner
+//! hands it the document's state. A doc links files as `lmk:` links, which members hold while it does.
 //!
-//! `Docs` is what every host of the kind does alike, in the plugin protocol: the session's plugin
-//! `letmeknow-kind-doc` (src/main.rs), which keeps each doc in a file, and the browser's in-page plugin (`Page`),
-//! which an editor binds to.
+//! `States` is what every host of these kinds does alike, in the plugin protocol: the session's plugins
+//! `letmeknow-kind-doc` and `letmeknow-kind-table` (`plugin`), which keep each document in a file, and the browser's
+//! in-page plugins (`Page`), which its views bind to.
 
+#[cfg(not(target_arch = "wasm32"))]
+mod file;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod plugin;
+pub mod table;
 pub mod ydoc;
 
 use std::collections::HashMap;
@@ -33,24 +38,56 @@ pub fn answer(id: &Value, answer: Result<Value>) -> Value {
     }
 }
 
-/// The docs of this session's doc groups, by group id: each one's Yjs state.
-#[derive(Default)]
-pub struct Docs {
+/// A kind whose groups share a Yjs document.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Kind {
+    Doc,
+    Table,
+}
+
+impl Kind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Doc => "doc",
+            Kind::Table => "table",
+        }
+    }
+
+    /// The document of a new group.
+    fn new_state(self) -> Vec<u8> {
+        match self {
+            Kind::Doc => ydoc::new(""),
+            Kind::Table => table::new(),
+        }
+    }
+
+    /// The files a document links.
+    fn links(self, state: &[u8]) -> Result<Vec<String>> {
+        match self {
+            Kind::Doc => Ok(ydoc::links(&ydoc::text(state)?)),
+            Kind::Table => Ok(Vec::new()),
+        }
+    }
+}
+
+/// The documents of this session's groups of one kind, by group id: each one's Yjs state.
+pub struct States {
+    pub kind: Kind,
     pub states: HashMap<String, Vec<u8>>,
 }
 
-impl Docs {
-    pub fn state(&self, group: &str) -> Result<&[u8]> {
-        self.states.get(group).map(Vec::as_slice).context("not a doc of this session")
+impl States {
+    pub fn new(kind: Kind) -> Self {
+        States { kind, states: HashMap::new() }
     }
 
-    pub fn text(&self, group: &str) -> Result<String> {
-        ydoc::text(self.state(group)?)
+    pub fn state(&self, group: &str) -> Result<&[u8]> {
+        self.states.get(group).map(Vec::as_slice).with_context(|| format!("not a {} of this session", self.kind.name()))
     }
 
     /// Takes in what every host takes in alike: `message` (`edit`, `diff`, `snapshot`, `sv`), `synced`, `state` and
-    /// `snapshot`; what it sends goes to `out`. Returns the group whose doc changed and the member who changed it, if
-    /// any. Other messages are the host's.
+    /// `snapshot`; what it sends goes to `out`. Returns the group whose document changed and the member who changed it,
+    /// if any. Other messages are the host's.
     pub fn handle(&mut self, message: &Value, out: &mut Vec<Value>) -> Result<Option<(String, Value)>> {
         let group = message["group"].as_str().unwrap_or_default().to_owned();
         let (payload, to) = (&message["payload"], &message["from"]["fp"]);
@@ -96,45 +133,46 @@ impl Docs {
         Ok(())
     }
 
-    /// Applies an update; if the doc links other files than before, tells the host which.
+    /// Applies an update; if the document links other files than before, tells the host which.
     fn apply(&mut self, group: &str, update: &[u8], out: &mut Vec<Value>) -> Result<()> {
         let old = self.state(group)?;
         let new = ydoc::apply(old, update)?;
-        let links = ydoc::links(&ydoc::text(&new)?);
-        if links != ydoc::links(&ydoc::text(old)?) {
+        let links = self.kind.links(&new)?;
+        if links != self.kind.links(old)? {
             out.push(json!({ "type": "links", "group": group, "links": links }));
         }
         self.states.insert(group.to_owned(), new);
         Ok(())
     }
 
-    /// Opens a group's doc from its saved state, and tells the host which files it links.
+    /// Opens a group's document from its saved state, and tells the host which files it links.
     pub fn open(&mut self, group: &str, state: Vec<u8>, out: &mut Vec<Value>) -> Result<()> {
-        let links = ydoc::links(&ydoc::text(&state)?);
+        let links = self.kind.links(&state)?;
         out.push(json!({ "type": "links", "group": group, "links": links }));
         self.states.insert(group.to_owned(), state);
         Ok(())
     }
 }
 
-/// Where the browser's in-page plugin keeps each doc's state: the page's records.
+/// Where the browser's in-page plugins keep each document: the page's records.
 pub trait Store {
     fn get(&self, key: &str) -> Option<Vec<u8>>;
     fn put(&self, key: &str, value: &[u8]);
     fn delete(&self, key: &str);
 }
 
-/// The doc kind as the browser's in-page plugin: it keeps each doc's state in the page's records, under `kind/doc/<group>`,
-/// and its editors bind to it through commands: `state <group>` gives the state, `diff <group> <state vector>` what an
-/// editor lacks, and `edit <group> <update>` takes an editor's edit. It tells of others' changes as `edited` events.
+/// A kind as the browser's in-page plugin: it keeps each group's document in the page's records, under
+/// `kind/<kind>/<group>`, and the page's views bind to it through commands: `state <group>` gives the state,
+/// `diff <group> <state vector>` what a view lacks, and `edit <group> <update>` takes a view's edit. It tells of others'
+/// changes as `edited` events.
 pub struct Page<S: Store> {
-    docs: Docs,
+    states: States,
     store: S,
 }
 
 impl<S: Store> Page<S> {
-    pub fn new(store: S) -> Self {
-        Page { docs: Docs::default(), store }
+    pub fn new(kind: Kind, store: S) -> Self {
+        Page { states: States::new(kind), store }
     }
 
     /// Takes in one message of the host; returns what it sends.
@@ -149,46 +187,49 @@ impl<S: Store> Page<S> {
         out
     }
 
+    fn key(&self, group: &str) -> String {
+        format!("kind/{}/{group}", self.states.kind.name())
+    }
+
     fn take(&mut self, message: &Value, out: &mut Vec<Value>) -> Result<()> {
         let group = message["group"].as_str().unwrap_or_default();
-        let key = format!("kind/doc/{group}");
         match str(&message["type"])? {
             "group" => {
-                let state = self.store.get(&key).unwrap_or_else(|| ydoc::new(""));
-                self.store.put(&key, &state);
-                self.docs.open(group, state, out)?;
+                let state = self.store.get(&self.key(group)).unwrap_or_else(|| self.states.kind.new_state());
+                self.store.put(&self.key(group), &state);
+                self.states.open(group, state, out)?;
                 if let Some(id) = message.get("id") {
                     out.push(answer(id, Ok(json!({}))));
                 }
             }
             "start" => out.push(answer(&message["id"], Ok(json!({})))),
             "gone" => {
-                self.docs.states.remove(group);
-                self.store.delete(&key);
+                self.states.states.remove(group);
+                self.store.delete(&self.key(group));
                 out.push(answer(&message["id"], Ok(json!({}))));
             }
             "command" => {
                 let answer_to = &message["id"];
                 let args: Vec<&str> = message["args"].as_array().context("no args")?.iter().filter_map(Value::as_str).collect();
                 let answered = match args[..] {
-                    ["state", group] => json!({ "state": Bytes(self.docs.state(group)?.to_vec()) }),
+                    ["state", group] => json!({ "state": Bytes(self.states.state(group)?.to_vec()) }),
                     ["diff", group, sv] => {
                         let sv = bytes(&json!(sv))?;
-                        json!({ "diff": Bytes(ydoc::diff(self.docs.state(group)?, &sv)?) })
+                        json!({ "diff": Bytes(ydoc::diff(self.states.state(group)?, &sv)?) })
                     }
                     ["edit", group, update] => {
-                        self.docs.edit(group, bytes(&json!(update))?, out)?;
-                        self.store.put(&format!("kind/doc/{group}"), self.docs.state(group)?);
+                        self.states.edit(group, bytes(&json!(update))?, out)?;
+                        self.store.put(&self.key(group), self.states.state(group)?);
                         json!({})
                     }
-                    _ => bail!("the doc kind's commands in a browser are state, diff and edit"),
+                    _ => bail!("the {} kind's commands in a browser are state, diff and edit", self.states.kind.name()),
                 };
                 out.push(answer(answer_to, Ok(answered)));
             }
             "sync" => out.push(answer(&message["id"], Ok(json!({})))),
             _ => {
-                if let Some((group, from)) = self.docs.handle(message, out)? {
-                    self.store.put(&format!("kind/doc/{group}"), self.docs.state(&group)?);
+                if let Some((group, from)) = self.states.handle(message, out)? {
+                    self.store.put(&self.key(&group), self.states.state(&group)?);
                     out.push(json!({ "type": "event", "group": group, "event": { "type": "edited", "by": [from] } }));
                 }
             }
@@ -207,7 +248,7 @@ mod tests {
 
     #[test]
     fn two_docs_that_differ_converge_through_a_diff() {
-        let (mut a, mut b, mut out) = (Docs::default(), Docs::default(), Vec::new());
+        let (mut a, mut b, mut out) = (States::new(Kind::Doc), States::new(Kind::Doc), Vec::new());
         let base = ydoc::new("- [ ] alpha\n");
         a.open("g", base.clone(), &mut out).unwrap();
         b.open("g", base.clone(), &mut out).unwrap();
@@ -233,7 +274,7 @@ mod tests {
         assert_eq!((&diff["to"], &diff["payload"]["type"]), (&json!("bb"), &json!("diff")));
         let changed = b.handle(&json!({ "type": "message", "group": "g", "from": ann, "payload": diff["payload"] }), &mut out).unwrap();
         assert_eq!(changed, Some(("g".into(), ann)));
-        assert_eq!(b.text("g").unwrap(), format!("- [x] alpha\n[spec]({link})\n"));
+        assert_eq!(ydoc::text(b.state("g").unwrap()).unwrap(), format!("- [x] alpha\n[spec]({link})\n"));
     }
 
     struct Memory(std::cell::RefCell<HashMap<String, Vec<u8>>>);
@@ -253,7 +294,7 @@ mod tests {
     #[test]
     fn the_page_keeps_a_doc_and_its_editors_edit_it() {
         let memory = Memory(Default::default());
-        let mut page = Page::new(&memory);
+        let mut page = Page::new(Kind::Doc, &memory);
         page.input(&json!({ "type": "group", "group": "g", "id": 1 }));
         let out = page.input(&json!({ "type": "command", "id": 2, "args": ["state", "g"] }));
         let state = bytes(&sent(&out, "answer")["answer"]["state"]).unwrap();

@@ -796,6 +796,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "csv"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52cd9d68cf7efc6ddfaaee42e7288d3a99d613d4b50f76ce9827ae0c6e14f938"
+dependencies = [
+ "csv-core",
+ "itoa",
+ "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "csv-core"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "ctr"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2552,9 +2573,9 @@ dependencies = [
  "gethostname",
  "hex",
  "iroh",
- "letmeknow-kind-doc",
  "lmk-client",
  "lmk-core",
+ "lmk-kinds",
  "lmk-node",
  "lmk-proto",
  "lmk-serve",
@@ -2568,19 +2589,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "letmeknow-kind-doc"
-version = "0.14.4"
-dependencies = [
- "anyhow",
- "lmk-proto",
- "notify",
- "serde_json",
- "sha2 0.11.0",
- "similar",
- "yrs",
 ]
 
 [[package]]
@@ -2893,6 +2901,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lmk-kinds"
+version = "0.14.4"
+dependencies = [
+ "anyhow",
+ "csv",
+ "lmk-proto",
+ "notify",
+ "serde_json",
+ "sha2 0.11.0",
+ "similar",
+ "yrs",
+]
+
+[[package]]
 name = "lmk-membership"
 version = "0.14.4"
 dependencies = [
@@ -3022,8 +3044,8 @@ dependencies = [
  "hex",
  "iroh",
  "js-sys",
- "letmeknow-kind-doc",
  "lmk-client",
+ "lmk-kinds",
  "lmk-node",
  "lmk-proto",
  "n0-future",

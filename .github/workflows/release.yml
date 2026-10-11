@@ -31,13 +31,13 @@ jobs:
           targets: ${{ matrix.target }}
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      # The plugin of the kind letmeknow ships goes beside it, where a session looks for it first.
-      - run: cargo build --release --target ${{ matrix.target }} -p letmeknow -p letmeknow-kind-doc
+      # The plugins of the kinds letmeknow ships go beside it, where a session looks for them first.
+      - run: cargo build --release --target ${{ matrix.target }} -p letmeknow -p lmk-kinds
       - name: Package
         run: |
           suffix=; [[ "${{ matrix.target }}" == *windows* ]] && suffix=.exe
           exes=()
-          for exe in letmeknow letmeknow-kind-doc; do exes+=("target/${{ matrix.target }}/release/$exe$suffix"); done
+          for exe in letmeknow letmeknow-kind-doc letmeknow-kind-table; do exes+=("target/${{ matrix.target }}/release/$exe$suffix"); done
           name=letmeknow-${{ github.ref_name }}-${{ matrix.target }}
           mkdir -p "$name" "npm/${{ matrix.npm }}/bin"
           cp README.md SKILL.md LICENSE "${exes[@]}" "$name/"

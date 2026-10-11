@@ -1,7 +1,7 @@
 //! The browser client: the client core on one lmk-node session, which is the browser's device too, with a device key of
 //! its own in its identity's group, reaching its peers only through the relay, with the identity kind on the
-//! same node. Chat is built in; the doc kind
-//! (`lmk_kind_doc::Page`) is an in-page plugin, whose messages go
+//! same node. Chat is built in; the doc and table kinds
+//! (`lmk_kinds::Page`) are in-page plugins, whose messages go
 //! to and from the core as calls. The page persists the session's records in IndexedDB, one record per key, each step's
 //! before what the step produced leaves the session, and the ciphertext of the files it holds, which the session loads
 //! when it needs one. Results that are not bytes are JSON
@@ -39,6 +39,7 @@ const FILE_LIMIT: u64 = 25 << 20;
 const HISTORY: u64 = 90 * 24 * 3600 * 1000;
 /// The kinds the browser supports: chat, and those of its in-page plugins.
 const DOC: &str = "doc";
+const TABLE: &str = "table";
 
 type R<T> = Result<T, JsError>;
 
@@ -164,7 +165,7 @@ fn flush(store: &Store, idb: &Idb) -> Promise {
 /// The in-page plugins' records, among the session's.
 struct PageStore(Store);
 
-impl lmk_kind_doc::Store for PageStore {
+impl lmk_kinds::Store for PageStore {
     fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.0.get(key.as_bytes()).ok().flatten()
     }
@@ -180,18 +181,19 @@ impl lmk_kind_doc::Store for PageStore {
 
 /// The in-page plugins: what they send in answer to a message goes to the client as their lines.
 struct InPage {
-    docs: Mutex<lmk_kind_doc::Page<PageStore>>,
+    docs: Mutex<lmk_kinds::Page<PageStore>>,
+    tables: Mutex<lmk_kinds::Page<PageStore>>,
     started: Mutex<HashSet<String>>,
     lines: mpsc::UnboundedSender<(String, Option<Value>)>,
 }
 
 impl lmk_client::Plugins for InPage {
     fn kinds(&self) -> Vec<String> {
-        vec![DOC.into()]
+        vec![DOC.into(), TABLE.into()]
     }
 
     fn start(&self, kind: &str) -> Result<Value> {
-        anyhow::ensure!(kind == DOC, "this browser has no plugin for {kind} groups");
+        anyhow::ensure!([DOC, TABLE].contains(&kind), "this browser has no plugin for {kind} groups");
         self.started.lock().unwrap().insert(kind.to_owned());
         Ok(json!({}))
     }
@@ -201,7 +203,10 @@ impl lmk_client::Plugins for InPage {
     }
 
     fn send(&self, kind: &str, message: &Value) -> Result<()> {
-        let out = self.docs.lock().unwrap().input(message);
+        let out = match kind {
+            DOC => self.docs.lock().unwrap().input(message),
+            _ => self.tables.lock().unwrap().input(message),
+        };
         for line in out {
             self.lines.send((kind.to_owned(), Some(line))).ok();
         }
@@ -306,7 +311,7 @@ impl App {
             files: None,
             disk: Some(kept.clone()),
             file_limit: FILE_LIMIT,
-            kinds: vec![CHAT.into(), DOC.into(), IDENTITY.into()],
+            kinds: vec![CHAT.into(), DOC.into(), TABLE.into(), IDENTITY.into()],
             durable: Some(durable),
         };
         let (node, mut events) = Node::start(store.clone(), node_config).await?;
@@ -315,7 +320,8 @@ impl App {
         let membership = service(&config.membership)?;
         let (lines, written) = mpsc::unbounded_channel();
         let plugins = InPage {
-            docs: Mutex::new(lmk_kind_doc::Page::new(PageStore(store.clone()))),
+            docs: Mutex::new(lmk_kinds::Page::new(lmk_kinds::Kind::Doc, PageStore(store.clone()))),
+            tables: Mutex::new(lmk_kinds::Page::new(lmk_kinds::Kind::Table, PageStore(store.clone()))),
             started: Mutex::default(),
             lines,
         };
@@ -667,7 +673,7 @@ impl Lmk {
         self.app.only_here().map_err(js)
     }
 
-    /// A new chat or doc, speaking as this browser's identity; returns its id.
+    /// A new chat, doc or table, speaking as this browser's identity; returns its id.
     pub async fn create(&self, kind: String, name: String) -> R<String> {
         let app = &self.app;
         let settings = Settings { protocol: PROTOCOL, kind, name, carry: 7, update: lmk_proto::group::UPDATE, public: None, membership: app.membership.clone(), rest: Default::default() };

@@ -121,7 +121,7 @@ def serve():
 
 
 def main():
-    subprocess.run(["cargo", "build", "-q", "-p", "letmeknow", "-p", "letmeknow-kind-doc"], cwd=ROOT, check=True)
+    subprocess.run(["cargo", "build", "-q", "-p", "letmeknow", "-p", "lmk-kinds"], cwd=ROOT, check=True)
     if BROWSER:
         subprocess.run([shutil.which("npm"), "run", "build"], cwd=WEB, check=True)
     server = serve()

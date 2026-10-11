@@ -1,4 +1,4 @@
-//! The plugin as the session runs it: JSON lines on stdin and stdout.
+//! The plugins as the session runs them: JSON lines on stdin and stdout.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -14,8 +14,8 @@ struct Plugin {
 }
 
 impl Plugin {
-    fn start(dir: &std::path::Path) -> Plugin {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_letmeknow-kind-doc")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    fn start(exe: &str, kind: &str, dir: &std::path::Path) -> Plugin {
+        let mut child = Command::new(exe).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
         let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
         let (tx, lines) = mpsc::channel();
         std::thread::spawn(move || {
@@ -24,7 +24,7 @@ impl Plugin {
             }
         });
         let mut plugin = Plugin { child, stdin, lines };
-        plugin.send(json!({ "type": "start", "id": 0, "kind": "doc", "dir": dir }));
+        plugin.send(json!({ "type": "start", "id": 0, "kind": kind, "dir": dir }));
         assert_eq!(plugin.next("answer")["id"], 0);
         plugin
     }
@@ -51,7 +51,7 @@ fn a_doc_in_a_file_its_commands_and_its_comparisons() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("plan.md"), "- [ ] alpha\n").unwrap();
     std::fs::write(dir.join("chart.png"), b"\x89PNG....").unwrap();
-    let mut plugin = Plugin::start(&dir.join("state"));
+    let mut plugin = Plugin::start(env!("CARGO_BIN_EXE_letmeknow-kind-doc"), "doc", &dir.join("state"));
     let me = json!({ "name": "Alice", "fp": "aa" });
     let group = json!({ "type": "group", "group": "g1", "settings": { "name": "Plan" }, "me": me, "id": 1, "command": "invite", "args": ["plan.md"], "cwd": dir });
     plugin.send(group);
@@ -67,7 +67,7 @@ fn a_doc_in_a_file_its_commands_and_its_comparisons() {
     assert_eq!((&attached["id"], &attached["answer"]["markdown"]), (&json!(2), &json!("![chart.png](lmk:x)")));
 
     // A member whose doc differs gets this doc's state vector; one that sends its own gets a diff, to it alone.
-    let from = |payload| json!({ "type": "message", "group": "g1", "from": { "fp": "bb" }, "payload": payload, "held": false });
+    let from = |payload| json!({ "type": "message", "group": "g1", "from": { "fp": "bb" }, "payload": payload });
     plugin.send(from(json!({ "type": "snapshot", "snapshot": "AA" })));
     let sv = plugin.next("send");
     assert_eq!((&sv["to"], &sv["payload"]["type"]), (&json!("bb"), &json!("sv")));
@@ -76,7 +76,7 @@ fn a_doc_in_a_file_its_commands_and_its_comparisons() {
     assert_eq!((&diff["to"], &diff["payload"]["type"]), (&json!("bb"), &json!("diff")));
 
     // Another member's edit reaches the file at the next sync, told as `edited`.
-    plugin.send(json!({ "type": "message", "group": "g1", "from": { "name": "Bob", "fp": "bb" }, "payload": diff["payload"], "held": false }));
+    plugin.send(json!({ "type": "message", "group": "g1", "from": { "name": "Bob", "fp": "bb" }, "payload": diff["payload"] }));
     plugin.send(json!({ "type": "sync", "id": 3 }));
     plugin.next("answer");
     plugin.send(json!({ "type": "gone", "group": "g1" }));
@@ -84,6 +84,30 @@ fn a_doc_in_a_file_its_commands_and_its_comparisons() {
     plugin.next("answer");
     assert!(dir.join("plan.md").exists(), "a file the agent named stays");
     assert!(!dir.join("state").join("g1.yjs").exists());
+    drop(plugin.stdin);
+    assert!(plugin.child.wait().unwrap().success());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_table_in_a_csv_file() {
+    let dir = std::env::temp_dir().join(format!("lmk-kind-table-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("tasks.csv"), "Task,Done\nwrite,false\n").unwrap();
+    let mut plugin = Plugin::start(env!("CARGO_BIN_EXE_letmeknow-kind-table"), "table", &dir.join("state"));
+    let me = json!({ "name": "Alice", "fp": "aa" });
+    let group = json!({ "type": "group", "group": "t1", "settings": { "name": "Tasks" }, "me": me, "id": 1, "command": "invite", "args": ["tasks.csv"], "cwd": dir });
+    plugin.send(group);
+    assert_eq!(plugin.next("send")["payload"]["type"], "edit", "the file's rows are the new table's");
+    plugin.next("answer");
+    let text = std::fs::read_to_string(dir.join("tasks.csv")).unwrap();
+    let (header, row) = text.split_once('\n').unwrap();
+    assert_eq!(header, "id,Task,Done");
+    assert!(row.len() == 8 + ",write,false\n".len() && row.ends_with(",write,false\n"), "the row gets its id: {row}");
+
+    plugin.send(json!({ "type": "command", "id": 2, "args": ["attach", "tasks.csv"], "cwd": dir }));
+    assert_eq!(plugin.next("answer")["error"], "the table kind has no commands");
     drop(plugin.stdin);
     assert!(plugin.child.wait().unwrap().success());
     std::fs::remove_dir_all(dir).unwrap();

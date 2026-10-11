@@ -29,11 +29,13 @@ impl Drop for World {
     }
 }
 
-/// Where cargo builds the workspace's binaries, the doc plugin among them: beside this test's own directory.
+/// Where cargo builds the workspace's binaries, the kinds' plugins among them: beside this test's own directory.
 fn built() -> PathBuf {
     let dir = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
-    let plugin = dir.join(format!("letmeknow-kind-doc{}", std::env::consts::EXE_SUFFIX));
-    assert!(plugin.exists(), "build the doc plugin first: cargo build -p letmeknow-kind-doc");
+    for kind in ["doc", "table"] {
+        let plugin = dir.join(format!("letmeknow-kind-{kind}{}", std::env::consts::EXE_SUFFIX));
+        assert!(plugin.exists(), "build the plugins first: cargo build -p lmk-kinds");
+    }
     dir
 }
 
@@ -369,6 +371,35 @@ fn a_doc_is_a_file_that_others_edit_too() {
         std::fs::write(&attached, b"\x89PNG....").unwrap();
         let link = alice.cmd(&["doc", "attach", attached.to_str().unwrap()]).await.unwrap();
         assert!(link["markdown"].as_str().unwrap().starts_with("![chart.png](lmk:"));
+    });
+}
+
+#[test]
+fn a_table_is_a_csv_file_whose_cells_others_edit_too() {
+    local(async {
+        let world = world("table").await;
+        let mut alice = world.start("alice", HOUR).await;
+        let bob = world.start("bob", HOUR).await;
+        std::fs::create_dir_all(&world.root).unwrap();
+        let tasks = world.root.join("tasks.csv");
+        std::fs::write(&tasks, "Task,Owner,Done\nwrite,,false\nship,,false\n").unwrap();
+        let invite = alice.cmd(&["invite", "--kind", "table", "--name", "Tasks", tasks.to_str().unwrap()]).await.unwrap();
+        assert_eq!(invite["file"], tasks.to_str().unwrap());
+        let ours = std::fs::read_to_string(&tasks).unwrap();
+        assert!(ours.starts_with("id,Task,Owner,Done\n"), "the rows get ids: {ours}");
+        let theirs = world.root.join("bob-tasks.csv");
+        let joined = bob.cmd(&["join", invite["link"].as_str().unwrap(), theirs.to_str().unwrap()]).await.unwrap();
+        assert_eq!(joined["kind"], "table");
+        alice.told(&["joined"]).await;
+        assert_eq!(until_file(&bob, &theirs, |text| text == ours).await, ours);
+        // Bob takes the first task while Alice ticks the second: both stand.
+        let (first, second) = (ours.lines().nth(1).unwrap(), ours.lines().nth(2).unwrap());
+        std::fs::write(&theirs, ours.replace(first, &first.replace(",write,,", ",write,bob,"))).unwrap();
+        std::fs::write(&tasks, ours.replace(second, &second.replace(",false", ",true"))).unwrap();
+        let both = |text: &str| text.contains(",write,bob,false\n") && text.contains(",ship,,true\n");
+        assert!(both(&until_file(&alice, &tasks, both).await));
+        assert!(both(&until_file(&bob, &theirs, both).await));
+        assert_eq!(alice.expect("edited").await["by"], json!([bob.fp]));
     });
 }
 
@@ -829,7 +860,7 @@ fn a_restarted_session_resumes_its_groups_and_docs() {
 #[test]
 fn a_session_that_stopped_while_carrying_a_file_onto_its_doc_does_not_carry_it_twice() {
     local(async {
-        use lmk_kind_doc::ydoc;
+        use lmk_kinds::ydoc;
         let world = world("carrying").await;
         let mut alice = world.start("alice", HOUR).await;
         let invite = alice.cmd(&["invite", "--kind", "doc", "--name", "Notes"]).await.unwrap();
