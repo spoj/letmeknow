@@ -124,7 +124,7 @@ pub enum Request {
         /// text addresses too
         #[arg(long)]
         to: Vec<String>,
-        /// Id of the message this answers
+        /// Id of the message this answers, or any unique beginning of it
         #[arg(long)]
         reply_to: Option<String>,
         /// Deliver at once to every member, not only those addressed
@@ -142,6 +142,7 @@ pub enum Request {
     /// Show a chat message: of your own, who holds and who read it
     #[command(display_order = 13)]
     Read {
+        /// Its id, or any unique beginning of it
         id: String,
         /// Show first this many of the chat messages before it that its sender had read
         #[arg(long, default_value_t = 0)]
@@ -321,8 +322,9 @@ async fn answer(stream: TcpStream, token: String, inbound: mpsc::UnboundedSender
     let _ = write.write_all(format!("{response}\n").as_bytes()).await;
 }
 
-/// Sends a request to the running session and returns its answer. Files the request names are read, or made absolute,
-/// here, and a kind's arguments go with this directory: the session process runs elsewhere.
+/// Sends a request to the running session and returns its answer, made short but for `members`. Files the request
+/// names are read, or made absolute, here, and a kind's arguments go with this directory: the session process runs
+/// elsewhere.
 pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Value> {
     if let Request::Client(lmk_client::Request::Join { target, .. }) = &request {
         ensure!(
@@ -368,6 +370,7 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     {
         *cwd = absolute(".")?;
     }
+    let full = matches!(request, Request::Client(lmk_client::Request::Members { .. }));
     let channel = connect(&session_dir(home, session)?.join("endpoint"))
         .await
         .with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen`"))?;
@@ -384,6 +387,9 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
         if groups[0]["only_here"] == json!([]) {
             answer.as_object_mut().context("status is an object")?.remove("warning");
         }
+    }
+    if !full {
+        crate::short::compact(&mut answer);
     }
     Ok(answer)
 }

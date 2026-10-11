@@ -2,6 +2,7 @@ pub mod cli;
 pub mod kinds;
 pub mod policy;
 pub mod session;
+pub mod short;
 mod store;
 #[cfg(test)]
 mod tests;

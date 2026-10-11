@@ -77,7 +77,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(session) => session,
                 None => running_session(&home).await?,
             };
-            println!("{}", call(&home, &session, Request::Kind { kind, args, cwd: String::new() }).await?);
+            println!("{}", letmeknow::short::line(&call(&home, &session, Request::Kind { kind, args, cwd: String::new() }).await?));
             Ok(())
         }
         Command::Request(request) => {
@@ -92,7 +92,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 )
             );
             let answer = call(&home, &session, request).await?;
-            println!("{answer}");
+            println!("{}", letmeknow::short::line(&answer));
             if qr && let Some(link) = answer["link"].as_str() {
                 eprintln!("{}", letmeknow::cli::qr(link)?);
             }

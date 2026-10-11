@@ -6,7 +6,7 @@
 //! requests to the other, among them for the certificates their credentials carry. It also finds which of the device's
 //! sessions run, for the identity's other devices to hear, and hands each the adds for it.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, Described, DeviceState, File, Remote, message_id};
 use lmk_core::device::Device;
@@ -31,6 +31,7 @@ use crate::Network;
 use crate::cli::{Request, private_file};
 use crate::kinds::Plugins;
 use crate::policy::{Outbox, mentions, wakes};
+use crate::short;
 
 /// How long after starting what arrives counts as catching up.
 const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
@@ -115,6 +116,9 @@ pub struct Session {
     published: String,
     /// The groups as last written to `groups.json`.
     groups: String,
+    /// How each group this session has been in shows to the agent: by its name where none of its other groups has that
+    /// name, or else by its id. Kept once the session leaves a group, for the events that tell of that.
+    names: HashMap<String, String>,
     home: PathBuf,
     network: Network,
     config: Config,
@@ -183,6 +187,7 @@ impl Session {
             handed: HashMap::new(),
             published: String::new(),
             groups: String::new(),
+            names: HashMap::new(),
             home: home.to_path_buf(),
             network,
             config,
@@ -221,11 +226,6 @@ impl Session {
             }
         }
         Ok(session)
-    }
-
-    /// This session as the agent sees it in `ready`.
-    pub fn me(&self) -> Result<Value> {
-        self.client.me()
     }
 
     /// Acts for the device if no other session process does: runs its node and answers its command channel.
@@ -267,9 +267,14 @@ impl Session {
         let written = (|| {
             let node = self.client.node();
             let settings = node.groups().into_iter().filter_map(|gid| Some((node.settings(&gid.0).ok()?, gid)));
-            let groups: Vec<Value> = settings.filter(|(s, _)| s.kind != IDENTITY).map(|(s, gid)| json!({ "group": gid, "name": s.name })).collect();
+            let named: Vec<(String, String)> = settings.filter(|(s, _)| s.kind != IDENTITY).map(|(s, gid)| (b64(&gid.0), s.name)).collect();
+            let groups: Vec<Value> = named.iter().map(|(id, name)| json!({ "group": id, "name": name })).collect();
             let groups = serde_json::to_string(&groups)?;
             if groups != self.groups {
+                for (id, name) in &named {
+                    let unique = !name.is_empty() && named.iter().filter(|(_, other)| other == name).count() == 1;
+                    self.names.insert(id.clone(), if unique { name } else { id }.clone());
+                }
                 replace(self.config.dir.join("groups.json"), &groups)?;
                 self.groups = groups;
             }
@@ -335,7 +340,7 @@ impl Session {
         self.sync_kinds().await;
         for mut item in self.outbox.take() {
             let printed = item.as_object_mut().and_then(|item| item.remove("printed"));
-            print(item.to_string())?;
+            print(short::line(&self.compact(item.clone())))?;
             if item["type"] == "message"
                 && let Some(id) = item["id"].as_str().and_then(|id| message_id(id).ok())
             {
@@ -347,6 +352,15 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// An item as the agent reads it: made short, with its group by name where that name is its alone.
+    fn compact(&self, mut item: Value) -> Value {
+        if let Some(name) = item["group"].as_str().and_then(|group| self.names.get(group)) {
+            item["group"] = json!(name);
+        }
+        short::compact(&mut item);
+        item
     }
 
     /// Brings the plugins into step, and takes in what they told meanwhile.
@@ -494,7 +508,7 @@ impl Session {
             {
                 item["text"] = json!(format!(
                     "{} could not read {} of your messages; send again, with --reply-to <id>, any that still matters",
-                    member.name.as_deref().unwrap_or("a member"),
+                    short::shown(&item["member"]),
                     ids.len()
                 ));
             }
@@ -557,7 +571,10 @@ impl Session {
         text: String,
     ) -> Result<(Bytes, Chat)> {
         let gid = self.client.chat(group)?;
-        let reply_to = reply_to.map(|id| message_id(&id)).transpose()?;
+        let reply_to: Option<[u8; 32]> = match reply_to {
+            Some(id) => Some(self.find(&id)?.id.0.as_slice().try_into()?),
+            None => None,
+        };
         if let Some(id) = &reply_to {
             self.mark_seen(id)?;
         }
@@ -619,7 +636,8 @@ impl Session {
         let direct = to.iter().any(|fp| me["fp"] == fp.as_str()) || content.as_str().is_some_and(|text| mentions(text, &me));
         let mut item = json!({ "type": "message", "group": b64(&gid.0), "id": hex::encode(id), "position": position, "from": from, "direct": direct, "content": content });
         if !to.is_empty() {
-            item["to"] = json!(to);
+            let members = self.client.described_members(gid)?;
+            item["to"] = to.iter().map(|fp| members.iter().find(|m| m.fp.as_ref() == Some(fp)).map_or_else(|| json!(fp), |m| json!(m))).collect();
         }
         if let Some(reply_to) = payload.get("reply_to") {
             item["reply_to"] = json!(hex::encode(serde_json::from_value::<Bytes>(reply_to.clone())?.0));
@@ -659,9 +677,8 @@ impl Session {
     /// A chat message, after the last `ancestors` chat messages before it that its sender had read; this session's own
     /// say who holds and who read them.
     fn read(&mut self, id: &str, ancestors: usize) -> Result<Value> {
-        let id = message_id(id)?;
+        let message = self.find(id)?;
         let node = self.client.node();
-        let message = node.message(&id)?.with_context(|| format!("unknown message {}", hex::encode(id)))?;
         let chat: ChatMessage = serde_json::from_value(message.payload.clone()).context("not a chat message")?;
         let gid = message.group.clone();
         let mut shown: Vec<Message> = node
@@ -686,9 +703,23 @@ impl Session {
                 item["read_by"] = json!(described(&|r| r.read.contains(m.position)));
             }
             self.mark_seen(&id)?;
-            found.push(item);
+            found.push(self.compact(item));
         }
         Ok(Value::Array(found))
+    }
+
+    /// The message of this session's groups whose id begins with `id`.
+    fn find(&self, id: &str) -> Result<Message> {
+        let node = self.client.node();
+        let mut found = Vec::new();
+        for gid in node.groups() {
+            found.extend(node.messages(&gid.0)?.into_iter().filter(|m| hex::encode(&m.id.0).starts_with(id)));
+        }
+        match found.len() {
+            1 => Ok(found.remove(0)),
+            0 => bail!("no message has an id that begins {id}"),
+            _ => bail!("several messages have ids that begin {id}; give more of it"),
+        }
     }
 
     // Files.
@@ -768,11 +799,15 @@ pub async fn run(
     mut print: impl FnMut(String) -> std::io::Result<()>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    let ready = json!({ "type": "ready", "session": session.config.handle, "member": session.me()?, "state": session.config.dir });
+    let me = session.client.me()?;
+    let mut ready = json!({ "type": "ready", "session": session.config.handle, "name": me["device"]["name"], "fp": me["fp"] });
+    if let Some(identity) = me["identity"]["name"].as_str() {
+        ready["identity"] = json!(identity);
+    }
     let mut shutdown = std::pin::pin!(shutdown);
     let client = session.client.clone();
     let mut stopped = None;
-    if print(ready.to_string()).is_ok() {
+    if print(short::line(&ready)).is_ok() {
         loop {
             session.publish();
             if session.emit(&mut print).await.is_err() {
