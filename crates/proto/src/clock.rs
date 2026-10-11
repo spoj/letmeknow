@@ -1,4 +1,4 @@
-//! The one clock behind every timestamp: the system's, unless a simulator set its own for this thread.
+//! The one clock behind every timestamp: the system's, unless a test set its own for this thread.
 
 use std::cell::Cell;
 

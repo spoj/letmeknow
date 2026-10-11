@@ -16,7 +16,7 @@ use anyhow::{Context, Result, anyhow};
 use js_sys::{Array, Function, Promise, Uint8Array};
 use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Request, fp, message_id, service};
 use lmk_node::devices::Devices;
-use lmk_node::lmk_core::crypto::{Crypto, Rand};
+use lmk_node::lmk_core::provider::RustCrypto;
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
 use lmk_node::{COLLECT, Disk, Node, now};
@@ -99,19 +99,19 @@ impl Disk for Kept {
 struct Store(Arc<MemoryProvider>);
 
 impl OpenMlsProvider for Store {
-    type CryptoProvider = Crypto;
-    type RandProvider = Rand;
+    type CryptoProvider = RustCrypto;
+    type RandProvider = RustCrypto;
     type StorageProvider = MemoryStorage;
 
     fn storage(&self) -> &MemoryStorage {
         self.0.storage()
     }
 
-    fn crypto(&self) -> &Crypto {
+    fn crypto(&self) -> &RustCrypto {
         self.0.crypto()
     }
 
-    fn rand(&self) -> &Rand {
+    fn rand(&self) -> &RustCrypto {
         self.0.rand()
     }
 }

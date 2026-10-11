@@ -9,9 +9,6 @@ lmk-proto.workspace = true
 anyhow.workspace = true
 chacha20poly1305.workspace = true
 ed25519-dalek.workspace = true
-hpke-rs = "=0.7.0"
-hpke-rs-crypto = "=0.7.0"
-hpke-rs-rust-crypto = "=0.7.0"
 openmls.workspace = true
 openmls_basic_credential.workspace = true
 openmls_memory_storage.workspace = true
