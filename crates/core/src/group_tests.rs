@@ -5,6 +5,11 @@ use super::*;
 use crate::provider::MemoryProvider;
 use lmk_proto::group::{CHAT, ChatMessage, Control, REVISION, Service};
 
+/// A membership service at `relay`, for logs no test reaches.
+pub(crate) fn service(relay: &str) -> Service {
+    Service::Serve { key: Bytes(vec![1; 32]), relay: relay.into(), addrs: vec![], rest: Default::default() }
+}
+
 pub(crate) fn settings(name: &str) -> Settings {
     Settings {
         protocol: PROTOCOL,
@@ -12,7 +17,7 @@ pub(crate) fn settings(name: &str) -> Settings {
         name: name.into(),
         carry: 7,
         update: lmk_proto::group::UPDATE,
-        membership: Service::Folder("/tmp/lmk".into()),
+        membership: service("https://lmk.example"),
         rest: Default::default(),
     }
 }
@@ -503,7 +508,7 @@ fn settings_in_the_welcome() {
     let mut changed = w.m[0].g().settings();
     changed.name = "Plan v2".into();
     changed.carry = 30;
-    changed.membership = Service::Folder("/elsewhere".into());
+    changed.membership = service("https://elsewhere.example");
     let commit = w.m[0].commit(Change { settings: Some(changed.clone()), ..Change::default() });
     w.post(commit.entry);
     let read = w.read(&[0, 1, 2]);
@@ -610,7 +615,7 @@ fn rules_bind_everyone() {
     }
 
     // An update that changes the committer's credential beyond its name: C claims an identity.
-    let identity = lmk_proto::group::IdentityRef { id: Bytes(vec![1; 32]), membership: Service::Folder("/tmp/lmk".into()) };
+    let identity = lmk_proto::group::IdentityRef { id: Bytes(vec![1; 32]), membership: service("https://lmk.example") };
     w.m[2].session.credential.certificate = Some(lmk_proto::group::Certificate { identity, device: Bytes(vec![2; 32]), sig: Bytes(vec![3; 64]) }.into());
     let c = &mut w.m[2];
     let group = c.group.as_mut().unwrap();
@@ -668,9 +673,9 @@ fn credentials_are_checked_not_enforced() {
     use lmk_proto::identity::{Listed, certified};
     let mut w = World::new(&["A", "M"]);
     let (seed, laptop) = (crate::random(), crate::random());
-    let (id, first) = create(&seed, "Alice", Service::Folder("/tmp/lmk".into()), Listed { key: public(&laptop).into(), name: "laptop".into() });
+    let (id, first) = create(&seed, "Alice", service("https://lmk.example"), Listed { key: public(&laptop).into(), name: "laptop".into() });
     let log = KeyLog::replay(&id, [first.as_slice()]).unwrap();
-    let identity = IdentityRef { id: id.into(), membership: Service::Folder("/tmp/lmk".into()) };
+    let identity = IdentityRef { id: id.into(), membership: service("https://lmk.example") };
     // A speaks as Alice, certified by her laptop; M claims her identity with A's certificate.
     let sig = Bytes(sign(&laptop, &certified(&w.m[0].session.credential.key.0, &id)));
     let certificate = Certificate { identity, device: public(&laptop).into(), sig };

@@ -40,7 +40,7 @@ impl ServeClient {
         for a in addrs {
             addr = addr.with_ip_addr(a.parse()?);
         }
-        let chains = Chains::new(Some(VerifyingKey::from_bytes(&key)?));
+        let chains = Chains::new(VerifyingKey::from_bytes(&key)?);
         Ok(ServeClient(Arc::new(Inner {
             endpoint,
             addr,

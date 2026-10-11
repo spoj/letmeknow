@@ -20,8 +20,6 @@ tracing = "0.1"
 
 # The browser has only the client of `letmeknow serve`.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-notify.workspace = true
-rand.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 

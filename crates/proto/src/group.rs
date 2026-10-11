@@ -31,7 +31,6 @@ pub enum Service {
         #[serde(flatten)]
         rest: Map<String, Value>,
     },
-    Folder(String),
     /// A kind of service a newer letmeknow made, kept as it is.
     #[serde(untagged)]
     Newer(Value),
@@ -184,8 +183,8 @@ mod tests {
             sent_at: Some(5),
         };
         assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","read":[[1,3]],"sent_at":5}"#);
-        let folder = serde_json::to_string(&Service::Folder("/tmp/x".into())).unwrap();
-        assert_eq!(folder, r#"{"folder":"/tmp/x"}"#);
+        let service = Service::Serve { key: Bytes(vec![1]), relay: "https://r".into(), addrs: vec![], rest: Default::default() };
+        assert_eq!(serde_json::to_string(&service).unwrap(), r#"{"serve":{"key":"AQ","relay":"https://r","addrs":[]}}"#);
     }
 
     #[test]

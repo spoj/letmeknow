@@ -360,7 +360,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 let key: Option<[u8; 32]> = key.0.clone().try_into().ok();
                 key.and_then(|key| VerifyingKey::from_bytes(&key).ok()).is_some_and(|key| head.verify(&key))
             }
-            Service::Folder(_) => true,
             Service::Newer(_) => false,
         };
         if !signed {

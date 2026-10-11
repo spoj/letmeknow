@@ -1,16 +1,13 @@
 //! Session processes in one test process, each its own device, talking over a local relay with a self-signed
-//! certificate; their logs are in a folder. The CLI talks to them over their command channels.
+//! certificate, their logs on a membership service served through it. The CLI talks to them over their command
+//! channels.
 
 use anyhow::Result;
-use iroh::tls::CaTlsConfig;
-use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
 use lmk_proto::group::Service;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use lmk_testing::{Relay, relay};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -20,7 +17,7 @@ use crate::session::Config;
 const HOUR: Duration = Duration::from_secs(3600);
 
 struct World {
-    _relay: Server,
+    relay: Relay,
     network: crate::Network,
     root: PathBuf,
     plugins: Vec<PathBuf>,
@@ -44,28 +41,11 @@ fn built() -> PathBuf {
 
 async fn world(test: &str) -> World {
     let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_test_writer().try_init();
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let cert = CertificateDer::from(certified.cert.der().to_vec());
-    let key = PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
-    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.clone()], key)
-        .unwrap();
-    let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
-    relay.tls = Some(TlsConfig::new((Ipv6Addr::UNSPECIFIED, 0), CertConfig::Manual { server_config: tls.clone() }));
-    let mut quic = QuicConfig::new((Ipv6Addr::UNSPECIFIED, 0));
-    quic.server_config = Some(tls);
-    let mut config = ServerConfig::default();
-    config.relay = Some(relay);
-    config.quic = Some(quic);
-    let server = Server::spawn(config).await.unwrap();
-    let relay = format!("https://localhost:{}", server.https_addr().unwrap().port()).parse().unwrap();
+    let relay = relay().await;
     let root = std::env::temp_dir().join(format!("lmk-session-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    let network = crate::Network { relay, ca: CaTlsConfig::custom_roots([cert]) };
-    World { _relay: server, network, root, plugins: vec![built()] }
+    let network = crate::Network { relay: relay.url.clone(), ca: relay.ca() };
+    World { relay, network, root, plugins: vec![built()] }
 }
 
 struct Agent {
@@ -78,7 +58,7 @@ struct Agent {
 
 impl World {
     fn membership(&self) -> Service {
-        Service::Folder(self.root.join("logs").to_str().unwrap().into())
+        self.relay.service.clone()
     }
 
     /// A session process in its own home: its own device.

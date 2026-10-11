@@ -1,17 +1,15 @@
-//! Sessions over a local relay with a self-signed certificate, their logs in a folder.
+//! Sessions over a local relay with a self-signed certificate, their logs on a membership service served through it.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::RelayUrl;
 use iroh::tls::CaTlsConfig;
-use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
 use lmk_core::device::Device;
 use lmk_core::provider::{MemoryProvider, Provider, SqliteProvider};
-use lmk_membership::service::{Policy, Service as Membership};
+use lmk_membership::service::Service as Membership;
 use lmk_membership::store::Store;
+use lmk_testing::{Relay, relay};
 use lmk_node::devices::Devices;
 use lmk_node::{Config, Event, Node};
 use lmk_proto::group::{CHAT, Certificate, ChatMessage, DEVICES, IdentityRef, PROTOCOL, Service, Settings};
@@ -21,41 +19,12 @@ use lmk_proto::frame::{self, ALPN};
 use lmk_proto::head::Head;
 use lmk_proto::peer::{Frame, Item, Summary};
 use lmk_proto::ranges::Ranges;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Generous, for slow CI runners with tests running side by side.
 const WAIT: Duration = Duration::from_secs(60);
-
-struct Relay {
-    _server: Server,
-    url: RelayUrl,
-    cert: CertificateDer<'static>,
-}
-
-async fn relay() -> Relay {
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let cert = CertificateDer::from(certified.cert.der().to_vec());
-    let key = PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
-    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.clone()], key)
-        .unwrap();
-    let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
-    relay.tls = Some(TlsConfig::new((Ipv6Addr::UNSPECIFIED, 0), CertConfig::Manual { server_config: tls.clone() }));
-    let mut quic = QuicConfig::new((Ipv6Addr::UNSPECIFIED, 0));
-    quic.server_config = Some(tls);
-    let mut config = ServerConfig::default();
-    config.relay = Some(relay);
-    config.quic = Some(quic);
-    let server = Server::spawn(config).await.unwrap();
-    let url = format!("https://localhost:{}", server.https_addr().unwrap().port()).parse().unwrap();
-    Relay { _server: server, url, cert }
-}
 
 struct Session<P = MemoryProvider> {
     node: Node<P>,
@@ -86,7 +55,7 @@ fn config(relay: &Relay, name: &str, device: Option<Device>, kinds: &[&str]) -> 
         name: name.into(),
         device,
         relay: relay.url.clone(),
-        ca: CaTlsConfig::custom_roots([relay.cert.clone()]),
+        ca: relay.ca(),
         home: None,
         files: None,
         disk: None,
@@ -142,14 +111,14 @@ fn folder(test: &str) -> Folder {
     Folder(dir)
 }
 
-fn settings(kind: &str, folder: &Path) -> Settings {
+fn settings(kind: &str, relay: &Relay) -> Settings {
     Settings {
         protocol: PROTOCOL,
         kind: kind.into(),
         name: "Plan".into(),
         carry: 7,
         update: lmk_proto::group::UPDATE,
-        membership: Service::Folder(folder.to_str().unwrap().into()),
+        membership: relay.service.clone(),
         rest: Default::default(),
     }
 }
@@ -185,10 +154,9 @@ fn fp(key: &Bytes) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn chat_and_removal() {
     let relay = relay().await;
-    let dir = folder("chat");
     let mut alice = session(&relay, "Alice").await;
     let mut bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None).await.unwrap();
     let (joined, _) = bob.node.join(&link, None).await.unwrap();
     assert_eq!(joined, gid);
@@ -227,10 +195,9 @@ async fn chat_and_removal() {
 async fn any_member_admits_an_invite_once() {
     use lmk_proto::links::Invite;
     let relay = relay().await;
-    let dir = folder("invite");
     let mut alice = session(&relay, "Alice").await;
     let mut bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     // A member named first that cannot be reached holds up nothing while another can.
     let link = alice.node.invite(&gid.0, None).await.unwrap();
     let dead = lmk_proto::links::Address { key: *iroh::SecretKey::from_bytes(&lmk_core::random()).public().as_bytes(), relay: Some(relay.url.to_string()) };
@@ -284,10 +251,9 @@ async fn any_member_admits_an_invite_once() {
 async fn a_silent_member_reached_first_holds_up_no_other() {
     use lmk_proto::links::{Address, Invite};
     let relay = relay().await;
-    let dir = folder("silent");
     let alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None).await.unwrap();
     let key = iroh::SecretKey::from_bytes(&lmk_core::random());
     let silent = Address { key: *key.public().as_bytes(), relay: Some(relay.url.to_string()) };
@@ -303,10 +269,9 @@ async fn a_silent_member_reached_first_holds_up_no_other() {
 async fn an_invite_dies_when_its_inviter_leaves() {
     use lmk_proto::links::Invite;
     let relay = relay().await;
-    let dir = folder("inviter-left");
     let mut alice = session(&relay, "Alice").await;
     let (bob, carol) = (session(&relay, "Bob").await, session(&relay, "Carol").await);
-    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     for joiner in [&bob, &carol] {
         joiner.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -334,12 +299,11 @@ async fn an_invite_dies_when_its_inviter_leaves() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() {
     let relay = relay().await;
-    let dir = folder("kind");
     let mut alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
     let carol = node(&relay, "Carol", &[CHAT]).await;
-    let gid = alice.node.create(settings(KIND, &dir), None).unwrap();
-    assert!(carol.node.create(settings(KIND, &dir), None).is_err(), "a session makes no group of a kind it lacks");
+    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
+    assert!(carol.node.create(settings(KIND, &relay), None).is_err(), "a session makes no group of a kind it lacks");
     let link = alice.node.invite(&gid.0, None).await.unwrap();
     let refused = carol.node.join(&link, None).await.unwrap_err();
     assert!(format!("{refused:#}").contains("does not support test groups"), "{refused:#}");
@@ -396,17 +360,10 @@ async fn signing_service(relay: &Relay, dir: &Path) -> (Service, iroh::protocol:
     served(relay, dir, |service| service).await
 }
 
-/// A signing membership service, served through `serve`.
+/// A signing membership service, its store in `dir`, served through `serve`.
 async fn served<H: iroh::protocol::ProtocolHandler>(relay: &Relay, dir: &Path, serve: impl FnOnce(Membership) -> H) -> (Service, iroh::protocol::Router) {
-    let secret = iroh::SecretKey::from_bytes(&lmk_core::random());
-    let relays = iroh::RelayMap::from(iroh::RelayConfig::new(relay.url.clone(), Some(Default::default())));
-    let roots = CaTlsConfig::custom_roots([relay.cert.clone()]);
-    let endpoint = lmk_net::builder(relays).secret_key(secret.clone()).ca_tls_config(roots).bind().await.unwrap();
     std::fs::create_dir_all(dir).unwrap();
-    let store = Store::open(&dir.join("membership.db"), ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes())).unwrap();
-    let router = iroh::protocol::Router::builder(endpoint.clone()).accept(ALPN, serve(Membership::new(store, Policy::default()))).spawn();
-    let service = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: relay.url.to_string(), addrs: vec![], rest: Default::default() };
-    (service, router)
+    relay.serve(&dir.join("membership.db"), serve).await
 }
 
 /// A membership service's gate: closing it ends the service's connections, and those opened while it is closed wait
@@ -470,7 +427,7 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
     let dir = folder("rebuild");
     let alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None).await.unwrap();
     bob.node.join(&link, None).await.unwrap();
     let alice_only = vec![link.members[0].clone()];
@@ -525,7 +482,7 @@ async fn a_contradiction_is_reported_once() {
     let dir = folder("contradiction");
     let (membership, _service) = signing_service(&relay, &dir).await;
     let mut alice = session(&relay, "Alice").await;
-    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     let rename = |name: &'static str| move |s: Settings| Settings { name: name.into(), ..s };
     alice.node.change_settings(&gid.0, rename("Release")).await.unwrap();
     let db = rusqlite::Connection::open(dir.join("membership.db")).unwrap();
@@ -578,7 +535,7 @@ async fn a_kind_takes_held_messages_in_log_order_and_a_member_without_state_asks
     let (membership, _service) = signing_service(&relay, &dir).await;
     let mut alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(Settings { membership, ..settings(KIND, &dir) }, None).unwrap();
+    let gid = alice.node.create(Settings { membership, ..settings(KIND, &relay) }, None).unwrap();
     alice.node.follow_log(&gid.0, Some(0)).unwrap();
     let link = alice.node.invite(&gid.0, None).await.unwrap();
     let joining = tokio::spawn(async move { bob.node.join(&link, None).await.map(|_| bob) });
@@ -644,7 +601,7 @@ async fn a_member_without_state_asks_for_one_once_members_are_online() {
     let (membership, _service) = signing_service(&relay, &dir).await;
     std::fs::create_dir_all(&dir).unwrap();
     let mut alice = session(&relay, "Alice").await;
-    let gid = alice.node.create(Settings { membership, ..settings(KIND, &dir) }, None).unwrap();
+    let gid = alice.node.create(Settings { membership, ..settings(KIND, &relay) }, None).unwrap();
     alice.node.follow_log(&gid.0, Some(0)).unwrap();
     let start = || {
         let (relay, db) = (&relay, dir.join("carol.db"));
@@ -771,7 +728,7 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     assert_eq!(log.current(), &first, "a link keeps the key");
 
     // Each certifies its session, which joins a chat of Alice's by an invite.
-    let chat = alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &dir) }, None).unwrap();
+    let chat = alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &relay) }, None).unwrap();
     for (node, devices) in [(&tablet.node, &tablet_devices), (&laptop.node, &laptop_devices)] {
         let link = alice.node.invite(&chat.0, None).await.unwrap();
         node.join(&link, Some(devices.certify(&bob.id.0, &node.key().0).unwrap())).await.unwrap();
@@ -810,7 +767,7 @@ async fn a_dropped_devices_sessions_are_removed_once_and_reported() {
     let tablet_key: [u8; 32] = lmk_core::random();
     let log = alice.node.read_key_log(&carol).await.unwrap();
     alice.node.append_identity(&carol, &log.next(&key, &public(&key), vec![listed(&laptop, "laptop"), listed(&tablet_key, "tablet")])).await.unwrap();
-    let groups = [(); 2].map(|_| alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &dir) }, None).unwrap());
+    let groups = [(); 2].map(|_| alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &relay) }, None).unwrap());
     let (tablet, desk, dave, eve) = (session(&relay, "tablet").await, session(&relay, "desk").await, session(&relay, "Dave").await, session(&relay, "Eve").await);
     let alice_only = vec![alice.node.invite(&groups[0].0, None).await.unwrap().members[0].clone()];
     for gid in &groups {
@@ -879,7 +836,7 @@ async fn the_list_does_not_drop_a_device_just_linked() {
     let relay = relay().await;
     let dir = folder("link-race");
     std::fs::create_dir_all(&dir).unwrap();
-    let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
+    let membership = relay.service.clone();
     let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
     let (_phone, phone_devices) = stored_device(&relay, "phone", &dir.join("phone.db")).await;
     let (_tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
@@ -911,7 +868,7 @@ async fn a_new_key_is_named_once_another_device_holds_it() {
     let relay = relay().await;
     let dir = folder("key-held");
     std::fs::create_dir_all(&dir).unwrap();
-    let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
+    let membership = relay.service.clone();
     let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
     let (phone, phone_devices) = stored_device(&relay, "phone", &dir.join("phone.db")).await;
     let (tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
@@ -943,7 +900,7 @@ async fn a_device_missing_the_current_key_asks_for_it_and_reports_it_lost() {
     let relay = relay().await;
     let dir = folder("missing-key");
     std::fs::create_dir_all(&dir).unwrap();
-    let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
+    let membership = relay.service.clone();
     let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
     let (phone, phone_devices) = stored_device(&relay, "phone", &dir.join("phone.db")).await;
     let (tablet, tablet_devices) = stored_device(&relay, "tablet", &dir.join("tablet.db")).await;
@@ -998,10 +955,10 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
     let relay = relay().await;
     let dir = folder("revision");
     std::fs::create_dir_all(&dir).unwrap();
-    let (logs, bob_db) = (dir.join("logs"), dir.join("bob.db"));
+    let bob_db = dir.join("bob.db");
     let start = || async { Node::start(SqliteProvider::open(&bob_db).unwrap(), config(&relay, "Bob", None, &[CHAT])).await.unwrap().0 };
     let alice = session(&relay, "Alice").await;
-    let gid = alice.node.create(settings(CHAT, &logs), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let bob = start().await;
     bob.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     let revision = |wanted: u32| {
@@ -1021,7 +978,8 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
     let mls = Mls::load(&provider).unwrap();
     let old = lmk_proto::group::Leaf { revision: 0, ..mls.leaf.clone() };
     let commit = Group::load(&provider, &gid.0).unwrap().commit(&provider, &mls, Change { leaf: Some(old), ..Change::default() }).unwrap();
-    lmk_membership::folder::FolderClient::new(logs.to_str().unwrap()).append(&gid.0, &[commit.entry]).await.unwrap();
+    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
+    lmk_membership::client::ServeClient::for_service(endpoint, &relay.service).unwrap().append(&gid.0, &[commit.entry]).await.unwrap();
     drop(provider);
     revision(0).await.expect("Alice sees Bob's leaf of revision 0");
 
@@ -1037,7 +995,7 @@ async fn a_device_keeps_its_identities_across_restarts() {
     let relay = relay().await;
     let dir = folder("restart");
     std::fs::create_dir_all(&dir).unwrap();
-    let membership = Service::Folder(dir.join("logs").to_str().unwrap().into());
+    let membership = relay.service.clone();
     let device = Device::new("laptop");
     let start = || async {
         let (node, _events) =
@@ -1067,7 +1025,7 @@ async fn a_member_catching_up_takes_more_than_a_thousand_messages_of_one_sender(
     let mut alice = session(&relay, "Alice").await;
     let mut bob = session(&relay, "Bob").await;
     let (carol, _events) = Node::start(SqliteProvider::open(&carol_db).unwrap(), carol_config()).await.unwrap();
-    let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None).await.unwrap();
     bob.node.join(&link, None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -1126,7 +1084,7 @@ async fn held_leave(test: &str, restart_leaver: bool) {
     };
     let mut alice = start("Alice").await;
     let bob = start("Bob").await;
-    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
 
@@ -1167,7 +1125,7 @@ async fn an_old_leave_does_not_remove_a_member_added_again() {
     let mut alice = start().await;
     let mut bob = session(&relay, "Bob").await;
     let carol = session(&relay, "Carol").await;
-    let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     for joiner in [&bob, &carol] {
         joiner.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -1208,7 +1166,7 @@ async fn a_pending_send_sealed_again_is_reported_by_its_final_id() {
     let (gate, _reaching) = Gate::new();
     let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
     let (mut alice, mut bob) = (session(&relay, "Alice").await, session(&relay, "Bob").await);
-    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
 
@@ -1235,10 +1193,9 @@ async fn a_pending_send_sealed_again_is_reported_by_its_final_id() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leaver_left_alone_forgets_the_group() {
     let relay = relay().await;
-    let dir = folder("alone");
     let mut alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     let (a, b) = tokio::join!(alice.node.leave(&gid.0), bob.node.leave(&gid.0));
@@ -1251,11 +1208,10 @@ async fn a_leaver_left_alone_forgets_the_group() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_change_made_moot_commits_nothing() {
     let relay = relay().await;
-    let dir = folder("moot");
     let mut alice = session(&relay, "Alice").await;
     let mut bob = session(&relay, "Bob").await;
     let carol = session(&relay, "Carol").await;
-    let gid = alice.node.create(settings(CHAT, &dir), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     for joiner in [&bob, &carol] {
         joiner.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -1306,7 +1262,7 @@ async fn a_member_away_past_the_retention_drops_the_group() {
     };
     let mut alice = session(&relay, "Alice").await;
     let bob = start().await;
-    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     bob.node.shutdown().await.unwrap();
@@ -1340,7 +1296,7 @@ async fn an_announced_loss_reaches_every_member() {
     let mut alice = stored(&relay, "Alice", &db("alice")).await;
     let bob = stored(&relay, "Bob", &db("bob")).await;
     let carol = stored(&relay, "Carol", &db("carol")).await;
-    let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     for joiner in [&bob, &carol] {
         joiner.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -1397,7 +1353,7 @@ async fn a_pass_removes_every_member_due_in_one_commit() {
     let log = alice.node.read_key_log(&carol).await.unwrap();
     let all = vec![listed(&laptop, "laptop"), listed(&tablet_key, "tablet"), listed(&phone_key, "phone")];
     alice.node.append_identity(&carol, &log.next(&key, &public(&key), all)).await.unwrap();
-    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     let (tablet, phone) = (session(&relay, "tablet").await, session(&relay, "phone").await);
     for (joiner, device, name) in [(&tablet, &tablet_key, "tablet"), (&phone, &phone_key, "phone")] {
         let link = alice.node.invite(&gid.0, None).await.unwrap();
@@ -1429,7 +1385,7 @@ async fn a_leaver_asks_again_while_it_updates_every_t() {
     let alice_db = dir.join("alice.db");
     let alice = stored(&relay, "Alice", &alice_db).await;
     let mut bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(Settings { update: 2, ..settings(CHAT, &dir.join("logs")) }, None).unwrap();
+    let gid = alice.node.create(Settings { update: 2, ..settings(CHAT, &relay) }, None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     alice.node.shutdown().await.unwrap();
     drop(alice);
@@ -1540,7 +1496,7 @@ async fn summaries_are_kept_shown_and_dropped_with_their_member() {
     let mut alice = stored(&relay, "Alice", &alice_db).await;
     let bob = session(&relay, "Bob").await;
     let carol = session(&relay, "Carol").await;
-    let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let first = alice.node.send(&gid.0, &message("before anyone")).await.unwrap().position.unwrap();
     for joiner in [&bob, &carol] {
         joiner.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
@@ -1583,7 +1539,7 @@ async fn a_gap_holds_up_its_epoch_while_fetched_then_is_passed_and_opens_late_or
     let (sam_db, bob_db) = (dir.join("sam.db"), dir.join("bob.db"));
     let sam = stored(&relay, "Sam", &sam_db).await;
     let bob = stored(&relay, "Bob", &bob_db).await;
-    let gid = sam.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    let gid = sam.node.create(settings(CHAT, &relay), None).unwrap();
     bob.node.join(&sam.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     eventually("Bob is in", || sam.node.members(&gid.0).unwrap().len() == 2).await;
     bob.node.shutdown().await.unwrap();
@@ -1645,7 +1601,7 @@ async fn a_member_waits_while_the_member_between_it_and_the_holder_fetches() {
     std::fs::create_dir_all(&dir).unwrap();
     let dbs = ["sam", "quinn", "rita"].map(|name| dir.join(format!("{name}.db")));
     let sam = stored(&relay, "Sam", &dbs[0]).await;
-    let gid = sam.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    let gid = sam.node.create(settings(CHAT, &relay), None).unwrap();
     let links = [sam.node.invite(&gid.0, None).await.unwrap(), sam.node.invite(&gid.0, None).await.unwrap()];
     for ((name, db), link) in [("Quinn", &dbs[1]), ("Rita", &dbs[2])].into_iter().zip(links) {
         let joiner = stored(&relay, name, db).await;
@@ -1727,7 +1683,7 @@ async fn a_peer_not_admitted_changes_nothing() {
     let alice_db = dir.join("alice.db");
     let mut alice = stored(&relay, "Alice", &alice_db).await;
     let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &dir) }, None).unwrap();
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     let sent = bob.node.send(&gid.0, &message("real")).await.unwrap();
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
@@ -1768,10 +1724,9 @@ async fn a_peer_not_admitted_changes_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_joiner_whose_answer_was_lost_is_admitted_by_the_logged_welcome() {
     let relay = relay().await;
-    let dir = folder("lost-answer");
     let mut alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(KIND, &dir), None).unwrap();
+    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None).await.unwrap();
     let (node, first) = (bob.node.clone(), link.clone());
     let joining = tokio::spawn(async move { node.join(&first, None).await });
@@ -1814,7 +1769,7 @@ async fn a_link_altered_to_another_kind_admits_to_nothing() {
     assert!(format!("{refused:#}").contains("altered"), "{refused:#}");
     assert!(mallory.node.groups().is_empty());
 
-    let gid = laptop.node.create(settings(CHAT, &dir), None).unwrap();
+    let gid = laptop.node.create(settings(CHAT, &relay), None).unwrap();
     let link = laptop.node.invite(&gid.0, None).await.unwrap();
     let refused = mallory.node.join(&Invite { device: true, ..link }, None).await.unwrap_err();
     assert!(format!("{refused:#}").contains("altered"), "{refused:#}");
@@ -1832,7 +1787,7 @@ async fn a_member_online_is_not_away_and_a_file_spreads_on_its_first_holder() {
     let (alice_db, carol_db) = (dir.join("alice.db"), dir.join("carol.db"));
     let alice = stored(&relay, "Alice", &alice_db).await;
     let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(settings(CHAT, &dir.join("logs")), None).unwrap();
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None).await.unwrap(), None).await.unwrap();
     eventually("Alice has Bob's Add", || alice.node.members(&gid.0).unwrap().len() == 2).await;
     alice.node.shutdown().await.unwrap();

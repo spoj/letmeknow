@@ -1,19 +1,16 @@
 //! The client core as every shell runs it: on a node that is its device's too, as a browser's is, with plugins that
 //! answer in the call, as in-page plugins do, and requests as JSON, as the page and the command line send them.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iroh::tls::CaTlsConfig;
-use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
 use lmk_client::{Access, Client, ClientEvent, Config, Plugins, Request, Standing};
 use lmk_core::device::Device;
 use lmk_core::provider::MemoryProvider;
 use lmk_node::{Event, Node};
 use lmk_node::devices::Devices;
-use lmk_proto::group::{CHAT, DEVICES, Service};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use lmk_proto::group::{CHAT, DEVICES};
+use lmk_testing::{Relay, relay};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
 
@@ -79,13 +76,13 @@ struct Member {
 }
 
 impl Member {
-    async fn start(relay: &(Server, CertificateDer<'static>), logs: &std::path::Path, name: &str) -> Member {
+    async fn start(relay: &Relay, name: &str) -> Member {
         let device = Device::new(name);
         let config = lmk_node::Config {
             name: name.into(),
             device: Some(device.clone()),
-            relay: format!("https://localhost:{}", relay.0.https_addr().unwrap().port()).parse().unwrap(),
-            ca: CaTlsConfig::custom_roots([relay.1.clone()]),
+            relay: relay.url.clone(),
+            ca: relay.ca(),
             home: None,
             files: None,
             disk: None,
@@ -97,8 +94,7 @@ impl Member {
         let devices = Devices::new(node.clone(), device.clone(), Arc::new(|_: &Device| Ok(())));
         let (lines, written) = mpsc::unbounded_channel();
         let plugin = Arc::new(Recorder { started: Mutex::default(), sent: Mutex::default(), lines, gate: Mutex::default() });
-        let membership = Service::Folder(logs.to_str().unwrap().into());
-        let config = Config { name: name.into(), device, membership };
+        let config = Config { name: name.into(), device, membership: relay.service.clone() };
         let (client, told) = Client::new(node, config, Access::Here(devices), plugin.clone(), written);
         let (taking, pumping, stated) = (client.clone(), client.clone(), Arc::new(Notify::new()));
         let state = stated.clone();
@@ -139,56 +135,14 @@ impl Member {
     }
 }
 
-async fn relay() -> (Server, CertificateDer<'static>) {
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let cert = CertificateDer::from(certified.cert.der().to_vec());
-    let key = PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
-    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.clone()], key)
-        .unwrap();
-    let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
-    relay.tls = Some(TlsConfig::new((Ipv6Addr::UNSPECIFIED, 0), CertConfig::Manual { server_config: tls.clone() }));
-    let mut quic = QuicConfig::new((Ipv6Addr::UNSPECIFIED, 0));
-    quic.server_config = Some(tls);
-    let mut config = ServerConfig::default();
-    config.relay = Some(relay);
-    config.quic = Some(quic);
-    (Server::spawn(config).await.unwrap(), cert)
-}
-
-/// A test's folder, deleted when the test ends.
-struct Folder(std::path::PathBuf);
-
-impl std::ops::Deref for Folder {
-    type Target = std::path::Path;
-    fn deref(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for Folder {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn logs(test: &str) -> Folder {
-    let dir = std::env::temp_dir().join(format!("lmk-client-{test}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    Folder(dir)
-}
-
 /// Another identity's members show its own claim; this device's own identity is `self`. A link `--to` an identity
 /// admits only that one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_joiner_shows_its_identitys_claim_and_a_link_to_an_identity_admits_only_it() {
-    let (relay, logs) = (relay().await, logs("invite"));
-    let mut alice = Member::start(&relay, &logs, "Alice's laptop").await;
-    let bob = Member::start(&relay, &logs, "Bob's laptop").await;
-    let carol = Member::start(&relay, &logs, "Carol's laptop").await;
+    let relay = relay().await;
+    let mut alice = Member::start(&relay, "Alice's laptop").await;
+    let bob = Member::start(&relay, "Bob's laptop").await;
+    let carol = Member::start(&relay, "Carol's laptop").await;
     for (member, name) in [(&alice, "Alice"), (&bob, "Robert"), (&carol, "Carol")] {
         member.request(json!({ "cmd": "identity", "op": { "create": { "name": name } } })).await;
     }
@@ -211,8 +165,8 @@ async fn a_joiner_shows_its_identitys_claim_and_a_link_to_an_identity_admits_onl
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kinds_plugin_hears_of_its_groups_and_lets_go_of_one_left() {
-    let (relay, logs) = (relay().await, logs("kind"));
-    let mut alice = Member::start(&relay, &logs, "Alice").await;
+    let relay = relay().await;
+    let mut alice = Member::start(&relay, "Alice").await;
     let invite = alice.request(json!({ "cmd": "invite", "kind": KIND, "name": "Plan", "args": ["plan.md"], "cwd": "/tmp" })).await;
     assert_eq!(invite["told"], "group", "the plugin's answer to the group it was told of joins the answer");
     let sent = alice.plugin.sent.lock().unwrap().clone();
@@ -237,9 +191,9 @@ async fn joining(alice: &Member, bob: &Member) -> (Value, Arc<Notify>, tokio::ta
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_joiner_keeps_the_state_handed_before_its_kind_opened_and_joins_once() {
-    let (relay, logs) = (relay().await, logs("state"));
-    let alice = Member::start(&relay, &logs, "Alice").await;
-    let bob = Member::start(&relay, &logs, "Bob").await;
+    let relay = relay().await;
+    let alice = Member::start(&relay, "Alice").await;
+    let bob = Member::start(&relay, "Bob").await;
     let (invite, gate, joined) = joining(&alice, &bob).await;
     tokio::time::timeout(WAIT, bob.stated.notified()).await.expect("the state came with the Welcome");
     let again = invite["link"].as_str().unwrap().replace("https://letmeknow.dev/i", "https://example.com/x");
@@ -256,9 +210,9 @@ async fn a_joiner_keeps_the_state_handed_before_its_kind_opened_and_joins_once()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_group_left_while_its_kind_starts_is_never_told_of() {
-    let (relay, logs) = (relay().await, logs("gone"));
-    let alice = Member::start(&relay, &logs, "Alice").await;
-    let mut bob = Member::start(&relay, &logs, "Bob").await;
+    let relay = relay().await;
+    let alice = Member::start(&relay, "Alice").await;
+    let mut bob = Member::start(&relay, "Bob").await;
     let (invite, gate, joined) = joining(&alice, &bob).await;
     tokio::time::timeout(WAIT, bob.stated.notified()).await.expect("bob is in the group");
     bob.request(json!({ "cmd": "leave", "group": invite["group"] })).await;
@@ -296,10 +250,10 @@ async fn devices_of_bob(laptop: &Member, tablet: &Member) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_renamed_device_shows_its_new_name_to_its_other_devices_and_its_groups() {
-    let (relay, logs) = (relay().await, logs("rename"));
-    let alice = Member::start(&relay, &logs, "Alice").await;
-    let laptop = Member::start(&relay, &logs, "laptop").await;
-    let tablet = Member::start(&relay, &logs, "tablet").await;
+    let relay = relay().await;
+    let alice = Member::start(&relay, "Alice").await;
+    let laptop = Member::start(&relay, "laptop").await;
+    let tablet = Member::start(&relay, "tablet").await;
     devices_of_bob(&laptop, &tablet).await;
     let chat = alice.request(json!({ "cmd": "invite" })).await;
     laptop.request(json!({ "cmd": "join", "target": chat["link"] })).await;
@@ -317,10 +271,10 @@ async fn a_renamed_device_shows_its_new_name_to_its_other_devices_and_its_groups
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_device() {
-    let (relay, logs) = (relay().await, logs("leave"));
-    let alice = Member::start(&relay, &logs, "Alice").await;
-    let laptop = Member::start(&relay, &logs, "laptop").await;
-    let tablet = Member::start(&relay, &logs, "tablet").await;
+    let relay = relay().await;
+    let alice = Member::start(&relay, "Alice").await;
+    let laptop = Member::start(&relay, "laptop").await;
+    let tablet = Member::start(&relay, "tablet").await;
     devices_of_bob(&laptop, &tablet).await;
     let chat = alice.request(json!({ "cmd": "invite" })).await;
     tablet.request(json!({ "cmd": "join", "target": chat["link"] })).await;

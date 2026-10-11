@@ -21,8 +21,6 @@ thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
-iroh-relay = { workspace = true, features = ["server"] }
-rcgen = "0.14"
+lmk-testing.workspace = true
 rusqlite.workspace = true
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { workspace = true, features = ["full"] }

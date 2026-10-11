@@ -71,22 +71,14 @@ pub fn letmeknow_dev() -> Service {
     Service::Serve { key: Bytes(key), relay: lmk_proto::links::RELAY.into(), addrs: Vec::new(), rest: Default::default() }
 }
 
-/// A membership service from its address: `letmeknow.dev`, `<iroh key, hex>@<relay URL>`, or a folder's absolute path.
+/// A membership service from its address: `letmeknow.dev`, or `<iroh key, hex>@<relay URL>`.
 pub fn service(address: &str) -> Result<Service> {
     if address == "letmeknow.dev" {
         return Ok(letmeknow_dev());
     }
-    if let Some((key, relay)) = address.split_once("@https://") {
-        let key = Bytes(hex::decode(key).context("a service key is hex")?);
-        return Ok(Service::Serve { key, relay: format!("https://{relay}"), addrs: Vec::new(), rest: Default::default() });
-    }
-    ensure!(is_folder(address), "a membership service is letmeknow.dev, <key>@<relay URL>, or a folder");
-    Ok(Service::Folder(address.into()))
-}
-
-/// A membership address names a folder when it is a path, not a service at a relay.
-pub fn is_folder(address: &str) -> bool {
-    !address.contains("@https://") && (address.contains(['/', '\\']) || address.starts_with('.'))
+    let (key, relay) = address.split_once("@https://").context("a membership service is letmeknow.dev, or <key>@<relay URL>")?;
+    let key = Bytes(hex::decode(key).context("a service key is hex")?);
+    Ok(Service::Serve { key, relay: format!("https://{relay}"), addrs: Vec::new(), rest: Default::default() })
 }
 
 pub struct Config {

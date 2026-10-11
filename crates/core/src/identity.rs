@@ -174,7 +174,7 @@ mod tests {
     use lmk_proto::group::{Certificate, IdentityRef};
 
     fn service() -> Service {
-        Service::Folder("/tmp/lmk".into())
+        crate::group::tests::service("https://lmk.example")
     }
 
     fn listed(seed: &[u8; 32], name: &str) -> Listed {
@@ -212,7 +212,7 @@ mod tests {
         let seed = crate::random();
         let laptop = listed(&crate::random(), "laptop");
         let (_, first) = create(&seed, "Matthew", service(), laptop.clone());
-        let (other, _) = create(&seed, "Matthew", Service::Folder("/elsewhere".into()), laptop);
+        let (other, _) = create(&seed, "Matthew", crate::group::tests::service("https://elsewhere.example"), laptop);
         assert!(KeyLog::replay(&other, [first.as_slice()]).is_err());
     }
 

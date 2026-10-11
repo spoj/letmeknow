@@ -133,12 +133,11 @@ pub fn answers(member: &Value, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lmk_proto::group::Service;
     use serde_json::json;
 
     fn member(name: &str, key: u8, identity: Option<(u8, &str)>) -> Member {
         let identity = identity.map(|(id, claimed)| Claim {
-            identity: IdentityRef { id: Bytes(vec![id]), membership: Service::Folder("/logs".into()) },
+            identity: IdentityRef { id: Bytes(vec![id]), membership: crate::letmeknow_dev() },
             name: claimed.into(),
             error: None,
             added: false,
@@ -148,7 +147,7 @@ mod tests {
 
     #[test]
     fn an_identity_is_this_devices_own_or_known_by_its_own_claim() {
-        let own = IdentityRef { id: Bytes(vec![10]), membership: Service::Folder("/logs".into()) };
+        let own = IdentityRef { id: Bytes(vec![10]), membership: crate::letmeknow_dev() };
         let describer = Describer {
             me: Bytes(vec![1]),
             name: "Ann".into(),

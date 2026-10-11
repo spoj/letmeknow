@@ -43,10 +43,6 @@ impl Clients {
         }
         let client: Arc<dyn Membership> = match service {
             Service::Serve { .. } => Arc::new(ServeClient::for_service(self.endpoint.clone(), service)?),
-            #[cfg(not(target_arch = "wasm32"))]
-            Service::Folder(path) => Arc::new(lmk_membership::folder::FolderClient::new(path)),
-            #[cfg(target_arch = "wasm32")]
-            Service::Folder(_) => anyhow::bail!("a browser cannot reach a folder"),
             Service::Newer(_) => anyhow::bail!("a newer letmeknow made this membership service; update letmeknow"),
         };
         clients.insert(name, client.clone());

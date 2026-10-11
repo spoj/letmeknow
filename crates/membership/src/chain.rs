@@ -115,14 +115,14 @@ impl Chain {
     }
 }
 
-/// A client's chains, and the service key its heads must carry (none for a folder).
+/// A client's chains, and the service key its heads must carry.
 pub(crate) struct Chains {
-    key: Option<VerifyingKey>,
+    key: VerifyingKey,
     chains: Mutex<HashMap<Vec<u8>, Chain>>,
 }
 
 impl Chains {
-    pub fn new(key: Option<VerifyingKey>) -> Self {
+    pub fn new(key: VerifyingKey) -> Self {
         Chains {
             key,
             chains: Mutex::default(),
@@ -139,9 +139,7 @@ impl Chains {
 
     fn signed(&self, log: &[u8], head: &Head) -> Result<()> {
         ensure!(head.log.0 == log, "a head for another log");
-        if let Some(key) = &self.key {
-            ensure!(head.verify(key), Forged(head.clone()));
-        }
+        ensure!(head.verify(&self.key), Forged(head.clone()));
         Ok(())
     }
 
@@ -191,7 +189,7 @@ mod tests {
     #[test]
     fn verifies_and_extends() {
         let key = SigningKey::from_bytes(&[1; 32]);
-        let chains = Chains::new(Some(key.verifying_key()));
+        let chains = Chains::new(key.verifying_key());
         let hashes = chain_of(b"log", &[b"a", b"b", b"c"]);
         let head2 = Head::sign(&key, b"log", 2, hashes[2], 1);
         chains.page(b"log", 0, &bytes(&[b"a", b"b"]), &head2).unwrap();
@@ -231,7 +229,7 @@ mod tests {
     #[test]
     fn anchored() {
         let key = SigningKey::from_bytes(&[1; 32]);
-        let chains = Chains::new(Some(key.verifying_key()));
+        let chains = Chains::new(key.verifying_key());
         let hashes = chain_of(b"log", &[b"a", b"b", b"c", b"d"]);
         let head2 = Head::sign(&key, b"log", 2, hashes[2], 1);
         chains.page(b"log", 1, &bytes(&[b"b"]), &head2).unwrap();

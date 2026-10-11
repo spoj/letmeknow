@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
     let relays = RelayMap::from_iter([RelayConfig::new(relay.parse()?, Some(RelayQuicConfig::default()))]);
     let endpoint = Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(relays)).bind().await?;
     let client = ServeClient::new(endpoint, &key, relay, &[])?;
-    let log = rand::random::<[u8; 16]>();
+    let log = lmk_proto::random::random::<16>();
     let started = std::time::Instant::now();
     let appended = client.append(&log, &[b"probe".to_vec()]).await?;
     println!("appended at {} in {:?}", appended.position, started.elapsed());

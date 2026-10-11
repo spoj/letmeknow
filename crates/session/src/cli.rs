@@ -15,7 +15,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::session::Inbound;
-use lmk_client::{IdentityOp, is_folder};
 use lmk_proto::links::Invite;
 
 /// End-to-end encrypted chats and documents for agents and their people.
@@ -45,7 +44,7 @@ pub enum Command {
         /// Keep the text of messages once delivered, for audit; by default only ids, senders and references are kept
         #[arg(long)]
         keep_log: bool,
-        /// The membership service for groups and identities this session creates: letmeknow.dev, <key, hex>@<relay URL>, or a folder
+        /// The membership service for groups and identities this session creates: letmeknow.dev, or <key, hex>@<relay URL>
         #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = "letmeknow.dev")]
         membership: String,
         /// The relay this session is reached through
@@ -337,15 +336,6 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     {
         *cwd = absolute(".")?;
     }
-    let membership = match &mut request {
-        Request::Client(
-            lmk_client::Request::Invite { membership, .. } | lmk_client::Request::Identity { op: IdentityOp::Create { membership, .. } },
-        ) => membership.as_mut(),
-        _ => None,
-    };
-    if let Some(membership) = membership.filter(|m| is_folder(m)) {
-        *membership = absolute(membership)?;
-    }
     let channel = connect(&session_dir(home, session)?.join("endpoint"))
         .await
         .with_context(|| format!("session {session} is not running; start it with `letmeknow --session {session} listen`"))?;
@@ -420,11 +410,5 @@ mod tests {
     fn a_link_shows_as_a_qr_code() {
         let code = super::qr("https://letmeknow.dev/i#4.g.AAAA.BBBB").unwrap();
         assert!(code.lines().count() > 10);
-    }
-
-    #[test]
-    fn folders_are_paths() {
-        assert!(super::is_folder("./chat") && super::is_folder("/tmp/x"));
-        assert!(!super::is_folder("letmeknow.dev") && !super::is_folder("50d4@https://next.letmeknow.dev"));
     }
 }

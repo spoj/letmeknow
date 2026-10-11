@@ -1,0 +1,15 @@
+[package]
+name = "lmk-testing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+lmk-membership.workspace = true
+lmk-proto.workspace = true
+ed25519-dalek.workspace = true
+iroh = { workspace = true, features = ["tls-ring"] }
+iroh-relay = { workspace = true, features = ["server"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
