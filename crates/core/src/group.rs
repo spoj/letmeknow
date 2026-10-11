@@ -287,8 +287,6 @@ pub struct Applied {
     /// As their KeyPackages show them; `index` is their new leaf.
     pub added: Vec<Member>,
     pub how: Option<How>,
-    /// SHA-256 of the secret of the invite the added member came in by.
-    pub invite: Option<Bytes>,
     pub removed: Vec<Member>,
     pub settings: bool,
     /// This session was removed.
@@ -712,7 +710,6 @@ fn observe(
         lost,
         added,
         how: aad.how,
-        invite: aad.invite,
         removed,
         settings: staged.queued_proposals().any(|p| matches!(p.proposal(), Proposal::GroupContextExtensions(_))),
         gone: staged.self_removed(),

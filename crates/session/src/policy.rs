@@ -26,7 +26,7 @@ pub fn wakes(item: &Value, mine: impl Fn(&str) -> bool) -> bool {
             item["direct"] == true || item["urgent"] == true || item["reply_to"].as_str().is_some_and(mine)
         }
         Some("edited") => item["direct"] == true,
-        Some("attachment") | Some("introduced") => false,
+        Some("attachment") => false,
         _ => true,
     }
 }
@@ -104,12 +104,12 @@ mod tests {
 
     #[test]
     fn a_member_answers_to_its_name_the_first_word_of_it_and_its_identitys_name() {
-        let member = json!({ "name": "Claude, Matthew's coding agent", "identity": { "id": "e", "name": "Matthew", "how": "verified" } });
+        let member = json!({ "name": "Claude, Matthew's coding agent", "identity": { "id": "e", "name": "Matthew", "how": "self" } });
         assert!(["claude, matthew's coding agent", "Claude", "MATTHEW"].iter().all(|name| answers(&member, name)));
         assert!(!answers(&member, "Matt"));
-        let unverified = json!({ "name": "Claude", "identity": { "id": "e", "name": "Matthew", "how": "unknown", "claim": true, "error": "not on its list" } });
+        let unverified = json!({ "name": "Claude", "identity": { "id": "e", "name": "Matthew", "how": "self", "error": "not on its list" } });
         assert!(!answers(&unverified, "Matthew"));
-        let stranger = json!({ "name": "Claude", "identity": { "id": "e", "name": "Matthew", "how": "unknown", "claim": true } });
+        let stranger = json!({ "name": "Claude", "identity": { "id": "e", "name": "Matthew", "how": "unknown" } });
         assert!(!answers(&stranger, "Matthew"));
         assert!(mentions("@Claude please check", &member));
         assert!(mentions("ok, @claude.", &member));

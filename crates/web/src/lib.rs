@@ -476,10 +476,6 @@ impl App {
                 self.remember(&group.0, &item)?;
                 self.emit(json!({ "type": "settings", "group": group }));
             }
-            ClientEvent::Introduced { group, by, identity, how } => {
-                self.remember(&group.0, &json!({ "type": "introduced", "at": now(), "by": by, "identity": identity, "how": how }))?;
-                self.emit(json!({ "type": "introduced", "group": group }));
-            }
             ClientEvent::Message { group, id, missing, .. } => {
                 self.keep(&group.0)?;
                 if !missing.is_empty() {

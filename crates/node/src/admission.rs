@@ -44,9 +44,9 @@ struct Joining {
 }
 
 impl<P: Provider + Send + 'static> Node<P> {
-    /// An invite into a group, `--for` a contact name or `--to` an identity: shared with the members as a held
-    /// message, and a link that names this session and up to three members online that hold it.
-    pub async fn invite(&self, gid: &[u8], label: Option<String>, to: Option<Bytes>) -> Result<Invite> {
+    /// An invite into a group, for anyone or `--to` an identity: shared with the members as a held message, and a link
+    /// that names this session and up to three members online that hold it.
+    pub async fn invite(&self, gid: &[u8], to: Option<Bytes>) -> Result<Invite> {
         let secret: [u8; 16] = lmk_core::random();
         let hash = Bytes(Sha256::digest(secret).to_vec());
         let expires = now() + INVITE_VALID;
@@ -54,11 +54,11 @@ impl<P: Provider + Send + 'static> Node<P> {
             let mut st = self.inner.lock();
             let by = Bytes(st.me(gid).to_vec());
             let g = st.group_mut(gid)?;
-            g.rec.invites.push(Rule { hash: hash.clone(), expires, label: label.clone(), to: to.clone(), by });
+            g.rec.invites.push(Rule { hash: hash.clone(), expires, to: to.clone(), by });
             st.save(gid)?;
             st.group(gid)?.mls.settings().kind == DEVICES
         };
-        let rule = serde_json::to_value(Control::Invite { hash, expires, label, to })?;
+        let rule = serde_json::to_value(Control::Invite { hash, expires, to })?;
         let position = self.send(gid, &rule).await?.position;
         // The members online whose summaries hold the invite's message admit by it too: a member asked before its push
         // arrived would refuse the joiner.

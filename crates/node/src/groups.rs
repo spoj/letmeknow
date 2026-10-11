@@ -118,7 +118,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         by: Option<core::Member>,
         added: Vec<core::Member>,
         how: Option<How>,
-        invite: Option<Bytes>,
         removed: Vec<core::Member>,
         settings: bool,
         gone: bool,
@@ -132,22 +131,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let by = by.and_then(|by| st.member(gid, &by));
         if gone {
             drop(st);
-            self.gone(gid, by);
+            self.gone(gid, by, false);
             return;
         }
         let Some(by) = by else { return };
         let how = how.unwrap_or(How::Invite);
-        let me = st.me(gid).to_vec();
-        let rule = st.group(gid).ok().and_then(|g| g.rec.invites.iter().find(|rule| Some(&rule.hash) == invite.as_ref()).cloned());
-        let introduces = match how {
-            How::Open => by.key.0 == me,
-            _ => rule.as_ref().is_some_and(|rule| rule.by.0 == me),
-        };
-        let label = rule.and_then(|rule| rule.label).filter(|_| introduces);
         for member in &added {
             if let Some(member) = st.member(gid, member) {
-                let event = Event::Joined { group: group.clone(), member, by: by.clone(), how: how.clone(), introduces, label: label.clone() };
-                st.events.push(event);
+                st.events.push(Event::Joined { group: group.clone(), member, by: by.clone(), how: how.clone() });
             }
         }
         for member in &removed {
@@ -161,12 +152,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Tells that this session is out of a group, then forgets it, unless it did so already.
-    pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>) {
+    /// Tells that this session is out of a group, then forgets it, unless it did so already. `last`: it was the group's
+    /// last member.
+    pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>, last: bool) {
         if !self.lock().groups.contains_key(gid) {
             return;
         }
-        self.events.send(Event::Removed { group: Bytes(gid.to_vec()), by }).ok();
+        self.events.send(Event::Removed { group: Bytes(gid.to_vec()), by, last }).ok();
         if let Err(error) = self.forget(gid) {
             self.warn(Some(gid), format!("{error:#}"));
         }

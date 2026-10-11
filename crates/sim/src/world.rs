@@ -814,7 +814,7 @@ impl World {
                 self.observe(What::Device { identity, device, listed: true });
                 Ok(joined.to_string())
             }
-            Act::Invite { m, group, n, label, to, wait, race } => {
+            Act::Invite { m, group, n, to, wait, race } => {
                 let mut invite = json!({ "cmd": "invite" });
                 let m = match group {
                     Some(g) => {
@@ -827,9 +827,6 @@ impl World {
                         m
                     }
                 };
-                if label {
-                    invite["for"] = json!(format!("friend{}", self.index(n)));
-                }
                 if let Some(to) = to {
                     invite["to"] = json!(b64(&self.identity(to)?.0));
                 }

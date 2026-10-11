@@ -1,5 +1,5 @@
 //! The devices kind, built in: an identity's devices group, whose members are its devices, each with its own device key
-//! there. Its state is the identity, its private keys, its contacts and the groups open to it, kept in step through the
+//! there. Its state is the identity, its private keys and the groups open to it, kept in step through the
 //! group's held messages, in log order, and handed to a new device as any kind's state. At a loss of its own it stops:
 //! it takes no later message, appends nothing to the key log and hands out no state, until it takes a state past the
 //! loss. A device certifies its sessions
@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
-use lmk_core::contacts::Contact;
 use lmk_core::device::Device;
 use lmk_core::identity::{self, DAY, KeyLog, public};
 use lmk_core::provider::Provider;
@@ -38,7 +37,8 @@ struct Book {
     position: u64,
     /// The identity's private keys, each with when it was made, in milliseconds, and the devices group's epoch then.
     keys: Vec<(Bytes, u64, u64)>,
-    contacts: Vec<(Bytes, Contact)>,
+    /// The contacts of 0.13.0 and 0.13.1, kept as they are: their devices require the field.
+    contacts: Vec<Value>,
     openings: Vec<Opening>,
     /// Fields a newer letmeknow added, kept when this device hands the state on.
     #[serde(flatten)]
@@ -82,7 +82,6 @@ struct Record {
 enum Entry {
     /// A new key of the identity, made in the group's epoch `epoch`.
     Key { key: Bytes, at: u64, epoch: u64 },
-    Contact { identity: Bytes, contact: Contact },
     /// A group open to the identity, replacing the opening of the same group.
     Opening { opening: Opening },
 }
@@ -174,8 +173,8 @@ impl<P: Provider + Send + 'static> Devices<P> {
         self.books().into_iter().map(|(_, book)| (book.identity, book.name)).collect()
     }
 
-    /// The contacts of this device's identities.
-    pub fn contacts(&self) -> Vec<(Bytes, Contact)> {
+    /// The contacts of 0.13.0 and 0.13.1 that this device's identities keep, as they are.
+    pub fn contacts(&self) -> Vec<Value> {
         self.books().into_iter().flat_map(|(_, book)| book.contacts).collect()
     }
 
@@ -228,7 +227,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
     /// A device link: whoever opens it becomes a device of the identity.
     pub async fn invite(&self, identity: &[u8]) -> Result<String> {
         let (gid, _) = self.book(identity)?;
-        Ok(self.node.invite(&gid.0, None, None).await?.link())
+        Ok(self.node.invite(&gid.0, None).await?.link())
     }
 
     /// Joins an identity through a device link, with a new device key, and waits a while for its state.
@@ -253,22 +252,18 @@ impl<P: Provider + Send + 'static> Devices<P> {
         Ok(())
     }
 
-    /// Sets a contact of this device's first identity.
-    pub async fn set_contact(&self, id: &[u8], contact: Contact) -> Result<()> {
-        let (gid, _) = self.books().into_iter().next().context("this device is on no identity")?;
-        self.enter(&gid.0, Entry::Contact { identity: Bytes(id.to_vec()), contact }).await
-    }
-
     /// Records a group open to an identity, keeping the fields a newer letmeknow added to its record, unless it is
-    /// recorded so already.
+    /// recorded so already. One with no members, as a group that ended or closed to the identity leaves, is recorded
+    /// only over the group's opening.
     pub async fn set_opening(&self, identity: &[u8], mut opening: Opening) -> Result<()> {
         let (gid, book) = self.book(identity)?;
-        if let Some(held) = book.openings.iter().find(|held| held.group == opening.group) {
+        let held = book.openings.iter().find(|held| held.group == opening.group);
+        if let Some(held) = held {
             for (field, value) in &held.rest {
                 opening.rest.entry(field.clone()).or_insert_with(|| value.clone());
             }
         }
-        if book.openings.contains(&opening) {
+        if held.is_none() && opening.members.is_empty() || book.openings.contains(&opening) {
             return Ok(());
         }
         self.enter(&gid.0, Entry::Opening { opening }).await
@@ -314,7 +309,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let (devices, gid) = (self.clone(), gid.to_vec());
         spawn(async move {
             if let Err(error) = devices.duties(&gid).await {
-                tracing::warn!("the duties of a devices group: {error:#}");
+                tracing::debug!("the duties of a devices group: {error:#}");
             }
         });
     }
@@ -525,10 +520,6 @@ impl<P: Provider + Send + 'static> Devices<P> {
                     }
                     book.take_keys(vec![(key, at, epoch)]);
                 }
-                Ok(Entry::Contact { identity, contact }) => {
-                    book.contacts.retain(|(id, _)| *id != identity);
-                    book.contacts.push((identity, contact));
-                }
                 Ok(Entry::Opening { opening }) => {
                     book.openings.retain(|held| held.group != opening.group);
                     book.openings.push(opening);
@@ -543,5 +534,15 @@ impl<P: Provider + Send + 'static> Devices<P> {
         let text = format!("this device lost the message at position {lost} of its identity's devices group: it waits for a device's state past it");
         self.node.warn(gid, text);
         self.node.follow_log(gid, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_state_keeps_the_contacts_of_0_13_1_as_they_are() {
+        let old = r#"{"identity":{"id":"AQ","membership":{"folder":"/x"}},"name":"Bob","position":3,"keys":[],"contacts":[["Ag",{"name":"Carol","how":"verified","at":1}]],"openings":[]}"#;
+        let book: super::Book = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_value(&book).unwrap(), serde_json::from_str::<serde_json::Value>(old).unwrap());
     }
 }

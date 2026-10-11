@@ -193,14 +193,14 @@ fn local<F: std::future::Future>(test: F) -> F::Output {
     tokio::task::LocalSet::new().block_on(&runtime, test)
 }
 
-/// Alice makes a group and invites Bob, who speaks as his identity "Robert", for whom the link is meant.
+/// Alice makes a group and invites Bob, who speaks as his identity "Robert".
 async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let mut alice = world.start("alice", hold).await;
     let bob = world.start("bob", hold).await;
     alice.cmd(&["identity", "create", "Alice"]).await.unwrap();
     bob.cmd(&["identity", "create", "Robert"]).await.unwrap();
-    let invite = alice.cmd(&["invite", "--for", "Bob (Acme)"]).await.unwrap();
-    assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "kind": 0, "expires_in": 0, "for": 0 })));
+    let invite = alice.cmd(&["invite"]).await.unwrap();
+    assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "kind": 0, "expires_in": 0 })));
     let link = invite["link"].as_str().unwrap();
     assert!(link.starts_with("https://letmeknow.dev/i#3.g."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
@@ -210,10 +210,12 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     assert_eq!(event["member"]["name"], "Bob");
     assert_eq!(event["by"]["name"], "Alice");
     assert_eq!(event["how"], "invite");
-    // Alice records Bob as her contact, then introduces him, just after `joined` prints.
-    let contacts = until(|| async { alice.cmd(&["contacts"]).await.unwrap() }, |c| c["contacts"][0]["name"] == "Bob (Acme)").await;
-    assert_eq!(contacts["contacts"][0]["name"], "Bob (Acme)", "{contacts}");
     (alice, bob, invite["group"].as_str().unwrap().to_owned())
+}
+
+/// The id of an agent's identity.
+async fn identity_of(agent: &Agent) -> String {
+    agent.cmd(&["identity", "list"]).await.unwrap()["identities"][0]["identity"].as_str().unwrap().to_owned()
 }
 
 #[test]
@@ -232,9 +234,9 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "position": 0, "from": 0, "direct": 0, "content": 0 })));
         assert_eq!(second["position"].as_u64(), first["position"].as_u64().map(|p| p + 1), "in position order");
         assert_eq!(second["group"], group.as_str());
-        // Bob is Alice's contact under the name the link was for, verified; his own name for himself is only a claim.
-        assert_eq!(second["from"]["identity"]["name"], "Bob (Acme)");
-        assert_eq!(second["from"]["identity"]["how"], "verified");
+        // Bob's identity is known only by its own claim.
+        assert_eq!(second["from"]["identity"]["name"], "Robert");
+        assert_eq!(second["from"]["identity"]["how"], "unknown");
         assert_eq!(second["from"]["added_by"]["name"], "Alice");
         // The read frontier: Alice's answer comes after what she was shown, and a reply to Bob wakes him.
         let id = second["id"].as_str().unwrap();
@@ -487,7 +489,9 @@ fn status_lists_sends_held_only_here_and_members_away() {
         lmk_proto::clock::set(shifted);
         let world = world("only-here").await;
         let (alice, mut bob, _) = pair(&world, HOUR).await;
-        // Alice's invite came before Bob's start, so it is not only hers; her introduction of Bob he holds.
+        // Alice's invite came before Bob's start, so it is not only hers; her message is, until Bob's summary holds it.
+        assert_eq!(alice.cmd(&["status"]).await.unwrap()["groups"][0]["only_here"], json!([]));
+        alice.cmd(&["send", "hello"]).await.unwrap();
         let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"] == json!([])).await;
         assert_eq!(status["groups"][0]["only_here"], json!([]));
         bob.stop().await;
@@ -546,58 +550,6 @@ fn a_sender_is_told_who_lost_its_message() {
         let lost = alice.expect("lost").await;
         assert!(lost["member"]["name"] == "Bob" && lost["ids"].as_array().unwrap().contains(&sent["id"]), "{lost}");
         assert!(lost["text"].as_str().unwrap().contains("--reply-to"), "{lost}");
-    });
-}
-
-#[test]
-fn introductions_are_shown_until_accepted() {
-    local(async {
-        let world = world("introduce").await;
-        let (alice, _bob, group) = pair(&world, HOUR).await;
-        let mut carol = world.start("carol", HOUR).await;
-        carol.cmd(&["identity", "create", "Carol"]).await.unwrap();
-        assert!(alice.cmd(&["invite", "--group", "x"]).await.is_err());
-        let mut dave = world.start("dave", HOUR).await;
-        dave.cmd(&["identity", "create", "Dave"]).await.unwrap();
-        for joiner in [&carol, &dave] {
-            let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
-            joiner.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
-        }
-        let introduced = alice.cmd(&["introduce", "Bob", "--to", "Carol"]).await.unwrap();
-        assert_eq!(introduced["identity"]["name"], "Bob (Acme)");
-        let bob_seen = || async {
-            let members = carol.cmd(&["members"]).await.unwrap();
-            members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Bob").unwrap().clone()
-        };
-        for _ in 0..40 {
-            if bob_seen().await["identity"]["introduced"].is_array() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        let bob_seen = bob_seen().await;
-        let mut event = carol.expect("introduced").await;
-        while event["how"] != "introduce" {
-            assert_ne!(event["identity"]["name"], "Dave", "a plain invite vouches for no one");
-            event = carol.expect("introduced").await;
-        }
-        assert_eq!((event["by"]["name"].as_str(), event["how"].as_str()), (Some("Alice"), Some("introduce")));
-        assert_eq!(bob_seen["identity"]["how"], "unknown");
-        assert_eq!(bob_seen["identity"]["name"], "Robert");
-        assert_eq!(bob_seen["identity"]["claim"], true);
-        assert_eq!(bob_seen["identity"]["introduced"][0]["by"]["name"], "Alice");
-        assert_eq!(bob_seen["identity"]["introduced"][0]["name"], "Bob (Acme)");
-        // Dave, to whom Alice did not introduce Bob, ignores it.
-        assert_eq!(dave.cmd(&["contacts"]).await.unwrap()["introductions"], json!([]));
-        assert!(dave.printed().await.iter().all(|e| e["type"] != "introduced" || e["how"] != "introduce"));
-        let contacts = carol.cmd(&["contacts"]).await.unwrap();
-        let introductions = contacts["introductions"].as_array().unwrap();
-        let id = introductions.iter().find(|i| i["name"] == "Bob (Acme)").unwrap()["identity"].as_str().unwrap().to_owned();
-        carol.cmd(&["contacts", "accept", "--", &id]).await.unwrap();
-        let members = carol.cmd(&["members"]).await.unwrap();
-        let bob_seen = members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Bob").unwrap().clone();
-        assert_eq!((bob_seen["identity"]["how"].as_str(), bob_seen["identity"]["name"].as_str()), (Some("introduced"), Some("Bob (Acme)")));
-        assert!(carol.cmd(&["send", "--to", "Bob (Acme)", "hi"]).await.is_ok());
     });
 }
 
@@ -664,8 +616,9 @@ fn a_session_of_an_identity_joins_a_group_open_to_it() {
         let link = bob.cmd(&["invite", "--identity", "Robert"]).await.unwrap();
         assert!(link["link"].as_str().unwrap().contains("#3.d."));
         assert!(tablet.cmd(&["identity", "join", link["link"].as_str().unwrap()]).await.unwrap()["device"].is_string());
-        let opened = alice.cmd(&["open", "Bob (Acme)"]).await.unwrap();
-        assert_eq!(opened["settings"]["open"][0]["name"], "Bob (Acme)");
+        assert!(alice.cmd(&["open", "Robert"]).await.unwrap_err().to_string().contains("by its id"));
+        let opened = alice.cmd(&["open", &identity_of(&bob).await]).await.unwrap();
+        assert_eq!(opened["settings"]["open"][0]["name"], "Robert", "named as its key log names it, as Bob speaks as it");
         let mut groups = tablet.cmd(&["groups"]).await.unwrap();
         for _ in 0..40 {
             if groups.as_array().unwrap().iter().any(|g| g["group"] == group.as_str()) {
@@ -678,7 +631,7 @@ fn a_session_of_an_identity_joins_a_group_open_to_it() {
         let joined = tablet.cmd(&["join", "--", &group]).await.unwrap();
         assert_eq!(joined["members"].as_array().unwrap().len(), 3);
         let event = alice.expect("joined").await;
-        assert_eq!((event["member"]["identity"]["name"].as_str(), event["how"].as_str()), (Some("Bob (Acme)"), Some("open")));
+        assert_eq!((event["member"]["identity"]["name"].as_str(), event["how"].as_str()), (Some("Robert"), Some("open")));
         assert!(event["member"]["identity"]["new_device"].is_string(), "the tablet was added to Bob after his first device");
         // A session of another identity cannot see the group, so it cannot join it.
         let carol = world.start("carol", HOUR).await;
@@ -692,7 +645,7 @@ fn a_link_for_one_identity_admits_no_other() {
     local(async {
         let world = world("to").await;
         let (alice, bob, _) = pair(&world, HOUR).await;
-        let invite = alice.cmd(&["invite", "--to", "Bob (Acme)"]).await.unwrap();
+        let invite = alice.cmd(&["invite", "--to", &identity_of(&bob).await]).await.unwrap();
         let carol = world.start("carol", HOUR).await;
         carol.cmd(&["identity", "create", "Carol"]).await.unwrap();
         let link = invite["link"].as_str().unwrap();
@@ -898,17 +851,12 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
         assert_eq!(first.cmd(&["identity", "list"]).await.unwrap()["identities"][0]["name"], "Alice");
         let bob = world.start("bob", HOUR).await;
         bob.cmd(&["identity", "create", "Robert"]).await.unwrap();
-        let invite = second.cmd(&["invite", "--for", "Bob (Acme)"]).await.unwrap();
+        let invite = second.cmd(&["invite"]).await.unwrap();
         bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         second.expect("joined").await;
-        // The contact is recorded just after `joined` prints.
-        for agent in [&first, &second] {
-            let contacts = until(|| async { agent.cmd(&["contacts"]).await.unwrap() }, |c| c["contacts"][0]["name"] == "Bob (Acme)").await;
-            assert_eq!(contacts["contacts"][0]["name"], "Bob (Acme)", "{contacts}");
-        }
         let members = second.cmd(&["members"]).await.unwrap();
-        let bob_seen = members["members"].as_array().unwrap().iter().find(|m| m["name"] == "Bob").unwrap().clone();
-        assert_eq!(bob_seen["identity"]["how"], "verified");
+        let alice_seen = members["members"].as_array().unwrap().iter().find(|m| m["you"] == true).unwrap().clone();
+        assert_eq!((alice_seen["identity"]["name"].as_str(), alice_seen["identity"]["how"].as_str()), (Some("Alice"), Some("self")));
         // An opening the second records reaches the first.
         second.cmd(&["open", "Alice"]).await.unwrap();
         let groups = first.cmd(&["groups"]).await.unwrap();

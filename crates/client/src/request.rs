@@ -1,6 +1,5 @@
 //! What a client is asked: JSON objects tagged by `cmd`, and with the `clap` feature, a command line's subcommands.
 
-use lmk_core::contacts::Contact;
 use lmk_proto::Bytes;
 use lmk_proto::group::Opening;
 use serde::{Deserialize, Serialize};
@@ -40,19 +39,15 @@ pub enum Request {
         #[cfg_attr(feature = "clap", arg(long = "as", value_name = "IDENTITY"))]
         #[serde(rename = "as")]
         as_: Option<String>,
-        /// Whom the link is for: whoever redeems it becomes your contact under this name, verified
-        #[cfg_attr(feature = "clap", arg(long = "for", value_name = "NAME"))]
-        #[serde(rename = "for")]
-        for_: Option<String>,
-        /// A contact: only that identity can redeem the link
-        #[cfg_attr(feature = "clap", arg(long))]
+        /// Only the identity with this id, as `members` shows it, can redeem the link
+        #[cfg_attr(feature = "clap", arg(long, value_name = "IDENTITY"))]
         to: Option<String>,
         /// Also show the link as a QR code, on stderr
         #[cfg_attr(feature = "clap", arg(long))]
         #[serde(default)]
         qr: bool,
         /// Invite another device (a machine or a browser) into this identity, instead of a session into a group
-        #[cfg_attr(feature = "clap", arg(long, conflicts_with_all = ["group", "as_", "name", "for_", "to"]))]
+        #[cfg_attr(feature = "clap", arg(long, conflicts_with_all = ["group", "as_", "name", "to"]))]
         identity: Option<String>,
     },
     /// Join a group through an invite link, or a group open to your identity by its id
@@ -99,7 +94,8 @@ pub enum Request {
         group: Option<String>,
         name: String,
     },
-    /// Let sessions of an identity join the group without an invite (they run `join <group>`), or with --close, no longer
+    /// Let sessions of an identity join the group without an invite (they run `join <group>`), or with --close, no longer;
+    /// a session not in the group closes it only to its own identity, whose devices then no longer list it
     #[cfg_attr(feature = "clap", command(display_order = 19))]
     Open {
         #[cfg_attr(feature = "clap", arg(long))]
@@ -107,6 +103,7 @@ pub enum Request {
         #[cfg_attr(feature = "clap", arg(long))]
         #[serde(default)]
         close: bool,
+        /// One of your identities, by name or id, or another by id, as `members` shows it
         identity: String,
     },
     /// The members online in each group, and what only this session holds
@@ -118,24 +115,6 @@ pub enum Request {
         #[cfg_attr(feature = "clap", command(subcommand))]
         op: IdentityOp,
     },
-    /// Your identity's contacts, and introductions waiting to be accepted
-    #[cfg_attr(feature = "clap", command(display_order = 23))]
-    Contacts {
-        #[cfg_attr(feature = "clap", command(subcommand))]
-        op: Option<ContactsOp>,
-    },
-    /// Tell a member who another member's identity is to you
-    #[cfg_attr(feature = "clap", command(display_order = 24))]
-    Introduce {
-        #[cfg_attr(feature = "clap", arg(long))]
-        group: Option<String>,
-        member: String,
-        #[cfg_attr(feature = "clap", arg(long))]
-        to: String,
-    },
-    /// Sets a contact of the device's first identity: for the device.
-    #[cfg_attr(feature = "clap", command(skip))]
-    SetContact { identity: Bytes, contact: Contact },
     /// Records an opening in an identity's devices group: for the device.
     #[cfg_attr(feature = "clap", command(skip))]
     SetOpening { identity: Bytes, opening: Opening },
@@ -169,19 +148,6 @@ pub enum IdentityOp {
     Rename { name: String },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[cfg_attr(feature = "clap", derive(clap::Subcommand))]
-#[serde(rename_all = "snake_case")]
-pub enum ContactsOp {
-    /// Accept an introduction: the identity becomes a contact, known as introduced
-    Accept {
-        identity: String,
-        /// Your name for it [default: the introducer's]
-        #[cfg_attr(feature = "clap", arg(long))]
-        name: Option<String>,
-    },
-}
-
 fn chat() -> String {
     lmk_proto::group::CHAT.into()
 }
@@ -196,7 +162,7 @@ impl Request {
         match self {
             // A session leaves its own groups first.
             Request::Identity { op: IdentityOp::Leave { .. } } => false,
-            Request::Identity { .. } | Request::SetContact { .. } | Request::SetOpening { .. } | Request::Certify { .. } => true,
+            Request::Identity { .. } | Request::SetOpening { .. } | Request::Certify { .. } => true,
             Request::Invite { identity, .. } => identity.is_some(),
             Request::Join { target, .. } => lmk_proto::links::Invite::parse(target.trim()).is_ok_and(|invite| invite.device),
             _ => false,

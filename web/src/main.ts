@@ -153,35 +153,31 @@ function label(p: Person): string {
   return p.identity && !p.identity.error ? `${p.identity.name} · ${p.device}` : (p.name ?? "");
 }
 
-/** What a member's name rests on: this browser's own identity, a contact, an introduction, or only its own word. */
+/** What a member's name rests on: this browser's own identity, or only its own word. */
 function standing(p: Person): string | undefined {
   const i = p.identity;
   if (!i) return "speaks as no identity";
   if (i.error) return `unverified: ${i.error}`;
-  if (i.how === "self") return "you";
-  if (i.how === "verified") return "verified contact";
-  if (i.how === "introduced") return `introduced by ${i.by}`;
-  const introduced = introduction(i);
-  return introduced ? `their own name; ${introduced.by} says they are ${introduced.name}` : "their own name, not a contact";
-}
-
-/** Who vouched for an unknown identity first, by their label, and as whom. */
-function introduction(i: client.Identity): { by: string; name: string } | undefined {
-  const first = i.introduced?.[0];
-  return first && { by: label(first.by), name: first.name };
+  return i.how === "self" ? "you" : "their own name";
 }
 
 function who(p: Person): HTMLElement {
   const i = p.identity;
-  const warning = i?.error ?? i?.warning ?? p.warning ?? i?.new_device;
-  const level = p.you ? "self" : i && !i.error ? i.how : "unknown";
+  const warning = i?.error ?? i?.new_device;
+  const own = p.you || (i && !i.error && i.how === "self");
   return h(
     "span",
     { className: warning ? "who warn" : "who", title: [standing(p), warning, `key ${p.fp}`].filter(Boolean).join("\n") },
     warning && "⚠ ",
     label(p),
-    level !== "self" && h("small", { className: `level ${level}` }, level === "verified" ? " ✓" : level === "introduced" ? " (introduced)" : level === "unknown" ? " (unverified)" : "")
+    !own && h("small", { className: "level" }, " (unverified)")
   );
+}
+
+/** Whose devices an opening lets join: this browser's identity's, or another's, by its own name. */
+function devicesOf(o: client.Named): string {
+  if (me.identities.some(i => i.id === o.id)) return "your other devices";
+  return `the devices of ${o.name ? `${o.name} (unverified)` : "another identity"}`;
 }
 
 /** The group's name, or else who else is in it. */
@@ -527,7 +523,7 @@ function joinDialog() {
   );
 }
 
-// Your devices: the identities this browser is a device of, their devices, and their contacts.
+// Your devices: the identities this browser is a device of, and their devices.
 
 function showDevices() {
   show(devicesPage);
@@ -541,7 +537,6 @@ function showDevices() {
 const devicesBody = h("div", { className: "card" });
 async function drawDevices() {
   const identity = me.identities[0];
-  const contacts: client.Contacts = await request({ cmd: "contacts" });
   if (!identity) {
     return update(devicesBody, "none", () => {
       const name = h("input", { value: me.name, required: true });
@@ -566,7 +561,7 @@ async function drawDevices() {
   }
   const listed: { identities: { identity: string; devices: { key: string; name: string; you: boolean }[] }[] } = await request({ cmd: "identity", op: "list" });
   const list = listed.identities.find(i => i.identity === identity.id) ?? { devices: [] };
-  update(devicesBody, JSON.stringify([identity, list, contacts]), () => [
+  update(devicesBody, JSON.stringify([identity, list]), () => [
     h("p", {}, `The browsers and computers that are you, ${identity.name}. They join the chats and documents open to you, and others see them as yours.`),
     h(
       "ul",
@@ -586,22 +581,7 @@ async function drawDevices() {
         )
       )
     ),
-    h("button", { className: "primary", onclick: () => inviteDialog({ identity: identity.id }) }, "Add a device"),
-    h("h2", {}, "Contacts"),
-    contacts.contacts.length === 0 && h("p", { className: "muted" }, "Whoever joins through an invite you made for them becomes your contact."),
-    contacts.contacts.length > 0 &&
-      h("ul", { className: "devices" }, ...contacts.contacts.map(c => h("li", {}, h("span", {}, c.name), h("small", {}, c.how === "verified" ? "verified" : `introduced by ${c.by}`)))),
-    contacts.introductions.length > 0 && h("h3", {}, "Introduced to you"),
-    contacts.introductions.length > 0 &&
-      h(
-        "ul",
-        { className: "devices" },
-        ...contacts.introductions.map(i => {
-          const accept = h("button", {}, "Accept");
-          accept.onclick = () => busy(accept, "…", async () => (await request({ cmd: "contacts", op: { accept: { identity: i.identity } } }), render()));
-          return h("li", {}, h("span", {}, i.name, h("small", {}, ` by ${label(i.by)}`)), accept);
-        })
-      )
+    h("button", { className: "primary", onclick: () => inviteDialog({ identity: identity.id }) }, "Add a device")
   ]);
 }
 
@@ -661,9 +641,9 @@ async function inviteDialog(target: { gid: string } | { identity: string }) {
   const kind = g ? KINDS[g.settings.kind].name : "";
   const body = h("div", { className: "invite" });
   const dialog = modal(device ? "Add a device" : "Invite someone", body);
-  const make = async (label?: string) => {
+  const make = async () => {
     // The link opens this server's app, which is letmeknow.dev's unless the person runs their own.
-    const invite = device ? { identity: target.identity } : { group: target.gid, for: label || undefined };
+    const invite = device ? { identity: target.identity } : { group: target.gid };
     const made = new URL((await request({ cmd: "invite", ...invite })).link);
     const link = location.origin + made.pathname + made.hash;
     const { encode } = await import("uqr");
@@ -681,7 +661,7 @@ async function inviteDialog(target: { gid: string } | { identity: string }) {
         {},
         device
           ? "Open this link on your other device, or scan the QR code with its camera. Your chats and documents then reach it."
-          : `Send this link to a person or an agent. Whoever opens it first joins the ${kind}${label ? ` as your contact “${label}”` : ""}.`
+          : `Send this link to a person or an agent. Whoever opens it first joins the ${kind}.`
       ),
       h("div", { className: "qr" }, svg),
       copyable(link),
@@ -698,17 +678,7 @@ async function inviteDialog(target: { gid: string } | { identity: string }) {
     client.listen(joined);
     dialog.addEventListener("close", () => client.unlisten(joined));
   };
-  // Contacts belong to an identity, so only a browser that is a device of one labels its invites.
-  if (device || !me.identities.length) return make().catch(toast);
-  const label = h("input", { placeholder: "e.g. Bob (Acme)" });
-  const go = h("button", { className: "primary" }, "Make a link");
-  body.append(
-    form(
-      () => busy(go, "…", () => make(label.value.trim() || undefined)),
-      field("For", label, "Optional: who it is for. Whoever uses it becomes your contact by this name."),
-      h("div", { className: "buttons" }, go)
-    )
-  );
+  make().catch(toast);
 }
 
 function copyable(text: string) {
@@ -759,7 +729,7 @@ class View {
 
   protected drawPeople() {
     const others = this.members.filter(m => !m.you);
-    const warned = others.some(m => m.identity?.error || m.identity?.warning || m.warning);
+    const warned = others.some(m => m.identity?.error);
     const names = [...new Set(others.map(m => (m.away ? `${label(m)} (away)` : label(m))))];
     this.people.replaceChildren(...(others.length ? [warned ? "⚠ " : "", names.join(", "), " and you"] : ["Only you so far"]));
     this.people.classList.toggle("warn", warned);
@@ -775,17 +745,14 @@ class View {
     const kind = KINDS[settings.kind].name;
     const name = h("input", { value: settings.name, placeholder: title(gid), ariaLabel: "Name" });
     const save = h("button", {}, "Rename");
-    const contacts: client.Contacts = await request({ cmd: "contacts" });
-    const openable = [...me.identities.map(i => ({ ...i, own: true })), ...contacts.contacts.map(c => ({ id: c.identity, name: c.name, own: false }))];
-    const toggle = (identity: { id: string; name: string; own: boolean }) => {
+    const toggle = (identity: client.Named) => {
       const box = h("input", { type: "checkbox", checked: !!settings.open?.some(o => o.id === identity.id) });
       box.onchange = async () => {
         box.disabled = true;
         await request({ cmd: "open", group: gid, close: !box.checked, identity: identity.id }).catch(error => ((box.checked = !box.checked), toast(error)));
         box.disabled = false;
       };
-      const text = identity.own ? "Your other devices can join" : `${identity.name}'s devices can join`;
-      return h("label", { className: "switch" }, box, h("span", {}, h("b", {}, text), h("small", {}, `Their devices list this ${kind} under "Open to you", to join without an invite.`)));
+      return h("label", { className: "switch" }, box, h("span", {}, h("b", {}, "Your other devices can join"), h("small", {}, `They list this ${kind} under "Open to you", to join without an invite.`)));
     };
     const dialog = modal(
       kind[0].toUpperCase() + kind.slice(1),
@@ -794,11 +761,8 @@ class View {
       h(
         "ul",
         { className: "people-list" },
-        ...this.members.map(m => {
-          const introduced = m.identity?.how === "unknown" && introduction(m.identity);
-          const accept = introduced && h("button", {}, `Accept as ${introduced.name}`);
-          if (accept) accept.onclick = () => busy(accept, "…", async () => (await request({ cmd: "contacts", op: { accept: { identity: m.identity!.id } } }), render(), dialog.close()));
-          return h(
+        ...this.members.map(m =>
+          h(
             "li",
             {},
             h(
@@ -810,12 +774,11 @@ class View {
               h("p", { className: m.identity?.error ? "warn" : "muted" }, standing(m)),
               m.added_by && h("p", { className: "muted" }, `added by ${m.added_by.name ?? "a former member"} (${m.added_by.how})`)
             ),
-            accept,
             !m.you && confirmed("Remove", `Remove ${label(m)}?`, () => request({ cmd: "remove", group: gid, member: m.fp }))
-          );
-        })
+          )
+        )
       ),
-      openable.map(toggle),
+      me.identities.map(toggle),
       h(
         "div",
         { className: "buttons leave" },
@@ -1004,13 +967,11 @@ class ChatView extends View {
         const ids = (s?: { open?: { id: string }[] }) => (s?.open ?? []).map(o => o.id);
         const said = [
           before && after.name !== before.name && (after.name ? `named it “${after.name}”` : "removed its name"),
-          ...(after.open ?? []).filter(o => !ids(before).includes(o.id)).map(o => `let ${o.name}'s devices join`),
-          ...(before?.open ?? []).filter(o => !ids(after).includes(o.id)).map(o => `stopped letting ${o.name}'s devices join`)
+          ...(after.open ?? []).filter(o => !ids(before).includes(o.id)).map(o => `let ${devicesOf(o)} join`),
+          ...(before?.open ?? []).filter(o => !ids(after).includes(o.id)).map(o => `stopped letting ${devicesOf(o)} join`)
         ].filter(Boolean);
         return h("li", { className: "event" }, who(item.by), ` ${said.join(" and ") || "changed the settings"}`, at);
       }
-      case "introduced":
-        return h("li", { className: "event" }, who(item.by), ` introduced ${item.identity.name}`, at);
       case "pushed":
         return h(
           "li",
@@ -1020,6 +981,9 @@ class ChatView extends View {
           at,
           h("ul", {}, ...item.subjects.map(subject => h("li", {}, subject)))
         );
+      // An item of a kind this page no longer shows, which the timeline kept, as 0.13.1's introductions.
+      default:
+        return h("li", { hidden: true });
     }
   }
 

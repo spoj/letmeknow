@@ -43,9 +43,9 @@ pub enum Act {
     CreateIdentity { m: usize },
     /// `m` invites `n`'s device onto its identity.
     LinkDevice { m: usize, n: usize },
-    /// `m` invites `n` into a group, a new one if none, `--for` a contact name, or `--to` the identity of `to`'s device;
+    /// `m` invites `n` into a group, a new one if none, or `--to` the identity of `to`'s device;
     /// `n` joins `wait` milliseconds later, and `race` by the same link at once.
-    Invite { m: usize, group: Option<usize>, n: usize, label: bool, to: Option<usize>, wait: u64, race: Option<usize> },
+    Invite { m: usize, group: Option<usize>, n: usize, to: Option<usize>, wait: u64, race: Option<usize> },
     /// `n` joins a group open to its identity.
     JoinOpen { n: usize, group: usize },
     Send { m: usize, group: usize },
@@ -259,7 +259,7 @@ fn invite(rng: &mut Rng, members: usize, m: usize, group: Option<usize>, n: usiz
         _ => None,
     };
     let race = (rng.below(100) < 8).then(|| rng.index(members));
-    Act::Invite { m, group, n, label: rng.below(2) == 0, to, wait, race }
+    Act::Invite { m, group, n, to, wait, race }
 }
 
 /// Several members acting on one group at the same millisecond: mostly commits (renames, opening and closing one

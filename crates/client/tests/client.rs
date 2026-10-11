@@ -182,58 +182,30 @@ fn logs(test: &str) -> Folder {
     Folder(dir)
 }
 
+/// Another identity's members show its own claim; this device's own identity is `self`. A link `--to` an identity
+/// admits only that one.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_invite_made_for_someone_makes_its_joiner_that_contact_and_describes_them_so() {
+async fn a_joiner_shows_its_identitys_claim_and_a_link_to_an_identity_admits_only_it() {
     let (relay, logs) = (relay().await, logs("invite"));
     let mut alice = Member::start(&relay, &logs, "Alice's laptop").await;
-    let mut bob = Member::start(&relay, &logs, "Bob's laptop").await;
-    alice.request(json!({ "cmd": "identity", "op": { "create": { "name": "Alice" } } })).await;
-    bob.request(json!({ "cmd": "identity", "op": { "create": { "name": "Robert" } } })).await;
-    let invite = alice.request(json!({ "cmd": "invite", "for": "Bob (Acme)" })).await;
-    assert_eq!((invite["kind"].as_str(), invite["for"].as_str()), (Some(CHAT), Some("Bob (Acme)")));
+    let bob = Member::start(&relay, &logs, "Bob's laptop").await;
+    let carol = Member::start(&relay, &logs, "Carol's laptop").await;
+    for (member, name) in [(&alice, "Alice"), (&bob, "Robert"), (&carol, "Carol")] {
+        member.request(json!({ "cmd": "identity", "op": { "create": { "name": name } } })).await;
+    }
+    let robert = bob.client.me().unwrap()["identities"][0]["id"].clone();
+    let refused = alice.client.request(serde_json::from_value(json!({ "cmd": "invite", "to": "Robert" })).unwrap()).await;
+    assert_eq!(refused.unwrap_err().to_string(), "--to takes an identity's id, as `members` shows it");
+    let invite = alice.request(json!({ "cmd": "invite", "to": robert })).await;
+    assert_eq!((invite["kind"].as_str(), &invite["to"]), (Some(CHAT), &robert));
+    let other = carol.client.request(serde_json::from_value(json!({ "cmd": "join", "target": invite["link"] })).unwrap()).await;
+    assert!(other.unwrap_err().to_string().contains("another identity"));
     bob.request(json!({ "cmd": "join", "target": invite["link"] })).await;
     let ClientEvent::Joined { member, .. } = alice.until(|e| matches!(e, ClientEvent::Joined { .. })).await else { unreachable!() };
     let known = member.identity.unwrap();
-    assert_eq!((known.name.as_str(), known.how), ("Bob (Acme)", Standing::Verified), "whom the invite was for, at once");
-    // Whom the invite was for becomes a contact, and the group is told who they are. Every leaf names revision 1, so
-    // the introduce is held, by its sender and by those it reaches.
-    let holds_introduce = |m: &Member| {
-        let node = m.client.node();
-        node.groups().iter().any(|g| node.messages(&g.0).unwrap().iter().any(|message| message.payload["type"] == "introduce"))
-    };
-    // A shutdown lets the work the join caused end.
-    alice.client.shutdown().await;
-    assert!(holds_introduce(&alice));
-    tokio::time::timeout(WAIT, async {
-        while !holds_introduce(&bob) {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    })
-    .await
-    .expect("the introduce is held");
-    // Bob is not told who he is himself.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    while let Ok(event) = bob.told.try_recv() {
-        assert!(!matches!(event, ClientEvent::Introduced { .. }), "{event:?}");
-    }
-    let me = alice.client.me().unwrap()["fp"].as_str().unwrap().to_owned();
-    let introduced = alice.client.request(serde_json::from_value(json!({ "cmd": "introduce", "group": invite["group"], "member": me, "to": "Bob" })).unwrap()).await;
-    assert_eq!(introduced.unwrap_err().to_string(), "you can introduce only your contacts");
-    // The contact is the identity's once its devices group's log takes it.
-    let mut contacts = alice.request(json!({ "cmd": "contacts" })).await;
-    for _ in 0..200 {
-        if contacts["contacts"][0].is_object() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        contacts = alice.request(json!({ "cmd": "contacts" })).await;
-    }
-    assert_eq!((contacts["contacts"][0]["name"].as_str(), contacts["contacts"][0]["how"].as_str()), (Some("Bob (Acme)"), Some("verified")));
-    let gid = invite["group"].as_str().unwrap();
-    let members = alice.request(json!({ "cmd": "members", "group": gid })).await;
+    assert_eq!((known.id, known.name.as_str(), known.how), (serde_json::from_value(robert).unwrap(), "Robert", Standing::Unknown));
+    let members = alice.request(json!({ "cmd": "members", "group": invite["group"] })).await;
     let seen: Vec<lmk_client::Described> = serde_json::from_value(members["members"].clone()).unwrap();
-    let robert = seen.iter().find(|m| !m.you).unwrap().identity.clone().unwrap();
-    assert_eq!((robert.name.as_str(), robert.how), ("Bob (Acme)", Standing::Verified));
     let me = seen.iter().find(|m| m.you).unwrap().identity.clone().unwrap();
     assert_eq!((me.name.as_str(), me.how), ("Alice", Standing::Own));
 }
