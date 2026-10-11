@@ -161,6 +161,9 @@ pub trait Plugins: Send + Sync {
     fn send(&self, kind: &str, message: &Value) -> Result<()>;
     /// A plugin's lines ended: whether it ran steadily, and may be started again.
     fn stopped(&self, kind: &str) -> bool;
+    /// Stops a kind's plugin, as no group of its kind is left; its lines end without a `None`. Plugins that are no
+    /// process of their own have nothing to stop.
+    fn stop(&self, _kind: &str) {}
 }
 
 /// What the client tells its shell. Message ids and file hashes are hex.
@@ -667,6 +670,9 @@ impl<P: Provider + Send + 'static> Client<P> {
         if let Some(kind) = kind {
             // Answered once the plugin let go of the group, so that a doc file it made is gone when `leave` returns.
             self.ask(&kind, json!({ "type": "gone", "group": b64(&gid.0) })).await?;
+            if !self.state().kind_of.values().any(|k| *k == kind) {
+                self.inner.plugins.stop(&kind);
+            }
         }
         if ended {
             let (client, gid) = (self.clone(), gid.clone());

@@ -688,7 +688,7 @@ impl Session {
 
     pub async fn shutdown(&self) {
         self.client.shutdown().await;
-        self.plugins.stop().await;
+        self.plugins.stop_all().await;
         let _ = self.client.node().shutdown().await;
         if let Some(device) = &self.device {
             let _ = device.shutdown().await;
