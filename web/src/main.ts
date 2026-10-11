@@ -1,9 +1,13 @@
 // The page: this browser's session and its groups, each a chat, a doc, or a repository, shown as its pushes and chat. Background work ends in render(), which patches
 // only what changed, so what a person is typing, selecting or scrolling stays put. Joining from a link waits for a
 // click, so link scanners that open it join nothing.
+import "@fontsource-variable/ibm-plex-sans/wght.css";
+import "@fontsource-variable/ibm-plex-sans/wght-italic.css";
+import "@fontsource/ibm-plex-mono/latin-400.css";
 import "./app.css";
 import * as client from "./client";
 import type { Attachment, Group, Item, Me, Person } from "./client";
+import { icon } from "./icons";
 
 const { lmk, request } = client;
 
@@ -28,7 +32,7 @@ const set = (element: HTMLElement, text: string) => element.textContent !== text
 const form = (submit: () => unknown, ...children: Child[]) => h("form", { onsubmit: (event: Event) => (event.preventDefault(), submit()) }, ...children);
 const field = (label: string, input: HTMLElement, hint?: string) => h("label", { className: "field" }, h("span", {}, label), input, hint && h("small", {}, hint));
 const megabytes = (bytes: number) => (bytes < 1e6 ? `${Math.ceil(bytes / 1000)} KB` : `${(bytes / 1e6).toFixed(1)} MB`);
-const KINDS = { chat: { name: "chat", mark: "💬" }, doc: { name: "document", mark: "📄" }, git: { name: "repository", mark: "🌿" } };
+const KINDS = { chat: "chat", doc: "document", git: "repository" };
 const GIT_NOTE = "The repository lives with agent sessions; this browser shows its chat and pushes.";
 /** Files up to this size every member fetches; larger ones only on request. */
 const FILE_LIMIT = 25 << 20;
@@ -78,7 +82,7 @@ function modal(title: string, ...content: Child[]): HTMLDialogElement {
   const dialog = h(
     "dialog",
     {},
-    h("header", {}, h("h2", {}, title), h("button", { type: "button", className: "icon quiet", title: "Close", ariaLabel: "Close", onclick: () => dialog.close() }, "×")),
+    h("header", {}, h("h2", {}, title), h("button", { type: "button", className: "icon quiet", title: "Close", ariaLabel: "Close", onclick: () => dialog.close() }, icon("close"))),
     h("div", { className: "dialog-body" }, ...content)
   );
   dialog.onclose = () => dialog.remove();
@@ -175,7 +179,7 @@ function title(gid: string): string {
   const g = group(gid);
   if (!g) return "a group";
   const others = (g.members ?? []).filter(m => !m.you).map(p => p.name);
-  return g.settings.name || [...new Set(others)].join(", ") || `New ${KINDS[g.settings.kind].name}`;
+  return g.settings.name || [...new Set(others)].join(", ") || `New ${KINDS[g.settings.kind]}`;
 }
 
 // First visit, and invites.
@@ -345,13 +349,13 @@ const meButton = h("button", { className: "me quiet", onclick: () => showDevices
 const sidebar = h(
   "aside",
   { className: "sidebar" },
-  h("div", { className: "brand" }, "letmeknow"),
+  h("div", { className: "brand" }, h("img", { src: "/icon.svg", alt: "" }), "letmeknow"),
   h(
     "div",
     { className: "side-actions" },
-    h("button", { onclick: () => newGroupDialog("chat") }, "New chat"),
-    h("button", { onclick: () => newGroupDialog("doc") }, "New doc"),
-    h("button", { onclick: joinDialog }, "Join")
+    h("button", { onclick: () => newGroupDialog("chat") }, icon("chat"), "New chat"),
+    h("button", { onclick: () => newGroupDialog("doc") }, icon("doc"), "New doc"),
+    h("button", { onclick: joinDialog }, icon("join"), "Join")
   ),
   groupList,
   meButton
@@ -407,7 +411,7 @@ function showStart() {
 }
 
 function back() {
-  return h("button", { className: "back quiet icon", title: "All groups", onclick: () => layout.classList.remove("in-main") }, "‹");
+  return h("button", { className: "back quiet icon", title: "All groups", onclick: () => layout.classList.remove("in-main") }, icon("back"));
 }
 
 let rendering = Promise.resolve();
@@ -452,8 +456,7 @@ function drawNav() {
     if (!entry) {
       const name = h("span"),
         badge = h("b");
-      const mark = h("i", { className: "mark", ariaHidden: "true" }, KINDS[g.settings.kind].mark);
-      entry = { button: h("button", { onclick: () => select(g.group) }, mark, name, badge), name, badge };
+      entry = { button: h("button", { onclick: () => select(g.group) }, icon(g.settings.kind), name, badge), name, badge };
       navButtons.set(g.group, entry);
       groupList.prepend(entry.button);
     }
@@ -469,7 +472,7 @@ function newGroupDialog(kind: "chat" | "doc") {
   const name = h("input", { placeholder: kind === "chat" ? "e.g. Q3 plan" : "e.g. Tasks", autofocus: true });
   const create = h("button", { className: "primary" }, "Start");
   const dialog = modal(
-    `New ${KINDS[kind].name}`,
+    `New ${KINDS[kind]}`,
     kind === "doc" && h("p", { className: "muted" }, "One page that everyone in it, people and agents, edits at once."),
     form(
       () =>
@@ -623,7 +626,7 @@ async function leaveDialog(link?: string) {
 async function showLink(target: { gid: string } | { identity: string }, body: HTMLElement, dialog: HTMLDialogElement) {
   const device = "identity" in target;
   const g = device ? undefined : group(target.gid);
-  const kind = g ? KINDS[g.settings.kind].name : "";
+  const kind = g ? KINDS[g.settings.kind] : "";
   // The link opens this server's app, which is letmeknow.dev's unless the person runs their own.
   const made = new URL((await request(device ? { cmd: "identity", op: { invite: {} } } : { cmd: "invite", group: target.gid })).link);
   const link = location.origin + made.pathname + made.hash;
@@ -693,7 +696,7 @@ class View {
         { className: "group-head" },
         back(),
         h("div", { className: "title" }, this.heading, this.people, group(gid)?.settings.kind === "git" && h("small", { className: "note" }, GIT_NOTE)),
-        h("button", { className: "icon quiet", title: "Settings", ariaLabel: "Settings", onclick: () => this.settingsDialog() }, "⋯")
+        h("button", { className: "icon quiet", title: "Settings", ariaLabel: "Settings", onclick: () => this.settingsDialog() }, icon("more"))
       )
     );
     this.people.onclick = () => this.settingsDialog();
@@ -750,7 +753,7 @@ class View {
   protected settingsDialog(invite = false) {
     const gid = this.gid;
     const settings = group(gid)!.settings;
-    const kind = KINDS[settings.kind].name;
+    const kind = KINDS[settings.kind];
     const name = h("input", { value: settings.name, placeholder: title(gid), ariaLabel: "Name" });
     const save = h("button", {}, "Rename");
     const make = h("button", { type: "button" }, "Make a link");
@@ -808,7 +811,7 @@ class View {
 /** A chat: its timeline, and a composer that sends text and a file, to everyone or to some. */
 class ChatView extends View {
   private list = h("ol", { className: "messages" });
-  private newer = h("button", { className: "newer", hidden: true }, "New messages ↓");
+  private newer = h("button", { className: "newer", hidden: true }, "New messages", icon("down"));
   private empty = h("div", { className: "empty", hidden: true });
   private input = h("textarea", { rows: 1, placeholder: "Message", ariaLabel: "Message" });
   private context = h("div", { className: "context" });
@@ -828,7 +831,7 @@ class ChatView extends View {
   constructor(gid: string) {
     super(gid);
     const send = h("button", { className: "primary send", onclick: () => this.submit() }, "Send");
-    const attach = h("button", { className: "attach quiet icon", title: "Send a file", ariaLabel: "Attach a file", onclick: () => this.picker.click() }, "+");
+    const attach = h("button", { className: "attach quiet icon", title: "Send a file", ariaLabel: "Attach a file", onclick: () => this.picker.click() }, icon("attach"));
     this.el.append(
       h("div", { className: "log" }, this.list, this.empty, this.newer),
       h(
@@ -891,7 +894,7 @@ class ChatView extends View {
     let at: Element | null = this.list.firstElementChild;
     for (const item of items) {
       const key = "id" in item ? item.id : `${item.type} ${item.at}`;
-      const follows = item.type === "message" && previous?.type === "message" && previous.from.fp === item.from.fp && sentAt(item) - sentAt(previous) < 300_000 && !item.reply_to;
+      const follows = item.type === "message" && previous?.type === "message" && previous.from.fp === item.from.fp && sentAt(item) - sentAt(previous) < 300_000 && !item.reply_to && ![item, previous].some(m => m.to?.length || m.urgent);
       const json = JSON.stringify([item, follows, item.type === "message" && item.failed?.error]);
       previous = item;
       keep.add(key);
@@ -1037,7 +1040,7 @@ class ChatView extends View {
   }
 
   private drawContext() {
-    const close = (job: () => void) => h("button", { className: "icon quiet", title: "Cancel", onclick: () => (job(), this.drawContext()) }, "×");
+    const close = (job: () => void) => h("button", { className: "icon quiet", title: "Cancel", onclick: () => (job(), this.drawContext()) }, icon("close"));
     const { replyTo, attachment } = this;
     this.context.replaceChildren(
       ...kids([

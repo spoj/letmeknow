@@ -1,18 +1,31 @@
 // A doc's editor: markdown in CodeMirror, bound to the doc's Yjs text, which edits here and the copy the doc kind's
 // in-page plugin keeps (lmk_kind_doc::Page, through its commands) keep in step. It reads as written text: headings by
-// size, markdown's marks faint where they stand, list items hanging under their bullets, which show as dots, and "- [ ]"
-// items as checkboxes that tick with a click; a toolbar (and Alt+↑/↓, Tab, Shift+Tab) moves and indents lines. Links
-// show as their text, and open on a click, except while the cursor is in them. Images the doc links show below their
-// line; pasting or dropping a file uploads it and inserts its link.
+// size, emphasis, inline code and quotes as they look, fenced code as a block and `---` as a rule, with markdown's marks
+// hidden except where the cursor is; list items hang under their bullets, which show as dots, and "- [ ]" items show as
+// checkboxes that tick with a click. A toolbar (and Ctrl+B, I and K, Alt+↑/↓, Tab, Shift+Tab) makes text bold, italic
+// or a link, and moves and indents lines. Links show as their text, and open on a click, except while the cursor is in
+// them. Images the doc links show below their line; pasting or dropping a file uploads it and inserts its link.
 import { defaultKeymap, indentLess, indentMore, indentWithTab, moveLineDown, moveLineUp } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { HighlightStyle, syntaxHighlighting, syntaxTree } from "@codemirror/language";
-import { EditorState, type Range, StateField } from "@codemirror/state";
-import { Decoration, type DecorationSet, EditorView, ViewPlugin, type ViewUpdate, WidgetType, keymap, placeholder, showPanel } from "@codemirror/view";
+import { EditorSelection, EditorState, type Range, StateField } from "@codemirror/state";
+import {
+  type DOMEventHandlers,
+  Decoration,
+  type DecorationSet,
+  EditorView,
+  ViewPlugin,
+  type ViewUpdate,
+  WidgetType,
+  keymap,
+  placeholder,
+  showPanel
+} from "@codemirror/view";
 import { tags } from "@lezer/highlight";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import * as Y from "yjs";
 import type { Session } from "./client";
+import { type IconName, icon } from "./icons";
 
 class Checkbox extends WidgetType {
   constructor(readonly checked: boolean) {
@@ -32,15 +45,42 @@ class Checkbox extends WidgetType {
   }
 }
 
-class Dot extends WidgetType {
-  eq() {
-    return true;
+/** A shape drawn in place of text: a bullet's dot, or a rule. */
+class Shape extends WidgetType {
+  constructor(readonly className: string) {
+    super();
+  }
+
+  eq(other: Shape) {
+    return other.className === this.className;
   }
 
   toDOM() {
-    return Object.assign(document.createElement("span"), { className: "cm-dot" });
+    return Object.assign(document.createElement("span"), { className: this.className });
   }
 }
+
+/** Decorations from `build`, drawn again as the doc, its syntax tree, the viewport, the selection or the focus changes. */
+function drawing(build: (view: EditorView) => DecorationSet, eventHandlers?: DOMEventHandlers<unknown>) {
+  return ViewPlugin.fromClass(
+    class {
+      decorations: DecorationSet;
+
+      constructor(view: EditorView) {
+        this.decorations = build(view);
+      }
+
+      update(update: ViewUpdate) {
+        const { docChanged, viewportChanged, selectionSet, focusChanged, state, startState } = update;
+        if (docChanged || viewportChanged || selectionSet || focusChanged || syntaxTree(state) !== syntaxTree(startState)) this.decorations = build(update.view);
+      }
+    },
+    { decorations: plugin => plugin.decorations, eventHandlers }
+  );
+}
+
+/** Where the cursors are, while the editor has focus: markdown shows its marks there. */
+const cursors = (view: EditorView) => (view.hasFocus ? view.state.selection.ranges : []);
 
 /** The width of a character of a list item's indent or marker, in em: wider than most, so that lists line up in any font. */
 const CHAR = 0.6;
@@ -72,38 +112,22 @@ function items(view: EditorView): DecorationSet {
         // Inclusive, so that it holds the dot that starts it.
         found.push(Decoration.mark({ inclusiveStart: true, attributes: width(marker) }).range(node.from, Math.min(node.to + (task ? 5 : 1), line.to)));
         if (task) found.push(Decoration.replace({}).range(node.from, node.to + 1));
-        else if (/[-*+]/.test(state.sliceDoc(node.from, node.to))) found.push(Decoration.replace({ widget: new Dot() }).range(node.from, node.to));
+        else if (/[-*+]/.test(state.sliceDoc(node.from, node.to))) found.push(Decoration.replace({ widget: new Shape("cm-dot") }).range(node.from, node.to));
       }
     });
   }
   return Decoration.set(found, true);
 }
 
-const lists = ViewPlugin.fromClass(
-  class {
-    decorations: DecorationSet;
-
-    constructor(view: EditorView) {
-      this.decorations = items(view);
-    }
-
-    update(update: ViewUpdate) {
-      if (update.docChanged || update.viewportChanged || syntaxTree(update.state) !== syntaxTree(update.startState)) this.decorations = items(update.view);
-    }
-  },
-  {
-    decorations: plugin => plugin.decorations,
-    eventHandlers: {
-      mousedown(event, view) {
-        const box = event.target as HTMLElement;
-        if (!box.classList.contains("cm-task")) return false;
-        const at = view.posAtDOM(box) + 1;
-        view.dispatch({ changes: { from: at, to: at + 1, insert: view.state.sliceDoc(at, at + 1) === " " ? "x" : " " } });
-        return true;
-      }
-    }
+const lists = drawing(items, {
+  mousedown(event, view) {
+    const box = event.target as HTMLElement;
+    if (!box.classList.contains("cm-task")) return false;
+    const at = view.posAtDOM(box) + 1;
+    view.dispatch({ changes: { from: at, to: at + 1, insert: view.state.sliceDoc(at, at + 1) === " " ? "x" : " " } });
+    return true;
   }
-);
+});
 
 /**
  * Links: `[text](url)` shows as its text, styled as a link, unless a cursor is in it; bare URLs are links too. An image
@@ -125,7 +149,7 @@ function links(view: EditorView): DecorationSet {
         const url = node.node.getChild("URL");
         if (!url || !close) return false;
         const href = state.sliceDoc(url.from, url.to);
-        const shown = !state.selection.ranges.some(r => r.from <= node.to && r.to >= node.from);
+        const shown = !cursors(view).some(r => r.from <= node.to && r.to >= node.from);
         if (node.name === "Image") {
           if (shown && href.startsWith("lmk:")) found.push(Decoration.replace({}).range(node.from, node.to));
         } else if (close.from > open.to) {
@@ -141,34 +165,110 @@ function links(view: EditorView): DecorationSet {
 
 /** Links, which open on a click: web and mail links in a new tab, a file the doc links as a download. */
 const linking = (blobs: Blobs) =>
-  ViewPlugin.fromClass(
-    class {
-      decorations: DecorationSet;
-
-      constructor(view: EditorView) {
-        this.decorations = links(view);
-      }
-
-      update(update: ViewUpdate) {
-        if (update.docChanged || update.viewportChanged || update.selectionSet || syntaxTree(update.state) !== syntaxTree(update.startState)) {
-          this.decorations = links(update.view);
-        }
-      }
-    },
-    {
-      decorations: plugin => plugin.decorations,
-      eventHandlers: {
-        mousedown(event) {
-          const link = (event.target as HTMLElement).closest(".cm-link");
-          const href = link?.getAttribute("data-href") ?? "";
-          if (href.startsWith("lmk:")) blobs.open(href, link!.textContent!);
-          else if (/^(https?|mailto):/i.test(href)) window.open(href, "_blank", "noopener");
-          else return false;
-          return true;
-        }
-      }
+  drawing(links, {
+    mousedown(event) {
+      const link = (event.target as HTMLElement).closest(".cm-link");
+      const href = link?.getAttribute("data-href") ?? "";
+      if (href.startsWith("lmk:")) blobs.open(href, link!.textContent!);
+      else if (/^(https?|mailto):/i.test(href)) window.open(href, "_blank", "noopener");
+      else return false;
+      return true;
     }
+  });
+
+/** Of each inline element that hides its marks where no cursor is, the marks. */
+const MARKS: Record<string, string> = { Emphasis: "EmphasisMark", StrongEmphasis: "EmphasisMark", Strikethrough: "StrikethroughMark", InlineCode: "CodeMark" };
+
+/**
+ * Markdown as written text, except where a cursor is: headings, emphasis, inline code and quotes without their marks,
+ * fenced code without its fences, and `---` as a rule. Code and quotes show as blocks, and headings get room above.
+ */
+function writing(view: EditorView): DecorationSet {
+  const { state } = view;
+  const found: Range<Decoration>[] = [];
+  const touched = (from: number, to: number) => cursors(view).some(r => r.from <= to && r.to >= from);
+  const hide = (from: number, to: number) => from < to && found.push(Decoration.replace({}).range(from, to));
+  const lines = (from: number, to: number, className: string) => {
+    for (let at = from; at <= to; at = state.doc.lineAt(at).to + 1) found.push(Decoration.line({ class: className }).range(state.doc.lineAt(at).from));
+  };
+  for (const { from, to } of view.visibleRanges) {
+    syntaxTree(state).iterate({
+      from,
+      to,
+      enter: node => {
+        const line = state.doc.lineAt(node.from);
+        const spaced = (at: number) => at + (state.sliceDoc(at, at + 1) === " " ? 1 : 0);
+        if (node.name in MARKS) {
+          if (node.name === "InlineCode") found.push(Decoration.mark({ class: "cm-inline-code" }).range(node.from, node.to));
+          if (!touched(node.from, node.to)) for (const mark of node.node.getChildren(MARKS[node.name])) hide(mark.from, mark.to);
+        } else if (node.name.startsWith("ATXHeading")) {
+          found.push(Decoration.line({ class: "cm-heading" }).range(line.from));
+          if (touched(line.from, line.to)) return;
+          const [lead, ...closing] = node.node.getChildren("HeaderMark");
+          hide(lead.from, Math.min(spaced(lead.to), line.to));
+          for (const mark of closing) hide(mark.from - 1, mark.to);
+        } else if (node.name === "Blockquote") {
+          lines(node.from, node.to, "cm-quote");
+        } else if (node.name === "QuoteMark") {
+          if (!touched(line.from, line.to)) hide(node.from, Math.min(spaced(node.to), line.to));
+        } else if (node.name === "FencedCode") {
+          const [, close] = node.node.getChildren("CodeMark");
+          lines(node.from, node.to, "cm-code");
+          found.push(
+            Decoration.line({ class: "cm-code-first cm-fence" }).range(line.from),
+            Decoration.line({ class: close ? "cm-code-last cm-fence" : "cm-code-last" }).range(state.doc.lineAt(node.to).from)
+          );
+          if (touched(node.from, node.to)) return;
+          hide(node.from, line.to);
+          if (close) hide(close.from, close.to);
+        } else if (node.name === "HorizontalRule" && !touched(line.from, line.to)) {
+          found.push(Decoration.replace({ widget: new Shape("cm-hr") }).range(node.from, node.to));
+        }
+      }
+    });
+  }
+  return Decoration.set(found, true);
+}
+
+const written = drawing(writing);
+
+/** How many stars run from `at`, up to three, backwards (-1) or forwards (1). */
+function stars(state: EditorState, at: number, direction: -1 | 1): number {
+  let count = 0;
+  for (let pos = direction < 0 ? at - 1 : at; count < 3 && pos >= 0 && pos < state.doc.length && state.sliceDoc(pos, pos + 1) === "*"; pos += direction) count++;
+  return count;
+}
+
+/** Makes each selection bold (two stars) or italic (one), or no longer so: of the stars around it, two or more make it bold, and an odd number italic. */
+const emphasis = (marks: 1 | 2) => (view: EditorView) => {
+  const { state } = view;
+  view.dispatch(
+    state.changeByRange(range => {
+      const around = Math.min(stars(state, range.from, -1), stars(state, range.to, 1));
+      const shift = (marks === 2 ? around >= 2 : around % 2 === 1) ? -marks : marks;
+      const changes =
+        shift < 0
+          ? [{ from: range.from - marks, to: range.from }, { from: range.to, to: range.to + marks }]
+          : [{ from: range.from, insert: "*".repeat(marks) }, { from: range.to, insert: "*".repeat(marks) }];
+      return { changes, range: EditorSelection.range(range.anchor + shift, range.head + shift) };
+    })
   );
+  return true;
+};
+const bold = emphasis(2);
+const italic = emphasis(1);
+
+/** Makes each selection a link's text, with the cursor where its URL goes; with nothing selected, where its text goes. */
+function linkText(view: EditorView): boolean {
+  const { state } = view;
+  view.dispatch(
+    state.changeByRange(range => ({
+      changes: [{ from: range.from, insert: "[" }, { from: range.to, insert: "]()" }],
+      range: EditorSelection.cursor(range.empty ? range.from + 1 : range.to + 3)
+    }))
+  );
+  return true;
+}
 
 /** Makes each selected line a task, or ticks or unticks it if it is one. */
 function task(view: EditorView): boolean {
@@ -183,21 +283,34 @@ function task(view: EditorView): boolean {
   return true;
 }
 
-/** Buttons for what the keyboard does with lines, as phones have no Alt or Tab; they keep the editor's focus. */
+const MOD = /Mac|iPhone|iPad/.test(navigator.userAgent) ? "⌘" : "Ctrl";
+
+/** Buttons for what the keyboard does, as phones have no Ctrl, Alt or Tab, in groups; they keep the editor's focus. */
 function toolbar(view: EditorView): HTMLElement {
   const bar = Object.assign(document.createElement("div"), { className: "cm-tools" });
-  const tools: [string, string, (view: EditorView) => boolean][] = [
-    ["↑", "Move the line up (Alt+↑)", moveLineUp],
-    ["↓", "Move the line down (Alt+↓)", moveLineDown],
-    ["⇤", "Outdent (Shift+Tab)", indentLess],
-    ["⇥", "Indent (Tab)", indentMore],
-    ["☑", "Make the line a task, or tick it", task]
+  const groups: [IconName, string, (view: EditorView) => boolean][][] = [
+    [
+      ["bold", `Bold (${MOD}+B)`, bold],
+      ["italic", `Italic (${MOD}+I)`, italic],
+      ["link", `Link (${MOD}+K)`, linkText]
+    ],
+    [["task", "Make the line a task, or tick it", task]],
+    [
+      ["up", "Move the line up (Alt+↑)", moveLineUp],
+      ["down", "Move the line down (Alt+↓)", moveLineDown],
+      ["outdent", "Outdent (Shift+Tab)", indentLess],
+      ["indent", "Indent (Tab)", indentMore]
+    ]
   ];
-  for (const [label, title, run] of tools) {
-    const button = Object.assign(document.createElement("button"), { type: "button", className: "quiet icon", textContent: label, title, ariaLabel: title });
-    button.onpointerdown = event => event.preventDefault();
-    button.onclick = () => run(view);
-    bar.append(button);
+  for (const [i, group] of groups.entries()) {
+    if (i) bar.append(Object.assign(document.createElement("span"), { className: "cm-tools-gap" }));
+    for (const [name, title, run] of group) {
+      const button = Object.assign(document.createElement("button"), { type: "button", className: "quiet icon", title, ariaLabel: title });
+      button.append(icon(name));
+      button.onpointerdown = event => event.preventDefault();
+      button.onclick = () => run(view);
+      bar.append(button);
+    }
   }
   return bar;
 }
@@ -315,22 +428,22 @@ export async function bind(parent: HTMLElement, lmk: Session, gid: string, blobs
   };
 }
 
-/** Markdown as it reads: headings by their size, emphasis as it says, and faint the marks that make them. */
+/** Markdown as it reads: headings by their size, emphasis as it says, and faint the marks that make them where they show. */
 const reading = HighlightStyle.define([
-  { tag: tags.heading1, fontSize: "1.6em", fontWeight: "600" },
-  { tag: tags.heading2, fontSize: "1.35em", fontWeight: "600" },
-  { tag: tags.heading3, fontSize: "1.15em", fontWeight: "600" },
+  { tag: tags.heading1, fontSize: "1.75em", fontWeight: "650", letterSpacing: "-0.02em" },
+  { tag: tags.heading2, fontSize: "1.375em", fontWeight: "600", letterSpacing: "-0.01em" },
+  { tag: tags.heading3, fontSize: "1.125em", fontWeight: "600" },
   { tag: [tags.heading4, tags.heading5, tags.heading6], fontWeight: "600" },
   { tag: tags.strong, fontWeight: "600" },
   { tag: tags.emphasis, fontStyle: "italic" },
   { tag: tags.strikethrough, textDecoration: "line-through" },
-  { tag: tags.monospace, fontFamily: "ui-monospace, monospace", fontSize: "0.9em" },
+  { tag: tags.monospace, fontFamily: "var(--mono)", fontSize: "0.875em" },
   { tag: [tags.processingInstruction, tags.url, tags.contentSeparator], color: "var(--muted)" }
 ]);
 
 function editor(parent: HTMLElement, text: Y.Text, blobs: Blobs): EditorView {
   const extensions = [
-    keymap.of([...yUndoManagerKeymap, ...defaultKeymap, indentWithTab]),
+    keymap.of([{ key: "Mod-b", run: bold }, { key: "Mod-i", run: italic }, { key: "Mod-k", run: linkText }, ...yUndoManagerKeymap, ...defaultKeymap, indentWithTab]),
     markdown({ base: markdownLanguage }),
     linking(blobs),
     showPanel.of(view => ({ dom: toolbar(view), top: true })),
@@ -338,6 +451,7 @@ function editor(parent: HTMLElement, text: Y.Text, blobs: Blobs): EditorView {
     EditorView.lineWrapping,
     placeholder("Write here. Everyone in this document, people and agents, edits it at once."),
     lists,
+    written,
     StateField.define<DecorationSet>({
       create: state => pictures(state, blobs),
       update: (decorations, tr) => (tr.docChanged ? pictures(tr.state, blobs) : decorations),

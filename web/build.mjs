@@ -19,7 +19,7 @@ await build({
   assetNames: "[name]-[hash]",
   chunkNames: "[name]-[hash]",
   splitting: true,
-  loader: { ".wasm": "file" },
+  loader: { ".wasm": "file", ".woff": "file", ".woff2": "file" },
   publicPath: "/",
   bundle: true,
   minify: true,
@@ -40,7 +40,7 @@ await build({
   outfile: `${out}sw.js`
 });
 // `letmeknow serve` sends these instead when the browser takes them.
-for (const file of readdirSync(out).filter(file => !file.endsWith(".png"))) {
+for (const file of readdirSync(out).filter(file => !/\.(png|woff2?)$/.test(file))) {
   const bytes = readFileSync(out + file);
   writeFileSync(`${out}${file}.br`, brotliCompressSync(bytes));
   writeFileSync(`${out}${file}.gz`, gzipSync(bytes, { level: 9 }));
