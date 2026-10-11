@@ -566,7 +566,7 @@ impl App {
         }
         let joined = node.groups();
         for opening in self.client.device_state()?.openings {
-            if !joined.contains(&opening.group) && !groups.iter().any(|g| g["group"] == json!(opening.group)) {
+            if !joined.contains(&opening.group) && !opening.members.is_empty() && !groups.iter().any(|g| g["group"] == json!(opening.group)) {
                 groups.push(json!({ "group": opening.group, "settings": { "kind": opening.kind, "name": opening.name }, "joined": false }));
             }
         }

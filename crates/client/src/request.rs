@@ -95,7 +95,7 @@ pub enum Request {
         name: String,
     },
     /// Let sessions of an identity join the group without an invite (they run `join <group>`), or with --close, no longer;
-    /// a session not in the group closes it only to its own identity, whose devices then no longer list it
+    /// with --close, a session not in the group takes it off the lists of its own identity's devices
     #[cfg_attr(feature = "clap", command(display_order = 19))]
     Open {
         #[cfg_attr(feature = "clap", arg(long))]

@@ -640,6 +640,45 @@ fn a_session_of_an_identity_joins_a_group_open_to_it() {
     });
 }
 
+/// A group open to an identity leaves its devices' lists once closed to it, once it ends, or once a device of the
+/// identity that is not in it takes it off.
+#[test]
+fn a_group_leaves_an_identitys_lists_closed_ended_or_taken_off() {
+    local(async {
+        let world = world("unlisted").await;
+        let alice = world.start("alice", HOUR).await;
+        alice.cmd(&["identity", "create", "Alice"]).await.unwrap();
+        let tablet = world.start("tablet", HOUR).await;
+        let link = alice.cmd(&["invite", "--identity", "Alice"]).await.unwrap();
+        tablet.cmd(&["identity", "join", link["link"].as_str().unwrap()]).await.unwrap();
+        for name in ["Closed", "Ended", "Taken off"] {
+            alice.cmd(&["invite", "--name", name]).await.unwrap();
+            alice.cmd(&["open", "--group", name, "Alice"]).await.unwrap();
+        }
+        // The names of the groups the tablet lists, none of which it is in.
+        let listed = async || {
+            let groups = tablet.cmd(&["groups"]).await.unwrap();
+            assert!(groups.as_array().unwrap().iter().all(|g| g["joined"] == false), "{groups}");
+            let mut names: Vec<String> = groups.as_array().unwrap().iter().map(|g| g["name"].as_str().unwrap().to_owned()).collect();
+            names.sort();
+            json!(names)
+        };
+        let all = json!(["Closed", "Ended", "Taken off"]);
+        assert_eq!(until(&listed, |names| *names == all).await, all);
+        alice.cmd(&["open", "--group", "Closed", "--close", "Alice"]).await.unwrap();
+        assert_eq!(until(&listed, |names| names.as_array().unwrap().len() < 3).await, json!(["Ended", "Taken off"]));
+        alice.cmd(&["leave", "--group", "Ended"]).await.unwrap();
+        assert_eq!(until(&listed, |names| names.as_array().unwrap().len() < 2).await, json!(["Taken off"]));
+        let refused = tablet.cmd(&["join", "Ended"]).await.unwrap_err().to_string();
+        assert!(refused.contains("open to your identity"), "{refused}");
+        let unlisted = tablet.cmd(&["open", "--group", "Taken off", "--close", "Alice"]).await.unwrap();
+        assert_eq!(keys(&unlisted), keys(&json!({ "group": 0 })));
+        assert_eq!(listed().await, json!([]));
+        let unknown = tablet.cmd(&["open", "--group", "Gone", "--close", "Alice"]).await.unwrap_err().to_string();
+        assert!(unknown.contains("unknown group Gone"), "{unknown}");
+    });
+}
+
 #[test]
 fn a_link_for_one_identity_admits_no_other() {
     local(async {

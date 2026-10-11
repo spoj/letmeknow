@@ -449,7 +449,10 @@ impl<P: Provider + Send + 'static> Client<P> {
                 Ok(json!({ "group": b64(&gid.0), "settings": settings }))
             }
             Request::Open { group, close, identity } => {
-                let gid = self.resolve(group)?;
+                let gid = match self.resolve(group.clone()) {
+                    Err(unknown) if close => return self.unlist(&identity, group.as_deref(), unknown).await,
+                    gid => gid?,
+                };
                 let (id, name) = self.identity_named(&gid, &identity)?;
                 let settings = self
                     .inner
@@ -465,7 +468,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                         settings
                     })
                     .await?;
-                self.refresh_opening(&gid).await?;
+                self.refresh_opening(&gid, Some(settings.open.clone())).await?;
                 Ok(json!({ "group": b64(&gid.0), "settings": settings }))
             }
             Request::Status => self.status(),
@@ -550,7 +553,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             Ok(opened) => Ok((gid, opened)),
             Err(error) => {
                 self.inner.node.leave(&gid.0).await?;
-                self.drop_group(&gid).await?;
+                self.drop_group(&gid, true).await?;
                 Err(error)
             }
         }
@@ -561,7 +564,8 @@ impl<P: Provider + Send + 'static> Client<P> {
         let target = if target.contains('#') {
             Either::Left(Invite::parse(target)?)
         } else {
-            let opening = self.device_state()?.openings.into_iter().find(|o| b64(&o.group.0) == target || o.name == target);
+            let mut openings = self.device_state()?.openings.into_iter();
+            let opening = openings.find(|o| !o.members.is_empty() && (b64(&o.group.0) == target || o.name == target));
             Either::Right(opening.context("expected an invite link, or the id or name of a group open to your identity")?)
         };
         // As the node's, which share one KeyPackage per target.
@@ -611,7 +615,7 @@ impl<P: Provider + Send + 'static> Client<P> {
     async fn leave(&self, gid: &Bytes) -> Result<Value> {
         let gid = gid.clone();
         let Some(sent) = self.inner.node.leave(&gid.0).await? else {
-            self.drop_group(&gid).await?;
+            self.drop_group(&gid, true).await?;
             return Ok(json!({ "group": b64(&gid.0), "left": true }));
         };
         let mut answer = json!({ "group": b64(&gid.0), "left": true, "status": "another member commits the removal" });
@@ -637,8 +641,9 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// Lets go of a group the node has left: tells its kind's plugin, and the shell.
-    async fn drop_group(&self, gid: &Bytes) -> Result<()> {
+    /// Lets go of a group the node has left: tells its kind's plugin, and the shell. A group that `ended`, as this session
+    /// was its last member, opens to no one any longer.
+    async fn drop_group(&self, gid: &Bytes, ended: bool) -> Result<()> {
         let kind = {
             let mut st = self.state();
             st.infos.remove(gid);
@@ -650,6 +655,10 @@ impl<P: Provider + Send + 'static> Client<P> {
         if let Some(kind) = kind {
             // Answered once the plugin let go of the group, so that a doc file it made is gone when `leave` returns.
             self.ask(&kind, json!({ "type": "gone", "group": b64(&gid.0) })).await?;
+        }
+        if ended {
+            let (client, gid) = (self.clone(), gid.clone());
+            self.later(&gid.clone(), Box::pin(async move { client.refresh_opening(&gid, Some(Vec::new())).await }));
         }
         self.emit(ClientEvent::Gone { group: gid.clone() });
         self.inner.node.scrub()
@@ -677,7 +686,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
         let joined = node.groups();
         for opening in self.device_state()?.openings {
-            if !joined.contains(&opening.group) && node.kinds().contains(&opening.kind) {
+            if !joined.contains(&opening.group) && node.kinds().contains(&opening.kind) && !opening.members.is_empty() {
                 groups.push(json!({ "group": b64(&opening.group.0), "kind": opening.kind, "name": opening.name, "joined": false }));
             }
         }
@@ -913,13 +922,13 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let describer = self.describer(&group)?;
                 self.emit(ClientEvent::Joined { group: group.clone(), member: describer.describe(&member), by: describer.describe(&by), how });
                 let client = self.clone();
-                self.later(&group.clone(), Box::pin(async move { client.refresh_opening(&group).await }));
+                self.later(&group.clone(), Box::pin(async move { client.refresh_opening(&group, None).await }));
             }
             Event::Left { group, member, by } => {
                 let describer = self.describer(&group)?;
                 self.emit(ClientEvent::Left { group: group.clone(), member: describer.describe(&member), by: describer.describe(&by) });
                 let client = self.clone();
-                self.later(&group.clone(), Box::pin(async move { client.refresh_opening(&group).await }));
+                self.later(&group.clone(), Box::pin(async move { client.refresh_opening(&group, None).await }));
             }
             Event::Revoked { group, removed, added } => {
                 let describer = self.describer(&group)?;
@@ -927,16 +936,17 @@ impl<P: Provider + Send + 'static> Client<P> {
                 self.emit(ClientEvent::Revoked { group, removed, added });
             }
             Event::Keys { .. } | Event::Duties { .. } => {}
-            Event::Removed { group, by, .. } => {
+            Event::Removed { group, by, last } => {
                 let by = by.map(|by| self.describe(&group, &by)).transpose()?;
-                self.drop_group(&group).await?;
+                self.drop_group(&group, last).await?;
                 self.emit(ClientEvent::Removed { group, by });
             }
             Event::Settings { group, settings, by } => {
                 let by = self.describe(&group, &by)?;
+                let open = settings.open.clone();
                 self.emit(ClientEvent::Settings { group: group.clone(), settings, by });
                 let client = self.clone();
-                self.later(&group.clone(), Box::pin(async move { client.refresh_opening(&group).await }));
+                self.later(&group.clone(), Box::pin(async move { client.refresh_opening(&group, Some(open)).await }));
             }
             Event::Message(message) if message.payload["type"] == "message" && self.chats(&message.group) => {
                 // Chat holds the file a message attaches.
@@ -1032,19 +1042,45 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(describer.members.iter().map(|m| describer.describe(m)).collect())
     }
 
-    /// Records, in the devices group of each of this device's identities the group is open to, the group's opening.
-    async fn refresh_opening(&self, gid: &Bytes) -> Result<()> {
-        let Ok(settings) = self.inner.node.settings(&gid.0) else { return Ok(()) };
-        for (identity, _) in self.device_state()?.identities {
-            if settings.open.iter().any(|named| named.id == identity.id) {
-                let opening = self.inner.node.opening(&gid.0)?;
-                match self.access() {
-                    Access::Here(devices) => devices.set_opening(&identity.id.0, opening).await?,
-                    Access::Elsewhere(remote) => drop(remote.request(Request::SetOpening { identity: identity.id, opening }).await?),
-                }
-            }
+    /// Records the group's opening in the devices group of each of this device's identities: as it stands where the
+    /// group is open to the identity, and with no members where it is not. By `open`, the identities an event told it is
+    /// open to, as the group may be gone by now; or else by its settings.
+    async fn refresh_opening(&self, gid: &Bytes, open: Option<Vec<Named>>) -> Result<()> {
+        let Some(open) = open.or_else(|| self.inner.node.settings(&gid.0).ok().map(|settings| settings.open)) else { return Ok(()) };
+        let state = self.device_state()?;
+        let recorded = state.openings.into_iter().find(|o| o.group == *gid && !o.members.is_empty());
+        for (identity, _) in state.identities {
+            let opening = if open.iter().any(|named| named.id == identity.id) {
+                let Ok(opening) = self.inner.node.opening(&gid.0) else { return Ok(()) };
+                opening
+            } else if let Some(recorded) = &recorded {
+                Opening { members: Vec::new(), ..recorded.clone() }
+            } else {
+                continue;
+            };
+            self.record_opening(&identity.id, opening).await?;
         }
         Ok(())
+    }
+
+    /// Records with no members the opening of a group this session is not in, by the group's id or name, in one of this
+    /// device's identities' devices groups, so that its devices no longer list it; else fails with `unknown`, as naming
+    /// the group among this session's did.
+    async fn unlist(&self, identity: &str, group: Option<&str>, unknown: anyhow::Error) -> Result<Value> {
+        let joined = self.inner.node.groups();
+        let mut listed = self.device_state()?.openings.into_iter().filter(|o| !o.members.is_empty() && !joined.contains(&o.group));
+        let Some(opening) = listed.find(|o| group.is_some_and(|group| b64(&o.group.0) == group || o.name == group)) else { return Err(unknown) };
+        let (identity, _) = self.own_identity(identity)?;
+        self.record_opening(&identity.id, Opening { members: Vec::new(), ..opening.clone() }).await?;
+        Ok(json!({ "group": b64(&opening.group.0) }))
+    }
+
+    /// Records an opening in an identity's devices group, through the device's node.
+    async fn record_opening(&self, identity: &Bytes, opening: Opening) -> Result<()> {
+        match self.access() {
+            Access::Here(devices) => devices.set_opening(&identity.0, opening).await,
+            Access::Elsewhere(remote) => remote.request(Request::SetOpening { identity: identity.clone(), opening }).await.map(drop),
+        }
     }
 
     /// Leaves the groups it speaks as an identity in that its device is no longer on. Returns what failed.
