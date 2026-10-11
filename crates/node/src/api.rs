@@ -10,14 +10,13 @@ use lmk_net::Net;
 use lmk_proto::group::{Certificate, DEVICES, IdentityRef, Settings};
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::Frame;
-use lmk_proto::ranges::Ranges;
 use lmk_proto::Bytes;
 use n0_future::{FutureExt, MergeUnbounded, StreamExt};
 use n0_future::time::{Duration, sleep, timeout};
 use serde_json::{Value, json};
 
 use crate::groups::renaming;
-use crate::{Dropped, G, MEMBER_WAIT, Member, Message, Node, Observation, Positions, Rec, SEND_WAIT, Sent, State, UNFINISHED, Work, device_key_key, endpoint_id, get, kind_key, message_key, put, sending};
+use crate::{G, MEMBER_WAIT, Member, Message, Node, Rec, SEND_WAIT, Sent, State, UNFINISHED, Work, device_key_key, endpoint_id, get, kind_key, message_key, put, sending};
 
 impl<P: Provider + Send + 'static> Node<P> {
     /// Stops the peers and every task.
@@ -139,7 +138,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             if st.group(gid)?.mls.members().len() > 1 {
                 self.inner.start_send(&mut st, gid, &json!({ "type": "leave" }))?
             } else {
-                st.observe(|| Observation::Dropped { group: Bytes(gid.to_vec()), reason: Dropped::Forgotten });
                 drop(st);
                 self.inner.forget(gid)?;
                 return Ok(None);
@@ -241,20 +239,6 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub fn lost(&self, gid: &[u8], id: &[u8]) -> bool {
         let st = self.inner.lock();
         st.position_of(gid, id).ok().flatten().and_then(|position| st.pos(gid, position).ok().flatten()).is_some_and(|pos| pos.lost)
-    }
-
-    /// The group's counted positions as this session stands, as a simulator checks them.
-    pub fn positions(&self, gid: &[u8]) -> Result<Positions> {
-        let st = self.inner.lock();
-        let rec = &st.group(gid)?.rec;
-        let unopened: Ranges = rec.unopened.keys().copied().collect();
-        Ok(Positions {
-            start: rec.start,
-            head: rec.position,
-            held: rec.messages.difference(&rec.lacking).difference(&rec.lost),
-            opened: rec.messages.difference(&unopened).difference(&rec.lost),
-            lost: rec.lost.clone(),
-        })
     }
 
     /// A held message, opened.

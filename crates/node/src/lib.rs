@@ -94,53 +94,10 @@ pub struct Config {
     /// Where committed steps are not durable yet when they commit, as in the browser: makes them so, before anything
     /// they produced leaves the node.
     pub durable: Option<Durable>,
-    /// Told what each step did once it commits, as a simulator checks it. It must not call the node.
-    pub observe: Option<Observe>,
 }
 
 /// Makes the steps committed so far durable.
 pub type Durable = Arc<dyn Fn() -> BoxFuture<Result<()>> + Send + Sync>;
-
-pub type Observe = Arc<dyn Fn(Observation) + Send + Sync>;
-
-/// What a step did to a group, for `Config::observe`.
-#[derive(Clone, Debug)]
-pub enum Observation {
-    /// A position of the group's log judged, in the epoch current then; `entry` is SHA-256 of its bytes.
-    Read { group: Bytes, position: u64, entry: [u8; 32], epoch: u64, verdict: Judgement },
-    /// This session is in the group with `key` from after `start`: its Add, or 0 for the group's creator.
-    Joined { group: Bytes, key: Bytes, start: u64 },
-    /// The last position of the group's log held.
-    Head { group: Bytes, head: u64 },
-    /// A counted position opened, or one of this session's own: of the group's kind or a core payload's type, with
-    /// SHA-256 of its payload.
-    Opened { group: Bytes, position: u64, kind: String, sender: Bytes, plaintext: [u8; 32] },
-    Lost { group: Bytes, position: u64 },
-    /// This session's own `lost` counted at `position`.
-    Announced { group: Bytes, position: u64, positions: Vec<u64> },
-    /// A position kept for a kind other than chat.
-    Handed { group: Bytes, kind: String, position: u64 },
-    Live { group: Bytes, sender: Bytes, epoch: u64 },
-    /// A state of the group's kind taken from the member with key `from`.
-    State { group: Bytes, from: Bytes },
-    /// This session let go of the group other than by its removal.
-    Dropped { group: Bytes, reason: Dropped },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Judgement {
-    Commit { committer: Bytes, added: Vec<Bytes>, removed: Vec<Bytes> },
-    Counted { id: Bytes },
-    Skipped,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Dropped {
-    Retention,
-    Copied,
-    /// It asked to leave, and its leaf was the group's only one.
-    Forgotten,
-}
 
 /// A group member, from its leaf and credential, and its credential's certificate checked against its identity's key
 /// log.
@@ -472,9 +429,6 @@ pub(crate) struct State<P> {
     out: Vec<Out>,
     /// The current step deleted what should leave no copy: scrub once it commits.
     scrub: bool,
-    /// What the current step did, told `Config::observe` once it commits; kept only while there is one.
-    observed: Vec<Observation>,
-    observing: bool,
     /// What the current step tells the session, sent once it commits.
     events: Vec<Event>,
     session: Session,
@@ -544,11 +498,6 @@ impl<P: Provider + Send + 'static> Drop for Step<'_, P> {
         {
             self.inner.warn(None, format!("{error:#}"));
         }
-        if let Some(observe) = &self.inner.observe {
-            for observation in std::mem::take(&mut self.guard.observed) {
-                observe(observation);
-            }
-        }
         for event in std::mem::take(&mut self.guard.events) {
             self.inner.events.send(event).ok();
         }
@@ -600,7 +549,6 @@ pub(crate) struct Inner<P> {
     /// What steps produced for the peers, in order, sent once durable.
     outbox: mpsc::UnboundedSender<Vec<Out>>,
     durable: Option<Durable>,
-    observe: Option<Observe>,
     committing: tokio::sync::Mutex<()>,
     /// Woken whenever a group's log is read further, for sends waiting to reach its head.
     advanced: tokio::sync::Notify,
@@ -658,12 +606,6 @@ fn endpoint_id(key: &[u8]) -> Option<EndpointId> {
 }
 
 impl<P: Provider> State<P> {
-    pub(crate) fn observe(&mut self, observation: impl FnOnce() -> Observation) {
-        if self.observing {
-            self.observed.push(observation());
-        }
-    }
-
     /// What the credential of the group this session makes or joins next names: the certificate of its identity.
     fn speak(&mut self, identity: Option<Certificate>) {
         self.session.credential.certificate = identity.map(Box::new);
@@ -817,9 +759,6 @@ impl<P: Provider> State<P> {
     fn add_group(&mut self, mls: Group, mut rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
         (rec.updated, rec.shown) = (now(), rec.position);
-        let own = mls.members().into_iter().find(|m| m.index == mls.own_index()).context("a member of its group")?;
-        let (key, start) = (Bytes(own.key), rec.start);
-        self.observe(|| Observation::Joined { group: Bytes(gid.clone()), key, start });
         self.add_log(&gid, logs::Log::new(logs::Of::Group, mls.settings().membership, rec.position))?;
         self.groups.insert(gid.clone(), G::new(mls, rec, BTreeMap::new()));
         self.save(&gid)?;
@@ -827,78 +766,6 @@ impl<P: Provider> State<P> {
         self.gate = true;
         Ok(gid)
     }
-}
-
-/// A group's counted positions, of those kept: those whose ciphertext this session holds, those it opened or sent, and
-/// its known losses; with its start, and the last position it judged.
-#[derive(Clone, Debug)]
-pub struct Positions {
-    pub start: u64,
-    pub head: u64,
-    pub held: Ranges,
-    pub opened: Ranges,
-    pub lost: Ranges,
-}
-
-/// A group's records as storage holds them, which a session starts from.
-#[derive(Clone, Debug)]
-pub struct Saved {
-    /// openmls's.
-    pub epoch: u64,
-    pub start: u64,
-    /// What this session kept of positions up to here is gone, read longer than H ago.
-    pub expired: u64,
-    /// The last position judged, and the last held.
-    pub head: u64,
-    pub logged: u64,
-    /// The kept positions with a verdict, and the commits among them with the epoch each was judged in.
-    pub judged: Vec<u64>,
-    pub commits: Vec<(u64, u64)>,
-    /// As the summary shows it.
-    pub held: Ranges,
-    /// SHA-256 of the entries saved for posting: a staged commit's, and pending sends'.
-    pub entries: Vec<[u8; 32]>,
-    /// The epochs pending sends are sealed in.
-    pub sends: Vec<u64>,
-    /// The iroh keys of the peers whose summaries are kept, and of the current epoch's leaves.
-    pub summaries: Vec<Bytes>,
-    pub roster: Vec<Bytes>,
-}
-
-/// A group's records, read from storage alone; none if this session holds none of it.
-pub fn saved(provider: &impl Provider, gid: &[u8]) -> Result<Option<Saved>> {
-    let Some(rec) = get::<Rec>(provider, &rec_key(gid))? else { return Ok(None) };
-    let mls = Group::load(provider, gid)?;
-    let log: logs::Log = get(provider, &logs::log_key(gid))?.context("a group without its log")?;
-    let (mut judged, mut commits) = (Vec::new(), Vec::new());
-    for position in rec.expired + 1..=rec.position {
-        let Some(pos) = get::<reading::Pos>(provider, &reading::pos_key(gid, position))? else { continue };
-        judged.push(position);
-        if let reading::Judged::Commit { .. } = pos.judged {
-            commits.push((position, pos.epoch));
-        }
-    }
-    let mut entries: Vec<[u8; 32]> = mls.posted().map(|posted| Sha256::digest(posted).into()).into_iter().collect();
-    let mut sends = Vec::new();
-    for handle in &rec.sends {
-        let (epoch, entry) = sending::sealed(provider, &handle.0)?;
-        entries.push(Sha256::digest(entry).into());
-        sends.push(epoch);
-    }
-    Ok(Some(Saved {
-        epoch: mls.epoch(),
-        start: rec.start,
-        expired: rec.expired,
-        head: rec.position,
-        logged: log.logged,
-        judged,
-        commits,
-        held: Ranges::range(rec.expired + 1, rec.position).difference(&rec.lacking).difference(&rec.lost),
-        entries,
-        sends,
-        summaries: peering::load_heard(provider, gid)?.into_keys().collect(),
-        roster: mls.members().into_iter().filter_map(|m| Some(m.leaf?.key)).collect(),
-    }))
 }
 
 /// The session's iroh key, made on first use.

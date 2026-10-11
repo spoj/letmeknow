@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use lmk_core::identity::{KeyLog, Verdict};
 use lmk_proto::group::IdentityRef;
 
-use crate::{Dropped, Event, Inner, MEMBER_WAIT, Observation, REREAD, State, SUBSCRIBED, Work, get, hex, put};
+use crate::{Event, Inner, MEMBER_WAIT, REREAD, State, SUBSCRIBED, Work, get, hex, put};
 
 pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
@@ -219,7 +219,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     if error.downcast_ref::<Refused>().is_some_and(|refused| refused.0 == "expired")
                         && self.lock().log(id).is_ok_and(|log| log.of == Of::Group)
                     {
-                        self.lock().observe(|| Observation::Dropped { group: Bytes(id.to_vec()), reason: Dropped::Retention });
                         self.work.send(Work::Gone(id.to_vec())).ok();
                     }
                     return Err(error);
@@ -262,10 +261,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         st.save_log(id)?;
         if !fresh.is_empty() {
-            if st.log(id)?.of == Of::Group {
-                let head = st.log(id)?.logged;
-                st.observe(|| Observation::Head { group: Bytes(id.to_vec()), head });
-            }
             self.check(st, id)?;
         }
         Ok(())
