@@ -39,9 +39,6 @@ use crate::{
 
 /// How long to wait for a peer's `have`.
 const ANSWER_WAIT: Duration = Duration::from_secs(5);
-/// How long a stopping session waits for peers to acknowledge that its connections closed, which takes three round
-/// trips' timeouts per connection. A peer told nothing yet finds out when the connection times out.
-const CLOSE_WAIT: Duration = Duration::from_millis(250);
 
 /// What this crate needs from the group logic to serve files and gate frames. Calls are quick and local.
 pub trait Groups: Send + Sync + 'static {
@@ -249,6 +246,9 @@ impl Net {
         self.inner.files.read(link, out).await
     }
 
+    /// Closes the files store, then the connections and the endpoint, each in full: a session started again in this
+    /// process can open the store only once it is closed (on Windows), and is reached only once no endpoint of its key
+    /// is left closing, refusing connections.
     pub async fn shutdown(&self) -> Result<()> {
         #[cfg(not(target_family = "wasm"))]
         let publishing = self.inner.publishing.lock().unwrap().take();
@@ -262,11 +262,8 @@ impl Net {
                 removed => removed?,
             }
         }
-        // The store closes in full, the connections within CLOSE_WAIT and after it in the background.
         self.inner.files.shutdown().await?;
-        if let Ok(shut) = timeout(CLOSE_WAIT, self.router.shutdown()).await {
-            shut?;
-        }
+        self.router.shutdown().await?;
         Ok(())
     }
 }
