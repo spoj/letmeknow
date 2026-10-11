@@ -65,6 +65,9 @@ const SEND_WAIT: Duration = Duration::from_secs(5);
 const MEMBER_WAIT: Duration = Duration::from_secs(5);
 /// How often a followed log is read again whole.
 const REREAD: Duration = Duration::from_secs(5 * 60);
+/// How long after subscribing to a log it is read again, for what was appended before the subscription reached the
+/// service.
+const SUBSCRIBED: Duration = Duration::from_secs(10);
 /// How long a member admitting a joiner waits for the state of the group's kind.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 /// How long a session whose kind is behind waits before it asks the members online for the kind's state again, in
