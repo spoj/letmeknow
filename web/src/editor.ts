@@ -1,13 +1,15 @@
 // A doc's editor: markdown in CodeMirror, bound to the doc's Yjs text, which edits here and the copy the doc kind's
-// in-page plugin keeps (lmk_kind_doc::Page, through its commands) keep in step. "- [ ]" items show as checkboxes that tick with
-// a click; a toolbar (and Alt+↑/↓, Tab, Shift+Tab) moves and indents lines. Links show as their text, and open on a
-// click, except on the line being edited. Images the doc links show below their line; pasting or dropping a file
-// uploads it and inserts its link.
+// in-page plugin keeps (lmk_kind_doc::Page, through its commands) keep in step. It reads as written text: headings by
+// size, markdown's marks faint where they stand, list items hanging under their bullets, which show as dots, and "- [ ]"
+// items as checkboxes that tick with a click; a toolbar (and Alt+↑/↓, Tab, Shift+Tab) moves and indents lines. Links
+// show as their text, and open on a click, except while the cursor is in them. Images the doc links show below their
+// line; pasting or dropping a file uploads it and inserts its link.
 import { defaultKeymap, indentLess, indentMore, indentWithTab, moveLineDown, moveLineUp } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { defaultHighlightStyle, syntaxHighlighting, syntaxTree } from "@codemirror/language";
+import { HighlightStyle, syntaxHighlighting, syntaxTree } from "@codemirror/language";
 import { EditorState, type Range, StateField } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, ViewPlugin, type ViewUpdate, WidgetType, keymap, placeholder, showPanel } from "@codemirror/view";
+import { tags } from "@lezer/highlight";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import * as Y from "yjs";
 import type { Session } from "./client";
@@ -30,32 +32,63 @@ class Checkbox extends WidgetType {
   }
 }
 
-function boxes(view: EditorView): DecorationSet {
-  const found: Range<Decoration>[] = [];
-  for (const { from, to } of view.visibleRanges) {
-    for (let pos = from; pos <= to; ) {
-      const line = view.state.doc.lineAt(pos);
-      const match = /^\s*[-*+] \[([ xX])\]/.exec(line.text);
-      if (match) {
-        const at = line.from + match[0].length - 3;
-        found.push(Decoration.replace({ widget: new Checkbox(match[1] !== " ") }).range(at, at + 3));
-      }
-      pos = line.to + 1;
-    }
+class Dot extends WidgetType {
+  eq() {
+    return true;
   }
-  return Decoration.set(found);
+
+  toDOM() {
+    return Object.assign(document.createElement("span"), { className: "cm-dot" });
+  }
 }
 
-const checkboxes = ViewPlugin.fromClass(
+/** The width of a character of a list item's indent or marker, in em: wider than most, so that lists line up in any font. */
+const CHAR = 0.6;
+
+/**
+ * List items as in written lists: an item's indent and marker take a set width a character, so that its wrapped lines
+ * start under its text. A bullet shows as a dot, and a task's checkbox, which ticks with a click, takes its bullet's place.
+ */
+function items(view: EditorView): DecorationSet {
+  const { state } = view;
+  const found: Range<Decoration>[] = [];
+  const width = (chars: number) => ({ style: `display: inline-block; min-width: ${chars * CHAR}em; text-indent: 0` });
+  for (const { from, to } of view.visibleRanges) {
+    syntaxTree(state).iterate({
+      from,
+      to,
+      enter: node => {
+        if (node.name === "TaskMarker") {
+          found.push(Decoration.replace({ widget: new Checkbox(state.sliceDoc(node.from + 1, node.to - 1) !== " ") }).range(node.from, node.to));
+        }
+        if (node.name !== "ListMark") return;
+        const line = state.doc.lineAt(node.from);
+        const task = /^ \[[ xX]\] /.test(state.sliceDoc(node.to, node.to + 5));
+        const marker = task ? 3 : node.to - node.from + 1;
+        const indent = state.sliceDoc(line.from, node.from).replace(/\t/g, "    ").length;
+        const hang = (indent + marker) * CHAR;
+        found.push(Decoration.line({ attributes: { style: `padding-left: calc(var(--s4) + ${hang}em); text-indent: -${hang}em` } }).range(line.from));
+        if (indent) found.push(Decoration.mark({ attributes: width(indent) }).range(line.from, node.from));
+        // Inclusive, so that it holds the dot that starts it.
+        found.push(Decoration.mark({ inclusiveStart: true, attributes: width(marker) }).range(node.from, Math.min(node.to + (task ? 5 : 1), line.to)));
+        if (task) found.push(Decoration.replace({}).range(node.from, node.to + 1));
+        else if (/[-*+]/.test(state.sliceDoc(node.from, node.to))) found.push(Decoration.replace({ widget: new Dot() }).range(node.from, node.to));
+      }
+    });
+  }
+  return Decoration.set(found, true);
+}
+
+const lists = ViewPlugin.fromClass(
   class {
     decorations: DecorationSet;
 
     constructor(view: EditorView) {
-      this.decorations = boxes(view);
+      this.decorations = items(view);
     }
 
     update(update: ViewUpdate) {
-      if (update.docChanged || update.viewportChanged) this.decorations = boxes(update.view);
+      if (update.docChanged || update.viewportChanged || syntaxTree(update.state) !== syntaxTree(update.startState)) this.decorations = items(update.view);
     }
   },
   {
@@ -73,12 +106,11 @@ const checkboxes = ViewPlugin.fromClass(
 );
 
 /**
- * Links: `[text](url)` shows as its text, styled as a link, unless a cursor is on its line; bare URLs are links too. An
- * image the doc links (`![alt](lmk:…)`) shows only as the image below its line, unless a cursor is on that line.
+ * Links: `[text](url)` shows as its text, styled as a link, unless a cursor is in it; bare URLs are links too. An image
+ * the doc links (`![alt](lmk:…)`) shows only as the image below its line, unless a cursor is in its link.
  */
 function links(view: EditorView): DecorationSet {
   const { state } = view;
-  const editing = new Set(state.selection.ranges.map(r => state.doc.lineAt(r.head).number));
   const found: Range<Decoration>[] = [];
   const link = (from: number, to: number, href: string) =>
     found.push(Decoration.mark({ class: "cm-link", attributes: { "data-href": href, title: href } }).range(from, to));
@@ -93,7 +125,7 @@ function links(view: EditorView): DecorationSet {
         const url = node.node.getChild("URL");
         if (!url || !close) return false;
         const href = state.sliceDoc(url.from, url.to);
-        const shown = !editing.has(state.doc.lineAt(node.from).number);
+        const shown = !state.selection.ranges.some(r => r.from <= node.to && r.to >= node.from);
         if (node.name === "Image") {
           if (shown && href.startsWith("lmk:")) found.push(Decoration.replace({}).range(node.from, node.to));
         } else if (close.from > open.to) {
@@ -283,16 +315,29 @@ export async function bind(parent: HTMLElement, lmk: Session, gid: string, blobs
   };
 }
 
+/** Markdown as it reads: headings by their size, emphasis as it says, and faint the marks that make them. */
+const reading = HighlightStyle.define([
+  { tag: tags.heading1, fontSize: "1.6em", fontWeight: "600" },
+  { tag: tags.heading2, fontSize: "1.35em", fontWeight: "600" },
+  { tag: tags.heading3, fontSize: "1.15em", fontWeight: "600" },
+  { tag: [tags.heading4, tags.heading5, tags.heading6], fontWeight: "600" },
+  { tag: tags.strong, fontWeight: "600" },
+  { tag: tags.emphasis, fontStyle: "italic" },
+  { tag: tags.strikethrough, textDecoration: "line-through" },
+  { tag: tags.monospace, fontFamily: "ui-monospace, monospace", fontSize: "0.9em" },
+  { tag: [tags.processingInstruction, tags.url, tags.contentSeparator], color: "var(--muted)" }
+]);
+
 function editor(parent: HTMLElement, text: Y.Text, blobs: Blobs): EditorView {
   const extensions = [
     keymap.of([...yUndoManagerKeymap, ...defaultKeymap, indentWithTab]),
     markdown({ base: markdownLanguage }),
     linking(blobs),
     showPanel.of(view => ({ dom: toolbar(view), top: true })),
-    syntaxHighlighting(defaultHighlightStyle),
+    syntaxHighlighting(reading),
     EditorView.lineWrapping,
     placeholder("Write here. Everyone in this document, people and agents, edits it at once."),
-    checkboxes,
+    lists,
     StateField.define<DecorationSet>({
       create: state => pictures(state, blobs),
       update: (decorations, tr) => (tr.docChanged ? pictures(tr.state, blobs) : decorations),

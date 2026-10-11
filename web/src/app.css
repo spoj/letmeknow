@@ -120,10 +120,11 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 .editor { flex: 1; min-width: 0; overflow: auto; }
 .editor .cm-editor { min-height: 100%; }
 .editor .cm-editor.cm-focused { outline: none; }
-.editor .cm-content { padding: var(--s3) 0; }
+.editor .cm-content { max-width: 46rem; margin: 0 auto; padding: var(--s3) 0; }
 .editor .cm-line { padding: 0 var(--s4); }
 .editor .cm-scroller { font-family: inherit; line-height: 1.6; }
 .cm-task { margin: 0 2px; vertical-align: middle; }
+.cm-dot { display: inline-block; width: 0.32em; height: 0.32em; margin: 0 0.14em; border-radius: 50%; background: var(--muted); vertical-align: 0.22em; }
 
 .log { position: relative; flex: 1; min-height: 0; display: flex; }
 .messages { flex: 1; overflow-y: auto; overflow-anchor: none; list-style: none; margin: 0; padding: var(--s4) var(--s3); display: flex; flex-direction: column; }
