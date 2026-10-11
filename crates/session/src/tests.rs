@@ -260,7 +260,8 @@ fn send_answers_the_position_and_refuses_a_message_too_large() {
         let before = lmk_node::now();
         let sent = alice.cmd(&["send", "--urgent", "anyone?"]).await.unwrap();
         assert!(sent["position"].is_u64(), "{sent}");
-        let status = alice.cmd(&["status"]).await.unwrap();
+        // Alice finds out that Bob's connection closed once his close reaches her.
+        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["online"] == json!([])).await;
         assert_eq!(status["groups"][0]["online"], json!([]));
         // Once Bob is back, he takes it.
         let mut bob = world.start("bob", HOUR).await;
@@ -489,7 +490,8 @@ fn status_lists_sends_held_only_here_and_members_away() {
         assert!(status.get("warning").is_none());
         bob.stop().await;
         SHIFT.store(8 * 24 * 3600 * 1000, std::sync::atomic::Ordering::Relaxed);
-        let status = alice.cmd(&["status"]).await.unwrap();
+        // Once Bob's close reaches Alice.
+        let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["away"][0]["name"] == "Bob").await;
         assert_eq!(status["groups"][0]["away"][0]["name"], "Bob", "not heard from for longer than members carry messages");
         assert_eq!(alice.cmd(&["members"]).await.unwrap()["members"].as_array().unwrap().len(), 2, "away, not removed");
     });
