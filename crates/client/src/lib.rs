@@ -493,7 +493,8 @@ impl<P: Provider + Send + 'static> Client<P> {
 
     /// Adds a session of one of this identity's devices to a group: by an invite that admits only that device's
     /// sessions, valid for `ADD_VALID`, which the device's node hands that device in the identity group. `target` is a
-    /// running session's handle, or a device, by its name or key, whose session is the one it runs, or with none the one
+    /// device's name and one of the sessions it runs, as members show them ("desk (swift-koala)"); a session's handle
+    /// that only one device runs; or a device, by its name or key, whose session is the one it runs, or with none the one
     /// that next acts for it, as a browser. It is refused while the group has a member of this identity on a device of
     /// that name, with that session's handle if it names one.
     async fn add(&self, target: &str, group: Option<String>) -> Result<Value> {
@@ -501,9 +502,17 @@ impl<P: Provider + Send + 'static> Client<P> {
         let listed = Box::pin(self.request(Request::Identity { op: IdentityOp::List })).await?;
         let devices = listed["devices"].as_array().context(NO_IDENTITY)?;
         let sessions = |device: &Value| device["sessions"].as_array().cloned().unwrap_or_default();
-        let (device, session) = match devices.iter().find(|device| sessions(device).iter().any(|session| session == target)) {
-            Some(device) => (device, target.to_owned()),
-            None => {
+        let runs = |device: &Value, handle: &str| sessions(device).iter().any(|session| session == handle);
+        let running: Vec<&Value> = devices.iter().filter(|device| runs(device, target)).collect();
+        ensure!(running.len() < 2, "several of your devices run a session {target}: add one as \"<device> ({target})\"");
+        let named = target.strip_suffix(')').and_then(|target| target.rsplit_once(" ("));
+        let (device, session) = match (running.first(), named) {
+            (Some(device), _) => (*device, target.to_owned()),
+            (None, Some((name, handle))) => {
+                let device = devices.iter().find(|device| device["name"] == name && runs(device, handle));
+                (device.with_context(|| format!("none of your devices {name} runs a session {handle}: see `identity list`"))?, handle.to_owned())
+            }
+            (None, None) => {
                 let device = devices.iter().find(|device| device["name"] == target || device["key"] == target);
                 let device = device.with_context(|| format!("none of your devices is {target}, nor runs a session {target}: see `identity list`"))?;
                 let running = sessions(device);

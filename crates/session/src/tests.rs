@@ -1066,6 +1066,20 @@ fn an_add_brings_a_session_of_another_device_into_a_group_once() {
         assert!(again.contains("desk is in this group already"), "{again}");
         let stale = Request::Added { link: link.to_owned(), group: serde_json::from_value(json!(group)).unwrap(), device: "laptop".into() };
         assert_eq!(crate::cli::call(&desk.home, &desk.handle, stale).await.unwrap(), Value::Null);
+
+        // Two devices run a session "other": an add names one as members show it.
+        desk.cmd(&["identity", "rename", "--device", "desk"]).await.unwrap();
+        let _mine = world.start_in("bob", "other", HOUR).await;
+        let heard = |listed: &Value| {
+            let devices = listed["devices"].as_array().unwrap();
+            let other = |d: &Value| d["sessions"].as_array().is_some_and(|sessions| sessions.contains(&json!("other")));
+            devices.iter().all(other) && devices.iter().any(|d| d["name"] == "desk")
+        };
+        until(|| async { bob.cmd(&["identity", "list"]).await.unwrap() }, heard).await;
+        let several = bob.cmd(&["add", "other", &format!("--group={group}")]).await.unwrap_err().to_string();
+        assert!(several.contains("several of your devices run a session other"), "{several}");
+        let added = bob.cmd(&["add", "desk (other)", &format!("--group={group}")]).await.unwrap();
+        assert_eq!((added["device"].as_str(), added["session"].as_str()), (Some("desk"), Some("other")));
     });
 }
 

@@ -731,7 +731,7 @@ class View {
       const has = (device: string, session?: string) => own.some(m => m.device === device && (!session || m.handle === session));
       const others = listed.devices.filter(d => !d.you);
       const targets = others.flatMap(d =>
-        d.sessions.length ? d.sessions.filter(s => !has(d.name, s)).map(s => [`${d.name} · ${s}`, s]) : has(d.name) ? [] : [[d.name, d.key]]
+        d.sessions.length ? d.sessions.filter(s => !has(d.name, s)).map(s => [`${d.name} · ${s}`, `${d.name} (${s})`]) : has(d.name) ? [] : [[d.name, d.key]]
       );
       const add = ([label, target]: string[]) => {
         const button = h("button", { type: "button" }, "Add");

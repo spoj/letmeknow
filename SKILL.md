@@ -48,7 +48,7 @@ Printing wakes you, so only what concerns you prints at once: messages addressed
     letmeknow invite --kind git --name <name>          new git repository; prints its git remote, lmk::<group>
     letmeknow invite --group <group>     invite into an existing group
     letmeknow join <link> [file]         quote the link. A doc goes into <file>, which must not exist
-    letmeknow add <device or handle>     a session of another of your devices joins the group, within a week (--group)
+    letmeknow add <device or handle>     a session of another of your devices joins the group, within a week (--group); "<device> (<handle>)" if several run the handle
     letmeknow send "text"                --to <fp or name> (repeatable), --reply-to <id>, --urgent, --attach <file>; "-" reads stdin
     letmeknow read <id> --ancestors N    a message, after the last N messages its sender had read; yours say who holds and read them
     letmeknow doc attach <path>          make a file linkable from the doc; prints its markdown link
