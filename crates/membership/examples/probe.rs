@@ -4,7 +4,7 @@
 use anyhow::{Result, ensure};
 use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, endpoint::presets};
 use iroh_relay::RelayQuicConfig;
-use lmk_membership::{Membership, client::ServeClient};
+use lmk_membership::client::ServeClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use lmk_core::provider::Provider;
 use lmk_membership::client::ServeClient;
-use lmk_membership::{Chain, Contradiction, Membership, Refused};
+use lmk_membership::{Chain, Contradiction, Refused};
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
@@ -27,7 +27,7 @@ pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 /// One membership client per service, sharing the session's endpoint.
 pub(crate) struct Clients {
     endpoint: iroh::Endpoint,
-    clients: Mutex<HashMap<String, Arc<dyn Membership>>>,
+    clients: Mutex<HashMap<String, ServeClient>>,
 }
 
 impl Clients {
@@ -35,16 +35,13 @@ impl Clients {
         Clients { endpoint, clients: Mutex::default() }
     }
 
-    pub fn client(&self, service: &Service) -> Result<Arc<dyn Membership>> {
+    pub fn client(&self, service: &Service) -> Result<ServeClient> {
         let name = serde_json::to_string(service)?;
         let mut clients = self.clients.lock().unwrap();
         if let Some(client) = clients.get(&name) {
             return Ok(client.clone());
         }
-        let client: Arc<dyn Membership> = match service {
-            Service::Serve { .. } => Arc::new(ServeClient::for_service(self.endpoint.clone(), service)?),
-            Service::Newer(_) => anyhow::bail!("a newer letmeknow made this membership service; update letmeknow"),
-        };
+        let client = ServeClient::for_service(self.endpoint.clone(), service)?;
         clients.insert(name, client.clone());
         Ok(client)
     }

@@ -17,7 +17,7 @@ use iroh_relay::{
     server::{CertConfig, QuicConfig, RelayConfig as RelayServerConfig, Server, ServerConfig, TlsConfig},
 };
 use lmk_membership::{
-    Contradiction, Forged, Membership, Refused,
+    Contradiction, Forged, Refused,
     client::ServeClient,
     service::{Policy, Service},
     store::Store,

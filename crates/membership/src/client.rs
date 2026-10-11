@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
-use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 use iroh::{Endpoint, EndpointAddr, PublicKey, endpoint::Connection};
 use lmk_proto::{
@@ -17,8 +16,10 @@ use serde::de::DeserializeOwned;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{Chain, Membership, Refused, Subscription, Unreached, chain::Chains};
+use crate::{Chain, Refused, Subscription, Unreached, chain::Chains};
 
+/// Every head it returns has been checked against its chain of the log: a bad signature is a [`Forged`](crate::Forged)
+/// error, a head that contradicts the chain a [`Contradiction`](crate::Contradiction).
 #[derive(Clone)]
 pub struct ServeClient(Arc<Inner>);
 
@@ -51,7 +52,7 @@ impl ServeClient {
 
     pub fn for_service(endpoint: Endpoint, service: &Service) -> Result<Self> {
         let Service::Serve { key, relay, addrs, .. } = service else {
-            anyhow::bail!("not a serve service")
+            anyhow::bail!("a newer letmeknow made this membership service; update letmeknow")
         };
         Self::new(endpoint, &key.0, relay, addrs)
     }
@@ -121,9 +122,9 @@ impl ServeClient {
     }
 }
 
-#[async_trait]
-impl Membership for ServeClient {
-    async fn append(&self, log: &[u8], entries: &[Vec<u8>]) -> Result<Appended> {
+impl ServeClient {
+    /// Appends entries one after another, as one append against the service's rate limit.
+    pub async fn append(&self, log: &[u8], entries: &[Vec<u8>]) -> Result<Appended> {
         let entries: Vec<Bytes> = entries.iter().map(|entry| Bytes(entry.clone())).collect();
         let appended: Appended = self.request(Request::Append { log: log.into(), entries: entries.clone() }).await?;
         let after = appended.position.checked_sub(1).context("appended at position 0")?;
@@ -131,19 +132,22 @@ impl Membership for ServeClient {
         Ok(appended)
     }
 
-    async fn read(&self, log: &[u8], after: u64) -> Result<Page> {
+    /// One page of the entries after `after`.
+    pub async fn read(&self, log: &[u8], after: u64) -> Result<Page> {
         let page: Page = self.request(Request::Read { log: log.into(), after }).await?;
         self.0.chains.page(log, after, &page.entries, &page.head)?;
         Ok(page)
     }
 
-    async fn head(&self, log: &[u8]) -> Result<Head> {
+    pub async fn head(&self, log: &[u8]) -> Result<Head> {
         let Latest { head } = self.request(Request::Head { log: log.into() }).await?;
         self.0.chains.head(log, &head)?;
         Ok(head)
     }
 
-    async fn subscribe(&self, logs: Vec<Bytes>) -> Result<Subscription> {
+    /// New entries of these logs, in order. Once the client's chain of a log has started, notices continue it
+    /// without gaps; read first to catch up, since a subscription brings only what arrives after it.
+    pub async fn subscribe(&self, logs: Vec<Bytes>) -> Result<Subscription> {
         let (mut send, mut recv) = self.connection().await?.open_bi().await?;
         frame::write(
             &mut send,
@@ -171,11 +175,13 @@ impl Membership for ServeClient {
         Ok(Subscription(notices))
     }
 
-    fn chain(&self, log: &[u8]) -> Option<Chain> {
+    /// The client's chain of a log, to persist.
+    pub fn chain(&self, log: &[u8]) -> Option<Chain> {
         self.0.chains.get(log)
     }
 
-    fn set_chain(&self, chain: Chain) {
+    /// Restores a persisted chain.
+    pub fn set_chain(&self, chain: Chain) {
         self.0.chains.set(chain)
     }
 }

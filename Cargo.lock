@@ -2907,7 +2907,6 @@ name = "lmk-membership"
 version = "0.13.2"
 dependencies = [
  "anyhow",
- "async-trait",
  "ed25519-dalek 3.0.0",
  "hex",
  "iroh",

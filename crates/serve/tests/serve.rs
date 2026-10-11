@@ -2,7 +2,7 @@ use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, endpoint::presets, tls::CaTlsConfig};
 use iroh_relay::RelayQuicConfig;
-use lmk_membership::{Membership, client::ServeClient};
+use lmk_membership::client::ServeClient;
 use lmk_serve::{Certificate, ServeConfig, serve};
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::{

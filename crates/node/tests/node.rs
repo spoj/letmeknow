@@ -951,7 +951,6 @@ async fn a_device_missing_the_current_key_asks_for_it_and_reports_it_lost() {
 async fn a_session_updates_an_older_leaf_as_it_starts() {
     use lmk_core::group::{Change, Group, Session as Mls};
     use lmk_core::provider::SqliteProvider;
-    use lmk_membership::Membership;
     let relay = relay().await;
     let dir = folder("revision");
     std::fs::create_dir_all(&dir).unwrap();
