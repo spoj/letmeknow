@@ -886,7 +886,7 @@ class ChatView extends View {
     let at: Element | null = this.list.firstElementChild;
     for (const item of items) {
       const key = "id" in item ? item.id : `${item.type} ${item.at}`;
-      const follows = item.type === "message" && previous?.type === "message" && previous.from.fp === item.from.fp && item.at - previous.at < 300_000 && !item.reply_to;
+      const follows = item.type === "message" && previous?.type === "message" && previous.from.fp === item.from.fp && sentAt(item) - sentAt(previous) < 300_000 && !item.reply_to;
       const json = JSON.stringify([item, follows, item.type === "message" && item.failed?.error]);
       previous = item;
       keep.add(key);
@@ -907,7 +907,7 @@ class ChatView extends View {
   }
 
   private line(item: Item, items: Item[], follows: boolean): HTMLElement {
-    const at = timeOf(item.at);
+    const at = timeOf(sentAt(item));
     switch (item.type) {
       case "message": {
         const parent = item.reply_to ? (items.find(i => i.type === "message" && i.id === item.reply_to) as Message | undefined) : undefined;
@@ -1148,6 +1148,9 @@ class DocView extends View {
     this.bound?.destroy();
   }
 }
+
+/** When an item happened: a message as its sender's clock says it was sent, if it says; else when it arrived. */
+const sentAt = (item: Item) => (item.type === "message" && item.sent_at) || item.at;
 
 function timeOf(at: number): HTMLElement {
   return h("time", { dateTime: new Date(at).toISOString(), title: new Date(at).toLocaleString() }, new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));

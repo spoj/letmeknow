@@ -811,6 +811,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             reply_to: chat.reply_to.map(|id| Bytes(id.to_vec())),
             urgent: chat.urgent,
             attachment: attachment.as_ref().map(|(_, a)| a.clone()),
+            sent_at: Some(lmk_node::now()),
         };
         let sent = node.send(&gid.0, &serde_json::to_value(payload)?).await?;
         let id = sent.id.clone();
@@ -1539,7 +1540,7 @@ mod tests {
     }
 
     fn chat(sender: u8, position: u64, read: Ranges) -> Message {
-        let payload = serde_json::to_value(ChatMessage { content: String::new(), read, to: Vec::new(), reply_to: None, urgent: false, attachment: None });
+        let payload = serde_json::to_value(ChatMessage { content: String::new(), read, to: Vec::new(), reply_to: None, urgent: false, attachment: None, sent_at: None });
         Message {
             id: Bytes(vec![sender, position as u8]),
             group: Bytes::default(),

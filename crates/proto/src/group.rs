@@ -167,6 +167,9 @@ pub struct ChatMessage {
     pub urgent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<Attachment>,
+    /// When the sender sent it, by its clock: milliseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,8 +207,9 @@ mod tests {
             reply_to: None,
             urgent: false,
             attachment: None,
+            sent_at: Some(5),
         };
-        assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","read":[[1,3]]}"#);
+        assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","read":[[1,3]],"sent_at":5}"#);
         let folder = serde_json::to_string(&Service::Folder("/tmp/x".into())).unwrap();
         assert_eq!(folder, r#"{"folder":"/tmp/x"}"#);
     }

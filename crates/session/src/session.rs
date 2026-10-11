@@ -572,6 +572,9 @@ impl Session {
         if let Some(attachment) = payload.get("attachment") {
             item["attachment"] = attachment.clone();
         }
+        if let Some(sent_at) = payload.get("sent_at") {
+            item["sent_at"] = sent_at.clone();
+        }
         Ok(item)
     }
 

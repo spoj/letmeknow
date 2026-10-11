@@ -277,6 +277,7 @@ fn send_answers_the_position_and_refuses_a_message_too_large() {
         let refused = alice.cmd(&["send", "--to", "Bob", &big]).await.unwrap_err().to_string();
         assert!(refused.contains("members take"), "{refused}");
         bob.stop().await;
+        let before = lmk_node::now();
         let sent = alice.cmd(&["send", "--urgent", "anyone?"]).await.unwrap();
         assert!(sent["position"].is_u64(), "{sent}");
         let status = alice.cmd(&["status"]).await.unwrap();
@@ -285,6 +286,8 @@ fn send_answers_the_position_and_refuses_a_message_too_large() {
         let mut bob = world.start("bob", HOUR).await;
         let message = bob.expect("message").await;
         assert_eq!((message["id"].as_str(), message["content"].as_str()), (sent["id"].as_str(), Some("anyone?")));
+        let sent_at = message["sent_at"].as_u64().unwrap();
+        assert!(before <= sent_at && sent_at < lmk_node::now(), "it tells when it was sent, not when it arrived");
     });
 }
 

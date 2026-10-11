@@ -19,7 +19,10 @@ export type Item =
   | {
       type: "message";
       id: string;
+      /** When it arrived; the timeline is in this order. */
       at: number;
+      /** When the sender sent it, by its clock. */
+      sent_at?: number;
       from: Person;
       content: string;
       to?: string[];

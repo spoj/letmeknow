@@ -602,7 +602,7 @@ impl App {
                 let only_here = mine && position.is_some_and(|position| only_here.contains(position));
                 items.push(json!({ "type": "leave", "id": id, "at": at, "from": from, "only_here": only_here }));
             }
-            let Ok(lmk_proto::group::ChatMessage { content, to, reply_to, urgent, attachment, .. }) = serde_json::from_value(payload) else {
+            let Ok(lmk_proto::group::ChatMessage { content, to, reply_to, urgent, attachment, sent_at, .. }) = serde_json::from_value(payload) else {
                 continue;
             };
             let mut item = json!({ "type": "message", "id": id, "at": at, "from": from, "content": content });
@@ -635,6 +635,9 @@ impl App {
             }
             if urgent {
                 item["urgent"] = json!(true);
+            }
+            if let Some(sent_at) = sent_at {
+                item["sent_at"] = json!(sent_at);
             }
             if let Some(attachment) = attachment {
                 let kept = self.kept.has(&FileLink::parse(&attachment.link)?.hash);
