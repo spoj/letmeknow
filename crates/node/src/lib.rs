@@ -2,13 +2,13 @@
 //! files, the invites it shares and the joiners it admits, and its members' identities: their public logs, against which
 //! their credentials' certificates are checked. A group's kind sees its content through the channels here (held
 //! messages in log order, live ones, files, and a state link for joiners), and nothing of the rest; the core reads only
-//! its own payloads (`Control`). The devices kind (`devices`) is built on those channels. It stores everything through
+//! its own payloads (`Control`). The identity kind (`devices`) is built on those channels. It stores everything through
 //! the core's `Provider`, so the same code runs natively (SQLite) and in the browser (memory the web client persists),
 //! one transaction per step (`Step`): nothing a step produces leaves the node before its transaction commits.
 
 mod admission;
 mod api;
-pub mod devices;
+pub mod identity;
 mod duties;
 mod groups;
 mod kind;
@@ -75,11 +75,11 @@ const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 const STATE_ASK: u64 = 60 * 1000;
 
 pub struct Config {
-    /// The name its credential gives it in groups but devices groups, fixed when it is created: a session process's
+    /// The name its credential gives it in groups but identity groups, fixed when it is created: a session process's
     /// handle, or empty for a device's node.
     pub handle: String,
     /// The device, where this is a device's node or a browser's one session: its name is its credential's in its
-    /// devices groups, each of which this node joins with a key of its own, the device's key on that identity.
+    /// identity groups, each of which this node joins with a key of its own, the device's key on that identity.
     pub device: Option<Device>,
     pub relay: RelayUrl,
     pub ca: CaTlsConfig,
@@ -110,7 +110,7 @@ pub struct Member {
     pub iroh: Bytes,
     /// The protocol revision its leaf names.
     pub revision: u32,
-    /// Its credential's name: its device's name in a devices group, and in any other its session's handle.
+    /// Its credential's name: its device's name in an identity group, and in any other its session's handle.
     pub name: String,
     /// The name of its device, as its identity's public log lists it.
     pub device_name: String,
@@ -285,7 +285,7 @@ pub enum Event {
     File([u8; 32]),
     /// An identity's public log grew, as this session read it.
     Public { identity: Bytes },
-    /// A pass of a devices group's duties ran: the devices kind runs its own.
+    /// A pass of an identity group's duties ran: the identity kind runs its own.
     Duties {
         group: Bytes,
     },
@@ -433,7 +433,7 @@ pub(crate) struct State<P> {
     /// What the current step tells the session, sent once it commits.
     events: Vec<Event>,
     session: Session,
-    /// The device's name, which its credential names in its devices groups, where this is a device's node.
+    /// The device's name, which its credential names in its identity groups, where this is a device's node.
     device: Option<String>,
     groups: BTreeMap<Vec<u8>, G>,
     /// The logs this session follows, by id.
@@ -443,7 +443,7 @@ pub(crate) struct State<P> {
     /// The identities and devices this session read a public log again for, as members' certificates named devices it
     /// did not list.
     unlisted: HashSet<(Vec<u8>, Vec<u8>)>,
-    /// In each devices group, this node's own key there, the device's key on that identity: its seed, and the member.
+    /// In each identity group, this node's own key there, the device's key on that identity: its seed, and the member.
     device_keys: BTreeMap<Vec<u8>, ([u8; 32], Session)>,
     /// `send`s waiting for their entries to count, by the id they started with.
     waiters: HashMap<Vec<u8>, Vec<oneshot::Sender<sending::Outcome>>>,
@@ -608,7 +608,7 @@ impl<P: Provider> State<P> {
         self.session.credential.certificate = identity.map(Box::new);
     }
 
-    /// A new device key, for a devices group this node makes or joins, whose credential names the device.
+    /// A new device key, for an identity group this node makes or joins, whose credential names the device.
     fn device_key(&self) -> Result<([u8; 32], Session)> {
         let seed = lmk_core::random();
         Ok((seed, self.keyed(seed)?))
@@ -618,7 +618,7 @@ impl<P: Provider> State<P> {
         Session::with_signer(&self.provider, signer(&seed), self.device.as_deref().unwrap_or_default(), self.session.leaf.clone())
     }
 
-    /// This session as a member of a group: in a devices group, the device's key there.
+    /// This session as a member of a group: in an identity group, the device's key there.
     fn session_of(&self, gid: &[u8]) -> &Session {
         self.device_keys.get(gid).map_or(&self.session, |(_, session)| session)
     }

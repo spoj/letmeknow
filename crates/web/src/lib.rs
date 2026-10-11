@@ -1,5 +1,5 @@
 //! The browser client: the client core on one lmk-node session, which is the browser's device too, with a device key of
-//! its own in its identity's devices group, reaching its peers only through the relay, with the devices kind on the
+//! its own in its identity's group, reaching its peers only through the relay, with the identity kind on the
 //! same node. Chat is built in; the doc kind
 //! (`lmk_kind_doc::Page`) and the git kind, display-only (`lmk_kind_git::Page`), are in-page plugins, whose messages go
 //! to and from the core as calls. The page persists the session's records in IndexedDB, one record per key, each step's
@@ -15,13 +15,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
 use js_sys::{Array, Function, Promise, Uint8Array};
 use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Request, fp, message_id, service};
-use lmk_node::devices::Devices;
+use lmk_node::identity::Identity;
 use lmk_node::lmk_core::provider::RustCrypto;
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
 use lmk_node::{COLLECT, Disk, Node, now};
 use lmk_proto::Bytes;
-use lmk_proto::group::{CHAT, DEVICES, PROTOCOL, Settings};
+use lmk_proto::group::{CHAT, IDENTITY, PROTOCOL, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::{Duration, sleep};
@@ -325,12 +325,12 @@ impl App {
             files: None,
             disk: Some(kept.clone()),
             file_limit: FILE_LIMIT,
-            kinds: vec![CHAT.into(), DOC.into(), GIT.into(), DEVICES.into()],
+            kinds: vec![CHAT.into(), DOC.into(), GIT.into(), IDENTITY.into()],
             durable: Some(durable),
         };
         let (node, mut events) = Node::start(store.clone(), node_config).await?;
         let saved = store.clone();
-        let devices = Devices::new(node.clone(), device.clone(), Arc::new(move |device: &Device| put(&saved, b"web/device", device)));
+        let devices = Identity::new(node.clone(), device.clone(), Arc::new(move |device: &Device| put(&saved, b"web/device", device)));
         let membership = service(&config.membership)?;
         let (lines, written) = mpsc::unbounded_channel();
         let plugins = InPage {
@@ -490,7 +490,7 @@ impl App {
                 event.insert("kind".into(), json!(kind));
                 self.emit(Value::Object(event));
             }
-            ClientEvent::Devices { identity } => self.emit(json!({ "type": "devices", "identity": identity })),
+            ClientEvent::Identity { identity } => self.emit(json!({ "type": "devices", "identity": identity })),
             ClientEvent::Warning { group, text } => self.emit(json!({ "type": "warning", "group": group, "text": text })),
             // The page shows messages as they come, waiting for none; a held leave shows as its tick.
             ClientEvent::Synced { .. } | ClientEvent::LeaveHeld { .. } => {}
@@ -540,7 +540,7 @@ impl App {
         let mut groups = Vec::new();
         for gid in node.groups() {
             let settings = node.settings(&gid.0)?;
-            if settings.kind == DEVICES {
+            if settings.kind == IDENTITY {
                 continue;
             }
             let away: Vec<String> = node.away(&gid.0)?.iter().map(|m| fp(&m.key.0)).collect();
@@ -635,13 +635,13 @@ impl App {
         Ok(Value::Array(items))
     }
 
-    /// How many of this session's sends no other member's summary shows held, in its groups but devices groups, its
+    /// How many of this session's sends no other member's summary shows held, in its groups but identity groups, its
     /// pending sends among them.
     fn only_here(&self) -> Result<u32> {
         let node = self.client.node();
         let mut count = 0;
         for gid in node.groups() {
-            if node.settings(&gid.0)?.kind != DEVICES {
+            if node.settings(&gid.0)?.kind != IDENTITY {
                 count += node.only_here(&gid.0)?.len() as u32 + node.sending(&gid.0)?.len() as u32;
             }
         }

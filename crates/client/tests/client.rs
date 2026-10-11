@@ -8,8 +8,8 @@ use lmk_client::{Access, Client, ClientEvent, Config, Plugins, Request, Standing
 use lmk_core::device::Device;
 use lmk_core::provider::MemoryProvider;
 use lmk_node::{Event, Node};
-use lmk_node::devices::Devices;
-use lmk_proto::group::{CHAT, DEVICES};
+use lmk_node::identity::Identity;
+use lmk_proto::group::{CHAT, IDENTITY};
 use lmk_testing::{Relay, relay};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
@@ -88,10 +88,10 @@ impl Member {
             disk: None,
             file_limit: 100 << 20,
             durable: None,
-            kinds: vec![CHAT.into(), DEVICES.into(), KIND.into()],
+            kinds: vec![CHAT.into(), IDENTITY.into(), KIND.into()],
         };
         let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-        let devices = Devices::new(node.clone(), device.clone(), Arc::new(|_: &Device| Ok(())));
+        let devices = Identity::new(node.clone(), device.clone(), Arc::new(|_: &Device| Ok(())));
         let (lines, written) = mpsc::unbounded_channel();
         let plugin = Arc::new(Recorder { started: Mutex::default(), sent: Mutex::default(), lines, gate: Mutex::default() });
         let config = Config { device, membership: relay.service.clone() };
@@ -258,7 +258,7 @@ async fn a_renamed_device_shows_its_new_name_to_its_other_devices_and_its_groups
     let chat = alice.request(json!({ "cmd": "invite" })).await;
     laptop.request(json!({ "cmd": "join", "target": chat["link"] })).await;
     let device = |m: &Value| m["members"].as_array().unwrap().iter().any(|m| m["device"] == "desk");
-    let renamed = laptop.request(json!({ "cmd": "identity", "op": { "rename": { "name": "desk" } } })).await;
+    let renamed = laptop.request(json!({ "cmd": "identity", "op": { "rename": { "name": "desk", "device": true } } })).await;
     assert_eq!(renamed["device"]["name"], "desk");
     assert_eq!(laptop.client.me().unwrap()["device"]["name"], "desk");
     let names = |listed: &Value| -> Vec<String> {
@@ -267,6 +267,10 @@ async fn a_renamed_device_shows_its_new_name_to_its_other_devices_and_its_groups
     let listed = polled(&tablet, json!({ "cmd": "identity", "op": "list" }), |listed| names(listed).contains(&"desk".to_owned())).await;
     assert_eq!(names(&listed).len(), 2, "the tablet lists the laptop by its new name");
     polled(&alice, json!({ "cmd": "members", "group": chat["group"] }), device).await;
+    // Renamed, the identity shows so to its devices and to the members of its sessions' groups.
+    assert_eq!(laptop.request(json!({ "cmd": "identity", "op": { "rename": { "name": "Robert" } } })).await["name"], "Robert");
+    polled(&tablet, json!({ "cmd": "identity", "op": "list" }), |listed| listed["name"] == "Robert").await;
+    polled(&alice, json!({ "cmd": "members", "group": chat["group"] }), |m| m["members"].as_array().unwrap().iter().any(|m| m["identity"]["name"] == "Robert")).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -293,6 +297,6 @@ async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_de
     let left = laptop.request(json!({ "cmd": "identity", "op": "leave" })).await;
     assert_eq!((left["left"].clone(), left["ended"].clone()), (json!([]), json!(true)));
     assert_eq!(laptop.client.me().unwrap()["identity"], json!(null));
-    assert!(laptop.client.node().groups().is_empty(), "its devices group is gone");
+    assert!(laptop.client.node().groups().is_empty(), "its identity group is gone");
     assert!(alice.client.node().read_public(&bob).await.unwrap().closed(), "no session speaks for Bob any more");
 }

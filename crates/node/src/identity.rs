@@ -1,4 +1,4 @@
-//! The devices kind, built in: an identity's devices group, whose members are its devices, each with its own device key
+//! The identity kind, built in: an identity's group, whose members are its devices, each with its own device key
 //! there, and whose settings carry the id of the identity's public log. A device certifies its sessions with its device
 //! key, and keeps the public log in step with the group: a device the latest entry lists appends the next whenever the
 //! group's members, their names or the group's name differ from it, and the latest again once it is half a year old.
@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
-use lmk_proto::group::{Certificate, DEVICES, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
+use lmk_proto::group::{Certificate, IDENTITY, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::Invite;
 use lmk_proto::public::{Listed, certified};
 use n0_future::task::spawn;
@@ -24,8 +24,8 @@ const NO_IDENTITY: &str = "this device is on no identity";
 /// Keeps the device, as when it is renamed: its `device.json`, or a browser's record.
 pub type Save = Arc<dyn Fn(&Device) -> Result<()> + Send + Sync>;
 
-/// The devices kind, on a device's node.
-pub struct Devices<P> {
+/// The identity kind, on a device's node.
+pub struct Identity<P> {
     node: Node<P>,
     device: Device,
     save: Save,
@@ -33,27 +33,27 @@ pub struct Devices<P> {
     passing: Arc<tokio::sync::Mutex<()>>,
 }
 
-impl<P> Clone for Devices<P> {
+impl<P> Clone for Identity<P> {
     fn clone(&self) -> Self {
-        Devices { node: self.node.clone(), device: self.device.clone(), save: self.save.clone(), passing: self.passing.clone() }
+        Identity { node: self.node.clone(), device: self.device.clone(), save: self.save.clone(), passing: self.passing.clone() }
     }
 }
 
-impl<P: Provider + Send + 'static> Devices<P> {
-    /// The devices kind on `node`, kept by `save`. Its duties run as each devices group's do (`Event::Duties`).
+impl<P: Provider + Send + 'static> Identity<P> {
+    /// The identity kind on `node`, kept by `save`. Its duties run as each identity group's do (`Event::Duties`).
     pub fn new(node: Node<P>, device: Device, save: Save) -> Self {
-        Devices { node, device, save, passing: Arc::default() }
+        Identity { node, device, save, passing: Arc::default() }
     }
 
-    /// The devices group of this device's identity, once it made or joined one, until it leaves it.
+    /// The identity group of this device's identity, once it made or joined one, until it leaves it.
     fn group(&self) -> Option<Bytes> {
-        self.node.groups().into_iter().find(|gid| self.node.settings(&gid.0).is_ok_and(|s| s.kind == DEVICES) && !self.node.leaving(&gid.0))
+        self.node.groups().into_iter().find(|gid| self.node.settings(&gid.0).is_ok_and(|s| s.kind == IDENTITY) && !self.node.leaving(&gid.0))
     }
 
-    /// The devices group, and the identity it is of.
+    /// The identity group, and the identity it is of.
     fn own(&self) -> Result<(Bytes, IdentityRef)> {
         let gid = self.group().context(NO_IDENTITY)?;
-        let identity = self.identity_of(&gid.0).context("a devices group without a public log")?;
+        let identity = self.identity_of(&gid.0).context("an identity group without a public log")?;
         Ok((gid, identity))
     }
 
@@ -79,11 +79,11 @@ impl<P: Provider + Send + 'static> Devices<P> {
         Ok(self.node.key_in(&self.group().context(NO_IDENTITY)?.0))
     }
 
-    /// Starts an identity, with this device its first, and its devices group.
+    /// Starts an identity, with this device its first, and its identity group.
     pub async fn create(&self, name: &str, membership: Service) -> Result<IdentityRef> {
         ensure!(self.group().is_none(), "this device is on an identity already: leave it first");
         let settings =
-            Settings { protocol: PROTOCOL, kind: DEVICES.into(), name: name.into(), carry: 7, update: UPDATE, membership, public: None, rest: Default::default() };
+            Settings { protocol: PROTOCOL, kind: IDENTITY.into(), name: name.into(), carry: 7, update: UPDATE, membership, public: None, rest: Default::default() };
         self.node.create_identity(settings).await
     }
 
@@ -99,7 +99,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
         ensure!(link.device, "not a device link");
         ensure!(self.group().is_none(), "this device is on an identity already: leave it first");
         let (gid, _) = self.node.join(link, None).await?;
-        ensure!(self.node.settings(&gid.0)?.kind == DEVICES, "the link led to a group, not an identity");
+        ensure!(self.node.settings(&gid.0)?.kind == IDENTITY, "the link led to a group, not an identity");
         Ok(())
     }
 
@@ -124,8 +124,15 @@ impl<P: Provider + Send + 'static> Devices<P> {
         Ok(self.node.leave(&gid.0).await?.is_none())
     }
 
-    /// Renames this device: its record, and its credential in its devices group, whose public log then lists it so.
+    /// Renames the identity, in its group's settings, whose public log then names it so.
     pub async fn rename(&self, name: &str) -> Result<()> {
+        let gid = self.group().context(NO_IDENTITY)?;
+        self.node.change_settings(&gid.0, |settings| Settings { name: name.into(), ..settings }).await?;
+        self.duties(&gid.0).await
+    }
+
+    /// Renames this device: its record, and its credential in its identity group, whose public log then lists it so.
+    pub async fn rename_device(&self, name: &str) -> Result<()> {
         let mut device = self.device.clone();
         device.name = name.into();
         (self.save)(&device)?;
@@ -136,17 +143,17 @@ impl<P: Provider + Send + 'static> Devices<P> {
         }
     }
 
-    /// Runs the duties of a devices group in the background.
+    /// Runs the duties of an identity group in the background.
     fn due(&self, gid: &[u8]) {
         let (devices, gid) = (self.clone(), gid.to_vec());
         spawn(async move {
             if let Err(error) = devices.duties(&gid).await {
-                tracing::debug!("the duties of a devices group: {error:#}");
+                tracing::debug!("the duties of an identity group: {error:#}");
             }
         });
     }
 
-    /// The duties of a devices group, as it and the identity's public log stand, each read afresh: a device the latest
+    /// The duties of an identity group, as it and the identity's public log stand, each read afresh: a device the latest
     /// entry lists appends the next, listing the group's members by their names under the group's name, when that
     /// differs from the latest, and the latest again once it is `RESTATE` old.
     pub async fn duties(&self, gid: &[u8]) -> Result<()> {
@@ -177,13 +184,13 @@ impl<P: Provider + Send + 'static> Devices<P> {
         Ok(Certificate { identity, device: self.node.key_in(&gid.0), sig: Bytes(sig) })
     }
 
-    /// The identity whose devices group `gid` is.
+    /// The identity whose identity group `gid` is.
     pub fn identity_of(&self, gid: &[u8]) -> Option<IdentityRef> {
-        let settings = self.node.settings(gid).ok().filter(|settings| settings.kind == DEVICES)?;
+        let settings = self.node.settings(gid).ok().filter(|settings| settings.kind == IDENTITY)?;
         Some(IdentityRef { id: settings.public?, membership: settings.membership })
     }
 
-    /// Takes the events of devices groups, but for their members joining and leaving and warnings; returns every other
+    /// Takes the events of identity groups, but for their members joining and leaving and warnings; returns every other
     /// event. Its duties run as the group's do, and as the identity's public log moves.
     pub fn on(&self, event: Event) -> Option<Event> {
         if let Event::Public { identity } = &event {
@@ -195,7 +202,7 @@ impl<P: Provider + Send + 'static> Devices<P> {
             return Some(event);
         }
         if let Event::Removed { kind, .. } = &event {
-            return (kind != DEVICES).then_some(event);
+            return (kind != IDENTITY).then_some(event);
         }
         let Some(gid) = event.group().cloned() else { return Some(event) };
         if self.identity_of(&gid.0).is_none() {

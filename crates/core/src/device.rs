@@ -1,4 +1,4 @@
-//! The device, kept in `device.json`: its name. Its key in each identity's devices group is that group's own.
+//! The device, kept in `device.json`: its name. Its key in each identity's group is that group's own.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use openmls::prelude::SignatureScheme;

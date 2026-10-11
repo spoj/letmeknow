@@ -702,7 +702,7 @@ fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
         desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
         carol.expect("joined").await;
 
-        assert_eq!(desk.cmd(&["identity", "rename", "studio"]).await.unwrap()["device"]["name"], "studio");
+        assert_eq!(desk.cmd(&["identity", "rename", "--device", "studio"]).await.unwrap()["device"]["name"], "studio");
         let listed = alice.cmd(&["identity", "list"]).await.unwrap();
         assert_eq!(listed["devices"][0]["name"], "studio");
         assert_eq!(lmk_core::device::Device::load(&alice.home.join("device.json")).unwrap().name, "studio");

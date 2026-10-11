@@ -10,9 +10,9 @@ use lmk_core::provider::{MemoryProvider, Provider, SqliteProvider};
 use lmk_membership::service::Service as Membership;
 use lmk_membership::store::Store;
 use lmk_testing::{Relay, relay};
-use lmk_node::devices::Devices;
+use lmk_node::identity::Identity;
 use lmk_node::{Config, Event, Node};
-use lmk_proto::group::{CHAT, Certificate, ChatMessage, DEVICES, IdentityRef, PROTOCOL, Service, Settings};
+use lmk_proto::group::{CHAT, Certificate, ChatMessage, IDENTITY, IdentityRef, PROTOCOL, Service, Settings};
 use lmk_proto::public::Listed;
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
@@ -44,10 +44,10 @@ async fn node(relay: &Relay, name: &str, kinds: &[&str]) -> Session {
 }
 
 /// A device's own node, whose key is the device key, as a browser's is: a device and a session at once.
-async fn device(relay: &Relay, name: &str) -> (Session, Devices<MemoryProvider>) {
+async fn device(relay: &Relay, name: &str) -> (Session, Identity<MemoryProvider>) {
     let device = Device::new(name);
-    let (node, events) = Node::start(MemoryProvider::default(), config(relay, name, Some(device.clone()), &[CHAT, DEVICES])).await.unwrap();
-    (Session { node: node.clone(), events }, Devices::new(node, device, Arc::new(|_: &Device| Ok(()))))
+    let (node, events) = Node::start(MemoryProvider::default(), config(relay, name, Some(device.clone()), &[CHAT, IDENTITY])).await.unwrap();
+    (Session { node: node.clone(), events }, Identity::new(node, device, Arc::new(|_: &Device| Ok(()))))
 }
 
 fn config(relay: &Relay, name: &str, device: Option<Device>, kinds: &[&str]) -> Config {
@@ -656,8 +656,8 @@ impl<P: Provider + Send + 'static> Session<P> {
     }
 }
 
-/// Has the devices kind take a device's events first, as a client does.
-fn routed<P: Provider + Send + 'static>(session: &mut Session<P>, devices: Devices<P>) {
+/// Has the identity kind take a device's events first, as a client does.
+fn routed<P: Provider + Send + 'static>(session: &mut Session<P>, devices: Identity<P>) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut events = std::mem::replace(&mut session.events, rx);
     tokio::spawn(async move {
@@ -669,11 +669,11 @@ fn routed<P: Provider + Send + 'static>(session: &mut Session<P>, devices: Devic
     });
 }
 
-/// A device's own node on SQLite at `db`, which survives a restart, with the devices kind taking its events first.
-async fn stored_device(relay: &Relay, name: &str, db: &Path) -> (Session<SqliteProvider>, Devices<SqliteProvider>) {
+/// A device's own node on SQLite at `db`, which survives a restart, with the identity kind taking its events first.
+async fn stored_device(relay: &Relay, name: &str, db: &Path) -> (Session<SqliteProvider>, Identity<SqliteProvider>) {
     let device = Device::new(name);
-    let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), config(relay, name, Some(device.clone()), &[CHAT, DEVICES])).await.unwrap();
-    let devices = Devices::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
+    let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), config(relay, name, Some(device.clone()), &[CHAT, IDENTITY])).await.unwrap();
+    let devices = Identity::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
     let mut session = Session { node, events };
     routed(&mut session, devices.clone());
     (session, devices)
@@ -696,9 +696,9 @@ async fn lists<P: Provider + Send + 'static>(node: &Node<P>, identity: &Identity
     .expect("the public log lists the devices")
 }
 
-/// The devices group of a device's only identity.
+/// The identity group of a device's only identity.
 fn devices_group<P: Provider + Send + 'static>(node: &Node<P>) -> Bytes {
-    node.groups().into_iter().find(|gid| node.settings(&gid.0).unwrap().kind == DEVICES).unwrap()
+    node.groups().into_iter().find(|gid| node.settings(&gid.0).unwrap().kind == IDENTITY).unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -756,9 +756,8 @@ async fn an_identitys_public_log_follows_its_group_until_its_last_device_closes_
     let (mut laptop, laptop_devices) = device(&relay, "laptop").await;
     routed(&mut laptop, laptop_devices.clone());
     let bob = laptop_devices.create("Bob", relay.service.clone()).await.unwrap();
-    let gid = devices_group(&laptop.node);
-    laptop.node.change_settings(&gid.0, |s| Settings { name: "Robert".into(), ..s }).await.unwrap();
-    laptop_devices.rename("desk").await.unwrap();
+    laptop_devices.rename("Robert").await.unwrap();
+    laptop_devices.rename_device("desk").await.unwrap();
     let log = lists(&laptop.node, &bob, &["desk"]).await;
     assert_eq!(log.name, "Robert");
 
@@ -868,7 +867,7 @@ async fn the_list_does_not_drop_a_device_just_linked() {
     let link = lmk_proto::links::Invite::parse(&phone_devices.invite().await.unwrap()).unwrap();
     tablet_devices.join(&link).await.unwrap();
 
-    // The laptop starts with its devices group as it stopped, and the public log as it is now.
+    // The laptop starts with its identity group as it stopped, and the public log as it is now.
     let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
     let gid = devices_group(&laptop.node);
     laptop_devices.duties(&gid.0).await.unwrap();
@@ -928,8 +927,8 @@ async fn a_device_keeps_its_identity_across_restarts() {
     let device = Device::new("laptop");
     let start = || async {
         let (node, _events) =
-            Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), config(&relay, "laptop", Some(device.clone()), &[CHAT, DEVICES])).await.unwrap();
-        (node.clone(), Devices::new(node, device.clone(), Arc::new(|_: &Device| Ok(()))))
+            Node::start(SqliteProvider::open(&dir.join("device.db")).unwrap(), config(&relay, "laptop", Some(device.clone()), &[CHAT, IDENTITY])).await.unwrap();
+        (node.clone(), Identity::new(node, device.clone(), Arc::new(|_: &Device| Ok(()))))
     };
     let (node, devices) = start().await;
     let bob = devices.create("Bob", membership).await.unwrap();
@@ -1688,7 +1687,7 @@ async fn a_link_altered_to_another_kind_admits_to_nothing() {
     let (mut laptop, laptop_devices) = device(&relay, "laptop").await;
     routed(&mut laptop, laptop_devices.clone());
     laptop_devices.create("Bob", membership.clone()).await.unwrap();
-    let mallory = node(&relay, "Mallory", &[CHAT, DEVICES]).await;
+    let mallory = node(&relay, "Mallory", &[CHAT, IDENTITY]).await;
     let link = Invite::parse(&laptop_devices.invite().await.unwrap()).unwrap();
     // Nor does a device-link attempt left waiting make the same secret, read as a group link, join with a device key.
     let dead = lmk_proto::links::Address { key: *iroh::SecretKey::from_bytes(&lmk_core::random()).public().as_bytes(), relay: Some(relay.url.to_string()) };

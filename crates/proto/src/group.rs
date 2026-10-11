@@ -13,10 +13,10 @@ pub const REVISION: u32 = 0;
 pub const SETTINGS_EXTENSION: u16 = 0xff01;
 pub const LEAF_EXTENSION: u16 = 0xff02;
 
-/// The kind every client supports, built in. Every other kind is a plugin's, but `DEVICES`.
+/// The kind every client supports, built in. Every other kind is a plugin's, but `IDENTITY`.
 pub const CHAT: &str = "chat";
-/// The built-in kind of an identity's devices group, which devices join and sessions do not.
-pub const DEVICES: &str = "devices";
+/// The built-in kind of an identity's group, whose members are its devices; sessions do not join it.
+pub const IDENTITY: &str = "identity";
 /// T's default: daily.
 pub const UPDATE: u32 = 24 * 60 * 60;
 

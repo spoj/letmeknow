@@ -521,7 +521,7 @@ async function drawDevices() {
       const create = h("button", { className: "primary" }, "Start");
       const started = async () => {
         await request({ cmd: "identity", op: { create: { name: name.value.trim() } } });
-        if (device.value.trim() !== me.device.name) await request({ cmd: "identity", op: { rename: { name: device.value.trim() } } });
+        if (device.value.trim() !== me.device.name) await request({ cmd: "identity", op: { rename: { name: device.value.trim(), device: true } } });
         render();
       };
       return [
@@ -562,18 +562,22 @@ async function drawDevices() {
 }
 
 function renameDialog() {
+  const identity = h("input", { value: me.identity!.name, required: true });
   const name = h("input", { value: me.device.name, required: true, autofocus: true });
   const save = h("button", { className: "primary" }, "Rename");
   const dialog = modal(
-    "Rename this browser",
+    "Rename",
     form(
       () =>
+        identity.reportValidity() &&
         name.reportValidity() &&
         busy(save, "Renaming…", async () => {
-          await request({ cmd: "identity", op: { rename: { name: name.value.trim() } } });
+          if (identity.value.trim() !== me.identity!.name) await request({ cmd: "identity", op: { rename: { name: identity.value.trim() } } });
+          if (name.value.trim() !== me.device.name) await request({ cmd: "identity", op: { rename: { name: name.value.trim(), device: true } } });
           render();
           dialog.close();
         }),
+      field("Your name", identity, "Your devices, and everyone you share with, see it."),
       field("This device", name, "Your other devices, and everyone you share with, see it next to your name."),
       h("div", { className: "buttons" }, save)
     )

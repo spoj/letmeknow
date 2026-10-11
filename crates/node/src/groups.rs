@@ -8,7 +8,7 @@ use lmk_core::group::{self as core, Change, Group};
 use lmk_core::provider::Provider;
 use lmk_membership::Refused;
 use lmk_proto::Bytes;
-use lmk_proto::group::{DEVICES, How};
+use lmk_proto::group::{IDENTITY, How};
 
 use crate::{Event, G, Inner, Member, State, device_key_key, kind, logs, peering, reading, rec_key, sending};
 
@@ -162,9 +162,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 }
 
-/// The name this session takes in a group: in a devices group, the device's, where its credential names another.
+/// The name this session takes in a group: in an identity group, the device's, where its credential names another.
 pub(crate) fn renaming(g: &Group, device: Option<&str>) -> Option<String> {
     let own = g.members().into_iter().find(|m| m.index == g.own_index())?.credential?;
-    let device = device.filter(|device| g.settings().kind == DEVICES && own.name != *device)?;
+    let device = device.filter(|device| g.settings().kind == IDENTITY && own.name != *device)?;
     Some(device.to_owned())
 }

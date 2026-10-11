@@ -2,7 +2,7 @@
 //! advance, at start, and every `TIMER`. It drops what the group kept past H; commits at most once, with every Remove
 //! due (members whose counted `leave` was sealed in their current membership, and members whose devices their
 //! identities dropped) and this session's update if due (each T, at an offset of its own); asks the others to remove
-//! this session while it leaves; announces this session's known losses; and in a devices group, has the devices kind
+//! this session while it leaves; announces this session's known losses; and in an identity group, has the identity kind
 //! run its own (`Event::Duties`).
 
 use std::collections::BTreeSet;
@@ -12,7 +12,7 @@ use anyhow::Result;
 use lmk_core::group::{self as core, Change};
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
-use lmk_proto::group::{Control, DEVICES, type_of};
+use lmk_proto::group::{Control, IDENTITY, type_of};
 use n0_future::time::{Duration, sleep};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -98,7 +98,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             st.scrub |= st.group(gid)?.rec.expired != expired;
             self.leaving(&mut st, gid)?;
             self.announce(&mut st, gid)?;
-            if st.group(gid)?.mls.settings().kind == DEVICES {
+            if st.group(gid)?.mls.settings().kind == IDENTITY {
                 st.events.push(Event::Duties { group: Bytes(gid.to_vec()) });
             }
             let g = st.group(gid)?;

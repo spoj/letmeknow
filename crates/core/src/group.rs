@@ -102,7 +102,7 @@ impl Session {
     }
 
     /// A member with the given MLS key beside the provider's own session, which it does not replace: a device's key in
-    /// one identity's devices group.
+    /// one identity's group.
     pub fn with_signer<P: Provider>(provider: &P, signer: SignatureKeyPair, name: &str, leaf: Leaf) -> Result<Self> {
         signer.store(provider.storage())?;
         let credential = Credential { name: name.into(), key: signer.public().into(), certificate: None };

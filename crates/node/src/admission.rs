@@ -11,7 +11,7 @@ use lmk_core::public::Verdict;
 use lmk_core::provider::Provider;
 use lmk_net::Admit;
 use lmk_proto::entry::Entry;
-use lmk_proto::group::{CHAT, Certificate, Control, Credential, DEVICES, How};
+use lmk_proto::group::{CHAT, Certificate, Control, Credential, IDENTITY, How};
 use lmk_proto::links::{Address, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Join};
 use lmk_proto::{Answer, Bytes};
@@ -36,7 +36,7 @@ const JOIN_WAIT: Duration = Duration::from_secs(30);
 /// inviter admits whom it invited when it is online.
 const INVITER_FIRST: Duration = Duration::from_secs(3);
 
-/// A joiner's KeyPackage, whose private keys openmls keeps, and the device key it is made with for a devices group.
+/// A joiner's KeyPackage, whose private keys openmls keeps, and the device key it is made with for an identity group.
 #[derive(Serialize, Deserialize)]
 struct Joining {
     key_package: Bytes,
@@ -56,7 +56,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             let g = st.group_mut(gid)?;
             g.rec.invites.push(Rule { hash: hash.clone(), expires, to: to.clone(), by });
             st.save(gid)?;
-            st.group(gid)?.mls.settings().kind == DEVICES
+            st.group(gid)?.mls.settings().kind == IDENTITY
         };
         let rule = serde_json::to_value(Control::Invite { hash, expires, to })?;
         let position = self.send(gid, &rule).await?.position;
@@ -172,7 +172,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Joins a group from the Welcome a member at `by` sent: a devices group with the device key `device_key`, and only
+    /// Joins a group from the Welcome a member at `by` sent: an identity group with the device key `device_key`, and only
     /// then, as a link's kind is not authenticated.
     async fn welcomed(self: &Arc<Self>, admitted: Admitted, by: EndpointId, device_key: Option<[u8; 32]>) -> Result<Bytes> {
         let gid = {
@@ -180,7 +180,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let st = &mut *st;
             let mls = Group::join(&st.provider, &admitted.welcome.0)?;
             ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
-            if (mls.settings().kind == DEVICES) != device_key.is_some() {
+            if (mls.settings().kind == IDENTITY) != device_key.is_some() {
                 mls.delete(&st.provider)?;
                 bail!("the link was altered: it admits to a group of another kind than it says");
             }

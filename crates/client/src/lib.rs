@@ -18,11 +18,11 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
-use lmk_node::devices::Devices;
+use lmk_node::identity::Identity;
 use lmk_node::{Event, Heard, INVITE_VALID, Item, Member, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::ranges::Ranges;
-use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, DEVICES, How, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
+use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, IDENTITY, How, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::time::{Duration, Instant, timeout};
 use n0_future::{Either, FutureExt};
@@ -90,8 +90,8 @@ pub struct Config {
 
 /// The device's node, which keeps its identity, and certifies its sessions.
 pub enum Access<P> {
-    /// It runs here: the devices kind on it.
-    Here(Devices<P>),
+    /// It runs here: the identity kind on it.
+    Here(Identity<P>),
     /// Another process runs it.
     Elsewhere(Arc<dyn Remote>),
 }
@@ -125,7 +125,7 @@ pub struct DeviceState {
 }
 
 impl DeviceState {
-    pub fn of<P: Provider + Send + 'static>(devices: &Devices<P>) -> Self {
+    pub fn of<P: Provider + Send + 'static>(devices: &Identity<P>) -> Self {
         DeviceState {
             device: devices.name(),
             identity: devices.identity(),
@@ -186,7 +186,7 @@ pub enum ClientEvent {
     /// the same key.
     Plugin { group: Bytes, kind: String, event: serde_json::Map<String, Value>, wake: bool, key: Option<String> },
     /// The devices of this device's identity changed.
-    Devices { identity: Bytes },
+    Identity { identity: Bytes },
     Warning { group: Option<Bytes>, text: String },
 }
 
@@ -341,7 +341,7 @@ impl<P: Provider + Send + 'static> Client<P> {
     /// Tells the plugins of its groups' kinds of the groups, as when the client starts.
     pub async fn start(&self) {
         for gid in self.inner.node.groups() {
-            if self.inner.node.settings(&gid.0).is_ok_and(|s| s.kind != CHAT && s.kind != DEVICES)
+            if self.inner.node.settings(&gid.0).is_ok_and(|s| s.kind != CHAT && s.kind != IDENTITY)
                 && let Err(error) = self.open_kind(&gid, None).await
             {
                 self.warn(Some(&gid), format!("{error:#}"));
@@ -357,8 +357,8 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// The devices kind, where the device's node runs here.
-    fn devices(&self) -> Result<Devices<P>> {
+    /// The identity kind, where the device's node runs here.
+    fn devices(&self) -> Result<Identity<P>> {
         match self.access() {
             Access::Here(devices) => Ok(devices),
             Access::Elsewhere(_) => bail!("the device's node runs elsewhere"),
@@ -792,9 +792,9 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// Takes an event of the device's node, where it is not this client's node: the devices kind takes its groups'
+    /// Takes an event of the device's node, where it is not this client's node: the identity kind takes its groups'
     /// events, and of the rest only warnings concern the user.
-    pub fn device_event(&self, devices: &Devices<P>, event: Event) {
+    pub fn device_event(&self, devices: &Identity<P>, event: Event) {
         let Some(event) = devices.on(event) else { return };
         if let Some(changed) = Self::devices_changed(devices, &event) {
             self.emit(changed);
@@ -804,9 +804,9 @@ impl<P: Provider + Send + 'static> Client<P> {
     }
 
     /// A device joined or left this device's identity.
-    fn devices_changed(devices: &Devices<P>, event: &Event) -> Option<ClientEvent> {
+    fn devices_changed(devices: &Identity<P>, event: &Event) -> Option<ClientEvent> {
         let (Event::Joined { group, .. } | Event::Left { group, .. }) = event else { return None };
-        Some(ClientEvent::Devices { identity: devices.identity_of(&group.0)?.id })
+        Some(ClientEvent::Identity { identity: devices.identity_of(&group.0)?.id })
     }
 
     async fn on(&self, event: Event) -> Result<()> {
@@ -1001,9 +1001,13 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let listed: Vec<Value> = devices.devices()?.iter().map(|(key, name)| json!({ "key": key, "name": name, "you": *key == me })).collect();
                 Ok(json!({ "identity": identity.id, "name": name, "devices": listed }))
             }
-            IdentityOp::Rename { name } => {
-                devices.rename(&name).await?;
+            IdentityOp::Rename { name, device: true } => {
+                devices.rename_device(&name).await?;
                 Ok(json!({ "device": { "name": name } }))
+            }
+            IdentityOp::Rename { name, device: false } => {
+                devices.rename(&name).await?;
+                Ok(json!({ "identity": devices.identity().context(NO_IDENTITY)?.0.id, "name": name }))
             }
             IdentityOp::Leave => unreachable!("a client leaves an identity itself"),
             IdentityOp::Remove { device: removed } => {
@@ -1109,7 +1113,7 @@ impl<P: Provider + Send + 'static> Client<P> {
     /// Sends a plugin a message about one of its groups, if it has the group, or holds a state or synced till it does.
     fn tell_plugin(&self, gid: &Bytes, mut message: Value) -> Result<()> {
         message["group"] = json!(b64(&gid.0));
-        let kinded = message["type"] != "message" && self.inner.node.settings(&gid.0).is_ok_and(|s| s.kind != CHAT && s.kind != DEVICES);
+        let kinded = message["type"] != "message" && self.inner.node.settings(&gid.0).is_ok_and(|s| s.kind != CHAT && s.kind != IDENTITY);
         let mut st = self.state();
         match st.kind_of.get(gid) {
             Some(kind) => self.inner.plugins.send(kind, &message)?,

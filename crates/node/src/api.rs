@@ -78,7 +78,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         &self.inner.kinds
     }
 
-    /// A new group with this session its only member, speaking as `identity`; a devices group with a new device key.
+    /// A new group with this session its only member, speaking as `identity`.
     pub fn create(&self, settings: Settings, identity: Option<Certificate>) -> Result<Bytes> {
         ensure!(self.inner.kinds.contains(&settings.kind), "this session does not support {} groups", settings.kind);
         let gid = {
@@ -92,7 +92,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(Bytes(gid))
     }
 
-    /// Creates an identity's devices group, with a new device key of this node's its first member, and the identity's
+    /// Creates an identity's group, with a new device key of this node's its first member, and the identity's
     /// public log, whose first entry lists that key as its writer, and whose id the group's settings carry. Leaves the
     /// group if the entry cannot be appended.
     pub async fn create_identity(&self, mut settings: Settings) -> Result<IdentityRef> {
@@ -372,7 +372,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.read_public(identity).await
     }
 
-    /// Appends to the public log of a devices group, by this node's device key there, the entry after the latest, read
+    /// Appends to the public log of an identity group, by this node's device key there, the entry after the latest, read
     /// afresh, listing `writers` and `name`; and reads the log.
     pub async fn publish(&self, gid: &[u8], writers: Vec<Listed>, name: &str) -> Result<PublicLog> {
         let settings = self.settings(gid)?;
@@ -380,7 +380,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let latest = self.inner.read_public(&identity).await?;
         let entry = {
             let st = self.inner.lock();
-            let (seed, _) = st.device_keys.get(gid).context("not a devices group of this node")?;
+            let (seed, _) = st.device_keys.get(gid).context("not an identity group of this node")?;
             latest.next(seed, writers, name, now())
         };
         let address = lmk_proto::public::address(&identity.id.0);
@@ -403,15 +403,15 @@ impl<P: Provider + Send + 'static> Node<P> {
         spoken
     }
 
-    /// This session's key in a group: in a devices group, the device's key on its identity.
+    /// This session's key in a group: in an identity group, the device's key on its identity.
     pub fn key_in(&self, gid: &[u8]) -> Bytes {
         Bytes(self.inner.lock().me(gid).to_vec())
     }
 
-    /// A signature over `bytes` by the device's key in a devices group.
+    /// A signature over `bytes` by the device's key in an identity group.
     pub fn sign(&self, gid: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
         let st = self.inner.lock();
-        let (seed, _) = st.device_keys.get(gid).context("not a devices group of this node")?;
+        let (seed, _) = st.device_keys.get(gid).context("not an identity group of this node")?;
         Ok(lmk_core::device::sign(seed, bytes))
     }
 
@@ -432,7 +432,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.lock().device.clone()
     }
 
-    /// Renames the device, in its credential in each devices group.
+    /// Renames the device, in its credential in each identity group.
     pub async fn rename_device(&self, name: &str) -> Result<()> {
         self.inner.lock().device = Some(name.into());
         for gid in self.groups() {

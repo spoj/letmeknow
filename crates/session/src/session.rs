@@ -1,5 +1,5 @@
 //! The session process: the client core on this session's node, and, holding the device's lock, the device's node with
-//! the devices kind; the plugins of its groups' kinds as executables; and what concerns the agent, printed. Chat is its
+//! the identity kind; the plugins of its groups' kinds as executables; and what concerns the agent, printed. Chat is its
 //! built-in kind. The session process that holds the lock publishes the device's identity and its key on it to
 //! `device-state.json`, and answers the requests only the device's node can on the command channel `device-endpoint`,
 //! both in `LETMEKNOW_HOME`; the device's other session processes read the one and send such
@@ -10,10 +10,10 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, Described, DeviceState, File, Remote, message_id};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
-use lmk_node::devices::Devices;
+use lmk_node::identity::Identity;
 use lmk_node::{Event, Message, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::{ChatMessage, DEVICES, Service};
+use lmk_proto::group::{ChatMessage, IDENTITY, Service};
 use lmk_proto::ranges::Ranges;
 use lmk_proto::links::FileLink;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -221,11 +221,11 @@ impl Session {
         }
         let device = Device::load(&self.home.join("device.json"))?;
         let provider = SqliteProvider::open(&self.home.join("device.db"))?;
-        let kinds = vec![lmk_proto::group::CHAT.into(), DEVICES.into()];
+        let kinds = vec![lmk_proto::group::CHAT.into(), IDENTITY.into()];
         let config = crate::node_config(&self.network, &self.home, "", Some(device.clone()), self.home.join("device-files"), kinds);
         let (node, mut events) = Node::start(provider, config).await?;
         let path = self.home.join("device.json");
-        let devices = Devices::new(node.clone(), device, Arc::new(move |device: &Device| device.save(&path)));
+        let devices = Identity::new(node.clone(), device, Arc::new(move |device: &Device| device.save(&path)));
         let (client, taking) = (self.client.clone(), devices.clone());
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {

@@ -123,8 +123,14 @@ pub enum IdentityOp {
     Remove { device: String },
     /// Take this device off its identity: its sessions leave the groups they are in as it first; the identity ends if this is its only device
     Leave,
-    /// Rename this device, as its identity's devices and members of its sessions' groups see it
-    Rename { name: String },
+    /// Rename the identity, or with --device this device, as the identity's devices and members of its sessions' groups
+    /// see it
+    Rename {
+        name: String,
+        #[cfg_attr(feature = "clap", arg(long))]
+        #[serde(default)]
+        device: bool,
+    },
 }
 
 fn chat() -> String {
