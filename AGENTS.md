@@ -27,7 +27,7 @@ CI's Linux job, to run before pushing:
     (cd web && npm ci) && python3 -u test/e2e.py && (cd web && npm run check)
 
 - e2e.py needs wasm-bindgen-cli 0.2.129 and Playwright's chromium-headless-shell.
-- Give each change example tests made for the cases that matter. What happens between machines is checked in real use before a release.
+- Give each change example tests made for the cases that matter. What happens between machines is checked in real use, after release: releases are alphas.
 - While iterating, run the tests of what you changed. Run the whole list once before merging: build first (the workspace's tests and the wasm build), then the rest side by side.
 - CI also runs on macOS and Windows, which are slower. When a test flakes there, fix the timing it assumes; do not rerun it until it passes.
 
