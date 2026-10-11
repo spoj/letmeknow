@@ -4,7 +4,7 @@ The code and its comments are the documentation. SKILL.md, compiled into the bin
 
 ## Branches
 
-- `main` is the 0.13 line. `0.14` develops the next minor version, which may break compatibility: merge `main` into it after each 0.13.x change.
+- `main` is the 0.14 line. A next minor version, which may break compatibility, develops on a branch of its own (as `0.15`): merge `main` into it after each 0.14.x change.
 - Work on short-lived branches, in worktrees beside this checkout when working in parallel. Merge them, then delete them.
 - Commit subjects read `Area: what changed`.
 
