@@ -1,4 +1,4 @@
-//! The doc kind: one markdown text that every member edits at once, a Yjs document. Its payloads are live, none held:
+//! The doc kind: one markdown text that every member edits at once, a Yjs document. Its payloads are live:
 //! edits go to the members online; two members that meet compare their docs by a hash of each one's snapshot
 //! (`snapshot`), and if they differ, each sends the other a `diff` against the other's state vector (`sv`), all to that
 //! member alone. Whoever admits a joiner hands it the doc's state. The doc links files as `lmk:` links, which members hold
@@ -224,14 +224,14 @@ mod tests {
         let snapshot = sent(&out, "send");
         assert_eq!((&snapshot["to"], &snapshot["payload"]["type"]), (&json!("bb"), &json!("snapshot")));
         out.clear();
-        b.handle(&json!({ "type": "message", "group": "g", "from": ann, "payload": snapshot["payload"], "held": false }), &mut out).unwrap();
+        b.handle(&json!({ "type": "message", "group": "g", "from": ann, "payload": snapshot["payload"] }), &mut out).unwrap();
         let sv = sent(&out, "send");
         assert_eq!((&sv["to"], &sv["payload"]["type"]), (&json!("aa"), &json!("sv")));
         out.clear();
-        a.handle(&json!({ "type": "message", "group": "g", "from": ben, "payload": sv["payload"], "held": false }), &mut out).unwrap();
+        a.handle(&json!({ "type": "message", "group": "g", "from": ben, "payload": sv["payload"] }), &mut out).unwrap();
         let diff = sent(&out, "send");
         assert_eq!((&diff["to"], &diff["payload"]["type"]), (&json!("bb"), &json!("diff")));
-        let changed = b.handle(&json!({ "type": "message", "group": "g", "from": ann, "payload": diff["payload"], "held": false }), &mut out).unwrap();
+        let changed = b.handle(&json!({ "type": "message", "group": "g", "from": ann, "payload": diff["payload"] }), &mut out).unwrap();
         assert_eq!(changed, Some(("g".into(), ann)));
         assert_eq!(b.text("g").unwrap(), format!("- [x] alpha\n[spec]({link})\n"));
     }

@@ -1,7 +1,7 @@
 //! The browser client: the client core on one lmk-node session, which is the browser's device too, with a device key of
 //! its own in its identity's group, reaching its peers only through the relay, with the identity kind on the
 //! same node. Chat is built in; the doc kind
-//! (`lmk_kind_doc::Page`) and the git kind, display-only (`lmk_kind_git::Page`), are in-page plugins, whose messages go
+//! (`lmk_kind_doc::Page`) is an in-page plugin, whose messages go
 //! to and from the core as calls. The page persists the session's records in IndexedDB, one record per key, each step's
 //! before what the step produced leaves the session, and the ciphertext of the files it holds, which the session loads
 //! when it needs one. Results that are not bytes are JSON
@@ -39,7 +39,6 @@ const FILE_LIMIT: u64 = 25 << 20;
 const HISTORY: u64 = 90 * 24 * 3600 * 1000;
 /// The kinds the browser supports: chat, and those of its in-page plugins.
 const DOC: &str = "doc";
-const GIT: &str = "git";
 
 type R<T> = Result<T, JsError>;
 
@@ -179,35 +178,20 @@ impl lmk_kind_doc::Store for PageStore {
     }
 }
 
-impl lmk_kind_git::Store for PageStore {
-    fn get(&self, key: &str) -> Option<Vec<u8>> {
-        lmk_kind_doc::Store::get(self, key)
-    }
-
-    fn put(&self, key: &str, value: &[u8]) {
-        lmk_kind_doc::Store::put(self, key, value)
-    }
-
-    fn delete(&self, key: &str) {
-        lmk_kind_doc::Store::delete(self, key)
-    }
-}
-
 /// The in-page plugins: what they send in answer to a message goes to the client as their lines.
 struct InPage {
     docs: Mutex<lmk_kind_doc::Page<PageStore>>,
-    git: Mutex<lmk_kind_git::Page<PageStore>>,
     started: Mutex<HashSet<String>>,
     lines: mpsc::UnboundedSender<(String, Option<Value>)>,
 }
 
 impl lmk_client::Plugins for InPage {
     fn kinds(&self) -> Vec<String> {
-        vec![DOC.into(), GIT.into()]
+        vec![DOC.into()]
     }
 
     fn start(&self, kind: &str) -> Result<Value> {
-        anyhow::ensure!([DOC, GIT].contains(&kind), "this browser has no plugin for {kind} groups");
+        anyhow::ensure!(kind == DOC, "this browser has no plugin for {kind} groups");
         self.started.lock().unwrap().insert(kind.to_owned());
         Ok(json!({}))
     }
@@ -217,10 +201,7 @@ impl lmk_client::Plugins for InPage {
     }
 
     fn send(&self, kind: &str, message: &Value) -> Result<()> {
-        let out = match kind {
-            DOC => self.docs.lock().unwrap().input(message),
-            _ => self.git.lock().unwrap().input(message),
-        };
+        let out = self.docs.lock().unwrap().input(message);
         for line in out {
             self.lines.send((kind.to_owned(), Some(line))).ok();
         }
@@ -325,7 +306,7 @@ impl App {
             files: None,
             disk: Some(kept.clone()),
             file_limit: FILE_LIMIT,
-            kinds: vec![CHAT.into(), DOC.into(), GIT.into(), IDENTITY.into()],
+            kinds: vec![CHAT.into(), DOC.into(), IDENTITY.into()],
             durable: Some(durable),
         };
         let (node, mut events) = Node::start(store.clone(), node_config).await?;
@@ -335,7 +316,6 @@ impl App {
         let (lines, written) = mpsc::unbounded_channel();
         let plugins = InPage {
             docs: Mutex::new(lmk_kind_doc::Page::new(PageStore(store.clone()))),
-            git: Mutex::new(lmk_kind_git::Page::new(PageStore(store.clone()))),
             started: Mutex::default(),
             lines,
         };
@@ -483,10 +463,6 @@ impl App {
             ClientEvent::Heard { group } => self.emit(json!({ "type": "heard", "group": group })),
             ClientEvent::File { hash } => self.emit(json!({ "type": "file", "hash": hash })),
             ClientEvent::Plugin { group, kind, mut event, .. } => {
-                if event.get("type") == Some(&json!("pushed")) {
-                    let item = json!({ "type": "pushed", "at": now(), "by": event["by"], "ref": event["ref"], "subjects": event["subjects"] });
-                    self.remember(&group.0, &item)?;
-                }
                 event.insert("group".into(), json!(group));
                 event.insert("kind".into(), json!(kind));
                 self.emit(Value::Object(event));
@@ -691,7 +667,7 @@ impl Lmk {
         self.app.only_here().map_err(js)
     }
 
-    /// A new chat, doc or git repository, speaking as this browser's identity; returns its id.
+    /// A new chat or doc, speaking as this browser's identity; returns its id.
     pub async fn create(&self, kind: String, name: String) -> R<String> {
         let app = &self.app;
         let settings = Settings { protocol: PROTOCOL, kind, name, carry: 7, update: lmk_proto::group::UPDATE, public: None, membership: app.membership.clone(), rest: Default::default() };

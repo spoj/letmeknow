@@ -1,4 +1,4 @@
-// The page: this browser's session and its groups, each a chat, a doc, or a repository, shown as its pushes and chat. Background work ends in render(), which patches
+// The page: this browser's session and its groups, each a chat or a doc. Background work ends in render(), which patches
 // only what changed, so what a person is typing, selecting or scrolling stays put. Joining from a link waits for a
 // click, so link scanners that open it join nothing.
 import "@fontsource-variable/ibm-plex-sans/wght.css";
@@ -32,8 +32,7 @@ const set = (element: HTMLElement, text: string) => element.textContent !== text
 const form = (submit: () => unknown, ...children: Child[]) => h("form", { onsubmit: (event: Event) => (event.preventDefault(), submit()) }, ...children);
 const field = (label: string, input: HTMLElement, hint?: string) => h("label", { className: "field" }, h("span", {}, label), input, hint && h("small", {}, hint));
 const megabytes = (bytes: number) => (bytes < 1e6 ? `${Math.ceil(bytes / 1000)} KB` : `${(bytes / 1e6).toFixed(1)} MB`);
-const KINDS = { chat: "chat", doc: "document", git: "repository" };
-const GIT_NOTE = "The repository lives with agent sessions; this browser shows its chat and pushes.";
+const KINDS = { chat: "chat", doc: "document" };
 /** Files up to this size every member fetches; larger ones only on request. */
 const FILE_LIMIT = 25 << 20;
 const INVITE_PREFIX = "https://letmeknow.dev/i";
@@ -143,7 +142,7 @@ async function start(device: string, name?: string) {
 
 client.listen(event => {
   // The tab that runs the session counts what is unread; a tab showing the group clears it.
-  if ((event.type === "message" || event.type === "pushed") && client.runs() && event.group && !(page === "group" && event.group === selected && document.visibilityState === "visible")) {
+  if (event.type === "message" && client.runs() && event.group && !(page === "group" && event.group === selected && document.visibilityState === "visible")) {
     localStorage.setItem(`unread ${event.group}`, String(unread(event.group) + 1));
   }
   if (event.type === "warning") toast(event.text);
@@ -695,7 +694,7 @@ class View {
         "header",
         { className: "group-head" },
         back(),
-        h("div", { className: "title" }, this.heading, this.people, group(gid)?.settings.kind === "git" && h("small", { className: "note" }, GIT_NOTE)),
+        h("div", { className: "title" }, this.heading, this.people),
         h("button", { className: "icon quiet", title: "Settings", ariaLabel: "Settings", onclick: () => this.settingsDialog() }, icon("more"))
       )
     );
@@ -981,15 +980,6 @@ class ChatView extends View {
         const said = before && after.name !== before.name && (after.name ? `named it “${after.name}”` : "removed its name");
         return h("li", { className: "event" }, who(item.by), ` ${said || "changed the settings"}`, at);
       }
-      case "pushed":
-        return h(
-          "li",
-          { className: "event pushed" },
-          who(item.by),
-          ` pushed to ${item.ref.replace(/^refs\/heads\//, "")}`,
-          at,
-          h("ul", {}, ...item.subjects.map(subject => h("li", {}, subject)))
-        );
       // An item of a kind this page does not show, as a newer page may keep in the timeline.
       default:
         return h("li", { hidden: true });

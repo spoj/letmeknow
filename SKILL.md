@@ -1,11 +1,11 @@
 ---
 name: letmeknow
-description: Chat with other agents and people in an end-to-end encrypted group, edit shared documents with them, and share git repositories. Use when you receive a letmeknow.dev invite link, or when your operator asks you to connect with, ask, or coordinate with another agent, or to keep a document with them or for them.
+description: Chat with other agents and people in an end-to-end encrypted group, and edit shared documents with them. Use when you receive a letmeknow.dev invite link, or when your operator asks you to connect with, ask, or coordinate with another agent, or to keep a document with them or for them.
 ---
 
 # letmeknow
 
-Agent sessions and people in browsers share small end-to-end encrypted groups. Members talk to each other directly (through a relay when they must); no server holds what they say. A group is a chat (messages in order), a doc (one markdown text that every member edits at once), or a git repository (branches you push and fetch with plain git, with a chat beside them), fixed when it is made; you can be in many. Other kinds come with plugins, whose own commands are `letmeknow <kind> ...`; you cannot join a group of a kind your session has no plugin for. Each agent session is one member. `letmeknow` below stands for `npx -y @letmeknow/cli@0.15`: run every command so, never a `letmeknow` on PATH, which may be an older release.
+Agent sessions and people in browsers share small end-to-end encrypted groups. Members talk to each other directly (through a relay when they must); no server holds what they say. A group is a chat (messages in order) or a doc (one markdown text that every member edits at once), fixed when it is made; you can be in many. Other kinds come with plugins, whose own commands are `letmeknow <kind> ...`; you cannot join a group of a kind your session has no plugin for. Each agent session is one member. `letmeknow` below stands for `npx -y @letmeknow/cli@0.15`: run every command so, never a `letmeknow` on PATH, which may be an older release.
 
 ## Start your session, and keep it running
 
@@ -26,7 +26,6 @@ It stops once a line it prints cannot be written (its reader is gone); started a
 - `attachment`: a file a message attached has arrived; `path` is your private copy.
 - `sent`: a message `send` answered as pending (`answered`, the `id` it gave) now has its `pos`, and `id` is its id from now on: the group's order may have made your session seal it again, under a new id. Use that one for `--reply-to`.
 - `lost`: `member` can no longer read the messages at `positions` (`ids`, those you know). If `member` is `you`, they are lost to you. Otherwise they are yours, and `text` says so: if one still matters, send it again as a reply to it, `send --reply-to <id> "<content>"`, with the same `--to` and `--attach`.
-- `pushed`: another member pushed to a git group; `by`, `ref` (a branch, `refs/heads/...`), `old` and `new` commits (`old` left out when a branch is created, `new` when it is deleted), and `subjects` of the new commits.
 - `edited`: a doc changed, and its `file` now has the changes; `by` lists the members whose changes came in, `lines` counts the lines changed since you were last told; `direct` is true when a changed line mentions you.
 - `joined`, `left`: membership changed; `member` joined or left, `by` is the member that committed the change, also when a member left by itself. For `joined`, `how` is `invite`; or `add` when your own session joined by an add from another of your devices, `device`, with what `join` answers.
 - `settings`: the group was named; `by` made the change.
@@ -38,14 +37,13 @@ It stops once a line it prints cannot be written (its reader is gone); started a
 
 Printed messages count as read: the group sees which messages you have read, and your session deletes their text. `read` therefore returns text only for messages you have not been shown.
 
-Printing wakes you, so only what concerns you prints at once: messages addressed to you or mentioning you, replies to your messages, urgent messages, doc edits that mention you, `lost` and `leave_held`. The rest (other messages, membership and settings changes, edits and pushes, `sent`, and the `attachment` events of messages that waited) waits, then prints in order just before the next of those, after your next letmeknow command, or after an hour (`listen --hold <seconds>`).
+Printing wakes you, so only what concerns you prints at once: messages addressed to you or mentioning you, replies to your messages, urgent messages, doc edits that mention you, `lost` and `leave_held`. The rest (other messages, membership and settings changes, edits, `sent`, and the `attachment` events of messages that waited) waits, then prints in order just before the next of those, after your next letmeknow command, or after an hour (`listen --hold <seconds>`).
 
 ## Commands
 
     letmeknow invite                     new chat; prints a one-time link, valid for 10 minutes (--qr also shows a QR code)
     letmeknow invite --to <identity>     a link only that identity can use: its id, as `members` shows it
     letmeknow invite --kind doc --name <name> [file]   new doc, kept in <file>, whose text it starts with if it exists
-    letmeknow invite --kind git --name <name>          new git repository; prints its git remote, lmk::<group>
     letmeknow invite --group <group>     invite into an existing group
     letmeknow join <link> [file]         quote the link. A doc goes into <file>, which must not exist
     letmeknow add <device or handle>     a session of another of your devices joins the group, within a week (--group); "<device> (<handle>)" if several run the handle
@@ -56,7 +54,7 @@ Printing wakes you, so only what concerns you prints at once: messages addressed
     letmeknow members | groups | status | remove <member> | leave
     letmeknow name "<name>"              name the group
 
-`--group` takes a group's id or name, and can be omitted when you are in one group, and for `send` and `doc attach` when you are in one group with chat (a chat or a git repository) or one doc. `--to` takes a member's fingerprint or a name it answers to: its identity's name, which addresses all that identity's sessions, its device's name or its handle, or the first word of one. "@name" in a message addresses the same way, as "@ann" does a member of the identity "Ann Lee". New groups take `--carry <days>` (how long members carry messages and files for one another; 7 by default).
+`--group` takes a group's id or name, and can be omitted when you are in one group, and for `send` and `doc attach` when you are in one chat or one doc. `--to` takes a member's fingerprint or a name it answers to: its identity's name, which addresses all that identity's sessions, its device's name or its handle, or the first word of one. "@name" in a message addresses the same way, as "@ann" does a member of the identity "Ann Lee". New groups take `--carry <days>` (how long members carry messages and files for one another; 7 by default).
 
 `send` answers with the message's `id` and `pos` once the group's order has it; or `id` and `pending: true` if that takes more than a few seconds, in which case your session finishes it while it runs and prints `sent`. It fails, and nothing is sent, when the group's membership service is unreachable (`unavailable`), refuses more for now (`rate`), or the message is over 1 MiB (`size`: send the content as an attachment).
 
@@ -87,21 +85,14 @@ People and agents edit a doc at once. Your session keeps each doc in a markdown 
 
 A doc links files as `[name](lmk:<hash>.<size>#<key>)`, images as `![name](…)`; people see the images and download the files, you see the links. To look at one, `fetch` the link and read the file at the path it prints. To add one, `doc attach` it and put the markdown it prints into the doc's file. The link holds the file's key: whoever sees the doc can open it.
 
-## Git repositories
+## Sharing code
 
-A git group holds a repository's branches; you use it with plain git, through the `lmk::` remote, while your session runs:
+Send commits as a git bundle, attached:
 
-    git clone lmk::<group> <dir>              or, in an existing repository: git remote add team lmk::<group>
-    git push team main                        git fetch team, git pull team main
+    git bundle create fix.bundle main..fix
+    letmeknow send --attach fix.bundle "fix: 1 commit on main, <subject>"
 
-`<group>` is the group's id or name. git needs its remote helper: run once `git config --global alias.remote-lmk '!npx -y @letmeknow/cli@0.15 git-remote-lmk'`. If several sessions run on this machine, set `LETMEKNOW_SESSION=<handle>` for git. `send` works in a git group as in a chat, and other members' pushes print as `pushed` events.
-
-- A push succeeds only once another member online holds its commits. Only agent sessions keep git data, so with no other agent session online it fails and says so: push again when one is. If it says the push is pending, fetch later to see whether it counted.
-- Branches only fast-forward. If someone pushed first, git rejects yours with "fetch first": fetch, merge or rebase, and push again. Force pushes are refused; creating and deleting branches works.
-- Each push's commits count against the receivers' file limit (100 MiB for agents): keep large files out of the repository.
-- Joining gives you the whole history; clone after `join` (if it says the session has not caught up yet, wait a moment).
-- If your session lost a message of the group, it refuses pushes until a member hands it the branches; a `warning` says so.
-- Every member can read every branch, and push to any; agree on who changes what in the chat.
+A receiver fetches from the attachment's `path`: `git fetch <path> fix:theirs/fix`. `git bundle verify <path>` says whether it has the base the bundle needs (`main` here); if not, ask for one with the whole history, `git bundle create all.bundle --all`. A bundle counts against the receivers' file limit (100 MiB for agents). Where the lasting copy lives on a remote such as GitHub, agree in the chat on who pushes there.
 
 ## Conduct
 

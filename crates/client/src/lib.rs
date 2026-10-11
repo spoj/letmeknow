@@ -19,7 +19,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
 use lmk_node::identity::{ADD_VALID, Add, Identity, Pending};
-use lmk_node::{Event, Heard, INVITE_VALID, Item, Member, Message, Node};
+use lmk_node::{Event, Heard, INVITE_VALID, Member, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::ranges::Ranges;
 use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, IDENTITY, How, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
@@ -247,10 +247,6 @@ struct State {
     files: Vec<([u8; 32], oneshot::Sender<()>)>,
     /// What plugins show of their groups in `groups`.
     infos: HashMap<Bytes, Value>,
-    /// The kinds whose groups carry chat too, as their plugins said when they started.
-    chat_kinds: HashSet<String>,
-    /// The last position of each group's log handed to its plugin, once the plugin follows the log.
-    handed: HashMap<Bytes, u64>,
     /// The groups whose `leave` was answered pending, until another member's summary holds it.
     leaving: HashSet<Bytes>,
     /// What a group's kind is told before it opens, as a joiner's state may come: its latest state and synced of each
@@ -671,7 +667,6 @@ impl<P: Provider + Send + 'static> Client<P> {
         let kind = {
             let mut st = self.state();
             st.infos.remove(gid);
-            st.handed.remove(gid);
             st.leaving.remove(gid);
             st.held.remove(gid);
             st.kind_of.remove(gid)
@@ -762,16 +757,16 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// Whether a group carries chat: a chat, or a group of a kind whose plugin says its groups do.
+    /// Whether a group is a chat.
     pub fn chats(&self, gid: &Bytes) -> bool {
-        self.inner.node.settings(&gid.0).is_ok_and(|s| s.kind == CHAT || self.state().chat_kinds.contains(&s.kind))
+        self.inner.node.settings(&gid.0).is_ok_and(|s| s.kind == CHAT)
     }
 
-    /// The group carrying chat a request acts on: the one it names, or else the client's one such group.
+    /// The chat a request acts on: the one it names, or else the client's one chat.
     pub fn chat(&self, group: Option<String>) -> Result<Bytes> {
         if group.is_some() {
             let gid = self.resolve(group)?;
-            ensure!(self.chats(&gid), "{} carries no chat", b64(&gid.0));
+            ensure!(self.chats(&gid), "{} is not a chat", b64(&gid.0));
             return Ok(gid);
         }
         let found: Vec<Bytes> = self.inner.node.groups().into_iter().filter(|gid| self.chats(gid)).collect();
@@ -954,7 +949,7 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let (removed, added) = (removed.iter().map(|m| describer.describe(m)).collect(), added.iter().map(|m| describer.describe(m)).collect());
                 self.emit(ClientEvent::Revoked { group, removed, added });
             }
-            Event::Public { .. } | Event::Duties { .. } => {}
+            Event::Public { .. } | Event::Duties { .. } | Event::Logged { .. } => {}
             Event::Removed { group, by, .. } => {
                 let by = by.map(|by| self.describe(&group, &by)).transpose()?;
                 self.drop_group(&group).await?;
@@ -973,13 +968,10 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let (id, position, missing) = (hex::encode(&message.id.0), message.position, message.missing);
                 self.emit(ClientEvent::Message { group: message.group, id, position, missing, from, payload: message.payload });
             }
-            Event::Message(message) => {
-                let from = self.describe(&message.group, &message.sender)?;
-                let item = json!({ "type": "message", "id": hex::encode(&message.id.0), "position": message.position, "from": from, "payload": message.payload, "held": true });
-                self.tell_plugin(&message.group, item)?;
-            }
+            // No other kind holds messages.
+            Event::Message(_) => {}
             Event::Live { group, sender, payload } => {
-                let item = json!({ "type": "message", "from": self.describe(&group, &sender)?, "payload": payload, "held": false });
+                let item = json!({ "type": "message", "from": self.describe(&group, &sender)?, "payload": payload });
                 self.tell_plugin(&group, item)?;
             }
             Event::Lost(lost) => {
@@ -1003,7 +995,6 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let item = json!({ "type": "state", "from": self.describe(&group, &from)?, "data": Bytes(data) });
                 self.tell_plugin(&group, item)?;
             }
-            Event::Logged { group } => self.hand_entries(&group)?,
             Event::Snapshot { group, reply } => {
                 let kind = self.state().kind_of.get(&group).cloned();
                 if let Some(kind) = kind {
@@ -1191,40 +1182,12 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// Starts a kind's plugin, which answers `start` with what its groups carry besides its own content.
+    /// Starts a kind's plugin, and waits until it answers `start`.
     async fn start_plugin(&self, kind: &str) -> Result<()> {
         let mut start = self.inner.plugins.start(kind)?;
         start["type"] = json!("start");
         start["kind"] = json!(kind);
-        if self.ask(kind, start).await?["chat"] == true {
-            self.state().chat_kinds.insert(kind.to_owned());
-        }
-        Ok(())
-    }
-
-    /// Hands a group's plugin its held messages and the losses, in log order, that it has not had.
-    fn hand_entries(&self, gid: &Bytes) -> Result<()> {
-        let mut st = self.state();
-        let (Some(&after), Some(kind)) = (st.handed.get(gid), st.kind_of.get(gid).cloned()) else { return Ok(()) };
-        let entries = self.inner.node.entries(&gid.0, after)?;
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let describer = self.describer(gid)?;
-        for item in entries {
-            let position = item.position();
-            let item = match item {
-                Item::Entry(entry) => {
-                    json!({ "type": "entry", "group": b64(&gid.0), "position": position, "id": hex::encode(&entry.id.0), "from": describer.describe(&entry.from), "payload": entry.payload })
-                }
-                Item::Lost(lost) => {
-                    let ids: Vec<String> = lost.ids.iter().map(|id| hex::encode(&id.0)).collect();
-                    json!({ "type": "lost", "group": b64(&gid.0), "position": position, "member": describer.describe(&lost.member), "positions": lost.positions, "ids": ids })
-                }
-            };
-            self.inner.plugins.send(&kind, &item)?;
-            st.handed.insert(gid.clone(), position);
-        }
+        self.ask(kind, start).await?;
         Ok(())
     }
 
@@ -1362,35 +1325,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         let to = message["to"].as_str();
         let id = message["id"].clone();
         match message["type"].as_str().unwrap_or_default() {
-            // The core orders a held send, and answers with its position once it counts, the plugin handed its
-            // messages up to there: this takes a while, answered without holding up the client.
-            "send" if message["held"] == true => {
-                let (client, gid, kind, payload) = (self.clone(), group()?, kind.to_owned(), message["payload"].clone());
-                n0_future::task::spawn(async move {
-                    let sent = async {
-                        let sent = client.inner.node.send(&gid.0, &payload).await?;
-                        client.hand_entries(&gid)?;
-                        Ok(sent_answer(&sent))
-                    };
-                    let sent = sent.await;
-                    match sent {
-                        Ok(sent) if !id.is_null() => client.answer(&kind, id, Ok(sent)),
-                        Err(error) if !id.is_null() => client.answer(&kind, id, Err(error)),
-                        Err(error) => client.warn(Some(&gid), format!("the {kind} plugin's send: {error:#}")),
-                        Ok(_) => {}
-                    }
-                });
-            }
             "send" => node.send_live(&group()?.0, &message["payload"], to)?,
-            "log" => {
-                let gid = group()?;
-                let after = message["after"].as_u64();
-                node.follow_log(&gid.0, after)?;
-                if let Some(after) = after {
-                    self.state().handed.insert(gid.clone(), after);
-                    self.hand_entries(&gid)?;
-                }
-            }
             // These take a while: they are answered without holding up the client.
             "spread" => {
                 let (client, gid, kind) = (self.clone(), group()?, kind.to_owned());

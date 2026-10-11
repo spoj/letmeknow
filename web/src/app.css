@@ -127,7 +127,6 @@ form { display: flex; flex-direction: column; gap: var(--s3); align-items: flex-
 .group-list button span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .group-list button:has(b:not(:empty)) span { font-weight: 600; }
 .group-list b:not(:empty) { min-width: 20px; padding: 0 6px; border-radius: 10px; background: var(--accent); color: var(--on-accent); font-size: var(--t-xs); font-weight: 600; line-height: 20px; text-align: center; font-variant-numeric: tabular-nums; }
-.note { display: block; }
 button.me { display: flex; flex-direction: column; align-items: flex-start; gap: 0; padding: var(--s3) var(--s2) var(--s2); border-top: 1px solid var(--line); border-radius: 0 0 var(--radius) var(--radius); text-align: left; font-weight: 600; }
 .me small { font-size: var(--t-xs); font-weight: 400; }
 .me.on { background: var(--select); }
@@ -178,7 +177,6 @@ blockquote b { font-weight: 500; color: var(--text); }
 .messages li.event { margin-top: var(--s2); font-size: var(--t-sm); color: var(--muted); }
 .messages li.event .who { font-weight: 500; }
 .messages li.event time { margin-left: var(--s2); }
-.messages li.pushed ul { margin: var(--s1) 0 0; padding-left: var(--s4); color: var(--text); }
 .messages li.day { display: flex; align-items: center; gap: var(--s3); margin: var(--s5) 0 var(--s1); font-size: var(--t-xs); font-weight: 600; color: var(--muted); }
 .messages li.day::before, .messages li.day::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
 .empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--s3); padding: var(--s5); text-align: center; pointer-events: none; }

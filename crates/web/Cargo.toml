@@ -12,7 +12,6 @@ crate-type = ["cdylib", "rlib"]
 lmk-client.workspace = true
 lmk-node.workspace = true
 letmeknow-kind-doc.workspace = true
-letmeknow-kind-git.workspace = true
 lmk-proto.workspace = true
 anyhow.workspace = true
 hex.workspace = true

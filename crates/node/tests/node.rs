@@ -576,7 +576,7 @@ async fn a_kind_takes_held_messages_in_log_order_and_a_member_without_state_asks
     assert_eq!(bob.node.entries(&gid.0, 0).unwrap().len(), 1, "messages the kind read past go");
 
     // Carol joins with no state, admitted by whichever member she reaches first: she asks every member online for the
-    // kind's state, gets none from Bob, as a browser gives none for git, and Alice's, and follows from her start.
+    // kind's state, gets none from Bob, and Alice's, and follows from her start.
     let carol = session(&relay, "Carol").await;
     let link = bob.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
     let joining = tokio::spawn(async move { carol.node.join(&link, None).await.map(|_| carol) });

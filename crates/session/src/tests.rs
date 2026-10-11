@@ -29,13 +29,11 @@ impl Drop for World {
     }
 }
 
-/// Where cargo builds the workspace's binaries, the doc and git plugins among them: beside this test's own directory.
+/// Where cargo builds the workspace's binaries, the doc plugin among them: beside this test's own directory.
 fn built() -> PathBuf {
     let dir = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
-    for kind in ["doc", "git"] {
-        let plugin = dir.join(format!("letmeknow-kind-{kind}{}", std::env::consts::EXE_SUFFIX));
-        assert!(plugin.exists(), "build the plugins first: cargo build -p letmeknow-kind-{kind}");
-    }
+    let plugin = dir.join(format!("letmeknow-kind-doc{}", std::env::consts::EXE_SUFFIX));
+    assert!(plugin.exists(), "build the doc plugin first: cargo build -p letmeknow-kind-doc");
     dir
 }
 
@@ -909,69 +907,6 @@ fn a_message_no_member_online_holds_is_passed_and_shown_missing() {
         let got = carol.expect("message").await;
         assert_eq!((&got["content"], &got["pos"]), (&json!("@carol after the gap"), &sent["pos"]));
         assert_eq!(got["missing"], json!([unseen["pos"]]));
-    });
-}
-
-/// git, as the git plugin's caller runs it, in `repo`.
-fn git(repo: &Path, args: &[&str]) -> String {
-    let config = ["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "init.defaultBranch=main"];
-    let out = std::process::Command::new("git").arg("-C").arg(repo).args(config).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
-}
-
-#[test]
-fn git_pushes_count_in_the_groups_log_in_order() {
-    local(async {
-        let world = world("git").await;
-        let mut alice = world.start("alice", HOUR).await;
-        let mut bob = world.start("bob", HOUR).await;
-        let mut carol = world.start("carol", HOUR).await;
-        let group = alice.cmd(&["invite", "--kind", "git", "--name", "Repo"]).await.unwrap()["group"].as_str().unwrap().to_owned();
-        for joiner in [&bob, &carol] {
-            joiner.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
-            alice.told(&["joined"]).await;
-        }
-        let repo = world.root.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q"]);
-        let push = async |old: &str, n: u32| {
-            std::fs::write(repo.join("file.txt"), n.to_string()).unwrap();
-            git(&repo, &["add", "file.txt"]);
-            git(&repo, &["commit", "-qm", &format!("change {n}")]);
-            let (new, bundle) = (git(&repo, &["rev-parse", "HEAD"]), world.root.join(format!("{n}.bundle")));
-            let range = if old == "-" { "main".to_owned() } else { format!("{old}..main") };
-            git(&repo, &["bundle", "create", bundle.to_str().unwrap(), &range]);
-            let pushed = alice.cmd(&["git", "push", &group, "refs/heads/main", old, &new, bundle.to_str().unwrap()]).await.unwrap();
-            for _ in 0..80 {
-                if bob.cmd(&["git", "list", &group]).await.is_ok_and(|list| list["refs"]["refs/heads/main"] == new.as_str()) {
-                    return (new, pushed["position"].clone());
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            panic!("bob did not take push {n}");
-        };
-        let (first, position) = push("-", 1).await;
-        let first_position = position.as_u64().unwrap();
-
-        // Once Alice removes Carol, the next push counts after the removal.
-        let members = alice.cmd(&["members"]).await.unwrap();
-        let fp = members["members"].as_array().unwrap().iter().find(|m| m["handle"] == "carol").unwrap()["fp"].as_str().unwrap().to_owned();
-        alice.cmd(&["remove", &fp]).await.unwrap();
-        carol.told(&["removed"]).await;
-        let (second, position) = push(&first, 2).await;
-        assert_eq!(position.as_u64(), Some(first_position + 2), "after the removal's commit");
-
-        // With no other member online to take its bundle, a push is refused, and nothing counts.
-        bob.stop().await;
-        std::fs::write(repo.join("file.txt"), "3").unwrap();
-        git(&repo, &["commit", "-qam", "change 3"]);
-        let (new, bundle) = (git(&repo, &["rev-parse", "HEAD"]), world.root.join("3.bundle"));
-        git(&repo, &["bundle", "create", bundle.to_str().unwrap(), &format!("{second}..main")]);
-        let refused = alice.cmd(&["git", "push", &group, "refs/heads/main", &second, &new, bundle.to_str().unwrap()]).await.unwrap_err().to_string();
-        assert!(refused.contains("no other member online took the push's bundle") && refused.contains("agent session"), "{refused}");
-        let tips = alice.cmd(&["git", "list", &group, "--push"]).await.unwrap();
-        assert_eq!(tips["refs"]["refs/heads/main"], second.as_str(), "the push did not count");
     });
 }
 

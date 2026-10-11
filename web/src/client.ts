@@ -12,7 +12,7 @@ export type Identity = { id: string; name: string; how: "self" | "unknown"; erro
 /** A member; `name` is how it shows: "Matthew · phone", or its fingerprint where it speaks for no identity this browser could check. */
 export type Person = { fp: string; name: string; handle?: string; device: string; you?: boolean; identity?: Identity; added_by?: { fp: string; how: string }; away?: boolean };
 export type Named = { id: string; name: string };
-export type Settings = { kind: "chat" | "doc" | "git"; name: string; carry?: number };
+export type Settings = { kind: "chat" | "doc"; name: string; carry?: number };
 export type Group = { group: string; settings: Settings; members: Person[] };
 export type Attachment = { link: string; name: string; size: number; type: string; kept: boolean };
 
@@ -49,8 +49,7 @@ export type Item =
   | { type: "joined"; at: number; member: Person; by: Person; how: string }
   | { type: "left"; at: number; member: Person; by: Person }
   | { type: "revoked"; at: number; removed: Person[]; added: Person[] }
-  | { type: "settings"; at: number; by: Person; before?: Settings; settings: Settings }
-  | { type: "pushed"; at: number; by: Person; ref: string; subjects: string[] };
+  | { type: "settings"; at: number; by: Person; before?: Settings; settings: Settings };
 export type Event = { type: string; group?: string; identity?: string; id?: string; hash?: string; text?: string; by?: string };
 export type Me = { fp: string; device: { name: string }; identity: (Named & { device?: string }) | null };
 

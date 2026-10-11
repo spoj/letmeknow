@@ -222,7 +222,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Asks every member online for the kind's state, unless this session asked or was handed one in the last minute:
-    /// some, as browsers for git, give none.
+    /// some may give none.
     pub(crate) fn ask_state(&self, st: &mut State<P>, gid: &[u8]) {
         let group = Bytes(gid.to_vec());
         let none = !st.served.values().any(|served| served.contains(&group));
