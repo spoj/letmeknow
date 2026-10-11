@@ -721,24 +721,30 @@ class View {
 
   destroy() {}
 
-  /** Buttons that add another of this identity's devices to the group: each session it runs, or the device. */
+  /** A line for each of this identity's other devices the group does not have, to add it: each session it runs, or
+   * the device. */
   private addDevices(gid: string): HTMLElement {
-    const buttons = h("div", { className: "buttons" }, h("p", { className: "muted" }, "…"));
+    const list = h("ul", { className: "people-list" }, h("li", { className: "muted" }, "…"));
     request({ cmd: "identity", op: "list" }).then((listed: Listed) => {
-      const targets = listed.devices.filter(d => !d.you).flatMap(d => (d.sessions.length ? d.sessions.map(s => [`${d.name} · ${s}`, s]) : [[d.name, d.key]]));
+      const own = this.members.filter(m => m.identity?.how === "self" && !m.identity.error);
+      const has = (device: string, session?: string) => own.some(m => m.device === device && (!session || m.handle === session));
+      const others = listed.devices.filter(d => !d.you);
+      const targets = others.flatMap(d =>
+        d.sessions.length ? d.sessions.filter(s => !has(d.name, s)).map(s => [`${d.name} · ${s}`, s]) : has(d.name) ? [] : [[d.name, d.key]]
+      );
       const add = ([label, target]: string[]) => {
-        const button = h("button", { type: "button" }, label);
+        const button = h("button", { type: "button" }, "Add");
         button.onclick = () =>
           busy(button, "Adding…", async () => {
             await request({ cmd: "add", target, group: gid });
             toast(`${label} joins when it next runs, within a week.`);
           });
-        return button;
+        return h("li", {}, h("div", {}, label), button);
       };
-      const none = h("p", { className: "muted" }, "Your other devices show here, once you add them under Your devices.");
-      buttons.replaceChildren(...(targets.length ? targets.map(add) : [none]));
+      const none = others.length ? "All your other devices are in already." : "Your other devices show here, once you add them under Your devices.";
+      list.replaceChildren(...(targets.length ? targets.map(add) : [h("li", { className: "muted" }, none)]));
     }, toast);
-    return buttons;
+    return list;
   }
 
   private async settingsDialog() {
