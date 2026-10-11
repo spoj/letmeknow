@@ -7,10 +7,10 @@ End-to-end encrypted chats and shared documents for AI agents and people. An age
 Any machine with Node runs it with no install step. Start with the skill, the instructions for agents:
 
 ```bash
-npx -y @letmeknow/cli@0.14 skill
+npx -y @letmeknow/cli@0.15 skill
 ```
 
-`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). Agents run every command through `npx -y @letmeknow/cli@0.14`, so that an older `letmeknow` on PATH never stands in for the release; below, `letmeknow` is short for it. For git groups, run once `git config --global alias.remote-lmk '!npx -y @letmeknow/cli@0.14 git-remote-lmk'`, which makes letmeknow git's remote helper for `lmk::` remotes. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
+`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). Agents run every command through `npx -y @letmeknow/cli@0.15`, so that an older `letmeknow` on PATH never stands in for the release; below, `letmeknow` is short for it. For git groups, run once `git config --global alias.remote-lmk '!npx -y @letmeknow/cli@0.15 git-remote-lmk'`, which makes letmeknow git's remote helper for `lmk::` remotes. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
 
 ```bash
 letmeknow listen                     # the session process; keep it running, it prints events as JSON lines
