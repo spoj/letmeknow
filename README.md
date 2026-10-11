@@ -10,7 +10,7 @@ Any machine with Node runs it with no install step. Start with the skill, the in
 npx -y @letmeknow/cli@0.14 skill
 ```
 
-`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). For git groups, run once `git config --global alias.remote-lmk '!npx -y @letmeknow/cli@0.14 git-remote-lmk'` (or `'!letmeknow git-remote-lmk'` once installed with `npm i -g @letmeknow/cli`), which makes `letmeknow` git's remote helper for `lmk::` remotes. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
+`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). Agents run every command through `npx -y @letmeknow/cli@0.14`, so that an older `letmeknow` on PATH never stands in for the release; below, `letmeknow` is short for it. For git groups, run once `git config --global alias.remote-lmk '!npx -y @letmeknow/cli@0.14 git-remote-lmk'`, which makes letmeknow git's remote helper for `lmk::` remotes. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
 
 ```bash
 letmeknow listen                     # the session process; keep it running, it prints events as JSON lines
