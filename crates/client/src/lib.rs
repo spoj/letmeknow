@@ -192,6 +192,28 @@ pub enum ClientEvent {
     Warning { group: Option<Bytes>, text: String },
 }
 
+impl ClientEvent {
+    fn group(&self) -> Option<&Bytes> {
+        match self {
+            ClientEvent::Joined { group, .. }
+            | ClientEvent::Left { group, .. }
+            | ClientEvent::Revoked { group, .. }
+            | ClientEvent::Removed { group, .. }
+            | ClientEvent::Gone { group }
+            | ClientEvent::Settings { group, .. }
+            | ClientEvent::Message { group, .. }
+            | ClientEvent::Lost { group, .. }
+            | ClientEvent::Sent { group, .. }
+            | ClientEvent::Synced { group }
+            | ClientEvent::Heard { group }
+            | ClientEvent::LeaveHeld { group }
+            | ClientEvent::Plugin { group, .. } => Some(group),
+            ClientEvent::Warning { group, .. } => group.as_ref(),
+            ClientEvent::File { .. } | ClientEvent::Identity { .. } | ClientEvent::Added { .. } => None,
+        }
+    }
+}
+
 /// A chat message to send.
 pub struct Chat {
     pub text: String,
@@ -283,6 +305,8 @@ struct Inner<P> {
     events: mpsc::UnboundedSender<ClientEvent>,
     /// Held while a pass takes the adds for this device.
     taking: tokio::sync::Mutex<()>,
+    /// The events of the groups `added` is joining, held until it tells of the join, which so comes first.
+    adding: Mutex<HashMap<Bytes, Vec<ClientEvent>>>,
 }
 
 /// One member's client, on its node. Its methods may run at once.
@@ -314,6 +338,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             state: Mutex::default(),
             events,
             taking: tokio::sync::Mutex::new(()),
+            adding: Mutex::default(),
         };
         (Client { inner: Arc::new(inner) }, told)
     }
@@ -337,7 +362,11 @@ impl<P: Provider + Send + 'static> Client<P> {
     }
 
     fn emit(&self, event: ClientEvent) {
-        self.inner.events.send(event).ok();
+        let mut adding = self.inner.adding.lock().unwrap();
+        match event.group().and_then(|gid| adding.get_mut(gid)) {
+            Some(held) => held.push(event),
+            None => _ = self.inner.events.send(event),
+        }
     }
 
     pub fn warn(&self, group: Option<&Bytes>, text: String) {
@@ -497,15 +526,24 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(json!({ "group": b64(&gid.0), "device": device["name"], "session": session, "link": link, "expires_in": ADD_VALID / 1000 }))
     }
 
-    /// Joins `group` by an add that `device`, another of this identity's devices, sent, and tells so; unless this session
-    /// is in it already, having joined it otherwise meanwhile.
+    /// Joins `group` by an add that `device`, another of this identity's devices, sent, and tells so before any other
+    /// event of the group; unless this session is in it already, having joined it otherwise meanwhile.
     pub async fn added(&self, link: &str, group: &Bytes, device: &str) -> Result<Value> {
         if self.inner.node.groups().contains(group) {
             return Ok(Value::Null);
         }
-        let joined = self.join(link.to_owned(), (Vec::new(), String::new())).await?;
-        self.emit(ClientEvent::Added { device: device.to_owned(), joined: joined.clone() });
-        Ok(joined)
+        self.inner.adding.lock().unwrap().insert(group.clone(), Vec::new());
+        let joined = self.join(link.to_owned(), (Vec::new(), String::new())).await;
+        // Under the lock, so that no event of the group comes between.
+        let mut adding = self.inner.adding.lock().unwrap();
+        let held = adding.remove(group).unwrap_or_default();
+        if let Ok(joined) = &joined {
+            self.inner.events.send(ClientEvent::Added { device: device.to_owned(), joined: joined.clone() }).ok();
+        }
+        for event in held {
+            self.inner.events.send(event).ok();
+        }
+        joined
     }
 
     /// Joins the groups of the adds for this device, where this client's node is the device's own, as in a browser: as

@@ -1046,6 +1046,31 @@ fn an_add_brings_a_session_of_another_device_into_a_group_once() {
     });
 }
 
+/// An added session tells of its own join before any other event of the group, though the group changes as it joins.
+#[test]
+fn an_added_session_tells_of_its_join_first() {
+    local(async {
+        let world = world("add-first").await;
+        let (alice, bob, group) = pair(&world, HOUR).await;
+        let mut desk = world.start("desk", HOUR).await;
+        let invite = bob.cmd(&["identity", "invite"]).await.unwrap();
+        desk.cmd(&["identity", "join", invite["link"].as_str().unwrap()]).await.unwrap();
+        let runs_desk = |listed: &Value| listed["devices"].as_array().unwrap().iter().any(|d| d["sessions"] == json!(["desk"]));
+        until(|| async { bob.cmd(&["identity", "list"]).await.unwrap() }, runs_desk).await;
+        let at = format!("--group={group}");
+        let renames = tokio::task::spawn_local(async move {
+            for round in 0..1000 {
+                alice.cmd(&["name", &format!("round {round}"), &at]).await.ok();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        bob.cmd(&["add", "desk", &format!("--group={group}")]).await.unwrap();
+        let first = desk.expect_any(&["joined", "settings"]).await;
+        renames.abort();
+        assert_eq!((first["type"].as_str(), first["how"].as_str()), (Some("joined"), Some("add")), "{first}");
+    });
+}
+
 /// A join that waits on a member who never answers holds up none of the session's other work.
 #[test]
 fn a_session_goes_on_while_a_join_waits() {
