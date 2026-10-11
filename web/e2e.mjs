@@ -429,7 +429,7 @@ try {
   await laptop.getByRole("button", { name: "End for everyone" }).click();
   await laptop.getByRole("button", { name: "Remove everyone and end this chat?" }).click();
   await laptop.locator(".group-list button", { hasText: "Ideas" }).waitFor({ state: "detached" });
-  await tablet.printed(e => e.type === "removed" && e.by?.startsWith("Matt · "));
+  await tablet.printed(e => e.type === "removed" && e.by === "laptop");
   check(!tablet.run("groups").some(g => g.name === "Ideas"), "the browser ends a chat for everyone");
   await tablet.stop();
 
@@ -467,7 +467,7 @@ try {
   await laptop.getByText("the build is green").waitFor();
   await laptop.locator("textarea:visible").fill("thanks");
   await laptop.locator("textarea:visible").press("Enter");
-  await ann.printed(e => e.type === "message" && e.group === code.group && e.content === "thanks");
+  await ann.printed(e => e.type === "message" && e.group === "Code" && e.content === "thanks");
   check(true, "and its chat, both ways");
 
   // A message larger than members take is not sent: the timeline keeps its text, says why, and offers Retry.
@@ -511,7 +511,7 @@ try {
   await closed;
   delete pages["second tab"];
   const annBack = native("ann");
-  await annBack.printed(e => e.type === "lost" && e.member.you, 60_000);
+  await annBack.printed(e => e.type === "lost" && e.member === "you", 60_000);
   laptop = watch("laptop", await context.newPage());
   laptop.on("dialog", dialog => dialog.accept());
   await laptop.goto(SITE);
