@@ -49,9 +49,6 @@ pub struct Known {
     /// Why it is not verified: its device is not on the identity's list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Another identity's device, added to it after its first devices.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub new_device: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,7 +109,6 @@ impl Describer {
             name,
             how,
             error: claim.error.clone(),
-            new_device: (claim.added && own.is_none()).then(|| "a device added to the identity after its first".into()),
         }
     }
 }
@@ -140,7 +136,6 @@ mod tests {
             identity: IdentityRef { id: Bytes(vec![id]), membership: crate::letmeknow_dev() },
             name: claimed.into(),
             error: None,
-            added: false,
         });
         Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, name: name.into(), device_name: "laptop".into(), identity, added: None }
     }

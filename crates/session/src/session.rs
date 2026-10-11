@@ -1,6 +1,6 @@
 //! The session process: the client core on this session's node, and, holding the device's lock, the device's node with
 //! the devices kind; the plugins of its groups' kinds as executables; and what concerns the agent, printed. Chat is its
-//! built-in kind. The session process that holds the lock publishes the device's identities and its key on each to
+//! built-in kind. The session process that holds the lock publishes the device's identity and its key on it to
 //! `device-state.json`, and answers the requests only the device's node can on the command channel `device-endpoint`,
 //! both in `LETMEKNOW_HOME`; the device's other session processes read the one and send such
 //! requests to the other, among them for the certificates their credentials carry.
@@ -34,8 +34,8 @@ use crate::policy::{Outbox, mentions, wakes};
 const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
 /// How often a session process that does not act for the device tries its lock.
 const DEVICE_RETRY: Duration = Duration::from_secs(10);
-/// How often a session checks that its device is still on the identities it speaks as.
-const IDENTITIES_CHECK: Duration = Duration::from_secs(10);
+/// How often a session checks that its device is still on the identity it speaks as.
+const IDENTITY_CHECK: Duration = Duration::from_secs(10);
 /// How long a stopping session waits for peers to acknowledge that its connections closed, which takes three round
 /// trips' timeouts per connection. A peer told nothing yet finds out when the connection times out.
 const CLOSE_WAIT: Duration = Duration::from_millis(250);
@@ -102,8 +102,8 @@ pub struct Session {
     device: Option<SessionNode>,
     lock: std::fs::File,
     device_retry: Instant,
-    /// When this session next checks its device's identities.
-    identities_at: Instant,
+    /// When this session next checks its device's identity.
+    identity_at: Instant,
     /// The device's state as last published.
     published: String,
     home: PathBuf,
@@ -186,7 +186,7 @@ impl Session {
             device: None,
             lock,
             device_retry: Instant::now(),
-            identities_at: Instant::now(),
+            identity_at: Instant::now(),
             published: String::new(),
             home: home.to_path_buf(),
             network,
@@ -287,7 +287,7 @@ impl Session {
         let held = self.outbox.deadline(self.config.hold);
         let device = self.device.is_none().then_some(self.device_retry);
         let later = Instant::now() + Duration::from_secs(3600);
-        let due = held.into_iter().chain(device).chain([self.identities_at]);
+        let due = held.into_iter().chain(device).chain([self.identity_at]);
         due.chain(self.catching_up).fold(later, Instant::min)
     }
 
@@ -299,9 +299,9 @@ impl Session {
         {
             self.warn(None, format!("acting for this device: {error:#}"));
         }
-        if self.identities_at <= now {
+        if self.identity_at <= now {
             // Not due again until this check finishes.
-            self.identities_at = now + Duration::from_secs(3600);
+            self.identity_at = now + Duration::from_secs(3600);
             let client = self.client.clone();
             self.running.spawn_local(async move { Done::Left(client.leave_identities_left().await) });
         }
@@ -406,7 +406,7 @@ impl Session {
                 self.answer(answer, reply);
             }
             Done::Left(failed) => {
-                self.identities_at = Instant::now() + IDENTITIES_CHECK;
+                self.identity_at = Instant::now() + IDENTITY_CHECK;
                 for error in failed {
                     eprintln!("letmeknow: leaving the groups of an identity this device left: {error:#}");
                 }

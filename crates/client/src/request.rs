@@ -123,7 +123,7 @@ pub enum IdentityOp {
     Remove { device: String },
     /// Take this device off its identity: its sessions leave the groups they are in as it first; the identity ends if this is its only device
     Leave,
-    /// Rename this device, as its identities' devices and members of its sessions' groups see it
+    /// Rename this device, as its identity's devices and members of its sessions' groups see it
     Rename { name: String },
 }
 

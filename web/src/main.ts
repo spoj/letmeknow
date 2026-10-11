@@ -164,7 +164,7 @@ function standing(p: Person): string | undefined {
 
 function who(p: Person): HTMLElement {
   const i = p.identity;
-  const warning = i?.error ?? i?.new_device;
+  const warning = i?.error;
   const own = p.you || (i && !i.error && i.how === "self");
   return h(
     "span",

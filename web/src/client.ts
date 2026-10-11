@@ -8,7 +8,7 @@ import wasm from "../pkg/lmk_web_bg.wasm";
 import * as store from "./store";
 
 /** A member as the client core describes it; an endpoint that is not one has only its `iroh` key. */
-export type Identity = { id: string; name: string; how: "self" | "unknown"; error?: string; new_device?: string };
+export type Identity = { id: string; name: string; how: "self" | "unknown"; error?: string };
 export type Person = { fp: string; name: string; device: string; you?: boolean; identity?: Identity; added_by?: { name?: string; how: string }; away?: boolean };
 export type Named = { id: string; name: string };
 export type Settings = { kind: "chat" | "doc" | "git"; name: string; carry?: number };

@@ -125,8 +125,6 @@ pub struct Claim {
     pub name: String,
     /// Why it is not verified, if it is not: its device is not on the identity's list.
     pub error: Option<String>,
-    /// Its device was added to the identity after the identity's first devices.
-    pub added: bool,
 }
 
 /// A held message of the group, opened: a payload of its kind, or one of the core's.
@@ -681,15 +679,15 @@ impl<P: Provider> State<P> {
         let identity = identity.clone();
         let Some(log) = self.keys.get(&identity.id.0) else {
             let error = Some("its identity's key log could not be read yet".into());
-            return (Claim { identity, name: String::new(), error, added: false }, None);
+            return (Claim { identity, name: String::new(), error }, None);
         };
         let name = log.name.clone();
         let error = match log.verify(credential) {
-            Verdict::Verified { device, added } => return (Claim { identity, name, error: None, added }, Some(device)),
+            Verdict::Verified { device } => return (Claim { identity, name, error: None }, Some(device)),
             Verdict::Unverified => "its device is not on its identity's list",
             Verdict::Dropped => "its device was taken off its identity",
         };
-        (Claim { identity, name, error: Some(error.into()), added: false }, None)
+        (Claim { identity, name, error: Some(error.into()) }, None)
     }
 
     fn members(&self, gid: &[u8]) -> Result<Vec<Member>> {

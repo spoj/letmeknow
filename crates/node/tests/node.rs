@@ -733,10 +733,8 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
         let link = alice.node.invite(&chat.0, None).await.unwrap();
         node.join(&link, Some(devices.certify(&node.key().0).unwrap())).await.unwrap();
     }
-    let seen = alice.checked(&chat, "tablet", true).await;
-    assert_eq!((seen.device_name.as_str(), seen.identity.unwrap().added), ("tablet", true));
-    let seen = alice.checked(&chat, "laptop", true).await;
-    assert_eq!((seen.device_name.as_str(), seen.identity.unwrap().added), ("laptop", false));
+    assert_eq!(alice.checked(&chat, "tablet", true).await.device_name, "tablet");
+    assert_eq!(alice.checked(&chat, "laptop", true).await.device_name, "laptop");
 
     // The tablet stops, and the laptop takes it off Bob: a new key, and a list without it. Alice removes its session
     // from the chat without its coming back; the laptop's certificate still checks out, and alice serves it.

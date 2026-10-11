@@ -686,7 +686,7 @@ fn credentials_are_checked_not_enforced() {
     w.found(0, &[1]);
     w.agree(&[0, 1]);
     let checked: Vec<Verdict> = w.m[1].g().members().iter().map(|member| log.verify(member.credential.as_ref().unwrap())).collect();
-    assert_eq!(checked, [Verdict::Verified { device: "laptop".into(), added: false }, Verdict::Unverified]);
+    assert_eq!(checked, [Verdict::Verified { device: "laptop".into() }, Verdict::Unverified]);
     let hi = w.m[1].send("hi from M");
     let opened = w.m[0].open(&hi).unwrap();
     assert_eq!((opened.sender.key.0, opened.sender.name), (w.m[1].session.key().to_vec(), "M".to_owned()));

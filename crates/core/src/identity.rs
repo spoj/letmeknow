@@ -40,8 +40,6 @@ pub struct KeyLog {
     pub keys: Vec<[u8; 32]>,
     /// The current list of devices.
     pub devices: Vec<Listed>,
-    /// The keys of the devices its first entry listed.
-    first: Vec<Bytes>,
     /// The keys of the devices an earlier entry listed and the current one does not.
     dropped: Vec<Bytes>,
     /// SHA-256 of the latest valid entry's body.
@@ -51,8 +49,8 @@ pub struct KeyLog {
 /// How a member's certificate stands against its identity's key log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// Its device is listed, by this name; `added`: not among the identity's first devices.
-    Verified { device: String, added: bool },
+    /// Its device is listed, by this name.
+    Verified { device: String },
     /// Its device was never listed, or the certificate does not check out: the key log may not show it yet.
     Unverified,
     /// An earlier entry listed its device and the current one does not.
@@ -112,8 +110,7 @@ impl KeyLog {
         if body.prev.is_some() || Sha256::digest(&entry.body.0)[..] != id[..] {
             return None;
         }
-        let first = body.devices.iter().map(|device| device.key.clone()).collect();
-        Some(KeyLog { id: *id, name: body.name?, membership: body.membership?, keys: vec![key], devices: body.devices, first, dropped: Vec::new(), latest: *id })
+        Some(KeyLog { id: *id, name: body.name?, membership: body.membership?, keys: vec![key], devices: body.devices, dropped: Vec::new(), latest: *id })
     }
 
     /// Applies the next entry of the log if the current key signed it and it extends the log; returns whether it did.
@@ -161,7 +158,7 @@ impl KeyLog {
             return Verdict::Unverified;
         }
         match self.devices.iter().find(|device| device.key == certificate.device) {
-            Some(device) => Verdict::Verified { device: device.name.clone(), added: !self.first.contains(&device.key) },
+            Some(device) => Verdict::Verified { device: device.name.clone() },
             None if self.dropped(&certificate.device.0) => Verdict::Dropped,
             None => Verdict::Unverified,
         }
@@ -253,10 +250,10 @@ mod tests {
             key: session.clone(),
             certificate: Some(Certificate { identity: identity.clone(), device: public(device).into(), sig: Bytes(sign(device, &certified(&session.0, &id))) }.into()),
         };
-        assert_eq!(log.verify(&of(&laptop)), Verdict::Verified { device: "laptop".into(), added: false });
+        assert_eq!(log.verify(&of(&laptop)), Verdict::Verified { device: "laptop".into() });
         assert_eq!(log.verify(&of(&tablet)), Verdict::Unverified, "never listed");
         assert!(log.apply(&log.next(&key, &public(&key), vec![listed(&laptop, "laptop"), listed(&tablet, "tablet")])));
-        assert_eq!(log.verify(&of(&tablet)), Verdict::Verified { device: "tablet".into(), added: true });
+        assert_eq!(log.verify(&of(&tablet)), Verdict::Verified { device: "tablet".into() });
         assert!(log.apply(&log.next(&key, &public(&crate::random()), vec![listed(&laptop, "laptop")])));
         assert_eq!(log.verify(&of(&tablet)), Verdict::Dropped);
         assert_eq!(log.verify(&of(&phone)), Verdict::Unverified);
