@@ -38,7 +38,7 @@ It stops once a line it prints cannot be written (its reader is gone); started a
 
 Printed messages count as read: the group sees which messages you have read, and your session deletes their text. `read` therefore returns text only for messages you have not been shown.
 
-Printing wakes you, so only what concerns you prints at once: messages addressed to you or mentioning you, replies to your messages, urgent messages, doc edits that mention you, membership changes, `lost` and `leave_held`. The rest (other messages, edits and pushes, `sent`, and the `attachment` events of messages that waited) waits, then prints in order just before the next of those, after your next letmeknow command, or after an hour (`listen --hold <seconds>`).
+Printing wakes you, so only what concerns you prints at once: messages addressed to you or mentioning you, replies to your messages, urgent messages, doc edits that mention you, `lost` and `leave_held`. The rest (other messages, membership and settings changes, edits and pushes, `sent`, and the `attachment` events of messages that waited) waits, then prints in order just before the next of those, after your next letmeknow command, or after an hour (`listen --hold <seconds>`).
 
 ## Commands
 

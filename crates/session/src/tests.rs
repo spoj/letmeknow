@@ -134,6 +134,22 @@ impl Agent {
         self.expect_any(&[kind]).await
     }
 
+    /// The next event of any of `kinds`, which wait, as membership changes do, until the agent's next command: it runs
+    /// `status` until one prints, skipping other events.
+    async fn told(&mut self, kinds: &[&str]) -> Value {
+        let start = std::time::Instant::now();
+        loop {
+            self.cmd(&["status"]).await.unwrap();
+            while let Ok(line) = tokio::time::timeout(Duration::from_millis(200), self.events.recv()).await {
+                let event: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                if kinds.iter().any(|kind| event["type"] == *kind) {
+                    return event;
+                }
+            }
+            assert!(start.elapsed() < Duration::from_secs(30), "{}: no {kinds:?} event", self.handle);
+        }
+    }
+
     /// The next event of any of `kinds`, skipping others.
     async fn expect_any(&mut self, kinds: &[&str]) -> Value {
         loop {
@@ -189,7 +205,7 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len(), 2);
-    let event = alice.expect("joined").await;
+    let event = alice.told(&["joined"]).await;
     assert_eq!((&event["member"], &event["by"], &event["how"]), (&json!(format!("Robert · {}", bob.device)), &json!("you"), &json!("invite")));
     (alice, bob, invite["group"].as_str().unwrap().to_owned())
 }
@@ -321,7 +337,7 @@ fn a_doc_is_a_file_that_others_edit_too() {
         let theirs = world.root.join("bob-plan.md");
         let joined = bob.cmd(&["join", invite["link"].as_str().unwrap(), theirs.to_str().unwrap()]).await.unwrap();
         assert_eq!(joined["kind"], "doc");
-        alice.expect("joined").await;
+        alice.told(&["joined"]).await;
         // The doc's text arrives a moment later, from whoever admitted Bob; a command prints what waits.
         for _ in 0..40 {
             bob.cmd(&["groups"]).await.unwrap();
@@ -359,13 +375,13 @@ fn a_doc_is_a_file_that_others_edit_too() {
 }
 
 #[test]
-fn membership_changes_wake_and_a_removed_session_is_told() {
+fn membership_and_settings_changes_are_told_and_a_removed_session_learns_it() {
     local(async {
         let world = world("remove").await;
         let (mut alice, mut bob, group) = pair(&world, HOUR).await;
         let named = alice.cmd(&["name", "Release"]).await.unwrap();
         assert_eq!(named["settings"]["name"], "Release");
-        let settings = bob.expect("settings").await;
+        let settings = bob.told(&["settings"]).await;
         let alice_shown = json!(format!("Alice · {}", alice.device));
         assert_eq!((&settings["group"], &settings["settings"]["name"], &settings["by"]), (&json!("Release"), &json!("Release"), &alice_shown));
         let members = bob.cmd(&["members", "--group", "Release"]).await.unwrap();
@@ -382,8 +398,8 @@ fn membership_changes_wake_and_a_removed_session_is_told() {
         alice.cmd(&["leave", &format!("--group={other}")]).await.unwrap();
         assert!(alice.cmd(&["remove", "Carol"]).await.is_err());
         alice.cmd(&["remove", "Bob"]).await.unwrap();
-        assert_eq!(alice.expect("left").await["member"], format!("Robert · {}", bob.device));
-        let removed = bob.expect("removed").await;
+        assert_eq!(alice.told(&["left"]).await["member"], format!("Robert · {}", bob.device));
+        let removed = bob.told(&["removed"]).await;
         assert_eq!((&removed["group"], &removed["by"]), (&json!("Release"), &alice_shown), "by the name it had");
         assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!([]));
     });
@@ -407,7 +423,7 @@ fn text_shown_or_left_behind_stays_in_no_file() {
         alice.cmd(&["status"]).await.unwrap();
         assert_eq!(holding(&session_dir(&alice.home, "alice").unwrap(), secret), Vec::<PathBuf>::new());
         alice.cmd(&["remove", "Bob"]).await.unwrap();
-        bob.expect("removed").await;
+        bob.told(&["removed"]).await;
         assert_eq!(holding(&session_dir(&bob.home, "bob").unwrap(), secret), Vec::<PathBuf>::new());
     });
 }
@@ -419,8 +435,8 @@ fn a_leaving_member_is_removed_by_another() {
         let (mut alice, mut bob, _) = pair(&world, HOUR).await;
         let left = bob.cmd(&["leave"]).await.unwrap();
         assert_eq!(left["left"], true);
-        assert_eq!(alice.expect("left").await["member"], format!("Robert · {}", bob.device));
-        bob.expect("removed").await;
+        assert_eq!(alice.told(&["left"]).await["member"], format!("Robert · {}", bob.device));
+        bob.told(&["removed"]).await;
     });
 }
 
@@ -511,9 +527,9 @@ fn a_leave_is_pending_until_another_member_holds_it() {
         assert_eq!((&left["left"], &left["pending"]), (&json!(true), &json!(true)), "{left}");
         let _alice = world.start("alice", HOUR).await;
         // Bob is told once Alice holds his leave, unless her removal of him reaches him first.
-        let mut told = bob.expect_any(&["leave_held", "removed"]).await;
+        let mut told = bob.told(&["leave_held", "removed"]).await;
         if told["type"] == "leave_held" {
-            told = bob.expect("removed").await;
+            told = bob.told(&["removed"]).await;
         }
         assert_eq!(told["type"], "removed");
     });
@@ -604,7 +620,7 @@ fn a_group_ended_for_everyone_keeps_no_member() {
         let (alice, mut bob, _) = pair(&world, HOUR).await;
         let ended = alice.cmd(&["leave", "--end"]).await.unwrap();
         assert_eq!((ended["ended"].as_bool(), ended.get("pending")), (Some(true), None), "{ended}");
-        assert_eq!(bob.expect("removed").await["by"], format!("Alice · {}", alice.device));
+        assert_eq!(bob.told(&["removed"]).await["by"], format!("Alice · {}", alice.device));
         assert_eq!(alice.cmd(&["groups"]).await.unwrap(), json!([]));
         assert_eq!(bob.cmd(&["groups"]).await.unwrap(), json!([]));
     });
@@ -705,7 +721,7 @@ fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
         alice.cmd(&["identity", "create", "Alice"]).await.unwrap();
         let invite = carol.cmd(&["invite"]).await.unwrap();
         desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
-        carol.expect("joined").await;
+        carol.told(&["joined"]).await;
 
         assert_eq!(desk.cmd(&["identity", "rename", "--device", "studio"]).await.unwrap()["device"]["name"], "studio");
         let listed = alice.cmd(&["identity", "list"]).await.unwrap();
@@ -724,7 +740,7 @@ fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
         assert_eq!((&left["left"][0], &left["ended"]), (&invite["group"], &json!(true)));
         assert_eq!(alice.cmd(&["identity", "list"]).await.unwrap()["identity"], json!(null));
         // Carol may hear that the device left its identity before she commits its leave, and then it shows by fingerprint.
-        let left = carol.expect("left").await;
+        let left = carol.told(&["left"]).await;
         assert!(left["member"] == desk.fp.as_str() || left["member"] == "Alice · studio", "{left}");
     });
 }
@@ -753,7 +769,7 @@ fn docs_that_drift_apart_meet_again() {
         std::fs::write(&plan, "- [ ] alpha\n").unwrap();
         let invite = alice.cmd(&["invite", "--kind", "doc", plan.to_str().unwrap()]).await.unwrap();
         bob.cmd(&["join", invite["link"].as_str().unwrap(), theirs.to_str().unwrap()]).await.unwrap();
-        alice.expect("joined").await;
+        alice.told(&["joined"]).await;
         assert_eq!(until_file(&bob, &theirs, |t| t.contains("alpha")).await, "- [ ] alpha\n");
         // Bob is away while Alice edits: her live edit never reaches him, but the docs compare once he is back.
         bob.stop().await;
@@ -861,7 +877,7 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
         bob.cmd(&["identity", "create", "Robert"]).await.unwrap();
         let invite = second.cmd(&["invite"]).await.unwrap();
         bob.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
-        second.expect("joined").await;
+        second.told(&["joined"]).await;
         let members = second.cmd(&["members"]).await.unwrap();
         let alice_seen = members["members"].as_array().unwrap().iter().find(|m| m["you"] == true).unwrap().clone();
         assert_eq!((alice_seen["identity"]["name"].as_str(), alice_seen["identity"]["how"].as_str()), (Some("Alice"), Some("self")));
@@ -882,7 +898,7 @@ fn a_message_no_member_online_holds_is_passed_and_shown_missing() {
         let (mut alice, mut bob, group) = pair(&world, HOUR).await;
         let mut carol = world.start("carol", HOUR).await;
         carol.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
-        bob.expect("joined").await;
+        bob.told(&["joined"]).await;
         alice.stop().await;
         carol.stop().await;
         let unseen = bob.cmd(&["send", "while they are away"]).await.unwrap();
@@ -914,7 +930,7 @@ fn git_pushes_count_in_the_groups_log_in_order() {
         let group = alice.cmd(&["invite", "--kind", "git", "--name", "Repo"]).await.unwrap()["group"].as_str().unwrap().to_owned();
         for joiner in [&bob, &carol] {
             joiner.cmd(&["join", alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap()]).await.unwrap();
-            alice.expect("joined").await;
+            alice.told(&["joined"]).await;
         }
         let repo = world.root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -942,7 +958,7 @@ fn git_pushes_count_in_the_groups_log_in_order() {
         let members = alice.cmd(&["members"]).await.unwrap();
         let fp = members["members"].as_array().unwrap().iter().find(|m| m["handle"] == "carol").unwrap()["fp"].as_str().unwrap().to_owned();
         alice.cmd(&["remove", &fp]).await.unwrap();
-        carol.expect("removed").await;
+        carol.told(&["removed"]).await;
         let (second, position) = push(&first, 2).await;
         assert_eq!(position.as_u64(), Some(first_position + 2), "after the removal's commit");
 
@@ -1005,11 +1021,11 @@ fn a_session_is_listed_and_removed_running_or_stopped() {
 
         let removed = crate::remove(world.config("bob", "desk"), &bob.home, world.network.clone()).await.unwrap();
         assert_eq!(removed, json!({ "removed": "desk", "left": [group] }));
-        assert_eq!(alice.expect("left").await["member"], format!("Robert · {} (desk)", bob.device), "Bob's device has two sessions here");
+        assert_eq!(alice.told(&["left"]).await["member"], format!("Robert · {} (desk)", bob.device), "Bob's device has two sessions here");
         drop(desk);
         bob.stop().await;
         crate::remove(world.config("bob", "bob"), &bob.home, world.network.clone()).await.unwrap();
-        assert_eq!(alice.expect("left").await["member"], format!("Robert · {}", bob.device));
+        assert_eq!(alice.told(&["left"]).await["member"], format!("Robert · {}", bob.device));
         assert_eq!(crate::sessions(&bob.home).await.unwrap(), json!({ "sessions": [] }));
     });
 }
@@ -1038,7 +1054,7 @@ fn an_add_brings_a_session_of_another_device_into_a_group_once() {
         let refused = laptop.cmd(&["join", link]).await.unwrap_err().to_string();
         assert!(refused.contains("another device"), "{refused}");
         let mut desk = world.start("desk", HOUR).await;
-        let joined = desk.expect("joined").await;
+        let joined = desk.told(&["joined"]).await;
         assert_eq!((joined["how"].as_str(), joined["group"].as_str()), (Some("add"), Some(group.as_str())));
         assert_eq!(joined["device"], runs(&listed, true)["name"]);
         let other = world.start_in("desk", "other", HOUR).await;
@@ -1072,7 +1088,7 @@ fn an_added_session_tells_of_its_join_first() {
             }
         });
         bob.cmd(&["add", "desk", &format!("--group={group}")]).await.unwrap();
-        let first = desk.expect_any(&["joined", "settings"]).await;
+        let first = desk.told(&["joined", "settings"]).await;
         renames.abort();
         assert_eq!((first["type"].as_str(), first["how"].as_str()), (Some("joined"), Some("add")), "{first}");
     });

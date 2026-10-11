@@ -492,16 +492,14 @@ impl Session {
     }
 
     async fn on(&mut self, event: ClientEvent) -> Result<()> {
-        let wake = match &event {
-            ClientEvent::Joined { .. }
-            | ClientEvent::Left { .. }
-            | ClientEvent::Revoked { .. }
-            | ClientEvent::Removed { .. }
-            | ClientEvent::Settings { .. } => Some(true),
-            ClientEvent::Lost { .. } | ClientEvent::LeaveHeld { .. } => Some(true),
-            _ => None,
-        };
-        if let Some(wake) = wake {
+        if let ClientEvent::Joined { .. }
+        | ClientEvent::Left { .. }
+        | ClientEvent::Revoked { .. }
+        | ClientEvent::Removed { .. }
+        | ClientEvent::Settings { .. }
+        | ClientEvent::Lost { .. }
+        | ClientEvent::LeaveHeld { .. } = &event
+        {
             let mut item = serde_json::to_value(&event)?;
             if let ClientEvent::Lost { member, ids, .. } = &event
                 && !member.you
@@ -512,6 +510,7 @@ impl Session {
                     ids.len()
                 ));
             }
+            let wake = wakes(&item, |id| self.mine(id));
             self.outbox.deliver(item, wake);
             return Ok(());
         }
@@ -529,7 +528,8 @@ impl Session {
                 joined["type"] = json!("joined");
                 joined["how"] = json!("add");
                 joined["device"] = json!(device);
-                self.outbox.deliver(joined, true);
+                let wake = wakes(&joined, |id| self.mine(id));
+                self.outbox.deliver(joined, wake);
             }
             ClientEvent::File { hash } => self.arrived(hex::decode(hash)?.try_into().ok().context("a hash is 32 bytes")?).await?,
             ClientEvent::Plugin { group, kind, event, wake, key } => {
