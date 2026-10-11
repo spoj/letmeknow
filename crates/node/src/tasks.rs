@@ -10,7 +10,7 @@ use iroh::{EndpointId, RelayMap};
 use lmk_core::group::{Group, Session};
 use lmk_core::provider::Provider;
 use lmk_net::peers::Peers;
-use lmk_net::{Net, Network};
+use lmk_net::Net;
 use lmk_proto::group::{Leaf, REVISION};
 use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
@@ -29,13 +29,8 @@ impl<P: Provider + Send + 'static> Node<P> {
         let relays = RelayMap::from(iroh::RelayConfig::new(config.relay.clone(), Some(Default::default())));
         let ca = std::mem::take(&mut config.ca);
         let endpoint = lmk_net::builder(relays).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
-        Self::start_on(provider, config, Network::Iroh(endpoint)).await
-    }
-
-    /// Opens the session on a network of the caller's, whose key is `iroh_key`'s.
-    pub async fn start_on(provider: P, config: Config, network: Network) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
-        let transport = network.transport();
-        let leaf = Leaf { key: Bytes(transport.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone(), revision: REVISION };
+        let transport = Arc::new(lmk_transport::Iroh(endpoint.clone()));
+        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone(), revision: REVISION };
         let clients = logs::Clients::new(transport);
         let state = State::open(provider, &config, leaf, &clients)?;
         let (events, events_rx) = mpsc::unbounded_channel();
@@ -64,7 +59,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             contradictions: Mutex::default(),
         });
         let net_config = lmk_net::Config { home: config.home, files: config.files, disk: config.disk, file_limit: config.file_limit, collect: COLLECT };
-        let (net, net_events) = Net::spawn(network, net_config, inner.clone(), Arc::new(admission::Admitter(inner.clone()))).await?;
+        let (net, net_events) = Net::spawn(endpoint, net_config, inner.clone(), Arc::new(admission::Admitter(inner.clone()))).await?;
         inner.net.set(net).ok();
         inner.run(net_events, work_rx, outbox_rx);
         Ok((Node { inner }, events_rx))

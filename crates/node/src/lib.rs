@@ -48,7 +48,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
 pub use lmk_core;
-pub use lmk_net::{Disk, Fetch};
+pub use lmk_net::Disk;
 pub use peering::Heard;
 pub use lmk_proto::clock::now;
 

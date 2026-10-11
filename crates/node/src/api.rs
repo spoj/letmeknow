@@ -35,7 +35,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         Bytes(self.inner.lock().session.key().to_vec())
     }
 
-    /// Its peers: what a transport of the caller's hands the connections peers open, and the files they fetch.
     pub fn net(&self) -> &Net {
         self.inner.net()
     }

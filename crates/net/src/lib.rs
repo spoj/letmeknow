@@ -1,7 +1,6 @@
 //! Everything a session says to its peers over iroh: one `letmeknow/2` connection per pair of sessions, its `peer`
 //! stream of frames, an `admission` stream per joiner's request, and files over iroh-blobs. What the frames mean is the
-//! node's (see [`peers`]): this crate moves them, answers the files' `want_files`, and holds no keys. A simulator runs
-//! it over its own transport instead.
+//! node's (see [`peers`]): this crate moves them, answers the files' `want_files`, and holds no keys.
 
 mod files;
 mod peer;
@@ -15,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl,
     endpoint::{Builder, presets},
@@ -35,7 +34,7 @@ use tokio::{
 };
 
 use crate::{
-    files::{Blobs, Files},
+    files::Files,
     peer::Input,
 };
 
@@ -63,27 +62,6 @@ pub trait Disk: Send + Sync + 'static {
     /// A kept file's ciphertext.
     fn load(&self, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>>;
     fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>);
-}
-
-/// How a session reaches its peers: iroh, or another transport, such as a simulator's, over which files move whole.
-pub enum Network {
-    Iroh(Endpoint),
-    Other { transport: Arc<dyn Transport>, fetch: Arc<dyn Fetch> },
-}
-
-impl Network {
-    pub fn transport(&self) -> Arc<dyn Transport> {
-        match self {
-            Network::Iroh(endpoint) => Arc::new(Iroh(endpoint.clone())),
-            Network::Other { transport, .. } => transport.clone(),
-        }
-    }
-}
-
-/// Fetches a file whole from a peer that holds it, over a transport other than iroh: the peer answers by
-/// [`Net::upload`].
-pub trait Fetch: Send + Sync + 'static {
-    fn fetch(&self, holder: EndpointId, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>>;
 }
 
 /// A member's decision on a joiner's request; it may commit an Add before it answers.
@@ -123,7 +101,7 @@ pub fn builder(relays: RelayMap) -> Builder {
 #[derive(Clone)]
 pub struct Net {
     inner: Arc<Inner>,
-    router: Option<Router>,
+    router: Router,
 }
 
 pub(crate) struct Inner {
@@ -147,24 +125,17 @@ struct Link {
 
 impl Net {
     pub async fn spawn(
-        network: Network,
+        endpoint: Endpoint,
         config: Config,
         groups: Arc<dyn Groups>,
         admit: Arc<dyn Admit>,
     ) -> Result<(Net, mpsc::UnboundedReceiver<Event>)> {
-        let (transport, blobs) = match &network {
-            Network::Iroh(endpoint) => (network.transport(), Blobs::Iroh(endpoint.clone())),
-            Network::Other { transport, fetch } => (transport.clone(), Blobs::Fetch(fetch.clone())),
-        };
-        let files = Arc::new(Files::new(blobs, config.files.clone(), config.disk.clone(), groups.clone(), config.collect).await?);
+        let files = Arc::new(Files::new(endpoint.clone(), config.files.clone(), config.disk.clone(), groups.clone(), config.collect).await?);
         #[cfg(not(target_family = "wasm"))]
-        let publishing = match (&network, &config.home) {
-            (Network::Iroh(endpoint), Some(home)) => Some(addresses::publish(endpoint, home)?),
-            _ => None,
-        };
+        let publishing = config.home.as_ref().map(|home| addresses::publish(&endpoint, home)).transpose()?;
         let (events, rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
-            transport,
+            transport: Arc::new(Iroh(endpoint.clone())),
             config,
             groups,
             admit,
@@ -174,31 +145,13 @@ impl Net {
             #[cfg(not(target_family = "wasm"))]
             publishing: Mutex::new(publishing),
         });
-        let router = match network {
-            Network::Iroh(endpoint) => {
-                let blobs = inner.files.protocol(inner.groups.clone());
-                Some(Router::builder(endpoint).accept(ALPN, Handler(inner.clone())).accept(iroh_blobs::ALPN, blobs).spawn())
-            }
-            Network::Other { .. } => None,
-        };
+        let blobs = inner.files.protocol(inner.groups.clone());
+        let router = Router::builder(endpoint).accept(ALPN, Handler(inner.clone())).accept(iroh_blobs::ALPN, blobs).spawn();
         Ok((Net { inner, router }, rx))
     }
 
     pub fn id(&self) -> EndpointId {
         self.inner.transport.id()
-    }
-
-    /// Serves a connection a peer opened, until it closes.
-    pub async fn accept(&self, conn: Conn) {
-        self.inner.clone().accept(conn).await;
-    }
-
-    /// A file's ciphertext for a peer that fetches it whole (see [`Fetch`]), by the rules iroh-blobs serves files by.
-    pub async fn upload(&self, peer: EndpointId, hash: [u8; 32]) -> Result<Vec<u8>> {
-        let groups = &self.inner.groups;
-        let linked = groups.groups().iter().any(|g| groups.is_member(g, &peer) && groups.files(g).iter().any(|file| file.hash == hash));
-        ensure!(linked && self.inner.files.serve(&hash).await?, "not served");
-        self.inner.files.ciphertext(&hash).await
     }
 
     /// Connects to a member by the key and relay in its leaf, unless already connected.
@@ -307,9 +260,7 @@ impl Net {
                 removed => removed?,
             }
         }
-        if let Some(router) = &self.router {
-            router.shutdown().await?;
-        }
+        self.router.shutdown().await?;
         Ok(())
     }
 }
