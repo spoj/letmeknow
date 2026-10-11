@@ -61,7 +61,7 @@ pub enum Command {
     /// `git config --global alias.remote-lmk '!letmeknow git-remote-lmk'`
     #[command(name = "git-remote-lmk")]
     GitRemoteLmk {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
     #[command(flatten)]
@@ -189,10 +189,10 @@ pub fn parse<T: Into<OsString> + Clone>(args: impl IntoIterator<Item = T>) -> Re
         .about("Add this device to an identity, through a device link (`identity invite` makes them)")
         .arg(clap::Arg::new("link").value_name("LINK").required(true));
     let group = clap::Arg::new("group").long("group").value_name("GROUP").help("Only this group");
-    let mut matches = Cli::command()
+    let command = Cli::command()
         .mut_subcommand("identity", |identity| identity.subcommand(join))
-        .mut_subcommand("status", |status| status.arg(group))
-        .try_get_matches_from(args)?;
+        .mut_subcommand("status", |status| status.arg(group));
+    let mut matches = hyphens(command).try_get_matches_from(args)?;
     let request = match matches.subcommand() {
         Some(("identity", identity)) => {
             identity.subcommand_matches("join").and_then(|join| join.get_one::<String>("link")).map(|link| Request::IdentityJoin { link: link.clone() })
@@ -208,6 +208,11 @@ pub fn parse<T: Into<OsString> + Clone>(args: impl IntoIterator<Item = T>) -> Re
         }),
         None => Cli::from_arg_matches_mut(&mut matches),
     }
+}
+
+/// Lets every value start with '-', as ids and fingerprints in base64url do, and text may. Known flags stay flags.
+fn hyphens(command: clap::Command) -> clap::Command {
+    command.mut_args(|arg| if arg.get_action().takes_values() { arg.allow_hyphen_values(true) } else { arg }).mut_subcommands(hyphens)
 }
 
 pub fn home_dir(home: Option<PathBuf>) -> Result<PathBuf> {
@@ -423,6 +428,17 @@ pub fn qr(link: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{Command, Request, parse};
+
+    #[test]
+    fn a_value_may_start_with_a_hyphen() {
+        let cli = parse(["letmeknow", "send", "--to", "-Ia", "- an item", "--urgent"]).unwrap();
+        let Command::Request(Request::Send { to, text, urgent, .. }) = cli.command else { panic!("not a send") };
+        assert_eq!((to, text.as_str(), urgent), (vec!["-Ia".to_owned()], "- an item", true));
+        assert!(matches!(parse(["letmeknow", "read", "-Ia"]).unwrap().command, Command::Request(Request::Read { id, .. }) if id == "-Ia"));
+        assert_eq!(parse(["letmeknow", "send", "--help"]).err().unwrap().kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
     #[test]
     fn a_link_shows_as_a_qr_code() {
         let code = super::qr("https://letmeknow.dev/i#4.g.AAAA.BBBB").unwrap();
