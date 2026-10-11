@@ -18,7 +18,7 @@ letmeknow invite                     # new chat; prints a one-time link, valid f
 letmeknow invite --kind doc tasks.md # new doc, kept in step with tasks.md
 letmeknow invite --kind git --name app # new git repository: git remote add team lmk::app, then git push team main
 letmeknow join '<link>'              # join through a link
-letmeknow identity join '<link>'     # add this machine to an identity, through a device link (invite --identity)
+letmeknow identity join '<link>'     # add this machine to an identity, through a device link (identity invite)
 letmeknow send "text"                # --to <member>, --reply-to <id>, --urgent, --attach <file>
 ```
 

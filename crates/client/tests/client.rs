@@ -146,7 +146,7 @@ async fn a_joiner_shows_its_identitys_claim_and_a_link_to_an_identity_admits_onl
     for (member, name) in [(&alice, "Alice"), (&bob, "Robert"), (&carol, "Carol")] {
         member.request(json!({ "cmd": "identity", "op": { "create": { "name": name } } })).await;
     }
-    let robert = bob.client.me().unwrap()["identities"][0]["id"].clone();
+    let robert = bob.client.me().unwrap()["identity"]["id"].clone();
     let refused = alice.client.request(serde_json::from_value(json!({ "cmd": "invite", "to": "Robert" })).unwrap()).await;
     assert_eq!(refused.unwrap_err().to_string(), "--to takes an identity's id, as `members` shows it");
     let invite = alice.request(json!({ "cmd": "invite", "to": robert })).await;
@@ -243,9 +243,9 @@ async fn polled(member: &Member, request: Value, wanted: impl Fn(&Value) -> bool
 /// A device link from the first member's identity, `Bob`, which the second joins.
 async fn devices_of_bob(laptop: &Member, tablet: &Member) {
     laptop.request(json!({ "cmd": "identity", "op": { "create": { "name": "Bob" } } })).await;
-    let link = laptop.request(json!({ "cmd": "invite", "identity": "Bob" })).await;
+    let link = laptop.request(json!({ "cmd": "identity", "op": { "invite": {} } })).await;
     tablet.request(json!({ "cmd": "join", "target": link["link"] })).await;
-    polled(tablet, json!({ "cmd": "identity", "op": "list" }), |listed| listed["identities"][0]["name"] == "Bob").await;
+    polled(tablet, json!({ "cmd": "identity", "op": "list" }), |listed| listed["name"] == "Bob").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -262,7 +262,7 @@ async fn a_renamed_device_shows_its_new_name_to_its_other_devices_and_its_groups
     assert_eq!(renamed["device"]["name"], "desk");
     assert_eq!(laptop.client.me().unwrap()["device"]["name"], "desk");
     let names = |listed: &Value| -> Vec<String> {
-        listed["identities"][0]["devices"].as_array().unwrap().iter().map(|d| d["name"].as_str().unwrap().to_owned()).collect()
+        listed["devices"].as_array().unwrap().iter().map(|d| d["name"].as_str().unwrap().to_owned()).collect()
     };
     let listed = polled(&tablet, json!({ "cmd": "identity", "op": "list" }), |listed| names(listed).contains(&"desk".to_owned())).await;
     assert_eq!(names(&listed).len(), 2, "the tablet lists the laptop by its new name");
@@ -278,15 +278,15 @@ async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_de
     devices_of_bob(&laptop, &tablet).await;
     let chat = alice.request(json!({ "cmd": "invite" })).await;
     tablet.request(json!({ "cmd": "join", "target": chat["link"] })).await;
-    let bob = laptop.client.device_state().unwrap().identities[0].0.clone();
+    let bob = laptop.client.device_state().unwrap().identity.unwrap().0;
     let before = *laptop.client.node().read_key_log(&bob).await.unwrap().current();
 
     // The tablet leaves Bob: its session leaves the chat first, and the laptop, which removes it, replaces Bob's key.
-    let left = tablet.request(json!({ "cmd": "identity", "op": { "leave": { "identity": "Bob" } } })).await;
+    let left = tablet.request(json!({ "cmd": "identity", "op": "leave" })).await;
     assert_eq!((left["left"][0].clone(), left["ended"].clone()), (chat["group"].clone(), json!(false)));
-    assert_eq!(tablet.client.me().unwrap()["identities"], json!([]));
+    assert_eq!(tablet.client.me().unwrap()["identity"], json!(null));
     polled(&alice, json!({ "cmd": "members", "group": chat["group"] }), |m| m["members"].as_array().unwrap().len() == 1).await;
-    polled(&laptop, json!({ "cmd": "identity", "op": "list" }), |listed| listed["identities"][0]["devices"].as_array().unwrap().len() == 1).await;
+    polled(&laptop, json!({ "cmd": "identity", "op": "list" }), |listed| listed["devices"].as_array().unwrap().len() == 1).await;
     tokio::time::timeout(WAIT, async {
         while *laptop.client.node().read_key_log(&bob).await.unwrap().current() == before {
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -296,8 +296,8 @@ async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_de
     .expect("the laptop replaces Bob's key");
 
     // Bob's only device leaves him, and he ends.
-    let left = laptop.request(json!({ "cmd": "identity", "op": { "leave": { "identity": "Bob" } } })).await;
+    let left = laptop.request(json!({ "cmd": "identity", "op": "leave" })).await;
     assert_eq!((left["left"].clone(), left["ended"].clone()), (json!([]), json!(true)));
-    assert_eq!(laptop.client.me().unwrap()["identities"], json!([]));
+    assert_eq!(laptop.client.me().unwrap()["identity"], json!(null));
     assert!(laptop.client.node().groups().is_empty(), "its devices group is gone");
 }

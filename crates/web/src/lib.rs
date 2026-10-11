@@ -1,5 +1,5 @@
 //! The browser client: the client core on one lmk-node session, which is the browser's device too, with a device key of
-//! its own in each identity's devices group, reaching its peers only through the relay, with the devices kind on the
+//! its own in its identity's devices group, reaching its peers only through the relay, with the devices kind on the
 //! same node. Chat is built in; the doc kind
 //! (`lmk_kind_doc::Page`) and the git kind, display-only (`lmk_kind_git::Page`), are in-page plugins, whose messages go
 //! to and from the core as calls. The page persists the session's records in IndexedDB, one record per key, each step's
@@ -661,8 +661,8 @@ impl Lmk {
         self.app.flush();
     }
 
-    /// This browser: `{"name", "fp", "device": {"name"}, "identities": [{"id", "name", "device"}]}`, `device` its key on
-    /// the identity.
+    /// This browser: `{"name", "fp", "device": {"name"}, "identity": {"id", "name", "device"}}`, `device` its key on the
+    /// identity; `identity` null without one.
     pub fn me(&self) -> R<String> {
         Ok(self.app.client.me().map_err(js)?.to_string())
     }
@@ -675,7 +675,7 @@ impl Lmk {
         Ok(answer.to_string())
     }
 
-    /// Every group this browser is in, with its settings and members, then the open groups it could join.
+    /// Every group this browser is in, with its settings and members.
     pub fn groups(&self) -> R<String> {
         Ok(self.app.groups().map_err(js)?.to_string())
     }
@@ -690,11 +690,11 @@ impl Lmk {
         self.app.only_here().map_err(js)
     }
 
-    /// A new chat, doc or git repository, speaking as this browser's first identity; returns its id.
+    /// A new chat, doc or git repository, speaking as this browser's identity; returns its id.
     pub async fn create(&self, kind: String, name: String) -> R<String> {
         let app = &self.app;
         let settings = Settings { protocol: PROTOCOL, kind, name, carry: 7, update: lmk_proto::group::UPDATE, membership: app.membership.clone(), rest: Default::default() };
-        let (gid, _) = app.client.create(settings, None, (Vec::new(), String::new())).await.map_err(js)?;
+        let (gid, _) = app.client.create(settings, (Vec::new(), String::new())).await.map_err(js)?;
         app.remember_settings(&gid.0).map_err(js)?;
         app.flush();
         Ok(json!(gid).as_str().expect("base64url").to_owned())

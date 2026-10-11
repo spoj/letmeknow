@@ -219,7 +219,7 @@ def main():
         listeners += [alice, bob, carol]
         for name in ("alice", "bob", "carol"):
             run(name, "identity", "create", name.title())
-        check(run("bob", "identity", "list")["identities"][0]["devices"][0]["you"], "an identity starts with this device on its list")
+        check(run("bob", "identity", "list")["devices"][0]["you"], "an identity starts with this device on its list")
 
         # An invite, and chat.
         invite = run("alice", "invite", "--name", "Plans")
@@ -282,17 +282,17 @@ def main():
         check(len(joined["members"]) == 3, "a member invites another")
         alice.expect("joined", lambda e: e["member"]["name"] == "Carol" and e["by"]["name"] == "Bob")
         desk = Listener("desk", device="bob")
-        check(run("desk", "identity", "list", device="bob")["identities"][0]["name"] == "Bob", "another session on bob's machine shares his identity")
+        check(run("desk", "identity", "list", device="bob")["name"] == "Bob", "another session on bob's machine shares his identity")
         desk.stop()
 
         # A device link: bob's tablet joins his identity.
-        link = run("bob", "invite", "--identity", "Bob")["link"]
-        check("#4.d." in link, "invite --identity gives a device link")
+        link = run("bob", "identity", "invite")["link"]
+        check("#4.d." in link, "identity invite gives a device link")
         tablet = Listener("tablet")
         listeners.append(tablet)
         check("device" in run("tablet", "identity", "join", link), "the tablet joins bob's identity")
-        check(len(run("bob", "identity", "list")["identities"][0]["devices"]) == 2, "bob's identity lists two devices")
-        bob_id = run("tablet", "identity", "list")["identities"][0]["identity"]
+        check(len(run("bob", "identity", "list")["devices"]) == 2, "bob's identity lists two devices")
+        bob_id = run("tablet", "identity", "list")["identity"]
 
         # Bob's tablet joins the chat by a link, as a device of his identity.
         joined = run("tablet", "join", run("bob", "invite", f"--group={group}")["link"])
@@ -331,7 +331,7 @@ def main():
         check(any(g.get("name") == "Release" for g in renamed), "and on the commits it missed")
 
         # Bob takes his tablet off his identity while it is stopped: its session leaves his groups all the same.
-        key = next(d["key"] for d in run("tablet", "identity", "list")["identities"][0]["devices"] if d["you"])
+        key = next(d["key"] for d in run("tablet", "identity", "list")["devices"] if d["you"])
         tablet.stop()
         listeners.remove(tablet)
         run("bob", "identity", "remove", "--", key)

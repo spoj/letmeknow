@@ -225,13 +225,13 @@ try {
 
   // A device link adds a phone to Matthew's identity, made on his desk; the phone then joins a chat by a link.
   const phone = await open("phone", { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
-  const deviceLink = desk.run("invite", "--identity", "Matthew").link;
+  const deviceLink = desk.run("identity", "invite").link;
   await phone.goto(local(deviceLink));
   await phone.getByRole("heading", { name: "Add this browser to your devices" }).waitFor();
   check((await phone.getByLabel("Name this device").inputValue()) === "phone", "a phone suggests its own device name");
   await phone.getByRole("button", { name: "Add this browser" }).click();
   await phone.locator(".devices li", { hasText: "phone" }).waitFor();
-  const devices = desk.run("identity", "list").identities[0].devices;
+  const devices = desk.run("identity", "list").devices;
   check(devices.length === 2 && devices.some(d => d.name === "phone"), "a device link adds the browser to the identity's devices");
   const team = desk.run("invite", "--name", "Team");
   await phone.locator(".back:visible").click();
@@ -263,7 +263,7 @@ try {
   await phone.locator("dialog").getByRole("button", { name: "Rename" }).click();
   await phone.locator(".devices li", { hasText: "pocket" }).waitFor();
   const listed = await until(
-    () => desk.run("identity", "list").identities[0].devices.map(d => d.name),
+    () => desk.run("identity", "list").devices.map(d => d.name),
     names => names.includes("pocket")
   );
   check(listed.includes("pocket") && !listed.includes("phone"), "a renamed browser shows under its new name in another device's list");
@@ -299,7 +299,7 @@ try {
   await kiosk.getByRole("button", { name: "New chat" }).click();
   await kiosk.locator(".group-list button", { hasText: "Kiosk notes" }).waitFor();
   check((await kiosk.locator(".me").textContent()).includes("Kim"), "a chat started from the welcome screen makes the browser its identity's first device");
-  await kiosk.goto(local(desk.run("invite", "--identity", "Matthew").link));
+  await kiosk.goto(local(desk.run("identity", "invite").link));
   const moving = kiosk.locator("dialog", { hasText: "Move this browser to another identity" });
   await moving.waitFor();
   const moveSaid = await moving.textContent();
@@ -307,7 +307,7 @@ try {
   await moving.getByRole("button", { name: "Move this browser" }).click();
   await kiosk.locator(".devices li", { hasText: "this browser" }).waitFor();
   check((await kiosk.locator(".me").textContent()).includes("Matthew"), "and moves the browser to the identity of the link");
-  const moved = desk.run("identity", "list").identities[0].devices.map(d => d.name);
+  const moved = desk.run("identity", "list").devices.map(d => d.name);
   check(moved.includes("kiosk") && (await kiosk.locator(".group-list button", { hasText: "Kiosk notes" }).count()) === 0, "which lists it, and it left Kim's chat");
 
   check((await laptop.evaluate(() => window.toasts)).length === 0, "the laptop showed no error before its reload");
@@ -406,7 +406,7 @@ try {
     () => laptop.locator(".devices li").count(),
     n => n === 2
   );
-  check(tablet.run("identity", "list").identities[0].name === "Matt", "a native device joins the browser's identity by its link");
+  check(tablet.run("identity", "list").name === "Matt", "a native device joins the browser's identity by its link");
 
   // The laptop starts a chat, and the tablet joins it by the link the laptop shows.
   await laptop.getByRole("button", { name: "New chat" }).click();

@@ -1,6 +1,6 @@
 //! The client core: what one member does on top of its lmk-node session, alike in every client. It answers requests,
 //! turns the node's events into `ClientEvent`s with members described as this client knows them, has its device certify
-//! it for the identities it speaks as, and hosts kinds' plugins.
+//! it for the identity it speaks as, and hosts kinds' plugins.
 //! A shell gives it storage (the node's provider), a network, the device's node, the plugins' transport, and shows or
 //! prints what it tells.
 
@@ -37,6 +37,7 @@ const ASK_WAIT: Duration = Duration::from_secs(60);
 const SPREAD_WAIT: Duration = Duration::from_secs(30);
 /// How long a file asked for may take to arrive.
 const FETCH_WAIT: Duration = Duration::from_secs(60);
+const NO_IDENTITY: &str = "this device is on no identity";
 
 pub fn fp(key: &[u8]) -> String {
     hex::encode(&Sha256::digest(key)[..8])
@@ -89,7 +90,7 @@ pub struct Config {
     pub membership: Service,
 }
 
-/// The device's node, which keeps its identities, and certifies its sessions.
+/// The device's node, which keeps its identity, and certifies its sessions.
 pub enum Access<P> {
     /// It runs here: the devices kind on it.
     Here(Devices<P>),
@@ -119,17 +120,18 @@ pub trait Remote: Send + Sync {
 pub struct DeviceState {
     /// The device's name; none until a device's node publishes its state.
     pub device: Option<String>,
-    pub identities: Vec<(IdentityRef, String)>,
-    /// This device's key on each identity, by identity id.
-    pub keys: Vec<(Bytes, Bytes)>,
+    /// The device's identity, with its name.
+    pub identity: Option<(IdentityRef, String)>,
+    /// This device's key on its identity.
+    pub key: Option<Bytes>,
 }
 
 impl DeviceState {
     pub fn of<P: Provider + Send + 'static>(devices: &Devices<P>) -> Self {
         DeviceState {
             device: devices.name(),
-            identities: devices.identities(),
-            keys: devices.identities().into_iter().filter_map(|(identity, _)| Some((identity.id.clone(), devices.key(&identity.id.0).ok()?))).collect(),
+            identity: devices.identity(),
+            key: devices.key().ok(),
         }
     }
 }
@@ -185,7 +187,7 @@ pub enum ClientEvent {
     /// An event of a kind's plugin: by the delivery policy, waking with `wake`; with `key`, it replaces a held one with
     /// the same key.
     Plugin { group: Bytes, kind: String, event: serde_json::Map<String, Value>, wake: bool, key: Option<String> },
-    /// The devices of one of this device's identities changed.
+    /// The devices of this device's identity changed.
     Devices { identity: Bytes },
     Warning { group: Option<Bytes>, text: String },
 }
@@ -365,16 +367,13 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// This client: its name and fingerprint, its device, and the device's identities, each with the device's key on it.
+    /// This client: its name and fingerprint, its device, and the device's identity, with the device's key on it.
     pub fn me(&self) -> Result<Value> {
-        let device = &self.inner.config.device;
         let state = self.device_state()?;
-        let key = |id: &Bytes| state.keys.iter().find(|(of, _)| of == id).map(|(_, key)| key.clone());
-        let identities: Vec<Value> =
-            state.identities.iter().map(|(identity, name)| json!({ "id": identity.id, "name": name, "device": key(&identity.id) })).collect();
+        let identity = state.identity.map(|(identity, name)| json!({ "id": identity.id, "name": name, "device": state.key }));
         let fp = fp(&self.inner.node.key().0);
-        let name = state.device.clone().unwrap_or_else(|| device.name.clone());
-        Ok(json!({ "name": self.inner.config.name, "fp": fp, "device": { "name": name }, "identities": identities }))
+        let name = state.device.unwrap_or_else(|| self.inner.config.device.name.clone());
+        Ok(json!({ "name": self.inner.config.name, "fp": fp, "device": { "name": name }, "identity": identity }))
     }
 
     /// Answers a request; one only the device's node answers goes to it where it runs elsewhere.
@@ -385,10 +384,10 @@ impl<P: Provider + Send + 'static> Client<P> {
             return remote.request(request).await;
         }
         match request {
-            Request::Invite { group, kind, name, args, cwd, carry, membership, as_, to, qr: _, identity } => {
-                self.invite(group, kind, name, (args, cwd), carry, membership, as_, to, identity).await
+            Request::Invite { group, kind, name, args, cwd, carry, membership, to, qr: _ } => {
+                self.invite(group, kind, name, (args, cwd), carry, membership, to).await
             }
-            Request::Join { target, args, cwd, as_ } => self.join(target, (args, cwd), as_).await,
+            Request::Join { target, args, cwd } => self.join(target, (args, cwd)).await,
             Request::Members { group } => {
                 let gid = self.resolve(group)?;
                 Ok(json!({ "group": b64(&gid.0), "kind": self.inner.node.settings(&gid.0)?.kind, "members": self.described_members(&gid)? }))
@@ -409,9 +408,9 @@ impl<P: Provider + Send + 'static> Client<P> {
                 Ok(json!({ "group": b64(&gid.0), "settings": settings }))
             }
             Request::Status => self.status(),
-            Request::Identity { op: IdentityOp::Leave { identity } } => self.leave_identity(&identity).await,
+            Request::Identity { op: IdentityOp::Leave } => self.leave_identity().await,
             Request::Identity { op } => self.identity(op).await,
-            Request::Certify { identity, key } => Ok(json!(self.devices()?.certify(&identity.0, &key.0)?)),
+            Request::Certify { key } => Ok(json!(self.devices()?.certify(&key.0)?)),
         }
     }
 
@@ -426,59 +425,44 @@ impl<P: Provider + Send + 'static> Client<P> {
         args: (Vec<String>, String),
         carry: u32,
         membership: Option<String>,
-        as_: Option<String>,
         to: Option<String>,
-        identity: Option<String>,
     ) -> Result<Value> {
         let to = to.map(|to| URL_SAFE_NO_PAD.decode(&to).ok().filter(|id| id.len() == 32).map(Bytes).context("--to takes an identity's id, as `members` shows it"));
         let to = to.transpose()?;
         let mut answer = json!({ "expires_in": INVITE_VALID / 1000 });
-        let link = match identity {
-            Some(identity) => {
-                let (identity, name) = self.own_identity(&identity)?;
-                answer["identity"] = json!({ "id": identity.id, "name": name });
-                self.devices()?.invite(&identity.id.0).await?
-            }
+        let gid = match group {
+            Some(group) => self.resolve(Some(group))?,
             None => {
-                let gid = match group {
-                    Some(group) => self.resolve(Some(group))?,
-                    None => {
-                        let membership = membership.map(|m| service(&m)).transpose()?.unwrap_or(self.inner.config.membership.clone());
-                        let settings =
-                            Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), carry, update: UPDATE, membership, rest: Default::default() };
-                        let (gid, opened) = self.create(settings, as_, args).await?;
-                        merge(&mut answer, opened);
-                        gid
-                    }
-                };
-                let settings = self.inner.node.settings(&gid.0)?;
-                answer["group"] = json!(b64(&gid.0));
-                answer["kind"] = json!(settings.kind);
-                if !settings.name.is_empty() {
-                    answer["name"] = json!(settings.name);
-                }
-                self.inner.node.invite(&gid.0, to.clone()).await?.link()
+                let membership = membership.map(|m| service(&m)).transpose()?.unwrap_or(self.inner.config.membership.clone());
+                let settings = Settings { protocol: PROTOCOL, kind, name: name.unwrap_or_default(), carry, update: UPDATE, membership, rest: Default::default() };
+                let (gid, opened) = self.create(settings, args).await?;
+                merge(&mut answer, opened);
+                gid
             }
         };
+        let settings = self.inner.node.settings(&gid.0)?;
+        answer["group"] = json!(b64(&gid.0));
+        answer["kind"] = json!(settings.kind);
+        if !settings.name.is_empty() {
+            answer["name"] = json!(settings.name);
+        }
         if let Some(to) = &to {
             answer["to"] = json!(to);
         }
-        answer["link"] = json!(link);
+        answer["link"] = json!(self.inner.node.invite(&gid.0, to).await?.link());
         Ok(answer)
     }
 
-    /// Makes a group, speaking as `as_` or else the device's first identity, and tells its kind's plugin, with the
-    /// arguments `invite` has for the kind and the directory they are relative to; returns its id and what the plugin
-    /// answered.
-    pub async fn create(&self, settings: Settings, as_: Option<String>, (args, cwd): (Vec<String>, String)) -> Result<(Bytes, Value)> {
+    /// Makes a group, speaking as the device's identity if it has one, and tells its kind's plugin, with the arguments
+    /// `invite` has for the kind and the directory they are relative to; returns its id and what the plugin answered.
+    pub async fn create(&self, settings: Settings, (args, cwd): (Vec<String>, String)) -> Result<(Bytes, Value)> {
         let kind = settings.kind.clone();
         ensure!(
             kind == CHAT || self.inner.plugins.kinds().contains(&kind),
             "this session has no plugin for {kind} groups (letmeknow-kind-{kind})"
         );
         ensure!(args.is_empty() || kind != CHAT, "a chat takes no arguments");
-        let as_ = self.speaking_as(as_).await?;
-        let gid = self.inner.node.create(settings, as_)?;
+        let gid = self.inner.node.create(settings, self.speaking_as().await?)?;
         if kind == CHAT {
             return Ok((gid, json!({})));
         }
@@ -492,24 +476,23 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    async fn join(&self, link: String, args: (Vec<String>, String), as_: Option<String>) -> Result<Value> {
+    async fn join(&self, link: String, args: (Vec<String>, String)) -> Result<Value> {
         let invite = Invite::parse(link.trim())?;
         // As the node's, which share one KeyPackage per invite.
         let key = invite.secret.to_vec();
         ensure!(self.state().joining.insert(key.clone()), "this session is joining that already: wait for that join to end");
-        let joined = self.join_by(invite, args, as_).await;
+        let joined = self.join_by(invite, args).await;
         self.state().joining.remove(&key);
         joined
     }
 
-    async fn join_by(&self, invite: Invite, (args, cwd): (Vec<String>, String), as_: Option<String>) -> Result<Value> {
+    async fn join_by(&self, invite: Invite, (args, cwd): (Vec<String>, String)) -> Result<Value> {
         if invite.device {
             self.devices()?.join(&invite).await?;
             return Ok(json!({ "device": "this device joined the identity" }));
         }
-        let as_ = self.speaking_as(as_).await?;
         let node = &self.inner.node;
-        let gid = node.join(&invite, as_).await?.0;
+        let gid = node.join(&invite, self.speaking_as().await?).await?.0;
         let settings = node.settings(&gid.0)?;
         let mut answer = json!({ "group": b64(&gid.0), "kind": settings.kind, "name": settings.name, "members": self.described_members(&gid)? });
         if settings.kind != CHAT {
@@ -822,10 +805,10 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// A device joined or left one of this device's identities.
+    /// A device joined or left this device's identity.
     fn devices_changed(devices: &Devices<P>, event: &Event) -> Option<ClientEvent> {
         let (Event::Joined { group, .. } | Event::Left { group, .. }) = event else { return None };
-        Some(ClientEvent::Devices { identity: devices.identity(&group.0)?.id })
+        Some(ClientEvent::Devices { identity: devices.identity_of(&group.0)?.id })
     }
 
     async fn on(&self, event: Event) -> Result<()> {
@@ -928,7 +911,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(Describer {
             me: self.inner.node.key(),
             name: self.inner.config.name.clone(),
-            identities: self.device_state()?.identities,
+            identity: self.device_state()?.identity,
             members: self.inner.node.members(&gid.0).unwrap_or_default(),
         })
     }
@@ -955,7 +938,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         for identity in self.inner.node.spoken() {
             // None is published before the device's node first runs.
             if state.device.is_some()
-                && !state.identities.iter().any(|(own, _)| own.id == identity.id)
+                && state.identity.as_ref().is_none_or(|(own, _)| own.id != identity.id)
                 && let Err(error) = self.leave_as(&identity.id).await
             {
                 failed.push(error);
@@ -964,19 +947,20 @@ impl<P: Provider + Send + 'static> Client<P> {
         failed
     }
 
-    /// Takes this device off an identity, once this client left the groups it speaks as it in, as the device's node
+    /// Takes this device off its identity, once this client left the groups it speaks as it in, as the device's node
     /// leaves those of its own client.
-    async fn leave_identity(&self, identity: &str) -> Result<Value> {
-        let (identity, _) = self.own_identity(identity)?;
-        let left = self.leave_as(&identity.id).await?;
-        let ended = match self.access() {
-            Access::Here(devices) => devices.leave(&identity.id.0).await?,
-            Access::Elsewhere(remote) => {
-                let request = Request::Identity { op: IdentityOp::Leave { identity: b64(&identity.id.0) } };
-                remote.request(request).await?["ended"] == true
-            }
+    async fn leave_identity(&self) -> Result<Value> {
+        // None while the device waits for its identity's state, when no session speaks as it.
+        let identity = self.device_state()?.identity.map(|(identity, _)| identity.id);
+        let left = match &identity {
+            Some(identity) => self.leave_as(identity).await?,
+            None => Vec::new(),
         };
-        Ok(json!({ "identity": identity.id, "left": left, "ended": ended }))
+        let ended = match self.access() {
+            Access::Here(devices) => devices.leave().await?,
+            Access::Elsewhere(remote) => remote.request(Request::Identity { op: IdentityOp::Leave }).await?["ended"] == true,
+        };
+        Ok(json!({ "identity": identity, "left": left, "ended": ended }))
     }
 
     /// Leaves the groups this client speaks as an identity in; returns them.
@@ -993,28 +977,16 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(left)
     }
 
-    /// The identity a new membership speaks as, the one named or else the device's first, with the device's certificate
-    /// of this client.
-    async fn speaking_as(&self, as_: Option<String>) -> Result<Option<Certificate>> {
-        let identity = match as_ {
-            Some(as_) => Some(self.own_identity(&as_)?.0),
-            None => self.device_state()?.identities.into_iter().next().map(|(identity, _)| identity),
-        };
-        let Some(identity) = identity else { return Ok(None) };
+    /// What a new membership speaks as: the device's certificate of this client, on its identity, if it has one.
+    async fn speaking_as(&self) -> Result<Option<Certificate>> {
+        if self.device_state()?.identity.is_none() {
+            return Ok(None);
+        }
         let key = self.inner.node.key();
         Ok(Some(match self.access() {
-            Access::Here(devices) => devices.certify(&identity.id.0, &key.0)?,
-            Access::Elsewhere(remote) => serde_json::from_value(remote.request(Request::Certify { identity: identity.id, key }).await?)?,
+            Access::Here(devices) => devices.certify(&key.0)?,
+            Access::Elsewhere(remote) => serde_json::from_value(remote.request(Request::Certify { key }).await?)?,
         }))
-    }
-
-    /// An identity this device is on, by id or name.
-    fn own_identity(&self, name: &str) -> Result<(IdentityRef, String)> {
-        let identities = self.device_state()?.identities;
-        identities
-            .into_iter()
-            .find(|(identity, own)| b64(&identity.id.0) == name || own == name)
-            .with_context(|| format!("this device is on no identity {name}"))
     }
 
     async fn identity(&self, op: IdentityOp) -> Result<Value> {
@@ -1025,31 +997,27 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let identity = devices.create(&name, membership).await?;
                 Ok(json!({ "identity": identity.id, "name": name }))
             }
+            IdentityOp::Invite { .. } => {
+                let (identity, name) = devices.identity().context(NO_IDENTITY)?;
+                let link = devices.invite().await?;
+                Ok(json!({ "identity": { "id": identity.id, "name": name }, "link": link, "expires_in": INVITE_VALID / 1000 }))
+            }
             IdentityOp::List => {
-                let mut identities = Vec::new();
-                for (identity, name) in devices.identities() {
-                    let me = devices.key(&identity.id.0)?;
-                    let listed = devices.devices(&identity.id.0)?;
-                    let listed: Vec<Value> = listed.iter().map(|(key, name)| json!({ "key": key, "name": name, "you": *key == me })).collect();
-                    identities.push(json!({ "identity": identity.id, "name": name, "devices": listed }));
-                }
-                Ok(json!({ "identities": identities }))
+                let Some((identity, name)) = devices.identity() else { return Ok(json!({ "identity": null })) };
+                let me = devices.key()?;
+                let listed: Vec<Value> = devices.devices()?.iter().map(|(key, name)| json!({ "key": key, "name": name, "you": *key == me })).collect();
+                Ok(json!({ "identity": identity.id, "name": name, "devices": listed }))
             }
             IdentityOp::Rename { name } => {
                 devices.rename(&name).await?;
                 Ok(json!({ "device": { "name": name } }))
             }
-            IdentityOp::Leave { .. } => unreachable!("a client leaves an identity itself"),
-            IdentityOp::Remove { identity, device: removed } => {
-                let identities = devices.identities();
-                let identity = match (identity, &identities[..]) {
-                    (Some(identity), _) => self.own_identity(&identity)?.0,
-                    (None, [(only, _)]) => only.clone(),
-                    (None, _) => bail!("pass --identity: this device is on {} identities", identities.len()),
-                };
-                let listed = devices.devices(&identity.id.0)?;
+            IdentityOp::Leave => unreachable!("a client leaves an identity itself"),
+            IdentityOp::Remove { device: removed } => {
+                let (identity, _) = devices.identity().context(NO_IDENTITY)?;
+                let listed = devices.devices()?;
                 let (key, _) = listed.iter().find(|(key, name)| b64(&key.0) == removed || *name == removed).context("no such device")?;
-                devices.remove(&identity.id.0, &key.0).await?;
+                devices.remove(&key.0).await?;
                 // This client's groups lose the device's sessions too, once it shows them the new key.
                 self.inner.node.read_key_log(&identity).await?;
                 Ok(json!({ "identity": identity.id, "removed": key }))

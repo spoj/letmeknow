@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "clap", derive(clap::Subcommand))]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    /// Make a one-time invite link, valid for 10 minutes: into a group (a new one unless --group is given), or with --identity, for another device to join an identity
+    /// Make a one-time invite link, valid for 10 minutes, into a group: a new one unless --group is given
     #[cfg_attr(feature = "clap", command(display_order = 10))]
     Invite {
         #[cfg_attr(feature = "clap", arg(long))]
@@ -20,7 +20,7 @@ pub enum Request {
         #[cfg_attr(feature = "clap", arg(long, conflicts_with = "group"))]
         name: Option<String>,
         /// For the new group's kind: a doc's file, kept in step with the doc, and its first text if it exists [default: a new file in the session's state]
-        #[cfg_attr(feature = "clap", arg(conflicts_with_all = ["group", "identity"]))]
+        #[cfg_attr(feature = "clap", arg(conflicts_with = "group"))]
         #[serde(default)]
         args: Vec<String>,
         /// The command's directory, which the arguments are relative to
@@ -34,10 +34,6 @@ pub enum Request {
         /// The new group's membership service [default: listen's]
         #[cfg_attr(feature = "clap", arg(long, conflicts_with = "group"))]
         membership: Option<String>,
-        /// What this session speaks as in a new group: one of its device's identities [default: the device's first]
-        #[cfg_attr(feature = "clap", arg(long = "as", value_name = "IDENTITY"))]
-        #[serde(rename = "as")]
-        as_: Option<String>,
         /// Only the identity with this id, as `members` shows it, can redeem the link
         #[cfg_attr(feature = "clap", arg(long, value_name = "IDENTITY"))]
         to: Option<String>,
@@ -45,9 +41,6 @@ pub enum Request {
         #[cfg_attr(feature = "clap", arg(long))]
         #[serde(default)]
         qr: bool,
-        /// Invite another device (a machine or a browser) into this identity, instead of a session into a group
-        #[cfg_attr(feature = "clap", arg(long, conflicts_with_all = ["group", "as_", "name", "to"]))]
-        identity: Option<String>,
     },
     /// Join a group through an invite link
     #[cfg_attr(feature = "clap", command(display_order = 11))]
@@ -59,10 +52,6 @@ pub enum Request {
         #[cfg_attr(feature = "clap", arg(skip))]
         #[serde(default)]
         cwd: String,
-        /// What this session speaks as in the group: one of its device's identities [default: the device's first]
-        #[cfg_attr(feature = "clap", arg(long = "as", value_name = "IDENTITY"))]
-        #[serde(rename = "as")]
-        as_: Option<String>,
     },
     /// List members of a group
     #[cfg_attr(feature = "clap", command(display_order = 14))]
@@ -99,38 +88,41 @@ pub enum Request {
     /// The members online in each group, and what only this session holds
     #[cfg_attr(feature = "clap", command(display_order = 21))]
     Status,
-    /// Identities this device is on: create one, join one through a device link, list them, take a device off one, leave one, or rename this device
+    /// This device's identity: create one, invite another device to it, list its devices, take one off it, leave it, or rename this device
     #[cfg_attr(feature = "clap", command(display_order = 22))]
     Identity {
         #[cfg_attr(feature = "clap", command(subcommand))]
         op: IdentityOp,
     },
-    /// A certificate of a session of this device, with MLS key `key`, by the device's key on an identity: for the device.
+    /// A certificate of a session of this device, with MLS key `key`, by the device's key on its identity: for the device.
     #[cfg_attr(feature = "clap", command(skip))]
-    Certify { identity: Bytes, key: Bytes },
+    Certify { key: Bytes },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(feature = "clap", derive(clap::Subcommand))]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityOp {
-    /// Start an identity with this device as its first device
+    /// Start an identity with this device as its first device; a device is on one identity at a time
     Create {
         name: String,
         /// The membership service that keeps its key log [default: listen's]
         #[cfg_attr(feature = "clap", arg(long))]
         membership: Option<String>,
     },
-    /// The identities this device is on, and their devices
-    List,
-    /// Take another device, by key or name, off an identity, whose key is then replaced
-    Remove {
+    /// Make a device link, valid for 10 minutes, for another device (a machine or a browser) to join this identity
+    Invite {
+        /// Also show the link as a QR code, on stderr
         #[cfg_attr(feature = "clap", arg(long))]
-        identity: Option<String>,
-        device: String,
+        #[serde(default)]
+        qr: bool,
     },
-    /// Take this device off an identity: its sessions leave the groups they are in as it first; the identity ends if this is its only device
-    Leave { identity: String },
+    /// This device's identity, and its devices
+    List,
+    /// Take another device, by key or name, off the identity, whose key is then replaced
+    Remove { device: String },
+    /// Take this device off its identity: its sessions leave the groups they are in as it first; the identity ends if this is its only device
+    Leave,
     /// Rename this device, as its identities' devices and members of its sessions' groups see it
     Rename { name: String },
 }
@@ -148,9 +140,8 @@ impl Request {
     pub fn for_device(&self) -> bool {
         match self {
             // A session leaves its own groups first.
-            Request::Identity { op: IdentityOp::Leave { .. } } => false,
+            Request::Identity { op: IdentityOp::Leave } => false,
             Request::Identity { .. } | Request::Certify { .. } => true,
-            Request::Invite { identity, .. } => identity.is_some(),
             Request::Join { target, .. } => lmk_proto::links::Invite::parse(target.trim()).is_ok_and(|invite| invite.device),
             _ => false,
         }

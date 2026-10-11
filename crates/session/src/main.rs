@@ -69,7 +69,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(session) => session,
                 None => running_session(&home).await?,
             };
-            let qr = matches!(request, Request::Client(lmk_client::Request::Invite { qr: true, .. }));
+            let qr = matches!(
+                request,
+                Request::Client(
+                    lmk_client::Request::Invite { qr: true, .. } | lmk_client::Request::Identity { op: lmk_client::IdentityOp::Invite { qr: true } }
+                )
+            );
             let answer = call(&home, &session, request).await?;
             println!("{answer}");
             if qr && let Some(link) = answer["link"].as_str() {

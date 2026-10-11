@@ -169,7 +169,7 @@ struct Call {
 /// commands.
 pub fn parse<T: Into<OsString> + Clone>(args: impl IntoIterator<Item = T>) -> Result<Cli, clap::Error> {
     let join = clap::Command::new("join")
-        .about("Add this device to an identity, through a device link (`invite --identity` makes them)")
+        .about("Add this device to an identity, through a device link (`identity invite` makes them)")
         .arg(clap::Arg::new("link").value_name("LINK").required(true));
     let group = clap::Arg::new("group").long("group").value_name("GROUP").help("Only this group");
     let mut matches = Cli::command()
@@ -301,8 +301,8 @@ pub async fn call(home: &Path, session: &str, mut request: Request) -> Result<Va
     let mut only = None;
     match request {
         Request::IdentityJoin { link } => {
-            ensure!(Invite::parse(link.trim())?.device, "that is not a device link; `invite --identity` makes them");
-            request = Request::Client(lmk_client::Request::Join { target: link, args: Vec::new(), cwd: String::new(), as_: None })
+            ensure!(Invite::parse(link.trim())?.device, "that is not a device link; `identity invite` makes them");
+            request = Request::Client(lmk_client::Request::Join { target: link, args: Vec::new(), cwd: String::new() })
         }
         Request::Status { group } => {
             only = Some(group);

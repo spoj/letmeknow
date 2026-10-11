@@ -195,7 +195,7 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
 
 /// The id of an agent's identity.
 async fn identity_of(agent: &Agent) -> String {
-    agent.cmd(&["identity", "list"]).await.unwrap()["identities"][0]["identity"].as_str().unwrap().to_owned()
+    agent.cmd(&["identity", "list"]).await.unwrap()["identity"].as_str().unwrap().to_owned()
 }
 
 #[test]
@@ -621,16 +621,16 @@ fn a_link_for_one_identity_admits_no_other() {
 }
 
 #[test]
-fn identities_are_created_listed_and_lose_devices() {
+fn a_device_is_on_one_identity_which_lists_and_loses_devices() {
     local(async {
         let world = world("identity").await;
         let alice = world.start("alice", HOUR).await;
         let created = alice.cmd(&["identity", "create", "Alice Smith"]).await.unwrap();
         assert_eq!(created["name"], "Alice Smith");
         let listed = alice.cmd(&["identity", "list"]).await.unwrap();
-        assert_eq!(listed["identities"][0]["devices"][0]["you"], true);
-        assert_eq!(listed["identities"][0]["name"], "Alice Smith");
-        let invite = alice.cmd(&["invite", "--identity", "Alice Smith"]).await.unwrap();
+        assert_eq!(listed["devices"][0]["you"], true);
+        assert_eq!(listed["name"], "Alice Smith");
+        let invite = alice.cmd(&["identity", "invite"]).await.unwrap();
         assert!(invite["link"].as_str().unwrap().contains("#4.d."));
         let phone = world.start("phone", HOUR).await;
         let refused = phone.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap_err().to_string();
@@ -640,14 +640,19 @@ fn identities_are_created_listed_and_lose_devices() {
         assert!(refused.contains("not a device link"), "{refused}");
         let joined = phone.cmd(&["identity", "join", invite["link"].as_str().unwrap()]).await.unwrap();
         assert!(joined["device"].is_string());
-        assert_eq!(phone.cmd(&["identity", "list"]).await.unwrap()["identities"][0]["name"], "Alice Smith");
+        assert_eq!(phone.cmd(&["identity", "list"]).await.unwrap()["name"], "Alice Smith");
+        let refused = phone.cmd(&["identity", "create", "Phone"]).await.unwrap_err().to_string();
+        assert!(refused.contains("on an identity already"), "{refused}");
+        let again = alice.cmd(&["identity", "invite"]).await.unwrap();
+        let refused = phone.cmd(&["identity", "join", again["link"].as_str().unwrap()]).await.unwrap_err().to_string();
+        assert!(refused.contains("on an identity already"), "{refused}");
         let listed = alice.cmd(&["identity", "list"]).await.unwrap();
-        let devices = listed["identities"][0]["devices"].as_array().unwrap();
+        let devices = listed["devices"].as_array().unwrap();
         assert_eq!(devices.len(), 2);
         let phone_key = devices.iter().find(|d| d["you"] == false).unwrap()["key"].as_str().unwrap().to_owned();
         alice.cmd(&["identity", "remove", "--", &phone_key]).await.unwrap();
         let listed = alice.cmd(&["identity", "list"]).await.unwrap();
-        assert_eq!(listed["identities"][0]["devices"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["devices"].as_array().unwrap().len(), 1);
     });
 }
 
@@ -667,7 +672,7 @@ fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
 
         assert_eq!(desk.cmd(&["identity", "rename", "studio"]).await.unwrap()["device"]["name"], "studio");
         let listed = alice.cmd(&["identity", "list"]).await.unwrap();
-        assert_eq!(listed["identities"][0]["devices"][0]["name"], "studio");
+        assert_eq!(listed["devices"][0]["name"], "studio");
         assert_eq!(lmk_core::device::Device::load(&alice.home.join("device.json")).unwrap().name, "studio");
         let device = || async { carol.cmd(&["members"]).await.unwrap()["members"].as_array().unwrap().iter().any(|m| m["device"] == "studio") };
         for _ in 0..120 {
@@ -678,9 +683,9 @@ fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
         }
         assert!(device().await, "carol sees the device's new name, as the identity's key log lists it");
 
-        let left = desk.cmd(&["identity", "leave", "Alice"]).await.unwrap();
+        let left = desk.cmd(&["identity", "leave"]).await.unwrap();
         assert_eq!((&left["left"][0], &left["ended"]), (&invite["group"], &json!(true)));
-        assert_eq!(alice.cmd(&["identity", "list"]).await.unwrap()["identities"], json!([]));
+        assert_eq!(alice.cmd(&["identity", "list"]).await.unwrap()["identity"], json!(null));
         assert_eq!(carol.expect("left").await["member"]["name"], "Desk");
     });
 }
@@ -812,7 +817,7 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
         let mut second = world.start_in("alice", "second", HOUR).await;
         // The second session process acts through the first, which holds the device's lock.
         second.cmd(&["identity", "create", "Alice"]).await.unwrap();
-        assert_eq!(first.cmd(&["identity", "list"]).await.unwrap()["identities"][0]["name"], "Alice");
+        assert_eq!(first.cmd(&["identity", "list"]).await.unwrap()["name"], "Alice");
         let bob = world.start("bob", HOUR).await;
         bob.cmd(&["identity", "create", "Robert"]).await.unwrap();
         let invite = second.cmd(&["invite"]).await.unwrap();
@@ -823,7 +828,7 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
         assert_eq!((alice_seen["identity"]["name"].as_str(), alice_seen["identity"]["how"].as_str()), (Some("Alice"), Some("self")));
         // Once the first stops, the second acts for the device, from its next command on.
         first.stop().await;
-        assert_eq!(second.cmd(&["identity", "list"]).await.unwrap()["identities"][0]["name"], "Alice");
+        assert_eq!(second.cmd(&["identity", "list"]).await.unwrap()["name"], "Alice");
         // Work the second sent the first in the background may fail as the first stops; taking over may not.
         let warnings: Vec<Value> = second.printed().await.into_iter().filter(|e| e["type"] == "warning").collect();
         assert!(warnings.iter().all(|w| !w["text"].as_str().unwrap_or_default().contains("acting for this device")), "{warnings:?}");
@@ -968,7 +973,7 @@ fn a_session_goes_on_while_a_join_waits() {
         let mut invite = lmk_proto::links::Invite::parse(&link).unwrap();
         invite.members[0].key = *iroh::SecretKey::generate().public().as_bytes();
         let (home, handle) = (bob.home.clone(), bob.handle.clone());
-        let join = lmk_client::Request::Join { target: invite.link(), args: Vec::new(), cwd: String::new(), as_: None };
+        let join = lmk_client::Request::Join { target: invite.link(), args: Vec::new(), cwd: String::new() };
         let joining = tokio::task::spawn_local(async move { crate::cli::call(&home, &handle, Request::Client(join)).await });
         tokio::time::sleep(Duration::from_millis(500)).await;
         let started = std::time::Instant::now();

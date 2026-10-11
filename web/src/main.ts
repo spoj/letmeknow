@@ -311,7 +311,7 @@ function starters(before: () => Promise<boolean> = async () => true): HTMLElemen
 function offer(kind: string | undefined) {
   history.replaceState(null, "", "/");
   if (!kind) return toast("That is not a letmeknow invite link.");
-  if (kind === "device" && me.identities[0]) return leaveDialog(invite);
+  if (kind === "device" && me.identity) return leaveDialog(invite);
   const go = h("button", { className: "primary", autofocus: true }, kind === "group" ? "Join" : "Add this browser");
   const dialog = modal(
     kind === "group" ? "You're invited" : "Add this browser to your devices",
@@ -334,7 +334,7 @@ function offer(kind: string | undefined) {
 /** Uses an invite link: lands in the group it joined, or, for a device link, on this browser's devices. A browser on an
  * identity asks first to move to the one a device link is of. */
 async function redeem(link: string) {
-  if (client.kindOf(link) === "device" && me?.identities[0]) return leaveDialog(link);
+  if (client.kindOf(link) === "device" && me?.identity) return leaveDialog(link);
   const joined = await request({ cmd: "join", target: link });
   history.replaceState(null, "", "/");
   if (joined.group) await select(joined.group);
@@ -466,7 +466,7 @@ function drawNav() {
     set(entry.badge, unread(g.group) ? String(unread(g.group)) : "");
     entry.button.classList.toggle("on", page === "group" && g.group === selected);
   }
-  set(meName, me.identities[0]?.name ?? me.name);
+  set(meName, me.identity?.name ?? me.name);
   meButton.classList.toggle("on", page === "devices");
 }
 
@@ -506,7 +506,7 @@ function joinDialog() {
   );
 }
 
-// Your devices: the identities this browser is a device of, and their devices.
+// Your devices: the identity this browser is a device of, and its devices.
 
 function showDevices() {
   show(devicesPage);
@@ -519,7 +519,7 @@ function showDevices() {
 
 const devicesBody = h("div", { className: "card" });
 async function drawDevices() {
-  const identity = me.identities[0];
+  const identity = me.identity;
   if (!identity) {
     return update(devicesBody, "none", () => {
       const name = h("input", { value: me.name, required: true });
@@ -542,14 +542,13 @@ async function drawDevices() {
       ];
     });
   }
-  const listed: { identities: { identity: string; devices: { key: string; name: string; you: boolean }[] }[] } = await request({ cmd: "identity", op: "list" });
-  const list = listed.identities.find(i => i.identity === identity.id) ?? { devices: [] };
-  update(devicesBody, JSON.stringify([identity, list]), () => [
+  const listed: { devices: { key: string; name: string; you: boolean }[] } = await request({ cmd: "identity", op: "list" });
+  update(devicesBody, JSON.stringify([identity, listed]), () => [
     h("p", {}, `The browsers and computers that are you, ${identity.name}. They join your chats and documents, and others see them as yours.`),
     h(
       "ul",
       { className: "devices" },
-      ...list.devices.map(d =>
+      ...listed.devices.map(d =>
         h(
           "li",
           {},
@@ -557,7 +556,7 @@ async function drawDevices() {
           d.you
             ? h("span", {}, h("button", { onclick: renameDialog }, "Rename"), h("button", { className: "danger", onclick: () => leaveDialog() }, "Leave"))
             : confirmed("Remove", `Remove ${d.name}?`, async () => {
-                await request({ cmd: "identity", op: { remove: { identity: identity.id, device: d.key } } });
+                await request({ cmd: "identity", op: { remove: { device: d.key } } });
                 shown.delete(devicesBody);
                 render();
               })
@@ -589,9 +588,9 @@ function renameDialog() {
 
 /** Takes this browser off its identity, saying first what that does; with a device link, then joins the identity it is of. */
 async function leaveDialog(link?: string) {
-  const identity = me.identities[0];
-  const listed: { identities: { identity: string; devices: unknown[] }[] } = await request({ cmd: "identity", op: "list" });
-  const only = (listed.identities.find(i => i.identity === identity.id)?.devices.length ?? 1) === 1;
+  const identity = me.identity!;
+  const listed: { devices: unknown[] } = await request({ cmd: "identity", op: "list" });
+  const only = listed.devices.length === 1;
   const speaking = groups.filter(g => g.members.some(m => m.you && m.identity?.id === identity.id)).map(g => title(g.group));
   const go = h("button", { className: "danger", autofocus: true }, link ? "Move this browser" : `Leave ${identity.name}`);
   const dialog = modal(
@@ -608,7 +607,7 @@ async function leaveDialog(link?: string) {
   );
   go.onclick = () =>
     busy(go, link ? "Moving…" : "Leaving…", async () => {
-      await request({ cmd: "identity", op: { leave: { identity: identity.id } } });
+      await request({ cmd: "identity", op: "leave" });
       me = JSON.parse(await lmk.me());
       dialog.close();
       if (link) await redeem(link);
@@ -626,8 +625,7 @@ async function inviteDialog(target: { gid: string } | { identity: string }) {
   const dialog = modal(device ? "Add a device" : "Invite someone", body);
   const make = async () => {
     // The link opens this server's app, which is letmeknow.dev's unless the person runs their own.
-    const invite = device ? { identity: target.identity } : { group: target.gid };
-    const made = new URL((await request({ cmd: "invite", ...invite })).link);
+    const made = new URL((await request(device ? { cmd: "identity", op: { invite: {} } } : { cmd: "invite", group: target.gid })).link);
     const link = location.origin + made.pathname + made.hash;
     const { encode } = await import("uqr");
     const { data, size } = encode(link, { border: 0 });

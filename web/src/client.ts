@@ -51,7 +51,7 @@ export type Item =
   | { type: "settings"; at: number; by: Person; before?: Settings; settings: Settings }
   | { type: "pushed"; at: number; by: Person; ref: string; subjects: string[] };
 export type Event = { type: string; group?: string; identity?: string; id?: string; hash?: string; text?: string; by?: string };
-export type Me = { fp: string; name: string; device: { name: string }; identities: (Named & { device?: string })[] };
+export type Me = { fp: string; name: string; device: { name: string }; identity: (Named & { device?: string }) | null };
 
 
 /** The session's methods, as every tab calls them: asynchronously, wherever it runs. */

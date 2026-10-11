@@ -66,7 +66,7 @@ pub struct AddedBy {
 pub struct Describer {
     pub(crate) me: Bytes,
     pub(crate) name: String,
-    pub(crate) identities: Vec<(IdentityRef, String)>,
+    pub(crate) identity: Option<(IdentityRef, String)>,
     pub(crate) members: Vec<Member>,
 }
 
@@ -100,9 +100,9 @@ impl Describer {
         }
     }
 
-    /// An identity as this one knows it: one of this device's own, or another's, by its own claim.
+    /// An identity as this one knows it: this device's own, or another's, by its own claim.
     fn known(&self, claim: &Claim) -> Known {
-        let own = self.identities.iter().find(|(identity, _)| identity.id == claim.identity.id);
+        let own = self.identity.as_ref().filter(|(identity, _)| identity.id == claim.identity.id);
         let (name, how) = match own {
             Some((_, name)) => (name.clone(), Standing::Own),
             None => (claim.name.clone(), Standing::Unknown),
@@ -151,7 +151,7 @@ mod tests {
         let describer = Describer {
             me: Bytes(vec![1]),
             name: "Ann".into(),
-            identities: vec![(own, "Ann".into())],
+            identity: Some((own, "Ann".into())),
             members: vec![member("Claude", 1, Some((10, "Ann Smith"))), member("Bob", 2, Some((20, "Robert")))],
         };
         let shown = |m: &Member| serde_json::to_value(describer.describe(m)).unwrap();
