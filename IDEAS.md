@@ -48,6 +48,22 @@ Explorations, kept loose on purpose: ideas, questions and the trade-offs seen so
 
 - Built (DESIGN.md, Identity): the devices group is an identity's only membership, its key log lists its devices, each device certifies its sessions with a key of its own, and the certificate travels in the session's credential.
 
+## Identity as a group
+
+For 0.14 (#39); contacts go in 0.13.2 (#40).
+
+- Today an identity is two things kept in step by duties: a key log, public to whoever knows the id, listing device keys; and a devices group, private, holding the identity's keys and openings. Contacts were one identity's names for others, and introductions a member telling a group its name for someone.
+- The idea: an identity is a group whose membership is public and whose content is private. A device speaks for X when X's roster lists it. Device links become ordinary invites into X, certificates become proofs of membership, and the key log's duties and the devices kind's special cases may go.
+- Members could be keys or identities: Alice speaks for Acme when Acme's roster lists Alice. Teams and companies fall out (Later: entities), and so does a group open to Acme.
+- The identity's private content carries what its devices share: openings, notes between one's own devices (#38), which devices are online (#26).
+- Questions:
+  - Do identities nest, or do organisations stay plain groups?
+  - Does anything replace contacts: names only, or sets that groups open to?
+  - Is a roster seen only by whoever knows the id, or can identities be found?
+  - How does removal reach every group someone speaks in as X, one level up from today's device duty?
+  - How do outsiders check a roster without replaying MLS? A signed roster may stay the public face, written from the group's membership rather than beside it.
+  - Nesting is a chain of trust, which DESIGN.md leaves out: where does it stop?
+
 ## Delivery and history
 
 - Delivery is peer to peer and transitive: every member carries the ciphertexts of its group's counted messages for H, whether or not it can open them, so a message travels A to B to C even if A and C never overlap. Keys are kept for the current and prior epoch only, so a member that comes back after a commit or two gets what the members online in its first seconds carry, and the rest is a known loss, announced to all.
