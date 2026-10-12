@@ -390,7 +390,10 @@ impl Session {
             }
             Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
                 match self.message(group, to, reply_to, urgent, attach.map(|data| (data, attach_name)), text) {
-                    Ok((gid, chat)) => _ = self.running.spawn_local(async move { Done::Sent(gid.clone(), client.send(&gid, chat).await, reply) }),
+                    Ok((gid, chat)) => _ = self.running.spawn_local(async move {
+                        let sent = client.send(&gid, chat).await;
+                        Done::Sent(gid, sent, reply)
+                    }),
                     Err(error) => self.answer(Err(error), reply),
                 }
             }
