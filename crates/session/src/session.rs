@@ -290,7 +290,7 @@ impl Session {
             anyhow::Ok(())
         })();
         if let Err(error) = written {
-            self.warn(None, format!("publishing this session's state: {error:#}"));
+            self.warn(format!("publishing this session's state: {error:#}"));
         }
     }
 
@@ -310,7 +310,7 @@ impl Session {
             && self.device_retry <= now
             && let Err(error) = self.take_device().await
         {
-            self.warn(None, format!("acting for this device: {error:#}"));
+            self.warn(format!("acting for this device: {error:#}"));
         }
         if self.device.is_some() && self.presence_at <= now {
             // Not due again until this pass finishes.
@@ -378,7 +378,7 @@ impl Session {
         if self.device.is_none()
             && let Err(error) = self.take_device().await
         {
-            self.warn(None, format!("acting for this device: {error:#}"));
+            self.warn(format!("acting for this device: {error:#}"));
         }
         // The agent may have just changed a file.
         self.sync_kinds().await;
@@ -440,19 +440,19 @@ impl Session {
             Done::IdentityRefreshed(failed) => {
                 self.identity_at = Instant::now() + IDENTITY_CHECK;
                 for error in failed {
-                    self.warn(None, format!("refreshing identity claims: {error:#}"));
+                    self.warn(format!("refreshing identity claims: {error:#}"));
                 }
             }
             Done::Found(running) => {
                 self.presence_at = Instant::now() + PRESENCE;
                 if let Err(error) = self.hand_adds(running) {
-                    self.warn(None, format!("handing this device's sessions their adds: {error:#}"));
+                    self.warn(format!("handing this device's sessions their adds: {error:#}"));
                 }
             }
             Done::Handed(position, handed) => {
                 let Access::Here(devices) = self.client.access() else { return };
                 if let Err(error) = handed.and_then(|_| devices.take(position)) {
-                    self.warn(None, format!("handing a session of this device an add: {error:#}"));
+                    self.warn(format!("handing a session of this device an add: {error:#}"));
                 }
             }
         }
@@ -497,7 +497,7 @@ impl Session {
     /// What the client tells.
     pub async fn client_event(&mut self, event: ClientEvent) {
         if let Err(error) = self.on(event).await {
-            self.warn(None, format!("{error:#}"));
+            self.warn(format!("{error:#}"));
         }
     }
 
@@ -781,8 +781,8 @@ impl Session {
         Ok(None)
     }
 
-    fn warn(&mut self, gid: Option<&Bytes>, text: String) {
-        self.outbox.print(json!({ "type": "warning", "group": gid.map(|g| b64(&g.0)), "text": text }));
+    fn warn(&mut self, text: String) {
+        self.outbox.print(json!({ "type": "warning", "text": text }));
     }
 
     pub async fn shutdown(&self) {
