@@ -6,6 +6,10 @@ use sha2::{Digest, Sha256};
 
 use crate::Bytes;
 
+pub fn reference(service: &[u8; 32], capability: &[u8]) -> [u8; 32] {
+    Sha256::new().chain_update(b"letmeknow log reference v1\0").chain_update(service).chain_update(capability).finalize().into()
+}
+
 /// h₀ of a log's chain.
 pub fn start(log: &[u8]) -> [u8; 32] {
     Sha256::new().chain_update(b"letmeknow log v1\0").chain_update(log).finalize().into()
@@ -55,6 +59,18 @@ impl Head {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_references_bind_the_authority() {
+        let service = [7; 32];
+        let capability = [9; 32];
+        let expected: [u8; 32] = Sha256::digest([b"letmeknow log reference v1\0".as_slice(), &service, &capability].concat()).into();
+        assert_eq!(reference(&service, &capability), expected);
+        assert_ne!(reference(&[8; 32], &capability), expected);
+        assert_ne!(reference(&service, &[8; 32]), expected);
+        assert_ne!(reference(&service, &expected), expected);
+        assert_ne!(reference(&service, b"public directory"), reference(&service, b"public directory\0"));
+    }
 
     #[test]
     fn sign_and_verify() {

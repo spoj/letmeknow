@@ -1,11 +1,11 @@
-//! Sessions and groups on openmls, protocol version 3: a group's log of commits and held messages' entries
-//! (`lmk_proto::entry`), judged strictly in order, and the messages its members seal and open.
+//! Sessions and groups on OpenMLS: epoch-sealed log entries judged strictly in order, and application messages.
 
 use anyhow::{Context, Result, bail, ensure};
+use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, KeyInit, Payload}};
 use lmk_proto::Bytes;
 use lmk_proto::clock::now;
 use lmk_proto::entry::{Entry, signed};
-use lmk_proto::group::{Control, Credential, How, LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Settings};
+use lmk_proto::group::{Control, Credential, How, IDENTITY, LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -23,6 +23,18 @@ pub const MAX_MESSAGE: usize = 1 << 20;
 pub const FRAMING: usize = 1024;
 /// The exporter label of the key that MACs an epoch's message entries.
 const ENTRY_LABEL: &str = "letmeknow entry";
+const ADDRESS_LABEL: &str = "letmeknow epoch log address v1";
+const SEALING_LABEL: &str = "letmeknow epoch log sealing v1";
+const ENVELOPE_DOMAIN: &[u8] = b"letmeknow epoch envelope v1\0";
+const MAX_INNER: usize = (1 << 20) - 45;
+
+fn service_key(settings: &Settings) -> Result<[u8; 32]> {
+    let Service::Serve { key, .. } = &settings.membership else { bail!("unsupported membership service authority") };
+    let key = key.0.as_slice().try_into().context("membership service authority is not 32 bytes")?;
+    let authority = ed25519_dalek::VerifyingKey::from_bytes(&key).context("invalid membership service authority")?;
+    ensure!(!authority.is_weak(), "weak membership service authority");
+    Ok(key)
+}
 
 fn capabilities() -> Capabilities {
     let ours = [ExtensionType::Unknown(SETTINGS_EXTENSION), ExtensionType::Unknown(LEAF_EXTENSION)];
@@ -49,7 +61,7 @@ fn settings_of(extensions: &Extensions<GroupContext>) -> Result<Settings> {
     Ok(serde_json::from_slice(&extensions.unknown(SETTINGS_EXTENSION).context("no settings")?.0)?)
 }
 
-/// Keys of the current and the prior epoch only.
+/// Application-message keys of the current and the prior epoch only; exporters are current-epoch only.
 fn join_config() -> MlsGroupJoinConfig {
     MlsGroupJoinConfig::builder()
         .use_ratchet_tree_extension(true)
@@ -167,6 +179,10 @@ fn leaf_credential(leaf: &LeafNode) -> Result<Credential> {
     Ok(credential)
 }
 
+pub fn key_package_reference<P: Provider>(provider: &P, key_package: &[u8]) -> Result<[u8; 32]> {
+    Ok(key_package_in(provider, key_package)?.hash_ref(provider.crypto())?.as_slice().try_into()?)
+}
+
 /// The leaf data a KeyPackage carries.
 pub fn key_package_leaf<P: Provider>(provider: &P, key_package: &[u8]) -> Result<Leaf> {
     leaf_of(key_package_in(provider, key_package)?.leaf_node().extensions()).context("a KeyPackage without our leaf data")
@@ -224,7 +240,7 @@ impl std::fmt::Display for Unheld {
 
 impl std::error::Error for Unheld {}
 
-/// A commit's log entry, to post, with the Welcome it carries if it adds members.
+/// A commit's sealed wire entry, with the Welcome also available separately for admission.
 pub struct Commit {
     pub entry: Vec<u8>,
     pub welcome: Option<Vec<u8>>,
@@ -319,12 +335,20 @@ pub struct Added {
     pub invite: Option<Bytes>,
     /// The epoch the Add moves into.
     pub epoch: u64,
+    pub key_package_ref: [u8; 32],
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+struct Posted {
+    inner: Bytes,
+    wire: Bytes,
+    // OpenMLS drops the original KeyPackage serialization when saving a pending commit.
+    add_refs: Vec<[u8; 32]>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct State {
-    /// This session's pending commit's whole entry, as posted.
-    posted: Option<Bytes>,
+    posted: Option<Posted>,
     /// Its authenticated data.
     aad: Aad,
     added: Vec<Added>,
@@ -344,6 +368,7 @@ fn creator_lifetime() -> Lifetime {
 impl Group {
     pub fn create<P: Provider>(provider: &P, session: &Session, settings: &Settings) -> Result<Self> {
         ensure!(settings.protocol == PROTOCOL, "settings name protocol {}", settings.protocol);
+        service_key(settings)?;
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(CIPHERSUITE)
             .capabilities(capabilities())
@@ -362,24 +387,37 @@ impl Group {
         Ok(group)
     }
 
-    /// Joins from a Welcome; refuses a group that runs another protocol version.
-    pub fn join<P: Provider>(provider: &P, welcome: &[u8]) -> Result<Self> {
+    /// The caller must surround joining and admission-checkpoint validation with a savepoint: OpenMLS consumes a
+    /// package during `build_from_welcome`, before `into_group`. An error here rolls back this call's writes.
+    pub fn join<P: Provider>(provider: &P, welcome: &[u8], expected_package: &[u8; 32]) -> Result<Self> {
         let MlsMessageBodyIn::Welcome(welcome) = parse::<MlsMessageIn>(welcome)?.extract() else {
             bail!("not a Welcome")
         };
-        let staged = StagedWelcome::build_from_welcome(provider, &join_config(), welcome)?
-            .skip_lifetime_validation()
-            .build()?;
-        let settings = settings_of(staged.group_context().extensions())?;
-        ensure!(
-            settings.protocol == PROTOCOL,
-            "this group runs protocol {}; this client runs {PROTOCOL}",
-            settings.protocol
-        );
-        let mls = staged.into_group(provider)?;
-        let group = Group { state: State::default(), mls };
-        group.save(provider)?;
-        Ok(group)
+        provider.savepoint()?;
+        let result = (|| {
+            let builder = StagedWelcome::build_from_welcome(provider, &join_config(), welcome)?;
+            let package = builder.processed_welcome().own_key_package().context("Welcome did not use a saved KeyPackage")?;
+            ensure!(package.hash_ref(provider.crypto())?.as_slice() == expected_package, "Welcome used another KeyPackage");
+            let staged = builder.skip_lifetime_validation().build()?;
+            let settings = settings_of(staged.group_context().extensions())?;
+            ensure!(
+                settings.protocol == PROTOCOL,
+                "this group runs protocol {}; this client runs {PROTOCOL}",
+                settings.protocol
+            );
+            service_key(&settings)?;
+            ensure!(staged.group_context().group_id().as_slice().len() == 16, "group ID is not 16 bytes");
+            let mls = staged.into_group(provider)?;
+            let group = Group { state: State::default(), mls };
+            group.save(provider)?;
+            Ok(group)
+        })();
+        if result.is_ok() {
+            provider.release()?;
+        } else {
+            provider.rollback_to()?;
+        }
+        result
     }
 
     pub fn load<P: Provider>(provider: &P, id: &[u8]) -> Result<Self> {
@@ -420,7 +458,7 @@ impl Group {
 
     /// The entry of the pending commit, to post again until the log shows it or another commit wins.
     pub fn posted(&self) -> Option<&[u8]> {
-        self.state.posted.as_ref().map(|posted| posted.0.as_slice())
+        self.state.posted.as_ref().map(|posted| posted.wire.0.as_slice())
     }
 
     pub fn epoch_authenticator(&self) -> &[u8] {
@@ -431,7 +469,7 @@ impl Group {
         self.mls.members().filter_map(|member| Member::of(&self.mls, member.index)).collect()
     }
 
-    /// Whether a member's leaf is still the one this KeyPackage brought: it has not updated since its Add.
+    /// Leaf liveness after exact package-reference matching, not a package-identity test.
     pub fn unchanged<P: Provider>(&self, provider: &P, key_package: &[u8]) -> Result<bool> {
         let key_package = key_package_in(provider, key_package)?;
         let leaf = key_package.leaf_node();
@@ -455,14 +493,63 @@ impl Group {
         Ok(provider.crypto().hmac(HashType::Sha2_256, &key, id)?.as_slice().try_into()?)
     }
 
-    /// The log entry of a message sealed in the current epoch.
+    fn epoch_context(&self) -> Result<([u8; 32], Vec<u8>)> {
+        let service = service_key(&self.settings())?;
+        Ok((service, [self.id(), &self.epoch().to_be_bytes(), &service].concat()))
+    }
+
+    pub fn capability<P: Provider>(&self, provider: &P) -> Result<[u8; 32]> {
+        let (_, context) = self.epoch_context()?;
+        Ok(self.mls.export_secret(provider.crypto(), ADDRESS_LABEL, &context, 32)?.try_into().unwrap())
+    }
+
+    fn seal_entry<P: Provider>(&self, provider: &P, inner: &[u8]) -> Result<Vec<u8>> {
+        ensure!(inner.len() <= MAX_INNER, "entry exceeds the 1 MiB envelope limit");
+        Entry::parse(inner)?;
+        let bucket = (inner.len() + 45).next_power_of_two().max(1024);
+        let mut plaintext = vec![0; bucket - 41];
+        plaintext[..4].copy_from_slice(&(inner.len() as u32).to_be_bytes());
+        plaintext[4..4 + inner.len()].copy_from_slice(inner);
+        let nonce = crate::random::<24>();
+        let (service, context) = self.epoch_context()?;
+        let key = self.mls.export_secret(provider.crypto(), SEALING_LABEL, &context, 32)?;
+        let reference = lmk_proto::head::reference(&service, &self.capability(provider)?);
+        let aad = [ENVELOPE_DOMAIN, &context, &reference, &(bucket as u32).to_be_bytes()].concat();
+        let ciphertext = XChaCha20Poly1305::new_from_slice(&key).unwrap().encrypt((&nonce).into(), Payload { msg: &plaintext, aad: &aad })?;
+        Ok([&[1], nonce.as_slice(), &ciphertext].concat())
+    }
+
+    /// Opens only the current epoch's outer envelope, returning the encoded Entry. `judge` checks its inner signature/MAC.
+    pub fn open_entry<P: Provider>(&self, provider: &P, wire: &[u8]) -> Result<Vec<u8>> {
+        let bucket = wire.len();
+        ensure!((1024..=1 << 20).contains(&bucket) && bucket.is_power_of_two(), "invalid envelope bucket");
+        ensure!(wire[0] == 1, "unsupported envelope version");
+        let (service, context) = self.epoch_context()?;
+        let key = self.mls.export_secret(provider.crypto(), SEALING_LABEL, &context, 32)?;
+        let reference = lmk_proto::head::reference(&service, &self.capability(provider)?);
+        let aad = [ENVELOPE_DOMAIN, &context, &reference, &(bucket as u32).to_be_bytes()].concat();
+        let nonce: &[u8; 24] = wire[1..25].try_into()?;
+        let plaintext = XChaCha20Poly1305::new_from_slice(&key).unwrap().decrypt(nonce.into(), Payload { msg: &wire[25..], aad: &aad })
+            .map_err(|_| anyhow::anyhow!("invalid epoch envelope authentication"))?;
+        let length = u32::from_be_bytes(plaintext[..4].try_into()?) as usize;
+        ensure!(length <= plaintext.len() - 4, "invalid envelope inner length");
+        ensure!((length + 45).next_power_of_two().max(1024) == bucket, "noncanonical envelope bucket");
+        ensure!(plaintext[4 + length..].iter().all(|byte| *byte == 0), "nonzero envelope padding");
+        let inner = &plaintext[4..4 + length];
+        Entry::parse(inner)?;
+        Ok(inner.to_vec())
+    }
+
+    /// The sealed wire entry of a message in the current epoch.
     pub fn entry<P: Provider>(&self, provider: &P, id: &[u8; 32]) -> Result<Vec<u8>> {
-        Ok(Entry::Message { id: *id, mac: self.mac(provider, id)? }.encode())
+        self.seal_entry(provider, &Entry::Message { id: *id, mac: self.mac(provider, id)? }.encode())
     }
 
     /// Runs `f` under a savepoint, kept if `keep` says so of its result; else rolled back, and the group reloaded from
     /// storage, so that nothing of it is left.
     fn guarded<P: Provider, T>(&mut self, provider: &P, keep: impl FnOnce(&Result<T>) -> bool, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let state = self.state.clone();
+        let aad = self.mls.aad().to_vec();
         provider.savepoint()?;
         let result = f(self);
         if keep(&result) {
@@ -471,6 +558,8 @@ impl Group {
             provider.rollback_to()?;
             let id = self.mls.group_id().clone();
             self.mls = MlsGroup::load(provider.storage(), &id)?.context("the group is gone from storage")?;
+            self.mls.set_aad(aad);
+            self.state = state;
         }
         result
     }
@@ -478,56 +567,60 @@ impl Group {
     /// Builds a commit and keeps it pending, with its whole entry saved: post that next, then read the log.
     pub fn commit<P: Provider>(&mut self, provider: &P, session: &Session, change: Change) -> Result<Commit> {
         ensure!(self.state.posted.is_none(), "a commit is already pending");
-        // One staged but never saved, so never posted.
-        self.mls.clear_pending_commit(provider.storage())?;
-        let adds = change.add.iter().map(|bytes| key_package_in(provider, bytes)).collect::<Result<Vec<_>>>()?;
-        let aad = Aad { how: change.how, invite: change.invite };
-        if aad.how.is_some() {
-            self.mls.set_aad(serde_json::to_vec(&aad)?);
-        }
-        let mut parameters = LeafNodeParameters::builder();
-        if let Some(leaf) = &change.leaf {
-            parameters = parameters.with_extensions(leaf_extensions(leaf)?);
-        }
-        if let Some(name) = &change.name {
-            let own = self.mls.own_leaf_node().context("no leaf of its own")?;
-            let credential = Credential { name: name.clone(), ..credential_of(own.credential()).context("not a letmeknow credential")? };
-            parameters = parameters.with_credential_with_key(CredentialWithKey {
-                credential: BasicCredential::new(serde_json::to_vec(&credential)?).into(),
-                signature_key: session.signer.public().into(),
-            });
-        }
-        let mut builder = self
-            .mls
-            .commit_builder()
-            .consume_proposal_store(false)
-            .force_self_update(true)
-            .propose_adds(adds)
-            .propose_removals(change.remove.into_iter().map(LeafNodeIndex::new));
         if let Some(settings) = &change.settings {
-            builder = builder.propose_group_context_extensions(context_extensions(settings)?)?;
+            service_key(settings)?;
         }
-        builder = builder.leaf_node_parameters(parameters.build());
-        let bundle = builder
-            .load_psks(provider.storage())?
-            .build(provider.rand(), provider.crypto(), &session.signer, |_| true)?
-            .stage_commit(provider)?;
-        if let Err(error) = rules(&self.mls, self.mls.pending_commit().unwrap(), self.mls.own_leaf_index(), &aad) {
-            self.mls.clear_pending_commit(provider.storage())?;
-            return Err(error);
-        }
-        let (commit, welcome, _) = bundle.into_messages();
-        let commit = commit.to_bytes()?;
-        let welcome = welcome.map(|welcome| welcome.to_bytes()).transpose()?;
-        let sig = session.signer.sign(&signed(&commit, welcome.as_deref())).map_err(|error| anyhow::anyhow!("signing: {error:?}"))?;
-        let entry = Entry::Commit { commit, welcome: welcome.clone(), sig }.encode();
-        self.state.posted = Some(Bytes(entry.clone()));
-        self.state.aad = aad;
-        self.save(provider)?;
-        Ok(Commit { entry, welcome })
+        self.guarded(provider, Result::is_ok, |g| {
+            // One staged but never saved, so never posted.
+            g.mls.clear_pending_commit(provider.storage())?;
+            let adds = change.add.iter().map(|bytes| key_package_in(provider, bytes)).collect::<Result<Vec<_>>>()?;
+            let aad = Aad { how: change.how, invite: change.invite };
+            g.mls.set_aad(if aad.how.is_some() { serde_json::to_vec(&aad)? } else { Vec::new() });
+            let mut parameters = LeafNodeParameters::builder();
+            if let Some(leaf) = &change.leaf {
+                parameters = parameters.with_extensions(leaf_extensions(leaf)?);
+            }
+            if let Some(name) = &change.name {
+                let own = g.mls.own_leaf_node().context("no leaf of its own")?;
+                let credential = Credential { name: name.clone(), ..credential_of(own.credential()).context("not a letmeknow credential")? };
+                parameters = parameters.with_credential_with_key(CredentialWithKey {
+                    credential: BasicCredential::new(serde_json::to_vec(&credential)?).into(),
+                    signature_key: session.signer.public().into(),
+                });
+            }
+            let mut builder = g
+                .mls
+                .commit_builder()
+                .consume_proposal_store(false)
+                .force_self_update(true)
+                .propose_adds(adds)
+                .propose_removals(change.remove.into_iter().map(LeafNodeIndex::new));
+            if let Some(settings) = &change.settings {
+                builder = builder.propose_group_context_extensions(context_extensions(settings)?)?;
+            }
+            builder = builder.leaf_node_parameters(parameters.build());
+            let bundle = builder
+                .load_psks(provider.storage())?
+                .build(provider.rand(), provider.crypto(), &session.signer, |_| true)?
+                .stage_commit(provider)?;
+            rules(&g.mls, g.mls.pending_commit().unwrap(), g.mls.own_leaf_index(), &aad)?;
+            let (commit, welcome, _) = bundle.into_messages();
+            let commit = commit.to_bytes()?;
+            let welcome = welcome.map(|welcome| welcome.to_bytes()).transpose()?;
+            let sig = session.signer.sign(&signed(&commit, welcome.as_deref())).map_err(|error| anyhow::anyhow!("signing: {error:?}"))?;
+            let entry = Entry::Commit { commit, welcome: welcome.clone(), sig }.encode();
+            let wire = g.seal_entry(provider, &entry)?;
+            let add_refs = g.mls.pending_commit().unwrap().add_proposals()
+                .map(|add| Ok(add.add_proposal().key_package().hash_ref(provider.crypto())?.as_slice().try_into()?))
+                .collect::<Result<_>>()?;
+            g.state.posted = Some(Posted { inner: Bytes(entry), wire: Bytes(wire.clone()), add_refs });
+            g.state.aad = aad;
+            g.save(provider)?;
+            Ok(Commit { entry: wire, welcome })
+        })
     }
 
-    /// Drops the pending commit, when the log refused it.
+    /// Explicitly abandons a pending commit. A refusal does not prove an earlier attempt was never accepted.
     pub fn cancel<P: Provider>(&mut self, provider: &P) -> Result<()> {
         self.mls.clear_pending_commit(provider.storage())?;
         self.state.posted = None;
@@ -541,7 +634,12 @@ impl Group {
         if !self.mls.is_active() {
             return Ok(Verdict::Skipped { reason: "removed from the group".into(), lost: false });
         }
-        if self.state.posted.as_ref().is_some_and(|posted| posted.0 == entry) {
+        let skipped = |error: anyhow::Error| Verdict::Skipped { reason: format!("{error:#}"), lost: false };
+        let entry = match self.open_entry(provider, entry) {
+            Ok(entry) => entry,
+            Err(error) => return Ok(skipped(error)),
+        };
+        if self.state.posted.as_ref().is_some_and(|posted| posted.inner.0 == entry) {
             let staged = self.mls.pending_commit().expect("a posted commit is pending");
             if let Err(error) = rules(&self.mls, staged, self.mls.own_leaf_index(), &self.state.aad) {
                 self.state.posted = None;
@@ -551,8 +649,7 @@ impl Group {
             }
             return Ok(Verdict::Commit { removes: false });
         }
-        let skipped = |error: anyhow::Error| Verdict::Skipped { reason: format!("{error:#}"), lost: false };
-        match Entry::parse(entry) {
+        match Entry::parse(&entry) {
             Err(error) => Ok(skipped(error)),
             Ok(Entry::Message { id, mac }) if mac == self.mac(provider, &id)? => Ok(Verdict::Message { id }),
             Ok(Entry::Message { .. }) => Ok(skipped(anyhow::anyhow!("a MAC that does not verify in this epoch"))),
@@ -569,22 +666,25 @@ impl Group {
 
     /// Applies a commit `judge` found valid.
     pub fn apply<P: Provider>(&mut self, provider: &P, entry: &[u8]) -> Result<Applied> {
-        if self.state.posted.as_ref().is_some_and(|posted| posted.0 == entry) {
-            self.state.posted = None;
-            let by = self.mls.own_leaf_index();
-            let staged = self.mls.pending_commit().expect("a posted commit is pending");
-            let aad = self.state.aad.clone();
-            let applied = observe(&self.mls, &mut self.state, staged, by, aad, true, false);
-            self.mls.merge_pending_commit(provider)?;
-            return self.merged(provider, applied);
-        }
-        let Entry::Commit { commit, welcome, sig } = Entry::parse(entry)? else { bail!("not a commit") };
-        let Staged::Commit(staged, by, aad) = self.stage(provider, &commit, welcome.as_deref(), &sig)? else { bail!("not a commit to apply") };
-        let lost = self.state.posted.take().is_some();
-        self.mls.clear_pending_commit(provider.storage())?;
-        let applied = observe(&self.mls, &mut self.state, &staged, by, aad, false, lost);
-        self.mls.merge_staged_commit(provider, *staged)?;
-        self.merged(provider, applied)
+        let entry = self.open_entry(provider, entry)?;
+        self.guarded(provider, Result::is_ok, |g| {
+            if g.state.posted.as_ref().is_some_and(|posted| posted.inner.0 == entry) {
+                let by = g.mls.own_leaf_index();
+                let staged = g.mls.pending_commit().expect("a posted commit is pending");
+                let aad = g.state.aad.clone();
+                let applied = observe(provider, &g.mls, &mut g.state, staged, by, aad, true)?;
+                g.state.posted = None;
+                g.mls.merge_pending_commit(provider)?;
+                return g.merged(provider, applied);
+            }
+            let Entry::Commit { commit, welcome, sig } = Entry::parse(&entry)? else { bail!("not a commit") };
+            let Staged::Commit(staged, by, aad) = g.stage(provider, &commit, welcome.as_deref(), &sig)? else { bail!("not a commit to apply") };
+            let applied = observe(provider, &g.mls, &mut g.state, &staged, by, aad, false)?;
+            g.state.posted = None;
+            g.mls.clear_pending_commit(provider.storage())?;
+            g.mls.merge_staged_commit(provider, *staged)?;
+            g.merged(provider, applied)
+        })
     }
 
     fn stage<P: Provider>(&mut self, provider: &P, commit: &[u8], welcome: Option<&[u8]>, sig: &[u8]) -> Result<Staged> {
@@ -674,15 +774,15 @@ enum Staged {
 }
 
 /// Records what a commit does, before it is merged.
-fn observe(
+fn observe<P: Provider>(
+    provider: &P,
     group: &MlsGroup,
     state: &mut State,
     staged: &StagedCommit,
     by: LeafNodeIndex,
     aad: Aad,
     own: bool,
-    lost: bool,
-) -> Applied {
+) -> Result<Applied> {
     let committer = group.member_at(by).and_then(|member| credential_of(&member.credential));
     let removed: Vec<Member> =
         staged.remove_proposals().filter_map(|remove| Member::of(group, remove.remove_proposal().removed())).collect();
@@ -701,19 +801,29 @@ fn observe(
         .collect();
     let epoch = staged.epoch().as_u64();
     if let Some(committer) = &committer {
-        let credentials = added.iter().filter_map(|member| member.credential.clone());
-        state.added.extend(credentials.map(|member| Added { member, by: committer.clone(), how: aad.how.clone(), invite: aad.invite.clone(), epoch }));
+        let records = staged.add_proposals().enumerate().map(|(index, add)| {
+            let key_package_ref = if own {
+                state.posted.as_ref().unwrap().add_refs[index]
+            } else {
+                add.add_proposal().key_package().hash_ref(provider.crypto())?.as_slice().try_into()?
+            };
+            Ok(Added {
+                member: leaf_credential(add.add_proposal().key_package().leaf_node())?,
+                by: committer.clone(), how: aad.how.clone(), invite: aad.invite.clone(), epoch, key_package_ref,
+            })
+        }).collect::<Result<Vec<_>>>()?;
+        state.added.extend(records);
     }
-    Applied {
+    Ok(Applied {
         by: by.u32(),
         own,
-        lost,
+        lost: !own && state.posted.is_some(),
         added,
         how: aad.how,
         removed,
         settings: staged.queued_proposals().any(|p| matches!(p.proposal(), Proposal::GroupContextExtensions(_))),
         gone: staged.self_removed(),
-    }
+    })
 }
 
 fn state_key(id: &[u8]) -> Vec<u8> {
@@ -738,6 +848,10 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad) 
     ensure!(new.protocol == PROTOCOL, "settings name protocol {}", new.protocol);
     ensure!(new.kind == old.kind, "the kind changed");
     ensure!(new.public == old.public, "the public log changed");
+    let authority = service_key(&new)?;
+    if old.kind == IDENTITY {
+        ensure!(authority == service_key(&old)?, "an identity group's service authority changed");
+    }
     if let Some(leaf) = staged.update_path_leaf_node() {
         let before = group.member_at(by).and_then(|member| credential_of(&member.credential));
         let after = leaf_credential(leaf)?;
