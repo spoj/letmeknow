@@ -2,6 +2,7 @@
 """Linux published-native compatibility gate. No installs or historical source builds."""
 import argparse
 import base64
+from collections import Counter
 import ctypes
 import hashlib
 import json
@@ -48,6 +49,18 @@ def sha(path):
 
 def save(path, value):
     Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def provenance(root, args):
+    sources = root / "runner-source"
+    sources.mkdir(exist_ok=True)
+    files = {}
+    for source in (Path(__file__), Path(e2e.__file__)):
+        digest = sha(source)
+        target = sources / f"{digest}-{source.name}"
+        shutil.copyfile(source, target)
+        files[source.name] = {"sha256": digest, "copy": str(target)}
+    save(root / f"{args.action}-provenance.json", {"arguments": vars(args), "python": platform.python_version(), "sources": files})
 
 
 def environment(root):
@@ -121,14 +134,17 @@ def release_metadata(cli, native, v):
                 "missing/invalid sha512 integrity")
     require(cli["versions"][v]["optionalDependencies"][PLATFORM] == v, "CLI/native version mismatch")
     release = native["versions"][v]
-    require("linux" in release["os"] and release["cpu"] == ["x64"], "wrong platform metadata")
+    require(isinstance(release["os"], list) and "linux" in release["os"]
+            and set(release["os"]) <= {"linux", "android"} and release["cpu"] == ["x64"], "wrong platform metadata")
 
 
-def tree(root):
+def tree(root, timestamps=False):
     result = {}
     for path in sorted(Path(root).rglob("*")):
         info = path.lstat()
         item = {"mode": stat.S_IMODE(info.st_mode)}
+        if timestamps:
+            item.update(mtime_ns=info.st_mtime_ns, ctime_ns=info.st_ctime_ns)
         if path.is_symlink():
             item.update(type="link", target=os.readlink(path))
         elif path.is_dir():
@@ -152,25 +168,32 @@ def unpack(tarball, directory, package, v, integrity):
         for m in members:
             path = Path(m.name)
             require(path.parts and path.parts[0] == "package" and ".." not in path.parts
-                    and not path.is_absolute() and (m.isfile() or m.isdir()) and m.name not in names,
+                    and not path.is_absolute() and (m.isfile() or m.isdir()) and str(path) not in names,
                     f"unsafe/duplicate tar member {m.name}")
             require(not m.mode & 0o7000, "privileged package mode")
-            names.add(m.name)
+            names.add(str(path))
         archive.extractall(directory, members=members, filter="data")
     pkg = json.loads((directory / "package/package.json").read_text())
     require(pkg["name"] == package and pkg["version"] == v, "extracted package/version mismatch")
     if package == PLATFORM:
-        require("linux" in pkg["os"] and pkg["cpu"] == ["x64"], "extracted platform mismatch")
+        require(isinstance(pkg["os"], list) and "linux" in pkg["os"]
+                and set(pkg["os"]) <= {"linux", "android"} and pkg["cpu"] == ["x64"], "extracted platform mismatch")
+    else:
+        require(pkg["optionalDependencies"][PLATFORM] == v, "extracted CLI/native mismatch")
 
 
 def download(cli, native, v, role, directory, env):
     release_metadata(cli, native, v)
     packages = []
+    npm, node = shutil.which("npm"), shutil.which("node")
+    require(npm and node, "npm and node must already be available (no installation)")
     for package, data in ((CLI, cli), (PLATFORM, native)):
         dest = directory / v / package.rsplit("/", 1)[1]
         dest.mkdir(parents=True)
         dist = data["versions"][v]["dist"]
-        args = ["/usr/bin/npm", "--userconfig=/dev/null", f"--cache={directory / 'npm-cache'}",
+        config = dest / "empty-global.npmrc"
+        config.write_text("")
+        args = [node, str(Path(npm).resolve()), "--userconfig=/dev/null", f"--globalconfig={config}", f"--cache={directory / 'npm-cache'}",
                 "--registry=" + REGISTRY, "--fetch-retries=0", "--fetch-timeout=20000", "pack", "--ignore-scripts",
                 "--json", "--pack-destination", dest, f"{package}@{v}"]
         result = e2e.execute(args, env=env, timeout=90)
@@ -185,7 +208,7 @@ def download(cli, native, v, role, directory, env):
         tarball = dest / packed["filename"]
         unpack(tarball, dest, package, v, dist["integrity"])
         packages.append({"name": package, "version": v, "tarball_url": dist["tarball"], "integrity": dist["integrity"],
-                         "tarball": str(tarball), "sha256": sha(tarball), "root": str(dest / "package"),
+                         "tarball": str(tarball), "sha256": sha(tarball), "pack_command": list(map(str, args)), "root": str(dest / "package"),
                          "files": tree(dest / "package")})
     binary = Path(packages[1]["root"]) / "bin/letmeknow"
     binary_version(binary, v, env)
@@ -211,12 +234,13 @@ def verify(artifact, env):
 def resolve(args):
     out = Path(args.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
+    provenance(out.parent, args)
     env = environment(out.parent / "resolver-home")
-    cli, cli_source = metadata(CLI, out.parent)
-    native, native_source = metadata(PLATFORM, out.parent)
     contract = json.loads(Path(args.contract).read_text())
     require(".".join(map(str, version(args.candidate_version)[:2])) == contract["candidate_minor"], "candidate/contract minor mismatch")
     require(contract["previous_policy"] in ("compatible", "incompatible"), "explicit previous policy required")
+    cli, cli_source = metadata(CLI, out.parent)
+    native, native_source = metadata(PLATFORM, out.parent)
     chosen = select(args.candidate_version, cli, native)
     require(".".join(map(str, version(chosen["previous"])[:2])) == contract["previous_minor"], "resolved previous minor differs from contract")
     manifest = {"schema": 1, "candidate_version": args.candidate_version, "contract": contract,
@@ -256,7 +280,8 @@ def load_manifest(path):
         release_metadata(*metadata_values, artifact["version"])
         for pkg, data in zip(artifact["packages"], metadata_values, strict=True):
             dist = data["versions"][artifact["version"]]["dist"]
-            require(pkg["integrity"] == dist["integrity"] and pkg["tarball_url"] == dist["tarball"], "provenance differs from metadata")
+            require(pkg["name"] == data["name"] and pkg["version"] == artifact["version"]
+                    and pkg["integrity"] == dist["integrity"] and pkg["tarball_url"] == dist["tarball"], "provenance differs from metadata")
         verify(artifact, env)
     return manifest
 
@@ -320,7 +345,7 @@ class Peer(e2e.Listener):
         if not default:
             env["LETMEKNOW_HOME"] = str(self.home)
         self.commands = root / "commands.jsonl"
-        self.event_file = root / "events.json"
+        self.event_file, self.saved_events = root / "events.jsonl", 0
         super().__init__(handle, bin=str(binary), env=env, log=root / "listen.log", keep_log=True,
                          ready_bin=sha(binary) not in LEGACY_READY)
 
@@ -337,26 +362,34 @@ class Peer(e2e.Listener):
         if ok:
             require(result.returncode == 0, f"{self.session} {args}: {result.stderr}")
             return json.loads(result.stdout)
-        require(result.returncode != 0, f"unexpected command success: {args}: {result.stdout}")
+        require(result.returncode > 0, f"unexpected command success or signal: {args}: {result.stdout}")
         return result.stderr
 
     def stop(self):
         super().stop()
-        save(self.event_file, self.events)
+        with self.event_file.open("a") as file:
+            for event in self.events[self.saved_events:]:
+                file.write(json.dumps({"bin": self.bin, "event": event}) + "\n")
+        self.saved_events = len(self.events)
 
-    def restart(self, binary=None):
-        self.stop()
-        return Peer(binary or self.bin, self.root, self.service, self.session, home=self.home)
+
+def send(peer, *args):
+    sent = peer.cmd("send", *args)
+    if sent.get("pending"):
+        committed = peer.expect("sent", lambda e, answered=sent["id"]: e["answered"] == answered)
+        sent.update(id=committed["id"], pos=committed["pos"], pending=False)
+    require(isinstance(sent.get("pos"), int), f"message did not commit: {sent}")
+    return sent
 
 
-def message(sender, receiver, group, text, *, reply=None, attach=None):
-    args = ["send", f"--group={group}", text]
+def message(sender, receiver, group, text, *, reply=None, attach=None, after=0):
+    args = [f"--group={group}", text]
     if reply:
         args += ["--reply-to", reply]
     if attach:
         args += ["--attach", str(attach)]
-    sent = sender.cmd(*args)
-    require(isinstance(sent.get("pos"), int), f"message did not commit: {sent}")
+    sent = send(sender, *args)
+    require(sent["pos"] > after, "global chat position did not advance")
     got = receiver.expect("message", lambda e: e["content"] == text)
     require((got["id"], got["pos"], got["content"]) == (sent["id"], sent["pos"], text), "message ID/position/content")
     if reply:
@@ -370,10 +403,12 @@ def message(sender, receiver, group, text, *, reply=None, attach=None):
     return sent
 
 
-def edit_doc(peer, other, group, path, other_path, text):
+def edit_doc(peer, other, path, other_path, text):
+    start = len(other.events)
     path.write_text(text)
     peer.cmd("groups")
     wait(lambda: other_path.read_text(), lambda value: value == text, "exact doc convergence")
+    other.expect("edited", lambda e: Path(e["file"]) == other_path and any(e is new for new in other.events[start:]))
     require(path.read_text() == text, "source doc changed during convergence")
 
 
@@ -381,9 +416,10 @@ def groups(peer, expected):
     return wait(lambda: peer.cmd("groups"), lambda gs: {g["group"] for g in gs} == set(expected), "group set")
 
 
-def join_pair(a, b, root):
-    a.cmd("identity", "create", "Compatibility")
-    b.cmd("identity", "join", a.cmd("identity", "invite")["link"])
+def join_pair(a, b, root, identity=True):
+    if identity:
+        a.cmd("identity", "create", "Compatibility")
+        b.cmd("identity", "join", a.cmd("identity", "invite")["link"])
     invite = a.cmd("invite", "--name", "Chat")
     chat = invite["group"]
     require(b.cmd("join", invite["link"])["group"] == chat, "chat join")
@@ -394,16 +430,16 @@ def join_pair(a, b, root):
     wait(lambda: bp.read_text(), lambda value: value == ap.read_text(), "initial doc state")
     blob = root / "payload.bin"
     blob.write_bytes(bytes(range(256)) * 137 + b"\x00\xffcompatibility\n")
-    links = []
+    links, last = [], 0
     for i, (sender, receiver, src, dest) in enumerate(((a, b, ap, bp), (b, a, bp, ap))):
-        sent = message(sender, receiver, chat, f"message-{i}", attach=blob)
-        replied = message(receiver, sender, chat, f"reply-{i}", reply=sent["id"])
-        require(replied["pos"] > sent["pos"], "reply position did not advance")
+        sent = message(sender, receiver, chat, f"message-{i}", attach=blob, after=last)
+        replied = message(receiver, sender, chat, f"reply-{i}", reply=sent["id"], after=sent["pos"])
+        last = replied["pos"]
         linked = sender.cmd("doc", "attach", f"--group={doc['group']}", str(blob))
         links.append(linked["link"])
-        edit_doc(sender, receiver, doc["group"], src, dest, src.read_text() + f"edit-{i} α\n" + linked["markdown"] + "\n")
+        edit_doc(sender, receiver, src, dest, src.read_text() + f"edit-{i} α\n" + linked["markdown"] + "\n")
         require(Path(receiver.cmd("fetch", linked["link"])["path"]).read_bytes() == blob.read_bytes(), "doc linked bytes differ")
-    return {"chat": chat, "doc": doc["group"], "ap": ap, "bp": bp, "blob": blob, "links": links}
+    return {"chat": chat, "doc": doc["group"], "ap": ap, "bp": bp, "blob": blob, "links": links, "last": last}
 
 
 def exercise_pair(a_bin, b_bin, service, root):
@@ -428,7 +464,11 @@ def exercise_pair(a_bin, b_bin, service, root):
                     if gid == doc:
                         guest_path = Path(joined_groups[0]["file"])
                         wait(lambda: guest_path.read_text(), lambda text: text == state["ap"].read_text(), "added doc snapshot applied")
-                        guest.cmd("groups")
+                        src, dest = (state["ap"], state["bp"]) if i == 0 else (state["bp"], state["ap"])
+                        text = guest_path.read_text() + f"added guest edit {handle}\n"
+                        edit_doc(guest, actor, guest_path, src, text)
+                        wait(lambda: dest.read_text(), lambda value: value == text, "observer applied guest edit")
+                        observer.expect("edited", lambda e: any(handle in by for by in e.get("by", [])))
                     wait(lambda: observer.cmd("members", f"--group={gid}"), lambda ms: len(ms["members"]) == 3, "Add epoch observed")
                     actor.cmd("remove", guest.ready["fp"], f"--group={gid}")
                     groups(guest, [])
@@ -437,7 +477,10 @@ def exercise_pair(a_bin, b_bin, service, root):
                     if gid == doc:
                         guest_path = Path(rejoined["file"])
                         wait(lambda: guest_path.read_text(), lambda text: text == state["ap"].read_text(), "rejoined doc snapshot applied")
-                        guest.cmd("groups")
+                        text = guest_path.read_text() + f"rejoined guest edit {handle}\n"
+                        edit_doc(guest, actor, guest_path, src, text)
+                        wait(lambda: dest.read_text(), lambda value: value == text, "observer applied rejoined edit")
+                        observer.expect("edited", lambda e: any(handle in by for by in e.get("by", [])))
                     guest.cmd("leave", f"--group={gid}")
                     groups(guest, [])
                     wait(lambda: observer.cmd("members", f"--group={gid}"), lambda ms: len(ms["members"]) == 2, "leave observed")
@@ -446,13 +489,14 @@ def exercise_pair(a_bin, b_bin, service, root):
                     wait(lambda: observer.cmd("groups"), lambda gs: any(g["group"] == gid and g["epoch"] == advanced for g in gs), "epoch agreement")
                 finally:
                     guest.stop()
-            message(actor, observer, chat, f"after-epochs-{i}")
+            state["last"] = message(actor, observer, chat, f"after-epochs-{i}", after=state["last"])["pos"]
             src, dest = (state["ap"], state["bp"]) if i == 0 else (state["bp"], state["ap"])
-            edit_doc(actor, observer, doc, src, dest, src.read_text() + f"after epochs {i}\n")
+            edit_doc(actor, observer, src, dest, src.read_text() + f"after epochs {i}\n")
         fp = b.ready["fp"]
         b.stop()
         a.cmd("name", f"--group={chat}", "Missed epoch")
-        missed = a.cmd("send", f"--group={chat}", "offline catchup")
+        missed = send(a, f"--group={chat}", "offline catchup")
+        require(missed["pos"] > state["last"], "offline epoch reset the global position")
         text = state["ap"].read_text() + "missed doc change\n"
         state["ap"].write_text(text)
         a.cmd("groups")
@@ -463,7 +507,7 @@ def exercise_pair(a_bin, b_bin, service, root):
         wait(lambda: state["bp"].read_text(), lambda value: value == text, "restarted plugin state")
         for link in state["links"]:
             require(Path(b.cmd("fetch", link)["path"]).read_bytes() == state["blob"].read_bytes(), "restart doc blob")
-        message(b, a, chat, "after restart")
+        message(b, a, chat, "after restart", after=missed["pos"])
     finally:
         a.stop()
         b.stop()
@@ -486,7 +530,8 @@ def sequential(a_bin, b_bin, service, root):
             text = state["bp"].read_text() + f"offline switch {i}\n"
             state["bp"].write_text(text)
             b.cmd("groups")
-            sent = b.cmd("send", f"--group={state['chat']}", f"switch {i}")
+            sent = send(b, f"--group={state['chat']}", f"switch {i}")
+            require(sent["pos"] > state["last"], "switch reset the global position")
             a = Peer(binary, root / "a", service, "same-handle")
             require((a.ready["fp"], a.ready["name"]) == (fp, name), "same handle/device identity changed")
             require((a.home / "device.json").read_bytes() == device and a.cmd("identity", "list")["identity"] == identity, "device/identity changed on version switch")
@@ -498,7 +543,7 @@ def sequential(a_bin, b_bin, service, root):
                 require(Path(a.cmd("fetch", link)["path"]).read_bytes() == state["blob"].read_bytes(), "switch lost ciphertext")
             for path, digest in ciphertext.items():
                 require(sha(a.home / path) == digest, f"switch changed native ciphertext {path}")
-            message(a, b, state["chat"], f"switched reply {i}", reply=sent["id"])
+            state["last"] = message(a, b, state["chat"], f"switched reply {i}", reply=sent["id"], after=sent["pos"])["pos"]
     finally:
         a.stop()
         b.stop()
@@ -524,13 +569,16 @@ def concurrent(a_bin, b_bin, service, root):
         for gid in (state["chat"], state["doc"]):
             follower.cmd("join", remote.cmd("invite", f"--group={gid}")["link"])
         def presence(peer, handles):
+            expected = {(state["chat"], "chat"), (state["doc"], "doc")}
             return wait(lambda: peer.cmd("identity", "list"),
                         lambda ids: sorted(h for d in ids["devices"] for h in d.get("sessions", [])) == sorted(handles)
-                        and all(d.get("groups") for d in ids["devices"]), "live identity handles/groups")
+                        and all({(g["group"], g["kind"]) for d in ids["devices"] for g in d.get("groups", [])
+                                 if g.get("session") == handle} == expected for handle in handles), "live identity handles/groups")
         presence(remote, ["owner", "follower", "remote"])
         presence(follower, ["owner", "follower", "remote"])
         device = (owner.home / "device.json").read_bytes()
         endpoint = (owner.home / "device-endpoint").read_bytes()
+        owner.proc.kill()
         owner.stop()
         wait(lambda: (owner.home / "device-endpoint").read_bytes() if (owner.home / "device-endpoint").exists() else b"",
              lambda value: bool(value) and value != endpoint, "device owner takeover", timeout=45)
@@ -539,10 +587,10 @@ def concurrent(a_bin, b_bin, service, root):
         follower.cmd("identity", "rename", "After takeover")
         wait(lambda: remote.cmd("identity", "list"), lambda ids: ids["name"] == "After takeover", "takeover identity operation")
         presence(remote, ["follower", "remote"])
-        message(follower, remote, state["chat"], "takeover chat")
-        message(remote, follower, state["chat"], "takeover reply")
+        sent = message(follower, remote, state["chat"], "takeover chat", after=state["last"])
+        message(remote, follower, state["chat"], "takeover reply", after=sent["pos"])
         fdoc = Path(next(g["file"] for g in follower.cmd("groups") if g["group"] == state["doc"]))
-        edit_doc(follower, remote, state["doc"], fdoc, state["bp"], fdoc.read_text() + "takeover doc\n")
+        edit_doc(follower, remote, fdoc, state["bp"], fdoc.read_text() + "takeover doc\n")
         successor = (owner.home / "device-endpoint").read_bytes()
         owner = Peer(a_bin, root / "owner", service, "owner")
         presence(remote, ["owner", "follower", "remote"])
@@ -582,7 +630,11 @@ def unsupported(a_bin, b_bin, service, root):
     unrelated = Peer(a_bin, root / "unrelated", service, "unrelated")
     try:
         doc = inviter.cmd("invite", "--kind", "doc")
+        unrelated.cmd("join", inviter.cmd("invite", f"--group={doc['group']}")["link"])
+        inviter.expect("joined", lambda e: e["member"] == unrelated.ready["fp"])
         before = inviter.cmd("members", f"--group={doc['group']}")
+        epoch = inviter.cmd("groups")[0]["epoch"]
+        event_start = len(inviter.events)
         error = target.cmd("join", doc["link"], ok=False)
         require("does not support doc groups" in error, f"not a targeted kind refusal: {error}")
         require(target.cmd("groups") == [], "unsupported kind installed a group")
@@ -592,7 +644,9 @@ def unsupported(a_bin, b_bin, service, root):
         target.cmd("groups")
         unrelated.cmd("groups")
         require(not any(e["type"] == "warning" for e in target.events + unrelated.events), "warning leaked beyond inviter")
-        require(not any(e["type"] == "joined" for e in inviter.events + target.events), "unsupported kind emitted joined")
+        require(inviter.cmd("groups")[0]["epoch"] == epoch, "unsupported kind advanced the epoch")
+        require(not any(e["type"] == "joined" for e in inviter.events[event_start:] + target.events), "unsupported kind emitted joined")
+        require(sum(e["type"] == "warning" for e in inviter.events) == 1, "unexpected additional inviter warning")
     finally:
         target.stop()
         inviter.stop()
@@ -632,6 +686,13 @@ def logical_tree(root):
         path = Path(root) / name
         if item["type"] != "file":
             continue
+        parts = Path(name).parts
+        if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "groups.json":
+            listed = json.loads(path.read_text())
+            indexed = {group["group"]: group for group in listed}
+            require(len(indexed) == len(listed), "duplicate session group index entry")
+            result[name] = {"type": "group-index", "mode": item["mode"], "groups": indexed}
+            continue
         with path.open("rb") as file:
             header = file.read(16)
         if header != b"SQLite format 3\x00":
@@ -654,16 +715,23 @@ def logical_tree(root):
 def snapshot(peers, destination, logical=False):
     inventory = {}
     for i, peer in enumerate(peers):
-        inventory[str(i)] = logical_tree(peer.home) if logical else tree(peer.home)
+        inventory[str(i)] = logical_tree(peer.home) if logical else tree(peer.home, timestamps=True)
+        info = peer.home.stat()
+        inventory[str(i)]["."] = {"type": "directory", "mode": stat.S_IMODE(info.st_mode)}
+        if not logical:
+            inventory[str(i)]["."].update(mtime_ns=info.st_mtime_ns, ctime_ns=info.st_ctime_ns)
     save(destination, inventory)
+    if logical:
+        save(Path(destination).with_suffix(".raw.json"), {str(i): tree(peer.home, timestamps=True) for i, peer in enumerate(peers)})
     return inventory
 
 
 def refused_open(binary, peer):
     result = e2e.execute([binary, "--session", peer.session, "listen"], env=peer.env, timeout=15)
-    save(peer.root / "refused-open.json", {"bin": str(binary), "code": result.returncode, "out": result.stdout, "err": result.stderr})
-    require(result.returncode != 0 and '"type":"ready"' not in result.stdout.replace(" ", ""), "incompatible open succeeded")
-    require(re.search(r"incompatible|format", result.stderr, re.I), f"not a format refusal: {result.stderr}")
+    with (peer.root / "refused-opens.jsonl").open("a") as file:
+        file.write(json.dumps({"bin": str(binary), "code": result.returncode, "out": result.stdout, "err": result.stderr}) + "\n")
+    require(result.returncode > 0 and '"type":"ready"' not in result.stdout.replace(" ", ""), "incompatible open succeeded or crashed")
+    require(re.search(r"incompatible|format|holds the state of an earlier letmeknow", result.stderr, re.I), f"not a format refusal: {result.stderr}")
 
 
 def refused_commands(binary, peer, state):
@@ -688,11 +756,11 @@ def default_isolation(a_bin, b_bin, a_service, b_service, a_name, b_name, root):
         a.cmd("identity", "create", "First default")
         doc = a.cmd("invite", "--kind", "doc", "--name", "Retained default")
         a.stop()
-        before = tree(homes[0])
+        before = tree(homes[0], timestamps=True)
         b = Peer(b_bin, root / "second", b_service, "default", home=homes[1], default=True, env=env)
         try:
             require(homes[1].is_dir() and homes[0] != homes[1], "default homes collide")
-            require(tree(homes[0]) == before, "default startup changed other version's home")
+            require(tree(homes[0], timestamps=True) == before, "default startup changed other version's home")
             b.cmd("identity", "create", "Second default")
             a = Peer(a_bin, root / "first", a_service, "default", home=homes[0], default=True, env=env)
             require(a.ready["fp"] != b.ready["fp"], "defaults adopted one session")
@@ -708,22 +776,25 @@ def default_isolation(a_bin, b_bin, a_service, b_service, a_name, b_name, root):
 def retained(before, after):
     for name, item in before.items():
         require(name in after, f"pre-existing path disappeared: {name}")
+        if item["type"] == "group-index":
+            require(item["mode"] == after[name]["mode"], f"group index mode changed: {name}")
+            for gid, group in item["groups"].items():
+                require(after[name]["groups"].get(gid) == group, f"pre-existing group index changed: {name}/{gid}")
+            continue
         if item["type"] != "sqlite":
             require(item == after[name], f"pre-existing file/mode changed: {name}")
             continue
         newer = after[name]
         require(item["schema"] == newer["schema"] and item["mode"] == newer["mode"], f"schema/mode changed: {name}")
         for table, rows in item["tables"].items():
-            for row in rows:
-                if row in newer["tables"][table]:
-                    continue
+            for row in (Counter(rows) - Counter(newer["tables"][table])).elements():
                 values = json.loads(row)
                 # A deliberately uncertain new-group attempt may extend these indexes, never shrink them.
                 if table == "lmk" and values[0] in ({"bytes": b"node/groups".hex()}, {"bytes": b"node/logs".hex()}):
                     matching, = [json.loads(r) for r in newer["tables"][table] if json.loads(r)[0] == values[0]]
                     old_ids = json.loads(bytes.fromhex(values[1]["bytes"]))
                     new_ids = json.loads(bytes.fromhex(matching[1]["bytes"]))
-                    require(set(old_ids) <= set(new_ids), f"attempt lost index entries: {name}/{values[0]}")
+                    require(len(new_ids) == len(set(new_ids)) and set(old_ids) <= set(new_ids), f"attempt lost/duplicated index entries: {name}/{values[0]}")
                 else:
                     raise AssertionError(f"pre-existing durable value changed: {name}/{table}: {row}")
 
@@ -733,16 +804,27 @@ def cross_service(peers, states, service, old_service, root, probe, contract):
     before = snapshot(peers, root / "cross-before.json", logical=True)
     stores = [logical_tree(s.state) for s in services]
     save(root / "cross-service-before.json", stores)
+    save(root / "cross-service-before.raw.json", [tree(s.state, timestamps=True) for s in services])
+    outcomes = []
     for peer, other in ((peers[0], old_service), (peers[2], service)):
-        error = peer.cmd("invite", "--name", "uncertain cross-service attempt", "--membership",
-                         other.env["LETMEKNOW_MEMBERSHIP"], ok=False, timeout=45)
-        require(re.search(r"unavailable|protocol|connect|transport|refus", error, re.I), f"not a service refusal: {error}")
+        try:
+            error = peer.cmd("invite", "--name", "uncertain cross-service attempt", "--membership",
+                             other.env["LETMEKNOW_MEMBERSHIP"], ok=False, timeout=45)
+            require(re.search(r"unavailable|protocol|connect|transport|refus", error, re.I), f"not a service refusal: {error}")
+            outcome = "explicit-refusal"
+        except subprocess.TimeoutExpired:
+            # The unchanged old client can keep retrying. This is NOT rejection evidence:
+            # both direct ALPN controls below and every preservation assertion must still pass.
+            outcome = "bounded-uncertain"
+        outcomes.append({"bin": peer.bin, "service": other.env["LETMEKNOW_MEMBERSHIP"], "outcome": outcome})
+        save(root / "cross-rpc-results.json", outcomes)
     after = snapshot(peers, root / "cross-after.json", logical=True)
     for i in before:
         retained(before[i], after[i])
     for s, old in zip(services, stores, strict=True):
         require(logical_tree(s.state) == old, "cross-service attempt changed service rows/anchors")
     save(root / "cross-service-after.json", [logical_tree(s.state) for s in services])
+    save(root / "cross-service-after.raw.json", [tree(s.state, timestamps=True) for s in services])
     probe_results = []
     for i, server in enumerate(services):
         own = contract["candidate_alpn" if i == 0 else "previous_alpn"]
@@ -761,10 +843,16 @@ def cross_service(peers, states, service, old_service, root, probe, contract):
                 probe_results.append({"key": key, "address": address, "alpn": alpn, "expect": expected,
                                       "code": result.returncode, "stdout": result.stdout, "stderr": result.stderr})
                 save(root / "alpn-results.json", probe_results)
-                require(result.returncode == 0, f"direct ALPN {expected} failed: {result.stderr}")
+                evidence = "accepted" if expected == "accept" else "refused: TLS no_application_protocol (0x178)"
+                require(result.returncode == 0 and result.stdout.strip() == evidence, f"direct ALPN {expected} failed: {result.stderr} {result.stdout}")
+    after_alpn = snapshot(peers, root / "cross-after-alpn.json", logical=True)
+    for i in before:
+        retained(before[i], after_alpn[i])
+    for server, old in zip(services, stores, strict=True):
+        require(logical_tree(server.state) == old, "ALPN probes changed service rows/anchors")
     for i, state in enumerate(states):
         a, b = peers[2*i:2*i+2]
-        message(a, b, state["chat"], "after cross-service refusal")
+        message(a, b, state["chat"], "after cross-service refusal", after=state["last"])
         for link in state["links"]:
             require(Path(a.cmd("fetch", link)["path"]).read_bytes() == state["blob"].read_bytes(), "cross-service lost blob")
 
@@ -795,17 +883,19 @@ def incompatible(candidate, published, service, root, contract, results, output,
                 require(before == after, "reciprocal refused open changed a populated home")
             for i, peer in enumerate(peers):
                 peers[i] = Peer(peer.bin, peer.root, peer.service, peer.session, home=peer.home)
+                require(peers[i].ready["fp"] == peer.ready["fp"], "own reopen changed session fingerprint")
             for i, state in enumerate(states):
                 a, b = peers[2*i:2*i+2]
                 groups(a, [state["chat"], state["doc"]])
                 require(a.cmd("identity", "list")["name"] == "Compatibility", "own reopen lost identity")
                 for link in state["links"]:
                     require(Path(a.cmd("fetch", link)["path"]).read_bytes() == state["blob"].read_bytes(), "own reopen lost native blob")
-                message(a, b, state["chat"], "usable after reciprocal refusal")
+                state["last"] = message(a, b, state["chat"], "usable after reciprocal refusal", after=state["last"])["pos"]
         case(results, "previous-incompatible/reciprocal-complete-homes", home_opens, output)
         def commands():
             before = snapshot(peers, root / "commands-before.json", logical=True)
             for binary, peer, state in ((published, peers[0], states[0]), (candidate, peers[2], states[1])):
+                refused_open(binary, peer)
                 refused_commands(binary, peer, state)
             after = snapshot(peers, root / "commands-after.json", logical=True)
             require(before == after, "refused caller/Stop changed durable logical records or blobs")
@@ -827,7 +917,26 @@ def incompatible(candidate, published, service, root, contract, results, output,
         for i, ordered in enumerate(((published, candidate, old_service, service, contract["previous_default_home"], contract["candidate_default_home"]),
                                      (candidate, published, service, old_service, contract["candidate_default_home"], contract["previous_default_home"]))):
             case(results, f"previous-incompatible/defaults-{i}", lambda ordered=ordered, i=i: default_isolation(*ordered, root / f"defaults-{i}"), output)
-        case(results, "previous-incompatible/cross-service-and-alpn", lambda: cross_service(peers, states, service, old_service, root, probe, contract), output)
+        def service_boundary():
+            for peer in peers:
+                peer.stop()
+            original = snapshot(peers, root / "transport-original-homes-before.json")
+            transport, transport_states = [], []
+            try:
+                # Anonymous populated clients keep an uncertain new-group attempt from publishing
+                # identity-presence changes. The original identity homes remain quiescent and byte-checked.
+                for label, binary, server in (("candidate", candidate, service), ("published", published, old_service)):
+                    a = Peer(binary, root / "transport" / label / "a", server, "primary")
+                    transport.append(a)
+                    b = Peer(binary, root / "transport" / label / "b", server, "witness")
+                    transport.append(b)
+                    transport_states.append(join_pair(a, b, a.home, identity=False))
+                cross_service(transport, transport_states, service, old_service, root, probe, contract)
+            finally:
+                for peer in transport:
+                    peer.stop()
+                require(snapshot(peers, root / "transport-original-homes-after.json") == original, "cross-service work changed original identity homes")
+        case(results, "previous-incompatible/cross-service-and-alpn", service_boundary, output)
     finally:
         for peer in peers:
             peer.stop()
@@ -864,6 +973,7 @@ def guard_controls(binary, service, root, results, output):
 def control_run(args):
     root = Path(args.out).resolve()
     root.mkdir(parents=True)
+    provenance(root, args)
     env = environment(root / "resolver-home")
     if args.artifacts:
         manifest = json.loads(Path(args.artifacts).read_text())
@@ -883,7 +993,8 @@ def control_run(args):
         release_metadata(*metadata_values, artifact["version"])
         for pkg, data in zip(artifact["packages"], metadata_values, strict=True):
             dist = data["versions"][artifact["version"]]["dist"]
-            require(pkg["integrity"] == dist["integrity"] and pkg["tarball_url"] == dist["tarball"], "control package provenance changed")
+            require(pkg["name"] == data["name"] and pkg["version"] == artifact["version"]
+                    and pkg["integrity"] == dist["integrity"] and pkg["tarball_url"] == dist["tarball"], "control package provenance changed")
         verify(artifact, env)
     # 0.15.0 predates ready.bin; only this digest-verified control permits its absence.
     LEGACY_READY.add(artifacts[0]["binary_sha256"])
@@ -899,12 +1010,20 @@ def control_run(args):
 def old_writer(args):
     manifest = load_manifest(args.baselines)
     minor = manifest["contract"]["old_writer_minor"]
+    if minor is None:
+        status = {"status": "not-applicable", "reason": "explicit contract disables the legacy service-writer test"}
+        save(Path(args.baselines).resolve().parent / "old-writer-result.json", status)
+        print(json.dumps(status))
+        return
+    require(minor == "0.15", "the old_writer fixture specifically exercises 0.15")
     artifact, = [a for a in manifest["artifacts"] if a["version"].rsplit(".", 1)[0] == minor]
     env = {**os.environ, "LMK_0_15_BIN": artifact["bin"], "CARGO_BUILD_JOBS": "4"}
     result = e2e.execute(["cargo", "test", "-p", "lmk-membership", "--test", "old_writer", "--", "--ignored"], env=env, timeout=1100)
     log = Path(args.baselines).resolve().parent / "old-writer.log"
     log.write_text(result.stdout + result.stderr)
-    require(result.returncode == 0 and "1 passed" in result.stdout, f"published service old-writer gate failed: {log}")
+    passed = result.returncode == 0 and re.search(r"test result: ok\. 1 passed; 0 failed; 0 ignored;", result.stdout) is not None
+    save(log.with_name("old-writer-result.json"), {"status": "passed" if passed else "failed", "bin": artifact["bin"], "log": str(log)})
+    require(passed, f"published service old-writer gate failed: {log}")
     print(f"PASS published service old-writer: {artifact['bin']}; {log}")
 
 
@@ -912,8 +1031,10 @@ def run_matrix(args):
     manifest = load_manifest(args.baselines)
     root = Path(args.baselines).resolve().parent / "run"
     root.mkdir()
+    provenance(root, args)
     results, output = [], root / "results.json"
     save(output, results)
+    require(Path(args.bin).is_absolute(), "candidate --bin must be an explicit absolute path")
     binary = Path(args.bin).resolve(strict=True)
     env = environment(root / "env")
     def candidate_identity():
@@ -923,8 +1044,13 @@ def run_matrix(args):
         binary_version(binary, cargo, env)
         for kind in ("doc", "table"):
             require((binary.parent / f"letmeknow-kind-{kind}").is_file(), f"missing candidate {kind} plugin")
-        save(root / "candidate.json", {"bin": str(binary), "version": cargo, "sha256": sha(binary),
-                                       "plugins": {p.name: sha(p) for p in binary.parent.glob("letmeknow-kind-*")}})
+        identity = {"bin": str(binary), "version": cargo, "sha256": sha(binary),
+                    "plugins": {p.name: sha(p) for p in binary.parent.glob("letmeknow-kind-*")}}
+        if manifest["contract"]["previous_policy"] == "incompatible":
+            require(args.alpn_probe and Path(args.alpn_probe).is_absolute() and Path(args.alpn_probe).is_file(),
+                    "explicit ALPN fixture executable required")
+            identity["alpn_fixture"] = {"bin": args.alpn_probe, "sha256": sha(args.alpn_probe)}
+        save(root / "candidate.json", identity)
     case(results, "candidate-identity", candidate_identity, output)
     service = Service(binary, root / "candidate-service", manifest["contract"]["candidate_service_initialize"])
     try:
@@ -933,7 +1059,6 @@ def run_matrix(args):
             if artifact["role"] in ("same-minor-positive", "previous-compatible"):
                 positive(binary, artifact["bin"], service, root / artifact["role"], results, output, artifact["role"])
             else:
-                require(args.alpn_probe and Path(args.alpn_probe).is_absolute(), "explicit ALPN fixture executable required")
                 incompatible(binary, artifact["bin"], service, root / "incompatible", manifest["contract"], results, output, args.alpn_probe)
     finally:
         service.stop()
@@ -963,7 +1088,9 @@ def main():
     require(platform.system() == "Linux" and platform.machine() == "x86_64", "this gate is Linux x64 only")
     require(ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0, "cannot enable descendant reaping")
     signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(1200)
+    signal.signal(signal.SIGTERM, timeout_handler)
+    # Leave the rest of the 20-minute CI bound for reaping the at-most-eight process groups.
+    signal.alarm(1020)
     try:
         if args.action == "resolve":
             resolve(args)

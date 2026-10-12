@@ -34,16 +34,10 @@ def spawn(args, **kwargs):
 
 
 def stop(proc):
-    if os.name == "nt":
-        if proc.poll() is None:
-            proc.terminate()
-    else:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+    if proc.poll() is None:
+        proc.terminate()
     try:
-        proc.wait(timeout=5)
+        proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
@@ -63,6 +57,19 @@ def stop(proc):
                 if time.monotonic() > deadline:
                     raise RuntimeError(f"descendants of {proc.pid} did not exit")
                 time.sleep(0.01)
+        if sys.platform == "linux":
+            deadline = time.monotonic() + 5
+            while True:
+                with open(f"/proc/self/task/{os.getpid()}/children") as children:
+                    orphaned = set(map(int, children.read().split())) - {p.pid for p in PROCESSES}
+                if not orphaned:
+                    break
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"orphaned descendants did not exit: {orphaned}")
+                for pid in orphaned:
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, os.WNOHANG)
+                time.sleep(0.01)
     PROCESSES.remove(proc)
 
 
@@ -74,6 +81,9 @@ def execute(args, *, env, timeout=60, input=None):
         return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
     finally:
         stop(proc)
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
 
 
 def check(condition, message):
@@ -120,6 +130,8 @@ class Listener:
     def read(self):
         try:
             for line in self.proc.stdout:
+                self.log.write(line)
+                self.log.flush()
                 event = json.loads(line)
                 self.events.append(event)
                 self.lines.put(event)

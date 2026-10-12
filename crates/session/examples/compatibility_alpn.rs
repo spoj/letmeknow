@@ -1,5 +1,8 @@
 use anyhow::{Result, ensure};
-use iroh::{Endpoint, EndpointAddr, RelayMode, endpoint::{ConnectionError, presets}};
+use iroh::{
+    Endpoint, EndpointAddr, RelayMode,
+    endpoint::{ConnectionError, presets},
+};
 use std::{net::SocketAddr, time::Duration};
 
 #[tokio::main]
@@ -19,12 +22,15 @@ async fn main() -> Result<()> {
         }
         ("refuse", Err(error)) => {
             let error = anyhow::Error::new(error);
-            ensure!(error.chain().any(|cause| matches!(cause.downcast_ref::<ConnectionError>(),
-                Some(ConnectionError::ConnectionClosed(close)) if u64::from(close.error_code) == 0x178)),
-                "not TLS no_application_protocol: {error:#}");
+            ensure!(
+                error.chain().any(|cause| matches!(cause.downcast_ref::<ConnectionError>(),
+                    Some(ConnectionError::ConnectionClosed(close)) if u64::from(close.error_code) == 0x178)),
+                "not TLS no_application_protocol: {error:#}"
+            );
             println!("refused: TLS no_application_protocol (0x178)");
         }
-        (_, result) => anyhow::bail!("unexpected ALPN result: {result:?}"),
+        (_, Ok(_)) => anyhow::bail!("ALPN unexpectedly accepted"),
+        (_, Err(error)) => anyhow::bail!("ALPN unexpectedly refused: {error:#}"),
     }
     endpoint.close().await;
     Ok(())
