@@ -274,7 +274,10 @@ impl Plugin {
 
     fn slug(&self, group: &str) -> String {
         let name: String = self.names[group].chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
-        Some(name.trim_matches('-').to_owned()).filter(|name| !name.is_empty()).unwrap_or(self.states.kind.name().into())
+        match name.trim_matches('-') {
+            "" => self.states.kind.name().into(),
+            name => name.to_owned(),
+        }
     }
 
     /// Where a binding was left: a plugin stopped while carrying a file's changes onto the document finishes, and one
