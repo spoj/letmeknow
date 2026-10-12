@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
-/// How long the client waits for a plugin's answer, but to a command.
+/// How long the client waits for a plugin's answer, except to a command.
 const ASK_WAIT: Duration = Duration::from_secs(60);
 /// How long a plugin's `spread` waits for a member online to hold its file.
 const SPREAD_WAIT: Duration = Duration::from_secs(30);
