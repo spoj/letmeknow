@@ -14,7 +14,7 @@ use tokio::{io::AsyncWriteExt, sync::{Mutex, Semaphore, mpsc}};
 
 use crate::{Contradiction, Forged, Frontier, InvalidProof, Refused, Subscription, Unreached, VerifiedPage, WrongLog};
 
-pub const MAX_IN_FLIGHT: usize = 4;
+const MAX_IN_FLIGHT: usize = 4;
 
 // Transport errors can include a peer's arbitrary application-close reason.
 fn safe_error(error: anyhow::Error) -> anyhow::Error {

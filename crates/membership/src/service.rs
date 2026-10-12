@@ -10,17 +10,17 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{OwnedSemaphorePermit, Sema
 
 use crate::{Refused, store::{DAY_MS, Stats, Store}};
 
-pub const MAX_CONNECTIONS: usize = 2048;
-pub const MAX_STREAMS: usize = 1024;
+const MAX_CONNECTIONS: usize = 2048;
+const MAX_STREAMS: usize = 1024;
 /// A session's requests and subscriptions to one service at once, one subscription per log it follows there: under
 /// QUIC's 100 streams a peer may open, so that a stream over it is refused rather than left waiting.
 pub const CONNECTION_STREAMS: usize = 64;
-pub const DB_WORK: usize = 4;
+const DB_WORK: usize = 4;
 pub const MAX_SUBSCRIBERS: usize = 4096;
-pub const LAG: usize = 8;
+const LAG: usize = 8;
 /// How long a request waits for a slot of `DB_WORK` before it is refused as busy. Work that started runs to its end:
 /// a refusal tells the client the work was not done.
-pub const DB_WAIT: Duration = Duration::from_secs(2);
+const DB_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct Policy {

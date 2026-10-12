@@ -9,10 +9,10 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::Refused;
 use membership::{MAX_LOGS, MAX_LOG_LENGTH, MAX_LOG_BYTES, MAX_ROWS, MAX_STORED_BYTES};
-pub const EXPIRE_ROWS: usize = 1024;
-pub const EXPIRE_BYTES: u64 = 4 << 20;
+const EXPIRE_ROWS: usize = 1024;
+const EXPIRE_BYTES: u64 = 4 << 20;
 pub const DAY_MS: u64 = 86_400_000;
-pub const STATS_DAYS: u64 = 7;
+const STATS_DAYS: u64 = 7;
 const FORMAT: u32 = 3;
 const PRIVATE_EXPIRY: &str = "SELECT reference,position,length(entry) FROM records WHERE expiry_day<? ORDER BY expiry_day LIMIT ?";
 const PUBLIC_EXPIRY: &str = "SELECT reference FROM anchors WHERE public=1 AND rows>0 AND day<? ORDER BY day LIMIT 1";
