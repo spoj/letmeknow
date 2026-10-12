@@ -424,7 +424,7 @@ try {
   await laptop.locator(".devices li", { hasText: "this browser" }).waitFor();
   await laptop.getByRole("button", { name: "Add a device" }).click();
   const link = await laptop.locator("dialog .copy code").first().textContent();
-  check(link.includes("#5.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
+  check(link.includes("#4.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
   const tablet = native("tablet");
   await tablet.printed(e => e.type === "ready");
   const joining = tablet.start("identity", "join", link);

@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn a_link_shows_as_a_qr_code() {
-        let code = super::qr("https://letmeknow.dev/i#5.g.AAAA.BBBB").unwrap();
+        let code = super::qr("https://letmeknow.dev/i#4.g.AAAA.BBBB").unwrap();
         assert!(code.lines().count() > 10);
     }
 }

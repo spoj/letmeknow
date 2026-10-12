@@ -71,12 +71,12 @@ pub async fn listen(
     let format = home.join("format");
     let found = std::fs::read_to_string(&format).ok();
     ensure!(
-        found.as_deref().map(str::trim) == Some("5") || found.is_none() && !home.join("device.json").exists(),
+        found.as_deref().map(str::trim) == Some("4") || found.is_none() && !home.join("device.json").exists(),
         "{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home",
         home.display()
     );
     cli::private_dir(&config.dir)?;
-    std::fs::write(&format, "5\n")?;
+    std::fs::write(&format, "4\n")?;
     let (inbound, queue) = tokio::sync::mpsc::unbounded_channel();
     cli::open_channel(&config.dir.join("endpoint"), inbound.clone()).await?;
     let device_file = home.join("device.json");
