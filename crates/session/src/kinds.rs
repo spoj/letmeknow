@@ -58,7 +58,7 @@ const STEADY: Duration = Duration::from_secs(60);
 
 /// The plugins found, speaking JSON lines over their stdio.
 pub struct Plugins {
-    pub found: BTreeMap<String, PathBuf>,
+    found: BTreeMap<String, PathBuf>,
     /// Where each kind's plugin keeps its state, in a directory named after its kind.
     dir: PathBuf,
     running: Mutex<HashMap<String, Running>>,
