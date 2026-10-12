@@ -935,7 +935,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             }
             Access::Elsewhere(_) => event,
         };
-        let group = event.group().filter(|_| !matches!(event, Event::Warning { .. })).cloned();
+        let group = event.group().cloned();
         if let Err(error) = self.on(event).await {
             self.warn(group.as_ref(), format!("{error:#}"));
         }
