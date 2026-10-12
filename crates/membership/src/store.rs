@@ -31,12 +31,14 @@ pub struct Store {
     key: SigningKey,
 }
 
+#[cfg(unix)]
 fn sync_dir(path: &Path) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x02000000);
-    options.open(path)?.sync_all()?;
+    Ok(File::open(path)?.sync_all()?)
+}
+
+/// Windows cannot flush a directory; NTFS journals its entries.
+#[cfg(not(unix))]
+fn sync_dir(_: &Path) -> Result<()> {
     Ok(())
 }
 
