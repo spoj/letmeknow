@@ -467,8 +467,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         membership: Option<String>,
         to: Option<String>,
     ) -> Result<Value> {
-        let to = to.map(|to| URL_SAFE_NO_PAD.decode(&to).ok().filter(|id| id.len() == 32).map(Bytes).context("--to takes an identity's id, as `members` shows it"));
-        let to = to.transpose()?;
+        let to = to.map(|to| URL_SAFE_NO_PAD.decode(&to).ok().filter(|id| id.len() == 32).map(Bytes).context("--to takes an identity's id, as `members` shows it")).transpose()?;
         let mut answer = json!({ "expires_in": INVITE_VALID / 1000 });
         let gid = match group {
             Some(group) => self.resolve(Some(group))?,
