@@ -5,20 +5,18 @@ import { copyFileSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { build } from "esbuild";
+import { readBackend } from "./backend.mjs";
 
 const web = fileURLToPath(new URL(".", import.meta.url));
 const root = fileURLToPath(new URL("..", import.meta.url));
 const out = resolve(web, process.env.LMK_FRONTEND_OUT ?? "dist");
-const backend = JSON.parse(readFileSync(process.env.LMK_FRONTEND_CONFIG ?? `${web}backend.json`, "utf8"));
-if (!/^[0-9a-f]{64}$/.test(backend.membershipKey)) throw new Error("Set backend.json membershipKey to the reviewed fresh authority's PUBLIC key before release");
-const relay = new URL(backend.relay);
-if (relay.protocol !== "https:" || relay.username || relay.password || relay.search || relay.hash || relay.pathname !== "/") throw new Error("Backend relay must be an HTTPS origin");
+const backend = readBackend();
 execFileSync("cargo", ["build", "-p", "lmk-web", "--profile", "wasm", "--target", "wasm32-unknown-unknown"], { cwd: root, stdio: "inherit" });
 execFileSync("wasm-bindgen", ["--target", "web", "--out-dir", "pkg", resolve(root, process.env.CARGO_TARGET_DIR ?? "target", "wasm32-unknown-unknown/wasm/lmk_web.wasm")], { cwd: web, stdio: "inherit" });
 rmSync(out, { recursive: true, force: true });
 await build({
   entryPoints: { app: `${web}src/main.ts` },
-  define: { DEFAULT_MEMBERSHIP: JSON.stringify(`${backend.membershipKey}@${relay.origin}`) },
+  define: { DEFAULT_MEMBERSHIP: JSON.stringify(`${backend.membershipKey}@${backend.relay}`) },
   assetNames: "[name]-[hash]",
   chunkNames: "[name]-[hash]",
   splitting: true,
@@ -35,6 +33,7 @@ for (const file of ["index.html", "manifest.webmanifest", "icon.svg", "icon-180.
 mkdirSync(`${out}/i`);
 copyFileSync(`${out}/index.html`, `${out}/i/index.html`);
 writeFileSync(`${out}/.nojekyll`, "");
+writeFileSync(`${out}/backend.json`, JSON.stringify(backend) + "\n");
 const files = readdirSync(out).filter(file => !["i", ".nojekyll"].includes(file)).sort();
 const version = createHash("sha256");
 for (const file of files) version.update(file).update(readFileSync(`${out}/${file}`));

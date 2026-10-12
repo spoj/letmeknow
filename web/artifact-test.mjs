@@ -6,12 +6,14 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { resolve, extname, join } from "node:path";
 import { chromium } from "playwright";
+import { readBackend } from "./backend.mjs";
 
 const dist = resolve(process.argv[2]);
-const backend = JSON.parse(await readFile(process.env.LMK_FRONTEND_CONFIG ?? "backend.json", "utf8"));
+const backend = readBackend();
 const files = await readdir(dist);
 const app = (await Promise.all(files.filter(file => file.endsWith(".js")).map(file => readFile(`${dist}/${file}`, "utf8")))).join("\n");
 assert(app.includes(`${backend.membershipKey}@${new URL(backend.relay).origin}`));
+assert.deepEqual(JSON.parse(await readFile(`${dist}/backend.json`, "utf8")), backend);
 assert.equal(await readFile(`${dist}/i/index.html`, "utf8"), await readFile(`${dist}/index.html`, "utf8"));
 assert(!files.includes("CNAME"), "the frontend hostname belongs in the static host's configuration");
 assert(!files.includes("membership"));

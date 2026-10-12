@@ -31,6 +31,13 @@ jobs:
           targets: ${{ matrix.target }}
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Bind the backend to this release identity
+        run: |
+          printf 'LMK_RELEASE_VERSION=%s\nLMK_RELEASE_RUN=%s\nLMK_RELEASE_SHA=%s\n' \
+            "${GITHUB_REF_NAME#v}" "$GITHUB_RUN_ID" "$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       # The plugins of the kinds letmeknow ships go beside it, where a session looks for them first.
       - run: cargo build --release --target ${{ matrix.target }} -p letmeknow -p lmk-kinds
       - if: matrix.npm == 'linux-x64'
@@ -44,6 +51,7 @@ jobs:
           name=letmeknow-${{ github.ref_name }}-${{ matrix.target }}
           mkdir -p "$name" "npm/${{ matrix.npm }}/bin"
           cp README.md SKILL.md LICENSE deploy/letmeknow.service "${exes[@]}" "$name/"
+          node --input-type=module -e 'import {readBackend} from "./web/backend.mjs"; import {writeFileSync} from "node:fs"; writeFileSync(process.argv[1] + "/backend.json", JSON.stringify(readBackend("web/backend.json")) + "\n")' "$name"
           cp "${exes[@]}" "npm/${{ matrix.npm }}/bin/"
           if [[ -n "$suffix" ]]; then 7z a "$name.zip" "$name"; else tar czf "$name.tar.gz" "$name"; fi
       - uses: actions/upload-artifact@v4

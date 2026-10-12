@@ -29,6 +29,8 @@ jobs:
   verify:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      checker_artifact: ${{ steps.checker.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
       - name: Require tested, published release artifacts
@@ -44,6 +46,17 @@ jobs:
           gh run download "$RELEASE_RUN" --repo "$GITHUB_REPOSITORY" --name frontend --dir artifact
           mkdir site
           tar -xzf artifact/frontend.tar.gz -C site
+          gh run download "$RELEASE_RUN" --repo "$GITHUB_REPOSITORY" --name archive-x86_64-unknown-linux-musl --dir backend
+          tar -xzf backend/letmeknow-*-x86_64-unknown-linux-musl.tar.gz --strip-components=1 -C backend
+          cmp site/backend.json backend/backend.json
+          python3 deploy/check-backend.py backend/letmeknow site/backend.json "$RELEASE_TAG" "$RELEASE_RUN" "$RELEASE_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        id: checker
+        with:
+          name: backend-checker
+          path: |
+            backend/letmeknow
+            backend/backend.json
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
@@ -56,5 +69,23 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.verify.outputs.checker_artifact }}
+          merge-multiple: true
+          path: checker
+      - name: Recheck pinned readiness after approval
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN: ${{ inputs.release_run }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          python3 deploy/release-run.py "$GITHUB_REPOSITORY" "$RELEASE_RUN" "$RELEASE_TAG" "$RELEASE_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          chmod +x checker/letmeknow
+          python3 deploy/check-backend.py checker/letmeknow checker/backend.json "$RELEASE_TAG" "$RELEASE_RUN" "$RELEASE_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/deploy-pages@v4
         id: deployment
