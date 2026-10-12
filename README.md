@@ -43,7 +43,7 @@ Docs and tables give every joiner their shared state. Do not put secrets in them
 
 Open the trusted frontend at https://letmeknow.dev, or an invite link on that origin. The page can be added to the home screen; on iPhone and iPad it asks to be, since the home-screen app keeps its own storage.
 
-The 0.16 deployment separates the whole GitHub-built frontend on GitHub Pages from membership/relay at `relay.letmeknow.dev`. The backend supplies neither application code nor runtime default configuration: its public key is compiled into the frontend. This cutover is staged, not deployed; the fresh authority's public key and the remaining protocol/security gates must be reviewed before release (see [deploy/README.md](deploy/README.md)). GitHub/DNS/release administration remain trusted. Published provenance is not proof of harmlessness or reproducibility.
+The app comes entirely from GitHub Pages. The membership service and relay run separately, at relay.letmeknow.dev, and the app has their public key built in.
 
 The service worker normally offers **Reload** for an update. This is not cryptographic version pinning: the same-origin host controls code, and closing all old tabs may let a waiting worker activate.
 
@@ -51,7 +51,7 @@ Local protocol records are committed before dependent protocol output. Native SQ
 
 In a browser, keep the owning tab open, fix storage, then use **Retry saving and reload** from any tab. Closing the owner first can lose unsaved changes. Changes arriving during recovery require another explicit retry. Successful recovery reloads the tabs; it does not resume the failed process. An unacknowledged file addition returns no link and may need to be submitted again.
 
-These guarantees depend on the storage stack honoring synchronization; process-restart tests do not simulate power loss. Catastrophic service storage loss requires explicit recovery decisions: a fresh authority and affected groups/identities may need recreation, with its new public key published in a trusted client release, not restoration of old signing state or erasure of client data.
+These guarantees hold as far as the storage honors synchronization; tests restart processes, they do not cut power.
 
 ## Your own server
 
@@ -62,7 +62,7 @@ letmeknow serve --initialize --domain relay.example.com --state /var/lib/letmekn
 letmeknow serve --domain relay.example.com --state /var/lib/letmeknow
 ```
 
-Each prints its public membership address, `<key>@https://relay.example.com`. `/health` reports the running version and that key; `/stats` the entries and bytes the service took on each of the last 7 completed UTC days. Sessions use it with `listen --membership <address> --relay https://relay.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). Build and publish the browser client separately on a trusted static HTTPS host, with that public key in its build configuration. Explicit browser backend choices remain supported; there is no automatic discovery or failure fallback. See [deploy/README.md](deploy/README.md) for build configuration, localStorage choices, Pages rollout and backend artifact installation. Deployment does not provision replicas or automatically restore service state.
+Each prints its public membership address, `<key>@https://relay.example.com`. `/health` reports the running version and that key; `/stats` the entries and bytes the service took on each of the last 7 completed UTC days. Sessions use it with `listen --membership <address> --relay https://relay.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). For browsers, build the app with its key, or point letmeknow.dev at it: see [deploy/README.md](deploy/README.md).
 
 ## Working on letmeknow
 
