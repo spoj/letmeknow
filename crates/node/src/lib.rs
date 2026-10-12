@@ -110,7 +110,7 @@ pub struct Member {
     pub revision: u32,
     /// Its credential's name: its device's name in an identity group, and in any other its session's handle.
     pub name: String,
-    /// The name of its device, as its identity's public log lists it.
+    /// Its authorized certificate's private device label.
     pub device_name: String,
     pub identity: Option<Claim>,
     /// Who added it, by session key, and how; none for the group's creator and this session.
@@ -121,10 +121,17 @@ pub struct Member {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub identity: IdentityRef,
-    /// The identity's own name, from its public log: a claim.
+    /// Its authorized device's signed private name claim.
     pub name: String,
-    /// Why it is not verified, if it is not: its device is not on the identity's list.
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed: Option<Observation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Observation {
+    pub names: Vec<String>,
+    pub other_ids: Vec<Bytes>,
 }
 
 /// A held message of the group, opened: a payload of its kind, or one of the core's.
@@ -252,7 +259,7 @@ pub enum Event {
         group: Bytes,
         member: Member,
     },
-    /// A member's summary of the group was heard: who holds and read what may have changed (`Node::heard`).
+    /// Receipts or member presentation changed: a summary, accepted MLS change, or directory replay.
     Heard {
         group: Bytes,
     },
@@ -354,6 +361,8 @@ struct Rec {
     leaving: bool,
     /// When this session's leaf was last updated, in milliseconds.
     updated: u64,
+    /// Local UTC day of this device's last directory publication, for retention only.
+    publication_day: u64,
     /// Counted `lost`s, by position: the sender's key, and the positions it lost.
     losses: BTreeMap<u64, (Bytes, Vec<u64>)>,
     /// The last position handed on as events in position order, and the counted ones passed over unopened since the
@@ -442,6 +451,8 @@ pub(crate) struct State<P> {
     logs: BTreeMap<Vec<u8>, logs::Log>,
     /// Public logs, by id.
     public: BTreeMap<Vec<u8>, PublicLog>,
+    bindings: Vec<(Bytes, String)>,
+    notified: BTreeSet<(Bytes, String)>,
     /// The identities and devices this session read a public log again for, as members' certificates named devices it
     /// did not list.
     unlisted: HashSet<(Vec<u8>, Vec<u8>)>,
@@ -660,7 +671,12 @@ impl<P: Provider> State<P> {
             let added = g.mls.added().iter().rev().find(|added| added.member.key == credential.key)?;
             Some((added.by.key.clone(), added.how.clone().unwrap_or(How::Invite)))
         });
-        let claim = credential.identity().map(|identity| self.claim(&credential, identity));
+        let claim = credential.identity().map(|identity| {
+            if credential.key.0 != member.key {
+                return (Claim { identity: identity.clone(), name: String::new(), error: Some("its credential does not name its actual session key".into()), observed: None }, None);
+            }
+            self.claim(&credential, identity)
+        });
         let device_name = claim.as_ref().and_then(|(_, device)| device.clone()).unwrap_or_default();
         Some(Member {
             key: Bytes(member.key.clone()),
@@ -673,20 +689,82 @@ impl<P: Provider> State<P> {
         })
     }
 
-    /// The identity a member speaks as, checked; and its device's name, if its identity lists the device.
     fn claim(&self, credential: &Credential, identity: &IdentityRef) -> (Claim, Option<String>) {
-        let identity = identity.clone();
+        let mut identity = identity.clone();
         let Some(log) = self.public.get(&identity.id.0) else {
             let error = Some("its identity's public log could not be read yet".into());
-            return (Claim { identity, name: String::new(), error }, None);
+            return (Claim { identity, name: String::new(), error, observed: None }, None);
         };
-        let name = log.name.clone();
+        identity.membership = log.membership.clone();
         let error = match log.verify(credential) {
-            Verdict::Verified { device } => return (Claim { identity, name, error: None }, Some(device)),
-            Verdict::Unverified => "its device is not on its identity's list",
-            Verdict::Dropped => "its device was taken off its identity",
+            Verdict::Authorized => {
+                let c = credential.certificate.as_ref().unwrap();
+                let names: Vec<String> = self.bindings.iter().filter(|(id, _)| *id == identity.id).map(|(_, name)| name.clone()).collect();
+                let mut other_ids = Vec::new();
+                for (id, name) in &self.bindings {
+                    if *id != identity.id && name.to_lowercase() == c.name.to_lowercase() && !other_ids.contains(id) {
+                        other_ids.push(id.clone());
+                    }
+                }
+                let observed = (!names.is_empty()).then_some(Observation { names, other_ids });
+                return (Claim { identity, name: c.name.clone(), error: None, observed }, Some(c.device_name.clone()));
+            }
+            Verdict::Unverified => "its session certificate is invalid or its device is not authorized in the directory view held here",
+            Verdict::Dropped => "its device was taken off the identity in the directory view held here",
         };
-        (Claim { identity, name, error: Some(error.into()) }, None)
+        (Claim { identity, name: String::new(), error: Some(error.into()), observed: None }, None)
+    }
+
+    fn observe_identities(&mut self) -> Result<()> {
+        let mut claims = Vec::new();
+        for (gid, g) in &self.groups {
+            if !g.mls.active() {
+                continue;
+            }
+            for member in g.mls.members() {
+                let Some(credential) = member.credential.filter(|c| c.key.0 == member.key) else { continue };
+                let Some(c) = &credential.certificate else { continue };
+                if self.public.get(&c.identity.id.0).is_some_and(|log| log.verify(&credential) == Verdict::Authorized) {
+                    claims.push((Bytes(gid.clone()), c.identity.id.clone(), c.name.clone(), credential));
+                }
+            }
+        }
+        let mut bindings = self.bindings.clone();
+        let mut fresh = BTreeSet::new();
+        for (_, id, name, _) in &claims {
+            let pair = (id.clone(), name.clone());
+            if !bindings.contains(&pair) {
+                bindings.push(pair.clone());
+                fresh.insert(pair);
+            }
+        }
+        if !fresh.is_empty() {
+            put(&self.provider, b"node/identity-bindings", &bindings)?;
+            self.bindings = bindings;
+        }
+        for (group, id, name, credential) in claims {
+            let pair = (id.clone(), name.clone());
+            let observed = self.claim(&credential, credential.identity().unwrap()).0.observed.unwrap();
+            let changed = observed.names.len() > 1 || !observed.other_ids.is_empty();
+            if (!fresh.contains(&pair) && !changed) || !self.notified.insert(pair.clone()) {
+                continue;
+            }
+            let identity = serde_json::to_string(&id)?;
+            let mut text = if fresh.contains(&pair) {
+                format!("First locally observed identity claim: {name:?} — {identity}.")
+            } else {
+                format!("Previously observed identity-name change or shared name: {name:?} — {identity}.")
+            };
+            if observed.names.len() > 1 {
+                text.push_str(&format!(" Same identity ID, changed name claims; first observed here as {:?}; observed names: {:?}.", observed.names[0], observed.names));
+            }
+            if !observed.other_ids.is_empty() {
+                text.push_str(&format!(" This full name is also claimed by identities {}. Names are not unique; confirm the full identity ID with your operator before assuming continuity.", serde_json::to_string(&observed.other_ids)?));
+            }
+            text.push_str(" Its device is authorized in the authenticated directory view held here; the person or organization has not been independently verified.");
+            self.events.push(Event::Warning { group: Some(group), text });
+        }
+        Ok(())
     }
 
     fn members(&self, gid: &[u8]) -> Result<Vec<Member>> {
@@ -726,7 +804,7 @@ impl<P: Provider> State<P> {
             return true;
         };
         let log = self.public.get(&identity.id.0);
-        log.is_some_and(|log| matches!(log.verify(credential), Verdict::Verified { .. }))
+        credential.key.0 == member.key && log.is_some_and(|log| log.verify(credential) == Verdict::Authorized)
     }
 
     /// The connected peers in a leaf of the group the gate cannot check yet: their identities' public logs are unread.
@@ -749,6 +827,7 @@ impl<P: Provider> State<P> {
         self.groups.insert(gid.clone(), G::new(mls, rec, BTreeMap::new()));
         self.next_log(&gid, base)?;
         self.save_groups()?;
+        self.observe_identities()?;
         self.gate = true;
         Ok(gid)
     }

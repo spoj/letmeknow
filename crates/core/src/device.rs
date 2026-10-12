@@ -1,6 +1,6 @@
 //! The device, kept in `device.json`: its name. Its key in each identity's group is that group's own.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use openmls::prelude::SignatureScheme;
 use openmls_basic_credential::SignatureKeyPair;
 use serde::{Deserialize, Serialize};
@@ -56,7 +56,7 @@ pub fn verify(key: &[u8], context: &[u8], bytes: &[u8], sig: &[u8]) -> bool {
     let (Ok(key), Ok(sig)) = (<[u8; 32]>::try_from(key), Signature::from_slice(sig)) else {
         return false;
     };
-    VerifyingKey::from_bytes(&key).is_ok_and(|key| key.verify(&[context, bytes].concat(), &sig).is_ok())
+    VerifyingKey::from_bytes(&key).is_ok_and(|key| key.verify_strict(&[context, bytes].concat(), &sig).is_ok())
 }
 
 #[cfg(test)]

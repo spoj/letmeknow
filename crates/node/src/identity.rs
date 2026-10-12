@@ -1,7 +1,7 @@
 //! The identity kind, built in: an identity's group, whose members are its devices, each with its own device key
 //! there, and whose settings carry the id of the identity's public log. A device certifies its sessions with its device
-//! key, and keeps the public log in step with the group: a device the latest entry lists appends the next whenever the
-//! group's members, their names or the group's name differ from it, and the latest again once it is half a year old.
+//! key, and keeps the keys-only directory in step with the group, restating it twice a year for retention.
+//! Names are signed from committed private state, never published in the directory.
 //! Its held messages are adds, invites into groups for one device's sessions, which that device keeps until it takes
 //! them or they expire; its live ones tell which sessions each device runs, and the groups they are in.
 
@@ -14,15 +14,12 @@ use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
 use lmk_proto::group::{Certificate, IDENTITY, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::Invite;
-use lmk_proto::public::{Listed, certified};
+use lmk_proto::public::certified;
 use n0_future::task::spawn;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{Event, Item, Node, hex, now};
-
-/// How old the latest entry of an identity's public log grows before a device appends it again, in milliseconds.
-const RESTATE: u64 = 182 * 24 * 60 * 60 * 1000;
 
 const NO_IDENTITY: &str = "this device is on no identity";
 
@@ -261,21 +258,21 @@ impl<P: Provider + Send + 'static> Identity<P> {
     pub async fn leave(&self) -> Result<bool> {
         let (gid, identity) = self.own()?;
         let me = self.node.key_in(&gid.0);
-        if self.node.read_public(&identity).await?.writers.iter().any(|writer| writer.key == me) {
-            let others = self.node.members(&gid.0)?.into_iter().filter(|m| m.key != me).map(|m| Listed { key: m.key, name: m.name }).collect();
-            self.node.publish(&gid.0, others, &self.node.settings(&gid.0)?.name).await?;
+        if self.node.read_public(&identity).await?.writers.contains(&me) {
+            let others = self.node.members(&gid.0)?.into_iter().filter(|m| m.key != me).map(|m| m.key).collect();
+            self.node.publish(&gid.0, others).await?;
         }
         Ok(self.node.leave(&gid.0).await?.is_none())
     }
 
-    /// Renames the identity, in its group's settings, whose public log then names it so.
+    /// Renames the identity in its private settings; sessions refresh their signed claims after catching up.
     pub async fn rename(&self, name: &str) -> Result<()> {
         let gid = self.group().context(NO_IDENTITY)?;
         self.node.change_settings(&gid.0, |settings| Settings { name: name.into(), ..settings }).await?;
         self.duties(&gid.0).await
     }
 
-    /// Renames this device: its record, and its credential in its identity group, whose public log then lists it so.
+    /// Renames this device's record and its credential in its private identity group.
     pub async fn rename_device(&self, name: &str) -> Result<()> {
         let mut device = self.device.clone();
         device.name = name.into();
@@ -292,40 +289,40 @@ impl<P: Provider + Send + 'static> Identity<P> {
         let (devices, gid) = (self.clone(), gid.to_vec());
         spawn(async move {
             if let Err(error) = devices.duties(&gid).await {
-                tracing::debug!("the duties of an identity group: {error:#}");
+                devices.node.inner.warn(Some(&gid), format!("the duties of an identity group: {error:#}"));
             }
         });
     }
 
-    /// The duties of an identity group, as it and the identity's public log stand, each read afresh: a device the latest
-    /// entry lists appends the next, listing the group's members by their names under the group's name, when that
-    /// differs from the latest, and the latest again once it is `RESTATE` old.
+    /// Read the directory before the private roster so a just-added device cannot be dropped by a stale roster.
     pub async fn duties(&self, gid: &[u8]) -> Result<()> {
         let _passing = self.shared.passing.lock().await;
         let Some(identity) = self.identity_of(gid) else { return Ok(()) };
         let latest = self.node.read_public(&identity).await?;
         self.node.read_group(gid).await?;
         let me = self.node.key_in(gid);
-        if !latest.writers.iter().any(|writer| writer.key == me) {
+        if !latest.writers.contains(&me) {
             return Ok(());
         }
-        let mut writers: Vec<Listed> = self.node.members(gid)?.into_iter().map(|m| Listed { key: m.key, name: m.name }).collect();
-        writers.sort();
-        let mut listed = latest.writers.clone();
-        listed.sort();
-        let name = self.node.settings(gid)?.name;
-        if writers != listed || name != latest.name || latest.at + RESTATE <= now() {
-            self.node.publish(gid, writers, &name).await?;
-        }
+        let writers = self.node.members(gid)?.into_iter().map(|m| m.key).collect();
+        self.node.publish(gid, writers).await?;
         Ok(())
     }
 
     /// A certificate that the session with MLS key `key` is one of this device's, speaking as the identity: by this
     /// device's key on it.
     pub fn certify(&self, key: &[u8]) -> Result<Certificate> {
-        let (gid, identity) = self.own()?;
-        let sig = self.node.sign(&gid.0, &certified(key, &identity.id.0))?;
-        Ok(Certificate { identity, device: self.node.key_in(&gid.0), sig: Bytes(sig) })
+        let gid = self.group().context(NO_IDENTITY)?;
+        let st = self.node.inner.lock();
+        let g = st.group(&gid.0)?;
+        let settings = g.mls.settings();
+        let identity = IdentityRef { id: settings.public.context("an identity without a directory")?, membership: settings.membership };
+        let (seed, session) = st.device_keys.get(&gid.0).context("not this device's identity")?;
+        let own = g.mls.members().into_iter().find(|m| m.key == session.key()).context("not a member")?;
+        let device_name = own.credential.context("not a letmeknow credential")?.name;
+        let device = lmk_core::device::public(seed);
+        let sig = lmk_core::device::sign(seed, &certified(key.try_into()?, identity.id.0.as_slice().try_into()?, &device, &settings.name, &device_name));
+        Ok(Certificate { identity, device: device.into(), name: settings.name, device_name, sig: Bytes(sig) })
     }
 
     /// The identity whose identity group `gid` is.
@@ -362,7 +359,7 @@ impl<P: Provider + Send + 'static> Identity<P> {
                     self.shared.heard.lock().unwrap().insert(sender.key, presence);
                 }
             }
-            Event::Joined { .. } | Event::Left { .. } | Event::Logged { .. } | Event::Warning { .. } => return Some(event),
+            Event::Joined { .. } | Event::Left { .. } | Event::Settings { .. } | Event::Heard { .. } | Event::Logged { .. } | Event::Warning { .. } => return Some(event),
             _ => {}
         }
         None

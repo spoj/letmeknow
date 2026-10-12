@@ -8,7 +8,6 @@ use lmk_core::public::{self, PublicLog};
 use lmk_core::provider::Provider;
 use lmk_net::Net;
 use lmk_proto::group::{Certificate, IdentityRef, Settings};
-use lmk_proto::public::Listed;
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::Frame;
 use lmk_proto::Bytes;
@@ -106,11 +105,10 @@ impl<P: Provider + Send + 'static> Node<P> {
             let mut st = self.inner.lock();
             let st = &mut *st;
             let (seed, session) = st.device_key()?;
-            let writer = Listed { key: Bytes(session.key().to_vec()), name: st.device.clone().unwrap_or_default() };
-            let (id, first) = public::create(&seed, &settings.name, settings.membership.clone(), writer, now());
+            let (id, first) = public::create(&seed, settings.membership.clone());
             settings.public = Some(Bytes(id.to_vec()));
             let mls = Group::create(&st.provider, &session, &settings)?;
-            let gid = st.add_group(mls, Rec::default())?;
+            let gid = st.add_group(mls, Rec { publication_day: now() / crate::days(1), ..Rec::default() })?;
             self.inner.follow(&st.group(&gid)?.rec.log.0);
             put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
             st.device_keys.insert(gid.clone(), (seed, session));
@@ -382,21 +380,54 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.read_public(identity).await
     }
 
-    /// Appends to the public log of an identity group, by this node's device key there, the entry after the latest, read
-    /// afresh, listing `writers` and `name`; and reads the log.
-    pub async fn publish(&self, gid: &[u8], writers: Vec<Listed>, name: &str) -> Result<PublicLog> {
+    /// Publishes changed keys, or restates them every 182 local UTC days for directory retention, not freshness.
+    pub async fn publish(&self, gid: &[u8], mut writers: Vec<Bytes>) -> Result<PublicLog> {
+        writers.sort();
+        writers.dedup();
         let settings = self.settings(gid)?;
         let identity = IdentityRef { id: settings.public.context("a group without a public log")?, membership: settings.membership };
         let latest = self.inner.read_public(&identity).await?;
         let entry = {
             let st = self.inner.lock();
-            let (seed, _) = st.device_keys.get(gid).context("not an identity group of this node")?;
-            latest.next(seed, writers, name, now())
+            let (seed, session) = st.device_keys.get(gid).context("not an identity group of this node")?;
+            ensure!(latest.writers.contains(&Bytes(session.key().to_vec())), "this device is not a directory writer");
+            if latest.writers == writers && now() / crate::days(1) < st.group(gid)?.rec.publication_day + 182 {
+                return Ok(latest);
+            }
+            latest.next(seed, writers)
         };
         self.inner.durable().await?;
         let address = lmk_proto::public::address(&identity.id.0);
         self.inner.clients.client(&identity.membership)?.append(&address, &[entry], true).await?;
+        {
+            let mut st = self.inner.lock();
+            st.group_mut(gid)?.rec.publication_day = now() / crate::days(1);
+            st.save(gid)?;
+        }
+        self.inner.durable().await?;
         self.inner.read_public(&identity).await
+    }
+
+    pub async fn recertify(&self, gid: &[u8], certificate: Certificate) -> Result<()> {
+        let change = |st: &State<P>, g: &G| {
+            ensure!(g.mls.settings().kind != lmk_proto::group::IDENTITY, "not a session membership");
+            let own = g.mls.members().into_iter().find(|m| m.key == st.session.key()).context("not a member")?;
+            let mut credential = own.credential.context("not a letmeknow credential")?;
+            let before = credential.certificate.as_ref().context("an anonymous membership cannot acquire an identity")?;
+            ensure!(before.identity.id == certificate.identity.id && before.device == certificate.device, "a refresh cannot change identity or device");
+            let unchanged = **before == certificate;
+            credential.certificate = Some(Box::new(certificate.clone()));
+            ensure!(credential.key.0 == st.session.key() && public::verify_certificate(&credential), "invalid signed identity claims");
+            Ok((!unchanged).then(|| Change { certificate: Some(certificate.clone()), ..Change::default() }))
+        };
+        let needed = {
+            let st = self.inner.lock();
+            change(&st, st.group(gid)?)?.is_some()
+        };
+        if needed {
+            self.inner.commit(gid, change).await?;
+        }
+        self.inner.durable().await
     }
 
     /// The identities this session speaks as in its groups.

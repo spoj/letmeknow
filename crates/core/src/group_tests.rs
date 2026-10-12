@@ -633,7 +633,7 @@ fn rules_bind_everyone() {
 
     // An update that changes the committer's credential beyond its name: C claims an identity.
     let identity = lmk_proto::group::IdentityRef { id: Bytes(vec![1; 32]), membership: service("https://lmk.example") };
-    w.m[2].session.credential.certificate = Some(lmk_proto::group::Certificate { identity, device: Bytes(vec![2; 32]), sig: Bytes(vec![3; 64]) }.into());
+    w.m[2].session.credential.certificate = Some(lmk_proto::group::Certificate { identity, device: Bytes(vec![2; 32]), name: "Ann".into(), device_name: "laptop".into(), sig: Bytes(vec![3; 64]) }.into());
     let c = &mut w.m[2];
     let group = c.group.as_mut().unwrap();
     let leaf = LeafNodeParameters::builder()
@@ -657,7 +657,7 @@ fn rules_bind_everyone() {
     group.state.posted = Some(Posted { inner: Bytes(entry), wire: Bytes(wire.clone()), add_refs: vec![] });
     w.post(wire);
     let read = w.read(&[0, 1, 2]);
-    assert!(matches!(&read[2][0].0, Verdict::Skipped { lost: true, reason } if reason.contains("credential")));
+    assert!(matches!(&read[2][0].0, Verdict::Skipped { lost: true, reason } if reason.contains("authorization")));
     assert!(!is_commit(&read[0][0]) && !is_commit(&read[1][0]));
     w.agree(&[0, 1, 2]);
 
@@ -686,19 +686,83 @@ fn rules_bind_everyone() {
 }
 
 #[test]
+fn private_certificates_refresh_but_cannot_rebind_a_membership() {
+    use crate::device::{public, sign};
+    use lmk_proto::group::IdentityRef;
+    use lmk_proto::public::certified;
+    let mut w = World::new(&["A", "B", "Later"]);
+    let device = crate::random();
+    let id = crate::random();
+    let key: [u8; 32] = w.m[0].session.key().try_into().unwrap();
+    let of = |id: [u8; 32], seed: &[u8; 32], key: [u8; 32], name: &str, label: &str| Certificate {
+        identity: IdentityRef { id: id.into(), membership: service("https://lmk.example") },
+        device: public(seed).into(), name: name.into(), device_name: label.into(),
+        sig: Bytes(sign(seed, &certified(&key, &id, &public(seed), name, label))),
+    };
+    let original = of(id, &device, key, "Ann", "phone");
+    w.m[0].session.credential.certificate = Some(Box::new(original));
+    w.found(0, &[1]);
+    let refreshed = of(id, &device, key, "Ann Lee", "pocket");
+    let mut forged = refreshed.clone();
+    forged.name = "unsigned label".into();
+    for certificate in [forged, of(crate::random(), &device, key, "Ann Lee", "pocket"), of(id, &crate::random(), key, "Ann Lee", "pocket"), of(id, &device, crate::random(), "Ann Lee", "pocket")] {
+        let a = &mut w.m[0];
+        let before: std::collections::BTreeMap<_, _> = a.provider.records().into_iter().collect();
+        assert!(a.group.as_mut().unwrap().commit(&a.provider, &a.session, Change { certificate: Some(certificate), ..Change::default() }).is_err());
+        assert!(a.g().posted().is_none());
+        assert_eq!(a.provider.records().into_iter().collect::<std::collections::BTreeMap<_, _>>(), before, "refused refresh leaves no stored residue");
+    }
+    let b = &mut w.m[1];
+    let before: std::collections::BTreeMap<_, _> = b.provider.records().into_iter().collect();
+    let attached = of(id, &device, b.session.key().try_into().unwrap(), "Ann", "phone");
+    assert!(b.group.as_mut().unwrap().commit(&b.provider, &b.session, Change { certificate: Some(attached), ..Change::default() }).is_err());
+    assert_eq!(b.provider.records().into_iter().collect::<std::collections::BTreeMap<_, _>>(), before, "an anonymous leaf cannot acquire an identity");
+    let commit = w.m[0].commit(Change { certificate: Some(refreshed.clone()), ..Change::default() });
+    w.post(commit.entry);
+    assert!(w.read(&[0, 1]).iter().all(|r| is_commit(&r[0])));
+    w.agree(&[0, 1]);
+    let kp = w.key_package(2);
+    let add = w.m[1].commit(Change { add: vec![kp], how: Some(How::Invite), ..Change::default() });
+    let pos = w.post(add.entry);
+    w.read(&[0, 1]);
+    w.m[2].join(add.welcome.as_ref().unwrap(), pos);
+    for reader in &mut w.m {
+        let a = reader.g().members().into_iter().find(|m| m.key == key).unwrap().credential.unwrap();
+        assert_eq!(a.name, "A");
+        assert_eq!(a.certificate.as_deref(), Some(&refreshed));
+    }
+    // Bypass our update API to try dropping a certificate; both continuing members reject it.
+    let a = &mut w.m[0];
+    let mut unsigned = a.session.credential.clone();
+    unsigned.certificate = None;
+    let leaf = LeafNodeParameters::builder().with_credential_with_key(CredentialWithKey {
+        credential: BasicCredential::new(serde_json::to_vec(&unsigned).unwrap()).into(),
+        signature_key: a.session.signer.public().into(),
+    }).build();
+    let group = a.group.as_mut().unwrap();
+    let bundle = group.mls.commit_builder().consume_proposal_store(false).force_self_update(true).leaf_node_parameters(leaf)
+        .load_psks(a.provider.storage()).unwrap().build(a.provider.rand(), a.provider.crypto(), &a.session.signer, |_| true).unwrap().stage_commit(&a.provider).unwrap();
+    let entry = entry_of(&a.session.signer, bundle.into_messages().0.to_bytes().unwrap(), None);
+    group.state.posted = Some(Bytes(entry.clone()));
+    w.post(entry);
+    assert!(w.read(&[0, 1, 2]).iter().all(|r| matches!(&r[0].0, Verdict::Skipped { reason, .. } if reason.contains("authorization"))));
+    w.agree(&[0, 1, 2]);
+}
+
+#[test]
 fn credentials_are_checked_not_enforced() {
     use crate::device::{public, sign};
     use crate::public::{PublicLog, Verdict, create};
     use lmk_proto::group::{Certificate, IdentityRef};
-    use lmk_proto::public::{Listed, certified};
+    use lmk_proto::public::certified;
     let mut w = World::new(&["A", "M"]);
     let laptop = crate::random();
-    let (id, first) = create(&laptop, "Alice", service("https://lmk.example"), Listed { key: public(&laptop).into(), name: "laptop".into() }, 1);
+    let (id, first) = create(&laptop, service("https://lmk.example"));
     let log = PublicLog::replay(&id, [first.as_slice()]).unwrap();
     let identity = IdentityRef { id: id.into(), membership: service("https://lmk.example") };
     // A speaks as Alice, certified by her laptop; M claims her identity with A's certificate.
-    let sig = Bytes(sign(&laptop, &certified(&w.m[0].session.credential.key.0, &id)));
-    let certificate = Certificate { identity, device: public(&laptop).into(), sig };
+    let sig = Bytes(sign(&laptop, &certified(w.m[0].session.key().try_into().unwrap(), &id, &public(&laptop), "Alice", "laptop")));
+    let certificate = Certificate { identity, device: public(&laptop).into(), name: "Alice".into(), device_name: "laptop".into(), sig };
     w.m[0].session.credential.certificate = Some(certificate.clone().into());
     w.m[1].session.credential.certificate = Some(certificate.into());
     let m = key_package_credential(&w.m[0].provider, &w.key_package(1)).unwrap();
@@ -706,7 +770,7 @@ fn credentials_are_checked_not_enforced() {
     w.found(0, &[1]);
     w.agree(&[0, 1]);
     let checked: Vec<Verdict> = w.m[1].g().members().iter().map(|member| log.verify(member.credential.as_ref().unwrap())).collect();
-    assert_eq!(checked, [Verdict::Verified { device: "laptop".into() }, Verdict::Unverified]);
+    assert_eq!(checked, [Verdict::Authorized, Verdict::Unverified]);
     let hi = w.m[1].send("hi from M");
     let opened = w.m[0].open(&hi).unwrap();
     assert_eq!((opened.sender.key.0, opened.sender.name), (w.m[1].session.key().to_vec(), "M".to_owned()));

@@ -84,16 +84,17 @@ impl Credential {
     }
 }
 
-/// That a session speaks as an identity: its device's key on the identity's list, and that key's signature over
-/// `identity::certified(session key, identity id)`.
+/// A device's signed private claims for this session (`public::certified`). Directory authorization is checked separately.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Certificate {
     pub identity: IdentityRef,
     pub device: Bytes,
+    pub name: String,
+    pub device_name: String,
     pub sig: Bytes,
 }
 
-/// An identity, by id and the service that keeps its public log.
+/// An identity commitment and an untrusted lookup hint. Genesis authenticates its directory's service.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityRef {
     pub id: Bytes,

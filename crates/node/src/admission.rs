@@ -260,7 +260,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if let Some(to) = &rule.to {
             let certificate = joiner.certificate.as_ref().filter(|c| c.identity.id == *to || c.device == *to).context(FOR_ANOTHER)?;
             match self.read_public(&certificate.identity).await?.verify(&joiner) {
-                Verdict::Verified { .. } => {}
+                Verdict::Authorized => {}
                 Verdict::Unverified => bail!("its device is not on its identity's list"),
                 Verdict::Dropped => bail!("its device was taken off its identity"),
             }

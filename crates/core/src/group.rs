@@ -5,7 +5,7 @@ use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, KeyInit, Payload}};
 use lmk_proto::Bytes;
 use lmk_proto::clock::now;
 use lmk_proto::entry::{Entry, signed};
-use lmk_proto::group::{Control, Credential, How, IDENTITY, LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
+use lmk_proto::group::{Certificate, Control, Credential, How, IDENTITY, LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -209,6 +209,7 @@ pub struct Change {
     pub leaf: Option<Leaf>,
     /// A new name in the committer's credential.
     pub name: Option<String>,
+    pub certificate: Option<Certificate>,
 }
 
 /// A commit's authenticated data: how the members it adds came in.
@@ -580,9 +581,18 @@ impl Group {
             if let Some(leaf) = &change.leaf {
                 parameters = parameters.with_extensions(leaf_extensions(leaf)?);
             }
-            if let Some(name) = &change.name {
+            if change.name.is_some() || change.certificate.is_some() {
                 let own = g.mls.own_leaf_node().context("no leaf of its own")?;
-                let credential = Credential { name: name.clone(), ..credential_of(own.credential()).context("not a letmeknow credential")? };
+                let mut credential = credential_of(own.credential()).context("not a letmeknow credential")?;
+                if let Some(name) = change.name {
+                    credential.name = name;
+                }
+                if let Some(certificate) = change.certificate {
+                    let unchanged = credential.certificate.as_deref() == Some(&certificate);
+                    let same = credential.certificate.as_ref().is_some_and(|old| old.identity.id == certificate.identity.id && old.device == certificate.device);
+                    credential.certificate = Some(Box::new(certificate));
+                    ensure!(unchanged || (same && crate::public::verify_certificate(&credential)), "an update changed the member's authorization or has invalid claims");
+                }
                 parameters = parameters.with_credential_with_key(CredentialWithKey {
                     credential: BasicCredential::new(serde_json::to_vec(&credential)?).into(),
                     signature_key: session.signer.public().into(),
@@ -832,7 +842,7 @@ fn state_key(id: &[u8]) -> Vec<u8> {
 
 /// The app's rules on a commit, from MLS state alone, binding the committer too: changes inline only, of the kinds we
 /// make; added members whose credentials name their own keys; settings that parse, at this protocol, with the kind and
-/// the public log unchanged; and no update of the committer's leaf that changes its credential but its name.
+/// the public log unchanged; and only name or signed same-identity/device claim updates to the committer's credential.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad) -> Result<()> {
     for proposal in staged.queued_proposals() {
         ensure!(proposal.proposal_or_ref_type() == ProposalOrRefType::Proposal, "a proposal by reference");
@@ -853,9 +863,15 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad) 
         ensure!(authority == service_key(&old)?, "an identity group's service authority changed");
     }
     if let Some(leaf) = staged.update_path_leaf_node() {
-        let before = group.member_at(by).and_then(|member| credential_of(&member.credential));
+        let member = group.member_at(by).context("not a member")?;
+        let before = credential_of(&member.credential).context("not a letmeknow credential")?;
         let after = leaf_credential(leaf)?;
-        ensure!(before.is_some_and(|before| Credential { name: after.name.clone(), ..before } == after), "an update changed the member's credential");
+        ensure!(before.key == after.key && after.key.0 == member.signature_key, "an update changed the member's key");
+        if before.certificate != after.certificate {
+            let same = before.certificate.as_ref().zip(after.certificate.as_ref())
+                .is_some_and(|(old, new)| old.identity.id == new.identity.id && old.device == new.device);
+            ensure!(same && crate::public::verify_certificate(&after), "an update changed the member's authorization or has invalid claims");
+        }
     }
     Ok(())
 }

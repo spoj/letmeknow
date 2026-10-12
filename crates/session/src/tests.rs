@@ -14,6 +14,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::cli::{Command, Request, session_dir};
 use crate::session::Config;
 
+#[path = "identity_tests.rs"]
+mod private_identity;
+
 const HOUR: Duration = Duration::from_secs(3600);
 
 struct World {
@@ -163,7 +166,11 @@ impl Agent {
                 return event;
             }
             eprintln!("{}: {event}", self.handle);
-            assert_ne!(event["type"], "warning", "{event}");
+            if event["type"] == "warning" {
+                let text = event["text"].as_str().unwrap();
+                assert!(text.starts_with("First locally observed identity claim:") || text.starts_with("Previously observed identity-name change or shared name:"), "{event}");
+                assert!(text.contains("not been independently verified"), "{event}");
+            }
         }
     }
 
@@ -236,7 +243,7 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         assert_eq!(second["from"], format!("Robert · {}", bob.device));
         let members = alice.cmd(&["members"]).await.unwrap();
         let robert = members["members"].as_array().unwrap().iter().find(|m| m["handle"] == "bob").unwrap();
-        assert_eq!((&robert["identity"]["how"], &robert["added_by"]), (&json!("unknown"), &json!({ "fp": alice.fp, "how": "invite" })));
+        assert_eq!((&robert["identity"]["how"], &robert["added_by"]), (&json!("observed"), &json!({ "fp": alice.fp, "how": "invite" })));
         // The read frontier: Alice's answer comes after what she was shown, and a reply to Bob wakes him.
         let id = second["id"].as_str().unwrap();
         let answer = alice.cmd(&["send", "--reply-to", id, "on it"]).await.unwrap();
@@ -740,7 +747,7 @@ fn a_member_shows_as_its_identity_and_device_and_answers_to_them() {
 }
 
 /// A session that does not act for its device renames the device and takes it off its identity, through the session
-/// that does: its credential and its identity's public log name it anew, and the identity, whose only device it was, ends.
+/// that does: both sessions refresh their private signed credentials, and the identity, whose only device it was, ends.
 #[test]
 fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
     local(async {
@@ -764,7 +771,7 @@ fn a_device_is_renamed_and_leaves_its_identity_from_another_of_its_sessions() {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        assert!(device().await, "carol sees the device's new name, as the identity's public log lists it");
+        assert!(device().await, "carol sees the device's new name in its refreshed signed leaf");
 
         let left = desk.cmd(&["identity", "leave"]).await.unwrap();
         assert_eq!((&left["left"][0], &left["ended"]), (&invite["group"], &json!(true)));

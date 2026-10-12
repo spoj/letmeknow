@@ -190,6 +190,21 @@ const record = (page, store, key) => page.evaluate(([store, key]) => new Promise
   request.onerror = () => reject(request.error);
 }), [store, key]);
 
+const bindingsKey = [...new TextEncoder().encode("lmk/node/identity-bindings")];
+const bindings = async page => JSON.parse(new TextDecoder().decode(new Uint8Array(await record(page, "records", bindingsKey))));
+
+async function notices(page) {
+  const all = await page.evaluate(() => window.toasts.splice(0));
+  const observations = all.filter(t => t.startsWith("First locally observed identity claim:") || t.startsWith("Previously observed identity-name change or shared name:"));
+  if (observations.length) {
+    const held = await bindings(page);
+    for (const text of observations) {
+      check(text.includes("not been independently verified") && held.some(([id]) => text.includes(id)), "observation notice has durable full-ID evidence, not human verification");
+    }
+  }
+  return all.filter(t => !observations.includes(t));
+}
+
 async function until(produce, accept, ms = 20_000) {
   const deadline = Date.now() + ms;
   let value = await produce();
@@ -258,7 +273,7 @@ try {
     () => ann.run("members", `--group=${invite.group}`).members.find(m => !m.you),
     m => m?.identity?.name === "Matt"
   );
-  check(matt.identity.how === "unknown" && matt.device === "laptop", "the welcome screen makes the browser its identity's first device, which others know by its own name");
+  check(matt.identity.how === "observed" && matt.identity.observed.names[0] === "Matt" && matt.device === "laptop", "the welcome screen makes the browser its identity's first device, which others know by its own name");
 
   // Messages both ways, with a reply.
   const hello = ann.run("send", "hello from the terminal").id;
@@ -278,9 +293,9 @@ try {
   check(receipt.startsWith("✓✓") && receipt.includes("read by Ann"), "the browser shows that another member holds its message, and who read it");
 
   // Members: Ann's identity is only her own claim to the laptop.
-  await laptop.locator(".people").click();
+  await laptop.locator(".people:visible").click();
   const annRow = laptop.locator("dialog .people-list li", { hasText: "Ann" });
-  check((await annRow.textContent()).includes("their own name"), "members show an identity's name as its own claim");
+  check((await annRow.textContent()).includes("Locally observed here; not independently verified"), "members distinguish local observation from human verification");
   await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
 
   // Attachments both ways.
@@ -358,6 +373,51 @@ try {
   const rows = await until(() => readFileSync(leads, "utf8"), t => !t.includes("Globex"));
   check(!rows.includes("Globex") && rows.includes("Acme Corp") && (await cells("Name")) === "Acme Corp", "a row deleted in the browser goes from the native session's file");
 
+  // Existing private leaves, not a public directory overlay, drive the open People dialog.
+  const annIdentity = ann.run("identity", "list").identity;
+  const initialBindings = await bindings(laptop);
+  check(initialBindings.some(([id, name]) => id === annIdentity && name === "Ann"), "the browser durably observes an installed authorized name");
+  await laptop.locator(".people:visible").click();
+  await laptop.locator("dialog").getByLabel("Name", { exact: true }).fill("keep this draft");
+  ann.run("identity", "rename", "Ann Lee");
+  await laptop.locator("dialog .identity-warning", { hasText: "Changed identity-name claim" }).waitFor({ timeout: 30_000 });
+  check((await laptop.locator("dialog").getByLabel("Name", { exact: true }).inputValue()) === "keep this draft", "a live People update preserves the name form");
+  check((await laptop.locator("dialog .identity-details").textContent()).includes(annIdentity), "People exposes the full identity ID");
+  const signedGroups = await until(() => call(laptop, "groups"), value =>
+    [invite.group, doc.group, table.group].every(gid => JSON.parse(value).find(g => g.group === gid)?.members.some(m => m.identity?.id === annIdentity && m.identity.name === "Ann Lee")), 30_000);
+  check([invite.group, doc.group, table.group].every(gid => JSON.parse(signedGroups).find(g => g.group === gid).members.some(m => m.identity?.id === annIdentity && m.identity.name === "Ann Lee")), "native identity rename refreshes already joined chat, doc and table leaves");
+  await laptop.waitForTimeout(8_500);
+  check(await laptop.locator("dialog .identity-warning").isVisible(), "binding warnings outlive the toast");
+  await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
+
+  for (const abort of [false, true]) {
+    const name = abort ? "Ann Aborted" : "Ann Committed";
+    const beforeBindings = await bindings(laptop);
+    await holdSave(laptop, { store: "records", key: "lmk/node/identity-bindings", text: name });
+    ann.run("identity", "rename", name);
+    await laptop.waitForFunction(() => window.storageFault.phase === "held", { timeout: 30_000 });
+    let groupsAnswered = false, itemsAnswered = false;
+    const heldGroups = outcome(call(laptop, "groups")).then(result => (groupsAnswered = true, result));
+    const heldItems = outcome(call(laptop, "items", invite.group, false)).then(result => (itemsAnswered = true, result));
+    await laptop.waitForTimeout(300);
+    check(!groupsAnswered && !itemsAnswered, "groups and items descriptions await the actual binding-record transaction");
+    check(await laptop.evaluate(name => !window.storageFault.events.some(e => e.type === "warning" && e.text?.includes(name)), name), "no observed-name warning escapes held IndexedDB storage");
+    await laptop.evaluate(abort => { window.storageFault.release = abort ? "abort" : "commit"; }, abort);
+    const [descriptions, timeline] = await Promise.all([heldGroups, heldItems]);
+    if (abort) {
+      check(descriptions.error && timeline.error && !descriptions.value && !timeline.value, "failed binding storage releases neither description snapshot");
+      check(JSON.stringify(await bindings(laptop)) === JSON.stringify(beforeBindings), "aborted observation storage leaves the first bindings unchanged");
+      await laptop.getByRole("button", { name: "Retry saving and reload" }).waitFor();
+      await recover(laptop);
+      await laptop.locator(".group-list button", { hasText: "Plans" }).click();
+    } else {
+      check(!descriptions.error && !timeline.error && descriptions.value.includes(name), "successful saving releases the authorized description");
+    }
+    check((await bindings(laptop)).some(([id, held]) => id === annIdentity && held === name), "explicit recovery/commit retains the signed observation");
+  }
+  ann.run("identity", "rename", "Ann");
+  check((await until(() => call(laptop, "groups"), value => JSON.parse(value).filter(g => [invite.group, doc.group, table.group].includes(g.group)).every(g => g.members.some(m => m.identity?.id === annIdentity && m.identity.name === "Ann")), 30_000)).includes(annIdentity), "revisiting an old name keeps the original binding, without a new pin");
+
   // A device link adds a phone to Matthew's identity, made on his desk; the phone then joins a chat by a link.
   const phone = await open("phone", { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
   const deviceLink = desk.run("identity", "invite").link;
@@ -414,8 +474,8 @@ try {
   await phone.getByRole("button", { name: "Leave for good?" }).click();
   await desk.printed(e => e.type === "left" && e.member === "pocket");
   await phone.locator(".group-list button", { hasText: "Team" }).waitFor({ state: "detached" });
-  const told = await phone.evaluate(() => window.toasts.splice(0));
-  check(told.every(t => t.startsWith("Asked the others to remove you") || t.startsWith("You were removed from Team")), `the phone leaves the chat (${told.length} notices)`);
+  const told = await notices(phone);
+  check(told.every(t => t.startsWith("Asked the others to remove you") || t.startsWith("You were removed from Team")), `the phone leaves the chat (${JSON.stringify(told)})`);
   await phone.reload();
   await phone.getByRole("button", { name: "New chat" }).waitFor();
   const left = await until(
@@ -448,7 +508,7 @@ try {
   const moved = desk.run("identity", "list").devices.map(d => d.name);
   check(moved.includes("kiosk") && (await kiosk.locator(".group-list button", { hasText: "Kiosk notes" }).count()) === 0, "which lists it, and it left Kim's chat");
 
-  check((await laptop.evaluate(() => window.toasts)).length === 0, "the laptop showed no error before its reload");
+  check((await notices(laptop)).length === 0, "the laptop showed only explicitly checked identity observations before its reload");
 
   // A reload keeps the laptop's groups, messages and doc, and it still talks.
   const recorded = await laptop.evaluate(
@@ -507,6 +567,7 @@ try {
     "and its doc"
   );
 
+  const bindingsBeforeTakeover = await bindings(laptop);
   // A second tab works through the session the first one runs, and runs it once the first closes.
   const second = watch("second tab", await laptop.context().newPage());
   await second.goto(SITE);
@@ -522,7 +583,7 @@ try {
   await laptop.getByText("to both tabs").waitFor();
   await second.getByText("to both tabs").waitFor();
   check(true, "every tab hears the session's events");
-  check((await laptop.evaluate(() => window.toasts)).length === 0, "the first tab showed no error");
+  check((await notices(laptop)).length === 0, "the first tab showed only explicitly checked identity observations");
   await laptop.close();
   delete pages.laptop;
   laptop = second;
@@ -532,6 +593,11 @@ try {
   await laptop.locator("textarea:visible").press("Enter");
   await ann.printed(e => e.type === "message" && e.content === "the second tab runs it");
   check(true, "when the first tab closes, the second runs the session");
+  check(JSON.stringify(await bindings(laptop)) === JSON.stringify(bindingsBeforeTakeover), "browser ownership takeover preserves first bindings and name history");
+  await laptop.locator(".people:visible").click();
+  await laptop.locator("dialog .identity-warning", { hasText: "Changed identity-name claim" }).waitFor();
+  check((await laptop.locator("dialog .identity-details").textContent()).includes(annIdentity), "persistent warning and full identity ID survive reload and takeover");
+  await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
 
   // The laptop's device link adds a native session's device to its identity.
   await laptop.locator(".me").click();
@@ -592,7 +658,23 @@ try {
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   const added = laptop.locator(".messages li.event", { hasText: "added Carl" });
   await added.waitFor();
-  check((await added.locator(".who").last().textContent()).includes("Carl · ") && (await added.locator(".who").last().textContent()).endsWith("(unverified)"), "the browser shows another identity's name as unverified");
+  check((await added.locator(".who").last().textContent()).includes("Carl · ") && (await added.locator(".who").last().getAttribute("title")).includes("not independently verified"), "the browser shows an authorized name claim without a human-verification badge");
+
+  const carlIdentity = carl.run("identity", "list").identity;
+  carl.run("identity", "rename", "ann");
+  const collided = JSON.parse(await until(() => call(laptop, "groups"), value => {
+    const members = JSON.parse(value).find(g => g.group === invite.group)?.members ?? [];
+    return [annIdentity, carlIdentity].every(id => members.some(m => m.identity?.id === id && m.identity.observed?.other_ids.length));
+  }, 30_000)).find(g => g.group === invite.group).members;
+  check([annIdentity, carlIdentity].every(id => collided.some(m => m.identity?.id === id && m.name.includes("["))), "different identities sharing a case-insensitive full name have disambiguated labels");
+  const ambiguous = await outcome(call(laptop, "request", JSON.stringify({ cmd: "send", content: "must not send", to: ["Ann"], group: invite.group })));
+  check(ambiguous.error?.includes("could be any"), "a familiar colliding name does not silently address one identity");
+  await laptop.locator(".people:visible").click();
+  const detail = await laptop.locator("dialog .identity-details").textContent();
+  check(detail.includes(annIdentity) && detail.includes(carlIdentity) && detail.includes("Names are not unique"), "People preserves both full IDs and a collision warning");
+  await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
+  carl.run("identity", "rename", "Carl");
+  await until(() => call(laptop, "groups"), value => JSON.parse(value).find(g => g.group === invite.group).members.some(m => m.identity?.id === carlIdentity && m.identity.name === "Carl"), 30_000);
 
   // A message larger than members take is not sent: the timeline keeps its text, says why, and offers Retry.
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
@@ -662,22 +744,25 @@ try {
   await laptop.getByRole("button", { name: "Retry saving and reload" }).waitFor();
   const sentFile = await sendingFile;
   check(!sentFile.error && sentFile.value.attachment.pending === true && !sentFile.value.attachment.held_by, "the real sender receives no browser holder acknowledgement after a files-only abort");
-  const failedItems = JSON.parse(await call(laptop, "items", fileChat.group, false));
-  const failedAttachment = failedItems.find(item => item.content === "file transaction abort").attachment;
-  check(!failedAttachment.kept && !(await kept(laptop)).includes(fileHash), "neither the browser nor IndexedDB claims the aborted ciphertext is kept");
+  const failedItems = await outcome(call(laptop, "items", fileChat.group, false));
+  const failedAttachment = sentFile.value.attachment;
+  check(failedItems.error?.includes("could not be saved") && !(await kept(laptop)).includes(fileHash), "neither a description nor IndexedDB claims the aborted ciphertext is kept");
   check(await laptop.evaluate(hash => !window.storageFault.events.some(e => e.type === "file" && e.hash === hash), fileHash), "no file-ready callback escapes the ciphertext abort");
   await holdSave(laptop, { store: "files", key: fileHash });
   const retryingFiles = outcome(call(laptop, "flush", true));
   await laptop.waitForFunction(() => window.storageFault.phase === "held");
   ann.run("send", `--group=${fileChat.group}`, "arrived during ciphertext recovery");
-  check((await until(() => call(laptop, "items", fileChat.group, false), items => items.includes("arrived during ciphertext recovery"))).includes("arrived during ciphertext recovery"), "records change while the ciphertext recovery transaction is in flight");
+  const heldItems = outcome(call(laptop, "items", fileChat.group, true));
+  await laptop.waitForTimeout(1_000);
   await laptop.evaluate(() => { window.storageFault.release = "commit"; });
   check((await retryingFiles).error?.includes("changed during the recovery save"), "a ciphertext retry also refuses reload when records changed during its transaction");
+  check((await heldItems).error?.includes("could not be saved"), "descriptions remain withheld during a failed process's recovery");
   check((await kept(laptop)).includes(fileHash) && await call(laptop, "file", failedAttachment.link) === undefined, "a committed recovery file is not published by the terminally failed process before reload");
   await ann.stop();
   await recover(laptop);
   await laptop.locator(".group-list button", { hasText: "File durability" }).click();
   check((await kept(laptop)).includes(fileHash) && new TextDecoder().decode(new Uint8Array(await call(laptop, "file", failedAttachment.link))) === original, "with the only peer offline, retry and reload recover the original plaintext from retained ciphertext");
+  check((await call(laptop, "items", fileChat.group, false)).includes("arrived during ciphertext recovery"), "the incoming mutation during file recovery survived with its peer offline");
   ann = native("ann");
   await ann.printed(e => e.type === "ready");
 
@@ -744,17 +829,18 @@ try {
   await late.getByRole("button", { name: "Retry saving and reload" }).waitFor();
   check(true, "both an existing follower and a tab opened after failure show the latched storage diagnostic");
   ann.run("send", `--group=${invite.group}`, "arrived while saving was stopped");
-  const intervening = await until(() => call(laptop, "items", invite.group, false), items => items.includes("arrived while saving was stopped"));
-  check(intervening.includes("arrived while saving was stopped"), "intervening writes stay available in memory before the explicit retry");
+  const intervening = await outcome(call(laptop, "items", invite.group, false));
+  check(intervening.error?.includes("could not be saved"), "intervening descriptions cannot escape before the explicit retry; their data is checked after reload");
 
   await holdSave(laptop, target);
   const retrying = outcome(call(follower, "flush", true));
   await laptop.waitForFunction(() => window.storageFault.phase === "held");
   ann.run("send", `--group=${invite.group}`, "arrived during the recovery transaction");
-  const during = await until(() => call(laptop, "items", invite.group, false), items => items.includes("arrived during the recovery transaction"));
-  check(during.includes("arrived during the recovery transaction"), "a real incoming message mutates records while the recovery transaction is in flight");
+  const during = outcome(call(laptop, "items", invite.group, true));
+  await laptop.waitForTimeout(1_000);
   await laptop.evaluate(() => { window.storageFault.release = "commit"; });
   const dirtyRetry = await retrying;
+  check((await during).error?.includes("could not be saved"), "the accessor does not acknowledge in-memory changes during recovery");
   check(dirtyRetry.error?.includes("changed during the recovery save") && await laptop.evaluate(() => !window.storageFault.events.some(e => e.type === "storage_saved")), "a dirty retry refuses reload and retains the intervening delta without clearing the terminal latch");
   for (const tab of [laptop, follower, late]) await tab.getByRole("button", { name: "Retry saving and reload" }).waitFor();
   await Promise.all([laptop.waitForEvent("load"), follower.waitForEvent("load"), recover(late)]);
@@ -836,7 +922,7 @@ try {
   check(readFileSync(fetched.path, "utf8") === "the spec", "a tab serves a kept file, loading it from IndexedDB when a member wants it");
 
   for (const [name, page] of Object.entries(pages)) {
-    const toasts = await page.evaluate(() => window.toasts);
+    const toasts = await notices(page);
     check(toasts.length === 0, `${name} showed no error${toasts.length ? `: ${toasts.join("; ")}` : ""}`);
   }
 

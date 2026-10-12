@@ -65,7 +65,7 @@ pub enum Done {
     /// A message this session sent in a group: its id and the answer, and where that goes.
     Sent(Bytes, Result<(Bytes, Value)>, oneshot::Sender<Value>),
     /// What failed of leaving the groups of identities this device left.
-    Left(Vec<anyhow::Error>),
+    IdentityRefreshed(Vec<anyhow::Error>),
     /// The handles of the device's sessions that run.
     Found(Vec<String>),
     /// How handing a session an add, at its position, went.
@@ -318,7 +318,7 @@ impl Session {
             // Not due again until this check finishes.
             self.identity_at = now + Duration::from_secs(3600);
             let client = self.client.clone();
-            self.running.spawn_local(async move { Done::Left(client.leave_identities_left().await) });
+            self.running.spawn_local(async move { Done::IdentityRefreshed(client.refresh_identity().await) });
         }
         if self.outbox.deadline(self.config.hold).is_some_and(|at| at <= now) {
             self.outbox.flush_held();
@@ -433,10 +433,10 @@ impl Session {
                 });
                 self.answer(answer, reply);
             }
-            Done::Left(failed) => {
+            Done::IdentityRefreshed(failed) => {
                 self.identity_at = Instant::now() + IDENTITY_CHECK;
                 for error in failed {
-                    eprintln!("letmeknow: leaving the groups of an identity this device left: {error:#}");
+                    self.warn(None, format!("refreshing identity claims: {error:#}"));
                 }
             }
             Done::Found(running) => {

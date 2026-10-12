@@ -301,6 +301,7 @@ struct Inner<P> {
     events: mpsc::UnboundedSender<ClientEvent>,
     /// Held while a pass takes the adds for this device.
     taking: tokio::sync::Mutex<()>,
+    refreshing: tokio::sync::Mutex<()>,
     /// The events of the groups `added` is joining, held until it tells of the join, which so comes first.
     adding: Mutex<HashMap<Bytes, Vec<ClientEvent>>>,
 }
@@ -334,6 +335,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             state: Mutex::default(),
             events,
             taking: tokio::sync::Mutex::new(()),
+            refreshing: tokio::sync::Mutex::new(()),
             adding: Mutex::default(),
         };
         (Client { inner: Arc::new(inner) }, told)
@@ -371,6 +373,12 @@ impl<P: Provider + Send + 'static> Client<P> {
 
     /// Tells the plugins of its groups' kinds of the groups, as when the client starts.
     pub async fn start(&self) {
+        let client = self.clone();
+        n0_future::task::spawn(async move {
+            for error in client.refresh_identity().await {
+                client.warn(None, format!("refreshing identity claims: {error:#}"));
+            }
+        });
         for gid in self.inner.node.groups() {
             if self.inner.node.settings(&gid.0).is_ok_and(|s| s.kind != CHAT && s.kind != IDENTITY)
                 && let Err(error) = self.open_kind(&gid, None).await
@@ -721,7 +729,20 @@ impl<P: Provider + Send + 'static> Client<P> {
                 .collect();
             only_here.extend(node.pending_files(&gid.0)?.iter().map(|hash| json!({ "what": "file", "id": hex::encode(hash) })));
             only_here_count += only_here.len();
-            let mut group = json!({ "group": b64(&gid.0), "online": online, "away": away, "only_here": only_here });
+            let mut identity_warnings = Vec::new();
+            for member in &describer.members {
+                if let Some(claim) = &member.identity
+                    && let Some(observed) = &claim.observed
+                    && (observed.names.len() > 1 || !observed.other_ids.is_empty())
+                {
+                    let warning = format!("Identity {} claims {:?}; locally observed names: {:?}; other IDs claiming this name: {}. Not independently verified.",
+                        b64(&claim.identity.id.0), claim.name, observed.names, serde_json::to_string(&observed.other_ids)?);
+                    if !identity_warnings.contains(&warning) {
+                        identity_warnings.push(warning);
+                    }
+                }
+            }
+            let mut group = json!({ "group": b64(&gid.0), "online": online, "away": away, "only_here": only_here, "identity_warnings": identity_warnings });
             if let Some(name) = Some(node.settings(&gid.0)?.name).filter(|n| !n.is_empty()) {
                 group["name"] = json!(name);
             }
@@ -896,6 +917,12 @@ impl<P: Provider + Send + 'static> Client<P> {
             Access::Here(devices) => {
                 let Some(event) = devices.on(event) else { return };
                 if let Some(changed) = Self::devices_changed(&devices, &event) {
+                    let client = self.clone();
+                    n0_future::task::spawn(async move {
+                        for error in client.refresh_identity().await {
+                            client.warn(None, format!("refreshing identity claims: {error:#}"));
+                        }
+                    });
                     return self.emit(changed);
                 }
                 if let Event::Logged { group } = &event
@@ -927,9 +954,8 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
     }
 
-    /// A device joined or left this device's identity.
     fn devices_changed(devices: &Identity<P>, event: &Event) -> Option<ClientEvent> {
-        let (Event::Joined { group, .. } | Event::Left { group, .. }) = event else { return None };
+        let (Event::Joined { group, .. } | Event::Left { group, .. } | Event::Settings { group, .. } | Event::Heard { group }) = event else { return None };
         Some(ClientEvent::Identity { identity: devices.identity_of(&group.0)?.id })
     }
 
@@ -1066,17 +1092,41 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(groups)
     }
 
-    /// Leaves the groups it speaks as an identity in that its device is no longer on. Returns what failed.
-    pub async fn leave_identities_left(&self) -> Vec<anyhow::Error> {
-        let Ok(state) = self.device_state() else { return Vec::new() };
+    /// Leaves identities this device left and refreshes signed claims in existing memberships. Each group can retry independently.
+    pub async fn refresh_identity(&self) -> Vec<anyhow::Error> {
+        let Ok(_refreshing) = self.inner.refreshing.try_lock() else { return Vec::new() };
+        let state = match self.device_state() {
+            Ok(state) => state,
+            Err(error) => return vec![error],
+        };
         let mut failed = Vec::new();
-        for identity in self.inner.node.spoken() {
-            // None is published before the device's node first runs.
-            if state.device.is_some()
-                && state.identity.as_ref().is_none_or(|(own, _)| own.id != identity.id)
-                && let Err(error) = self.leave_as(&identity.id).await
-            {
+        let certificate = match timeout(Duration::from_secs(10), self.speaking_as()).await.map_err(anyhow::Error::from).and_then(|r| r) {
+            Ok(certificate) => certificate,
+            Err(error) => {
                 failed.push(error);
+                None
+            }
+        };
+        let node = &self.inner.node;
+        for gid in node.groups() {
+            let refresh = async {
+                if node.settings(&gid.0)?.kind == IDENTITY {
+                    return Ok(());
+                }
+                let own = node.members(&gid.0)?.into_iter().find(|m| m.key == node.key()).and_then(|m| m.identity);
+                let Some(own) = own else { return Ok(()) };
+                // None is published before the device manager first runs.
+                if state.device.is_some() && state.identity.as_ref().is_none_or(|(id, _)| id.id != own.identity.id) {
+                    self.leave(&gid).await?;
+                } else if let Some(certificate) = &certificate
+                    && certificate.identity.id == own.identity.id
+                {
+                    node.recertify(&gid.0, certificate.clone()).await?;
+                }
+                anyhow::Ok(())
+            };
+            if let Err(error) = timeout(Duration::from_secs(10), refresh).await.map_err(anyhow::Error::from).and_then(|r| r) {
+                failed.push(error.context(format!("group {}", b64(&gid.0))));
             }
         }
         failed

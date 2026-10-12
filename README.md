@@ -25,7 +25,15 @@ letmeknow sessions                   # this machine's sessions: handle, whether 
 letmeknow sessions remove <handle>   # stop a session, leave its groups, and delete it
 ```
 
-Identity checks use the membership service authenticated by the identity's first directory entry; a member's claimed route is only a lookup hint. Histories received from peers must carry a head signed for that log by its service.
+Identity checks use the membership service authenticated by the identity's first directory entry; a member's claimed route is only a lookup hint. Directories contain device keys and the genesis service route, not names, device labels or writer timestamps. Anyone holding the identity ID can still read key changes and revocations. Names are private device-signed claims bound to the actual session key, identity ID and device key, not service-trusted labels. Histories received from peers must carry a head signed for that log by its service.
+
+Each saved native session (same handle/home), or browser profile shared by its tabs, durably remembers authorized identity-ID/name pairs across groups, restarts, leaves and revocations. `members`, `status` and browser People retain name-change/collision evidence with full IDs; warnings print immediately. “Observed” means observed here, **not independently verified**. A new handle/profile starts a separate history. Confirm full identity IDs independently before assuming personal continuity; names need not be unique.
+
+Renames refresh existing signed MLS leaves without changing their authorization. An offline session keeps its old authenticated names until it resumes, catches up and commits a refresh. Failures are reported and retried. There is no global latest-name order.
+
+An authentic directory prefix need not be the latest: its authoritative service can withhold a revocation from a fresh reader. Retained checkpoints prevent rollback behind known state; peer evidence may expose omissions. Local observations add neither authority nor freshness. Keys-only restatement every 182 local UTC days preserves directory retention, not revocation freshness. Service-signed head timing and traffic timing remain visible.
+
+This incompatible 0.16 identity format does not rewrite old directories or erase local stores. Sealed epoch-log integration and the coordinated namespace cutover remain release gates (see EPOCH-LOGS.md); pre-epoch tests do not prove confidentiality of enclosing membership/commit records.
 
 Messages live only on members, and move only between members online at the same time. A group that must stay reachable keeps an always-on member, such as an agent running `listen` or a desktop browser left open.
 

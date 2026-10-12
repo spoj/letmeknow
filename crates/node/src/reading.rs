@@ -223,6 +223,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if own {
             g.rec.updated = now;
         }
+        st.observe_identities()?;
+        if !gone {
+            st.events.push(Event::Heard { group: Bytes(gid.to_vec()) });
+        }
         st.scrub = true;
         st.gate = true;
         for leaf in applied.removed.iter().filter_map(|m| m.leaf.as_ref()) {

@@ -1,12 +1,12 @@
-//! A public log: making entries, sealing them, and replaying the log into its writers and name; and checking a member's
-//! certificate against an identity's writers, its devices.
+//! Keys-only public directories and authorization of device-signed private session claims.
 
 use anyhow::{Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use ed25519_dalek::VerifyingKey;
 use lmk_proto::Bytes;
 use lmk_proto::group::{Credential, Service};
-use lmk_proto::public::{Body, ENTRY_CONTEXT, Envelope, Listed, certified, id, key};
+use lmk_proto::public::{Body, ENTRY_CONTEXT, Envelope, certified, id, key};
 use sha2::{Digest, Sha256};
 
 use crate::device::{public, sign, verify};
@@ -16,42 +16,31 @@ fn envelope(seed: &[u8; 32], body: &Body) -> Envelope {
     Envelope { sig: Bytes(sign(seed, &[ENTRY_CONTEXT, &body].concat())), by: Bytes(public(seed).to_vec()), body: Bytes(body) }
 }
 
-/// A public log as replayed from its log.
 #[derive(Clone, Debug)]
 pub struct PublicLog {
     pub id: [u8; 32],
-    pub name: String,
     pub membership: Service,
-    /// The latest entry's writers.
-    pub writers: Vec<Listed>,
-    /// When the latest entry was appended, by its writer's clock, in milliseconds.
-    pub at: u64,
-    /// The keys of the writers an earlier entry listed and the latest does not.
+    pub writers: Vec<Bytes>,
     dropped: Vec<Bytes>,
-    /// SHA-256 of the latest entry's body.
     latest: [u8; 32],
 }
 
-/// How a member's certificate stands against its identity's public log.
+/// Authorization in the authenticated directory view held here, not proof of its freshness or a person's identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// Its device is a writer, by this name.
-    Verified { device: String },
-    /// Its device was never a writer, or the certificate does not check out: the log may not show it yet.
+    Authorized,
     Unverified,
-    /// An earlier entry listed its device and the latest does not, or the log is closed.
     Dropped,
 }
 
-/// A new public log whose first writer is `writer`, `seed`'s: its id, and its first entry, sealed.
-pub fn create(seed: &[u8; 32], name: &str, membership: Service, writer: Listed, at: u64) -> ([u8; 32], Vec<u8>) {
-    let body = Body { prev: None, writers: vec![writer], name: name.into(), at, membership: Some(membership) };
+pub fn create(seed: &[u8; 32], membership: Service) -> ([u8; 32], Vec<u8>) {
+    let body = Body { prev: None, writers: vec![public(seed).into()], membership: Some(membership) };
     let entry = envelope(seed, &body);
     let id = id(&entry.body.0);
     (id, seal(&id, &entry))
 }
 
-/// An entry as the service keeps it: a random nonce, then the sealed JSON envelope.
+/// A random nonce followed by the sealed JSON envelope. Every identity-ID holder can open it.
 pub fn seal(id: &[u8], entry: &Envelope) -> Vec<u8> {
     let nonce = crate::random::<12>();
     let sealed = ChaCha20Poly1305::new(&Key::from(key(id)))
@@ -70,15 +59,31 @@ pub fn open(id: &[u8], sealed: &[u8]) -> Result<Envelope> {
     Ok(serde_json::from_slice(&plain)?)
 }
 
-/// An entry's body, if one of `writers` signed it.
-fn signed_body(entry: &Envelope, writers: &[Listed]) -> Option<Body> {
-    let signed = writers.iter().any(|writer| writer.key == entry.by) && verify(&entry.by.0, ENTRY_CONTEXT, &entry.body.0, &entry.sig.0);
-    signed.then(|| serde_json::from_slice(&entry.body.0).ok())?
+fn signed_body(entry: &Envelope, writers: &[Bytes]) -> Option<Body> {
+    if !writers.contains(&entry.by) || !verify(&entry.by.0, ENTRY_CONTEXT, &entry.body.0, &entry.sig.0) {
+        return None;
+    }
+    let body: Body = serde_json::from_slice(&entry.body.0).ok()?;
+    for writer in &body.writers {
+        let key = VerifyingKey::from_bytes(writer.0.as_slice().try_into().ok()?).ok()?;
+        if key.is_weak() {
+            return None;
+        }
+    }
+    Some(body)
+}
+
+/// Checks the signed claims only. Whether this device is a writer is a separate directory check.
+pub fn verify_certificate(credential: &Credential) -> bool {
+    let Some(c) = &credential.certificate else { return false };
+    let (Ok(session), Ok(identity), Ok(device)) = (
+        credential.key.0.as_slice().try_into(), c.identity.id.0.as_slice().try_into(), c.device.0.as_slice().try_into(),
+    ) else { return false };
+    verify(&c.device.0, b"", &certified(session, identity, device, &c.name, &c.device_name), &c.sig.0)
 }
 
 impl PublicLog {
-    /// Replays a public log, in order: the first valid entry whose body hashes to the id, then the first valid entry per
-    /// `prev`.
+    /// The first valid genesis and then the first valid successor per predecessor, in service order.
     pub fn replay<'a>(id: &[u8; 32], entries: impl IntoIterator<Item = &'a [u8]>) -> Result<Self> {
         let mut entries = entries.into_iter();
         let mut log = entries.by_ref().find_map(|entry| Self::created(id, entry)).context("the log has no valid first entry")?;
@@ -88,7 +93,6 @@ impl PublicLog {
         Ok(log)
     }
 
-    /// The log its first entry starts, which hashes to the id and is signed by a writer it lists.
     fn created(id: &[u8; 32], sealed: &[u8]) -> Option<Self> {
         let entry = open(id, sealed).ok()?;
         let first: Body = serde_json::from_slice(&entry.body.0).ok()?;
@@ -96,52 +100,44 @@ impl PublicLog {
         if body.prev.is_some() || Sha256::digest(&entry.body.0)[..] != id[..] {
             return None;
         }
-        let membership = body.membership?;
-        Some(PublicLog { id: *id, name: body.name, membership, writers: body.writers, at: body.at, dropped: Vec::new(), latest: *id })
+        Some(PublicLog { id: *id, membership: body.membership?, writers: body.writers, dropped: Vec::new(), latest: *id })
     }
 
-    /// Applies the next entry of the log if a writer of the latest signed it and it extends the log; returns whether it
-    /// did.
     pub fn apply(&mut self, sealed: &[u8]) -> bool {
-        let Ok(entry) = open(&self.id, sealed) else {
-            return false;
-        };
-        let Some(body) = signed_body(&entry, &self.writers) else {
-            return false;
-        };
-        if body.prev.as_ref().map(|prev| prev.0.as_slice()) != Some(self.latest.as_slice()) {
+        let Ok(entry) = open(&self.id, sealed) else { return false };
+        let Some(body) = signed_body(&entry, &self.writers) else { return false };
+        if body.prev.as_ref().map(|prev| prev.0.as_slice()) != Some(self.latest.as_slice()) || body.membership.is_some() {
             return false;
         }
-        let gone: Vec<Bytes> = self.writers.iter().filter(|held| !body.writers.iter().any(|w| w.key == held.key)).map(|held| held.key.clone()).collect();
-        self.dropped.extend(gone);
-        self.dropped.retain(|dropped| !body.writers.iter().any(|w| w.key == *dropped));
-        (self.writers, self.name, self.at) = (body.writers, body.name, body.at);
+        self.dropped.extend(self.writers.iter().filter(|held| !body.writers.contains(held)).cloned());
+        self.dropped.retain(|dropped| !body.writers.contains(dropped));
+        self.writers = body.writers;
         self.latest = Sha256::digest(&entry.body.0).into();
         true
     }
 
-    /// Whether the closing entry, which lists no writers, ended the log.
     pub fn closed(&self) -> bool {
         self.writers.is_empty()
     }
 
-    /// The sealed entry after the latest, by `seed`'s writer, listing `writers` and `name`, appended at `at`.
-    pub fn next(&self, seed: &[u8; 32], writers: Vec<Listed>, name: &str, at: u64) -> Vec<u8> {
-        let body = Body { prev: Some(self.latest.into()), writers, name: name.into(), at, membership: None };
+    pub fn next(&self, seed: &[u8; 32], mut writers: Vec<Bytes>) -> Vec<u8> {
+        writers.sort();
+        writers.dedup();
+        let body = Body { prev: Some(self.latest.into()), writers, membership: None };
         seal(&self.id, &envelope(seed, &body))
     }
 
-    /// How a member's certificate stands: its device's key must have signed its session key and the identity's id.
     pub fn verify(&self, credential: &Credential) -> Verdict {
         let Some(certificate) = &credential.certificate else { return Verdict::Unverified };
-        let signed = verify(&certificate.device.0, b"", &certified(&credential.key.0, &self.id), &certificate.sig.0);
-        if certificate.identity.id.0 != self.id || !signed {
+        if certificate.identity.id.0 != self.id || !verify_certificate(credential) {
             return Verdict::Unverified;
         }
-        match self.writers.iter().find(|device| device.key == certificate.device) {
-            Some(device) => Verdict::Verified { device: device.name.clone() },
-            None if self.closed() || self.dropped.contains(&certificate.device) => Verdict::Dropped,
-            None => Verdict::Unverified,
+        if self.writers.contains(&certificate.device) {
+            Verdict::Authorized
+        } else if self.closed() || self.dropped.contains(&certificate.device) {
+            Verdict::Dropped
+        } else {
+            Verdict::Unverified
         }
     }
 }
@@ -155,82 +151,110 @@ mod tests {
         crate::group::tests::service("https://lmk.example")
     }
 
-    fn listed(seed: &[u8; 32], name: &str) -> Listed {
-        Listed { key: public(seed).into(), name: name.into() }
-    }
-
     fn replay(id: &[u8; 32], log: &[Vec<u8>]) -> PublicLog {
         PublicLog::replay(id, log.iter().map(Vec::as_slice)).unwrap()
     }
 
     #[test]
-    fn an_entry_counts_only_if_a_writer_of_the_one_before_signed_it() {
-        let (laptop, tablet, stranger) = (crate::random(), crate::random(), crate::random());
-        let (id, first) = create(&laptop, "Matthew", service(), listed(&laptop, "laptop"), 1);
-        let mut log = vec![b"junk".to_vec(), first];
-        let latest = replay(&id, &log);
-        assert_eq!((latest.name.as_str(), &latest.writers[..], latest.at), ("Matthew", &[listed(&laptop, "laptop")][..], 1));
-        assert!(open(&[0; 32], &log[1]).is_err());
-        // Neither the tablet, not listed yet, nor a stranger writes.
-        log.push(latest.next(&tablet, vec![listed(&tablet, "tablet")], "Matthew", 2));
-        log.push(latest.next(&stranger, vec![listed(&stranger, "stranger")], "Mallory", 2));
-        assert_eq!(replay(&id, &log).writers, [listed(&laptop, "laptop")]);
-        // The laptop lists the tablet; of two entries after the same one, the first counts.
-        log.push(latest.next(&laptop, vec![listed(&laptop, "laptop"), listed(&tablet, "tablet")], "Matthew", 3));
-        log.push(latest.next(&laptop, vec![listed(&laptop, "laptop")], "Fork", 3));
-        let latest = replay(&id, &log);
-        assert_eq!(latest.writers, [listed(&laptop, "laptop"), listed(&tablet, "tablet")]);
-        // The tablet, now a writer, renames the identity and drops the laptop, which then writes no more.
-        log.push(latest.next(&tablet, vec![listed(&tablet, "tablet")], "Matt", 4));
-        let mut latest = replay(&id, &log);
-        assert_eq!((latest.name.as_str(), &latest.writers[..], latest.at), ("Matt", &[listed(&tablet, "tablet")][..], 4));
-        assert!(!latest.apply(&latest.next(&laptop, vec![listed(&laptop, "laptop")], "Matt", 5)));
-    }
-
-    #[test]
-    fn after_the_closing_entry_no_entry_counts() {
-        let laptop = crate::random();
-        let (id, first) = create(&laptop, "Matthew", service(), listed(&laptop, "laptop"), 1);
-        let mut log = replay(&id, &[first]);
-        assert!(log.apply(&log.next(&laptop, Vec::new(), "Matthew", 2)));
+    fn writer_succession_authority_and_permanent_closure() {
+        let (a, b, stranger) = (crate::random(), crate::random(), crate::random());
+        let (id, first) = create(&a, service());
+        let mut log = replay(&id, &[b"junk".to_vec(), first.clone()]);
+        let keys: Vec<Bytes> = vec![public(&a).into(), public(&b).into()];
+        assert_eq!(log.writers, keys[..1]);
+        assert!(open(&[0; 32], &first).is_err());
+        assert!(!log.apply(&log.next(&b, keys.clone())));
+        assert!(!log.apply(&log.next(&stranger, keys.clone())));
+        let branch = log.next(&a, keys[..1].to_vec());
+        assert!(log.apply(&log.next(&a, vec![keys[1].clone(), keys[0].clone(), keys[1].clone()])));
+        assert!(!log.apply(&branch));
+        let mut ordered = keys.clone();
+        ordered.sort();
+        assert_eq!(log.writers, ordered);
+        let body = Body { prev: Some(log.latest.into()), writers: keys.clone(), membership: Some(service()) };
+        assert!(!log.apply(&seal(&id, &envelope(&a, &body))), "a continuation cannot supply a service");
+        for key in [Bytes(vec![1]), Bytes(vec![0; 32]), Bytes([vec![1], vec![0; 31]].concat())] {
+            let bad = Body { writers: vec![key], membership: None, ..body.clone() };
+            assert!(!log.apply(&seal(&id, &envelope(&a, &bad))), "malformed/weak writer");
+        }
+        assert!(log.apply(&log.next(&b, keys[1..].to_vec())));
+        assert!(!log.apply(&log.next(&a, keys.clone())), "dropped writer");
+        assert!(log.apply(&log.next(&b, keys.clone())), "explicit reauthorization");
+        assert!(log.apply(&log.next(&a, vec![])));
         assert!(log.closed());
-        assert!(!log.apply(&log.next(&laptop, vec![listed(&laptop, "laptop")], "Matthew", 3)));
+        assert!(!log.apply(&log.next(&b, keys)));
     }
 
     #[test]
-    fn a_first_entry_hashes_to_the_id_and_is_signed_by_a_writer_it_lists() {
-        let (seed, other) = (crate::random(), crate::random());
-        let (_, first) = create(&seed, "Matthew", service(), listed(&seed, "laptop"), 1);
-        let (elsewhere, _) = create(&seed, "Matthew", crate::group::tests::service("https://elsewhere.example"), listed(&seed, "laptop"), 1);
+    fn genesis_is_bound_to_its_bytes_service_writer_and_v2_domain() {
+        let seed = crate::random();
+        let (id, first) = create(&seed, service());
+        let (elsewhere, _) = create(&seed, crate::group::tests::service("https://elsewhere.example"));
         assert!(PublicLog::replay(&elsewhere, [first.as_slice()]).is_err());
-        let (id, unlisted) = create(&other, "Matthew", service(), listed(&seed, "laptop"), 1);
-        assert!(PublicLog::replay(&id, [unlisted.as_slice()]).is_err(), "signed by a key it does not list");
+        let mut entry = open(&id, &first).unwrap();
+        entry.sig = Bytes(sign(&seed, &[b"letmeknow public log v1\0", entry.body.0.as_slice()].concat()));
+        assert!(PublicLog::replay(&id, [seal(&id, &entry).as_slice()]).is_err());
+        let body = Body { prev: None, writers: vec![public(&crate::random()).into()], membership: Some(service()) };
+        let entry = envelope(&seed, &body);
+        let id = id_of(&entry.body.0);
+        assert!(PublicLog::replay(&id, [seal(&id, &entry).as_slice()]).is_err());
     }
 
     #[test]
-    fn a_certificate_is_verified_unverified_or_dropped() {
-        let (laptop, tablet, phone): ([u8; 32], [u8; 32], [u8; 32]) = (crate::random(), crate::random(), crate::random());
-        let (id, first) = create(&laptop, "Matthew", service(), listed(&laptop, "laptop"), 1);
+    fn private_claims_are_exactly_bound_and_authorization_remains_separate() {
+        let seed = crate::random();
+        let (id, first) = create(&seed, service());
         let mut log = replay(&id, &[first]);
-        let identity = IdentityRef { id: id.into(), membership: service() };
-        let session = Bytes(vec![1; 32]);
-        let of = |device: &[u8; 32]| Credential {
-            name: "builder".into(),
-            key: session.clone(),
-            certificate: Some(Certificate { identity: identity.clone(), device: public(device).into(), sig: Bytes(sign(device, &certified(&session.0, &id))) }.into()),
+        let key = public(&crate::random());
+        let device = public(&seed);
+        let of = |name: &str, device_name: &str| Credential {
+            name: "handle".into(), key: key.into(),
+            certificate: Some(Box::new(Certificate {
+                identity: IdentityRef { id: id.into(), membership: service() }, device: device.into(),
+                name: name.into(), device_name: device_name.into(),
+                sig: Bytes(sign(&seed, &certified(&key, &id, &device, name, device_name))),
+            })),
         };
-        assert_eq!(log.verify(&of(&laptop)), Verdict::Verified { device: "laptop".into() });
-        assert_eq!(log.verify(&of(&tablet)), Verdict::Unverified, "never listed");
-        assert!(log.apply(&log.next(&laptop, vec![listed(&laptop, "laptop"), listed(&tablet, "tablet")], "Matthew", 2)));
-        assert_eq!(log.verify(&of(&tablet)), Verdict::Verified { device: "tablet".into() });
-        assert!(log.apply(&log.next(&laptop, vec![listed(&laptop, "desk")], "Matthew", 3)));
-        assert_eq!((log.verify(&of(&tablet)), log.verify(&of(&laptop))), (Verdict::Dropped, Verdict::Verified { device: "desk".into() }));
-        assert_eq!(log.verify(&of(&phone)), Verdict::Unverified);
-        let forged = Credential { key: Bytes(vec![2; 32]), ..of(&laptop) };
-        assert_eq!(log.verify(&forged), Verdict::Unverified, "a signature over another session key");
-        let none = Credential { certificate: None, ..of(&laptop) };
-        assert_eq!(log.verify(&none), Verdict::Unverified);
-        assert!(log.apply(&log.next(&laptop, Vec::new(), "Matthew", 4)));
-        assert_eq!((log.verify(&of(&laptop)), log.verify(&of(&phone))), (Verdict::Dropped, Verdict::Dropped), "closed: every device");
+        assert_ne!(certified(&key, &id, &device, "ab", "c"), certified(&key, &id, &device, "a", "bc"));
+        for (name, label) in [("", ""), ("Ånn 🦊", "pöcket"), ("Ann", "laptop")] {
+            let good = of(name, label);
+            assert_eq!(log.verify(&good), Verdict::Authorized);
+            for mutation in 0..9 {
+                let mut bad = good.clone();
+                let c = bad.certificate.as_mut().unwrap();
+                match mutation {
+                    0 => c.name.push('x'),
+                    1 => c.device_name.push('x'),
+                    2 => bad.key.0[0] ^= 1,
+                    3 => c.device.0[0] ^= 1,
+                    4 => c.identity.id.0[0] ^= 1,
+                    5 => c.sig.0[0] ^= 1,
+                    6 => c.device.0.pop().map(drop).unwrap(),
+                    7 => c.identity.id.0.pop().map(drop).unwrap(),
+                    _ => c.sig = Bytes(sign(&seed, &[b"letmeknow certificate v1\0", key.as_slice(), id.as_slice()].concat())),
+                }
+                assert!(!verify_certificate(&bad), "mutation {mutation}");
+                assert_eq!(log.verify(&bad), Verdict::Unverified);
+            }
+            let mut hint = good.clone();
+            hint.certificate.as_mut().unwrap().identity.membership = crate::group::tests::service("https://hint.example");
+            assert_eq!(log.verify(&hint), Verdict::Authorized, "route hint is not signed authority");
+        }
+        let other = crate::random();
+        assert!(log.apply(&log.next(&seed, vec![public(&other).into()])));
+        assert_eq!(log.verify(&of("Ann", "laptop")), Verdict::Dropped);
+        assert!(log.apply(&log.next(&other, vec![device.into()])));
+        assert_eq!(log.verify(&of("Ann", "laptop")), Verdict::Authorized);
     }
+
+    #[test]
+    fn weak_key_forgeries_and_old_name_bearing_bodies_are_rejected() {
+        let weak = [vec![1], vec![0; 31]].concat();
+        let sig = [weak.as_slice(), &[0; 32]].concat();
+        assert!(!verify(&weak, b"", b"anything", &sig));
+        let old = serde_json::json!({"prev":null,"writers":[{"key":Bytes(weak),"name":"leak"}],"name":"leak","at":1734567890123_u64,"membership":service()});
+        assert!(serde_json::from_value::<Body>(old).is_err());
+    }
+
+    use lmk_proto::public::id as id_of;
 }

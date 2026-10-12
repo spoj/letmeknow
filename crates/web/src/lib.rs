@@ -450,6 +450,16 @@ impl App {
                 sleep(Duration::from_secs(1)).await;
             }
         });
+        let refreshing = Rc::downgrade(&app);
+        spawn_local(async move {
+            while let Some(app) = refreshing.upgrade() {
+                for error in app.client.refresh_identity().await {
+                    app.client.warn(None, format!("refreshing identity claims: {error:#}"));
+                }
+                drop(app);
+                sleep(Duration::from_secs(10)).await;
+            }
+        });
         let collecting = Rc::downgrade(&app);
         spawn_local(async move {
             while let Some(app) = collecting.upgrade() {
@@ -741,13 +751,17 @@ impl Lmk {
     }
 
     /// Every group this browser is in, with its settings and members.
-    pub fn groups(&self) -> R<String> {
-        Ok(self.app.groups().map_err(js)?.to_string())
+    pub async fn groups(&self) -> R<String> {
+        let snapshot = self.app.groups().map_err(js)?.to_string();
+        self.app.saved().await.map_err(js)?;
+        Ok(snapshot)
     }
 
     /// A group's timeline; `shown`: the page shows it, so its messages are read.
-    pub fn items(&self, gid: &str, shown: bool) -> R<String> {
-        Ok(self.app.items(&Bytes(unb64(gid).map_err(js)?), shown).map_err(js)?.to_string())
+    pub async fn items(&self, gid: &str, shown: bool) -> R<String> {
+        let snapshot = self.app.items(&Bytes(unb64(gid).map_err(js)?), shown).map_err(js)?.to_string();
+        self.app.saved().await.map_err(js)?;
+        Ok(snapshot)
     }
 
     /// How many of this browser's sends no other member holds yet: closing it while any is loses them.

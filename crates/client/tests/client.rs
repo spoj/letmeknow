@@ -156,7 +156,7 @@ async fn a_joiner_shows_its_identitys_claim_and_a_link_to_an_identity_admits_onl
     bob.request(json!({ "cmd": "join", "target": invite["link"] })).await;
     let ClientEvent::Joined { member, .. } = alice.until(|e| matches!(e, ClientEvent::Joined { .. })).await else { unreachable!() };
     let known = member.identity.unwrap();
-    assert_eq!((known.id, known.name.as_str(), known.how), (serde_json::from_value(robert).unwrap(), "Robert", Standing::Unknown));
+    assert_eq!((known.id, known.name.as_str(), known.how), (serde_json::from_value(robert).unwrap(), "Robert", Standing::Observed));
     let members = alice.request(json!({ "cmd": "members", "group": invite["group"] })).await;
     let seen: Vec<lmk_client::Described> = serde_json::from_value(members["members"].clone()).unwrap();
     let me = seen.iter().find(|m| m.you).unwrap().identity.clone().unwrap();
@@ -288,6 +288,63 @@ async fn a_browser_joins_a_group_another_of_its_devices_adds_it_to() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_welcome_observes_two_colliding_identities_without_merging_their_names() {
+    let relay = relay().await;
+    let host = Member::start(&relay, "host").await;
+    let ann = Member::start(&relay, "phone").await;
+    let other = Member::start(&relay, "desk").await;
+    let reader = Member::start(&relay, "reader").await;
+    for (member, name) in [(&ann, "Ann"), (&other, "ann")] {
+        member.request(json!({ "cmd": "identity", "op": { "create": { "name": name } } })).await;
+    }
+    let invite = host.request(json!({ "cmd": "invite" })).await;
+    ann.request(json!({ "cmd": "join", "target": invite["link"] })).await;
+    let link = host.request(json!({ "cmd": "invite", "group": invite["group"] })).await;
+    other.request(json!({ "cmd": "join", "target": link["link"] })).await;
+    for peer in [&ann, &other] {
+        reader.client.node().read_public(&peer.client.device_state().unwrap().identity.unwrap().0).await.unwrap();
+    }
+    let link = host.request(json!({ "cmd": "invite", "group": invite["group"] })).await;
+    reader.request(json!({ "cmd": "join", "target": link["link"] })).await;
+    let members = reader.request(json!({ "cmd": "members", "group": invite["group"] })).await;
+    let claims: Vec<_> = members["members"].as_array().unwrap().iter().filter(|m| m["identity"].is_object()).collect();
+    assert_eq!(claims.len(), 2);
+    for claim in &claims {
+        assert_eq!(claim["identity"]["how"], "observed");
+        assert_eq!(claim["identity"]["observed"]["names"], json!([claim["identity"]["name"]]));
+        let other = claims.iter().find(|other| other["identity"]["id"] != claim["identity"]["id"]).unwrap();
+        assert_eq!(claim["identity"]["observed"]["other_ids"], json!([other["identity"]["id"]]));
+        assert!(claim["name"].as_str().unwrap().contains('['));
+    }
+    let gid = serde_json::from_value(invite["group"].clone()).unwrap();
+    assert!(reader.client.addressed(&gid, "Ann").unwrap_err().to_string().contains("could be any"));
+    let status = reader.request(json!({ "cmd": "status" })).await.to_string();
+    for claim in claims {
+        assert!(status.contains(claim["identity"]["id"].as_str().unwrap()));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unavailable_group_does_not_starve_other_private_claim_refreshes() {
+    let relay = relay().await;
+    let observer = Member::start(&relay, "observer").await;
+    let mut member = Member::start(&relay, "phone").await;
+    member.request(json!({ "cmd": "identity", "op": { "create": { "name": "Ann" } } })).await;
+    let invite = observer.request(json!({ "cmd": "invite" })).await;
+    member.request(json!({ "cmd": "join", "target": invite["link"] })).await;
+    let gid: lmk_proto::Bytes = serde_json::from_value(invite["group"].clone()).unwrap();
+    let mut settings = member.client.node().settings(&gid.0).unwrap();
+    let lmk_proto::group::Service::Serve { key, .. } = &mut settings.membership else { unreachable!() };
+    *key = lmk_core::device::public(&lmk_core::random()).into();
+    let Access::Here(devices) = member.client.access() else { unreachable!() };
+    let certificate = devices.certify(&member.client.node().key().0).unwrap();
+    member.client.node().create(settings, Some(certificate)).unwrap();
+    member.request(json!({ "cmd": "identity", "op": { "rename": { "name": "Ann Lee" } } })).await;
+    polled(&observer, json!({ "cmd": "members", "group": invite["group"] }), |m| m["members"].as_array().unwrap().iter().any(|m| m["identity"]["name"] == "Ann Lee")).await;
+    member.until(|e| matches!(e, ClientEvent::Warning { text, .. } if text.contains("refreshing identity claims") && text.contains("group"))).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_device() {
     let relay = relay().await;
     let alice = Member::start(&relay, "Alice").await;
@@ -306,7 +363,7 @@ async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_de
     polled(&laptop, json!({ "cmd": "identity", "op": "list" }), |listed| listed["devices"].as_array().unwrap().len() == 1).await;
     // Listed when it left, the tablet lists the laptop alone; not yet listed, it leaves that to the laptop's duties.
     let alone = async {
-        while alice.client.node().read_public(&bob).await.unwrap().writers.iter().map(|w| w.name.as_str()).ne(["laptop"]) {
+        while alice.client.node().read_public(&bob).await.unwrap().writers != [laptop.client.device_state().unwrap().key.unwrap()] {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     };

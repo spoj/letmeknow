@@ -83,7 +83,10 @@ impl<P: Provider> State<P> {
             let heard = peering::load_heard(&provider, &gid.0)?;
             groups.insert(gid.0, G::new(mls, rec, heard));
         }
+        let bindings = get(&provider, b"node/identity-bindings")?.unwrap_or_default();
         let mut state = State {
+            bindings,
+            notified: BTreeSet::new(),
             provider,
             out: Vec::new(),
             scrub: false,

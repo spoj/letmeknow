@@ -16,6 +16,8 @@ Releases of one minor version run side by side in the same groups:
 - Anything else waits for a new minor version, behind its switches: the ALPN, a group's protocol version, the invite link version, the home's format, and the browser's database version. A minor version flips only the switches its changes need. Test the chosen contract: supported versions coexist; incompatible versions refuse without changing newer state.
 - Browsers load the entire frontend from GitHub Pages at letmeknow.dev, independently of relay.letmeknow.dev. A service worker normally offers a waiting update; this is not cryptographic pinning, and the same-origin host still controls code. Agents pin `@letmeknow/cli@0.15`, so they get the latest 0.15.x when they restart.
 
+The 0.16 identity cutover uses keys-only v2 directories and required device-signed private claims, without rewriting old directories or clearing old local state. Its namespace/version switches are coordinated with sealed epochs, not independently bumped by identity work. Authorization, durable local observations, and independent operator verification remain separate; test installed leaves and persistence barriers, not only display structs.
+
 ## Checks
 
 CI's Linux job, to run before pushing:

@@ -1,6 +1,6 @@
 //! Members as this client shows them: by their identities and devices, and who added them.
 
-use lmk_node::{Claim, Member};
+use lmk_node::{Claim, Member, Observation};
 use lmk_proto::Bytes;
 use lmk_proto::group::{How, IdentityRef};
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,8 @@ pub enum Standing {
     /// One of this device's own.
     #[serde(rename = "self")]
     Own,
-    /// Another's: its name is only its own claim.
+    /// Authenticated claims durably observed by this saved session, not independent verification.
+    Observed,
     Unknown,
 }
 
@@ -47,10 +48,12 @@ pub enum Standing {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Known {
     pub id: Bytes,
-    /// This device's name for it, if it is its own, or else its own claim.
+    /// The authorized device's signed claim.
     pub name: String,
     pub how: Standing,
-    /// Why it is not verified: its device is not on the identity's list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed: Option<Observation>,
+    /// Why the current certificate is not authorized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -79,10 +82,12 @@ impl Describer {
                 let twin = self.members.iter().any(|m| {
                     m.key != member.key && m.device_name == member.device_name && m.identity.as_ref().is_some_and(|c| c.identity.id == known.id)
                 });
+                let collision = known.observed.as_ref().is_some_and(|o| !o.other_ids.is_empty());
+                let name = if collision { format!("{} [{}]", known.name, &crate::b64(&known.id.0)[..8]) } else { known.name.clone() };
                 if twin && !member.name.is_empty() {
-                    format!("{} · {} ({})", known.name, member.device_name, member.name)
+                    format!("{} · {} ({})", name, member.device_name, member.name)
                 } else {
-                    format!("{} · {}", known.name, member.device_name)
+                    format!("{} · {}", name, member.device_name)
                 }
             }
             _ => fp(&member.key.0),
@@ -109,15 +114,20 @@ impl Describer {
 
     /// An identity as this one knows it: this device's own, or another's, by its own claim.
     fn known(&self, claim: &Claim) -> Known {
-        let own = self.identity.as_ref().filter(|(identity, _)| identity.id == claim.identity.id);
-        let (name, how) = match own {
-            Some((_, name)) => (name.clone(), Standing::Own),
-            None => (claim.name.clone(), Standing::Unknown),
+        let how = if claim.error.is_some() {
+            Standing::Unknown
+        } else if self.identity.as_ref().is_some_and(|(identity, _)| identity.id == claim.identity.id) {
+            Standing::Own
+        } else if claim.observed.is_some() {
+            Standing::Observed
+        } else {
+            Standing::Unknown
         };
         Known {
             id: claim.identity.id.clone(),
-            name,
+            name: if claim.error.is_none() { claim.name.clone() } else { String::new() },
             how,
+            observed: claim.observed.clone().filter(|_| claim.error.is_none()),
             error: claim.error.clone(),
         }
     }
@@ -141,10 +151,12 @@ pub fn shown(member: &Value) -> String {
 /// first word of one.
 pub fn answers(member: &Value, name: &str) -> bool {
     let name = name.to_lowercase();
-    [&member["identity"]["name"], &member["device"], &member["handle"]].into_iter().filter_map(Value::as_str).any(|own| {
-        let own = own.to_lowercase();
-        own == name || own.split(|c: char| !c.is_alphanumeric()).next() == Some(name.as_str())
-    })
+    let authorized = member["identity"]["error"].is_null();
+    [authorized.then_some(&member["identity"]["name"]), authorized.then_some(&member["device"]), Some(&member["handle"])]
+        .into_iter().flatten().filter_map(Value::as_str).any(|own| {
+            let own = own.to_lowercase();
+            own == name || own.split(|c: char| !c.is_alphanumeric()).next() == Some(name.as_str())
+        })
 }
 
 #[cfg(test)]
@@ -157,6 +169,7 @@ mod tests {
             identity: IdentityRef { id: Bytes(vec![id]), membership: crate::letmeknow_dev() },
             name: claimed.into(),
             error: None,
+            observed: Some(Observation { names: vec![claimed.into()], other_ids: vec![] }),
         });
         Member { key: Bytes(vec![key]), iroh: Bytes(vec![key]), revision: 1, name: handle.into(), device_name: "laptop".into(), identity, added: None }
     }
@@ -179,14 +192,17 @@ mod tests {
         };
         let shown = |m: &Member| serde_json::to_value(describer.describe(m)).unwrap();
         let claude = shown(&describer.members[0]);
-        assert_eq!(claude["identity"], json!({ "id": "Cg", "name": "Ann", "how": "self" }));
-        assert_eq!((&claude["name"], &claude["you"]), (&json!("Ann · laptop (claude)"), &json!(true)));
+        assert_eq!(claude["identity"], json!({ "id": "Cg", "name": "Ann Smith", "how": "self", "observed": { "names": ["Ann Smith"], "other_ids": [] } }));
+        assert_eq!((&claude["name"], &claude["you"]), (&json!("Ann Smith · laptop (claude)"), &json!(true)));
         let bob = shown(&describer.members[1]);
-        assert_eq!(bob, json!({ "name": "Robert · laptop", "fp": crate::fp(&[2]), "device": "laptop", "identity": { "id": "FA", "name": "Robert", "how": "unknown" } }));
+        assert_eq!(bob, json!({ "name": "Robert · laptop", "fp": crate::fp(&[2]), "device": "laptop", "identity": { "id": "FA", "name": "Robert", "how": "observed", "observed": { "names": ["Robert"], "other_ids": [] } } }));
         let (dan, eve) = (shown(&describer.members[3]), shown(&describer.members[4]));
         assert_eq!((&dan["name"], &eve["name"]), (&dan["fp"], &eve["fp"]), "no identity, or one that failed the check: a fingerprint");
         assert!(["ANN", "claude", "Laptop"].iter().all(|name| answers(&claude, name)) && answers(&bob, "robert") && answers(&dan, "dan"));
         assert!(!answers(&claude, "smith") && !answers(&bob, "bob"));
+        assert!(!answers(&eve, "Robert") && !answers(&eve, "laptop"));
+        assert!(answers(&eve, "eve"));
+        assert!(eve["identity"]["observed"].is_null());
         let peer = Member { key: Bytes::default(), ..member("", 9, None) };
         assert_eq!(shown(&peer), json!({ "iroh": "CQ" }));
     }

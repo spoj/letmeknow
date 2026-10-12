@@ -6,8 +6,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{Bytes, group::Service};
 
-pub const ENTRY_CONTEXT: &[u8] = b"letmeknow public log v1\0";
-pub const CERTIFICATE_CONTEXT: &[u8] = b"letmeknow certificate v1\0";
+pub const ENTRY_CONTEXT: &[u8] = b"letmeknow public log v2\0";
+pub const CERTIFICATE_CONTEXT: &[u8] = b"letmeknow certificate v2\0";
 
 /// A public log entry before sealing. `sig` is `by`'s, over `ENTRY_CONTEXT` ‖ `body`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -26,26 +26,16 @@ pub struct Body {
     pub prev: Option<Bytes>,
     /// The log's writers from this entry on: an identity's devices. None in the closing entry, after which no entry
     /// counts.
-    pub writers: Vec<Listed>,
-    /// The identity's name.
-    pub name: String,
-    /// When its writer appended it, by its clock, in milliseconds.
-    pub at: u64,
+    pub writers: Vec<Bytes>,
     /// In the first entry only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub membership: Option<Service>,
 }
 
-/// A writer of a public log: in an identity's, a device, by its key in the identity's group, and its name.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Listed {
-    pub key: Bytes,
-    pub name: String,
-}
-
-/// What a device's key signs, after `CERTIFICATE_CONTEXT`, for a session that speaks as the identity.
-pub fn certified(session: &[u8], identity: &[u8]) -> Vec<u8> {
-    [CERTIFICATE_CONTEXT, session, identity].concat()
+/// The device-signed claims. Lengths count UTF-8 bytes; the service route remains an untrusted lookup hint.
+pub fn certified(session: &[u8; 32], identity: &[u8; 32], device: &[u8; 32], name: &str, device_name: &str) -> Vec<u8> {
+    [CERTIFICATE_CONTEXT, session, identity, device, &(name.len() as u64).to_be_bytes(), name.as_bytes(),
+        &(device_name.len() as u64).to_be_bytes(), device_name.as_bytes()].concat()
 }
 
 /// A public log's id: SHA-256 of its first entry's body.

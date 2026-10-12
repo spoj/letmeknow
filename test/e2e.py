@@ -69,7 +69,11 @@ class Listener:
             if event["type"] == kind and predicate(event):
                 return event
             if event["type"] == "warning":
-                sys.exit(f"{self.session} warning: {event}")
+                text = event["text"]
+                if text.startswith(("First locally observed identity claim:", "Previously observed identity-name change or shared name:")):
+                    check("not been independently verified" in text, "identity observation is not human verification")
+                else:
+                    sys.exit(f"{self.session} warning: {event}")
             seen.append(event)
         sys.exit(f"{self.session}: no {kind} event, only {seen}")
 
@@ -160,7 +164,7 @@ def main():
         check(event["member"] == f"Bob · {bob.ready['name']}" and event["how"] == "invite", "alice sees bob join by invite, as his identity claims")
         check("unknown, used or expired" in run("carol", "join", invite["link"], ok=False), "an invite link works once")
         seen = next(m for m in run("alice", "members")["members"] if m["handle"] == "bob")
-        check(seen["identity"]["name"] == "Bob" and seen["identity"]["how"] == "unknown", "another identity is known by its own name, a claim")
+        check(seen["identity"]["name"] == "Bob" and seen["identity"]["how"] == "observed", "another identity is known by its own name, a claim")
 
         sent = run("alice", "send", "hello bob")
         check(isinstance(sent.get("pos"), int), "send answers the message's position in the group's log")

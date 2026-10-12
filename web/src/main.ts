@@ -170,24 +170,29 @@ client.listen(event => {
   if (entered) render();
 });
 
-/** What a member's name rests on: this browser's own identity, or only its own word. */
-function standing(p: Person): string | undefined {
+function standing(p: Person): string {
   const i = p.identity;
-  if (!i) return "speaks as no identity";
-  if (i.error) return `unverified: ${i.error}`;
-  return i.how === "self" ? "you" : "their own name";
+  if (!i) return "Speaks as no identity";
+  if (i.error) return `Authorization failed: ${i.error}`;
+  return `${i.how === "self" ? "Your identity. " : ""}Locally observed here; not independently verified`;
+}
+
+function bindingWarning(p: Person): string | undefined {
+  const o = p.identity?.observed;
+  if (!o || p.identity?.error) return;
+  const warnings = [];
+  if (o.names.length > 1) warnings.push(`Changed identity-name claim; first observed here as ${JSON.stringify(o.names[0])}.`);
+  if (o.other_ids.length) warnings.push("This name is also claimed by other identities. Names are not unique.");
+  return warnings.join(" ") || undefined;
 }
 
 function who(p: Person): HTMLElement {
-  const i = p.identity;
-  const warning = i?.error;
-  const own = p.you || (i && !i.error && i.how === "self");
+  const warning = p.identity?.error || bindingWarning(p);
   return h(
     "span",
-    { className: warning ? "who warn" : "who", title: [standing(p), warning, `key ${p.fp}`].filter(Boolean).join("\n") },
+    { className: warning ? "who warn" : "who", title: [standing(p), warning, p.identity?.id, `key ${p.fp}`].filter(Boolean).join("\n") },
     warning && "⚠ ",
-    p.name,
-    !own && h("small", { className: "level" }, " (unverified)")
+    p.name
   );
 }
 
@@ -633,6 +638,8 @@ class View {
   protected members: Person[] = [];
   private heading = h("h2");
   private people = h("button", { className: "people quiet" });
+  private peopleDetails?: HTMLElement;
+  private peopleHeading?: HTMLElement;
 
   constructor(readonly gid: string) {
     this.el = h(
@@ -659,10 +666,27 @@ class View {
 
   protected drawPeople() {
     const others = this.members.filter(m => !m.you);
-    const warned = others.some(m => m.identity?.error);
+    const warned = this.members.some(m => m.identity?.error || bindingWarning(m));
     const names = [...new Set(others.map(m => (m.away ? `${m.name} (away)` : m.name)))];
-    this.people.replaceChildren(...(others.length ? [warned ? "⚠ " : "", names.join(", "), " and you"] : ["Only you so far"]));
+    this.people.replaceChildren(warned ? "⚠ " : "", ...(others.length ? [names.join(", "), " and you"] : ["Only you so far"]));
     this.people.classList.toggle("warn", warned);
+    if (this.peopleHeading) set(this.peopleHeading, `People (${this.members.length})`);
+    this.peopleDetails?.replaceChildren(...this.members.map(m =>
+      h("li", {},
+        h("div", {},
+          who(m),
+          m.you && h("small", { className: "muted" }, " you"),
+          m.away && h("small", { className: "muted" }, " away: not heard from for as long as members carry messages"),
+          h("p", { className: m.identity?.error ? "warn" : "muted" }, standing(m)),
+          bindingWarning(m) && h("p", { className: "warn identity-warning" }, bindingWarning(m)),
+          m.identity && copyable(m.identity.id),
+          m.identity?.observed && h("p", { className: "observed-names" }, `Names observed here, first to last: ${m.identity.observed.names.map(n => JSON.stringify(n)).join(", ")}`),
+          ...((m.identity?.observed?.other_ids ?? []).map(id => h("div", {}, "Also claimed by identity:", copyable(id)))),
+          m.added_by && h("p", { className: "muted" }, `added by ${this.members.find(a => a.fp === m.added_by!.fp)?.name ?? "a former member"} (${m.added_by.how})`)
+        ),
+        !m.you && confirmed("Remove", `Remove ${m.name}?`, () => request({ cmd: "remove", group: this.gid, member: m.fp }))
+      )
+    ));
   }
 
   show() {}
@@ -708,30 +732,11 @@ class View {
     const dialog = modal(
       kind[0].toUpperCase() + kind.slice(1),
       form(() => busy(save, "Renaming…", () => request({ cmd: "name", group: gid, name: name.value.trim() })), field("Name", h("div", { className: "row" }, name, save))),
-      h("h3", {}, `People (${this.members.length})`),
+      this.peopleHeading = h("h3"),
       link,
       me.identity && h("small", {}, "Add one of your devices"),
       me.identity && this.addDevices(gid),
-      h(
-        "ul",
-        { className: "people-list" },
-        ...this.members.map(m =>
-          h(
-            "li",
-            {},
-            h(
-              "div",
-              {},
-              who(m),
-              m.you && h("small", { className: "muted" }, " you"),
-              m.away && h("small", { className: "muted" }, " away: not heard from for as long as members carry messages"),
-              h("p", { className: m.identity?.error ? "warn" : "muted" }, standing(m)),
-              m.added_by && h("p", { className: "muted" }, `added by ${this.members.find(a => a.fp === m.added_by!.fp)?.name ?? "a former member"} (${m.added_by.how})`)
-            ),
-            !m.you && confirmed("Remove", `Remove ${m.name}?`, () => request({ cmd: "remove", group: gid, member: m.fp }))
-          )
-        )
-      ),
+      this.peopleDetails = h("ul", { className: "people-list identity-details" }),
       h(
         "div",
         { className: "buttons leave" },
@@ -750,6 +755,7 @@ class View {
           })
       )
     );
+    this.drawPeople();
     make.onclick = () => busy(make, "Making…", () => showLink({ gid }, link, dialog));
     if (invite) make.click();
   }

@@ -104,7 +104,7 @@ pub enum Request {
         #[cfg_attr(feature = "clap", command(subcommand))]
         op: IdentityOp,
     },
-    /// A certificate of a session of this device, with MLS key `key`, by the device's key on its identity: for the device.
+    /// Device-signed claims for this actual session key, named from committed private identity state, not caller labels.
     #[cfg_attr(feature = "clap", command(skip))]
     Certify { key: Bytes },
     /// `add`'s invite, which the device's node hands to the device it names, in the identity group.
@@ -136,8 +136,7 @@ pub enum IdentityOp {
     Remove { device: String },
     /// Take this device off its identity: its sessions leave the groups they are in as it first; the identity ends if this is its only device
     Leave,
-    /// Rename the identity, or with --device this device, as the identity's devices and members of its sessions' groups
-    /// see it
+    /// Rename private identity claims, or with --device this device; offline sessions refresh their leaves after resume
     Rename {
         name: String,
         #[cfg_attr(feature = "clap", arg(long))]

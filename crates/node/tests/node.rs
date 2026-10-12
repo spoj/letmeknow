@@ -13,7 +13,6 @@ use lmk_testing::{Relay, relay};
 use lmk_node::identity::Identity;
 use lmk_node::{Config, Event, INVITE_VALID, Node};
 use lmk_proto::group::{CHAT, Certificate, ChatMessage, IDENTITY, IdentityRef, PROTOCOL, Service, Settings};
-use lmk_proto::public::Listed;
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
 use lmk_proto::head::Head;
@@ -22,6 +21,10 @@ use lmk_proto::ranges::Ranges;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
+
+#[path = "identity/claims.rs"]
+mod private_identity;
+use private_identity::binding_record;
 
 /// Generous, for slow CI runners with tests running side by side.
 const WAIT: Duration = Duration::from_secs(60);
@@ -130,9 +133,9 @@ fn message(text: &str) -> Value {
 
 /// A new identity, its public log on `membership`, whose first writer is a device called laptop, read by `node`: the
 /// identity, and the laptop's key on it.
-async fn identity<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, name: &str, membership: Service) -> (IdentityRef, [u8; 32]) {
+async fn identity<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, membership: Service) -> (IdentityRef, [u8; 32]) {
     let laptop: [u8; 32] = lmk_core::random();
-    let (id, first) = lmk_core::public::create(&laptop, name, membership.clone(), listed(&laptop, "laptop"), lmk_node::now());
+    let (id, first) = lmk_core::public::create(&laptop, membership.clone());
     let identity = IdentityRef { id: id.into(), membership };
     publish(relay, node, &identity, first).await;
     (identity, laptop)
@@ -146,14 +149,11 @@ async fn publish<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, id
     node.read_public(identity).await.unwrap();
 }
 
-fn listed(device: &[u8; 32], name: &str) -> Listed {
-    Listed { key: lmk_core::device::public(device).into(), name: name.into() }
-}
-
 /// That the session with key `session` speaks as `identity`, by the device key `device`.
-fn certificate(identity: &IdentityRef, device: &[u8; 32], session: &Bytes) -> Certificate {
-    let sig = lmk_core::device::sign(device, &lmk_proto::public::certified(&session.0, &identity.id.0));
-    Certificate { identity: identity.clone(), device: lmk_core::device::public(device).into(), sig: Bytes(sig) }
+fn certificate(identity: &IdentityRef, device: &[u8; 32], session: &Bytes, name: &str, device_name: &str) -> Certificate {
+    let key = lmk_core::device::public(device);
+    let sig = lmk_core::device::sign(device, &lmk_proto::public::certified(session.0.as_slice().try_into().unwrap(), identity.id.0.as_slice().try_into().unwrap(), &key, name, device_name));
+    Certificate { identity: identity.clone(), device: key.into(), name: name.into(), device_name: device_name.into(), sig: Bytes(sig) }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -169,12 +169,12 @@ async fn an_identity_mirror_is_only_a_hint_to_its_authoritative_service() {
     let authority = ServeClient::for_service(endpoint.clone(), &relay.service).unwrap();
     let mirror_client = ServeClient::for_service(endpoint, &mirror).unwrap();
     let (laptop, tablet) = (lmk_core::random(), lmk_core::random());
-    let (id, first) = lmk_core::public::create(&laptop, "Carol", relay.service.clone(), listed(&laptop, "laptop"), 1);
+    let (id, first) = lmk_core::public::create(&laptop, relay.service.clone());
     let address = lmk_proto::public::address(&id);
     let mut public = PublicLog::replay(&id, [first.as_slice()]).unwrap();
-    let added = public.next(&laptop, vec![listed(&laptop, "laptop"), listed(&tablet, "tablet")], "Carol", 2);
+    let added = public.next(&laptop, vec![lmk_core::device::public(&laptop).into(), lmk_core::device::public(&tablet).into()]);
     assert!(public.apply(&added));
-    let revoked = public.next(&laptop, vec![listed(&laptop, "laptop")], "Carol", 3);
+    let revoked = public.next(&laptop, vec![lmk_core::device::public(&laptop).into()]);
     authority.append(&address, &[first.clone(), added.clone(), revoked], true).await.unwrap();
     mirror_client.append(&address, &[first, added], true).await.unwrap();
 
@@ -184,22 +184,25 @@ async fn an_identity_mirror_is_only_a_hint_to_its_authoritative_service() {
     let credential = |device| Credential {
         name: "claimant".into(),
         key: reader.node.key(),
-        certificate: Some(certificate(&claim, device, &reader.node.key()).into()),
+        certificate: Some(certificate(&claim, device, &reader.node.key(), "Carol", "device").into()),
     };
-    assert_eq!(public.verify(&credential(&tablet)), Verdict::Verified { device: "tablet".into() }, "the genuine prefix still lists the revoked device");
+    let gid = reader.node.create(settings(CHAT, &relay), Some(*credential(&tablet).certificate.unwrap())).unwrap();
+    assert_eq!(public.verify(&credential(&tablet)), Verdict::Authorized, "the genuine prefix still lists the revoked device");
     let latest = reader.node.read_public(&claim).await.unwrap();
     assert_eq!(latest.membership, relay.service);
     assert_eq!(latest.verify(&credential(&tablet)), Verdict::Dropped);
-    assert_eq!(latest.verify(&credential(&laptop)), Verdict::Verified { device: "laptop".into() }, "a claimant's route is not its authority");
+    assert_eq!(latest.verify(&credential(&laptop)), Verdict::Authorized, "a claimant's route is not its authority");
+    assert!(reader.node.members(&gid.0).unwrap()[0].identity.as_ref().unwrap().observed.is_none());
+    assert!(binding_record(&db).is_none(), "a genuine stale hint must not pin an installed revoked claim");
 
-    let fork = public.next(&tablet, vec![listed(&tablet, "tablet")], "Stale mirror", 4);
+    let fork = public.next(&tablet, vec![lmk_core::device::public(&tablet).into()]);
     mirror_client.append(&address, &[fork], true).await.unwrap();
-    assert_eq!(reader.node.read_public(&claim).await.unwrap().name, "Carol");
+    assert_eq!(reader.node.read_public(&claim).await.unwrap().writers, [lmk_core::device::public(&laptop).into()]);
     reader.node.shutdown().await.unwrap();
     drop(reader);
     mirror_service.shutdown().await.unwrap();
     let reader = stored(&relay, "Reader", &db).await;
-    assert_eq!(reader.node.read_public(&claim).await.unwrap().writers, [listed(&laptop, "laptop")], "the persisted route is the authority, not the mirror");
+    assert_eq!(reader.node.read_public(&claim).await.unwrap().writers, [lmk_core::device::public(&laptop).into()], "the persisted route is the authority, not the mirror");
     reader.node.shutdown().await.unwrap();
 }
 
@@ -214,13 +217,14 @@ async fn a_failed_first_identity_lookup_does_not_persist_a_route() {
     let authority = ServeClient::for_service(endpoint.clone(), &relay.service).unwrap();
     let mirror_client = ServeClient::for_service(endpoint, &mirror).unwrap();
     let laptop = lmk_core::random();
-    let (id, first) = lmk_core::public::create(&laptop, "Carol", relay.service.clone(), listed(&laptop, "laptop"), 1);
+    let (id, first) = lmk_core::public::create(&laptop, relay.service.clone());
     let address = lmk_proto::public::address(&id);
     let claim = IdentityRef { id: id.into(), membership: mirror };
     mirror_client.append(&address, &[b"not a genesis".to_vec()], true).await.unwrap();
 
     let db = dir.join("reader.db");
     let mut reader = stored(&relay, "Reader", &db).await;
+    let gid = reader.node.create(settings(CHAT, &relay), Some(certificate(&claim, &laptop, &reader.node.key(), "Carol", "laptop"))).unwrap();
     assert!(reader.node.read_public(&claim).await.is_err());
     mirror_client.append(&address, std::slice::from_ref(&first), true).await.unwrap();
     assert!(reader.node.read_public(&claim).await.is_err(), "a genuine genesis alone is not authoritative history");
@@ -230,6 +234,7 @@ async fn a_failed_first_identity_lookup_does_not_persist_a_route() {
     reader.node.shutdown().await.unwrap();
     drop(reader);
     let mut provider = SqliteProvider::open(&db).unwrap();
+    assert!(provider.get(b"node/identity-bindings").unwrap().is_none());
     assert!(provider.get(&[b"node/log/".as_slice(), &address].concat()).unwrap().is_none());
     assert!(provider.get(&[b"node/entry/".as_slice(), &address, b"/", &1u64.to_be_bytes()].concat()).unwrap().is_none());
     provider.close().unwrap();
@@ -238,8 +243,10 @@ async fn a_failed_first_identity_lookup_does_not_persist_a_route() {
     let reader = stored(&relay, "Reader", &db).await;
     let legitimate = IdentityRef { membership: relay.service.clone(), ..claim };
     let public = reader.node.read_public(&legitimate).await.unwrap();
+    assert_eq!(reader.node.members(&gid.0).unwrap()[0].identity.as_ref().unwrap().observed.as_ref().unwrap().names, ["Carol"]);
+    assert_eq!(serde_json::from_slice::<Value>(&binding_record(&db).unwrap()).unwrap(), json!([[legitimate.id, "Carol"]]));
     assert_eq!(public.membership, relay.service);
-    assert_eq!(public.writers, [listed(&laptop, "laptop")]);
+    assert_eq!(public.writers, [lmk_core::device::public(&laptop).into()]);
     reader.node.shutdown().await.unwrap();
 }
 
@@ -642,19 +649,21 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
     let identity = node.create_identity(Settings { membership, ..settings(IDENTITY, &relay) }).await.unwrap();
     let gid = devices_group(&node);
     let before = node.read_public(&identity).await.unwrap();
-    let published = node.publish(&gid.0, before.writers.clone(), "Published").await.unwrap();
-    assert_eq!(published.name, "Published");
-    assert_eq!(published.writers, before.writers);
+    let mut writers = before.writers.clone();
+    writers.push(lmk_core::device::public(&lmk_core::random()).into());
+    let published = node.publish(&gid.0, writers).await.unwrap();
+    assert_eq!(published.writers.len(), 2);
     let reader = session(&relay, "Reader").await;
-    assert_eq!(reader.node.read_public(&identity).await.unwrap().name, "Published");
+    assert_eq!(reader.node.read_public(&identity).await.unwrap().writers, published.writers);
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
     let directory = lmk_membership::client::ServeClient::for_service(endpoint, &identity.membership).unwrap();
     let address = lmk_proto::public::address(&identity.id.0);
     let before = directory.head(&address).await.unwrap();
     assert_eq!(before.length, 2, "genesis and the successful publication");
 
+    let before_writers = vec![node.key_in(&gid.0)];
     gate.set(false);
-    let publication = node.publish(&gid.0, published.writers.clone(), "Must not escape");
+    let publication = node.publish(&gid.0, before_writers.clone());
     tokio::pin!(publication);
     tokio::time::timeout(WAIT, async {
         loop {
@@ -664,7 +673,7 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
                     // Closing the gate can race a request on the old connection; establish its replacement.
                     let error = result.unwrap_err();
                     assert!(format!("{error:#}").contains("membership transport interrupted"), "{error:#}");
-                    publication.set(node.publish(&gid.0, published.writers.clone(), "Must not escape"));
+                    publication.set(node.publish(&gid.0, before_writers.clone()));
                 }
                 reached = reaching.recv() => {
                     assert_eq!(reached.unwrap().0, node.net().id().as_bytes());
@@ -681,7 +690,6 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
     let error = tokio::time::timeout(WAIT, publication).await.unwrap().unwrap_err();
     assert!(format!("{error:#}").contains("injected persistence failure"), "{error:#}");
     let after = reader.node.read_public(&identity).await.unwrap();
-    assert_eq!(after.name, "Published");
     assert_eq!(after.writers, published.writers);
     let after = directory.head(&address).await.unwrap();
     assert_eq!((after.length, after.hash), (before.length, before.hash), "no append reached the directory");
@@ -710,8 +718,8 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
         let (gate, mut reaching) = Gate::new();
         let (membership, _service) = served(&relay, &dir.join(valid.to_string()), |service| Gated { service, gate: gate.clone() }).await;
         let joiner = session(&relay, "Carol").await;
-        let (carol, device) = identity(&relay, &joiner.node, "Carol", membership).await;
-        let certificate = certificate(&carol, &device, &joiner.node.key());
+        let (carol, device) = identity(&relay, &joiner.node, membership).await;
+        let certificate = certificate(&carol, &device, &joiner.node.key(), "Carol", "laptop");
         gate.set(false);
         let expires = lmk_node::now() + valid;
         let secret: [u8; 16] = lmk_core::random();
@@ -943,14 +951,14 @@ async fn stored_device(relay: &Relay, name: &str, db: &Path) -> (Session<SqliteP
     (session, devices)
 }
 
-/// Waits until an identity's public log lists these devices, by name.
-async fn lists<P: Provider + Send + 'static>(node: &Node<P>, identity: &IdentityRef, names: &[&str]) -> lmk_core::public::PublicLog {
+/// Waits until the keys-only directory lists exactly these devices.
+async fn lists<P: Provider + Send + 'static>(node: &Node<P>, identity: &IdentityRef, keys: &[Bytes]) -> lmk_core::public::PublicLog {
     tokio::time::timeout(WAIT, async {
         loop {
             let log = node.read_public(identity).await.unwrap();
-            let mut listed: Vec<&str> = log.writers.iter().map(|device| device.name.as_str()).collect();
-            listed.sort();
-            if listed == names {
+            let mut keys = keys.to_vec();
+            keys.sort();
+            if log.writers == keys {
                 return log;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -976,7 +984,7 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     routed(&mut laptop, laptop_devices.clone());
     routed(&mut tablet, tablet_devices.clone());
     let bob = laptop_devices.create("Bob", membership.clone()).await.unwrap();
-    lists(&laptop.node, &bob, &["laptop"]).await;
+    lists(&laptop.node, &bob, &[laptop_devices.key().unwrap()]).await;
 
     // A device link: the tablet joins with a key of its own, which the public log lists once the laptop restates the
     // list.
@@ -985,7 +993,7 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     assert_eq!(tablet_devices.identity(), Some((bob.clone(), "Bob".to_owned())));
     let (laptop_key, tablet_key) = (laptop_devices.key().unwrap(), tablet_devices.key().unwrap());
     assert!(laptop_key != tablet_key && laptop_key != laptop.node.key() && tablet_key != tablet.node.key(), "a device key per identity");
-    lists(&laptop.node, &bob, &["laptop", "tablet"]).await;
+    lists(&laptop.node, &bob, &[laptop_devices.key().unwrap(), tablet_devices.key().unwrap()]).await;
 
     // Each certifies its session, which joins a chat of Alice's by an invite.
     let chat = alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &relay) }, None).unwrap();
@@ -1000,7 +1008,7 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     // without its coming back; the laptop's certificate still checks out, and alice serves it.
     tablet.node.shutdown().await.unwrap();
     laptop_devices.remove(&tablet_key.0).await.unwrap();
-    lists(&laptop.node, &bob, &["laptop"]).await;
+    lists(&laptop.node, &bob, &[laptop_devices.key().unwrap()]).await;
     alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "tablet").then_some(())).await;
     alice.checked(&chat, "laptop", true).await;
     let id = alice.node.send(&chat.0, &message("after the tablet left")).await.unwrap().id;
@@ -1011,7 +1019,7 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     assert_eq!(got, id);
 }
 
-/// An identity's public log follows its group: its devices, their names and the group's name. The last device to leave
+/// An identity's public log follows its group's keys, not its names. The last device to leave
 /// closes it, and from then on no session speaks for the identity.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_identitys_public_log_follows_its_group_until_its_last_device_closes_it() {
@@ -1022,8 +1030,8 @@ async fn an_identitys_public_log_follows_its_group_until_its_last_device_closes_
     let bob = laptop_devices.create("Bob", relay.service.clone()).await.unwrap();
     laptop_devices.rename("Robert").await.unwrap();
     laptop_devices.rename_device("desk").await.unwrap();
-    let log = lists(&laptop.node, &bob, &["desk"]).await;
-    assert_eq!(log.name, "Robert");
+    lists(&laptop.node, &bob, &[laptop_devices.key().unwrap()]).await;
+    assert_eq!(laptop_devices.certify(&alice.node.key().0).unwrap().name, "Robert");
 
     let chat = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let agent = session(&relay, "agent").await;
@@ -1043,11 +1051,11 @@ async fn a_dropped_devices_sessions_are_removed_once_and_reported() {
     let dir = folder("revoke");
     let (membership, _service) = signing_service(&relay, &dir).await;
     let alice = session(&relay, "Alice").await;
-    let (carol, laptop) = identity(&relay, &alice.node, "Carol", membership.clone()).await;
+    let (carol, laptop) = identity(&relay, &alice.node, membership.clone()).await;
     let tablet_key: [u8; 32] = lmk_core::random();
     let log = alice.node.read_public(&carol).await.unwrap();
-    let both = vec![listed(&laptop, "laptop"), listed(&tablet_key, "tablet")];
-    publish(&relay, &alice.node, &carol, log.next(&laptop, both, "Carol", lmk_node::now())).await;
+    let both = vec![lmk_core::device::public(&laptop).into(), lmk_core::device::public(&tablet_key).into()];
+    publish(&relay, &alice.node, &carol, log.next(&laptop, both)).await;
     let groups = [(); 2].map(|_| alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &relay) }, None).unwrap());
     let (tablet, desk, dave, eve) = (session(&relay, "tablet").await, session(&relay, "desk").await, session(&relay, "Dave").await, session(&relay, "Eve").await);
     let alice_only = vec![alice.node.invite(&groups[0].0, None, INVITE_VALID).await.unwrap().members[0].clone()];
@@ -1056,7 +1064,7 @@ async fn a_dropped_devices_sessions_are_removed_once_and_reported() {
             // Alice admits each: a link that named the tablet too could have the tablet add the desk.
             let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
             let link = lmk_proto::links::Invite { members: link.members[..1].to_vec(), ..link };
-            joiner.node.join(&link, Some(certificate(&carol, device, &joiner.node.key()))).await.unwrap();
+            joiner.node.join(&link, Some(certificate(&carol, device, &joiner.node.key(), "Carol", "device"))).await.unwrap();
             alice.checked(gid, &joiner.node.members(&gid.0).unwrap().iter().find(|m| m.key == joiner.node.key()).unwrap().name, true).await;
         }
     }
@@ -1086,7 +1094,7 @@ async fn a_dropped_devices_sessions_are_removed_once_and_reported() {
         });
     }
     let log = alice.node.read_public(&carol).await.unwrap();
-    publish(&relay, &alice.node, &carol, log.next(&laptop, vec![listed(&laptop, "laptop")], "Carol", lmk_node::now())).await;
+    publish(&relay, &alice.node, &carol, log.next(&laptop, vec![lmk_core::device::public(&laptop).into()])).await;
     let (mut left, mut revoked) = (Vec::new(), Vec::new());
     tokio::time::timeout(WAIT, async {
         while left.len() < 4 || revoked.len() < 2 {
@@ -1124,7 +1132,7 @@ async fn the_list_does_not_drop_a_device_just_linked() {
     let bob = laptop_devices.create("Bob", membership).await.unwrap();
     let link = lmk_proto::links::Invite::parse(&laptop_devices.invite().await.unwrap()).unwrap();
     phone_devices.join(&link).await.unwrap();
-    lists(&laptop.node, &bob, &["laptop", "phone"]).await;
+    lists(&laptop.node, &bob, &[laptop_devices.key().unwrap(), phone_devices.key().unwrap()]).await;
     // While the laptop is stopped, the phone links the tablet.
     laptop.node.shutdown().await.unwrap();
     drop((laptop, laptop_devices));
@@ -1135,7 +1143,7 @@ async fn the_list_does_not_drop_a_device_just_linked() {
     let (laptop, laptop_devices) = stored_device(&relay, "laptop", &dir.join("laptop.db")).await;
     let gid = devices_group(&laptop.node);
     laptop_devices.duties(&gid.0).await.unwrap();
-    lists(&laptop.node, &bob, &["laptop", "phone", "tablet"]).await;
+    lists(&laptop.node, &bob, &[laptop_devices.key().unwrap(), phone_devices.key().unwrap(), tablet_devices.key().unwrap()]).await;
     assert_eq!(laptop.node.members(&gid.0).unwrap().len(), 3);
 }
 
@@ -1668,16 +1676,16 @@ async fn a_pass_removes_every_member_due_in_one_commit() {
     let dir = folder("one-commit");
     let (membership, _service) = signing_service(&relay, &dir).await;
     let mut alice = session(&relay, "Alice").await;
-    let (carol, laptop) = identity(&relay, &alice.node, "Carol", membership.clone()).await;
+    let (carol, laptop) = identity(&relay, &alice.node, membership.clone()).await;
     let (tablet_key, phone_key): ([u8; 32], [u8; 32]) = (lmk_core::random(), lmk_core::random());
     let log = alice.node.read_public(&carol).await.unwrap();
-    let all = vec![listed(&laptop, "laptop"), listed(&tablet_key, "tablet"), listed(&phone_key, "phone")];
-    publish(&relay, &alice.node, &carol, log.next(&laptop, all, "Carol", lmk_node::now())).await;
+    let all = vec![lmk_core::device::public(&laptop).into(), lmk_core::device::public(&tablet_key).into(), lmk_core::device::public(&phone_key).into()];
+    publish(&relay, &alice.node, &carol, log.next(&laptop, all)).await;
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     let (tablet, phone) = (session(&relay, "tablet").await, session(&relay, "phone").await);
     for (joiner, device, name) in [(&tablet, &tablet_key, "tablet"), (&phone, &phone_key, "phone")] {
         let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-        joiner.node.join(&link, Some(certificate(&carol, device, &joiner.node.key()))).await.unwrap();
+        joiner.node.join(&link, Some(certificate(&carol, device, &joiner.node.key(), "Carol", "device"))).await.unwrap();
         alice.checked(&gid, name, true).await;
     }
     for session in [&tablet, &phone] {
@@ -1685,7 +1693,7 @@ async fn a_pass_removes_every_member_due_in_one_commit() {
     }
     let epoch = alice.node.epoch(&gid.0).unwrap();
     let log = alice.node.read_public(&carol).await.unwrap();
-    publish(&relay, &alice.node, &carol, log.next(&laptop, vec![listed(&laptop, "laptop")], "Carol", lmk_node::now())).await;
+    publish(&relay, &alice.node, &carol, log.next(&laptop, vec![lmk_core::device::public(&laptop).into()])).await;
     let mut removed = alice.until(|e| match e {
         Event::Revoked { removed, .. } => Some(removed.into_iter().map(|m| m.name).collect::<Vec<_>>()),
         _ => None,
@@ -2063,10 +2071,10 @@ async fn peer_entries_are_bound_to_the_destination_log_and_service() {
     let db = dir.join("reader.db");
     let reader = stored(&relay, "Reader", &db).await;
     let gid = reader.node.create(settings(CHAT, &relay), None).unwrap();
-    let (identity_a, _) = identity(&relay, &reader.node, "A", service_a).await;
-    let (identity_b, writer_b) = identity(&relay, &reader.node, "B", service_b).await;
+    let (identity_a, _) = identity(&relay, &reader.node, service_a).await;
+    let (identity_b, writer_b) = identity(&relay, &reader.node, service_b).await;
     let public = reader.node.read_public(&identity_b).await.unwrap();
-    let entry = Bytes(public.next(&writer_b, public.writers.clone(), "Caught up", lmk_node::now()));
+    let entry = Bytes(public.next(&writer_b, public.writers.clone()));
     reader.node.shutdown().await.unwrap();
     drop(reader);
     gate_a.set(false);

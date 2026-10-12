@@ -443,8 +443,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let public = PublicLog::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
         ensure!(public.membership == st.log(&log)?.service, "the public log belongs to another membership service");
         st.public.insert(id.to_vec(), public);
+        st.observe_identities()?;
         st.gate = true;
         for gid in st.groups_of(&log) {
+            st.events.push(Event::Heard { group: Bytes(gid.clone()) });
             self.work.send(Work::Duties(gid)).ok();
         }
         st.events.push(Event::Public { identity: Bytes(id.to_vec()) });
