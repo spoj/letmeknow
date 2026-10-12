@@ -55,7 +55,7 @@ pub enum Command {
     },
     /// Print instructions for agents
     Skill,
-    /// Run a membership service, an iroh relay and the web client (letmeknow.dev)
+    /// Run a membership service and an iroh relay
     Serve(Serve),
     #[command(flatten)]
     Request(Request),
@@ -93,9 +93,6 @@ pub struct Serve {
     /// Logs, keys and certificates
     #[arg(long)]
     pub state: PathBuf,
-    /// The web client's files
-    #[arg(long)]
-    pub web: Option<PathBuf>,
     /// A certificate (PEM) to use instead of Let's Encrypt, with --key
     #[arg(long, requires = "key")]
     pub cert: Option<PathBuf>,

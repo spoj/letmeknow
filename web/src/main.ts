@@ -43,7 +43,7 @@ const agentsHelp = document.getElementById("agents")!;
 const toasts = h("div", { className: "toasts" });
 const narrow = matchMedia("(max-width: 699px)");
 const touch = matchMedia("(pointer: coarse)");
-const invite = location.pathname === "/i" && location.hash.length > 1 ? INVITE_PREFIX + location.hash : undefined;
+const invite = /^\/i\/?$/.test(location.pathname) && location.hash.length > 1 ? INVITE_PREFIX + location.hash : undefined;
 
 function toast(error: unknown) {
   const text = error instanceof Error ? error.message : String(error);
@@ -574,7 +574,7 @@ async function showLink(target: { gid: string } | { identity: string }, body: HT
   const device = "identity" in target;
   const g = device ? undefined : group(target.gid);
   const kind = g ? KINDS[g.settings.kind] : "";
-  // The link opens this server's app, which is letmeknow.dev's unless the person runs their own.
+  // Invite presentation stays on the trusted frontend origin, never the backend's.
   const made = new URL((await request(device ? { cmd: "identity", op: { invite: {} } } : { cmd: "invite", group: target.gid })).link);
   const link = location.origin + made.pathname + made.hash;
   const { encode } = await import("uqr");

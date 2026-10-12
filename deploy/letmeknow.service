@@ -1,11 +1,11 @@
 [Unit]
-Description=letmeknow serve: membership service, relay and web client
+Description=letmeknow serve: membership service and relay
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=letmeknow
-ExecStart=/usr/local/bin/letmeknow serve --domain @DOMAIN@ --state /var/lib/letmeknow --web /usr/local/share/letmeknow/web
+ExecStart=/usr/local/bin/letmeknow serve --domain @DOMAIN@ --state /var/lib/letmeknow
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 Environment=RUST_LOG=info
 Restart=always

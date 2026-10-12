@@ -49,13 +49,10 @@ async fn http_get(port: u16, request: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn serves_relay_membership_and_page() {
+async fn serves_relay_and_membership_without_frontend() {
     let state = std::env::temp_dir().join(format!("lmk-serve-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state);
-    let web = state.join("web");
-    std::fs::create_dir_all(&web).unwrap();
-    std::fs::write(web.join("index.html"), "<h1>letmeknow</h1>").unwrap();
-    std::fs::write(web.join("index.html.br"), "brotli").unwrap();
+    std::fs::create_dir_all(&state).unwrap();
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     std::fs::write(state.join("cert.pem"), ck.cert.pem()).unwrap();
     std::fs::write(state.join("key.pem"), ck.signing_key.serialize_pem()).unwrap();
@@ -64,7 +61,6 @@ async fn serves_relay_membership_and_page() {
     let mut config = ServeConfig::new("localhost", &state);
     (config.https_port, config.qad_port, config.membership_port) = (free_port(), free_port(), free_port());
     config.http_port = Some(free_port());
-    config.web = Some(web);
     config.certificate = Certificate::Files {
         chain: state.join("cert.pem"),
         key: state.join("key.pem"),
@@ -85,19 +81,12 @@ async fn serves_relay_membership_and_page() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let page = https_get(https, &cert, "/i", "").await;
-    assert!(
-        page.starts_with("HTTP/1.1 200") && page.ends_with("<h1>letmeknow</h1>"),
-        "{page}"
-    );
-    let compressed = https_get(https, &cert, "/", "Accept-Encoding: gzip, br;q=1\r\n").await;
-    assert!(compressed.contains("content-encoding: br") && compressed.ends_with("brotli"), "{compressed}");
-    assert!(https_get(https, &cert, "/missing.js", "").await.starts_with("HTTP/1.1 404"));
-    assert!(https_get(https, &cert, "/ping", "").await.starts_with("HTTP/1.1 200"));
-    let lmk_proto::group::Service::Serve { key, .. } = &service else { unreachable!() };
-    let hex: String = key.0.iter().map(|b| format!("{b:02x}")).collect();
-    let address = https_get(https, &cert, "/membership", "").await;
-    assert!(address.ends_with(&format!("\r\n\r\n{hex}@{relay}")), "{address}");
+    for path in ["/", "/i", "/index.html", "/app.js", "/sw.js", "/membership", "/missing.js"] {
+        let response = https_get(https, &cert, path, "").await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
+    }
+    let ping = https_get(https, &cert, "/ping", "Origin: https://frontend.example\r\n").await;
+    assert!(ping.starts_with("HTTP/1.1 200") && ping.contains("access-control-allow-origin: *"), "{ping}");
     let portal = http_get(
         http,
         "GET /generate_204 HTTP/1.1\r\nHost: localhost\r\nX-Iroh-Challenge: abc\r\nConnection: close\r\n\r\n",

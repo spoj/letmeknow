@@ -1,4 +1,4 @@
-//! `letmeknow serve`: the membership service, an embedded iroh relay, and the web client, on one TLS listener.
+//! `letmeknow serve`: the membership service and an embedded iroh relay.
 
 use std::{
     future::Future,
@@ -58,8 +58,6 @@ pub struct ServeConfig {
     pub membership_port: u16,
     /// Holds the service's key, its database and the ACME cache.
     pub state: PathBuf,
-    /// The web client's static files; `None` serves only the relay.
-    pub web: Option<PathBuf>,
     pub certificate: Certificate,
     /// Bytes a second that the relay reads from each connection.
     pub relay_rate_limit: NonZeroU32,
@@ -75,7 +73,6 @@ impl ServeConfig {
             qad_port: 7842,
             membership_port: 7843,
             state: state.into(),
-            web: None,
             certificate: Certificate::Acme { contact: None },
             relay_rate_limit: NonZeroU32::new(1 << 20).unwrap(),
             policy: Policy::default(),
@@ -199,7 +196,6 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         .bind_addr((Ipv6Addr::UNSPECIFIED, config.membership_port))?
         .bind()
         .await?;
-    let membership = Bytes::from(format!("{}@{}", endpoint.id(), config.relay_url()));
     let key = SigningKey::from_bytes(&endpoint.secret_key().to_bytes());
     let store = Store::open(&config.state.join("membership.db"), key)?;
     let _router = Router::builder(endpoint)
@@ -207,10 +203,9 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         .spawn();
 
     let tls = Arc::new(tls);
-    let web = config.web.map(Arc::new);
     loop {
         let (tcp, _) = https.accept().await?;
-        let (tls, relay, web, membership) = (tls.clone(), relay.clone(), web.clone(), membership.clone());
+        let (tls, relay) = (tls.clone(), relay.clone());
         tokio::spawn(async move {
             let stream = match &*tls {
                 Tls::Files(acceptor) => acceptor.accept(tcp).await.ok(),
@@ -222,8 +217,6 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
             let Some(stream) = stream else { return };
             let site = Site {
                 relay: RelayServiceWithNotify::new(relay, Arc::new(Notify::new())),
-                web,
-                membership,
             };
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(MaybeTlsStream::Tls(stream)), site)
@@ -279,13 +272,9 @@ async fn redirect(listener: TcpListener, base: String) {
     }
 }
 
-/// The HTTPS listener's routes: the relay's, the membership service's address for the web client, and the web
-/// client's files for everything else.
+/// WebSocket upgrades at /relay are cross-origin and cookie-free; iroh authenticates the peers.
 struct Site {
     relay: RelayServiceWithNotify,
-    web: Option<Arc<PathBuf>>,
-    /// `<iroh key, hex>@<relay URL>`.
-    membership: Bytes,
 }
 
 type Answer = Pin<Box<dyn Future<Output = Result<Response<BytesBody>, HyperError>> + Send>>;
@@ -304,60 +293,10 @@ impl HyperService<Request<Incoming>> for Site {
                     .body(body(""));
                 return Box::pin(std::future::ready(res.map_err(Into::into)));
             }
-            "/membership" => {
-                let res = respond(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, content_type("txt"))
-                    .body(body(self.membership.clone()));
-                return Box::pin(std::future::ready(res.map_err(Into::into)));
-            }
             _ => {}
         }
-        let web = self.web.clone();
-        let path = req.uri().path().to_owned();
-        let accept = req.headers().get(header::ACCEPT_ENCODING).and_then(|a| a.to_str().ok()).unwrap_or_default().to_owned();
-        Box::pin(async move { Ok(file(web.as_deref(), &path, &accept).await?) })
-    }
-}
-
-/// A file of the web client, or its `.br` or `.gz` beside it when the client takes that encoding.
-async fn file(web: Option<&PathBuf>, path: &str, accept: &str) -> http::Result<Response<BytesBody>> {
-    let not_found = || respond(StatusCode::NOT_FOUND).body(body("not found"));
-    let Some(web) = web else { return not_found() };
-    let name = path.trim_start_matches('/');
-    if name.split('/').any(|part| part == ".." || part.starts_with('.')) {
-        return not_found();
-    }
-    let last = name.rsplit('/').next().unwrap_or_default();
-    let name = if last.contains('.') { name } else { "index.html" };
-    let ext = name.rsplit('.').next().unwrap_or_default();
-    let res = respond(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type(ext))
-        .header(header::VARY, "accept-encoding");
-    for (encoding, suffix) in [("br", "br"), ("gzip", "gz")] {
-        if accept.split(',').any(|a| a.split(';').next().map(str::trim) == Some(encoding))
-            && let Ok(bytes) = tokio::fs::read(web.join(format!("{name}.{suffix}"))).await
-        {
-            return res.header(header::CONTENT_ENCODING, encoding).body(body(bytes));
-        }
-    }
-    let Ok(bytes) = tokio::fs::read(web.join(name)).await else {
-        return not_found();
-    };
-    res.body(body(bytes))
-}
-
-fn content_type(ext: &str) -> &'static str {
-    match ext {
-        "html" => "text/html; charset=utf-8",
-        "js" | "mjs" => "text/javascript; charset=utf-8",
-        "wasm" => "application/wasm",
-        "css" => "text/css; charset=utf-8",
-        "json" => "application/json",
-        "webmanifest" => "application/manifest+json",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "ico" => "image/x-icon",
-        "txt" => "text/plain; charset=utf-8",
-        _ => "application/octet-stream",
+        Box::pin(std::future::ready(
+            respond(StatusCode::NOT_FOUND).body(body("not found")).map_err(Into::into),
+        ))
     }
 }

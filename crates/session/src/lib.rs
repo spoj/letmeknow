@@ -27,7 +27,6 @@ pub async fn serve(serve: cli::Serve) -> Result<()> {
     config.http_port = Some(serve.http_port);
     config.membership_port = serve.membership_port;
     config.qad_port = serve.qad_port;
-    config.web = serve.web;
     if let (Some(chain), Some(key)) = (serve.cert, serve.key) {
         config.certificate = lmk_serve::Certificate::Files { chain, key };
     }

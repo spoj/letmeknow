@@ -35,11 +35,11 @@ Expiring device authorizations renewed by a separate owner-controlled authority 
 - [ ] #73/#74: fresh incompatible store with hashed capabilities and day-based expiry metadata; reject old writers and unsafe reuse.
 - [ ] F15/F21/F32: audit diagnostic capability/metadata leaks and bound append/read/subscription/storage work.
 - [ ] #67: bounded health checks and completed-day public totals without blocking appends on scans.
-- [ ] F6/F22: GitHub-built whole frontend, independent backend configuration, trusted invite presentation and provenance documentation.
+- [ ] F6/F22: implementation staged: whole static frontend/Pages artifacts, compiled backend public-key configuration, independent HTTPS/WSS E2E and trusted-origin invite presentation. Release remains blocked on the fresh public key, native-default coordination, workflow/environment review and actual operator cutover; provenance does not prove harmlessness or reproducibility.
 - [ ] F27: minimize the public identity-directory payload.
 - [ ] #55: first-seen identity bindings and change warnings; distinguish observations from operator verification.
 - [ ] #69/#71: automated pins, gated artifact rollout, bounded newer-minor notice visible through pi-letmeknow.
-- [ ] Remove replication/restore provisioning; document and test explicit service-loss behavior.
+- [ ] Replication/restore provisioning removed from deployment; explicit loss -> fresh authority/groups documented. Service-loss/refusal protocol tests and operator-reviewed removal of actual old state/replicas remain separate gates.
 - [ ] Full checks and an operator-reviewed cutover inventory covering old processes, storage, replicas, service workers and diagnostic histories.
 
 Update code, README.md, SKILL.md, AGENTS.md, deploy/README.md and relevant tests together. Do not retain claims of harmless publication, legacy compatibility or recoverability that this contract rejects.

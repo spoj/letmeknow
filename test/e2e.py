@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""End-to-end test: a local `letmeknow serve` (membership service, relay and web client, with a self-signed certificate)
-and several `letmeknow listen` processes, each its own device; then the browser client in Chromium (web/e2e.mjs) with
-native sessions of its own. --no-browser skips building and testing the browser client, which is the same on every OS."""
-import json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, time
+"""Native sessions and a separately served HTTPS frontend use the real local membership/iroh relay.
+--no-browser skips the frontend. LMK_E2E_BIN tests an already-built native artifact."""
+import functools, http.server, json, os, queue, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, os.environ.get("CARGO_TARGET_DIR", "target"), "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
+BIN = os.environ.get("LMK_E2E_BIN") or os.path.join(ROOT, os.environ.get("CARGO_TARGET_DIR", "target"), "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
 WEB = os.path.join(ROOT, "web")
 BROWSER = "--no-browser" not in sys.argv
 TMP = tempfile.mkdtemp(prefix="lmk-e2e-")
@@ -112,8 +111,6 @@ def serve():
     https = free_port()
     args = [BIN, "serve", "--domain", "localhost", "--https-port", str(https), "--http-port", str(free_port()), "--membership-port", str(free_port()),
             "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key]
-    if BROWSER:
-        args += ["--web", os.path.join(WEB, "dist")]
     proc = subprocess.Popen(args, env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
     membership = proc.stdout.readline().strip().removeprefix("membership: ")
     ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_RELAY=f"https://localhost:{https}", LETMEKNOW_MEMBERSHIP=membership)
@@ -121,13 +118,29 @@ def serve():
 
 
 def main():
-    subprocess.run(["cargo", "build", "-q", "-p", "letmeknow", "-p", "lmk-kinds"], cwd=ROOT, check=True)
-    if BROWSER:
-        subprocess.run([shutil.which("npm"), "run", "build"], cwd=WEB, check=True)
+    if "LMK_E2E_BIN" not in os.environ:
+        subprocess.run(["cargo", "build", "-q", "-p", "letmeknow", "-p", "lmk-kinds"], cwd=ROOT, check=True)
     server = serve()
+    frontend = None
     listeners = []
     passed = False
     try:
+        if BROWSER:
+            config = write("frontend.json", json.dumps({"membershipKey": ENV["LETMEKNOW_MEMBERSHIP"].split("@")[0], "relay": ENV["LETMEKNOW_RELAY"]}))
+            dist = os.path.join(TMP, "frontend")
+            subprocess.run([shutil.which("npm"), "run", "build"], cwd=WEB,
+                           env={**ENV, "LMK_FRONTEND_CONFIG": config, "LMK_FRONTEND_OUT": dist}, check=True)
+            subprocess.run([shutil.which("node"), "artifact-test.mjs", dist], cwd=WEB,
+                           env={**ENV, "LMK_FRONTEND_CONFIG": config}, check=True)
+            with open(os.path.join(dist, "blank.html"), "w") as f:
+                f.write("<!doctype html><title>Test setup only</title>")
+            frontend = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=dist))
+            tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            tls.load_cert_chain(os.path.join(TMP, "cert.pem"), os.path.join(TMP, "key.pem"))
+            frontend.socket = tls.wrap_socket(frontend.socket, server_side=True)
+            frontend_thread = threading.Thread(target=frontend.serve_forever)
+            frontend_thread.start()
+            ENV.update(URL=f"https://localhost:{frontend.server_port}", FRONTEND_DIST=dist)
         alice, bob, carol = (Listener(s) for s in ("alice", "bob", "carol"))
         listeners += [alice, bob, carol]
         check(os.path.samefile(alice.ready["bin"], BIN), "ready names the session's program, which runs the other commands")
@@ -249,7 +262,7 @@ def main():
         # Alice may hear that the tablet is off bob's identity before it leaves, and then it shows by fingerprint.
         left = alice.expect("left", lambda e: e["member"] in (tablet.ready["fp"], f"Bob · {tablet.ready['name']} (tablet)"), timeout=60)
         check(left["group"] == "Release", "a device taken off its identity while it is stopped leaves its groups")
-        if BROWSER and subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=WEB, env={**ENV, "URL": ENV["LETMEKNOW_RELAY"], "BIN": BIN}).returncode:
+        if BROWSER and subprocess.run([shutil.which("node"), "e2e.mjs"], cwd=WEB, env={**ENV, "BIN": BIN}).returncode:
             sys.exit("FAIL: the browser test")
         print("all ok")
         passed = True
@@ -257,11 +270,15 @@ def main():
         for listener in listeners:
             listener.proc.kill()
         server.kill()
+        for listener in listeners:
+            listener.proc.wait()
+        server.wait()
+        if frontend:
+            frontend.shutdown()
+            frontend.server_close()
+            frontend_thread.join()
         # A failed run keeps its sessions' logs.
         if passed:
-            for listener in listeners:
-                listener.proc.wait()
-            server.wait()
             shutil.rmtree(TMP, ignore_errors=True)
 
 

@@ -35,23 +35,27 @@ Docs and tables give every joiner their shared state. Do not put secrets in them
 
 ## People
 
-Open https://letmeknow.dev in a browser, or an invite link someone sent. The page can be added to the home screen; on iPhone and iPad it asks to be, since the home-screen app keeps its own storage.
+Open the trusted frontend at https://letmeknow.dev, or an invite link on that origin. The page can be added to the home screen; on iPhone and iPad it asks to be, since the home-screen app keeps its own storage.
+
+The 0.16 deployment separates the whole GitHub-built frontend on GitHub Pages from membership/relay at `relay.letmeknow.dev`. The backend supplies neither application code nor runtime default configuration: its public key is compiled into the frontend. This cutover is staged, not deployed; the fresh authority's public key and the remaining protocol/security gates must be reviewed before release (see [deploy/README.md](deploy/README.md)). GitHub/DNS/release administration remain trusted. Published provenance is not proof of harmlessness or reproducibility.
+
+The service worker normally offers **Reload** for an update. This is not cryptographic version pinning: the same-origin host controls code, and closing all old tabs may let a waiting worker activate.
 
 Local protocol records are committed before dependent protocol output. Native SQLite uses WAL with full synchronization; browsers wait for strict IndexedDB transactions, including file ciphertext and plugin/timeline records before dependent holder claims, Welcomes or callbacks. Storage failures stop dependent output, not erase local records. Incompatible browser storage is refused without resetting it.
 
 In a browser, keep the owning tab open, fix storage, then use **Retry saving and reload** from any tab. Closing the owner first can lose unsaved changes. Changes arriving during recovery require another explicit retry. Successful recovery reloads the tabs; it does not resume the failed process. An unacknowledged file addition returns no link and may need to be submitted again.
 
-These guarantees depend on the storage stack honoring synchronization; process-restart tests do not simulate power loss. Catastrophic service storage loss may require explicitly recreating the service and groups.
+These guarantees depend on the storage stack honoring synchronization; process-restart tests do not simulate power loss. Catastrophic service storage loss requires explicit recovery decisions: a fresh authority and affected groups/identities may need recreation, with its new public key published in a trusted client release, not restoration of old signing state or erasure of client data.
 
 ## Your own server
 
-`letmeknow serve` runs a membership service, an iroh relay and the web client on one host, with a certificate from Let's Encrypt:
+`letmeknow serve` runs a membership service and an iroh relay, with a certificate from Let's Encrypt. It does not serve application files:
 
 ```bash
-letmeknow serve --domain chat.example.com --state /var/lib/letmeknow --web web/dist
+letmeknow serve --domain relay.example.com --state /var/lib/letmeknow
 ```
 
-It prints its membership address, `<key>@https://chat.example.com`. Sessions use it with `listen --membership <address> --relay https://chat.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). The web client at https://chat.example.com uses that membership service and relay by itself: it reads the address from `/membership`. `deploy/` holds letmeknow.dev's systemd unit, Litestream config and install script.
+It prints its public membership address, `<key>@https://relay.example.com`. Sessions use it with `listen --membership <address> --relay https://relay.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). Build and publish the browser client separately on a trusted static HTTPS host, with that public key in its build configuration. Explicit browser backend choices remain supported; there is no automatic discovery or failure fallback. See [deploy/README.md](deploy/README.md) for build configuration, localStorage choices, Pages rollout and backend artifact installation. Deployment does not provision replicas or automatically restore service state.
 
 ## Working on letmeknow
 

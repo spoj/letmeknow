@@ -1,5 +1,5 @@
-// Browser end-to-end test, run by test/e2e.py against its local `letmeknow serve` (URL, serving dist/) with the native
-// binary (BIN): Matt's laptop, which takes its relay and membership service from the server that served it, joins Ann's
+// Browser end-to-end test: URL serves the trusted static build, separately from the real local backend.
+// With the native binary (BIN), Matt's laptop uses the build's configured backend and joins Ann's
 // chat from a link, becoming his identity's first device as it does, and they talk and pass files both ways; it joins
 // her doc and her table and they edit them both ways; Matthew's desk adds his phone by a device link, the phone joins a chat by a link
 // and is renamed, and a kiosk on an identity of its own moves to his; the laptop keeps everything
@@ -13,7 +13,7 @@ import { createInterface } from "node:readline";
 import { chromium } from "playwright";
 import * as Y from "yjs";
 
-const { URL: SITE, BIN, LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP } = process.env;
+const { URL: SITE, BIN, LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP, FRONTEND_DIST } = process.env;
 const tmp = mkdtempSync(join(tmpdir(), "lmk-browser-"));
 const check = (condition, message) => {
   if (!condition) throw new Error(`FAIL: ${message}`);
@@ -66,13 +66,17 @@ const desk = native("desk");
 const browser = await chromium.launch({ args: ["--ignore-certificate-errors"] });
 const pages = {};
 const pageErrors = [];
+const requests = [];
+const sockets = [];
 function watch(name, page) {
   pages[name] = page;
+  page.on("request", request => requests.push([request.url(), request.resourceType()]));
+  page.on("websocket", socket => sockets.push(socket.url()));
   page.on("console", message => message.type() === "error" && console.log(`${name}: ${message.text()}`));
   page.on("pageerror", error => { pageErrors.push(`${name}: ${error}`); console.log(`${name}: ${error}`); });
   return page;
 }
-/** A browser profile; unless `own`, localStorage names the test's relay and membership service, as the server would. */
+/** Tests both explicit localStorage backend choices and the trusted build's defaults (`own`). */
 async function open(name, options, own = false) {
   const context = await browser.newContext({ ignoreHTTPSErrors: true, acceptDownloads: true, permissions: ["clipboard-read", "clipboard-write"], ...options });
   await context.addInitScript(
@@ -207,7 +211,8 @@ try {
     const legacy = await open("legacy", { viewport: { width: 1280, height: 800 } }, true);
     const errors = [];
     legacy.on("pageerror", error => errors.push(error.message));
-    await legacy.goto(`${SITE}/ping`);
+    await legacy.goto(`${SITE}/blank.html`);
+    check(await legacy.locator("script").count() === 0 && await legacy.evaluate(() => !navigator.serviceWorker.controller), "legacy setup page has no app script or service worker");
     await legacy.evaluate(version => new Promise((resolve, reject) => {
       const request = indexedDB.open("lmk", version);
       request.onupgradeneeded = () => {
@@ -553,7 +558,7 @@ try {
   await laptop.getByText("They joined the chat.").waitFor();
   await laptop.locator("dialog").waitFor({ state: "detached" });
   const ideas = tablet.run("groups").find(g => g.name === "Ideas");
-  check(JSON.stringify(ideas.membership).includes(LETMEKNOW_RELAY), "on the membership service of the server that served the browser");
+  check(JSON.stringify(ideas.membership).includes(LETMEKNOW_RELAY), "on the membership service compiled into the trusted frontend");
   const browsers = await until(
     () => tablet.run("identity", "list").devices.find(d => !d.you).groups ?? [],
     groups => groups.some(g => g.name === "Ideas")
@@ -833,9 +838,8 @@ try {
   }
 
   // A new version waits until the person accepts it, then the tab reloads into it.
-  const sw = join("dist", "sw.js");
+  const sw = join(FRONTEND_DIST, "sw.js");
   writeFileSync(sw, `${readFileSync(sw, "utf8")}\n// a new version\n`);
-  for (const compressed of [`${sw}.br`, `${sw}.gz`]) rmSync(compressed);
   await laptop.evaluate(() => ((window.before = true), navigator.serviceWorker.getRegistration().then(registration => registration.update())));
   await laptop.getByText("A new version of letmeknow is ready.").waitFor();
   await new Promise(resolve => setTimeout(resolve, 1_000));
@@ -851,6 +855,11 @@ try {
   await laptop.locator(".group-list button", { hasText: "Plans" }).waitFor();
   check(true, "and opens the app offline, groups and all");
   check(pageErrors.length === 0, `no unhandled browser errors: ${pageErrors.join("; ")}`);
+  check(new URL(SITE).origin !== new URL(LETMEKNOW_RELAY).origin, "frontend and backend have distinct HTTPS origins");
+  check(sockets.some(url => url.startsWith(LETMEKNOW_RELAY.replace("https:", "wss:") + "/relay")), "browser/native traffic uses cross-origin iroh-over-WSS");
+  check(!requests.some(([url]) => new URL(url).pathname === "/membership"), "no runtime membership-key discovery");
+  check(requests.filter(([, type]) => ["document", "script", "stylesheet"].includes(type)).every(([url]) => new URL(url).origin === SITE), "HTML, JavaScript and CSS come only from the trusted frontend");
+  check(requests.filter(([url]) => new URL(url).pathname.endsWith(".wasm")).every(([url]) => new URL(url).origin === SITE), "WASM comes only from the trusted frontend");
   console.log("browser ok");
   passed = true;
 } catch (error) {

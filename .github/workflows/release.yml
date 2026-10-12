@@ -33,6 +33,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       # The plugins of the kinds letmeknow ships go beside it, where a session looks for them first.
       - run: cargo build --release --target ${{ matrix.target }} -p letmeknow -p lmk-kinds
+      - if: matrix.npm == 'linux-x64'
+        name: Test the release backend artifact
+        run: LMK_E2E_BIN="$PWD/target/${{ matrix.target }}/release/letmeknow" python3 -u test/e2e.py --no-browser
       - name: Package
         run: |
           suffix=; [[ "${{ matrix.target }}" == *windows* ]] && suffix=.exe
@@ -40,7 +43,7 @@ jobs:
           for exe in letmeknow letmeknow-kind-doc letmeknow-kind-table; do exes+=("target/${{ matrix.target }}/release/$exe$suffix"); done
           name=letmeknow-${{ github.ref_name }}-${{ matrix.target }}
           mkdir -p "$name" "npm/${{ matrix.npm }}/bin"
-          cp README.md SKILL.md LICENSE "${exes[@]}" "$name/"
+          cp README.md SKILL.md LICENSE deploy/letmeknow.service "${exes[@]}" "$name/"
           cp "${exes[@]}" "npm/${{ matrix.npm }}/bin/"
           if [[ -n "$suffix" ]]; then 7z a "$name.zip" "$name"; else tar czf "$name.tar.gz" "$name"; fi
       - uses: actions/upload-artifact@v4
@@ -54,8 +57,36 @@ jobs:
           name: npm-${{ matrix.npm }}
           path: npm/${{ matrix.npm }}
 
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.129
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci && npx playwright install --with-deps chromium-headless-shell
+        working-directory: web
+      # backend.json must contain the reviewed fresh public key. No environment override in releases.
+      - run: npm run build && npm run check && node artifact-test.mjs dist --negative-controls
+        working-directory: web
+      - run: tar -C web/dist -czf frontend.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend
+          path: frontend.tar.gz
+
   publish:
-    needs: [ci, build]
+    needs: [ci, build, frontend]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,7 +101,10 @@ jobs:
         run: |
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes
-          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/archive-*/*
+          for file in dist/archive-*/* dist/frontend/frontend.tar.gz; do
+            (cd "$(dirname "$file")" && sha256sum "$(basename "$file")")
+          done > SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/archive-*/* dist/frontend/frontend.tar.gz SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
       # Trusted publishing: npm takes the workflow's OIDC token, so no npm token is kept.
@@ -99,9 +133,11 @@ jobs:
           done
           for dir in dist/npm-*; do
             package=@letmeknow/${dir#dist/npm-}@$version
-            # Scanning usually takes minutes, but npm may hold a package for review: its platform's users get it later.
+            # A package held for review blocks rollout rather than leaving that platform behind.
             for _ in $(seq 90); do npm view "$package" version --prefer-online >/dev/null 2>&1 && break; sleep 10; done
-            npm view "$package" version --prefer-online >/dev/null 2>&1 || echo "::warning::npm does not show $package yet"
+            npm view "$package" version --prefer-online
           done
           cp README.md LICENSE npm/cli/
           cd npm/cli && npm pkg set version="$version" && publish @letmeknow/cli
+          for _ in $(seq 90); do npm view "@letmeknow/cli@$version" version --prefer-online >/dev/null 2>&1 && break; sleep 10; done
+          npm view "@letmeknow/cli@$version" version --prefer-online

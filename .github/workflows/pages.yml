@@ -1,0 +1,60 @@
+name: pages
+on:
+  workflow_dispatch:
+    inputs:
+      release_run:
+        description: Successful release workflow run ID (review cutover before approving)
+        required: true
+        type: string
+      release_tag:
+        description: Reviewed vX.Y.Z tag
+        required: true
+        type: string
+      release_sha:
+        description: Reviewed full source commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require tested, published release artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN: ${{ inputs.release_run }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          python3 deploy/release-run.py "$GITHUB_REPOSITORY" "$RELEASE_RUN" "$RELEASE_TAG" "$RELEASE_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          gh run download "$RELEASE_RUN" --repo "$GITHUB_REPOSITORY" --name frontend --dir artifact
+          mkdir site
+          tar -xzf artifact/frontend.tar.gz -C site
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment

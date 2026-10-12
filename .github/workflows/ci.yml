@@ -60,6 +60,8 @@ jobs:
       - if: runner.os == 'Linux'
         run: npm ci && npx playwright install --with-deps chromium-headless-shell
         working-directory: web
+      - if: runner.os == 'Linux'
+        run: python -u test/deploy.py
       - run: python -u test/e2e.py ${{ runner.os != 'Linux' && '--no-browser' || '' }}
         timeout-minutes: 15
       # After e2e.py, which builds web/pkg, the WebAssembly bindings the app imports.
