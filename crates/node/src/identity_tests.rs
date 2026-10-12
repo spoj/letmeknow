@@ -98,6 +98,7 @@ async fn device(relay: &Relay, name: &str) -> (Node<MemoryProvider>, Identity<Me
 }
 
 struct Race {
+    _dir: tempfile::TempDir,
     relay: Relay,
     authority: Arc<Authority>,
     router: iroh::protocol::Router,
@@ -114,7 +115,8 @@ struct Race {
 impl Race {
     async fn new(with_b: bool) -> Self {
         let relay = relay().await;
-        let store = Store::initialize(&std::env::temp_dir().join(format!("lmk-identity-{:x}", u128::from_le_bytes(lmk_core::random())))).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::initialize(&dir.path().join("state")).unwrap();
         let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&store.key().to_bytes())).await;
         let membership = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: relay.url.to_string(), addrs: vec![], rest: Default::default() };
         let authority = Arc::new(Authority { store, gate: Mutex::default(), stale: Mutex::default() });
@@ -137,7 +139,7 @@ impl Race {
         tasks.extend(a.inner.follows.lock().unwrap().drain().map(|(_, task)| task));
         for task in &tasks { task.abort(); }
         for task in tasks { let _ = task.await; }
-        Self { relay, authority, router, a, a_identity, c, c_identity, b, b_identity, identity, gid }
+        Self { _dir: dir, relay, authority, router, a, a_identity, c, c_identity, b, b_identity, identity, gid }
     }
 
     fn gate(&self, log: [u8; 32], remaining: usize) -> (Arc<Notify>, Arc<Notify>) {

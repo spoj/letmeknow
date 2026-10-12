@@ -1,6 +1,6 @@
 //! Sessions over a local relay with a self-signed certificate, their logs on a membership service served through it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,31 +87,23 @@ impl<P: Provider + Send + 'static> Session<P> {
 }
 
 /// A test's folder, deleted when the test ends.
-struct Folder(PathBuf);
+struct Folder(tempfile::TempDir);
 
 impl std::ops::Deref for Folder {
     type Target = Path;
     fn deref(&self) -> &Path {
-        &self.0
+        self.0.path()
     }
 }
 
 impl AsRef<Path> for Folder {
     fn as_ref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Folder {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        self.0.path()
     }
 }
 
 fn folder(test: &str) -> Folder {
-    let dir = std::env::temp_dir().join(format!("lmk-node-{test}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    Folder(dir)
+    Folder(tempfile::Builder::new().prefix(&format!("lmk-node-{test}-")).tempdir().unwrap())
 }
 
 fn settings(kind: &str, relay: &Relay) -> Settings {

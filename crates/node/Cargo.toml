@@ -22,5 +22,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 lmk-testing.workspace = true
+tempfile.workspace = true
 rusqlite.workspace = true
 tokio = { workspace = true, features = ["full"] }
