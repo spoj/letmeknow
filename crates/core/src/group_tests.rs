@@ -717,6 +717,13 @@ fn private_certificates_refresh_but_cannot_rebind_a_membership() {
     let attached = of(id, &device, b.session.key().try_into().unwrap(), "Ann", "phone");
     assert!(b.group.as_mut().unwrap().commit(&b.provider, &b.session, Change { certificate: Some(attached), ..Change::default() }).is_err());
     assert_eq!(b.provider.records().into_iter().collect::<std::collections::BTreeMap<_, _>>(), before, "an anonymous leaf cannot acquire an identity");
+    let losing = w.m[0].commit(Change { certificate: Some(refreshed.clone()), ..Change::default() });
+    let competing = w.m[1].commit(Change { name: Some("Bee".into()), ..Change::default() });
+    w.post(competing.entry);
+    w.post(losing.entry);
+    assert!(w.read(&[0, 1]).iter().all(|r| is_commit(&r[0]) && !is_commit(&r[1])));
+    w.agree(&[0, 1]);
+    assert!(w.m[0].g().posted().is_none());
     let commit = w.m[0].commit(Change { certificate: Some(refreshed.clone()), ..Change::default() });
     w.post(commit.entry);
     assert!(w.read(&[0, 1]).iter().all(|r| is_commit(&r[0])));
@@ -731,22 +738,26 @@ fn private_certificates_refresh_but_cannot_rebind_a_membership() {
         assert_eq!(a.name, "A");
         assert_eq!(a.certificate.as_deref(), Some(&refreshed));
     }
-    // Bypass our update API to try dropping a certificate; both continuing members reject it.
-    let a = &mut w.m[0];
-    let mut unsigned = a.session.credential.clone();
-    unsigned.certificate = None;
-    let leaf = LeafNodeParameters::builder().with_credential_with_key(CredentialWithKey {
-        credential: BasicCredential::new(serde_json::to_vec(&unsigned).unwrap()).into(),
-        signature_key: a.session.signer.public().into(),
-    }).build();
-    let group = a.group.as_mut().unwrap();
-    let bundle = group.mls.commit_builder().consume_proposal_store(false).force_self_update(true).leaf_node_parameters(leaf)
-        .load_psks(a.provider.storage()).unwrap().build(a.provider.rand(), a.provider.crypto(), &a.session.signer, |_| true).unwrap().stage_commit(&a.provider).unwrap();
-    let entry = entry_of(&a.session.signer, bundle.into_messages().0.to_bytes().unwrap(), None);
-    group.state.posted = Some(Bytes(entry.clone()));
-    w.post(entry);
-    assert!(w.read(&[0, 1, 2]).iter().all(|r| matches!(&r[0].0, Verdict::Skipped { reason, .. } if reason.contains("authorization"))));
-    w.agree(&[0, 1, 2]);
+    // Bypass our update API: dropping a certificate or forging its names must fail on the wire too.
+    let mut forged = refreshed;
+    forged.name = "unsigned".into();
+    for certificate in [None, Some(Box::new(forged))] {
+        let a = &mut w.m[0];
+        let mut unsigned = a.session.credential.clone();
+        unsigned.certificate = certificate;
+        let leaf = LeafNodeParameters::builder().with_credential_with_key(CredentialWithKey {
+            credential: BasicCredential::new(serde_json::to_vec(&unsigned).unwrap()).into(),
+            signature_key: a.session.signer.public().into(),
+        }).build();
+        let group = a.group.as_mut().unwrap();
+        let bundle = group.mls.commit_builder().consume_proposal_store(false).force_self_update(true).leaf_node_parameters(leaf)
+            .load_psks(a.provider.storage()).unwrap().build(a.provider.rand(), a.provider.crypto(), &a.session.signer, |_| true).unwrap().stage_commit(&a.provider).unwrap();
+        let entry = entry_of(&a.session.signer, bundle.into_messages().0.to_bytes().unwrap(), None);
+        group.state.posted = Some(Bytes(entry.clone()));
+        w.post(entry);
+        assert!(w.read(&[0, 1, 2]).iter().all(|r| matches!(&r[0].0, Verdict::Skipped { reason, .. } if reason.contains("authorization"))));
+        w.agree(&[0, 1, 2]);
+    }
 }
 
 #[test]

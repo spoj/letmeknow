@@ -219,7 +219,7 @@ mod tests {
         for (name, label) in [("", ""), ("Ånn 🦊", "pöcket"), ("Ann", "laptop")] {
             let good = of(name, label);
             assert_eq!(log.verify(&good), Verdict::Authorized);
-            for mutation in 0..9 {
+            for mutation in 0..10 {
                 let mut bad = good.clone();
                 let c = bad.certificate.as_mut().unwrap();
                 match mutation {
@@ -231,6 +231,7 @@ mod tests {
                     5 => c.sig.0[0] ^= 1,
                     6 => c.device.0.pop().map(drop).unwrap(),
                     7 => c.identity.id.0.pop().map(drop).unwrap(),
+                    8 => bad.key.0.pop().map(drop).unwrap(),
                     _ => c.sig = Bytes(sign(&seed, &[b"letmeknow certificate v1\0", key.as_slice(), id.as_slice()].concat())),
                 }
                 assert!(!verify_certificate(&bad), "mutation {mutation}");

@@ -622,7 +622,7 @@ try {
   await laptop.locator("dialog").getByRole("button", { name: "Rename" }).click();
   await laptop.locator(".group-list button.on", { hasText: "Ideas" }).waitFor();
   await laptop.locator("dialog").getByRole("button", { name: "Make a link" }).click();
-  const ideasLink = await laptop.locator("dialog .copy code").first().textContent();
+  const ideasLink = await laptop.locator("dialog .invite .copy code").first().textContent();
   check(tablet.run("join", ideasLink).members.length === 2, "a native session joins a chat the browser started, by its link");
   await laptop.getByText("They joined the chat.").waitFor();
   await laptop.locator("dialog").waitFor({ state: "detached" });
@@ -667,7 +667,7 @@ try {
     return [annIdentity, carlIdentity].every(id => members.some(m => m.identity?.id === id && m.identity.observed?.other_ids.length));
   }, 30_000)).find(g => g.group === invite.group).members;
   check([annIdentity, carlIdentity].every(id => collided.some(m => m.identity?.id === id && m.name.includes("["))), "different identities sharing a case-insensitive full name have disambiguated labels");
-  const ambiguous = await outcome(call(laptop, "request", JSON.stringify({ cmd: "send", content: "must not send", to: ["Ann"], group: invite.group })));
+  const ambiguous = await outcome(call(laptop, "send", invite.group, "must not send", undefined, ["Ann"], false, undefined, undefined, undefined));
   check(ambiguous.error?.includes("could be any"), "a familiar colliding name does not silently address one identity");
   await laptop.locator(".people:visible").click();
   const detail = await laptop.locator("dialog .identity-details").textContent();
@@ -745,7 +745,7 @@ try {
   const sentFile = await sendingFile;
   check(!sentFile.error && sentFile.value.attachment.pending === true && !sentFile.value.attachment.held_by, "the real sender receives no browser holder acknowledgement after a files-only abort");
   const failedItems = await outcome(call(laptop, "items", fileChat.group, false));
-  const failedAttachment = sentFile.value.attachment;
+  const failedAttachment = ann.run("read", sentFile.value.id)[0].attachment;
   check(failedItems.error?.includes("could not be saved") && !(await kept(laptop)).includes(fileHash), "neither a description nor IndexedDB claims the aborted ciphertext is kept");
   check(await laptop.evaluate(hash => !window.storageFault.events.some(e => e.type === "file" && e.hash === hash), fileHash), "no file-ready callback escapes the ciphertext abort");
   await holdSave(laptop, { store: "files", key: fileHash });
@@ -900,11 +900,13 @@ try {
   check(true, "and two ticks once Carl, back, holds it");
   await carlBack.stop();
 
-  // The tab that took over loaded no file; it loads the doc's file from IndexedDB when a new member wants it.
+  // Selection now awaits its durable description snapshot before switching the visible view.
   await laptop.locator(".group-list button", { hasText: "Notes" }).click();
+  await laptop.getByRole("heading", { name: "Notes", exact: true }).waitFor();
+  // The tab that took over loads the doc's file from IndexedDB when a new member wants it.
   await laptop.getByRole("button", { name: "Settings" }).click();
   await laptop.locator("dialog").getByRole("button", { name: "Make a link" }).click();
-  const readerLink = await laptop.locator("dialog .copy code").first().textContent();
+  const readerLink = await laptop.locator("dialog .invite .copy code").first().textContent();
   const reader = native("reader");
   await reader.printed(e => e.type === "ready");
   reader.run("join", readerLink);

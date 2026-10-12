@@ -288,7 +288,9 @@ impl<P: Provider + Send + 'static> Identity<P> {
     fn due(&self, gid: &[u8]) {
         let (devices, gid) = (self.clone(), gid.to_vec());
         spawn(async move {
-            if let Err(error) = devices.duties(&gid).await {
+            if let Err(error) = devices.duties(&gid).await
+                && devices.node.groups().iter().any(|group| group.0 == gid)
+            {
                 devices.node.inner.warn(Some(&gid), format!("the duties of an identity group: {error:#}"));
             }
         });

@@ -164,13 +164,17 @@ async fn invalid_installed_claims_cannot_supply_names_or_poison_observations_or_
     let dir = folder("invalid-observations");
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("observer.db");
-    let observer = stored(&relay, "observer", &db).await;
+    let mut observer = stored(&relay, "observer", &db).await;
     let (identity, device) = identity(&relay, &observer.node, relay.service.clone()).await;
     let gid = observer.node.create(settings(CHAT, &relay), None).unwrap();
     let legitimate = session(&relay, "legitimate").await;
     legitimate.node.join(&observer.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), Some(certificate(&identity, &device, &legitimate.node.key(), "Ann", "phone"))).await.unwrap();
     observer.checked(&gid, "legitimate", true).await;
     let baseline = binding_record(&db).unwrap();
+    eventually("authorized peer connection", || observer.node.online(&gid.0).unwrap().iter().any(|m| m.key == legitimate.node.key())).await;
+    legitimate.node.send_live(&gid.0, &json!({ "type": "presence", "identity": { "id": identity.id, "name": "Poison" }, "device_name": "Poison" }), None).unwrap();
+    observer.until(|e| matches!(e, Event::Live { payload, .. } if payload["identity"]["name"] == "Poison").then_some(())).await;
+    assert_eq!(binding_record(&db).unwrap(), baseline, "even an authorized peer's live profile is not a roster credential");
     for mutation in 0..7 {
         let handle = format!("bad-{mutation}");
         let bad = session(&relay, &handle).await;
@@ -199,6 +203,38 @@ async fn invalid_installed_claims_cannot_supply_names_or_poison_observations_or_
     eventually("legitimate name compared to the original", || binding_record(&db).is_some_and(|r| serde_json::from_slice::<Value>(&r).unwrap() == json!([[identity.id, "Ann"], [identity.id, "Ann Lee"]]))).await;
     observer.node.shutdown().await.unwrap();
     legitimate.node.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_directory_response_cannot_observe_a_roster_that_was_left() {
+    let relay = relay().await;
+    let dir = folder("late-observation");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (gate, mut reaching) = Gate::new();
+    let (membership, service) = served(&relay, &dir.join("service"), |service| Gated { service, gate: gate.clone() }).await;
+    let seed = lmk_core::random();
+    let (id, first) = lmk_core::public::create(&seed, membership.clone());
+    let identity = IdentityRef { id: id.into(), membership: membership.clone() };
+    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
+    ServeClient::for_service(endpoint, &membership).unwrap().append(&lmk_proto::public::address(&id), &[first], true).await.unwrap();
+    gate.set(false);
+    let db = dir.join("observer.db");
+    let observer = stored(&relay, "observer", &db).await;
+    let gid = observer.node.create(settings(CHAT, &relay), Some(certificate(&identity, &seed, &observer.node.key(), "Too late", "phone"))).unwrap();
+    let reader = observer.node.clone();
+    let lookup = tokio::spawn(async move { reader.read_public(&identity).await });
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if reaching.recv().await.unwrap().0 == observer.node.net().id().as_bytes() { break; }
+        }
+    }).await.unwrap();
+    assert!(binding_record(&db).is_none());
+    observer.node.leave(&gid.0).await.unwrap();
+    gate.set(true);
+    tokio::time::timeout(WAIT, lookup).await.unwrap().unwrap().unwrap();
+    assert!(binding_record(&db).is_none(), "an authenticated response authorizes no departed/historical roster");
+    observer.node.shutdown().await.unwrap();
+    service.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
