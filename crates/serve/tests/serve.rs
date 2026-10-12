@@ -87,6 +87,12 @@ async fn serves_relay_and_membership_without_frontend() {
     }
     let ping = https_get(https, &cert, "/ping", "Origin: https://frontend.example\r\n").await;
     assert!(ping.starts_with("HTTP/1.1 200") && ping.contains("access-control-allow-origin: *"), "{ping}");
+    let lmk_proto::group::Service::Serve { key, .. } = &service else {
+        unreachable!()
+    };
+    let health = https_get(https, &cert, "/health", "").await;
+    let expected = format!(r#"{{"version":"{}","membership":"{}"}}"#, env!("CARGO_PKG_VERSION"), hex::encode(&key.0));
+    assert!(health.starts_with("HTTP/1.1 200") && health.ends_with(&expected), "{health}");
     let portal = http_get(
         http,
         "GET /generate_204 HTTP/1.1\r\nHost: localhost\r\nX-Iroh-Challenge: abc\r\nConnection: close\r\n\r\n",

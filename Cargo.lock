@@ -3005,6 +3005,7 @@ version = "0.15.1"
 dependencies = [
  "anyhow",
  "ed25519-dalek 3.0.0",
+ "hex",
  "http",
  "http-body-util",
  "hyper",

@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
-import datetime, hashlib, json, pathlib, subprocess, sys
+"""Require the backend a release's backend.json names to report that release's version and public service key."""
+import json, pathlib, subprocess, sys
 
-binary, config, tag, run, sha = sys.argv[1:]
-binary = pathlib.Path(binary).resolve()
+config, tag = sys.argv[1:]
 backend = json.loads(pathlib.Path(config).read_text())
-result = subprocess.run([
-    str(binary), "check-service", "--membership", f"{backend['membershipKey']}@{backend['relay']}",
-    "--expect-version", tag[1:], "--expect-run", run, "--expect-sha", sha,
-], capture_output=True, text=True, timeout=35)
-if result.returncode:
-    sys.exit(result.stderr.strip() or "pinned backend check failed")
-expected = {"ok": True, "version": tag[1:], "run": run, "sha": sha}
-if json.loads(result.stdout) != expected:
-    sys.exit("unexpected pinned backend check result")
-with binary.open("rb") as file:
-    digest = hashlib.file_digest(file, "sha256").hexdigest()
-print(json.dumps({**expected, "backend": backend, "checker_sha256": digest,
-                  "checked_at": datetime.datetime.now(datetime.UTC).isoformat()}))
+expected = {"version": tag.removeprefix("v"), "membership": backend["membershipKey"]}
+# Retries cover a service that is still starting after its restart.
+health = subprocess.run(["curl", "-fsS", "--max-time", "10", "--retry", "6", "--retry-all-errors", "--retry-delay", "5",
+                         backend["relay"] + "/health"], capture_output=True, text=True)
+if health.returncode:
+    sys.exit(f"backend health check failed: {health.stderr.strip()}")
+reported = json.loads(health.stdout)
+if {key: reported.get(key) for key in expected} != expected:
+    sys.exit(f"backend reports {health.stdout.strip()}, expected {json.dumps(expected)}")
+print(json.dumps({**expected, "relay": backend["relay"]}))

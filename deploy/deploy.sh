@@ -33,4 +33,4 @@ ssh "$host" 'set -eu
   systemctl daemon-reload
   systemctl enable --now letmeknow
 '
-python3 deploy/check-backend.py "$tmp/letmeknow" "$tmp/backend.json" "$tag" "$run" "$sha"
+python3 deploy/check-backend.py "$tmp/backend.json" "$tag"

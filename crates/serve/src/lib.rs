@@ -197,6 +197,11 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         .bind()
         .await?;
     let key = SigningKey::from_bytes(&endpoint.secret_key().to_bytes());
+    let health = Bytes::from(format!(
+        r#"{{"version":"{}","membership":"{}"}}"#,
+        env!("CARGO_PKG_VERSION"),
+        hex::encode(key.verifying_key().as_bytes())
+    ));
     let store = Store::open(&config.state.join("membership.db"), key)?;
     let _router = Router::builder(endpoint)
         .accept(ALPN, Service::new(store, config.policy))
@@ -205,7 +210,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
     let tls = Arc::new(tls);
     loop {
         let (tcp, _) = https.accept().await?;
-        let (tls, relay) = (tls.clone(), relay.clone());
+        let (tls, relay, health) = (tls.clone(), relay.clone(), health.clone());
         tokio::spawn(async move {
             let stream = match &*tls {
                 Tls::Files(acceptor) => acceptor.accept(tcp).await.ok(),
@@ -217,6 +222,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
             let Some(stream) = stream else { return };
             let site = Site {
                 relay: RelayServiceWithNotify::new(relay, Arc::new(Notify::new())),
+                health,
             };
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(MaybeTlsStream::Tls(stream)), site)
@@ -275,6 +281,8 @@ async fn redirect(listener: TcpListener, base: String) {
 /// WebSocket upgrades at /relay are cross-origin and cookie-free; iroh authenticates the peers.
 struct Site {
     relay: RelayServiceWithNotify,
+    /// This release's version and the service's public key, which rollouts compare with the release they install.
+    health: Bytes,
 }
 
 type Answer = Pin<Box<dyn Future<Output = Result<Response<BytesBody>, HyperError>> + Send>>;
@@ -291,6 +299,14 @@ impl HyperService<Request<Incoming>> for Site {
                 let res = respond(StatusCode::OK)
                     .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                     .body(body(""));
+                return Box::pin(std::future::ready(res.map_err(Into::into)));
+            }
+            "/health" => {
+                let res = respond(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CACHE_CONTROL, "no-store")
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(body(self.health.clone()));
                 return Box::pin(std::future::ready(res.map_err(Into::into)));
             }
             _ => {}
