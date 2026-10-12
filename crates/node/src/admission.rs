@@ -156,7 +156,20 @@ impl<P: Provider + Send + 'static> Node<P> {
                 refused_by_all = false;
                 continue;
             }
-            match timeout(JOIN_WAIT, self.inner.net().join(peer, relay, join.clone())).await {
+            let deadline = Instant::now() + JOIN_WAIT;
+            let answer = loop {
+                let answer = timeout(deadline.saturating_duration_since(Instant::now()), self.inner.net().join(peer, relay.clone(), join.clone())).await;
+                match answer {
+                    // The connection may have been replaced by one the member dialed meanwhile; asking again is safe, as a
+                    // member that added this session answers with the Welcome its log holds.
+                    Ok(Err(error)) if Instant::now() + Duration::from_secs(1) < deadline => {
+                        tracing::debug!("asking {} to admit this session: {error:#}", peer.fmt_short());
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    answer => break answer,
+                }
+            };
+            match answer {
                 Ok(Ok(Answer::Ok(admitted))) => {
                     let gid = self.inner.welcomed(admitted, &join.key_package.0, peer, device_key).await?;
                     self.inner.lock().provider.delete(&joining)?;

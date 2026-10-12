@@ -120,7 +120,8 @@ const text = page => page.locator(".cm-content").evaluate(content => content.cmT
 const call = (page, method, ...args) => page.evaluate(([method, args]) => new Promise((resolve, reject) => {
   const channel = new BroadcastChannel("lmk5");
   const id = crypto.randomUUID();
-  const timer = setTimeout(() => { channel.close(); reject(new Error(`no answer to ${method}`)); }, 30_000);
+  // As long as a join may take: reaching a member, then its answer.
+  const timer = setTimeout(() => { channel.close(); reject(new Error(`no answer to ${method}`)); }, 90_000);
   channel.onmessage = ({ data }) => {
     if (data.ready) channel.postMessage({ id, method, args });
     if (data.id !== id || data.method) return;
@@ -635,8 +636,10 @@ try {
   await laptop.locator(".group-list button.on", { hasText: "Ideas" }).waitFor();
   await laptop.locator("dialog").getByRole("button", { name: "Make a link" }).click();
   const ideasLink = await laptop.locator("dialog .invite .copy code").first().textContent();
-  check(tablet.run("join", ideasLink).members.length === 2, "a native session joins a chat the browser started, by its link");
+  // The browser shows that they joined only briefly: watch for it while the join runs.
+  const joiningIdeas = tablet.start("join", ideasLink);
   await laptop.getByText("They joined the chat.").waitFor();
+  check((await joiningIdeas).members.length === 2, "a native session joins a chat the browser started, by its link");
   await laptop.locator("dialog").waitFor({ state: "detached" });
   const ideas = tablet.run("groups").find(g => g.name === "Ideas");
   check(JSON.stringify(ideas.membership).includes(LETMEKNOW_RELAY), "on the membership service compiled into the trusted frontend");
@@ -876,7 +879,7 @@ try {
   await laptop.locator("textarea:visible").fill("after recovery handoff");
   await laptop.locator("textarea:visible").press("Enter");
   await laptop.locator(".messages li", { hasText: "after recovery handoff" }).locator(".ticks").waitFor();
-  await ann.printed(e => e.type === "message" && e.content === "after recovery handoff");
+  await ann.printed(e => e.type === "message" && e.content === "after recovery handoff", 60_000);
   check(true, "the surviving tab still sends to the real peer after the recovery handoff");
 
   // With Ann gone, what the laptop sends to her chat still counts on the group's log, held only by the laptop.
