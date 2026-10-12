@@ -26,10 +26,12 @@ CI's Linux job, to run before pushing:
     cargo clippy -p lmk-web --target wasm32-unknown-unknown --all-targets -- -D warnings
     python3 deploy/version-pins.py check
     python3 -u test/release.py
+    python3 -u test/compatibility_test.py
     python3 -u test/deploy.py
     (cd web && npm ci) && python3 -u test/e2e.py && (cd web && npm run check)
 
 - e2e.py needs wasm-bindgen-cli 0.2.129 and Playwright's chromium-headless-shell. It builds a test-key frontend and serves it on a separate HTTPS origin from the real backend; it exercises cross-origin iroh-over-WSS, not WebRTC. Its script-free `blank.html` seeds old databases before the app loads. `web/backend.json` stages the production public key; never discover it from the backend or replace it with the old authority just to pass a build.
+- Linux also runs `test/compatibility.py` against exact published packages and the exact candidate/release executable; see [test/COMPATIBILITY.md](test/COMPATIBILITY.md). Its checked-in contract targets the incompatible 0.16 cutover: the old Cargo version must fail, not masquerade as 0.16. The ignored membership `old_writer` test is invoked explicitly with the manifest's verified published binary.
 - Give each change example tests made for the cases that matter. What happens between machines is checked in real use, after release: releases are alphas.
 - While iterating, run the tests of what you changed. Run the whole list once before merging: build first (the workspace's tests and the wasm build), then the rest side by side.
 - CI also runs on macOS and Windows, which are slower. When a test flakes there, fix the timing it assumes; do not rerun it until it passes.

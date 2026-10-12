@@ -61,4 +61,4 @@ It prints its public membership address, `<key>@https://relay.example.com`. Sess
 
 ## Working on letmeknow
 
-See AGENTS.md.
+See AGENTS.md. Linux CI and the exact Linux release artifact run the [published-native compatibility gate](test/COMPATIBILITY.md): verified npm packages, never rebuilt old source. Supported same-minor patches coexist; the declared 0.16/0.15 contract is refusal/isolation, not migration. A future minor can explicitly retain compatibility. There is no published 0.15 frontend archive, so this gate makes no published-browser claim.

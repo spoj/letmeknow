@@ -1,0 +1,12 @@
+{
+  "candidate_minor": "0.16",
+  "previous_minor": "0.15",
+  "previous_policy": "incompatible",
+  "candidate_service_initialize": true,
+  "previous_service_initialize": false,
+  "candidate_default_home": "letmeknow-v5",
+  "previous_default_home": "letmeknow",
+  "old_writer_minor": "0.15",
+  "candidate_alpn": "letmeknow/3",
+  "previous_alpn": "letmeknow/2"
+}

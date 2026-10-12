@@ -44,6 +44,30 @@ jobs:
       - run: python deploy/version-pins.py check
       - if: runner.os == 'Linux'
         run: python -u test/release.py
+      - if: runner.os == 'Linux'
+        run: python -u test/compatibility_test.py
+      - if: runner.os == 'Linux'
+        name: Build the native compatibility candidate and ALPN fixture
+        run: cargo build -p letmeknow -p lmk-kinds --bins --example compatibility_alpn
+      - if: runner.os == 'Linux'
+        name: Resolve authoritative published baselines
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          python -u test/compatibility.py resolve --candidate-version "$version" --out "$RUNNER_TEMP/compatibility/baselines.json"
+        timeout-minutes: 20
+      - if: runner.os == 'Linux'
+        name: Published old service writer (not covered by ordinary cargo test)
+        run: python -u test/compatibility.py old-writer --baselines "$RUNNER_TEMP/compatibility/baselines.json"
+        timeout-minutes: 20
+      - if: runner.os == 'Linux'
+        name: Exact native candidate against published baselines
+        run: python -u test/compatibility.py run --bin "$PWD/target/debug/letmeknow" --alpn-probe "$PWD/target/debug/examples/compatibility_alpn" --baselines "$RUNNER_TEMP/compatibility/baselines.json"
+        timeout-minutes: 20
+      - if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-compatibility-ci
+          path: ${{ runner.temp }}/compatibility
       # The browser client is the same on every OS, so only Linux builds and tests it.
       - if: runner.os == 'Linux'
         uses: taiki-e/install-action@v2

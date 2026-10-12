@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """Native sessions and a separately served HTTPS frontend use the real local membership/iroh relay.
 --no-browser skips the frontend. LMK_E2E_BIN tests an already-built native artifact."""
-import functools, http.server, json, os, queue, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
+import functools, http.server, json, os, queue, shutil, signal, socket, ssl, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("LMK_E2E_BIN") or os.path.join(ROOT, os.environ.get("CARGO_TARGET_DIR", "target"), "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
 WEB = os.path.join(ROOT, "web")
 BROWSER = "--no-browser" not in sys.argv
-TMP = tempfile.mkdtemp(prefix="lmk-e2e-")
+TMP = None
+PROCESSES = []
 ENV = {**os.environ, "NO_PROXY": "localhost,127.0.0.1"}
 ENV.pop("LETMEKNOW_SESSION", None)
 
 
 def free_port():
     """A port free on every address for UDP and TCP alike, as `serve` binds them."""
-    while True:
+    for _ in range(100):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
             udp.bind(("", 0))
             port = udp.getsockname()[1]
@@ -23,6 +24,56 @@ def free_port():
                 return port
             except OSError:
                 pass
+    raise RuntimeError("no free TCP/UDP port after 100 attempts")
+
+
+def spawn(args, **kwargs):
+    proc = subprocess.Popen(args, start_new_session=os.name != "nt", **kwargs)
+    PROCESSES.append(proc)
+    return proc
+
+
+def stop(proc):
+    if os.name == "nt":
+        if proc.poll() is None:
+            proc.terminate()
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+    if os.name != "nt":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        # The Linux compatibility runner is a subreaper, including orphaned plugins.
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                pid, _ = os.waitpid(-proc.pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if not pid:
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"descendants of {proc.pid} did not exit")
+                time.sleep(0.01)
+    PROCESSES.remove(proc)
+
+
+def execute(args, *, env, timeout=60, input=None):
+    proc = spawn([str(a) for a in args], env=env, stdin=subprocess.PIPE,
+                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+    try:
+        stdout, stderr = proc.communicate(input, timeout=timeout)
+        return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+    finally:
+        stop(proc)
 
 
 def check(condition, message):
@@ -37,7 +88,7 @@ def home(name):
 
 def run(session, *args, ok=True, input=None, device=None, bin=BIN):
     env = {**ENV, "LETMEKNOW_HOME": home(device or session)}
-    result = subprocess.run([bin, "--session", session, *args], env=env, input=input, capture_output=True, text=True, encoding="utf-8", timeout=120)
+    result = execute([bin, "--session", session, *args], env=env, input=input, timeout=120)
     if ok and result.returncode:
         sys.exit(f"{session} {args}: {result.stderr}")
     return json.loads(result.stdout) if result.returncode == 0 else result.stderr
@@ -46,41 +97,57 @@ def run(session, *args, ok=True, input=None, device=None, bin=BIN):
 class Listener:
     """A session process, in its own home (its own device) unless it shares `device`'s."""
 
-    def __init__(self, session, device=None, bin=BIN):
-        self.session, self.lines = session, queue.Queue()
-        env = {**ENV, "LETMEKNOW_HOME": home(device or session)}
-        args = [bin, "--session", session, "listen", "--hold", "0"]
-        self.log = open(os.path.join(TMP, f"{session}.log"), "a")
-        self.proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8")
-        threading.Thread(target=self.read, daemon=True).start()
-        self.ready = self.expect("ready")
+    def __init__(self, session, device=None, bin=BIN, *, env=None, log=None, keep_log=False, ready_bin=True):
+        self.session, self.lines, self.events = session, queue.Queue(), []
+        self.bin = os.path.abspath(bin)
+        self.env = env if env is not None else {**ENV, "LETMEKNOW_HOME": home(device or session)}
+        args = [self.bin, "--session", session, "listen", "--hold", "0"]
+        if keep_log:
+            args.append("--keep-log")
+        self.log = open(log or os.path.join(TMP, f"{session}.log"), "a")
+        self.proc = None
+        try:
+            self.proc = spawn(args, env=self.env, stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8")
+            self.reader = threading.Thread(target=self.read, daemon=True)
+            self.reader.start()
+            self.ready = self.expect("ready")
+            if ready_bin and not os.path.samefile(self.ready["bin"], self.bin):
+                raise AssertionError(f"ready.bin is not {self.bin}: {self.ready}")
+        except BaseException:
+            self.stop()
+            raise
 
     def read(self):
-        for line in self.proc.stdout:
-            self.lines.put(json.loads(line))
+        try:
+            for line in self.proc.stdout:
+                event = json.loads(line)
+                self.events.append(event)
+                self.lines.put(event)
+        except (ValueError, OSError) as error:
+            self.lines.put({"type": "reader-error", "error": str(error)})
+        finally:
+            self.lines.put({"type": "eof"})
 
     def expect(self, kind, predicate=lambda e: True, timeout=30):
-        deadline, seen = time.time() + timeout, []
-        while time.time() < deadline:
+        deadline, seen = time.monotonic() + timeout, []
+        while time.monotonic() < deadline:
             try:
-                event = self.lines.get(timeout=deadline - time.time())
+                event = self.lines.get(timeout=max(0, deadline - time.monotonic()))
             except queue.Empty:
                 break
             if event["type"] == kind and predicate(event):
                 return event
-            if event["type"] == "warning":
-                sys.exit(f"{self.session} warning: {event}")
+            if event["type"] in ("warning", "reader-error", "eof"):
+                raise AssertionError(f"{self.session} waiting for {kind}: {event}; log {self.log.name}")
             seen.append(event)
-        sys.exit(f"{self.session}: no {kind} event, only {seen}")
+        raise AssertionError(f"{self.session}: no {kind} event, only {seen}; log {self.log.name}")
 
     def stop(self):
-        # SIGTERM where there are signals; on Windows, the process ends at once.
-        self.proc.terminate()
-        try:
-            self.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            sys.exit(f"{self.session}: listen did not stop")
+        if self.proc is not None and self.proc in PROCESSES:
+            stop(self.proc)
+            self.reader.join(timeout=5)
+            self.proc.stdout.close()
+        self.log.close()
 
 
 def write(name, text):
@@ -111,13 +178,15 @@ def serve():
     https = free_port()
     args = [BIN, "serve", "--domain", "localhost", "--https-port", str(https), "--http-port", str(free_port()), "--membership-port", str(free_port()),
             "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key]
-    proc = subprocess.Popen(args, env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
+    proc = spawn(args, env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
     membership = proc.stdout.readline().strip().removeprefix("membership: ")
     ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_RELAY=f"https://localhost:{https}", LETMEKNOW_MEMBERSHIP=membership)
     return proc
 
 
 def main():
+    global TMP
+    TMP = tempfile.mkdtemp(prefix="lmk-e2e-")
     if "LMK_E2E_BIN" not in os.environ:
         subprocess.run(["cargo", "build", "-q", "-p", "letmeknow", "-p", "lmk-kinds"], cwd=ROOT, check=True)
     server = serve()
@@ -267,12 +336,8 @@ def main():
         print("all ok")
         passed = True
     finally:
-        for listener in listeners:
-            listener.proc.kill()
-        server.kill()
-        for listener in listeners:
-            listener.proc.wait()
-        server.wait()
+        for proc in list(reversed(PROCESSES)):
+            stop(proc)
         if frontend:
             frontend.shutdown()
             frontend.server_close()

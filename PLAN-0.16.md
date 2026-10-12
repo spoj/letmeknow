@@ -24,7 +24,7 @@ Expiring device authorizations renewed by a separate owner-controlled authority 
 
 - [x] #68: warn about secrets and deletion in Docs and Tables.
 - [x] #70: develop the next release on main, with short-lived change branches.
-- [ ] #64: compatibility matrix and published baselines, including first-minor-release handling.
+- [ ] #64: [published-native compatibility gate](test/COMPATIBILITY.md) implemented with explicit 0.16 refusal/isolation policy and first-minor-release handling. Closure still requires the integrated, correctly versioned candidate passing native guards and the separately owned complete browser-store/lock/channel tests.
 - [x] F8: preserve local state when the service refuses history as expired.
 - [x] C1: bind peer entries to the destination log and its service authority.
 - [x] C2: authenticate identity-directory authority before caching a claimant's route or accepting verification.

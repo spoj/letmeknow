@@ -36,6 +36,26 @@ jobs:
       - if: matrix.npm == 'linux-x64'
         name: Test the release backend artifact
         run: LMK_E2E_BIN="$PWD/target/${{ matrix.target }}/release/letmeknow" python3 -u test/e2e.py --no-browser
+      - if: matrix.npm == 'linux-x64'
+        name: Build the ALPN compatibility fixture
+        run: cargo build --release --target ${{ matrix.target }} -p letmeknow --example compatibility_alpn
+      - if: matrix.npm == 'linux-x64'
+        name: Resolve published baselines for the exact release artifact
+        run: python3 -u test/compatibility.py resolve --candidate-version "${GITHUB_REF_NAME#v}" --out "$RUNNER_TEMP/compatibility/baselines.json"
+        timeout-minutes: 20
+      - if: matrix.npm == 'linux-x64'
+        name: Published old service writer
+        run: python3 -u test/compatibility.py old-writer --baselines "$RUNNER_TEMP/compatibility/baselines.json"
+        timeout-minutes: 20
+      - if: matrix.npm == 'linux-x64'
+        name: Exact release executable against published baselines
+        run: python3 -u test/compatibility.py run --bin "$PWD/target/${{ matrix.target }}/release/letmeknow" --alpn-probe "$PWD/target/${{ matrix.target }}/release/examples/compatibility_alpn" --baselines "$RUNNER_TEMP/compatibility/baselines.json"
+        timeout-minutes: 20
+      - if: always() && matrix.npm == 'linux-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-compatibility-release
+          path: ${{ runner.temp }}/compatibility
       - name: Package
         run: |
           suffix=; [[ "${{ matrix.target }}" == *windows* ]] && suffix=.exe
