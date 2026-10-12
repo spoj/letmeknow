@@ -4,6 +4,7 @@ pub mod policy;
 pub mod session;
 pub mod short;
 mod store;
+mod update;
 #[cfg(test)]
 mod tests;
 

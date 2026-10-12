@@ -811,6 +811,7 @@ pub async fn run(
     if let Some(identity) = me["identity"]["name"].as_str() {
         ready["identity"] = json!(identity);
     }
+    crate::update::check(&mut ready).await;
     let mut shutdown = std::pin::pin!(shutdown);
     let client = session.client.clone();
     let mut stopped = None;

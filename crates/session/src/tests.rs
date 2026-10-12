@@ -110,6 +110,9 @@ impl World {
         let mut agent = Agent { handle, home, fp: String::new(), device: String::new(), events, stop: Some(stop), done: Some(done) };
         let ready = agent.expect("ready").await;
         assert!(keys(&ready).is_superset(&keys(&json!({ "type": 0, "session": 0, "name": 0, "fp": 0, "bin": 0 }))), "{ready}");
+        assert_eq!(ready["version_check_error"], "network");
+        assert!(ready.get("newer_version").is_none());
+        assert_eq!(ready["bin"], std::env::current_exe().unwrap().to_str().unwrap());
         agent.fp = ready["fp"].as_str().unwrap().into();
         agent.device = ready["name"].as_str().unwrap().into();
         agent
