@@ -50,8 +50,8 @@ async fn http_get(port: u16, request: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn serves_relay_and_membership_without_frontend() {
-    let state = std::env::temp_dir().join(format!("lmk-serve-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&state);
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
     lmk_membership::store::Store::initialize(&state).unwrap();
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     std::fs::write(state.join("cert.pem"), ck.cert.pem()).unwrap();
@@ -148,5 +148,4 @@ async fn serves_relay_and_membership_without_frontend() {
     assert_eq!((head.length, head.hash), (page.page().head.length, page.page().head.hash));
 
     server.abort();
-    let _ = std::fs::remove_dir_all(state);
 }

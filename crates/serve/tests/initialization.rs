@@ -4,7 +4,8 @@ use lmk_serve::{Certificate, ServeConfig};
 
 #[test]
 fn offline_initialization_emits_only_the_durable_public_configuration() {
-    let path = std::env::temp_dir().join(format!("lmk-bootstrap-{:032x}", u128::from_be_bytes(lmk_proto::random::random::<16>())));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
     let config = ServeConfig::new("relay.example", &path);
     assert!(config.service().is_err());
     assert!(!path.exists());
@@ -17,12 +18,12 @@ fn offline_initialization_emits_only_the_durable_public_configuration() {
     assert!(config.initialize().is_err());
     assert_eq!(std::fs::read(path.join("membership.key")).unwrap(), store.key().to_bytes());
     drop(store);
-    std::fs::remove_dir_all(path).unwrap();
 }
 
 #[tokio::test]
 async fn restart_rejects_missing_store_before_certificates_or_listeners() {
-    let path = std::env::temp_dir().join(format!("lmk-bootstrap-loss-{:032x}", u128::from_be_bytes(lmk_proto::random::random::<16>())));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
     let mut config = ServeConfig::new("localhost", &path);
     config.initialize().unwrap();
     std::fs::remove_file(path.join("membership.db")).unwrap();
@@ -31,6 +32,5 @@ async fn restart_rejects_missing_store_before_certificates_or_listeners() {
     assert!(error.to_string().contains("unable to open database"));
     assert!(!path.join("membership.db").exists());
     assert!(!path.join("acme").exists());
-    std::fs::remove_dir_all(path).unwrap();
 }
 
