@@ -387,8 +387,8 @@ impl Group {
         Ok(group)
     }
 
-    /// The caller must surround joining and admission-checkpoint validation with a savepoint: OpenMLS consumes a
-    /// package during `build_from_welcome`, before `into_group`. An error here rolls back this call's writes.
+    /// OpenMLS consumes a package during `build_from_welcome`, before `into_group`, so an error here rolls back this
+    /// call's writes, the package's consumption included.
     pub fn join<P: Provider>(provider: &P, welcome: &[u8], expected_package: &[u8; 32]) -> Result<Self> {
         let MlsMessageBodyIn::Welcome(welcome) = parse::<MlsMessageIn>(welcome)?.extract() else {
             bail!("not a Welcome")
