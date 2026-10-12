@@ -1,5 +1,5 @@
 // The browser's session: lmk-node in WebAssembly (crates/web), its records and files kept in IndexedDB. One tab at a
-// time runs it, holding the Web Lock "letmeknow"; the other tabs call it over the BroadcastChannel "letmeknow", and hear
+// time runs it, holding the Web Lock "letmeknow-0.16"; the other tabs call it over the BroadcastChannel "letmeknow-0.16", and hear
 // its events there. When that tab closes, a waiting tab takes the lock and runs the session from IndexedDB. Its
 // membership service is the one the page's server names at /membership, `<key>@<relay URL>`, and its relay that one's,
 // unless localStorage names others ("lmk membership", "lmk relay"), as tests do.
@@ -73,7 +73,7 @@ export const listen = (listener: (event: Event) => void) => listeners.add(listen
 export const unlisten = (listener: (event: Event) => void) => listeners.delete(listener);
 const dispatch = (event: Event) => listeners.forEach(listener => listener(event));
 
-const channel = new BroadcastChannel("letmeknow");
+const channel = new BroadcastChannel("letmeknow-0.16");
 const tab = crypto.randomUUID();
 let calls = 0;
 /** This tab's calls not answered yet: sent again whenever a tab starts running the session. */
@@ -166,7 +166,7 @@ function run(device = ""): Promise<void> {
 export async function prepare(): Promise<boolean> {
   const had = await store.has();
   await init({ module_or_path: wasm });
-  navigator.locks.request("letmeknow", async () => {
+  navigator.locks.request("letmeknow-0.16", async () => {
     leading = true;
     if (await store.has()) await run();
     await new Promise(() => {});

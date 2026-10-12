@@ -6,23 +6,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
 use lmk_core::provider::Provider;
-use lmk_membership::Contradiction;
 use lmk_net::Groups;
 use lmk_net::peers::{self, Own};
 use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
-use lmk_proto::group::Service;
 use lmk_proto::head::Head;
-use lmk_proto::peer::{Frame, Summary};
+use lmk_proto::peer::Frame;
 use lmk_proto::ranges::Ranges;
 use n0_future::StreamExt;
 use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep};
 
-use crate::logs::empty;
 use crate::reading::ciphertext_key;
 use crate::{Event, Inner, Member, Node, Out, State, days, endpoint_id, get, now, put};
 
@@ -69,7 +65,8 @@ fn endpoint(key: peers::Key) -> EndpointId {
 /// The group a frame other than `hello` and `entries` is of.
 fn group_of(frame: &Frame) -> Option<&Bytes> {
     match frame {
-        Frame::Hello { .. } | Frame::Entries { .. } => None,
+        Frame::Hello { .. } | Frame::Entries { .. } | Frame::HistoryRequest { .. } | Frame::History { .. }
+        | Frame::SegmentRequest { .. } | Frame::Segment { .. } => None,
         Frame::Messages { group, .. }
         | Frame::Want { group, .. }
         | Frame::WantFiles { group, .. }
@@ -88,7 +85,8 @@ impl<P: Provider> State<P> {
 
     /// Whether this session has applied the group's log to its head as last read.
     pub(crate) fn at_head(&self, gid: &[u8]) -> bool {
-        self.groups.get(gid).zip(self.logs.get(gid)).is_some_and(|(g, log)| g.rec.position >= log.logged)
+        !self.conflicting(gid) && self.groups.get(gid).is_some_and(|g| g.mls.active() && self.active(gid).is_ok_and(|log|
+            log.cut.is_none() && log.logged == log.length() && log.anchor().is_ok_and(|anchor| anchor.position(log.length()).ok() == Some(g.rec.position))))
     }
 
     /// This session's state of a group, as its summary shows it.
@@ -96,11 +94,13 @@ impl<P: Provider> State<P> {
         let g = &self.groups[gid];
         let kept = Ranges::range(g.rec.expired + 1, g.rec.position);
         Own {
-            head: self.logs.get(gid).map_or_else(|| empty(gid), |log| log.head(gid)),
+            anchor: self.active(gid).unwrap().anchor().unwrap().clone(),
+            position: g.rec.position,
+            head: self.active(gid).unwrap().head.clone(),
             held: kept.difference(&g.rec.lacking).difference(&g.rec.lost),
             read: g.rec.read.union(&kept.difference(&g.rec.messages)),
             lacking: g.rec.lacking.clone(),
-            public: g.public.iter().filter_map(|log| Some(self.logs.get(log)?.head(log))).collect(),
+            public: g.public.iter().filter_map(|log| self.logs.get(log)?.head.clone()).collect(),
         }
     }
 
@@ -132,7 +132,7 @@ impl<P: Provider> State<P> {
         let now = self.tick();
         let gids: Vec<Vec<u8>> = self.groups.keys().cloned().collect();
         for gid in &gids {
-            let mut public: Vec<Vec<u8>> = self.identities(gid).iter().map(|identity| lmk_proto::public::address(&identity.id.0).to_vec()).collect();
+            let mut public: Vec<Vec<u8>> = self.identities(gid).iter().filter_map(|identity| self.public_ref(&identity.id.0)).collect();
             public.retain(|log| self.logs.contains_key(log));
             public.sort();
             public.dedup();
@@ -155,40 +155,54 @@ impl<P: Provider> State<P> {
     }
 
     /// Sends a frame of a group to a peer once the step commits, if the gate lets it go.
-    pub(crate) fn emit(&mut self, gid: &[u8], peer: EndpointId, frame: Frame) {
-        if peers::sends(&frame, self.admitted(gid, &peer), self.at_head(gid)) {
-            self.out.push(Out::Frame { peer, frame });
+    pub(crate) fn frame_out(&mut self, peer: EndpointId, frame: Frame) {
+        if let Some(permit) = self.outgoing.as_ref().and_then(|budget| budget.prepare(peer, &frame)) {
+            self.out.push(Out::Frame { peer, packet: lmk_net::budget::Packet { frame, permit } });
+        }
+    }
+
+    pub(crate) fn emit(&mut self, gid: &[u8], peer: EndpointId, frame: &Frame) {
+        if peers::sends(frame, self.admitted(gid, &peer) && self.compatible(gid, &peer), self.at_head(gid))
+            && let Some(permit) = self.outgoing.as_ref().and_then(|budget| budget.prepare(peer, frame)) {
+            self.out.push(Out::Frame { peer, packet: lmk_net::budget::Packet { frame: frame.clone(), permit } });
         }
     }
 
     /// What of a frame goes to a peer as it is written, by the gate as it is then: a step may have removed the peer
     /// since another queued the frame.
     pub(crate) fn admissible(&mut self, peer: &EndpointId, frame: Frame) -> Option<Frame> {
+        if let Frame::Messages { items, .. } = &frame && items.is_empty() { return Some(frame); }
+        match &frame {
+            Frame::HistoryRequest { group, anchor, .. } =>
+                return (self.associated(&group.0, anchor) || self.admitted(&group.0, peer)).then_some(frame),
+            Frame::History { group, anchor, .. } => return self.associated(&group.0, anchor).then_some(frame),
+            Frame::SegmentRequest { group, anchor, .. } =>
+                return self.associated(&group.0, anchor).then_some(frame),
+            Frame::Want { group, anchor, .. } | Frame::Messages { group, anchor, .. } => {
+                return (self.associated(&group.0, anchor) && self.admitted(&group.0, peer) && !self.conflicting(&group.0)).then_some(frame);
+            }
+            Frame::Segment { group, anchor, after, entries, .. } => {
+                let allowed = self.associated(&group.0, anchor) && (entries.is_empty() ||
+                    self.raw_reader(&group.0, anchor, peer) && self.log(&anchor.log_ref).is_ok_and(|log|
+                        after.checked_add(entries.len() as u64).is_some_and(|end| end <= log.cut.unwrap_or(log.logged))));
+                return allowed.then_some(frame);
+            }
+            Frame::Entries { log, .. } => return self.logs.get(&log.0).is_some_and(|log| matches!(log.of, crate::logs::Of::Public(_))).then_some(frame),
+            _ => {}
+        }
         if let Frame::Hello { groups, heads } = frame {
-            let groups = groups.into_iter().filter(|summary| self.admitted(&summary.group.0, peer)).collect();
+            let groups = groups.into_iter().filter(|summary| self.admitted(&summary.group.0, peer) && !self.conflicting(&summary.group.0)).collect();
             return Some(Frame::Hello { groups, heads });
         }
-        let group = match &frame {
-            Frame::Hello { .. } => None,
-            // Every `want` is answered, with nothing if the gate refuses it.
-            Frame::Messages { items, .. } if items.is_empty() => None,
-            Frame::Entries { log, .. } => Some(log).filter(|log| self.groups.contains_key(&log.0)),
-            Frame::Messages { group, .. }
-            | Frame::Want { group, .. }
-            | Frame::WantFiles { group, .. }
-            | Frame::Have { group, .. }
-            | Frame::State { group, .. }
-            | Frame::Live { group, .. } => Some(group),
-        };
-        let Some(gid) = group.map(|group| group.0.clone()) else { return Some(frame) };
-        peers::sends(&frame, self.admitted(&gid, peer), self.at_head(&gid)).then_some(frame)
+        let gid = group_of(&frame)?.0.clone();
+        peers::sends(&frame, self.admitted(&gid, peer) && self.compatible(&gid, peer), self.at_head(&gid)).then_some(frame)
     }
 
     /// Sends a frame of a group to every connected peer the gate lets it go to.
     pub(crate) fn broadcast(&mut self, gid: &[u8], frame: Frame) {
         let peers: Vec<EndpointId> = self.served.keys().copied().collect();
         for peer in peers {
-            self.emit(gid, peer, frame.clone());
+            self.emit(gid, peer, &frame);
         }
     }
 
@@ -225,6 +239,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let mut dialed = 0;
         loop {
             sleep(POLL).await;
+            self.proof_wake.notify_one();
             if now() >= dialed + REDIAL {
                 dialed = now();
                 self.dial_all();
@@ -243,17 +258,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let now = st.tick();
         for out in st.peers.poll(now) {
             match out {
-                peers::Out::Frame(key, frame) => st.out.push(Out::Frame { peer: endpoint(key), frame }),
+                peers::Out::Frame(key, frame) => st.frame_out(endpoint(key), frame),
                 peers::Out::Entries { peer, log, after } => {
-                    let entries = st.entries(&log.0, after);
-                    if !entries.is_empty() {
-                        let head = st.log(&log.0)?.head(&log.0);
-                        st.out.push(Out::Frame { peer: endpoint(peer), frame: Frame::Entries { log, entries, head } });
-                    }
+                    self.work.send(crate::Work::PublicPage { peer: endpoint(peer), id: log.0, after }).ok();
                 }
             }
         }
         for gid in &gids {
+            for peer in st.served.keys().copied().collect::<Vec<_>>() { self.audit_history(st, peer, gid, None)?; }
             let Some(g) = st.groups.get(gid) else { continue };
             if g.waiting {
                 self.advance(st, gid)?;
@@ -279,10 +291,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 st.peers.connect(*peer.as_bytes(), served, now);
             }
             lmk_net::Event::Disconnected(peer) => {
+                self.disconnected_history(peer);
                 st.served.remove(&peer);
                 st.peers.disconnect(peer.as_bytes());
             }
-            lmk_net::Event::Frame(peer, frame) if st.served.contains_key(&peer) => {
+            lmk_net::Event::Frame(peer, frame, _receipt) if st.served.contains_key(&peer) => {
                 if let Err(error) = self.frame(&mut st, peer, frame) {
                     self.warn(None, format!("a frame from {}: {error:#}", peer.fmt_short()));
                 }
@@ -294,40 +307,55 @@ impl<P: Provider + Send + 'static> Inner<P> {
     fn frame(self: &Arc<Self>, st: &mut State<P>, peer: EndpointId, frame: Frame) -> Result<()> {
         let (key, now) = (*peer.as_bytes(), st.tick());
         if let Frame::Hello { groups, heads } = frame {
-            let heads: Vec<Head> = heads.into_iter().filter(|head| self.vouched(st, head, &peer)).collect();
-            let ours = |s: &Summary| s.head.log == s.group && st.groups.contains_key(&s.group.0);
-            let groups: Vec<Summary> = groups.into_iter().filter(|s| ours(s) && self.vouched(st, &s.head, &peer)).collect();
-            for heard in st.peers.frame(&key, &Frame::Hello { groups: groups.clone(), heads }, now) {
+            let heads: Vec<Head> = heads.into_iter().filter(|head| self.vouched(st, head)).collect();
+            let mut accepted = Vec::new();
+            for summary in groups {
+                let gid = &summary.group.0;
+                if !st.groups.contains_key(gid) { continue; }
+                self.request_history(st, peer, &summary)?;
+                if !st.associated(gid, &summary.anchor) {
+                    st.peers.unproved(peer.as_bytes(), &summary.group);
+                    self.audit_history(st, peer, gid, Some(summary.anchor.clone()))?;
+                    continue;
+                }
+                if let Some(head) = &summary.head {
+                    if head.log_ref != summary.anchor.log_ref || !self.vouched(st, head) { continue; }
+                } else if summary.position != summary.anchor.base { continue; }
+                accepted.push(summary);
+            }
+            for heard in st.peers.frame(&key, &Frame::Hello { groups: accepted.clone(), heads }, now) {
                 let group = heard.summary.group.clone();
                 st.hear(heard)?;
                 st.events.push(Event::Heard { group });
                 self.heard.notify_waiters();
             }
-            for summary in groups {
-                let gid = summary.group.0;
-                let head = st.log(&gid)?.head(&gid);
-                if st.admitted(&gid, &peer) && (summary.head.length, &summary.head.hash) == (head.length, &head.hash) {
-                    self.synced(st, &gid, peer)?;
+            for summary in accepted {
+                let gid = &summary.group.0;
+                let log = st.active(gid)?;
+                let ours = log.head.as_ref().map_or((0, *log.frontier()?.hash()), |head| (head.length, head.hash));
+                let theirs = summary.head.as_ref().map_or((0, lmk_proto::head::start(&summary.anchor.service, &summary.anchor.log_ref)), |head| (head.length, head.hash));
+                if log.anchor()? == &summary.anchor && st.at_head(gid) && summary.position == st.group(gid)?.rec.position
+                    && ours == theirs && st.admitted(gid, &peer) {
+                    self.synced(st, gid, peer)?;
                 }
             }
             return Ok(());
         }
         st.peers.frame(&key, &frame, now);
         match frame {
-            Frame::Entries { log, entries, head } => {
-                if log == head.log && self.vouched(st, &head, &peer) {
-                    self.take_entries(st, &log.0, entries, head)?;
-                }
-            }
-            Frame::Want { group, positions } if st.groups.contains_key(&group.0) => {
-                let held = if st.admitted(&group.0, &peer) { st.own(&group.0).held } else { Ranges::default() };
+            Frame::Want { group, anchor, positions } if st.groups.contains_key(&group.0) => {
+                let held = if st.admitted(&group.0, &peer) && st.associated(&group.0, &anchor) && !st.conflicting(&group.0) { st.own(&group.0).held } else { Ranges::default() };
                 let provider = &st.provider;
-                let answer = peers::answer(group.clone(), &positions, &held, |position| provider.get(&ciphertext_key(&group.0, position)).ok().flatten());
-                st.out.push(Out::Frame { peer, frame: answer });
+                let answer = peers::answer(group.clone(), anchor, &positions, &held, |position| provider.get(&ciphertext_key(&group.0, position)).ok().flatten());
+                st.frame_out(peer, answer);
             }
             frame => {
                 let Some(gid) = group_of(&frame).filter(|gid| st.groups.contains_key(&gid.0)).map(|gid| gid.0.clone()) else { return Ok(()) };
-                let admitted = st.admitted(&gid, &peer);
+                let compatible = match &frame {
+                    Frame::State { link: Some(link), .. } => st.associated(&gid, &link.anchor),
+                    _ => st.compatible(&gid, &peer),
+                };
+                let admitted = st.admitted(&gid, &peer) && compatible;
                 if !peers::takes(&frame, admitted, st.at_head(&gid)) {
                     return Ok(());
                 }
@@ -352,27 +380,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Whether a head a peer showed of a log this session follows is signed by its service and agrees with this
     /// session's chain; a contradiction is reported.
-    fn vouched(&self, st: &State<P>, head: &Head, peer: &EndpointId) -> bool {
-        let Some(log) = st.logs.get(&head.log.0) else { return false };
-        let signed = match &log.service {
-            _ if head.length == 0 => head.hash == empty(&head.log.0).hash,
-            Service::Serve { key, .. } => {
-                let key: Option<[u8; 32]> = key.0.clone().try_into().ok();
-                key.and_then(|key| VerifyingKey::from_bytes(&key).ok()).is_some_and(|key| head.verify(&key))
+    fn vouched(&self, st: &mut State<P>, head: &Head) -> bool {
+        let checked = (|| {
+            let log = st.log(&head.log_ref)?;
+            log.frontier()?.check(head, st.hash_at(&head.log_ref, head.length)?)
+        })();
+        match checked {
+            Ok(()) => true,
+            Err(error) => {
+                if let Some(lmk_membership::Contradiction { ours, theirs }) = error.downcast_ref::<lmk_membership::Contradiction>() {
+                    if let Err(error) = self.contradicted(st, &head.log_ref, ours.clone(), theirs.clone()) { self.stop(st, &error); }
+                }
+                false
             }
-            Service::Newer(_) => false,
-        };
-        if !signed {
-            tracing::warn!("{} showed a head its service did not sign", peer.fmt_short());
-            return false;
         }
-        let ours = log.chain.as_ref().and_then(|chain| chain.hash_at(head.length));
-        if ours.is_some_and(|ours| ours[..] != head.hash.0[..]) {
-            let contradiction = Contradiction { ours: log.head(&head.log.0), theirs: head.clone() };
-            self.contradicted(st, &head.log.0, &contradiction, &peer.fmt_short().to_string());
-            return false;
-        }
-        true
     }
 
     /// A connected member's `hello` shows this session's head of the group's log.
@@ -403,6 +424,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub fn heard(&self, gid: &[u8]) -> Result<Vec<Heard>> {
         let st = self.inner.lock();
         let heard = st.group(gid)?.heard.values().filter_map(|heard| {
+            if !st.associated(gid, &heard.summary.anchor) { return None; }
             let member = st.in_leaf(gid, &endpoint_id(&heard.peer.0)?)?;
             let member = st.member(gid, &member)?;
             Some(Heard { member, held: heard.summary.held.clone(), read: heard.summary.read.clone(), at: heard.at })
@@ -428,7 +450,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let start = |m: &lmk_core::group::Member| g.rec.starts.iter().find(|(key, _)| key.0 == m.key).map_or(0, |(_, start)| *start);
         let first = g.mls.members().iter().filter(|m| m.key != st.me(gid)).map(start).min();
         let before = first.map_or_else(Ranges::default, |first| Ranges::range(0, first));
-        let summaries = g.heard.values().filter(|h| h.at >= since && endpoint_id(&h.peer.0).is_some_and(|peer| st.in_leaf(gid, &peer).is_some()));
+        let summaries = g.heard.values().filter(|h| st.associated(gid, &h.summary.anchor) && h.at >= since && endpoint_id(&h.peer.0).is_some_and(|peer| st.in_leaf(gid, &peer).is_some()));
         let held = summaries.fold(Ranges::default(), |held, h| held.union(&h.summary.held));
         Ok(g.rec.own.difference(&held).difference(&before))
     }
@@ -460,7 +482,9 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
     }
 
     fn is_member(&self, group: &[u8], peer: &EndpointId) -> bool {
-        self.lock().serves(group, peer)
+        if self.persistence_error.lock().unwrap().is_some() { return false; }
+        let st = self.lock();
+        st.serves(group, peer) && st.compatible(group, peer)
     }
 
     fn files(&self, group: &[u8]) -> Vec<FileLink> {
@@ -472,6 +496,7 @@ impl<P: Provider + Send + 'static> Groups for Inner<P> {
     }
 
     fn admit(&self, peer: &EndpointId, frame: Frame) -> Option<Frame> {
+        if self.persistence_error.lock().unwrap().is_some() { return None; }
         self.lock().admissible(peer, frame)
     }
 }

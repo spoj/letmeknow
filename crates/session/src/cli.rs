@@ -77,6 +77,9 @@ pub enum SessionsOp {
 
 #[derive(clap::Args, Debug)]
 pub struct Serve {
+    /// Offline: create a NEW authority/store in a nonexistent --state directory, print public config, and exit
+    #[arg(long)]
+    pub initialize: bool,
     /// The domain to serve, with a certificate from Let's Encrypt unless --cert is given
     #[arg(long)]
     pub domain: String,

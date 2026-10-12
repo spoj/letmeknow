@@ -118,7 +118,22 @@ impl FromIterator<u64> for Ranges {
 
 impl<'de> Deserialize<'de> for Ranges {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Self::from(Vec::<(u64, u64)>::deserialize(d)?))
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Ranges;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("canonical ranges") }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Ranges, A::Error> {
+                let mut ranges: Vec<(u64, u64)> = Vec::new();
+                while let Some((first, last)) = seq.next_element()? {
+                    if (first == 0 && last == u64::MAX) || last < first || ranges.last().is_some_and(|&(_, end)| first <= end.saturating_add(1)) {
+                        return Err(serde::de::Error::custom("noncanonical ranges"));
+                    }
+                    ranges.push((first, last));
+                }
+                Ok(Ranges(ranges))
+            }
+        }
+        d.deserialize_seq(Visitor)
     }
 }
 
@@ -131,8 +146,11 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_what_a_peer_sends() {
-        let r: Ranges = serde_json::from_str("[[13,50],[1,10],[11,11],[60,59],[5,7]]").unwrap();
+    fn requires_canonical_peer_ranges() {
+        for text in ["[[13,50],[1,10]]", "[[1,10],[11,11]]", "[[60,59]]", "[[0,18446744073709551615]]"] {
+            assert!(serde_json::from_str::<Ranges>(text).is_err());
+        }
+        let r: Ranges = serde_json::from_str("[[1,11],[13,50]]").unwrap();
         assert_eq!(r.ranges(), &[(1, 11), (13, 50)]);
         assert_eq!(serde_json::to_string(&r).unwrap(), "[[1,11],[13,50]]");
         assert_eq!(r.len(), 49);

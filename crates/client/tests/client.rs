@@ -88,6 +88,8 @@ impl Member {
             disk: None,
             file_limit: 100 << 20,
             durable: None,
+            proof_temp: None,
+            archive: None,
             kinds: vec![CHAT.into(), IDENTITY.into(), KIND.into()],
         };
         let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();

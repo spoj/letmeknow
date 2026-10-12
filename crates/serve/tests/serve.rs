@@ -52,6 +52,7 @@ async fn http_get(port: u16, request: &str) -> String {
 async fn serves_relay_membership_and_page() {
     let state = std::env::temp_dir().join(format!("lmk-serve-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state);
+    lmk_membership::store::Store::initialize(&state).unwrap();
     let web = state.join("web");
     std::fs::create_dir_all(&web).unwrap();
     std::fs::write(web.join("index.html"), "<h1>letmeknow</h1>").unwrap();
@@ -129,7 +130,7 @@ async fn serves_relay_membership_and_page() {
         .await
         .unwrap();
     let client = ServeClient::for_service(endpoint, &service).unwrap();
-    let appended = tokio::time::timeout(Duration::from_secs(10), client.append(b"g", &[b"commit".to_vec()], false))
+    let appended = tokio::time::timeout(Duration::from_secs(10), client.append(&[7; 32], &[b"commit".to_vec()], false))
         .await
         .unwrap()
         .unwrap();
@@ -145,10 +146,12 @@ async fn serves_relay_membership_and_page() {
         unreachable!()
     };
     let direct = ServeClient::new(endpoint, &key.0, "", &[format!("127.0.0.1:{membership}")]).unwrap();
-    let page = direct.read(b"g", 0).await.unwrap();
-    assert_eq!(page.entries[0].0, b"commit");
-    let head = direct.head(b"g").await.unwrap();
-    assert_eq!((head.length, head.hash), (page.head.length, page.head.hash));
+    let service_key = key.0.as_slice().try_into().unwrap();
+    let log_ref = lmk_proto::head::reference(&service_key, &[7; 32]);
+    let page = direct.read(&[7; 32], &lmk_membership::Frontier::empty(service_key, log_ref)).await.unwrap();
+    assert_eq!(page.page().entries[0].0, b"commit");
+    let head = direct.head(&[7; 32]).await.unwrap();
+    assert_eq!((head.length, head.hash), (page.page().head.length, page.page().head.hash));
 
     server.abort();
     let _ = std::fs::remove_dir_all(state);

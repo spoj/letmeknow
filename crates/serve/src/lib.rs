@@ -4,13 +4,12 @@ use std::{
     future::Future,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU32,
-    path::{Path, PathBuf},
+    path::PathBuf,
     pin::Pin,
     sync::Arc,
 };
 
 use anyhow::{Context, Result};
-use ed25519_dalek::SigningKey;
 use http::{Request, Response, StatusCode, header};
 use http_body_util::Full;
 use hyper::{
@@ -91,7 +90,8 @@ impl ServeConfig {
 
     /// The address members put in their settings: the service's key and relay.
     pub fn service(&self) -> Result<group::Service> {
-        let key = membership_key(&self.state)?.public();
+        let store = Store::open(&self.state)?;
+        let key = store.key().verifying_key();
         Ok(group::Service::Serve {
             key: (*key.as_bytes()).into(),
             relay: self.relay_url(),
@@ -99,25 +99,11 @@ impl ServeConfig {
             rest: Default::default(),
         })
     }
-}
 
-/// The membership service's iroh key, which also signs its heads; made on first use.
-fn membership_key(state: &Path) -> Result<SecretKey> {
-    let path = state.join("membership.key");
-    if let Ok(bytes) = std::fs::read(&path) {
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("{} is not a key", path.display()))?;
-        return Ok(SecretKey::from_bytes(&bytes));
+    pub fn initialize(&self) -> Result<group::Service> {
+        drop(Store::initialize(&self.state)?);
+        self.service()
     }
-    std::fs::create_dir_all(state)?;
-    let key = SecretKey::generate();
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    std::io::Write::write_all(&mut options.open(&path)?, &key.to_bytes())?;
-    Ok(key)
 }
 
 enum Tls {
@@ -134,7 +120,8 @@ fn rustls_builder() -> rustls::ConfigBuilder<rustls::ServerConfig, rustls::serve
 
 /// Runs until the HTTPS listener fails.
 pub async fn serve(config: ServeConfig) -> Result<()> {
-    std::fs::create_dir_all(&config.state)?;
+    let store = Store::open(&config.state)?;
+    let secret = SecretKey::from_bytes(&store.key().to_bytes());
     let mut roots = Vec::new();
     let (tls, server_config) = match &config.certificate {
         Certificate::Acme { contact } => {
@@ -191,7 +178,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
 
     let relay_config = RelayConfig::new(config.relay_url().parse()?, Some(RelayQuicConfig::new(config.qad_port)));
     let endpoint = Endpoint::builder(presets::Minimal)
-        .secret_key(membership_key(&config.state)?)
+        .secret_key(secret)
         .relay_mode(RelayMode::Custom(RelayMap::from_iter([relay_config])))
         .ca_tls_config(CaTlsConfig::embedded().with_extra_roots(roots))
         .clear_ip_transports()
@@ -200,8 +187,6 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         .bind()
         .await?;
     let membership = Bytes::from(format!("{}@{}", endpoint.id(), config.relay_url()));
-    let key = SigningKey::from_bytes(&endpoint.secret_key().to_bytes());
-    let store = Store::open(&config.state.join("membership.db"), key)?;
     let _router = Router::builder(endpoint)
         .accept(ALPN, Service::new(store, config.policy))
         .spawn();

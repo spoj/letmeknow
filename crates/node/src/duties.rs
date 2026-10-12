@@ -49,7 +49,7 @@ fn due<P: Provider>(st: &State<P>, g: &G) -> Option<(Change, Vec<core::Member>)>
     let own = members.iter().find(|m| m.index == g.mls.own_index())?;
     let name = renaming(&g.mls, st.device.as_deref());
     let leaf = &st.session.leaf;
-    let update = own.leaf.as_ref() != Some(leaf) || name.is_some() || now() >= next_update(g.rec.updated, g.mls.settings().update, me);
+    let update = st.active(g.mls.id()).is_ok_and(|log| log.rotate()) || own.leaf.as_ref() != Some(leaf) || name.is_some() || now() >= next_update(g.rec.updated, g.mls.settings().update, me);
     (update || !remove.is_empty()).then(|| (Change { remove, leaf: Some(leaf.clone()), name, ..Change::default() }, dropped))
 }
 
@@ -85,7 +85,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let (commit, next) = {
             let mut st = self.lock();
             let Some(g) = st.groups.get(gid) else { return Ok(()) };
-            if !g.mls.active() || g.rec.position < st.log(gid)?.logged || g.waiting {
+            if !g.mls.active() || !st.at_head(gid) || g.waiting {
                 return Ok(());
             }
             if g.rec.leaving && g.mls.members().len() == 1 {

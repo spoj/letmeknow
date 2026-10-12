@@ -63,7 +63,7 @@ impl<P: Provider> State<P> {
 
     /// The position at which a message's id first counted, while it is held.
     pub(crate) fn position_of(&self, gid: &[u8], id: &[u8]) -> Result<Option<u64>> {
-        get(&self.provider, &id_key(gid, id))
+        Ok(get::<(u64, u64)>(&self.provider, &id_key(gid, id))?.map(|(_, position)| position))
     }
 
     pub(crate) fn held(&self, gid: &[u8], position: u64) -> Result<bool> {
@@ -94,6 +94,7 @@ impl<P: Provider> State<P> {
         while position < last && self.pos(gid, position + 1)?.is_none_or(|pos| pos.at < before) {
             position += 1;
         }
+        self.expire_raw(gid)?;
         self.expire_to(gid, position)
     }
 
@@ -103,7 +104,9 @@ impl<P: Provider> State<P> {
         let (from, to) = (rec.expired + 1, to.min(rec.position));
         for position in from..=to {
             if let Some(Pos { judged: Judged::Counted { id }, .. }) = self.pos(gid, position)? {
-                if self.position_of(gid, &id.0)? == Some(position) {
+                if self.position_of(gid, &id.0)? == Some(position)
+                    && get::<(u64, u64)>(&self.provider, &id_key(gid, &id.0))?.is_some_and(|(epoch, _)| epoch < self.group(gid).unwrap().mls.epoch())
+                {
                     self.provider.delete(&id_key(gid, &id.0))?;
                 }
                 if get::<Message>(&self.provider, &message_key(&id.0))?.is_some_and(|m| m.position == position) {
@@ -138,22 +141,28 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Reads the stored entries of a group's log this session has not judged yet, in order, then opens what it can and
     /// hands its kind what is next in order.
     pub(crate) fn advance(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
-        let logged = st.log(gid)?.logged;
         while let Some(g) = st.groups.get(gid)
-            && g.rec.position < logged
             && g.mls.active()
+            && !st.conflicting(gid)
         {
-            let position = g.rec.position + 1;
-            let entry = st.provider.get(&crate::logs::entry_key(gid, position))?.context("a stored entry is missing")?;
-            if !self.judge(st, gid, position, &entry)? {
+            let source = st.active(gid)?;
+            let base = source.anchor()?.base;
+            if g.rec.position.checked_sub(base).context("cursor before epoch base")? >= source.logged { break; }
+            let position = g.rec.position.checked_add(1).context("global position overflow")?;
+            let local = position - base;
+            let entry = st.replay.as_ref().filter(|r| r.id == g.rec.active.0 && local > r.page.after)
+                .and_then(|r| r.page.entries.get((local - r.page.after - 1) as usize)).map(|entry| entry.0.clone());
+            let Some(entry) = entry else {
+                if st.loading.insert(gid.to_vec()) { self.work.send(Work::Load(gid.to_vec())).ok(); }
                 break;
-            }
+            };
+            if !self.judge(st, gid, position, &entry)? { break; }
         }
         if st.groups.contains_key(gid) {
             st.save(gid)?;
             self.open_ready(st, gid)?;
             self.kind_advance(st, gid)?;
-            if st.group(gid)?.rec.position == logged {
+            if st.at_head(gid) {
                 self.work.send(Work::Duties(gid.to_vec())).ok();
             }
         }
@@ -168,10 +177,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let epoch = g.mls.epoch();
         let judged = match g.mls.judge(&st.provider, entry)? {
             Verdict::Message { id } => {
-                let counted = match st.position_of(gid, &id)? {
-                    Some(earlier) => st.pos(gid, earlier)?.is_some_and(|pos| pos.epoch == epoch),
-                    None => false,
-                };
+                let counted = get::<(u64, u64)>(&st.provider, &id_key(gid, &id))?.is_some_and(|(earlier, _)| earlier == epoch);
                 if counted {
                     Judged::Skipped
                 } else {
@@ -195,9 +201,28 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Applies the commit at `position`, unless it waits (`cleared`); false if it waits, or removed this session.
     fn apply(&self, st: &mut State<P>, gid: &[u8], position: u64, entry: &[u8], removes: bool, now: u64) -> Result<bool> {
-        if !self.cleared(st, gid, position)? {
+        let source_id = st.group(gid)?.rec.active.0.clone();
+        let source = st.log(&source_id)?.clone();
+        let anchor = source.anchor()?.clone();
+        let cut = position - anchor.base;
+        if source.cut.is_none() {
+            self.critical(st, |st| {
+                st.logs.get_mut(&source_id).unwrap().cut = Some(cut);
+                st.save_log(&source_id)
+            })?;
+            self.unfollow(&source_id);
+            self.work.send(Work::Advance(gid.to_vec())).ok();
             return Ok(false);
         }
+        anyhow::ensure!(source.cut == Some(cut), "commit differs from durable cut");
+        if !self.cleared(st, gid, position)? { return Ok(false); }
+        let inner = st.group(gid)?.mls.open_entry(&st.provider, entry)?;
+        let welcome = match lmk_proto::entry::Entry::parse(&inner)? {
+            lmk_proto::entry::Entry::Commit { welcome, .. } => welcome,
+            _ => unreachable!("judged commit"),
+        };
+        let source_carry = st.group(gid)?.mls.settings().carry;
+        let (continuing, applied, by) = self.critical(st, |st| {
         self.before_commit(st, gid, removes)?;
         let g = st.groups.get_mut(gid).unwrap();
         let epoch = g.mls.epoch();
@@ -219,17 +244,50 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for leaf in applied.removed.iter().filter_map(|m| m.leaf.as_ref()) {
             st.unhear(gid, &leaf.key.0)?;
         }
-        let core::Applied { added, how, removed, settings, .. } = applied;
-        self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, removed, settings, gone }).ok();
         let pos = Pos { epoch, at: now, judged: Judged::Commit { own }, lost: false };
         put(&st.provider, &pos_key(gid, position), &pos)?;
         st.group_mut(gid)?.rec.position = position;
-        Ok(!gone)
+        let raw_until = now.saturating_add(crate::days(source_carry));
+        let old = st.logs.get_mut(&source_id).unwrap();
+        old.closed = Some(now);
+        old.raw_until = Some(raw_until);
+        if !gone {
+            let mls = &st.group(gid)?.mls;
+            let service = mls.settings().membership;
+            let key = crate::logs::authority(&service)?;
+            let id = lmk_proto::head::reference(&key, &mls.capability(&st.provider)?);
+            let transition = lmk_proto::epoch::Transition {
+                group: gid.try_into()?, source: anchor.clone(), cut,
+                cut_hash: st.replay.as_ref().and_then(|r| r.hash_at(&source_id, cut)).context("cut is not loaded")?,
+                terminal_wire_digest: Sha256::digest(entry).into(),
+                inner_entry_digest: Sha256::digest(&inner).into(),
+                successor_service: key, successor_ref: id,
+            };
+            let next = transition.successor()?;
+            anyhow::ensure!(next.epoch == mls.epoch(), "MLS epoch mismatch");
+            let readers = mls.members().into_iter().filter_map(|m| m.leaf.map(|leaf| leaf.key)).collect();
+            st.add_log(&id, crate::logs::Log::new(crate::logs::Of::Group { group: Bytes(gid.to_vec()), anchor: next }, service, id, readers))?;
+            if let Some(welcome) = welcome { st.cache_admissions(gid, &transition, &welcome)?; }
+            st.prune_admissions(gid)?;
+            st.logs.get_mut(&source_id).unwrap().transition = Some(transition);
+            st.group_mut(gid)?.rec.active = Bytes(id.to_vec());
+        }
+        st.save_log(&source_id)?;
+        st.save(gid)?;
+        Ok((!gone, applied, by))
+        })?;
+        let core::Applied { added, how, removed, settings, gone, .. } = applied;
+        self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, removed, settings, gone }).ok();
+        if continuing {
+            self.work.send(Work::Follow(st.group(gid)?.rec.active.0.clone())).ok();
+            self.work.send(Work::Send(gid.to_vec())).ok();
+        }
+        Ok(continuing)
     }
 
     /// A message entry counts: its ciphertext is this session's own send, one that came early, or yet to come.
     fn count(&self, st: &mut State<P>, gid: &[u8], position: u64, epoch: u64, id: [u8; 32], now: u64) -> Result<()> {
-        put(&st.provider, &id_key(gid, &id), &position)?;
+        put(&st.provider, &id_key(gid, &id), &(epoch, position))?;
         let rec = &mut st.group_mut(gid)?.rec;
         rec.unopened.insert(position, (epoch, now));
         rec.messages.insert(position);

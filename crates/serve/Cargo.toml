@@ -8,7 +8,6 @@ license.workspace = true
 lmk-membership.workspace = true
 lmk-proto.workspace = true
 anyhow.workspace = true
-ed25519-dalek.workspace = true
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }

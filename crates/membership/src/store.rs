@@ -1,138 +1,183 @@
-//! The logs of `letmeknow serve`, in SQLite.
+//! Disposable authority and its durable, reference-only SQLite store.
 
-use std::{path::Path, sync::Mutex};
+use std::{fs::{self, File, OpenOptions}, io::Write, path::Path, sync::Mutex};
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use ed25519_dalek::SigningKey;
-use lmk_proto::{
-    Bytes,
-    clock::now,
-    head::{self, Head},
-    membership::{Appended, Page},
-};
-use rusqlite::{Connection, OptionalExtension, params};
+use lmk_proto::{Bytes, clock::now, head::{self, Head}, membership::{self, Appended, Page}};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+
+use crate::Refused;
+use membership::{MAX_LOGS, MAX_LOG_LENGTH, MAX_LOG_BYTES, MAX_ROWS, MAX_STORED_BYTES};
+pub const EXPIRE_ROWS: usize = 1024;
+pub const DAY_MS: u64 = 86_400_000;
+const FORMAT: u32 = 2;
 
 pub struct Store {
     db: Mutex<Connection>,
     key: SigningKey,
 }
 
+fn sync_dir(path: &Path) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x02000000);
+    options.open(path)?.sync_all()?;
+    Ok(())
+}
+
 impl Store {
-    pub fn open(path: &Path, key: SigningKey) -> Result<Self> {
-        let db = Connection::open(path)?;
+    /// Requires a new directory; interrupted initialization must be abandoned, not resumed with its key.
+    pub fn initialize(state: &Path) -> Result<Self> {
+        let mut dir = fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+        dir.create(state)?;
+        sync_dir(state.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
+        let key = SigningKey::from_bytes(&lmk_proto::random::random::<32>());
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(state.join("membership.key"))?;
+        file.write_all(&key.to_bytes())?;
+        file.sync_all()?;
+        sync_dir(state)?;
+        let db = Connection::open(state.join("membership.db"))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "fullfsync", true)?;
-        // `public` marks a log kept whole while it is appended to; `appended`, in milliseconds, is its last append.
         db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS logs (id BLOB PRIMARY KEY, length INTEGER NOT NULL, hash BLOB NOT NULL,
-                 public INTEGER NOT NULL DEFAULT 0, appended INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
-             CREATE TABLE IF NOT EXISTS entries (log BLOB NOT NULL, position INTEGER NOT NULL, entry BLOB NOT NULL,
-                 hash BLOB NOT NULL, time INTEGER NOT NULL, PRIMARY KEY (log, position)) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS entries_time ON entries (time);",
+            "BEGIN IMMEDIATE;
+             CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id=1), format INTEGER NOT NULL,
+                 authority BLOB NOT NULL CHECK(length(authority)=32), logs INTEGER NOT NULL, rows INTEGER NOT NULL, bytes INTEGER NOT NULL);
+             CREATE TABLE anchors (reference BLOB PRIMARY KEY CHECK(length(reference)=32), length INTEGER NOT NULL,
+                 hash BLOB NOT NULL CHECK(length(hash)=32), public INTEGER NOT NULL, day INTEGER NOT NULL,
+                 rows INTEGER NOT NULL, bytes INTEGER NOT NULL) WITHOUT ROWID;
+             CREATE INDEX public_expiry ON anchors(day) WHERE public=1 AND rows>0;
+             CREATE TABLE records (reference BLOB NOT NULL, position INTEGER NOT NULL, entry BLOB NOT NULL,
+                 hash BLOB NOT NULL CHECK(length(hash)=32), expiry_day INTEGER, PRIMARY KEY(reference,position)) WITHOUT ROWID;
+             CREATE INDEX private_expiry ON records(expiry_day) WHERE expiry_day IS NOT NULL;
+             CREATE VIEW logs AS SELECT reference,length,hash FROM anchors;
+             CREATE VIEW entries AS SELECT reference,position FROM records;",
         )?;
-        // A database of 0.13 has its logs, without these columns.
-        let public: bool = db.query_row("SELECT count(*) FROM pragma_table_info('logs') WHERE name = 'public'", [], |r| r.get(0))?;
-        if !public {
-            db.execute_batch(
-                "ALTER TABLE logs ADD COLUMN public INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE logs ADD COLUMN appended INTEGER NOT NULL DEFAULT 0;",
-            )?;
-        }
-        Ok(Store {
-            db: Mutex::new(db),
-            key,
-        })
+        db.execute("INSERT INTO metadata VALUES(1,?,?,0,0,0)", params![FORMAT, key.verifying_key().as_bytes()])?;
+        db.execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        File::open(state.join("membership.db"))?.sync_all()?;
+        sync_dir(state)?;
+        let mut ready = options.open(state.join("membership.ready"))?;
+        ready.write_all(key.verifying_key().as_bytes())?;
+        ready.sync_all()?;
+        sync_dir(state)?;
+        Ok(Self { db: Mutex::new(db), key })
     }
 
-    fn sign(&self, log: &[u8], length: u64, hash: [u8; 32]) -> Head {
-        Head::sign(&self.key, log, length, hash, now())
+    pub fn open(state: &Path) -> Result<Self> {
+        let bytes: [u8; 32] = fs::read(state.join("membership.key"))?.try_into().map_err(|_| anyhow::anyhow!("invalid membership key file"))?;
+        let key = SigningKey::from_bytes(&bytes);
+        ensure!(fs::read(state.join("membership.ready"))? == key.verifying_key().as_bytes(), "incomplete membership initialization");
+        let path = state.join("membership.db");
+        let check = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let (format, authority): (u32, Vec<u8>) = check.query_row("SELECT format,authority FROM metadata WHERE id=1", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        ensure!(format == FORMAT && authority == key.verifying_key().as_bytes(), "incompatible membership store or authority");
+        let guards: u32 = check.query_row("SELECT count(*) FROM sqlite_schema WHERE type='view' AND name IN ('logs','entries')", [], |r| r.get(0))?;
+        ensure!(guards == 2, "incompatible membership schema");
+        drop(check);
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        db.pragma_update(None, "journal_mode", "WAL")?;
+        db.pragma_update(None, "synchronous", "FULL")?;
+        db.pragma_update(None, "fullfsync", true)?;
+        Ok(Self { db: Mutex::new(db), key })
     }
 
-    fn latest(db: &Connection, log: &[u8]) -> Result<(u64, [u8; 32])> {
-        let row = db
-            .query_row("SELECT length, hash FROM logs WHERE id = ?", [log], |r| {
-                Ok((r.get::<_, u64>(0)?, r.get::<_, [u8; 32]>(1)?))
-            })
-            .optional()?;
-        Ok(row.unwrap_or((0, head::start(log))))
+    pub fn key(&self) -> &SigningKey { &self.key }
+
+    fn sign(&self, log_ref: &[u8; 32], length: u64, hash: [u8; 32]) -> Head {
+        Head::sign(&self.key, log_ref, length, hash, now())
     }
 
-    /// Appends entries one after another, creating the log if it is new, as a public one if `public`; answers the first
-    /// one's position.
-    pub fn append(&self, log: &[u8], entries: &[Bytes], public: bool) -> Result<Appended> {
+    pub fn append(&self, log_ref: &[u8; 32], entries: &[Bytes], public: bool) -> Result<Appended> {
+        ensure!(membership::valid_append(entries), Refused("size".into()));
+        let bytes = entries.iter().map(|e| e.0.len() as u64).sum::<u64>();
         let mut db = self.db.lock().unwrap();
-        let tx = db.transaction()?;
-        let (length, mut hash) = Self::latest(&tx, log)?;
-        let mut position = length;
-        for entry in entries {
-            (position, hash) = (position + 1, head::next(&hash, &entry.0));
-            tx.execute(
-                "INSERT INTO entries (log, position, entry, hash, time) VALUES (?, ?, ?, ?, ?)",
-                params![log, position, entry.0, hash, now()],
-            )?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing = tx.query_row(
+            "SELECT length,hash,public,bytes FROM anchors WHERE reference=?", [log_ref],
+            |r| Ok((r.get::<_, u64>(0)?, r.get::<_, [u8; 32]>(1)?, r.get::<_, bool>(2)?, r.get::<_, u64>(3)?)),
+        ).optional()?;
+        let (length, mut hash, public, retained) = existing.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), log_ref), public, 0));
+        let end = length.checked_add(entries.len() as u64).ok_or_else(|| Refused("quota".into()))?;
+        let (logs, rows, stored): (u64, u64, u64) = tx.query_row("SELECT logs,rows,bytes FROM metadata WHERE id=1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        ensure!(end <= MAX_LOG_LENGTH && retained + bytes <= MAX_LOG_BYTES && rows + entries.len() as u64 <= MAX_ROWS
+            && stored + bytes <= MAX_STORED_BYTES && (existing.is_some() || logs < MAX_LOGS), Refused("quota".into()));
+        let day = now() / DAY_MS;
+        for (index, entry) in entries.iter().enumerate() {
+            hash = head::next(&hash, &entry.0);
+            tx.execute("INSERT INTO records VALUES(?,?,?,?,?)", params![log_ref, length + index as u64 + 1, entry.0, hash, (!public).then_some(day)])?;
         }
         tx.execute(
-            "INSERT INTO logs (id, length, hash, public, appended) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (id) DO UPDATE SET length = ?2, hash = ?3, appended = ?5",
-            params![log, position, hash, public, now()],
+            "INSERT INTO anchors VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(reference) DO UPDATE
+             SET length=?2, hash=?3, day=?5, rows=rows+?6, bytes=bytes+?7",
+            params![log_ref, end, hash, public, day, entries.len() as u64, bytes],
         )?;
+        tx.execute("UPDATE metadata SET logs=logs+?,rows=rows+?,bytes=bytes+? WHERE id=1", params![u64::from(existing.is_none()), entries.len() as u64, bytes])?;
         tx.commit()?;
-        Ok(Appended {
-            position: length + 1,
-            head: self.sign(log, position, hash),
-        })
+        Ok(Appended { position: length + 1, head: self.sign(log_ref, end, hash) })
     }
 
-    /// The entries after `after`, up to about `max_bytes`, or `None` if some of them have expired.
-    pub fn read(&self, log: &[u8], after: u64, max_bytes: usize) -> Result<Option<Page>> {
+    pub fn read(&self, log_ref: &[u8; 32], after: u64) -> Result<Page> {
         let db = self.db.lock().unwrap();
-        let (length, hash) = Self::latest(&db, log)?;
-        let mut rows = db.prepare_cached(
-            "SELECT position, entry, hash FROM entries WHERE log = ? AND position > ? ORDER BY position",
-        )?;
-        let mut rows = rows.query(params![log, after])?;
-        let (mut entries, mut bytes, mut last) = (Vec::new(), 0, None);
-        while bytes < max_bytes
-            && let Some(row) = rows.next()?
-        {
-            let (position, entry, hash): (u64, Vec<u8>, [u8; 32]) = (row.get(0)?, row.get(1)?, row.get(2)?);
-            if position != after + 1 + entries.len() as u64 {
-                return Ok(None);
+        let tip: Option<(u64, [u8; 32])> = db.query_row("SELECT length,hash FROM anchors WHERE reference=?", [log_ref], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let (length, mut hash) = tip.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), log_ref)));
+        ensure!(after <= length, Refused("policy".into()));
+        let mut query = db.prepare_cached("SELECT position,entry,hash FROM records WHERE reference=? AND position>? ORDER BY position LIMIT ?")?;
+        let mut rows = query.query(params![log_ref, after, membership::PAGE_ROWS as u64])?;
+        let mut entries = Vec::new();
+        let mut encoded = membership::PAGE_OVERHEAD;
+        while let Some(row) = rows.next()? {
+            let (position, entry, next_hash): (u64, Vec<u8>, [u8; 32]) = (row.get(0)?, row.get(1)?, row.get(2)?);
+            ensure!(position == after + entries.len() as u64 + 1, Refused("expired".into()));
+            let entry = Bytes(entry);
+            let size = membership::encoded_entry_bytes(&entry);
+            if encoded + size > membership::MAX_BODY { break; }
+            entries.push(entry);
+            encoded += size;
+            hash = next_hash;
+        }
+        ensure!(!entries.is_empty() || after == length, Refused("expired".into()));
+        Ok(Page { after, head: self.sign(log_ref, after + entries.len() as u64, hash), entries })
+    }
+
+    pub fn head(&self, log_ref: &[u8; 32]) -> Result<Head> {
+        let tip: Option<(u64, [u8; 32])> = self.db.lock().unwrap().query_row("SELECT length,hash FROM anchors WHERE reference=?", [log_ref], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let (length, hash) = tip.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), log_ref)));
+        Ok(self.sign(log_ref, length, hash))
+    }
+
+    /// Bounded expiry work; removed rows never remove the lifetime sequence/hash anchor.
+    pub fn expire(&self, before_day: u64) -> Result<usize> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut expired: Vec<([u8; 32], u64, u64)> = tx.prepare_cached(
+            "SELECT reference,position,length(entry) FROM records WHERE expiry_day<? ORDER BY expiry_day LIMIT ?",
+        )?.query_map(params![before_day, EXPIRE_ROWS as u64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        if expired.len() < EXPIRE_ROWS {
+            let public: Option<[u8; 32]> = tx.query_row("SELECT reference FROM anchors WHERE public=1 AND rows>0 AND day<? ORDER BY day LIMIT 1", [before_day], |r| r.get(0)).optional()?;
+            if let Some(reference) = public {
+                let mut query = tx.prepare_cached("SELECT reference,position,length(entry) FROM records WHERE reference=? ORDER BY position LIMIT ?")?;
+                expired.extend(query.query_map(params![reference, (EXPIRE_ROWS - expired.len()) as u64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?);
             }
-            bytes += entry.len();
-            entries.push(Bytes(entry));
-            last = Some((position, hash));
         }
-        if last.is_none() && after < length {
-            return Ok(None);
+        let mut bytes = 0;
+        for (reference, position, size) in &expired {
+            tx.execute("DELETE FROM records WHERE reference=? AND position=?", params![reference, position])?;
+            tx.execute("UPDATE anchors SET rows=rows-1,bytes=bytes-? WHERE reference=?", params![size, reference])?;
+            bytes += size;
         }
-        let (length, hash) = last.unwrap_or((length, hash));
-        Ok(Some(Page {
-            entries,
-            head: self.sign(log, length, hash),
-        }))
-    }
-
-    /// The signed head after `position` entries of a log.
-    pub fn head_at(&self, log: &[u8], position: u64) -> Result<Head> {
-        let db = self.db.lock().unwrap();
-        let hash: [u8; 32] = db.query_row("SELECT hash FROM entries WHERE log = ? AND position = ?", params![log, position], |r| r.get(0))?;
-        Ok(self.sign(log, position, hash))
-    }
-
-    pub fn head(&self, log: &[u8]) -> Result<Head> {
-        let (length, hash) = Self::latest(&self.db.lock().unwrap(), log)?;
-        Ok(self.sign(log, length, hash))
-    }
-
-    /// Deletes the entries appended before `time` of logs but public ones, and every entry of a public log last appended
-    /// to before then. Logs keep their length and hash, so that one deleted does not start again.
-    pub fn expire(&self, time: u64) -> Result<usize> {
-        let db = self.db.lock().unwrap();
-        let entries = db.execute("DELETE FROM entries WHERE time < ?1 AND log IN (SELECT id FROM logs WHERE public = 0)", [time])?;
-        let public = db.execute("DELETE FROM entries WHERE log IN (SELECT id FROM logs WHERE public = 1 AND appended < ?1)", [time])?;
-        Ok(entries + public)
+        tx.execute("UPDATE metadata SET rows=rows-?,bytes=bytes-? WHERE id=1", params![expired.len() as u64, bytes])?;
+        tx.commit()?;
+        Ok(expired.len())
     }
 }
 
@@ -140,103 +185,162 @@ impl Store {
 mod tests {
     use super::*;
 
+    fn state() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lmk-membership-{}", hex::encode(lmk_proto::random::random::<16>())))
+    }
+
     #[test]
-    fn durable_append_returns_no_head_when_commit_fails() {
-        let dir = std::env::temp_dir().join(format!("lmk-store-durable-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("store.db");
-        let key = SigningKey::from_bytes(&[3; 32]);
-        let store = Store::open(&path, key.clone()).unwrap();
+    fn durable_restart_and_transaction_abort() {
+        let path = state();
+        let store = Store::initialize(&path).unwrap();
+        let d = head::reference(store.key().verifying_key().as_bytes(), &[7; 32]);
         {
             let db = store.db.lock().unwrap();
             assert_eq!(db.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "wal");
             assert_eq!(db.query_row("PRAGMA synchronous", [], |r| r.get::<_, u32>(0)).unwrap(), 2);
             assert_eq!(db.query_row("PRAGMA fullfsync", [], |r| r.get::<_, u32>(0)).unwrap(), 1);
-            db.execute_batch(
-                "PRAGMA foreign_keys = ON;
-                 CREATE TABLE parent (id INTEGER PRIMARY KEY);
-                 CREATE TABLE child (id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
-                 CREATE TRIGGER fail_commit AFTER INSERT ON entries BEGIN INSERT INTO child VALUES (1); END;",
-            ).unwrap();
+            db.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                CREATE TABLE child(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+                CREATE TRIGGER abort_append AFTER INSERT ON records BEGIN INSERT INTO child VALUES(1); END;").unwrap();
         }
-        assert!(store.append(b"g", &[Bytes(b"not committed".to_vec())], false).is_err());
-        assert_eq!(store.head(b"g").unwrap().length, 0);
-        assert!(store.read(b"g", 0, 1024).unwrap().unwrap().entries.is_empty());
-        store.db.lock().unwrap().execute_batch("DROP TRIGGER fail_commit").unwrap();
-        let appended = store.append(b"g", &[Bytes(b"committed".to_vec())], false).unwrap();
-        let reader = Store::open(&path, key).unwrap();
-        assert_eq!(reader.head(b"g").unwrap().hash, appended.head.hash);
-        assert_eq!(reader.read(b"g", 0, 1024).unwrap().unwrap().entries, [Bytes(b"committed".to_vec())]);
-        drop((reader, store));
-        std::fs::remove_dir_all(dir).unwrap();
+        assert!(store.append(&d, &[Bytes(b"uncommitted".to_vec())], false).is_err());
+        assert_eq!(store.head(&d).unwrap().length, 0);
+        assert!(store.read(&d, 0).unwrap().entries.is_empty());
+        let counters: (u64, u64, u64) = store.db.lock().unwrap().query_row("SELECT logs,rows,bytes FROM metadata", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(counters, (0, 0, 0));
+        store.db.lock().unwrap().execute_batch("DROP TRIGGER abort_append").unwrap();
+        let appended = store.append(&d, &[Bytes(b"committed".to_vec())], false).unwrap();
+        let s = store.key().verifying_key();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.key().verifying_key(), s);
+        assert_eq!(store.head(&d).unwrap().hash, appended.head.hash);
+        assert_eq!(store.read(&d, 0).unwrap().entries, [Bytes(b"committed".to_vec())]);
+        drop(store);
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
-    fn append_read_expire() {
-        let dir = std::env::temp_dir().join(format!("lmk-store-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let key = SigningKey::from_bytes(&[3; 32]);
-        let store = Store::open(&dir.join("store.db"), key.clone()).unwrap();
-        assert_eq!(store.head(b"g").unwrap().length, 0);
-        assert_eq!(store.append(b"g", &[Bytes(b"one".to_vec())], false).unwrap().position, 1);
-        let two = store.append(b"g", &[Bytes(b"two".to_vec())], false).unwrap();
-        assert_eq!(two.position, 2);
-        assert!(two.head.verify(&key.verifying_key()));
-        let expected = head::next(&head::next(&head::start(b"g"), b"one"), b"two");
-        assert_eq!(two.head.hash.0, expected);
-
-        let page = store.read(b"g", 0, 1).unwrap().unwrap();
-        assert_eq!((page.entries, page.head.length), (vec![Bytes(b"one".to_vec())], 1));
-        let page = store.read(b"g", 1, 1 << 20).unwrap().unwrap();
-        assert_eq!((page.entries.len(), page.head.length), (1, 2));
-        let page = store.read(b"g", 2, 1 << 20).unwrap().unwrap();
-        assert_eq!((page.entries.len(), page.head.hash.0), (0, expected.to_vec()));
-
-        assert_eq!(store.expire(now() + 1).unwrap(), 2);
-        assert!(store.read(b"g", 0, 1 << 20).unwrap().is_none());
-        assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().head.length, 2);
-        let batch = store.append(b"g", &[Bytes(b"three".to_vec()), Bytes(b"four".to_vec())], false).unwrap();
-        assert_eq!((batch.position, batch.head.length), (3, 4));
-        assert_eq!(store.read(b"g", 2, 1 << 20).unwrap().unwrap().entries.len(), 2);
+    fn expiry_and_public_retention_use_days_and_keep_anchors() {
+        let path = state();
+        let store = Store::initialize(&path).unwrap();
+        let d = [7; 32];
+        let public = [8; 32];
+        for r in [&d, &public] { store.append(r, &[Bytes(vec![1])], *r == public).unwrap(); }
+        let day = now() / DAY_MS;
+        store.db.lock().unwrap().execute("UPDATE records SET expiry_day=? WHERE reference=?", params![day-2, d]).unwrap();
+        store.db.lock().unwrap().execute("UPDATE anchors SET day=? WHERE reference=?", params![day-2, public]).unwrap();
+        store.append(&public, &[Bytes(vec![2])], false).unwrap();
+        assert_eq!(store.expire(day).unwrap(), 1);
+        assert_eq!(store.read(&public, 0).unwrap().entries.len(), 2);
+        assert_eq!(store.read(&d, 0).unwrap_err().downcast::<Refused>().unwrap().0, "expired");
+        let anchor = store.head(&d).unwrap();
+        assert_eq!(anchor.length, 1);
+        assert_eq!(store.read(&d, 1).unwrap().head.hash, anchor.hash);
+        assert_eq!(store.append(&d, &[Bytes(vec![3])], false).unwrap().position, 2);
+        assert_eq!(store.expire(day+1).unwrap(), 3);
+        assert_eq!(store.head(&public).unwrap().length, 2);
+        assert_eq!(store.append(&public, &[Bytes(vec![4])], true).unwrap().position, 3);
+        assert_eq!(store.read(&public, 2).unwrap().entries.len(), 1);
         drop(store);
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
-    fn a_public_log_is_kept_whole_and_deleted_only_a_while_after_its_last_append() {
-        let dir = std::env::temp_dir().join(format!("lmk-store-public-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = Store::open(&dir.join("store.db"), SigningKey::from_bytes(&[3; 32])).unwrap();
-        store.append(b"p", &[Bytes(b"first".to_vec())], true).unwrap();
-        store.append(b"g", &[Bytes(b"one".to_vec())], false).unwrap();
-        let before_second = now() + 1;
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        store.append(b"p", &[Bytes(b"second".to_vec())], false).unwrap();
-        assert_eq!(store.expire(before_second).unwrap(), 1, "the group log's entry, not the public log's first");
-        assert_eq!(store.read(b"p", 0, 1 << 20).unwrap().unwrap().entries.len(), 2);
-        assert_eq!(store.expire(now() + 1).unwrap(), 2, "once appended to before the time, the public log goes whole");
-        assert!(store.read(b"p", 0, 1 << 20).unwrap().is_none());
-        assert_eq!(store.append(b"p", &[Bytes(b"again".to_vec())], true).unwrap().position, 3, "and does not start again");
-        drop(store);
-        std::fs::remove_dir_all(&dir).unwrap();
+    fn lost_or_mismatched_state_never_initializes() {
+        let missing = state();
+        assert!(Store::open(&missing).is_err());
+        assert!(!missing.exists());
+        for lost in ["membership.key", "membership.db", "membership.ready"] {
+            let path = state();
+            let store = Store::initialize(&path).unwrap();
+            store.append(&[7; 32], &[Bytes(vec![1])], false).unwrap();
+            drop(store);
+            fs::remove_file(path.join(lost)).unwrap();
+            assert!(Store::open(&path).is_err());
+            assert!(Store::initialize(&path).is_err());
+            assert!(!path.join(lost).exists());
+            fs::remove_dir_all(path).unwrap();
+        }
+        for fault in ["empty", "authority", "format"] {
+            let path = state();
+            let store = Store::initialize(&path).unwrap();
+            store.append(&[7; 32], &[Bytes(vec![1])], false).unwrap();
+            drop(store);
+            let db_path = path.join("membership.db");
+            if fault == "empty" { fs::write(&db_path, []).unwrap(); }
+            else {
+                let db = Connection::open(&db_path).unwrap();
+                db.execute_batch(if fault == "format" { "UPDATE metadata SET format=999" } else { "UPDATE metadata SET authority=zeroblob(32)" }).unwrap();
+            }
+            let before = fs::read(&db_path).unwrap();
+            assert!(Store::open(&path).is_err());
+            assert_eq!(fs::read(&db_path).unwrap(), before);
+            fs::remove_dir_all(path).unwrap();
+        }
     }
 
     #[test]
-    fn a_database_of_0_13_gains_the_columns() {
-        let dir = std::env::temp_dir().join(format!("lmk-store-old-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("store.db");
-        let old = Connection::open(&path).unwrap();
-        old.execute_batch(
-            "CREATE TABLE logs (id BLOB PRIMARY KEY, length INTEGER NOT NULL, hash BLOB NOT NULL) WITHOUT ROWID;
-             INSERT INTO logs VALUES (x'67', 0, x'00');",
-        )
-        .unwrap();
-        drop(old);
-        let store = Store::open(&path, SigningKey::from_bytes(&[3; 32])).unwrap();
-        store.append(b"p", &[Bytes(b"first".to_vec())], true).unwrap();
-        assert_eq!(store.read(b"p", 0, 1 << 20).unwrap().unwrap().entries.len(), 1);
+    fn row_byte_lifetime_and_anchor_limits_are_transactional() {
+        let path = state();
+        let store = Store::initialize(&path).unwrap();
+        let d = [7; 32];
+        assert!(store.append(&d, &vec![Bytes(vec![1]); membership::APPEND_ROWS+1], false).is_err());
+        assert!(store.append(&d, &[Bytes(vec![1; membership::MAX_ENTRY+1])], false).is_err());
+        assert!(store.append(&d, &vec![Bytes(vec![1; membership::MAX_ENTRY]); 3], false).is_err());
+        store.append(&d, &[Bytes(vec![1])], false).unwrap();
+        for sql in [format!("UPDATE metadata SET logs={MAX_LOGS}"), format!("UPDATE metadata SET rows={MAX_ROWS}"), format!("UPDATE metadata SET bytes={MAX_STORED_BYTES}")] {
+            store.db.lock().unwrap().execute_batch(&sql).unwrap();
+            let reference = if sql.contains("logs=") { [8; 32] } else { d };
+            assert_eq!(store.append(&reference, &[Bytes(vec![2])], false).unwrap_err().downcast::<Refused>().unwrap().0, "quota");
+            store.db.lock().unwrap().execute_batch("UPDATE metadata SET logs=1, rows=1, bytes=1").unwrap();
+        }
+        for sql in [format!("UPDATE anchors SET length={MAX_LOG_LENGTH}"), format!("UPDATE anchors SET bytes={MAX_LOG_BYTES}")] {
+            store.db.lock().unwrap().execute_batch(&sql).unwrap();
+            assert_eq!(store.append(&d, &[Bytes(vec![2])], false).unwrap_err().downcast::<Refused>().unwrap().0, "quota");
+            store.db.lock().unwrap().execute_batch("UPDATE anchors SET length=1,bytes=1").unwrap();
+        }
+        assert_eq!(store.head(&d).unwrap().length, 1);
         drop(store);
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn pages_and_expiry_work_are_bounded() {
+        let path = state();
+        let store = Store::initialize(&path).unwrap();
+        let d = [7; 32];
+        for _ in 0..17 { store.append(&d, &vec![Bytes(vec![1]); membership::APPEND_ROWS], false).unwrap(); }
+        assert_eq!(store.read(&d, 0).unwrap().entries.len(), membership::PAGE_ROWS);
+        assert_eq!(store.expire(now()/DAY_MS+1).unwrap(), EXPIRE_ROWS);
+        assert_eq!(store.expire(now()/DAY_MS+1).unwrap(), 64);
+        let d = [8; 32];
+        for _ in 0..3 { store.append(&d, &[Bytes(vec![3; membership::MAX_ENTRY])], false).unwrap(); }
+        let page = store.read(&d, 0).unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert!(serde_json::to_vec(&membership::Reply::Ok(&page)).unwrap().len() < membership::MAX_BODY);
+        assert_eq!(store.read(&d, 2).unwrap().entries.len(), 1);
+        drop(store);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn opaque_schema_and_structural_legacy_refusal() {
+        let path = state();
+        let store = Store::initialize(&path).unwrap();
+        let capability = lmk_proto::random::random::<32>();
+        let d = head::reference(store.key().verifying_key().as_bytes(), &capability);
+        store.append(&d, &[Bytes(vec![42])], false).unwrap();
+        let db = store.db.lock().unwrap();
+        assert!(db.execute_batch("CREATE TABLE IF NOT EXISTS logs(id BLOB PRIMARY KEY, length INTEGER NOT NULL, hash BLOB NOT NULL, public INTEGER NOT NULL DEFAULT 0, appended INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS entries(log BLOB NOT NULL, position INTEGER NOT NULL, entry BLOB NOT NULL, hash BLOB NOT NULL,time INTEGER NOT NULL, PRIMARY KEY(log,position)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS entries_time ON entries(time);").is_err());
+        assert_eq!(db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table'", [], |r| r.get::<_, u64>(0)).unwrap(), 3);
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert!(!fs::read(path.join("membership.db")).unwrap().windows(32).any(|w| w == capability));
+        drop(db);
+        assert_eq!(store.read(&d, 0).unwrap().entries, [Bytes(vec![42])]);
+        drop(store);
+        fs::remove_dir_all(path).unwrap();
     }
 }

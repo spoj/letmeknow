@@ -26,12 +26,34 @@ const FETCH_TRIES: u32 = 12;
 impl<P: Provider + Send + 'static> Node<P> {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
     pub async fn start(provider: P, mut config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
+        match provider.get(b"node/format")? {
+            Some(format) => anyhow::ensure!(format == b"epoch-logs-v1", "incompatible node records; preserve them and use a separate home"),
+            None => {
+                anyhow::ensure!(provider.get(b"session")?.is_none(), "incompatible node records; preserve them and use a separate home");
+                provider.put(b"node/format", b"epoch-logs-v1")?;
+            }
+        }
         let relays = RelayMap::from(iroh::RelayConfig::new(config.relay.clone(), Some(Default::default())));
         let ca = std::mem::take(&mut config.ca);
         let endpoint = lmk_net::builder(relays).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
         let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone(), revision: REVISION };
         let clients = logs::Clients::new(endpoint.clone());
-        let state = State::open(provider, &config, leaf, &clients)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let path = provider.path();
+        let (archive, proof_temp): (crate::archive::Cold, Arc<dyn crate::ProofTemp>) = match config.archive.clone() {
+            Some(archive) => (crate::archive::Cold(archive), config.proof_temp.clone().context("custom archive requires proof scratch")?),
+            #[cfg(not(target_arch = "wasm32"))]
+            None => {
+                let archive = Arc::new(crate::archive::Native::open(path.as_deref())?);
+                let scratch = config.proof_temp.clone().unwrap_or_else(|| archive.clone());
+                (crate::archive::Cold(archive), scratch)
+            }
+            #[cfg(target_arch = "wasm32")]
+            None => anyhow::bail!("browser cold epoch archive is required"),
+        };
+        let logs = State::load_logs(&provider)?;
+        archive.0.recover(logs.values().flat_map(|log| log.pins(&[0, 1, 2])).collect()).await?;
+        let state = State::open(provider, &config, leaf)?;
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
         let (outbox, outbox_rx) = mpsc::unbounded_channel();
@@ -51,15 +73,20 @@ impl<P: Provider + Send + 'static> Node<P> {
             committing: tokio::sync::Mutex::new(()),
             advanced: tokio::sync::Notify::new(),
             heard: tokio::sync::Notify::new(),
-            reading: Mutex::default(),
             sending: Mutex::default(),
             passing: Mutex::default(),
             timers: Mutex::default(),
             tasks: Mutex::default(),
-            contradictions: Mutex::default(),
+            proofs: Mutex::default(),
+            proof_wake: tokio::sync::Notify::new(),
+            proof_temp,
+            archive,
+            history_serving: tokio::sync::Semaphore::new(4),
+            archiving: Mutex::default(),
         });
         let net_config = lmk_net::Config { home: config.home, files: config.files, disk: config.disk, file_limit: config.file_limit, collect: COLLECT };
         let (net, net_events) = Net::spawn(endpoint, net_config, inner.clone(), Arc::new(admission::Admitter(inner.clone()))).await?;
+        inner.state.lock().unwrap().outgoing = Some(net.outgoing());
         inner.net.set(net).ok();
         inner.run(net_events, work_rx, outbox_rx);
         Ok((Node { inner }, events_rx))
@@ -68,7 +95,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 
 impl<P: Provider> State<P> {
     /// The session in `provider`, created on first use, with its leaf as `leaf`; its logs, groups and device keys.
-    fn open(provider: P, config: &Config, leaf: Leaf, clients: &logs::Clients) -> Result<Self> {
+    fn open(provider: P, config: &Config, leaf: Leaf) -> Result<Self> {
         let mut session = match provider.get(b"session")? {
             Some(_) => Session::load(&provider)?,
             None => Session::create(&provider, &config.handle, leaf.clone())?,
@@ -77,11 +104,6 @@ impl<P: Provider> State<P> {
             session.set_leaf(&provider, leaf)?;
         }
         let logs = State::load_logs(&provider)?;
-        for log in logs.values() {
-            if let Some(chain) = &log.chain {
-                clients.client(&log.service)?.set_chain(chain.clone());
-            }
-        }
         let mut groups = BTreeMap::new();
         for gid in get::<Vec<Bytes>>(&provider, b"node/groups")?.unwrap_or_default() {
             let mls = Group::load(&provider, &gid.0)?;
@@ -89,16 +111,26 @@ impl<P: Provider> State<P> {
             let heard = peering::load_heard(&provider, &gid.0)?;
             groups.insert(gid.0, G::new(mls, rec, heard));
         }
+        let mut public = BTreeMap::new();
+        for log in logs.values() {
+            if let logs::Of::Public(id) = &log.of
+                && let Some(state) = get(&provider, &logs::public_key(&id.0))? {
+                public.insert(id.0.clone(), state);
+            }
+        }
         let mut state = State {
             provider,
             out: Vec::new(),
+            outgoing: None,
             scrub: false,
             events: Vec::new(),
             device: config.device.as_ref().map(|device| device.name.clone()),
             session,
             groups,
             logs,
-            public: BTreeMap::new(),
+            public,
+            replay: None,
+            loading: HashSet::new(),
             unlisted: HashSet::new(),
             device_keys: BTreeMap::new(),
             waiters: HashMap::new(),
@@ -133,26 +165,44 @@ impl<P: Provider + Send + 'static> Inner<P> {
             while let Some(event) = net_events.recv().await {
                 match event {
                     lmk_net::Event::Fetched(hash) => peering.fetched_file(hash),
+                    lmk_net::Event::Frame(peer, frame @ (lmk_proto::peer::Frame::Segment { .. } | lmk_proto::peer::Frame::SegmentRequest { .. }
+                        | lmk_proto::peer::Frame::History { .. } | lmk_proto::peer::Frame::HistoryRequest { .. }), receipt) => {
+                        let inner = peering.clone();
+                        peering.spawn(async move {
+                            if let Err(error) = inner.history(peer, frame, receipt).await { tracing::debug!("history exchange: {error:#}"); }
+                        });
+                    }
+                    lmk_net::Event::Frame(_, lmk_proto::peer::Frame::Entries { log, entries, head }, _receipt) => {
+                        let accepted = {
+                            let st = peering.lock();
+                            st.log(&log.0).and_then(|source| {
+                                anyhow::ensure!(matches!(source.of, logs::Of::Public(_)) && log.0 == head.log_ref, "not a public source");
+                                let after = head.length.checked_sub(entries.len() as u64).context("invalid public page")?;
+                                source.frontier()?.verify_page(lmk_proto::membership::Page { after, entries, head })
+                            })
+                        };
+                        match accepted {
+                            Ok(page) => { if let Err(error) = peering.stored(&log.0, page).await { tracing::debug!("public page: {error:#}"); } }
+                            Err(error) => peering.log_error(&log.0, &error),
+                        }
+                    }
                     event => peering.peer_event(event),
                 }
             }
         });
         self.spawn(self.clone().drive(work));
+        self.spawn(self.clone().history_scheduler());
         self.spawn(self.clone().send_out(outbox));
-        let followed: Vec<Vec<u8>> = self.lock().logs.keys().cloned().collect();
+        let followed: Vec<Vec<u8>> = self.lock().logs.iter().filter(|(_, log)| log.cut.is_none() && log.closed.is_none()).map(|(id, _)| id.clone()).collect();
         for log in &followed {
             self.follow(log);
         }
-        let mut st = self.lock();
+        let st = self.lock();
         let public: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
             logs::Of::Public(id) => Some(id.clone()),
             _ => None,
         }).collect();
-        for id in public {
-            if let Err(error) = self.replayed(&mut st, &id.0) {
-                self.warn(None, format!("the public log {}: {error:#}", hex(&id.0)));
-            }
-        }
+        for id in public { self.work.send(Work::Public(id.0)).ok(); }
         // A session removed by a commit it applied before it stopped is told so now; its sends go on. A group its log's
         // reading dropped meanwhile is gone already.
         for (gid, g) in &st.groups {
@@ -179,8 +229,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             for out in out {
                 match (out, self.net.get()) {
+                    (Out::ArchivePins(pins), _) => {
+                        if let Err(error) = self.archive.0.publish(lmk_core::random(), pins).await { self.stop(&mut self.lock(), &error); }
+                    }
                     (Out::Outcome { waiters, outcome }, _) => waiters.into_iter().for_each(|waiter| drop(waiter.send(outcome.clone()))),
-                    (Out::Frame { peer, frame }, Some(net)) => drop(net.frame(peer, frame)),
+                    (Out::Frame { peer, packet }, Some(net)) => {
+                        let lmk_net::budget::Packet { frame, permit } = packet;
+                        if let Some(frame) = self.lock().admissible(&peer, frame) { net.packet(peer, lmk_net::budget::Packet { frame, permit }); }
+                    }
                     (Out::WantFiles { peer, group }, Some(net)) => net.want_files(peer, &group),
                     _ => {}
                 }
@@ -203,7 +259,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 self.work.send(Work::Duties(gid.clone())).ok();
             }
             sleep(duties::TIMER).await;
-            self.lock().scrub = true;
+            let mut st = self.lock();
+            let tombstones: std::collections::BTreeSet<_> = st.logs.values().filter_map(|log| match &log.of {
+                logs::Of::Group { group, .. } if !st.groups.contains_key(&group.0) => Some(group.0.clone()), _ => None,
+            }).collect();
+            for gid in tombstones {
+                if let Err(error) = st.expire_raw(&gid) { self.stop(&mut st, &error); }
+            }
+            st.scrub = true;
         }
     }
 
@@ -254,19 +317,25 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Handles what the group logic and the peers hand on, one at a time.
     async fn drive(self: Arc<Self>, mut work: mpsc::UnboundedReceiver<Work>) {
         while let Some(item) = work.recv().await {
+            if let Err(error) = self.durable().await {
+                self.warn(None, format!("{error:#}"));
+                return;
+            }
             match item {
-                Work::Applied { group, by, added, how, removed, settings, gone } => self.applied(&group, by, added, how, removed, settings, gone).await,
-                Work::Read(log) => {
-                    if self.reading.lock().unwrap().insert(log.clone()) {
-                        let inner = self.clone();
-                        self.spawn(async move {
-                            if let Err(error) = inner.read(&log).await {
-                                tracing::debug!("reading {}: {error:#}", hex(&log));
-                            }
-                            inner.reading.lock().unwrap().remove(&log);
-                        });
-                    }
+                Work::Follow(id) => self.follow(&id),
+                Work::Load(gid) => {
+                    if let Err(error) = self.load(&gid).await { self.warn(Some(&gid), format!("loading replay prefix: {error:#}")); }
                 }
+                Work::Public(id) => {
+                    if let Err(error) = self.replayed(&id).await { self.warn(None, format!("replaying public directory: {error:#}")); }
+                }
+                Work::PublicPage { peer, id, after } => {
+                    if let Err(error) = self.public_page(peer, &id, after).await { tracing::debug!("public page: {error:#}"); }
+                }
+                Work::Advance(gid) => {
+                    if let Err(error) = self.advance(&mut self.lock(), &gid) { self.warn(Some(&gid), format!("{error:#}")); }
+                }
+                Work::Applied { group, by, added, how, removed, settings, gone } => self.applied(&group, by, added, how, removed, settings, gone).await,
                 Work::Duties(gid) => self.duties(&gid),
                 Work::Gone(group) => self.gone(&group, None),
                 Work::Fetch { group, link } => {
@@ -327,6 +396,8 @@ mod tests {
             let config = Config {
                 handle: "Alice".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
                 home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
+                proof_temp: None,
+                archive: None,
                 durable: Some(Arc::new(move || {
                     let fail = failing.load(Ordering::SeqCst);
                     Box::pin(async move {
@@ -347,7 +418,7 @@ mod tests {
             if failed {
                 let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await.unwrap().unwrap();
                 assert!(matches!(event, Event::Warning { text, .. } if text.contains("injected persistence failure")), "cached file escaped the failed barrier");
-                assert!(node.inner.outbox.is_closed());
+                tokio::time::timeout(std::time::Duration::from_secs(10), node.inner.outbox.closed()).await.unwrap();
                 while let Ok(event) = events.try_recv() {
                     assert!(!matches!(event, Event::File(_)), "cached file escaped the failed barrier");
                 }
@@ -400,6 +471,8 @@ mod tests {
         let config = Config {
             handle: "Writer".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
             home: None, files: None, disk: Some(disk.clone()), file_limit: 0, kinds: vec![], durable: None,
+            proof_temp: None,
+            archive: None,
         };
         let (writer, _) = Node::start(MemoryProvider::default(), config).await.unwrap();
         let data = b"the complete state";
@@ -411,6 +484,8 @@ mod tests {
             let config = Config {
                 handle: "Reader".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
                 home: None, files: None, disk: Some(disk.clone()), file_limit: 0, kinds: vec!["test".into()],
+                proof_temp: None,
+                archive: None,
                 durable: Some(Arc::new(move || {
                     let fail = failing.load(Ordering::SeqCst);
                     Box::pin(async move {
@@ -425,7 +500,8 @@ mod tests {
                 update: lmk_proto::group::UPDATE, membership: relay.service.clone(), public: None, rest: Default::default(),
             }, None).unwrap();
             assert_eq!(node.net().held(link.hash).await.unwrap(), 0);
-            node.inner.state_from(&gid.0, link.link(), node.net().id());
+            let summary = node.summary(&gid.0).unwrap();
+            node.inner.state_from(&gid.0, lmk_proto::epoch::StateLink { link: link.link(), prefix: lmk_proto::head::start(&summary.anchor.service, &summary.anchor.log_ref), anchor: summary.anchor, position: summary.position }, node.net().id());
             // On this single-thread runtime, state_from just registered the last task, before it could be polled.
             let completion = node.inner.tasks.lock().unwrap().pop().unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(10), disk.entered.notified()).await.unwrap();
@@ -472,6 +548,8 @@ mod tests {
             handle: "Alice".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
             home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
             durable: Some(Arc::new(|| Box::pin(async { anyhow::bail!("injected persistence failure") }))),
+            proof_temp: None,
+            archive: None,
         };
         let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();
         let (waiter, outcome) = oneshot::channel();
@@ -479,7 +557,7 @@ mod tests {
         node.inner.state.lock().unwrap().waiters.insert(vec![2], vec![pending]);
         let peer = node.net().id();
         let out = vec![
-            Out::Frame { peer, frame: Frame::Hello { groups: vec![], heads: vec![] } },
+            Out::Frame { peer, packet: lmk_net::budget::Packet { permit: node.net().outgoing().prepare(peer, &Frame::Hello { groups: vec![], heads: vec![] }).unwrap(), frame: Frame::Hello { groups: vec![], heads: vec![] } } },
             Out::WantFiles { peer, group: vec![1] },
             Out::Outcome { waiters: vec![waiter], outcome: Ok((1, Bytes(vec![1]))) },
         ];
@@ -503,6 +581,8 @@ mod tests {
         let config = Config {
             handle: "Alice".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
             home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
+            proof_temp: None,
+            archive: None,
             durable: Some(Arc::new(move || {
                 saving.notify_one();
                 let saved = saved.clone();

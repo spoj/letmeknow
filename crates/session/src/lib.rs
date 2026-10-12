@@ -31,9 +31,11 @@ pub async fn serve(serve: cli::Serve) -> Result<()> {
     if let (Some(chain), Some(key)) = (serve.cert, serve.key) {
         config.certificate = lmk_serve::Certificate::Files { chain, key };
     }
-    if let Service::Serve { key, relay, .. } = config.service()? {
+    let service = if serve.initialize { config.initialize()? } else { config.service()? };
+    if let Service::Serve { key, relay, .. } = service {
         println!("membership: {}@{relay}", hex::encode(&key.0));
     }
+    if serve.initialize { return Ok(()); }
     lmk_serve::serve(config).await
 }
 
@@ -71,12 +73,12 @@ pub async fn listen(
     let format = home.join("format");
     let found = std::fs::read_to_string(&format).ok();
     ensure!(
-        found.as_deref().map(str::trim) == Some("4") || found.is_none() && !home.join("device.json").exists(),
-        "{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home",
+        found.as_deref().map(str::trim) == Some("5") || found.is_none() && !home.join("device.json").exists(),
+        "{} holds the state of an earlier letmeknow, which this one cannot read: preserve it and use another --home",
         home.display()
     );
     cli::private_dir(&config.dir)?;
-    std::fs::write(&format, "4\n")?;
+    std::fs::write(&format, "5\n")?;
     let (inbound, queue) = tokio::sync::mpsc::unbounded_channel();
     cli::open_channel(&config.dir.join("endpoint"), inbound.clone()).await?;
     let device_file = home.join("device.json");
@@ -174,6 +176,8 @@ fn node_config(network: &Network, home: &Path, handle: &str, device: Option<Devi
         file_limit: 100 << 20,
         kinds,
         durable: None,
+        proof_temp: None,
+        archive: None,
     }
 }
 

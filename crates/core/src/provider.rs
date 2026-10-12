@@ -15,6 +15,7 @@ pub use openmls_rust_crypto::RustCrypto;
 /// An openmls provider that also keeps our own records, by key.
 pub trait Provider: OpenMlsProvider<StorageProvider: StorageProvider<1, Error: Send + Sync + 'static>> {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    fn path(&self) -> Option<std::path::PathBuf> { None }
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete(&self, key: &[u8]) -> Result<()>;
     /// Starts a step: every write until `commit` is kept or lost together.
@@ -310,6 +311,10 @@ mod native {
     }
 
     impl super::Provider for SqliteProvider {
+        fn path(&self) -> Option<std::path::PathBuf> {
+            self.db.path().filter(|path| !path.is_empty()).map(std::path::PathBuf::from)
+        }
+
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
             Ok(self.db.query_row("SELECT value FROM lmk WHERE key = ?1", [key], |row| row.get(0)).optional()?)
         }

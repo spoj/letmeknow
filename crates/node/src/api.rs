@@ -29,6 +29,8 @@ impl<P: Provider + Send + 'static> Node<P> {
             follow.abort();
         }
         self.inner.net().shutdown().await?;
+        self.inner.proof_temp.close().await?;
+        self.inner.archive.0.close().await?;
         // Not a step (`lock`), which commits when it ends: after the close.
         let mut state = self.inner.state.lock().unwrap();
         state.waiters.clear();
@@ -55,6 +57,12 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     pub fn settings(&self, gid: &[u8]) -> Result<Settings> {
         Ok(self.inner.lock().group(gid)?.mls.settings())
+    }
+
+    pub fn summary(&self, gid: &[u8]) -> Result<lmk_proto::peer::Summary> {
+        let st = self.inner.lock();
+        st.group(gid)?;
+        Ok(st.peers.summary(&Bytes(gid.to_vec())))
     }
 
     pub fn epoch(&self, gid: &[u8]) -> Result<u64> {
@@ -90,9 +98,10 @@ impl<P: Provider + Send + 'static> Node<P> {
             let st = &mut *st;
             st.speak(identity);
             let mls = Group::create(&st.provider, &st.session, &settings)?;
-            st.add_group(mls, Rec::default())?
+            st.add_group(mls, Rec::default(), None)?
         };
-        self.inner.follow(&gid);
+        let id = self.inner.lock().group(&gid)?.rec.active.0.clone();
+        self.inner.follow(&id);
         Ok(Bytes(gid))
     }
 
@@ -109,12 +118,13 @@ impl<P: Provider + Send + 'static> Node<P> {
             let (id, first) = public::create(&seed, &settings.name, settings.membership.clone(), writer, now());
             settings.public = Some(Bytes(id.to_vec()));
             let mls = Group::create(&st.provider, &session, &settings)?;
-            let gid = st.add_group(mls, Rec::default())?;
+            let gid = st.add_group(mls, Rec::default(), None)?;
             put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
             st.device_keys.insert(gid.clone(), (seed, session));
             (gid, IdentityRef { id: Bytes(id.to_vec()), membership: settings.membership }, first)
         };
-        self.inner.follow(&gid);
+        let id = self.inner.lock().group(&gid)?.rec.active.0.clone();
+        self.inner.follow(&id);
         self.inner.durable().await?;
         let address = lmk_proto::public::address(&identity.id.0);
         if let Err(error) = self.inner.clients.client(&identity.membership)?.append(&address, &[first], true).await {
@@ -223,7 +233,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let ciphertext = g.mls.seal(&st.provider, session, payload, true)?.1;
         let frame = Frame::Live { group: Bytes(gid.to_vec()), items: vec![Bytes(ciphertext)] };
         match peer {
-            Some(peer) => st.emit(gid, peer, frame),
+            Some(peer) => st.emit(gid, peer, &frame),
             None => st.broadcast(gid, frame),
         }
         Ok(())
@@ -258,9 +268,16 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// Hands the member with fingerprint `to` a state of the group's kind, as a file it fetches.
     pub async fn hand_state(&self, gid: &[u8], to: &str, data: Vec<u8>) -> Result<()> {
-        let peer = self.inner.lock().by_fp(gid, to)?;
+        let (peer, anchor, position) = {
+            let st = self.inner.lock();
+            (st.by_fp(gid, to)?, st.active(gid)?.anchor()?.clone(), st.group(gid)?.rec.position)
+        };
+        let prefix = self.inner.state_hash(&anchor, position).await?;
         let link = self.inner.state_file(gid, data).await?;
-        self.inner.lock().emit(gid, peer, Frame::State { group: Bytes(gid.to_vec()), link: Some(link) });
+        let mut st = self.inner.lock();
+        ensure!(st.active(gid)?.anchor()? == &anchor && st.group(gid)?.rec.position == position, "state changed while preparing snapshot");
+        let link = lmk_proto::epoch::StateLink { link, anchor, position, prefix };
+        st.emit(gid, peer, &Frame::State { group: Bytes(gid.to_vec()), link: Some(link) });
         Ok(())
     }
 
@@ -427,13 +444,13 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// Reads a group's log from its service through its end, applying what it holds.
     pub async fn read_group(&self, gid: &[u8]) -> Result<()> {
-        self.inner.read(gid).await
+        self.inner.read_group(gid).await
     }
 
     /// Asks a member online, by its iroh key, for the state of the group's kind.
     pub fn ask_state(&self, gid: &[u8], peer: &[u8]) -> Result<()> {
         let peer = endpoint_id(peer).context("an iroh key")?;
-        self.inner.lock().emit(gid, peer, Frame::State { group: Bytes(gid.to_vec()), link: None });
+        self.inner.lock().emit(gid, peer, &Frame::State { group: Bytes(gid.to_vec()), link: None });
         Ok(())
     }
 

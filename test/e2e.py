@@ -114,6 +114,7 @@ def serve():
             "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key]
     if BROWSER:
         args += ["--web", os.path.join(WEB, "dist")]
+    subprocess.run([*args, "--initialize"], env=ENV, check=True, capture_output=True, text=True)
     proc = subprocess.Popen(args, env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
     membership = proc.stdout.readline().strip().removeprefix("membership: ")
     ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_RELAY=f"https://localhost:{https}", LETMEKNOW_MEMBERSHIP=membership)
@@ -137,7 +138,7 @@ def main():
 
         # An invite, and chat.
         invite = run("alice", "invite", "--name", "Plans")
-        check(invite["link"].startswith("https://letmeknow.dev/i#4.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
+        check(invite["link"].startswith("https://letmeknow.dev/i#5.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
         group = invite["group"]
         check("serve" in run("alice", "groups")[0]["membership"], "its log is on the local letmeknow serve")
         joined = run("bob", "join", invite["link"])
@@ -197,7 +198,7 @@ def main():
 
         # A device link: bob's tablet joins his identity.
         link = run("bob", "identity", "invite")["link"]
-        check("#4.d." in link, "identity invite gives a device link")
+        check("#5.d." in link, "identity invite gives a device link")
         tablet = Listener("tablet")
         listeners.append(tablet)
         check("device" in run("tablet", "identity", "join", link), "the tablet joins bob's identity")

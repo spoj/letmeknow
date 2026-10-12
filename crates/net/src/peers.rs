@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use lmk_proto::{
     Bytes,
     head::Head,
+    epoch::Anchor,
     peer::{Frame, Item, Summary},
     ranges::Ranges,
 };
@@ -34,7 +35,9 @@ pub const QUIET: u64 = 10_000;
 /// This member's state of a group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Own {
-    pub head: Head,
+    pub anchor: Anchor,
+    pub position: u64,
+    pub head: Option<Head>,
     /// Within H, as in its summary.
     pub held: Ranges,
     pub read: Ranges,
@@ -100,6 +103,7 @@ struct Group {
 
 struct Request {
     holder: Key,
+    positions: Ranges,
     at: u64,
 }
 
@@ -109,6 +113,7 @@ struct Conn {
     stalled: bool,
     served: BTreeSet<Bytes>,
     heard: BTreeMap<Bytes, Summary>,
+    unproved: BTreeSet<Bytes>,
     /// Per log, the longest the peer showed or was sent.
     theirs: BTreeMap<Bytes, u64>,
     /// Every served group's summary goes at the next poll, as after connecting.
@@ -141,14 +146,14 @@ impl Peers {
             self.changed.get_or_insert(now);
             return;
         };
-        if own.head.length > g.own.head.length {
-            g.read.push((Ranges::range(g.own.head.length + 1, own.head.length), now));
+        if own.position > g.own.position {
+            g.read.push((Ranges::range(g.own.position + 1, own.position), now));
         }
         if !g.own.lacking.intersection(&own.held).is_empty() {
             g.progress = now;
         }
         let o = &g.own;
-        if (o.head.length, &o.held, &o.read, &o.public) != (own.head.length, &own.held, &own.read, &own.public) {
+        if (&o.anchor, &o.head, o.position, &o.held, &o.read, &o.public) != (&own.anchor, &own.head, own.position, &own.held, &own.read, &own.public) {
             g.dirty = true;
             self.changed.get_or_insert(now);
         }
@@ -179,7 +184,7 @@ impl Peers {
             last: now,
             stalled: false,
             served,
-            heard: BTreeMap::new(),
+            heard: BTreeMap::new(), unproved: BTreeSet::new(),
             theirs: BTreeMap::new(),
             full: true,
             opened: BTreeSet::new(),
@@ -224,13 +229,11 @@ impl Peers {
         match frame {
             Frame::Hello { groups, heads } => {
                 for head in heads {
-                    let longest = c.theirs.entry(head.log.clone()).or_default();
+                    let longest = c.theirs.entry(Bytes(head.log_ref.to_vec())).or_default();
                     *longest = (*longest).max(head.length);
                 }
                 for summary in groups {
                     let Some(g) = self.groups.get_mut(&summary.group) else { continue };
-                    let longest = c.theirs.entry(summary.head.log.clone()).or_default();
-                    *longest = (*longest).max(summary.head.length);
                     g.struck.remove(peer);
                     if c.served.contains(&summary.group) && c.heard.get(&summary.group) != Some(summary) {
                         g.progress = now;
@@ -239,6 +242,7 @@ impl Peers {
                     if c.served.contains(&summary.group) && !c.heard.contains_key(&summary.group) {
                         c.opened.insert(summary.group.clone());
                     }
+                    c.unproved.remove(&summary.group);
                     c.heard.insert(summary.group.clone(), summary.clone());
                     heard.push(Heard { peer: Bytes::from(*peer), summary: summary.clone(), at: now });
                 }
@@ -263,9 +267,20 @@ impl Peers {
         let counted = |(k, c): &(&Key, &Conn)| c.served.contains(group) || undecided.contains(*k);
         let peers: Vec<&Summary> = self.conns.iter().filter(counted).filter_map(|(_, c)| c.heard.get(group)).collect();
         let online = if self.conns.is_empty() { 0 } else { now - self.online.max(g.since) };
-        let decision = wait(lacking, &peers, online, now - g.progress);
+        let decision = if g.request.as_ref().is_some_and(|r| !r.positions.intersection(lacking).is_empty()) && now - g.progress < QUIET {
+            Decision::Wait
+        } else { wait(lacking, &peers, online, now - g.progress) };
         g.urgent = if decision == Decision::Wait { lacking.clone() } else { Ranges::default() };
         decision
+    }
+
+    pub fn anchor(&self, peer: &Key, group: &Bytes) -> Option<&Anchor> {
+        Some(&self.conns.get(peer)?.heard.get(group)?.anchor)
+    }
+
+    pub fn unproved(&mut self, peer: &Key, group: &Bytes) {
+        if let Some(c) = self.conns.get_mut(peer) { c.heard.remove(group); c.unproved.insert(group.clone()); }
+        if let Some(g) = self.groups.get_mut(group) { g.struck.remove(peer); }
     }
 
     /// This member's summary of a group.
@@ -303,8 +318,8 @@ impl Peers {
             if g.request.is_none()
                 && let Some((holder, positions)) = choose(id, g, &self.conns)
             {
-                g.request = Some(Request { holder, at: now });
-                out.push(Out::Frame(holder, Frame::Want { group: id.clone(), positions }));
+                g.request = Some(Request { holder, positions: positions.clone(), at: now });
+                out.push(Out::Frame(holder, Frame::Want { group: id.clone(), anchor: g.own.anchor.clone(), positions }));
             }
         }
         out
@@ -321,20 +336,19 @@ impl Peers {
         for (key, c) in &mut self.conns {
             let served: Vec<(&Bytes, &Group)> = c.served.iter().filter_map(|id| Some((id, self.groups.get(id)?))).collect();
             for (_, g) in &served {
-                for head in std::iter::once(&g.own.head).chain(&g.own.public) {
-                    if let Some(theirs) = c.theirs.get_mut(&head.log)
+                for head in &g.own.public {
+                    if let Some(theirs) = c.theirs.get_mut(&Bytes(head.log_ref.to_vec()))
                         && *theirs < head.length
                     {
-                        out.push(Out::Entries { peer: *key, log: head.log.clone(), after: *theirs });
-                        *theirs = head.length;
+                        out.push(Out::Entries { peer: *key, log: Bytes(head.log_ref.to_vec()), after: *theirs });
                     }
                 }
             }
             let send: Vec<&(&Bytes, &Group)> = served.iter().filter(|(id, g)| periodic || c.full || c.opened.contains(*id) || due && g.dirty).collect();
             if !send.is_empty() {
                 let mut heads: Vec<Head> = send.iter().flat_map(|(_, g)| g.own.public.iter().cloned()).collect();
-                heads.sort_by(|a, b| a.log.cmp(&b.log));
-                heads.dedup_by(|a, b| a.log == b.log);
+                heads.sort_by(|a, b| a.log_ref.cmp(&b.log_ref));
+                heads.dedup_by(|a, b| a.log_ref == b.log_ref);
                 let groups = send.iter().map(|(id, g)| summary(id, g)).collect();
                 out.push(Out::Frame(*key, Frame::Hello { groups, heads }));
             }
@@ -352,7 +366,7 @@ impl Peers {
 }
 
 fn summary(id: &Bytes, g: &Group) -> Summary {
-    Summary { group: id.clone(), head: g.own.head.clone(), held: g.own.held.clone(), read: g.own.read.clone(), fetching: g.fetching.clone() }
+    Summary { group: id.clone(), anchor: g.own.anchor.clone(), position: g.own.position, head: g.own.head.clone(), held: g.own.held.clone(), read: g.own.read.clone(), fetching: g.fetching.clone() }
 }
 
 /// The current-connection summaries of the peers the gate admits to the group.
@@ -363,7 +377,8 @@ fn holders<'a>(id: &'a Bytes, conns: &'a BTreeMap<Key, Conn>) -> impl Iterator<I
 /// What the member lacks that a holder it may ask holds.
 fn fetching(id: &Bytes, g: &Group, conns: &BTreeMap<Key, Conn>) -> Ranges {
     let empty = Ranges::default();
-    holders(id, conns).fold(Ranges::default(), |acc, (k, _, s)| acc.union(&g.own.lacking.intersection(&s.held).difference(g.struck.get(k).unwrap_or(&empty))))
+    let requested = g.request.as_ref().map_or_else(Ranges::default, |r| r.positions.intersection(&g.own.lacking));
+    holders(id, conns).fold(requested, |acc, (k, _, s)| acc.union(&g.own.lacking.intersection(&s.held).difference(g.struck.get(k).unwrap_or(&empty))))
 }
 
 /// The holder holding the first askable position, the lowest key among several, and what it may be asked.
@@ -377,6 +392,10 @@ fn choose(id: &Bytes, g: &Group, conns: &BTreeMap<Key, Conn>) -> Option<(Key, Ra
             let positions = askable.intersection(&s.held).difference(g.struck.get(k).unwrap_or(&empty));
             Some((positions.first()?, *k, positions))
         })
+        .chain(conns.iter().filter(|(_, c)| c.served.contains(id) && c.unproved.contains(id) && !c.stalled).filter_map(|(k, _)| {
+            let positions = askable.difference(g.struck.get(k).unwrap_or(&empty));
+            Some((positions.first()?, *k, positions))
+        }))
         .min_by_key(|&(first, k, _)| (first, k))
         .map(|(_, k, positions)| (k, positions))
 }
@@ -394,18 +413,18 @@ pub fn wait(lacking: &Ranges, peers: &[&Summary], online: u64, quiet: u64) -> De
 
 /// The answer to a `want`: the asked ciphertexts this member holds, in position order, until about `ANSWER` bytes.
 /// `held` is its summary's; a want the gate does not take gets an empty `held`, so its asker moves on.
-pub fn answer(group: Bytes, asked: &Ranges, held: &Ranges, mut ciphertext: impl FnMut(u64) -> Option<Vec<u8>>) -> Frame {
+pub fn answer(group: Bytes, anchor: Anchor, asked: &Ranges, held: &Ranges, mut ciphertext: impl FnMut(u64) -> Option<Vec<u8>>) -> Frame {
     let (mut items, mut size) = (Vec::new(), 0);
     for position in asked.intersection(held).iter() {
-        if size >= ANSWER {
-            return Frame::Messages { group, items, answers: Some(asked.through(position - 1)) };
+        if size >= ANSWER || items.len() == 1024 {
+            return Frame::Messages { group, anchor, items, answers: Some(asked.through(position - 1)) };
         }
         if let Some(ciphertext) = ciphertext(position) {
             size += ciphertext.len();
             items.push(Item { position, ciphertext: Bytes(ciphertext) });
         }
     }
-    Frame::Messages { group, items, answers: Some(asked.clone()) }
+    Frame::Messages { group, anchor, items, answers: Some(asked.clone()) }
 }
 
 /// Whether a member acts on a frame of a group from a peer. What checks itself is taken from anyone: summaries are
@@ -414,7 +433,8 @@ pub fn answer(group: Bytes, asked: &Ranges, held: &Ranges, mut ciphertext: impl 
 /// applied its log to the head, it takes no `state` or live payloads.
 pub fn takes(frame: &Frame, admitted: bool, at_head: bool) -> bool {
     match frame {
-        Frame::Hello { .. } | Frame::Entries { .. } | Frame::Messages { .. } => true,
+        Frame::Hello { .. } | Frame::Entries { .. } | Frame::Messages { .. }
+        | Frame::HistoryRequest { .. } | Frame::History { .. } | Frame::SegmentRequest { .. } | Frame::Segment { .. } => true,
         Frame::State { .. } | Frame::Live { .. } => admitted && at_head,
         Frame::Want { .. } | Frame::WantFiles { .. } | Frame::Have { .. } => admitted,
     }

@@ -1,288 +1,310 @@
-use std::{
-    net::{Ipv4Addr, Ipv6Addr},
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::Ipv4Addr, path::PathBuf, sync::Mutex, time::Duration};
 
-use ed25519_dalek::SigningKey;
-use iroh::{
-    Endpoint, EndpointAddr, RelayConfig, RelayMap, RelayMode, SecretKey,
-    endpoint::{Builder, presets},
-    protocol::Router,
-    tls::CaTlsConfig,
-};
-use iroh_relay::{
-    RelayQuicConfig,
-    server::{CertConfig, QuicConfig, RelayConfig as RelayServerConfig, Server, ServerConfig, TlsConfig},
-};
-use lmk_membership::{
-    Contradiction, Forged, Refused,
-    client::ServeClient,
-    service::{Policy, Service},
-    store::Store,
-};
-use lmk_proto::{
-    Answer, Bytes,
-    frame::{self, ALPN, Open, Stream},
-};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use anyhow::Result;
+use iroh::{Endpoint, RelayMode, SecretKey, endpoint::{Connection, presets}, protocol::{AcceptError, ProtocolHandler, Router}};
+use lmk_membership::{Frontier, InvalidProof, Refused, client::ServeClient, service::{CONNECTION_STREAMS, Policy, Service}, store::Store};
+use lmk_proto::{Bytes, frame::{self, ALPN, Open, Stream}, head::{self, Head}, membership::{self, Latest, Page, Reply, Request, Subscribed}};
+use tokio::{io::AsyncWriteExt, sync::oneshot, time::timeout};
 
-struct Net {
-    _server: Server,
-    config: RelayConfig,
-    cert: CertificateDer<'static>,
-    dir: PathBuf,
+struct TestService {
+    path: PathBuf,
+    service: Router,
+    client: ServeClient,
+    endpoint: Endpoint,
+    key: [u8; 32],
 }
 
-impl Drop for Net {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+impl TestService {
+    async fn new(policy: Policy) -> Self {
+        let path = std::env::temp_dir().join(format!("lmk-service-{}", hex::encode(lmk_proto::random::random::<16>())));
+        let store = Store::initialize(&path).unwrap();
+        let secret = SecretKey::from_bytes(&store.key().to_bytes());
+        let key = *secret.public().as_bytes();
+        let server = endpoint(Some(secret)).await;
+        let service = Router::builder(server).accept(ALPN, Service::new(store, policy)).spawn();
+        let endpoint = endpoint(None).await;
+        let client = ServeClient::new(endpoint.clone(), &key, "", &service.endpoint().bound_sockets().iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap();
+        Self { path, service, client, endpoint, key }
+    }
+
+    fn empty(&self, c: &[u8; 32]) -> Frontier { Frontier::empty(self.key, head::reference(&self.key, c)) }
+
+    async fn close(self) {
+        drop(self.client);
+        self.endpoint.close().await;
+        self.service.shutdown().await.unwrap();
+        std::fs::remove_dir_all(self.path).unwrap();
     }
 }
 
-async fn net(name: &str) -> Net {
-    let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let cert = ck.cert.der().clone();
-    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()));
-    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.clone()], key)
-        .unwrap();
-    let mut relay = RelayServerConfig::new((Ipv4Addr::LOCALHOST, 0));
-    relay.tls = Some(TlsConfig::new(
-        (Ipv4Addr::LOCALHOST, 0),
-        CertConfig::Manual {
-            server_config: tls.clone(),
-        },
-    ));
-    let mut quic = QuicConfig::new((Ipv6Addr::UNSPECIFIED, 0));
-    quic.server_config = Some(tls);
-    let mut config = ServerConfig::default();
-    config.relay = Some(relay);
-    config.quic = Some(quic);
-    let server = Server::spawn(config).await.unwrap();
-    let url = format!("https://localhost:{}", server.https_addr().unwrap().port())
-        .parse()
-        .unwrap();
-    let config = RelayConfig::new(url, Some(RelayQuicConfig::new(server.quic_addr().unwrap().port())));
-    let dir = std::env::temp_dir().join(format!("lmk-membership-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    Net {
-        _server: server,
-        config,
-        cert,
-        dir,
-    }
+async fn endpoint(secret: Option<SecretKey>) -> Endpoint {
+    let mut builder = Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled).clear_ip_transports().bind_addr((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    if let Some(secret) = secret { builder = builder.secret_key(secret); }
+    builder.bind().await.unwrap()
 }
 
-impl Net {
-    fn builder(&self) -> Builder {
-        Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Custom(RelayMap::from_iter([self.config.clone()])))
-            .ca_tls_config(CaTlsConfig::custom_roots([self.cert.clone()]))
-    }
-
-    async fn service(&self, secret: &SecretKey, signer: SigningKey, db: &str, policy: Policy) -> Router {
-        let store = Store::open(&self.dir.join(db), signer).unwrap();
-        let endpoint = self.builder().secret_key(secret.clone()).bind().await.unwrap();
-        let router = Router::builder(endpoint)
-            .accept(ALPN, Service::new(store, policy))
-            .spawn();
-        tokio::time::timeout(Duration::from_secs(10), router.endpoint().online())
-            .await
-            .unwrap();
-        router
-    }
-
-    /// A client that reaches the service only through the relay.
-    async fn client(&self, service: &SecretKey) -> ServeClient {
-        let endpoint = self.builder().clear_ip_transports().bind().await.unwrap();
-        let relay = self.config.url.to_string();
-        ServeClient::new(endpoint, service.public().as_bytes(), &relay, &[]).unwrap()
-    }
+#[tokio::test]
+async fn complete_gap_pages_capabilities_and_public_directories() {
+    timeout(Duration::from_secs(15), async {
+        let net = TestService::new(Policy::default()).await;
+        let c = [7; 32];
+        let empty = net.empty(&c);
+        let first = net.client.append(&c, &[b"one".to_vec()], false).await.unwrap();
+        assert_eq!(first.head.log_ref, *empty.log_ref());
+        assert!(empty.head().is_none(), "append reply is not an installed anchor");
+        let one = net.client.read(&c, &empty).await.unwrap();
+        let anchor = one.frontier().clone();
+        net.client.append(&c, &[b"two".to_vec(), b"three".to_vec()], false).await.unwrap();
+        let mut subscription = net.client.subscribe(vec![(c, anchor)]).await.unwrap();
+        let page = subscription.next().await.unwrap().unwrap();
+        assert_eq!((page.page().after, page.page().head.length), (1, 3));
+        assert_eq!(page.page().entries, [Bytes(b"two".to_vec()), Bytes(b"three".to_vec())]);
+        assert_eq!(page.frontier().length(), 3);
+        subscription.cancel().await;
+        let d = *empty.log_ref();
+        assert_eq!(net.client.head(&d).await.unwrap().length, 0, "D as a capability hashes again");
+        assert_ne!(net.client.head(&d).await.unwrap().log_ref, d);
+        assert!(net.client.read(&d, &net.empty(&d)).await.unwrap().page().entries.is_empty());
+        net.client.append(&d, &[vec![9]], false).await.unwrap();
+        assert_eq!(net.client.head(&d).await.unwrap().length, 1);
+        assert_eq!(net.client.head(&c).await.unwrap().length, 3);
+        assert!(net.client.read(&d, &empty).await.is_err());
+        let public = lmk_proto::public::address(&[8; 32]);
+        let hint = net.client.append(&public, &[vec![2]], true).await.unwrap();
+        assert_eq!(hint.head.log_ref, head::reference(&net.key, &public));
+        assert_eq!(net.client.read(&public, &net.empty(&public)).await.unwrap().page().entries, [Bytes(vec![2])]);
+        net.close().await;
+    }).await.unwrap();
 }
 
-fn signer(secret: &SecretKey) -> SigningKey {
-    SigningKey::from_bytes(&secret.to_bytes())
+#[tokio::test]
+async fn legal_maximum_envelopes_fit_with_base64_and_json_framing() {
+    timeout(Duration::from_secs(15), async {
+        let net = TestService::new(Policy::default()).await;
+        let c = [7; 32];
+        let appended = net.client.append(&c, &vec![vec![42; membership::MAX_ENTRY]; 2], false).await.unwrap();
+        let page = net.client.read(&c, &net.empty(&c)).await.unwrap();
+        assert_eq!(page.page().entries.len(), 2);
+        assert_eq!(page.page().entries[0].0.len(), membership::MAX_ENTRY);
+        assert_eq!(page.page().entries[1].0.len(), membership::MAX_ENTRY);
+        assert_eq!(page.page().head.hash, appended.head.hash);
+        net.close().await;
+    }).await.unwrap();
 }
 
-fn entries(page: &[Bytes]) -> Vec<&[u8]> {
-    page.iter().map(|e| e.0.as_slice()).collect()
-}
-
-async fn read_all(client: &ServeClient, log: &[u8]) -> Vec<Vec<u8>> {
-    let mut all = Vec::new();
-    loop {
-        let page = client.read(log, all.len() as u64).await.unwrap();
-        if page.entries.is_empty() {
-            return all;
+#[tokio::test]
+async fn racing_appends_are_hints_until_coverage_is_read() {
+    timeout(Duration::from_secs(15), async {
+        let net = TestService::new(Policy::default()).await;
+        let c = [7; 32];
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..4u8 {
+            let client = net.client.clone();
+            tasks.spawn(async move { (client.append(&c, &[vec![i]], false).await.unwrap(), i) });
         }
-        all.extend(page.entries.into_iter().map(|e| e.0));
-    }
+        let mut positions = Vec::new();
+        while let Some(result) = tasks.join_next().await { positions.push(result.unwrap()); }
+        positions.sort_by_key(|(a, _)| a.position);
+        assert_eq!(positions.iter().map(|(a, _)| a.position).collect::<Vec<_>>(), [1, 2, 3, 4]);
+        let empty = net.empty(&c);
+        let page = net.client.read(&c, &empty).await.unwrap();
+        assert_eq!(page.page().entries, positions.iter().map(|(_, i)| Bytes(vec![*i])).collect::<Vec<_>>());
+        assert_eq!(page.frontier().length(), 4);
+        assert!(empty.head().is_none());
+        net.close().await;
+    }).await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn append_read_subscribe() {
-    let net = net("basic").await;
-    let secret = SecretKey::generate();
-    let _service = net
-        .service(&secret, signer(&secret), "store.db", Policy::default())
-        .await;
-    let (alice, bob) = (net.client(&secret).await, net.client(&secret).await);
-
-    let mut notices = alice.subscribe(vec![Bytes(b"g".to_vec())]).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(bob.append(b"g", &[b"one".to_vec()], false).await.unwrap().position, 1);
-    let behind = net.client(&secret).await;
-    assert_eq!(behind.read(b"g", 0).await.unwrap().entries.len(), 1);
-    assert_eq!(bob.append(b"g", &[b"two".to_vec()], false).await.unwrap().position, 2);
-    for (position, entry) in [(1, b"one"), (2, b"two")] {
-        let notice = notices.next().await.unwrap().unwrap();
-        assert_eq!(
-            (notice.position, notice.entry.0.as_slice()),
-            (position, entry.as_slice())
-        );
-    }
-    let page = alice.read(b"g", 0).await.unwrap();
-    assert_eq!(
-        (entries(&page.entries), page.head.length),
-        (vec![b"one".as_slice(), b"two"], 2)
-    );
-    assert_eq!(alice.read(b"g", 1).await.unwrap().entries.len(), 1);
-    assert_eq!(alice.head(b"g").await.unwrap().length, 2);
-    assert_eq!(alice.head(b"empty").await.unwrap().length, 0);
-
-    // A subscriber whose chain stops at 1 gets 2 as well when 3 arrives.
-    let mut catching_up = behind.subscribe(vec![Bytes(b"g".to_vec())]).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    bob.append(b"g", &[b"three".to_vec()], false).await.unwrap();
-    for (position, entry) in [(2, b"two".as_slice()), (3, b"three")] {
-        let notice = catching_up.next().await.unwrap().unwrap();
-        assert_eq!((notice.position, notice.entry.0.as_slice()), (position, entry));
-    }
-    assert_eq!(behind.chain(b"g").unwrap().length(), 3);
-    assert_eq!(read_all(&bob, b"g").await.len(), 3);
-
-    // A batch comes as one notice per entry, each with its own head; another log's appends wake no one here.
-    bob.append(b"other", &[b"elsewhere".to_vec()], false).await.unwrap();
-    bob.append(b"g", &[b"four".to_vec(), b"five".to_vec()], false).await.unwrap();
-    for (position, entry) in [(3, b"three".as_slice()), (4, b"four".as_slice()), (5, b"five")] {
-        let notice = notices.next().await.unwrap().unwrap();
-        assert_eq!((notice.position, notice.entry.0.as_slice(), notice.head.length), (position, entry, position));
-    }
+#[tokio::test]
+async fn rate_and_stream_limits_preserve_other_connections() {
+    timeout(Duration::from_secs(15), async {
+        let net = TestService::new(Policy { appends_per_minute: 1, ..Policy::default() }).await;
+        let c = [7; 32];
+        net.client.append(&c, &[vec![1]], false).await.unwrap();
+        assert_eq!(net.client.append(&c, &[vec![2]], false).await.unwrap_err().downcast::<Refused>().unwrap().0, "rate");
+        assert_eq!(net.client.append(&c, &[], false).await.unwrap_err().downcast::<Refused>().unwrap().0, "size");
+        let anchor = net.client.read(&c, &net.empty(&c)).await.unwrap().frontier().clone();
+        let mut subscriptions = Vec::new();
+        for _ in 0..CONNECTION_STREAMS { subscriptions.push(net.client.subscribe(vec![(c, anchor.clone())]).await.unwrap()); }
+        assert!(net.client.head(&c).await.is_err(), "ninth stream must be reset, not queued indefinitely");
+        let other_endpoint = endpoint(None).await;
+        let other = ServeClient::new(other_endpoint.clone(), &net.key, "", &net.service.endpoint().bound_sockets().iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap();
+        assert_eq!(other.head(&c).await.unwrap().length, 1);
+        for subscription in subscriptions { subscription.cancel().await; }
+        other_endpoint.close().await;
+        drop(other);
+        net.close().await;
+    }).await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn racing_appends_get_one_order() {
-    let net = net("race").await;
-    let secret = SecretKey::generate();
-    let policy = Policy {
-        appends_per_minute: 1000,
-        ..Policy::default()
-    };
-    let _service = net.service(&secret, signer(&secret), "store.db", policy).await;
-    let clients = [net.client(&secret).await, net.client(&secret).await];
-    let tasks = clients.iter().enumerate().map(|(c, client)| {
-        let client = client.clone();
-        tokio::spawn(async move {
-            let mut positions = Vec::new();
-            for i in 0..20 {
-                let entry = format!("{c}-{i}");
-                positions.push((client.append(b"g", &[entry.as_bytes().to_vec()], false).await.unwrap().position, entry));
+#[tokio::test]
+async fn full_subscription_capacity_leaves_short_request_slots_available() {
+    timeout(Duration::from_secs(15), async {
+        let net = TestService::new(Policy::default()).await;
+        let c = [7; 32];
+        let mut endpoints = Vec::new();
+        let mut subscriptions = Vec::new();
+        for _ in 0..lmk_membership::service::MAX_SUBSCRIBERS / CONNECTION_STREAMS {
+            let endpoint = endpoint(None).await;
+            let connection = endpoint.connect(net.service.endpoint().addr(), ALPN).await.unwrap();
+            for _ in 0..CONNECTION_STREAMS {
+                let (mut send, mut recv) = connection.open_bi().await.unwrap();
+                frame::write(&mut send, &Open { stream: Stream::Membership }).await.unwrap();
+                frame::write(&mut send, &Request::Subscribe { capabilities: vec![c] }).await.unwrap();
+                assert!(matches!(membership::read_frame::<Reply<Subscribed>, _>(&mut recv).await.unwrap(), Reply::Ok(_)));
+                let Reply::Ok(initial) = membership::read_frame::<Reply<Latest>, _>(&mut recv).await.unwrap() else { panic!("initial head refused") };
+                net.empty(&c).check(&initial.head, None).unwrap();
+                subscriptions.push((send, recv));
             }
-            positions
-        })
-    });
-    let mut positions: Vec<(u64, String)> = Vec::new();
-    for task in tasks.collect::<Vec<_>>() {
-        positions.extend(task.await.unwrap());
-    }
-    positions.sort();
-    assert_eq!(
-        positions.iter().map(|p| p.0).collect::<Vec<_>>(),
-        (1..=40).collect::<Vec<_>>()
-    );
-    let order: Vec<Vec<u8>> = positions.into_iter().map(|p| p.1.into_bytes()).collect();
-    for client in &clients {
-        assert_eq!(read_all(client, b"g").await, order);
-    }
-    assert_eq!(
-        clients[0].chain(b"g").unwrap().hashes,
-        clients[1].chain(b"g").unwrap().hashes
-    );
+            endpoints.push(endpoint);
+        }
+        assert_eq!(net.client.head(&c).await.unwrap().length, 0);
+        let error = net.client.subscribe(vec![(c, net.empty(&c))]).await.err().unwrap();
+        assert_eq!(error.downcast::<Refused>().unwrap().0, "busy");
+        drop(subscriptions);
+        for endpoint in endpoints { endpoint.close().await; }
+        net.close().await;
+    }).await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn refusals() {
-    let net = net("refusals").await;
-    let secret = SecretKey::generate();
-    let policy = Policy {
-        max_entry: 10,
-        appends_per_minute: 1,
-        ..Policy::default()
-    };
-    let _service = net.service(&secret, signer(&secret), "store.db", policy).await;
-    let client = net.client(&secret).await;
-    let refused = |r: anyhow::Result<_>| r.unwrap_err().downcast::<Refused>().unwrap().0;
-    assert_eq!(refused(client.append(b"g", &[b"x".to_vec(), vec![0; 11]], false).await), "size");
-    assert_eq!(refused(client.append(&[0; 65], &[b"x".to_vec()], false).await), "policy");
-    assert_eq!(refused(client.append(b"g", &[], false).await), "policy");
-    // Several entries count as one append.
-    let appended = client.append(b"g", &[b"x".to_vec(), b"y".to_vec(), b"z".to_vec()], false).await.unwrap();
-    assert_eq!((appended.position, appended.head.length), (1, 3));
-    assert_eq!(refused(client.append(b"g", &[b"w".to_vec()], false).await), "rate");
-
-    // A request of a newer letmeknow.
-    let endpoint = net.builder().clear_ip_transports().bind().await.unwrap();
-    let addr = EndpointAddr::new(secret.public()).with_relay_url(net.config.url.clone());
-    let (mut send, mut recv) = endpoint.connect(addr, ALPN).await.unwrap().open_bi().await.unwrap();
-    frame::write(&mut send, &Open { stream: Stream::Membership }).await.unwrap();
-    frame::write(&mut send, &serde_json::json!({"compact": {"log": "Zw"}})).await.unwrap();
-    let answer: Answer<()> = frame::read(&mut recv).await.unwrap();
-    assert_eq!(answer, Answer::Refused { refused: "unknown request".into() });
+#[derive(Debug)]
+struct Probe {
+    key: ed25519_dalek::SigningKey,
+    capability: [u8; 32],
+    tamper: bool,
+    gap: bool,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    read_stopped: Mutex<Option<oneshot::Sender<()>>>,
+    subscription_stopped: Mutex<Option<oneshot::Sender<()>>>,
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn forged_and_contradicting_heads() {
-    let net = net("heads").await;
-    let secret = SecretKey::generate();
+impl ProtocolHandler for Probe {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let mut tasks = tokio::task::JoinSet::new();
+        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+            let _: Open = membership::read_frame(&mut recv).await.unwrap();
+            let request: Request = membership::read_frame(&mut recv).await.unwrap();
+            let d = head::reference(self.key.verifying_key().as_bytes(), &self.capability);
+            let h0 = head::start(self.key.verifying_key().as_bytes(), &d);
+            let head = if self.gap { Head::sign(&self.key, &d, 2, head::next(&head::next(&h0, b"one"), b"two"), 0) }
+                else { Head::sign(&self.key, &d, 0, h0, 0) };
+            match request {
+                Request::Subscribe { .. } => {
+                    let stopped = self.subscription_stopped.lock().unwrap().take().unwrap();
+                    tasks.spawn(async move {
+                        frame::write(&mut send, &Reply::Ok(Subscribed {})).await.unwrap();
+                        frame::write(&mut send, &Reply::Ok(Latest { head })).await.unwrap();
+                        let _ = recv.read_to_end(1).await;
+                        stopped.send(()).unwrap();
+                    });
+                }
+                Request::Read { .. } => {
+                    if self.tamper {
+                        frame::write(&mut send, &Reply::Ok(Page { after: 0, entries: vec![Bytes(b"one".to_vec()), Bytes(b"BAD".to_vec())], head })).await.unwrap();
+                        send.shutdown().await.unwrap();
+                    } else {
+                        self.entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                        let stopped = self.read_stopped.lock().unwrap().take().unwrap();
+                        tasks.spawn(async move {
+                            send.stopped().await.unwrap();
+                            stopped.send(()).unwrap();
+                        });
+                    }
+                }
+                _ => panic!("unexpected request"),
+            }
+        }
+        Ok(())
+    }
+}
 
-    // A service whose heads are not signed by its key.
-    let impostor = net
-        .service(
-            &secret,
-            SigningKey::from_bytes(&[9; 32]),
-            "impostor.db",
-            Policy::default(),
-        )
-        .await;
-    let client = net.client(&secret).await;
-    assert!(client.head(b"g").await.unwrap_err().is::<Forged>());
-    impostor.shutdown().await.unwrap();
+#[tokio::test]
+async fn cancellation_owns_idle_and_gap_read_streams() {
+    timeout(Duration::from_secs(15), async {
+        for gap in [false, true] {
+            let secret = SecretKey::generate();
+            let key = ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes());
+            let s = key.verifying_key().to_bytes();
+            let c = [7; 32];
+            let (entered, read_entered) = oneshot::channel();
+            let (read_stopped, stopped_read) = oneshot::channel();
+            let (subscription_stopped, stopped_subscription) = oneshot::channel();
+            let probe = Probe { key, capability: c, tamper: false, gap, entered: Mutex::new(Some(entered)), read_stopped: Mutex::new(Some(read_stopped)), subscription_stopped: Mutex::new(Some(subscription_stopped)) };
+            let router = Router::builder(endpoint(Some(secret)).await).accept(ALPN, probe).spawn();
+            let endpoint = endpoint(None).await;
+            let client = ServeClient::new(endpoint.clone(), &s, "", &router.endpoint().bound_sockets().iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap();
+            let subscription = client.subscribe(vec![(c, Frontier::empty(s, head::reference(&s, &c)))]).await.unwrap();
+            if gap {
+                read_entered.await.unwrap();
+                subscription.cancel().await;
+                stopped_read.await.unwrap();
+            } else { drop(subscription); }
+            stopped_subscription.await.unwrap();
+            endpoint.close().await;
+            router.shutdown().await.unwrap();
+        }
+    }).await.unwrap();
+}
 
-    // The service shows the client one log, then, after losing its database, another.
-    let honest = net.service(&secret, signer(&secret), "one.db", Policy::default()).await;
-    let client = net.client(&secret).await;
-    client.append(b"g", &[b"a".to_vec()], false).await.unwrap();
-    client.append(b"g", &[b"b".to_vec()], false).await.unwrap();
-    let ours = client.chain(b"g").unwrap().head;
-    honest.shutdown().await.unwrap();
+#[tokio::test]
+async fn tampered_gap_page_never_delivers_a_prefix_or_contradiction() {
+    timeout(Duration::from_secs(15), async {
+        let secret = SecretKey::generate();
+        let key = ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes());
+        let s = key.verifying_key().to_bytes();
+        let c = [7; 32];
+        let (stopped, ended) = oneshot::channel();
+        let probe = Probe { key, capability: c, tamper: true, gap: true, entered: Mutex::new(None), read_stopped: Mutex::new(None), subscription_stopped: Mutex::new(Some(stopped)) };
+        let router = Router::builder(endpoint(Some(secret)).await).accept(ALPN, probe).spawn();
+        let endpoint = endpoint(None).await;
+        let client = ServeClient::new(endpoint.clone(), &s, "", &router.endpoint().bound_sockets().iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap();
+        let empty = Frontier::empty(s, head::reference(&s, &c));
+        let mut sub = client.subscribe(vec![(c, empty.clone())]).await.unwrap();
+        let first = sub.next().await.unwrap().unwrap_err();
+        assert!(first.is::<InvalidProof>());
+        assert!(sub.next().await.is_none());
+        assert!(empty.head().is_none());
+        ended.await.unwrap();
+        endpoint.close().await;
+        router.shutdown().await.unwrap();
+    }).await.unwrap();
+}
 
-    let split = net.service(&secret, signer(&secret), "two.db", Policy::default()).await;
-    let other = net.client(&secret).await;
-    other.append(b"g", &[b"x".to_vec()], false).await.unwrap();
-    other.append(b"g", &[b"y".to_vec()], false).await.unwrap();
-    let err = client
-        .head(b"g")
-        .await
-        .unwrap_err()
-        .downcast::<Contradiction>()
-        .unwrap();
-    assert_eq!((err.ours, err.theirs.length), (ours, 2));
-    assert!(client.read(b"g", 1).await.unwrap_err().is::<Contradiction>());
-    split.shutdown().await.unwrap();
+#[derive(Debug)]
+struct PrivateClose;
+
+impl ProtocolHandler for PrivateClose {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+        let _: Open = membership::read_frame(&mut recv).await.unwrap();
+        let _: Request = membership::read_frame(&mut recv).await.unwrap();
+        connection.close(1u32.into(), b"raw capability, entry and credential");
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn transport_errors_cannot_echo_private_close_reasons() {
+    timeout(Duration::from_secs(15), async {
+        let router = Router::builder(endpoint(None).await).accept(ALPN, PrivateClose).spawn();
+        let endpoint = endpoint(None).await;
+        let client = ServeClient::new(endpoint.clone(), router.endpoint().id().as_bytes(), "", &router.endpoint().bound_sockets().iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap();
+        let error = client.append(&[7; 32], &[b"opaque".to_vec()], false).await.unwrap_err();
+        assert_eq!(format!("{error:#}"), "membership transport interrupted");
+        endpoint.close().await;
+        router.shutdown().await.unwrap();
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_frame_is_rejected_before_reading_body() {
+    timeout(Duration::from_secs(15), async {
+        let net = TestService::new(Policy::default()).await;
+        let connection = net.endpoint.connect(net.service.endpoint().addr(), ALPN).await.unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        frame::write(&mut send, &Open { stream: Stream::Membership }).await.unwrap();
+        send.write_all(&((membership::MAX_BODY + 1) as u32).to_be_bytes()).await.unwrap();
+        assert!(matches!(membership::read_frame::<Reply<()>, _>(&mut recv).await.unwrap(), Reply::Refused(membership::Refusal::Policy)));
+        net.close().await;
+    }).await.unwrap();
 }

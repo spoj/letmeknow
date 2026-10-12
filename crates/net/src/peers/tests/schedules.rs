@@ -92,7 +92,7 @@ impl Net {
         let held = commits.union(&me.held.iter().copied().filter(|&p| p <= me.head).collect());
         let gone: Ranges = me.lost.union(&me.expired).copied().collect();
         let lacking = positions().collect::<Ranges>().difference(&held).difference(&gone);
-        Own { head: head(G, me.head), held, read: Ranges::default(), lacking, public: vec![] }
+        Own { held, ..own(G, me.head, Ranges::default(), lacking) }
     }
 
     fn connect(&mut self, a: usize, b: usize) {
@@ -152,7 +152,7 @@ impl Net {
             }
             Frame::Want { positions, .. } => {
                 let (held, size) = (me.held.clone(), self.size);
-                let reply = answer(id(G), positions, &self.own(to).held, |p| held.contains(&p).then(|| vec![p as u8; size]));
+                let reply = answer(id(G), Anchor::genesis(&[G; 16], [0; 32], [G; 32]), positions, &self.own(to).held, |p| held.contains(&p).then(|| vec![p as u8; size]));
                 self.send(to, from, reply);
             }
             _ => {}
@@ -246,7 +246,7 @@ fn random_schedules_converge_without_livelock_or_duplicate_asks_and_the_wait_hol
                     net.members[m].head = p;
                     let to: Vec<usize> = (0..n).filter(|&o| o != m && net.links.contains(&(m.min(o), m.max(o)))).collect();
                     for o in to {
-                        let push = Frame::Messages { group: id(G), items: vec![Item { position: p, ciphertext: Bytes(vec![1]) }], answers: None };
+                        let push = Frame::Messages { group: id(G), anchor: Anchor::genesis(&[G; 16], [0; 32], [G; 32]), items: vec![Item { position: p, ciphertext: Bytes(vec![1]) }], answers: None };
                         net.send(m, o, push);
                     }
                 }

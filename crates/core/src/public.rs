@@ -17,7 +17,7 @@ fn envelope(seed: &[u8; 32], body: &Body) -> Envelope {
 }
 
 /// A public log as replayed from its log.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PublicLog {
     pub id: [u8; 32],
     pub name: String,
@@ -89,7 +89,7 @@ impl PublicLog {
     }
 
     /// The log its first entry starts, which hashes to the id and is signed by a writer it lists.
-    fn created(id: &[u8; 32], sealed: &[u8]) -> Option<Self> {
+    pub fn created(id: &[u8; 32], sealed: &[u8]) -> Option<Self> {
         let entry = open(id, sealed).ok()?;
         let first: Body = serde_json::from_slice(&entry.body.0).ok()?;
         let body = signed_body(&entry, &first.writers)?;

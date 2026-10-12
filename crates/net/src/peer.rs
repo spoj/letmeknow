@@ -13,7 +13,14 @@ use iroh::{
 };
 use lmk_proto::{Bytes, frame, peer::Frame};
 use n0_future::task::spawn;
-use tokio::sync::{mpsc, oneshot};
+use tokio::{io::AsyncReadExt, sync::{mpsc, oneshot}};
+use crate::budget::{MAX_BODY, Packet, Permit};
+
+#[derive(Debug)]
+pub struct Receipt {
+    _body: Permit,
+    _decoded: Permit,
+}
 
 use crate::{Event, Inner};
 
@@ -21,9 +28,9 @@ use crate::{Event, Inner};
 type HaveReply = Option<oneshot::Sender<Vec<[u8; 32]>>>;
 
 pub(crate) enum Input {
-    Frame(Frame),
+    Frame(Frame, Receipt),
     Closed,
-    Send(Frame),
+    Send(Packet),
     Want { group: Bytes, files: Vec<[u8; 32]>, reply: HaveReply },
 }
 
@@ -46,29 +53,53 @@ pub(crate) async fn run(
 ) {
     let peer = conn.remote_id();
     inner.events.send(Event::Connected(peer)).ok();
+    let reading = inner.clone();
     spawn(async move {
-        while let Ok(frame) = frame::read_known(&mut recv).await {
-            if input.send(Input::Frame(frame)).is_err() {
-                return;
+        let read = async {
+            loop {
+                let length = recv.read_u32().await? as usize;
+                anyhow::ensure!(length <= MAX_BODY, "peer frame too large");
+                let body_slot = reading.bodies.clone().acquire_many_owned((length + 65_536) as u32).await?;
+                let mut body_permit = reading.incoming.acquire(peer, length + 65_536).await;
+                let body = async {
+                    let mut body = vec![0; length];
+                    recv.read_exact(&mut body).await?;
+                    let decoded = reading.incoming.acquire(peer, length * 3).await;
+                    let frame = serde_json::from_slice::<Frame>(&body);
+                    drop(body);
+                    anyhow::Ok((frame, decoded))
+                };
+                let (frame, decoded) = n0_future::time::timeout(std::time::Duration::from_secs(10 + length as u64 / 32_768), body).await??;
+                body_permit.release(length);
+                drop(body_slot);
+                if let Ok(frame) = frame {
+                    input.send(Input::Frame(frame, Receipt { _body: body_permit, _decoded: decoded })).map_err(|_| anyhow::anyhow!("peer closed"))?;
+                }
             }
-        }
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        }.await;
+        if let Err(error) = read { tracing::debug!("reading peer: {error:#}"); }
         input.send(Input::Closed).ok();
     });
     let mut session = Session { inner, peer, send, wants: HashMap::new() };
     let result = async {
         while let Some(input) = rx.recv().await {
             match input {
-                Input::Frame(frame) => session.frame(frame).await?,
+                Input::Frame(frame, receipt) => session.frame(frame, receipt).await?,
                 Input::Closed => break,
-                Input::Send(frame) => {
+                Input::Send(Packet { frame, permit }) => {
                     if let Some(frame) = session.inner.groups.admit(&session.peer, frame) {
-                        frame::write(&mut session.send, &frame).await?;
+                        n0_future::time::timeout(std::time::Duration::from_secs(75), frame::write(&mut session.send, &frame)).await??;
                     }
+                    drop(permit);
                 }
                 Input::Want { group, files, reply } => {
                     session.wants.entry(group.clone()).or_default().push_back(reply);
                     let files = files.into_iter().map(Bytes::from).collect();
-                    frame::write(&mut session.send, &Frame::WantFiles { group, files }).await?;
+                    if let Some(frame) = session.inner.groups.admit(&session.peer, Frame::WantFiles { group, files }) {
+                        frame::write(&mut session.send, &frame).await?;
+                    }
                 }
             }
         }
@@ -82,7 +113,7 @@ pub(crate) async fn run(
 }
 
 impl Session {
-    async fn frame(&mut self, frame: Frame) -> Result<()> {
+    async fn frame(&mut self, frame: Frame, receipt: Receipt) -> Result<()> {
         match frame {
             Frame::WantFiles { group, files } => {
                 let mut have = Vec::new();
@@ -95,11 +126,13 @@ impl Session {
                         }
                     }
                 }
-                frame::write(&mut self.send, &Frame::Have { group, files: have }).await?;
+                if let Some(frame) = self.inner.groups.admit(&self.peer, Frame::Have { group, files: have }) {
+                    frame::write(&mut self.send, &frame).await?;
+                }
             }
             Frame::Have { group, files } => self.on_have(group, files),
             frame => {
-                self.inner.events.send(Event::Frame(self.peer, frame)).ok();
+                self.inner.events.send(Event::Frame(self.peer, frame, receipt)).ok();
             }
         }
         Ok(())
@@ -107,6 +140,7 @@ impl Session {
 
     fn on_have(&mut self, group: Bytes, files: Vec<Bytes>) {
         let Some(reply) = self.wants.get_mut(&group).and_then(VecDeque::pop_front) else { return };
+        if !self.inner.groups.is_member(&group.0, &self.peer) { return; }
         let hashes: Vec<[u8; 32]> = files.iter().filter_map(|f| f.0[..].try_into().ok()).collect();
         match reply {
             Some(reply) => {

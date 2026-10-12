@@ -15,7 +15,7 @@ use lmk_proto::{
 const G: &[u8] = b"group";
 
 fn want(n: u64) -> Frame {
-    Frame::Want { group: Bytes(G.to_vec()), positions: Ranges::range(n, n) }
+    Frame::Want { group: Bytes(G.to_vec()), anchor: lmk_proto::epoch::Anchor::genesis(&[1; 16], [0; 32], [1; 32]), positions: Ranges::range(n, n) }
 }
 
 /// Each side of a new connection is told of it, then of the frames on its `peer` stream in order; frames of either
@@ -28,18 +28,18 @@ async fn frames_go_both_ways_in_order() {
     let mut a = node(&relay, keys[0].clone(), Fake::new(), Options::default()).await;
     let mut b = node(&relay, keys[1].clone(), Fake::new(), Options { relay_only: true, ..Options::default() }).await;
     a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    assert_eq!(a.until(|e| matches!(e, Event::Connected(_))).await, Event::Connected(members[1]));
-    assert_eq!(b.until(|e| matches!(e, Event::Connected(_))).await, Event::Connected(members[0]));
+    assert!(matches!(a.until(|e| matches!(e, Event::Connected(_))).await, Event::Connected(peer) if peer == members[1]));
+    assert!(matches!(b.until(|e| matches!(e, Event::Connected(_))).await, Event::Connected(peer) if peer == members[0]));
     for n in 1..=3 {
         assert!(a.net.frame(members[1], want(n)));
     }
     for n in 1..=3 {
-        assert_eq!(b.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(members[0], want(n)));
+        assert!(matches!(b.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(peer, frame, _) if peer == members[0] && frame == want(n)));
     }
     assert!(b.net.frame(members[0], want(4)));
-    assert_eq!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(members[1], want(4)));
+    assert!(matches!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(peer, frame, _) if peer == members[1] && frame == want(4)));
     b.net.shutdown().await.unwrap();
-    a.until(|e| *e == Event::Disconnected(members[1])).await;
+    a.until(|e| matches!(e, Event::Disconnected(peer) if *peer == members[1])).await;
     assert!(!a.net.frame(members[1], want(5)), "no frame goes to a peer not connected");
     a.net.shutdown().await.unwrap();
 }
@@ -59,8 +59,8 @@ async fn an_unknown_frame_is_skipped() {
     frame::write(&mut send, &serde_json::json!({"newer": {"group": "Zw"}})).await.unwrap();
     frame::write(&mut send, &want(2)).await.unwrap();
     let from = keys[1].public();
-    assert_eq!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(from, want(1)));
-    assert_eq!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(from, want(2)));
+    assert!(matches!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(peer, frame, _) if peer == from && frame == want(1)));
+    assert!(matches!(a.until(|e| matches!(e, Event::Frame(..))).await, Event::Frame(peer, frame, _) if peer == from && frame == want(2)));
     a.net.shutdown().await.unwrap();
 }
 
@@ -120,7 +120,7 @@ async fn small_files_are_fetched_when_wanted() {
     b.fake.groups.lock().unwrap().get_mut(G).unwrap().files.push(link.clone());
     b.net.dial(members[0], relay.url.clone()).await.unwrap();
     b.net.want_files(members[0], G);
-    b.until(|e| *e == Event::Fetched(link.hash)).await;
+    b.until(|e| matches!(e, Event::Fetched(hash) if *hash == link.hash)).await;
     let mut out = Vec::new();
     b.net.read_file(&link, &mut out).await.unwrap();
     assert_eq!(out, b"attachment");
@@ -205,7 +205,7 @@ async fn disk_acknowledgements_wait_for_persistence() {
         assert_eq!(fetched.await.unwrap().is_ok(), commit);
         assert_eq!(b.net.has(link.hash).await.unwrap(), commit);
         if commit {
-            b.until(|e| *e == Event::Fetched(link.hash)).await;
+            b.until(|e| matches!(e, Event::Fetched(hash) if *hash == link.hash)).await;
             assert_eq!(a.net.holders(G, link.hash).collect::<Vec<_>>().await, vec![members[1]]);
             let mut plain = Vec::new();
             b.net.read_file(&link, &mut plain).await.unwrap();

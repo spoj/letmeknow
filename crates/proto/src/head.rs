@@ -1,41 +1,51 @@
 //! A log's hash chain, and the heads a membership service signs over it.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::Bytes;
+use crate::{Bytes, membership::fixed32};
 
 pub fn reference(service: &[u8; 32], capability: &[u8]) -> [u8; 32] {
     Sha256::new().chain_update(b"letmeknow log reference v1\0").chain_update(service).chain_update(capability).finalize().into()
 }
 
-/// h₀ of a log's chain.
-pub fn start(log: &[u8]) -> [u8; 32] {
-    Sha256::new().chain_update(b"letmeknow log v1\0").chain_update(log).finalize().into()
+pub fn start(service: &[u8; 32], log_ref: &[u8; 32]) -> [u8; 32] {
+    Sha256::new().chain_update(b"letmeknow log v2\0").chain_update(service).chain_update(log_ref).finalize().into()
 }
 
-/// hₙ from hₙ₋₁ and entryₙ.
 pub fn next(prev: &[u8; 32], entry: &[u8]) -> [u8; 32] {
-    let entry: [u8; 32] = Sha256::digest(entry).into();
-    Sha256::new().chain_update(prev).chain_update(entry).finalize().into()
+    next_digest(prev, &Sha256::digest(entry).into())
 }
 
-/// A membership service's signed statement: this log had `length` entries, ending in `hash`, at `time`.
+pub fn next_digest(prev: &[u8; 32], digest: &[u8; 32]) -> [u8; 32] {
+    Sha256::new().chain_update(prev).chain_update(digest).finalize().into()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Head {
-    pub log: Bytes,
+    #[serde(with = "fixed32")]
+    pub log_ref: [u8; 32],
     pub length: u64,
-    pub hash: Bytes,
-    /// Milliseconds since the Unix epoch.
+    #[serde(with = "fixed32")]
+    pub hash: [u8; 32],
     pub time: u64,
+    #[serde(deserialize_with = "signature")]
     pub sig: Bytes,
 }
 
-fn signed(log: &[u8], length: u64, hash: &[u8], time: u64) -> Vec<u8> {
-    let mut bytes = b"letmeknow head v1\0".to_vec();
-    bytes.extend_from_slice(&(log.len() as u16).to_be_bytes());
-    bytes.extend_from_slice(log);
+fn signature<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Bytes, D::Error> {
+    let bytes = crate::membership::decode_bytes::<D, 64>(d)?;
+    if bytes.len() != 64 {
+        return Err(serde::de::Error::custom("signature length"));
+    }
+    Ok(Bytes(bytes))
+}
+
+fn signed(service: &[u8; 32], log_ref: &[u8; 32], length: u64, hash: &[u8; 32], time: u64) -> Vec<u8> {
+    let mut bytes = b"letmeknow head v2\0".to_vec();
+    bytes.extend_from_slice(service);
+    bytes.extend_from_slice(log_ref);
     bytes.extend_from_slice(&length.to_be_bytes());
     bytes.extend_from_slice(hash);
     bytes.extend_from_slice(&time.to_be_bytes());
@@ -43,16 +53,14 @@ fn signed(log: &[u8], length: u64, hash: &[u8], time: u64) -> Vec<u8> {
 }
 
 impl Head {
-    pub fn sign(key: &SigningKey, log: &[u8], length: u64, hash: [u8; 32], time: u64) -> Self {
-        let sig = key.sign(&signed(log, length, &hash, time));
-        Head { log: log.into(), length, hash: hash.into(), time, sig: sig.to_bytes().into() }
+    pub fn sign(key: &SigningKey, log_ref: &[u8; 32], length: u64, hash: [u8; 32], time: u64) -> Self {
+        let sig = key.sign(&signed(key.verifying_key().as_bytes(), log_ref, length, &hash, time));
+        Head { log_ref: *log_ref, length, hash, time, sig: sig.to_bytes().into() }
     }
 
     pub fn verify(&self, key: &VerifyingKey) -> bool {
-        let Ok(sig) = Signature::from_slice(&self.sig.0) else {
-            return false;
-        };
-        self.hash.0.len() == 32 && key.verify(&signed(&self.log.0, self.length, &self.hash.0, self.time), &sig).is_ok()
+        let Ok(sig) = Signature::from_slice(&self.sig.0) else { return false };
+        key.verify_strict(&signed(key.as_bytes(), &self.log_ref, self.length, &self.hash, self.time), &sig).is_ok()
     }
 }
 
@@ -61,29 +69,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capability_references_bind_the_authority() {
-        let service = [7; 32];
-        let capability = [9; 32];
-        let expected: [u8; 32] = Sha256::digest([b"letmeknow log reference v1\0".as_slice(), &service, &capability].concat()).into();
-        assert_eq!(reference(&service, &capability), expected);
-        assert_ne!(reference(&[8; 32], &capability), expected);
-        assert_ne!(reference(&service, &[8; 32]), expected);
-        assert_ne!(reference(&service, &expected), expected);
-        assert_ne!(reference(&service, b"public directory"), reference(&service, b"public directory\0"));
-    }
-
-    #[test]
-    fn sign_and_verify() {
+    fn domains_and_authority_binding() {
         let key = SigningKey::from_bytes(&[7; 32]);
-        let mut hash = start(b"log");
-        for entry in [b"a".as_slice(), b"b"] {
-            hash = next(&hash, entry);
-        }
-        let head = Head::sign(&key, b"log", 2, hash, 1);
+        let s = key.verifying_key().to_bytes();
+        let c = [9; 32];
+        let d = reference(&s, &c);
+        assert_eq!(d, <[u8; 32]>::from(Sha256::digest([b"letmeknow log reference v1\0".as_slice(), &s, &c].concat())));
+        assert_ne!(reference(&s, &d), d);
+        assert_ne!(reference(&[8; 32], &c), d);
+        let h0 = start(&s, &d);
+        assert_eq!(h0, <[u8; 32]>::from(Sha256::digest([b"letmeknow log v2\0".as_slice(), &s, &d].concat())));
+        let h = next(&h0, b"opaque");
+        let head = Head::sign(&key, &d, 1, h, 42);
+        let bytes = [b"letmeknow head v2\0".as_slice(), &s, &d, &1u64.to_be_bytes(), &h, &42u64.to_be_bytes()].concat();
+        assert_eq!(head.sig.0, key.sign(&bytes).to_bytes());
         assert!(head.verify(&key.verifying_key()));
-        let forged = Head { length: 3, ..head.clone() };
-        assert!(!forged.verify(&key.verifying_key()));
-        let json = serde_json::to_string(&head).unwrap();
-        assert_eq!(serde_json::from_str::<Head>(&json).unwrap(), head);
+        assert!(!head.verify(&SigningKey::from_bytes(&[8; 32]).verifying_key()));
+        assert!(!Head { log_ref: c, ..head.clone() }.verify(&key.verifying_key()));
+        assert!(!Head { length: 2, ..head.clone() }.verify(&key.verifying_key()));
+        assert_eq!(serde_json::from_slice::<Head>(&serde_json::to_vec(&head).unwrap()).unwrap(), head);
     }
 }

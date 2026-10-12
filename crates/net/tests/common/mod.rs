@@ -130,7 +130,14 @@ impl Admit for Inviter {
     fn join(&self, _: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>> {
         Box::pin(async move {
             if join.secret.0 == SECRET {
-                Answer::Ok(Admitted { welcome: Bytes(b"invited".to_vec()), position: 1, doc: None })
+                Answer::Ok(Admitted { welcome: Bytes(b"invited".to_vec()), checkpoint: lmk_proto::epoch::Checkpoint {
+                    transition: lmk_proto::epoch::Transition {
+                        group: [1; 16], source: lmk_proto::epoch::Anchor::genesis(&[1; 16], [0; 32], [1; 32]),
+                        cut: 1, cut_hash: [0; 32], terminal_wire_digest: [0; 32], inner_entry_digest: [0; 32],
+                        successor_service: [0; 32], successor_ref: [2; 32],
+                    },
+                    package: [0; 32], added_key: [0; 32], signer: [0; 32], signature: Bytes(vec![0; 64]),
+                }, doc: None })
             } else {
                 Answer::Refused { refused: "unknown secret".into() }
             }

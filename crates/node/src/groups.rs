@@ -6,11 +6,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 use lmk_core::group::{self as core, Change, Group};
 use lmk_core::provider::Provider;
-use lmk_membership::Refused;
 use lmk_proto::Bytes;
 use lmk_proto::group::{IDENTITY, How};
 
-use crate::{Event, G, Inner, Member, State, device_key_key, kind, logs, peering, reading, rec_key, sending};
+use crate::{Event, G, Inner, Member, State, device_key_key, kind, peering, reading, rec_key, sending};
 
 const COMMIT_TRIES: u32 = 5;
 
@@ -25,40 +24,36 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let mut built: Option<(Vec<u8>, Option<Vec<u8>>)> = None;
         for _ in 0..COMMIT_TRIES {
             self.caught_up(gid).await?;
-            let (entry, service, before) = {
+            let (entry, service, before, source, capability, epoch) = {
                 let mut st = self.lock();
                 let st = &mut *st;
                 let g = st.group(gid)?;
-                let (service, before) = (g.mls.settings().membership, g.rec.position);
-                match g.mls.posted() {
-                    Some(posted) => (posted.to_vec(), service, before),
+                let (service, before, source, epoch) = (g.mls.settings().membership, g.rec.position, g.rec.active.0.clone(), g.mls.epoch());
+                let capability = st.capability(&source)?;
+                let entry = match g.mls.posted() {
+                    Some(posted) => posted.to_vec(),
                     None => {
                         let Some(change) = change(st, g)? else { return Ok(None) };
                         let g = st.groups.get_mut(gid).unwrap();
                         let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
                         let commit = g.mls.commit(&st.provider, session, change)?;
                         built = Some((commit.entry.clone(), commit.welcome));
-                        (commit.entry, service, before)
+                        commit.entry
                     }
-                }
+                };
+                (entry, service, before, source, capability, epoch)
             };
             self.durable().await?;
-            match self.clients.client(&service)?.append(gid, std::slice::from_ref(&entry), false).await {
+            match self.clients.client(&service)?.append(&capability, std::slice::from_ref(&entry), false).await {
                 Ok(_) => {}
-                Err(error) if error.is::<Refused>() => {
-                    let mut st = self.lock();
-                    let st = &mut *st;
-                    st.groups.get_mut(gid).context("left the group")?.mls.cancel(&st.provider)?;
-                    return Err(error);
-                }
                 Err(error) => tracing::debug!("appending a commit, which the log may show: {error:#}"),
             }
             self.caught_up(gid).await?;
-            let Some((ours, welcome)) = built.as_ref().filter(|(ours, _)| *ours == entry) else { continue };
+            let Some((_, welcome)) = built.as_ref().filter(|(ours, _)| *ours == entry) else { continue };
             let st = self.lock();
             for position in before + 1..=st.group(gid)?.rec.position {
-                let own = st.pos(gid, position)?.is_some_and(|pos| pos.judged == reading::Judged::Commit { own: true });
-                if own && st.provider.get(&logs::entry_key(gid, position))?.as_deref() == Some(ours.as_slice()) {
+                let own = st.pos(gid, position)?.is_some_and(|pos| pos.epoch == epoch && pos.judged == reading::Judged::Commit { own: true });
+                if own && st.log(&source)?.closed.is_some() {
                     return Ok(Some((welcome.clone(), position)));
                 }
             }
@@ -68,14 +63,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Reads the group's log, and waits until this session applied it to the head it read.
     pub(crate) async fn caught_up(&self, gid: &[u8]) -> Result<()> {
-        self.read(gid).await?;
+        if let Err(error) = self.read_group(gid).await {
+            tracing::debug!("service catch-up unavailable; using retained verified prefix: {error:#}");
+        }
         loop {
             let advanced = self.advanced.notified();
             {
                 let st = self.lock();
                 let g = st.group(gid)?;
                 ensure!(g.mls.active(), "this session was removed from the group");
-                if g.rec.position >= st.log(gid)?.logged {
+                ensure!(!st.conflicting(gid), "group has conflicting signed history");
+                if st.at_head(gid) {
                     return Ok(());
                 }
             }
@@ -87,8 +85,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     pub(crate) fn forget(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
         st.expire_to(gid, u64::MAX)?;
         let g = st.groups.remove(gid).context("this session is not in that group")?;
-        self.unfollow(gid);
-        st.drop_log(gid)?;
+        self.unfollow(&g.rec.active.0);
         for id in &g.rec.sends {
             st.provider.delete(&sending::send_key(&id.0))?;
             st.waiters.remove(&id.0);

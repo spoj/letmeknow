@@ -11,6 +11,8 @@ mod api;
 pub mod identity;
 mod duties;
 mod groups;
+mod history;
+mod archive;
 mod kind;
 mod logs;
 mod peering;
@@ -35,7 +37,6 @@ use lmk_net::peers::{self, Peers};
 use lmk_net::Net;
 use lmk_proto::group::{Certificate, Credential, How, IdentityRef, Settings};
 use lmk_proto::links::FileLink;
-use lmk_proto::peer::Frame;
 use lmk_proto::ranges::Ranges;
 use lmk_proto::Bytes;
 use n0_future::boxed::BoxFuture;
@@ -49,6 +50,8 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use lmk_core;
 pub use lmk_net::Disk;
+pub use history::ProofTemp;
+pub use archive::{Archive, Pins};
 pub use peering::Heard;
 pub use lmk_proto::clock::now;
 
@@ -68,7 +71,7 @@ const MEMBER_WAIT: Duration = Duration::from_secs(5);
 const REREAD: Duration = Duration::from_secs(5 * 60);
 /// How long after subscribing to a log it is read again, for what was appended before the subscription reached the
 /// service.
-const SUBSCRIBED: Duration = Duration::from_secs(10);
+
 /// How long a member admitting a joiner waits for the state of the group's kind.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 /// How long a session whose kind is behind waits before it asks the members online for the kind's state again, in
@@ -96,6 +99,8 @@ pub struct Config {
     /// Where committed steps are not durable yet when they commit, as in the browser: makes them so, before anything
     /// they produced leaves the node.
     pub durable: Option<Durable>,
+    pub proof_temp: Option<Arc<dyn ProofTemp>>,
+    pub archive: Option<Arc<dyn Archive>>,
 }
 
 /// Makes the steps committed so far durable. A failure stops dependent output until the node restarts.
@@ -324,6 +329,8 @@ impl Event {
 /// A group's own record, beside its MLS state and its log.
 #[derive(Default, Serialize, Deserialize)]
 struct Rec {
+    active: Bytes,
+    admissions: Vec<Bytes>,
     /// The last position of its log read and judged.
     position: u64,
     /// The position this session started after: the Add that brought it in, or 0 for the group's creator.
@@ -429,6 +436,7 @@ pub(crate) struct State<P> {
     provider: P,
     /// What the current step produced for the peers, sent once it commits.
     out: Vec<Out>,
+    outgoing: Option<Arc<lmk_net::budget::Budget>>,
     /// The current step deleted what should leave no copy: scrub once it commits.
     scrub: bool,
     /// What the current step tells the session, sent once it commits.
@@ -441,6 +449,8 @@ pub(crate) struct State<P> {
     logs: BTreeMap<Vec<u8>, logs::Log>,
     /// Public logs, by id.
     public: BTreeMap<Vec<u8>, PublicLog>,
+    replay: Option<logs::Replay>,
+    loading: HashSet<Vec<u8>>,
     /// The identities and devices this session read a public log again for, as members' certificates named devices it
     /// did not list.
     unlisted: HashSet<(Vec<u8>, Vec<u8>)>,
@@ -459,7 +469,8 @@ pub(crate) struct State<P> {
 
 /// What a step produced for the peers.
 pub(crate) enum Out {
-    Frame { peer: EndpointId, frame: Frame },
+    ArchivePins(archive::Pins),
+    Frame { peer: EndpointId, packet: lmk_net::budget::Packet },
     /// Ask the peer for the files the group links that this session lacks.
     WantFiles { peer: EndpointId, group: Vec<u8> },
     /// A send's outcome, for those waiting on it.
@@ -519,7 +530,11 @@ pub(crate) enum Work {
         gone: bool,
     },
     /// A log to read from its service.
-    Read(Vec<u8>),
+    Advance(Vec<u8>),
+    Follow(Vec<u8>),
+    Load(Vec<u8>),
+    Public(Vec<u8>),
+    PublicPage { peer: EndpointId, id: Vec<u8>, after: u64 },
     /// A group's duties to run.
     Duties(Vec<u8>),
     /// A group this session is out of, by no one's commit.
@@ -533,7 +548,6 @@ pub(crate) enum Work {
 }
 
 /// A log, and the lengths and hashes of two heads of it that contradict each other.
-type Contradicted = (Vec<u8>, [(u64, Vec<u8>); 2]);
 
 pub(crate) struct Inner<P> {
     state: Mutex<State<P>>,
@@ -555,7 +569,6 @@ pub(crate) struct Inner<P> {
     advanced: tokio::sync::Notify,
     /// Woken whenever a peer's summary is heard.
     heard: tokio::sync::Notify,
-    reading: Mutex<HashSet<Vec<u8>>>,
     /// The groups whose held sends are being appended.
     sending: Mutex<HashSet<Vec<u8>>>,
     /// The groups whose duties run, each with whether another pass is due once it ends.
@@ -563,8 +576,12 @@ pub(crate) struct Inner<P> {
     /// The groups with a timer for their next update.
     timers: Mutex<HashSet<Vec<u8>>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    /// The contradictions reported, each once.
-    contradictions: Mutex<HashSet<Contradicted>>,
+    proofs: Mutex<history::Jobs>,
+    proof_wake: tokio::sync::Notify,
+    proof_temp: Arc<dyn ProofTemp>,
+    archive: archive::Cold,
+    history_serving: tokio::sync::Semaphore,
+    archiving: Mutex<HashMap<Vec<u8>, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// One member's session. Clones share it.
@@ -742,10 +759,16 @@ impl<P: Provider> State<P> {
     }
 
     /// A new group's records, its MLS state, and its log, read after `rec.position`.
-    fn add_group(&mut self, mls: Group, mut rec: Rec) -> Result<Vec<u8>> {
+    fn add_group(&mut self, mls: Group, mut rec: Rec, checkpoint: Option<lmk_proto::epoch::Anchor>) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
-        (rec.updated, rec.shown) = (now(), rec.position);
-        self.add_log(&gid, logs::Log::new(logs::Of::Group, mls.settings().membership, rec.position))?;
+        let service = mls.settings().membership;
+        let key = logs::authority(&service)?;
+        let id = lmk_proto::head::reference(&key, &mls.capability(&self.provider)?);
+        let anchor = checkpoint.unwrap_or_else(|| lmk_proto::epoch::Anchor::genesis(gid.as_slice().try_into().unwrap(), key, id));
+        anyhow::ensure!((anchor.epoch, anchor.service, anchor.log_ref) == (mls.epoch(), key, id), "admission destination mismatch");
+        let readers = mls.members().into_iter().filter_map(|m| m.leaf.map(|leaf| leaf.key)).collect();
+        (rec.updated, rec.shown, rec.active) = (now(), rec.position, Bytes(id.to_vec()));
+        self.add_log(&id, logs::Log::new(logs::Of::Group { group: Bytes(gid.clone()), anchor }, service, id, readers))?;
         self.groups.insert(gid.clone(), G::new(mls, rec, BTreeMap::new()));
         self.save(&gid)?;
         self.save_groups()?;
@@ -800,6 +823,39 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Step { guard, inner: self }
     }
 
+    fn critical<T>(&self, st: &mut State<P>, write: impl FnOnce(&mut State<P>) -> Result<T>) -> Result<T> {
+        if let Some(error) = &*self.persistence_error.lock().unwrap() { anyhow::bail!(error.clone()); }
+        if let Err(error) = st.provider.savepoint() {
+            self.stop(st, &error);
+            return Err(error);
+        }
+        match write(st) {
+            Ok(value) => {
+                if let Err(error) = st.provider.release() {
+                    tracing::error!("releasing critical savepoint: {error:#}; stopping");
+                    std::process::abort();
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                if let Err(rollback) = st.provider.rollback_to() {
+                    tracing::error!("rolling back critical savepoint after {error:#}: {rollback:#}; stopping");
+                    std::process::abort();
+                }
+                self.stop(st, &error);
+                Err(error)
+            }
+        }
+    }
+
+    fn stop(&self, st: &mut State<P>, error: &anyhow::Error) {
+        self.persistence_error.lock().unwrap().get_or_insert_with(|| format!("{PERSISTENCE_FAILED}: {error:#}; discard this process and reload"));
+        st.out.clear();
+        st.events.clear();
+        st.waiters.clear();
+        self.outbox.send((Vec::new(), Vec::new())).ok();
+    }
+
     /// Makes the steps committed so far durable, before what they produced leaves the node.
     async fn durable(&self) -> Result<()> {
         if let Some(error) = &*self.persistence_error.lock().unwrap() {
@@ -809,15 +865,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Some(durable) => durable().await,
             None => Ok(()),
         };
-        let mut failed = self.persistence_error.lock().unwrap();
-        if let Err(error) = saved {
-            failed.get_or_insert_with(|| format!("{PERSISTENCE_FAILED}: {error:#}; output stopped until restart"));
+        let failed = {
+            let mut failed = self.persistence_error.lock().unwrap();
+            if let Err(error) = saved { failed.get_or_insert_with(|| format!("{PERSISTENCE_FAILED}: {error:#}; output stopped until restart")); }
+            failed.clone()
+        };
+        if let Some(error) = failed {
             self.state.lock().unwrap().waiters.clear();
+            self.outbox.send((Vec::new(), Vec::new())).ok();
+            return Err(anyhow::anyhow!(error));
         }
-        match &*failed {
-            Some(error) => Err(anyhow::anyhow!(error.clone())),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
 }

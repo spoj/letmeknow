@@ -3,7 +3,7 @@ use super::*;
 const G: u8 = 7;
 
 fn head(log: u8, length: u64) -> Head {
-    Head { log: Bytes(vec![log]), length, hash: Bytes::default(), time: 0, sig: Bytes::default() }
+    Head { log_ref: [log; 32], length, hash: [0; 32], time: 0, sig: Bytes(vec![0; 64]) }
 }
 
 fn id(n: u8) -> Bytes {
@@ -23,11 +23,11 @@ fn served(groups: &[u8]) -> BTreeSet<Bytes> {
 }
 
 fn own(group: u8, length: u64, held: Ranges, lacking: Ranges) -> Own {
-    Own { head: head(group, length), held, read: Ranges::default(), lacking, public: vec![] }
+    Own { anchor: Anchor::genesis(&[group; 16], [0; 32], [group; 32]), position: length, head: Some(head(group, length)), held, read: Ranges::default(), lacking, public: vec![] }
 }
 
 fn summary(group: u8, length: u64, held: Ranges, fetching: Ranges) -> Summary {
-    Summary { group: id(group), head: head(group, length), held, read: Ranges::default(), fetching }
+    Summary { group: id(group), anchor: Anchor::genesis(&[group; 16], [0; 32], [group; 32]), position: length, head: Some(head(group, length)), held, read: Ranges::default(), fetching }
 }
 
 fn hello(summaries: Vec<Summary>) -> Frame {
@@ -54,7 +54,7 @@ fn wants(out: &[Out]) -> Vec<(Key, Ranges)> {
 
 fn answered(items: &[u64], asked: Ranges) -> Frame {
     let items = items.iter().map(|&position| Item { position, ciphertext: Bytes(vec![0]) }).collect();
-    Frame::Messages { group: id(G), items, answers: Some(asked) }
+    Frame::Messages { group: id(G), anchor: Anchor::genesis(&[G; 16], [0; 32], [G; 32]), items, answers: Some(asked) }
 }
 
 /// A member in group G at head 10, lacking `lacking`, with its first summaries sent.
@@ -225,7 +225,7 @@ fn the_timeout_runs_from_the_last_frame_from_the_holder() {
         p.frame(&key(k), &hello(vec![summary(G, 10, r(&[(1, 10)]), Ranges::default())]), DEBOUNCE);
     }
     assert_eq!(wants(&p.poll(DEBOUNCE)), vec![(key(1), r(&[(4, 4)]))]);
-    let push = Frame::Messages { group: id(9), items: vec![], answers: None };
+    let push = Frame::Messages { group: id(9), anchor: Anchor::genesis(&[G; 16], [0; 32], [G; 32]), items: vec![], answers: None };
     p.frame(&key(1), &push, 8_000);
     assert!(wants(&p.poll(8_000 + TIMEOUT - 1)).is_empty());
     assert_eq!(wants(&p.poll(8_000 + TIMEOUT)), vec![(key(2), r(&[(4, 4)]))]);
@@ -285,17 +285,18 @@ fn a_member_comes_online_as_it_connects_after_none() {
 }
 
 #[test]
-fn entries_go_once_to_a_peer_whose_head_is_shorter() {
+fn public_entries_wait_for_acknowledgement_and_epochs_require_explicit_requests() {
     let mut p = Peers::new(0);
     p.group(id(G), Own { public: vec![head(100, 4)], ..own(G, 10, r(&[(1, 10)]), Ranges::default()) }, 0);
     p.connect(key(1), served(&[G]), 0);
     p.poll(0);
     p.frame(&key(1), &Frame::Hello { groups: vec![summary(G, 6, r(&[(1, 6)]), Ranges::default())], heads: vec![head(100, 2)] }, 100);
     let entries: Vec<Out> = p.poll(100).into_iter().filter(|o| matches!(o, Out::Entries { .. })).collect();
-    assert_eq!(entries, vec![Out::Entries { peer: key(1), log: id(G), after: 6 }, Out::Entries { peer: key(1), log: id(100), after: 2 }]);
-    assert!(p.poll(200).iter().all(|o| !matches!(o, Out::Entries { .. })));
+    assert_eq!(entries, vec![Out::Entries { peer: key(1), log: Bytes(vec![100; 32]), after: 2 }]);
+    assert!(p.poll(200).iter().any(|o| matches!(o, Out::Entries { after: 2, .. })), "queuing is not acknowledgement");
+    p.frame(&key(1), &Frame::Hello { groups: vec![summary(G, 6, r(&[(1, 6)]), Ranges::default())], heads: vec![head(100, 4)] }, 250);
     p.group(id(G), Own { public: vec![head(100, 4)], ..own(G, 11, r(&[(1, 11)]), Ranges::default()) }, 300);
-    assert_eq!(p.poll(300), vec![Out::Entries { peer: key(1), log: id(G), after: 10 }]);
+    assert!(p.poll(300).is_empty(), "private replay is requested by source, never G-as-log push");
 }
 
 #[test]
@@ -333,10 +334,10 @@ fn progress_is_a_new_summary_a_connection_or_a_ciphertext() {
 fn an_answer_stops_at_about_a_mebibyte() {
     let asked = r(&[(1, 6)]);
     let held = r(&[(1, 2), (4, 6)]);
-    let Frame::Messages { items, answers, .. } = answer(id(G), &asked, &held, |_| Some(vec![0; ANSWER / 2])) else { panic!() };
+    let Frame::Messages { items, answers, .. } = answer(id(G), Anchor::genesis(&[G; 16], [0; 32], [G; 32]), &asked, &held, |_| Some(vec![0; ANSWER / 2])) else { panic!() };
     assert_eq!(items.iter().map(|i| i.position).collect::<Vec<_>>(), vec![1, 2]);
     assert_eq!(answers, Some(r(&[(1, 3)])), "3, not held, is settled too");
-    let Frame::Messages { items, answers, .. } = answer(id(G), &asked, &Ranges::default(), |_| unreachable!()) else { panic!() };
+    let Frame::Messages { items, answers, .. } = answer(id(G), Anchor::genesis(&[G; 16], [0; 32], [G; 32]), &asked, &Ranges::default(), |_| unreachable!()) else { panic!() };
     assert!(items.is_empty());
     assert_eq!(answers, Some(asked));
 }
@@ -349,7 +350,7 @@ fn the_gate() {
         assert!(takes(frame, false, false));
         assert!(!sends(frame, false, true));
     }
-    for frame in [Frame::Want { group: g(), positions: Ranges::default() }, Frame::WantFiles { group: g(), files: vec![] }, Frame::Have { group: g(), files: vec![] }] {
+    for frame in [Frame::Want { group: g(), anchor: Anchor::genesis(&[G; 16], [0; 32], [G; 32]), positions: Ranges::default() }, Frame::WantFiles { group: g(), files: vec![] }, Frame::Have { group: g(), files: vec![] }] {
         assert!(!takes(&frame, false, true) && takes(&frame, true, false));
     }
     for frame in [Frame::State { group: g(), link: None }, Frame::Live { group: g(), items: vec![] }] {

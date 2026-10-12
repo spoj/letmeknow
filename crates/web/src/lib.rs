@@ -62,6 +62,24 @@ extern "C" {
     /// Resolves to a kept file's ciphertext.
     #[wasm_bindgen(method, js_name = loadFile)]
     fn load_file(this: &Idb, hash: &str) -> Promise;
+    #[wasm_bindgen(method, js_name = proofReset)]
+    fn proof_reset(this: &Idb) -> Promise;
+    #[wasm_bindgen(method, js_name = proofWrite)]
+    fn proof_write(this: &Idb, target: &str, after: f64, bytes: Uint8Array) -> Promise;
+    #[wasm_bindgen(method, js_name = proofRead)]
+    fn proof_read(this: &Idb, target: &str, after: f64) -> Promise;
+    #[wasm_bindgen(method, js_name = proofRemove)]
+    fn proof_remove(this: &Idb, target: &str) -> Promise;
+    #[wasm_bindgen(method, js_name = archiveRead)]
+    fn archive_read(this: &Idb, hash: &str) -> Promise;
+    #[wasm_bindgen(method, js_name = archiveWrite)]
+    fn archive_write(this: &Idb, batch: &str, raw: bool, hash: &str, children: Array, bytes: Uint8Array) -> Promise;
+    #[wasm_bindgen(method, js_name = archivePublish)]
+    fn archive_publish(this: &Idb, batch: &str, pins: Array) -> Promise;
+    #[wasm_bindgen(method, js_name = archiveDiscard)]
+    fn archive_discard(this: &Idb, batch: &str) -> Promise;
+    #[wasm_bindgen(method, js_name = archiveRecover)]
+    fn archive_recover(this: &Idb, pins: Array) -> Promise;
 }
 
 /// The files kept in IndexedDB, which the session loads and saves through the page.
@@ -102,6 +120,94 @@ impl Disk for Kept {
             asked.map_err(|_| anyhow!("the page stopped saving"))?;
             saved.await?
         })
+    }
+}
+
+enum TempOperation {
+    Write(u64, Vec<u8>),
+    Read(u64),
+    Remove,
+    Close,
+}
+
+struct Temp {
+    io: mpsc::Sender<([u8; 16], TempOperation, oneshot::Sender<Result<Vec<u8>>>)>,
+}
+
+impl Temp {
+    fn request(&self, target: [u8; 16], operation: TempOperation) -> BoxFuture<Result<Vec<u8>>> {
+        let (reply, answer) = oneshot::channel();
+        let io = self.io.clone();
+        Box::pin(async move {
+            io.send((target, operation, reply)).await.map_err(|_| anyhow!("proof scratch worker stopped"))?;
+            answer.await?
+        })
+    }
+}
+
+impl lmk_node::ProofTemp for Temp {
+    fn write(&self, target: [u8; 16], after: u64, bytes: Vec<u8>) -> BoxFuture<Result<()>> {
+        let answer = self.request(target, TempOperation::Write(after, bytes));
+        Box::pin(async move { answer.await.map(|_| ()) })
+    }
+    fn read(&self, target: [u8; 16], after: u64) -> BoxFuture<Result<Vec<u8>>> {
+        self.request(target, TempOperation::Read(after))
+    }
+    fn remove(&self, target: [u8; 16]) -> BoxFuture<Result<()>> {
+        let answer = self.request(target, TempOperation::Remove);
+        Box::pin(async move { answer.await.map(|_| ()) })
+    }
+    fn close(&self) -> BoxFuture<Result<()>> {
+        let answer = self.request([0; 16], TempOperation::Close);
+        Box::pin(async move { answer.await.map(|_| ()) })
+    }
+}
+
+enum ArchiveOperation {
+    Read([u8; 32]),
+    Write([u8; 16], bool, [u8; 32], Vec<[u8; 32]>, Vec<u8>),
+    Publish([u8; 16], lmk_node::Pins),
+    Discard([u8; 16]),
+    Recover(lmk_node::Pins),
+    Close,
+}
+
+struct Archive {
+    io: mpsc::Sender<(ArchiveOperation, oneshot::Sender<Result<Vec<u8>>>)>,
+}
+
+impl Archive {
+    fn request(&self, operation: ArchiveOperation) -> BoxFuture<Result<Vec<u8>>> {
+        let (reply, answer) = oneshot::channel();
+        let io = self.io.clone();
+        Box::pin(async move {
+            io.send((operation, reply)).await.map_err(|_| anyhow!("epoch archive worker stopped"))?;
+            answer.await?
+        })
+    }
+}
+
+impl lmk_node::Archive for Archive {
+    fn read(&self, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>> { self.request(ArchiveOperation::Read(hash)) }
+    fn write(&self, batch: [u8; 16], raw: bool, hash: [u8; 32], children: Vec<[u8; 32]>, bytes: Vec<u8>) -> BoxFuture<Result<()>> {
+        let answer = self.request(ArchiveOperation::Write(batch, raw, hash, children, bytes));
+        Box::pin(async move { answer.await.map(|_| ()) })
+    }
+    fn publish(&self, batch: [u8; 16], pins: lmk_node::Pins) -> BoxFuture<Result<()>> {
+        let answer = self.request(ArchiveOperation::Publish(batch, pins));
+        Box::pin(async move { answer.await.map(|_| ()) })
+    }
+    fn discard(&self, batch: [u8; 16]) -> BoxFuture<Result<()>> {
+        let answer = self.request(ArchiveOperation::Discard(batch));
+        Box::pin(async move { answer.await.map(|_| ()) })
+    }
+    fn recover(&self, pins: lmk_node::Pins) -> BoxFuture<Result<()>> {
+        let answer = self.request(ArchiveOperation::Recover(pins));
+        Box::pin(async move { answer.await.map(|_| ()) })
+    }
+    fn close(&self) -> BoxFuture<Result<()>> {
+        let answer = self.request(ArchiveOperation::Close);
+        Box::pin(async move { answer.await.map(|_| ()) })
     }
 }
 
@@ -381,6 +487,54 @@ impl App {
                 saved.await?
             })
         });
+        JsFuture::from(idb.proof_reset()).await.map_err(|error| anyhow!("resetting untrusted proof scratch: {error:?}"))?;
+        let (proof_io, mut proofs) = mpsc::channel::<([u8; 16], TempOperation, oneshot::Sender<Result<Vec<u8>>>)>(1);
+        let proof_idb: Idb = idb.clone().unchecked_into();
+        spawn_local(async move {
+            while let Some((target, operation, reply)) = proofs.recv().await {
+                let target = hex::encode(target);
+                let loaded = matches!(operation, TempOperation::Read(_));
+                let close = matches!(operation, TempOperation::Close);
+                let promise = match operation {
+                    TempOperation::Write(after, bytes) => proof_idb.proof_write(&target, after as f64, Uint8Array::from(bytes.as_slice())),
+                    TempOperation::Read(after) => proof_idb.proof_read(&target, after as f64),
+                    TempOperation::Remove => proof_idb.proof_remove(&target),
+                    TempOperation::Close => Promise::resolve(&JsValue::NULL),
+                };
+                let result = JsFuture::from(promise).await.map(|value| if loaded { Uint8Array::new(&value).to_vec() } else { Vec::new() })
+                    .map_err(|error| anyhow!("untrusted proof scratch IO: {error:?}"));
+                reply.send(result).ok();
+                if close { break; }
+            }
+        });
+        let (archive_io, mut archives) = mpsc::channel::<(ArchiveOperation, oneshot::Sender<Result<Vec<u8>>>)>(1);
+        let archive_idb: Idb = idb.clone().unchecked_into();
+        spawn_local(async move {
+            while let Some((operation, reply)) = archives.recv().await {
+                let loaded = matches!(operation, ArchiveOperation::Read(_));
+                let close = matches!(operation, ArchiveOperation::Close);
+                let pins = |pins: lmk_node::Pins| pins.into_iter().map(|(slot, root)| Array::of2(
+                    &JsValue::from_str(&hex::encode(slot)),
+                    &root.map_or(JsValue::NULL, |root| JsValue::from_str(&hex::encode(root))),
+                )).collect::<Array>();
+                let promise = match operation {
+                    ArchiveOperation::Read(hash) => archive_idb.archive_read(&hex::encode(hash)),
+                    ArchiveOperation::Write(batch, raw, hash, children, bytes) => archive_idb.archive_write(
+                        &hex::encode(batch), raw, &hex::encode(hash),
+                        children.into_iter().map(|hash| JsValue::from_str(&hex::encode(hash))).collect(),
+                        Uint8Array::from(bytes.as_slice()),
+                    ),
+                    ArchiveOperation::Publish(batch, roots) => archive_idb.archive_publish(&hex::encode(batch), pins(roots)),
+                    ArchiveOperation::Discard(batch) => archive_idb.archive_discard(&hex::encode(batch)),
+                    ArchiveOperation::Recover(roots) => archive_idb.archive_recover(pins(roots)),
+                    ArchiveOperation::Close => Promise::resolve(&JsValue::NULL),
+                };
+                let result = JsFuture::from(promise).await.map(|value| if loaded { Uint8Array::new(&value).to_vec() } else { Vec::new() })
+                    .map_err(|error| anyhow!("cold epoch archive IO: {error:?}"));
+                reply.send(result).ok();
+                if close { break; }
+            }
+        });
         let node_config = lmk_node::Config {
             handle: String::new(),
             device: Some(device.clone()),
@@ -392,6 +546,8 @@ impl App {
             file_limit: FILE_LIMIT,
             kinds: vec![CHAT.into(), DOC.into(), TABLE.into(), IDENTITY.into()],
             durable: Some(durable.clone()),
+            proof_temp: Some(Arc::new(Temp { io: proof_io })),
+            archive: Some(Arc::new(Archive { io: archive_io })),
         };
         let (node, mut events) = Node::start(store.clone(), node_config).await?;
         let saved = store.clone();

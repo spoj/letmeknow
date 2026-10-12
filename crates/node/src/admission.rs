@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, RelayUrl};
-use lmk_core::group::{Change, Group, key_package_credential, key_package_leaf};
+use lmk_core::group::{Change, Group, key_package_credential, key_package_leaf, key_package_reference};
 use lmk_core::public::Verdict;
 use lmk_core::provider::Provider;
 use lmk_net::Admit;
-use lmk_proto::entry::Entry;
+use lmk_proto::epoch::{Checkpoint, StateLink, Transition};
 use lmk_proto::group::{CHAT, Certificate, Control, Credential, IDENTITY, How};
 use lmk_proto::links::{Address, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Join};
@@ -24,7 +24,6 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::logs::NOT_FOLLOWED;
-use crate::reading::Judged;
 use crate::{Event, G, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, SNAPSHOT_WAIT, State, device_key_key, endpoint_id, get, now, put};
 
 /// How many members besides the inviter a link names, of those online that hold the invite's message.
@@ -102,17 +101,17 @@ impl<P: Provider + Send + 'static> Node<P> {
             .map(|member| Ok((EndpointId::from_bytes(&member.key)?, member.relay.as_ref().map_or(Ok(ours.clone()), |relay| relay.parse())?)))
             .collect::<Result<Vec<_>>>()?;
         let (secret, devices) = (Bytes(link.secret.to_vec()), link.device);
-        // The KeyPackage, its private keys and its device key are kept until this session joins or every member it asks
-        // refuses it: a member that added it asks again answers with the Welcome its log holds.
+        // Refusals after an uncertain attempt do not erase the original package or its private keys.
         let joining = [b"node/joining/".as_slice(), &Sha256::digest(&secret.0)].concat();
         let (join, device_key) = {
             let mut st = self.inner.lock();
             st.speak(identity);
-            // One kept for the link read as the other kind, as altered, is not this join's: the Welcome is checked against
-            // the kind this join asks for.
             let kept = match get::<Joining>(&st.provider, &joining)? {
-                Some(kept) if kept.device.is_some() == devices => kept,
-                _ => {
+                Some(kept) => {
+                    ensure!(kept.device.is_some() == devices, "invite kind changed; original joining keys were preserved");
+                    kept
+                }
+                None => {
                     let device_key = devices.then(|| st.device_key()).transpose()?;
                     let session = device_key.as_ref().map_or(&st.session, |(_, session)| session);
                     let kept = Joining { key_package: Bytes(session.key_package(&st.provider)?), device: device_key.map(|(seed, _)| Bytes(seed.to_vec())) };
@@ -141,40 +140,29 @@ impl<P: Provider + Send + 'static> Node<P> {
             })
             .collect();
         let mut refusal = anyhow::anyhow!("no member the invite names is online");
-        let mut refused_by_all = true;
         while let Some(dialed) = dials.next().await {
             let (peer, relay, dialed) = dialed?;
             if !matches!(dialed, Ok(Ok(()))) {
                 tracing::debug!("{} is not online", peer.fmt_short());
-                refused_by_all = false;
                 continue;
             }
             match timeout(JOIN_WAIT, self.inner.net().join(peer, relay, join.clone())).await {
                 Ok(Ok(Answer::Ok(admitted))) => {
-                    let gid = self.inner.welcomed(admitted, peer, device_key).await?;
-                    self.inner.lock().provider.delete(&joining)?;
+                    let package = key_package_reference(&self.inner.lock().provider, &join.key_package.0)?;
+                    let gid = self.inner.welcomed(admitted, peer, device_key, package, &joining).await?;
                     self.inner.durable().await?;
                     return Ok((gid, *peer.as_bytes()));
                 }
                 Ok(Ok(Answer::Refused { refused })) => {
-                    // The Add may already be logged: keep its KeyPackage to recover the Welcome after storage is fixed.
-                    if refused.starts_with(crate::PERSISTENCE_FAILED) {
-                        refused_by_all = false;
-                    }
                     refusal = anyhow::anyhow!("refused: {refused}");
                 }
                 Ok(Err(error)) => {
-                    refused_by_all = false;
                     tracing::debug!("asking {} to admit this session: {error:#}", peer.fmt_short());
                 }
                 Err(_) => {
-                    refused_by_all = false;
                     tracing::debug!("{} did not answer", peer.fmt_short());
                 }
             }
-        }
-        if refused_by_all {
-            self.inner.lock().provider.delete(&joining)?;
         }
         Err(refusal)
     }
@@ -183,38 +171,92 @@ impl<P: Provider + Send + 'static> Node<P> {
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Joins a group from the Welcome a member at `by` sent: an identity group with the device key `device_key`, and only
     /// then, as a link's kind is not authenticated.
-    async fn welcomed(self: &Arc<Self>, admitted: Admitted, by: EndpointId, device_key: Option<[u8; 32]>) -> Result<Bytes> {
+    async fn welcomed(self: &Arc<Self>, admitted: Admitted, by: EndpointId, device_key: Option<[u8; 32]>, package: [u8; 32], joining: &[u8]) -> Result<Bytes> {
         let gid = {
             let mut st = self.lock();
-            let st = &mut *st;
-            let mls = Group::join(&st.provider, &admitted.welcome.0)?;
-            ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
-            if (mls.settings().kind == IDENTITY) != device_key.is_some() {
-                mls.delete(&st.provider)?;
-                bail!("the link was altered: it admits to a group of another kind than it says");
-            }
-            let rec = Rec { position: admitted.position, start: admitted.position, expired: admitted.position, ..Rec::default() };
-            let gid = st.add_group(mls, rec)?;
-            if let Some(seed) = device_key {
-                put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
-                let session = st.keyed(seed)?;
-                st.device_keys.insert(gid.clone(), (seed, session));
-            }
-            if admitted.doc.is_some() {
-                st.groups.get_mut(&gid).unwrap().asked = now();
-            }
+            st.provider.savepoint()?;
+            let installed = (|| {
+                let mls = Group::join(&st.provider, &admitted.welcome.0, &package)?;
+                let checkpoint = &admitted.checkpoint;
+                ensure!(checkpoint.package == package && checkpoint.verify(&admitted.welcome.0), "invalid admission checkpoint");
+                ensure!(checkpoint.transition.group.as_slice() == mls.id(), "checkpoint names another group");
+                let members = mls.members();
+                ensure!(members.iter().any(|member| member.key == checkpoint.signer
+                    && member.leaf.as_ref().is_some_and(|leaf| leaf.key.0 == by.as_bytes())), "attester is not the invite channel's MLS member");
+                ensure!(members.iter().any(|member| member.index == mls.own_index() && member.key == checkpoint.added_key), "checkpoint names another admitted key");
+                ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
+                ensure!((mls.settings().kind == IDENTITY) == device_key.is_some(), "the link was altered: another group kind");
+                ensure!(self.kinds.contains(&mls.settings().kind), "unsupported group kind");
+                let source = &checkpoint.transition.source;
+                if source.epoch == 0 {
+                    ensure!(*source == lmk_proto::epoch::Anchor::genesis(&checkpoint.transition.group, source.service, source.log_ref), "invalid checkpoint genesis");
+                }
+                let anchor = checkpoint.transition.successor()?;
+                let service = mls.settings().membership;
+                let key = crate::logs::authority(&service)?;
+                let id = lmk_proto::head::reference(&key, &mls.capability(&st.provider)?);
+                ensure!((anchor.epoch, anchor.service, anchor.log_ref) == (mls.epoch(), key, id), "admission destination mismatch");
+                let gid = mls.id().to_vec();
+                let rec = Rec { active: Bytes(id.to_vec()), position: anchor.base, start: anchor.base, expired: anchor.base,
+                    updated: now(), shown: anchor.base, ..Rec::default() };
+                let readers = members.into_iter().filter_map(|member| member.leaf.map(|leaf| leaf.key)).collect();
+                let log = crate::logs::Log::new(crate::logs::Of::Group { group: Bytes(gid.clone()), anchor }, service, id, readers);
+                let predecessor = if st.logs.contains_key(source.log_ref.as_slice()) { None } else {
+                    let service = lmk_proto::group::Service::Serve { key: Bytes(source.service.to_vec()), relay: String::new(), addrs: Vec::new(), rest: Default::default() };
+                    let mut old = crate::logs::Log::new(crate::logs::Of::Group { group: Bytes(gid.clone()), anchor: source.clone() }, service, source.log_ref, Vec::new());
+                    old.raw = false;
+                    old.cut = Some(checkpoint.transition.cut);
+                    old.closed = Some(now());
+                    old.transition = Some(checkpoint.transition.clone());
+                    Some(old)
+                };
+                let mut usage: crate::logs::Usage = get(&st.provider, b"node/archive-usage")?.unwrap_or_default();
+                for source in std::iter::once(&log).chain(predecessor.iter()) { usage.evidence += serde_json::to_vec(source)?.len() as u64 + 4096; }
+                ensure!(usage.evidence <= crate::logs::EVIDENCE_LIMIT, "admission metadata quota exhausted");
+                put(&st.provider, b"node/archive-usage", &usage)?;
+                put(&st.provider, &crate::rec_key(&gid), &rec)?;
+                put(&st.provider, &crate::logs::log_key(&id), &log)?;
+                let mut gids: Vec<Bytes> = st.groups.keys().map(|gid| Bytes(gid.clone())).collect();
+                gids.push(Bytes(gid.clone()));
+                put(&st.provider, b"node/groups", &gids)?;
+                let mut logs: Vec<Bytes> = st.logs.keys().map(|id| Bytes(id.clone())).collect();
+                logs.push(Bytes(id.to_vec()));
+                if let Some(old) = &predecessor {
+                    logs.push(Bytes(old.log_ref.to_vec()));
+                    put(&st.provider, &crate::logs::log_key(&old.log_ref), old)?;
+                }
+                put(&st.provider, b"node/logs", &logs)?;
+                put(&st.provider, &[b"node/checkpoint/".as_slice(), &gid].concat(), checkpoint)?;
+                let session = device_key.map(|seed| {
+                    put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
+                    Ok::<_, anyhow::Error>((seed, st.keyed(seed)?))
+                }).transpose()?;
+                st.provider.delete(joining)?;
+                Ok::<_, anyhow::Error>((gid, mls, rec, id, log, predecessor, session))
+            })();
+            let (gid, mls, rec, id, log, predecessor, session) = match installed {
+                Ok(value) => {
+                    if let Err(error) = st.provider.release() { tracing::error!("admission release failed: {error:#}"); std::process::abort(); }
+                    value
+                }
+                Err(error) => {
+                    if let Err(rollback) = st.provider.rollback_to() { tracing::error!("admission rollback failed: {rollback:#}"); std::process::abort(); }
+                    return Err(error);
+                }
+            };
+            st.logs.insert(id.to_vec(), log);
+            if let Some(old) = predecessor { st.logs.insert(old.log_ref.to_vec(), old); }
+            st.groups.insert(gid.clone(), G::new(mls, rec, Default::default()));
+            if let Some(session) = session { st.device_keys.insert(gid.clone(), session); }
+            st.gate = true;
             gid
         };
-        // The members' public logs first, which the gate needs to take their summaries, before the log's commits apply.
+        self.durable().await?;
         self.refresh_all().await;
         self.dial_all();
-        if let Err(error) = self.read(&gid).await {
-            self.warn(Some(&gid), format!("reading the group's log: {error:#}"));
-        }
-        self.follow(&gid);
-        if let Some(link) = admitted.doc {
-            self.state_from(&gid, link, by);
-        }
+        let id = self.lock().group(&gid)?.rec.active.0.clone();
+        self.follow(&id);
+        if let Some(link) = admitted.doc { self.state_from(&gid, link, by); }
         Ok(Bytes(gid))
     }
 }
@@ -247,14 +289,16 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let Join { secret, key_package } = join;
         let joiner = key_package_credential(&self.lock().provider, &key_package.0)?;
         let hash = Bytes(Sha256::digest(&secret.0).to_vec());
+        let package = key_package_reference(&self.lock().provider, &key_package.0)?;
+        let cached = self.lock().logged_welcome(&hash, &package)?;
+        if let Some((gid, cached)) = cached {
+            return self.admitted(&gid, cached).await;
+        }
         let found = self.lock().groups.iter().find_map(|(gid, g)| Some((gid.clone(), g.rec.invites.iter().find(|rule| rule.hash == hash)?.clone())));
         let (gid, rule) = found.context(UNKNOWN)?;
-        // A joiner the log shows added, whose answer was lost, asks again with the same KeyPackage.
         self.caught_up(&gid).await?;
-        let logged = self.lock().logged_welcome(&gid, &joiner, &key_package.0)?;
-        if let Some((welcome, position)) = logged {
-            return self.admitted(&gid, welcome, position).await;
-        }
+        let cached = self.lock().logged_welcome(&hash, &package)?;
+        if let Some((gid, cached)) = cached { return self.admitted(&gid, cached).await; }
         admits(self.lock().group(&gid)?, &joiner, &rule)?;
         // Its identity's public log, read afresh, must list the device that certified it.
         if let Some(to) = &rule.to {
@@ -278,70 +322,130 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let leaf = key_package_leaf(&st.provider, &key_package)?;
             ensure!(leaf.kinds.contains(&kind), "its session does not support {kind} groups");
         }
+        let package = key_package_reference(&self.lock().provider, &key_package)?;
         let add = Change { add: vec![key_package], how: Some(How::Invite), invite: Some(rule.hash.clone()), ..Change::default() };
-        let (welcome, position) = self
-            .commit(gid, |_, g| {
-                admits(g, joiner, &rule)?;
-                Ok(Some(add.clone()))
-            })
-            .await?
-            .context("an Add has effect")?;
-        self.admitted(gid, welcome.context("an add makes a Welcome")?, position).await
+        self.commit(gid, |_, g| {
+            admits(g, joiner, &rule)?;
+            Ok(Some(add.clone()))
+        }).await?.context("an Add has effect")?;
+        let (_, cached) = self.lock().logged_welcome(&rule.hash, &package)?.context("accepted Add cache missing")?;
+        self.admitted(gid, cached).await
     }
 
-    /// The answer to a joiner added at `position`: the Welcome, and the state of the group's kind, as a file.
-    async fn admitted(self: &Arc<Self>, gid: &[u8], welcome: Vec<u8>, position: u64) -> Result<Admitted> {
-        let state = {
+    async fn admitted(self: &Arc<Self>, gid: &[u8], mut cached: Admitted) -> Result<Admitted> {
+        let (anchor, position, state) = {
             let st = self.lock();
             let g = st.group(gid)?;
-            (g.mls.settings().kind != CHAT).then(|| {
+            let state = (g.mls.settings().kind != CHAT).then(|| {
                 let (reply, state) = oneshot::channel();
                 self.events.send(Event::Snapshot { group: Bytes(gid.to_vec()), reply }).ok();
                 state
-            })
+            });
+            (st.active(gid)?.anchor()?.clone(), g.rec.position, state)
         };
         let state = match state {
             Some(asked) => timeout(SNAPSHOT_WAIT, asked).await.ok().and_then(Result::ok).flatten(),
             None => None,
         };
-        // The joiner is added, by an entry in the log: refusing it now would strand it, and it asks members for the state
-        // later.
-        let doc = match state {
-            Some(state) => match self.state_file(gid, state).await {
-                Ok(link) => Some(link),
-                Err(error) => {
-                    self.warn(Some(gid), format!("admitting a member without the group's state: {error:#}"));
-                    None
-                }
-            },
-            None => None,
-        };
+        if let Some(state) = state {
+            let prefix = self.state_hash(&anchor, position).await?;
+            let link = self.state_file(gid, state).await?;
+            let st = self.lock();
+            if st.active(gid)?.anchor()? == &anchor && st.group(gid)?.rec.position == position {
+                cached.doc = Some(StateLink { link, anchor, position, prefix });
+            }
+        }
         self.durable().await?;
-        Ok(Admitted { welcome: Bytes(welcome), position, doc })
+        Ok(cached)
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct Acceptance {
+    welcome: Bytes,
+    transition: Transition,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Recovery {
+    invite: Bytes,
+    package: [u8; 32],
+    added_key: [u8; 32],
+    leaf: Bytes,
+    root: [u8; 32],
+    epoch: u64,
+    signer: [u8; 32],
+    signature: Bytes,
+}
+
+fn recovery_key(gid: &[u8], package: &[u8]) -> Vec<u8> {
+    [b"node/recovery/".as_slice(), gid, package].concat()
+}
+
+fn acceptance_key(root: &[u8; 32]) -> Vec<u8> {
+    [b"node/acceptance/".as_slice(), root].concat()
+}
+
 impl<P: Provider> State<P> {
-    /// The Welcome and position of the commit entry that added the joiner with this KeyPackage, if the joiner is a member
-    /// whose leaf has not updated since.
-    fn logged_welcome(&self, gid: &[u8], joiner: &Credential, key_package: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
-        let g = self.group(gid)?;
-        if !g.mls.unchanged(&self.provider, key_package)? {
-            return Ok(None);
+    pub(crate) fn cache_admissions(&mut self, gid: &[u8], transition: &Transition, welcome: &[u8]) -> Result<()> {
+        let epoch = transition.successor()?.epoch;
+        let adds: Vec<_> = self.group(gid)?.mls.added().iter().filter(|added| added.epoch == epoch && added.invite.is_some()).cloned().collect();
+        if adds.is_empty() { return Ok(()); }
+        let root = transition.hash();
+        put(&self.provider, &acceptance_key(&root), &Acceptance { welcome: Bytes(welcome.to_vec()), transition: transition.clone() })?;
+        for added in adds {
+            let leaf = self.group(gid)?.mls.leaf_bytes(&added.member.key.0)?.context("added leaf missing")?;
+            let mut checkpoint = Checkpoint { transition: transition.clone(), package: added.key_package_ref,
+                added_key: added.member.key.0.as_slice().try_into()?, signer: self.me(gid).try_into()?, signature: Bytes::default() };
+            checkpoint.signature = Bytes(self.session_of(gid).sign(&checkpoint.signed(welcome))?);
+            let cache = Recovery { invite: added.invite.unwrap(), package: checkpoint.package, added_key: checkpoint.added_key,
+                leaf: Bytes(leaf), root, epoch, signer: checkpoint.signer, signature: checkpoint.signature };
+            put(&self.provider, &recovery_key(gid, &cache.package), &cache)?;
+            self.group_mut(gid)?.rec.admissions.push(Bytes(cache.package.to_vec()));
         }
-        let Some(added) = g.mls.added().iter().rev().find(|added| added.member.key == joiner.key) else { return Ok(None) };
-        for position in (g.rec.expired + 1..=g.rec.position).rev() {
-            let Some(pos) = self.pos(gid, position)? else { continue };
-            if matches!(pos.judged, Judged::Commit { .. }) && pos.epoch + 1 == added.epoch {
-                let entry = self.provider.get(&crate::logs::entry_key(gid, position))?.context("a stored entry is missing")?;
-                let Entry::Commit { welcome: Some(welcome), .. } = Entry::parse(&entry)? else { return Ok(None) };
-                return Ok(Some((welcome, position)));
+        Ok(())
+    }
+
+    pub(crate) fn prune_admissions(&mut self, gid: &[u8]) -> Result<()> {
+        let mut keep = Vec::new();
+        let (mut live, mut pruned) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+        for package in &self.group(gid)?.rec.admissions {
+            let cache: Recovery = get(&self.provider, &recovery_key(gid, &package.0))?.context("missing recovery cache")?;
+            if self.group(gid)?.mls.leaf_bytes(&cache.added_key)?.as_deref() == Some(cache.leaf.0.as_slice()) {
+                keep.push(package.clone());
+                live.insert(cache.root);
+            } else {
+                pruned.insert(cache.root);
+                self.provider.delete(&recovery_key(gid, &package.0))?;
             }
+        }
+        for root in pruned.difference(&live) { self.provider.delete(&acceptance_key(root))?; }
+        self.group_mut(gid)?.rec.admissions = keep;
+        Ok(())
+    }
+
+    pub(crate) fn admission_floor(&self, gid: &[u8]) -> Result<Option<u64>> {
+        let mut floor: Option<u64> = None;
+        for package in &self.group(gid)?.rec.admissions {
+            let cache: Recovery = get(&self.provider, &recovery_key(gid, &package.0))?.context("missing recovery cache")?;
+            floor = Some(floor.map_or(cache.epoch, |floor| floor.min(cache.epoch)));
+        }
+        Ok(floor)
+    }
+
+    fn logged_welcome(&self, invite: &Bytes, package: &[u8; 32]) -> Result<Option<(Vec<u8>, Admitted)>> {
+        for (gid, g) in &self.groups {
+            if self.conflicting(gid) { continue; }
+            let Some(cache) = get::<Recovery>(&self.provider, &recovery_key(gid, package))? else { continue };
+            if cache.invite != *invite || g.mls.leaf_bytes(&cache.added_key)?.as_deref() != Some(cache.leaf.0.as_slice()) { continue; }
+            let accepted: Acceptance = get(&self.provider, &acceptance_key(&cache.root))?.context("missing accepted Welcome")?;
+            let checkpoint = Checkpoint { transition: accepted.transition, package: cache.package, added_key: cache.added_key,
+                signer: cache.signer, signature: cache.signature };
+            return Ok(Some((gid.clone(), Admitted { welcome: accepted.welcome, checkpoint, doc: None })));
         }
         Ok(None)
     }
 }
-
 
 pub(crate) struct Admitter<P>(pub Arc<Inner<P>>);
 

@@ -1,20 +1,19 @@
+export { archiveRead, archiveWrite, archivePublish, archiveDiscard, archiveRecover } from "./archive";
+
 // IndexedDB: "records" holds the session's records, one per key, as the WebAssembly hands them over; "files" the
 // ciphertext of the files it keeps, by hash (hex), which the session loads one at a time when it needs one.
 let db: Promise<IDBDatabase> | undefined;
 function database(): Promise<IDBDatabase> {
   return db ??= new Promise((resolve, reject) => {
-    const request = indexedDB.open("lmk", 4);
-    request.onupgradeneeded = event => {
-      if (event.oldVersion !== 0) {
-        request.transaction!.abort();
-        reject(new Error("This browser's stored session is from an incompatible version. Its local data was preserved; use that version to access it."));
-        return;
-      }
+    const request = indexedDB.open("lmk-0.16", 1);
+    request.onupgradeneeded = () => {
       request.result.createObjectStore("records");
       request.result.createObjectStore("files");
     };
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onerror = () => reject(request.error?.name === "VersionError"
+      ? new Error("This browser's stored session is from an incompatible version. Its local data was preserved; use that version to access it.")
+      : request.error);
   });
 }
 
@@ -65,4 +64,35 @@ export async function saveFiles(changes: [string, Uint8Array | null][]) {
 
 export async function loadFile(hash: string): Promise<Uint8Array> {
   return done((await database()).transaction("files").objectStore("files").get(hash));
+}
+
+let scratch: Promise<IDBDatabase> | undefined;
+function proofDatabase(): Promise<IDBDatabase> {
+  return scratch ??= new Promise((resolve, reject) => {
+    const request = indexedDB.open("lmk-epoch-proof-0.16", 1);
+    request.onupgradeneeded = () => request.result.createObjectStore("chunks");
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function proofReset(): Promise<void> {
+  await done((await proofDatabase()).transaction("chunks", "readwrite").objectStore("chunks").clear());
+}
+
+export async function proofWrite(target: string, after: number, bytes: Uint8Array): Promise<void> {
+  const tx = (await proofDatabase()).transaction("chunks", "readwrite");
+  tx.objectStore("chunks").put(bytes, [target, after]);
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(new Error("Proof scratch write failed", { cause: tx.error }));
+  });
+}
+
+export async function proofRead(target: string, after: number): Promise<Uint8Array> {
+  return done((await proofDatabase()).transaction("chunks").objectStore("chunks").get([target, after]));
+}
+
+export async function proofRemove(target: string): Promise<void> {
+  await done((await proofDatabase()).transaction("chunks", "readwrite").objectStore("chunks").delete(IDBKeyRange.bound([target, 0], [target, Number.MAX_SAFE_INTEGER])));
 }

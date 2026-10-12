@@ -4,6 +4,8 @@
 
 mod files;
 mod peer;
+pub mod budget;
+pub use peer::Receipt;
 pub mod peers;
 mod seal;
 
@@ -69,13 +71,13 @@ pub trait Admit: Send + Sync + 'static {
     fn join(&self, peer: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Event {
     /// A `peer` stream with the peer started, replacing any other.
     Connected(EndpointId),
     Disconnected(EndpointId),
     /// A frame on the peer's stream, but files' `want_files` and `have`, which this crate answers.
-    Frame(EndpointId, Frame),
+    Frame(EndpointId, Frame, Receipt),
     /// A file is now held whole.
     Fetched([u8; 32]),
 }
@@ -112,6 +114,9 @@ pub(crate) struct Inner {
     files: Arc<Files>,
     links: Mutex<BTreeMap<EndpointId, Link>>,
     events: mpsc::UnboundedSender<Event>,
+    incoming: budget::Budget,
+    bodies: Arc<tokio::sync::Semaphore>,
+    outgoing: Arc<budget::Budget>,
     /// The task that publishes this session's addresses in its home, as they change.
     #[cfg(not(target_family = "wasm"))]
     publishing: Mutex<Option<n0_future::task::JoinHandle<()>>>,
@@ -142,6 +147,9 @@ impl Net {
             files,
             links: Mutex::default(),
             events,
+            incoming: budget::Budget::default(),
+            bodies: Arc::new(tokio::sync::Semaphore::new(budget::TOTAL_BYTES - budget::ENDPOINT_BYTES)),
+            outgoing: Arc::new(budget::Budget::default()),
             #[cfg(not(target_family = "wasm"))]
             publishing: Mutex::new(publishing),
         });
@@ -166,7 +174,14 @@ impl Net {
 
     /// Sends a frame to a peer, if it is connected.
     pub fn frame(&self, peer: EndpointId, frame: Frame) -> bool {
-        self.inner.input(&peer).is_some_and(|input| input.send(Input::Send(frame)).is_ok())
+        let Some(permit) = self.inner.outgoing.prepare(peer, &frame) else { return false; };
+        self.packet(peer, budget::Packet { frame, permit })
+    }
+
+    pub fn outgoing(&self) -> Arc<budget::Budget> { self.inner.outgoing.clone() }
+
+    pub fn packet(&self, peer: EndpointId, packet: budget::Packet) -> bool {
+        self.inner.input(&peer).is_some_and(|input| input.send(Input::Send(packet)).is_ok())
     }
 
     /// Asks a peer for the files the group links that this session lacks, within its limit, and fetches those it has.

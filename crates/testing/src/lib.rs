@@ -24,6 +24,7 @@ pub struct Relay {
     pub service: Service,
     _server: Server,
     _router: Router,
+    _state: tempfile::TempDir,
 }
 
 impl Relay {
@@ -62,8 +63,9 @@ pub async fn relay() -> Relay {
     config.quic = Some(quic);
     let server = Server::spawn(config).await.unwrap();
     let url = format!("https://localhost:{}", server.https_addr().unwrap().port()).parse().unwrap();
-    let (service, router) = membership(&url, &cert, Path::new(":memory:"), |service| service).await;
-    Relay { url, cert, service, _server: server, _router: router }
+    let state = tempfile::tempdir().unwrap();
+    let (service, router) = membership(&url, &cert, &state.path().join("membership"), |service| service).await;
+    Relay { url, cert, service, _server: server, _router: router, _state: state }
 }
 
 async fn endpoint(url: &RelayUrl, cert: &CertificateDer<'static>, secret: SecretKey) -> Endpoint {
@@ -73,9 +75,9 @@ async fn endpoint(url: &RelayUrl, cert: &CertificateDer<'static>, secret: Secret
 }
 
 async fn membership<H: ProtocolHandler>(url: &RelayUrl, cert: &CertificateDer<'static>, db: &Path, serve: impl FnOnce(Membership) -> H) -> (Service, Router) {
-    let secret = SecretKey::from_bytes(&lmk_proto::random::random());
-    let endpoint = endpoint(url, cert, secret.clone()).await;
-    let store = Store::open(db, ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes())).unwrap();
+    let store = Store::initialize(db).unwrap();
+    let secret = SecretKey::from_bytes(&store.key().to_bytes());
+    let endpoint = endpoint(url, cert, secret).await;
     let router = Router::builder(endpoint.clone()).accept(ALPN, serve(Membership::new(store, Policy { appends_per_minute: u32::MAX, ..Policy::default() }))).spawn();
     let service = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: url.to_string(), addrs: vec![], rest: Default::default() };
     (service, router)

@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use iroh::EndpointId;
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
+use lmk_proto::epoch::StateLink;
 use lmk_proto::group::{Control, type_of};
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::Frame;
@@ -225,7 +226,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// some may give none.
     pub(crate) fn ask_state(&self, st: &mut State<P>, gid: &[u8]) {
         let group = Bytes(gid.to_vec());
-        let none = !st.served.values().any(|served| served.contains(&group));
+        let none = !st.served.iter().any(|(peer, served)| served.contains(&group) && st.compatible(gid, peer));
         if none || !st.at_head(gid) || st.group(gid).is_ok_and(|g| g.asked + STATE_ASK > now()) {
             return;
         }
@@ -241,9 +242,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.events.send(Event::Snapshot { group: Bytes(gid.to_vec()), reply }).ok();
         let (inner, gid) = (self.clone(), gid.to_vec());
         self.spawn(async move {
+            let (anchor, position) = {
+                let st = inner.lock();
+                let Ok(g) = st.group(&gid) else { return };
+                (st.active(&gid).unwrap().anchor().unwrap().clone(), g.rec.position)
+            };
             let Some(data) = timeout(SNAPSHOT_WAIT, state).await.ok().and_then(Result::ok).flatten() else { return };
-            match inner.state_file(&gid, data).await {
-                Ok(link) => inner.lock().emit(&gid, by, Frame::State { group: Bytes(gid.clone()), link: Some(link) }),
+            let prepared = async { Ok::<_, anyhow::Error>((inner.state_hash(&anchor, position).await?, inner.state_file(&gid, data).await?)) }.await;
+            match prepared {
+                Ok((prefix, link)) => {
+                    let mut st = inner.lock();
+                    if st.active(&gid).is_ok_and(|log| log.anchor().ok() == Some(&anchor)) && st.group(&gid).is_ok_and(|g| g.rec.position == position) {
+                        st.emit(&gid, by, &Frame::State { group: Bytes(gid.clone()), link: Some(StateLink { link, anchor, position, prefix }) });
+                    }
+                }
                 Err(error) => inner.warn(Some(&gid), format!("handing a member the group's state: {error:#}")),
             }
         });
@@ -252,20 +264,42 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Takes a state `by` handed this session, once it is fetched, and tells the group's kind.
-    pub(crate) fn state_from(self: &Arc<Self>, gid: &[u8], link: String, by: EndpointId) {
+    pub(crate) fn state_from(self: &Arc<Self>, gid: &[u8], link: StateLink, by: EndpointId) {
         let (inner, gid) = (self.clone(), gid.to_vec());
         self.spawn(async move {
             let taken = async {
-                let file = FileLink::parse(&link)?;
+                let wait = async {
+                    loop {
+                        let advanced = inner.advanced.notified();
+                        {
+                            let st = inner.lock();
+                            let g = st.group(&gid)?;
+                            anyhow::ensure!(!st.conflicting(&gid), "conflicting state ancestry");
+                            if st.associated(&gid, &link.anchor) && link.position <= g.rec.position {
+                                anyhow::ensure!(st.serves(&gid, &by), "state sender no longer authorized");
+                                let source = st.log(&link.anchor.log_ref)?;
+                                anyhow::ensure!(link.position <= link.anchor.position(source.cut.unwrap_or(source.length()))?, "snapshot beyond source cut");
+                                break;
+                            }
+                        }
+                        advanced.await;
+                    }
+                    anyhow::Ok(())
+                };
+                timeout(crate::MEMBER_WAIT * 12, wait).await??;
+                anyhow::ensure!(inner.state_hash(&link.anchor, link.position).await? == link.prefix, "snapshot prefix differs from accepted history");
+                let file = FileLink::parse(&link.link)?;
                 {
                     let mut st = inner.lock();
-                    st.group_mut(&gid)?.rec.link(link.clone());
+                    st.group_mut(&gid)?.rec.link(link.link.clone());
                     st.save(&gid)?;
                 }
                 inner.fetched(&gid, &file).await?;
                 let mut data = Vec::new();
                 inner.net().read_file(&file, &mut data).await?;
                 let mut st = inner.lock();
+                anyhow::ensure!(st.associated(&gid, &link.anchor) && !st.conflicting(&gid) && st.serves(&gid, &by)
+                    && st.group(&gid)?.rec.position >= link.position, "state lineage or authorization changed");
                 let from = st.by_iroh(&gid, &by);
                 st.events.push(Event::State { group: Bytes(gid.clone()), from, data });
                 anyhow::Ok(())
@@ -274,6 +308,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 inner.warn(Some(&gid), format!("the group's state did not arrive: {error:#}"));
             }
         });
+    }
+
+    pub(crate) async fn state_hash(&self, anchor: &lmk_proto::epoch::Anchor, position: u64) -> Result<[u8; 32]> {
+        let position = position.checked_sub(anchor.base).context("snapshot before epoch base")?;
+        if position == 0 { return Ok(lmk_proto::head::start(&anchor.service, &anchor.log_ref)); }
+        let lane = self.archiving(&anchor.log_ref);
+        let _lane = lane.lock().await;
+        let root = self.lock().log(&anchor.log_ref)?.digests.context("snapshot prefix is not retained")?;
+        self.archive.hash_at(root, position).await
     }
 
     /// Seals a state of the group's kind as a file to hand a member; holds it.

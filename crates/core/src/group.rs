@@ -142,6 +142,10 @@ impl Session {
         self.signer.public()
     }
 
+    pub fn sign(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.signer.sign(bytes).map_err(|error| anyhow::anyhow!("signing: {error:?}"))
+    }
+
     /// Changes the leaf that new KeyPackages carry; each group needs a commit with `Change::leaf` too.
     pub fn set_leaf<P: Provider>(&mut self, provider: &P, leaf: Leaf) -> Result<()> {
         self.leaf = leaf;
@@ -467,6 +471,11 @@ impl Group {
 
     pub fn members(&self) -> Vec<Member> {
         self.mls.members().filter_map(|member| Member::of(&self.mls, member.index)).collect()
+    }
+
+    pub fn leaf_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some(member) = self.mls.members().find(|member| member.signature_key == key) else { return Ok(None) };
+        Ok(Some(tls_codec::Serialize::tls_serialize_detached(self.mls.public_group().leaf(member.index).context("member without leaf")?)?))
     }
 
     /// Leaf liveness after exact package-reference matching, not a package-identity test.

@@ -23,7 +23,6 @@ rusqlite = { workspace = true, features = ["bundled"] }
 tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 
 [dev-dependencies]
-iroh-relay = { workspace = true, features = ["server"] }
+iroh-relay.workspace = true
 rcgen = "0.14"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { workspace = true, features = ["full"] }

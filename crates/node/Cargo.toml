@@ -20,6 +20,10 @@ tokio = { workspace = true, features = ["sync"] }
 thiserror = "2"
 tracing = "0.1"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite.workspace = true
+tempfile = "3"
+
 [dev-dependencies]
 lmk-testing.workspace = true
 rusqlite.workspace = true

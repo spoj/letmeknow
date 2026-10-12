@@ -27,7 +27,7 @@ const RETRY: Duration = Duration::from_secs(5);
 pub(crate) struct Held {
     payload: Value,
     /// The epoch it is sealed in, its id there, its ciphertext and its log entry; sealed again after a commit.
-    epoch: u64,
+    source: lmk_proto::epoch::Anchor,
     id: Bytes,
     ciphertext: Bytes,
     entry: Bytes,
@@ -35,6 +35,13 @@ pub(crate) struct Held {
     appended: bool,
     /// `send` answered that it is pending: `Event::Sent` tells once it counts.
     pending: bool,
+}
+
+struct Batch {
+    service: lmk_proto::group::Service,
+    capability: [u8; 32],
+    source: lmk_proto::epoch::Anchor,
+    sends: Vec<(Bytes, Vec<u8>, bool)>,
 }
 
 /// A send, by the id it started with.
@@ -75,7 +82,8 @@ impl<P: Provider> State<P> {
         let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
         let (id, ciphertext) = g.mls.seal(&st.provider, session, &send.payload, false)?;
         send.entry = Bytes(g.mls.entry(&st.provider, &id)?);
-        (send.epoch, send.id, send.ciphertext, send.appended) = (g.mls.epoch(), Bytes(id.to_vec()), Bytes(ciphertext), false);
+        (send.id, send.ciphertext, send.appended) = (Bytes(id.to_vec()), Bytes(ciphertext), false);
+        send.source = st.active(gid)?.anchor()?.clone();
         Ok(())
     }
 }
@@ -102,7 +110,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         let mut send = Held {
             payload: payload.clone(),
-            epoch: 0,
+            source: st.active(gid)?.anchor()?.clone(),
             id: Bytes::default(),
             ciphertext: Bytes::default(),
             entry: Bytes::default(),
@@ -141,10 +149,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         g.rec.sends.retain(|sent| *sent != handle);
         let me = g.mls.members().into_iter().find(|m| m.index == g.mls.own_index()).context("a member of its group")?;
         let sender = st.member(gid, &me).context("this session has a letmeknow credential")?;
-        let message = Message { id: send.id.clone(), group: Bytes(gid.to_vec()), epoch: send.epoch, position, at: now(), sender, payload: send.payload, missing: Vec::new() };
+        let message = Message { id: send.id.clone(), group: Bytes(gid.to_vec()), epoch: send.source.epoch, position, at: now(), sender, payload: send.payload, missing: Vec::new() };
         self.deliver(st, gid, message, true)?;
         let item = Item { position, ciphertext: send.ciphertext };
-        st.broadcast(gid, Frame::Messages { group: Bytes(gid.to_vec()), items: vec![item], answers: None });
+        st.broadcast(gid, Frame::Messages { group: Bytes(gid.to_vec()), anchor: st.active(gid)?.anchor()?.clone(), items: vec![item], answers: None });
         let waiters = st.waiters.remove(&handle.0).unwrap_or_default();
         if send.pending {
             st.events.push(Event::Sent { group: Bytes(gid.to_vec()), id: send.id.clone(), answered: handle, position });
@@ -153,7 +161,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    /// Appends the group's held sends, batched, until each counts or fails.
     pub(crate) async fn sends(&self, gid: &[u8]) {
         loop {
             let batch = loop {
@@ -164,101 +171,80 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     Err(error) => return self.warn(Some(gid), format!("sending: {error:#}")),
                 }
             };
-            let Some((service, sends)) = batch else { return };
-            if let Err(error) = self.durable().await {
-                return self.warn(Some(gid), format!("{error:#}"));
-            }
-            let appended = async {
-                let entries: Vec<Vec<u8>> = sends.iter().map(|(_, entry)| entry.clone()).collect();
-                self.clients.client(&service)?.append(gid, &entries, false).await
+            let Some(batch) = batch else { return };
+            if let Err(error) = self.durable().await { return self.warn(Some(gid), format!("{error:#}")); }
+            let entries: Vec<Vec<u8>> = batch.sends.iter().map(|(_, entry, _)| entry.clone()).collect();
+            let appended = match self.clients.client(&batch.service) {
+                Ok(client) => client.append(&batch.capability, &entries, false).await,
+                Err(error) => Err(error),
             };
-            match appended.await {
+            match appended {
                 Ok(_) => {
-                    if let Err(error) = self.read(gid).await {
-                        tracing::debug!("reading the group's log after an append: {error:#}");
-                    }
-                }
-                Err(error) if error.is::<Refused>() => {
-                    let reason = error.downcast::<Refused>().expect("refused").0;
-                    let error = Arc::new(match reason.as_str() {
-                        "rate" => SendError::Rate,
-                        "size" => SendError::Size("over the size the group's membership service takes".into()),
-                        _ => SendError::Refused(reason),
-                    });
-                    self.fail(gid, sends.iter().map(|(handle, _)| handle), error);
+                    if let Err(error) = self.read(&batch.source.log_ref).await { tracing::debug!("reading append source: {error:#}"); }
                 }
                 Err(error) => {
-                    tracing::debug!("appending held sends: {error:#}");
-                    let unreached = error.is::<Unreached>();
-                    let never: Vec<Bytes> = self.appended(gid, &sends, unreached);
-                    self.fail(gid, never.iter(), Arc::new(SendError::Unavailable));
+                    let known = error.is::<Unreached>() || error.is::<Refused>();
+                    if known {
+                        let reason = error.downcast_ref::<Refused>().map(|refused| refused.0.as_str());
+                        let error = Arc::new(match reason {
+                            None => SendError::Unavailable,
+                            Some("rate") => SendError::Rate,
+                            Some("size") => SendError::Size("over the service entry size limit".into()),
+                            Some(reason) => SendError::Refused(reason.to_owned()),
+                        });
+                        if let Err(error) = self.fail(gid, &batch, error) {
+                            self.warn(Some(gid), format!("{error:#}"));
+                            return;
+                        }
+                    }
+                    if let Err(error) = self.read(&batch.source.log_ref).await { tracing::debug!("reconciling uncertain append: {error:#}"); }
                     sleep(RETRY).await;
                 }
             }
         }
     }
 
-    /// The group's sends to append, each sealed in the current epoch, once this session has read the log to its head
-    /// as last read: none while it has not; an empty batch once there are no more.
-    #[allow(clippy::type_complexity)]
-    fn batch(&self, gid: &[u8]) -> Result<Option<Option<(lmk_proto::group::Service, Vec<(Bytes, Vec<u8>)>)>>> {
+    fn batch(&self, gid: &[u8]) -> Result<Option<Option<Batch>>> {
         let mut st = self.lock();
         let Ok(g) = st.group(gid) else { return Ok(Some(None)) };
-        if !st.at_head(gid) {
+        if !st.at_head(gid) { return Ok(None); }
+        if g.rec.sends.is_empty() { return Ok(Some(None)); }
+        if st.active(gid)?.rotate() {
+            self.work.send(crate::Work::Duties(gid.to_vec())).ok();
             return Ok(None);
         }
-        if g.rec.sends.is_empty() {
-            return Ok(Some(None));
-        }
-        let (epoch, service, handles) = (g.mls.epoch(), g.mls.settings().membership, g.rec.sends.clone());
+        let source = st.active(gid)?.anchor()?.clone();
+        let service = g.mls.settings().membership;
+        let capability = st.capability(&source.log_ref)?;
+        let handles = g.rec.sends.clone();
         let mut sends = Vec::new();
-        for handle in handles {
+        for handle in handles.into_iter().take(64) {
             let mut send: Held = get(&st.provider, &send_key(&handle.0))?.context("a send without its record")?;
-            if send.epoch != epoch {
+            if send.source != source {
+                anyhow::ensure!(st.log(&send.source.log_ref)?.closed.is_some(), "uncertain source not yet closed");
                 st.seal(gid, &mut send)?;
-                put(&st.provider, &send_key(&handle.0), &send)?;
             }
-            sends.push((handle, send.entry.0));
+            let uncertain = send.appended;
+            send.appended = true;
+            put(&st.provider, &send_key(&handle.0), &send)?;
+            sends.push((handle, send.entry.0, uncertain));
         }
-        Ok(Some(Some((service, sends))))
+        Ok(Some(Some(Batch { service, capability, source, sends })))
     }
 
-    /// Records that these sends' entries may have reached the service, unless it certainly was not reached; returns
-    /// those that never may have, and that `send` has not answered as pending: those go on.
-    fn appended(&self, gid: &[u8], sends: &[(Bytes, Vec<u8>)], unreached: bool) -> Vec<Bytes> {
-        let st = self.lock();
-        let mut never = Vec::new();
-        for (handle, _) in sends {
-            let Ok(Some(mut send)) = get::<Held>(&st.provider, &send_key(&handle.0)) else { continue };
-            if unreached && !send.appended {
-                if !send.pending {
-                    never.push(handle.clone());
-                }
-            } else if !send.appended {
-                send.appended = true;
-                if let Err(error) = put(&st.provider, &send_key(&handle.0), &send) {
-                    self.warn(Some(gid), format!("{error:#}"));
-                }
-            }
-        }
-        never
-    }
-
-    /// Drops sends the service certainly did not take, and tells why.
-    fn fail<'a>(&self, gid: &[u8], handles: impl Iterator<Item = &'a Bytes>, error: Arc<SendError>) {
+    fn fail(&self, gid: &[u8], batch: &Batch, error: Arc<SendError>) -> Result<()> {
         let mut st = self.lock();
-        for handle in handles {
-            let Ok(Some(send)) = get::<Held>(&st.provider, &send_key(&handle.0)) else { continue };
-            st.provider.delete(&send_key(&handle.0)).ok();
-            if let Ok(g) = st.group_mut(gid) {
-                g.rec.sends.retain(|sent| sent != handle);
-            }
-            st.save(gid).ok();
+        for (handle, wire, uncertain) in &batch.sends {
+            if *uncertain { continue; }
+            let Some(send) = get::<Held>(&st.provider, &send_key(&handle.0))? else { continue };
+            if send.source != batch.source || send.entry.0 != *wire { continue; }
+            st.provider.delete(&send_key(&handle.0))?;
+            st.group_mut(gid)?.rec.sends.retain(|sent| sent != handle);
+            st.save(gid)?;
             let waiters = st.waiters.remove(&handle.0).unwrap_or_default();
             st.out.push(Out::Outcome { waiters, outcome: Err(error.clone()) });
-            if send.pending {
-                self.warn(Some(gid), format!("a pending send ({}) failed: {error}", crate::hex(&handle.0)));
-            }
         }
+        Ok(())
     }
+
 }
