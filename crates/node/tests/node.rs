@@ -651,7 +651,7 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
     let before = node.read_public(&identity).await.unwrap();
     let mut writers = before.writers.clone();
     writers.push(lmk_core::device::public(&lmk_core::random()).into());
-    let published = node.publish(&gid.0, writers).await.unwrap();
+    let published = node.publish(&gid.0, &before, writers).await.unwrap();
     assert_eq!(published.writers.len(), 2);
     let reader = session(&relay, "Reader").await;
     assert_eq!(reader.node.read_public(&identity).await.unwrap().writers, published.writers);
@@ -663,7 +663,7 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
 
     let before_writers = vec![node.key_in(&gid.0)];
     gate.set(false);
-    let publication = node.publish(&gid.0, before_writers.clone());
+    let publication = node.publish(&gid.0, &published, before_writers.clone());
     tokio::pin!(publication);
     tokio::time::timeout(WAIT, async {
         loop {
@@ -673,7 +673,7 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
                     // Closing the gate can race a request on the old connection; establish its replacement.
                     let error = result.unwrap_err();
                     assert!(format!("{error:#}").contains("membership transport interrupted"), "{error:#}");
-                    publication.set(node.publish(&gid.0, before_writers.clone()));
+                    publication.set(node.publish(&gid.0, &published, before_writers.clone()));
                 }
                 reached = reaching.recv() => {
                     assert_eq!(reached.unwrap().0, node.net().id().as_bytes());

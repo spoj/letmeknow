@@ -16,7 +16,7 @@ fn envelope(seed: &[u8; 32], body: &Body) -> Envelope {
     Envelope { sig: Bytes(sign(seed, &[ENTRY_CONTEXT, &body].concat())), by: Bytes(public(seed).to_vec()), body: Bytes(body) }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicLog {
     pub id: [u8; 32],
     pub membership: Service,
@@ -246,6 +246,37 @@ mod tests {
         assert_eq!(log.verify(&of("Ann", "laptop")), Verdict::Dropped);
         assert!(log.apply(&log.next(&other, vec![device.into()])));
         assert_eq!(log.verify(&of("Ann", "laptop")), Verdict::Authorized);
+    }
+
+    #[test]
+    fn certificate_encoding_matches_literal_utf8_vector_and_rejects_wrong_length_signatures() {
+        // RFC 8032 test key; the expected bytes do not use the production serializer.
+        let seed = [0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
+            0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60];
+        let vector = b"letmeknow certificate v2\0\
+            SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\
+            \xd7\x5a\x98\x01\x82\xb1\x0a\xb7\xd5\x4b\xfe\xd3\xc9\x64\x07\x3a\
+            \x0e\xe1\x72\xf3\xda\xa6\x23\x25\xaf\x02\x1a\x68\xf7\x07\x51\x1a\
+            \0\0\0\0\0\0\0\x06\xc3\x85\xf0\x9f\xa6\x8a\
+            \0\0\0\0\0\0\0\x03e\xcc\x81";
+        assert_eq!(certified(&[b'S'; 32], &[b'I'; 32], &public(&seed), "Å🦊", "e\u{301}"), vector);
+        let mut credential = Credential {
+            name: "handle".into(), key: [b'S'; 32].into(),
+            certificate: Some(Box::new(Certificate {
+                identity: IdentityRef { id: [b'I'; 32].into(), membership: service() },
+                device: public(&seed).into(), name: "Å🦊".into(), device_name: "e\u{301}".into(),
+                sig: Bytes(sign(&seed, vector)),
+            })),
+        };
+        assert!(verify_certificate(&credential));
+        for (offset, length) in [(121, 6_u64.to_le_bytes()), (135, 3_u64.to_le_bytes()),
+            (121, 2_u64.to_be_bytes()), (135, 2_u64.to_be_bytes()),
+            (121, 7_u64.to_be_bytes()), (135, 4_u64.to_be_bytes())] {
+            let mut wrong = vector.to_vec();
+            wrong[offset..offset + 8].copy_from_slice(&length);
+            credential.certificate.as_mut().unwrap().sig = Bytes(sign(&seed, &wrong));
+            assert!(!verify_certificate(&credential), "noncanonical length at {offset}: {length:?}");
+        }
     }
 
     #[test]

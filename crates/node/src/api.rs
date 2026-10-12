@@ -380,13 +380,15 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.read_public(identity).await
     }
 
-    /// Publishes changed keys, or restates them every 182 local UTC days for directory retention, not freshness.
-    pub async fn publish(&self, gid: &[u8], mut writers: Vec<Bytes>) -> Result<PublicLog> {
+    /// Publishes an intent derived after reading `predecessor`, never rebasing it onto a later directory.
+    /// Restates unchanged keys every 182 local UTC days for retention, not freshness.
+    pub async fn publish(&self, gid: &[u8], predecessor: &PublicLog, mut writers: Vec<Bytes>) -> Result<PublicLog> {
         writers.sort();
         writers.dedup();
         let settings = self.settings(gid)?;
         let identity = IdentityRef { id: settings.public.context("a group without a public log")?, membership: settings.membership };
         let latest = self.inner.read_public(&identity).await?;
+        ensure!(latest == *predecessor, "the directory advanced; derive the writer intent again");
         let entry = {
             let st = self.inner.lock();
             let (seed, session) = st.device_keys.get(gid).context("not an identity group of this node")?;

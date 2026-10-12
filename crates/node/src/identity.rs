@@ -21,6 +21,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{Event, Item, Node, hex, now};
 
+#[cfg(test)]
+#[path = "identity_tests.rs"]
+mod tests;
+
 const NO_IDENTITY: &str = "this device is on no identity";
 
 /// How long an add's invite is valid, in milliseconds: a week, for a browser opened now and then.
@@ -258,9 +262,11 @@ impl<P: Provider + Send + 'static> Identity<P> {
     pub async fn leave(&self) -> Result<bool> {
         let (gid, identity) = self.own()?;
         let me = self.node.key_in(&gid.0);
-        if self.node.read_public(&identity).await?.writers.contains(&me) {
+        let predecessor = self.node.read_public(&identity).await?;
+        if predecessor.writers.contains(&me) {
+            self.node.inner.caught_up(&gid.0).await?;
             let others = self.node.members(&gid.0)?.into_iter().filter(|m| m.key != me).map(|m| m.key).collect();
-            self.node.publish(&gid.0, others).await?;
+            self.node.publish(&gid.0, &predecessor, others).await?;
         }
         Ok(self.node.leave(&gid.0).await?.is_none())
     }
@@ -296,18 +302,18 @@ impl<P: Provider + Send + 'static> Identity<P> {
         });
     }
 
-    /// Read the directory before the private roster so a just-added device cannot be dropped by a stale roster.
+    /// Derive the roster after reading its public predecessor and applying the private log, not merely receiving it.
     pub async fn duties(&self, gid: &[u8]) -> Result<()> {
         let _passing = self.shared.passing.lock().await;
         let Some(identity) = self.identity_of(gid) else { return Ok(()) };
         let latest = self.node.read_public(&identity).await?;
-        self.node.read_group(gid).await?;
+        self.node.inner.caught_up(gid).await?;
         let me = self.node.key_in(gid);
         if !latest.writers.contains(&me) {
             return Ok(());
         }
         let writers = self.node.members(gid)?.into_iter().map(|m| m.key).collect();
-        self.node.publish(gid, writers).await?;
+        self.node.publish(gid, &latest, writers).await?;
         Ok(())
     }
 

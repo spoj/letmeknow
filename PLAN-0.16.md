@@ -18,6 +18,8 @@ Implementation plan, not a description of the released software. Based on the ad
 
 Authentic directory history is not proof of the latest history. The authoritative service can withhold a revocation from a fresh reader. Persisted checkpoints prevent rollback behind known state; peer evidence can reveal omitted or conflicting history when it arrives. Instant revocation for isolated/offline readers is not promised.
 
+Separate blocker: an honest writer that already knows a public revocation can still be served an authenticated old private identity-group prefix. Directory-predecessor capture prevents concurrent-publication rebasing, and accepted-application catch-up prevents receipt/application races, but neither binds the private roster to that public predecessor. Maintenance can reauthorize a known-dropped key without new explicit intent. Approve a predecessor-bound private writer-intent design before treating this as fixed; no owner root, public names or clocks are needed.
+
 Expiring device authorizations renewed by a separate owner-controlled authority would bound stale acceptance, at a renewal/availability cost. That is a separate identity-design decision, not implicit approval from the metadata or disposable-service choices.
 
 ## Work
