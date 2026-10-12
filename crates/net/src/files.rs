@@ -58,6 +58,7 @@ pub(crate) struct Files {
     /// Files just added, kept from deletion until the next collection has seen them.
     added: Arc<Mutex<Vec<TempTag>>>,
     disk: Option<Arc<dyn Disk>>,
+    memory_only: Mutex<HashSet<[u8; 32]>>,
 }
 
 struct Download {
@@ -96,7 +97,7 @@ impl Files {
             Some(_) => bail!("a browser keeps files in memory"),
             None => (*iroh_blobs::store::mem::MemStore::new_with_opts(iroh_blobs::store::mem::Options { gc_config: Some(gc) })).clone(),
         };
-        Ok(Files { store, endpoint, downloads, added, disk })
+        Ok(Files { store, endpoint, downloads, added, disk, memory_only: Mutex::default() })
     }
 
     /// Serves complete files to current members only: checked per connection, per request, and
@@ -111,6 +112,7 @@ impl Files {
             throttle: ThrottleMode::Intercept,
         };
         let (events, mut rx) = EventSender::channel(64, mask);
+        let disk = self.disk.clone();
         spawn(async move {
             let mut peers = HashMap::new();
             let mut requests = HashMap::new();
@@ -135,7 +137,7 @@ impl Files {
                             })?;
                             Some((*peer, group))
                         });
-                        let allowed = found.is_some();
+                        let allowed = found.is_some() && disk.as_ref().is_none_or(|disk| disk.has(&hash));
                         if let Some(found) = found {
                             requests.insert((msg.connection_id, msg.request_id), found);
                         }
@@ -187,7 +189,7 @@ impl Files {
         let hash = *tag.hash().as_bytes();
         self.added.lock().unwrap().push(tag);
         if let Some(disk) = &self.disk {
-            disk.save(hash, self.ciphertext(&hash).await?);
+            disk.save(hash, self.ciphertext(&hash).await?).await?;
         }
         Ok(FileLink { hash, size: size.load(Ordering::Relaxed), key })
     }
@@ -199,7 +201,15 @@ impl Files {
 
     /// Whether a file is held whole, in memory or on a browser's disk.
     pub async fn has(&self, hash: &[u8; 32]) -> Result<bool> {
-        Ok(self.disk.as_ref().is_some_and(|disk| disk.has(hash)) || self.complete(hash).await?)
+        if let Some(disk) = &self.disk {
+            if disk.has(hash) {
+                return Ok(true);
+            }
+            if !self.memory_only.lock().unwrap().contains(hash) {
+                return Ok(false);
+            }
+        }
+        self.complete(hash).await
     }
 
     /// Whether a file is held for the other members, then in memory: with a disk, only the files kept there are.
@@ -212,6 +222,9 @@ impl Files {
 
     /// Whether a file is in memory, after loading it from a browser's disk if it is kept there.
     async fn load(&self, hash: &[u8; 32]) -> Result<bool> {
+        if !self.has(hash).await? {
+            return Ok(false);
+        }
         if self.complete(hash).await? {
             return Ok(true);
         }
@@ -263,6 +276,9 @@ impl Files {
         {
             return;
         }
+        if self.disk.is_some() && !keep {
+            self.memory_only.lock().unwrap().insert(link.hash);
+        }
         let (holders, rx) = mpsc::unbounded_channel();
         holders.send(holder).unwrap();
         let (finished, done_rx) = watch::channel(None);
@@ -271,7 +287,7 @@ impl Files {
         spawn(async move {
             let mut result = files.download(hash, sealed, rx).await;
             if let (Ok(()), Some(disk), true) = (&result, &files.disk, keep) {
-                result = files.ciphertext(&hash).await.map(|ciphertext| disk.save(hash, ciphertext));
+                result = async { disk.save(hash, files.ciphertext(&hash).await?).await }.await;
             }
             if let Err(e) = &result {
                 tracing::debug!("download of {} stopped: {e:#}", Hash::from_bytes(hash));
@@ -286,9 +302,9 @@ impl Files {
     pub async fn wait(&self, hash: &[u8; 32]) -> Result<bool> {
         let done = self.downloads.lock().unwrap().get(hash).map(|d| d.done.clone());
         if let Some(mut done) = done {
-            done.wait_for(Option::is_some).await?;
+            return Ok(done.wait_for(Option::is_some).await?.unwrap());
         }
-        self.complete(hash).await
+        self.has(hash).await
     }
 
     /// Fetches missing pieces from every holder at once; a holder that fails is dropped, and its

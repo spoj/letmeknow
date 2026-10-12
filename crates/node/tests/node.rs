@@ -248,6 +248,110 @@ fn fp(key: &Bytes) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn failed_welcome_is_retried_after_restart() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let relay = relay().await;
+    let dir = folder("failed-welcome");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("alice.db");
+    let fail = Arc::new(AtomicBool::new(false));
+    let failing = fail.clone();
+    let mut config = config(&relay, "Alice", None, &[CHAT, KIND]);
+    config.durable = Some(Arc::new(move || {
+        let fail = failing.load(Ordering::SeqCst);
+        Box::pin(async move {
+            anyhow::ensure!(!fail, "injected persistence failure");
+            Ok(())
+        })
+    }));
+    let (node, events) = Node::start(SqliteProvider::open(&path).unwrap(), config).await.unwrap();
+    let mut alice = Session { node, events };
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
+    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    let joining = {
+        let node = bob.node.clone();
+        let link = link.clone();
+        tokio::spawn(async move { node.join(&link, None).await })
+    };
+    let reply = alice.until(|event| match event {
+        Event::Snapshot { reply, .. } => Some(reply),
+        _ => None,
+    }).await;
+    fail.store(true, Ordering::SeqCst);
+    reply.send(None).unwrap();
+    let error = tokio::time::timeout(WAIT, joining).await.unwrap().unwrap().unwrap_err();
+    assert!(format!("{error:#}").contains("injected persistence failure"), "{error:#}");
+    assert!(bob.node.groups().is_empty(), "no Welcome escaped the failed barrier");
+    assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2, "the Add was already logged");
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+
+    let mut alice = stored(&relay, "Alice", &path).await;
+    let joining = {
+        let node = bob.node.clone();
+        tokio::spawn(async move { node.join(&link, None).await })
+    };
+    alice.until(|event| match event {
+        Event::Snapshot { reply, .. } => Some(reply),
+        _ => None,
+    }).await.send(None).unwrap();
+    assert_eq!(tokio::time::timeout(WAIT, joining).await.unwrap().unwrap().unwrap().0, gid);
+    assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2, "retry used the logged Welcome, not another Add");
+    alice.node.shutdown().await.unwrap();
+    bob.node.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removal_events_require_durability() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let relay = relay().await;
+    for failed in [false, true] {
+        let fail = Arc::new(AtomicBool::new(false));
+        let failing = fail.clone();
+        let mut config = config(&relay, "Bob", None, &[CHAT]);
+        config.durable = Some(Arc::new(move || {
+            let fail = failing.load(Ordering::SeqCst);
+            Box::pin(async move {
+                anyhow::ensure!(!fail, "injected persistence failure");
+                Ok(())
+            })
+        }));
+        let (node, events) = Node::start(MemoryProvider::default(), config).await.unwrap();
+        let mut bob = Session { node, events };
+        let alice = session(&relay, "Alice").await;
+        let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+        let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+        bob.node.join(&link, None).await.unwrap();
+        if failed {
+            fail.store(true, Ordering::SeqCst);
+            let error = bob.node.send(&gid.0, &message("not durable")).await.unwrap_err();
+            assert!(format!("{error:#}").contains("injected persistence failure"), "{error:#}");
+            fail.store(false, Ordering::SeqCst);
+        }
+        assert!(alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap());
+        eventually("the MLS removal forgot Bob's group", || bob.node.groups().is_empty()).await;
+        if failed {
+            while let Ok(event) = bob.events.try_recv() {
+                assert!(!matches!(event, Event::Removed { .. }), "removal escaped the failed barrier");
+            }
+        } else {
+            bob.until(|event| match event {
+                Event::Removed { group, kind, by } => {
+                    assert_eq!(group, gid);
+                    assert_eq!(kind, CHAT);
+                    assert_eq!(by.unwrap().name, "Alice");
+                    Some(())
+                }
+                _ => None,
+            }).await;
+        }
+        bob.node.shutdown().await.unwrap();
+        alice.node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn chat_and_removal() {
     let relay = relay().await;
     let mut alice = session(&relay, "Alice").await;
@@ -515,6 +619,75 @@ impl iroh::protocol::ProtocolHandler for Gated {
         open.wait_for(|open| *open).await.ok();
         iroh::protocol::ProtocolHandler::accept(&self.service, connection).await
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn publication_resuming_after_persistence_failure_does_not_append() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let relay = relay().await;
+    let dir = folder("publication-durability");
+    let (gate, mut reaching) = Gate::new();
+    let (membership, service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
+    let fail = Arc::new(AtomicBool::new(false));
+    let failing = fail.clone();
+    let mut config = config(&relay, "laptop", Some(Device::new("laptop")), &[CHAT, IDENTITY]);
+    config.durable = Some(Arc::new(move || {
+        let fail = failing.load(Ordering::SeqCst);
+        Box::pin(async move {
+            anyhow::ensure!(!fail, "injected persistence failure");
+            Ok(())
+        })
+    }));
+    let (node, _events) = Node::start(MemoryProvider::default(), config).await.unwrap();
+    let identity = node.create_identity(Settings { membership, ..settings(IDENTITY, &relay) }).await.unwrap();
+    let gid = devices_group(&node);
+    let before = node.read_public(&identity).await.unwrap();
+    let published = node.publish(&gid.0, before.writers.clone(), "Published").await.unwrap();
+    assert_eq!(published.name, "Published");
+    assert_eq!(published.writers, before.writers);
+    let reader = session(&relay, "Reader").await;
+    assert_eq!(reader.node.read_public(&identity).await.unwrap().name, "Published");
+    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
+    let directory = lmk_membership::client::ServeClient::for_service(endpoint, &identity.membership).unwrap();
+    let address = lmk_proto::public::address(&identity.id.0);
+    let before = directory.head(&address).await.unwrap();
+    assert_eq!(before.length, 2, "genesis and the successful publication");
+
+    gate.set(false);
+    let publication = node.publish(&gid.0, published.writers.clone(), "Must not escape");
+    tokio::pin!(publication);
+    tokio::time::timeout(WAIT, async {
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut publication => {
+                    // Closing the gate can race a request on the old connection; establish its replacement.
+                    let error = result.unwrap_err();
+                    assert!(format!("{error:#}").contains("closed by peer: closed (code 0)"), "{error:#}");
+                    publication.set(node.publish(&gid.0, published.writers.clone(), "Must not escape"));
+                }
+                reached = reaching.recv() => {
+                    assert_eq!(reached.unwrap().0, node.net().id().as_bytes());
+                    break;
+                }
+            }
+        }
+    }).await.unwrap();
+    fail.store(true, Ordering::SeqCst);
+    let error = node.send(&gid.0, &message("not durable")).await.unwrap_err();
+    assert!(format!("{error:#}").contains("injected persistence failure"), "{error:#}");
+    fail.store(false, Ordering::SeqCst);
+    gate.set(true);
+    let error = tokio::time::timeout(WAIT, publication).await.unwrap().unwrap_err();
+    assert!(format!("{error:#}").contains("injected persistence failure"), "{error:#}");
+    let after = reader.node.read_public(&identity).await.unwrap();
+    assert_eq!(after.name, "Published");
+    assert_eq!(after.writers, published.writers);
+    let after = directory.head(&address).await.unwrap();
+    assert_eq!((after.length, after.hash), (before.length, before.hash), "no append reached the directory");
+    node.shutdown().await.unwrap();
+    reader.node.shutdown().await.unwrap();
+    service.shutdown().await.unwrap();
 }
 
 /// The rule a joiner comes by is checked again as the Add is built: an invite that expired while the admitter read the

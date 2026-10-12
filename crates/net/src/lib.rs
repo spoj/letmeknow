@@ -60,7 +60,8 @@ pub trait Disk: Send + Sync + 'static {
     fn has(&self, hash: &[u8; 32]) -> bool;
     /// A kept file's ciphertext.
     fn load(&self, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>>;
-    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>);
+    /// Resolves only once the ciphertext is durable; failure must not publish it through `has`.
+    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>) -> BoxFuture<Result<()>>;
 }
 
 /// A member's decision on a joiner's request; it may commit an Add before it answers.

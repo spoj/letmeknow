@@ -57,24 +57,30 @@ extern "C" {
     /// Persists records: `[key, value]` pairs, and keys to delete; resolves once they are durable.
     #[wasm_bindgen(method)]
     fn save(this: &Idb, puts: Array, deletes: Array) -> Promise;
-    #[wasm_bindgen(method, js_name = saveFile)]
-    fn save_file(this: &Idb, hash: &str, ciphertext: Vec<u8>);
+    #[wasm_bindgen(method, js_name = saveFiles)]
+    fn save_files(this: &Idb, changes: Array) -> Promise;
     /// Resolves to a kept file's ciphertext.
     #[wasm_bindgen(method, js_name = loadFile)]
     fn load_file(this: &Idb, hash: &str) -> Promise;
-    #[wasm_bindgen(method, js_name = deleteFile)]
-    fn delete_file(this: &Idb, hash: &str);
 }
 
 /// The files kept in IndexedDB, which the session loads and saves through the page.
 struct Kept {
     hashes: Mutex<HashSet<[u8; 32]>>,
-    io: mpsc::UnboundedSender<Io>,
+    pending: Mutex<Vec<FileWrite>>,
+    io: mpsc::UnboundedSender<Load>,
+    saving: mpsc::UnboundedSender<Save>,
 }
 
-enum Io {
-    Load([u8; 32], oneshot::Sender<Result<Vec<u8>>>),
-    Save([u8; 32], Vec<u8>),
+#[derive(Clone)]
+struct FileWrite {
+    hash: [u8; 32],
+    ciphertext: Option<Vec<u8>>,
+}
+
+struct Load {
+    hash: [u8; 32],
+    reply: oneshot::Sender<Result<Vec<u8>>>,
 }
 
 impl Disk for Kept {
@@ -84,13 +90,18 @@ impl Disk for Kept {
 
     fn load(&self, hash: [u8; 32]) -> BoxFuture<Result<Vec<u8>>> {
         let (reply, answer) = oneshot::channel();
-        self.io.send(Io::Load(hash, reply)).ok();
+        self.io.send(Load { hash, reply }).ok();
         Box::pin(async move { answer.await? })
     }
 
-    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>) {
-        self.hashes.lock().unwrap().insert(hash);
-        self.io.send(Io::Save(hash, ciphertext)).ok();
+    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>) -> BoxFuture<Result<()>> {
+        self.pending.lock().unwrap().push(FileWrite { hash, ciphertext: Some(ciphertext) });
+        let (reply, saved) = oneshot::channel();
+        let asked = self.saving.send(Save::Barrier(reply));
+        Box::pin(async move {
+            asked.map_err(|_| anyhow!("the page stopped saving"))?;
+            saved.await?
+        })
     }
 }
 
@@ -150,16 +161,45 @@ impl Provider for Store {
     }
 }
 
-/// Hands the records that changed since the last flush to the page; resolves once they are durable.
-fn flush(store: &Store, idb: &Idb) -> Promise {
+#[derive(Debug)]
+enum Save {
+    Background,
+    Barrier(oneshot::Sender<Result<()>>),
+    Retry(oneshot::Sender<Result<()>>),
+}
+
+/// Called only by the save task, which serializes snapshots through their IndexedDB commits.
+async fn flush(store: &Store, kept: &Kept, idb: &Idb, publish: bool) -> Result<()> {
+    let changes = store.0.changes();
+    let files = kept.pending.lock().unwrap().clone();
     let (puts, deletes) = (Array::new(), Array::new());
-    for (key, value) in store.0.changes() {
+    for (key, value) in &changes {
         match value {
             Some(value) => drop(puts.push(&Array::of2(&Uint8Array::from(&key[..]), &Uint8Array::from(&value[..])))),
             None => drop(deletes.push(&Uint8Array::from(&key[..]))),
         }
     }
-    idb.save(puts, deletes)
+    JsFuture::from(idb.save(puts, deletes)).await.map_err(|e| anyhow!("saving to IndexedDB: {e:?}"))?;
+    store.0.persisted(&changes);
+    if !files.is_empty() {
+        let changes = Array::new();
+        for file in &files {
+            let hash = JsValue::from_str(&hex::encode(file.hash));
+            let bytes = file.ciphertext.as_ref().map_or(JsValue::NULL, |bytes| Uint8Array::from(&bytes[..]).into());
+            changes.push(&Array::of2(&hash, &bytes));
+        }
+        JsFuture::from(idb.save_files(changes)).await.map_err(|e| anyhow!("saving files to IndexedDB: {e:?}"))?;
+        kept.pending.lock().unwrap().drain(..files.len());
+        let mut hashes = kept.hashes.lock().unwrap();
+        for file in files {
+            if file.ciphertext.is_none() {
+                hashes.remove(&file.hash);
+            } else if publish {
+                hashes.insert(file.hash);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The in-page plugins' records, among the session's.
@@ -248,7 +288,8 @@ struct App {
     devices: Identity<Store>,
     store: Store,
     membership: lmk_proto::group::Service,
-    idb: Idb,
+    saving: mpsc::UnboundedSender<Save>,
+    durable: lmk_node::Durable,
     kept: Arc<Kept>,
     on_event: Function,
 }
@@ -277,33 +318,69 @@ pub fn invite_kind(link: &str) -> R<String> {
 impl App {
     async fn start(records: Array, kept: Vec<String>, config: &str, idb: Idb, on_event: Function) -> Result<Rc<Self>> {
         let config: Config = serde_json::from_str(config)?;
+        let fresh = records.length() == 0;
         let records = records.iter().map(|record| {
             let record = Array::from(&record);
             (Uint8Array::from(record.get(0)).to_vec(), Uint8Array::from(record.get(1)).to_vec())
         });
         let store = Store(Arc::new(MemoryProvider::load(records.collect::<Vec<_>>())));
-        // Each step's records are durable before what it produced leaves the session.
-        let (durable_tx, mut durable_rx) = mpsc::unbounded_channel::<oneshot::Sender<Result<()>>>();
-        let (saving, saving_idb): (_, Idb) = (store.clone(), idb.clone().unchecked_into());
+        let device: Device = if fresh {
+            Device::new(&config.device)
+        } else {
+            anyhow::ensure!(store.get(b"session")?.is_some(), "stored session is incomplete; local records were preserved");
+            get(&store, b"web/device")?.context("stored device is missing; local records were preserved")?
+        };
+        put(&store, b"web/device", &device)?;
+        // A failure latches: only an explicit Retry saves again, and output resumes only after reload.
+        let (durable_tx, mut durable_rx) = mpsc::unbounded_channel::<Save>();
+        let hashes = kept.iter().map(|hash| hex::decode(hash)?.try_into().map_err(|_| anyhow!("a hash is 32 bytes"))).collect::<Result<_>>()?;
+        let (io, mut io_rx) = mpsc::unbounded_channel();
+        let kept = Arc::new(Kept { hashes: Mutex::new(hashes), pending: Mutex::default(), io, saving: durable_tx.clone() });
+        let io_idb: Idb = idb.clone().unchecked_into();
         spawn_local(async move {
-            while let Some(reply) = durable_rx.recv().await {
-                let saved = JsFuture::from(flush(&saving, &saving_idb)).await;
-                reply.send(saved.map(drop).map_err(|e| anyhow!("saving to IndexedDB: {e:?}"))).ok();
+            while let Some(Load { hash, reply }) = io_rx.recv().await {
+                let loaded = JsFuture::from(io_idb.load_file(&hex::encode(hash))).await;
+                reply.send(loaded.map(|bytes| Uint8Array::new(&bytes).to_vec()).map_err(|e| anyhow!("loading a file: {e:?}"))).ok();
             }
         });
+        let (saving, saving_kept, saving_idb): (_, _, Idb) = (store.clone(), kept.clone(), idb.clone().unchecked_into());
+        let saving_event = on_event.clone();
+        spawn_local(async move {
+            let mut failed = None;
+            while let Some(request) = durable_rx.recv().await {
+                let retry = matches!(&request, Save::Retry(_));
+                let mut saved = match (&failed, &request) {
+                    (Some(_), Save::Background) => continue,
+                    (Some(error), Save::Barrier(_)) => Err(anyhow!("{error}")),
+                    _ => flush(&saving, &saving_kept, &saving_idb, failed.is_none()).await,
+                };
+                if retry && failed.is_some() && saved.is_ok() && (!saving.0.changes().is_empty() || !saving_kept.pending.lock().unwrap().is_empty()) {
+                    saved = Err(anyhow!("local state changed during the recovery save; retry saving again before reloading"));
+                }
+                if let Err(error) = &saved {
+                    if failed.is_none() {
+                        let text = format!("Local state could not be saved: {error:#}. Output is stopped. Keep this tab open, fix browser storage, then retry saving and reload.");
+                        saving_event.call1(&JsValue::NULL, &JsValue::from_str(&json!({ "type": "storage_failed", "text": text }).to_string())).unwrap();
+                        failed = Some(text);
+                    }
+                } else if retry && failed.is_some() {
+                    saving_event.call1(&JsValue::NULL, &JsValue::from_str(&json!({ "type": "storage_saved" }).to_string())).unwrap();
+                }
+                match request {
+                    Save::Background => {}
+                    Save::Barrier(reply) | Save::Retry(reply) => { reply.send(saved).ok(); }
+                }
+            }
+        });
+        let saving = durable_tx.clone();
         let durable: lmk_node::Durable = Arc::new(move || {
             let (reply, saved) = oneshot::channel();
-            let asked = durable_tx.send(reply);
+            let asked = durable_tx.send(Save::Barrier(reply));
             Box::pin(async move {
                 asked.map_err(|_| anyhow!("the page stopped saving"))?;
                 saved.await?
             })
         });
-        let device: Device = get(&store, b"web/device")?.unwrap_or_else(|| Device::new(&config.device));
-        put(&store, b"web/device", &device)?;
-        let hashes = kept.iter().map(|hash| hex::decode(hash)?.try_into().map_err(|_| anyhow!("a hash is 32 bytes"))).collect::<Result<_>>()?;
-        let (io, mut io_rx) = mpsc::unbounded_channel();
-        let kept = Arc::new(Kept { hashes: Mutex::new(hashes), io });
         let node_config = lmk_node::Config {
             handle: String::new(),
             device: Some(device.clone()),
@@ -314,7 +391,7 @@ impl App {
             disk: Some(kept.clone()),
             file_limit: FILE_LIMIT,
             kinds: vec![CHAT.into(), DOC.into(), TABLE.into(), IDENTITY.into()],
-            durable: Some(durable),
+            durable: Some(durable.clone()),
         };
         let (node, mut events) = Node::start(store.clone(), node_config).await?;
         let saved = store.clone();
@@ -329,11 +406,11 @@ impl App {
         };
         let client_config = lmk_client::Config { device, membership: membership.clone() };
         let (client, mut told) = Client::new(node, client_config, Access::Here(devices.clone()), Arc::new(plugins), written);
-        let app = Rc::new(App { client, devices, store, membership, idb, kept, on_event });
+        let app = Rc::new(App { client, devices, store, membership, saving, durable, kept, on_event });
         let told_app = app.clone();
         spawn_local(async move {
             while let Some(event) = told.recv().await {
-                if let Err(e) = told_app.on(event) {
+                if let Err(e) = told_app.on(event).await {
                     told_app.emit(json!({ "type": "warning", "text": format!("{e:#}") }));
                 }
                 told_app.flush();
@@ -352,18 +429,6 @@ impl App {
             app.keep(&gid.0)?;
         }
         app.flush();
-        let io_app = app.clone();
-        spawn_local(async move {
-            while let Some(io) = io_rx.recv().await {
-                match io {
-                    Io::Save(hash, ciphertext) => io_app.idb.save_file(&hex::encode(hash), ciphertext),
-                    Io::Load(hash, reply) => {
-                        let loaded = JsFuture::from(io_app.idb.load_file(&hex::encode(hash))).await;
-                        reply.send(loaded.map(|bytes| Uint8Array::new(&bytes).to_vec()).map_err(|e| anyhow!("loading a file: {e:?}"))).ok();
-                    }
-                }
-            }
-        });
         let events_app = app.clone();
         spawn_local(async move {
             while let Some(event) = events.recv().await {
@@ -399,18 +464,17 @@ impl App {
     /// Deletes the kept files no group links any longer, by the rule lmk-node holds files by.
     fn collect(&self) {
         let linked: HashSet<[u8; 32]> = self.client.node().files().iter().map(|link| link.hash).collect();
-        self.kept.hashes.lock().unwrap().retain(|hash| {
-            let keep = linked.contains(hash);
-            if !keep {
-                self.idb.delete_file(&hex::encode(hash));
-            }
-            keep
-        });
+        let hashes = self.kept.hashes.lock().unwrap();
+        self.kept.pending.lock().unwrap().extend(hashes.iter().filter(|hash| !linked.contains(*hash)).map(|hash| FileWrite { hash: *hash, ciphertext: None }));
+        self.flush();
     }
 
-    /// Hands the records that changed since the last flush to the page.
     fn flush(&self) {
-        drop(flush(&self.store, &self.idb));
+        self.saving.send(Save::Background).expect("the page's save task runs");
+    }
+
+    async fn saved(&self) -> Result<()> {
+        (self.durable)().await
     }
 
     fn emit(&self, event: Value) {
@@ -419,6 +483,7 @@ impl App {
 
     /// A request of the client core; a group joined has its settings remembered, for the changes to them.
     async fn request(&self, request: Request) -> Result<Value> {
+        self.saved().await?;
         let joining = matches!(request, Request::Join { .. });
         let answer = self.client.request(request).await?;
         if joining && let Some(gid) = answer["group"].as_str() {
@@ -428,21 +493,21 @@ impl App {
     }
 
     /// What the client tells: kept in its group's timeline and told the page.
-    fn on(&self, event: ClientEvent) -> Result<()> {
-        match event {
+    async fn on(&self, event: ClientEvent) -> Result<()> {
+        let event = match event {
             ClientEvent::Joined { group, member, by, how } => {
                 self.remember(&group.0, &json!({ "type": "joined", "at": now(), "member": member, "by": by, "how": how }))?;
-                self.emit(json!({ "type": "joined", "group": group }));
+                json!({ "type": "joined", "group": group })
             }
             ClientEvent::Left { group, member, by } => {
                 self.remember(&group.0, &json!({ "type": "left", "at": now(), "member": member, "by": by }))?;
-                self.emit(json!({ "type": "left", "group": group }));
+                json!({ "type": "left", "group": group })
             }
             ClientEvent::Revoked { group, removed, added } => {
                 self.remember(&group.0, &json!({ "type": "revoked", "at": now(), "removed": removed, "added": added }))?;
-                self.emit(json!({ "type": "revoked", "group": group }));
+                json!({ "type": "revoked", "group": group })
             }
-            ClientEvent::Removed { group, by } => self.emit(json!({ "type": "removed", "group": group, "by": by.and_then(|by| by.name) })),
+            ClientEvent::Removed { group, by } => json!({ "type": "removed", "group": group, "by": by.and_then(|by| by.name) }),
             ClientEvent::Gone { group } => {
                 let stored: Vec<(Bytes, u64)> = get(&self.store, &key("messages", &group.0))?.unwrap_or_default();
                 for (id, _) in stored {
@@ -451,46 +516,52 @@ impl App {
                 for kind in ["timeline", "settings", "messages"] {
                     self.store.delete(&key(kind, &group.0))?;
                 }
+                return self.saved().await;
             }
             ClientEvent::Settings { group, settings, by } => {
                 let before: Option<Settings> = get(&self.store, &key("settings", &group.0))?;
                 put(&self.store, &key("settings", &group.0), &settings)?;
                 let item = json!({ "type": "settings", "at": now(), "by": by, "before": before, "settings": settings });
                 self.remember(&group.0, &item)?;
-                self.emit(json!({ "type": "settings", "group": group }));
+                json!({ "type": "settings", "group": group })
             }
             ClientEvent::Message { group, id, missing, .. } => {
                 self.keep(&group.0)?;
                 if !missing.is_empty() {
                     self.remember(&group.0, &json!({ "type": "missing", "at": now(), "positions": missing }))?;
                 }
-                self.emit(json!({ "type": "message", "group": group, "id": id }));
+                json!({ "type": "message", "group": group, "id": id })
             }
             ClientEvent::Lost { group, member, positions, ids } => {
                 self.remember(&group.0, &json!({ "type": "lost", "at": now(), "member": member, "positions": positions, "ids": ids }))?;
-                self.emit(json!({ "type": "lost", "group": group }));
+                json!({ "type": "lost", "group": group })
             }
             ClientEvent::Sent { group, id, answered, .. } => {
                 self.keep(&group.0)?;
-                self.emit(json!({ "type": "sent", "group": group, "id": id, "answered": answered }));
+                json!({ "type": "sent", "group": group, "id": id, "answered": answered })
             }
-            ClientEvent::Heard { group } => self.emit(json!({ "type": "heard", "group": group })),
-            ClientEvent::File { hash } => self.emit(json!({ "type": "file", "hash": hash })),
+            ClientEvent::Heard { group } => json!({ "type": "heard", "group": group }),
+            ClientEvent::File { hash } => json!({ "type": "file", "hash": hash }),
             ClientEvent::Plugin { group, kind, mut event, .. } => {
                 event.insert("group".into(), json!(group));
                 event.insert("kind".into(), json!(kind));
-                self.emit(Value::Object(event));
+                Value::Object(event)
             }
-            ClientEvent::Identity { identity } => self.emit(json!({ "type": "devices", "identity": identity })),
+            ClientEvent::Identity { identity } => json!({ "type": "devices", "identity": identity }),
             ClientEvent::Added { device, joined } => {
                 let group = joined["group"].as_str().context("a joined group has an id")?;
                 self.remember_settings(&unb64(group)?)?;
-                self.emit(json!({ "type": "added", "group": group, "by": device }));
+                json!({ "type": "added", "group": group, "by": device })
             }
-            ClientEvent::Warning { group, text } => self.emit(json!({ "type": "warning", "group": group, "text": text })),
+            ClientEvent::Warning { group, text } => {
+                self.emit(json!({ "type": "warning", "group": group, "text": text }));
+                return Ok(());
+            }
             // The page shows messages as they come, waiting for none; a held leave shows as its tick.
-            ClientEvent::Synced { .. } | ClientEvent::LeaveHeld { .. } => {}
-        }
+            ClientEvent::Synced { .. } | ClientEvent::LeaveHeld { .. } => return Ok(()),
+        };
+        self.saved().await?;
+        self.emit(event);
         Ok(())
     }
 
@@ -647,9 +718,12 @@ impl App {
 
 #[wasm_bindgen]
 impl Lmk {
-    /// Persists what changed now, as when the page is hidden.
-    pub fn flush(&self) {
-        self.app.flush();
+    /// Waits for persistence; `retry` explicitly retries a failed save, then asks every tab to reload.
+    pub async fn flush(&self, retry: bool) -> R<()> {
+        let (reply, saved) = oneshot::channel();
+        let request = if retry { Save::Retry(reply) } else { Save::Barrier(reply) };
+        self.app.saving.send(request).map_err(|_| JsError::new("the page stopped saving"))?;
+        saved.await.map_err(|_| JsError::new("the page stopped saving"))?.map_err(js)
     }
 
     /// This browser: `{"name", "fp", "device": {"name"}, "identity": {"id", "name", "device"}}`, `device` its key on the
@@ -662,7 +736,7 @@ impl Lmk {
     pub async fn request(&self, request: String) -> R<String> {
         let request: Request = serde_json::from_str(&request).map_err(|e| js(e.into()))?;
         let answer = self.app.request(request).await.map_err(js)?;
-        self.app.flush();
+        self.app.saved().await.map_err(js)?;
         Ok(answer.to_string())
     }
 
@@ -684,10 +758,11 @@ impl Lmk {
     /// A new chat, doc or table, speaking as this browser's identity; returns its id.
     pub async fn create(&self, kind: String, name: String) -> R<String> {
         let app = &self.app;
+        app.saved().await.map_err(js)?;
         let settings = Settings { protocol: PROTOCOL, kind, name, carry: 7, update: lmk_proto::group::UPDATE, public: None, membership: app.membership.clone(), rest: Default::default() };
         let (gid, _) = app.client.create(settings, (Vec::new(), String::new())).await.map_err(js)?;
         app.remember_settings(&gid.0).map_err(js)?;
-        app.flush();
+        app.saved().await.map_err(js)?;
         Ok(json!(gid).as_str().expect("base64url").to_owned())
     }
 
@@ -705,29 +780,32 @@ impl Lmk {
         file_type: Option<String>,
         file: Option<Vec<u8>>,
     ) -> R<String> {
+        self.app.saved().await.map_err(js)?;
         let gid = Bytes(unb64(&gid).map_err(js)?);
         let attachment = file.map(|data| File { name: file_name.unwrap_or_default(), media_type: file_type.unwrap_or_default(), data });
         let reply_to = reply_to.map(|id| message_id(&id)).transpose().map_err(js)?;
         let (_, sent) = self.app.client.send(&gid, Chat { text: content, to, reply_to, urgent, attachment }).await.map_err(js)?;
         self.app.keep(&gid.0).map_err(js)?;
-        self.app.flush();
+        self.app.saved().await.map_err(js)?;
         Ok(sent.to_string())
     }
 
     /// A command of a kind's in-page plugin, `args` a JSON array; answers its answer, as JSON. The doc kind's bind an
     /// editor to a doc: `["state", group]`, `["diff", group, state vector]` and `["edit", group, update]`.
     pub async fn command(&self, kind: String, args: String) -> R<String> {
+        self.app.saved().await.map_err(js)?;
         let args: Vec<String> = serde_json::from_str(&args).map_err(|e| js(e.into()))?;
         let answered = self.app.client.command(&kind, args, String::new()).await.map_err(js)?;
         let answer = answered.await.map_err(|_| JsError::new("the plugin stopped"))?.map_err(js)?;
-        self.app.flush();
+        self.app.saved().await.map_err(js)?;
         Ok(answer.to_string())
     }
 
     /// Seals a file for a group and holds it; returns its link.
     pub async fn add_file(&self, gid: String, bytes: Vec<u8>) -> R<String> {
+        self.app.saved().await.map_err(js)?;
         let link = self.app.client.node().add_file(&unb64(&gid).map_err(js)?, bytes).await.map_err(js)?;
-        self.app.flush();
+        self.app.saved().await.map_err(js)?;
         Ok(link.link())
     }
 

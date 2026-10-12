@@ -21,7 +21,8 @@ impl Store {
     pub fn open(path: &Path, key: SigningKey) -> Result<Self> {
         let db = Connection::open(path)?;
         db.pragma_update(None, "journal_mode", "WAL")?;
-        db.pragma_update(None, "synchronous", "NORMAL")?;
+        db.pragma_update(None, "synchronous", "FULL")?;
+        db.pragma_update(None, "fullfsync", true)?;
         // `public` marks a log kept whole while it is appended to; `appended`, in milliseconds, is its last append.
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS logs (id BLOB PRIMARY KEY, length INTEGER NOT NULL, hash BLOB NOT NULL,
@@ -138,6 +139,37 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_append_returns_no_head_when_commit_fails() {
+        let dir = std::env::temp_dir().join(format!("lmk-store-durable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        let key = SigningKey::from_bytes(&[3; 32]);
+        let store = Store::open(&path, key.clone()).unwrap();
+        {
+            let db = store.db.lock().unwrap();
+            assert_eq!(db.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "wal");
+            assert_eq!(db.query_row("PRAGMA synchronous", [], |r| r.get::<_, u32>(0)).unwrap(), 2);
+            assert_eq!(db.query_row("PRAGMA fullfsync", [], |r| r.get::<_, u32>(0)).unwrap(), 1);
+            db.execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE child (id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+                 CREATE TRIGGER fail_commit AFTER INSERT ON entries BEGIN INSERT INTO child VALUES (1); END;",
+            ).unwrap();
+        }
+        assert!(store.append(b"g", &[Bytes(b"not committed".to_vec())], false).is_err());
+        assert_eq!(store.head(b"g").unwrap().length, 0);
+        assert!(store.read(b"g", 0, 1024).unwrap().unwrap().entries.is_empty());
+        store.db.lock().unwrap().execute_batch("DROP TRIGGER fail_commit").unwrap();
+        let appended = store.append(b"g", &[Bytes(b"committed".to_vec())], false).unwrap();
+        let reader = Store::open(&path, key).unwrap();
+        assert_eq!(reader.head(b"g").unwrap().hash, appended.head.hash);
+        assert_eq!(reader.read(b"g", 0, 1024).unwrap().unwrap().entries, [Bytes(b"committed".to_vec())]);
+        drop((reader, store));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn append_read_expire() {

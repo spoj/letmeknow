@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { chromium } from "playwright";
+import * as Y from "yjs";
 
 const { URL: SITE, BIN, LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP } = process.env;
 const tmp = mkdtempSync(join(tmpdir(), "lmk-browser-"));
@@ -60,14 +61,15 @@ function native(name) {
   };
 }
 
-const ann = native("ann");
+let ann = native("ann");
 const desk = native("desk");
 const browser = await chromium.launch({ args: ["--ignore-certificate-errors"] });
 const pages = {};
+const pageErrors = [];
 function watch(name, page) {
   pages[name] = page;
   page.on("console", message => message.type() === "error" && console.log(`${name}: ${message.text()}`));
-  page.on("pageerror", error => console.log(`${name}: ${error}`));
+  page.on("pageerror", error => { pageErrors.push(`${name}: ${error}`); console.log(`${name}: ${error}`); });
   return page;
 }
 /** A browser profile; unless `own`, localStorage names the test's relay and membership service, as the server would. */
@@ -101,6 +103,89 @@ const kept = page =>
       })
   );
 const text = page => page.locator(".cm-content").evaluate(content => content.cmTile.view.state.doc.toString());
+const call = (page, method, ...args) => page.evaluate(([method, args]) => new Promise((resolve, reject) => {
+  const channel = new BroadcastChannel("letmeknow");
+  const id = crypto.randomUUID();
+  const timer = setTimeout(() => { channel.close(); reject(new Error(`no answer to ${method}`)); }, 30_000);
+  channel.onmessage = ({ data }) => {
+    if (data.ready) channel.postMessage({ id, method, args });
+    if (data.id !== id || data.method) return;
+    clearTimeout(timer);
+    channel.close();
+    if (data.error !== undefined) reject(new Error(data.error));
+    else resolve(data.result);
+  };
+  channel.postMessage({ id, method, args });
+}), [method, args]);
+const outcome = promise => promise.then(value => ({ value }), error => ({ error: String(error) }));
+
+/** Holds the transaction containing a real mutation, not the preceding node save. */
+async function holdSave(page, target) {
+  await page.evaluate(target => {
+    window.storageFault = { target, phase: "armed", events: [], attempts: { records: 0, files: 0 }, committed: { records: 0, files: 0 }, strict: true };
+    if (window.storageFaultInstalled) return;
+    window.storageFaultInstalled = true;
+    const transaction = IDBDatabase.prototype.transaction;
+    IDBDatabase.prototype.transaction = function (stores, mode, options) {
+      const tx = transaction.call(this, stores, mode, options);
+      const fault = window.storageFault;
+      if (mode === "readwrite" && ["records", "files"].includes(stores)) {
+        fault.strict &&= options?.durability === "strict";
+        fault.attempts[stores]++;
+        tx.addEventListener("complete", () => fault.committed[stores]++);
+      }
+      return tx;
+    };
+    const put = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (value, key) {
+      const request = put.call(this, value, key);
+      const fault = window.storageFault;
+      const target = fault.target;
+      const name = typeof key === "string" ? key : new TextDecoder().decode(key);
+      if (fault.phase !== "armed" || this.name !== target.store || (target.key && name !== target.key) || (target.prefix && !name.startsWith(target.prefix)) || (target.text && !new TextDecoder().decode(value).includes(target.text))) return request;
+      fault.phase = "held";
+      fault.key = typeof key === "string" ? key : [...(key instanceof ArrayBuffer ? new Uint8Array(key) : key)];
+      fault.bytes = [...value];
+      const tx = this.transaction;
+      tx.addEventListener("complete", () => { fault.phase = "committed"; });
+      tx.addEventListener("abort", () => { fault.phase = "aborted"; });
+      const spin = () => {
+        if (fault.release === "abort") tx.abort();
+        else if (fault.release !== "commit") this.get(key).onsuccess = spin;
+      };
+      request.addEventListener("success", spin);
+      return request;
+    };
+    const post = BroadcastChannel.prototype.postMessage;
+    BroadcastChannel.prototype.postMessage = function (message) {
+      if (message.event) window.storageFault.events.push({ ...message.event, phase: window.storageFault.phase });
+      return post.call(this, message);
+    };
+  }, target);
+}
+
+async function recover(page) {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    await page.evaluate(() => { window.recoveryAttempt = window.toasts.length; });
+    await page.getByRole("button", { name: "Retry saving and reload" }).click();
+    await page.waitForFunction(() => window.recoveryAttempt === undefined || window.toasts.slice(window.recoveryAttempt).includes("local state changed during the recovery save; retry saving again before reloading"));
+    if (await page.evaluate(() => window.recoveryAttempt === undefined)) return;
+    check(Date.now() < deadline, "recovery explicitly refuses a concurrent background write; another explicit retry is required");
+  }
+}
+
+const record = (page, store, key) => page.evaluate(([store, key]) => new Promise((resolve, reject) => {
+  const request = indexedDB.open("lmk");
+  request.onsuccess = () => {
+    const db = request.result;
+    const value = db.transaction(store).objectStore(store).get(typeof key === "string" ? key : new Uint8Array(key));
+    value.onsuccess = () => { db.close(); resolve(value.result && [...value.result]); };
+    value.onerror = () => reject(value.error);
+  };
+  request.onerror = () => reject(request.error);
+}), [store, key]);
+
 async function until(produce, accept, ms = 20_000) {
   const deadline = Date.now() + ms;
   let value = await produce();
@@ -117,22 +202,41 @@ try {
   ann.run("identity", "create", "Ann");
   desk.run("identity", "create", "Matthew");
 
-  // Invited by link: what it is, a name, Join, and the chat. The profile holds what a letmeknow before 0.12 kept,
-  // which the app sets aside.
+  // Incompatible and incomplete local data is refused visibly, never reset.
+  for (const version of [1, 4]) {
+    const legacy = await open("legacy", { viewport: { width: 1280, height: 800 } }, true);
+    const errors = [];
+    legacy.on("pageerror", error => errors.push(error.message));
+    await legacy.goto(`${SITE}/ping`);
+    await legacy.evaluate(version => new Promise((resolve, reject) => {
+      const request = indexedDB.open("lmk", version);
+      request.onupgradeneeded = () => {
+        request.result.createObjectStore("records").put(new Uint8Array([1]), new Uint8Array([1]).buffer);
+        request.result.createObjectStore("files").put(new Uint8Array([1]), "00");
+      };
+      request.onsuccess = () => (request.result.close(), resolve());
+      request.onerror = () => reject(request.error);
+    }), version);
+    await legacy.goto(SITE);
+    await legacy.getByRole("alert").filter({ hasText: version === 1 ? "stored session is from an incompatible version" : "stored session is incomplete" }).waitFor();
+    const old = await legacy.evaluate(() => new Promise((resolve, reject) => {
+      const request = indexedDB.open("lmk");
+      request.onsuccess = () => {
+        const db = request.result;
+        const records = db.transaction("records").objectStore("records").getAll();
+        records.onsuccess = () => { db.close(); resolve([db.version, [...records.result[0]]]); };
+        records.onerror = () => reject(records.error);
+      };
+      request.onerror = () => reject(request.error);
+    }));
+    check(JSON.stringify(old) === JSON.stringify([version, [1]]) && (await kept(legacy)).includes("00"), `unusable browser database v${version} keeps its version, records and files`);
+    check(!errors.length, `browser database v${version} startup errors reach the UI, not unhandled promises: ${errors}`);
+    await legacy.context().close();
+    delete pages.legacy;
+  }
+
+  // Invited by link: what it is, a name, Join, and the chat.
   let laptop = await open("laptop", { viewport: { width: 1280, height: 800 } }, true);
-  await laptop.goto(`${SITE}/ping`);
-  await laptop.evaluate(
-    () =>
-      new Promise((resolve, reject) => {
-        const request = indexedDB.open("lmk", 1);
-        request.onupgradeneeded = () => {
-          request.result.createObjectStore("records").put(new Uint8Array([1]), new Uint8Array([1]).buffer);
-          request.result.createObjectStore("files").put(new Uint8Array([1]), "00");
-        };
-        request.onsuccess = () => (request.result.close(), resolve());
-        request.onerror = () => reject(request.error);
-      })
-  );
   const invite = ann.run("invite", "--name", "Plans");
   await laptop.goto(local(invite.link));
   await laptop.getByRole("heading", { name: "You're invited" }).waitFor();
@@ -140,7 +244,6 @@ try {
   await laptop.getByRole("button", { name: "Join", exact: true }).click();
   await laptop.locator(".people", { hasText: "Ann" }).waitFor();
   check(new URL(laptop.url()).pathname === "/", "a browser joins from an invite link, with a click");
-  check(!(await kept(laptop)).includes("00"), "a profile that a letmeknow before 0.12 used starts afresh");
   await ann.printed(e => e.type === "joined");
   check(true, "the native session sees the browser join");
   const matt = await until(
@@ -497,6 +600,172 @@ try {
   check(true, "and drops it when asked");
   await carl.stop();
 
+  // Observe the actual consumer mutations, after the node's earlier receive-state transaction succeeded.
+  for (const kind of ["doc", "table", "timeline"]) {
+    for (const decision of ["commit", "abort"]) {
+      const gid = kind === "doc" ? doc.group : kind === "table" ? table.group : invite.group;
+      const marker = kind === "timeline" ? `Plans durable ${decision}` : `durable-${kind}-${decision}`;
+      await laptop.locator(".group-list button", { hasText: kind === "doc" ? "Notes" : kind === "table" ? "Leads" : "Plans" }).click();
+      await call(laptop, "flush", false);
+      const target = kind === "timeline"
+        ? { store: "records", prefix: "lmk/web/timeline/", text: marker }
+        : { store: "records", key: `lmk/kind/${kind}/${gid}` };
+      await holdSave(laptop, target);
+      if (kind === "doc") writeFileSync(notes, readFileSync(notes, "utf8") + `${marker}\n`);
+      else if (kind === "table") writeFileSync(leads, readFileSync(leads, "utf8").replace(/,Acme Corp,|,durable-table-commit,/, `,${marker},`));
+      else ann.run("name", `--group=${gid}`, marker);
+      await laptop.waitForFunction(() => window.storageFault.phase === "held");
+      await call(laptop, "me");
+      const eventType = kind === "timeline" ? "settings" : "edited";
+      check(await laptop.evaluate(([type, group]) => !window.storageFault.events.some(e => e.type === type && e.group === group), [eventType, gid]), `${kind} callback waits for the transaction containing its mutation`);
+      const failedKey = await laptop.evaluate(() => window.storageFault.key);
+      await laptop.evaluate(decision => { window.storageFault.release = decision; }, decision);
+      if (decision === "commit") {
+        await laptop.waitForFunction(([type, group]) => window.storageFault.events.some(e => e.type === type && e.group === group), [eventType, gid]);
+        check(await laptop.evaluate(([type, group]) => window.storageFault.strict && window.storageFault.events.filter(e => e.type === type && e.group === group).every(e => e.phase === "committed"), [eventType, gid]), `${kind} callback follows strict transaction completion`);
+      } else {
+        await laptop.getByRole("button", { name: "Retry saving and reload" }).waitFor();
+        const refused = await outcome(call(laptop, "flush", false));
+        check(refused.error?.includes("could not be saved") && await laptop.evaluate(([type, group]) => !window.storageFault.events.some(e => e.type === type && e.group === group), [eventType, gid]), `${kind} callback cannot escape a real transaction abort`);
+        await recover(laptop);
+        await laptop.locator(".group-list button", { hasText: kind === "doc" ? "Notes" : kind === "table" ? "Leads" : "Plans" }).click();
+        const bytes = await record(laptop, "records", failedKey);
+        check(new TextDecoder().decode(new Uint8Array(bytes)).includes(marker), `${kind} retry preserves the actual failed consumer record across reload`);
+      }
+      if (kind === "doc") check((await until(() => text(laptop), value => value.includes(marker))).includes(marker), "the document consumer reads the persisted peer edit");
+      else if (kind === "table") check((await until(() => cells("Name"), value => value === marker)) === marker, "the table consumer reads the persisted peer edit");
+      else check(JSON.parse(await call(laptop, "items", gid, false)).some(item => item.type === "settings" && item.settings.name === marker), "the timeline consumer reads its one-time persisted settings entry");
+    }
+  }
+
+  // Only files abort: the received link and record saves succeed, but the browser cannot claim to hold the bytes.
+  const fileChat = ann.run("invite", "--name", "File durability");
+  await call(laptop, "request", JSON.stringify({ cmd: "join", target: fileChat.link }));
+  await laptop.locator(".group-list button", { hasText: "File durability" }).click();
+  const original = "original ciphertext retry bytes\n";
+  const retryFile = join(tmp, "durable-file.txt");
+  writeFileSync(retryFile, original);
+  await holdSave(laptop, { store: "files" });
+  const sendingFile = outcome(ann.start("send", `--group=${fileChat.group}`, "--attach", retryFile, "file transaction abort"));
+  await laptop.waitForFunction(() => window.storageFault.phase === "held");
+  check(await laptop.evaluate(() => window.storageFault.committed.records > 0), "record transactions complete while the ciphertext transaction is held");
+  const fileHash = await laptop.evaluate(() => window.storageFault.key);
+  await laptop.evaluate(() => { window.storageFault.release = "abort"; });
+  await laptop.getByRole("button", { name: "Retry saving and reload" }).waitFor();
+  const sentFile = await sendingFile;
+  check(!sentFile.error && sentFile.value.attachment.pending === true && !sentFile.value.attachment.held_by, "the real sender receives no browser holder acknowledgement after a files-only abort");
+  const failedItems = JSON.parse(await call(laptop, "items", fileChat.group, false));
+  const failedAttachment = failedItems.find(item => item.content === "file transaction abort").attachment;
+  check(!failedAttachment.kept && !(await kept(laptop)).includes(fileHash), "neither the browser nor IndexedDB claims the aborted ciphertext is kept");
+  check(await laptop.evaluate(hash => !window.storageFault.events.some(e => e.type === "file" && e.hash === hash), fileHash), "no file-ready callback escapes the ciphertext abort");
+  await holdSave(laptop, { store: "files", key: fileHash });
+  const retryingFiles = outcome(call(laptop, "flush", true));
+  await laptop.waitForFunction(() => window.storageFault.phase === "held");
+  ann.run("send", `--group=${fileChat.group}`, "arrived during ciphertext recovery");
+  check((await until(() => call(laptop, "items", fileChat.group, false), items => items.includes("arrived during ciphertext recovery"))).includes("arrived during ciphertext recovery"), "records change while the ciphertext recovery transaction is in flight");
+  await laptop.evaluate(() => { window.storageFault.release = "commit"; });
+  check((await retryingFiles).error?.includes("changed during the recovery save"), "a ciphertext retry also refuses reload when records changed during its transaction");
+  check((await kept(laptop)).includes(fileHash) && await call(laptop, "file", failedAttachment.link) === undefined, "a committed recovery file is not published by the terminally failed process before reload");
+  await ann.stop();
+  await recover(laptop);
+  await laptop.locator(".group-list button", { hasText: "File durability" }).click();
+  check((await kept(laptop)).includes(fileHash) && new TextDecoder().decode(new Uint8Array(await call(laptop, "file", failedAttachment.link))) === original, "with the only peer offline, retry and reload recover the original plaintext from retained ciphertext");
+  ann = native("ann");
+  await ann.printed(e => e.type === "ready");
+
+  // A direct add must reject too, rather than returning its link before the ciphertext commit.
+  await holdSave(laptop, { store: "files" });
+  const addingFile = outcome(call(laptop, "add_file", fileChat.group, [...Buffer.from("unacknowledged addition")]));
+  await laptop.waitForFunction(() => window.storageFault.phase === "held");
+  await laptop.evaluate(() => { window.storageFault.release = "abort"; });
+  const addedFile = await addingFile;
+  check(addedFile.error?.includes("saving files to IndexedDB") && !addedFile.value, "an aborted ciphertext transaction cannot return a successful add-file link");
+  const [addedHash, ciphertext] = await laptop.evaluate(() => [window.storageFault.key, window.storageFault.bytes]);
+  await holdSave(laptop, { store: "files", key: addedHash });
+  await laptop.getByRole("button", { name: "Retry saving and reload" }).click();
+  await laptop.waitForFunction(() => window.storageFault.phase === "held");
+  check(JSON.stringify(await laptop.evaluate(() => window.storageFault.bytes)) === JSON.stringify(ciphertext), "explicit retry re-submits the failed addition's original ciphertext bytes");
+  await Promise.all([laptop.waitForEvent("load"), laptop.evaluate(() => { window.storageFault.release = "commit"; })]);
+  await laptop.getByRole("button", { name: "New chat" }).waitFor();
+  // Unlinked additions are eligible for collection on restart; the known linked file remains readable.
+  check(new TextDecoder().decode(new Uint8Array(await call(laptop, "file", failedAttachment.link))) === original, "failed additions do not disturb already recovered linked files");
+
+  // Admission creates a state file after committing the Add: failure must still refuse the Welcome.
+  const stateGroup = await call(laptop, "create", "doc", "Welcome durability");
+  const stateDoc = new Y.Doc();
+  stateDoc.getText("text").insert(0, "state survives ciphertext abort\n");
+  await call(laptop, "command", "doc", JSON.stringify(["edit", stateGroup, Buffer.from(Y.encodeStateAsUpdate(stateDoc)).toString("base64url")]));
+  const stateInvite = JSON.parse(await call(laptop, "request", JSON.stringify({ cmd: "invite", group: stateGroup })));
+  const joiner = native("durable-joiner");
+  await joiner.printed(e => e.type === "ready");
+  const joinedDoc = join(tmp, "durable-joiner.md");
+  await holdSave(laptop, { store: "files" });
+  const joiningState = outcome(joiner.start("join", stateInvite.link, joinedDoc));
+  await laptop.waitForFunction(() => window.storageFault.phase === "held");
+  await laptop.evaluate(() => { window.storageFault.release = "abort"; });
+  await laptop.getByRole("button", { name: "Retry saving and reload" }).waitFor();
+  const refusedWelcome = await joiningState;
+  check(refusedWelcome.error?.includes("persistence failed") && !joiner.run("groups").some(group => group.name === "Welcome durability"), "a state-file transaction abort refuses the actual peer's Welcome despite successful record saves");
+  await recover(laptop);
+  await laptop.getByRole("button", { name: "New chat" }).waitFor();
+  await joiner.stop();
+  const joinerBack = native("durable-joiner");
+  await joinerBack.printed(e => e.type === "ready");
+  const recoveredJoin = await joinerBack.start("join", stateInvite.link, joinedDoc);
+  check(recoveredJoin.group === stateGroup && (await until(() => readFileSync(joinedDoc, "utf8"), value => value === "state survives ciphertext abort\n")) === "state survives ciphertext abort\n", "after both peers restart the same logged Welcome retry delivers its original document state");
+  await joinerBack.stop();
+
+  // Recovery sees writes made DURING its transaction, refuses reload, and requires another explicit attempt.
+  await laptop.locator(".group-list button", { hasText: "Plans" }).click();
+  const beforeFailure = JSON.parse(await call(laptop, "me")).fp;
+  const follower = watch("recovery follower", await laptop.context().newPage());
+  await follower.goto(SITE);
+  await follower.locator(".group-list button", { hasText: "Plans" }).waitFor();
+  const target = { store: "records", prefix: "lmk/web/message/", text: "survives the aborted background save" };
+  await holdSave(laptop, target);
+  ann.run("send", `--group=${invite.group}`, target.text);
+  await laptop.waitForFunction(() => window.storageFault.phase === "held");
+  await laptop.evaluate(() => { window.storageFault.release = "abort"; });
+  await laptop.getByRole("button", { name: "Retry saving and reload" }).waitFor();
+  await follower.getByRole("button", { name: "Retry saving and reload" }).waitFor();
+  const [attempts, failedKey] = await laptop.evaluate(() => [window.storageFault.attempts.records, window.storageFault.key]);
+  const refusedBarrier = await outcome(call(laptop, "flush", false));
+  check(refusedBarrier.error?.includes("could not be saved") && await laptop.evaluate(() => window.storageFault.attempts.records) === attempts, "an empty barrier reports the prior background failure without silently retrying");
+  const late = watch("late recovery follower", await laptop.context().newPage());
+  await late.goto(SITE);
+  await late.getByRole("button", { name: "Retry saving and reload" }).waitFor();
+  check(true, "both an existing follower and a tab opened after failure show the latched storage diagnostic");
+  ann.run("send", `--group=${invite.group}`, "arrived while saving was stopped");
+  const intervening = await until(() => call(laptop, "items", invite.group, false), items => items.includes("arrived while saving was stopped"));
+  check(intervening.includes("arrived while saving was stopped"), "intervening writes stay available in memory before the explicit retry");
+
+  await holdSave(laptop, target);
+  const retrying = outcome(call(follower, "flush", true));
+  await laptop.waitForFunction(() => window.storageFault.phase === "held");
+  ann.run("send", `--group=${invite.group}`, "arrived during the recovery transaction");
+  const during = await until(() => call(laptop, "items", invite.group, false), items => items.includes("arrived during the recovery transaction"));
+  check(during.includes("arrived during the recovery transaction"), "a real incoming message mutates records while the recovery transaction is in flight");
+  await laptop.evaluate(() => { window.storageFault.release = "commit"; });
+  const dirtyRetry = await retrying;
+  check(dirtyRetry.error?.includes("changed during the recovery save") && await laptop.evaluate(() => !window.storageFault.events.some(e => e.type === "storage_saved")), "a dirty retry refuses reload and retains the intervening delta without clearing the terminal latch");
+  for (const tab of [laptop, follower, late]) await tab.getByRole("button", { name: "Retry saving and reload" }).waitFor();
+  await Promise.all([laptop.waitForEvent("load"), follower.waitForEvent("load"), recover(late)]);
+  for (const tab of [laptop, follower, late]) {
+    await tab.locator(".group-list button", { hasText: "Plans" }).click();
+    for (const message of [target.text, "arrived while saving was stopped", "arrived during the recovery transaction"]) await tab.getByText(message, { exact: true }).waitFor();
+    check(JSON.parse(await call(tab, "me")).fp === beforeFailure, "follower-initiated explicit retry reloads every tab with the same session and all pending messages");
+  }
+  check(new TextDecoder().decode(new Uint8Array(await record(laptop, "records", failedKey))).includes(target.text), "the failed batch itself, not just later writes, reached IndexedDB");
+  check(await laptop.evaluate(async () => (await navigator.locks.query()).held.filter(lock => lock.name === "letmeknow").length === 1), "after recovery exactly one tab owns the session");
+  await follower.close();
+  await late.close();
+  delete pages["recovery follower"];
+  delete pages["late recovery follower"];
+  await laptop.locator("textarea:visible").fill("after recovery handoff");
+  await laptop.locator("textarea:visible").press("Enter");
+  await ann.printed(e => e.type === "message" && e.content === "after recovery handoff");
+  check(true, "the surviving tab still sends to the real peer after the recovery handoff");
+
   // With Ann gone, what the laptop sends to her chat still counts on the group's log, held only by the laptop.
   await ann.stop();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
@@ -581,10 +850,14 @@ try {
   await laptop.reload();
   await laptop.locator(".group-list button", { hasText: "Plans" }).waitFor();
   check(true, "and opens the app offline, groups and all");
+  check(pageErrors.length === 0, `no unhandled browser errors: ${pageErrors.join("; ")}`);
   console.log("browser ok");
   passed = true;
 } catch (error) {
-  for (const [name, page] of Object.entries(pages)) await page.screenshot({ path: join(tmp, `${name}.png`) });
+  for (const [name, page] of Object.entries(pages)) {
+    console.log(name, JSON.stringify(await page.evaluate(() => ({ fault: window.storageFault && { phase: window.storageFault.phase, events: window.storageFault.events.slice(-10), attempts: window.storageFault.attempts }, toasts: window.toasts }))));
+    await page.screenshot({ path: join(tmp, `${name}.png`) });
+  }
   console.log(`screenshots in ${tmp}`);
   throw error;
 } finally {

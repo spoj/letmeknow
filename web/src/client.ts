@@ -81,17 +81,19 @@ const pending = new Map<string, Call & { resolve: (result: unknown) => void; rej
 /** Calls this tab took while running the session, so a call sent again runs once. */
 const taken = new Set<string>();
 let local: Lmk | undefined;
+let storageFailure: Event | undefined;
 let leading = false;
 let readied: () => void;
+let failed: (error: unknown) => void;
 let ran: () => void;
 /** Resolves once the session runs, in this tab or another. */
-export const ready = new Promise<void>(resolve => (readied = resolve));
+export const ready = new Promise<void>((resolve, reject) => { readied = resolve; failed = reject; });
 const runsHere = new Promise<void>(resolve => (ran = resolve));
 /** Whether this tab runs the session. */
 export const runs = () => leading;
 
 function call(method: string, args: unknown[]): Promise<unknown> {
-  if (leading) return method === "open" ? run(...(args as string[])) : runsHere.then(() => (local![method as Methods] as (...a: unknown[]) => unknown)(...args));
+  if (leading) return method === "open" ? run(...(args as string[])) : (running ?? runsHere).then(() => (local![method as Methods] as (...a: unknown[]) => unknown)(...args));
   const id = `${tab} ${calls++}`;
   return new Promise((resolve, reject) => {
     pending.set(id, { id, method, args, resolve, reject });
@@ -121,7 +123,7 @@ channel.onmessage = ({ data }: MessageEvent<Message>) => {
     taken.add(data.id!);
     answer(data as Call);
   }
-  if (data.ask && local) channel.postMessage({ ready: true });
+  if (data.ask && local) channel.postMessage({ ready: true, event: storageFailure });
   if (data.ready) {
     readied();
     for (const { id, method, args } of pending.values()) channel.postMessage({ id, method, args });
@@ -144,10 +146,11 @@ function run(device = ""): Promise<void> {
     const config = { device, relay, membership };
     local = await start(records, kept, JSON.stringify(config), store, (json: string) => {
       const event = JSON.parse(json) as Event;
+      if (event.type === "storage_failed") storageFailure = event;
       dispatch(event);
       channel.postMessage({ event });
     });
-    addEventListener("pagehide", () => local!.flush());
+    addEventListener("pagehide", () => local!.flush(false).catch(error => dispatch({ type: "warning", text: String(error) })));
     ran();
     readied();
     for (const waiting of pending.values()) {
@@ -161,14 +164,18 @@ function run(device = ""): Promise<void> {
 
 /** Loads the WebAssembly and waits for the lock; resolves whether this browser has a session. */
 export async function prepare(): Promise<boolean> {
+  const had = await store.has();
   await init({ module_or_path: wasm });
   navigator.locks.request("letmeknow", async () => {
     leading = true;
     if (await store.has()) await run();
     await new Promise(() => {});
+  }).catch(error => {
+    failed(error);
+    dispatch({ type: "warning", text: String(error) });
   });
   channel.postMessage({ ask: true });
-  return store.has();
+  return had;
 }
 
 /** A file's plaintext, fetched from the members online if this browser does not hold it yet. */

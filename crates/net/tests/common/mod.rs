@@ -158,8 +158,9 @@ impl Disk for FakeDisk {
         Box::pin(async move { Ok(ciphertext) })
     }
 
-    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>) {
+    fn save(&self, hash: [u8; 32], ciphertext: Vec<u8>) -> BoxFuture<Result<()>> {
         self.0.lock().unwrap().insert(hash, ciphertext);
+        Box::pin(async { Ok(()) })
     }
 }
 

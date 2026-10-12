@@ -84,10 +84,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Leaves a group behind: its state and records go.
-    pub(crate) fn forget(&self, gid: &[u8]) -> Result<()> {
-        let mut st = self.lock();
+    pub(crate) fn forget(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
         st.expire_to(gid, u64::MAX)?;
-        let st = &mut *st;
         let g = st.groups.remove(gid).context("this session is not in that group")?;
         self.unfollow(gid);
         st.drop_log(gid)?;
@@ -152,12 +150,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Tells that this session is out of a group, then forgets it, unless it did so already.
+    /// Forgets a removed group and reports removal once that step is durable.
     pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>) {
-        let Some(kind) = self.lock().groups.get(gid).map(|g| g.mls.settings().kind) else { return };
-        self.events.send(Event::Removed { group: Bytes(gid.to_vec()), kind, by }).ok();
-        if let Err(error) = self.forget(gid) {
-            self.warn(Some(gid), format!("{error:#}"));
+        let mut st = self.lock();
+        let Some(kind) = st.groups.get(gid).map(|g| g.mls.settings().kind) else { return };
+        match self.forget(&mut st, gid) {
+            Ok(()) => st.events.push(Event::Removed { group: Bytes(gid.to_vec()), kind, by }),
+            Err(error) => self.warn(Some(gid), format!("{error:#}")),
         }
     }
 }

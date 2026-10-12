@@ -30,7 +30,9 @@ impl<P: Provider + Send + 'static> Node<P> {
         }
         self.inner.net().shutdown().await?;
         // Not a step (`lock`), which commits when it ends: after the close.
-        self.inner.state.lock().unwrap().provider.close()
+        let mut state = self.inner.state.lock().unwrap();
+        state.waiters.clear();
+        state.provider.close()
     }
 
     /// This session's key: its MLS signature key.
@@ -113,6 +115,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             (gid, IdentityRef { id: Bytes(id.to_vec()), membership: settings.membership }, first)
         };
         self.inner.follow(&gid);
+        self.inner.durable().await?;
         let address = lmk_proto::public::address(&identity.id.0);
         if let Err(error) = self.inner.clients.client(&identity.membership)?.append(&address, &[first], true).await {
             self.leave(&gid).await?;
@@ -165,8 +168,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             if st.group(gid)?.mls.members().len() > 1 {
                 self.inner.start_send(&mut st, gid, &json!({ "type": "leave" }))?
             } else {
-                drop(st);
-                self.inner.forget(gid)?;
+                self.inner.forget(&mut st, gid)?;
                 return Ok(None);
             }
         };
@@ -179,7 +181,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Sends a held payload: the node seals it, appends its entry to the group's log, and pushes it to the members
     /// online once the entry counts. Answers its position once it counts; or after a few seconds without the service's
     /// answer, that it is pending: the node finishes the send, after a restart too, and tells `Event::Sent`. Fails only
-    /// when the service certainly did not take it (`SendError`).
+    /// when the service certainly did not take it (`SendError`), or local persistence fails.
     pub async fn send(&self, gid: &[u8], payload: &Value) -> Result<Sent> {
         let (id, counted) = self.inner.held_send(gid, payload)?;
         self.answered(id, counted).await
@@ -187,9 +189,13 @@ impl<P: Provider + Send + 'static> Node<P> {
 
     /// What `send` answers: a send's position once it counts, or that it is pending after a few seconds.
     async fn answered(&self, id: Bytes, mut counted: sending::Counted) -> Result<Sent> {
+        self.inner.durable().await?;
         let outcome = match timeout(SEND_WAIT, &mut counted).await {
             Ok(outcome) => outcome,
-            Err(_) if self.inner.pending(&id)? => return Ok(Sent { id, position: None }),
+            Err(_) if self.inner.pending(&id)? => {
+                self.inner.durable().await?;
+                return Ok(Sent { id, position: None });
+            }
             Err(_) => counted.await,
         };
         let (position, id) = outcome.context(UNFINISHED)?.map_err(|error| anyhow::anyhow!(error))?;
@@ -199,6 +205,7 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Sends a held payload and waits as long as it takes for its entry to count; answers its position.
     pub async fn send_counted(&self, gid: &[u8], payload: &Value) -> Result<u64> {
         let (_, counted) = self.inner.held_send(gid, payload)?;
+        self.inner.durable().await?;
         Ok(counted.await.context(UNFINISHED)?.map_err(|error| anyhow::anyhow!(error))?.0)
     }
 
@@ -385,6 +392,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             let (seed, _) = st.device_keys.get(gid).context("not an identity group of this node")?;
             latest.next(seed, writers, name, now())
         };
+        self.inner.durable().await?;
         let address = lmk_proto::public::address(&identity.id.0);
         self.inner.clients.client(&identity.membership)?.append(&address, &[entry], true).await?;
         self.inner.read_public(&identity).await

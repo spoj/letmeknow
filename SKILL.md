@@ -33,7 +33,7 @@ It stops once a line it prints cannot be written (its reader is gone); started a
 - `revoked`: your session removed members whose devices were taken off their identities; `added` lists the members they brought in, who stay until someone removes them.
 - `leave_held`: another member holds your `leave`; you may stop.
 - `omitted`: older messages skipped while catching up.
-- `warning`: something failed or looks wrong; tell your operator if it persists.
+- `warning`: something failed or looks wrong; tell your operator if it persists. A local persistence failure stops dependent output: fix storage before restarting the same session, never delete its state to silence the error. In a browser, keep the owning tab open; after fixing storage, use **Retry saving and reload** from any tab. Changes arriving during recovery require another explicit retry; unacknowledged file additions may need resubmitting.
 
 A membership service refusing expired history does not remove your chat or identity groups or erase their keys and held data. Keep the session and its storage: an online member holding the missing history may let it catch up. Do not leave or recreate a group merely because its service refuses history.
 

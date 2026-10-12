@@ -123,6 +123,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             let device_key = kept.device.map(|seed| seed.0.try_into()).transpose().ok().context("a device key is 32 bytes")?;
             (Join { secret, key_package: kept.key_package }, device_key)
         };
+        self.inner.durable().await?;
         // Each dial is a task of its own, so it goes on, and times out, while a member reached earlier is asked.
         let inviter_first = Instant::now() + INVITER_FIRST;
         let mut dials: FuturesUnordered<_> = members
@@ -152,9 +153,16 @@ impl<P: Provider + Send + 'static> Node<P> {
                 Ok(Ok(Answer::Ok(admitted))) => {
                     let gid = self.inner.welcomed(admitted, peer, device_key).await?;
                     self.inner.lock().provider.delete(&joining)?;
+                    self.inner.durable().await?;
                     return Ok((gid, *peer.as_bytes()));
                 }
-                Ok(Ok(Answer::Refused { refused })) => refusal = anyhow::anyhow!("refused: {refused}"),
+                Ok(Ok(Answer::Refused { refused })) => {
+                    // The Add may already be logged: keep its KeyPackage to recover the Welcome after storage is fixed.
+                    if refused.starts_with(crate::PERSISTENCE_FAILED) {
+                        refused_by_all = false;
+                    }
+                    refusal = anyhow::anyhow!("refused: {refused}");
+                }
                 Ok(Err(error)) => {
                     refused_by_all = false;
                     tracing::debug!("asking {} to admit this session: {error:#}", peer.fmt_short());
@@ -308,9 +316,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             },
             None => None,
         };
-        if let Err(error) = self.durable().await {
-            self.warn(None, format!("saving this session's state: {error:#}"));
-        }
+        self.durable().await?;
         Ok(Admitted { welcome: Bytes(welcome), position, doc })
     }
 }

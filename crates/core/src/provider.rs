@@ -44,9 +44,9 @@ pub struct MemoryProvider {
     pub storage: MemoryStorage,
     ours: RwLock<HashMap<Vec<u8>, Vec<u8>>>,
     savepoints: Mutex<Vec<Savepoint>>,
-    /// Our keys written since the last `changes`.
+    /// Our keys not yet acknowledged by `persisted`.
     dirty: Mutex<HashSet<Vec<u8>>>,
-    /// A digest of each of openmls's records as last handed out by `changes`.
+    /// A digest of each of openmls's persisted records.
     shadow: Mutex<HashMap<Vec<u8>, u64>>,
 }
 
@@ -83,7 +83,7 @@ fn digest(value: &[u8]) -> u64 {
 }
 
 impl MemoryProvider {
-    /// A provider holding these records, as `changes` handed them out.
+    /// A provider holding these persisted records.
     pub fn load(records: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) -> Self {
         let provider = MemoryProvider::default();
         for (key, value) in records {
@@ -98,36 +98,51 @@ impl MemoryProvider {
         provider
     }
 
-    /// Every record, as a crash would leave it between steps.
+    /// Every record in memory, between steps.
     pub fn records(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let openmls = self.storage.values.read().unwrap().clone().into_iter();
         let ours = self.ours.read().unwrap().clone().into_iter().map(|(key, value)| ([OURS, &key].concat(), value));
         openmls.chain(ours).collect()
     }
 
-    /// The records written since the last call, and the keys deleted (`None`), to persist. Between steps.
+    /// Unpersisted records and deletions, between steps. Serialize saves and acknowledge only successful commits
+    /// with `persisted`; writes made while a save is in flight remain in the next batch.
     pub fn changes(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         let mut changes = Vec::new();
         let ours = self.ours.read().unwrap();
-        for key in self.dirty.lock().unwrap().drain() {
-            changes.push(([OURS, &key].concat(), ours.get(&key).cloned()));
+        for key in self.dirty.lock().unwrap().iter() {
+            changes.push(([OURS, key].concat(), ours.get(key).cloned()));
         }
         let values = self.storage.values.read().unwrap();
-        let mut shadow = self.shadow.lock().unwrap();
+        let shadow = self.shadow.lock().unwrap();
         for (key, value) in values.iter() {
-            let digest = digest(value);
-            if shadow.insert(key.clone(), digest) != Some(digest) {
+            if shadow.get(key) != Some(&digest(value)) {
                 changes.push((key.clone(), Some(value.clone())));
             }
         }
-        shadow.retain(|key, _| {
-            let kept = values.contains_key(key);
-            if !kept {
-                changes.push((key.clone(), None));
-            }
-            kept
-        });
+        for key in shadow.keys().filter(|key| !values.contains_key(*key)) {
+            changes.push((key.clone(), None));
+        }
         changes
+    }
+
+    pub fn persisted(&self, changes: &[(Vec<u8>, Option<Vec<u8>>)]) {
+        let ours = self.ours.read().unwrap();
+        let mut dirty = self.dirty.lock().unwrap();
+        let mut shadow = self.shadow.lock().unwrap();
+        for (key, value) in changes {
+            match key.strip_prefix(OURS) {
+                Some(key) => {
+                    if ours.get(key) == value.as_ref() {
+                        dirty.remove(key);
+                    }
+                }
+                None => match value {
+                    Some(value) => { shadow.insert(key.clone(), digest(value)); }
+                    None => { shadow.remove(key); }
+                },
+            }
+        }
     }
 
     fn touch(&self, key: &[u8], old: Option<Vec<u8>>) {
@@ -262,7 +277,7 @@ mod native {
     // only ever used from one thread at a time: the node holds the provider under a lock.
     unsafe impl Send for SqliteProvider {}
 
-    const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA secure_delete = ON;";
+    const PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA fullfsync = ON; PRAGMA secure_delete = ON;";
 
     impl SqliteProvider {
         pub fn open(path: &Path) -> Result<Self> {
@@ -350,11 +365,81 @@ mod native {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::provider::Provider;
+
+        #[test]
+        fn commits_sync_the_wal_before_becoming_visible() {
+            let dir = std::env::temp_dir().join(format!("lmk-core-durable-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("state.db");
+            let provider = SqliteProvider::open(&path).unwrap();
+            assert_eq!(provider.db.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "wal");
+            assert_eq!(provider.db.query_row("PRAGMA synchronous", [], |r| r.get::<_, u32>(0)).unwrap(), 2);
+            assert_eq!(provider.db.query_row("PRAGMA fullfsync", [], |r| r.get::<_, u32>(0)).unwrap(), 1);
+            let reader = SqliteProvider::open(&path).unwrap();
+            provider.begin().unwrap();
+            provider.put(b"head", b"one").unwrap();
+            assert_eq!(reader.get(b"head").unwrap(), None);
+            provider.commit().unwrap();
+            assert_eq!(reader.get(b"head").unwrap(), Some(b"one".to_vec()));
+            drop((reader, provider));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use super::{Provider, SqliteProvider};
+    use super::{MemoryProvider, Provider, SqliteProvider};
+
+    #[test]
+    fn failed_save_is_still_in_an_otherwise_empty_barrier() {
+        let provider = MemoryProvider::default();
+        provider.put(b"head", b"one").unwrap();
+        provider.storage.values.write().unwrap().insert(b"mls".to_vec(), b"epoch".to_vec());
+        let failed: std::collections::HashMap<_, _> = provider.changes().into_iter().collect();
+        let retry = provider.changes();
+        assert_eq!(retry.iter().cloned().collect::<std::collections::HashMap<_, _>>(), failed);
+        let reloaded = MemoryProvider::load(retry.iter().cloned().map(|(key, value)| (key, value.unwrap())));
+        assert_eq!(reloaded.get(b"head").unwrap(), Some(b"one".to_vec()));
+        assert_eq!(reloaded.storage.values.read().unwrap().get(b"mls".as_slice()).unwrap(), b"epoch");
+        provider.persisted(&retry);
+        assert!(provider.changes().is_empty());
+        assert!(reloaded.changes().is_empty());
+    }
+
+    #[test]
+    fn successful_save_does_not_acknowledge_intervening_writes() {
+        let provider = MemoryProvider::load([
+            (b"lmk/deleted".to_vec(), b"old".to_vec()),
+            (b"mls".to_vec(), b"old".to_vec()),
+        ]);
+        provider.put(b"head", b"one").unwrap();
+        provider.delete(b"deleted").unwrap();
+        provider.storage.values.write().unwrap().insert(b"mls".to_vec(), b"new".to_vec());
+        let saving = provider.changes();
+        provider.put(b"head", b"two").unwrap();
+        provider.put(b"deleted", b"back").unwrap();
+        provider.storage.values.write().unwrap().insert(b"mls".to_vec(), b"old".to_vec());
+        provider.persisted(&saving);
+        let next: std::collections::HashMap<_, _> = provider.changes().into_iter().collect();
+        assert_eq!(next.get(b"lmk/head".as_slice()), Some(&Some(b"two".to_vec())));
+        assert_eq!(next.get(b"lmk/deleted".as_slice()), Some(&Some(b"back".to_vec())));
+        assert_eq!(next.get(b"mls".as_slice()), Some(&Some(b"old".to_vec())));
+        provider.persisted(&next.into_iter().collect::<Vec<_>>());
+        provider.delete(b"head").unwrap();
+        provider.storage.values.write().unwrap().remove(b"mls".as_slice());
+        let deleted = provider.changes();
+        assert_eq!(deleted.len(), 2);
+        assert!(deleted.iter().all(|(_, value)| value.is_none()));
+        assert_eq!(provider.changes().len(), 2);
+        provider.persisted(&deleted);
+        assert!(provider.changes().is_empty());
+    }
 
     /// The database files that hold `secret`. The `-shm` file holds only the WAL's index, and Windows locks parts of it.
     fn in_files(dir: &std::path::Path, secret: &[u8]) -> Vec<String> {

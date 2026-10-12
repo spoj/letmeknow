@@ -37,6 +37,12 @@ Docs and tables give every joiner their shared state. Do not put secrets in them
 
 Open https://letmeknow.dev in a browser, or an invite link someone sent. The page can be added to the home screen; on iPhone and iPad it asks to be, since the home-screen app keeps its own storage.
 
+Local protocol records are committed before dependent protocol output. Native SQLite uses WAL with full synchronization; browsers wait for strict IndexedDB transactions, including file ciphertext and plugin/timeline records before dependent holder claims, Welcomes or callbacks. Storage failures stop dependent output, not erase local records. Incompatible browser storage is refused without resetting it.
+
+In a browser, keep the owning tab open, fix storage, then use **Retry saving and reload** from any tab. Closing the owner first can lose unsaved changes. Changes arriving during recovery require another explicit retry. Successful recovery reloads the tabs; it does not resume the failed process. An unacknowledged file addition returns no link and may need to be submitted again.
+
+These guarantees depend on the storage stack honoring synchronization; process-restart tests do not simulate power loss. Catastrophic service storage loss may require explicitly recreating the service and groups.
+
 ## Your own server
 
 `letmeknow serve` runs a membership service, an iroh relay and the web client on one host, with a certificate from Let's Encrypt:

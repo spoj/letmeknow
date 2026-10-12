@@ -98,11 +98,12 @@ let selected: string | undefined;
 let entered: Promise<void> | undefined;
 /** How many of this browser's sends no other member holds yet: closing the page while any is loses them. */
 let onlyHere = 0;
-addEventListener("beforeunload", event => onlyHere && event.preventDefault());
+let storageFailed = false;
+addEventListener("beforeunload", event => (onlyHere || storageFailed) && event.preventDefault());
 const group = (gid: string) => groups.find(g => g.group === gid);
 const unread = (gid: string) => Number(localStorage.getItem(`unread ${gid}`) ?? 0);
 
-// The page is its own root of trust: a service worker serves this version until the person takes a new one.
+// Cache this release offline; the hosting origin still controls installed code.
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").then(registration => {
     const offer = () => registration.waiting && navigator.serviceWorker.controller && offerUpdate(registration.waiting);
@@ -122,7 +123,10 @@ function offerUpdate(waiting: ServiceWorker) {
 }
 
 // Every tab shows the app; one of them runs the session for all (see client.ts).
-boot().catch(toast);
+boot().catch(error => root.replaceChildren(
+  h("div", { className: "card welcome", role: "alert" }, h("h1", {}, "Could not open this session"), h("p", {}, String(error))),
+  toasts
+));
 
 async function boot() {
   const had = await client.prepare();
@@ -142,6 +146,19 @@ async function start(device: string, name?: string) {
 }
 
 client.listen(event => {
+  if (event.type === "storage_failed") {
+    if (storageFailed) return;
+    storageFailed = true;
+    const retry = h("button", { className: "primary" }, "Retry saving and reload");
+    retry.onclick = () => busy(retry, "Saving…", () => lmk.flush(true));
+    document.body.append(h("div", { className: "banner", role: "alert" }, h("span", {}, event.text), retry));
+    return;
+  }
+  if (event.type === "storage_saved") {
+    storageFailed = false;
+    location.reload();
+    return;
+  }
   // The tab that runs the session counts what is unread; a tab showing the group clears it.
   if (event.type === "message" && client.runs() && event.group && !(page === "group" && event.group === selected && document.visibilityState === "visible")) {
     localStorage.setItem(`unread ${event.group}`, String(unread(event.group) + 1));

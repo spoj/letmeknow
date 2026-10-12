@@ -58,6 +58,7 @@ pub const INVITE_VALID: u64 = 10 * 60 * 1000;
 pub const COLLECT: Duration = Duration::from_secs(60 * 60);
 /// Why a send's outcome never came.
 const UNFINISHED: &str = "the send ended unfinished, as this session stopped or left the group";
+const PERSISTENCE_FAILED: &str = "local persistence failed";
 /// How long `send` waits for its entry to count before it answers that the send is pending.
 const SEND_WAIT: Duration = Duration::from_secs(5);
 /// How long some waits for other members last: for those online to hold a file or an invite, for added members'
@@ -97,7 +98,7 @@ pub struct Config {
     pub durable: Option<Durable>,
 }
 
-/// Makes the steps committed so far durable.
+/// Makes the steps committed so far durable. A failure stops dependent output until the node restarts.
 pub type Durable = Arc<dyn Fn() -> BoxFuture<Result<()>> + Send + Sync>;
 
 /// A group member, from its leaf and credential, and its credential's certificate checked against its identity's key
@@ -499,12 +500,10 @@ impl<P: Provider + Send + 'static> Drop for Step<'_, P> {
         {
             self.inner.warn(None, format!("{error:#}"));
         }
-        for event in std::mem::take(&mut self.guard.events) {
-            self.inner.events.send(event).ok();
-        }
+        let events = std::mem::take(&mut self.guard.events);
         let out = std::mem::take(&mut self.guard.out);
-        if !out.is_empty() {
-            self.inner.outbox.send(out).ok();
+        if !out.is_empty() || !events.is_empty() {
+            self.inner.outbox.send((out, events)).ok();
         }
     }
 }
@@ -547,9 +546,10 @@ pub(crate) struct Inner<P> {
     kinds: Vec<String>,
     events: mpsc::UnboundedSender<Event>,
     work: mpsc::UnboundedSender<Work>,
-    /// What steps produced for the peers, in order, sent once durable.
-    outbox: mpsc::UnboundedSender<Vec<Out>>,
+    /// Peer output and client events from steps, in order, released once durable.
+    outbox: mpsc::UnboundedSender<(Vec<Out>, Vec<Event>)>,
     durable: Option<Durable>,
+    persistence_error: Mutex<Option<String>>,
     committing: tokio::sync::Mutex<()>,
     /// Woken whenever a group's log is read further, for sends waiting to reach its head.
     advanced: tokio::sync::Notify,
@@ -802,8 +802,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Makes the steps committed so far durable, before what they produced leaves the node.
     async fn durable(&self) -> Result<()> {
-        match &self.durable {
+        if let Some(error) = &*self.persistence_error.lock().unwrap() {
+            anyhow::bail!(error.clone());
+        }
+        let saved = match &self.durable {
             Some(durable) => durable().await,
+            None => Ok(()),
+        };
+        let mut failed = self.persistence_error.lock().unwrap();
+        if let Err(error) = saved {
+            failed.get_or_insert_with(|| format!("{PERSISTENCE_FAILED}: {error:#}; output stopped until restart"));
+            self.state.lock().unwrap().waiters.clear();
+        }
+        match &*failed {
+            Some(error) => Err(anyhow::anyhow!(error.clone())),
             None => Ok(()),
         }
     }

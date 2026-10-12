@@ -165,8 +165,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
             };
             let Some((service, sends)) = batch else { return };
+            if let Err(error) = self.durable().await {
+                return self.warn(Some(gid), format!("{error:#}"));
+            }
             let appended = async {
-                self.durable().await?;
                 let entries: Vec<Vec<u8>> = sends.iter().map(|(_, entry)| entry.clone()).collect();
                 self.clients.client(&service)?.append(gid, &entries, false).await
             };

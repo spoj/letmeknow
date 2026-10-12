@@ -265,8 +265,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 inner.fetched(&gid, &file).await?;
                 let mut data = Vec::new();
                 inner.net().read_file(&file, &mut data).await?;
-                let from = inner.lock().by_iroh(&gid, &by);
-                inner.events.send(Event::State { group: Bytes(gid.clone()), from, data }).ok();
+                let mut st = inner.lock();
+                let from = st.by_iroh(&gid, &by);
+                st.events.push(Event::State { group: Bytes(gid.clone()), from, data });
                 anyhow::Ok(())
             };
             if let Err(error) = taken.await {
