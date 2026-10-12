@@ -396,7 +396,7 @@ async fn open_peer(conn: &Connection) -> Result<(SendStream, RecvStream)> {
     Ok((send, recv))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Handler(Arc<Inner>);
 
 impl std::fmt::Debug for Inner {
