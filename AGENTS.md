@@ -2,21 +2,16 @@
 
 The code and its comments are the documentation. SKILL.md, compiled into the binary as `letmeknow skill`, is what agents using letmeknow read, and README.md what people read first: keep both true in the same change as the code.
 
-## Branches
-
-- `main` is the next release, whether patch or minor. Choose the version at release time; minor releases need no long-lived branch.
-- Work on short-lived branches, in worktrees beside this checkout when working in parallel. Merge them, then delete them.
-- Commit subjects read `Area: what changed`.
+`main` is the next release, patch or minor; choose the version at release time. Commit subjects read `Area: what changed`.
 
 ## Compatibility
 
 Releases of one minor version run side by side in the same groups:
 - A reader ignores what it does not know. A member that rewrites a shared record keeps the fields it does not know.
 - An addition that other members must understand raises the protocol revision (`REVISION` in crates/proto/src/group.rs), and is used only toward members whose leaves name that revision.
-- Anything else waits for a new minor version, behind its switches: the ALPN, a group's protocol version, the invite link version, the home's format, and the browser's database version. A minor version flips only the switches its changes need. Test the chosen contract: supported versions coexist; incompatible versions refuse without changing newer state.
-- Browsers load the entire frontend from GitHub Pages at letmeknow.dev, independently of relay.letmeknow.dev. A service worker normally offers a waiting update; this is not cryptographic pinning, and the same-origin host still controls code. Agents pin `@letmeknow/cli@0.16`, so they get the latest 0.16.x when they restart.
+- Anything else waits for a new minor version, behind its switches: the ALPN, a group's protocol version, the invite link version, the home's format, and the browser's database version. A minor version flips only the switches its changes need.
 
-Identity authorization, durable local observations, and independent operator verification remain separate; test installed leaves and persistence barriers, not only display structs.
+Browsers load the frontend from GitHub Pages at letmeknow.dev and take updates through its service worker. Agents pin `@letmeknow/cli@0.16`, so they get the latest 0.16.x when they restart.
 
 ## Checks
 
@@ -29,14 +24,13 @@ CI's Linux job, to run before pushing:
     python3 -u test/deploy.py
     (cd web && npm ci) && python3 -u test/e2e.py && (cd web && npm run check)
 
-- e2e.py needs wasm-bindgen-cli 0.2.129 and Playwright's chromium-headless-shell. It builds a test-key frontend and serves it on a separate HTTPS origin from the real backend; it exercises cross-origin iroh-over-WSS, not WebRTC. Its script-free `blank.html` seeds old databases before the app loads. `web/backend.json` stages the production public key; never discover it from the backend or replace it with the old authority just to pass a build.
+- e2e.py needs wasm-bindgen-cli 0.2.129 and Playwright's chromium-headless-shell.
 - Give each change example tests made for the cases that matter. What happens between machines is checked in real use, after release: releases are alphas.
-- While iterating, run the tests of what you changed. Run the whole list once before merging: build first (the workspace's tests and the wasm build), then the rest side by side.
 - CI also runs on macOS and Windows, which are slower. When a test flakes there, fix the timing it assumes; do not rerun it until it passes.
 
 ## Releases
 
-1. web/backend.json and crates/proto/src/links.rs hold only the service's public key; never copy signing keys into builds.
-2. Write release notes, then run `deploy/release.sh X.Y.Z <notes file>` on clean `main`. It commits/tags/pushes the version; release.yml runs all-platform CI, builds five native platforms plus the whole production frontend, tests artifacts, and publishes only after all gates pass. The Linux release executable gets native E2E; the exact production frontend gets an offline startup/service-worker smoke test, while full browser/native E2E uses test configuration.
-3. The script waits for publication/npm availability and prints rollout commands. Backend deployment and Pages rollout are separate operator-reviewed actions (deploy/README.md), consuming the successful release run's artifacts without rebuilding. Pages dispatch runs from main and requires the github-pages environment approval configured by the operator.
-4. If the workflow fails, fix it on main; move the tag only if npm publication never ran. Never deploy a partial/failed release or silently substitute a local build. No script performs destructive cutover, backup restore, or client-state deletion.
+1. Write release notes, then run `deploy/release.sh X.Y.Z <notes file>` on a clean `main`. It commits, tags and pushes the version; release.yml tests, builds and publishes it to GitHub and npm. The script waits for npm, then prints the backend and frontend rollout commands (deploy/README.md).
+2. If the workflow fails, fix it on `main`; move the tag only if npm publication never ran.
+
+web/backend.json and crates/proto/src/links.rs hold only the service's public key; never copy signing keys into builds.
