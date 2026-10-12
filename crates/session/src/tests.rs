@@ -967,8 +967,9 @@ fn a_session_stops_once_it_cannot_print_and_prints_the_rest_when_started_again()
     });
 }
 
-/// `sessions` lists this machine's sessions, each with its groups and whether it runs. `sessions remove` stops one that
-/// runs, or runs one that does not, until another member holds its leave of each group, and deletes it.
+/// `sessions` lists this machine's sessions, each with its groups, and their other members as they show to it, and
+/// whether it runs. `sessions remove` stops one that runs, or runs one that does not, until another member holds its
+/// leave of each group, and deletes it.
 #[test]
 fn a_session_is_listed_and_removed_running_or_stopped() {
     local(async {
@@ -977,10 +978,10 @@ fn a_session_is_listed_and_removed_running_or_stopped() {
         let desk = world.start_in("bob", "desk", HOUR).await;
         let invite = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap();
         desk.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap();
-        let groups = json!([{ "group": group, "name": "" }]);
+        let groups = |other: &str| json!([{ "group": group, "name": "", "kind": "chat", "members": [format!("Alice · {}", alice.device), format!("{} ({other})", bob.device)] }]);
         let both = json!({ "sessions": [
-            { "handle": "bob", "running": true, "groups": groups },
-            { "handle": "desk", "running": true, "groups": groups },
+            { "handle": "bob", "running": true, "groups": groups("desk") },
+            { "handle": "desk", "running": true, "groups": groups("bob") },
         ] });
         let listed = until(|| async { crate::sessions(&bob.home).await.unwrap() }, |listed| *listed == both).await;
         assert_eq!(listed, both);
@@ -997,12 +998,13 @@ fn a_session_is_listed_and_removed_running_or_stopped() {
 }
 
 /// `add` brings a session of another of your devices into a group: `identity list` shows the sessions each device runs,
-/// and the session the add names joins once it runs, by an invite that admits only a session of its device, once.
+/// and their groups, and the session the add names joins once it runs, by an invite that admits only a session of its
+/// device, once.
 #[test]
 fn an_add_brings_a_session_of_another_device_into_a_group_once() {
     local(async {
         let world = world("add").await;
-        let (_alice, bob, group) = pair(&world, HOUR).await;
+        let (alice, bob, group) = pair(&world, HOUR).await;
         let mut desk = world.start("desk", HOUR).await;
         let invite = bob.cmd(&["identity", "invite"]).await.unwrap();
         desk.cmd(&["identity", "join", invite["link"].as_str().unwrap()]).await.unwrap();
@@ -1023,6 +1025,11 @@ fn an_add_brings_a_session_of_another_device_into_a_group_once() {
         let joined = desk.told(&["joined"]).await;
         assert_eq!((joined["how"].as_str(), joined["group"].as_str()), (Some("add"), Some(group.as_str())));
         assert_eq!(joined["device"], runs(&listed, true)["name"]);
+        // Both devices are named after this machine, so the laptop's session shows with its handle.
+        let members = [format!("Alice · {}", alice.device), format!("{} (bob)", bob.device)];
+        let shown = json!([{ "session": "desk", "group": group, "kind": "chat", "members": members }]);
+        let heard = until(|| async { bob.cmd(&["identity", "list"]).await.unwrap() }, |listed| runs(listed, false)["groups"] == shown).await;
+        assert_eq!(runs(&heard, false)["groups"], shown, "the laptop hears which groups the desk's sessions are in, with whom");
         let other = world.start_in("desk", "other", HOUR).await;
         let refused = other.cmd(&["join", link]).await.unwrap_err().to_string();
         assert!(refused.contains("used"), "{refused}");

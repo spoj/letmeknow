@@ -3,7 +3,7 @@
 //! key, and keeps the public log in step with the group: a device the latest entry lists appends the next whenever the
 //! group's members, their names or the group's name differ from it, and the latest again once it is half a year old.
 //! Its held messages are adds, invites into groups for one device's sessions, which that device keeps until it takes
-//! them or they expire; its live ones tell which sessions each device runs.
+//! them or they expire; its live ones tell which sessions each device runs, and the groups they are in.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,6 @@ use lmk_proto::links::Invite;
 use lmk_proto::public::{Listed, certified};
 use n0_future::task::spawn;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{Event, Item, Node, hex, now};
@@ -46,6 +45,31 @@ pub struct Add {
     pub expires: u64,
 }
 
+/// What a device tells its identity's other devices, live: the handles of its sessions that run, and the groups they are
+/// in. A device of 0.14 tells no groups.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "presence")]
+pub struct Presence {
+    pub sessions: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<SessionGroup>,
+}
+
+/// A group one of a device's sessions is in, as that session shows it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionGroup {
+    /// The session's handle; none for a browser's, its device's only session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    pub group: Bytes,
+    pub name: String,
+    /// Its kind and its other members, as they show to the session; empty where a session of 0.14 wrote them.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
 /// An add for this device, which its identity group keeps until it is taken: its position there, and the name of the
 /// device that sent it.
 pub struct Pending {
@@ -69,10 +93,10 @@ pub struct Identity<P> {
 struct Shared {
     /// Held while a pass of the duties runs.
     passing: tokio::sync::Mutex<()>,
-    /// The handles of this device's sessions that run, as the session acting for it last found them.
-    sessions: Mutex<Vec<String>>,
-    /// The handles of the sessions the other devices run, as each last told: by device key.
-    heard: Mutex<HashMap<Bytes, Vec<String>>>,
+    /// This device's sessions that run and their groups, as the session acting for it last found them.
+    presence: Mutex<Presence>,
+    /// What the other devices last told of theirs: by device key.
+    heard: Mutex<HashMap<Bytes, Presence>>,
     /// The positions of the adds taken, until the log is let go of past them.
     taken: Mutex<BTreeSet<u64>>,
 }
@@ -192,31 +216,31 @@ impl<P: Provider + Send + 'static> Identity<P> {
         self.adds().map(drop)
     }
 
-    /// Sets which of this device's sessions run, as the session acting for it found them; the identity's other devices
-    /// online hear of a change.
-    pub fn set_sessions(&self, sessions: Vec<String>) {
-        let mut own = self.shared.sessions.lock().unwrap();
-        if *own == sessions {
+    /// Sets which of this device's sessions run and their groups, as the session acting for it found them; the identity's
+    /// other devices online hear of a change.
+    pub fn set_presence(&self, presence: Presence) {
+        let mut own = self.shared.presence.lock().unwrap();
+        if *own == presence {
             return;
         }
-        *own = sessions;
+        *own = presence;
         drop(own);
         if let Some(gid) = self.group() {
             self.tell(&gid.0, None);
         }
     }
 
-    /// The handles of the sessions a device runs, as last heard; this device's as last found.
-    pub fn sessions_of(&self, device: &Bytes) -> Vec<String> {
+    /// The sessions a device runs and their groups, as last heard; this device's as last found.
+    pub fn presence_of(&self, device: &Bytes) -> Presence {
         if self.key().is_ok_and(|me| me == *device) {
-            return self.shared.sessions.lock().unwrap().clone();
+            return self.shared.presence.lock().unwrap().clone();
         }
         self.shared.heard.lock().unwrap().get(device).cloned().unwrap_or_default()
     }
 
-    /// Tells the other devices online, or the one with key `to`, which of this device's sessions run.
+    /// Tells the other devices online, or the one with key `to`, which of this device's sessions run, in which groups.
     fn tell(&self, gid: &[u8], to: Option<&Bytes>) {
-        let presence = json!({ "type": "presence", "sessions": *self.shared.sessions.lock().unwrap() });
+        let presence = serde_json::to_value(&*self.shared.presence.lock().unwrap()).expect("JSON");
         let to = to.map(|key| hex(&Sha256::digest(&key.0)[..8]));
         if let Err(error) = self.node.send_live(gid, &presence, to.as_deref()) {
             tracing::debug!("telling which sessions run: {error:#}");
@@ -334,10 +358,8 @@ impl<P: Provider + Send + 'static> Identity<P> {
             Event::Duties { .. } => self.due(&gid.0),
             Event::Synced { member, .. } => self.tell(&gid.0, Some(&member.key)),
             Event::Live { sender, payload, .. } => {
-                if payload["type"] == "presence"
-                    && let Ok(sessions) = serde_json::from_value(payload["sessions"].clone())
-                {
-                    self.shared.heard.lock().unwrap().insert(sender.key, sessions);
+                if let Ok(presence) = serde_json::from_value(payload) {
+                    self.shared.heard.lock().unwrap().insert(sender.key, presence);
                 }
             }
             Event::Joined { .. } | Event::Left { .. } | Event::Logged { .. } | Event::Warning { .. } => return Some(event),

@@ -123,6 +123,20 @@ impl Describer {
     }
 }
 
+/// How a member shows: this session as "you"; another of your own identity's as its device, with its handle where that
+/// device has several sessions in the group, as "laptop (swift-koala)"; another identity's as "Ann · laptop", that
+/// identity's own claim; one that speaks for no identity, or failed the check, by its fingerprint.
+pub fn shown(member: &Value) -> String {
+    if member["you"] == true {
+        return "you".into();
+    }
+    let name = member["name"].as_str().unwrap_or_default();
+    match member["identity"]["name"].as_str() {
+        Some(own) if member["identity"]["how"] == "self" => name.strip_prefix(&format!("{own} · ")).unwrap_or(name).into(),
+        _ => name.into(),
+    }
+}
+
 /// Whether a described member answers to `name`, in any case: its identity's name, its device's or its handle, or the
 /// first word of one.
 pub fn answers(member: &Value, name: &str) -> bool {

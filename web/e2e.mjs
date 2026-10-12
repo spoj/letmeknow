@@ -448,6 +448,19 @@ try {
   await laptop.locator("dialog").waitFor({ state: "detached" });
   const ideas = tablet.run("groups").find(g => g.name === "Ideas");
   check(JSON.stringify(ideas.membership).includes(LETMEKNOW_RELAY), "on the membership service of the server that served the browser");
+  const browsers = await until(
+    () => tablet.run("identity", "list").devices.find(d => !d.you).groups ?? [],
+    groups => groups.some(g => g.name === "Ideas")
+  );
+  const shown = browsers.find(g => g.name === "Ideas");
+  check(shown && !shown.session && shown.kind === "chat" && shown.members.length === 1, "a native device hears which groups the browser is in, and with whom");
+  const line = laptop.locator(".devices .in-groups li", { hasText: "tablet: Ideas" });
+  await until(
+    async () => (await laptop.locator(".me").click(), await line.count()),
+    n => n > 0
+  );
+  check((await line.count()) === 1, "the browser's devices page shows the groups of a native device's sessions");
+  await laptop.locator(".group-list button", { hasText: "Ideas" }).click();
   await laptop.locator(".people", { hasText: "Matt · " }).waitFor();
   await laptop.getByRole("button", { name: "Settings" }).click();
   await laptop.getByRole("button", { name: "End for everyone" }).click();

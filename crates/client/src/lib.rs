@@ -7,7 +7,7 @@
 mod describe;
 mod request;
 
-pub use describe::{AddedBy, Described, Describer, Known, Standing, answers};
+pub use describe::{AddedBy, Described, Describer, Known, Standing, answers, shown};
 pub use n0_future::boxed::BoxFuture;
 pub use request::{IdentityOp, Request};
 
@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use lmk_core::device::Device;
 use lmk_core::provider::Provider;
-use lmk_node::identity::{ADD_VALID, Add, Identity, Pending};
+use lmk_node::identity::{ADD_VALID, Add, Identity, Pending, Presence, SessionGroup};
 use lmk_node::{Event, Heard, INVITE_VALID, Member, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::ranges::Ranges;
@@ -1048,6 +1048,23 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(describer.members.iter().map(|m| describer.describe(m)).collect())
     }
 
+    /// This client's groups but identity groups, as its identity's devices hear of them: each one's id, name and kind,
+    /// and its other members as they show.
+    pub fn session_groups(&self) -> Result<Vec<SessionGroup>> {
+        let node = &self.inner.node;
+        let mut groups = Vec::new();
+        for gid in node.groups() {
+            let settings = node.settings(&gid.0)?;
+            if settings.kind == IDENTITY {
+                continue;
+            }
+            let members = self.described_members(&gid)?.into_iter().filter(|m| !m.you);
+            let members = members.map(|m| Ok(shown(&serde_json::to_value(m)?))).collect::<Result<_>>()?;
+            groups.push(SessionGroup { session: None, group: gid, name: settings.name, kind: settings.kind, members });
+        }
+        Ok(groups)
+    }
+
     /// Leaves the groups it speaks as an identity in that its device is no longer on. Returns what failed.
     pub async fn leave_identities_left(&self) -> Vec<anyhow::Error> {
         let Ok(state) = self.device_state() else { return Vec::new() };
@@ -1118,7 +1135,10 @@ impl<P: Provider + Send + 'static> Client<P> {
             IdentityOp::List => {
                 let Some((identity, name)) = devices.identity() else { return Ok(json!({ "identity": null })) };
                 let me = devices.key()?;
-                let listed = devices.devices()?.into_iter().map(|(key, name)| json!({ "you": key == me, "sessions": devices.sessions_of(&key), "key": key, "name": name }));
+                let listed = devices.devices()?.into_iter().map(|(key, name)| {
+                    let Presence { sessions, groups } = devices.presence_of(&key);
+                    json!({ "you": key == me, "sessions": sessions, "groups": groups, "key": key, "name": name })
+                });
                 let listed: Vec<Value> = listed.collect();
                 Ok(json!({ "identity": identity.id, "name": name, "devices": listed }))
             }

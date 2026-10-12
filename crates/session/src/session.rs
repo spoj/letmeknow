@@ -11,7 +11,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, Described, DeviceState, File, Remote, message_id};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
-use lmk_node::identity::{Identity, Pending};
+use lmk_node::identity::{Identity, Pending, Presence, SessionGroup};
 use lmk_node::{Event, Message, Node};
 use lmk_proto::Bytes;
 use lmk_proto::group::{ChatMessage, IDENTITY, Service};
@@ -255,9 +255,9 @@ impl Session {
         Ok(())
     }
 
-    /// Writes what changed of what other processes read: this session's groups, ids and names, to `groups.json` in its
-    /// directory, for `sessions`; and, if this process acts for the device, the device's state where its other session
-    /// processes read it.
+    /// Writes what changed of what other processes read: this session's groups to `groups.json` in its directory, for
+    /// `sessions` and the session acting for the device; and, if this process acts for it, the device's state where its
+    /// other session processes read it.
     fn publish(&mut self) {
         let replace = |path: PathBuf, text: &str| {
             let new = path.with_extension("new");
@@ -265,15 +265,13 @@ impl Session {
             anyhow::Ok(std::fs::rename(&new, &path)?)
         };
         let written = (|| {
-            let node = self.client.node();
-            let settings = node.groups().into_iter().filter_map(|gid| Some((node.settings(&gid.0).ok()?, gid)));
-            let named: Vec<(String, String)> = settings.filter(|(s, _)| s.kind != IDENTITY).map(|(s, gid)| (b64(&gid.0), s.name)).collect();
-            let groups: Vec<Value> = named.iter().map(|(id, name)| json!({ "group": id, "name": name })).collect();
-            let groups = serde_json::to_string(&groups)?;
+            let named = self.client.session_groups()?;
+            let groups = serde_json::to_string(&named)?;
             if groups != self.groups {
-                for (id, name) in &named {
-                    let unique = !name.is_empty() && named.iter().filter(|(_, other)| other == name).count() == 1;
-                    self.names.insert(id.clone(), if unique { name } else { id }.clone());
+                for group in &named {
+                    let unique = !group.name.is_empty() && named.iter().filter(|other| other.name == group.name).count() == 1;
+                    let id = b64(&group.group.0);
+                    self.names.insert(id.clone(), if unique { group.name.clone() } else { id });
                 }
                 replace(self.config.dir.join("groups.json"), &groups)?;
                 self.groups = groups;
@@ -456,11 +454,19 @@ impl Session {
         }
     }
 
-    /// Tells the identity's other devices which of this device's sessions run, and hands each running session the adds
-    /// for it it was not handed while it runs; an add for no session in particular goes to this one.
+    /// Tells the identity's other devices which of this device's sessions run, with the groups each last wrote, and hands
+    /// each running session the adds for it it was not handed while it runs; an add for no session in particular goes to
+    /// this one.
     fn hand_adds(&mut self, running: Vec<String>) -> Result<()> {
         let Access::Here(devices) = self.client.access() else { return Ok(()) };
-        devices.set_sessions(running.clone());
+        let mut groups = Vec::new();
+        for session in &running {
+            // None before the session first wrote its groups.
+            let Ok(written) = std::fs::read(crate::cli::session_dir(&self.home, session)?.join("groups.json")) else { continue };
+            let written: Vec<SessionGroup> = serde_json::from_slice(&written)?;
+            groups.extend(written.into_iter().map(|group| SessionGroup { session: Some(session.clone()), ..group }));
+        }
+        devices.set_presence(Presence { sessions: running.clone(), groups });
         self.handed.retain(|_, session| running.contains(session));
         for Pending { position, by, add } in devices.adds()? {
             let session = if add.session.is_empty() { self.config.handle.clone() } else { add.session };
@@ -506,7 +512,7 @@ impl Session {
             {
                 item["text"] = json!(format!(
                     "{} could not read {} of your messages; send again, with --reply-to <id>, any that still matters",
-                    short::shown(&item["member"]),
+                    lmk_client::shown(&item["member"]),
                     ids.len()
                 ));
             }

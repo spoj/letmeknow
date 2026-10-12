@@ -413,9 +413,18 @@ function joinDialog() {
   );
 }
 
-// Your devices: the identity this browser is a device of, and its devices, with the sessions each runs.
+// Your devices: the identity this browser is a device of, and its devices, with the sessions each runs and their groups.
 
-type Listed = { devices: { key: string; name: string; you: boolean; sessions: string[] }[] };
+/** A group a device's session is in, with its other members as they show to it; a browser's own have no session. */
+type SessionGroup = { session?: string; name: string; kind: string; members: string[] };
+type Listed = { devices: { key: string; name: string; you: boolean; sessions: string[]; groups: SessionGroup[] }[] };
+
+/** A group of another session, in a line: "tine: Plans, a chat with Matthew · phone". */
+function sessionGroup(g: SessionGroup): HTMLElement {
+  const kind = (KINDS as Record<string, string>)[g.kind] ?? "group";
+  const members = g.members.length ? ` with ${g.members.join(", ")}` : "";
+  return h("li", {}, g.session && `${g.session}: `, g.name || `a ${kind}`, h("small", {}, g.name ? `, a ${kind}${members}` : members));
+}
 
 function showDevices() {
   show(devicesPage);
@@ -461,7 +470,12 @@ async function drawDevices() {
         h(
           "li",
           {},
-          h("span", { title: `key ${d.key}` }, d.name, d.you && h("small", {}, " this browser"), d.sessions.length > 0 && h("small", {}, ` runs ${d.sessions.join(", ")}`)),
+          h(
+            "div",
+            {},
+            h("span", { title: `key ${d.key}` }, d.name, d.you && h("small", {}, " this browser"), d.sessions.length > 0 && h("small", {}, ` runs ${d.sessions.join(", ")}`)),
+            d.groups.length > 0 && h("ul", { className: "in-groups" }, ...d.groups.map(sessionGroup))
+          ),
           d.you
             ? h("span", {}, h("button", { onclick: renameDialog }, "Rename"), h("button", { className: "danger", onclick: () => leaveDialog() }, "Leave"))
             : confirmed("Remove", `Remove ${d.name}?`, async () => {

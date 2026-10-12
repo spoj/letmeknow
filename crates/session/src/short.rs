@@ -1,5 +1,6 @@
 //! What the agent reads, made short: it pays for every character.
 
+use lmk_client::shown;
 use serde_json::Value;
 
 /// How many characters of a message id show; commands take any unique beginning of one.
@@ -41,20 +42,6 @@ pub fn compact(value: &mut Value) {
 fn short(id: &mut String) {
     if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
         id.truncate(ID);
-    }
-}
-
-/// How a member shows: this session as "you"; another of your own identity's as its device, with its handle where that
-/// device has several sessions in the group, as "laptop (swift-koala)"; another identity's as "Ann · laptop", that
-/// identity's own claim; one that speaks for no identity, or failed the check, by its fingerprint.
-pub fn shown(member: &Value) -> String {
-    if member["you"] == true {
-        return "you".into();
-    }
-    let name = member["name"].as_str().unwrap_or_default();
-    match member["identity"]["name"].as_str() {
-        Some(own) if member["identity"]["how"] == "self" => name.strip_prefix(&format!("{own} · ")).unwrap_or(name).into(),
-        _ => name.into(),
     }
 }
 

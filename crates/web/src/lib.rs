@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow};
 use js_sys::{Array, Function, Promise, Uint8Array};
 use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Request, fp, message_id, service};
-use lmk_node::identity::Identity;
+use lmk_node::identity::{Identity, Presence};
 use lmk_node::lmk_core::provider::RustCrypto;
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
@@ -244,6 +244,8 @@ struct Config {
 
 struct App {
     client: Client<Store>,
+    /// The identity kind, on the browser's node.
+    devices: Identity<Store>,
     store: Store,
     membership: lmk_proto::group::Service,
     idb: Idb,
@@ -326,8 +328,8 @@ impl App {
             lines,
         };
         let client_config = lmk_client::Config { device, membership: membership.clone() };
-        let (client, mut told) = Client::new(node, client_config, Access::Here(devices), Arc::new(plugins), written);
-        let app = Rc::new(App { client, store, membership, idb, kept, on_event });
+        let (client, mut told) = Client::new(node, client_config, Access::Here(devices.clone()), Arc::new(plugins), written);
+        let app = Rc::new(App { client, devices, store, membership, idb, kept, on_event });
         let told_app = app.clone();
         spawn_local(async move {
             while let Some(event) = told.recv().await {
@@ -369,10 +371,16 @@ impl App {
                 events_app.flush();
             }
         });
+        // Each second, the records that changed go to the page, and the identity's other devices hear of a change to the
+        // browser's groups.
         let flushing = Rc::downgrade(&app);
         spawn_local(async move {
             while let Some(app) = flushing.upgrade() {
                 app.flush();
+                match app.client.session_groups() {
+                    Ok(groups) => app.devices.set_presence(Presence { sessions: Vec::new(), groups }),
+                    Err(e) => app.emit(json!({ "type": "warning", "text": format!("{e:#}") })),
+                }
                 drop(app);
                 sleep(Duration::from_secs(1)).await;
             }
