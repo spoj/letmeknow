@@ -741,7 +741,8 @@ impl<P: Provider + Send + 'static> Client<P> {
                 }
             }
             let mut group = json!({ "group": b64(&gid.0), "online": online, "away": away, "only_here": only_here, "identity_warnings": identity_warnings });
-            if let Some(name) = Some(node.settings(&gid.0)?.name).filter(|n| !n.is_empty()) {
+            let name = node.settings(&gid.0)?.name;
+            if !name.is_empty() {
                 group["name"] = json!(name);
             }
             groups.push(group);
