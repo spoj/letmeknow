@@ -756,7 +756,7 @@ impl Lmk {
         Ok(answer.to_string())
     }
 
-    /// Every group this browser is in, with its settings and members.
+    /// Every group this browser is in but its identity's, with its settings and members.
     pub async fn groups(&self) -> R<String> {
         let snapshot = self.app.groups().map_err(js)?.to_string();
         self.app.saved().await.map_err(js)?;
