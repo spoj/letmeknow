@@ -14,7 +14,7 @@ version = args[0] if args else None
 stable = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 if version is not None and (not re.fullmatch(stable, version) or any(int(part) > 0xffffffff for part in version.split("."))):
     sys.exit("expected stable X.Y.Z version")
-original = {name: (root / name).read_text() for name in ["Cargo.toml", "README.md", "SKILL.md", "AGENTS.md", "web/src/index.html"]}
+original = {name: (root / name).read_text(encoding="utf-8") for name in ["Cargo.toml", "README.md", "SKILL.md", "AGENTS.md", "web/src/index.html"]}
 current = tomllib.loads(original["Cargo.toml"])["workspace"]["package"]["version"]
 if not re.fullmatch(stable, current):
     sys.exit("Cargo workspace version must be stable X.Y.Z")
@@ -37,8 +37,8 @@ if action == "set":
         sys.exit("expected one Cargo workspace version line")
     try:
         for name, content in updated.items():
-            (root / name).write_text(content)
+            (root / name).write_text(content, encoding="utf-8", newline="\n")
     except Exception:
         for name, content in original.items():
-            (root / name).write_text(content)
+            (root / name).write_text(content, encoding="utf-8", newline="\n")
         raise
