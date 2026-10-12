@@ -318,16 +318,9 @@ const views = new Map<string, View>();
 /** The views of documents and tables, which others' edits reach. */
 const editors = new Map<string, DocView | TableView>();
 
-/** The session's groups; one of a kind this page has no view for, as of 0.14's git, shows as the chat it carried. */
-async function loadGroups(): Promise<Group[]> {
-  const loaded: Group[] = JSON.parse(await lmk.groups());
-  for (const g of loaded) if (!(g.settings.kind in KINDS)) g.settings.kind = "chat";
-  return loaded;
-}
-
 async function enter() {
   me = JSON.parse(await lmk.me());
-  groups = await loadGroups();
+  groups = JSON.parse(await lmk.groups());
   root.replaceChildren(layout, toasts);
   const last = localStorage.getItem("group");
   const shown = last && group(last) ? last : groups.at(-1)?.group;
@@ -343,7 +336,7 @@ function show(element: HTMLElement) {
 }
 
 async function select(gid: string) {
-  groups = await loadGroups();
+  groups = JSON.parse(await lmk.groups());
   let view = views.get(gid);
   if (!view) {
     const kind = group(gid)!.settings.kind;
@@ -369,7 +362,7 @@ function render() {
 
 async function draw() {
   me = JSON.parse(await lmk.me());
-  groups = await loadGroups();
+  groups = JSON.parse(await lmk.groups());
   onlyHere = await lmk.only_here();
   for (const [gid, view] of views) {
     if (group(gid)) continue;
