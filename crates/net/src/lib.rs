@@ -380,7 +380,7 @@ impl Inner {
         links.into_iter().filter(|(peer, _)| self.groups.is_member(group, peer)).collect()
     }
 
-    fn offer(self: &Arc<Self>, link: &FileLink, holder: EndpointId) {
+    fn offer(&self, link: &FileLink, holder: EndpointId) {
         let (events, hash) = (self.events.clone(), link.hash);
         self.files.offer(link, holder, link.size <= self.config.file_limit, move |ok| {
             if ok {
