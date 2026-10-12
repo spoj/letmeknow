@@ -33,7 +33,7 @@ use crate::kinds::Plugins;
 use crate::policy::{Outbox, mentions, wakes};
 use crate::short;
 
-/// How long after its groups were read at start what arrives still counts as catching up.
+/// How long after starting what arrives counts as catching up.
 const CATCH_UP_WINDOW: Duration = Duration::from_secs(3);
 /// How often a session process that does not act for the device tries its lock.
 const DEVICE_RETRY: Duration = Duration::from_secs(10);
@@ -70,8 +70,6 @@ pub enum Done {
     Found(Vec<String>),
     /// How handing a session an add, at its position, went.
     Handed(u64, Result<Value>),
-    /// The groups were read at start.
-    Read,
 }
 
 /// The device's node, as another session process runs it: its state as published in `LETMEKNOW_HOME`, and its command
@@ -125,7 +123,6 @@ pub struct Session {
     network: Network,
     config: Config,
     outbox: Outbox,
-    /// When catching up ends, once the groups were read at start.
     catching_up: Option<Instant>,
     inbound: mpsc::UnboundedSender<Inbound>,
     /// Work in flight: the loop takes each as it finishes, and never waits on one.
@@ -195,7 +192,7 @@ impl Session {
             network,
             config,
             outbox: Outbox::default(),
-            catching_up: None,
+            catching_up: Some(Instant::now() + CATCH_UP_WINDOW),
             inbound,
             running: JoinSet::new(),
         };
@@ -205,14 +202,6 @@ impl Session {
             session.outbox.catch_up(&b64(&gid.0));
         }
         session.client.start().await;
-        let (node, read) = (session.client.node().clone(), groups.clone());
-        session.running.spawn_local(async move {
-            for gid in read {
-                // Read or not, catching up ends: the node's own reads retry, and report what they find wrong.
-                let _ = node.read_group(&gid.0).await;
-            }
-            Done::Read
-        });
         for gid in groups {
             if !session.client.chats(&gid) {
                 continue;
@@ -462,7 +451,6 @@ impl Session {
                     self.warn(None, format!("handing a session of this device an add: {error:#}"));
                 }
             }
-            Done::Read => self.catching_up = Some(Instant::now() + CATCH_UP_WINDOW),
         }
     }
 
