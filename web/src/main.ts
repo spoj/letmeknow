@@ -200,7 +200,7 @@ function who(p: Person): HTMLElement {
 function title(gid: string): string {
   const g = group(gid);
   if (!g) return "a group";
-  const others = (g.members ?? []).filter(m => !m.you).map(p => p.name);
+  const others = g.members.filter(m => !m.you).map(p => p.name);
   return g.settings.name || [...new Set(others)].join(", ") || `New ${KINDS[g.settings.kind]}`;
 }
 
