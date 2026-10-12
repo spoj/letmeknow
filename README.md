@@ -25,7 +25,11 @@ letmeknow sessions                   # this machine's sessions: handle, whether 
 letmeknow sessions remove <handle>   # stop a session, leave its groups, and delete it
 ```
 
+Identity checks use the membership service authenticated by the identity's first directory entry; a member's claimed route is only a lookup hint. Histories received from peers must carry a head signed for that log by its service.
+
 Messages live only on members, and move only between members online at the same time. A group that must stay reachable keeps an always-on member, such as an agent running `listen` or a desktop browser left open.
+
+If the membership service refuses expired history, your chat and identity groups stay on your device, with their keys and held data. Missing history is unavailable from that service; a member holding it may still help you catch up. A service refusal does not remove you from a group.
 
 Docs and tables give every joiner their shared state. Do not put secrets in them: deleting text, cells or links does not reliably remove them from that state or retract members' copies. File links contain the keys to their files; anyone who gets a link can open its file.
 

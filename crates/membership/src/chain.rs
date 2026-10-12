@@ -88,6 +88,7 @@ impl Chain {
 
     /// Adds `entries`, which follow position `after` (within the chain) and end at `head`.
     pub fn extend(&mut self, after: u64, entries: &[Bytes], head: &Head) -> Result<()> {
+        ensure!(head.log == self.head.log, "a head for another log");
         let contradiction = || Contradiction {
             ours: self.head.clone(),
             theirs: head.clone(),
@@ -224,6 +225,21 @@ mod tests {
                 .is::<Contradiction>()
         );
         assert_eq!(chains.get(b"log").unwrap().head, head3);
+    }
+
+    #[test]
+    fn an_extension_cannot_rename_its_chain() {
+        let key = SigningKey::from_bytes(&[1; 32]);
+        let mut chain = Chain::new(b"destination");
+        let before = chain.clone();
+        let hash = head::next(&head::start(b"destination"), b"entry");
+        let wrong = Head::sign(&key, b"other", 1, hash, 1);
+        assert!(wrong.verify(&key.verifying_key()));
+        assert!(chain.extend(0, &bytes(&[b"entry"]), &wrong).is_err());
+        assert_eq!(chain, before);
+        let right = Head::sign(&key, b"destination", 1, hash, 1);
+        chain.extend(0, &bytes(&[b"entry"]), &right).unwrap();
+        assert_eq!(chain.head, right);
     }
 
     #[test]

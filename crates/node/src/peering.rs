@@ -315,7 +315,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         st.peers.frame(&key, &frame, now);
         match frame {
             Frame::Entries { log, entries, head } => {
-                if self.vouched(st, &head, &peer) {
+                if log == head.log && self.vouched(st, &head, &peer) {
                     self.take_entries(st, &log.0, entries, head)?;
                 }
             }

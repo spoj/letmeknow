@@ -156,6 +156,93 @@ fn certificate(identity: &IdentityRef, device: &[u8; 32], session: &Bytes) -> Ce
     Certificate { identity: identity.clone(), device: lmk_core::device::public(device).into(), sig: Bytes(sig) }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identity_mirror_is_only_a_hint_to_its_authoritative_service() {
+    use lmk_core::public::{PublicLog, Verdict};
+    use lmk_membership::client::ServeClient;
+    use lmk_proto::group::Credential;
+
+    let relay = relay().await;
+    let dir = folder("identity-mirror");
+    let (mirror, mirror_service) = signing_service(&relay, &dir).await;
+    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
+    let authority = ServeClient::for_service(endpoint.clone(), &relay.service).unwrap();
+    let mirror_client = ServeClient::for_service(endpoint, &mirror).unwrap();
+    let (laptop, tablet) = (lmk_core::random(), lmk_core::random());
+    let (id, first) = lmk_core::public::create(&laptop, "Carol", relay.service.clone(), listed(&laptop, "laptop"), 1);
+    let address = lmk_proto::public::address(&id);
+    let mut public = PublicLog::replay(&id, [first.as_slice()]).unwrap();
+    let added = public.next(&laptop, vec![listed(&laptop, "laptop"), listed(&tablet, "tablet")], "Carol", 2);
+    assert!(public.apply(&added));
+    let revoked = public.next(&laptop, vec![listed(&laptop, "laptop")], "Carol", 3);
+    authority.append(&address, &[first.clone(), added.clone(), revoked], true).await.unwrap();
+    mirror_client.append(&address, &[first, added], true).await.unwrap();
+
+    let db = dir.join("reader.db");
+    let reader = stored(&relay, "Reader", &db).await;
+    let claim = IdentityRef { id: id.into(), membership: mirror };
+    let credential = |device| Credential {
+        name: "claimant".into(),
+        key: reader.node.key(),
+        certificate: Some(certificate(&claim, device, &reader.node.key()).into()),
+    };
+    assert_eq!(public.verify(&credential(&tablet)), Verdict::Verified { device: "tablet".into() }, "the genuine prefix still lists the revoked device");
+    let latest = reader.node.read_public(&claim).await.unwrap();
+    assert_eq!(latest.membership, relay.service);
+    assert_eq!(latest.verify(&credential(&tablet)), Verdict::Dropped);
+    assert_eq!(latest.verify(&credential(&laptop)), Verdict::Verified { device: "laptop".into() }, "a claimant's route is not its authority");
+
+    let fork = public.next(&tablet, vec![listed(&tablet, "tablet")], "Stale mirror", 4);
+    mirror_client.append(&address, &[fork], true).await.unwrap();
+    assert_eq!(reader.node.read_public(&claim).await.unwrap().name, "Carol");
+    reader.node.shutdown().await.unwrap();
+    drop(reader);
+    mirror_service.shutdown().await.unwrap();
+    let reader = stored(&relay, "Reader", &db).await;
+    assert_eq!(reader.node.read_public(&claim).await.unwrap().writers, [listed(&laptop, "laptop")], "the persisted route is the authority, not the mirror");
+    reader.node.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_first_identity_lookup_does_not_persist_a_route() {
+    use lmk_membership::client::ServeClient;
+
+    let relay = relay().await;
+    let dir = folder("identity-failed-route");
+    let (mirror, _mirror_service) = signing_service(&relay, &dir).await;
+    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
+    let authority = ServeClient::for_service(endpoint.clone(), &relay.service).unwrap();
+    let mirror_client = ServeClient::for_service(endpoint, &mirror).unwrap();
+    let laptop = lmk_core::random();
+    let (id, first) = lmk_core::public::create(&laptop, "Carol", relay.service.clone(), listed(&laptop, "laptop"), 1);
+    let address = lmk_proto::public::address(&id);
+    let claim = IdentityRef { id: id.into(), membership: mirror };
+    mirror_client.append(&address, &[b"not a genesis".to_vec()], true).await.unwrap();
+
+    let db = dir.join("reader.db");
+    let mut reader = stored(&relay, "Reader", &db).await;
+    assert!(reader.node.read_public(&claim).await.is_err());
+    mirror_client.append(&address, std::slice::from_ref(&first), true).await.unwrap();
+    assert!(reader.node.read_public(&claim).await.is_err(), "a genuine genesis alone is not authoritative history");
+    while let Ok(event) = reader.events.try_recv() {
+        assert!(!matches!(event, Event::Public { .. }), "no identity state from either failed lookup");
+    }
+    reader.node.shutdown().await.unwrap();
+    drop(reader);
+    let mut provider = SqliteProvider::open(&db).unwrap();
+    assert!(provider.get(&[b"node/log/".as_slice(), &address].concat()).unwrap().is_none());
+    assert!(provider.get(&[b"node/entry/".as_slice(), &address, b"/", &1u64.to_be_bytes()].concat()).unwrap().is_none());
+    provider.close().unwrap();
+
+    authority.append(&address, &[first], true).await.unwrap();
+    let reader = stored(&relay, "Reader", &db).await;
+    let legitimate = IdentityRef { membership: relay.service.clone(), ..claim };
+    let public = reader.node.read_public(&legitimate).await.unwrap();
+    assert_eq!(public.membership, relay.service);
+    assert_eq!(public.writers, [listed(&laptop, "laptop")]);
+    reader.node.shutdown().await.unwrap();
+}
+
 fn fp(key: &Bytes) -> String {
     Sha256::digest(&key.0)[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1178,36 +1265,125 @@ async fn a_change_made_moot_commits_nothing() {
     assert!(format!("{again:#}").contains("not a member"), "removing a non-member fails at once: {again:#}");
 }
 
-/// A member away past its log's retention can apply none of the commits it missed: it is told it was removed, and
-/// forgets the group.
+/// Expired service history is unavailable, not a removal: both kinds keep their state and can catch up from a peer.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_member_away_past_the_retention_drops_the_group() {
-    use lmk_core::provider::SqliteProvider;
+async fn expired_service_history_preserves_chat_and_identity_groups() {
     let relay = relay().await;
-    let dir = folder("retention");
-    let (membership, _service) = signing_service(&relay, &dir).await;
-    let bob_db = dir.join("bob.db");
-    let start = || async {
-        let (node, events) = Node::start(SqliteProvider::open(&bob_db).unwrap(), config(&relay, "Bob", None, &[CHAT])).await.unwrap();
-        Session { node, events }
-    };
-    let mut alice = session(&relay, "Alice").await;
-    let bob = start().await;
-    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
-    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
-    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    bob.node.shutdown().await.unwrap();
-    drop(bob);
+    for kind in [CHAT, IDENTITY] {
+        let dir = folder(&format!("retention-{kind}"));
+        let (gate, _reaching) = Gate::new();
+        let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
+        let start = |name: &'static str| {
+            let (relay, dir) = (&relay, &dir);
+            async move {
+                let device = Device::new(name);
+                let mut config = config(relay, name, Some(device.clone()), &[CHAT, IDENTITY]);
+                config.files = Some(dir.join(format!("{name}-files")));
+                let (node, events) = Node::start(SqliteProvider::open(&dir.join(format!("{name}.db"))).unwrap(), config).await.unwrap();
+                let devices = Identity::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
+                (Session { node, events }, devices)
+            }
+        };
+        let (mut alice, alice_devices) = start("Alice").await;
+        let (bob, bob_devices) = start("Bob").await;
+        let gid = if kind == IDENTITY {
+            alice_devices.create("Plan", membership.clone()).await.unwrap();
+            let link = lmk_proto::links::Invite::parse(&alice_devices.invite().await.unwrap()).unwrap();
+            bob_devices.join(&link).await.unwrap();
+            devices_group(&bob.node)
+        } else {
+            let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
+            bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+            gid
+        };
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        let held = bob.node.send(&gid.0, &message("held before refusal")).await.unwrap();
+        let file = bob.node.add_file(&gid.0, b"held file".to_vec()).await.unwrap();
+        let members = bob.node.members(&gid.0).unwrap();
+        let epoch = bob.node.epoch(&gid.0).unwrap();
+        let key = bob.node.key_in(&gid.0);
+        let identity = bob_devices.identity();
+        let signature = (kind == IDENTITY).then(|| bob.node.sign(&gid.0, b"still my key").unwrap());
+        bob.node.shutdown().await.unwrap();
+        drop((bob, bob_devices));
+        let bob_db = dir.join("Bob.db");
+        let before = holdings(&bob_db, &gid, &[held.position.unwrap()]);
+        let log_key = [b"node/log/".as_slice(), &gid.0].concat();
+        let provider = SqliteProvider::open(&bob_db).unwrap();
+        let log = provider.get(&log_key).unwrap().unwrap();
+        let record: Value = serde_json::from_slice(&log).unwrap();
+        let entries: Vec<_> = (record["start"].as_u64().unwrap() + 1..=record["logged"].as_u64().unwrap()).map(|position| {
+            let key = [b"node/entry/".as_slice(), &gid.0, b"/", &position.to_be_bytes()].concat();
+            let entry = provider.get(&key).unwrap().unwrap();
+            (key, entry)
+        }).collect();
+        assert!(!entries.is_empty());
+        drop(provider);
 
-    alice.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
-    alice.node.shutdown().await.unwrap();
-    let store = Store::open(&dir.join("membership.db"), ed25519_dalek::SigningKey::from_bytes(&[0; 32])).unwrap();
-    store.expire(lmk_node::now() + 1).unwrap();
+        alice.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
+        let missed = alice.node.send(&gid.0, &message("recover from the peer")).await.unwrap();
+        alice.node.shutdown().await.unwrap();
+        drop((alice, alice_devices));
+        let store = Store::open(&dir.join("membership.db"), ed25519_dalek::SigningKey::from_bytes(&[0; 32])).unwrap();
+        assert!(store.expire(lmk_node::now() + 1).unwrap() > 0);
+        assert!(store.read(&gid.0, before.1.length, 1 << 20).unwrap().is_none());
 
-    let mut bob = start().await;
-    bob.until(|e| matches!(e, Event::Removed { by: None, .. }).then_some(())).await;
-    eventually("Bob forgot the group", || bob.node.groups().is_empty()).await;
-    bob.node.shutdown().await.unwrap();
+        let (mut bob, bob_devices) = start("Bob").await;
+        let error = bob.node.read_group(&gid.0).await.unwrap_err();
+        assert_eq!(error.downcast_ref::<lmk_membership::Refused>().unwrap().0, "expired");
+        // read() used to queue Gone before returning its error. Settings runs through the same FIFO work driver,
+        // so seeing this later commit's event proves that deletion is not merely still waiting to run.
+        let barrier = bob.node.create(settings(CHAT, &relay), None).unwrap();
+        bob.node.change_settings(&barrier.0, |s| Settings { name: "barrier".into(), ..s }).await.unwrap();
+        bob.until(|e| {
+            assert!(!matches!(&e, Event::Removed { group, .. } if group == &gid), "{kind}: refusal removed the group");
+            matches!(e, Event::Settings { group, .. } if group == barrier).then_some(())
+        }).await;
+        assert!(bob.node.groups().contains(&gid));
+        assert_eq!(bob.node.members(&gid.0).unwrap(), members);
+        assert_eq!(bob.node.epoch(&gid.0).unwrap(), epoch);
+        assert_eq!(bob.node.key_in(&gid.0), key);
+        assert_eq!(bob_devices.identity(), identity);
+        assert_eq!(bob.node.message(&held.id.0).unwrap().unwrap().payload, message("held before refusal"));
+        assert_eq!(bob.node.file(&file).await.unwrap().unwrap(), b"held file");
+        if let Some(signature) = &signature {
+            assert_eq!(&bob.node.sign(&gid.0, b"still my key").unwrap(), signature);
+        }
+        bob.node.shutdown().await.unwrap();
+        drop((bob, bob_devices));
+        let after = holdings(&bob_db, &gid, &[held.position.unwrap()]);
+        assert_eq!(after.0.public(), before.0.public());
+        assert_eq!(after.1, before.1);
+        assert_eq!(after.2, before.2);
+        let provider = SqliteProvider::open(&bob_db).unwrap();
+        assert_eq!(provider.get(&log_key).unwrap().unwrap(), log);
+        for (key, entry) in entries {
+            assert_eq!(provider.get(&key).unwrap().unwrap(), entry);
+        }
+        drop(provider);
+
+        // Neither member can reach the service: only Alice's retained entries and ciphertext can fill Bob's gap.
+        gate.set(false);
+        let (mut bob, bob_devices) = start("Bob").await;
+        assert_eq!(bob.node.members(&gid.0).unwrap(), members);
+        assert_eq!(bob_devices.identity(), identity);
+        let (alice, _alice_devices) = start("Alice").await;
+        bob.until(|e| {
+            assert!(!matches!(&e, Event::Removed { group, .. } if group == &gid));
+            matches!(e, Event::Settings { group, settings, .. } if group == gid && settings.name == "Later").then_some(())
+        }).await;
+        eventually("Bob decrypts the message beyond the expired history", || bob.node.message(&missed.id.0).unwrap().is_some()).await;
+        assert_eq!(bob.node.message(&missed.id.0).unwrap().unwrap().payload, message("recover from the peer"));
+        assert_eq!(bob.node.key_in(&gid.0), key);
+        assert_eq!(bob.node.members(&gid.0).unwrap(), members);
+        assert!(bob.node.epoch(&gid.0).unwrap() > epoch);
+        if let Some((identity, _)) = identity {
+            assert_eq!(bob_devices.identity(), Some((identity, "Later".into())));
+            assert_eq!(bob.node.sign(&gid.0, b"still my key").unwrap(), signature.unwrap());
+        }
+        bob.node.shutdown().await.unwrap();
+        alice.node.shutdown().await.unwrap();
+    }
 }
 
 /// A session on SQLite at `db`, which survives a restart.
@@ -1647,6 +1823,61 @@ async fn a_peer_not_admitted_changes_nothing() {
         assert!(!matches!(event, Event::Message(_) | Event::Live { .. } | Event::State { .. }), "{event:?}");
     }
     alice.node.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_entries_are_bound_to_the_destination_log_and_service() {
+    let relay = relay().await;
+    let dir = folder("wrong-log-head");
+    let (gate_a, _reaching_a) = Gate::new();
+    let (gate_b, _reaching_b) = Gate::new();
+    let (service_a, router_a) = served(&relay, &dir.join("a"), |service| Gated { service, gate: gate_a.clone() }).await;
+    let (service_b, router_b) = served(&relay, &dir.join("b"), |service| Gated { service, gate: gate_b.clone() }).await;
+    let key_a = ed25519_dalek::SigningKey::from_bytes(&router_a.endpoint().secret_key().to_bytes());
+    let key_b = ed25519_dalek::SigningKey::from_bytes(&router_b.endpoint().secret_key().to_bytes());
+    let db = dir.join("reader.db");
+    let reader = stored(&relay, "Reader", &db).await;
+    let gid = reader.node.create(settings(CHAT, &relay), None).unwrap();
+    let (identity_a, _) = identity(&relay, &reader.node, "A", service_a).await;
+    let (identity_b, writer_b) = identity(&relay, &reader.node, "B", service_b).await;
+    let public = reader.node.read_public(&identity_b).await.unwrap();
+    let entry = Bytes(public.next(&writer_b, public.writers.clone(), "Caught up", lmk_node::now()));
+    reader.node.shutdown().await.unwrap();
+    drop(reader);
+    gate_a.set(false);
+    gate_b.set(false);
+
+    let log_a = Bytes(lmk_proto::public::address(&identity_a.id.0).to_vec());
+    let log_b = Bytes(lmk_proto::public::address(&identity_b.id.0).to_vec());
+    let (_, before, _) = holdings(&db, &log_b, &[]);
+    assert_eq!(before.length, 1);
+    let hash = lmk_proto::head::next(&before.hash.0.as_slice().try_into().unwrap(), &entry.0);
+    let wrong_log = Head::sign(&key_a, &log_a.0, 2, hash, lmk_node::now());
+    assert!(wrong_log.verify(&key_a.verifying_key()), "a genuine signature by A beyond its known head, over B's extended hash");
+    let mut provider = SqliteProvider::open(&db).unwrap();
+    let record_key = [b"node/log/".as_slice(), &log_b.0].concat();
+    let record = provider.get(&record_key).unwrap();
+    provider.close().unwrap();
+
+    let mut reader = stored(&relay, "Reader", &db).await;
+    let mut peer = hand(&relay, iroh::SecretKey::from_bytes(&lmk_core::random()), &reader.node).await;
+    peer.send(&Frame::Entries { log: log_b.clone(), entries: vec![entry.clone()], head: wrong_log }).await;
+    peer.settle(&gid).await;
+    let wrong_service = Head::sign(&key_a, &log_b.0, 2, hash, lmk_node::now());
+    assert!(wrong_service.verify(&key_a.verifying_key()));
+    peer.send(&Frame::Entries { log: log_b.clone(), entries: vec![entry.clone()], head: wrong_service }).await;
+    peer.settle(&gid).await;
+    let mut provider = SqliteProvider::open(&db).unwrap();
+    assert_eq!(provider.get(&record_key).unwrap(), record, "neither attack changes the destination's head, length or timestamp");
+    assert!(provider.get(&[b"node/entry/".as_slice(), &log_b.0, b"/", &2u64.to_be_bytes()].concat()).unwrap().is_none());
+    provider.close().unwrap();
+
+    let right = Head::sign(&key_b, &log_b.0, 2, hash, lmk_node::now());
+    peer.send(&Frame::Entries { log: log_b.clone(), entries: vec![entry], head: right.clone() }).await;
+    peer.settle(&gid).await;
+    reader.until(|event| matches!(event, Event::Public { identity } if identity == identity_b.id).then_some(())).await;
+    reader.node.shutdown().await.unwrap();
+    assert_eq!(holdings(&db, &log_b, &[]).1, right, "same-log catch-up works while the authority is unreachable");
 }
 
 /// A joiner whose `admitted` was lost asks again with the KeyPackage it kept: the member answers with the Welcome its log

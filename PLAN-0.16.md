@@ -14,17 +14,23 @@ Implementation plan, not a description of the released software. Based on the ad
 - Disposable service for now: no remote replicas or automated disaster recovery. Catastrophic loss may require explicit service/group recreation, never silent signed-history rollback or client erasure. Normal restarts still require durable storage.
 - No production reset, DNS change, deletion of backups or release is authorized by this implementation checklist alone.
 
+## Known limit: directory freshness
+
+Authentic directory history is not proof of the latest history. The authoritative service can withhold a revocation from a fresh reader. Persisted checkpoints prevent rollback behind known state; peer evidence can reveal omitted or conflicting history when it arrives. Instant revocation for isolated/offline readers is not promised.
+
+Expiring device authorizations renewed by a separate owner-controlled authority would bound stale acceptance, at a renewal/availability cost. That is a separate identity-design decision, not implicit approval from the metadata or disposable-service choices.
+
 ## Work
 
 - [x] #68: warn about secrets and deletion in Docs and Tables.
 - [x] #70: develop the next release on main, with short-lived change branches.
 - [ ] #64: compatibility matrix and published baselines, including first-minor-release handling.
-- [ ] F8: preserve local state when the service refuses history as expired.
-- [ ] C1: bind peer entries to the destination log and its service authority.
-- [ ] C2: authenticate identity-directory authority before caching a claimant's route or accepting verification.
+- [x] F8: preserve local state when the service refuses history as expired.
+- [x] C1: bind peer entries to the destination log and its service authority.
+- [x] C2: authenticate identity-directory authority before caching a claimant's route or accepting verification.
 - [ ] C3: power-loss-durable native/service commits before external effects.
 - [ ] C4: retain failed browser writes and withhold dependent output until durable.
-- [ ] F26: bind pi-letmeknow sessions to immutable full-version/platform installations.
+- [x] F26: bind pi-letmeknow sessions to immutable full-version/platform installations (`pi-letmeknow` commit `757e27a`; typecheck and 12 focused tests pass).
 - [ ] #72: specify cross-epoch transition witnesses, ancestry comparison, global bases and peer-only catch-up; then implement sealed/padded epoch logs.
 - [ ] #73/#74: fresh incompatible store with hashed capabilities and day-based expiry metadata; reject old writers and unsafe reuse.
 - [ ] F15/F21/F32: audit diagnostic capability/metadata leaks and bound append/read/subscription/storage work.

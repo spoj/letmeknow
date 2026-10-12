@@ -6,10 +6,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use lmk_core::provider::Provider;
 use lmk_membership::client::ServeClient;
-use lmk_membership::{Chain, Contradiction, Refused};
+use lmk_membership::{Chain, Contradiction};
 use lmk_proto::Bytes;
 use lmk_proto::group::Service;
 use lmk_proto::head::{self, Head};
@@ -209,12 +209,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     if let Some(contradiction) = error.downcast_ref::<Contradiction>() {
                         self.contradicted(&self.lock(), id, contradiction, "this session");
                     }
-                    // Past its retention, a member can no longer apply the commits it missed, and must be added again.
-                    if error.downcast_ref::<Refused>().is_some_and(|refused| refused.0 == "expired")
-                        && self.lock().log(id).is_ok_and(|log| log.of == Of::Group)
-                    {
-                        self.work.send(Work::Gone(id.to_vec())).ok();
-                    }
                     return Err(error);
                 }
             };
@@ -316,14 +310,40 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Reads an identity's public log from its service; a log not held yet is followed from then on.
+    /// Uses a claimant's route only to find the genesis-authenticated service; only that service's history is held
+    /// and followed.
     pub(crate) async fn read_public(self: &Arc<Self>, identity: &IdentityRef) -> Result<PublicLog> {
         let address = lmk_proto::public::address(&identity.id.0);
-        {
+        if !self.lock().logs.contains_key(&address[..]) {
+            let id = identity.id.0.as_slice().try_into()?;
+            // Unauthenticated lookups must not seed the shared clients' chains or the persisted route.
+            let hint = ServeClient::for_service(self.clients.endpoint.clone(), &identity.membership)?;
+            let mut after = 0;
+            let service = loop {
+                let page = hint.read(&address, after).await?;
+                ensure!(!page.entries.is_empty(), "the public log has no valid first entry");
+                if let Ok(log) = PublicLog::replay(id, page.entries.iter().map(|entry| entry.0.as_slice())) {
+                    break log.membership;
+                }
+                after += page.entries.len() as u64;
+            };
+            let client = ServeClient::for_service(self.clients.endpoint.clone(), &service)?;
+            let mut entries = Vec::new();
+            loop {
+                let page = client.read(&address, entries.len() as u64).await?;
+                if page.entries.is_empty() {
+                    break;
+                }
+                entries.extend(page.entries);
+            }
+            let public = PublicLog::replay(id, entries.iter().map(|entry| entry.0.as_slice()))?;
+            ensure!(public.membership == service, "the public log belongs to another membership service");
             let mut st = self.lock();
             if !st.logs.contains_key(&address[..]) {
-                let of = Of::Public(identity.id.clone());
-                st.add_log(&address, Log::new(of, identity.membership.clone(), 0))?;
+                let chain = client.chain(&address).context("the public log has no chain")?;
+                self.clients.client(&service)?.set_chain(chain.clone());
+                st.add_log(&address, Log::new(Of::Public(identity.id.clone()), service, 0))?;
+                self.store(&mut st, &address, 0, entries, Some(chain))?;
                 self.follow(&address);
             }
         }
@@ -338,6 +358,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             return Ok(());
         }
         let log = PublicLog::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
+        ensure!(log.membership == st.log(&lmk_proto::public::address(id))?.service, "the public log belongs to another membership service");
         st.public.insert(id.to_vec(), log);
         st.gate = true;
         for gid in st.groups_of(&lmk_proto::public::address(id)) {
