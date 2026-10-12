@@ -631,14 +631,13 @@ impl<P: Provider + Send + 'static> Client<P> {
     }
 
     async fn leave(&self, gid: &Bytes) -> Result<Value> {
-        let gid = gid.clone();
         let Some(sent) = self.inner.node.leave(&gid.0).await? else {
-            self.drop_group(&gid).await?;
+            self.drop_group(gid).await?;
             return Ok(json!({ "group": b64(&gid.0), "left": true }));
         };
         let mut answer = json!({ "group": b64(&gid.0), "left": true, "status": "another member commits the removal" });
-        if sent.position.is_none() || !self.leave_held(&gid)? {
-            self.state().leaving.insert(gid);
+        if sent.position.is_none() || !self.leave_held(gid)? {
+            self.state().leaving.insert(gid.clone());
             answer["pending"] = json!(true);
         }
         Ok(answer)
