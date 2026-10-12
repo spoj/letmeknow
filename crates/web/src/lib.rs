@@ -329,7 +329,7 @@ impl App {
             let record = Array::from(&record);
             (Uint8Array::from(record.get(0)).to_vec(), Uint8Array::from(record.get(1)).to_vec())
         });
-        let store = Store(Arc::new(MemoryProvider::load(records.collect::<Vec<_>>())));
+        let store = Store(Arc::new(MemoryProvider::load(records)));
         let device: Device = if fresh {
             Device::new(&config.device)
         } else {
