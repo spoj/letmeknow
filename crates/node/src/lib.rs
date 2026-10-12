@@ -779,12 +779,7 @@ impl<P: Provider> State<P> {
 
     /// The member whose leaf names an iroh key, or a bare one.
     fn by_iroh(&self, gid: &[u8], iroh: &EndpointId) -> Member {
-        let found = self.groups.get(gid).and_then(|g| {
-            let members = g.mls.members();
-            let member = members.iter().find(|m| m.leaf.as_ref().is_some_and(|leaf| leaf.key.0 == iroh.as_bytes()))?;
-            self.member(gid, member)
-        });
-        found.unwrap_or_else(|| Member {
+        self.in_leaf(gid, iroh).and_then(|member| self.member(gid, &member)).unwrap_or_else(|| Member {
             key: Bytes::default(),
             iroh: Bytes(iroh.as_bytes().to_vec()),
             revision: 0,
