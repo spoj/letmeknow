@@ -6,7 +6,7 @@ use std::path::Path;
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
+PRAGMA synchronous = FULL;
 PRAGMA secure_delete = ON;
 -- Chat messages taken in: printed, or waiting to print; `seen` once printed or read: the read frontier.
 CREATE TABLE IF NOT EXISTS taken (id BLOB PRIMARY KEY, gid BLOB NOT NULL, seen INTEGER NOT NULL DEFAULT 0);

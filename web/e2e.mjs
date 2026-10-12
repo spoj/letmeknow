@@ -98,7 +98,7 @@ const kept = page =>
   page.evaluate(
     () =>
       new Promise((resolve, reject) => {
-        const db = indexedDB.open("lmk");
+        const db = indexedDB.open("lmk5");
         db.onsuccess = () => {
           const request = db.result.transaction("files").objectStore("files").getAllKeys();
           request.onsuccess = () => (db.result.close(), resolve(request.result));
@@ -108,7 +108,7 @@ const kept = page =>
   );
 const text = page => page.locator(".cm-content").evaluate(content => content.cmTile.view.state.doc.toString());
 const call = (page, method, ...args) => page.evaluate(([method, args]) => new Promise((resolve, reject) => {
-  const channel = new BroadcastChannel("letmeknow");
+  const channel = new BroadcastChannel("lmk5");
   const id = crypto.randomUUID();
   const timer = setTimeout(() => { channel.close(); reject(new Error(`no answer to ${method}`)); }, 30_000);
   channel.onmessage = ({ data }) => {
@@ -180,7 +180,7 @@ async function recover(page) {
 }
 
 const record = (page, store, key) => page.evaluate(([store, key]) => new Promise((resolve, reject) => {
-  const request = indexedDB.open("lmk");
+  const request = indexedDB.open("lmk5");
   request.onsuccess = () => {
     const db = request.result;
     const value = db.transaction(store).objectStore(store).get(typeof key === "string" ? key : new Uint8Array(key));
@@ -206,36 +206,39 @@ try {
   ann.run("identity", "create", "Ann");
   desk.run("identity", "create", "Matthew");
 
-  // Incompatible and incomplete local data is refused visibly, never reset.
-  for (const version of [1, 4]) {
+  // Another version's database is left as it is; this version's, incomplete, is refused visibly, never reset.
+  for (const [name, version] of [["lmk", 4], ["lmk5", 1]]) {
     const legacy = await open("legacy", { viewport: { width: 1280, height: 800 } }, true);
     const errors = [];
     legacy.on("pageerror", error => errors.push(error.message));
     await legacy.goto(`${SITE}/blank.html`);
     check(await legacy.locator("script").count() === 0 && await legacy.evaluate(() => !navigator.serviceWorker.controller), "legacy setup page has no app script or service worker");
-    await legacy.evaluate(version => new Promise((resolve, reject) => {
-      const request = indexedDB.open("lmk", version);
+    await legacy.evaluate(([name, version]) => new Promise((resolve, reject) => {
+      const request = indexedDB.open(name, version);
       request.onupgradeneeded = () => {
         request.result.createObjectStore("records").put(new Uint8Array([1]), new Uint8Array([1]).buffer);
         request.result.createObjectStore("files").put(new Uint8Array([1]), "00");
       };
       request.onsuccess = () => (request.result.close(), resolve());
       request.onerror = () => reject(request.error);
-    }), version);
+    }), [name, version]);
     await legacy.goto(SITE);
-    await legacy.getByRole("alert").filter({ hasText: version === 1 ? "stored session is from an incompatible version" : "stored session is incomplete" }).waitFor();
-    const old = await legacy.evaluate(() => new Promise((resolve, reject) => {
-      const request = indexedDB.open("lmk");
+    if (name === "lmk") await legacy.getByLabel("Your name").waitFor();
+    else await legacy.getByRole("alert").filter({ hasText: "stored session is incomplete" }).waitFor();
+    const old = await legacy.evaluate(name => new Promise((resolve, reject) => {
+      const request = indexedDB.open(name);
       request.onsuccess = () => {
         const db = request.result;
-        const records = db.transaction("records").objectStore("records").getAll();
-        records.onsuccess = () => { db.close(); resolve([db.version, [...records.result[0]]]); };
-        records.onerror = () => reject(records.error);
+        const tx = db.transaction(["records", "files"]);
+        const records = tx.objectStore("records").getAll();
+        const files = tx.objectStore("files").getAllKeys();
+        tx.oncomplete = () => { db.close(); resolve([db.version, [...records.result[0]], files.result]); };
+        tx.onerror = () => reject(tx.error);
       };
       request.onerror = () => reject(request.error);
-    }));
-    check(JSON.stringify(old) === JSON.stringify([version, [1]]) && (await kept(legacy)).includes("00"), `unusable browser database v${version} keeps its version, records and files`);
-    check(!errors.length, `browser database v${version} startup errors reach the UI, not unhandled promises: ${errors}`);
+    }), name);
+    check(JSON.stringify(old) === JSON.stringify([version, [1], ["00"]]), `browser database ${name} v${version} keeps its version, records and files`);
+    check(!errors.length, `browser database ${name} startup errors reach the UI, not unhandled promises: ${errors}`);
     await legacy.context().close();
     delete pages.legacy;
   }
@@ -451,7 +454,7 @@ try {
   const recorded = await laptop.evaluate(
     gid =>
       new Promise((resolve, reject) => {
-        const open = indexedDB.open("lmk");
+        const open = indexedDB.open("lmk5");
         open.onsuccess = () => {
           const records = open.result.transaction("records").objectStore("records");
           const count = records.count(new TextEncoder().encode(`lmk/kind/doc/${gid}`));
@@ -465,7 +468,7 @@ try {
   const stored = await laptop.evaluate(
     id =>
       new Promise((resolve, reject) => {
-        const open = indexedDB.open("lmk");
+        const open = indexedDB.open("lmk5");
         open.onsuccess = () => {
           const records = open.result.transaction("records").objectStore("records");
           const bytes = id.match(/../g).map(byte => parseInt(byte, 16));
@@ -535,7 +538,7 @@ try {
   await laptop.locator(".devices li", { hasText: "this browser" }).waitFor();
   await laptop.getByRole("button", { name: "Add a device" }).click();
   const link = await laptop.locator("dialog .copy code").first().textContent();
-  check(link.includes("#4.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
+  check(link.includes("#5.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
   const tablet = native("tablet");
   await tablet.printed(e => e.type === "ready");
   const joining = tablet.start("identity", "join", link);
@@ -761,7 +764,7 @@ try {
     check(JSON.parse(await call(tab, "me")).fp === beforeFailure, "follower-initiated explicit retry reloads every tab with the same session and all pending messages");
   }
   check(new TextDecoder().decode(new Uint8Array(await record(laptop, "records", failedKey))).includes(target.text), "the failed batch itself, not just later writes, reached IndexedDB");
-  check(await laptop.evaluate(async () => (await navigator.locks.query()).held.filter(lock => lock.name === "letmeknow").length === 1), "after recovery exactly one tab owns the session");
+  check(await laptop.evaluate(async () => (await navigator.locks.query()).held.filter(lock => lock.name === "lmk5").length === 1), "after recovery exactly one tab owns the session");
   await follower.close();
   await late.close();
   delete pages["recovery follower"];

@@ -3,13 +3,9 @@
 let db: Promise<IDBDatabase> | undefined;
 function database(): Promise<IDBDatabase> {
   return db ??= new Promise((resolve, reject) => {
-    const request = indexedDB.open("lmk", 4);
-    request.onupgradeneeded = event => {
-      if (event.oldVersion !== 0) {
-        request.transaction!.abort();
-        reject(new Error("This browser's stored session is from an incompatible version. Its local data was preserved; use that version to access it."));
-        return;
-      }
+    // This version's own database: another version's is left as it is.
+    const request = indexedDB.open("lmk5", 1);
+    request.onupgradeneeded = () => {
       request.result.createObjectStore("records");
       request.result.createObjectStore("files");
     };

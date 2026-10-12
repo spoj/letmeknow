@@ -39,3 +39,17 @@ fn the_binary_logs_what_rust_log_asks_without_colour_in_a_pipe() {
         assert!(!stderr.contains('\x1b'), "{stderr}");
     }
 }
+
+/// A home that 0.15 made is refused, and left as it is.
+#[test]
+fn the_binary_leaves_an_earlier_home_as_it_is() {
+    let home = std::env::temp_dir().join(format!("lmk-binary-earlier-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("format"), "4\n").unwrap();
+    let listen = letmeknow(&home, &["listen", "--relay", "http://127.0.0.1:1"]);
+    assert!(!listen.status.success());
+    assert!(String::from_utf8(listen.stderr).unwrap().contains("earlier letmeknow"));
+    assert_eq!(std::fs::read_to_string(home.join("format")).unwrap(), "4\n");
+    assert!(!home.join("sessions").exists());
+    std::fs::remove_dir_all(home).unwrap();
+}

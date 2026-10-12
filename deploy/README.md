@@ -8,7 +8,7 @@ Target topology (not yet cut over):
 
 ## Release gates
 
-**Do not release this staged configuration.** `web/backend.json` deliberately has a null `membershipKey`; production builds fail until the parent/operator inserts and reviews the fresh authority's 64-character hex PUBLIC key. The old local `membership.pub.hex` is not the final 0.16 authority. Never put a private key or Spaces credentials in the repo, build environment, artifacts or logs. Coordinate the same authority and relay defaults in native clients with the protocol owner; this frontend change does not change `crates/proto` defaults or compatibility namespaces.
+`web/backend.json` names the 0.16 authority's PUBLIC key, `7fdc5178ea2da4c7c282d34dd183e6fb109e8afdcb61ffd3f1a9a7c715e50518`, provisioned with `serve --initialize` on the VPS (step 4); native clients default to the same key and to `https://relay.letmeknow.dev` (`crates/proto/src/links.rs`). Production builds fail without a 64-character hex key. Never put a private key or Spaces credentials in the repo, build environment, artifacts or logs.
 
 The independent-origin tests are not a security approval. The other 0.16 gates in PLAN-0.16.md still apply: incompatible service/store/client namespaces, epoch/capability protocols, durability, resource/health semantics, and owner review. The backend's `/stats` reports sitewide totals per completed UTC day; no statistics UI is provided.
 

@@ -5,11 +5,11 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 pub const INVITE_PREFIX: &str = "https://letmeknow.dev/i#";
 /// letmeknow.dev's relay, which links leave out.
-pub const RELAY: &str = "https://letmeknow.dev";
+pub const RELAY: &str = "https://relay.letmeknow.dev";
 /// letmeknow.dev's membership service: its iroh key, hex. It is reached through `RELAY`.
-pub const MEMBERSHIP_KEY: &str = "50d422869a41e313ef48fa00284557a0c3d15374280b7f3d5d35a35c2393370f";
+pub const MEMBERSHIP_KEY: &str = "7fdc5178ea2da4c7c282d34dd183e6fb109e8afdcb61ffd3f1a9a7c715e50518";
 
-/// `https://letmeknow.dev/i#4.<g|d>.<secret>.<member>[.<member>...]`, where each member is its iroh key, then `~` and
+/// `https://letmeknow.dev/i#5.<g|d>.<secret>.<member>[.<member>...]`, where each member is its iroh key, then `~` and
 /// its relay when that is not letmeknow.dev's; every field after the kind in unpadded base64url.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invite {
@@ -28,7 +28,7 @@ pub struct Address {
 
 impl Invite {
     pub fn link(&self) -> String {
-        let mut link = format!("{INVITE_PREFIX}4.{}.{}", if self.device { "d" } else { "g" }, URL_SAFE_NO_PAD.encode(self.secret));
+        let mut link = format!("{INVITE_PREFIX}5.{}.{}", if self.device { "d" } else { "g" }, URL_SAFE_NO_PAD.encode(self.secret));
         for member in &self.members {
             link.push('.');
             link.push_str(&URL_SAFE_NO_PAD.encode(member.key));
@@ -43,7 +43,7 @@ impl Invite {
     pub fn parse(link: &str) -> Result<Self> {
         let fragment = link.split_once('#').context("an invite link has a part after #")?.1;
         let mut fields = fragment.split('.');
-        ensure!(fields.next() == Some("4"), "this invite link is from another version of letmeknow");
+        ensure!(fields.next() == Some("5"), "this invite link is from another version of letmeknow");
         let device = match fields.next() {
             Some("d") => true,
             Some("g") => false,
@@ -102,8 +102,10 @@ mod tests {
             let invite = Invite { device, secret: [2; 16], members: members.clone() };
             assert_eq!(Invite::parse(&invite.link()).unwrap(), invite);
         }
-        assert!(Invite::parse("https://letmeknow.dev/i#4.g.AA.AA").is_err());
-        assert!(Invite::parse("https://letmeknow.dev/i#4.g.AgICAgICAgICAgICAgICAg").is_err(), "a link names a member");
+        assert!(Invite::parse("https://letmeknow.dev/i#5.g.AA.AA").is_err());
+        assert!(Invite::parse("https://letmeknow.dev/i#5.g.AgICAgICAgICAgICAgICAg").is_err(), "a link names a member");
+        let older = Invite { device: false, secret: [2; 16], members }.link().replacen("#5.", "#4.", 1);
+        assert!(Invite::parse(&older).unwrap_err().to_string().contains("another version"));
     }
 
     #[test]
