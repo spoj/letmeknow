@@ -1,6 +1,6 @@
 # Independent frontend and backend
 
-Target topology (not yet cut over):
+Topology:
 
 - `https://letmeknow.dev`: the complete GitHub-built static distribution on GitHub Pages. HTML, JS, WASM, fonts, icons, manifest and service worker come from this origin. Invite `/i` has its own static entry, including Pages' `/i/` redirect.
 - `https://relay.letmeknow.dev`: VPS membership/iroh relay only. A `129.212.227.207`, AAAA `2400:6180:0:d2:0:3:37cd:7000`, DNS-only; the owner has created these records. Keep TCP 22/80/443 and UDP 7842/7843 open. TLS is issued independently for the relay name.
