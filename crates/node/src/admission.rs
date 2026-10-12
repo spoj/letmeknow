@@ -17,7 +17,7 @@ use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
 use n0_future::task::spawn;
 use n0_future::{FuturesUnordered, StreamExt};
-use n0_future::time::{Duration, Instant, sleep_until, timeout};
+use n0_future::time::{Duration, Instant, sleep, sleep_until, timeout};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
@@ -131,7 +131,15 @@ impl<P: Provider + Send + 'static> Node<P> {
             .map(|(i, (peer, relay))| {
                 let net = self.inner.net().clone();
                 spawn(async move {
-                    let dialed = timeout(DIAL_WAIT, net.dial(peer, relay.clone())).await;
+                    // A dial that fails at once, as one from a node that has just started can, is tried again until the wait
+                    // is up.
+                    let dialed = timeout(DIAL_WAIT, async {
+                        while let Err(error) = net.dial(peer, relay.clone()).await {
+                            tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                    })
+                    .await;
                     if i > 0 {
                         sleep_until(inviter_first).await;
                     }
@@ -143,7 +151,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let mut refused_by_all = true;
         while let Some(dialed) = dials.next().await {
             let (peer, relay, dialed) = dialed?;
-            if !matches!(dialed, Ok(Ok(()))) {
+            if dialed.is_err() {
                 tracing::debug!("{} is not online", peer.fmt_short());
                 refused_by_all = false;
                 continue;
