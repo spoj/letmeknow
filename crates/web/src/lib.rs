@@ -52,6 +52,10 @@ extern "C" {
     #[wasm_bindgen(js_namespace = console)]
     fn error(text: &str);
 
+    #[cfg(feature = "test-witness")]
+    #[wasm_bindgen(js_namespace = globalThis, js_name = __lmk_recorded)]
+    fn recorded(key: &[u8], value: &[u8]);
+
     /// The page's IndexedDB.
     pub type Idb;
     /// Persists records: `[key, value]` pairs, and keys to delete; resolves once they are durable.
@@ -133,7 +137,10 @@ impl Provider for Store {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.0.put(key, value)
+        self.0.put(key, value)?;
+        #[cfg(feature = "test-witness")]
+        recorded(key, value);
+        Ok(())
     }
 
     fn delete(&self, key: &[u8]) -> Result<()> {

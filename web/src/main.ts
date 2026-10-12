@@ -174,7 +174,7 @@ function standing(p: Person): string {
   const i = p.identity;
   if (!i) return "Speaks as no identity";
   if (i.error) return `Authorization failed: ${i.error}`;
-  return `${i.how === "self" ? "Your identity. " : ""}Locally observed here; not independently verified`;
+  return `${i.how === "self" ? "Your identity. " : ""}${i.observed ? "Locally observed here" : "Authorized claim; not recorded as a local observation"}; not independently verified`;
 }
 
 function bindingWarning(p: Person): string | undefined {
@@ -478,7 +478,7 @@ async function drawDevices() {
         render();
       };
       return [
-        h("p", {}, "This browser is no one's device yet. Start to make it your first device; you can then add your other devices, and others can tell it is you."),
+        h("p", {}, "Start an identity to make signed identity claims and add your other devices. An identity is not verification of a person. Existing anonymous memberships stay anonymous until you leave and rejoin; new memberships use this identity."),
         form(
           () => name.reportValidity() && device.reportValidity() && busy(create, "Starting…", started),
           field("Your name", name),
@@ -491,7 +491,7 @@ async function drawDevices() {
   }
   const listed: Listed = await request({ cmd: "identity", op: "list" });
   update(devicesBody, JSON.stringify([identity, listed]), () => [
-    h("p", {}, `The browsers and computers that are you, ${identity.name}. They join your chats and documents, and others see them as yours.`),
+    h("p", {}, `The browsers and computers authorized to speak as ${identity.name}. Certified memberships carry their signed identity claims, not proof of a person.`),
     h(
       "ul",
       { className: "devices" },
@@ -535,8 +535,8 @@ function renameDialog() {
           render();
           dialog.close();
         }),
-      field("Your name", identity, "Your devices, and everyone you share with, see it."),
-      field("This device", name, "Your other devices, and everyone you share with, see it next to your name."),
+      field("Your name", identity, "Certified memberships share the new claim as devices and sessions resume and refresh. Anonymous memberships stay anonymous."),
+      field("This device", name, "The signed device label updates in certified memberships as sessions resume and refresh."),
       h("div", { className: "buttons" }, save)
     )
   );

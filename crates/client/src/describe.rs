@@ -175,6 +175,17 @@ mod tests {
     }
 
     #[test]
+    fn an_authorized_historical_claim_without_observations_is_unknown_not_observed() {
+        let mut historical = member("former", 2, Some((20, "Robert")));
+        historical.identity.as_mut().unwrap().observed = None;
+        let describer = Describer { me: Bytes(vec![1]), identity: None, members: vec![] };
+        let known = describer.describe(&historical).identity.unwrap();
+        assert_eq!(known.how, Standing::Unknown);
+        assert_eq!(known.name, "Robert");
+        assert!(known.error.is_none() && known.observed.is_none());
+    }
+
+    #[test]
     fn a_member_shows_as_its_identity_and_device_and_its_handle_where_another_shows_so_too() {
         let own = IdentityRef { id: Bytes(vec![10]), membership: crate::letmeknow_dev() };
         let mut eve = member("eve", 5, Some((20, "Robert")));

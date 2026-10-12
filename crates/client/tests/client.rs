@@ -164,6 +164,37 @@ async fn a_joiner_shows_its_identitys_claim_and_a_link_to_an_identity_admits_onl
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn late_identity_creation_keeps_anonymous_leaves_and_certifies_future_memberships() {
+    let relay = relay().await;
+    let alice = Member::start(&relay, "Alice").await;
+    let old = alice.request(json!({ "cmd": "invite", "name": "anonymous" })).await;
+    let gid: lmk_proto::Bytes = serde_json::from_value(old["group"].clone()).unwrap();
+    let before = alice.client.node().members(&gid.0).unwrap();
+    assert!(before[0].identity.is_none());
+    let epoch = alice.client.node().epoch(&gid.0).unwrap();
+    alice.request(json!({ "cmd": "identity", "op": { "create": { "name": "Ann" } } })).await;
+    for _ in 0..3 {
+        assert!(alice.client.refresh_identity().await.is_empty(), "anonymous memberships must not cause a refresh error loop");
+    }
+    let after = alice.client.node().members(&gid.0).unwrap();
+    assert!(after[0].identity.is_none());
+    assert_eq!(after[0].key, before[0].key);
+    assert_eq!(alice.client.node().epoch(&gid.0).unwrap(), epoch);
+    let new = alice.request(json!({ "cmd": "invite", "name": "certified" })).await;
+    let spoken = alice.client.node().spoken();
+    assert_eq!(spoken.len(), 1, "the new installed leaf carries the identity certificate");
+    alice.client.node().read_public(&spoken[0]).await.unwrap();
+    let members = alice.request(json!({ "cmd": "members", "group": new["group"] })).await;
+    let claim = &members["members"][0]["identity"];
+    assert_eq!(claim["name"], "Ann");
+    assert!(claim["error"].is_null());
+    assert_eq!(claim["how"], "self");
+    let old_members = alice.request(json!({ "cmd": "members", "group": old["group"] })).await;
+    assert!(old_members["members"][0]["identity"].is_null());
+    alice.client.node().shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_kinds_plugin_hears_of_its_groups_and_lets_go_of_one_left() {
     let relay = relay().await;
     let mut alice = Member::start(&relay, "Alice").await;

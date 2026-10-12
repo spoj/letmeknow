@@ -84,6 +84,16 @@ async function open(name, options, own = false) {
       if (relay) localStorage.setItem("lmk relay", relay);
       if (membership) localStorage.setItem("lmk membership", membership);
       window.toasts = [];
+      window.__lmk_recorded = (key, value) => {
+        const witness = window.peerMutation;
+        if (!witness) return;
+        const name = new TextDecoder().decode(key);
+        const text = new TextDecoder().decode(value);
+        if (name.startsWith("node/message/") && text.includes(witness.text)) {
+          witness.record = JSON.parse(text);
+          witness.phase = window.storageFault.phase;
+        }
+      };
       new MutationObserver(records => records.forEach(r => r.addedNodes.forEach(node => node.className === "toast" && window.toasts.push(node.textContent)))).observe(document, {
         childList: true,
         subtree: true
@@ -751,9 +761,11 @@ try {
   await holdSave(laptop, { store: "files", key: fileHash });
   const retryingFiles = outcome(call(laptop, "flush", true));
   await laptop.waitForFunction(() => window.storageFault.phase === "held");
-  ann.run("send", `--group=${fileChat.group}`, "arrived during ciphertext recovery");
-  const heldItems = outcome(call(laptop, "items", fileChat.group, true));
-  await laptop.waitForTimeout(1_000);
+  await laptop.evaluate(() => { window.peerMutation = { text: "arrived during ciphertext recovery" }; });
+  const recoveryMessage = ann.run("send", `--group=${fileChat.group}`, "arrived during ciphertext recovery");
+  await laptop.waitForFunction(() => window.peerMutation.record && window.peerMutation.phase === "held");
+  check(await laptop.evaluate(pos => window.peerMutation.record.position === pos, recoveryMessage.pos), "the named peer message mutated the node provider while the ciphertext retry was held");
+  const heldItems = outcome(call(laptop, "items", fileChat.group, false));
   await laptop.evaluate(() => { window.storageFault.release = "commit"; });
   check((await retryingFiles).error?.includes("changed during the recovery save"), "a ciphertext retry also refuses reload when records changed during its transaction");
   check((await heldItems).error?.includes("could not be saved"), "descriptions remain withheld during a failed process's recovery");
@@ -835,9 +847,11 @@ try {
   await holdSave(laptop, target);
   const retrying = outcome(call(follower, "flush", true));
   await laptop.waitForFunction(() => window.storageFault.phase === "held");
-  ann.run("send", `--group=${invite.group}`, "arrived during the recovery transaction");
-  const during = outcome(call(laptop, "items", invite.group, true));
-  await laptop.waitForTimeout(1_000);
+  await laptop.evaluate(() => { window.peerMutation = { text: "arrived during the recovery transaction" }; });
+  const recoveryPeerMessage = ann.run("send", `--group=${invite.group}`, "arrived during the recovery transaction");
+  await laptop.waitForFunction(() => window.peerMutation.record && window.peerMutation.phase === "held");
+  check(await laptop.evaluate(pos => window.peerMutation.record.position === pos, recoveryPeerMessage.pos), "the named peer message mutated the node provider while the records retry was held");
+  const during = outcome(call(laptop, "items", invite.group, false));
   await laptop.evaluate(() => { window.storageFault.release = "commit"; });
   const dirtyRetry = await retrying;
   check((await during).error?.includes("could not be saved"), "the accessor does not acknowledge in-memory changes during recovery");

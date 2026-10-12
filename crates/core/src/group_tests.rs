@@ -738,13 +738,22 @@ fn private_certificates_refresh_but_cannot_rebind_a_membership() {
         assert_eq!(a.name, "A");
         assert_eq!(a.certificate.as_deref(), Some(&refreshed));
     }
-    // Bypass our update API: dropping a certificate or forging its names must fail on the wire too.
+    // Bypass our API, including valid signatures for forbidden authorization tuples.
     let mut forged = refreshed;
     forged.name = "unsigned".into();
-    for certificate in [None, Some(Box::new(forged))] {
-        let a = &mut w.m[0];
+    let attached = of(id, &device, w.m[1].session.key().try_into().unwrap(), "Ann", "phone");
+    for (author, certificate, signed) in [
+        (0, None, false),
+        (0, Some(forged), false),
+        (0, Some(of(crate::random(), &device, key, "Ann", "phone")), true),
+        (0, Some(of(id, &crate::random(), key, "Ann", "phone")), true),
+        (1, Some(attached), true),
+    ] {
+        let before: Vec<_> = w.m.iter_mut().map(|m| (m.g().epoch(), m.g().members().into_iter().map(|m| (m.key, m.credential)).collect::<Vec<_>>())).collect();
+        let a = &mut w.m[author];
         let mut unsigned = a.session.credential.clone();
-        unsigned.certificate = certificate;
+        unsigned.certificate = certificate.map(Box::new);
+        assert_eq!(crate::public::verify_certificate(&unsigned), signed);
         let leaf = LeafNodeParameters::builder().with_credential_with_key(CredentialWithKey {
             credential: BasicCredential::new(serde_json::to_vec(&unsigned).unwrap()).into(),
             signature_key: a.session.signer.public().into(),
@@ -757,6 +766,11 @@ fn private_certificates_refresh_but_cannot_rebind_a_membership() {
         w.post(entry);
         assert!(w.read(&[0, 1, 2]).iter().all(|r| matches!(&r[0].0, Verdict::Skipped { reason, .. } if reason.contains("authorization"))));
         w.agree(&[0, 1, 2]);
+        for (reader, (epoch, members)) in w.m.iter_mut().zip(before) {
+            assert_eq!(reader.g().epoch(), epoch);
+            assert_eq!(reader.g().members().into_iter().map(|m| (m.key, m.credential)).collect::<Vec<_>>(), members);
+            assert!(reader.g().posted().is_none());
+        }
     }
 }
 
