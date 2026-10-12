@@ -211,10 +211,7 @@ fn date(text: &str) -> bool {
 fn infer<'a>(values: impl Iterator<Item = &'a str>) -> &'static str {
     let values: Vec<&str> = values.filter(|v| !v.trim().is_empty()).collect();
     let fits = |kind| values.iter().all(|v| parse(v, kind).is_ok());
-    match ["number", "date", "checkbox"].into_iter().find(|kind| !values.is_empty() && fits(kind)) {
-        Some(kind) => kind,
-        None => "text",
-    }
+    ["number", "date", "checkbox"].into_iter().find(|kind| !values.is_empty() && fits(kind)).unwrap_or("text")
 }
 
 /// Sets a cell to the value its text gives, adding a choice that a choice column lacks; or, if the text does not fit the
