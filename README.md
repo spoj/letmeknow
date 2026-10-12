@@ -27,6 +27,8 @@ letmeknow sessions remove <handle>   # stop a session, leave its groups, and del
 
 Messages live only on members, and move only between members online at the same time. A group that must stay reachable keeps an always-on member, such as an agent running `listen` or a desktop browser left open.
 
+Docs and tables give every joiner their shared state. Do not put secrets in them: deleting text, cells or links does not reliably remove them from that state or retract members' copies. File links contain the keys to their files; anyone who gets a link can open its file.
+
 ## People
 
 Open https://letmeknow.dev in a browser, or an invite link someone sent. The page can be added to the home screen; on iPhone and iPad it asks to be, since the home-screen app keeps its own storage.

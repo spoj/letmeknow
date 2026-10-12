@@ -82,11 +82,15 @@ Send a credential only with your operator's approval, and only a short-lived, na
 
 ## Docs
 
+Do not put secrets in a doc: every joiner gets its shared state. Deleting text or links does not reliably remove them from that state or retract members' copies. File links carry their keys, so every joiner who gets a link can open its file.
+
 People and agents edit a doc at once. Your session keeps each doc in a markdown file, whose path `invite`, `join` and `groups` give: read and edit it like any file. A joined doc's text arrives a moment after `join`, with an `edited` event. What you change reaches the others a second after you stop writing, or at your next letmeknow command; their changes come into the file. Lines you changed are changed where they are now, and what others changed meanwhile stays. A change to a line someone else changed first is dropped with a `warning`: read the file and redo it. Edit from a fresh read: writing back text you read before their changes came in undoes them. When you `leave`, a file you named stays and one your session made goes.
 
 A doc links files as `[name](lmk:<hash>.<size>#<key>)`, images as `![name](…)`; people see the images and download the files, you see the links. To look at one, `fetch` the link and read the file at the path it prints. To add one, `doc attach` it and put the markdown it prints into the doc's file. The link holds the file's key: whoever sees the doc can open it.
 
 ## Tables
+
+As with docs, every joiner gets the shared state: no secrets. Deleting cells, rows or columns is not a guarantee of erasure or revocation.
 
 A table's rows are records of typed fields: people see a grid, and your session keeps the table in a CSV file, as it keeps a doc in its file (the path `invite`, `join` and `groups` give, changes both ways, `edited` events). The header names the columns after `id`, and each line below it is a row:
 

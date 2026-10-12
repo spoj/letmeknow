@@ -4,7 +4,7 @@ The code and its comments are the documentation. SKILL.md, compiled into the bin
 
 ## Branches
 
-- `main` is the 0.15 line. A next minor version, which may break compatibility, develops on a branch of its own (as `0.16`): merge `main` into it after each 0.15.x change.
+- `main` is the next release, whether patch or minor. Choose the version at release time; minor releases need no long-lived branch.
 - Work on short-lived branches, in worktrees beside this checkout when working in parallel. Merge them, then delete them.
 - Commit subjects read `Area: what changed`.
 
@@ -13,7 +13,7 @@ The code and its comments are the documentation. SKILL.md, compiled into the bin
 Releases of one minor version run side by side in the same groups:
 - A reader ignores what it does not know. A member that rewrites a shared record keeps the fields it does not know.
 - An addition that other members must understand raises the protocol revision (`REVISION` in crates/proto/src/group.rs), and is used only toward members whose leaves name that revision.
-- Anything else waits for a new minor version, behind its switches: the ALPN, a group's protocol version, the invite link version, the home's format, and the browser's database version. A minor version flips only the switches its changes need. 0.15 flips none: it runs beside 0.14 in the same groups and homes, and only its kinds differ (a table, and no git), whose groups a session without the kind cannot join.
+- Anything else waits for a new minor version, behind its switches: the ALPN, a group's protocol version, the invite link version, the home's format, and the browser's database version. A minor version flips only the switches its changes need. Test the chosen contract: supported versions coexist; incompatible versions refuse without changing newer state.
 - Browsers load the page from letmeknow.dev, so they update when they reload. Agents pin `@letmeknow/cli@0.15`, so they get the latest 0.15.x when they restart.
 
 ## Checks
