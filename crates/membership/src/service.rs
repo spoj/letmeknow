@@ -250,7 +250,8 @@ mod tests {
 
     #[tokio::test]
     async fn running_db_work_is_not_cut_off() {
-        let path = std::env::temp_dir().join(format!("lmk-running-{}", hex::encode(lmk_proto::random::random::<16>())));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
         let service = Service::new(Store::initialize(&path).unwrap(), Policy::default());
         service.0.expiry.lock().unwrap().take();
         let (release, wait) = std::sync::mpsc::channel();
@@ -262,12 +263,12 @@ mod tests {
         release.send(()).unwrap();
         running.await.unwrap().unwrap();
         drop(service);
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[tokio::test]
     async fn blocking_work_is_bounded_and_cancellation_does_not_free_running_slots() {
-        let path = std::env::temp_dir().join(format!("lmk-work-{}", hex::encode(lmk_proto::random::random::<16>())));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
         let service = Service::new(Store::initialize(&path).unwrap(), Policy::default());
         service.0.expiry.lock().unwrap().take();
         let mut jobs = Vec::new();
@@ -289,6 +290,5 @@ mod tests {
         let all = service.0.work.acquire_many(DB_WORK as u32).await.unwrap();
         drop(all);
         drop(service);
-        std::fs::remove_dir_all(path).unwrap();
     }
 }

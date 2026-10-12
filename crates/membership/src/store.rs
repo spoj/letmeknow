@@ -227,13 +227,15 @@ mod sql_tests;
 mod tests {
     use super::*;
 
-    fn state() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("lmk-membership-{}", hex::encode(lmk_proto::random::random::<16>())))
+    fn state() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        (dir, path)
     }
 
     #[test]
     fn durable_restart_and_transaction_abort() {
-        let path = state();
+        let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
         let d = head::reference(store.key().verifying_key().as_bytes(), &[7; 32]);
         {
@@ -260,12 +262,11 @@ mod tests {
         assert_eq!(store.head(&d).unwrap().hash, appended.head.hash);
         assert_eq!(store.read(&d, 0).unwrap().entries, [Bytes(b"committed".to_vec())]);
         drop(store);
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn expiry_and_public_retention_use_days_and_keep_anchors() {
-        let path = state();
+        let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
         let d = [7; 32];
         let public = [8; 32];
@@ -286,16 +287,15 @@ mod tests {
         assert_eq!(store.append(&public, &[Bytes(vec![4])], true).unwrap().position, 3);
         assert_eq!(store.read(&public, 2).unwrap().entries.len(), 1);
         drop(store);
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn lost_or_mismatched_state_never_initializes() {
-        let missing = state();
+        let (_dir, missing) = state();
         assert!(Store::open(&missing).is_err());
         assert!(!missing.exists());
         for lost in ["membership.key", "membership.db", "membership.ready"] {
-            let path = state();
+            let (_dir, path) = state();
             let store = Store::initialize(&path).unwrap();
             store.append(&[7; 32], &[Bytes(vec![1])], false).unwrap();
             drop(store);
@@ -303,10 +303,9 @@ mod tests {
             assert!(Store::open(&path).is_err());
             assert!(Store::initialize(&path).is_err());
             assert!(!path.join(lost).exists());
-            fs::remove_dir_all(path).unwrap();
         }
         for fault in ["empty", "authority", "format"] {
-            let path = state();
+            let (_dir, path) = state();
             let store = Store::initialize(&path).unwrap();
             store.append(&[7; 32], &[Bytes(vec![1])], false).unwrap();
             drop(store);
@@ -319,13 +318,12 @@ mod tests {
             let before = fs::read(&db_path).unwrap();
             assert!(Store::open(&path).is_err());
             assert_eq!(fs::read(&db_path).unwrap(), before);
-            fs::remove_dir_all(path).unwrap();
         }
     }
 
     #[test]
     fn row_byte_lifetime_and_anchor_limits_are_transactional() {
-        let path = state();
+        let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
         let d = [7; 32];
         assert!(store.append(&d, &vec![Bytes(vec![1]); membership::APPEND_ROWS+1], false).is_err());
@@ -345,13 +343,12 @@ mod tests {
         }
         assert_eq!(store.head(&d).unwrap().length, 1);
         drop(store);
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn completed_site_totals_survive_failures_restart_and_expiry() {
         lmk_proto::clock::set(|| 10 * DAY_MS);
-        let path = state();
+        let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
         store.append(&[1; 32], &[Bytes(vec![1; 3]), Bytes(vec![2; 5])], false).unwrap();
         store.append(&[2; 32], &[Bytes(vec![3; 7])], true).unwrap();
@@ -379,12 +376,11 @@ mod tests {
         lmk_proto::clock::set(|| 19 * DAY_MS);
         assert!(store.stats().unwrap().days.iter().all(|d| d.entries == 0 && d.bytes == 0));
         drop(store);
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn large_entry_expiry_and_foreground_append_share_bounded_batches() {
-        let path = state();
+        let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
         for _ in 0..8 { store.append(&[7; 32], &[Bytes(vec![3; membership::MAX_ENTRY])], false).unwrap(); }
         let day = now()/DAY_MS;
@@ -399,13 +395,12 @@ mod tests {
         assert_eq!(store.read(&[8; 32], 0).unwrap().entries, [Bytes(vec![9])]);
         assert_eq!(store.read(&[7; 32], 4).unwrap().entries.len(), 2);
         drop(store);
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn expiry_payload_budget_bounds_large_private_and_public_deletions() {
         for public in [false, true] {
-            let path = state();
+            let (_dir, path) = state();
             let store = Store::initialize(&path).unwrap();
             for _ in 0..5 { store.append(&[7; 32], &[Bytes(vec![3; membership::MAX_ENTRY])], public).unwrap(); }
             assert_eq!(store.expire(now()/DAY_MS+1).unwrap(), 4);
@@ -414,13 +409,12 @@ mod tests {
             assert_eq!(store.append(&[8; 32], &[Bytes(vec![9])], false).unwrap().position, 1);
             assert_eq!(store.expire(now()/DAY_MS+1).unwrap(), 2);
             drop(store);
-            fs::remove_dir_all(path).unwrap();
         }
     }
 
     #[test]
     fn pages_and_expiry_work_are_bounded() {
-        let path = state();
+        let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
         let d = [7; 32];
         for _ in 0..17 { store.append(&d, &vec![Bytes(vec![1]); membership::APPEND_ROWS], false).unwrap(); }
@@ -434,12 +428,11 @@ mod tests {
         assert!(serde_json::to_vec(&membership::Reply::Ok(&page)).unwrap().len() < membership::MAX_BODY);
         assert_eq!(store.read(&d, 2).unwrap().entries.len(), 1);
         drop(store);
-        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
     fn opaque_schema_and_structural_legacy_refusal() {
-        let path = state();
+        let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
         let capability = lmk_proto::random::random::<32>();
         let d = head::reference(store.key().verifying_key().as_bytes(), &capability);
@@ -454,6 +447,5 @@ mod tests {
         drop(db);
         assert_eq!(store.read(&d, 0).unwrap().entries, [Bytes(vec![42])]);
         drop(store);
-        fs::remove_dir_all(path).unwrap();
     }
 }

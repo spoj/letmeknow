@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, path::PathBuf, sync::Mutex, time::Duration};
+use std::{net::Ipv4Addr, sync::Mutex, time::Duration};
 
 use anyhow::Result;
 use iroh::{Endpoint, RelayMode, SecretKey, endpoint::{Connection, presets}, protocol::{AcceptError, ProtocolHandler, Router}};
@@ -7,7 +7,7 @@ use lmk_proto::{Bytes, frame::{self, ALPN, Open, Stream}, head::{self, Head}, me
 use tokio::{io::AsyncWriteExt, sync::oneshot, time::timeout};
 
 struct TestService {
-    path: PathBuf,
+    _dir: tempfile::TempDir,
     service: Router,
     client: ServeClient,
     endpoint: Endpoint,
@@ -16,15 +16,15 @@ struct TestService {
 
 impl TestService {
     async fn new(policy: Policy) -> Self {
-        let path = std::env::temp_dir().join(format!("lmk-service-{}", hex::encode(lmk_proto::random::random::<16>())));
-        let store = Store::initialize(&path).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::initialize(&dir.path().join("state")).unwrap();
         let secret = SecretKey::from_bytes(&store.key().to_bytes());
         let key = *secret.public().as_bytes();
         let server = endpoint(Some(secret)).await;
         let service = Router::builder(server).accept(ALPN, Service::new(store, policy)).spawn();
         let endpoint = endpoint(None).await;
         let client = ServeClient::new(endpoint.clone(), &key, "", &service.endpoint().bound_sockets().iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap();
-        Self { path, service, client, endpoint, key }
+        Self { _dir: dir, service, client, endpoint, key }
     }
 
     fn empty(&self, c: &[u8; 32]) -> Frontier { Frontier::empty(self.key, head::reference(&self.key, c)) }
@@ -33,7 +33,6 @@ impl TestService {
         drop(self.client);
         self.endpoint.close().await;
         self.service.shutdown().await.unwrap();
-        std::fs::remove_dir_all(self.path).unwrap();
     }
 }
 

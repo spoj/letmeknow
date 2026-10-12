@@ -11,8 +11,8 @@ fn published_writer_refuses_without_mutation_and_guard_removal_is_a_negative_con
     let version = Command::new(&binary).arg("--version").output().unwrap();
     assert_eq!(String::from_utf8(version.stdout).unwrap().trim(), "letmeknow 0.15.1");
     for guard in [true, false] {
-        let root = std::env::temp_dir().join(format!("lmk-old-writer-{}", hex::encode(lmk_proto::random::random::<16>())));
-        fs::create_dir(&root).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
         let state = root.join("state");
         let store = Store::initialize(&state).unwrap();
         let d = head::reference(store.key().verifying_key().as_bytes(), &[7; 32]);
@@ -50,6 +50,5 @@ fn published_writer_refuses_without_mutation_and_guard_removal_is_a_negative_con
         }
         assert_eq!(fs::read(state.join("membership.key")).unwrap(), key);
         assert_eq!(fs::read(state.join("membership.ready")).unwrap(), ready);
-        fs::remove_dir_all(root).unwrap();
     }
 }

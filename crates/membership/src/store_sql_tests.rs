@@ -5,7 +5,8 @@ use rusqlite::{StatementStatus::{FullscanStep, Sort, VmStep}, types::Value, para
 fn locked_sqlite_uses_bounded_index_ranges_not_limit_scans() {
     assert_eq!(rusqlite::version(), "3.50.2");
     for population in [100, 50_000] {
-        let path = std::env::temp_dir().join(format!("lmk-plans-{}", hex::encode(lmk_proto::random::random::<16>())));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
         let store = Store::initialize(&path).unwrap();
         let db = store.db.lock().unwrap();
         db.execute_batch(&format!("BEGIN;
@@ -56,6 +57,5 @@ fn locked_sqlite_uses_bounded_index_ranges_not_limit_scans() {
         }
         drop(db);
         drop(store);
-        fs::remove_dir_all(path).unwrap();
     }
 }
