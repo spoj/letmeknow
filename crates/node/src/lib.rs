@@ -664,7 +664,7 @@ impl<P: Provider> State<P> {
     /// The iroh key of the member with a fingerprint: the first 8 bytes of SHA-256 of its session key, hex.
     fn by_fp(&self, gid: &[u8], fp: &str) -> Result<EndpointId> {
         let members = self.group(gid)?.mls.members();
-        let member = members.iter().find(|m| hex(&Sha256::digest(&m.key)[..8]) == fp).with_context(|| format!("no member {fp}"))?;
+        let member = members.iter().find(|m| crate::fp(&m.key) == fp).with_context(|| format!("no member {fp}"))?;
         member.leaf.as_ref().and_then(|leaf| endpoint_id(&leaf.key.0)).context("a member without an iroh key")
     }
 
@@ -908,6 +908,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A member's fingerprint: the first 8 bytes of SHA-256 of its session key, hex.
+pub fn fp(key: &[u8]) -> String {
+    hex(&Sha256::digest(key)[..8])
 }
 
 #[cfg(test)]

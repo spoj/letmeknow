@@ -250,10 +250,6 @@ async fn a_failed_first_identity_lookup_does_not_persist_a_route() {
     reader.node.shutdown().await.unwrap();
 }
 
-fn fp(key: &Bytes) -> String {
-    Sha256::digest(&key.0)[..8].iter().map(|b| format!("{b:02x}")).collect()
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_welcome_is_retried_after_restart() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -541,7 +537,7 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
         _ => None,
     }).await;
     assert_eq!((held.id, held.payload), (sent.id, push));
-    alice.node.send_live(&gid.0, &json!({ "type": "edit", "n": 2 }), Some(&fp(&bob.node.key()))).unwrap();
+    alice.node.send_live(&gid.0, &json!({ "type": "edit", "n": 2 }), Some(&lmk_node::fp(&bob.node.key().0))).unwrap();
     let live = bob.until(|e| match e {
         Event::Live { payload, sender, .. } => Some((payload, sender.name)),
         _ => None,
@@ -557,7 +553,7 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
         _ => None,
     }).await;
     assert_eq!((hash, bob.node.linked(&gid.0).contains(&file)), (file.hash, true));
-    alice.node.hand_state(&gid.0, &fp(&bob.node.key()), b"newer".to_vec()).await.unwrap();
+    alice.node.hand_state(&gid.0, &lmk_node::fp(&bob.node.key().0), b"newer".to_vec()).await.unwrap();
     let data = bob.until(|e| match e {
         Event::State { data, .. } => Some(data),
         _ => None,

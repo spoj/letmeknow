@@ -17,9 +17,8 @@ use lmk_proto::links::Invite;
 use lmk_proto::public::certified;
 use n0_future::task::spawn;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use crate::{Event, Item, Node, hex, now};
+use crate::{Event, Item, Node, now};
 
 #[cfg(test)]
 #[path = "identity_tests.rs"]
@@ -47,12 +46,11 @@ pub struct Add {
 }
 
 /// What a device tells its identity's other devices, live: the handles of its sessions that run, and the groups they are
-/// in. A device of 0.14 tells no groups.
+/// in.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename = "presence")]
 pub struct Presence {
     pub sessions: Vec<String>,
-    #[serde(default)]
     pub groups: Vec<SessionGroup>,
 }
 
@@ -64,10 +62,8 @@ pub struct SessionGroup {
     pub session: Option<String>,
     pub group: Bytes,
     pub name: String,
-    /// Its kind and its other members, as they show to the session; empty where a session of 0.14 wrote them.
-    #[serde(default)]
+    /// Its kind and its other members, as they show to the session.
     pub kind: String,
-    #[serde(default)]
     pub members: Vec<String>,
 }
 
@@ -242,7 +238,7 @@ impl<P: Provider + Send + 'static> Identity<P> {
     /// Tells the other devices online, or the one with key `to`, which of this device's sessions run, in which groups.
     fn tell(&self, gid: &[u8], to: Option<&Bytes>) {
         let presence = serde_json::to_value(&*self.shared.presence.lock().unwrap()).expect("JSON");
-        let to = to.map(|key| hex(&Sha256::digest(&key.0)[..8]));
+        let to = to.map(|key| crate::fp(&key.0));
         if let Err(error) = self.node.send_live(gid, &presence, to.as_deref()) {
             tracing::debug!("telling which sessions run: {error:#}");
         }

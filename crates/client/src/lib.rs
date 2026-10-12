@@ -39,9 +39,7 @@ const SPREAD_WAIT: Duration = Duration::from_secs(30);
 const FETCH_WAIT: Duration = Duration::from_secs(60);
 const NO_IDENTITY: &str = "this device is on no identity";
 
-pub fn fp(key: &[u8]) -> String {
-    hex::encode(&Sha256::digest(key)[..8])
-}
+pub use lmk_node::fp;
 
 pub(crate) fn b64(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
