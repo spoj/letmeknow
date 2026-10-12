@@ -195,6 +195,16 @@ fn local<F: std::future::Future>(test: F) -> F::Output {
     tokio::task::LocalSet::new().block_on(&runtime, test)
 }
 
+#[test]
+fn offline_version_check_still_starts_a_usable_bound_session() {
+    local(async {
+        let world = world("offline-version-check").await;
+        let mut agent = tokio::time::timeout(Duration::from_secs(8), world.start("offline", HOUR)).await.unwrap();
+        assert_eq!(agent.cmd(&["groups"]).await.unwrap(), json!([]));
+        agent.stop().await;
+    });
+}
+
 /// Alice makes a group and invites Bob, who speaks as his identity "Robert".
 async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let mut alice = world.start("alice", hold).await;
