@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,7 +37,7 @@ pub fn discover(dirs: &[PathBuf]) -> BTreeMap<String, PathBuf> {
 
 /// The directories a session looks in for plugins: its executable's, then PATH's.
 pub fn dirs() -> Vec<PathBuf> {
-    let own = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.to_path_buf()));
+    let own = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
     let path = std::env::var_os("PATH").map(|path| std::env::split_paths(&path).collect::<Vec<_>>()).unwrap_or_default();
     own.into_iter().chain(path).collect()
 }
