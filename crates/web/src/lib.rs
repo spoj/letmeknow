@@ -742,7 +742,7 @@ impl Lmk {
         saved.await.map_err(|_| JsError::new("the page stopped saving"))?.map_err(js)
     }
 
-    /// This browser: `{"name", "fp", "device": {"name"}, "identity": {"id", "name", "device"}}`, `device` its key on the
+    /// This browser: `{"fp", "device": {"name"}, "identity": {"id", "name", "device"}}`, `device` its key on the
     /// identity; `identity` null without one.
     pub fn me(&self) -> R<String> {
         Ok(self.app.client.me().map_err(js)?.to_string())
