@@ -26,7 +26,8 @@ case "$version" in
     pi=${LETMEKNOW_PI_REPO:?set LETMEKNOW_PI_REPO to the reviewed local pi-letmeknow checkout}
     pi=$(cd "$pi" && pwd)
     git -C "$pi" remote get-url origin >/dev/null
-    node "$pi/scripts/pin.mjs" preflight "$version"
+    pi_head=$(git -C "$pi" rev-parse HEAD)
+    node "$pi/scripts/pin.mjs" preflight "$version" "$pi_head"
     ;;
 esac
 tag="v$version"
@@ -56,9 +57,11 @@ echo "waiting for https://github.com/$repo/actions/runs/$run"
 gh run watch "$run" --repo "$repo" --exit-status --interval 30 >/dev/null
 python3 deploy/release-run.py "$repo" "$run" "$tag" "$sha"
 gh release edit "$tag" --repo "$repo" --notes-file "$notes"
-[ "$(npm view "@letmeknow/cli@$version" version --prefer-online --registry=https://registry.npmjs.org)" = "$version" ]
+available=$(npm view "@letmeknow/cli@$version" version --prefer-online --registry=https://registry.npmjs.org)
+[ "$available" = "$version" ]
 if [ -n "$pi" ]; then
-  node "$pi/scripts/pin.mjs" set "$version"
+  [ "$(git -C "$pi" rev-parse HEAD)" = "$pi_head" ] || { echo 'Pi HEAD changed since preflight; review before retrying' >&2; exit 1; }
+  node "$pi/scripts/pin.mjs" set "$version" "$pi_head"
   git -C "$pi" push origin main
 fi
 echo "Published $version; review deploy/README.md before rollout."

@@ -28,13 +28,14 @@ elif name == "cargo":
     version = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
     pathlib.Path("Cargo.lock").write_text("fixture lock " + version + "\n")
 elif name == "node":
-    script, action, version = args
+    script, action, version, expected_head = args
     assert pathlib.Path(script).name == "pin.mjs"
     repo = pathlib.Path(script).parent.parent
     if os.environ.get("MOCK_PREFLIGHT_FAIL"):
         sys.exit(1)
     assert subprocess.check_output([real_git, "-C", str(repo), "branch", "--show-current"], text=True).strip() == "main"
     assert not subprocess.check_output([real_git, "-C", str(repo), "status", "--porcelain"], text=True)
+    assert subprocess.check_output([real_git, "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == expected_head
     if action == "set":
         minor = ".".join(version.split(".")[:2])
         for file in ["README.md", "extensions/letmeknow.ts"]:
@@ -47,6 +48,7 @@ elif name == "node":
 elif name == "npm":
     assert args == ["view", "@letmeknow/cli@" + os.environ["VERSION"], "version", "--prefer-online", "--registry=https://registry.npmjs.org"]
     print(os.environ.get("MOCK_PACKAGE", os.environ["VERSION"]))
+    sys.exit(int(os.environ.get("MOCK_NPM_EXIT", "0")))
 elif name == "gh":
     repo, version = "spoj/letmeknow", os.environ["VERSION"]
     sha = subprocess.check_output([real_git, "rev-parse", "HEAD"], text=True).strip()
@@ -55,6 +57,11 @@ elif name == "gh":
     elif args[:2] == ["run", "list"]:
         print(123)
     elif args[:2] == ["run", "watch"]:
+        if os.environ.get("MOCK_PI_COMMIT_DURING_WAIT"):
+            pi = pathlib.Path(os.environ["LETMEKNOW_PI_REPO"])
+            (pi / "unrelated").write_text("preserve new work during publication\n")
+            subprocess.check_call([real_git, "-C", str(pi), "add", "unrelated"])
+            subprocess.check_call([real_git, "-C", str(pi), "commit", "-qm", "Fixture: during workflow wait"])
         sys.exit(int(os.environ.get("MOCK_WATCH_FAILURE", "0")))
     elif args[:2] == ["release", "edit"]:
         pass
@@ -91,6 +98,7 @@ class ReleaseTests(unittest.TestCase):
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, dest)
         subprocess.run([sys.executable, "deploy/version-pins.py", "set", "0.15.1"], cwd=self.app, check=True)
+        (self.app / "Cargo.lock").write_text("fixture lock 0.15.1\n")
         (self.app / "existing.rs").write_text("preserve existing app code\n")
         (self.pi / "scripts").mkdir()
         (self.pi / "scripts/pin.mjs").write_text("mocked only at the release boundary\n")
@@ -197,7 +205,8 @@ class ReleaseTests(unittest.TestCase):
                     dict(MOCK_METADATA='{"path":".github/workflows/copied.yml"}'), dict(MOCK_METADATA='{"event":"workflow_dispatch"}'),
                     dict(MOCK_METADATA='{"head_sha":"wrong"}'), dict(MOCK_METADATA='{"head_branch":"wrong"}'),
                     dict(MOCK_METADATA='{"head_repository":{"full_name":"fork/repo"}}'), dict(MOCK_TAG_SHA="f" * 40),
-                    dict(MOCK_PACKAGE="0.16.1"), dict(MOCK_PACKAGE="")]
+                    dict(MOCK_PACKAGE="0.16.1"), dict(MOCK_PACKAGE=""), dict(MOCK_NPM_EXIT="1"),
+                    dict(MOCK_NPM_EXIT="1", MOCK_PACKAGE="")]
         for env in failures:
             with self.subTest(env=env):
                 self.log.write_text("")
@@ -243,6 +252,33 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.git(self.app, "rev-parse", "HEAD"), app_head)
         self.assertEqual(self.git(self.pi, "rev-parse", "HEAD"), pi_head)
         self.assertEqual(self.git(self.app, "rev-parse", "v0.16.0^{commit}"), app_head)
+
+    def test_clean_pi_commit_during_workflow_wait_refuses_followup(self):
+        original = self.git(self.pi, "rev-parse", "HEAD")
+        result = self.release(MOCK_PI_COMMIT_DURING_WAIT="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Pi HEAD changed since preflight", result.stderr)
+        self.assertNotEqual(self.git(self.pi, "rev-parse", "HEAD"), original)
+        self.assertEqual(self.git(self.pi, "rev-parse", "HEAD^"), original)
+        self.assertEqual(self.git(self.pi, "status", "--porcelain"), "")
+        self.assertEqual((self.pi / "unrelated").read_text(), "preserve new work during publication\n")
+        self.assertIn('const MINOR = "0.15";', (self.pi / "extensions/letmeknow.ts").read_text())
+        self.assertFalse(any(call[0] == "node" and call[2] == "set" for call in self.calls()))
+        self.assertFalse(any(call[0] == "git" and "-C" in call and "push" in call for call in self.calls()))
+
+    def test_already_desired_version_with_no_tag_or_lock_diff_tags_existing_head(self):
+        self.assertEqual(self.pins("set", "0.16.0").returncode, 0)
+        (self.app / "Cargo.lock").write_text("fixture lock 0.16.0\n")
+        self.git(self.app, "commit", "-qam", "Fixture: coherent version already desired")
+        head = self.git(self.app, "rev-parse", "HEAD")
+        self.assertEqual(self.git(self.app, "tag", "--list"), "")
+        result = self.release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git(self.app, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git(self.app, "rev-parse", "v0.16.0^{commit}"), head)
+        self.assertEqual(self.git(self.app, "status", "--porcelain"), "")
+        self.assertFalse(any(call[:2] == ["git", "commit"] for call in self.calls()))
+        self.assertIn(["git", "push", "-q", "origin", "v0.16.0"], self.calls())
 
     def test_existing_tag_at_another_commit_is_never_moved(self):
         self.assertEqual(self.pins("set", "0.16.0").returncode, 0)
