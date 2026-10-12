@@ -7,6 +7,7 @@ import "@fontsource/ibm-plex-mono/latin-400.css";
 import "./app.css";
 import * as client from "./client";
 import type { Attachment, Group, Item, Me, Person } from "./client";
+import type * as Yjs from "yjs";
 import { icon } from "./icons";
 
 const { lmk, request } = client;
@@ -32,7 +33,7 @@ const set = (element: HTMLElement, text: string) => element.textContent !== text
 const form = (submit: () => unknown, ...children: Child[]) => h("form", { onsubmit: (event: Event) => (event.preventDefault(), submit()) }, ...children);
 const field = (label: string, input: HTMLElement, hint?: string) => h("label", { className: "field" }, h("span", {}, label), input, hint && h("small", {}, hint));
 const megabytes = (bytes: number) => (bytes < 1e6 ? `${Math.ceil(bytes / 1000)} KB` : `${(bytes / 1e6).toFixed(1)} MB`);
-const KINDS = { chat: "chat", doc: "document" };
+const KINDS = { chat: "chat", doc: "document", table: "table" };
 /** Files up to this size every member fetches; larger ones only on request. */
 const FILE_LIMIT = 25 << 20;
 const INVITE_PREFIX = "https://letmeknow.dev/i";
@@ -92,7 +93,7 @@ function modal(title: string, ...content: Child[]): HTMLDialogElement {
 
 let me: Me;
 let groups: Group[] = [];
-let page: "group" | "devices" | "start" = "start";
+let page: "group" | "devices" = "group";
 let selected: string | undefined;
 let entered: Promise<void> | undefined;
 /** How many of this browser's sends no other member holds yet: closing the page while any is loses them. */
@@ -148,7 +149,7 @@ client.listen(event => {
   if (event.type === "warning") toast(event.text);
   if (event.type === "removed") toast(`You were removed from ${title(event.group!)}${event.by ? ` by ${event.by}` : ""}.`);
   if (event.type === "added") toast(`Your ${event.by} added this browser to ${title(event.group!)}.`);
-  if (event.type === "edited") docs.get(event.group!)?.edited();
+  if (event.type === "edited") editors.get(event.group!)?.edited();
   if (entered) render();
 });
 
@@ -208,101 +209,29 @@ function welcome(kind: string | undefined) {
       toasts
     );
   }
-  const guess = touch.matches ? "phone" : "laptop";
   const name = h("input", { required: true, autocomplete: "name", autofocus: true });
-  const device = h("input", { required: true, value: guess });
-  const deviceField = field("This device", device, "As in “Matthew · phone”, so you can tell your devices apart.");
+  const device = h("input", { required: true, value: touch.matches ? "phone" : "laptop" });
   const ready = () => name.reportValidity() && device.reportValidity();
-  const elsewhere = h("p", { className: "muted" }, "Already use letmeknow on another device? Make a device link there, under Your devices, and open it here.");
   let body: Child[];
   if (kind === "group") {
     const join = h("button", { className: "primary" }, "Join");
-    body = [
-      h("h1", {}, "You're invited"),
-      h("p", {}, "Someone sent you this link to share a chat or a document with you, and perhaps with their agents. It is end-to-end encrypted: only those in it can read it."),
-      form(
-        () =>
-          ready() &&
-          busy(join, "Joining…", async () => {
-            await start(device.value.trim(), name.value.trim());
-            await redeem(invite!);
-          }),
-        field("Your name", name, "Everyone you share with sees it."),
-        deviceField,
-        elsewhere,
-        join
-      )
-    ];
+    const go = () => ready() && busy(join, "Joining…", async () => (await start(device.value.trim(), name.value.trim()), await redeem(invite!)));
+    body = [h("h1", {}, "You're invited"), form(go, field("Your name", name), field("Device name", device), join)];
   } else if (kind === "device") {
     const add = h("button", { className: "primary" }, "Add this browser");
     device.autofocus = true;
-    body = [
-      h("h1", {}, "Add this browser to your devices"),
-      h("p", {}, "This link comes from one of your other devices. Once added, this browser can join your groups and speaks for you there."),
-      form(
-        () =>
-          device.reportValidity() &&
-          busy(add, "Adding…", async () => {
-            await start(device.value.trim());
-            await redeem(invite!);
-          }),
-        field("Name this device", device, "Shown next to your name, as in “Matthew · phone”."),
-        add
-      )
-    ];
+    const go = () => device.reportValidity() && busy(add, "Adding…", async () => (await start(device.value.trim()), await redeem(invite!)));
+    body = [h("h1", {}, "Add this browser to your devices"), form(go, field("Device name", device), add)];
   } else {
+    const begin = h("button", { className: "primary" }, "Continue");
+    const go = () => ready() && busy(begin, "Starting…", () => start(device.value.trim(), name.value.trim()));
     body = [
-      invite
-        ? [h("h1", {}, "This is not a letmeknow invite"), h("p", {}, "Ask whoever sent it for a new link, or start your own chat or document.")]
-        : [h("h1", {}, "letmeknow"), h("p", { className: "lede" }, "End-to-end encrypted chats and documents, for you and your agents on any computer.")],
-      field("Your name", name, "Shown to everyone you share with."),
-      deviceField,
-      elsewhere,
-      ...starters(async () => {
-        if (!ready()) return false;
-        await start(device.value.trim(), name.value.trim());
-        return true;
-      }),
+      h("h1", {}, invite ? "This is not a letmeknow invite" : "letmeknow"),
+      form(go, field("Your name", name), field("Device name", device), begin),
       h("details", { className: "agents" }, h("summary", {}, "For agents"), agentsHelp)
-    ].flat();
+    ];
   }
   root.replaceChildren(h("div", { className: "card welcome" }, ...body), toasts);
-}
-
-/** The ways in: start a chat or a document, or join with a link. `before` runs first and says whether to go on. */
-function starters(before: () => Promise<boolean> = async () => true): HTMLElement[] {
-  const name = h("input", { placeholder: "e.g. Q3 plan" });
-  const chat = h("button", { className: "primary" }, "New chat");
-  const doc = h("button", { type: "button" }, "New document");
-  const create = (kind: string, button: HTMLButtonElement) => busy(button, "Starting…", async () => (await before()) && select(await lmk.create(kind, name.value.trim())));
-  doc.onclick = () => create("doc", doc);
-  const link = h("input", { placeholder: "https://letmeknow.dev/i#…", autocomplete: "off", autocapitalize: "none", spellcheck: false });
-  const joinButton = h("button", {}, "Join");
-  const join = form(
-    () =>
-      busy(joinButton, "Joining…", async () => {
-        if (!client.kindOf(link.value.trim())) return toast("That is not a letmeknow invite link.");
-        if (await before()) await redeem(link.value.trim());
-      }),
-    h("h2", {}, "Join with a link"),
-    field("Invite link", link, "A link works once, within 10 minutes of being made."),
-    joinButton
-  );
-  return [
-    h(
-      "section",
-      { className: "starter" },
-      form(
-        () => create("chat", chat),
-        h("h2", {}, "Start"),
-        h("p", { className: "muted" }, "A chat, to talk back and forth with people and agents; or a document, one page that all of them edit at once, like a task list."),
-        field("Name", name, "Optional. You can rename it later."),
-        h("div", { className: "row" }, chat, doc)
-      )
-    ),
-    h("div", { className: "or" }, "or"),
-    h("section", { className: "starter" }, join)
-  ];
 }
 
 /** For a browser that has a session already: asks before it uses the invite it was opened with. */
@@ -352,8 +281,9 @@ const sidebar = h(
   h(
     "div",
     { className: "side-actions" },
-    h("button", { onclick: () => newGroupDialog("chat") }, icon("chat"), "New chat"),
-    h("button", { onclick: () => newGroupDialog("doc") }, icon("doc"), "New doc"),
+    h("button", { onclick: () => createGroup("chat").catch(toast) }, icon("chat"), "New chat"),
+    h("button", { onclick: () => createGroup("doc").catch(toast) }, icon("doc"), "New doc"),
+    h("button", { onclick: () => createGroup("table").catch(toast) }, icon("table"), "New table"),
     h("button", { onclick: joinDialog }, icon("join"), "Join")
   ),
   groupList,
@@ -362,9 +292,9 @@ const sidebar = h(
 const main = h("main", { className: "main" });
 const layout = h("div", { className: "layout" }, sidebar, main);
 const devicesPage = h("section", { className: "page" });
-const startPage = h("section", { className: "page" });
 const views = new Map<string, View>();
-const docs = new Map<string, DocView>();
+/** The views of documents and tables, which others' edits reach. */
+const editors = new Map<string, DocView | TableView>();
 
 async function enter() {
   me = JSON.parse(await lmk.me());
@@ -372,8 +302,8 @@ async function enter() {
   root.replaceChildren(layout, toasts);
   const last = localStorage.getItem("group");
   const shown = last && group(last) ? last : groups.at(-1)?.group;
-  if (!shown) return showStart();
-  await select(shown);
+  if (shown) await select(shown);
+  else render();
   if (narrow.matches) layout.classList.remove("in-main");
 }
 
@@ -387,7 +317,8 @@ async function select(gid: string) {
   groups = JSON.parse(await lmk.groups());
   let view = views.get(gid);
   if (!view) {
-    view = group(gid)!.settings.kind === "doc" ? new DocView(gid) : new ChatView(gid);
+    const kind = group(gid)!.settings.kind;
+    view = kind === "doc" ? new DocView(gid) : kind === "table" ? new TableView(gid) : new ChatView(gid);
     views.set(gid, view);
   }
   show(view.el);
@@ -395,17 +326,6 @@ async function select(gid: string) {
   selected = gid;
   localStorage.setItem("group", gid);
   view.show();
-  render();
-}
-
-function showStart() {
-  show(startPage);
-  page = "start";
-  selected = undefined;
-  startPage.replaceChildren(
-    h("header", { className: "page-head" }, back(), h("h1", {}, "Start")),
-    h("div", { className: "card" }, h("p", {}, "Start a chat or a document and invite people and agents into it, or join one with a link someone gave you."), ...starters())
-  );
   render();
 }
 
@@ -427,13 +347,14 @@ async function draw() {
     view.el.remove();
     view.destroy();
     views.delete(gid);
-    docs.delete(gid);
+    editors.delete(gid);
     if (gid === selected) selected = undefined;
   }
   if (page === "group" && !selected) {
+    // With no group, the main area stays empty, and a narrow screen shows the list.
     const newest = groups.at(-1);
     if (newest) await select(newest.group);
-    else showStart();
+    else layout.classList.remove("in-main");
   }
   drawNav();
   const total = groups.reduce((n, g) => n + unread(g.group), 0);
@@ -467,22 +388,11 @@ function drawNav() {
   meButton.classList.toggle("on", page === "devices");
 }
 
-function newGroupDialog(kind: "chat" | "doc") {
-  const name = h("input", { placeholder: kind === "chat" ? "e.g. Q3 plan" : "e.g. Tasks", autofocus: true });
-  const create = h("button", { className: "primary" }, "Start");
-  const dialog = modal(
-    `New ${KINDS[kind]}`,
-    kind === "doc" && h("p", { className: "muted" }, "One page that everyone in it, people and agents, edits at once."),
-    form(
-      () =>
-        busy(create, "Starting…", async () => {
-          await select(await lmk.create(kind, name.value.trim()));
-          dialog.close();
-        }),
-      field("Name", name, "Optional. You can rename it later."),
-      h("div", { className: "buttons" }, create)
-    )
-  );
+/** Starts a group of `kind`, unnamed, and opens its settings, where it gets a name and its people. */
+async function createGroup(kind: keyof typeof KINDS) {
+  const gid = await lmk.create(kind, "");
+  await select(gid);
+  views.get(gid)!.settingsDialog();
 }
 
 function joinDialog() {
@@ -749,11 +659,11 @@ class View {
 
   /** The group's one screen: its name, its people and bringing in more, and leaving it. With `invite`, it makes a link at
    * once. */
-  protected settingsDialog(invite = false) {
+  settingsDialog(invite = false) {
     const gid = this.gid;
     const settings = group(gid)!.settings;
     const kind = KINDS[settings.kind];
-    const name = h("input", { value: settings.name, placeholder: title(gid), ariaLabel: "Name" });
+    const name = h("input", { value: settings.name, placeholder: title(gid), ariaLabel: "Name", autofocus: !settings.name });
     const save = h("button", {}, "Rename");
     const make = h("button", { type: "button" }, "Make a link");
     const link = h("div", { className: "invite" }, h("ul", { className: "people-list" }, h("li", {}, h("div", {}, "Invite someone else"), make)));
@@ -1115,7 +1025,7 @@ class DocView extends View {
 
   constructor(gid: string) {
     super(gid);
-    docs.set(gid, this);
+    editors.set(gid, this);
     this.el.append(h("div", { className: "body" }, this.host));
     import("./editor").then(async ({ bind }) => {
       if (!group(gid)) return;
@@ -1139,6 +1049,209 @@ class DocView extends View {
 
   destroy() {
     this.bound?.destroy();
+  }
+}
+
+type ColumnType = "text" | "number" | "date" | "checkbox" | "choice";
+type Column = { id: string; name: string; type: ColumnType; choices: string[]; map: Yjs.Map<unknown> };
+const COLUMN_TYPES: Record<ColumnType, string> = { text: "Text", number: "Number", date: "Date", checkbox: "Checkbox", choice: "Choice" };
+/** The origin of what the table kind's plugin hands over, which goes no further. */
+const REMOTE = "lmk";
+
+/** A command of the table kind's in-page plugin. */
+const tableCommand = async (...args: string[]) => JSON.parse(await lmk.command("table", JSON.stringify(args)));
+
+/** A new row's or column's id, as the table plugin makes them: 8 lowercase letters and digits. */
+const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(8)), byte => "abcdefghijklmnopqrstuvwxyz0123456789"[byte % 36]).join("");
+
+/** A value as a column of type `type` reads it, where it can; else as it was. */
+function convert(value: unknown, type: ColumnType): unknown {
+  const text = String(value).trim();
+  if (type === "number") return text !== "" && Number.isFinite(Number(text)) ? Number(text) : value;
+  if (type === "checkbox") return /^(true|yes|x)$/i.test(text) ? true : /^(false|no)$/i.test(text) ? false : value;
+  return type === "date" ? value : String(value);
+}
+
+/** The order of two cells' values: numbers by size, the rest as text, and empty cells last. */
+function compare(a: unknown, b: unknown): number {
+  if (a === undefined || b === undefined) return Number(a === undefined) - Number(b === undefined);
+  return typeof a === "number" && typeof b === "number" ? a - b : String(a).localeCompare(String(b), undefined, { numeric: true });
+}
+
+/** A table: its rows as a grid of typed cells, which everyone in it edits at once. How the grid is sorted, filtered and
+ * grouped is this viewer's own. */
+class TableView extends View {
+  private Y?: typeof Yjs;
+  private doc?: Yjs.Doc;
+  private grid = h("table", { className: "grid" });
+  private filter = h("input", { type: "search", placeholder: "Filter", ariaLabel: "Filter rows" });
+  private grouping = h("select", { ariaLabel: "Group by" });
+  private sorted?: { column: string; down: boolean };
+
+  constructor(gid: string) {
+    super(gid);
+    editors.set(gid, this);
+    this.filter.oninput = () => this.draw();
+    this.grouping.onchange = () => this.draw();
+    const tools = h("div", { className: "table-tools" }, this.filter, this.grouping, h("button", { onclick: () => this.columnDialog() }, icon("plus"), "Column"));
+    const add = h("button", { className: "quiet", onclick: () => this.addRow() }, icon("plus"), "Row");
+    this.el.append(h("div", { className: "body table-body" }, tools, h("div", { className: "grid-wrap" }, this.grid), h("div", {}, add)));
+    import("yjs").then(async Y => {
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, client.unb64((await tableCommand("state", gid)).state), REMOTE);
+      doc.on("update", (update: Uint8Array, origin: unknown) => {
+        if (origin !== REMOTE) tableCommand("edit", gid, client.b64(update)).catch(toast);
+        this.draw();
+      });
+      [this.Y, this.doc] = [Y, doc];
+      this.draw();
+    }, toast);
+  }
+
+  edited() {
+    const { Y, doc } = this;
+    if (Y && doc) tableCommand("diff", this.gid, client.b64(Y.encodeStateVector(doc))).then(({ diff }) => Y.applyUpdate(doc, client.unb64(diff), REMOTE), toast);
+  }
+
+  destroy() {
+    this.doc?.destroy();
+  }
+
+  private columns(): Column[] {
+    return this.doc!.getArray<Yjs.Map<unknown>>("columns")
+      .toArray()
+      .map(map => ({ id: map.get("id") as string, name: map.get("name") as string, type: (map.get("type") as ColumnType) ?? "text", choices: (map.get("choices") as string[]) ?? [], map }));
+  }
+
+  private rows() {
+    return this.doc!.getArray<Yjs.Map<unknown>>("rows");
+  }
+
+  /** Draws the grid anew; a cell being edited keeps its text, focus and selection. */
+  private draw() {
+    if (!this.doc) return;
+    const columns = this.columns();
+    const active = document.activeElement;
+    const editing = active instanceof HTMLInputElement && active.dataset.cell && this.grid.contains(active) ? { cell: active.dataset.cell, text: active.value, from: active.selectionStart, to: active.selectionEnd } : undefined;
+    const choices = columns.filter(c => c.type === "choice");
+    const by = choices.find(c => c.id === this.grouping.value);
+    update(this.grouping, JSON.stringify([choices.map(c => [c.id, c.name]), by?.id]), () => [h("option", { value: "" }, "No grouping"), ...choices.map(c => h("option", { value: c.id, selected: c === by }, `Group by ${c.name}`))]);
+    this.grouping.hidden = !choices.length;
+    const needle = this.filter.value.trim().toLowerCase();
+    const rows = this.rows().toArray().filter(row => !needle || columns.some(c => String(row.get(c.id) ?? "").toLowerCase().includes(needle)));
+    const sort = this.sorted && columns.find(c => c.id === this.sorted!.column);
+    if (sort) rows.sort((a, b) => compare(a.get(sort.id), b.get(sort.id)) * (this.sorted!.down ? -1 : 1));
+    const value = (row: Yjs.Map<unknown>) => String(row.get(by!.id) ?? "");
+    const sections = by ? [...new Set([...by.choices, ...rows.map(value)])].sort((a, b) => Number(a === "") - Number(b === "")) : [];
+    const bodies = by
+      ? sections.map(section => {
+          const inside = rows.filter(row => value(row) === section);
+          const head = h("tr", { className: "section" }, h("th", { colSpan: columns.length + 1 }, section || "No value", h("small", {}, String(inside.length))));
+          return inside.length > 0 && h("tbody", {}, head, ...inside.map(row => this.row(row, columns)));
+        })
+      : [h("tbody", {}, ...rows.map(row => this.row(row, columns)))];
+    const empty = !columns.length && h("tbody", {}, h("tr", {}, h("td", { className: "empty-table muted" }, "No columns yet: add one, or have an agent fill the table from a CSV file.")));
+    this.grid.replaceChildren(...kids([h("thead", {}, h("tr", {}, ...columns.map(c => this.header(c)), h("th", { className: "actions" }))), bodies, empty]));
+    const input = editing && this.grid.querySelector<HTMLInputElement>(`[data-cell="${editing.cell}"]`);
+    if (input) {
+      input.value = editing.text;
+      input.focus();
+      if (input.type === "text") input.setSelectionRange(editing.from, editing.to);
+    }
+  }
+
+  private header(column: Column) {
+    const sorting = this.sorted?.column === column.id ? (this.sorted.down ? " ↓" : " ↑") : "";
+    const sort = h("button", { className: "quiet name", title: "Sort", onclick: () => this.sortBy(column.id) }, column.name, sorting);
+    return h("th", {}, h("div", {}, sort, h("button", { className: "icon quiet", title: "Column", ariaLabel: `Column ${column.name}`, onclick: () => this.columnDialog(column) }, icon("more"))));
+  }
+
+  /** Sorts by a column, rising, then falling, then not. */
+  private sortBy(id: string) {
+    const was = this.sorted?.column === id ? this.sorted : undefined;
+    this.sorted = !was ? { column: id, down: false } : was.down ? undefined : { column: id, down: true };
+    this.draw();
+  }
+
+  private row(row: Yjs.Map<unknown>, columns: Column[]) {
+    const remove = () => this.doc!.transact(() => this.rows().delete(this.rows().toArray().indexOf(row), 1));
+    return h("tr", {}, ...columns.map(c => h("td", {}, this.cell(row, c))), h("td", { className: "actions" }, h("button", { className: "icon quiet", title: "Delete row", ariaLabel: "Delete row", onclick: remove }, icon("close"))));
+  }
+
+  /** A cell's editor, by its column's type; a text field takes its change once left. */
+  private cell(row: Yjs.Map<unknown>, column: Column): HTMLElement {
+    const value = row.get(column.id);
+    const put = (next: unknown) => this.doc!.transact(() => (next === undefined ? row.delete(column.id) : row.set(column.id, next)));
+    if (column.type === "checkbox") return h("input", { type: "checkbox", checked: value === true, ariaLabel: column.name, onchange: (event: Event) => put((event.target as HTMLInputElement).checked) });
+    if (column.type === "choice") {
+      const options = [...new Set([...column.choices, ...(typeof value === "string" ? [value] : [])])];
+      const select = h("select", { ariaLabel: column.name }, h("option", { value: "" }), ...options.map(choice => h("option", { value: choice, selected: choice === value }, choice)));
+      select.onchange = () => put(select.value || undefined);
+      return select;
+    }
+    // A value that does not fit its column, as one written before the column had its type, shows as text.
+    const fits = value === undefined || (column.type === "number" ? typeof value === "number" : column.type !== "date" || /^\d{4}-\d{2}-\d{2}$/.test(String(value)));
+    const input = h("input", { type: fits && column.type !== "text" ? column.type : "text", value: value === undefined ? "" : String(value), ariaLabel: column.name });
+    if (input.type === "number") input.step = "any";
+    input.dataset.cell = `${row.get("id")}/${column.id}`;
+    const shown = input.value;
+    input.onblur = () => {
+      const text = input.value.trim();
+      if (input.value !== shown) put(text === "" ? undefined : column.type === "number" ? convert(text, "number") : input.value);
+    };
+    input.onkeydown = (event: KeyboardEvent) => event.key === "Enter" && input.blur();
+    return input;
+  }
+
+  private addRow() {
+    if (!this.Y || !this.doc) return;
+    const row = new this.Y.Map<unknown>();
+    const id = newId();
+    row.set("id", id);
+    this.filter.value = "";
+    this.doc.transact(() => this.rows().push([row]));
+    this.grid.querySelector<HTMLElement>(`[data-cell^="${id}/"]`)?.focus();
+  }
+
+  /** A column's name, type and choices, or a new column's; and deleting it. Changing a column's type converts the
+   * values that read as the new type. */
+  private columnDialog(column?: Column) {
+    const doc = this.doc!;
+    const columns = doc.getArray<Yjs.Map<unknown>>("columns");
+    const name = h("input", { value: column?.name ?? "", autofocus: true });
+    const type = h("select", {}, ...Object.entries(COLUMN_TYPES).map(([value, label]) => h("option", { value, selected: value === (column?.type ?? "text") }, label)));
+    const choices = h("textarea", { rows: 4, value: (column?.choices ?? []).join("\n") });
+    const choicesField = field("Choices", choices, "One per line.");
+    type.onchange = () => (choicesField.hidden = type.value !== "choice");
+    choicesField.hidden = type.value !== "choice";
+    const save = () => {
+      const named = name.value.trim();
+      if (!named || named === "id" || this.columns().some(c => c.map !== column?.map && c.name === named)) return toast("Give the column a name that no other column has, other than id.");
+      const kind = type.value as ColumnType;
+      doc.transact(() => {
+        const map = column?.map ?? new this.Y!.Map<unknown>();
+        if (!column) {
+          map.set("id", newId());
+          columns.push([map]);
+        }
+        const id = map.get("id") as string;
+        const rows = this.rows().toArray().filter(row => row.has(id));
+        if (column && column.type !== kind) for (const row of rows) row.set(id, convert(row.get(id), kind));
+        map.set("name", named);
+        map.set("type", kind);
+        const list = choices.value.split("\n").map(c => c.trim()).filter(Boolean);
+        if (kind === "choice") map.set("choices", [...new Set([...list, ...rows.map(row => String(row.get(id)))])]);
+        else map.delete("choices");
+      });
+      dialog.close();
+    };
+    const remove =
+      column &&
+      confirmed("Delete column", "Delete it for everyone", async () => {
+        doc.transact(() => columns.delete(columns.toArray().indexOf(column.map), 1));
+        dialog.close();
+      });
+    const dialog = modal(column ? column.name : "New column", form(save, field("Name", name), field("Type", type), choicesField, h("div", { className: "buttons" }, remove, h("button", { className: "primary" }, column ? "Save" : "Add"))));
   }
 }
 

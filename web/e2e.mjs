@@ -1,7 +1,7 @@
 // Browser end-to-end test, run by test/e2e.py against its local `letmeknow serve` (URL, serving dist/) with the native
 // binary (BIN): Matt's laptop, which takes its relay and membership service from the server that served it, joins Ann's
 // chat from a link, becoming his identity's first device as it does, and they talk and pass files both ways; it joins
-// her doc and they edit it both ways; Matthew's desk adds his phone by a device link, the phone joins a chat by a link
+// her doc and her table and they edit them both ways; Matthew's desk adds his phone by a device link, the phone joins a chat by a link
 // and is renamed, and a kiosk on an identity of its own moves to his; the laptop keeps everything
 // across a reload, a second tab works through the first and takes over when it closes; refusals, files kept and
 // deleted, and the service worker's updates.
@@ -223,12 +223,33 @@ try {
   const specHash = attached.link.slice(4, 68);
   check((await until(() => kept(laptop), hashes => hashes.includes(specHash))).includes(specHash), "the browser keeps a file the doc links");
 
+  // A table, edited both ways: the browser shows the native session's CSV as a grid of typed cells.
+  const leads = join(tmp, "leads.csv");
+  writeFileSync(leads, "Name,Size,Done\nAcme,12,false\nGlobex,3,true\n");
+  const table = ann.run("invite", "--kind", "table", "--name", "Leads", leads);
+  await laptop.getByRole("button", { name: "Join", exact: true }).first().click();
+  await laptop.locator("dialog").getByLabel("Invite link").fill(table.link);
+  await laptop.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
+  const cells = name => laptop.locator(`.grid input[aria-label="${name}"]`).evaluateAll(inputs => inputs.map(i => (i.type === "checkbox" ? String(i.checked) : i.value)).join());
+  check((await until(() => cells("Name"), v => v === "Acme,Globex")) === "Acme,Globex", "the browser gets a table's rows when it joins");
+  const typed = (await laptop.locator('.grid input[aria-label="Size"]').first().getAttribute("type")) === "number" && (await cells("Done")) === "false,true";
+  check(typed, "and shows each column's cells by its type");
+  await laptop.locator('.grid input[aria-label="Name"]').first().fill("Acme Corp");
+  await laptop.locator('.grid input[aria-label="Name"]').first().press("Enter");
+  check((await until(() => readFileSync(leads, "utf8"), t => t.includes(",Acme Corp,12,false\n"))).includes(",Acme Corp,12,false\n"), "a cell edited in the browser reaches the native session's file");
+  await laptop.getByRole("button", { name: "Column", exact: true }).click();
+  await laptop.locator("dialog").getByLabel("Name").fill("Owner");
+  await laptop.locator("dialog").getByRole("button", { name: "Add" }).click();
+  check((await until(() => readFileSync(leads, "utf8"), t => t.startsWith("id,Name,Size,Done,Owner\n"))).startsWith("id,Name,Size,Done,Owner\n"), "and so does a column added there");
+  writeFileSync(leads, readFileSync(leads, "utf8").replace(",Globex,3,", ",Globex,5,"));
+  check((await until(() => cells("Size"), v => v === "12,5")) === "12,5", "and the native session's edit reaches the browser");
+
   // A device link adds a phone to Matthew's identity, made on his desk; the phone then joins a chat by a link.
   const phone = await open("phone", { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
   const deviceLink = desk.run("identity", "invite").link;
   await phone.goto(local(deviceLink));
   await phone.getByRole("heading", { name: "Add this browser to your devices" }).waitFor();
-  check((await phone.getByLabel("Name this device").inputValue()) === "phone", "a phone suggests its own device name");
+  check((await phone.getByLabel("Device name").inputValue()) === "phone", "a phone suggests its own device name");
   await phone.getByRole("button", { name: "Add this browser" }).click();
   await phone.locator(".devices li", { hasText: "phone" }).waitFor();
   const devices = desk.run("identity", "list").devices;
@@ -282,7 +303,7 @@ try {
   const told = await phone.evaluate(() => window.toasts.splice(0));
   check(told.every(t => t.startsWith("Asked the others to remove you") || t.startsWith("You were removed from Team")), `the phone leaves the chat (${told.length} notices)`);
   await phone.reload();
-  await phone.getByRole("heading", { name: "Start", exact: true }).first().waitFor();
+  await phone.getByRole("button", { name: "New chat" }).waitFor();
   const left = await until(
     () => kept(phone),
     hashes => !hashes.includes(reportHash)
@@ -294,11 +315,14 @@ try {
   const kiosk = await open("kiosk", { viewport: { width: 1280, height: 800 } });
   await kiosk.goto(SITE);
   await kiosk.getByLabel("Your name").fill("Kim");
-  await kiosk.getByLabel("This device").fill("kiosk");
-  await kiosk.getByPlaceholder("e.g. Q3 plan").fill("Kiosk notes");
+  await kiosk.getByLabel("Device name").fill("kiosk");
+  await kiosk.getByRole("button", { name: "Continue" }).click();
   await kiosk.getByRole("button", { name: "New chat" }).click();
+  await kiosk.locator("dialog").getByLabel("Name").fill("Kiosk notes");
+  await kiosk.locator("dialog").getByRole("button", { name: "Rename" }).click();
   await kiosk.locator(".group-list button", { hasText: "Kiosk notes" }).waitFor();
-  check((await kiosk.locator(".me").textContent()).includes("Kim"), "a chat started from the welcome screen makes the browser its identity's first device");
+  await kiosk.locator("dialog").getByRole("button", { name: "Close" }).click();
+  check((await kiosk.locator(".me").textContent()).includes("Kim"), "the welcome screen makes the browser its identity's first device, and a new chat opens its settings");
   await kiosk.goto(local(desk.run("identity", "invite").link));
   const moving = kiosk.locator("dialog", { hasText: "Move this browser to another identity" });
   await moving.waitFor();
@@ -351,7 +375,7 @@ try {
   await laptop.reload();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.getByText("hello from the terminal", { exact: true }).waitFor();
-  check((await laptop.locator(".group-list button").count()) === 2, "a reloaded browser keeps its groups and their messages");
+  check((await laptop.locator(".group-list button").count()) === 3, "a reloaded browser keeps its groups and their messages");
   ann.run("send", `--group=${invite.group}`, "after the reload");
   await laptop.getByText("after the reload").waitFor();
   await laptop.getByPlaceholder("Message").fill("still here");
@@ -415,9 +439,9 @@ try {
   // The laptop starts a chat, and the tablet joins it by the link the laptop shows.
   await laptop.getByRole("button", { name: "New chat" }).click();
   await laptop.locator("dialog").getByLabel("Name").fill("Ideas");
-  await laptop.locator("dialog").getByRole("button", { name: "Start" }).click();
+  await laptop.locator("dialog").getByRole("button", { name: "Rename" }).click();
   await laptop.locator(".group-list button.on", { hasText: "Ideas" }).waitFor();
-  await laptop.getByRole("button", { name: "Invite someone" }).click();
+  await laptop.locator("dialog").getByRole("button", { name: "Make a link" }).click();
   const ideasLink = await laptop.locator("dialog .copy code").first().textContent();
   check(tablet.run("join", ideasLink).members.length === 2, "a native session joins a chat the browser started, by its link");
   await laptop.getByText("They joined the chat.").waitFor();

@@ -24,7 +24,7 @@ import {
 import { tags } from "@lezer/highlight";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import * as Y from "yjs";
-import type { Session } from "./client";
+import { type Session, b64, unb64 } from "./client";
 import { type IconName, icon } from "./icons";
 
 class Checkbox extends WidgetType {
@@ -401,16 +401,6 @@ function insertFiles(view: EditorView, blobs: Blobs, event: Event, files: FileLi
 
 /** From the session: an edit made elsewhere. */
 const REMOTE = "lmk";
-
-function b64(bytes: Uint8Array): string {
-  let text = "";
-  for (const byte of bytes) text += String.fromCharCode(byte);
-  return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function unb64(text: string): Uint8Array {
-  return Uint8Array.from(atob(text.replace(/-/g, "+").replace(/_/g, "/")), char => char.charCodeAt(0));
-}
 
 /** A command of the doc kind's in-page plugin. */
 const command = async (lmk: Session, ...args: string[]) => JSON.parse(await lmk.command("doc", JSON.stringify(args)));

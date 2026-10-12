@@ -12,7 +12,7 @@ export type Identity = { id: string; name: string; how: "self" | "unknown"; erro
 /** A member; `name` is how it shows: "Matthew · phone", or its fingerprint where it speaks for no identity this browser could check. */
 export type Person = { fp: string; name: string; handle?: string; device: string; you?: boolean; identity?: Identity; added_by?: { fp: string; how: string }; away?: boolean };
 export type Named = { id: string; name: string };
-export type Settings = { kind: "chat" | "doc"; name: string; carry?: number };
+export type Settings = { kind: "chat" | "doc" | "table"; name: string; carry?: number };
 export type Group = { group: string; settings: Settings; members: Person[] };
 export type Attachment = { link: string; name: string; size: number; type: string; kept: boolean };
 
@@ -189,4 +189,15 @@ export async function file(gid: string, link: string): Promise<Uint8Array> {
   await lmk.fetch(gid, link);
   await arrived;
   return (await lmk.file(link))!;
+}
+
+/** Bytes as the session's commands take them: unpadded base64url. */
+export function b64(bytes: Uint8Array): string {
+  let text = "";
+  for (const byte of bytes) text += String.fromCharCode(byte);
+  return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+export function unb64(text: string): Uint8Array {
+  return Uint8Array.from(atob(text.replace(/-/g, "+").replace(/_/g, "/")), char => char.charCodeAt(0));
 }
