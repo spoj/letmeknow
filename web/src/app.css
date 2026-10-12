@@ -188,9 +188,9 @@ blockquote { margin: 2px 0 4px; padding: 0 var(--s2); border-left: 2px solid var
 blockquote b { font-weight: 500; color: var(--text); }
 .image { display: block; max-width: min(100%, 420px); max-height: 320px; margin: var(--s1) 0; border-radius: var(--radius); border: 1px solid var(--line); }
 .download { margin: var(--s1) 0; font-size: var(--t-sm); }
-.actions { position: absolute; top: 3px; right: var(--s4); display: none; padding: 2px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg); box-shadow: 0 1px 2px var(--shadow); }
-.actions button { min-height: 24px; padding: 0 var(--s2); font-size: var(--t-sm); color: var(--muted); }
-.actions button:hover { color: var(--text); }
+.messages .actions { position: absolute; top: 3px; right: var(--s4); display: none; padding: 2px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg); box-shadow: 0 1px 2px var(--shadow); }
+.messages .actions button { min-height: 24px; padding: 0 var(--s2); font-size: var(--t-sm); color: var(--muted); }
+.messages .actions button:hover { color: var(--text); }
 .messages li:hover .actions, .messages li:focus-within .actions { display: block; }
 .messages li.event { margin-top: var(--s2); font-size: var(--t-sm); color: var(--muted); }
 .messages li.event .who { font-weight: 500; }

@@ -243,6 +243,9 @@ try {
   check((await until(() => readFileSync(leads, "utf8"), t => t.startsWith("id,Name,Size,Done,Owner\n"))).startsWith("id,Name,Size,Done,Owner\n"), "and so does a column added there");
   writeFileSync(leads, readFileSync(leads, "utf8").replace(",Globex,3,", ",Globex,5,"));
   check((await until(() => cells("Size"), v => v === "12,5")) === "12,5", "and the native session's edit reaches the browser");
+  await laptop.getByRole("button", { name: "Delete row" }).last().click();
+  const rows = await until(() => readFileSync(leads, "utf8"), t => !t.includes("Globex"));
+  check(!rows.includes("Globex") && rows.includes("Acme Corp") && (await cells("Name")) === "Acme Corp", "a row deleted in the browser goes from the native session's file");
 
   // A device link adds a phone to Matthew's identity, made on his desk; the phone then joins a chat by a link.
   const phone = await open("phone", { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
