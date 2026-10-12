@@ -28,7 +28,6 @@ enum Input {
 }
 
 /// A group's file, kept in step with its document; what of it is saved.
-#[derive(Clone, Default)]
 struct Saved {
     path: PathBuf,
     /// The text file and document last had in common.
