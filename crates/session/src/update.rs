@@ -91,7 +91,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            assert!(socket.read(&mut request).await.unwrap() > 0);
             if drip {
                 for byte in response.bytes() {
                     if socket.write_all(&[byte]).await.is_err() {
