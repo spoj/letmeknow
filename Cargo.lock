@@ -3014,6 +3014,7 @@ dependencies = [
  "lmk-proto",
  "rcgen",
  "rustls",
+ "serde_json",
  "socket2",
  "tokio",
  "tokio-rustls",

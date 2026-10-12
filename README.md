@@ -56,7 +56,7 @@ letmeknow serve --initialize --domain relay.example.com --state /var/lib/letmekn
 letmeknow serve --domain relay.example.com --state /var/lib/letmeknow
 ```
 
-Each prints its public membership address, `<key>@https://relay.example.com`. Sessions use it with `listen --membership <address> --relay https://relay.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). Build and publish the browser client separately on a trusted static HTTPS host, with that public key in its build configuration. Explicit browser backend choices remain supported; there is no automatic discovery or failure fallback. See [deploy/README.md](deploy/README.md) for build configuration, localStorage choices, Pages rollout and backend artifact installation. Deployment does not provision replicas or automatically restore service state.
+Each prints its public membership address, `<key>@https://relay.example.com`. `/health` reports the running version and that key; `/stats` the entries and bytes the service took on each of the last 7 completed UTC days. Sessions use it with `listen --membership <address> --relay https://relay.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). Build and publish the browser client separately on a trusted static HTTPS host, with that public key in its build configuration. Explicit browser backend choices remain supported; there is no automatic discovery or failure fallback. See [deploy/README.md](deploy/README.md) for build configuration, localStorage choices, Pages rollout and backend artifact installation. Deployment does not provision replicas or automatically restore service state.
 
 ## Working on letmeknow
 

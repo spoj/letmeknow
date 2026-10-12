@@ -189,14 +189,13 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         hex::encode(store.key().verifying_key().as_bytes())
     ));
-    let _router = Router::builder(endpoint)
-        .accept(ALPN, Service::new(store, config.policy))
-        .spawn();
+    let membership = Service::new(store, config.policy);
+    let _router = Router::builder(endpoint).accept(ALPN, membership.clone()).spawn();
 
     let tls = Arc::new(tls);
     loop {
         let (tcp, _) = https.accept().await?;
-        let (tls, relay, health) = (tls.clone(), relay.clone(), health.clone());
+        let (tls, relay, health, membership) = (tls.clone(), relay.clone(), health.clone(), membership.clone());
         tokio::spawn(async move {
             let stream = match &*tls {
                 Tls::Files(acceptor) => acceptor.accept(tcp).await.ok(),
@@ -209,6 +208,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
             let site = Site {
                 relay: RelayServiceWithNotify::new(relay, Arc::new(Notify::new())),
                 health,
+                membership,
             };
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(MaybeTlsStream::Tls(stream)), site)
@@ -236,6 +236,14 @@ fn respond(status: StatusCode) -> http::response::Builder {
 
 fn body(bytes: impl Into<Bytes>) -> BytesBody {
     Box::new(Full::new(bytes.into()))
+}
+
+fn json(bytes: impl Into<Bytes>) -> http::Result<Response<BytesBody>> {
+    respond(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .body(body(bytes))
 }
 
 /// Port 80: the captive-portal check iroh clients make, and redirects to HTTPS.
@@ -269,6 +277,7 @@ struct Site {
     relay: RelayServiceWithNotify,
     /// This release's version and the service's public key, which rollouts compare with the release they install.
     health: Bytes,
+    membership: Service,
 }
 
 type Answer = Pin<Box<dyn Future<Output = Result<Response<BytesBody>, HyperError>> + Send>>;
@@ -287,13 +296,17 @@ impl HyperService<Request<Incoming>> for Site {
                     .body(body(""));
                 return Box::pin(std::future::ready(res.map_err(Into::into)));
             }
-            "/health" => {
-                let res = respond(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::CACHE_CONTROL, "no-store")
-                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .body(body(self.health.clone()));
-                return Box::pin(std::future::ready(res.map_err(Into::into)));
+            "/health" => return Box::pin(std::future::ready(json(self.health.clone()).map_err(Into::into))),
+            // What the service took in each of the last completed days, which it keeps nothing private of.
+            "/stats" => {
+                let membership = self.membership.clone();
+                return Box::pin(async move {
+                    let res = match membership.stats().await {
+                        Ok(stats) => json(serde_json::to_vec(&stats).unwrap()),
+                        Err(_) => respond(StatusCode::SERVICE_UNAVAILABLE).body(body("busy")),
+                    };
+                    res.map_err(Into::into)
+                });
             }
             _ => {}
         }
