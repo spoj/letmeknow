@@ -2147,6 +2147,27 @@ async fn a_joiner_whose_answer_was_lost_is_admitted_by_the_logged_welcome() {
     assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
 }
 
+/// Two asks with one KeyPackage at once, as a joiner's again after one failed in transit: the member adds it once and
+/// answers both with its Welcome, refusing neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_asks_with_one_key_package_add_it_once() {
+    let relay = relay().await;
+    let alice = session(&relay, "Alice").await;
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    let (one, two) = tokio::join!(bob.node.join(&link, None), bob.node.join(&link, None));
+    // The joiner applies one Welcome; the other answer finds its KeyPackage spent.
+    let (joined, other) = match (one, two) {
+        (Ok((joined, _)), Err(other)) | (Err(other), Ok((joined, _))) => (joined, other),
+        answers => panic!("{answers:?}"),
+    };
+    assert_eq!(joined, gid);
+    assert!(!format!("{other:#}").contains("refused"), "{other:#}");
+    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch + 1, "one Add");
+}
+
 /// A link's kind is not authenticated: a device link altered to read as a group's admits to nothing, nor does a group's
 /// link altered to read as a device link.
 #[tokio::test(flavor = "multi_thread")]

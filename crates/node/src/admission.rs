@@ -161,9 +161,10 @@ impl<P: Provider + Send + 'static> Node<P> {
                 let answer = timeout(deadline.saturating_duration_since(Instant::now()), self.inner.net().join(peer, relay.clone(), join.clone())).await;
                 match answer {
                     // The connection may have been replaced by one the member dialed meanwhile; asking again is safe, as a
-                    // member that added this session answers with the Welcome its log holds.
+                    // member that added this session answers with the Welcome its log holds. The ask may have added it.
                     Ok(Err(error)) if Instant::now() + Duration::from_secs(1) < deadline => {
                         tracing::debug!("asking {} to admit this session: {error:#}", peer.fmt_short());
+                        refused_by_all = false;
                         sleep(Duration::from_secs(1)).await;
                     }
                     answer => break answer,
@@ -286,7 +287,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 Verdict::Dropped => bail!("its device was taken off its identity"),
             }
         }
-        self.admit(&gid, key_package.0, &joiner, rule).await
+        match self.admit(&gid, key_package.0.clone(), &joiner, rule).await {
+            // Another ask with this KeyPackage, as the joiner's again after one failed in transit, may have added it meanwhile.
+            Err(error) => {
+                let logged = self.lock().logged_welcome(&gid, &key_package.0)?;
+                match logged {
+                    Some((welcome, position)) => self.admitted(&gid, welcome, position).await,
+                    None => Err(error),
+                }
+            }
+            admitted => admitted,
+        }
     }
 
     /// Commits the Add, naming the invite the joiner came in by, and answers with the Welcome and the state of the group's
