@@ -92,7 +92,13 @@ with tempfile.TemporaryDirectory(prefix="lmk-update-dns-") as directory:
                 print(f"{'held' if held else 'answered'} DNS: ready after {elapsed:.3f}s ({event['version_check_error']})", flush=True)
                 for args in (["groups"], ["status"], ["sessions"]):
                     result = subprocess.run([*command, *args], env=env, capture_output=True, text=True, check=True, timeout=5)
-                    json.loads(result.stdout)
+                    answer = json.loads(result.stdout)
+                    if args[0] == "groups":
+                        assert answer == [], answer
+                    elif args[0] == "status":
+                        assert "error" not in answer and answer.get("groups", []) == [], answer
+                    else:
+                        assert answer == {"sessions": [{"handle": "dns-test", "groups": [], "running": True}]}, answer
                     print(f"usable command: {args[0]}", flush=True)
                 stopped = time.monotonic()
                 endpoint = json.loads((home / "sessions" / "dns-test" / "endpoint").read_text())
