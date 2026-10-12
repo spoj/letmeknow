@@ -63,7 +63,7 @@ impl ServeClient {
     }
 
     async fn request<T: DeserializeOwned>(&self, request: Request) -> Result<T> {
-        let _request = self.0.requests.try_acquire().map_err(|_| Refused("busy".into()))?;
+        let _request = self.0.requests.acquire().await?;
         n0_future::time::timeout(Duration::from_secs(30), async {
             let connection = self.connection().await?;
             let (mut send, mut recv) = connection.open_bi().await?;
@@ -114,7 +114,7 @@ impl ServeClient {
             ensure!(anchor.service() == &self.0.key && anchor.log_ref() == &head::reference(&self.0.key, capability), WrongLog);
             ensure!(!logs[..i].iter().any(|(c, _)| c == capability), Refused("policy".into()));
         }
-        let request_slot = self.0.requests.try_acquire().map_err(|_| Refused("busy".into()))?;
+        let request_slot = self.0.requests.acquire().await?;
         let (send, recv) = n0_future::time::timeout(Duration::from_secs(30), async {
             let (mut send, mut recv) = self.connection().await?.open_bi().await?;
             frame::write(&mut send, &Open { stream: Stream::Membership }).await?;

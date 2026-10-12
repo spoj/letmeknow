@@ -126,7 +126,7 @@ async fn rate_and_stream_limits_preserve_other_connections() {
         let anchor = net.client.read(&c, &net.empty(&c)).await.unwrap().frontier().clone();
         let mut subscriptions = Vec::new();
         for _ in 0..CONNECTION_STREAMS { subscriptions.push(net.client.subscribe(vec![(c, anchor.clone())]).await.unwrap()); }
-        assert!(net.client.head(&c).await.is_err(), "ninth stream must be reset, not queued indefinitely");
+        assert!(net.client.head(&c).await.is_err(), "a stream over the limit must be reset, not queued indefinitely");
         let other_endpoint = endpoint(None).await;
         let other = ServeClient::new(other_endpoint.clone(), &net.key, "", &net.service.endpoint().bound_sockets().iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap();
         assert_eq!(other.head(&c).await.unwrap().length, 1);

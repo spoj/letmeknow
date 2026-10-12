@@ -10,13 +10,17 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{OwnedSemaphorePermit, Sema
 
 use crate::{Refused, store::{DAY_MS, Stats, Store}};
 
-pub const MAX_CONNECTIONS: usize = 64;
-pub const MAX_STREAMS: usize = 64;
-pub const CONNECTION_STREAMS: usize = 8;
+pub const MAX_CONNECTIONS: usize = 2048;
+pub const MAX_STREAMS: usize = 1024;
+/// A session's requests and subscriptions to one service at once, one subscription per log it follows there: under
+/// QUIC's 100 streams a peer may open, so that a stream over it is refused rather than left waiting.
+pub const CONNECTION_STREAMS: usize = 64;
 pub const DB_WORK: usize = 4;
-pub const MAX_SUBSCRIBERS: usize = 64;
+pub const MAX_SUBSCRIBERS: usize = 4096;
 pub const LAG: usize = 8;
-pub const DB_DEADLINE: Duration = Duration::from_secs(2);
+/// How long a request waits for a slot of `DB_WORK` before it is refused as busy. Work that started runs to its end:
+/// a refusal tells the client the work was not done.
+pub const DB_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct Policy {
@@ -83,7 +87,7 @@ impl Service {
                 interval.tick().await;
                 let Some(inner) = weak.upgrade() else { return };
                 let before = (now() / DAY_MS).saturating_sub(inner.policy.retention_days);
-                if Service(inner).work(move |store| store.expire(before)).await.is_err() {
+                if Service(inner).work(move |inner| inner.store.expire(before)).await.is_err() {
                     tracing::warn!("membership expiry deferred");
                 }
             }
@@ -92,14 +96,13 @@ impl Service {
         service
     }
 
-    async fn work<T: Send + 'static>(&self, f: impl FnOnce(&Store) -> Result<T> + Send + 'static) -> Result<T> {
-        let permit = self.0.work.clone().try_acquire_owned().map_err(|_| Refused("busy".into()))?;
+    async fn work<T: Send + 'static>(&self, f: impl FnOnce(&Inner) -> Result<T> + Send + 'static) -> Result<T> {
+        let permit = timeout(DB_WAIT, self.0.work.clone().acquire_owned()).await.map_err(|_| Refused("busy".into()))??;
         let inner = self.0.clone();
-        timeout(DB_DEADLINE, tokio::task::spawn_blocking(move || { let _permit = permit; f(&inner.store) }))
-            .await.map_err(|_| Refused("busy".into()))??
+        tokio::task::spawn_blocking(move || { let _permit = permit; f(&inner) }).await?
     }
 
-    pub async fn stats(&self) -> Result<Stats> { self.work(Store::stats).await }
+    pub async fn stats(&self) -> Result<Stats> { self.work(|inner| inner.store.stats()).await }
 
     async fn stream(&self, mut send: SendStream, mut recv: RecvStream, appends: &Mutex<Window>, work_slot: OwnedSemaphorePermit) -> Result<()> {
         let request = timeout(Duration::from_secs(15), async {
@@ -122,18 +125,22 @@ impl Service {
                 let answer = if !appends.lock().unwrap().take(self.0.policy.appends_per_minute) {
                     Err(Refused("rate".into()).into())
                 } else {
-                    self.work(move |store| store.append(&d, &entries, public)).await
+                    // Subscribers hear of what committed, even if this request goes no further.
+                    self.work(move |inner| {
+                        let appended = inner.store.append(&d, &entries, public)?;
+                        inner.subscribers.lock().unwrap().notify(&appended.head);
+                        Ok(appended)
+                    }).await
                 };
-                if let Ok(appended) = &answer { self.0.subscribers.lock().unwrap().notify(&appended.head); }
                 reply(&mut send, answer).await?;
             }
             Request::Read { capability, after } => {
                 let d = head::reference(&service, &capability);
-                reply(&mut send, self.work(move |store| store.read(&d, after)).await).await?;
+                reply(&mut send, self.work(move |inner| inner.store.read(&d, after)).await).await?;
             }
             Request::Head { capability } => {
                 let d = head::reference(&service, &capability);
-                reply(&mut send, self.work(move |store| Ok(Latest { head: store.head(&d)? })).await).await?;
+                reply(&mut send, self.work(move |inner| Ok(Latest { head: inner.store.head(&d)? })).await).await?;
             }
             Request::Subscribe { capabilities } => {
                 drop(work_slot);
@@ -156,7 +163,7 @@ impl Service {
         let forward = async {
             reply(&mut send, Ok(Subscribed {})).await?;
             for d in refs {
-                reply(&mut send, self.work(move |store| Ok(Latest { head: store.head(&d)? })).await).await?;
+                reply(&mut send, self.work(move |inner| Ok(Latest { head: inner.store.head(&d)? })).await).await?;
             }
             while let Some(head) = notices.recv().await { reply(&mut send, Ok(Latest { head })).await?; }
             anyhow::bail!("membership subscription lagged")
@@ -242,17 +249,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_out_db_jobs_keep_their_slots_until_the_work_ends() {
-        let path = std::env::temp_dir().join(format!("lmk-deadline-{}", hex::encode(lmk_proto::random::random::<16>())));
+    async fn running_db_work_is_not_cut_off() {
+        let path = std::env::temp_dir().join(format!("lmk-running-{}", hex::encode(lmk_proto::random::random::<16>())));
         let service = Service::new(Store::initialize(&path).unwrap(), Policy::default());
         service.0.expiry.lock().unwrap().take();
         let (release, wait) = std::sync::mpsc::channel();
-        let result = service.work(move |_| { wait.recv().unwrap(); Ok(()) }).await;
-        assert_eq!(result.unwrap_err().downcast::<Refused>().unwrap().0, "busy");
-        assert_eq!(service.0.work.available_permits(), DB_WORK - 1);
+        let running = tokio::spawn({
+            let service = service.clone();
+            async move { service.work(move |_| { wait.recv().unwrap(); Ok(()) }).await }
+        });
+        tokio::time::sleep(DB_WAIT + Duration::from_millis(500)).await;
         release.send(()).unwrap();
-        drop(service.0.work.acquire_many(DB_WORK as u32).await.unwrap());
-        service.stats().await.unwrap();
+        running.await.unwrap().unwrap();
         drop(service);
         std::fs::remove_dir_all(path).unwrap();
     }
