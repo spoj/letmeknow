@@ -25,7 +25,7 @@ pub fn csv(state: &[u8]) -> Result<String> {
     let mut out = csv::WriterBuilder::new().terminator(csv::Terminator::Any(b'\n')).from_writer(Vec::new());
     out.write_record(std::iter::once("id").chain(columns.iter().map(|c| c.name.as_str())))?;
     for row in read_rows(&rows, &txn) {
-        out.write_record(std::iter::once(row.id.clone()).chain(columns.iter().map(|c| show(row.map.get(&txn, &c.id), &c.kind))))?;
+        out.write_record(std::iter::once(row.id).chain(columns.iter().map(|c| show(row.map.get(&txn, &c.id), &c.kind))))?;
     }
     Ok(String::from_utf8(out.into_inner().map_err(|error| error.into_error())?)?)
 }
