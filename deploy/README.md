@@ -18,6 +18,16 @@ Publication waits for all those jobs. The GitHub release includes native archive
 
 `deploy/release.sh X.Y.Z <notes file>` tags/publishes and prints the rollout commands; it does **not** deploy. Both rollout paths verify the actual release workflow path/ID, completed successful push, repository, reviewed tag and full source SHA, including the current tag target; display names are not provenance. The resolved identity is printed for review. Do not move a tag after npm publication. A failed or partial publication cannot be rolled out by the scripts. Artifact retention matters: use a retained successful run, not a local rebuild.
 
+### Release pins and retries
+
+Release preparation needs Python 3.11+ and Pi's Node/test dependencies already available. Before an X.Y.0 release, set `LETMEKNOW_PI_REPO` to an operator-reviewed local pi-letmeknow checkout on clean `main`, with an `origin`, `scripts/pin.mjs`, and dependencies already installed. It must contain the reviewed implementation supporting the new minor. The release preflights its pin invariant, TypeScript check and tests **before mutating or pushing the app release**; it never clones, installs, overwrites source from a remote, stashes, or discards user work.
+
+`python3 deploy/version-pins.py check` is the CI invariant for Cargo's version and all CLI pins in README (both), SKILL, AGENTS (including its patch-range prose), and browser welcome text. `set X.Y.Z` validates everything first and rewrites them together; release.sh then updates Cargo.lock offline and commits those files together. No compatibility switches are inferred from a minor bump.
+
+Only after `release-run.py` verifies the actual successful canonical workflow/tag/SHA and npm returns the exact CLI version from the public registry does an X.Y.0 release call Pi's tested pin action and push its coherent README/MINOR commit. It never changes a running session's executable or state. Patch releases do not touch Pi.
+
+Rerun the same command from clean app `main` at the same release-tag commit to finish a failed npm-availability check or Pi follow-up/push. Existing tags are never moved; canonical workflow success is checked again. A failed/incomplete publication requires operator investigation, not an automatic retag. If Pi changed or became dirty during publication, follow-up refuses it; the app may already be published. A failed Pi push leaves its tested local commit for retry. Files are one coherent commit, not a cross-file crash transaction: interruption during local preparation can leave uncommitted changes (including Cargo.lock); review and repair those before retrying. Scripts do not silently roll back published work or move a published tag.
+
 ## Reviewed cutover (operator only)
 
 1. Review all security gates, the intended tag/commit and release artifacts. Confirm administrative access to frontend DNS, repository Pages settings and the `github-pages` environment. Configure Pages source **GitHub Actions**, custom domain `letmeknow.dev`, HTTPS enforcement, and required operator approval on `github-pages`. Review the dispatch workflow on `main`; no token is copied to the VPS. Set/verify GitHub's domain ownership TXT record before changing DNS. Keep that verification record.
