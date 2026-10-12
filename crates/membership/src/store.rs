@@ -43,6 +43,7 @@ fn sync_dir(path: &Path) -> Result<()> {
 impl Store {
     /// Requires a new directory; interrupted initialization must be abandoned, not resumed with its key.
     pub fn initialize(state: &Path) -> Result<Self> {
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut dir = fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);

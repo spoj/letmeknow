@@ -663,7 +663,7 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
                 result = &mut publication => {
                     // Closing the gate can race a request on the old connection; establish its replacement.
                     let error = result.unwrap_err();
-                    assert!(format!("{error:#}").contains("closed by peer: closed (code 0)"), "{error:#}");
+                    assert!(format!("{error:#}").contains("membership transport interrupted"), "{error:#}");
                     publication.set(node.publish(&gid.0, published.writers.clone(), "Must not escape"));
                 }
                 reached = reaching.recv() => {
