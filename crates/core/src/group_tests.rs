@@ -7,7 +7,7 @@ use lmk_proto::group::{CHAT, ChatMessage, Control, REVISION, Service};
 
 /// A membership service at `relay`, for logs no test reaches.
 pub(crate) fn service(relay: &str) -> Service {
-    Service::Serve { key: Bytes(vec![1; 32]), relay: relay.into(), addrs: vec![], rest: Default::default() }
+    Service::Serve { key: ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes().into(), relay: relay.into(), addrs: vec![], rest: Default::default() }
 }
 
 pub(crate) fn settings(name: &str) -> Settings {
@@ -91,8 +91,9 @@ impl<P: Provider> Member<P> {
         group.members().iter().find(|m| m.credential.as_ref().unwrap().name == name).unwrap().index
     }
 
-    pub fn join(&mut self, welcome: &[u8], pos: usize) {
-        self.group = Some(Group::join(&self.provider, welcome).unwrap());
+    pub fn join(&mut self, welcome: &[u8], pos: usize, package: &[u8]) {
+        let reference = key_package_reference(&self.provider, package).unwrap();
+        self.group = Some(Group::join(&self.provider, welcome, &reference).unwrap());
         self.pos = pos;
     }
 }
@@ -143,6 +144,11 @@ impl World {
         self.log.len()
     }
 
+    fn post_inner(&mut self, inner: Vec<u8>) -> usize {
+        let a = &self.m[0];
+        self.post(a.group.as_ref().unwrap().seal_entry(&a.provider, &inner).unwrap())
+    }
+
     fn read(&mut self, who: &[usize]) -> Vec<Vec<Read>> {
         who.iter().map(|&i| self.m[i].read(&self.log)).collect()
     }
@@ -151,12 +157,12 @@ impl World {
     fn found(&mut self, creator: usize, others: &[usize]) {
         let c = &mut self.m[creator];
         c.group = Some(Group::create(&c.provider, &c.session, &settings("Plan")).unwrap());
-        let adds = others.iter().map(|&i| self.m[i].session.key_package(&self.m[i].provider).unwrap()).collect();
-        let commit = self.m[creator].commit(Change { add: adds, how: Some(How::Invite), ..Change::default() });
+        let adds: Vec<_> = others.iter().map(|&i| self.m[i].session.key_package(&self.m[i].provider).unwrap()).collect();
+        let commit = self.m[creator].commit(Change { add: adds.clone(), how: Some(How::Invite), ..Change::default() });
         let pos = self.post(commit.entry);
         self.read(&[creator]);
-        for &i in others {
-            self.m[i].join(commit.welcome.as_ref().unwrap(), pos);
+        for (&i, package) in others.iter().zip(adds) {
+            self.m[i].join(commit.welcome.as_ref().unwrap(), pos, &package);
         }
     }
 
@@ -200,12 +206,12 @@ fn commit_race() {
     assert!(w.m[1].g().posted().is_none() && w.m[1].g().epoch() == e + 1);
     w.agree(&[0, 1, 2]);
 
-    let b2 = w.m[1].commit(Change { add: vec![kp_d], how: Some(How::Invite), ..Change::default() });
+    let b2 = w.m[1].commit(Change { add: vec![kp_d.clone()], how: Some(How::Invite), ..Change::default() });
     let pos = w.post(b2.entry);
     let read = w.read(&[0, 1, 2]);
     let Applied { added, by, .. } = applied(&read[0][0]);
     assert_eq!((added[0].credential.as_ref().unwrap().name.as_str(), *by), ("D", w.m[1].g().own_index()));
-    w.m[3].join(&b2.welcome.unwrap(), pos);
+    w.m[3].join(&b2.welcome.unwrap(), pos, &kp_d);
     w.agree(&[0, 1, 2, 3]);
     let added = w.m[0].g().added().last().unwrap().clone();
     assert_eq!((added.member.name.as_str(), added.by.name.as_str(), added.epoch), ("D", "B", e + 2));
@@ -228,7 +234,7 @@ fn junk_is_skipped() {
     w.post(b"\xde\xad\xbe\xef".to_vec());
     w.post(w.log[p_old - 1].clone());
     let app = w.m[3].send("hello");
-    w.post(Entry::Commit { commit: app, welcome: None, sig: vec![0; 64] }.encode());
+    w.post_inner(Entry::Commit { commit: app, welcome: None, sig: vec![0; 64] }.encode());
     let x = &mut w.m[4];
     x.group = Some(Group::create(&x.provider, &x.session, &settings("other")).unwrap());
     let foreign = w.m[4].commit(Change::default());
@@ -267,10 +273,12 @@ fn a_commit_entry_needs_its_committers_signature() {
     w.found(0, &[1, 2]);
     let kp = w.key_package(3);
     let commit = w.m[1].commit(Change { add: vec![kp], how: Some(How::Invite), ..Change::default() });
-    let Entry::Commit { commit: bytes, welcome, sig } = Entry::parse(&commit.entry).unwrap() else { panic!() };
+    let a = &w.m[0];
+    let inner = a.group.as_ref().unwrap().open_entry(&a.provider, &commit.entry).unwrap();
+    let Entry::Commit { commit: bytes, welcome, sig } = Entry::parse(&inner).unwrap() else { panic!() };
     // Signed by a stranger, or carrying another Welcome than the committer signed.
-    w.post(entry_of(&stranger(), bytes.clone(), welcome));
-    w.post(Entry::Commit { commit: bytes, welcome: Some(b"another welcome".to_vec()), sig }.encode());
+    w.post_inner(entry_of(&stranger(), bytes.clone(), welcome));
+    w.post_inner(Entry::Commit { commit: bytes, welcome: Some(b"another welcome".to_vec()), sig }.encode());
     let read = w.read(&[0, 2]);
     assert!(read.iter().flatten().all(|read| matches!(&read.0, Verdict::Skipped { reason, .. } if reason.contains("did not sign"))));
     w.post(commit.entry);
@@ -284,7 +292,9 @@ fn a_commit_never_applies_through_open() {
     let mut w = World::new(&["A", "B"]);
     w.found(0, &[1]);
     let commit = w.m[0].commit(Change::default());
-    let Entry::Commit { commit: bytes, .. } = Entry::parse(&commit.entry).unwrap() else { panic!() };
+    let a = &w.m[0];
+    let inner = a.group.as_ref().unwrap().open_entry(&a.provider, &commit.entry).unwrap();
+    let Entry::Commit { commit: bytes, .. } = Entry::parse(&inner).unwrap() else { panic!() };
     assert!(w.m[1].open(&bytes).is_err());
     w.post(commit.entry);
     w.read(&[0, 1]);
@@ -303,7 +313,8 @@ fn a_message_entry_counts_in_the_epoch_it_is_read_in() {
     let c = &w.m[2];
     let exported = c.group.as_ref().unwrap().mls.export_secret(c.provider.crypto(), "letmeknow entry", &[], 32).unwrap();
     let mac = c.provider.crypto().hmac(HashType::Sha2_256, &exported, &id).unwrap();
-    assert_eq!(entry, [&[2], &id[..], mac.as_slice()].concat());
+    let inner = c.group.as_ref().unwrap().open_entry(&c.provider, &entry).unwrap();
+    assert_eq!(inner, [&[2], &id[..], mac.as_slice()].concat());
     w.post(entry.clone());
     // A's own commit comes next in the log: the same entry again, after it, is under another epoch.
     let commit = w.m[0].commit(Change::default());
@@ -313,10 +324,12 @@ fn a_message_entry_counts_in_the_epoch_it_is_read_in() {
     for reader in &read {
         assert_eq!(reader[0].0, Verdict::Message { id });
         assert!(is_commit(&reader[1]));
-        assert!(matches!(&reader[2].0, Verdict::Skipped { reason, .. } if reason.contains("MAC")));
+        assert!(matches!(&reader[2].0, Verdict::Skipped { reason, .. } if reason.contains("authentication")));
     }
+    w.post_inner(inner);
+    assert!(w.read(&[0, 1, 2]).iter().all(|reader| matches!(&reader[0].0, Verdict::Skipped { reason, .. } if reason.contains("MAC"))));
     // A forged MAC, and a non-member's, never count.
-    w.post(Entry::Message { id, mac: [0; 32] }.encode());
+    w.post_inner(Entry::Message { id, mac: [0; 32] }.encode());
     assert!(w.read(&[0, 1, 2]).iter().all(|reader| matches!(reader[0].0, Verdict::Skipped { .. })));
     // A message sealed in the new epoch counts in it.
     let later = w.m[2].send("later");
@@ -365,10 +378,10 @@ fn a_forged_message_leaves_no_trace<P: Provider>(providers: impl Fn(&str) -> P) 
     let mut b = Member::new(MemoryProvider::default(), "B");
     a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
     let kp = b.session.key_package(&b.provider).unwrap();
-    let commit = a.commit(Change { add: vec![kp], how: Some(How::Invite), ..Change::default() });
+    let commit = a.commit(Change { add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
     let log = vec![commit.entry];
     a.read(&log);
-    b.join(commit.welcome.as_ref().unwrap(), 1);
+    b.join(commit.welcome.as_ref().unwrap(), 1, &kp);
     let real = |b: &mut Member, text: &str| b.send(text);
     let first = real(&mut b, "first");
     let forger = b.copy();
@@ -415,10 +428,11 @@ fn a_step_commits_or_rolls_back_with_openmls() {
     let mut a = Member::new(SqliteProvider::open(&dir.join("a.db")).unwrap(), "A");
     let mut b = Member::new(MemoryProvider::default(), "B");
     a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
-    let commit = a.commit(Change { add: vec![b.session.key_package(&b.provider).unwrap()], how: Some(How::Invite), ..Change::default() });
+    let kp = b.session.key_package(&b.provider).unwrap();
+    let commit = a.commit(Change { add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
     let log = vec![commit.entry];
     a.read(&log);
-    b.join(commit.welcome.as_ref().unwrap(), 1);
+    b.join(commit.welcome.as_ref().unwrap(), 1, &kp);
     let id = a.g().id().to_vec();
     let one = b.send("one");
     let two = b.send("two");
@@ -461,8 +475,9 @@ fn commits_from_ones_own_leaf_are_told_apart() {
     let mut copy = w.m[0].copy();
     // Junk: the copy's commit, signed by another key. Then the copy's commit as it signs it.
     let junk = copy.commit(Change::default());
-    let Entry::Commit { commit, welcome, .. } = Entry::parse(&junk.entry).unwrap() else { panic!() };
-    w.post(entry_of(&stranger(), commit, welcome));
+    let inner = copy.group.as_ref().unwrap().open_entry(&copy.provider, &junk.entry).unwrap();
+    let Entry::Commit { commit, welcome, .. } = Entry::parse(&inner).unwrap() else { panic!() };
+    w.post_inner(entry_of(&stranger(), commit, welcome));
     copy.cancel();
     let copied = copy.commit(Change::default());
     w.post(copied.entry);
@@ -519,10 +534,10 @@ fn settings_in_the_welcome() {
     assert!(w.m[2].g().mls.extensions().required_capabilities().is_some());
 
     let kp = w.key_package(3);
-    let commit = w.m[2].commit(Change { add: vec![kp], how: Some(How::Invite), ..Change::default() });
+    let commit = w.m[2].commit(Change { add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
     let pos = w.post(commit.entry);
     w.read(&[0, 1, 2]);
-    w.m[3].join(&commit.welcome.unwrap(), pos);
+    w.m[3].join(&commit.welcome.unwrap(), pos, &kp);
     assert_eq!(w.m[3].g().settings(), changed);
     w.agree(&[0, 1, 2, 3]);
 }
@@ -607,8 +622,9 @@ fn rules_bind_everyone() {
             .stage_commit(&b.provider)
             .unwrap();
         let entry = entry_of(&b.session.signer, bundle.into_messages().0.to_bytes().unwrap(), None);
-        group.state.posted = Some(Bytes(entry.clone()));
-        w.post(entry);
+        let wire = group.seal_entry(&b.provider, &entry).unwrap();
+        group.state.posted = Some(Posted { inner: Bytes(entry), wire: Bytes(wire.clone()), add_refs: vec![] });
+        w.post(wire);
         let read = w.read(&[0, 1, 2]);
         assert!(matches!(&read[1][0].0, Verdict::Skipped { lost: true, .. }));
         assert!(read.iter().all(|reader| !is_commit(&reader[0])));
@@ -637,8 +653,9 @@ fn rules_bind_everyone() {
         .stage_commit(&c.provider)
         .unwrap();
     let entry = entry_of(&c.session.signer, bundle.into_messages().0.to_bytes().unwrap(), None);
-    group.state.posted = Some(Bytes(entry.clone()));
-    w.post(entry);
+    let wire = group.seal_entry(&c.provider, &entry).unwrap();
+    group.state.posted = Some(Posted { inner: Bytes(entry), wire: Bytes(wire.clone()), add_refs: vec![] });
+    w.post(wire);
     let read = w.read(&[0, 1, 2]);
     assert!(matches!(&read[2][0].0, Verdict::Skipped { lost: true, reason } if reason.contains("credential")));
     assert!(!is_commit(&read[0][0]) && !is_commit(&read[1][0]));
@@ -658,9 +675,10 @@ fn rules_bind_everyone() {
     group.mls.store_pending_proposal(c.provider.storage(), *queued).unwrap();
     let (commit, _, _) = group.mls.commit_to_pending_proposals(&c.provider, &c.session.signer).unwrap();
     let entry = entry_of(&c.session.signer, commit.to_bytes().unwrap(), None);
-    group.state.posted = Some(Bytes(entry.clone()));
-    w.post(entry_of(&w.m[1].session.signer, proposal, None));
-    w.post(entry);
+    let wire = group.seal_entry(&c.provider, &entry).unwrap();
+    group.state.posted = Some(Posted { inner: Bytes(entry), wire: Bytes(wire.clone()), add_refs: vec![] });
+    w.post_inner(entry_of(&w.m[1].session.signer, proposal, None));
+    w.post(wire);
     let read = w.read(&[0, 1, 2]);
     assert!(read.iter().all(|reader| reader.iter().all(|a| !is_commit(a))));
     assert!(matches!(&read[2][1].0, Verdict::Skipped { lost: true, reason } if reason.contains("reference")));
@@ -722,7 +740,9 @@ fn another_protocol_is_refused_at_join() {
     a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
     let mut future = w.m[0].g().settings();
     future.protocol = PROTOCOL + 1;
-    let kp = key_package_in(&w.m[1].provider, &w.key_package(1)).unwrap();
+    let package = w.key_package(1);
+    let reference = key_package_reference(&w.m[1].provider, &package).unwrap();
+    let kp = key_package_in(&w.m[1].provider, &package).unwrap();
     let a = &mut w.m[0];
     let group = a.group.as_mut().unwrap();
     let bundle = group
@@ -739,7 +759,7 @@ fn another_protocol_is_refused_at_join() {
         .unwrap();
     let welcome = bundle.into_messages().1.unwrap().to_bytes().unwrap();
     group.mls.merge_pending_commit(&a.provider).unwrap();
-    let error = Group::join(&w.m[1].provider, &welcome).err().unwrap();
+    let error = Group::join(&w.m[1].provider, &welcome, &reference).err().unwrap();
     assert!(error.to_string().contains(&format!("protocol {}", PROTOCOL + 1)), "{error}");
 }
 
@@ -753,24 +773,37 @@ fn state_survives_a_restart() {
     let mut a = Member::new(SqliteProvider::open(&dir.join("a.db")).unwrap(), "A");
     let b = Member::new(SqliteProvider::open(&dir.join("b.db")).unwrap(), "B");
     a.group = Some(Group::create(&a.provider, &a.session, &settings("Plan")).unwrap());
-    let commit = a.commit(Change { add: vec![b.session.key_package(&b.provider).unwrap()], how: Some(How::Invite), ..Change::default() });
+    let kp = b.session.key_package(&b.provider).unwrap();
+    let commit = a.commit(Change { add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
     log.push(commit.entry);
     a.read(&log);
     let id = a.g().id().to_vec();
     let mut b = Member { pos: 1, ..b };
-    b.join(commit.welcome.as_ref().unwrap(), 1);
-    // B commits, then restarts before reading the log.
-    let pending = b.commit(Change::default());
-    log.push(pending.entry);
+    b.join(commit.welcome.as_ref().unwrap(), 1, &kp);
+    // B adds C, then restarts before reading a separately re-enveloped copy of its pending inner Entry.
+    let mut c = Member::new(MemoryProvider::default(), "C");
+    let c_package = c.session.key_package(&c.provider).unwrap();
+    let c_ref = key_package_reference(&c.provider, &c_package).unwrap();
+    let pending = b.commit(Change { add: vec![c_package.clone()], how: Some(How::Invite), ..Change::default() });
+    let g = a.group.as_ref().unwrap();
+    let inner = g.open_entry(&a.provider, &pending.entry).unwrap();
+    let rewrapped = g.seal_entry(&a.provider, &inner).unwrap();
+    assert_ne!(rewrapped, pending.entry);
+    log.push(rewrapped);
     drop(b);
     let provider = SqliteProvider::open(&dir.join("b.db")).unwrap();
     let session = Session::load(&provider).unwrap();
     let group = Group::load(&provider, &id).unwrap();
-    assert!(group.posted().is_some());
+    assert_eq!(group.posted().unwrap(), pending.entry);
+    assert_eq!(group.state.posted.as_ref().unwrap().add_refs, vec![c_ref]);
     let mut b = Member { provider, session, group: Some(group), pos: 1 };
     assert!(applied(&b.read(&log)[0]).own);
     a.read(&log);
     assert_eq!(a.g().epoch_authenticator(), b.g().epoch_authenticator());
+    assert_eq!(a.g().added().last().unwrap().key_package_ref, c_ref);
+    assert_eq!(b.g().added().last().unwrap().key_package_ref, c_ref);
+    c.join(pending.welcome.as_ref().unwrap(), log.len(), &c_package);
+    assert_eq!(a.g().epoch_authenticator(), c.g().epoch_authenticator());
     let hi = b.send("after a restart");
     assert_eq!(text(&a.open(&hi).unwrap()), "after a restart");
     // Windows cannot delete a database that is still open.
@@ -807,3 +840,6 @@ fn a_payload_that_could_seal_over_the_limit_is_refused() {
     assert!(sealed.len() <= MAX_MESSAGE);
     assert!(!w.m[1].open(&sealed).unwrap().live);
 }
+
+#[path = "group_epoch_tests.rs"]
+mod epoch;

@@ -111,6 +111,7 @@ def serve():
     https = free_port()
     args = [BIN, "serve", "--domain", "localhost", "--https-port", str(https), "--http-port", str(free_port()), "--membership-port", str(free_port()),
             "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key]
+    subprocess.run(args + ["--initialize"], env=ENV, check=True, stdout=subprocess.DEVNULL)
     proc = subprocess.Popen(args, env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
     membership = proc.stdout.readline().strip().removeprefix("membership: ")
     ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_RELAY=f"https://localhost:{https}", LETMEKNOW_MEMBERSHIP=membership)

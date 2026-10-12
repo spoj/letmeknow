@@ -3,11 +3,15 @@ use super::*;
 const G: u8 = 7;
 
 fn head(log: u8, length: u64) -> Head {
-    Head { log: Bytes(vec![log]), length, hash: Bytes::default(), time: 0, sig: Bytes::default() }
+    Head { log_ref: [log; 32], length, hash: [0; 32], time: 0, sig: Bytes::default() }
 }
 
 fn id(n: u8) -> Bytes {
     Bytes(vec![n])
+}
+
+fn log(n: u8) -> Bytes {
+    Bytes(vec![n; 32])
 }
 
 fn key(n: u8) -> Key {
@@ -23,11 +27,11 @@ fn served(groups: &[u8]) -> BTreeSet<Bytes> {
 }
 
 fn own(group: u8, length: u64, held: Ranges, lacking: Ranges) -> Own {
-    Own { head: head(group, length), held, read: Ranges::default(), lacking, public: vec![] }
+    Own { log: [group; 32], head: Some(head(group, length)), position: length, held, read: Ranges::default(), lacking, public: vec![], earlier: vec![] }
 }
 
 fn summary(group: u8, length: u64, held: Ranges, fetching: Ranges) -> Summary {
-    Summary { group: id(group), head: head(group, length), held, read: Ranges::default(), fetching }
+    Summary { group: id(group), log: [group; 32], head: Some(head(group, length)), held, read: Ranges::default(), fetching }
 }
 
 fn hello(summaries: Vec<Summary>) -> Frame {
@@ -292,10 +296,25 @@ fn entries_go_once_to_a_peer_whose_head_is_shorter() {
     p.poll(0);
     p.frame(&key(1), &Frame::Hello { groups: vec![summary(G, 6, r(&[(1, 6)]), Ranges::default())], heads: vec![head(100, 2)] }, 100);
     let entries: Vec<Out> = p.poll(100).into_iter().filter(|o| matches!(o, Out::Entries { .. })).collect();
-    assert_eq!(entries, vec![Out::Entries { peer: key(1), log: id(G), after: 6 }, Out::Entries { peer: key(1), log: id(100), after: 2 }]);
+    assert_eq!(entries, vec![Out::Entries { peer: key(1), log: log(G), after: 6 }, Out::Entries { peer: key(1), log: log(100), after: 2 }]);
     assert!(p.poll(200).iter().all(|o| !matches!(o, Out::Entries { .. })));
     p.group(id(G), Own { public: vec![head(100, 4)], ..own(G, 11, r(&[(1, 11)]), Ranges::default()) }, 300);
-    assert_eq!(p.poll(300), vec![Out::Entries { peer: key(1), log: id(G), after: 10 }]);
+    assert_eq!(p.poll(300), vec![Out::Entries { peer: key(1), log: log(G), after: 10 }]);
+}
+
+#[test]
+fn a_peer_on_an_earlier_log_is_sent_it_then_the_next() {
+    let mut p = Peers::new(0);
+    let moved = Own { log: [8; 32], head: Some(head(8, 2)), position: 12, earlier: vec![head(G, 10)], ..own(G, 10, r(&[(1, 12)]), Ranges::default()) };
+    p.group(id(G), moved, 0);
+    p.connect(key(1), served(&[G]), 0);
+    p.poll(0);
+    p.frame(&key(1), &Frame::Hello { groups: vec![summary(G, 6, r(&[(1, 6)]), Ranges::default())], heads: vec![] }, 100);
+    let entries = |out: Vec<Out>| -> Vec<Out> { out.into_iter().filter(|o| matches!(o, Out::Entries { .. })).collect() };
+    assert_eq!(entries(p.poll(100)), vec![Out::Entries { peer: key(1), log: log(G), after: 6 }]);
+    let next = Summary { log: [8; 32], head: None, ..summary(G, 0, r(&[(1, 10)]), Ranges::default()) };
+    p.frame(&key(1), &Frame::Hello { groups: vec![next], heads: vec![] }, 200);
+    assert_eq!(entries(p.poll(200)), vec![Out::Entries { peer: key(1), log: log(8), after: 0 }]);
 }
 
 #[test]

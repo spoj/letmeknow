@@ -4,7 +4,7 @@
 use anyhow::{Result, ensure};
 use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, endpoint::presets};
 use iroh_relay::RelayQuicConfig;
-use lmk_membership::client::ServeClient;
+use lmk_membership::{Frontier, client::ServeClient};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -13,12 +13,14 @@ async fn main() -> Result<()> {
     let relays = RelayMap::from_iter([RelayConfig::new(relay.parse()?, Some(RelayQuicConfig::default()))]);
     let endpoint = Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(relays)).bind().await?;
     let client = ServeClient::new(endpoint, &key, relay, &[])?;
-    let log = lmk_proto::random::random::<16>();
+    let log = lmk_proto::random::random::<32>();
+    let service: [u8; 32] = key.as_slice().try_into()?;
+    let anchor = Frontier::empty(service, lmk_proto::head::reference(&service, &log));
     let started = std::time::Instant::now();
     let appended = client.append(&log, &[b"probe".to_vec()], false).await?;
     println!("appended at {} in {:?}", appended.position, started.elapsed());
-    let page = client.read(&log, 0).await?;
-    ensure!(page.entries.len() == 1 && page.head.length == 1, "read back {page:?}");
+    let page = client.read(&log, &anchor).await?;
+    ensure!(page.page().entries.len() == 1 && page.page().head.length == 1, "unexpected probe page");
     println!("read back; heads verified");
     Ok(())
 }

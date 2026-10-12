@@ -10,40 +10,40 @@ use lmk_membership::Refused;
 use lmk_proto::Bytes;
 use lmk_proto::group::{IDENTITY, How};
 
-use crate::{Event, G, Inner, Member, State, device_key_key, kind, logs, peering, reading, rec_key, sending};
+use crate::{Event, G, Inner, Member, State, device_key_key, kind, peering, reading, rec_key, sending};
 
 const COMMIT_TRIES: u32 = 5;
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Commits a change built on the group's current epoch, posts its entry, and reads the log until it is known whether
-    /// it won its epoch; if another commit won, builds it again. Returns the Welcome, if it adds, and the position; none
-    /// once the change has no effect (`None`), and it commits nothing. An entry posted before, which the log may or may
-    /// not have taken, as when the service's answer was lost, is posted again first: only the service's refusal drops it.
-    /// This call's own entry is found in the log by its bytes.
+    /// Commits a change built on the group's current epoch, posts its entry to the epoch's log, and reads the log until
+    /// it is known whether it won its epoch; if another commit won, builds it again. Returns the Welcome, if it adds, and
+    /// the position; none once the change has no effect (`None`), and it commits nothing. An entry posted before, which
+    /// the log may or may not have taken, as when the service's answer was lost, is posted again first: only the
+    /// service's refusal drops it.
     pub(crate) async fn commit(&self, gid: &[u8], change: impl Fn(&State<P>, &G) -> Result<Option<Change>>) -> Result<Option<(Option<Vec<u8>>, u64)>> {
         let _committing = self.committing.lock().await;
         let mut built: Option<(Vec<u8>, Option<Vec<u8>>)> = None;
         for _ in 0..COMMIT_TRIES {
             self.caught_up(gid).await?;
-            let (entry, service, before) = {
+            let (entry, service, capability, before) = {
                 let mut st = self.lock();
                 let st = &mut *st;
                 let g = st.group(gid)?;
-                let (service, before) = (g.mls.settings().membership, g.rec.position);
+                let (service, capability, before) = (g.mls.settings().membership, g.mls.capability(&st.provider)?, g.rec.position);
                 match g.mls.posted() {
-                    Some(posted) => (posted.to_vec(), service, before),
+                    Some(posted) => (posted.to_vec(), service, capability, before),
                     None => {
                         let Some(change) = change(st, g)? else { return Ok(None) };
                         let g = st.groups.get_mut(gid).unwrap();
                         let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
                         let commit = g.mls.commit(&st.provider, session, change)?;
                         built = Some((commit.entry.clone(), commit.welcome));
-                        (commit.entry, service, before)
+                        (commit.entry, service, capability, before)
                     }
                 }
             };
             self.durable().await?;
-            match self.clients.client(&service)?.append(gid, std::slice::from_ref(&entry), false).await {
+            match self.clients.client(&service)?.append(&capability, std::slice::from_ref(&entry), false).await {
                 Ok(_) => {}
                 Err(error) if error.is::<Refused>() => {
                     let mut st = self.lock();
@@ -54,11 +54,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 Err(error) => tracing::debug!("appending a commit, which the log may show: {error:#}"),
             }
             self.caught_up(gid).await?;
-            let Some((ours, welcome)) = built.as_ref().filter(|(ours, _)| *ours == entry) else { continue };
+            // The one commit of this session's that can apply is the one it posted.
+            let Some((_, welcome)) = built.as_ref().filter(|(ours, _)| *ours == entry) else { continue };
             let st = self.lock();
             for position in before + 1..=st.group(gid)?.rec.position {
-                let own = st.pos(gid, position)?.is_some_and(|pos| pos.judged == reading::Judged::Commit { own: true });
-                if own && st.provider.get(&logs::entry_key(gid, position))?.as_deref() == Some(ours.as_slice()) {
+                if st.pos(gid, position)?.is_some_and(|pos| pos.judged == reading::Judged::Commit { own: true }) {
                     return Ok(Some((welcome.clone(), position)));
                 }
             }
@@ -66,29 +66,47 @@ impl<P: Provider + Send + 'static> Inner<P> {
         bail!("the group kept changing over {COMMIT_TRIES} tries; try again")
     }
 
-    /// Reads the group's log, and waits until this session applied it to the head it read.
+    /// Reads a group's logs from their service, each epoch's it moves to, through the current one's end.
+    pub(crate) async fn read_group(&self, gid: &[u8]) -> Result<()> {
+        loop {
+            let log = self.lock().group(gid)?.rec.log.0.clone();
+            self.read(&log).await?;
+            if self.lock().group(gid)?.rec.log.0 == log {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Reads the group's logs, and waits until this session applied them to the head it read.
     pub(crate) async fn caught_up(&self, gid: &[u8]) -> Result<()> {
-        self.read(gid).await?;
+        let mut read = Vec::new();
         loop {
             let advanced = self.advanced.notified();
-            {
+            let (log, at_head) = {
                 let st = self.lock();
                 let g = st.group(gid)?;
                 ensure!(g.mls.active(), "this session was removed from the group");
-                if g.rec.position >= st.log(gid)?.logged {
-                    return Ok(());
-                }
+                (g.rec.log.0.clone(), st.at_head(gid))
+            };
+            if log != read {
+                self.read(&log).await?;
+                read = log;
+            } else if at_head {
+                return Ok(());
+            } else {
+                advanced.await;
             }
-            advanced.await;
         }
     }
 
     /// Leaves a group behind: its state and records go.
     pub(crate) fn forget(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
         st.expire_to(gid, u64::MAX)?;
+        for log in st.group_logs(gid) {
+            self.unfollow(&log);
+            st.drop_log(&log)?;
+        }
         let g = st.groups.remove(gid).context("this session is not in that group")?;
-        self.unfollow(gid);
-        st.drop_log(gid)?;
         for id in &g.rec.sends {
             st.provider.delete(&sending::send_key(&id.0))?;
             st.waiters.remove(&id.0);

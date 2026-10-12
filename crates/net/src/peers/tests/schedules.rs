@@ -92,7 +92,7 @@ impl Net {
         let held = commits.union(&me.held.iter().copied().filter(|&p| p <= me.head).collect());
         let gone: Ranges = me.lost.union(&me.expired).copied().collect();
         let lacking = positions().collect::<Ranges>().difference(&held).difference(&gone);
-        Own { head: head(G, me.head), held, read: Ranges::default(), lacking, public: vec![] }
+        Own { log: [G; 32], head: Some(head(G, me.head)), position: me.head, held, read: Ranges::default(), lacking, public: vec![], earlier: vec![] }
     }
 
     fn connect(&mut self, a: usize, b: usize) {

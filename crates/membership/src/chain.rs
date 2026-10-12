@@ -1,270 +1,204 @@
-//! A reader's own hash chain of a log, and the checks it makes on a service's heads.
-
-use std::{collections::HashMap, sync::Mutex};
+//! Constant-space authentication. Callers retain complete verified digest paths separately.
 
 use anyhow::{Result, ensure};
 use ed25519_dalek::VerifyingKey;
-use lmk_proto::{
-    Bytes,
-    head::{self, Head},
-};
+use lmk_proto::{head::{self, Head}, membership::{Page, PAGE_ROWS, valid_page}};
 
-/// A head whose signature is not the service's.
 #[derive(Debug, thiserror::Error)]
-#[error("a head for log {} is not signed by the membership service", hex::encode(&.0.log.0))]
-pub struct Forged(pub Head);
+#[error("invalid membership signature")]
+pub struct Forged;
 
-/// Two heads that cannot both be true: proof that the service showed different logs.
 #[derive(Debug, thiserror::Error)]
-#[error("the membership service contradicted itself on log {}: length {} vs {}", hex::encode(&.ours.log.0), .ours.length, .theirs.length)]
+#[error("unexpected membership authority or reference")]
+pub struct WrongLog;
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid membership proof")]
+pub struct InvalidProof;
+
+#[derive(Debug, thiserror::Error)]
+#[error("the membership service signed incompatible histories")]
 pub struct Contradiction {
-    /// The newest head the reader's chain rests on.
     pub ours: Head,
     pub theirs: Head,
 }
 
-/// The hashes h_start..=h_len of a log, and the newest head covering h_len. A client starts a chain when it reads a
-/// log from the beginning; a reader that starts later, such as a joiner, anchors one at a head it trusts.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Chain {
-    pub start: u64,
-    pub hashes: Vec<[u8; 32]>,
-    pub head: Head,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frontier {
+    service: [u8; 32],
+    log_ref: [u8; 32],
+    length: u64,
+    hash: [u8; 32],
+    head: Option<Head>,
 }
 
-impl Chain {
-    pub fn new(log: &[u8]) -> Self {
-        let h0 = head::start(log);
-        let head = Head {
-            log: log.into(),
-            length: 0,
-            hash: h0.into(),
-            time: 0,
-            sig: Bytes::default(),
-        };
-        Chain {
-            start: 0,
-            hashes: vec![h0],
-            head,
-        }
+impl Frontier {
+    pub fn empty(service: [u8; 32], log_ref: [u8; 32]) -> Self {
+        Self { service, log_ref, length: 0, hash: head::start(&service, &log_ref), head: None }
     }
 
-    pub fn anchored(head: Head) -> Self {
-        let hash = head
-            .hash
-            .0
-            .as_slice()
-            .try_into()
-            .expect("a verified head's hash is 32 bytes");
-        Chain {
-            start: head.length,
-            hashes: vec![hash],
-            head,
-        }
+    /// The caller authenticates the anchor's association/admission; a latest RPC is not an anchor.
+    pub fn from_head(service: [u8; 32], log_ref: [u8; 32], head: Head) -> Result<Self> {
+        let mut frontier = Self::empty(service, log_ref);
+        frontier.check(&head, None)?;
+        frontier.length = head.length;
+        frontier.hash = head.hash;
+        frontier.head = Some(head);
+        Ok(frontier)
     }
 
-    pub fn length(&self) -> u64 {
-        self.start + self.hashes.len() as u64 - 1
-    }
+    pub fn service(&self) -> &[u8; 32] { &self.service }
+    pub fn log_ref(&self) -> &[u8; 32] { &self.log_ref }
+    pub fn length(&self) -> u64 { self.length }
+    pub fn hash(&self) -> &[u8; 32] { &self.hash }
+    pub fn head(&self) -> Option<&Head> { self.head.as_ref() }
 
-    pub fn hash_at(&self, position: u64) -> Option<[u8; 32]> {
-        position
-            .checked_sub(self.start)
-            .and_then(|i| self.hashes.get(i as usize))
-            .copied()
-    }
-
-    /// Fails if `head` contradicts this chain: another hash at a length it covers.
-    pub fn check(&self, head: &Head) -> Result<()> {
-        match self.hash_at(head.length) {
-            Some(hash) if hash.as_slice() != head.hash.0 => Err(Contradiction {
-                ours: self.head.clone(),
-                theirs: head.clone(),
+    /// `hash_at` must come from the caller's retained, independently verified path to this frontier.
+    pub fn check(&self, head: &Head, hash_at: Option<[u8; 32]>) -> Result<()> {
+        ensure!(head.log_ref == self.log_ref, WrongLog);
+        let key = VerifyingKey::from_bytes(&self.service).map_err(|_| WrongLog)?;
+        ensure!(head.verify(&key), Forged);
+        let hash = if head.length == self.length { Some(self.hash) } else if head.length < self.length { hash_at } else { None };
+        if hash.is_some_and(|hash| head.hash != hash) {
+            if let Some(ours) = &self.head {
+                return Err(Contradiction { ours: ours.clone(), theirs: head.clone() }.into());
             }
-            .into()),
-            _ => Ok(()),
+            return Err(InvalidProof.into());
         }
-    }
-
-    /// Adds `entries`, which follow position `after` (within the chain) and end at `head`.
-    pub fn extend(&mut self, after: u64, entries: &[Bytes], head: &Head) -> Result<()> {
-        ensure!(head.log == self.head.log, "a head for another log");
-        let contradiction = || Contradiction {
-            ours: self.head.clone(),
-            theirs: head.clone(),
-        };
-        let mut hash = self.hash_at(after).expect("after is within the chain");
-        let mut position = after;
-        let mut fresh = Vec::new();
-        for entry in entries {
-            hash = head::next(&hash, &entry.0);
-            position += 1;
-            match self.hash_at(position) {
-                Some(ours) if ours != hash => return Err(contradiction().into()),
-                Some(_) => {}
-                None => fresh.push(hash),
-            }
-        }
-        if position != head.length || hash.as_slice() != head.hash.0 {
-            return Err(contradiction().into());
-        }
-        self.hashes.extend(fresh);
-        if head.length >= self.head.length {
-            self.head = head.clone();
+        if head.length == 0 {
+            ensure!(head.hash == head::start(&self.service, &self.log_ref), InvalidProof);
         }
         Ok(())
+    }
+
+    pub fn proof(&self, target: Head) -> Result<Proof> {
+        self.check(&target, None)?;
+        ensure!(target.length >= self.length, InvalidProof);
+        Ok(Proof { service: self.service, log_ref: self.log_ref, position: self.length, hash: self.hash, target })
+    }
+
+    pub fn verify_page(&self, page: Page) -> Result<VerifiedPage> {
+        let mut proof = self.proof(page.head.clone())?;
+        ensure!(page.after == self.length && valid_page(&page.entries), InvalidProof);
+        ensure!(page.after.checked_add(page.entries.len() as u64) == Some(page.head.length), InvalidProof);
+        for entry in &page.entries {
+            proof.hash = head::next(&proof.hash, &entry.0);
+            proof.position += 1;
+        }
+        let frontier = proof.finish()?;
+        Ok(VerifiedPage { page, frontier })
     }
 }
 
-/// A client's chains, and the service key its heads must carry.
-pub(crate) struct Chains {
-    key: VerifyingKey,
-    chains: Mutex<HashMap<Vec<u8>, Chain>>,
+pub struct Proof {
+    service: [u8; 32],
+    log_ref: [u8; 32],
+    position: u64,
+    hash: [u8; 32],
+    target: Head,
 }
 
-impl Chains {
-    pub fn new(key: VerifyingKey) -> Self {
-        Chains {
-            key,
-            chains: Mutex::default(),
-        }
-    }
-
-    pub fn get(&self, log: &[u8]) -> Option<Chain> {
-        self.chains.lock().unwrap().get(log).cloned()
-    }
-
-    pub fn set(&self, chain: Chain) {
-        self.chains.lock().unwrap().insert(chain.head.log.0.clone(), chain);
-    }
-
-    fn signed(&self, log: &[u8], head: &Head) -> Result<()> {
-        ensure!(head.log.0 == log, "a head for another log");
-        ensure!(head.verify(&self.key), Forged(head.clone()));
+impl Proof {
+    pub fn push(&mut self, digests: &[[u8; 32]]) -> Result<()> {
+        ensure!(digests.len() <= PAGE_ROWS, InvalidProof);
+        let end = self.position.checked_add(digests.len() as u64).ok_or(InvalidProof)?;
+        ensure!(end <= self.target.length, InvalidProof);
+        for digest in digests { self.hash = head::next_digest(&self.hash, digest); }
+        self.position = end;
         Ok(())
     }
 
-    pub fn head(&self, log: &[u8], head: &Head) -> Result<()> {
-        self.signed(log, head)?;
-        if let Some(chain) = self.chains.lock().unwrap().get(log) {
-            chain.check(head)?;
-        }
-        Ok(())
+    pub fn finish(self) -> Result<Frontier> {
+        ensure!(self.position == self.target.length && self.hash == self.target.hash, InvalidProof);
+        Ok(Frontier { service: self.service, log_ref: self.log_ref, length: self.position, hash: self.hash, head: Some(self.target) })
     }
+}
 
-    /// Checks entries after `after` that end at `head`, and extends the chain with them where it can.
-    pub fn page(&self, log: &[u8], after: u64, entries: &[Bytes], head: &Head) -> Result<()> {
-        self.signed(log, head)?;
-        let mut chains = self.chains.lock().unwrap();
-        if after == 0 {
-            chains.entry(log.to_vec()).or_insert_with(|| Chain::new(log));
-        }
-        match chains.get_mut(log) {
-            Some(chain) if !entries.is_empty() && chain.start <= after && after <= chain.length() => {
-                chain.extend(after, entries, head)?
-            }
-            Some(chain) => chain.check(head)?,
-            None => {}
-        }
-        Ok(())
-    }
+#[derive(Debug)]
+pub struct VerifiedPage {
+    page: Page,
+    frontier: Frontier,
+}
+
+impl VerifiedPage {
+    pub fn page(&self) -> &Page { &self.page }
+    pub fn into_page(self) -> Page { self.page }
+    pub fn frontier(&self) -> &Frontier { &self.frontier }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use lmk_proto::Bytes;
 
-    fn chain_of(log: &[u8], entries: &[&[u8]]) -> Vec<[u8; 32]> {
-        let mut hashes = vec![head::start(log)];
-        for entry in entries {
-            hashes.push(head::next(hashes.last().unwrap(), entry));
-        }
-        hashes
-    }
-
-    fn bytes(entries: &[&[u8]]) -> Vec<Bytes> {
-        entries.iter().map(|e| Bytes(e.to_vec())).collect()
+    fn page(key: &SigningKey, d: &[u8; 32], entries: &[&[u8]]) -> Page {
+        let hash = entries.iter().fold(head::start(key.verifying_key().as_bytes(), d), |h, e| head::next(&h, e));
+        Page { after: 0, entries: entries.iter().map(|e| Bytes(e.to_vec())).collect(), head: Head::sign(key, d, entries.len() as u64, hash, 42) }
     }
 
     #[test]
-    fn verifies_and_extends() {
-        let key = SigningKey::from_bytes(&[1; 32]);
-        let chains = Chains::new(key.verifying_key());
-        let hashes = chain_of(b"log", &[b"a", b"b", b"c"]);
-        let head2 = Head::sign(&key, b"log", 2, hashes[2], 1);
-        chains.page(b"log", 0, &bytes(&[b"a", b"b"]), &head2).unwrap();
-        let head3 = Head::sign(&key, b"log", 3, hashes[3], 2);
-        chains.page(b"log", 1, &bytes(&[b"b", b"c"]), &head3).unwrap();
-        assert_eq!(chains.get(b"log").unwrap().length(), 3);
-        chains.head(b"log", &head2).unwrap();
-
-        let forged = Head::sign(&SigningKey::from_bytes(&[2; 32]), b"log", 3, hashes[3], 2);
-        assert!(chains.head(b"log", &forged).unwrap_err().is::<Forged>());
-
-        let other = chain_of(b"log", &[b"a", b"x"]);
-        let split = Head::sign(&key, b"log", 2, other[2], 3);
-        let err = chains
-            .head(b"log", &split)
-            .unwrap_err()
-            .downcast::<Contradiction>()
-            .unwrap();
-        assert_eq!((err.ours, err.theirs), (head3.clone(), split.clone()));
-        assert!(
-            chains
-                .page(b"log", 1, &bytes(&[b"x"]), &split)
-                .unwrap_err()
-                .is::<Contradiction>()
-        );
-
-        let lying = Head::sign(&key, b"log", 4, hashes[3], 4);
-        assert!(
-            chains
-                .page(b"log", 3, &bytes(&[b"d"]), &lying)
-                .unwrap_err()
-                .is::<Contradiction>()
-        );
-        assert_eq!(chains.get(b"log").unwrap().head, head3);
+    fn empty_signatures_and_expected_destination() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let s = key.verifying_key().to_bytes();
+        let d = head::reference(&s, &[8; 32]);
+        let empty = Frontier::empty(s, d);
+        assert!(empty.head().is_none());
+        let signed = empty.verify_page(page(&key, &d, &[])).unwrap();
+        assert_eq!(signed.frontier().hash(), empty.hash());
+        assert!(signed.frontier().head().unwrap().verify(&key.verifying_key()));
+        assert!(empty.verify_page(page(&key, &[2; 32], &[])).unwrap_err().is::<WrongLog>());
+        assert!(empty.verify_page(page(&SigningKey::from_bytes(&[9; 32]), &d, &[])).unwrap_err().is::<Forged>());
+        let unsigned = Head { sig: Bytes::default(), ..page(&key, &d, &[]).head };
+        assert!(Frontier::from_head(s, d, unsigned).unwrap_err().is::<Forged>());
+        let impossible = Head::sign(&key, &d, 0, [0; 32], 0);
+        assert!(Frontier::from_head(s, d, impossible).unwrap_err().is::<InvalidProof>());
     }
 
     #[test]
-    fn an_extension_cannot_rename_its_chain() {
-        let key = SigningKey::from_bytes(&[1; 32]);
-        let mut chain = Chain::new(b"destination");
-        let before = chain.clone();
-        let hash = head::next(&head::start(b"destination"), b"entry");
-        let wrong = Head::sign(&key, b"other", 1, hash, 1);
-        assert!(wrong.verify(&key.verifying_key()));
-        assert!(chain.extend(0, &bytes(&[b"entry"]), &wrong).is_err());
-        assert_eq!(chain, before);
-        let right = Head::sign(&key, b"destination", 1, hash, 1);
-        chain.extend(0, &bytes(&[b"entry"]), &right).unwrap();
-        assert_eq!(chain.head, right);
+    fn only_independently_authenticated_conflicts_are_evidence() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let s = key.verifying_key().to_bytes();
+        let d = head::reference(&s, &[8; 32]);
+        let empty = Frontier::empty(s, d);
+        let short = page(&key, &d, &[b"a"]).head;
+        let long = page(&key, &d, &[b"a", b"b"]);
+        let mut tampered = long.clone();
+        tampered.entries[0] = Bytes(b"tampered".to_vec());
+        assert!(empty.verify_page(tampered).unwrap_err().is::<InvalidProof>());
+        assert!(empty.head().is_none());
+        let verified = empty.verify_page(long.clone()).unwrap();
+        verified.frontier().check(&short, Some(short.hash)).unwrap();
+        let resigned = Head::sign(&key, &d, 2, long.head.hash, 100);
+        verified.frontier().check(&resigned, None).unwrap();
+        let fork = page(&key, &d, &[b"x"]).head;
+        verified.frontier().check(&fork, None).unwrap();
+        let err = verified.frontier().check(&fork, Some(short.hash)).unwrap_err().downcast::<Contradiction>().unwrap();
+        assert_eq!((err.ours, err.theirs), (long.head.clone(), fork));
+        let equal_fork = page(&key, &d, &[b"x", b"y"]).head;
+        assert!(verified.frontier().check(&equal_fork, None).unwrap_err().is::<Contradiction>());
+        let shorter = Frontier::from_head(s, d, short).unwrap();
+        let bad_extension = Page { after: 1, entries: vec![Bytes(b"garbage".to_vec())], head: long.head };
+        assert!(shorter.verify_page(bad_extension).unwrap_err().is::<InvalidProof>());
     }
 
     #[test]
-    fn anchored() {
-        let key = SigningKey::from_bytes(&[1; 32]);
-        let chains = Chains::new(key.verifying_key());
-        let hashes = chain_of(b"log", &[b"a", b"b", b"c", b"d"]);
-        let head2 = Head::sign(&key, b"log", 2, hashes[2], 1);
-        chains.page(b"log", 1, &bytes(&[b"b"]), &head2).unwrap();
-        assert!(chains.get(b"log").is_none());
-        chains.set(Chain::anchored(head2));
-        chains
-            .page(b"log", 2, &bytes(&[b"c"]), &Head::sign(&key, b"log", 3, hashes[3], 2))
-            .unwrap();
-        chains.head(b"log", &Head::sign(&key, b"log", 1, hashes[1], 3)).unwrap();
-        let wrong = Head::sign(&key, b"log", 4, hashes[3], 4);
-        assert!(
-            chains
-                .page(b"log", 3, &bytes(&[b"d"]), &wrong)
-                .unwrap_err()
-                .is::<Contradiction>()
-        );
-        assert_eq!(
-            (chains.get(b"log").unwrap().start, chains.get(b"log").unwrap().length()),
-            (2, 3)
-        );
+    fn rolling_proof_has_no_eight_mib_total_ceiling() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let s = key.verifying_key().to_bytes();
+        let d = head::reference(&s, &[8; 32]);
+        let empty = Frontier::empty(s, d);
+        let digest = [4; 32];
+        let n = (8 << 20) / 32 + 1;
+        let hash = (0..n).fold(*empty.hash(), |h, _| head::next_digest(&h, &digest));
+        let target = Head::sign(&key, &d, n, hash, 0);
+        let mut proof = empty.proof(target.clone()).unwrap();
+        let chunk = [digest; PAGE_ROWS];
+        for _ in 0..n / PAGE_ROWS as u64 { proof.push(&chunk).unwrap(); }
+        proof.push(&[digest]).unwrap();
+        assert_eq!(proof.finish().unwrap().head(), Some(&target));
+        let mut bad = empty.proof(Head::sign(&key, &d, 1, hash, 0)).unwrap();
+        bad.push(&[digest]).unwrap();
+        assert!(bad.finish().unwrap_err().is::<InvalidProof>());
     }
 }

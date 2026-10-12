@@ -90,9 +90,10 @@ impl<P: Provider + Send + 'static> Node<P> {
             let st = &mut *st;
             st.speak(identity);
             let mls = Group::create(&st.provider, &st.session, &settings)?;
-            st.add_group(mls, Rec::default())?
+            let gid = st.add_group(mls, Rec::default())?;
+            self.inner.follow(&st.group(&gid)?.rec.log.0);
+            gid
         };
-        self.inner.follow(&gid);
         Ok(Bytes(gid))
     }
 
@@ -110,11 +111,11 @@ impl<P: Provider + Send + 'static> Node<P> {
             settings.public = Some(Bytes(id.to_vec()));
             let mls = Group::create(&st.provider, &session, &settings)?;
             let gid = st.add_group(mls, Rec::default())?;
+            self.inner.follow(&st.group(&gid)?.rec.log.0);
             put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
             st.device_keys.insert(gid.clone(), (seed, session));
             (gid, IdentityRef { id: Bytes(id.to_vec()), membership: settings.membership }, first)
         };
-        self.inner.follow(&gid);
         self.inner.durable().await?;
         let address = lmk_proto::public::address(&identity.id.0);
         if let Err(error) = self.inner.clients.client(&identity.membership)?.append(&address, &[first], true).await {
@@ -425,9 +426,14 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(lmk_core::device::sign(seed, bytes))
     }
 
-    /// Reads a group's log from its service through its end, applying what it holds.
+    /// The reference of a group's current log, its epoch's, at its membership service.
+    pub fn log(&self, gid: &[u8]) -> Result<Bytes> {
+        Ok(self.inner.lock().group(gid)?.rec.log.clone())
+    }
+
+    /// Reads a group's logs from their service through the current one's end, applying what they hold.
     pub async fn read_group(&self, gid: &[u8]) -> Result<()> {
-        self.inner.read(gid).await
+        self.inner.read_group(gid).await
     }
 
     /// Asks a member online, by its iroh key, for the state of the group's kind.

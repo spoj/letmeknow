@@ -30,9 +30,11 @@ pub async fn serve(serve: cli::Serve) -> Result<()> {
     if let (Some(chain), Some(key)) = (serve.cert, serve.key) {
         config.certificate = lmk_serve::Certificate::Files { chain, key };
     }
-    if let Service::Serve { key, relay, .. } = config.service()? {
+    let service = if serve.initialize { config.initialize()? } else { config.service()? };
+    if let Service::Serve { key, relay, .. } = service {
         println!("membership: {}@{relay}", hex::encode(&key.0));
     }
+    if serve.initialize { return Ok(()); }
     lmk_serve::serve(config).await
 }
 

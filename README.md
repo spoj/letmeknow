@@ -52,10 +52,11 @@ These guarantees depend on the storage stack honoring synchronization; process-r
 `letmeknow serve` runs a membership service and an iroh relay, with a certificate from Let's Encrypt. It does not serve application files:
 
 ```bash
+letmeknow serve --initialize --domain relay.example.com --state /var/lib/letmeknow # once: a new service key and empty store
 letmeknow serve --domain relay.example.com --state /var/lib/letmeknow
 ```
 
-It prints its public membership address, `<key>@https://relay.example.com`. Sessions use it with `listen --membership <address> --relay https://relay.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). Build and publish the browser client separately on a trusted static HTTPS host, with that public key in its build configuration. Explicit browser backend choices remain supported; there is no automatic discovery or failure fallback. See [deploy/README.md](deploy/README.md) for build configuration, localStorage choices, Pages rollout and backend artifact installation. Deployment does not provision replicas or automatically restore service state.
+Each prints its public membership address, `<key>@https://relay.example.com`. Sessions use it with `listen --membership <address> --relay https://relay.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). Build and publish the browser client separately on a trusted static HTTPS host, with that public key in its build configuration. Explicit browser backend choices remain supported; there is no automatic discovery or failure fallback. See [deploy/README.md](deploy/README.md) for build configuration, localStorage choices, Pages rollout and backend artifact installation. Deployment does not provision replicas or automatically restore service state.
 
 ## Working on letmeknow
 

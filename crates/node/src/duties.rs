@@ -85,7 +85,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let (commit, next) = {
             let mut st = self.lock();
             let Some(g) = st.groups.get(gid) else { return Ok(()) };
-            if !g.mls.active() || g.rec.position < st.log(gid)?.logged || g.waiting {
+            if !g.mls.active() || !st.at_head(gid) || g.waiting {
                 return Ok(());
             }
             if g.rec.leaving && g.mls.members().len() == 1 {

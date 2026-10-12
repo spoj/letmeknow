@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ed25519_dalek::VerifyingKey;
 use iroh::EndpointId;
 use lmk_core::provider::Provider;
 use lmk_membership::Contradiction;
@@ -14,7 +13,6 @@ use lmk_net::Groups;
 use lmk_net::peers::{self, Own};
 use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
-use lmk_proto::group::Service;
 use lmk_proto::head::Head;
 use lmk_proto::peer::{Frame, Summary};
 use lmk_proto::ranges::Ranges;
@@ -22,7 +20,7 @@ use n0_future::StreamExt;
 use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep};
 
-use crate::logs::empty;
+use crate::logs::Of;
 use crate::reading::ciphertext_key;
 use crate::{Event, Inner, Member, Node, Out, State, days, endpoint_id, get, now, put};
 
@@ -88,19 +86,25 @@ impl<P: Provider> State<P> {
 
     /// Whether this session has applied the group's log to its head as last read.
     pub(crate) fn at_head(&self, gid: &[u8]) -> bool {
-        self.groups.get(gid).zip(self.logs.get(gid)).is_some_and(|(g, log)| g.rec.position >= log.logged)
+        self.groups.get(gid).is_some_and(|g| self.held_to(gid).is_ok_and(|held| g.rec.position >= held))
     }
 
     /// This session's state of a group, as its summary shows it.
     fn own(&self, gid: &[u8]) -> Own {
         let g = &self.groups[gid];
         let kept = Ranges::range(g.rec.expired + 1, g.rec.position);
+        let mut logs = self.group_logs(gid);
+        let log = logs.pop().unwrap();
+        let heads = |logs: &[Vec<u8>]| logs.iter().filter_map(|log| self.logs.get(log)?.head.clone()).collect();
         Own {
-            head: self.logs.get(gid).map_or_else(|| empty(gid), |log| log.head(gid)),
+            log: log.as_slice().try_into().unwrap(),
+            head: self.logs[&log].head.clone(),
+            position: g.rec.base + self.logs[&log].length(),
             held: kept.difference(&g.rec.lacking).difference(&g.rec.lost),
             read: g.rec.read.union(&kept.difference(&g.rec.messages)),
             lacking: g.rec.lacking.clone(),
-            public: g.public.iter().filter_map(|log| Some(self.logs.get(log)?.head(log))).collect(),
+            public: heads(&g.public),
+            earlier: heads(&logs),
         }
     }
 
@@ -132,8 +136,7 @@ impl<P: Provider> State<P> {
         let now = self.tick();
         let gids: Vec<Vec<u8>> = self.groups.keys().cloned().collect();
         for gid in &gids {
-            let mut public: Vec<Vec<u8>> = self.identities(gid).iter().map(|identity| lmk_proto::public::address(&identity.id.0).to_vec()).collect();
-            public.retain(|log| self.logs.contains_key(log));
+            let mut public: Vec<Vec<u8>> = self.identities(gid).iter().filter_map(|identity| self.public_log(&identity.id.0)).collect();
             public.sort();
             public.dedup();
             self.groups.get_mut(gid).unwrap().public = public;
@@ -172,7 +175,10 @@ impl<P: Provider> State<P> {
             Frame::Hello { .. } => None,
             // Every `want` is answered, with nothing if the gate refuses it.
             Frame::Messages { items, .. } if items.is_empty() => None,
-            Frame::Entries { log, .. } => Some(log).filter(|log| self.groups.contains_key(&log.0)),
+            Frame::Entries { log, .. } => match self.logs.get(&log.0).map(|log| &log.of) {
+                Some(Of::Group(group)) => Some(group),
+                _ => None,
+            },
             Frame::Messages { group, .. }
             | Frame::Want { group, .. }
             | Frame::WantFiles { group, .. }
@@ -245,9 +251,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
             match out {
                 peers::Out::Frame(key, frame) => st.out.push(Out::Frame { peer: endpoint(key), frame }),
                 peers::Out::Entries { peer, log, after } => {
-                    let entries = st.entries(&log.0, after);
-                    if !entries.is_empty() {
-                        let head = st.log(&log.0)?.head(&log.0);
+                    if let Some(head) = st.log(&log.0)?.head.clone().filter(|head| head.length > after) {
+                        let entries = st.entries(&log.0, after);
                         st.out.push(Out::Frame { peer: endpoint(peer), frame: Frame::Entries { log, entries, head } });
                     }
                 }
@@ -295,18 +300,22 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let (key, now) = (*peer.as_bytes(), st.tick());
         if let Frame::Hello { groups, heads } = frame {
             let heads: Vec<Head> = heads.into_iter().filter(|head| self.vouched(st, head, &peer)).collect();
-            let ours = |s: &Summary| s.head.log == s.group && st.groups.contains_key(&s.group.0);
-            let groups: Vec<Summary> = groups.into_iter().filter(|s| ours(s) && self.vouched(st, &s.head, &peer)).collect();
+            // A summary of a log this session does not hold, of an epoch it has not reached or has dropped, is taken unchecked.
+            let shown = |s: &Summary| {
+                s.head.as_ref().is_none_or(|head| head.log_ref == s.log && (!st.logs.contains_key(s.log.as_slice()) || self.vouched(st, head, &peer)))
+            };
+            let groups: Vec<Summary> = groups.into_iter().filter(|s| st.groups.contains_key(&s.group.0) && shown(s)).collect();
             for heard in st.peers.frame(&key, &Frame::Hello { groups: groups.clone(), heads }, now) {
                 let group = heard.summary.group.clone();
                 st.hear(heard)?;
                 st.events.push(Event::Heard { group });
                 self.heard.notify_waiters();
             }
+            let shows = |head: &Option<Head>| head.as_ref().map(|head| (head.length, head.hash));
             for summary in groups {
                 let gid = summary.group.0;
-                let head = st.log(&gid)?.head(&gid);
-                if st.admitted(&gid, &peer) && (summary.head.length, &summary.head.hash) == (head.length, &head.hash) {
+                let log = &st.group(&gid)?.rec.log.0;
+                if summary.log.as_slice() == log && shows(&summary.head) == shows(&st.log(log)?.head) && st.admitted(&gid, &peer) {
                     self.synced(st, &gid, peer)?;
                 }
             }
@@ -315,8 +324,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         st.peers.frame(&key, &frame, now);
         match frame {
             Frame::Entries { log, entries, head } => {
-                if log == head.log && self.vouched(st, &head, &peer) {
-                    self.take_entries(st, &log.0, entries, head)?;
+                if log.0 == head.log_ref && self.vouched(st, &head, &peer) {
+                    self.take_entries(st, &log.0, head.length.saturating_sub(entries.len() as u64), entries, head)?;
                 }
             }
             Frame::Want { group, positions } if st.groups.contains_key(&group.0) => {
@@ -351,28 +360,21 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Whether a head a peer showed of a log this session follows is signed by its service and agrees with this
-    /// session's chain; a contradiction is reported.
+    /// session's copy; a contradiction is reported.
     fn vouched(&self, st: &State<P>, head: &Head, peer: &EndpointId) -> bool {
-        let Some(log) = st.logs.get(&head.log.0) else { return false };
-        let signed = match &log.service {
-            _ if head.length == 0 => head.hash == empty(&head.log.0).hash,
-            Service::Serve { key, .. } => {
-                let key: Option<[u8; 32]> = key.0.clone().try_into().ok();
-                key.and_then(|key| VerifyingKey::from_bytes(&key).ok()).is_some_and(|key| head.verify(&key))
+        let id = head.log_ref.as_slice();
+        let Some(log) = st.logs.get(id) else { return false };
+        let checked = log.frontier(id).and_then(|frontier| frontier.check(head, st.hash_at(id, head.length)?));
+        match checked {
+            Ok(()) => true,
+            Err(error) => {
+                match error.downcast_ref::<Contradiction>() {
+                    Some(contradiction) => self.contradicted(st, id, contradiction, &peer.fmt_short().to_string()),
+                    None => tracing::warn!("{} showed a head its service did not sign: {error:#}", peer.fmt_short()),
+                }
+                false
             }
-            Service::Newer(_) => false,
-        };
-        if !signed {
-            tracing::warn!("{} showed a head its service did not sign", peer.fmt_short());
-            return false;
         }
-        let ours = log.chain.as_ref().and_then(|chain| chain.hash_at(head.length));
-        if ours.is_some_and(|ours| ours[..] != head.hash.0[..]) {
-            let contradiction = Contradiction { ours: log.head(&head.log.0), theirs: head.clone() };
-            self.contradicted(st, &head.log.0, &contradiction, &peer.fmt_short().to_string());
-            return false;
-        }
-        true
     }
 
     /// A connected member's `hello` shows this session's head of the group's log.

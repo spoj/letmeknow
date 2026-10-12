@@ -20,8 +20,7 @@ ssh "$host" 'set -eu
     exit 1
   fi
   id letmeknow >/dev/null
-  test -s /var/lib/letmeknow/membership.key
-  test -d /var/lib/letmeknow
+  test -s /var/lib/letmeknow/membership.ready
 '
 scp -q "$tmp/letmeknow" "$host:/usr/local/bin/letmeknow.new"
 sed "s|@DOMAIN@|$domain|" "$tmp/letmeknow.service" > "$tmp/service"

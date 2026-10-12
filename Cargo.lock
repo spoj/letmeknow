@@ -2927,7 +2927,6 @@ dependencies = [
  "n0-future",
  "rcgen",
  "rusqlite",
- "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -3004,7 +3003,6 @@ name = "lmk-serve"
 version = "0.15.1"
 dependencies = [
  "anyhow",
- "ed25519-dalek 3.0.0",
  "hex",
  "http",
  "http-body-util",
@@ -3035,6 +3033,7 @@ dependencies = [
  "lmk-proto",
  "rcgen",
  "rustls",
+ "tempfile",
 ]
 
 [[package]]

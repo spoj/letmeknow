@@ -566,7 +566,7 @@ async fn signing_service(relay: &Relay, dir: &Path) -> (Service, iroh::protocol:
 /// A signing membership service, its store in `dir`, served through `serve`.
 async fn served<H: iroh::protocol::ProtocolHandler>(relay: &Relay, dir: &Path, serve: impl FnOnce(Membership) -> H) -> (Service, iroh::protocol::Router) {
     std::fs::create_dir_all(dir).unwrap();
-    relay.serve(&dir.join("membership.db"), serve).await
+    relay.serve(&dir.join("membership"), serve).await
 }
 
 /// A membership service's gate: closing it ends the service's connections, and those opened while it is closed wait
@@ -757,8 +757,9 @@ async fn a_contradiction_is_reported_once() {
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     let rename = |name: &'static str| move |s: Settings| Settings { name: name.into(), ..s };
     alice.node.change_settings(&gid.0, rename("Release")).await.unwrap();
-    let db = rusqlite::Connection::open(dir.join("membership.db")).unwrap();
-    db.execute("UPDATE logs SET hash = zeroblob(32) WHERE id = ?", [&gid.0]).unwrap();
+    alice.node.send_counted(&gid.0, &message("in the epoch's log")).await.unwrap();
+    let db = rusqlite::Connection::open(dir.join("membership/membership.db")).unwrap();
+    assert_eq!(db.execute("UPDATE anchors SET hash = zeroblob(32) WHERE reference = ?", [&alice.node.log(&gid.0).unwrap().0]).unwrap(), 1);
     for name in ["Again", "And again"] {
         assert!(alice.node.change_settings(&gid.0, rename(name)).await.is_err());
     }
@@ -1168,9 +1169,11 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
     let provider = SqliteProvider::open(&bob_db).unwrap();
     let mls = Mls::load(&provider).unwrap();
     let old = lmk_proto::group::Leaf { revision: 0, ..mls.leaf.clone() };
-    let commit = Group::load(&provider, &gid.0).unwrap().commit(&provider, &mls, Change { leaf: Some(old), ..Change::default() }).unwrap();
+    let mut group = Group::load(&provider, &gid.0).unwrap();
+    let capability = group.capability(&provider).unwrap();
+    let commit = group.commit(&provider, &mls, Change { leaf: Some(old), ..Change::default() }).unwrap();
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    lmk_membership::client::ServeClient::for_service(endpoint, &relay.service).unwrap().append(&gid.0, &[commit.entry], false).await.unwrap();
+    lmk_membership::client::ServeClient::for_service(endpoint, &relay.service).unwrap().append(&capability, &[commit.entry], false).await.unwrap();
     drop(provider);
     revision(0).await.expect("Alice sees Bob's leaf of revision 0");
 
@@ -1349,6 +1352,41 @@ async fn a_pending_leave_is_finished_once_the_log_is_reachable() {
     held_leave("leave-reachable", false).await;
 }
 
+/// Each commit moves a group to its new epoch's log, at a reference only the epoch's members can derive: a joiner reads
+/// from the log its Add moved the group to, a removed member is left behind on the last one it could name, and positions
+/// go on across the moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_commit_moves_the_group_to_its_new_epochs_log() {
+    let relay = relay().await;
+    let mut alice = session(&relay, "Alice").await;
+    let mut bob = session(&relay, "Bob").await;
+    let mut carol = session(&relay, "Carol").await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    let mut logs = vec![alice.node.log(&gid.0).unwrap()];
+    let before = alice.node.send_counted(&gid.0, &message("before anyone")).await.unwrap();
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        let log = joiner.node.log(&gid.0).unwrap();
+        assert!(!logs.contains(&log), "the Add moved the group to a new log");
+        assert_eq!(alice.node.log(&gid.0).unwrap(), log, "the joiner reads from the log its Add moved the group to");
+        logs.push(log);
+    }
+    alice.node.remove(&gid.0, &carol.node.key_in(&gid.0).0).await.unwrap();
+    carol.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
+    assert!(!logs.contains(&alice.node.log(&gid.0).unwrap()), "the Remove moved the group to a log Carol cannot name");
+    let after = alice.node.send_counted(&gid.0, &message("after Carol")).await.unwrap();
+    assert!(after >= before + 4, "two Adds and a Remove came between: {before}, then {after}");
+    let got = bob.until(|e| match e {
+        Event::Message(m) if m.payload == message("after Carol") => Some(m.position),
+        _ => None,
+    }).await;
+    assert_eq!(got, after);
+    for session in [&alice, &bob, &carol] {
+        session.node.shutdown().await.unwrap();
+    }
+}
+
 /// A pending send sealed again after a commit is reported sent by the id its members know it by.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pending_send_sealed_again_is_reported_by_its_final_id() {
@@ -1438,7 +1476,8 @@ async fn a_change_made_moot_commits_nothing() {
     assert!(format!("{again:#}").contains("not a member"), "removing a non-member fails at once: {again:#}");
 }
 
-/// Expired service history is unavailable, not a removal: both kinds keep their state and can catch up from a peer.
+/// Expired service history is unavailable, not a removal: both kinds keep their state and can catch up from a peer,
+/// across the two logs the group moved through meanwhile.
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_service_history_preserves_chat_and_identity_groups() {
     let relay = relay().await;
@@ -1481,25 +1520,27 @@ async fn expired_service_history_preserves_chat_and_identity_groups() {
         drop((bob, bob_devices));
         let bob_db = dir.join("Bob.db");
         let before = holdings(&bob_db, &gid, &[held.position.unwrap()]);
-        let log_key = [b"node/log/".as_slice(), &gid.0].concat();
+        let (log_ref, length) = (before.1.log, before.1.head.as_ref().map_or(0, |head| head.length));
+        let log_key = [b"node/log/".as_slice(), &log_ref].concat();
         let provider = SqliteProvider::open(&bob_db).unwrap();
         let log = provider.get(&log_key).unwrap().unwrap();
-        let record: Value = serde_json::from_slice(&log).unwrap();
-        let entries: Vec<_> = (record["start"].as_u64().unwrap() + 1..=record["logged"].as_u64().unwrap()).map(|position| {
-            let key = [b"node/entry/".as_slice(), &gid.0, b"/", &position.to_be_bytes()].concat();
+        let entries: Vec<_> = (1..=length).map(|position| {
+            let key = [b"node/entry/".as_slice(), &log_ref, b"/", &position.to_be_bytes()].concat();
             let entry = provider.get(&key).unwrap().unwrap();
             (key, entry)
         }).collect();
         assert!(!entries.is_empty());
         drop(provider);
 
-        alice.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
+        for name in ["Sooner", "Later"] {
+            alice.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
+        }
         let missed = alice.node.send(&gid.0, &message("recover from the peer")).await.unwrap();
         alice.node.shutdown().await.unwrap();
         drop((alice, alice_devices));
-        let store = Store::open(&dir.join("membership.db"), ed25519_dalek::SigningKey::from_bytes(&[0; 32])).unwrap();
-        assert!(store.expire(lmk_node::now() + 1).unwrap() > 0);
-        assert!(store.read(&gid.0, before.1.length, 1 << 20).unwrap().is_none());
+        let store = Store::open(&dir.join("membership")).unwrap();
+        assert!(store.expire(lmk_node::now() / lmk_membership::store::DAY_MS + 1).unwrap() > 0);
+        assert!(store.read(&log_ref, length).unwrap_err().is::<lmk_membership::Refused>());
 
         let (mut bob, bob_devices) = start("Bob").await;
         let error = bob.node.read_group(&gid.0).await.unwrap_err();
@@ -1527,7 +1568,7 @@ async fn expired_service_history_preserves_chat_and_identity_groups() {
         let after = holdings(&bob_db, &gid, &[held.position.unwrap()]);
         assert_eq!(after.0.public(), before.0.public());
         assert_eq!(after.1, before.1);
-        assert_eq!(after.2, before.2);
+        assert_eq!(after.3, before.3);
         let provider = SqliteProvider::open(&bob_db).unwrap();
         assert_eq!(provider.get(&log_key).unwrap().unwrap(), log);
         for (key, entry) in entries {
@@ -1681,14 +1722,24 @@ async fn a_leaver_asks_again_while_it_updates_every_t() {
     alice.node.shutdown().await.unwrap();
 }
 
-/// What a stopped session at `db` held: its iroh key, its head of the group's log, and its ciphertexts at `positions`.
-fn holdings(db: &Path, gid: &Bytes, positions: &[u64]) -> (iroh::SecretKey, Head, Vec<Bytes>) {
+/// A stopped session's iroh key; its summary of a group, holding nothing, and the position its log ends at; and its
+/// ciphertexts at `positions`.
+fn holdings(db: &Path, gid: &Bytes, positions: &[u64]) -> (iroh::SecretKey, Summary, u64, Vec<Bytes>) {
     let provider = SqliteProvider::open(db).unwrap();
     let key = lmk_node::iroh_key(&provider).unwrap();
-    let log: Value = serde_json::from_slice(&provider.get(&[b"node/log/".as_slice(), &gid.0].concat()).unwrap().unwrap()).unwrap();
-    let head = serde_json::from_value(log["chain"]["head"].clone()).unwrap();
+    let rec: Value = serde_json::from_slice(&provider.get(&[b"node/group/".as_slice(), &gid.0].concat()).unwrap().unwrap()).unwrap();
+    let log: Bytes = serde_json::from_value(rec["log"].clone()).unwrap();
+    let head = held_head(&provider, &log);
+    let position = rec["base"].as_u64().unwrap() + head.as_ref().map_or(0, |head| head.length);
+    let summary = Summary { group: gid.clone(), log: log.0.try_into().unwrap(), head, held: Ranges::default(), read: Ranges::default(), fetching: Ranges::default() };
     let ciphertext = |p: &u64| Bytes(provider.get(&[b"node/ciphertext/".as_slice(), &gid.0, b"/", &p.to_be_bytes()].concat()).unwrap().unwrap());
-    (key, head, positions.iter().map(ciphertext).collect())
+    (key, summary, position, positions.iter().map(ciphertext).collect())
+}
+
+/// The newest head of a log a session holds.
+fn held_head(provider: &SqliteProvider, log: &Bytes) -> Option<Head> {
+    let record: Value = serde_json::from_slice(&provider.get(&[b"node/log/".as_slice(), &log.0].concat()).unwrap().unwrap()).unwrap();
+    serde_json::from_value(record["head"].clone()).unwrap()
 }
 
 /// A peer speaking the peer protocol by hand, on a connection it opens to a node.
@@ -1748,9 +1799,9 @@ impl Hand {
     }
 }
 
-/// A `hello` showing a group's log at `head`, with `held` held.
-fn summary(gid: &Bytes, head: &Head, held: Ranges) -> Frame {
-    let summary = Summary { group: gid.clone(), head: head.clone(), held: held.clone(), read: held, fetching: Ranges::default() };
+/// A `hello` showing a group as `shown` does, with `held` held.
+fn summary(shown: &Summary, held: Ranges) -> Frame {
+    let summary = Summary { held: held.clone(), read: held, ..shown.clone() };
     Frame::Hello { groups: vec![summary], heads: vec![] }
 }
 
@@ -1830,15 +1881,15 @@ async fn a_gap_holds_up_its_epoch_while_fetched_then_is_passed_and_opens_late_or
     sam.node.shutdown().await.unwrap();
     drop(sam);
     let p: Vec<u64> = sent.iter().map(|s| s.position.unwrap()).collect();
-    let (key, head, ciphertexts) = holdings(&sam_db, &gid, &p);
+    let (key, shown, position, ciphertexts) = holdings(&sam_db, &gid, &p);
 
     // Bob comes back. Sam, by hand, holds the first two: Bob asks for them, and gets the second only.
     let mut bob = stored(&relay, "Bob", &bob_db).await;
     // Bob knows the log's head before Sam's summary, so he asks for both at once.
     bob.node.read_group(&gid.0).await.unwrap();
     let mut sam = hand(&relay, key, &bob.node).await;
-    let held = Ranges::range(1, head.length).difference(&one(p[2]));
-    sam.send(&summary(&gid, &head, held.clone())).await;
+    let held = Ranges::range(1, position).difference(&one(p[2]));
+    sam.send(&summary(&shown, held.clone())).await;
     assert_eq!(sam.wanted().await, Ranges::range(p[0], p[1]));
     sam.send(&answer(&gid, p[1], Some((p[1], &ciphertexts[1])))).await;
     // The first is being fetched still: the second waits for it.
@@ -1853,7 +1904,7 @@ async fn a_gap_holds_up_its_epoch_while_fetched_then_is_passed_and_opens_late_or
     }).await;
     assert_eq!(got.id, sent[1].id);
     // Sam's next summary shows it again: it opens late.
-    sam.send(&summary(&gid, &head, held)).await;
+    sam.send(&summary(&shown, held)).await;
     assert_eq!(sam.wanted().await, one(p[0]));
     sam.send(&answer(&gid, p[0], Some((p[0], &ciphertexts[0])))).await;
     let got = bob.until(|e| match e {
@@ -1896,12 +1947,12 @@ async fn a_member_waits_while_the_member_between_it_and_the_holder_fetches() {
     sam.node.shutdown().await.unwrap();
     drop(sam);
     let p = sent.position.unwrap();
-    let (key, head, ciphertexts) = holdings(&dbs[0], &gid, &[p]);
+    let (key, shown, position, ciphertexts) = holdings(&dbs[0], &gid, &[p]);
 
     // Q comes back, reads to the second rename, which deletes p's keys, and fetches p from S.
     let quinn = stored(&relay, "Quinn", &dbs[1]).await;
     let mut sam = hand(&relay, key, &quinn.node).await;
-    sam.send(&summary(&gid, &head, Ranges::range(1, head.length))).await;
+    sam.send(&summary(&shown, Ranges::range(1, position))).await;
     assert_eq!(sam.wanted().await, one(p));
     let file = lmk_proto::links::FileLink { hash: [7; 32], size: 1, key: [0; 32] };
     sam.send(&Frame::State { group: gid.clone(), link: Some(file.link()) }).await;
@@ -1916,7 +1967,7 @@ async fn a_member_waits_while_the_member_between_it_and_the_holder_fetches() {
     eventually("R reached the second rename", || rita.node.epoch(&gid.0).unwrap() == epoch + 1).await;
     while online.elapsed() < Duration::from_secs(4) {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        sam.send(&summary(&gid, &head, Ranges::range(1, head.length))).await;
+        sam.send(&summary(&shown, Ranges::range(1, position))).await;
     }
     assert_eq!(rita.node.epoch(&gid.0).unwrap(), epoch + 1, "R waits past the 3 seconds after it came online");
     sam.send(&answer(&gid, p, Some((p, &ciphertexts[0])))).await;
@@ -1984,8 +2035,9 @@ async fn a_peer_not_admitted_changes_nothing() {
     };
     let items = vec![Item { position: p, ciphertext: forged(1) }, Item { position: p + 1, ciphertext: forged(2) }];
     mallory.send(&Frame::Messages { group: gid.clone(), items, answers: None }).await;
-    let head = Head { log: gid.clone(), length: p + 1, hash: Bytes(vec![9; 32]), time: lmk_node::now(), sig: Bytes(vec![0; 64]) };
-    mallory.send(&Frame::Entries { log: gid.clone(), entries: vec![Bytes(b"junk".to_vec())], head }).await;
+    let log = alice.node.log(&gid.0).unwrap();
+    let head = Head { log_ref: log.0.as_slice().try_into().unwrap(), length: p + 1, hash: [9; 32], time: lmk_node::now(), sig: Bytes(vec![0; 64]) };
+    mallory.send(&Frame::Entries { log, entries: vec![Bytes(b"junk".to_vec())], head }).await;
     let file = lmk_proto::links::FileLink { hash: [7; 32], size: 1, key: [0; 32] };
     mallory.send(&Frame::State { group: gid.clone(), link: Some(file.link()) }).await;
     mallory.send(&Frame::Live { group: gid.clone(), items: vec![forged(3)] }).await;
@@ -2020,37 +2072,41 @@ async fn peer_entries_are_bound_to_the_destination_log_and_service() {
     gate_a.set(false);
     gate_b.set(false);
 
-    let log_a = Bytes(lmk_proto::public::address(&identity_a.id.0).to_vec());
-    let log_b = Bytes(lmk_proto::public::address(&identity_b.id.0).to_vec());
-    let (_, before, _) = holdings(&db, &log_b, &[]);
-    assert_eq!(before.length, 1);
-    let hash = lmk_proto::head::next(&before.hash.0.as_slice().try_into().unwrap(), &entry.0);
-    let wrong_log = Head::sign(&key_a, &log_a.0, 2, hash, lmk_node::now());
-    assert!(wrong_log.verify(&key_a.verifying_key()), "a genuine signature by A beyond its known head, over B's extended hash");
+    let reference = |key: &ed25519_dalek::SigningKey, identity: &IdentityRef| {
+        lmk_proto::head::reference(key.verifying_key().as_bytes(), &lmk_proto::public::address(&identity.id.0))
+    };
+    let (log_a, log_b) = (reference(&key_a, &identity_a), reference(&key_b, &identity_b));
     let mut provider = SqliteProvider::open(&db).unwrap();
-    let record_key = [b"node/log/".as_slice(), &log_b.0].concat();
+    let before = held_head(&provider, &Bytes(log_b.to_vec())).unwrap();
+    assert_eq!(before.length, 1);
+    let hash = lmk_proto::head::next(&before.hash, &entry.0);
+    let wrong_log = Head::sign(&key_a, &log_a, 2, hash, lmk_node::now());
+    assert!(wrong_log.verify(&key_a.verifying_key()), "a genuine signature by A beyond its known head, over B's extended hash");
+    let record_key = [b"node/log/".as_slice(), &log_b].concat();
     let record = provider.get(&record_key).unwrap();
     provider.close().unwrap();
 
     let mut reader = stored(&relay, "Reader", &db).await;
     let mut peer = hand(&relay, iroh::SecretKey::from_bytes(&lmk_core::random()), &reader.node).await;
-    peer.send(&Frame::Entries { log: log_b.clone(), entries: vec![entry.clone()], head: wrong_log }).await;
+    let log = Bytes(log_b.to_vec());
+    peer.send(&Frame::Entries { log: log.clone(), entries: vec![entry.clone()], head: wrong_log }).await;
     peer.settle(&gid).await;
-    let wrong_service = Head::sign(&key_a, &log_b.0, 2, hash, lmk_node::now());
+    let wrong_service = Head::sign(&key_a, &log_b, 2, hash, lmk_node::now());
     assert!(wrong_service.verify(&key_a.verifying_key()));
-    peer.send(&Frame::Entries { log: log_b.clone(), entries: vec![entry.clone()], head: wrong_service }).await;
+    peer.send(&Frame::Entries { log: log.clone(), entries: vec![entry.clone()], head: wrong_service }).await;
     peer.settle(&gid).await;
     let mut provider = SqliteProvider::open(&db).unwrap();
     assert_eq!(provider.get(&record_key).unwrap(), record, "neither attack changes the destination's head, length or timestamp");
-    assert!(provider.get(&[b"node/entry/".as_slice(), &log_b.0, b"/", &2u64.to_be_bytes()].concat()).unwrap().is_none());
+    assert!(provider.get(&[b"node/entry/".as_slice(), &log_b, b"/", &2u64.to_be_bytes()].concat()).unwrap().is_none());
     provider.close().unwrap();
 
-    let right = Head::sign(&key_b, &log_b.0, 2, hash, lmk_node::now());
-    peer.send(&Frame::Entries { log: log_b.clone(), entries: vec![entry], head: right.clone() }).await;
+    let right = Head::sign(&key_b, &log_b, 2, hash, lmk_node::now());
+    peer.send(&Frame::Entries { log: log.clone(), entries: vec![entry], head: right.clone() }).await;
     peer.settle(&gid).await;
     reader.until(|event| matches!(event, Event::Public { identity } if identity == identity_b.id).then_some(())).await;
     reader.node.shutdown().await.unwrap();
-    assert_eq!(holdings(&db, &log_b, &[]).1, right, "same-log catch-up works while the authority is unreachable");
+    let provider = SqliteProvider::open(&db).unwrap();
+    assert_eq!(held_head(&provider, &log), Some(right), "same-log catch-up works while the authority is unreachable");
 }
 
 /// A joiner whose `admitted` was lost asks again with the KeyPackage it kept: the member answers with the Welcome its log

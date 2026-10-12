@@ -66,9 +66,6 @@ const SEND_WAIT: Duration = Duration::from_secs(5);
 const MEMBER_WAIT: Duration = Duration::from_secs(5);
 /// How often a followed log is read again whole.
 const REREAD: Duration = Duration::from_secs(5 * 60);
-/// How long after subscribing to a log it is read again, for what was appended before the subscription reached the
-/// service.
-const SUBSCRIBED: Duration = Duration::from_secs(10);
 /// How long a member admitting a joiner waits for the state of the group's kind.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 /// How long a session whose kind is behind waits before it asks the members online for the kind's state again, in
@@ -324,8 +321,12 @@ impl Event {
 /// A group's own record, beside its MLS state and its log.
 #[derive(Default, Serialize, Deserialize)]
 struct Rec {
-    /// The last position of its log read and judged.
+    /// The last position of its logs read and judged.
     position: u64,
+    /// Its current log, by reference: its epoch's, which every commit moves on from; and the position the log starts
+    /// after, the commit's that moved the group to the epoch, or its start.
+    log: Bytes,
+    base: u64,
     /// The position this session started after: the Add that brought it in, or 0 for the group's creator.
     start: u64,
     /// Positions up to here were read longer than H ago, and what this session kept of them is gone.
@@ -518,8 +519,8 @@ pub(crate) enum Work {
         settings: bool,
         gone: bool,
     },
-    /// A log to read from its service.
-    Read(Vec<u8>),
+    /// A group's new log to follow at its service, instead of its old one.
+    Follow { log: Vec<u8>, old: Vec<u8> },
     /// A group's duties to run.
     Duties(Vec<u8>),
     /// A group this session is out of, by no one's commit.
@@ -555,7 +556,6 @@ pub(crate) struct Inner<P> {
     advanced: tokio::sync::Notify,
     /// Woken whenever a peer's summary is heard.
     heard: tokio::sync::Notify,
-    reading: Mutex<HashSet<Vec<u8>>>,
     /// The groups whose held sends are being appended.
     sending: Mutex<HashSet<Vec<u8>>>,
     /// The groups whose duties run, each with whether another pass is due once it ends.
@@ -741,13 +741,13 @@ impl<P: Provider> State<P> {
         g.mls.members().into_iter().filter_map(|m| Some(m.credential?.certificate?.identity)).collect()
     }
 
-    /// A new group's records, its MLS state, and its log, read after `rec.position`.
+    /// A new group's records, its MLS state, and the log of its epoch, read after `rec.position`.
     fn add_group(&mut self, mls: Group, mut rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
-        (rec.updated, rec.shown) = (now(), rec.position);
-        self.add_log(&gid, logs::Log::new(logs::Of::Group, mls.settings().membership, rec.position))?;
+        let base = rec.position;
+        (rec.updated, rec.shown) = (now(), base);
         self.groups.insert(gid.clone(), G::new(mls, rec, BTreeMap::new()));
-        self.save(&gid)?;
+        self.next_log(&gid, base)?;
         self.save_groups()?;
         self.gate = true;
         Ok(gid)

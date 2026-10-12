@@ -1,4 +1,5 @@
-//! Reading a group's log strictly in order: each position's epoch and verdict is recorded in the step that applies it.
+//! Reading a group's logs strictly in order, each epoch's from the commit that moved the group to it, its entries after
+//! that epoch's first commit passed over: each position's epoch and verdict is recorded in the step that applies it.
 //! A message entry counts once per id per epoch; its ciphertext, which may come before or after it, is carried for H
 //! and opened in position order within its epoch. Before a commit that deletes an epoch's keys while this session lacks
 //! some of its messages, it waits as `Peers::wait` decides, fetching them from the members that hold them.
@@ -11,6 +12,7 @@ use lmk_core::group::{self as core, Verdict};
 use lmk_core::provider::Provider;
 use lmk_net::peers::{Decision, HOLD_OFF};
 use lmk_proto::Bytes;
+use lmk_proto::entry::Entry;
 use lmk_proto::group::{Control, type_of};
 use lmk_proto::ranges::Ranges;
 use serde::{Deserialize, Serialize};
@@ -50,6 +52,11 @@ pub(crate) fn pos_key(gid: &[u8], position: u64) -> Vec<u8> {
 /// The position at which an id first counted.
 fn id_key(gid: &[u8], id: &[u8]) -> Vec<u8> {
     [b"node/id/".as_slice(), gid, b"/", id].concat()
+}
+
+/// The Welcome of the commit at a position, for a joiner it added whose answer was lost.
+pub(crate) fn welcome_key(gid: &[u8], position: u64) -> Vec<u8> {
+    [b"node/welcome/".as_slice(), gid, b"/", &position.to_be_bytes()].concat()
 }
 
 pub(crate) fn ciphertext_key(gid: &[u8], position: u64) -> Vec<u8> {
@@ -94,6 +101,7 @@ impl<P: Provider> State<P> {
         while position < last && self.pos(gid, position + 1)?.is_none_or(|pos| pos.at < before) {
             position += 1;
         }
+        self.drop_earlier(gid, before)?;
         self.expire_to(gid, position)
     }
 
@@ -111,6 +119,7 @@ impl<P: Provider> State<P> {
                 }
                 self.provider.delete(&ciphertext_key(gid, position))?;
             }
+            self.provider.delete(&welcome_key(gid, position))?;
             self.provider.delete(&pos_key(gid, position))?;
         }
         let rec = &mut self.group_mut(gid)?.rec;
@@ -138,13 +147,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Reads the stored entries of a group's log this session has not judged yet, in order, then opens what it can and
     /// hands its kind what is next in order.
     pub(crate) fn advance(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
-        let logged = st.log(gid)?.logged;
         while let Some(g) = st.groups.get(gid)
-            && g.rec.position < logged
             && g.mls.active()
+            && g.rec.position < st.held_to(gid)?
         {
             let position = g.rec.position + 1;
-            let entry = st.provider.get(&crate::logs::entry_key(gid, position))?.context("a stored entry is missing")?;
+            let entry = st.group_entry(gid, position)?.context("a stored entry is missing")?;
             if !self.judge(st, gid, position, &entry)? {
                 break;
             }
@@ -153,7 +161,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             st.save(gid)?;
             self.open_ready(st, gid)?;
             self.kind_advance(st, gid)?;
-            if st.group(gid)?.rec.position == logged {
+            if st.at_head(gid) {
                 self.work.send(Work::Duties(gid.to_vec())).ok();
             }
         }
@@ -201,6 +209,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.before_commit(st, gid, removes)?;
         let g = st.groups.get_mut(gid).unwrap();
         let epoch = g.mls.epoch();
+        let Entry::Commit { welcome, .. } = Entry::parse(&g.mls.open_entry(&st.provider, entry)?)? else { anyhow::bail!("not a commit") };
         let applied = g.mls.apply(&st.provider, entry)?;
         let current = g.mls.epoch();
         g.early.retain(|(_, early)| core::header(early).is_ok_and(|(epoch, _)| epoch >= current));
@@ -223,7 +232,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, removed, settings, gone }).ok();
         let pos = Pos { epoch, at: now, judged: Judged::Commit { own }, lost: false };
         put(&st.provider, &pos_key(gid, position), &pos)?;
+        if let Some(welcome) = welcome {
+            st.provider.put(&welcome_key(gid, position), &welcome)?;
+        }
         st.group_mut(gid)?.rec.position = position;
+        if !gone {
+            let old = st.group(gid)?.rec.log.0.clone();
+            let log = st.next_log(gid, position)?;
+            self.work.send(Work::Follow { log, old }).ok();
+        }
         Ok(!gone)
     }
 

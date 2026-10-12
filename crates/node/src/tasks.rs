@@ -31,7 +31,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let endpoint = lmk_net::builder(relays).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
         let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone(), revision: REVISION };
         let clients = logs::Clients::new(endpoint.clone());
-        let state = State::open(provider, &config, leaf, &clients)?;
+        let state = State::open(provider, &config, leaf)?;
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
         let (outbox, outbox_rx) = mpsc::unbounded_channel();
@@ -51,7 +51,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             committing: tokio::sync::Mutex::new(()),
             advanced: tokio::sync::Notify::new(),
             heard: tokio::sync::Notify::new(),
-            reading: Mutex::default(),
             sending: Mutex::default(),
             passing: Mutex::default(),
             timers: Mutex::default(),
@@ -68,7 +67,7 @@ impl<P: Provider + Send + 'static> Node<P> {
 
 impl<P: Provider> State<P> {
     /// The session in `provider`, created on first use, with its leaf as `leaf`; its logs, groups and device keys.
-    fn open(provider: P, config: &Config, leaf: Leaf, clients: &logs::Clients) -> Result<Self> {
+    fn open(provider: P, config: &Config, leaf: Leaf) -> Result<Self> {
         let mut session = match provider.get(b"session")? {
             Some(_) => Session::load(&provider)?,
             None => Session::create(&provider, &config.handle, leaf.clone())?,
@@ -77,11 +76,6 @@ impl<P: Provider> State<P> {
             session.set_leaf(&provider, leaf)?;
         }
         let logs = State::load_logs(&provider)?;
-        for log in logs.values() {
-            if let Some(chain) = &log.chain {
-                clients.client(&log.service)?.set_chain(chain.clone());
-            }
-        }
         let mut groups = BTreeMap::new();
         for gid in get::<Vec<Bytes>>(&provider, b"node/groups")?.unwrap_or_default() {
             let mls = Group::load(&provider, &gid.0)?;
@@ -139,11 +133,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
         });
         self.spawn(self.clone().drive(work));
         self.spawn(self.clone().send_out(outbox));
-        let followed: Vec<Vec<u8>> = self.lock().logs.keys().cloned().collect();
+        let mut st = self.lock();
+        let followed: Vec<Vec<u8>> = st.logs.keys().filter(|log| st.capability(log).is_ok()).cloned().collect();
         for log in &followed {
             self.follow(log);
         }
-        let mut st = self.lock();
         let public: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
             logs::Of::Public(id) => Some(id.clone()),
             _ => None,
@@ -256,16 +250,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         while let Some(item) = work.recv().await {
             match item {
                 Work::Applied { group, by, added, how, removed, settings, gone } => self.applied(&group, by, added, how, removed, settings, gone).await,
-                Work::Read(log) => {
-                    if self.reading.lock().unwrap().insert(log.clone()) {
-                        let inner = self.clone();
-                        self.spawn(async move {
-                            if let Err(error) = inner.read(&log).await {
-                                tracing::debug!("reading {}: {error:#}", hex(&log));
-                            }
-                            inner.reading.lock().unwrap().remove(&log);
-                        });
-                    }
+                Work::Follow { log, old } => {
+                    self.unfollow(&old);
+                    self.follow(&log);
                 }
                 Work::Duties(gid) => self.duties(&gid),
                 Work::Gone(group) => self.gone(&group, None),

@@ -3,14 +3,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Bytes, head::Head, ranges::Ranges};
+use crate::{Bytes, head::Head, membership::fixed32, ranges::Ranges};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Frame {
     /// The sender's summaries of groups, and the heads of the public logs their members follow.
     Hello { groups: Vec<Summary>, heads: Vec<Head> },
-    /// Entries of a log the other lacks, ending at `head`.
+    /// Entries of a log the other lacks, by its reference, ending at `head`.
     Entries { log: Bytes, entries: Vec<Bytes>, head: Head },
     /// Ciphertexts of counted positions: pushed at send, or the answer to `want`, whose positions up to where the
     /// sender stopped are `answers`.
@@ -39,8 +39,11 @@ pub enum Frame {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
     pub group: Bytes,
-    /// The group log's head: the last position read from the service.
-    pub head: Head,
+    /// The group's current log, by its reference: each commit moves a group to the log of its new epoch.
+    #[serde(with = "fixed32")]
+    pub log: [u8; 32],
+    /// That log's newest signed head the sender holds; none while it holds none of it.
+    pub head: Option<Head>,
     /// Within H: the positions it holds, has read (chat), and is fetching.
     pub held: Ranges,
     pub read: Ranges,
@@ -65,7 +68,7 @@ pub struct Join {
 pub struct Admitted {
     /// The Welcome of the commit entry that added the joiner.
     pub welcome: Bytes,
-    /// The Add's position in the group's log: the joiner reads on from there.
+    /// The Add's position in the group: the joiner reads on from there, in the log of the epoch the Welcome brings.
     pub position: u64,
     /// A file link to the state of the group's kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -164,17 +164,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     Err(error) => return self.warn(Some(gid), format!("sending: {error:#}")),
                 }
             };
-            let Some((service, sends)) = batch else { return };
+            let Some((service, capability, sends)) = batch else { return };
             if let Err(error) = self.durable().await {
                 return self.warn(Some(gid), format!("{error:#}"));
             }
             let appended = async {
                 let entries: Vec<Vec<u8>> = sends.iter().map(|(_, entry)| entry.clone()).collect();
-                self.clients.client(&service)?.append(gid, &entries, false).await
+                self.clients.client(&service)?.append(&capability, &entries, false).await
             };
             match appended.await {
                 Ok(_) => {
-                    if let Err(error) = self.read(gid).await {
+                    if let Err(error) = self.read_group(gid).await {
                         tracing::debug!("reading the group's log after an append: {error:#}");
                     }
                 }
@@ -198,10 +198,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// The group's sends to append, each sealed in the current epoch, once this session has read the log to its head
-    /// as last read: none while it has not; an empty batch once there are no more.
+    /// The group's sends to append to its current log, by its capability, each sealed in the current epoch, once this
+    /// session has read the log to its head as last read: none while it has not; an empty batch once there are no more.
     #[allow(clippy::type_complexity)]
-    fn batch(&self, gid: &[u8]) -> Result<Option<Option<(lmk_proto::group::Service, Vec<(Bytes, Vec<u8>)>)>>> {
+    fn batch(&self, gid: &[u8]) -> Result<Option<Option<(lmk_proto::group::Service, [u8; 32], Vec<(Bytes, Vec<u8>)>)>>> {
         let mut st = self.lock();
         let Ok(g) = st.group(gid) else { return Ok(Some(None)) };
         if !st.at_head(gid) {
@@ -210,7 +210,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if g.rec.sends.is_empty() {
             return Ok(Some(None));
         }
-        let (epoch, service, handles) = (g.mls.epoch(), g.mls.settings().membership, g.rec.sends.clone());
+        let (epoch, service, capability, handles) = (g.mls.epoch(), g.mls.settings().membership, g.mls.capability(&st.provider)?, g.rec.sends.clone());
         let mut sends = Vec::new();
         for handle in handles {
             let mut send: Held = get(&st.provider, &send_key(&handle.0))?.context("a send without its record")?;
@@ -220,7 +220,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             sends.push((handle, send.entry.0));
         }
-        Ok(Some(Some((service, sends))))
+        Ok(Some(Some((service, capability, sends))))
     }
 
     /// Records that these sends' entries may have reached the service, unless it certainly was not reached; returns

@@ -34,7 +34,11 @@ pub const QUIET: u64 = 10_000;
 /// This member's state of a group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Own {
-    pub head: Head,
+    /// The group's current log, by its reference, and its newest signed head held.
+    pub log: [u8; 32],
+    pub head: Option<Head>,
+    /// The group position its current log's head ends at.
+    pub position: u64,
     /// Within H, as in its summary.
     pub held: Ranges,
     pub read: Ranges,
@@ -42,6 +46,8 @@ pub struct Own {
     pub lacking: Ranges,
     /// The heads of the public logs of the group's members' identities.
     pub public: Vec<Head>,
+    /// The heads of the group's earlier logs still held, for members that have not moved on from them.
+    pub earlier: Vec<Head>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,8 +115,8 @@ struct Conn {
     stalled: bool,
     served: BTreeSet<Bytes>,
     heard: BTreeMap<Bytes, Summary>,
-    /// Per log, the longest the peer showed or was sent.
-    theirs: BTreeMap<Bytes, u64>,
+    /// Per log, by reference, the longest the peer showed or was sent.
+    theirs: BTreeMap<[u8; 32], u64>,
     /// Every served group's summary goes at the next poll, as after connecting.
     full: bool,
     /// Groups whose summary goes at the next poll, as the gate opened, or the peer's first summary of it came.
@@ -141,14 +147,14 @@ impl Peers {
             self.changed.get_or_insert(now);
             return;
         };
-        if own.head.length > g.own.head.length {
-            g.read.push((Ranges::range(g.own.head.length + 1, own.head.length), now));
+        if own.position > g.own.position {
+            g.read.push((Ranges::range(g.own.position + 1, own.position), now));
         }
         if !g.own.lacking.intersection(&own.held).is_empty() {
             g.progress = now;
         }
         let o = &g.own;
-        if (o.head.length, &o.held, &o.read, &o.public) != (own.head.length, &own.held, &own.read, &own.public) {
+        if (o.log, &o.head, &o.held, &o.read, &o.public) != (own.log, &own.head, &own.held, &own.read, &own.public) {
             g.dirty = true;
             self.changed.get_or_insert(now);
         }
@@ -224,13 +230,13 @@ impl Peers {
         match frame {
             Frame::Hello { groups, heads } => {
                 for head in heads {
-                    let longest = c.theirs.entry(head.log.clone()).or_default();
+                    let longest = c.theirs.entry(head.log_ref).or_default();
                     *longest = (*longest).max(head.length);
                 }
                 for summary in groups {
                     let Some(g) = self.groups.get_mut(&summary.group) else { continue };
-                    let longest = c.theirs.entry(summary.head.log.clone()).or_default();
-                    *longest = (*longest).max(summary.head.length);
+                    let longest = c.theirs.entry(summary.log).or_default();
+                    *longest = (*longest).max(summary.head.as_ref().map_or(0, |head| head.length));
                     g.struck.remove(peer);
                     if c.served.contains(&summary.group) && c.heard.get(&summary.group) != Some(summary) {
                         g.progress = now;
@@ -321,11 +327,11 @@ impl Peers {
         for (key, c) in &mut self.conns {
             let served: Vec<(&Bytes, &Group)> = c.served.iter().filter_map(|id| Some((id, self.groups.get(id)?))).collect();
             for (_, g) in &served {
-                for head in std::iter::once(&g.own.head).chain(&g.own.public) {
-                    if let Some(theirs) = c.theirs.get_mut(&head.log)
+                for head in g.own.head.iter().chain(&g.own.public).chain(&g.own.earlier) {
+                    if let Some(theirs) = c.theirs.get_mut(&head.log_ref)
                         && *theirs < head.length
                     {
-                        out.push(Out::Entries { peer: *key, log: head.log.clone(), after: *theirs });
+                        out.push(Out::Entries { peer: *key, log: Bytes(head.log_ref.to_vec()), after: *theirs });
                         *theirs = head.length;
                     }
                 }
@@ -333,8 +339,8 @@ impl Peers {
             let send: Vec<&(&Bytes, &Group)> = served.iter().filter(|(id, g)| periodic || c.full || c.opened.contains(*id) || due && g.dirty).collect();
             if !send.is_empty() {
                 let mut heads: Vec<Head> = send.iter().flat_map(|(_, g)| g.own.public.iter().cloned()).collect();
-                heads.sort_by(|a, b| a.log.cmp(&b.log));
-                heads.dedup_by(|a, b| a.log == b.log);
+                heads.sort_by_key(|head| head.log_ref);
+                heads.dedup_by(|a, b| a.log_ref == b.log_ref);
                 let groups = send.iter().map(|(id, g)| summary(id, g)).collect();
                 out.push(Out::Frame(*key, Frame::Hello { groups, heads }));
             }
@@ -352,7 +358,14 @@ impl Peers {
 }
 
 fn summary(id: &Bytes, g: &Group) -> Summary {
-    Summary { group: id.clone(), head: g.own.head.clone(), held: g.own.held.clone(), read: g.own.read.clone(), fetching: g.fetching.clone() }
+    Summary {
+        group: id.clone(),
+        log: g.own.log,
+        head: g.own.head.clone(),
+        held: g.own.held.clone(),
+        read: g.own.read.clone(),
+        fetching: g.fetching.clone(),
+    }
 }
 
 /// The current-connection summaries of the peers the gate admits to the group.

@@ -1,4 +1,4 @@
-//! Membership logs: the store and service behind `letmeknow serve`, and its client.
+//! Membership authentication, clients, and the disposable authority's service/store.
 
 pub mod chain;
 pub mod client;
@@ -8,26 +8,29 @@ pub mod service;
 pub mod store;
 
 use anyhow::Result;
-use lmk_proto::membership::Notice;
+use n0_future::task::AbortOnDropHandle;
 use tokio::sync::mpsc;
 
-pub use chain::{Chain, Contradiction, Forged};
+pub use chain::{Contradiction, Forged, Frontier, InvalidProof, Proof, VerifiedPage, WrongLog};
 
-/// The service refused a request: an append as `size`, `rate` or `policy`, a read as `expired`.
 #[derive(Debug, thiserror::Error)]
 #[error("the membership service refused: {0}")]
 pub struct Refused(pub String);
 
-/// The request certainly did not reach the service: it could not be reached.
 #[derive(Debug, thiserror::Error)]
-#[error("the membership service is unavailable: {0}")]
-pub struct Unreached(pub String);
+#[error("the membership service could not be reached")]
+pub struct Unreached;
 
-/// Notices until the subscription ends; on an error or end, subscribe again.
-pub struct Subscription(mpsc::Receiver<Result<Notice>>);
+pub struct Subscription {
+    pages: mpsc::Receiver<Result<VerifiedPage>>,
+    reader: AbortOnDropHandle<()>,
+}
 
 impl Subscription {
-    pub async fn next(&mut self) -> Option<Result<Notice>> {
-        self.0.recv().await
+    pub async fn next(&mut self) -> Option<Result<VerifiedPage>> { self.pages.recv().await }
+
+    pub async fn cancel(self) {
+        self.reader.abort();
+        let _ = self.reader.await;
     }
 }

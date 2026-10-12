@@ -6,11 +6,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, RelayUrl};
-use lmk_core::group::{Change, Group, key_package_credential, key_package_leaf};
+use lmk_core::group::{Change, Group, key_package_credential, key_package_leaf, key_package_reference};
 use lmk_core::public::Verdict;
 use lmk_core::provider::Provider;
 use lmk_net::Admit;
-use lmk_proto::entry::Entry;
 use lmk_proto::group::{CHAT, Certificate, Control, Credential, IDENTITY, How};
 use lmk_proto::links::{Address, Invite, RELAY};
 use lmk_proto::peer::{Admitted, Join};
@@ -24,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::logs::NOT_FOLLOWED;
-use crate::reading::Judged;
+use crate::reading::{Judged, welcome_key};
 use crate::{Event, G, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, SNAPSHOT_WAIT, State, device_key_key, endpoint_id, get, now, put};
 
 /// How many members besides the inviter a link names, of those online that hold the invite's message.
@@ -151,7 +150,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
             match timeout(JOIN_WAIT, self.inner.net().join(peer, relay, join.clone())).await {
                 Ok(Ok(Answer::Ok(admitted))) => {
-                    let gid = self.inner.welcomed(admitted, peer, device_key).await?;
+                    let gid = self.inner.welcomed(admitted, &join.key_package.0, peer, device_key).await?;
                     self.inner.lock().provider.delete(&joining)?;
                     self.inner.durable().await?;
                     return Ok((gid, *peer.as_bytes()));
@@ -181,13 +180,13 @@ impl<P: Provider + Send + 'static> Node<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Joins a group from the Welcome a member at `by` sent: an identity group with the device key `device_key`, and only
-    /// then, as a link's kind is not authenticated.
-    async fn welcomed(self: &Arc<Self>, admitted: Admitted, by: EndpointId, device_key: Option<[u8; 32]>) -> Result<Bytes> {
-        let gid = {
+    /// Joins a group from the Welcome a member at `by` sent for this session's KeyPackage: an identity group with the
+    /// device key `device_key`, and only then, as a link's kind is not authenticated.
+    async fn welcomed(self: &Arc<Self>, admitted: Admitted, key_package: &[u8], by: EndpointId, device_key: Option<[u8; 32]>) -> Result<Bytes> {
+        let (gid, log) = {
             let mut st = self.lock();
             let st = &mut *st;
-            let mls = Group::join(&st.provider, &admitted.welcome.0)?;
+            let mls = Group::join(&st.provider, &admitted.welcome.0, &key_package_reference(&st.provider, key_package)?)?;
             ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
             if (mls.settings().kind == IDENTITY) != device_key.is_some() {
                 mls.delete(&st.provider)?;
@@ -203,15 +202,16 @@ impl<P: Provider + Send + 'static> Inner<P> {
             if admitted.doc.is_some() {
                 st.groups.get_mut(&gid).unwrap().asked = now();
             }
-            gid
+            let log = st.group(&gid)?.rec.log.0.clone();
+            (gid, log)
         };
         // The members' public logs first, which the gate needs to take their summaries, before the log's commits apply.
         self.refresh_all().await;
         self.dial_all();
-        if let Err(error) = self.read(&gid).await {
+        self.follow(&log);
+        if let Err(error) = self.read_group(&gid).await {
             self.warn(Some(&gid), format!("reading the group's log: {error:#}"));
         }
-        self.follow(&gid);
         if let Some(link) = admitted.doc {
             self.state_from(&gid, link, by);
         }
@@ -251,7 +251,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let (gid, rule) = found.context(UNKNOWN)?;
         // A joiner the log shows added, whose answer was lost, asks again with the same KeyPackage.
         self.caught_up(&gid).await?;
-        let logged = self.lock().logged_welcome(&gid, &joiner, &key_package.0)?;
+        let logged = self.lock().logged_welcome(&gid, &key_package.0)?;
         if let Some((welcome, position)) = logged {
             return self.admitted(&gid, welcome, position).await;
         }
@@ -322,20 +322,19 @@ impl<P: Provider + Send + 'static> Inner<P> {
 }
 
 impl<P: Provider> State<P> {
-    /// The Welcome and position of the commit entry that added the joiner with this KeyPackage, if the joiner is a member
-    /// whose leaf has not updated since.
-    fn logged_welcome(&self, gid: &[u8], joiner: &Credential, key_package: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
+    /// The Welcome and position of the commit that added the joiner with this KeyPackage, if its leaf has not updated
+    /// since.
+    fn logged_welcome(&self, gid: &[u8], key_package: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
         let g = self.group(gid)?;
         if !g.mls.unchanged(&self.provider, key_package)? {
             return Ok(None);
         }
-        let Some(added) = g.mls.added().iter().rev().find(|added| added.member.key == joiner.key) else { return Ok(None) };
+        let reference = key_package_reference(&self.provider, key_package)?;
+        let Some(added) = g.mls.added().iter().rev().find(|added| added.key_package_ref == reference) else { return Ok(None) };
         for position in (g.rec.expired + 1..=g.rec.position).rev() {
             let Some(pos) = self.pos(gid, position)? else { continue };
             if matches!(pos.judged, Judged::Commit { .. }) && pos.epoch + 1 == added.epoch {
-                let entry = self.provider.get(&crate::logs::entry_key(gid, position))?.context("a stored entry is missing")?;
-                let Entry::Commit { welcome: Some(welcome), .. } = Entry::parse(&entry)? else { return Ok(None) };
-                return Ok(Some((welcome, position)));
+                return Ok(self.provider.get(&welcome_key(gid, position))?.map(|welcome| (welcome, position)));
             }
         }
         Ok(None)

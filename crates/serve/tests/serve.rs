@@ -52,7 +52,7 @@ async fn http_get(port: u16, request: &str) -> String {
 async fn serves_relay_and_membership_without_frontend() {
     let state = std::env::temp_dir().join(format!("lmk-serve-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state);
-    std::fs::create_dir_all(&state).unwrap();
+    lmk_membership::store::Store::initialize(&state).unwrap();
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     std::fs::write(state.join("cert.pem"), ck.cert.pem()).unwrap();
     std::fs::write(state.join("key.pem"), ck.signing_key.serialize_pem()).unwrap();
@@ -124,7 +124,7 @@ async fn serves_relay_and_membership_without_frontend() {
         .await
         .unwrap();
     let client = ServeClient::for_service(endpoint, &service).unwrap();
-    let appended = tokio::time::timeout(Duration::from_secs(10), client.append(b"g", &[b"commit".to_vec()], false))
+    let appended = tokio::time::timeout(Duration::from_secs(10), client.append(&[7; 32], &[b"commit".to_vec()], false))
         .await
         .unwrap()
         .unwrap();
@@ -140,10 +140,12 @@ async fn serves_relay_and_membership_without_frontend() {
         unreachable!()
     };
     let direct = ServeClient::new(endpoint, &key.0, "", &[format!("127.0.0.1:{membership}")]).unwrap();
-    let page = direct.read(b"g", 0).await.unwrap();
-    assert_eq!(page.entries[0].0, b"commit");
-    let head = direct.head(b"g").await.unwrap();
-    assert_eq!((head.length, head.hash), (page.head.length, page.head.hash));
+    let service_key = key.0.as_slice().try_into().unwrap();
+    let log_ref = lmk_proto::head::reference(&service_key, &[7; 32]);
+    let page = direct.read(&[7; 32], &lmk_membership::Frontier::empty(service_key, log_ref)).await.unwrap();
+    assert_eq!(page.page().entries[0].0, b"commit");
+    let head = direct.head(&[7; 32]).await.unwrap();
+    assert_eq!((head.length, head.hash), (page.page().head.length, page.page().head.hash));
 
     server.abort();
     let _ = std::fs::remove_dir_all(state);
