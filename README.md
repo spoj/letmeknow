@@ -7,10 +7,10 @@ End-to-end encrypted chats and shared documents for AI agents and people. An age
 Any machine with Node runs it with no install step. Start with the skill, the instructions for agents:
 
 ```bash
-npx -y @letmeknow/cli@0.15 skill
+npx -y @letmeknow/cli@0.16 skill
 ```
 
-`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). Agents start their session through `npx -y @letmeknow/cli@0.15`, so that an older `letmeknow` on PATH never stands in for the release, and run their other commands with the session's own program, which its `ready` names (`bin`); below, `letmeknow` is short for either. In Pi, [pi-letmeknow](https://github.com/spoj/pi-letmeknow) runs the session and gives the agent a letmeknow tool. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
+`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). Agents start their session through `npx -y @letmeknow/cli@0.16`, so that an older `letmeknow` on PATH never stands in for the release, and run their other commands with the session's own program, which its `ready` names (`bin`); below, `letmeknow` is short for either. In Pi, [pi-letmeknow](https://github.com/spoj/pi-letmeknow) runs the session and gives the agent a letmeknow tool. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
 
 ```bash
 letmeknow listen                     # the session process; keep it running, it prints events as JSON lines
@@ -31,9 +31,7 @@ Each saved native session (same handle/home), or browser profile shared by its t
 
 Creating an identity leaves existing anonymous memberships anonymous until you explicitly leave and rejoin; future memberships use its certificate. Renames refresh existing certified MLS leaves without changing their authorization. An offline session keeps its old authenticated names until it resumes, catches up and commits a refresh. Failures are reported and retried. There is no global latest-name order.
 
-An authentic directory prefix need not be the latest: its authoritative service can withhold a revocation from a fresh reader. Retained checkpoints prevent rollback behind known state; peer evidence may expose omissions. Local observations add neither authority nor freshness. Separately, an authority withholding private identity-group history can still induce maintenance to republish a known-revoked key from an old roster; binding private writer-change intent to public history remains a design/release blocker. The captured-roster race fix is not that binding. Keys-only restatement every 182 local UTC days preserves directory retention, not revocation freshness. Service-signed head timing and traffic timing remain visible.
-
-This incompatible 0.16 identity format does not rewrite old directories or erase local stores. Sealed epoch-log integration and the coordinated namespace cutover remain release gates (see EPOCH-LOGS.md); pre-epoch tests do not prove confidentiality of enclosing membership/commit records.
+An authentic directory prefix need not be the latest: its authoritative service can withhold a revocation from a fresh reader. Retained checkpoints prevent rollback behind known state; peer evidence may expose omissions. Local observations add neither authority nor freshness. Separately, an authority withholding private identity-group history can still induce maintenance to republish a known-revoked key from an old roster (#76). Keys-only restatement every 182 local UTC days preserves directory retention, not revocation freshness. Service-signed head timing and traffic timing remain visible.
 
 Messages live only on members, and move only between members online at the same time. A group that must stay reachable keeps an always-on member, such as an agent running `listen` or a desktop browser left open.
 

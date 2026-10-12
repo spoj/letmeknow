@@ -10,7 +10,7 @@ Target topology (not yet cut over):
 
 `web/backend.json` names the 0.16 authority's PUBLIC key, `7fdc5178ea2da4c7c282d34dd183e6fb109e8afdcb61ffd3f1a9a7c715e50518`, provisioned with `serve --initialize` on the VPS (step 4); native clients default to the same key and to `https://relay.letmeknow.dev` (`crates/proto/src/links.rs`). Production builds fail without a 64-character hex key. Never put a private key or Spaces credentials in the repo, build environment, artifacts or logs.
 
-The independent-origin tests are not a security approval. The other 0.16 gates in PLAN-0.16.md still apply: incompatible service/store/client namespaces, epoch/capability protocols, durability, resource/health semantics, and owner review. The backend's `/stats` reports sitewide totals per completed UTC day; no statistics UI is provided.
+The backend's `/stats` reports sitewide totals per completed UTC day; no statistics UI is provided.
 
 `.github/workflows/release.yml` runs all-platform CI alongside five native platform builds. The Linux x64 release executable runs native E2E before packaging. A separate job builds the production frontend once from checked-in `backend.json`, typechecks it, and smoke-tests that exact directory (healthy welcome controls online, after service-worker control and offline) without contacting production. Malformed-Wasm and caught-startup-failure copies must fail the same gate. A separate inherited-worker/cache/settings scenario exercises browser-controlled recovery while preserving client IndexedDB. Full browser/native E2E uses a test-key build against a real local backend at a different HTTPS origin; it is not byte-identical to the production-configured build.
 

@@ -14,9 +14,9 @@ Releases of one minor version run side by side in the same groups:
 - A reader ignores what it does not know. A member that rewrites a shared record keeps the fields it does not know.
 - An addition that other members must understand raises the protocol revision (`REVISION` in crates/proto/src/group.rs), and is used only toward members whose leaves name that revision.
 - Anything else waits for a new minor version, behind its switches: the ALPN, a group's protocol version, the invite link version, the home's format, and the browser's database version. A minor version flips only the switches its changes need. Test the chosen contract: supported versions coexist; incompatible versions refuse without changing newer state.
-- Browsers load the entire frontend from GitHub Pages at letmeknow.dev, independently of relay.letmeknow.dev. A service worker normally offers a waiting update; this is not cryptographic pinning, and the same-origin host still controls code. Agents pin `@letmeknow/cli@0.15`, so they get the latest 0.15.x when they restart.
+- Browsers load the entire frontend from GitHub Pages at letmeknow.dev, independently of relay.letmeknow.dev. A service worker normally offers a waiting update; this is not cryptographic pinning, and the same-origin host still controls code. Agents pin `@letmeknow/cli@0.16`, so they get the latest 0.16.x when they restart.
 
-The 0.16 identity cutover uses keys-only v2 directories and required device-signed private claims, without rewriting old directories or clearing old local state. Its namespace/version switches are coordinated with sealed epochs, not independently bumped by identity work. Authorization, durable local observations, and independent operator verification remain separate; test installed leaves and persistence barriers, not only display structs.
+Identity authorization, durable local observations, and independent operator verification remain separate; test installed leaves and persistence barriers, not only display structs.
 
 ## Checks
 
@@ -36,7 +36,7 @@ CI's Linux job, to run before pushing:
 
 ## Releases
 
-1. Complete the security/protocol gates in PLAN-0.16.md and the fresh public-key configuration in web/backend.json before release. Never copy signing keys into builds. This frontend work does not implement the other 0.16 protocols or compatibility namespaces.
+1. web/backend.json and crates/proto/src/links.rs hold only the service's public key; never copy signing keys into builds.
 2. Write release notes, then run `deploy/release.sh X.Y.Z <notes file>` on clean `main`. It commits/tags/pushes the version; release.yml runs all-platform CI, builds five native platforms plus the whole production frontend, tests artifacts, and publishes only after all gates pass. The Linux release executable gets native E2E; the exact production frontend gets an offline startup/service-worker smoke test, while full browser/native E2E uses test configuration.
 3. The script waits for publication/npm availability and prints rollout commands. Backend deployment and Pages rollout are separate operator-reviewed actions (deploy/README.md), consuming the successful release run's artifacts without rebuilding. Pages dispatch runs from main and requires the github-pages environment approval configured by the operator.
 4. If the workflow fails, fix it on main; move the tag only if npm publication never ran. Never deploy a partial/failed release or silently substitute a local build. No script performs destructive cutover, backup restore, or client-state deletion.
