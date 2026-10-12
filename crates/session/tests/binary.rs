@@ -6,7 +6,8 @@ fn letmeknow(home: &std::path::Path, args: &[&str]) -> std::process::Output {
 
 #[test]
 fn the_binary_prints_the_skill_and_needs_a_session_for_requests() {
-    let home = std::env::temp_dir().join(format!("lmk-binary-{}", std::process::id()));
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
     let skill = letmeknow(&home, &["skill"]);
     assert!(String::from_utf8(skill.stdout).unwrap().starts_with("---\nname: letmeknow"));
     let groups = letmeknow(&home, &["groups"]);
@@ -23,7 +24,8 @@ fn the_binary_prints_the_skill_and_needs_a_session_for_requests() {
 fn the_binary_logs_what_rust_log_asks_without_colour_in_a_pipe() {
     use std::io::BufRead;
     for (rust_log, quiet) in [(None, true), (Some("debug"), false)] {
-        let home = std::env::temp_dir().join(format!("lmk-binary-log-{}-{quiet}", std::process::id()));
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
         let mut command = Command::new(env!("CARGO_BIN_EXE_letmeknow"));
         command.arg("--home").arg(&home).args(["listen", "--relay", "http://127.0.0.1:1"]).env_remove("LETMEKNOW_SESSION").env_remove("RUST_LOG");
         if let Some(rust_log) = rust_log {
@@ -43,13 +45,12 @@ fn the_binary_logs_what_rust_log_asks_without_colour_in_a_pipe() {
 /// A home that 0.15 made is refused, and left as it is.
 #[test]
 fn the_binary_leaves_an_earlier_home_as_it_is() {
-    let home = std::env::temp_dir().join(format!("lmk-binary-earlier-{}", std::process::id()));
-    std::fs::create_dir_all(&home).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
     std::fs::write(home.join("format"), "4\n").unwrap();
-    let listen = letmeknow(&home, &["listen", "--relay", "http://127.0.0.1:1"]);
+    let listen = letmeknow(home, &["listen", "--relay", "http://127.0.0.1:1"]);
     assert!(!listen.status.success());
     assert!(String::from_utf8(listen.stderr).unwrap().contains("earlier letmeknow"));
     assert_eq!(std::fs::read_to_string(home.join("format")).unwrap(), "4\n");
     assert!(!home.join("sessions").exists());
-    std::fs::remove_dir_all(home).unwrap();
 }

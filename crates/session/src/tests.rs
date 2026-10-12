@@ -22,14 +22,8 @@ const HOUR: Duration = Duration::from_secs(3600);
 struct World {
     relay: Relay,
     network: crate::Network,
-    root: PathBuf,
+    root: tempfile::TempDir,
     plugins: Vec<PathBuf>,
-}
-
-impl Drop for World {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
 }
 
 /// Where cargo builds the workspace's binaries, the kinds' plugins among them: beside this test's own directory.
@@ -45,8 +39,7 @@ fn built() -> PathBuf {
 async fn world(test: &str) -> World {
     let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_test_writer().try_init();
     let relay = relay().await;
-    let root = std::env::temp_dir().join(format!("lmk-session-{test}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = tempfile::Builder::new().prefix(&format!("lmk-session-{test}-")).tempdir().unwrap();
     let network = crate::Network { relay: relay.url.clone(), ca: relay.ca() };
     World { relay, network, root, plugins: vec![built()] }
 }
@@ -81,7 +74,7 @@ impl World {
     fn config(&self, device: &str, handle: &str) -> Config {
         Config {
             handle: handle.into(),
-            dir: session_dir(&self.root.join(device), handle).unwrap(),
+            dir: session_dir(&self.root.path().join(device), handle).unwrap(),
             hold: HOUR,
             keep_log: false,
             membership: self.membership(),
@@ -303,7 +296,7 @@ fn an_attachment_arrives_as_a_private_file() {
     local(async {
         let world = world("attach").await;
         let (mut alice, bob, _) = pair(&world, HOUR).await;
-        let file = world.root.join("token.txt");
+        let file = world.root.path().join("token.txt");
         std::fs::write(&file, "s3cret").unwrap();
         let sent = bob.cmd(&["send", "--to", "Alice", "--attach", file.to_str().unwrap(), "the token"]).await.unwrap();
         assert_eq!(sent["attachment"]["held_by"], json!([format!("Alice · {}", alice.device)]));
@@ -337,12 +330,11 @@ fn a_doc_is_a_file_that_others_edit_too() {
         let world = world("doc").await;
         let mut alice = world.start("alice", HOUR).await;
         let mut bob = world.start("bob", HOUR).await;
-        std::fs::create_dir_all(&world.root).unwrap();
-        let plan = world.root.join("plan.md");
+        let plan = world.root.path().join("plan.md");
         std::fs::write(&plan, "- [ ] alpha\n- [ ] beta\n").unwrap();
         let invite = alice.cmd(&["invite", "--kind", "doc", "--name", "Plan", plan.to_str().unwrap()]).await.unwrap();
         assert_eq!(invite["file"], plan.to_str().unwrap());
-        let theirs = world.root.join("bob-plan.md");
+        let theirs = world.root.path().join("bob-plan.md");
         let joined = bob.cmd(&["join", invite["link"].as_str().unwrap(), theirs.to_str().unwrap()]).await.unwrap();
         assert_eq!(joined["kind"], "doc");
         alice.told(&["joined"]).await;
@@ -375,7 +367,7 @@ fn a_doc_is_a_file_that_others_edit_too() {
         }
         assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "- [x] alpha\n- [ ] beta (Tuesday)\n- [ ] gamma @alice\n");
         assert!(bob.printed().await.iter().all(|e| e["type"] != "warning"));
-        let attached = world.root.join("chart.png");
+        let attached = world.root.path().join("chart.png");
         std::fs::write(&attached, b"\x89PNG....").unwrap();
         let link = alice.cmd(&["doc", "attach", attached.to_str().unwrap()]).await.unwrap();
         assert!(link["markdown"].as_str().unwrap().starts_with("![chart.png](lmk:"));
@@ -388,14 +380,13 @@ fn a_table_is_a_csv_file_whose_cells_others_edit_too() {
         let world = world("table").await;
         let mut alice = world.start("alice", HOUR).await;
         let bob = world.start("bob", HOUR).await;
-        std::fs::create_dir_all(&world.root).unwrap();
-        let tasks = world.root.join("tasks.csv");
+        let tasks = world.root.path().join("tasks.csv");
         std::fs::write(&tasks, "Task,Owner,Done\nwrite,,false\nship,,false\n").unwrap();
         let invite = alice.cmd(&["invite", "--kind", "table", "--name", "Tasks", tasks.to_str().unwrap()]).await.unwrap();
         assert_eq!(invite["file"], tasks.to_str().unwrap());
         let ours = std::fs::read_to_string(&tasks).unwrap();
         assert!(ours.starts_with("id,Task,Owner,Done\n"), "the rows get ids: {ours}");
-        let theirs = world.root.join("bob-tasks.csv");
+        let theirs = world.root.path().join("bob-tasks.csv");
         let joined = bob.cmd(&["join", invite["link"].as_str().unwrap(), theirs.to_str().unwrap()]).await.unwrap();
         assert_eq!(joined["kind"], "table");
         alice.told(&["joined"]).await;
@@ -801,8 +792,7 @@ fn docs_that_drift_apart_meet_again() {
         let world = world("frames").await;
         let mut alice = world.start("alice", HOUR).await;
         let mut bob = world.start("bob", HOUR).await;
-        std::fs::create_dir_all(&world.root).unwrap();
-        let (plan, theirs) = (world.root.join("plan.md"), world.root.join("bob-plan.md"));
+        let (plan, theirs) = (world.root.path().join("plan.md"), world.root.path().join("bob-plan.md"));
         std::fs::write(&plan, "- [ ] alpha\n").unwrap();
         let invite = alice.cmd(&["invite", "--kind", "doc", plan.to_str().unwrap()]).await.unwrap();
         bob.cmd(&["join", invite["link"].as_str().unwrap(), theirs.to_str().unwrap()]).await.unwrap();
@@ -838,7 +828,7 @@ fn a_kinds_commands_pass_through_and_a_session_without_its_plugin_is_refused() {
         // Alice's plugin answers her doc's commands, and refuses those it does not know.
         let error = alice.cmd(&["doc", "frobnicate"]).await.unwrap_err();
         assert!(format!("{error:#}").contains("usage: letmeknow doc attach"), "{error:#}");
-        let readme = world.root.join("readme.txt");
+        let readme = world.root.path().join("readme.txt");
         std::fs::write(&readme, "read me").unwrap();
         let attached = alice.cmd(&["doc", "attach", readme.to_str().unwrap()]).await.unwrap();
         assert!(attached["markdown"].as_str().unwrap().starts_with("[readme.txt](lmk:"));

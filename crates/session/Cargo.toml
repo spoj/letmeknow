@@ -38,3 +38,4 @@ qrcode = { version = "0.14", default-features = false }
 lmk-testing.workspace = true
 rcgen = "0.14"
 lmk-kinds.workspace = true
+tempfile.workspace = true
