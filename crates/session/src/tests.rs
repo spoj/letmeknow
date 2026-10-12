@@ -139,7 +139,8 @@ impl Agent {
     async fn told(&mut self, kinds: &[&str]) -> Value {
         let start = std::time::Instant::now();
         loop {
-            self.cmd(&["status"]).await.unwrap();
+            // Once removed from its last group, the session has no status to give, but still prints what it was told.
+            let _ = self.cmd(&["status"]).await;
             while let Ok(line) = tokio::time::timeout(Duration::from_millis(200), self.events.recv()).await {
                 let event: Value = serde_json::from_str(&line.unwrap()).unwrap();
                 if kinds.iter().any(|kind| event["type"] == *kind) {

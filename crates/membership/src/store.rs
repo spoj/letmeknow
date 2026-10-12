@@ -1,6 +1,6 @@
 //! Disposable authority and its durable, reference-only SQLite store.
 
-use std::{fs::{self, File, OpenOptions}, io::Write, path::Path, sync::Mutex};
+use std::{fs::{self, OpenOptions}, io::Write, path::Path, sync::Mutex};
 
 use anyhow::{Result, ensure};
 use ed25519_dalek::SigningKey;
@@ -33,7 +33,7 @@ pub struct Store {
 
 #[cfg(unix)]
 fn sync_dir(path: &Path) -> Result<()> {
-    Ok(File::open(path)?.sync_all()?)
+    Ok(fs::File::open(path)?.sync_all()?)
 }
 
 /// Windows cannot flush a directory; NTFS journals its entries.
@@ -82,7 +82,6 @@ impl Store {
         )?;
         db.execute("INSERT INTO metadata VALUES(1,?,?,0,0,0)", params![FORMAT, key.verifying_key().as_bytes()])?;
         db.execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE);")?;
-        File::open(state.join("membership.db"))?.sync_all()?;
         sync_dir(state)?;
         let mut ready = options.open(state.join("membership.ready"))?;
         ready.write_all(key.verifying_key().as_bytes())?;
