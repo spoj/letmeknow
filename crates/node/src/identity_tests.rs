@@ -3,10 +3,10 @@ use crate::Config;
 use lmk_core::provider::MemoryProvider;
 use lmk_core::public::{PublicLog, Verdict};
 use lmk_membership::store::Store;
-use lmk_proto::Answer;
 use lmk_proto::frame::{self, ALPN, Open};
 use lmk_proto::group::{CHAT, Credential};
-use lmk_proto::membership::{Latest, Page, Request};
+use lmk_proto::head::reference;
+use lmk_proto::membership::{Latest, Page, Reply, Request};
 use lmk_testing::{Relay, relay};
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
@@ -16,7 +16,7 @@ const WAIT: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 struct ReadGate {
     peer: iroh::EndpointId,
-    log: Bytes,
+    log: [u8; 32],
     remaining: usize,
     reached: Arc<Notify>,
     release: Arc<Notify>,
@@ -25,7 +25,17 @@ struct ReadGate {
 struct Authority {
     store: Store,
     gate: Mutex<Option<ReadGate>>,
-    stale: Mutex<Option<(iroh::EndpointId, Bytes, Page)>>,
+    stale: Mutex<Option<(iroh::EndpointId, [u8; 32], Page)>>,
+}
+
+impl Authority {
+    fn log(&self, capability: &[u8; 32]) -> [u8; 32] {
+        reference(&self.store.key().verifying_key().to_bytes(), capability)
+    }
+
+    fn read(&self, log: &[u8]) -> Page {
+        self.store.read(log.try_into().unwrap(), 0).unwrap()
+    }
 }
 
 impl std::fmt::Debug for Authority {
@@ -38,7 +48,8 @@ impl iroh::protocol::ProtocolHandler for Authority {
             let _: Open = frame::read(&mut recv).await.unwrap();
             let request: Request = frame::read(&mut recv).await.unwrap();
             let answer = match request {
-                Request::Read { log, after } => {
+                Request::Read { capability, after } => {
+                    let log = self.log(&capability);
                     let gate = {
                         let mut gate = self.gate.lock().unwrap();
                         match gate.as_mut() {
@@ -57,14 +68,14 @@ impl iroh::protocol::ProtocolHandler for Authority {
                     let page = match stale {
                         Some((peer, id, page)) if peer == connection.remote_id() && id == log => {
                             assert!(after <= page.head.length);
-                            Page { entries: page.entries.into_iter().skip(after as usize).collect(), head: page.head }
+                            Page { after, entries: page.entries.into_iter().skip(after as usize).collect(), head: page.head }
                         }
-                        _ => self.store.read(&log.0, after, 4 << 20).unwrap().unwrap(),
+                        _ => self.store.read(&log, after).unwrap(),
                     };
-                    serde_json::to_value(Answer::Ok(page)).unwrap()
+                    serde_json::to_value(Reply::Ok(page)).unwrap()
                 }
-                Request::Append { log, entries, public } => serde_json::to_value(Answer::Ok(self.store.append(&log.0, &entries, public).unwrap())).unwrap(),
-                Request::Head { log } => serde_json::to_value(Answer::Ok(Latest { head: self.store.head(&log.0).unwrap() })).unwrap(),
+                Request::Append { capability, entries, public } => serde_json::to_value(Reply::Ok(self.store.append(&self.log(&capability), &entries, public).unwrap())).unwrap(),
+                Request::Head { capability } => serde_json::to_value(Reply::Ok(Latest { head: self.store.head(&self.log(&capability)).unwrap() })).unwrap(),
                 // No subscription delivery: the test controls when each node reads and applies history.
                 Request::Subscribe { .. } => continue,
             };
@@ -103,11 +114,10 @@ struct Race {
 impl Race {
     async fn new(with_b: bool) -> Self {
         let relay = relay().await;
-        let secret = iroh::SecretKey::from_bytes(&lmk_core::random());
-        let key = ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes());
-        let endpoint = relay.endpoint(secret).await;
+        let store = Store::initialize(&std::env::temp_dir().join(format!("lmk-identity-{:x}", u128::from_le_bytes(lmk_core::random())))).unwrap();
+        let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&store.key().to_bytes())).await;
         let membership = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: relay.url.to_string(), addrs: vec![], rest: Default::default() };
-        let authority = Arc::new(Authority { store: Store::open(std::path::Path::new(":memory:"), key).unwrap(), gate: Mutex::default(), stale: Mutex::default() });
+        let authority = Arc::new(Authority { store, gate: Mutex::default(), stale: Mutex::default() });
         let router = iroh::protocol::Router::builder(endpoint).accept(ALPN, authority.clone()).spawn();
         let (a, a_identity) = device(&relay, "A").await;
         let (c, c_identity) = device(&relay, "C").await;
@@ -130,7 +140,7 @@ impl Race {
         Self { relay, authority, router, a, a_identity, c, c_identity, b, b_identity, identity, gid }
     }
 
-    fn gate(&self, log: Bytes, remaining: usize) -> (Arc<Notify>, Arc<Notify>) {
+    fn gate(&self, log: [u8; 32], remaining: usize) -> (Arc<Notify>, Arc<Notify>) {
         let (reached, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
         *self.authority.gate.lock().unwrap() = Some(ReadGate { peer: self.a.net().id(), log, remaining, reached: reached.clone(), release: release.clone() });
         (reached, release)
@@ -144,9 +154,9 @@ impl Race {
 
 async fn captured_roster_race(remove: bool, leave: bool) {
     let r = Race::new(remove).await;
-    let address = Bytes(lmk_proto::public::address(&r.identity.id.0).to_vec());
+    let address = r.authority.log(&lmk_proto::public::address(&r.identity.id.0));
     let old_epoch = r.a.epoch(&r.gid.0).unwrap();
-    let (reached, release) = r.gate(address.clone(), 2);
+    let (reached, release) = r.gate(address, 2);
     let (a, gid) = (r.a_identity.clone(), r.gid.clone());
     let pending = tokio::spawn(async move {
         if leave { a.leave().await.map(drop) } else { a.duties(&gid.0).await }
@@ -166,11 +176,11 @@ async fn captured_roster_race(remove: bool, leave: bool) {
     let (observer, _) = device(&r.relay, "Observer").await;
     let published = observer.read_public(&r.identity).await.unwrap();
     assert_eq!(published.verify(&credential), expected);
-    let cut = r.authority.store.head(&address.0).unwrap().length;
+    let cut = r.authority.store.head(&address).unwrap().length;
     assert_eq!(r.a.epoch(&r.gid.0).unwrap(), old_epoch, "private application is still delayed");
     release.notify_one();
     let result = timeout(WAIT, pending).await.unwrap().unwrap();
-    let page = r.authority.store.read(&address.0, 0, 4 << 20).unwrap().unwrap();
+    let page = r.authority.read(&address);
     let mut view = PublicLog::replay(r.identity.id.0.as_slice().try_into().unwrap(), [page.entries[0].0.as_slice()]).unwrap();
     for (index, entry) in page.entries.iter().enumerate().skip(1) {
         if view.apply(&entry.0) && index as u64 + 1 >= cut {
@@ -206,32 +216,32 @@ async fn publication_waits_for_application_not_just_a_received_page() {
     let r = Race::new(false).await;
     r.b_identity.join(&Invite::parse(&r.c_identity.invite().await.unwrap()).unwrap()).await.unwrap();
     r.c_identity.duties(&r.gid.0).await.unwrap();
-    let page = r.authority.store.read(&r.gid.0, 0, 4 << 20).unwrap().unwrap();
+    let log = r.a.log(&r.gid.0).unwrap();
+    let page = r.authority.read(&log.0);
     {
         let mut st = r.a.inner.lock();
-        let logged = st.log(&r.gid.0).unwrap().logged;
-        for (pos, entry) in page.entries.iter().enumerate().skip(logged as usize) {
-            st.provider.put(&crate::logs::entry_key(&r.gid.0, pos as u64 + 1), &entry.0).unwrap();
+        let held = st.log(&log.0).unwrap().length();
+        let mut hash = st.hash_at(&log.0, held).unwrap().unwrap();
+        for (pos, entry) in page.entries.iter().enumerate().skip(held as usize) {
+            hash = lmk_proto::head::next(&hash, &entry.0);
+            st.provider.put(&crate::logs::entry_key(&log.0, pos as u64 + 1), &[hash.as_slice(), &entry.0].concat()).unwrap();
         }
-        let log = st.logs.get_mut(&r.gid.0).unwrap();
-        log.logged = page.head.length;
-        log.chain = Some(lmk_membership::Chain::anchored(page.head));
-        st.save_log(&r.gid.0).unwrap();
-        assert!(st.group(&r.gid.0).unwrap().rec.position < st.log(&r.gid.0).unwrap().logged);
+        st.logs.get_mut(&log.0).unwrap().head = Some(page.head);
+        st.save_log(&log.0).unwrap();
+        assert!(st.group(&r.gid.0).unwrap().rec.position < st.held_to(&r.gid.0).unwrap());
     }
-    let (reached, release) = r.gate(r.gid.clone(), 1);
+    let (reached, release) = r.gate(log.0.as_slice().try_into().unwrap(), 1);
     let (a, gid) = (r.a_identity.clone(), r.gid.clone());
     let pending = tokio::spawn(async move { a.duties(&gid.0).await });
     timeout(WAIT, reached.notified()).await.unwrap();
     release.notify_one();
     // A second public read is reachable only after the accepted-application barrier.
-    let address = Bytes(lmk_proto::public::address(&r.identity.id.0).to_vec());
-    let (published, proceed) = r.gate(address, 1);
+    let (published, proceed) = r.gate(r.authority.log(&lmk_proto::public::address(&r.identity.id.0)), 1);
     assert!(timeout(Duration::from_millis(100), published.notified()).await.is_err(), "receipt alone allowed writer derivation");
     {
         let mut st = r.a.inner.lock();
         r.a.inner.advance(&mut st, &r.gid.0).unwrap();
-        assert_eq!(st.group(&r.gid.0).unwrap().rec.position, st.log(&r.gid.0).unwrap().logged);
+        assert_eq!(st.group(&r.gid.0).unwrap().rec.position, st.held_to(&r.gid.0).unwrap());
     }
     timeout(WAIT, published.notified()).await.unwrap();
     proceed.notify_one();
@@ -282,13 +292,14 @@ async fn an_authorized_unobserved_historical_sender_does_not_change_the_ledger()
 async fn known_public_revocation_does_not_bind_an_authenticated_private_prefix() {
     // Characterization of the remaining design blocker, NOT an accepted freshness guarantee.
     let r = Race::new(true).await;
-    let prefix = r.authority.store.read(&r.gid.0, 0, 4 << 20).unwrap().unwrap();
+    let log = r.a.log(&r.gid.0).unwrap();
+    let prefix = r.authority.read(&log.0);
     let certificate = r.b_identity.certify(&[7; 32]).unwrap();
     let credential = Credential { key: [7; 32].into(), name: "external session".into(), certificate: Some(Box::new(certificate)) };
     r.c_identity.remove(&r.b_identity.key().unwrap().0).await.unwrap();
     let revoked = r.a.read_public(&r.identity).await.unwrap();
     assert_eq!(revoked.verify(&credential), Verdict::Dropped, "A already knows the public revocation");
-    *r.authority.stale.lock().unwrap() = Some((r.a.net().id(), r.gid.clone(), prefix));
+    *r.authority.stale.lock().unwrap() = Some((r.a.net().id(), log.0.as_slice().try_into().unwrap(), prefix));
     r.a_identity.duties(&r.gid.0).await.unwrap();
     let (observer, _) = device(&r.relay, "Observer").await;
     assert_eq!(observer.read_public(&r.identity).await.unwrap().verify(&credential), Verdict::Authorized,

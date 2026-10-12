@@ -98,7 +98,7 @@ pub(crate) fn log_key(id: &[u8]) -> Vec<u8> {
 }
 
 /// An entry, after the chain's hash through it.
-fn entry_key(id: &[u8], position: u64) -> Vec<u8> {
+pub(crate) fn entry_key(id: &[u8], position: u64) -> Vec<u8> {
     [b"node/entry/".as_slice(), id, b"/", &position.to_be_bytes()].concat()
 }
 

@@ -729,10 +729,10 @@ fn private_certificates_refresh_but_cannot_rebind_a_membership() {
     assert!(w.read(&[0, 1]).iter().all(|r| is_commit(&r[0])));
     w.agree(&[0, 1]);
     let kp = w.key_package(2);
-    let add = w.m[1].commit(Change { add: vec![kp], how: Some(How::Invite), ..Change::default() });
+    let add = w.m[1].commit(Change { add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
     let pos = w.post(add.entry);
     w.read(&[0, 1]);
-    w.m[2].join(add.welcome.as_ref().unwrap(), pos);
+    w.m[2].join(add.welcome.as_ref().unwrap(), pos, &kp);
     for reader in &mut w.m {
         let a = reader.g().members().into_iter().find(|m| m.key == key).unwrap().credential.unwrap();
         assert_eq!(a.name, "A");
@@ -762,8 +762,9 @@ fn private_certificates_refresh_but_cannot_rebind_a_membership() {
         let bundle = group.mls.commit_builder().consume_proposal_store(false).force_self_update(true).leaf_node_parameters(leaf)
             .load_psks(a.provider.storage()).unwrap().build(a.provider.rand(), a.provider.crypto(), &a.session.signer, |_| true).unwrap().stage_commit(&a.provider).unwrap();
         let entry = entry_of(&a.session.signer, bundle.into_messages().0.to_bytes().unwrap(), None);
-        group.state.posted = Some(Bytes(entry.clone()));
-        w.post(entry);
+        let wire = group.seal_entry(&a.provider, &entry).unwrap();
+        group.state.posted = Some(Posted { inner: Bytes(entry), wire: Bytes(wire.clone()), add_refs: vec![] });
+        w.post(wire);
         assert!(w.read(&[0, 1, 2]).iter().all(|r| matches!(&r[0].0, Verdict::Skipped { reason, .. } if reason.contains("authorization"))));
         w.agree(&[0, 1, 2]);
         for (reader, (epoch, members)) in w.m.iter_mut().zip(before) {

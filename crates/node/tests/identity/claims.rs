@@ -60,12 +60,14 @@ async fn every_public_body_is_keys_only_through_rename_restatement_removal_and_c
     lists(&laptop.node, &identity, std::slice::from_ref(&key)).await;
     assert!(devices.leave().await.unwrap());
     let mut bodies = Vec::new();
-    let mut after = 0;
+    let Service::Serve { key, .. } = &identity.membership else { unreachable!() };
+    let key: [u8; 32] = key.0.as_slice().try_into().unwrap();
+    let mut frontier = lmk_membership::Frontier::empty(key, lmk_proto::head::reference(&key, &address));
     loop {
-        let page = reader.read(&address, after).await.unwrap();
-        if page.entries.is_empty() { break; }
-        after += page.entries.len() as u64;
-        for entry in page.entries {
+        let page = reader.read(&address, &frontier).await.unwrap();
+        if page.page().entries.is_empty() { break; }
+        frontier = page.frontier().clone();
+        for entry in page.into_page().entries {
             let envelope = lmk_core::public::open(&identity.id.0, &entry.0).unwrap();
             let body: Value = serde_json::from_slice(&envelope.body.0).unwrap();
             let mut fields: Vec<_> = body.as_object().unwrap().keys().map(String::as_str).collect();
