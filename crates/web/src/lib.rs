@@ -168,7 +168,6 @@ impl Provider for Store {
     }
 }
 
-#[derive(Debug)]
 enum Save {
     Background,
     Barrier(oneshot::Sender<Result<()>>),
