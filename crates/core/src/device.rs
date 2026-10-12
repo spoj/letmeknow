@@ -36,7 +36,7 @@ impl Device {
     }
 }
 
-/// A device key, a 32-byte Ed25519 seed, as an MLS signature key.
+/// An Ed25519 seed as an MLS signature key: a device's, or a session's.
 pub fn signer(seed: &[u8; 32]) -> SignatureKeyPair {
     SignatureKeyPair::from_raw(SignatureScheme::ED25519, seed.to_vec(), public(seed).to_vec())
 }
