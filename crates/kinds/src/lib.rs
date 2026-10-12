@@ -202,7 +202,6 @@ impl<S: Store> Page<S> {
                     out.push(answer(id, Ok(json!({}))));
                 }
             }
-            "start" => out.push(answer(&message["id"], Ok(json!({})))),
             "gone" => {
                 self.states.states.remove(group);
                 self.store.delete(&self.key(group));
@@ -226,7 +225,7 @@ impl<S: Store> Page<S> {
                 };
                 out.push(answer(answer_to, Ok(answered)));
             }
-            "sync" => out.push(answer(&message["id"], Ok(json!({})))),
+            "start" | "sync" => out.push(answer(&message["id"], Ok(json!({})))),
             _ => {
                 if let Some((group, from)) = self.states.handle(message, out)? {
                     self.store.put(&self.key(&group), self.states.state(&group)?);
