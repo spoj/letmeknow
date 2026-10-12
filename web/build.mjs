@@ -6,13 +6,14 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { brotliCompressSync, gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import { build } from "esbuild";
 
 const web = fileURLToPath(new URL(".", import.meta.url));
 const root = fileURLToPath(new URL("..", import.meta.url));
 const out = `${web}dist/`;
 execFileSync("cargo", ["build", "-p", "lmk-web", "--profile", "wasm", "--target", "wasm32-unknown-unknown"], { cwd: root, stdio: "inherit" });
-execFileSync("wasm-bindgen", ["--target", "web", "--out-dir", "pkg", `${root}target/wasm32-unknown-unknown/wasm/lmk_web.wasm`], { cwd: web, stdio: "inherit" });
+execFileSync("wasm-bindgen", ["--target", "web", "--out-dir", "pkg", resolve(root, process.env.CARGO_TARGET_DIR ?? "target", "wasm32-unknown-unknown/wasm/lmk_web.wasm")], { cwd: web, stdio: "inherit" });
 rmSync(out, { recursive: true, force: true });
 await build({
   entryPoints: { app: `${web}src/main.ts` },

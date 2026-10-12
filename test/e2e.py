@@ -5,7 +5,7 @@ native sessions of its own. --no-browser skips building and testing the browser 
 import json, os, queue, shutil, socket, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, "target", "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
+BIN = os.path.join(ROOT, os.environ.get("CARGO_TARGET_DIR", "target"), "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
 WEB = os.path.join(ROOT, "web")
 BROWSER = "--no-browser" not in sys.argv
 TMP = tempfile.mkdtemp(prefix="lmk-e2e-")
