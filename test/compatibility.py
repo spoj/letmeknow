@@ -836,7 +836,7 @@ def cross_service(peers, states, service, old_service, root, probe, contract):
             # Replace the discovered local interface IP, not the bound UDP port.
             port = addresses[0].rsplit(":", 1)[1]
             targets.append((path.stem, f"127.0.0.1:{port}"))
-        require(len(targets) >= 2, "no native application ALPN target")
+        require(len(targets) >= 3, "missing session/device ALPN targets")
         for key, address in targets:
             for alpn, expected in ((own, "accept"), (other, "refuse")):
                 result = e2e.execute([probe, key, address, alpn, expected], env=server.env, timeout=15)
@@ -848,6 +848,7 @@ def cross_service(peers, states, service, old_service, root, probe, contract):
     after_alpn = snapshot(peers, root / "cross-after-alpn.json", logical=True)
     for i in before:
         retained(before[i], after_alpn[i])
+        retained(after[i], after_alpn[i])
     for server, old in zip(services, stores, strict=True):
         require(logical_tree(server.state) == old, "ALPN probes changed service rows/anchors")
     for i, state in enumerate(states):
