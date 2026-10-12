@@ -195,6 +195,11 @@ pub struct Sent {
     pub position: Option<u64>,
 }
 
+/// The directory moved on from the one a writer intent was derived from.
+#[derive(Debug, thiserror::Error)]
+#[error("the directory advanced; derive the writer intent again")]
+pub struct Advanced;
+
 /// Why a held send failed: the membership service certainly did not take it.
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {

@@ -11,7 +11,7 @@ const web = fileURLToPath(new URL(".", import.meta.url));
 const root = fileURLToPath(new URL("..", import.meta.url));
 const out = resolve(web, process.env.LMK_FRONTEND_OUT ?? "dist");
 const backend = readBackend();
-execFileSync("cargo", ["build", "-p", "lmk-web", "--profile", "wasm", "--target", "wasm32-unknown-unknown"], { cwd: root, stdio: "inherit" });
+execFileSync("cargo", ["build", "-p", "lmk-web", "--profile", "wasm", "--target", "wasm32-unknown-unknown", ...(process.env.LMK_TEST_WITNESS ? ["--features", "test-witness"] : [])], { cwd: root, stdio: "inherit" });
 execFileSync("wasm-bindgen", ["--target", "web", "--out-dir", "pkg", resolve(root, process.env.CARGO_TARGET_DIR ?? "target", "wasm32-unknown-unknown/wasm/lmk_web.wasm")], { cwd: web, stdio: "inherit" });
 rmSync(out, { recursive: true, force: true });
 await build({

@@ -134,7 +134,7 @@ def main():
             config = write("frontend.json", json.dumps({"membershipKey": ENV["LETMEKNOW_MEMBERSHIP"].split("@")[0], "relay": ENV["LETMEKNOW_RELAY"]}))
             dist = os.path.join(TMP, "frontend")
             subprocess.run([shutil.which("npm"), "run", "build"], cwd=WEB,
-                           env={**ENV, "LMK_FRONTEND_CONFIG": config, "LMK_FRONTEND_OUT": dist}, check=True)
+                           env={**ENV, "LMK_FRONTEND_CONFIG": config, "LMK_FRONTEND_OUT": dist, "LMK_TEST_WITNESS": "1"}, check=True)
             subprocess.run([shutil.which("node"), "artifact-test.mjs", dist], cwd=WEB,
                            env={**ENV, "LMK_FRONTEND_CONFIG": config}, check=True)
             with open(os.path.join(dist, "blank.html"), "w") as f:

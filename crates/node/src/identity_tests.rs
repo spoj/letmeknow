@@ -189,14 +189,16 @@ async fn captured_roster_race(remove: bool, leave: bool) {
         }
     }
     assert_eq!(observer.read_public(&r.identity).await.unwrap().verify(&credential), expected);
-    assert!(result.unwrap_err().to_string().contains("directory advanced"));
-    assert_eq!(r.a.epoch(&r.gid.0).unwrap(), old_epoch);
     if leave {
+        assert!(result.unwrap_err().is::<crate::Advanced>());
+        assert_eq!(r.a.epoch(&r.gid.0).unwrap(), old_epoch);
         assert!(!r.a.leaving(&r.gid.0), "refused publication must retain the leave intent for a complete retry");
         r.a_identity.leave().await.unwrap();
         let after = observer.read_public(&r.identity).await.unwrap();
         assert!(!after.writers.contains(&r.a.key_in(&r.gid.0)));
         assert_eq!(after.verify(&credential), Verdict::Authorized, "retry keeps the added device, omitting only self");
+    } else {
+        result.expect("duties derive the intent again from the advanced directory");
     }
     observer.shutdown().await.unwrap();
     r.close().await;

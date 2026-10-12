@@ -302,19 +302,24 @@ impl<P: Provider + Send + 'static> Identity<P> {
         });
     }
 
-    /// Derive the roster after reading its public predecessor and applying the private log, not merely receiving it.
+    /// Derive the roster after reading its public predecessor and applying the private log, not merely receiving it;
+    /// again while another device's publication moves the directory on meanwhile.
     pub async fn duties(&self, gid: &[u8]) -> Result<()> {
         let _passing = self.shared.passing.lock().await;
         let Some(identity) = self.identity_of(gid) else { return Ok(()) };
-        let latest = self.node.read_public(&identity).await?;
-        self.node.inner.caught_up(gid).await?;
-        let me = self.node.key_in(gid);
-        if !latest.writers.contains(&me) {
-            return Ok(());
+        loop {
+            let latest = self.node.read_public(&identity).await?;
+            self.node.inner.caught_up(gid).await?;
+            let me = self.node.key_in(gid);
+            if !latest.writers.contains(&me) {
+                return Ok(());
+            }
+            let writers = self.node.members(gid)?.into_iter().map(|m| m.key).collect();
+            match self.node.publish(gid, &latest, writers).await {
+                Err(error) if error.is::<crate::Advanced>() => continue,
+                published => return published.map(drop),
+            }
         }
-        let writers = self.node.members(gid)?.into_iter().map(|m| m.key).collect();
-        self.node.publish(gid, &latest, writers).await?;
-        Ok(())
     }
 
     /// A certificate that the session with MLS key `key` is one of this device's, speaking as the identity: by this
