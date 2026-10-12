@@ -276,7 +276,9 @@ try {
   await laptop.getByLabel("Your name").fill("Matt");
   await laptop.getByRole("button", { name: "Join", exact: true }).click();
   await laptop.locator(".people", { hasText: "Ann" }).waitFor();
-  check(new URL(laptop.url()).pathname === "/", "a browser joins from an invite link, with a click");
+  // The chat may show before the join's answer, after which the page leaves the invite's address.
+  await laptop.waitForURL(url => new URL(url).pathname === "/");
+  check(true, "a browser joins from an invite link, with a click");
   await ann.printed(e => e.type === "joined");
   check(true, "the native session sees the browser join");
   const matt = await until(
@@ -869,8 +871,11 @@ try {
   await late.close();
   delete pages["recovery follower"];
   delete pages["late recovery follower"];
+  // Either closed tab may have run the session: the laptop takes over before it answers.
+  await call(laptop, "me");
   await laptop.locator("textarea:visible").fill("after recovery handoff");
   await laptop.locator("textarea:visible").press("Enter");
+  await laptop.locator(".messages li", { hasText: "after recovery handoff" }).locator(".ticks").waitFor();
   await ann.printed(e => e.type === "message" && e.content === "after recovery handoff");
   check(true, "the surviving tab still sends to the real peer after the recovery handoff");
 
