@@ -118,7 +118,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             .await?;
         let removed = removing.into_inner().unwrap();
         if committed.is_some() && !removed.is_empty() {
-            self.revoked(gid, removed)?;
+            self.revoked(gid, &removed)?;
         }
         Ok(())
     }
@@ -168,7 +168,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Tells that this session's commit removed members whose devices were dropped, and which members they added or
     /// let in by their invites.
-    fn revoked(&self, gid: &[u8], removed: Vec<core::Member>) -> Result<()> {
+    fn revoked(&self, gid: &[u8], removed: &[core::Member]) -> Result<()> {
         let mut st = self.lock();
         let g = st.group(gid)?;
         let by_them = |key: &[u8]| removed.iter().any(|m| m.key == key);
