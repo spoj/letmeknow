@@ -1054,7 +1054,8 @@ impl<P: Provider + Send + 'static> Client<P> {
         let node = &self.inner.node;
         let mut groups = Vec::new();
         for gid in node.groups() {
-            let settings = node.settings(&gid.0)?;
+            // None for a group left since it was listed.
+            let Ok(settings) = node.settings(&gid.0) else { continue };
             if settings.kind == IDENTITY {
                 continue;
             }
