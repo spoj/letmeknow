@@ -579,6 +579,9 @@ async function showLink(target: { gid: string } | { identity: string }, body: HT
   const device = "identity" in target;
   const g = device ? undefined : group(target.gid);
   const kind = g ? KINDS[g.settings.kind] : "";
+  // "devices" also tells of the identity's devices being heard from: the one added is a key the list did not have.
+  const keys = async () => ((await request({ cmd: "identity", op: "list" })) as Listed).devices.map(d => d.key);
+  const before = device ? await keys() : [];
   // Invite presentation stays on the trusted frontend origin, never the backend's.
   const made = new URL((await request(device ? { cmd: "identity", op: { invite: {} } } : { cmd: "invite", group: target.gid })).link);
   const link = location.origin + made.pathname + made.hash;
@@ -605,8 +608,10 @@ async function showLink(target: { gid: string } | { identity: string }, body: HT
     copyable(`letmeknow ${device ? "identity join" : "join"} '${link}'`),
     h("p", { className: "expiry" }, "It works once, within 10 minutes, while this browser is open.")
   );
-  const joined = (event: client.Event) => {
-    const added = device ? event.type === "devices" && event.identity === target.identity : event.type === "joined" && event.group === target.gid;
+  const joined = async (event: client.Event) => {
+    const added = device
+      ? event.type === "devices" && event.identity === target.identity && (await keys()).some(key => !before.includes(key))
+      : event.type === "joined" && event.group === target.gid;
     if (!added || !dialog.open) return;
     body.replaceChildren(h("p", { className: "done" }, device ? "Added. The device can now join your chats and documents." : `They joined the ${kind}.`));
     setTimeout(() => dialog.close(), 1_500);

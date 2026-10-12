@@ -441,6 +441,13 @@ try {
   await phone.locator(".devices li", { hasText: "phone" }).waitFor();
   const devices = desk.run("identity", "list").devices;
   check(devices.length === 2 && devices.some(d => d.name === "phone"), "a device link adds the browser to the identity's devices");
+  // The phone's own device link stays up while the desk, online, is heard from: only a device that joins by it is added.
+  await phone.getByRole("button", { name: "Add a device" }).click();
+  await phone.locator("dialog .qr").waitFor();
+  desk.run("identity", "rename", "--device", "study");
+  await phone.locator(".devices li", { hasText: "study" }).waitFor();
+  check(await phone.locator("dialog .qr").isVisible(), "a device link stays up while the identity's other devices are heard from");
+  await phone.locator("dialog").getByRole("button", { name: "Close" }).click();
   const team = desk.run("invite", "--name", "Team");
   await phone.locator(".back:visible").click();
   await phone.getByRole("button", { name: "Join", exact: true }).first().click();
