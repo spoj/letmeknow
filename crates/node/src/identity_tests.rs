@@ -182,23 +182,20 @@ async fn captured_roster_race(remove: bool, leave: bool) {
     let result = timeout(WAIT, pending).await.unwrap().unwrap();
     let page = r.authority.read(&address);
     let mut view = PublicLog::replay(r.identity.id.0.as_slice().try_into().unwrap(), [page.entries[0].0.as_slice()]).unwrap();
+    let me = r.a.key_in(&r.gid.0);
+    let without_me: Vec<_> = published.writers.iter().filter(|writer| **writer != me).cloned().collect();
     for (index, entry) in page.entries.iter().enumerate().skip(1) {
         if view.apply(&entry.0) && index as u64 + 1 >= cut {
             assert_eq!(view.verify(&credential), expected, "an ACCEPTED successor transiently reversed B's authorization");
-            assert_eq!(view.writers, published.writers, "an obsolete intent became an accepted successor");
+            assert!(view.writers == published.writers || leave && view.writers == without_me, "an obsolete intent became an accepted successor");
         }
     }
-    assert_eq!(observer.read_public(&r.identity).await.unwrap().verify(&credential), expected);
+    result.expect("the intent is derived again from the advanced directory");
+    let after = observer.read_public(&r.identity).await.unwrap();
+    assert_eq!(after.verify(&credential), expected);
     if leave {
-        assert!(result.unwrap_err().is::<crate::Advanced>());
-        assert_eq!(r.a.epoch(&r.gid.0).unwrap(), old_epoch);
-        assert!(!r.a.leaving(&r.gid.0), "refused publication must retain the leave intent for a complete retry");
-        r.a_identity.leave().await.unwrap();
-        let after = observer.read_public(&r.identity).await.unwrap();
-        assert!(!after.writers.contains(&r.a.key_in(&r.gid.0)));
-        assert_eq!(after.verify(&credential), Verdict::Authorized, "retry keeps the added device, omitting only self");
-    } else {
-        result.expect("duties derive the intent again from the advanced directory");
+        assert!(!after.writers.contains(&me));
+        assert_eq!(after.verify(&credential), Verdict::Authorized, "the leave keeps the added device, omitting only self");
     }
     observer.shutdown().await.unwrap();
     r.close().await;

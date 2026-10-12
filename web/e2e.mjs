@@ -466,7 +466,7 @@ try {
   await phone.locator(".devices li", { hasText: "this browser" }).getByRole("button", { name: "Rename" }).click();
   await phone.locator("dialog").getByLabel("This device").fill("pocket");
   await phone.locator("dialog").getByRole("button", { name: "Rename" }).click();
-  await phone.locator(".devices li", { hasText: "pocket" }).waitFor();
+  await phone.locator(".devices li", { hasText: "this browser" }).filter({ hasText: "pocket" }).waitFor();
   const listed = await until(
     () => desk.run("identity", "list").devices.map(d => d.name),
     names => names.includes("pocket")

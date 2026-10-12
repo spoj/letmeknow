@@ -257,16 +257,23 @@ impl<P: Provider + Send + 'static> Identity<P> {
     }
 
     /// Takes this device off its identity. Listed on the identity's public log, it first lists the other devices, or as
-    /// the only one closes the log; then it asks the others to remove it, or, the only device, ends the identity. Returns
-    /// whether it ended.
+    /// the only one closes the log, again while another device's publication moves the directory on meanwhile; then it
+    /// asks the others to remove it, or, the only device, ends the identity. Returns whether it ended.
     pub async fn leave(&self) -> Result<bool> {
         let (gid, identity) = self.own()?;
         let me = self.node.key_in(&gid.0);
-        let predecessor = self.node.read_public(&identity).await?;
-        if predecessor.writers.contains(&me) {
+        loop {
+            let predecessor = self.node.read_public(&identity).await?;
+            if !predecessor.writers.contains(&me) {
+                break;
+            }
             self.node.inner.caught_up(&gid.0).await?;
             let others = self.node.members(&gid.0)?.into_iter().filter(|m| m.key != me).map(|m| m.key).collect();
-            self.node.publish(&gid.0, &predecessor, others).await?;
+            match self.node.publish(&gid.0, &predecessor, others).await {
+                Err(error) if error.is::<crate::Advanced>() => continue,
+                published => _ = published?,
+            }
+            break;
         }
         Ok(self.node.leave(&gid.0).await?.is_none())
     }
