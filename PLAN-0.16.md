@@ -6,13 +6,13 @@ Implementation plan, not a description of the released software. Based on the ad
 
 - Clean break from 0.15 is acceptable, including new groups and identities. No preserving migration or mixed-version activation path.
 - Clients trust the project's GitHub/npm distribution. The backend must neither supply their code nor authorize deletion of their local state.
-- The entire static frontend, including HTML and service worker, comes from GitHub Pages. Proposed hosts: `letmeknow.dev` for the frontend, `relay.letmeknow.dev` for membership/relay. DNS and release administration remain trusted.
+- The entire static frontend, including HTML and service worker, comes from GitHub Pages. Hosts: `letmeknow.dev` for the frontend, `relay.letmeknow.dev` for membership/relay. DNS and release administration remain trusted.
 - New group logs are independently named and sealed from epoch zero, rotating on every MLS commit. Log capabilities and sealing keys use separate exporters.
 - Modest size-bucket padding. Counts, coarse activity and residual size-class inference remain visible; no cover traffic or anonymity claim.
 - Public stats contain completed-day site-wide totals, not per-log rows, current online counts or live traffic.
 - Identity directories retain minimum authorization/revocation and authenticated service-routing information. Unnecessary descriptive metadata stays private; identity-ID holders keep directory read access.
 - Disposable service for now: no remote replicas or automated disaster recovery. Catastrophic loss may require explicit service/group recreation, never silent signed-history rollback or client erasure. Normal restarts still require durable storage.
-- No production reset, DNS change, deletion of backups or release is authorized by this implementation checklist alone.
+- The owner authorized release and deployment after passing review/tests, confirmed the frontend/backend hosts, and explicitly approved deleting the old server database and Litestream/Spaces backups at cutover. The owner has created the relay DNS records. Do not erase client-local data or waive a security/test blocker. The frontend DNS switch still needs verified administrative access.
 
 ## Known limit: directory freshness
 
@@ -58,7 +58,7 @@ Update code, README.md, SKILL.md, AGENTS.md, deploy/README.md and relevant tests
 
 ## #72 design gate
 
-Specify the transition witness before implementation. It binds the predecessor commit, terminal local position, cumulative base/history, and covering signed-chain evidence. Keep enough ancestry to compare histories across multiple moves even when current heads match. Do not reveal old capabilities to joiners or new ones to removed members.
+The adopted implementation contract is [EPOCH-LOGS.md](EPOCH-LOGS.md), refined by separate cryptographic and simplicity reviews. Its transition witness binds the predecessor commit, terminal local position, cumulative base/history, and covering signed-chain evidence. Keep enough ancestry to compare histories across multiple moves even when current heads match. Do not reveal old capabilities to joiners or new ones to removed members.
 
 Test competing commits; the same commit after different prefixes; a page with an ignored post-transition suffix; admission at a nonzero base; lost append/Welcome replies and retry through another admitter; two-move peer-only catch-up without the service, including restart; sends racing a move; self-update after capability disclosure; removed members holding all old secrets; doc/table cursors; and failed persistence.
 
