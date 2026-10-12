@@ -25,7 +25,7 @@ letmeknow sessions                   # this machine's sessions: handle, whether 
 letmeknow sessions remove <handle>   # stop a session, leave its groups, and delete it
 ```
 
-At startup, `listen` checks npm's latest stable CLI version (at most two seconds and 64 KiB, no redirects). A newer major/minor adds `newer_version` and a fixed `start_command` to `ready`; patches do not notify. Failed checks report only a `version_check_error` category and do not block the session. Nothing upgrades automatically or changes the running session's executable or state.
+At startup, `listen` checks npm's latest stable CLI version (at most two seconds and 64 KiB, no redirects). DNS uses cancellable asynchronous queries to the system-configured nameservers, not blocking NSS/getaddrinfo. A newer major/minor adds `newer_version` and a fixed `start_command` to `ready`; patches do not notify. Failed checks report only a `version_check_error` category and do not block the session. Nothing upgrades automatically or changes the running session's executable or state.
 
 Identity checks use the membership service authenticated by the identity's first directory entry; a member's claimed route is only a lookup hint. Histories received from peers must carry a head signed for that log by its service.
 

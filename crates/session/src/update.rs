@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 #[cfg(not(test))]
 const ENDPOINT: &str = "https://registry.npmjs.org/@letmeknow/cli/latest";
@@ -7,6 +7,19 @@ const ENDPOINT: &str = "https://registry.npmjs.org/@letmeknow/cli/latest";
 const ENDPOINT: &str = "http://127.0.0.1:0";
 const TIMEOUT: Duration = Duration::from_secs(2);
 const BODY_LIMIT: usize = 64 * 1024;
+
+struct AsyncDns(iroh::dns::DnsResolver);
+
+impl reqwest::dns::Resolve for AsyncDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let resolver = self.0.clone();
+        Box::pin(async move {
+            // The request deadline drops these async lookups before their own timeout.
+            let addresses = resolver.lookup_ipv4_ipv6(name.as_str().to_owned(), TIMEOUT * 2).await?;
+            Ok(Box::new(addresses.map(|ip| SocketAddr::new(ip, 0))) as reqwest::dns::Addrs)
+        })
+    }
+}
 
 fn stable(version: &str) -> Option<[u32; 3]> {
     let mut parts = version.split('.');
@@ -35,6 +48,9 @@ async fn check_at(ready: &mut Value, endpoint: &str, current: &str) {
             .tls_backend_preconfigured(tls)
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
+            .dns_resolver(Arc::new(AsyncDns(
+                iroh::dns::DnsResolver::builder().with_system_defaults().disable_fallback().build(),
+            )))
             .build()
             .map_err(|_| "network")?;
         let mut response = client.get(endpoint).send().await.map_err(|_| "network")?;
