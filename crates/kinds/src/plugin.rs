@@ -242,6 +242,7 @@ impl Plugin {
         }
         let cwd = Path::new(message["cwd"].as_str().unwrap_or("."));
         let named = message["args"].get(0).map(|file| anyhow::Ok(cwd.join(str(file)?))).transpose()?;
+        let made = named.is_none();
         if let Some(path) = &named
             && self.bindings.values().any(|b| b.saved.path == *path)
         {
@@ -265,7 +266,6 @@ impl Plugin {
         if !path.exists() {
             file::write_file(&path, &base)?;
         }
-        let made = message["args"].get(0).is_none();
         self.follow(group, Saved { path: path.clone(), base, made, carrying: None }, me);
         self.save(group)?;
         self.sync(group)?;
