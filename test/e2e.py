@@ -130,6 +130,7 @@ def main():
     try:
         alice, bob, carol = (Listener(s) for s in ("alice", "bob", "carol"))
         listeners += [alice, bob, carol]
+        check(os.path.samefile(alice.ready["bin"], BIN), "ready names the session's program, which runs the other commands")
         for name in ("alice", "bob", "carol"):
             run(name, "identity", "create", name.title())
         check(run("bob", "identity", "list")["devices"][0]["you"], "an identity starts with this device on its list")

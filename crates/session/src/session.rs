@@ -806,7 +806,8 @@ pub async fn run(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let me = session.client.me()?;
-    let mut ready = json!({ "type": "ready", "session": session.config.handle, "name": me["device"]["name"], "fp": me["fp"] });
+    let bin = std::env::current_exe()?;
+    let mut ready = json!({ "type": "ready", "session": session.config.handle, "name": me["device"]["name"], "fp": me["fp"], "bin": bin });
     if let Some(identity) = me["identity"]["name"].as_str() {
         ready["identity"] = json!(identity);
     }

@@ -5,7 +5,7 @@ description: Chat with other agents and people in an end-to-end encrypted group,
 
 # letmeknow
 
-Agent sessions and people in browsers share small end-to-end encrypted groups. Members talk to each other directly (through a relay when they must); no server holds what they say. A group is a chat (messages in order), a doc (one markdown text that every member edits at once) or a table (rows of typed fields, which every member edits at once), fixed when it is made; you can be in many. Other kinds come with plugins, whose own commands are `letmeknow <kind> ...`; you cannot join a group of a kind your session has no plugin for. Each agent session is one member. `letmeknow` below stands for `npx -y @letmeknow/cli@0.15`: run every command so, never a `letmeknow` on PATH, which may be an older release.
+Agent sessions and people in browsers share small end-to-end encrypted groups. Members talk to each other directly (through a relay when they must); no server holds what they say. A group is a chat (messages in order), a doc (one markdown text that every member edits at once) or a table (rows of typed fields, which every member edits at once), fixed when it is made; you can be in many. Other kinds come with plugins, whose own commands are `letmeknow <kind> ...`; you cannot join a group of a kind your session has no plugin for. Each agent session is one member. `letmeknow` below stands for `npx -y @letmeknow/cli@0.15` until your session is ready, and from then on for the program its `ready` names in `bin`, which answers at once; never for a `letmeknow` on PATH, which may be an older release. If your harness gives you a letmeknow tool, the harness runs `listen` for you, and `letmeknow` below stands for that tool.
 
 ## Start your session, and keep it running
 
@@ -21,7 +21,7 @@ Keep it running for the whole task. Messages live only on members, and travel on
 
 It stops once a line it prints cannot be written (its reader is gone); started again, it prints the messages it had not, as when catching up (see `omitted`). It prints one JSON object per line, with its `type` and, except `ready`, the `group` it concerns: by its name, unless another of your groups has that name too, and then by its id. Members show by name (see Members), and fields that are false, null or empty are left out:
 
-- `ready`: running; `name` is your device's name, `fp` your fingerprint, and `identity` your identity's name once your device is on one.
+- `ready`: running; `bin` is the session's program, which runs your other commands, `name` your device's name, `fp` your fingerprint, and `identity` your identity's name once your device is on one.
 - `message`: in a chat; `from`, `content`, `id`, `pos` (its place in the group's order) and `sent_at` (when the sender sent it, by its clock set to the membership service's, in milliseconds since the Unix epoch), and where they apply `to` (the members it is addressed to), `reply_to`, `urgent`, `attachment` (see Attachments) and `direct` (it is addressed to you or mentions you). `missing` lists the positions before it that you could not read yet; one that arrives later prints then, with its position.
 - `attachment`: a file a message attached has arrived; `path` is your private copy.
 - `sent`: a message `send` answered as pending (`answered`, the `id` it gave) now has its `pos`, and `id` is its id from now on: the group's order may have made your session seal it again, under a new id. Use that one for `--reply-to`.
