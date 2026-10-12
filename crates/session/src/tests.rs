@@ -1005,6 +1005,20 @@ fn a_session_is_listed_and_removed_running_or_stopped() {
     });
 }
 
+/// One process runs a session: another `listen` of it fails, also one that does not find its command channel, as when
+/// both start at once.
+#[test]
+fn a_session_runs_in_one_process() {
+    local(async {
+        let world = world("one-process").await;
+        let alice = world.start("alice", HOUR).await;
+        std::fs::remove_file(world.config("alice", "alice").dir.join("endpoint")).unwrap();
+        let again = crate::listen(world.config("alice", "alice"), &alice.home, world.network.clone(), |_| Ok(()), std::future::pending());
+        let error = tokio::time::timeout(Duration::from_secs(10), again).await.expect("it fails at once").unwrap_err();
+        assert_eq!(error.to_string(), "session alice is already running");
+    });
+}
+
 /// `add` brings a session of another of your devices into a group: `identity list` shows the sessions each device runs,
 /// and their groups, and the session the add names joins once it runs, by an invite that admits only a session of its
 /// device, once.

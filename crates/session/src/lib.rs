@@ -7,7 +7,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::Node;
@@ -78,6 +78,13 @@ pub async fn listen(
     );
     cli::private_dir(&config.dir)?;
     std::fs::write(&format, "5\n")?;
+    // One process runs a session, even when two start at once.
+    let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(config.dir.join("session.lock"))?;
+    match held.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => bail!("session {} is already running", config.handle),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
     let (inbound, queue) = tokio::sync::mpsc::unbounded_channel();
     cli::open_channel(&config.dir.join("endpoint"), inbound.clone()).await?;
     let device_file = home.join("device.json");
@@ -89,7 +96,7 @@ pub async fn listen(
     let kinds = [lmk_proto::group::CHAT.to_owned()].into_iter().chain(kinds::discover(&config.plugins).into_keys()).collect();
     let node_config = node_config(&network, home, &config.handle, None, config.dir.join("files"), kinds);
     let (node, events) = Node::start(provider, node_config).await?;
-    let session = session::Session::open(config, db, node, home, network, inbound).await?;
+    let session = session::Session::open(config, db, node, home, network, inbound, held).await?;
     session::run(session, queue, events, print, shutdown).await
 }
 

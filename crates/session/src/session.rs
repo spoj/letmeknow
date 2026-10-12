@@ -102,9 +102,11 @@ pub struct Session {
     plugins: Arc<Plugins>,
     /// What the client tells.
     told: mpsc::UnboundedReceiver<ClientEvent>,
+    /// The session's lock, held while this process runs it.
+    _held: std::fs::File,
     /// The device's node, when this process holds the device's lock.
     device: Option<SessionNode>,
-    lock: std::fs::File,
+    device_lock: std::fs::File,
     device_retry: Instant,
     /// When this session next checks its device's identity.
     identity_at: Instant,
@@ -166,6 +168,7 @@ impl Session {
         home: &Path,
         network: Network,
         inbound: mpsc::UnboundedSender<Inbound>,
+        held: std::fs::File,
     ) -> Result<Self> {
         let (plugins, lines) = Plugins::new(crate::kinds::discover(&config.plugins), config.dir.join("kinds"));
         let device = Device::load(&home.join("device.json"))?;
@@ -173,14 +176,15 @@ impl Session {
         let access = Access::Elsewhere(Arc::new(Published(home.to_path_buf())));
         let plugins = Arc::new(plugins);
         let (client, told) = Client::new(node, client_config, access, plugins.clone(), lines);
-        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("device.lock"))?;
+        let device_lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("device.lock"))?;
         let mut session = Self {
             db,
             client,
             plugins,
             told,
+            _held: held,
             device: None,
-            lock,
+            device_lock,
             device_retry: Instant::now(),
             identity_at: Instant::now(),
             presence_at: Instant::now(),
@@ -231,7 +235,7 @@ impl Session {
     /// Acts for the device if no other session process does: runs its node and answers its command channel.
     async fn take_device(&mut self) -> Result<()> {
         self.device_retry = Instant::now() + DEVICE_RETRY;
-        match self.lock.try_lock() {
+        match self.device_lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
@@ -840,6 +844,8 @@ pub async fn run(
     }
     session.running.shutdown().await;
     session.shutdown().await;
+    // Its locks go before the answer: `sessions remove` runs the session as soon as it has it.
+    drop(session);
     if let Some(reply) = stopped {
         reply.send(json!({ "stopped": true })).ok();
     }
