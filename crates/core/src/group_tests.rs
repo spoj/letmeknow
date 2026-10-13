@@ -237,7 +237,9 @@ fn header(m: &Member, group: &[u8], joined: u64) -> Header {
 }
 
 fn live(m: &Member, payload: &serde_json::Value) -> Vec<u8> {
-    m.group.as_ref().unwrap().seal_live(&m.provider, &m.session, payload).unwrap()
+    let (wire, id) = m.group.as_ref().unwrap().seal_live(&m.provider, &m.session, payload).unwrap();
+    assert_eq!(m.group.as_ref().unwrap().open_live(&m.provider, &wire).unwrap().2, id);
+    wire
 }
 
 /// The sender's key and the payload of a live payload `m` opens, if it opens.

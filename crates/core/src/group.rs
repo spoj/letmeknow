@@ -814,19 +814,21 @@ impl Group {
     }
 
     /// Seals a live payload under the current epoch's live key, signed by this session: `epoch ‖ nonce ‖ ciphertext` of
-    /// `body ‖ sig`, the body `{"author", "payload"}`. It uses none of the MLS ratchet.
-    pub fn seal_live<P: Provider>(&self, provider: &P, session: &Session, payload: &Value) -> Result<Vec<u8>> {
+    /// `body ‖ sig`, the body `{"author", "payload"}`, and its id, as `open_live` gives it. It uses none of the MLS
+    /// ratchet.
+    pub fn seal_live<P: Provider>(&self, provider: &P, session: &Session, payload: &Value) -> Result<(Vec<u8>, [u8; 32])> {
         let epoch = self.epoch();
         let context = self.live_context(epoch);
         let body = serde_json::to_vec(&Live { author: Bytes(session.key().to_vec()), payload: payload.clone() })?;
         let sig = session.sign(&[&context, &body[..]].concat());
+        let id = held::id(&sig);
         let plaintext = [body, sig].concat();
         let size = plaintext.len() + FRAMING;
         ensure!(size <= MAX_MESSAGE, "the payload is {size} bytes, over the 1 MiB members take");
         let key = self.mls.export_secret(provider.crypto(), LIVE_LABEL, &context, 32)?;
         let nonce = crate::random::<24>();
         let ciphertext = XChaCha20Poly1305::new_from_slice(&key).unwrap().encrypt((&nonce).into(), Payload { msg: &plaintext, aad: &context })?;
-        Ok([&epoch.to_be_bytes()[..], &nonce, &ciphertext].concat())
+        Ok(([&epoch.to_be_bytes()[..], &nonce, &ciphertext].concat(), id))
     }
 
     /// Opens a live payload sealed in the current epoch by a current member, its signature checked: the member, the
