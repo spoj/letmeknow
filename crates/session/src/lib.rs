@@ -20,8 +20,8 @@ use n0_future::boxed::BoxFuture;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Where letmeknow's releases are published.
 pub const REGISTRY: &str = "https://registry.npmjs.org";
@@ -30,6 +30,8 @@ const LOOKUP: Duration = Duration::from_secs(2);
 /// How long a fetched directory answers without another fetch, and how long a fetch of one may take.
 const FRESH: Duration = Duration::from_secs(10 * 60);
 const FETCH: Duration = Duration::from_secs(5);
+/// How long a domain whose fetch failed is not fetched again.
+const RETRY: Duration = Duration::from_secs(60);
 
 /// The skill text for agents.
 pub const SKILL: &str = include_str!("../../../SKILL.md");
@@ -125,16 +127,24 @@ fn fetch(http: reqwest::Client) -> Resolve {
 
 /// Answers a domain's directory from its copy in `dir` while that is younger than `FRESH`. Otherwise fetches it with
 /// `fetch`, stores it and answers it; where the fetch fails, answers the copy, else letmeknow.dev's built-in directory,
-/// else the failure.
+/// else the failure. A failed fetch is not repeated for `RETRY`.
 fn cached(dir: PathBuf, fetch: Resolve) -> Resolve {
+    let failed: Arc<Mutex<BTreeMap<String, Instant>>> = Default::default();
     Arc::new(move |domain: String| -> BoxFuture<Result<Directory>> {
-        let (dir, fetch) = (dir.clone(), fetch.clone());
+        let (dir, fetch, failed) = (dir.clone(), fetch.clone(), failed.clone());
         Box::pin(async move {
             let file = dir.join(format!("{}.json", domain.replace(':', "_")));
             if age(&file).is_some_and(|age| age < FRESH) && let Some(directory) = stored(&file) {
                 return Ok(directory);
             }
-            match fetch(domain.clone()).await {
+            let failed_at = failed.lock().unwrap().get(&domain).copied();
+            let fetched = match failed_at {
+                Some(at) if at.elapsed() < RETRY => Err(anyhow!("the fetch of {domain} failed less than a minute ago")),
+                _ => fetch(domain.clone()).await.inspect_err(|_| {
+                    failed.lock().unwrap().insert(domain.clone(), Instant::now());
+                }),
+            };
+            match fetched {
                 Ok(directory) => {
                     std::fs::create_dir_all(&dir)?;
                     std::fs::write(&file, serde_json::to_vec(&directory)?)?;

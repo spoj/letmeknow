@@ -1373,6 +1373,9 @@ async fn a_directory_is_cached_and_the_built_in_one_answers_for_letmeknow_dev() 
     file.set_modified(SystemTime::now() - Duration::from_secs(3600)).unwrap();
     assert_eq!(resolve("localhost:8443".into()).await.unwrap(), served, "a failed fetch answers the copy");
     assert!(resolve("localhost:9443".into()).await.unwrap_err().to_string().contains("is down"));
+    let fetches = calls.load(Ordering::Relaxed);
+    assert!(resolve("localhost:9443".into()).await.is_err());
+    assert_eq!(calls.load(Ordering::Relaxed), fetches, "a failed fetch is not repeated for a minute");
     assert_eq!(calls.load(Ordering::Relaxed), 3);
     let down: lmk_membership::client::Resolve = Arc::new(|domain: String| -> BoxFuture<anyhow::Result<Directory>> {
         Box::pin(async move { anyhow::bail!("{domain} is down") })
