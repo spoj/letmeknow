@@ -38,9 +38,9 @@ const KINDS = { chat: "chat", doc: "document", table: "table" };
 /** Files up to this size every member fetches; larger ones only on request. */
 const FILE_LIMIT = 25 << 20;
 const INVITE_PREFIX = "https://letmeknow.dev/i";
-/** letmeknow 0.16's invite links, which this version cannot read. */
-const madeByOlder = (link: string) => /#5\./.test(link);
-const OLDER_INVITE = "This invite was made by letmeknow 0.16. Its maker must restart with `npx -y @letmeknow/cli@0.17`, then make a new link.";
+/** letmeknow 0.17's invite links, which this version cannot read. */
+const madeByOlder = (link: string) => /#6\./.test(link);
+const OLDER_INVITE = "This invite was made by letmeknow 0.17. Its maker must restart with `npx -y @letmeknow/cli@0.18`, then make a new link.";
 
 const root = document.getElementById("app")!;
 const agentsHelp = document.getElementById("agents")!;

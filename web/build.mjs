@@ -16,7 +16,7 @@ execFileSync("wasm-bindgen", ["--target", "web", "--out-dir", "pkg", resolve(roo
 rmSync(out, { recursive: true, force: true });
 await build({
   entryPoints: { app: `${web}src/main.ts` },
-  define: { DEFAULT_MEMBERSHIP: JSON.stringify(`${backend.membershipKey}@${backend.relay}`) },
+  define: { BACKEND: JSON.stringify(backend) },
   assetNames: "[name]-[hash]",
   chunkNames: "[name]-[hash]",
   splitting: true,

@@ -12,7 +12,7 @@ const dist = resolve(process.argv[2]);
 const backend = readBackend();
 const files = await readdir(dist);
 const app = (await Promise.all(files.filter(file => file.endsWith(".js")).map(file => readFile(`${dist}/${file}`, "utf8")))).join("\n");
-assert(app.includes(`${backend.membershipKey}@${new URL(backend.relay).origin}`));
+assert(app.includes(backend.domain) && app.includes(backend.directory.key));
 assert.deepEqual(JSON.parse(await readFile(`${dist}/backend.json`, "utf8")), backend);
 assert.equal(await readFile(`${dist}/i/index.html`, "utf8"), await readFile(`${dist}/index.html`, "utf8"));
 assert(!files.includes("CNAME"), "the frontend hostname belongs in the static host's configuration");

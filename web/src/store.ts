@@ -1,13 +1,15 @@
 // IndexedDB: "records" holds the session's records, one per key, as the WebAssembly hands them over; "files" the
-// ciphertext of the files it keeps, by hash (hex), which the session loads one at a time when it needs one.
+// ciphertext of the files it keeps, by hash (hex), which the session loads one at a time when it needs one; "directories"
+// the directories fetched, by domain. The directories are fetched here, as the session asks for them.
 let db: Promise<IDBDatabase> | undefined;
 function database(): Promise<IDBDatabase> {
   return db ??= new Promise((resolve, reject) => {
     // This version's own database: another version's is left as it is.
-    const request = indexedDB.open("lmk6", 1);
+    const request = indexedDB.open("lmk7", 1);
     request.onupgradeneeded = () => {
       request.result.createObjectStore("records");
       request.result.createObjectStore("files");
+      request.result.createObjectStore("directories");
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -66,4 +68,33 @@ export async function saveFiles(changes: [string, Uint8Array | null][]) {
 
 export async function loadFile(hash: string): Promise<Uint8Array> {
   return done((await database()).transaction("files").objectStore("files").get(hash));
+}
+
+/** The directory a domain publishes at `url`: no credentials, no redirects, 5 s, at most 64 KB. */
+export async function fetchDirectory(url: string): Promise<Uint8Array> {
+  const response = await fetch(url, { credentials: "omit", redirect: "error", signal: AbortSignal.timeout(5_000) });
+  if (!response.ok) throw new Error(`${url} answered ${response.status}`);
+  const reader = response.body!.getReader();
+  const chunks: Uint8Array<ArrayBuffer>[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.length;
+    if (size > 64 << 10) {
+      await reader.cancel();
+      throw new Error("a directory is at most 64 KB");
+    }
+    chunks.push(value);
+  }
+  return new Uint8Array(await new Blob(chunks).arrayBuffer());
+}
+
+/** The directory last fetched for a domain, as the session stored it. */
+export async function loadDirectory(domain: string): Promise<string | undefined> {
+  return done((await database()).transaction("directories").objectStore("directories").get(domain));
+}
+
+export async function saveDirectory(domain: string, text: string) {
+  await done((await database()).transaction("directories", "readwrite").objectStore("directories").put(text, domain));
 }
