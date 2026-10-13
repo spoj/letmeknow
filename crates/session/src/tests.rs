@@ -153,10 +153,10 @@ impl Agent {
     /// The next event of any of `kinds`, skipping others.
     async fn expect_any(&mut self, kinds: &[&str]) -> Value {
         loop {
-            let line = tokio::time::timeout(Duration::from_secs(30), self.events.recv())
-                .await
-                .unwrap_or_else(|_| panic!("{}: no {kinds:?} event", self.handle))
-                .unwrap();
+            let Ok(line) = tokio::time::timeout(Duration::from_secs(30), self.events.recv()).await else {
+                panic!("{}: no {kinds:?} event; status: {:?}", self.handle, self.cmd(&["status"]).await);
+            };
+            let line = line.unwrap();
             let event: Value = serde_json::from_str(&line).unwrap();
             if kinds.iter().any(|kind| event["type"] == *kind) {
                 return event;
