@@ -337,6 +337,64 @@ fn an_answer_strikes_what_it_covered_and_the_next_holder_is_asked() {
     assert_eq!(wants(&p.poll(100)), vec![(key(2), ask())]);
 }
 
+/// An answer that covers nothing, as a holder that refuses gives, strikes all that was asked of it: the next holder is
+/// asked, not it again.
+#[test]
+fn an_answer_covering_nothing_strikes_all_asked() {
+    let mut p = both_hold();
+    assert_eq!(wants(&p.poll(0)), vec![(key(1), ask())]);
+    p.frame(&key(1), &Frame::Held { group: id(), items: vec![], answers: Some(vec![]) }, 100);
+    assert_eq!(wants(&p.poll(100)), vec![(key(2), ask())]);
+}
+
+/// An answer cut at `ANSWER` bytes strikes only what it covered: the rest is asked of the same holder again.
+#[test]
+fn an_answer_cut_at_its_size_strikes_only_what_it_covered() {
+    let mut p = both_hold();
+    p.poll(0);
+    let items = vec![Bytes(vec![0; ANSWER])];
+    p.frame(&key(1), &Frame::Held { group: id(), items, answers: Some(vec![seqs(1, &[(1, 1)])]) }, 100);
+    p.group(id(), Own { wanted: vec![seqs(1, &[(2, 2)])], ..own(1, &[1, 2]) }, 100);
+    assert_eq!(wants(&p.poll(100)), vec![(key(1), vec![seqs(1, &[(2, 2)])])]);
+}
+
+/// A request times out 10 s after it was made, however busy the connection is with other frames.
+#[test]
+fn a_request_times_out_though_the_holder_sends_other_frames() {
+    let mut p = both_hold();
+    p.poll(0);
+    p.frame(&key(1), &Frame::Hello { groups: vec![], heads: vec![] }, TIMEOUT - 1);
+    assert_eq!(wants(&p.poll(TIMEOUT)), vec![(key(2), ask())]);
+}
+
+/// The commit wait dials holders four at a time, those that hold the lowest lacking seq first.
+#[test]
+fn the_commit_wait_dials_four_holders_at_a_time() {
+    let mut p = peers();
+    p.group(id(), own(1, &[1, 2, 3, 4, 5, 6]), 0);
+    let lacking = vec![seqs(1, &[(5, 9)])];
+    for n in 1..=6 {
+        p.summary(&id(), heard(n, 1, 0, vec![seqs(1, &[(10 - u64::from(n), 9)])]), Some(key(n)));
+    }
+    assert_eq!(p.wait(&id(), &lacking, 0, 0), Decision::Wait);
+    assert_eq!(dials(&p.poll(0)), vec![key(5), key(6), key(4), key(3)]);
+}
+
+/// A peer that stops being served a group, and is served it again, is sent the group's summaries anew: what it held
+/// before is not assumed.
+#[test]
+fn a_peer_served_a_group_again_is_sent_its_summaries_anew() {
+    let mut p = peers();
+    p.group(id(), own(1, &[1, 2]), 0);
+    p.connect(key(1), gs(), false, 0);
+    p.summary(&id(), heard(2, 1, 0, ask()), Some(key(2)));
+    p.poll(0);
+    p.served(&key(1), BTreeSet::new(), 10);
+    p.served(&key(1), gs(), 20);
+    let answered = p.frame(&key(1), &Frame::Versions { group: id(), versions: vec![] }, 30);
+    assert_eq!(summaries_to(&answered), vec![key(1)]);
+}
+
 /// Strikes last for the epoch: when it grows, the struck holder is asked again.
 #[test]
 fn strikes_clear_when_the_epoch_grows() {

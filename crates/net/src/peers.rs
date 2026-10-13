@@ -129,8 +129,6 @@ struct Conn {
     served_at: u64,
     /// Its last directed traffic.
     active: u64,
-    /// Its last frame.
-    heard_at: u64,
     /// Whether its `hello` is due at the next poll.
     hello: bool,
     /// Groups whose `versions` are due at the next poll.
@@ -212,7 +210,6 @@ impl Peers {
             dialed,
             served_at: now,
             active: now,
-            heard_at: now,
             hello: true,
             opened: served.clone(),
             served,
@@ -241,6 +238,8 @@ impl Peers {
         if !served.is_empty() {
             c.served_at = now;
         }
+        c.known.retain(|id, _| served.contains(id));
+        c.pending.retain(|id, _| served.contains(id));
         c.served = served;
         for (id, g) in &mut self.groups {
             if !c.served.contains(id) {
@@ -269,7 +268,6 @@ impl Peers {
     /// A frame from a connected peer, after the node's own checks. `Summaries` go to `summary`.
     pub fn frame(&mut self, peer: &Key, frame: &Frame, now: u64) -> Vec<Out> {
         let Some(c) = self.conns.get_mut(peer) else { return Vec::new() };
-        c.heard_at = now;
         match frame {
             Frame::Hello { groups, heads } => {
                 let logs = heads.iter().map(|h| (h.log_ref, h.length)).chain(groups.iter().map(|at| (at.log, at.head.as_ref().map_or(0, |h| h.length))));
@@ -303,16 +301,18 @@ impl Peers {
                     vec![Out::Frame(*peer, Frame::Summaries { group: group.clone(), items })]
                 }
             }
-            Frame::Held { group, answers: Some(answers), .. } => {
+            Frame::Held { group, items, answers: Some(answers) } => {
                 c.active = now;
                 if let Some(g) = self.groups.get_mut(group)
-                    && g.request.as_ref().is_some_and(|r| r.holder == *peer)
+                    && let Some(r) = g.request.take_if(|r| r.holder == *peer)
                 {
-                    for s in answers {
-                        let struck = g.struck.entry((*peer, membership(s))).or_default();
-                        *struck = struck.union(&s.seqs);
+                    // An answer short of `ANSWER` bytes, or covering nothing, is all the holder has of what was asked.
+                    let whole = answers.is_empty() || items.iter().map(|item| item.0.len()).sum::<usize>() < ANSWER;
+                    let covered = if whole { r.asked } else { to_set(answers) };
+                    for (m, seqs) in covered {
+                        let struck = g.struck.entry((*peer, m)).or_default();
+                        *struck = struck.union(&seqs);
                     }
-                    g.request = None;
                 }
                 Vec::new()
             }
@@ -459,7 +459,7 @@ impl Peers {
 
     fn timeouts(&mut self, now: u64) {
         for g in self.groups.values_mut() {
-            if let Some(r) = g.request.take_if(|r| now - self.conns[&r.holder].heard_at.max(r.at) >= TIMEOUT) {
+            if let Some(r) = g.request.take_if(|r| now - r.at >= TIMEOUT) {
                 for (m, asked) in r.asked {
                     let struck = g.struck.entry((r.holder, m)).or_default();
                     *struck = struck.union(&asked);
@@ -537,11 +537,13 @@ impl Peers {
             let g = &self.groups[&id];
             let epoch = g.own.epoch;
             let holders = holds(g);
-            let waiting: Vec<Key> = holders
+            let mut waiting: Vec<(Option<(Membership, u64)>, Key)> = holders
                 .iter()
-                .filter(|(k, held)| !self.conns.contains_key(k) && !self.dialing.contains(k) && !self.backing(k, now) && !offer(&g.waiting, held, &g.struck, k).is_empty())
-                .map(|(k, _)| *k)
+                .filter(|(k, _)| !self.conns.contains_key(k) && !self.dialing.contains(k) && !self.backing(k, now))
+                .map(|(k, held)| (lowest(&offer(&g.waiting, held, &g.struck, k)), *k))
+                .filter(|(lowest, _)| lowest.is_some())
                 .collect();
+            waiting.sort();
             let mut wanted = to_set(&g.own.wanted);
             for (m, r) in &g.waiting {
                 let all = wanted.entry(m.clone()).or_default();
@@ -560,7 +562,10 @@ impl Peers {
             } else {
                 None
             };
-            for k in waiting.into_iter().chain(dial) {
+            for k in waiting.into_iter().map(|(_, k)| k).chain(dial) {
+                if self.flight(&id) >= DIALS {
+                    break;
+                }
                 if self.dialing.insert(k) {
                     out.push(Out::Dial(k));
                 }
