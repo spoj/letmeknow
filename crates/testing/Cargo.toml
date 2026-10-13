@@ -6,9 +6,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
+anyhow.workspace = true
 lmk-membership.workspace = true
 lmk-proto.workspace = true
 ed25519-dalek.workspace = true
+n0-future = "0.3"
 iroh = { workspace = true, features = ["tls-ring"] }
 iroh-relay = { workspace = true, features = ["server"] }
 rcgen = "0.14"
