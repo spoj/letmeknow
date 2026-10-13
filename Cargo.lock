@@ -3020,6 +3020,7 @@ dependencies = [
  "iroh-relay",
  "lmk-membership",
  "lmk-proto",
+ "n0-future",
  "rcgen",
  "rustls",
  "serde_json",

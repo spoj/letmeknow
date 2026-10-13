@@ -2,8 +2,9 @@ use std::{net::Ipv4Addr, path::Path, sync::Arc, time::Duration};
 
 use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, endpoint::presets, tls::CaTlsConfig};
 use iroh_relay::RelayQuicConfig;
-use lmk_membership::client::ServeClient;
+use lmk_membership::client::{Resolve, ServeClient};
 use lmk_proto::directory::Directory;
+use n0_future::boxed::BoxFuture;
 use lmk_serve::{Certificate, ServeConfig, serve};
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::{
@@ -90,6 +91,12 @@ async fn serves_relay_and_membership_without_frontend() {
     let service = config.service().unwrap();
     let server = tokio::spawn(serve(config));
     wait_for_https(https).await;
+    let resolved = |directory: Directory| -> Resolve {
+        Arc::new(move |_: String| -> BoxFuture<anyhow::Result<Directory>> {
+            let directory = directory.clone();
+            Box::pin(async move { Ok(directory) })
+        })
+    };
 
     for path in ["/", "/i", "/index.html", "/app.js", "/sw.js", "/membership", "/missing.js"] {
         let response = https_get(https, &cert, path, "").await;
@@ -112,6 +119,7 @@ async fn serves_relay_and_membership_without_frontend() {
     );
     let directory = Directory::parse(directory.split_once("\r\n\r\n").unwrap().1.as_bytes()).unwrap();
     assert_eq!(directory.key.to_vec(), key.0);
+    let through_relay = directory.clone();
     assert_eq!(directory.addrs, [format!("localhost:{membership}")]);
     assert_eq!(directory.relay, relay);
     assert_eq!(directory.relays, [relay.as_str()]);
@@ -145,7 +153,7 @@ async fn serves_relay_and_membership_without_frontend() {
         .bind()
         .await
         .unwrap();
-    let client = ServeClient::for_service(endpoint, &service).unwrap();
+    let client = ServeClient::for_service(endpoint, resolved(through_relay), &service).unwrap();
     let appended = tokio::time::timeout(Duration::from_secs(10), client.append(&[7; 32], &[b"commit".to_vec()], false))
         .await
         .unwrap()
@@ -158,10 +166,11 @@ async fn serves_relay_and_membership_without_frontend() {
         .bind()
         .await
         .unwrap();
-    let lmk_proto::group::Service::Serve { key, .. } = service else {
+    let lmk_proto::group::Service::Serve { key, .. } = &service else {
         unreachable!()
     };
-    let direct = ServeClient::new(endpoint, &key.0, "", &[format!("127.0.0.1:{membership}")]).unwrap();
+    let at_port = Directory { key: key.0.as_slice().try_into().unwrap(), addrs: vec![format!("127.0.0.1:{membership}")], relay: relay.clone(), relays: vec![relay.clone()] };
+    let direct = ServeClient::for_service(endpoint, resolved(at_port), &service).unwrap();
     let service_key = key.0.as_slice().try_into().unwrap();
     let log_ref = lmk_proto::head::reference(&service_key, &[7; 32]);
     let page = direct.read(&[7; 32], &lmk_membership::Frontier::empty(service_key, log_ref)).await.unwrap();

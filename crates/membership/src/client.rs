@@ -2,13 +2,13 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use iroh::{Endpoint, EndpointAddr, PublicKey, endpoint::Connection};
 use lmk_proto::{
-    Bytes, clock, frame::{self, ALPN, Open, Stream}, group::Service, head::{self, Head},
+    Bytes, clock, directory::Directory, frame::{self, ALPN, Open, Stream}, group::Service, head::{self, Head},
     membership::{self, Appended, Latest, Page, Reply, Request, Subscribed},
 };
-use n0_future::task::AbortOnDropHandle;
+use n0_future::{boxed::BoxFuture, task::AbortOnDropHandle};
 use serde::de::DeserializeOwned;
 use tokio::{io::AsyncWriteExt, sync::{Mutex, Semaphore, mpsc}};
 
@@ -29,35 +29,51 @@ fn record_time(sent: u64, head: &Head) -> Result<()> {
     Ok(())
 }
 
+/// Resolves a domain to the directory its service publishes.
+pub type Resolve = Arc<dyn Fn(String) -> BoxFuture<Result<Directory>> + Send + Sync>;
+
+/// The directory of a service: what its domain publishes, which must name the service's key.
+pub async fn directory(resolve: &Resolve, service: &Service) -> Result<Directory> {
+    let Service::Serve { key, domain, .. } = service else { bail!("unsupported membership service") };
+    let directory = resolve(domain.clone()).await?;
+    ensure!(directory.key.as_slice() == key.0.as_slice(), "the directory of {domain} names another key than the service");
+    Ok(directory)
+}
+
 #[derive(Clone)]
 pub struct ServeClient(Arc<Inner>);
 
 struct Inner {
     endpoint: Endpoint,
-    addr: EndpointAddr,
+    resolve: Resolve,
+    service: Service,
     key: [u8; 32],
     conn: Mutex<Option<Connection>>,
     requests: Semaphore,
 }
 
 impl ServeClient {
-    pub fn new(endpoint: Endpoint, key: &[u8], relay: &str, addrs: &[String]) -> Result<Self> {
-        let key: [u8; 32] = key.try_into().context("a service key is 32 bytes")?;
-        let mut addr = EndpointAddr::new(PublicKey::from_bytes(&key)?);
-        if !relay.is_empty() { addr = addr.with_relay_url(relay.parse()?); }
-        for a in addrs { addr = addr.with_ip_addr(a.parse()?); }
-        Ok(Self(Arc::new(Inner { endpoint, addr, key, conn: Mutex::default(), requests: Semaphore::new(MAX_IN_FLIGHT) })))
+    pub fn for_service(endpoint: Endpoint, resolve: Resolve, service: &Service) -> Result<Self> {
+        let Service::Serve { key, .. } = service else { bail!("unsupported membership service") };
+        let key: [u8; 32] = key.0.as_slice().try_into().context("a service key is 32 bytes")?;
+        Ok(Self(Arc::new(Inner { endpoint, resolve, service: service.clone(), key, conn: Mutex::default(), requests: Semaphore::new(MAX_IN_FLIGHT) })))
     }
 
-    pub fn for_service(endpoint: Endpoint, service: &Service) -> Result<Self> {
-        let Service::Serve { key, relay, addrs, .. } = service else { anyhow::bail!("unsupported membership service") };
-        Self::new(endpoint, &key.0, relay, addrs)
-    }
-
+    /// Connects at the service's directory as it is now: its relay, and its addresses where this platform resolves them.
     async fn connection(&self) -> Result<Connection> {
         let mut conn = self.0.conn.lock().await;
         if let Some(c) = conn.as_ref() && c.close_reason().is_none() { return Ok(c.clone()); }
-        let c = self.0.endpoint.connect(self.0.addr.clone(), ALPN).await.map_err(|_| Unreached)?;
+        let directory = directory(&self.0.resolve, &self.0.service).await?;
+        #[allow(unused_mut)]
+        let mut addr = EndpointAddr::new(PublicKey::from_bytes(&directory.key)?).with_relay_url(directory.relay.parse()?);
+        #[cfg(not(target_family = "wasm"))]
+        for host in &directory.addrs {
+            // An address that does not resolve now is no reason to lose the relay.
+            if let Ok(sockets) = tokio::net::lookup_host(host).await {
+                addr = sockets.fold(addr, EndpointAddr::with_ip_addr);
+            }
+        }
+        let c = self.0.endpoint.connect(addr, ALPN).await.map_err(|_| Unreached)?;
         *conn = Some(c.clone());
         Ok(c)
     }

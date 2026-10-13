@@ -32,7 +32,7 @@ use lmk_membership::{
     service::{Policy, Service},
     store::Store,
 };
-use lmk_proto::{directory::Directory, frame::ALPN, group};
+use lmk_proto::{directory::{self, Directory}, frame::ALPN, group};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use socket2::{Domain, Socket, Type};
 use tokio::{net::TcpListener, sync::Notify};
@@ -81,24 +81,25 @@ impl ServeConfig {
         }
     }
 
-    pub fn relay_url(&self) -> String {
+    /// Where the service's directory is published: `host`, or `host:port` off the default port.
+    pub fn domain(&self) -> String {
         match self.https_port {
-            443 => format!("https://{}", self.domain),
-            port => format!("https://{}:{port}", self.domain),
+            443 => self.domain.clone(),
+            port => format!("{}:{port}", self.domain),
         }
     }
 
-    /// The address members put in their settings: the service's key and relay.
+    pub fn relay_url(&self) -> String {
+        format!("https://{}", self.domain())
+    }
+
+    /// The address members put in their settings: the service's key and domain.
     pub fn service(&self) -> Result<group::Service> {
         let store = Store::open(&self.state)
             .with_context(|| format!("opening the service's state in {}; make a new one with `serve --initialize`", self.state.display()))?;
         let key = store.key().verifying_key();
-        Ok(group::Service::Serve {
-            key: (*key.as_bytes()).into(),
-            relay: self.relay_url(),
-            addrs: vec![],
-            rest: Default::default(),
-        })
+        directory::check_domain(&self.domain())?;
+        Ok(group::Service::Serve { key: (*key.as_bytes()).into(), domain: self.domain(), rest: Default::default() })
     }
 
     pub fn initialize(&self) -> Result<group::Service> {
