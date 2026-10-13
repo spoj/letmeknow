@@ -3,8 +3,10 @@
 // chat from a link, becoming his identity's first device as it does, and they talk and pass files both ways; it joins
 // her doc and her table and they edit them both ways; Matthew's desk adds his phone by a device link, the phone joins a chat by a link
 // and is renamed, and a kiosk on an identity of its own moves to his; the laptop keeps everything
-// across a reload, a second tab works through the first and takes over when it closes; refusals, files kept and
-// deleted, and the service worker's updates.
+// across a reload, a second tab works through the first and takes over when it closes; a chat on another domain of the
+// service, and a phone on another relay of its directory; refusals, files kept and deleted, and the service worker's
+// updates. From test/e2e.py: LETMEKNOW_MEMBERSHIP (the default domain), LETMEKNOW_RELAY, LETMEKNOW_OTHER (another domain of
+// that service, whose directory is served cross-origin with CORS) and LETMEKNOW_OTHER_RELAY (another URL of its relay).
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
