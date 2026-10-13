@@ -13,7 +13,7 @@ import { createInterface } from "node:readline";
 import { chromium } from "playwright";
 import * as Y from "yjs";
 
-const { URL: SITE, BIN, LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP, FRONTEND_DIST } = process.env;
+const { URL: SITE, BIN, LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP, LETMEKNOW_OTHER, LETMEKNOW_OTHER_RELAY, FRONTEND_DIST } = process.env;
 const tmp = mkdtempSync(join(tmpdir(), "lmk-browser-"));
 const check = (condition, message) => {
   if (!condition) throw new Error(`FAIL: ${message}`);
@@ -24,8 +24,8 @@ const local = link => SITE + new URL(link).pathname + new URL(link).hash;
 const natives = [];
 let passed = false;
 /** A native session in a home of its own: its own device. */
-function native(name) {
-  const env = { ...process.env, LETMEKNOW_HOME: join(tmp, name) };
+function native(name, membership = LETMEKNOW_MEMBERSHIP) {
+  const env = { ...process.env, LETMEKNOW_HOME: join(tmp, name), LETMEKNOW_MEMBERSHIP: membership };
   const proc = spawn(BIN, ["--session", name, "listen", "--hold", "0"], { env, stdio: ["ignore", "pipe", "inherit"] });
   natives.push(proc);
   const exited = new Promise(resolve => proc.once("exit", resolve));
@@ -77,7 +77,7 @@ function watch(name, page) {
   return page;
 }
 /** Tests both explicit localStorage backend choices and the trusted build's defaults (`own`). */
-async function open(name, options, own = false) {
+async function open(name, options, own = false, relay = LETMEKNOW_RELAY) {
   const context = await browser.newContext({ ignoreHTTPSErrors: true, acceptDownloads: true, permissions: ["clipboard-read", "clipboard-write"], ...options });
   await context.addInitScript(
     ([relay, membership]) => {
@@ -99,7 +99,7 @@ async function open(name, options, own = false) {
         subtree: true
       });
     },
-    own ? [] : [LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP]
+    own ? [] : [relay, LETMEKNOW_MEMBERSHIP]
   );
   return watch(name, await context.newPage());
 }
@@ -108,7 +108,7 @@ const kept = page =>
   page.evaluate(
     () =>
       new Promise((resolve, reject) => {
-        const db = indexedDB.open("lmk6");
+        const db = indexedDB.open("lmk7");
         db.onsuccess = () => {
           const request = db.result.transaction("files").objectStore("files").getAllKeys();
           request.onsuccess = () => (db.result.close(), resolve(request.result));
@@ -118,7 +118,7 @@ const kept = page =>
   );
 const text = page => page.locator(".cm-content").evaluate(content => content.cmTile.view.state.doc.toString());
 const call = (page, method, ...args) => page.evaluate(([method, args]) => new Promise((resolve, reject) => {
-  const channel = new BroadcastChannel("lmk6");
+  const channel = new BroadcastChannel("lmk7");
   const id = crypto.randomUUID();
   // As long as a join may take: reaching a member, then its answer.
   const timer = setTimeout(() => { channel.close(); reject(new Error(`no answer to ${method}`)); }, 90_000);
@@ -191,7 +191,7 @@ async function recover(page) {
 }
 
 const record = (page, store, key) => page.evaluate(([store, key]) => new Promise((resolve, reject) => {
-  const request = indexedDB.open("lmk6");
+  const request = indexedDB.open("lmk7");
   request.onsuccess = () => {
     const db = request.result;
     const value = db.transaction(store).objectStore(store).get(typeof key === "string" ? key : new Uint8Array(key));
@@ -234,7 +234,7 @@ try {
 
   // Another version's database is left as it is, and 0.16's chats are said to stay with 0.16; this version's, incomplete,
   // is refused visibly, never reset.
-  for (const [name, version] of [["lmk", 4], ["lmk5", 1], ["lmk6", 1]]) {
+  for (const [name, version] of [["lmk", 4], ["lmk5", 1], ["lmk6", 1], ["lmk7", 1]]) {
     const legacy = await open("legacy", { viewport: { width: 1280, height: 800 } }, true);
     const errors = [];
     legacy.on("pageerror", error => errors.push(error.message));
@@ -250,13 +250,13 @@ try {
       request.onerror = () => reject(request.error);
     }), [name, version]);
     await legacy.goto(SITE);
-    if (name === "lmk6") await legacy.getByRole("alert").filter({ hasText: "stored session is incomplete" }).waitFor();
+    if (name === "lmk7") await legacy.getByRole("alert").filter({ hasText: "stored session is incomplete" }).waitFor();
     else await legacy.getByLabel("Your name").waitFor();
     if (name === "lmk5") {
       await legacy.getByText("Chats from letmeknow 0.16 stay with 0.16").waitFor();
       await legacy.getByRole("button", { name: "OK" }).click();
-      await legacy.goto(`${SITE}/i#5.g.${"A".repeat(22)}`);
-      await legacy.getByText("This invite was made by letmeknow 0.16").waitFor();
+      await legacy.goto(`${SITE}/i#6.g.${"A".repeat(22)}`);
+      await legacy.getByText("This invite was made by letmeknow 0.17").waitFor();
       check(await legacy.locator(".banner").count() === 0, "letmeknow 0.16's notice is said once");
     }
     const old = await legacy.evaluate(name => new Promise((resolve, reject) => {
@@ -276,6 +276,20 @@ try {
     await legacy.context().close();
     delete pages.legacy;
   }
+
+  // letmeknow 0.17's membership is refused: the browser keeps to its default domain, says so, and clears the relay.
+  const refused = await open("refused", { viewport: { width: 1280, height: 800 } }, true);
+  await refused.goto(SITE);
+  await refused.evaluate(([membership, relay]) => { localStorage.setItem("lmk membership", membership); localStorage.setItem("lmk relay", relay); }, [`${"11".repeat(32)}@https://old-relay.invalid`, "https://old-relay.invalid"]);
+  await refused.reload();
+  await refused.getByLabel("Your name").fill("Refused");
+  await refused.getByLabel("Device name").fill("refused");
+  await refused.getByRole("button", { name: "Continue" }).click();
+  await refused.getByRole("button", { name: "New chat" }).waitFor();
+  await until(() => refused.evaluate(() => window.toasts.splice(0)), toasts => toasts.some(t => t.includes("is letmeknow 0.17's")));
+  check(await refused.evaluate(() => localStorage.getItem("lmk relay") === null), "a browser refuses letmeknow 0.17's membership, clears its relay and says so");
+  await refused.context().close();
+  delete pages.refused;
 
   // Invited by link: what it is, a name, Join, and the chat.
   let laptop = await open("laptop", { viewport: { width: 1280, height: 800 } }, true);
@@ -394,6 +408,20 @@ try {
   const rows = await until(() => readFileSync(leads, "utf8"), t => !t.includes("Globex"));
   check(!rows.includes("Globex") && rows.includes("Acme Corp") && (await cells("Name")) === "Acme Corp", "a row deleted in the browser goes from the native session's file");
 
+  // A chat on another domain of the same service: the browser fetches that domain's directory, cross-origin, to join it.
+  const across = native("across", LETMEKNOW_OTHER);
+  await across.printed(e => e.type === "ready");
+  across.run("identity", "create", "Across");
+  const crossing = across.run("invite", "--name", "Across");
+  await laptop.getByRole("button", { name: "Join", exact: true }).first().click();
+  await laptop.locator("dialog").getByLabel("Invite link").fill(crossing.link);
+  await laptop.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
+  await laptop.locator(".group-list button", { hasText: "Across" }).waitFor();
+  check(requests.some(([url]) => url === `https://${LETMEKNOW_OTHER}/.well-known/letmeknow.json`), "a browser joins a chat on another domain of the service, fetching that domain's directory");
+  across.run("send", `--group=${crossing.group}`, "across domains");
+  await laptop.getByText("across domains").waitFor();
+  check(true, "and exchanges messages with it");
+
   // Existing private leaves, not a public directory overlay, drive the open People dialog.
   const annIdentity = ann.run("identity", "list").identity;
   const initialBindings = await bindings(laptop);
@@ -440,7 +468,8 @@ try {
   check((await until(() => call(laptop, "groups"), value => JSON.parse(value).filter(g => [invite.group, doc.group, table.group].includes(g.group)).every(g => g.members.some(m => m.identity?.id === annIdentity && m.identity.name === "Ann")), 30_000)).includes(annIdentity), "revisiting an old name keeps the original binding, without a new pin");
 
   // A device link adds a phone to Matthew's identity, made on his desk; the phone then joins a chat by a link.
-  const phone = await open("phone", { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  // The phone reaches the desk through another relay of the same directory.
+  const phone = await open("phone", { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true }, false, LETMEKNOW_OTHER_RELAY);
   const deviceLink = desk.run("identity", "invite").link;
   await phone.goto(local(deviceLink));
   await phone.getByRole("heading", { name: "Add this browser to your devices" }).waitFor();
@@ -542,7 +571,7 @@ try {
   const recorded = await laptop.evaluate(
     gid =>
       new Promise((resolve, reject) => {
-        const open = indexedDB.open("lmk6");
+        const open = indexedDB.open("lmk7");
         open.onsuccess = () => {
           const records = open.result.transaction("records").objectStore("records");
           const count = records.count(new TextEncoder().encode(`lmk/kind/doc/${gid}`));
@@ -556,7 +585,7 @@ try {
   const stored = await laptop.evaluate(
     ([gid, id]) =>
       new Promise((resolve, reject) => {
-        const open = indexedDB.open("lmk6");
+        const open = indexedDB.open("lmk7");
         open.onsuccess = () => {
           const records = open.result.transaction("records").objectStore("records");
           const bytes = id.match(/../g).map(byte => parseInt(byte, 16));
@@ -634,7 +663,7 @@ try {
   await laptop.locator(".devices li", { hasText: "this browser" }).waitFor();
   await laptop.getByRole("button", { name: "Add a device" }).click();
   const link = await laptop.locator("dialog .copy code").first().textContent();
-  check(link.includes("#6.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
+  check(link.includes("#7.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
   const tablet = native("tablet");
   await tablet.printed(e => e.type === "ready");
   const joining = tablet.start("identity", "join", link);
@@ -659,7 +688,7 @@ try {
   check((await joiningIdeas).members.length === 2, "a native session joins a chat the browser started, by its link");
   await laptop.locator("dialog").waitFor({ state: "detached" });
   const ideas = tablet.run("groups").find(g => g.name === "Ideas");
-  check(JSON.stringify(ideas.membership).includes(LETMEKNOW_RELAY), "on the membership service compiled into the trusted frontend");
+  check(JSON.stringify(ideas.membership).includes(LETMEKNOW_MEMBERSHIP), "on the membership service compiled into the trusted frontend");
   const browsers = await until(
     () => tablet.run("identity", "list").devices.find(d => !d.you).groups ?? [],
     groups => groups.some(g => g.name === "Ideas")
@@ -889,7 +918,7 @@ try {
     check(JSON.parse(await call(tab, "me")).fp === beforeFailure, "follower-initiated explicit retry reloads every tab with the same session and all pending messages");
   }
   check(new TextDecoder().decode(new Uint8Array(await record(laptop, "records", failedKey))).includes(target.text), "the failed batch itself, not just later writes, reached IndexedDB");
-  check(await laptop.evaluate(async () => (await navigator.locks.query()).held.filter(lock => lock.name === "lmk6").length === 1), "after recovery exactly one tab owns the session");
+  check(await laptop.evaluate(async () => (await navigator.locks.query()).held.filter(lock => lock.name === "lmk7").length === 1), "after recovery exactly one tab owns the session");
   await follower.close();
   await late.close();
   delete pages["recovery follower"];
