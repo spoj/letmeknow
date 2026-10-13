@@ -142,7 +142,7 @@ impl Net {
         let (events, rx) = mpsc::unbounded_channel();
         let mut homes = endpoint.watch_addr().stream();
         let reporting = events.clone();
-        spawn(async move {
+        spawn(endpoint.closed().run_until(async move {
             let mut last = None;
             while let Some(addr) = homes.next().await {
                 if let Some(home) = addr.relay_urls().next()
@@ -152,7 +152,7 @@ impl Net {
                     reporting.send(Event::Home(home.clone())).ok();
                 }
             }
-        });
+        }));
         let inner = Arc::new(Inner {
             endpoint: endpoint.clone(),
             config,
