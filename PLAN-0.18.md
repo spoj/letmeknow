@@ -54,8 +54,14 @@ one relay (#78). 0.18 keeps only keys in data and gets routes from outside:
   at start. A key that becomes relevant to none of the session's groups is dropped.
 - **Resolver.** iroh's pkarr relay protocol at `<service host>/pkarr/<z32 key>`: `PUT` stores a record, `GET`
   returns the newest. In memory only.
-- **Relays.** A session's config lists relays (default: letmeknow.dev's). iroh picks the home relay by latency and
-  moves off one that stops answering, in about a minute (validated: about 50 s). The session's record follows.
+- **Relays: chosen, or the defaults.** A session's relays are where it lives. Its home relay is one of them, and its
+  record names that one. iroh picks the home relay among them by latency and moves off one that stops answering, in
+  about a minute (validated: about 50 s).
+  - **Chosen** (`--relay`): the session lives only on those relays and tries hard to use no other, for a small
+    footprint (Dialing).
+  - **Defaults** (nothing configured): the session uses the built-in `RELAYS`, and any relay a record names, freely.
+    For now `RELAYS` is letmeknow.dev's relay, the service's own. Once a second relay exists, letmeknow.dev's leaves
+    the list and serves as the fallback only (Later).
 - **Who covers what:**
   - Peers carry moves among members who are online, and spread records in larger groups.
   - The resolver covers reconnection when no peer can help, such as a two-member group after both were offline.
@@ -114,6 +120,12 @@ changes from "holds no keys" to "holds no group keys".
   - **Validated natively:** a member was reached through that relay alone after 88 s idle, with its own relay down.
     A browser is not run yet.
   - **Rate limit:** fallback traffic counts against the service relay's per-client limit (1 MiB/s).
+- **Chosen relays.** With `--relay` set, the lookup yields the chosen relays in place of a record's relay. So the
+  first dial to any peer goes through the session's own relays:
+  - a co-member is reachable there whenever it follows a log at a service on one of them;
+  - the service is reached at its direct address.
+
+  Only when that dial fails does the node dial again with the record's own relay.
 - **The membership service** is dialed by key the same way: `ServeClient::new(endpoint, key)`. `addrs` goes.
 - **Admission.** The joiner dials the members a link names by key, adding each member's hint relay. As in 0.17, a
   member without a hint means letmeknow.dev's relay.
@@ -144,8 +156,10 @@ changes from "holds no keys" to "holds no group keys".
   - `MEMBERSHIP_KEY` stays.
 - **`listen` and `sessions remove`:**
   - `--membership letmeknow.dev | <key, hex>` (`listen` only).
-  - `--relay <url>`, repeatable (`LETMEKNOW_RELAY`, comma-separated).
-  - `--resolver <url>` (`LETMEKNOW_RESOLVER`).
+  - `--relay <url>`, repeatable (`LETMEKNOW_RELAY`, comma-separated): the chosen relays. Without it, the built-in
+    `RELAYS`.
+  - `--resolver <url>` (`LETMEKNOW_RESOLVER`). Its default is the first chosen relay's `/pkarr`, since a service host
+    runs both; with no chosen relays, the built-in `RESOLVER`.
 - **The resolver client:**
   - It honours `LETMEKNOW_CA`, through its rustls config.
   - It uses the relays' proxy rule: iroh's `proxy_from_env` takes `HTTP_PROXY` first and ignores `NO_PROXY`, while
@@ -154,7 +168,7 @@ changes from "holds no keys" to "holds no group keys".
   - It needs a direct `iroh-dns = "=1.3.0"` dependency.
 - **Browser:**
   - backend.json gains `relays` and `resolver`; `DEFAULT_MEMBERSHIP` becomes a key.
-  - localStorage: `lmk membership` (a key), `lmk relays`, `lmk resolver`.
+  - localStorage: `lmk membership` (a key), `lmk relays` (the chosen relays), `lmk resolver`.
 
 ## The resolver, in `letmeknow serve`
 
@@ -229,6 +243,9 @@ changes from "holds no keys" to "holds no group keys".
     `Admitted.routes`.
   - **Failover:** with two relays, the home relay goes down; peers follow within a bound of about a minute.
   - **Fallback:** a member is reached through its group's service's relay when its own relay is down.
+  - **Chosen relay:** a session with `--relay` set to the service's relay, whose co-members live on another relay:
+    - it reaches them through its own relay and opens no connection to theirs;
+    - when one can't be reached that way, it dials that member's relay.
 - **Serve:**
   - `/pkarr` `PUT` and `GET`;
   - older, future-dated and forged records refused;
@@ -243,13 +260,13 @@ changes from "holds no keys" to "holds no group keys".
    - Anyone with a key learns its relay and whether it is online. Today anyone with a key and its relay can probe
      that by dialing, and an old invite link lets its holder do so for good (as in 0.17).
    - The resolver also sees lookups: who looks up whom, from which IP, though only on cache misses and failed dials.
-   - Self-hosters should set `--resolver`.
+   - A session that chooses its relays uses their host's resolver by default, so its lookups stay with that host.
    - Restricting the resolver to co-members would need our own protocol.
 2. **IP addresses** stay out of sessions' records and of gossip. iroh's hole punching shares them with connected peers
    only, as now.
 3. **One host by default.** letmeknow.dev's relay, resolver and service share relay.letmeknow.dev. When it is down,
    so are the default route, the resolver and the fallback. Failover and the fallback help only setups with relays
-   elsewhere, unless a second default relay runs on another host (open question 1).
+   elsewhere, unless a second default relay runs on another host (Later).
 4. **Bootstrap.** A session that was offline while all its contacts moved, with the resolver down, reaches no one
    until one of them recovers. In 0.17, the service being down blocks the same recovery.
 5. **Transition.** Browsers move to 0.18 at once through the service worker, while agents pinned to `@0.17` stay until
