@@ -851,6 +851,26 @@ async fn a_contradiction_is_reported_once() {
     assert_eq!(warnings, 1);
 }
 
+/// A service whose domain then publishes a directory naming another key is reported once, though the session that
+/// follows its group retries every 2 s.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_naming_another_key_is_reported_once() {
+    let relay = relay().await;
+    let dir = folder("misdirected");
+    let (membership, router) = signing_service(&relay, &dir).await;
+    let mut alice = session(&relay, "Alice").await;
+    alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &relay) }, None).unwrap();
+    let Service::Serve { domain, .. } = membership else { unreachable!() };
+    lmk_testing::publish(&domain, Directory { key: [9; 32], addrs: vec![], relay: relay.url.to_string(), relays: vec![relay.url.to_string()] });
+    router.shutdown().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    let mut warnings = 0;
+    while let Ok(event) = alice.events.try_recv() {
+        warnings += matches!(&event, Event::Warning { group, text } if group.is_none() && text.contains("names another key")) as usize;
+    }
+    assert_eq!(warnings, 1);
+}
+
 impl Session {
     /// Answers the next request for the kind's state.
     async fn snapshot(&mut self, state: Option<&[u8]>) {

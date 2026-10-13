@@ -569,6 +569,8 @@ pub(crate) struct Inner<P> {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// The contradictions reported, each once.
     contradictions: Mutex<HashSet<Contradicted>>,
+    /// The domains whose directories named another key than their service, each reported once.
+    misdirected: Mutex<HashSet<String>>,
 }
 
 /// One member's session. Clones share it.

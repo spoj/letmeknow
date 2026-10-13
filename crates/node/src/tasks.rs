@@ -57,6 +57,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             timers: Mutex::default(),
             tasks: Mutex::default(),
             contradictions: Mutex::default(),
+            misdirected: Mutex::default(),
         });
         let net_config = lmk_net::Config { home: config.home, files: config.files, disk: config.disk, file_limit: config.file_limit, collect: COLLECT };
         let (net, net_events) = Net::spawn(endpoint, net_config, inner.clone(), Arc::new(admission::Admitter(inner.clone()))).await?;

@@ -21,6 +21,11 @@ pub struct Refused(pub String);
 #[error("the membership service could not be reached")]
 pub struct Unreached;
 
+/// The directory a domain publishes names another key than the service it was fetched for; the domain's name.
+#[derive(Debug, thiserror::Error)]
+#[error("the directory of {0} names another key than the service")]
+pub struct WrongDirectory(pub String);
+
 pub struct Subscription {
     pages: mpsc::Receiver<Result<VerifiedPage>>,
     reader: AbortOnDropHandle<()>,

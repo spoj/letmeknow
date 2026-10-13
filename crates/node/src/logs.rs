@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use lmk_core::provider::Provider;
 use lmk_core::public::{PublicLog, Verdict};
 use lmk_membership::client::{Resolve, ServeClient};
-use lmk_membership::{Contradiction, Frontier, VerifiedPage};
+use lmk_membership::{Contradiction, Frontier, VerifiedPage, WrongDirectory};
 use lmk_proto::Bytes;
 use lmk_proto::group::{IdentityRef, Service};
 use lmk_proto::head::{self, Head};
@@ -263,6 +263,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 if let Err(error) = followed.await {
                     if let Some(contradiction) = error.downcast_ref::<Contradiction>() {
                         inner.contradicted(&inner.lock(), &id, contradiction, "this session");
+                    }
+                    if let Some(wrong) = error.downcast_ref::<WrongDirectory>()
+                        && inner.misdirected.lock().unwrap().insert(wrong.0.clone())
+                    {
+                        inner.warn(None, error.to_string());
                     }
                     tracing::debug!("following log {}: {error:#}", hex(&id));
                 }
