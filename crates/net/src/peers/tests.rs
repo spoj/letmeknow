@@ -411,6 +411,22 @@ fn strikes_clear_when_the_epoch_grows() {
     assert_eq!(wants(&p.poll(200)), vec![(key(1), ask())]);
 }
 
+/// An answer to a request made in an earlier epoch strikes nothing: its holder may have sealed what was asked again in
+/// the later one, and is asked again.
+#[test]
+fn an_answer_to_a_request_of_an_earlier_epoch_strikes_nothing() {
+    let mut p = peers();
+    let mut o = own(1, &[1]);
+    o.wanted = ask();
+    p.group(id(), o.clone(), 0);
+    p.connect(key(1), gs(), false, 0);
+    p.summary(&id(), heard(1, 1, 0, ask()), Some(key(1)));
+    assert_eq!(wants(&p.poll(0)), vec![(key(1), ask())]);
+    p.group(id(), Own { epoch: 2, ..o }, 50);
+    p.frame(&key(1), &Frame::Held { group: id(), items: vec![], answers: Some(vec![]) }, 100);
+    assert_eq!(wants(&p.poll(100)), vec![(key(1), ask())]);
+}
+
 /// A wanted seq that only an unconnected member holds dials that member.
 #[test]
 fn a_wanted_seq_held_only_by_an_unconnected_member_is_dialed() {

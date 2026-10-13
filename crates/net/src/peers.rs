@@ -122,6 +122,8 @@ struct Group {
 struct Request {
     holder: Key,
     asked: Set,
+    /// The epoch it was made in: once this member is in a later one, its answer or silence strikes nothing.
+    epoch: u64,
     at: u64,
 }
 
@@ -308,6 +310,7 @@ impl Peers {
                 c.active = now;
                 if let Some(g) = self.groups.get_mut(group)
                     && let Some(r) = g.request.take_if(|r| r.holder == *peer)
+                    && r.epoch == g.own.epoch
                 {
                     // An answer short of `ANSWER` bytes, or covering nothing, is all the holder has of what was asked.
                     let whole = answers.is_empty() || items.iter().map(|item| item.0.len()).sum::<usize>() < ANSWER;
@@ -467,7 +470,9 @@ impl Peers {
 
     fn timeouts(&mut self, now: u64) {
         for g in self.groups.values_mut() {
-            if let Some(r) = g.request.take_if(|r| now - r.at >= TIMEOUT) {
+            if let Some(r) = g.request.take_if(|r| now - r.at >= TIMEOUT)
+                && r.epoch == g.own.epoch
+            {
                 for (m, asked) in r.asked {
                     let struck = g.struck.entry((r.holder, m)).or_default();
                     *struck = struck.union(&asked);
@@ -582,7 +587,7 @@ impl Peers {
                 let asked: Set = asked.into_iter().map(|(m, r)| (m, r.iter().take(512).collect::<Ranges>())).collect();
                 let wants = to_seqs(&asked);
                 self.conns.get_mut(&holder).expect("a connected holder").active = now;
-                self.groups.get_mut(&id).expect("a group of ours").request = Some(Request { holder, asked, at: now });
+                self.groups.get_mut(&id).expect("a group of ours").request = Some(Request { holder, asked, epoch, at: now });
                 out.push(Out::Frame(holder, Frame::Want { group: id, epoch, wants, ids: Vec::new() }));
             }
         }
