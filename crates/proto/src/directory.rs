@@ -74,7 +74,6 @@ mod hex_key {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
