@@ -1,5 +1,5 @@
 // The browser's session: lmk-node in WebAssembly (crates/web), its records and files kept in IndexedDB. One tab at a
-// time runs it, holding the Web Lock "lmk5"; the other tabs call it over the BroadcastChannel "lmk5", and hear
+// time runs it, holding the Web Lock "lmk6"; the other tabs call it over the BroadcastChannel "lmk6", and hear
 // its events there. When that tab closes, a waiting tab takes the lock and runs the session from IndexedDB. Its
 // default backend is compiled into the trusted frontend. Explicit localStorage choices override it; the backend
 // never supplies configuration or code.
@@ -30,12 +30,11 @@ export type Item =
       reply_to?: string;
       urgent?: boolean;
       attachment?: Attachment;
-      /** Its position in the group's log; none while its send is pending. */
-      position?: number;
-      pending?: boolean;
+      /** Delivered without messages it needed, which were given up on. */
+      late?: boolean;
       /** A send that failed, kept with its text until sent again or dropped. */
       failed?: { error: string; retry: () => void; drop: () => void };
-      /** Of this browser's own: no other member's summary shows it held. */
+      /** Of this browser's own: no cut keeps it yet. */
       only_here?: boolean;
       /** Of this browser's own: the other members that hold it, and those that read it. */
       held_by?: Person[];
@@ -43,14 +42,14 @@ export type Item =
       /** Members that lost this message of this browser's. */
       lost_by?: Person[];
     }
-  | { type: "missing"; at: number; positions: number[] }
-  | { type: "lost"; at: number; member: Person; positions: number[] }
+  | { type: "missing"; at: number; missing: { from: Person; seqs: number[] }[] }
+  | { type: "lost"; at: number; member: Person; messages: { from: Person; seqs: number[]; ids: string[] }[] }
   | { type: "leave"; id: string; at: number; from: Person; only_here: boolean }
   | { type: "joined"; at: number; member: Person; by: Person }
   | { type: "left"; at: number; member: Person; by: Person }
   | { type: "revoked"; at: number; removed: Person[]; added: Person[] }
   | { type: "settings"; at: number; by: Person; before?: Settings; settings: Settings };
-export type Event = { type: string; group?: string; identity?: string; hash?: string; text?: string; by?: string };
+export type Event = { type: string; group?: string; identity?: string; hash?: string; text?: string; by?: string; not_kept?: string[] };
 export type Me = { fp: string; device: { name: string }; identity: Named | null };
 
 
@@ -73,7 +72,7 @@ export const listen = (listener: (event: Event) => void) => listeners.add(listen
 export const unlisten = (listener: (event: Event) => void) => listeners.delete(listener);
 const dispatch = (event: Event) => listeners.forEach(listener => listener(event));
 
-const channel = new BroadcastChannel("lmk5");
+const channel = new BroadcastChannel("lmk6");
 const tab = crypto.randomUUID();
 let calls = 0;
 /** This tab's calls not answered yet: sent again whenever a tab starts running the session. */
@@ -166,7 +165,7 @@ function run(device = ""): Promise<void> {
 export async function prepare(): Promise<boolean> {
   const had = await store.has();
   await init({ module_or_path: wasm });
-  navigator.locks.request("lmk5", async () => {
+  navigator.locks.request("lmk6", async () => {
     leading = true;
     if (await store.has()) await run();
     await new Promise(() => {});

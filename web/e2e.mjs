@@ -108,7 +108,7 @@ const kept = page =>
   page.evaluate(
     () =>
       new Promise((resolve, reject) => {
-        const db = indexedDB.open("lmk5");
+        const db = indexedDB.open("lmk6");
         db.onsuccess = () => {
           const request = db.result.transaction("files").objectStore("files").getAllKeys();
           request.onsuccess = () => (db.result.close(), resolve(request.result));
@@ -118,7 +118,7 @@ const kept = page =>
   );
 const text = page => page.locator(".cm-content").evaluate(content => content.cmTile.view.state.doc.toString());
 const call = (page, method, ...args) => page.evaluate(([method, args]) => new Promise((resolve, reject) => {
-  const channel = new BroadcastChannel("lmk5");
+  const channel = new BroadcastChannel("lmk6");
   const id = crypto.randomUUID();
   // As long as a join may take: reaching a member, then its answer.
   const timer = setTimeout(() => { channel.close(); reject(new Error(`no answer to ${method}`)); }, 90_000);
@@ -191,7 +191,7 @@ async function recover(page) {
 }
 
 const record = (page, store, key) => page.evaluate(([store, key]) => new Promise((resolve, reject) => {
-  const request = indexedDB.open("lmk5");
+  const request = indexedDB.open("lmk6");
   request.onsuccess = () => {
     const db = request.result;
     const value = db.transaction(store).objectStore(store).get(typeof key === "string" ? key : new Uint8Array(key));
@@ -232,8 +232,9 @@ try {
   ann.run("identity", "create", "Ann");
   desk.run("identity", "create", "Matthew");
 
-  // Another version's database is left as it is; this version's, incomplete, is refused visibly, never reset.
-  for (const [name, version] of [["lmk", 4], ["lmk5", 1]]) {
+  // Another version's database is left as it is, and 0.16's chats are said to stay with 0.16; this version's, incomplete,
+  // is refused visibly, never reset.
+  for (const [name, version] of [["lmk", 4], ["lmk5", 1], ["lmk6", 1]]) {
     const legacy = await open("legacy", { viewport: { width: 1280, height: 800 } }, true);
     const errors = [];
     legacy.on("pageerror", error => errors.push(error.message));
@@ -249,8 +250,15 @@ try {
       request.onerror = () => reject(request.error);
     }), [name, version]);
     await legacy.goto(SITE);
-    if (name === "lmk") await legacy.getByLabel("Your name").waitFor();
-    else await legacy.getByRole("alert").filter({ hasText: "stored session is incomplete" }).waitFor();
+    if (name === "lmk6") await legacy.getByRole("alert").filter({ hasText: "stored session is incomplete" }).waitFor();
+    else await legacy.getByLabel("Your name").waitFor();
+    if (name === "lmk5") {
+      await legacy.getByText("Chats from letmeknow 0.16 stay with 0.16").waitFor();
+      await legacy.getByRole("button", { name: "OK" }).click();
+      await legacy.goto(`${SITE}/i#5.g.${"A".repeat(22)}`);
+      await legacy.getByText("This invite was made by letmeknow 0.16").waitFor();
+      check(await legacy.locator(".banner").count() === 0, "letmeknow 0.16's notice is said once");
+    }
     const old = await legacy.evaluate(name => new Promise((resolve, reject) => {
       const request = indexedDB.open(name);
       request.onsuccess = () => {
@@ -534,7 +542,7 @@ try {
   const recorded = await laptop.evaluate(
     gid =>
       new Promise((resolve, reject) => {
-        const open = indexedDB.open("lmk5");
+        const open = indexedDB.open("lmk6");
         open.onsuccess = () => {
           const records = open.result.transaction("records").objectStore("records");
           const count = records.count(new TextEncoder().encode(`lmk/kind/doc/${gid}`));
@@ -546,24 +554,26 @@ try {
   );
   check(recorded, "the browser keeps its doc as the doc plugin's record");
   const stored = await laptop.evaluate(
-    id =>
+    ([gid, id]) =>
       new Promise((resolve, reject) => {
-        const open = indexedDB.open("lmk5");
+        const open = indexedDB.open("lmk6");
         open.onsuccess = () => {
           const records = open.result.transaction("records").objectStore("records");
           const bytes = id.match(/../g).map(byte => parseInt(byte, 16));
-          // The id's start, as the CLI shows it: the record whose key begins with it.
-          const at = prefix => {
-            const start = [...new TextEncoder().encode(prefix), ...bytes];
+          const group = Uint8Array.from(atob(gid.replace(/-/g, "+").replace(/_/g, "/")), char => char.charCodeAt(0));
+          const encode = text => [...new TextEncoder().encode(text)];
+          // The record whose key begins with the head and then the id, as the CLI shows the id: a node's key holds its group too.
+          const at = head => {
+            const start = [...head, ...bytes];
             return records.get(IDBKeyRange.bound(new Uint8Array(start), new Uint8Array([...start, ...Array(32 - bytes.length).fill(255)])));
           };
-          const [timeline, node] = [at("lmk/web/message/"), at("lmk/node/message/")];
-          const content = record => record.result && JSON.parse(new TextDecoder().decode(record.result)).payload.content;
-          node.onsuccess = () => resolve([content(timeline), content(node)]);
+          const [timeline, node] = [at(encode("lmk/web/message/")), at([...encode("lmk/node/message/"), ...group, ...encode("/")])];
+          const parse = record => record.result && JSON.parse(new TextDecoder().decode(record.result));
+          node.onsuccess = () => resolve([parse(timeline)?.payload.content, parse(node)?.header.payload.content]);
           node.onerror = () => reject(node.error);
         };
       }),
-    hello
+    [invite.group, hello]
   );
   check(stored[0] === "hello from the terminal" && stored[1] === "", "the browser's timeline keeps the messages it showed, and the session forgets their text");
   await laptop.reload();
@@ -776,7 +786,7 @@ try {
   await laptop.evaluate(() => { window.peerMutation = { text: "arrived during ciphertext recovery" }; });
   const recoveryMessage = ann.run("send", `--group=${fileChat.group}`, "arrived during ciphertext recovery");
   await laptop.waitForFunction(() => window.peerMutation.record && window.peerMutation.phase === "held");
-  check(await laptop.evaluate(pos => window.peerMutation.record.position === pos, recoveryMessage.pos), "the named peer message mutated the node provider while the ciphertext retry was held");
+  check(await laptop.evaluate(id => window.peerMutation.record.id === id, Buffer.from(recoveryMessage.id, "hex").toString("base64url")), "the named peer message mutated the node provider while the ciphertext retry was held");
   const heldItems = outcome(call(laptop, "items", fileChat.group, false));
   await laptop.evaluate(() => { window.storageFault.release = "commit"; });
   check((await retryingFiles).error?.includes("changed during the recovery save"), "a ciphertext retry also refuses reload when records changed during its transaction");
@@ -863,7 +873,7 @@ try {
   await laptop.evaluate(() => { window.peerMutation = { text: "arrived during the recovery transaction" }; });
   const recoveryPeerMessage = ann.run("send", `--group=${invite.group}`, "arrived during the recovery transaction");
   await laptop.waitForFunction(() => window.peerMutation.record && window.peerMutation.phase === "held");
-  check(await laptop.evaluate(pos => window.peerMutation.record.position === pos, recoveryPeerMessage.pos), "the named peer message mutated the node provider while the records retry was held");
+  check(await laptop.evaluate(id => window.peerMutation.record.id === id, Buffer.from(recoveryPeerMessage.id, "hex").toString("base64url")), "the named peer message mutated the node provider while the records retry was held");
   const during = outcome(call(laptop, "items", invite.group, false));
   await laptop.evaluate(() => { window.storageFault.release = "commit"; });
   const dirtyRetry = await retrying;
@@ -877,7 +887,7 @@ try {
     check(JSON.parse(await call(tab, "me")).fp === beforeFailure, "follower-initiated explicit retry reloads every tab with the same session and all pending messages");
   }
   check(new TextDecoder().decode(new Uint8Array(await record(laptop, "records", failedKey))).includes(target.text), "the failed batch itself, not just later writes, reached IndexedDB");
-  check(await laptop.evaluate(async () => (await navigator.locks.query()).held.filter(lock => lock.name === "lmk5").length === 1), "after recovery exactly one tab owns the session");
+  check(await laptop.evaluate(async () => (await navigator.locks.query()).held.filter(lock => lock.name === "lmk6").length === 1), "after recovery exactly one tab owns the session");
   await follower.close();
   await late.close();
   delete pages["recovery follower"];

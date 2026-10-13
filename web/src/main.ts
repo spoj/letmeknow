@@ -9,6 +9,7 @@ import * as client from "./client";
 import type { Attachment, Group, Item, Me, Person } from "./client";
 import type * as Yjs from "yjs";
 import { icon } from "./icons";
+import * as store from "./store";
 
 const { lmk, request } = client;
 
@@ -37,6 +38,9 @@ const KINDS = { chat: "chat", doc: "document", table: "table" };
 /** Files up to this size every member fetches; larger ones only on request. */
 const FILE_LIMIT = 25 << 20;
 const INVITE_PREFIX = "https://letmeknow.dev/i";
+/** letmeknow 0.16's invite links, which this version cannot read. */
+const madeByOlder = (link: string) => /#5\./.test(link);
+const OLDER_INVITE = "This invite was made by letmeknow 0.16. Its maker must restart with `npx -y @letmeknow/cli@0.17`, then make a new link.";
 
 const root = document.getElementById("app")!;
 const agentsHelp = document.getElementById("agents")!;
@@ -96,7 +100,7 @@ let groups: Group[] = [];
 let page: "group" | "devices" = "group";
 let selected: string | undefined;
 let entered: Promise<void> | undefined;
-/** How many of this browser's sends no other member holds yet: closing the page while any is loses them. */
+/** How many of this browser's messages and files no cut keeps yet: closing the page while any is loses them. */
 let onlyHere = 0;
 let storageFailed = false;
 addEventListener("beforeunload", event => (onlyHere || storageFailed) && event.preventDefault());
@@ -129,12 +133,23 @@ boot().catch(error => root.replaceChildren(
 ));
 
 async function boot() {
+  await keptByOlder();
   const had = await client.prepare();
   const kind = invite && client.kindOf(invite);
   if (!had) welcome(kind);
   await client.ready;
   await (entered ??= enter());
   if (invite && had) offer(kind);
+}
+
+/** letmeknow 0.16's chats stay in its own database, which this version leaves as it is: said once. */
+async function keptByOlder() {
+  if (localStorage.getItem("lmk 0.16 kept") || !(await store.older())) return;
+  localStorage.setItem("lmk 0.16 kept", "1");
+  const ok = h("button", { className: "primary" }, "OK");
+  const notice = h("div", { className: "banner", role: "status" }, h("span", {}, "Chats from letmeknow 0.16 stay with 0.16 in this browser. This version keeps its own and does not open them."), ok);
+  ok.onclick = () => notice.remove();
+  document.body.append(notice);
 }
 
 /** Starts this browser's session, and given `name`, makes it the first device of an identity of that name; without, it is to join one by a device link. */
@@ -164,7 +179,7 @@ client.listen(event => {
     localStorage.setItem(`unread ${event.group}`, String(unread(event.group) + 1));
   }
   if (event.type === "warning") toast(event.text);
-  if (event.type === "removed") toast(`You were removed from ${title(event.group!)}${event.by ? ` by ${event.by}` : ""}.`);
+  if (event.type === "removed") toast(`You were removed from ${title(event.group!)}${event.by ? ` by ${event.by}` : ""}.${event.not_kept?.length ? ` ${event.not_kept.length} of your messages were not kept by any cut, so the others may lack them.` : ""}`);
   if (event.type === "added") toast(`Your ${event.by} added this browser to ${title(event.group!)}.`);
   if (event.type === "edited") editors.get(event.group!)?.edited();
   if (entered) render();
@@ -249,6 +264,7 @@ function welcome(kind: string | undefined) {
     const go = () => ready() && busy(begin, "Starting…", () => start(device.value.trim(), name.value.trim()));
     body = [
       h("h1", {}, invite ? "This is not a letmeknow invite" : "letmeknow"),
+      invite && madeByOlder(invite) && h("p", {}, OLDER_INVITE),
       form(go, field("Your name", name), field("Device name", device), begin),
       h("details", { className: "agents" }, h("summary", {}, "For agents"), agentsHelp)
     ];
@@ -259,7 +275,7 @@ function welcome(kind: string | undefined) {
 /** For a browser that has a session already: asks before it uses the invite it was opened with. */
 function offer(kind: string | undefined) {
   history.replaceState(null, "", "/");
-  if (!kind) return toast("That is not a letmeknow invite link.");
+  if (!kind) return toast(madeByOlder(invite!) ? OLDER_INVITE : "That is not a letmeknow invite link.");
   if (kind === "device" && me.identity) return leaveDialog(invite);
   const go = h("button", { className: "primary", autofocus: true }, kind === "group" ? "Join" : "Add this browser");
   const dialog = modal(
@@ -425,7 +441,7 @@ function joinDialog() {
     form(
       () =>
         busy(join, "Joining…", async () => {
-          if (!client.kindOf(link.value.trim())) return toast("That is not a letmeknow invite link.");
+          if (!client.kindOf(link.value.trim())) return toast(madeByOlder(link.value) ? OLDER_INVITE : "That is not a letmeknow invite link.");
           await redeem(link.value.trim());
           dialog.close();
         }),
@@ -871,7 +887,7 @@ class ChatView extends View {
       case "message": {
         const parent = item.reply_to ? (items.find(i => i.type === "message" && i.id === item.reply_to) as Message | undefined) : undefined;
         const to = item.to?.map(fp => this.members.find(m => m.fp === fp)).filter(m => m != null);
-        const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent", (item.pending || item.failed) && "unsent"];
+        const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent", item.failed && "unsent"];
         const lostBy = item.lost_by?.length && h("p", { className: "tag" }, item.lost_by.map(p => p.name).join(", "), " could not read this; send it again if it matters");
         const readBy = item.read_by?.length ? ` · read by ${item.read_by.map(p => p.name).join(", ")}` : "";
         const ticks =
@@ -889,7 +905,6 @@ class ChatView extends View {
               who(item.from),
               to?.length && h("span", { className: "muted" }, "to ", to.map(p => p.name).join(", ")),
               item.urgent && h("span", { className: "tag" }, "Urgent"),
-              item.pending && h("span", { className: "muted" }, "Pending: sent while this browser is open"),
               at
             ),
           item.reply_to &&
@@ -897,6 +912,7 @@ class ChatView extends View {
           item.content && h("div", { className: "text" }, item.content),
           item.attachment && this.attachmentView(item.attachment),
           lostBy,
+          item.late && h("p", { className: "tag" }, "Late: delivered without messages it needed"),
           ticks,
           item.failed
             ? h(
@@ -906,13 +922,17 @@ class ChatView extends View {
                 h("button", { className: "quiet", onclick: item.failed.retry }, "Retry"),
                 h("button", { className: "quiet", onclick: item.failed.drop }, "Drop")
               )
-            : item.position !== undefined && h("div", { className: "actions" }, h("button", { className: "quiet", onclick: () => this.reply(item) }, "Reply"))
+            : h("div", { className: "actions" }, h("button", { className: "quiet", onclick: () => this.reply(item) }, "Reply"))
         );
       }
-      case "missing":
-        return h("li", { className: "event warn" }, `${item.positions.length === 1 ? "A message" : `${item.positions.length} messages`} before this could not be fetched`, at);
-      case "lost":
-        return h("li", { className: "event warn" }, `You could not read ${item.positions.length === 1 ? "a message" : `${item.positions.length} messages`}: no member online held them in time`, at);
+      case "missing": {
+        const count = item.missing.flatMap(m => m.seqs).length;
+        return h("li", { className: "event warn" }, `${count === 1 ? "A message" : `${count} messages`} before this could not be fetched`, at);
+      }
+      case "lost": {
+        const count = item.messages.flatMap(m => m.seqs).length;
+        return h("li", { className: "event warn" }, `You could not read ${count === 1 ? "a message" : `${count} messages`}: no member online held them in time`, at);
+      }
       case "leave":
         return h("li", { className: "event" }, who(item.from), " asked to leave", item.only_here && h("small", { className: "ticks", title: "Only on this device: keep this page open until another member has it" }, " ✓"), at);
       case "joined":

@@ -14,14 +14,14 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use js_sys::{Array, Function, Promise, Uint8Array};
-use lmk_client::{Access, Chat, Client, ClientEvent, Described, File, Request, fp, message_id, service};
+use lmk_client::{Access, Chat, Client, ClientEvent, File, Request, fp, message_id, service};
 use lmk_node::identity::{Identity, Presence};
 use lmk_node::lmk_core::provider::RustCrypto;
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
 use lmk_node::{COLLECT, Disk, Node, now};
 use lmk_proto::Bytes;
-use lmk_proto::group::{CHAT, IDENTITY, PROTOCOL, Settings};
+use lmk_proto::group::{CHAT, ChatMessage, IDENTITY, PROTOCOL, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::{Duration, sleep};
@@ -523,7 +523,7 @@ impl App {
                 self.remember(&group.0, &json!({ "type": "revoked", "at": now(), "removed": removed, "added": added }))?;
                 json!({ "type": "revoked", "group": group })
             }
-            ClientEvent::Removed { group, by } => json!({ "type": "removed", "group": group, "by": by.and_then(|by| by.name) }),
+            ClientEvent::Removed { group, by, not_kept } => json!({ "type": "removed", "group": group, "by": by.and_then(|by| by.name), "not_kept": not_kept }),
             ClientEvent::Gone { group } => {
                 let stored: Vec<(Bytes, u64)> = get(&self.store, &key("messages", &group.0))?.unwrap_or_default();
                 for (id, _) in stored {
@@ -544,17 +544,13 @@ impl App {
             ClientEvent::Message { group, id, missing, .. } => {
                 self.keep(&group.0)?;
                 if !missing.is_empty() {
-                    self.remember(&group.0, &json!({ "type": "missing", "at": now(), "positions": missing }))?;
+                    self.remember(&group.0, &json!({ "type": "missing", "at": now(), "missing": missing }))?;
                 }
                 json!({ "type": "message", "group": group, "id": id })
             }
-            ClientEvent::Lost { group, member, positions, ids } => {
-                self.remember(&group.0, &json!({ "type": "lost", "at": now(), "member": member, "positions": positions, "ids": ids }))?;
+            ClientEvent::Lost { group, member, messages } => {
+                self.remember(&group.0, &json!({ "type": "lost", "at": now(), "member": member, "messages": messages }))?;
                 json!({ "type": "lost", "group": group })
-            }
-            ClientEvent::Sent { group, id, answered, .. } => {
-                self.keep(&group.0)?;
-                json!({ "type": "sent", "group": group, "id": id, "answered": answered })
             }
             ClientEvent::Heard { group } => json!({ "type": "heard", "group": group }),
             ClientEvent::File { hash } => json!({ "type": "file", "hash": hash }),
@@ -573,8 +569,8 @@ impl App {
                 self.emit(json!({ "type": "warning", "group": group, "text": text }));
                 return Ok(());
             }
-            // The page shows messages as they come, waiting for none; a held leave shows as its tick.
-            ClientEvent::Synced { .. } | ClientEvent::LeaveHeld { .. } => return Ok(()),
+            // The page shows messages as they come, waiting for none.
+            ClientEvent::Synced { .. } => return Ok(()),
         };
         self.saved().await?;
         self.emit(event);
@@ -608,7 +604,7 @@ impl App {
             stored.push((message.id.clone(), message.at));
             if chat && message.sender.key != node.key() {
                 message.payload["content"] = json!("");
-                node.redact(&message.id.0, message.payload)?;
+                node.redact(gid, &message.id.0, message.payload)?;
             }
         }
         put(&self.store, &key("messages", gid), &stored)
@@ -638,14 +634,14 @@ impl App {
         Ok(Value::Array(groups))
     }
 
-    /// A group's timeline: the messages it stored, the changes and losses this session saw, oldest first; then its sends
-    /// pending. Its own messages say which other members hold them (`held_by`), read them (`read_by`) or lost them
-    /// (`lost_by`), and whether no other member's summary shows them held (`only_here`). `shown`: the page shows them,
-    /// so they are read.
+    /// A group's timeline: the messages it stored, the changes and losses this session saw, in delivery time. Its own
+    /// messages say which other members hold them (`held_by`), show them (`read_by`) or lost them (`lost_by`), and whether
+    /// no cut keeps them yet (`only_here`). `shown`: the page shows them, so they are marked shown.
     fn items(&self, gid: &Bytes, shown: bool) -> Result<Value> {
         let node = self.client.node();
         let describer = self.client.describer(gid)?;
         let (receipts, only_here) = (self.client.receipts(gid)?, node.only_here(&gid.0)?);
+        let only_here: HashSet<Bytes> = only_here.into_iter().map(|(id, _)| id).collect();
         let mut read = Vec::new();
         let mut items: Vec<Value> = get(&self.store, &key("timeline", &gid.0))?.unwrap_or_default();
         let losses: Vec<Value> = items.iter().filter(|item| item["type"] == "lost" && item["member"]["you"] != true).cloned().collect();
@@ -656,46 +652,40 @@ impl App {
         for (id, _) in stored {
             messages.extend(get::<lmk_node::Message>(&self.store, &key("message", &id.0))?);
         }
-        let held = messages.into_iter().map(|message| (message.id, message.at, Some(message.position), message.sender, message.payload));
-        let me = node.members(&gid.0)?.into_iter().find(|m| m.key == node.key());
-        let pending = node.sending(&gid.0)?.into_iter().filter_map(|(id, payload)| Some((id, now(), None, me.clone()?, payload)));
-        for (id, at, position, sender, payload) in held.chain(pending) {
-            let from = describer.describe(&sender);
-            let id = hex::encode(&id.0);
-            let mine = sender.key == node.key();
-            if payload["type"] == "leave" {
-                let only_here = mine && position.is_some_and(|position| only_here.contains(position));
-                items.push(json!({ "type": "leave", "id": id, "at": at, "from": from, "only_here": only_here }));
+        for message in messages {
+            let from = describer.describe(&message.sender);
+            let id = hex::encode(&message.id.0);
+            let mine = message.sender.key == node.key();
+            if message.payload["type"] == "leave" {
+                let only_here = mine && only_here.contains(&message.id);
+                items.push(json!({ "type": "leave", "id": id, "at": message.at, "from": from, "only_here": only_here }));
             }
-            let Ok(lmk_proto::group::ChatMessage { content, to, reply_to, urgent, attachment, sent_at, .. }) = serde_json::from_value(payload) else {
+            let Ok(ChatMessage { content, to, urgent, attachment, sent_at, .. }) = serde_json::from_value(message.payload.clone()) else {
                 continue;
             };
-            let mut item = json!({ "type": "message", "id": id, "at": at, "from": from, "content": content });
-            match position {
-                Some(position) if mine => {
-                    let by = |of: &dyn Fn(&lmk_client::Receipt) -> bool| -> Vec<Described> {
-                        receipts.iter().filter(|r| of(r)).map(|r| describer.describe(&r.member)).collect()
-                    };
-                    item["position"] = json!(position);
-                    item["only_here"] = json!(only_here.contains(position));
-                    item["held_by"] = json!(by(&|r| r.held.contains(position)));
-                    item["read_by"] = json!(by(&|r| r.read.contains(position)));
-                    read.push(position);
-                }
-                Some(position) => {
-                    item["position"] = json!(position);
-                    read.push(position);
-                }
-                None => item["pending"] = json!(true),
+            let mut item = json!({ "type": "message", "id": id, "at": message.at, "from": from, "content": content });
+            if mine {
+                let by = |of: &dyn Fn(&lmk_client::Receipt) -> bool| receipts.iter().filter(|r| of(r)).map(|r| describer.describe(&r.member)).collect::<Vec<_>>();
+                item["only_here"] = json!(only_here.contains(&message.id));
+                item["held_by"] = json!(by(&|r| r.holds(&message)));
+                item["read_by"] = json!(by(&|r| r.showed(&message)));
             }
-            let lost_by: Vec<&Value> = losses.iter().filter(|lost| lost["ids"].as_array().is_some_and(|ids| ids.contains(&json!(id)))).map(|lost| &lost["member"]).collect();
+            if message.late {
+                item["late"] = json!(true);
+            }
+            read.push(message.id.clone());
+            let lost_by: Vec<&Value> = losses
+                .iter()
+                .filter(|lost| lost["messages"].as_array().into_iter().flatten().any(|of| of["ids"].as_array().is_some_and(|ids| ids.contains(&json!(id)))))
+                .map(|lost| &lost["member"])
+                .collect();
             if !lost_by.is_empty() {
                 item["lost_by"] = json!(lost_by);
             }
             if !to.is_empty() {
                 item["to"] = json!(to.iter().map(|fp| hex::encode(&fp.0)).collect::<Vec<_>>());
             }
-            if let Some(reply_to) = reply_to {
+            if let Some(reply_to) = &message.reply_to {
                 item["reply_to"] = json!(hex::encode(&reply_to.0));
             }
             if urgent {
@@ -713,19 +703,19 @@ impl App {
         }
         items.sort_by_key(|item| item["at"].as_u64());
         if shown {
-            self.client.mark_read(gid, &read.into_iter().collect())?;
+            self.client.mark_shown(gid, &read)?;
         }
         Ok(Value::Array(items))
     }
 
-    /// How many of this session's sends no other member's summary shows held, in its groups but identity groups, its
-    /// pending sends among them.
+    /// How many of this browser's messages no cut keeps yet, and files it holds only here, in its groups but identity
+    /// groups.
     fn only_here(&self) -> Result<u32> {
         let node = self.client.node();
         let mut count = 0;
         for gid in node.groups() {
             if node.settings(&gid.0)?.kind != IDENTITY {
-                count += node.only_here(&gid.0)?.len() as u32 + node.sending(&gid.0)?.len() as u32;
+                count += node.only_here(&gid.0)?.len() as u32 + node.pending_files(&gid.0)?.len() as u32;
             }
         }
         Ok(count)
@@ -770,7 +760,7 @@ impl Lmk {
         Ok(snapshot)
     }
 
-    /// How many of this browser's sends no other member holds yet: closing it while any is loses them.
+    /// How many of this browser's messages and files no cut keeps yet: closing it while any is loses them.
     pub fn only_here(&self) -> R<u32> {
         self.app.only_here().map_err(js)
     }
@@ -786,8 +776,7 @@ impl Lmk {
         Ok(json!(gid).as_str().expect("base64url").to_owned())
     }
 
-    /// Sends a chat message, with an optional file, as `letmeknow send` does: `{"id", "position" | "pending",
-    /// "attachment": {"held_by"} | {"pending"}}`.
+    /// Sends a chat message, with an optional file, as `letmeknow send` does: `{"id", "attachment"}`.
     #[allow(clippy::too_many_arguments)]
     pub async fn send(
         &self,
