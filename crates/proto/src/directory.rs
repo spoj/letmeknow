@@ -122,7 +122,7 @@ mod tests {
         assert!(refused(body(&key, "[]", r#""h.example""#, r#"["https://h"]"#)).contains("https URL"));
         assert!(refused(body(&key, "[]", "\"\"", r#"["https://h"]"#)).contains("https URL"));
         assert!(refused(format!(r#"{{"key":"{key}","addrs":[],"relays":["https://h"]}}"#)).contains("relay"));
-        assert!(refused(body(&key, &format!("[{}]", vec![r#""h:1""#; 5].join(",")), ok, r#"["https://h"]"#)).contains("4 addresses"));
+        assert!(refused(body(&key, r#"["h:1","h:1","h:1","h:1","h:1"]"#, ok, r#"["https://h"]"#)).contains("4 addresses"));
         assert!(refused(body(&key, r#"["h.example"]"#, ok, r#"["https://h"]"#)).contains("host:port"));
         assert!(refused(body(&key, r#"["h.example:"]"#, ok, r#"["https://h"]"#)).contains("host:port"));
         assert!(refused(body(&key, r#"["h.example:99999"]"#, ok, r#"["https://h"]"#)).contains("host:port"));
