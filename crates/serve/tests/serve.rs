@@ -1,8 +1,9 @@
-use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{net::Ipv4Addr, path::Path, sync::Arc, time::Duration};
 
 use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, endpoint::presets, tls::CaTlsConfig};
 use iroh_relay::RelayQuicConfig;
 use lmk_membership::client::ServeClient;
+use lmk_proto::directory::Directory;
 use lmk_serve::{Certificate, ServeConfig, serve};
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::{
@@ -48,23 +49,37 @@ async fn http_get(port: u16, request: &str) -> String {
     response
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn serves_relay_and_membership_without_frontend() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("state");
-    lmk_membership::store::Store::initialize(&state).unwrap();
+/// A service initialized in `state`, with a certificate for localhost and free ports.
+fn configure(state: &Path) -> (ServeConfig, CertificateDer<'static>) {
+    lmk_membership::store::Store::initialize(state).unwrap();
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     std::fs::write(state.join("cert.pem"), ck.cert.pem()).unwrap();
     std::fs::write(state.join("key.pem"), ck.signing_key.serialize_pem()).unwrap();
-    let cert = ck.cert.der().clone();
 
-    let mut config = ServeConfig::new("localhost", &state);
+    let mut config = ServeConfig::new("localhost", state);
     (config.https_port, config.qad_port, config.membership_port) = (free_port(), free_port(), free_port());
     config.http_port = Some(free_port());
     config.certificate = Certificate::Files {
         chain: state.join("cert.pem"),
         key: state.join("key.pem"),
     };
+    (config, ck.cert.der().clone())
+}
+
+async fn wait_for_https(port: u16) {
+    for _ in 0..50 {
+        if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn serves_relay_and_membership_without_frontend() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (config, cert) = configure(&state);
     let (https, http, qad, membership) = (
         config.https_port,
         config.http_port.unwrap(),
@@ -74,13 +89,8 @@ async fn serves_relay_and_membership_without_frontend() {
     let relay = config.relay_url();
     let service = config.service().unwrap();
     let server = tokio::spawn(serve(config));
+    wait_for_https(https).await;
 
-    for _ in 0..50 {
-        if TcpStream::connect((Ipv4Addr::LOCALHOST, https)).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
     for path in ["/", "/i", "/index.html", "/app.js", "/sw.js", "/membership", "/missing.js"] {
         let response = https_get(https, &cert, path, "").await;
         assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
@@ -93,6 +103,17 @@ async fn serves_relay_and_membership_without_frontend() {
     let health = https_get(https, &cert, "/health", "").await;
     let expected = format!(r#"{{"version":"{}","membership":"{}"}}"#, env!("CARGO_PKG_VERSION"), hex::encode(&key.0));
     assert!(health.starts_with("HTTP/1.1 200") && health.ends_with(&expected), "{health}");
+    let directory = https_get(https, &cert, "/.well-known/letmeknow.json", "Origin: https://frontend.example\r\n").await;
+    assert!(
+        directory.starts_with("HTTP/1.1 200")
+            && directory.contains("access-control-allow-origin: *")
+            && directory.to_lowercase().contains("content-type: application/json"),
+        "{directory}"
+    );
+    let directory = Directory::parse(directory.split_once("\r\n\r\n").unwrap().1.as_bytes()).unwrap();
+    assert_eq!(directory.key.to_vec(), key.0);
+    assert_eq!(directory.addrs, [format!("localhost:{membership}")]);
+    assert_eq!(directory.relays, [relay.as_str()]);
     let portal = http_get(
         http,
         "GET /generate_204 HTTP/1.1\r\nHost: localhost\r\nX-Iroh-Challenge: abc\r\nConnection: close\r\n\r\n",
@@ -147,5 +168,21 @@ async fn serves_relay_and_membership_without_frontend() {
     let head = direct.head(&[7; 32]).await.unwrap();
     assert_eq!((head.length, head.hash), (page.page().head.length, page.page().head.hash));
 
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_names_the_relays_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (mut config, cert) = configure(&state);
+    config.relays = vec!["https://relay.example:8443".into(), "https://relay2.example".into()];
+    let https = config.https_port;
+    let server = tokio::spawn(serve(config));
+    wait_for_https(https).await;
+
+    let response = https_get(https, &cert, "/.well-known/letmeknow.json", "").await;
+    let directory = Directory::parse(response.split_once("\r\n\r\n").unwrap().1.as_bytes()).unwrap();
+    assert_eq!(directory.relays, ["https://relay.example:8443", "https://relay2.example"]);
     server.abort();
 }

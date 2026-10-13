@@ -32,6 +32,7 @@ pub async fn serve(serve: cli::Serve) -> Result<()> {
     config.https_port = serve.https_port;
     config.http_port = Some(serve.http_port);
     config.membership_port = serve.membership_port;
+    config.relays = serve.relays;
     config.qad_port = serve.qad_port;
     config.policy.disk = serve.disk << 20;
     if let (Some(chain), Some(key)) = (serve.cert, serve.key) {

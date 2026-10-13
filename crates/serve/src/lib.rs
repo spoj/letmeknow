@@ -32,7 +32,7 @@ use lmk_membership::{
     service::{Policy, Service},
     store::Store,
 };
-use lmk_proto::{frame::ALPN, group};
+use lmk_proto::{directory::Directory, frame::ALPN, group};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use socket2::{Domain, Socket, Type};
 use tokio::{net::TcpListener, sync::Notify};
@@ -55,6 +55,8 @@ pub struct ServeConfig {
     pub qad_port: u16,
     /// The membership service's iroh endpoint.
     pub membership_port: u16,
+    /// The relays the directory names, which members live on; empty names this service's own `relay_url()`.
+    pub relays: Vec<String>,
     /// Holds the service's key, its database and the ACME cache.
     pub state: PathBuf,
     pub certificate: Certificate,
@@ -71,6 +73,7 @@ impl ServeConfig {
             http_port: Some(80),
             qad_port: 7842,
             membership_port: 7843,
+            relays: vec![],
             state: state.into(),
             certificate: Certificate::Acme { contact: None },
             relay_rate_limit: NonZeroU32::new(1 << 20).unwrap(),
@@ -184,6 +187,13 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         .bind_addr((Ipv6Addr::UNSPECIFIED, config.membership_port))?
         .bind()
         .await?;
+    let directory = Directory {
+        key: *store.key().verifying_key().as_bytes(),
+        addrs: vec![format!("{}:{}", config.domain, config.membership_port)],
+        relays: if config.relays.is_empty() { vec![config.relay_url()] } else { config.relays.clone() },
+    };
+    directory.check()?;
+    let directory = Bytes::from(serde_json::to_vec(&directory)?);
     let health = Bytes::from(format!(
         r#"{{"version":"{}","membership":"{}"}}"#,
         env!("CARGO_PKG_VERSION"),
@@ -195,7 +205,8 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
     let tls = Arc::new(tls);
     loop {
         let (tcp, _) = https.accept().await?;
-        let (tls, relay, health, membership) = (tls.clone(), relay.clone(), health.clone(), membership.clone());
+        let (tls, relay, health, directory, membership) =
+            (tls.clone(), relay.clone(), health.clone(), directory.clone(), membership.clone());
         tokio::spawn(async move {
             let stream = match &*tls {
                 Tls::Files(acceptor) => acceptor.accept(tcp).await.ok(),
@@ -208,6 +219,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
             let site = Site {
                 relay: RelayServiceWithNotify::new(relay, Arc::new(Notify::new())),
                 health,
+                directory,
                 membership,
             };
             let _ = hyper::server::conn::http1::Builder::new()
@@ -277,6 +289,8 @@ struct Site {
     relay: RelayServiceWithNotify,
     /// This release's version and the service's public key, which rollouts compare with the release they install.
     health: Bytes,
+    /// The directory at `/.well-known/letmeknow.json`.
+    directory: Bytes,
     membership: Service,
 }
 
@@ -296,6 +310,7 @@ impl HyperService<Request<Incoming>> for Site {
                     .body(body(""));
                 return Box::pin(std::future::ready(res.map_err(Into::into)));
             }
+            "/.well-known/letmeknow.json" => return Box::pin(std::future::ready(json(self.directory.clone()).map_err(Into::into))),
             "/health" => return Box::pin(std::future::ready(json(self.health.clone()).map_err(Into::into))),
             // What the service took in each of the last completed days, which it keeps nothing private of.
             "/stats" => {
