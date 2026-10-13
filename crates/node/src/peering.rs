@@ -606,7 +606,9 @@ impl<P: Provider + Send + 'static> Node<P> {
         for id in ids {
             let Some(record) = st.record(gid, &id.0)? else { continue };
             let g = st.group_mut(gid)?;
-            if let Some(author) = g.author_mut(&record.header.author.0, record.header.joined) {
+            if let Some(author) = g.author_mut(&record.header.author.0, record.header.joined)
+                && !author.shown.contains(record.header.seq)
+            {
                 author.shown.insert(record.header.seq);
                 g.changed = true;
             }
