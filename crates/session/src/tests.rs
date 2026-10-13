@@ -18,6 +18,8 @@ use crate::session::Config;
 mod private_identity;
 
 const HOUR: Duration = Duration::from_secs(3600);
+/// How long a test waits for what a session prints: sessions start slowly on CI's Windows runners.
+const WAIT: Duration = Duration::from_secs(60);
 
 struct World {
     relay: Relay,
@@ -146,14 +148,14 @@ impl Agent {
                     return event;
                 }
             }
-            assert!(start.elapsed() < Duration::from_secs(30), "{}: no {kinds:?} event", self.handle);
+            assert!(start.elapsed() < WAIT, "{}: no {kinds:?} event", self.handle);
         }
     }
 
     /// The next event of any of `kinds`, skipping others.
     async fn expect_any(&mut self, kinds: &[&str]) -> Value {
         loop {
-            let Ok(line) = tokio::time::timeout(Duration::from_secs(30), self.events.recv()).await else {
+            let Ok(line) = tokio::time::timeout(WAIT, self.events.recv()).await else {
                 panic!("{}: no {kinds:?} event; status: {:?}", self.handle, self.cmd(&["status"]).await);
             };
             let line = line.unwrap();
@@ -1178,14 +1180,15 @@ fn read_shows_the_latest_messages_in_its_causal_past() {
 fn a_leave_then_a_removal_finishes_on_the_removal() {
     local(async {
         let world = world("leave-remove").await;
-        let (mut alice, bob, group) = pair(&world, HOUR).await;
+        let (mut alice, mut bob, group) = pair(&world, HOUR).await;
         alice.stop().await;
         let left = bob.cmd(&["leave"]).await.unwrap();
         assert_eq!((&left["left"], &left["pending"]), (&json!(true), &json!(true)), "{left}");
+        bob.stop().await;
         let (home, config, network) = (bob.home.clone(), world.config("bob", "bob"), world.network.clone());
         let removing = tokio::task::spawn_local(async move { crate::remove(config, &home, network).await });
-        // Bob's removal waits for Alice, who comes back only once the removal is waiting.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Bob's removal waits for Alice, who comes back only once the session it runs answers, and so waits for her.
+        until(|| async { json!(bob.cmd(&["status"]).await.is_ok()) }, |running| *running == json!(true)).await;
         assert!(!removing.is_finished());
         let _alice = world.start("alice", HOUR).await;
         assert_eq!(removing.await.unwrap().unwrap(), json!({ "removed": "bob", "left": [group] }));
