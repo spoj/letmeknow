@@ -11,7 +11,7 @@ gh run download "$run" --repo "$repo" --name archive-x86_64-unknown-linux-musl -
 tar -xzf "$tmp"/letmeknow-*-x86_64-unknown-linux-musl.tar.gz --strip-components=1 -C "$tmp"
 python3 - "$tmp/backend.json" "$domain" <<'PY'
 import json, sys
-if json.load(open(sys.argv[1]))["relay"].rstrip("/") != "https://" + sys.argv[2]:
+if json.load(open(sys.argv[1]))["domain"] != sys.argv[2]:
     sys.exit("selected artifact targets a different backend domain")
 PY
 ssh "$host" 'set -eu

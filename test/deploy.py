@@ -5,7 +5,8 @@ import copy, io, json, os, pathlib, re, subprocess, sys, tarfile, tempfile, text
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 VERSION = re.search(r'^version = "(.+)"', (ROOT / "Cargo.toml").read_text(), re.M).group(1)
 REPO, TAG, SHA = "spoj/letmeknow", f"v{VERSION}", "a" * 40
-BACKEND = {"membershipKey": "11" * 32, "relay": "https://relay.example.com"}
+BACKEND = {"domain": "relay.example.com", "directory": {"key": "11" * 32, "addrs": ["relay.example.com:7843"],
+                                                     "relay": "https://relay.example.com", "relays": ["https://relay.example.com"]}}
 RUN = {"name": "release", "path": ".github/workflows/release.yml", "workflow_id": 17,
        "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
        "status": "completed", "conclusion": "success", "event": "push", "head_branch": TAG, "head_sha": SHA}
@@ -38,6 +39,9 @@ elif name == "ssh" and "systemctl is-active" in sys.argv[-1]:
 elif name == "scp" and sys.argv[-1].endswith("letmeknow.service"):
     assert "--web" not in pathlib.Path(sys.argv[-2]).read_text()
     assert "--domain relay.example.com" in pathlib.Path(sys.argv[-2]).read_text()
+elif name == "curl" and sys.argv[-1].endswith("/.well-known/letmeknow.json"):
+    assert sys.argv[-1] == "https://relay.example.com/.well-known/letmeknow.json"
+    print(os.environ["MOCK_DIRECTORY"])
 elif name == "curl":
     assert sys.argv[-1] == "https://relay.example.com/health"
     if os.environ["MOCK_PROBE"] == "fail":
@@ -100,7 +104,9 @@ with tempfile.TemporaryDirectory(prefix="lmk-deploy-test-") as directory:
             f"repos/{REPO}/git/tags/{'b' * 40}": {"object": {"type": "commit", "sha": tag_sha}},
         }
         frontend = tmp / f"frontend-{index}.tar.gz"
-        frontend_config = {**BACKEND, **({"membershipKey": "22" * 32} if name == "frontend backend mismatch" else {})}
+        frontend_config = copy.deepcopy(BACKEND)
+        if name == "frontend backend mismatch":
+            frontend_config["directory"]["key"] = "22" * 32
         with tarfile.open(frontend, "w:gz") as tar:
             for file, data in [("index.html", b"selected artifact"), ("backend.json", json.dumps(frontend_config).encode())]:
                 info = tarfile.TarInfo(file)
@@ -119,6 +125,7 @@ with tempfile.TemporaryDirectory(prefix="lmk-deploy-test-") as directory:
             env = {**os.environ, "PATH": str(tmp) + os.pathsep + os.environ["PATH"],
                    "MOCK_LOG": str(log), "MOCK_ARCHIVE": str(archive), "MOCK_FRONTEND": str(frontend),
                    "MOCK_METADATA": json.dumps(metadata), "MOCK_LITESTREAM": litestream, "MOCK_PROBE": probe,
+                   "MOCK_DIRECTORY": json.dumps(BACKEND["directory"]),
                    "GITHUB_REPOSITORY": REPO, "RELEASE_RUN": "123", "RELEASE_TAG": TAG, "RELEASE_SHA": SHA,
                    "GITHUB_STEP_SUMMARY": str(work / "summary.md")}
             domain = "wrong.example.com" if name == "wrong installation domain" else "relay.example.com"
@@ -135,13 +142,13 @@ with tempfile.TemporaryDirectory(prefix="lmk-deploy-test-") as directory:
             probes = [call for call in calls if call[0] == "curl"]
             assert len(downloads) == (0 if mode == "pages-after" else int(accepted) * (2 if mode == "pages-before" else 1)), calls
             assert len(uploads) == (2 if preflight and mode == "backend" else 0), calls
-            assert len(probes) == int(preflight), calls
+            assert len(probes) == (2 if ok else int(preflight)), calls
             if mode != "backend":
                 assert (work / "pages-authorized").exists() == ok
             if ok:
                 assert SHA in result.stdout and TAG in result.stdout and '"workflow_id": 17' in result.stdout
                 evidence = json.loads(result.stdout.splitlines()[-1])
-                assert evidence == {"version": VERSION, "membership": BACKEND["membershipKey"], "relay": BACKEND["relay"]}
+                assert evidence == {"version": VERSION, "membership": BACKEND["directory"]["key"], "domain": BACKEND["domain"]}
                 if mode == "backend":
                     assert uploads[0][-1] == "mock-host:/usr/local/bin/letmeknow.new"
                     assert uploads[1][-1] == "mock-host:/etc/systemd/system/letmeknow.service"
