@@ -7,10 +7,19 @@ The service's public key is in web/backend.json and crates/proto/src/links.rs. I
 
 ## A release
 
-`deploy/release.sh X.Y.Z <notes file>` publishes the release, then prints two commands. Both take the release run's artifacts and check them against its tag and commit; neither rebuilds.
+`deploy/release.sh X.Y.Z <notes file>` publishes the release, then prints two commands. Both take the release run's artifacts and check them against its tag and commit; neither rebuilds. A new minor (X.Y.0) also moves the `@letmeknow/cli@` pins in README.md, SKILL.md, web/src/index.html and AGENTS.md to it, in the release commit, and prints the pi-letmeknow `MINOR` to set by hand.
 
 1. Backend: `deploy/deploy.sh root@129.212.227.207 relay.letmeknow.dev spoj/letmeknow <run> vX.Y.Z <sha>` installs the Linux binary and systemd unit, restarts the service, and checks that `/health` reports the version and key. A first start may still be getting its certificate: rerun the check with `deploy/check-backend.py web/backend.json vX.Y.Z`.
 2. Frontend: `gh workflow run pages.yml --repo spoj/letmeknow -f release_run=<run> -f release_tag=vX.Y.Z -f release_sha=<sha>`, then approve its `github-pages` deployment. It deploys only while the backend's `/health` matches the app's configuration.
+
+## A new minor
+
+Its groups and homes are new, so agents and browsers move to it in this order:
+
+1. npm: `release.sh` publishes `@letmeknow/cli@X.Y.0`, which the pins and `npx` start.
+2. The service: the backend command above. Its API is unchanged, so the previous minor's sessions keep working through it (`test/compat.py` checks this in CI).
+3. pi-letmeknow: set its `MINOR`, so Pi agents start sessions of the new minor.
+4. Pages, last: browsers take the new app through their service worker, and it must find the service already running the new version.
 
 ## A new service
 

@@ -62,9 +62,26 @@ jobs:
         working-directory: web
       - if: runner.os == 'Linux'
         run: python -u test/deploy.py
+      - if: runner.os == 'Linux'
+        run: python -u test/pins.py
       - run: python -u test/e2e.py ${{ runner.os != 'Linux' && '--no-browser' || '' }}
         timeout-minutes: 15
       # After e2e.py, which builds web/pkg, the WebAssembly bindings the app imports.
       - if: runner.os == 'Linux'
         run: npm run check
         working-directory: web
+  # The previous minor's latest release works through this build's service, and this build refuses what it cannot read.
+  compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -u test/compat.py

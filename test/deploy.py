@@ -3,7 +3,8 @@
 import copy, io, json, os, pathlib, re, subprocess, sys, tarfile, tempfile, textwrap
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-REPO, TAG, SHA = "spoj/letmeknow", "v0.16.0", "a" * 40
+VERSION = re.search(r'^version = "(.+)"', (ROOT / "Cargo.toml").read_text(), re.M).group(1)
+REPO, TAG, SHA = "spoj/letmeknow", f"v{VERSION}", "a" * 40
 BACKEND = {"membershipKey": "11" * 32, "relay": "https://relay.example.com"}
 RUN = {"name": "release", "path": ".github/workflows/release.yml", "workflow_id": 17,
        "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
@@ -30,7 +31,7 @@ elif name == "gh":
             shutil.copy(os.environ["MOCK_FRONTEND"], dest / "frontend.tar.gz")
         else:
             assert artifact == "archive-x86_64-unknown-linux-musl"
-            shutil.copy(os.environ["MOCK_ARCHIVE"], dest / "letmeknow-v0.16.0-x86_64-unknown-linux-musl.tar.gz")
+            shutil.copy(os.environ["MOCK_ARCHIVE"], dest / f"letmeknow-{os.environ['RELEASE_TAG']}-x86_64-unknown-linux-musl.tar.gz")
 elif name == "ssh" and "systemctl is-active" in sys.argv[-1]:
     prelude = 'systemctl() { [ "$MOCK_LITESTREAM" = "$1" ]; }; id() { return 0; }; test() { return 0; }; '
     sys.exit(subprocess.run(["sh", "-c", prelude + sys.argv[-1]]).returncode)
@@ -41,7 +42,7 @@ elif name == "curl":
     assert sys.argv[-1] == "https://relay.example.com/health"
     if os.environ["MOCK_PROBE"] == "fail":
         sys.exit(22)
-    version = "0.15.1" if os.environ["MOCK_PROBE"] == "stale" else "0.16.0"
+    version = "0.15.1" if os.environ["MOCK_PROBE"] == "stale" else os.environ["RELEASE_TAG"].removeprefix("v")
     print(json.dumps({"version": version, "membership": "11" * 32}))
 '''
 
@@ -140,7 +141,7 @@ with tempfile.TemporaryDirectory(prefix="lmk-deploy-test-") as directory:
             if ok:
                 assert SHA in result.stdout and TAG in result.stdout and '"workflow_id": 17' in result.stdout
                 evidence = json.loads(result.stdout.splitlines()[-1])
-                assert evidence == {"version": "0.16.0", "membership": BACKEND["membershipKey"], "relay": BACKEND["relay"]}
+                assert evidence == {"version": VERSION, "membership": BACKEND["membershipKey"], "relay": BACKEND["relay"]}
                 if mode == "backend":
                     assert uploads[0][-1] == "mock-host:/usr/local/bin/letmeknow.new"
                     assert uploads[1][-1] == "mock-host:/etc/systemd/system/letmeknow.service"
@@ -150,3 +151,66 @@ with tempfile.TemporaryDirectory(prefix="lmk-deploy-test-") as directory:
                     if mode == "pages-before":
                         assert (work / "site/index.html").read_bytes() == b"selected artifact"
             print(f"ok - {mode}: {name}, deployment={ok}")
+
+# deploy/release.sh, from a clean main pushed to a bare origin: the commit carries the version and any pins, and the tag is pushed.
+RELEASE_MOCK = r"""
+import pathlib, sys
+name = pathlib.Path(sys.argv[0]).name
+if name == "gh" and sys.argv[1:3] == ["repo", "view"]:
+    print("spoj/letmeknow")
+elif name == "gh" and sys.argv[1:3] == ["run", "list"]:
+    print(123)
+elif name == "npm":
+    print(sys.argv[2].rsplit("@", 1)[1])
+"""
+PIN_FILES = ["README.md", "SKILL.md", "web/src/index.html", "AGENTS.md"]
+
+
+def git(*args, cwd):
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def release(tmp, before, version, mock_dir):
+    tmp = tmp / version
+    tmp.mkdir()
+    origin, work = tmp / "origin.git", tmp / "work"
+    git("init", "-q", "--bare", "-b", "main", str(origin), cwd=tmp)
+    (work / "deploy").mkdir(parents=True)
+    (work / "web/src").mkdir(parents=True)
+    (work / "deploy/release.sh").write_bytes((ROOT / "deploy/release.sh").read_bytes())
+    (work / "deploy/release-run.py").write_text("")
+    (work / "Cargo.toml").write_text(f'[workspace.package]\nversion = "{before}"\n')
+    for name in PIN_FILES:
+        (work / name).write_text("@letmeknow/cli@0.16\n")
+    git("init", "-q", "-b", "main", cwd=work)
+    git("config", "user.name", "test", cwd=work)
+    git("config", "user.email", "test@example.com", cwd=work)
+    git("remote", "add", "origin", str(origin), cwd=work)
+    git("add", "-A", cwd=work)
+    git("commit", "-qm", "before", cwd=work)
+    git("push", "-q", "origin", "main", cwd=work)
+    notes = tmp / "notes.md"
+    notes.write_text("notes\n")
+    env = {**os.environ, "PATH": str(mock_dir) + os.pathsep + os.environ["PATH"]}
+    result = subprocess.run(["sh", "deploy/release.sh", version, str(notes)], cwd=work, env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, (version, result.stdout, result.stderr)
+    minor = version.rsplit(".", 1)[0]
+    patch = version.endswith(".0")
+    pins = {name: git("show", f"main:{name}", cwd=origin) for name in PIN_FILES}
+    assert f'version = "{version}"' in git("show", "main:Cargo.toml", cwd=origin), version
+    assert pins == {name: f"@letmeknow/cli@{minor if patch else '0.16'}\n" for name in PIN_FILES}, pins
+    assert ("MINOR = \"" + minor + "\"" in result.stdout) == patch, result.stdout
+    assert f"v{version}" in git("tag", cwd=origin).split(), version
+    print(f"ok - release {version}: pins {'move to ' + minor if patch else 'stay at 0.16'}")
+
+
+with tempfile.TemporaryDirectory(prefix="lmk-release-test-") as directory:
+    tmp = pathlib.Path(directory)
+    mock_dir = tmp / "bin"
+    mock_dir.mkdir()
+    for name in ["gh", "npm", "cargo", "sleep"]:
+        path = mock_dir / name
+        path.write_text(f"#!{sys.executable}\n" + RELEASE_MOCK)
+        path.chmod(0o755)
+    release(tmp, "0.16.1", "0.17.0", mock_dir)
+    release(tmp, "0.16.1", "0.16.2", mock_dir)
