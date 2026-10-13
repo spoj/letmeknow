@@ -19,15 +19,15 @@ pub fn mentions(text: &str, member: &Value) -> bool {
 }
 
 /// Messages addressed to this session (by `to` or by mention), answering one of its messages, or urgent; doc edits that
-/// mention it; `lost` and `leave_held`. Membership and settings changes wait, as other members' messages do: each wakes
-/// every agent of the group, and seldom needs one.
+/// mention it; `lost`; and `removed`, which a `sessions remove` waits for. Membership and settings changes wait, as other
+/// members' messages do: each wakes every agent of the group, and seldom needs one.
 pub fn wakes(item: &Value, mine: impl Fn(&str) -> bool) -> bool {
     match item["type"].as_str() {
         Some("message") => {
             item["direct"] == true || item["urgent"] == true || item["reply_to"].as_str().is_some_and(mine)
         }
         Some("edited") => item["direct"] == true,
-        Some("lost" | "leave_held") => true,
+        Some("lost" | "removed") => true,
         _ => false,
     }
 }
@@ -130,10 +130,9 @@ mod tests {
         assert!(!wakes(&json!({ "type": "edited", "direct": false }), mine));
         assert!(wakes(&json!({ "type": "edited", "direct": true }), mine));
         assert!(!wakes(&json!({ "type": "joined" }), mine));
-        assert!(!wakes(&json!({ "type": "removed" }), mine));
+        assert!(wakes(&json!({ "type": "removed" }), mine));
         assert!(!wakes(&json!({ "type": "settings" }), mine));
         assert!(wakes(&json!({ "type": "lost" }), mine));
-        assert!(wakes(&json!({ "type": "leave_held" }), mine));
         assert!(!wakes(&json!({ "type": "attachment" }), mine));
     }
 

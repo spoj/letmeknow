@@ -53,6 +53,7 @@ struct Agent {
     events: mpsc::UnboundedReceiver<String>,
     stop: Option<oneshot::Sender<()>>,
     done: Option<tokio::task::JoinHandle<()>>,
+    ready: Value,
 }
 
 impl World {
@@ -79,6 +80,7 @@ impl World {
             keep_log: false,
             membership: self.membership(),
             plugins: self.plugins.clone(),
+            registry: "http://127.0.0.1:1".into(),
         }
     }
 
@@ -103,11 +105,12 @@ impl World {
             };
             crate::listen(config, &at, network, print, async { drop(stopped.await) }).await.unwrap();
         });
-        let mut agent = Agent { handle, home, fp: String::new(), device: String::new(), events, stop: Some(stop), done: Some(done) };
+        let mut agent = Agent { handle, home, fp: String::new(), device: String::new(), events, stop: Some(stop), done: Some(done), ready: Value::Null };
         let ready = agent.expect("ready").await;
         assert!(keys(&ready).is_superset(&keys(&json!({ "type": 0, "session": 0, "name": 0, "fp": 0, "bin": 0 }))), "{ready}");
         agent.fp = ready["fp"].as_str().unwrap().into();
         agent.device = ready["name"].as_str().unwrap().into();
+        agent.ready = ready;
         agent
     }
 }
@@ -202,7 +205,7 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let invite = alice.cmd(&["invite"]).await.unwrap();
     assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "kind": 0, "expires_in": 0 })));
     let link = invite["link"].as_str().unwrap();
-    assert!(link.starts_with("https://letmeknow.dev/i#5.g."));
+    assert!(link.starts_with("https://letmeknow.dev/i#6.g."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len(), 2);
@@ -222,15 +225,15 @@ fn messages_that_do_not_concern_a_session_wait_for_one_that_does() {
         let world = world("steer").await;
         let (mut alice, mut bob, group) = pair(&world, HOUR).await;
         let sent = bob.cmd(&["send", "the build is green"]).await.unwrap();
-        assert!(sent["pos"].is_u64() && sent.get("pending").is_none(), "{sent}");
+        assert!(sent["id"].is_string() && sent.get("pos").is_none(), "{sent}");
         assert!(alice.printed().await.iter().all(|e| e["type"] != "message"));
         bob.cmd(&["send", "@alice can you deploy?"]).await.unwrap();
         let first = alice.expect("message").await;
         let second = alice.expect("message").await;
         assert_eq!((first["content"].as_str(), first.get("direct")), (Some("the build is green"), None));
         assert_eq!((second["content"].as_str(), second["direct"].as_bool()), (Some("@alice can you deploy?"), Some(true)));
-        assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "pos": 0, "from": 0, "direct": 0, "content": 0, "sent_at": 0 })));
-        assert_eq!(second["pos"].as_u64(), first["pos"].as_u64().map(|p| p + 1), "in position order");
+        assert_eq!(keys(&second), keys(&json!({ "type": 0, "group": 0, "id": 0, "seq": 0, "from": 0, "direct": 0, "content": 0, "sent_at": 0 })));
+        assert_eq!(second["seq"].as_u64(), first["seq"].as_u64().map(|s| s + 1), "in order");
         assert_eq!((second["group"].as_str(), second["id"].as_str().unwrap().len()), (Some(group.as_str()), crate::short::ID));
         // Bob's identity is known only by its own claim; `members` tells more of him.
         assert_eq!(second["from"], format!("Robert · {}", bob.device));
@@ -268,7 +271,7 @@ fn held_messages_print_once_the_hold_runs_out() {
 }
 
 #[test]
-fn send_answers_the_position_and_refuses_a_message_too_large() {
+fn send_answers_its_id_and_refuses_a_message_too_large() {
     local(async {
         let world = world("pending").await;
         let (alice, mut bob, _) = pair(&world, HOUR).await;
@@ -278,7 +281,7 @@ fn send_answers_the_position_and_refuses_a_message_too_large() {
         bob.stop().await;
         let before = lmk_node::now();
         let sent = alice.cmd(&["send", "--urgent", "anyone?"]).await.unwrap();
-        assert!(sent["pos"].is_u64(), "{sent}");
+        assert!(sent["id"].is_string() && sent.get("pos").is_none(), "{sent}");
         // Alice finds out that Bob's connection closed once his close reaches her.
         let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["online"].is_null()).await;
         assert!(status["groups"][0]["online"].is_null(), "{status}");
@@ -506,6 +509,12 @@ fn a_message_printed_is_read_and_one_waiting_only_held() {
     });
 }
 
+/// Waits until the member named `by` holds a message of `alice`'s, as her `read` shows.
+async fn held(alice: &Agent, sent: &Value, by: &str) {
+    let read = until(|| async { alice.cmd(&["read", sent["id"].as_str().unwrap()]).await.unwrap() }, |read| read[0]["held_by"] == json!([by])).await;
+    assert_eq!(read[0]["held_by"], json!([by]), "{read}");
+}
+
 static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The system's clock, moved on by `SHIFT`.
@@ -521,20 +530,23 @@ fn status_lists_sends_held_only_here_and_members_away() {
         let world = world("only-here").await;
         let (alice, mut bob, _) = pair(&world, HOUR).await;
         let robert = format!("Robert · {}", bob.device);
-        // Alice's invite came before Bob's start, so it is not only hers; her message is, until Bob's summary holds it.
-        assert!(alice.cmd(&["status"]).await.unwrap()["groups"][0]["only_here"].is_null());
-        alice.cmd(&["send", "hello"]).await.unwrap();
+        let hello = alice.cmd(&["send", "hello"]).await.unwrap();
+        // Bob holds it, so Alice's next commit keeps it.
+        held(&alice, &hello, &robert).await;
+        alice.cmd(&["name", "Kept"]).await.unwrap();
         let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
-        assert!(status["groups"][0]["only_here"].is_null());
+        assert!(status["groups"][0]["only_here"].is_null(), "{status}");
         bob.stop().await;
         let sent = alice.cmd(&["send", "anyone?"]).await.unwrap();
         let status = alice.cmd(&["status"]).await.unwrap();
-        assert_eq!(status["groups"][0]["only_here"], json!([{ "what": "message", "id": sent["id"], "pos": sent["pos"] }]));
+        assert_eq!(status["groups"][0]["only_here"], json!([{ "what": "message", "id": sent["id"] }]));
         assert!(status["warning"].is_string());
         assert!(status["groups"][0]["away"].is_null(), "Bob was heard from just now");
         let mut bob = world.start("bob", HOUR).await;
+        held(&alice, &sent, &robert).await;
+        alice.cmd(&["name", "Again"]).await.unwrap();
         let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
-        assert!(status["groups"][0]["only_here"].is_null(), "Bob holds it");
+        assert!(status["groups"][0]["only_here"].is_null(), "Bob holds it, and a commit kept it");
         assert!(status.get("warning").is_none());
         bob.stop().await;
         SHIFT.store(8 * 24 * 3600 * 1000, std::sync::atomic::Ordering::Relaxed);
@@ -546,7 +558,7 @@ fn status_lists_sends_held_only_here_and_members_away() {
 }
 
 #[test]
-fn a_leave_is_pending_until_another_member_holds_it() {
+fn a_leave_is_pending_until_another_member_removes_the_session() {
     local(async {
         let world = world("leave-pending").await;
         let (mut alice, mut bob, _) = pair(&world, HOUR).await;
@@ -554,35 +566,26 @@ fn a_leave_is_pending_until_another_member_holds_it() {
         let left = bob.cmd(&["leave"]).await.unwrap();
         assert_eq!((&left["left"], &left["pending"]), (&json!(true), &json!(true)), "{left}");
         let _alice = world.start("alice", HOUR).await;
-        // Bob is told once Alice holds his leave, unless her removal of him reaches him first.
-        let mut told = bob.told(&["leave_held", "removed"]).await;
-        if told["type"] == "leave_held" {
-            told = bob.told(&["removed"]).await;
-        }
-        assert_eq!(told["type"], "removed");
+        assert_eq!(bob.told(&["removed"]).await["type"], "removed");
     });
 }
 
-/// Bob is away while Alice sends, and two commits pass before he is back with no member online holding it: he loses
-/// it, and Alice is told, with what to do.
+/// A message no commit kept is not told lost: Bob is away while Alice sends and commits twice, and gets the message once
+/// Alice is back, as she still holds it.
 #[test]
-fn a_sender_is_told_who_lost_its_message() {
+fn a_message_no_commit_kept_is_not_lost() {
     local(async {
-        let world = world("lost").await;
+        let world = world("unkept").await;
         let (mut alice, mut bob, _) = pair(&world, HOUR).await;
         bob.stop().await;
-        let sent = alice.cmd(&["send", "while you were out"]).await.unwrap();
+        alice.cmd(&["send", "while you were out"]).await.unwrap();
         alice.cmd(&["name", "Once"]).await.unwrap();
         alice.cmd(&["name", "Twice"]).await.unwrap();
         alice.stop().await;
         let mut bob = world.start("bob", HOUR).await;
-        let own = bob.expect("lost").await;
-        assert!(own["member"] == "you" && own["positions"].as_array().unwrap().contains(&sent["pos"]), "{own}");
-        assert!(own.get("text").is_none());
-        let mut alice = world.start("alice", HOUR).await;
-        let lost = alice.expect("lost").await;
-        assert!(lost["member"] == format!("Robert · {}", bob.device) && lost["ids"].as_array().unwrap().contains(&sent["id"]), "{lost}");
-        assert!(lost["text"].as_str().unwrap().contains("--reply-to"), "{lost}");
+        let _alice = world.start("alice", HOUR).await;
+        assert_eq!(bob.expect("message").await["content"], "while you were out");
+        assert!(bob.printed().await.iter().all(|e| e["type"] != "lost"));
     });
 }
 
@@ -610,20 +613,20 @@ fn the_command_channel_needs_its_token_and_a_running_session() {
         let finding = std::time::Instant::now();
         assert_eq!(crate::cli::running_session(&alice.home).await.unwrap(), "alice");
         assert!(finding.elapsed() < Duration::from_secs(1), "{:?}", finding.elapsed());
-        let missing = Agent { handle: "nobody".into(), home: alice.home.clone(), fp: String::new(), device: String::new(), events: mpsc::unbounded_channel().1, stop: None, done: None };
+        let missing = Agent { handle: "nobody".into(), home: alice.home.clone(), fp: String::new(), device: String::new(), events: mpsc::unbounded_channel().1, stop: None, done: None, ready: Value::Null };
         let error = missing.cmd(&["groups"]).await.unwrap_err().to_string();
         assert!(error.contains("not running"), "{error}");
     });
 }
 
 #[test]
-fn a_restarted_session_takes_in_what_it_missed_in_position_order() {
+fn a_restarted_session_takes_in_what_it_missed_in_delivery_order() {
     local(async {
         let world = world("causal").await;
         let (mut alice, bob, group) = pair(&world, HOUR).await;
         alice.stop().await;
         let first = bob.cmd(&["send", "--urgent", "first"]).await.unwrap();
-        assert!(first["pos"].is_u64(), "the log takes it with Alice away");
+        assert!(first["id"].is_string(), "{first}");
         let second = bob.cmd(&["send", "--urgent", "second"]).await.unwrap();
         let bob_renamed = bob.cmd(&["name", "Later"]).await.unwrap();
         assert_eq!(bob_renamed["settings"]["name"], "Later");
@@ -632,9 +635,9 @@ fn a_restarted_session_takes_in_what_it_missed_in_position_order() {
         while got.len() < 2 {
             let message = alice.expect("message").await;
             assert!(message.get("missing").is_none());
-            got.push((message["id"].clone(), message["pos"].clone()));
+            got.push(message["id"].clone());
         }
-        assert_eq!(got, [(first["id"].clone(), first["pos"].clone()), (second["id"].clone(), second["pos"].clone())]);
+        assert_eq!(got, [first["id"].clone(), second["id"].clone()]);
         let groups = alice.cmd(&["groups"]).await.unwrap();
         assert_eq!((groups[0]["group"].as_str(), groups[0]["name"].as_str()), (Some(group.as_str()), Some("Later")));
     });
@@ -681,7 +684,7 @@ fn a_device_is_on_one_identity_which_lists_and_loses_devices() {
         assert_eq!(listed["devices"][0]["you"], true);
         assert_eq!(listed["name"], "Alice Smith");
         let invite = alice.cmd(&["identity", "invite"]).await.unwrap();
-        assert!(invite["link"].as_str().unwrap().contains("#5.d."));
+        assert!(invite["link"].as_str().unwrap().contains("#6.d."));
         let phone = world.start("phone", HOUR).await;
         let refused = phone.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap_err().to_string();
         assert!(refused.contains("letmeknow identity join <link>"), "{refused}");
@@ -917,9 +920,10 @@ fn every_session_of_a_device_sees_its_state_and_changes_it() {
     });
 }
 
-/// A message whose holders are all away holds up the later ones a while, then they show it missing, by position.
+/// A message whose holders are all away does not hold up a later one that does not depend on it: that one comes as soon as
+/// its author is online, and says nothing missing.
 #[test]
-fn a_message_no_member_online_holds_is_passed_and_shown_missing() {
+fn a_message_no_member_online_holds_does_not_hold_up_others() {
     local(async {
         let world = world("gap").await;
         let (mut alice, mut bob, group) = pair(&world, HOUR).await;
@@ -928,14 +932,14 @@ fn a_message_no_member_online_holds_is_passed_and_shown_missing() {
         bob.told(&["joined"]).await;
         alice.stop().await;
         carol.stop().await;
-        let unseen = bob.cmd(&["send", "while they are away"]).await.unwrap();
+        bob.cmd(&["send", "while they are away"]).await.unwrap();
         bob.stop().await;
         let alice = world.start("alice", HOUR).await;
         let mut carol = world.start("carol", HOUR).await;
-        let sent = alice.cmd(&["send", "@carol after the gap"]).await.unwrap();
+        alice.cmd(&["send", "@carol after the gap"]).await.unwrap();
         let got = carol.expect("message").await;
-        assert_eq!((&got["content"], &got["pos"]), (&json!("@carol after the gap"), &sent["pos"]));
-        assert_eq!(got["missing"], json!([unseen["pos"]]));
+        assert_eq!(got["content"], "@carol after the gap");
+        assert!(got.get("missing").is_none(), "{got}");
     });
 }
 
@@ -1113,4 +1117,147 @@ fn a_session_goes_on_while_a_join_waits() {
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         assert!(!joining.is_finished(), "the join still waits");
     });
+}
+
+/// A restarted session prints what was delivered after the last message it showed, and not what came before it.
+#[test]
+fn a_restarted_session_prints_what_came_after_the_last_it_showed() {
+    local(async {
+        let world = world("reprint").await;
+        let (mut alice, bob, _) = pair(&world, HOUR).await;
+        bob.cmd(&["send", "before"]).await.unwrap();
+        bob.cmd(&["send", "@alice shown"]).await.unwrap();
+        assert_eq!(alice.expect("message").await["content"], "before");
+        assert_eq!(alice.expect("message").await["content"], "@alice shown");
+        bob.cmd(&["send", "after one"]).await.unwrap();
+        let last = bob.cmd(&["send", "after two"]).await.unwrap();
+        // Alice holds both and, unaddressed, prints neither.
+        let alice_shown = json!([format!("Alice \u{b7} {}", alice.device)]);
+        let read = until(|| async { bob.cmd(&["read", last["id"].as_str().unwrap()]).await.unwrap() }, |read| read[0]["held_by"] == alice_shown).await;
+        assert_eq!(read[0]["held_by"], alice_shown);
+        alice.stop().await;
+        let mut alice = world.start("alice", HOUR).await;
+        assert_eq!(alice.expect("message").await["content"], "after one");
+        assert_eq!(alice.expect("message").await["content"], "after two");
+        assert!(alice.printed().await.iter().all(|e| e["type"] != "message"));
+    });
+}
+
+/// `read --ancestors` shows the latest chat messages in a message's causal past that the session delivered, before it.
+#[test]
+fn read_shows_the_latest_messages_in_its_causal_past() {
+    local(async {
+        let world = world("ancestors").await;
+        let (alice, bob, _) = pair(&world, HOUR).await;
+        let mut sent = Vec::new();
+        for text in ["one", "two", "three"] {
+            sent.push(bob.cmd(&["send", text]).await.unwrap()["id"].as_str().unwrap().to_owned());
+        }
+        // Alice replies to the last once she holds it: the reply's causal past is all three.
+        let reply = until(|| async { alice.cmd(&["send", "--reply-to", sent[2].as_str(), "four"]).await.unwrap_or_default() }, |reply| reply["id"].is_string()).await;
+        let reply = reply["id"].as_str().unwrap().to_owned();
+        let ids = |read: &Value| read.as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        let cases = [
+            ("0", vec![reply.clone()]),
+            ("1", vec![sent[2].clone(), reply.clone()]),
+            ("5", vec![sent[0].clone(), sent[1].clone(), sent[2].clone(), reply.clone()]),
+        ];
+        for (n, expected) in cases {
+            let read = alice.cmd(&["read", &reply, "--ancestors", n]).await.unwrap();
+            assert_eq!(ids(&read), expected, "--ancestors {n}");
+        }
+    });
+}
+
+/// `leave` is pending until another member removes the session, and `sessions remove` finishes on that removal.
+#[test]
+fn a_leave_then_a_removal_finishes_on_the_removal() {
+    local(async {
+        let world = world("leave-remove").await;
+        let (mut alice, bob, group) = pair(&world, HOUR).await;
+        alice.stop().await;
+        let left = bob.cmd(&["leave"]).await.unwrap();
+        assert_eq!((&left["left"], &left["pending"]), (&json!(true), &json!(true)), "{left}");
+        let (home, config, network) = (bob.home.clone(), world.config("bob", "bob"), world.network.clone());
+        let removing = tokio::task::spawn_local(async move { crate::remove(config, &home, network).await });
+        // Bob's removal waits for Alice, who comes back only once the removal is waiting.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!removing.is_finished());
+        let _alice = world.start("alice", HOUR).await;
+        assert_eq!(removing.await.unwrap().unwrap(), json!({ "removed": "bob", "left": [group] }));
+        assert_eq!(crate::sessions(&bob.home).await.unwrap(), json!({ "sessions": [] }));
+    });
+}
+
+/// A home another release wrote is refused and left as it is, and the refusal names the release that wrote it.
+#[test]
+fn a_home_of_another_format_is_refused_and_names_its_release() {
+    local(async {
+        let world = world("format").await;
+        for (format, names, run) in [("5", "letmeknow 0.16", "@letmeknow/cli@0.16"), ("7", "a newer letmeknow", "@letmeknow/cli@latest")] {
+            let home = world.root.path().join(format!("format-{format}"));
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join("format"), format!("{format}\n")).unwrap();
+            let config = Config { dir: session_dir(&home, "alice").unwrap(), ..world.config("alice", "alice") };
+            let error = crate::listen(config, &home, world.network.clone(), |_| Ok(()), std::future::pending()).await.unwrap_err().to_string();
+            assert!(error.contains(names) && error.contains(run), "{error}");
+            assert_eq!(std::fs::read_to_string(home.join("format")).unwrap(), format!("{format}\n"));
+            assert!(!home.join("sessions").exists());
+        }
+    });
+}
+
+/// `ready` names a newer minor version the registry has, and the command to run it; the same minor is no news.
+#[test]
+fn ready_names_a_newer_minor_version_and_the_command_to_run_it() {
+    local(async {
+        let world = world("newer").await;
+        let newer = registry(r#"{"dist-tags":{"latest":"0.18.2"}}"#, Duration::ZERO).await;
+        let alice = world.launch(Config { registry: newer, ..world.config("alice", "alice") }, usize::MAX).await;
+        let home = world.root.path().join("alice");
+        assert_eq!(alice.ready["newer"], "0.18.2");
+        assert_eq!(alice.ready["update"], format!("LETMEKNOW_HOME={} npx -y @letmeknow/cli@0.18 --session alice listen", home.display()));
+        let same = registry(r#"{"dist-tags":{"latest":"0.17.4"}}"#, Duration::ZERO).await;
+        let bob = world.launch(Config { registry: same, ..world.config("bob", "bob") }, usize::MAX).await;
+        assert!(bob.ready.get("newer").is_none(), "{}", bob.ready);
+    });
+}
+
+/// A registry that does not answer within the lookup's bound leaves `ready` without a notice, and `ready` comes once
+/// the bound passes.
+#[test]
+fn a_slow_registry_leaves_ready_without_a_notice() {
+    local(async {
+        let world = world("slow").await;
+        let slow = registry(r#"{"dist-tags":{"latest":"0.18.2"}}"#, Duration::from_secs(10)).await;
+        let started = std::time::Instant::now();
+        let alice = world.launch(Config { registry: slow, ..world.config("alice", "alice") }, usize::MAX).await;
+        assert!(alice.ready.get("newer").is_none(), "{}", alice.ready);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    });
+}
+
+/// A registry answering each request with `body` after `delay`; returns its address.
+async fn registry(body: &'static str, delay: Duration) -> String {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                {
+                    let mut lines = BufReader::new(&mut stream).lines();
+                    while let Some(line) = lines.next_line().await.unwrap() {
+                        if line.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(delay).await;
+                let answer = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(answer.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    address
 }

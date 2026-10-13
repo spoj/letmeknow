@@ -28,6 +28,7 @@ fn the_binary_logs_what_rust_log_asks_without_colour_in_a_pipe() {
         let home = dir.path().join("home");
         let mut command = Command::new(env!("CARGO_BIN_EXE_letmeknow"));
         command.arg("--home").arg(&home).args(["listen", "--relay", "http://127.0.0.1:1"]).env_remove("LETMEKNOW_SESSION").env_remove("RUST_LOG");
+        command.env("LETMEKNOW_REGISTRY", "http://127.0.0.1:1");
         if let Some(rust_log) = rust_log {
             command.env("RUST_LOG", rust_log);
         }
@@ -50,6 +51,7 @@ fn the_binary_names_itself_as_termux_names_it() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_letmeknow"));
     command.arg("--home").arg(dir.path().join("home")).args(["listen", "--relay", "http://127.0.0.1:1"]).env_remove("LETMEKNOW_SESSION");
     command.env("TERMUX_EXEC__PROC_SELF_EXE", "/data/data/com.termux/files/home/letmeknow");
+    command.env("LETMEKNOW_REGISTRY", "http://127.0.0.1:1");
     let mut child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
     let mut ready = String::new();
     std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();

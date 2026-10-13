@@ -21,6 +21,11 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Where the newer-release notice looks: the registry, or `LETMEKNOW_REGISTRY`, which tests point at a mock.
+fn registry() -> String {
+    std::env::var("LETMEKNOW_REGISTRY").unwrap_or_else(|_| letmeknow::REGISTRY.to_owned())
+}
+
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let home = home_dir(cli.home)?;
     match cli.command {
@@ -36,6 +41,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 keep_log,
                 membership: lmk_client::service(&membership)?,
                 plugins: kinds::dirs(),
+                registry: registry(),
             };
             let print = |line: String| {
                 use std::io::Write;
@@ -57,6 +63,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 keep_log: false,
                 membership: lmk_client::service("letmeknow.dev")?,
                 plugins: kinds::dirs(),
+                registry: registry(),
             };
             let remove = letmeknow::remove(config, &home, letmeknow::Network::new(&relay)?);
             println!("{}", tokio::task::LocalSet::new().run_until(remove).await?);

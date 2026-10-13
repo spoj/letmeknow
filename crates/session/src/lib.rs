@@ -14,9 +14,15 @@ use lmk_node::Node;
 use lmk_proto::group::Service;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use lmk_proto::links::RELAY;
+
+/// Where letmeknow's releases are published.
+pub const REGISTRY: &str = "https://registry.npmjs.org";
+/// How long `ready` may wait for the registry to say whether a newer minor version is out.
+const LOOKUP: Duration = Duration::from_secs(2);
 
 /// The skill text for agents.
 pub const SKILL: &str = include_str!("../../../SKILL.md");
@@ -71,14 +77,22 @@ pub async fn listen(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let format = home.join("format");
-    let found = std::fs::read_to_string(&format).ok();
-    ensure!(
-        found.as_deref().map(str::trim) == Some("5") || found.is_none() && !home.join("device.json").exists(),
-        "{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home",
-        home.display()
-    );
+    let found = std::fs::read_to_string(&format).ok().map(|found| found.trim().to_owned());
+    match found.as_deref() {
+        Some("6") => {}
+        None if !home.join("device.json").exists() => {}
+        Some("5") => bail!(
+            "{home} holds state that letmeknow 0.16 wrote (format 5), which this one cannot read: to keep using it, run `npx -y @letmeknow/cli@0.16 --home {home} listen`, or use another --home for this one",
+            home = home.display()
+        ),
+        Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 6) => bail!(
+            "{home} holds state that a newer letmeknow wrote (format {newer}), which this one cannot read: run the newest release, `npx -y @letmeknow/cli@latest --home {home} listen`, or use another --home for this one",
+            home = home.display()
+        ),
+        _ => bail!("{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home", home.display()),
+    }
     cli::private_dir(&config.dir)?;
-    std::fs::write(&format, "5\n")?;
+    std::fs::write(&format, "6\n")?;
     // One process runs a session, even when two start at once.
     let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(config.dir.join("session.lock"))?;
     match held.try_lock() {
@@ -97,8 +111,20 @@ pub async fn listen(
     let kinds = [lmk_proto::group::CHAT.to_owned()].into_iter().chain(kinds::discover(&config.plugins).into_keys()).collect();
     let node_config = node_config(&network, home, &config.handle, None, config.dir.join("files"), kinds);
     let (node, events) = Node::start(provider, node_config).await?;
-    let session = session::Session::open(config, db, node, home, network, inbound, held).await?;
-    session::run(session, queue, events, print, shutdown).await
+    let lookup = newer_minor(network.clone(), config.registry.clone());
+    let (session, newer) = tokio::join!(session::Session::open(config, db, node, home, network, inbound, held), lookup);
+    session::run(session?, queue, events, print, shutdown, newer).await
+}
+
+/// The version of the newest release on `registry`, if its minor version is newer than this one's. Nothing if the registry
+/// does not answer within `LOOKUP`.
+async fn newer_minor(network: Network, registry: String) -> Option<String> {
+    let tls = network.ca.client_config(Arc::new(rustls::crypto::ring::default_provider())).ok()?;
+    let client = reqwest::Client::builder().tls_backend_preconfigured(tls).timeout(LOOKUP).build().ok()?;
+    let body = client.get(format!("{registry}/@letmeknow/cli")).send().await.ok()?.text().await.ok()?;
+    let latest = semver::Version::parse(serde_json::from_str::<Value>(&body).ok()?["dist-tags"]["latest"].as_str()?).ok()?;
+    let own = semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("this crate's version");
+    ((latest.major, latest.minor) > (own.major, own.minor)).then(|| latest.to_string())
 }
 
 /// This machine's sessions: each one's handle, whether its process answers, and its groups as it last wrote them.
@@ -114,11 +140,11 @@ pub async fn sessions(home: &Path) -> Result<Value> {
     Ok(json!({ "sessions": sessions }))
 }
 
-/// How long removing a session waits for another member of each of its groups to hold its leave.
+/// How long removing a session waits for the other members of its groups to remove it.
 const LEAVE_WAIT: Duration = Duration::from_secs(60);
 
-/// Removes a session: stops its process if one runs, runs it here, printing nothing, until another member of each of its
-/// groups holds its leave, and deletes it. Fails, keeping the session, where a leave is not held within `LEAVE_WAIT`.
+/// Removes a session: stops its process if one runs, runs it here, printing nothing, until the other members of each of its
+/// groups have removed it, and deletes it. Fails, keeping the session, where that does not happen within `LEAVE_WAIT`.
 /// Runs on a `LocalSet`, as `listen` does.
 pub async fn remove(config: session::Config, home: &Path, network: Network) -> Result<Value> {
     let (handle, dir) = (config.handle.clone(), config.dir.clone());
@@ -154,13 +180,13 @@ pub async fn remove(config: session::Config, home: &Path, network: Network) -> R
         let held = async {
             while !waiting.is_empty() {
                 let line: Value = serde_json::from_str(&printed.recv().await.context("the session stopped")?)?;
-                if line["type"] == "leave_held" || line["type"] == "removed" {
+                if line["type"] == "removed" {
                     waiting.retain(|group| *group != line["group"]);
                 }
             }
             anyhow::Ok(())
         };
-        tokio::time::timeout(LEAVE_WAIT, held).await.map_err(|_| anyhow!("no other member of a group it left held its leave: the session stays; remove it again once one is online"))??;
+        tokio::time::timeout(LEAVE_WAIT, held).await.map_err(|_| anyhow!("a group it left has not removed the session yet: the session stays; remove it again once another member is online"))??;
         anyhow::Ok(groups)
     };
     let left = left.await;

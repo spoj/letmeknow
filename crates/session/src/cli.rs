@@ -66,7 +66,7 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum SessionsOp {
-    /// Stop a session if it runs, leave its groups, and delete it, once another member of each group holds its leave
+    /// Stop a session if it runs, leave its groups, and delete it, once the other members have removed it from each group
     Remove {
         handle: String,
         /// The relay the session is reached through
@@ -135,12 +135,12 @@ pub enum Request {
         attach_name: String,
         text: String,
     },
-    /// Show a chat message: of your own, who holds and who read it
+    /// Show a chat message: of your own, who holds and who was shown it
     #[command(display_order = 13)]
     Read {
         /// Its id, or any unique beginning of it
         id: String,
-        /// Show first this many of the chat messages before it that its sender had read
+        /// Show first this many of the chat messages in its causal past that this session delivered, latest last
         #[arg(long, default_value_t = 0)]
         ancestors: usize,
     },
@@ -219,7 +219,7 @@ fn hyphens(command: clap::Command) -> clap::Command {
 pub fn home_dir(home: Option<PathBuf>) -> Result<PathBuf> {
     match home {
         Some(home) => Ok(home),
-        None => Ok(dirs::data_local_dir().context("no local data directory")?.join("letmeknow-v5")),
+        None => Ok(dirs::data_local_dir().context("no local data directory")?.join("letmeknow-v6")),
     }
 }
 

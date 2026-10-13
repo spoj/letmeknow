@@ -8,14 +8,13 @@
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, Described, DeviceState, File, Remote, message_id};
+use lmk_client::{Access, BoxFuture, Chat, Client, ClientEvent, DeviceState, File, Missing, Remote, message_id};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::identity::{Identity, Pending, Presence, SessionGroup};
 use lmk_node::{Event, Message, Node};
 use lmk_proto::Bytes;
-use lmk_proto::group::{ChatMessage, IDENTITY, Service};
-use lmk_proto::ranges::Ranges;
+use lmk_proto::group::{IDENTITY, Service};
 use lmk_proto::links::FileLink;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -53,6 +52,8 @@ pub struct Config {
     pub membership: Service,
     /// Where it looks for kinds' plugins, in order.
     pub plugins: Vec<PathBuf>,
+    /// Where it looks for a newer release.
+    pub registry: String,
 }
 
 /// A request on a command channel, and where its answer goes.
@@ -62,14 +63,12 @@ pub type Inbound = (Request, oneshot::Sender<Value>);
 pub enum Done {
     /// A request's answer, and where it goes.
     Answered(Result<Value>, oneshot::Sender<Value>),
-    /// A message this session sent in a group: its id and the answer, and where that goes.
-    Sent(Bytes, Result<(Bytes, Value)>, oneshot::Sender<Value>),
     /// What failed of leaving the groups of identities this device left.
     IdentityRefreshed(Vec<anyhow::Error>),
     /// The handles of the device's sessions that run.
     Found(Vec<String>),
-    /// How handing a session an add, at its position, went.
-    Handed(u64, Result<Value>),
+    /// How handing a session the add with this id went.
+    Handed(Bytes, Result<Value>),
 }
 
 /// The device's node, as another session process runs it: its state as published in `LETMEKNOW_HOME`, and its command
@@ -112,8 +111,8 @@ pub struct Session {
     identity_at: Instant,
     /// When the session acting for the device next finds which of the device's sessions run, and hands them their adds.
     presence_at: Instant,
-    /// The adds handed to a session, by position, while it runs: one that failed goes again once the session starts again.
-    handed: HashMap<u64, String>,
+    /// The adds handed to a session, by id, while it runs: one that failed goes again once the session starts again.
+    handed: HashMap<Bytes, String>,
     /// The device's state as last published.
     published: String,
     /// The groups as last written to `groups.json`.
@@ -210,23 +209,20 @@ impl Session {
             if !session.client.chats(&gid) {
                 continue;
             }
-            // Messages that arrived after the last one printed, as when the session stopped while they waited or could
-            // not print them. Those catch-up left out, before it, stay out.
-            let me = session.client.node().key();
-            let mut unprinted = Vec::new();
-            for message in session.client.node().messages(&gid.0)?.into_iter().rev() {
-                if message.payload["type"] != "message" || message.sender.key == me {
-                    continue;
-                }
-                if session.seen(&message.id.0)? {
+            // What was delivered after the last message shown, as when the session stopped before printing it.
+            let (node, me) = (session.client.node(), session.client.node().key());
+            let mut unshown = Vec::new();
+            for message in node.messages(&gid.0)?.into_iter().rev() {
+                if node.shown(&gid.0, &message.id.0)? {
                     break;
                 }
-                unprinted.push(message);
+                if message.payload["type"] == "message" && message.sender.key != me {
+                    unshown.push(message);
+                }
             }
-            for message in unprinted.into_iter().rev() {
-                let sender = serde_json::to_value(session.client.describe(&gid, &message.sender)?)?;
-                let id = message.id.0.as_slice().try_into()?;
-                session.received(gid.clone(), id, message.position, Vec::new(), sender, message.payload).await?;
+            for message in unshown.iter().rev() {
+                let event = session.message_event(message)?;
+                session.received(event).await?;
             }
         }
         Ok(session)
@@ -335,7 +331,7 @@ impl Session {
 
     /// Prints what is waiting, once the plugins are in step (a doc's file with its doc): whatever wakes the agent, it
     /// acts on current state. A message is seen once its line is written.
-    pub async fn emit(&mut self, print: &mut impl FnMut(String) -> std::io::Result<()>) -> std::io::Result<()> {
+    pub async fn emit(&mut self, print: &mut impl FnMut(String) -> std::io::Result<()>) -> Result<()> {
         if self.outbox.is_empty() {
             return Ok(());
         }
@@ -343,10 +339,9 @@ impl Session {
         for mut item in self.outbox.take() {
             let printed = item.as_object_mut().and_then(|item| item.remove("printed"));
             print(short::line(&self.compact(item.clone())))?;
-            if item["type"] == "message"
-                && let Some(id) = item["id"].as_str().and_then(|id| message_id(id).ok())
-            {
-                let _ = self.mark_seen(&id);
+            if item["type"] == "message" {
+                let gid: Bytes = serde_json::from_value(item["group"].clone())?;
+                self.show(&gid, &message_id(item["id"].as_str().context("a message has an id")?)?)?;
             }
             if let Some(printed) = printed {
                 let (kind, key) = (printed["kind"].as_str().unwrap_or_default(), printed["key"].as_str().unwrap_or_default());
@@ -391,8 +386,8 @@ impl Session {
             Request::Send { group, to, reply_to, urgent, attach, attach_name, text } => {
                 match self.message(group, to, reply_to, urgent, attach.map(|data| (data, attach_name)), text) {
                     Ok((gid, chat)) => _ = self.running.spawn_local(async move {
-                        let sent = client.send(&gid, chat).await;
-                        Done::Sent(gid, sent, reply)
+                        let sent = client.send(&gid, chat).await.map(|(_, answer)| answer);
+                        Done::Answered(sent, reply)
                     }),
                     Err(error) => self.answer(Err(error), reply),
                 }
@@ -433,13 +428,6 @@ impl Session {
     pub fn done(&mut self, done: Done) {
         match done {
             Done::Answered(answer, reply) => self.answer(answer, reply),
-            Done::Sent(gid, sent, reply) => {
-                let answer = sent.and_then(|(id, answer)| {
-                    self.db.execute("INSERT OR IGNORE INTO taken (id, gid, seen) VALUES (?, ?, 1)", params![id.0, gid.0])?;
-                    Ok(answer)
-                });
-                self.answer(answer, reply);
-            }
             Done::IdentityRefreshed(failed) => {
                 self.identity_at = Instant::now() + IDENTITY_CHECK;
                 for error in failed {
@@ -452,9 +440,9 @@ impl Session {
                     self.warn(format!("handing this device's sessions their adds: {error:#}"));
                 }
             }
-            Done::Handed(position, handed) => {
+            Done::Handed(id, handed) => {
                 let Access::Here(devices) = self.client.access() else { return };
-                if let Err(error) = handed.and_then(|_| devices.take(position)) {
+                if let Err(error) = handed.map(|_| devices.take(&id)) {
                     self.warn(format!("handing a session of this device an add: {error:#}"));
                 }
             }
@@ -475,16 +463,16 @@ impl Session {
         }
         devices.set_presence(Presence { sessions: running.clone(), groups });
         self.handed.retain(|_, session| running.contains(session));
-        for Pending { position, by, add } in devices.adds()? {
+        for Pending { id, by, add } in devices.adds()? {
             let session = if add.session.is_empty() { self.config.handle.clone() } else { add.session };
-            if !running.contains(&session) || self.handed.contains_key(&position) {
+            if !running.contains(&session) || self.handed.contains_key(&id) {
                 continue;
             }
-            self.handed.insert(position, session.clone());
+            self.handed.insert(id.clone(), session.clone());
             let home = self.home.clone();
             self.running.spawn_local(async move {
                 let request = Request::Added { link: add.link, group: add.group, device: by };
-                Done::Handed(position, crate::cli::call(&home, &session, request).await)
+                Done::Handed(id, crate::cli::call(&home, &session, request).await)
             });
         }
         Ok(())
@@ -510,33 +498,32 @@ impl Session {
         | ClientEvent::Revoked { .. }
         | ClientEvent::Removed { .. }
         | ClientEvent::Settings { .. }
-        | ClientEvent::Lost { .. }
-        | ClientEvent::LeaveHeld { .. } = &event
+        | ClientEvent::Lost { .. } = &event
         {
             let mut item = serde_json::to_value(&event)?;
-            if let ClientEvent::Lost { member, ids, .. } = &event
+            if let ClientEvent::Lost { member, messages, .. } = &event
                 && !member.you
             {
+                let count: usize = messages.iter().map(|lost| lost.seqs.len()).sum();
                 item["text"] = json!(format!(
-                    "{} could not read {} of your messages; send again, with --reply-to <id>, any that still matters",
+                    "{} could not read {count} of your messages; send again, with --reply-to <id>, any that still matters",
                     lmk_client::shown(&item["member"]),
-                    ids.len()
                 ));
             }
             let wake = wakes(&item, |id| self.mine(id));
             self.outbox.deliver(item, wake);
             return Ok(());
         }
+        if let ClientEvent::Message { id, .. } = &event {
+            let id = message_id(id)?;
+            if !self.taken(&id)? {
+                self.received(event).await?;
+            }
+            return Ok(());
+        }
         match event {
             ClientEvent::Warning { .. } => self.outbox.print(serde_json::to_value(&event)?),
             ClientEvent::Gone { group } => self.forget(&group)?,
-            ClientEvent::Message { group, id, position, missing, from, payload } => {
-                let id = message_id(&id)?;
-                if !self.taken(&id)? {
-                    self.received(group, id, position, missing, serde_json::to_value(from)?, payload).await?
-                }
-            }
-            ClientEvent::Sent { .. } => self.outbox.deliver(serde_json::to_value(&event)?, false),
             ClientEvent::Added { device, mut joined } => {
                 joined["type"] = json!("joined");
                 joined["how"] = json!("add");
@@ -585,12 +572,13 @@ impl Session {
     ) -> Result<(Bytes, Chat)> {
         let gid = self.client.chat(group)?;
         let reply_to: Option<[u8; 32]> = match reply_to {
-            Some(id) => Some(self.find(&id)?.id.0.as_slice().try_into()?),
+            Some(id) => {
+                let target = self.find(&id)?;
+                self.show(&target.group, &target.id.0)?;
+                Some(target.id.0.as_slice().try_into()?)
+            }
             None => None,
         };
-        if let Some(id) = &reply_to {
-            self.mark_seen(id)?;
-        }
         let attachment = match attach {
             Some((data, name)) => {
                 let data = B64.decode(data)?;
@@ -602,18 +590,16 @@ impl Session {
         Ok((gid, Chat { text, to, reply_to, urgent, attachment }))
     }
 
-    /// Takes in a chat message, as the client hands them on in position order: `missing`, the counted positions before
-    /// it that were passed over unopened.
-    async fn received(&mut self, gid: Bytes, id: [u8; 32], position: u64, missing: Vec<u64>, sender: Value, payload: Value) -> Result<()> {
+    /// Takes in a chat message, in delivery order: printed, with its attachment's file once it is held.
+    async fn received(&mut self, event: ClientEvent) -> Result<()> {
+        let mut item = self.message_item(event)?;
+        let gid: Bytes = serde_json::from_value(item["group"].clone())?;
+        let id = message_id(item["id"].as_str().context("a message has an id")?)?;
         self.db.execute("INSERT OR IGNORE INTO taken (id, gid) VALUES (?, ?)", params![id, gid.0])?;
-        let mut item = self.message_json(&gid, id, position, sender, &payload, true)?;
-        if !missing.is_empty() {
-            item["missing"] = json!(missing);
-        }
         let wakes = wakes(&item, |id| self.mine(id));
-        if let Some(attachment) = payload.get("attachment").filter(|a| a.is_object()) {
-            let link = FileLink::parse(attachment["link"].as_str().context("an attachment has a link")?)?;
-            let name = attachment["name"].as_str().unwrap_or_default().to_owned();
+        if item["attachment"].is_object() {
+            let link = FileLink::parse(item["attachment"]["link"].as_str().context("an attachment has a link")?)?;
+            let name = item["attachment"]["name"].as_str().unwrap_or_default().to_owned();
             self.db.execute(
                 "INSERT OR IGNORE INTO attachments (hash, gid, message, link, name, wakes) VALUES (?, ?, ?, ?, ?, ?)",
                 params![link.hash, gid.0, id, link.link(), name, wakes],
@@ -635,87 +621,90 @@ impl Session {
         Ok(self.db.query_row("SELECT 1 FROM taken WHERE id = ?", [id], |_| Ok(())).optional()?.is_some())
     }
 
+    /// Whether a message of this session's, in any of its groups, has this id.
     fn mine(&self, id: &str) -> bool {
         let node = self.client.node();
-        message_id(id).is_ok_and(|id| node.message(&id).ok().flatten().is_some_and(|m| m.sender.key == node.key()))
+        message_id(id).is_ok_and(|id| node.groups().iter().any(|gid| node.message(&gid.0, &id).ok().flatten().is_some_and(|m| m.sender.key == node.key())))
     }
 
-    fn message_json(&self, gid: &Bytes, id: [u8; 32], position: u64, from: Value, payload: &Value, fresh: bool) -> Result<Value> {
-        let me = serde_json::to_value(self.client.describe_key(gid, &self.client.node().key())?)?;
+    /// A delivered chat message, as the client tells of it.
+    fn message_event(&self, message: &Message) -> Result<ClientEvent> {
+        let describer = self.client.describer(&message.group)?;
+        Ok(ClientEvent::Message {
+            group: message.group.clone(),
+            id: hex::encode(&message.id.0),
+            from: describer.describe(&message.sender),
+            seq: message.seq,
+            missing: message.missing.iter().map(|seqs| Missing { from: describer.describe_key(&seqs.key), seqs: seqs.seqs.iter().collect() }).collect(),
+            late: message.late,
+            reply_outside: message.reply_outside,
+            reply_to: message.reply_to.as_ref().map(|id| hex::encode(&id.0)),
+            payload: message.payload.clone(),
+        })
+    }
+
+    /// A chat message as the agent reads it: its text is left out once shown, unless `listen --keep-log`.
+    fn message_item(&self, event: ClientEvent) -> Result<Value> {
+        let mut item = serde_json::to_value(&event)?;
+        let payload = item["payload"].take();
+        let gid: Bytes = serde_json::from_value(item["group"].clone())?;
+        let id = message_id(item["id"].as_str().context("a message has an id")?)?;
+        let me = serde_json::to_value(self.client.describe_key(&gid, &self.client.node().key())?)?;
         let to: Vec<Bytes> = serde_json::from_value(payload.get("to").cloned().unwrap_or(json!([])))?;
         let to: Vec<String> = to.iter().map(|fp| hex::encode(&fp.0)).collect();
-        let forgotten = !fresh && !self.config.keep_log && self.seen(&id)?;
+        let forgotten = !self.config.keep_log && self.client.node().shown(&gid.0, &id)?;
         let content = if forgotten { Value::Null } else { payload.get("content").cloned().unwrap_or(Value::Null) };
         let direct = to.iter().any(|fp| me["fp"] == fp.as_str()) || content.as_str().is_some_and(|text| mentions(text, &me));
-        let mut item = json!({ "type": "message", "group": b64(&gid.0), "id": hex::encode(id), "position": position, "from": from, "direct": direct, "content": content });
+        item["content"] = content;
+        item["direct"] = json!(direct);
         if !to.is_empty() {
-            let members = self.client.described_members(gid)?;
+            let members = self.client.described_members(&gid)?;
             item["to"] = to.iter().map(|fp| members.iter().find(|m| m.fp.as_ref() == Some(fp)).map_or_else(|| json!(fp), |m| json!(m))).collect();
-        }
-        if let Some(reply_to) = payload.get("reply_to") {
-            item["reply_to"] = json!(hex::encode(serde_json::from_value::<Bytes>(reply_to.clone())?.0));
         }
         if payload["urgent"] == true {
             item["urgent"] = json!(true);
         }
-        if let Some(attachment) = payload.get("attachment") {
-            item["attachment"] = attachment.clone();
-        }
-        if let Some(sent_at) = payload.get("sent_at") {
-            item["sent_at"] = sent_at.clone();
+        for field in ["attachment", "sent_at"] {
+            if let Some(value) = payload.get(field) {
+                item[field] = value.clone();
+            }
         }
         Ok(item)
     }
 
-    fn seen(&self, id: &[u8]) -> Result<bool> {
-        Ok(self.db.query_row("SELECT seen FROM taken WHERE id = ?", [id], |r| r.get(0)).optional()?.unwrap_or(false))
-    }
-
-    /// Records that a message entered the agent's context. Its text is then deleted, unless `listen --keep-log` or it
-    /// is this session's own, which it keeps to send again.
-    fn mark_seen(&self, id: &[u8; 32]) -> Result<()> {
+    /// Marks a delivered message shown, as printed or replied to. Its text is then deleted, unless `listen --keep-log` or
+    /// it is this session's own, which it keeps to send again.
+    fn show(&self, gid: &Bytes, id: &[u8]) -> Result<()> {
         let node = self.client.node();
-        let Some(message) = node.message(id)? else { return Ok(()) };
-        self.db.execute("INSERT OR IGNORE INTO taken (id, gid) VALUES (?, ?)", params![id, message.group.0])?;
-        self.db.execute("UPDATE taken SET seen = 1 WHERE id = ?", [id])?;
-        self.client.mark_read(&message.group, &Ranges::range(message.position, message.position))?;
+        // Gone when the session left the group meanwhile, with what was waiting to print.
+        let Some(message) = node.message(&gid.0, id)? else { return Ok(()) };
+        self.client.mark_shown(gid, &[Bytes(id.to_vec())])?;
         if !self.config.keep_log && message.payload["type"] == "message" && message.sender.key != node.key() {
             let mut payload = message.payload;
             payload["content"] = json!("");
-            node.redact(id, payload)?;
+            node.redact(&gid.0, id, payload)?;
         }
         Ok(())
     }
 
-    /// A chat message, after the last `ancestors` chat messages before it that its sender had read; this session's own
-    /// say who holds and who read them.
-    fn read(&mut self, id: &str, ancestors: usize) -> Result<Value> {
+    /// A chat message, after the latest `ancestors` chat messages in its causal past that this session delivered; this
+    /// session's own say who holds and who was shown them.
+    fn read(&self, id: &str, ancestors: usize) -> Result<Value> {
         let message = self.find(id)?;
         let node = self.client.node();
-        let chat: ChatMessage = serde_json::from_value(message.payload.clone()).context("not a chat message")?;
-        let gid = message.group.clone();
-        let mut shown: Vec<Message> = node
-            .messages(&gid.0)?
-            .into_iter()
-            .filter(|m| m.position < message.position && chat.read.contains(m.position) && m.payload["type"] == "message")
-            .collect();
-        shown.drain(..shown.len().saturating_sub(ancestors));
+        let (gid, me) = (message.group.clone(), node.key());
+        let mut shown = node.ancestors(&gid.0, &message.id.0, ancestors)?;
         shown.push(message);
-        let (receipts, me) = (self.client.receipts(&gid)?, node.key());
+        let receipts = self.client.receipts(&gid)?;
         let describer = self.client.describer(&gid)?;
-        let described = |of: &dyn Fn(&lmk_client::Receipt) -> bool| -> Vec<Described> {
-            receipts.iter().filter(|r| of(r)).map(|r| describer.describe(&r.member)).collect()
-        };
         let mut found = Vec::new();
         for m in shown {
-            let from = serde_json::to_value(describer.describe(&m.sender))?;
-            let id: [u8; 32] = m.id.0.as_slice().try_into()?;
-            let mut item = self.message_json(&gid, id, m.position, from, &m.payload, false)?;
+            let mut item = self.message_item(self.message_event(&m)?)?;
             if m.sender.key == me {
-                item["held_by"] = json!(described(&|r| r.held.contains(m.position)));
-                item["read_by"] = json!(described(&|r| r.read.contains(m.position)));
+                item["held_by"] = json!(receipts.iter().filter(|r| r.holds(&m)).map(|r| describer.describe(&r.member)).collect::<Vec<_>>());
+                item["read_by"] = json!(receipts.iter().filter(|r| r.showed(&m)).map(|r| describer.describe(&r.member)).collect::<Vec<_>>());
             }
-            self.mark_seen(&id)?;
+            self.show(&gid, &m.id.0)?;
             found.push(self.compact(item));
         }
         Ok(Value::Array(found))
@@ -811,6 +800,7 @@ pub async fn run(
     mut events: mpsc::UnboundedReceiver<Event>,
     mut print: impl FnMut(String) -> std::io::Result<()>,
     shutdown: impl std::future::Future<Output = ()>,
+    newer: Option<String>,
 ) -> Result<()> {
     let me = session.client.me()?;
     // Termux may run a program through Android's linker, which /proc/self/exe then names; it names the program in
@@ -819,6 +809,12 @@ pub async fn run(
     let mut ready = json!({ "type": "ready", "session": session.config.handle, "name": me["device"]["name"], "fp": me["fp"], "bin": bin });
     if let Some(identity) = me["identity"]["name"].as_str() {
         ready["identity"] = json!(identity);
+    }
+    if let Some(version) = newer {
+        let minor = version.split('.').take(2).collect::<Vec<_>>().join(".");
+        let home = if session.home == crate::cli::home_dir(None)? { String::new() } else { format!("LETMEKNOW_HOME={} ", session.home.display()) };
+        ready["newer"] = json!(version);
+        ready["update"] = json!(format!("{home}npx -y @letmeknow/cli@{minor} --session {} listen", session.config.handle));
     }
     let mut shutdown = std::pin::pin!(shutdown);
     let client = session.client.clone();

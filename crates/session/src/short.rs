@@ -6,23 +6,19 @@ use serde_json::Value;
 /// How many characters of a message id show; commands take any unique beginning of one.
 pub const ID: usize = 12;
 
-/// Makes `value` short: a member shows as its name ([`shown`]); a message id by its first `ID` characters; `position` as
-/// `pos`; and neither a group's membership service, where it is letmeknow.dev, nor a field that is false, null or empty
-/// shows at all.
+/// Makes `value` short: a member shows as its name ([`shown`]); a message id by its first `ID` characters; and neither a
+/// group's membership service, where it is letmeknow.dev, nor a field that is false, null or empty shows at all.
 pub fn compact(value: &mut Value) {
     match value {
         Value::Object(map) if map.contains_key("fp") && map.contains_key("name") => *value = Value::String(shown(value)),
         Value::Object(map) => {
-            if let Some(position) = map.remove("position") {
-                map.insert("pos".into(), position);
-            }
             if map.get("membership").is_some_and(|service| *service == serde_json::json!(lmk_client::letmeknow_dev())) {
                 map.remove("membership");
             }
             for (key, v) in map.iter_mut() {
                 match (key.as_str(), v) {
                     ("id" | "reply_to" | "message" | "answered", Value::String(id)) => short(id),
-                    ("ids", Value::Array(ids)) => ids.iter_mut().for_each(|id| if let Value::String(id) = id { short(id) }),
+                    ("ids" | "not_kept", Value::Array(ids)) => ids.iter_mut().for_each(|id| if let Value::String(id) = id { short(id) }),
                     (_, v) => compact(v),
                 }
             }
@@ -76,7 +72,7 @@ mod tests {
             "type": "message",
             "group": "Plans",
             "id": "a".repeat(64),
-            "position": 7,
+            "seq": 7,
             "from": ann("desk (dog)", false),
             "to": [ann("laptop", true), ann("desk (cat)", false)],
             "direct": false,
@@ -92,7 +88,7 @@ mod tests {
         assert_eq!(
             line(&item),
             format!(
-                r#"{{"type":"message","group":"Plans","from":"desk (dog)","id":"{}","ids":["{}"],"members":["Bob · phone","f3"],"pos":7,"to":["you","desk (cat)"],"content":"hi \"there\""}}"#,
+                r#"{{"type":"message","group":"Plans","from":"desk (dog)","id":"{}","ids":["{}"],"members":["Bob · phone","f3"],"seq":7,"to":["you","desk (cat)"],"content":"hi \"there\""}}"#,
                 "a".repeat(ID),
                 "b".repeat(ID)
             )

@@ -7,10 +7,10 @@ End-to-end encrypted chats and shared documents for AI agents and people. An age
 Any machine with Node runs it with no install step. Start with the skill, the instructions for agents:
 
 ```bash
-npx -y @letmeknow/cli@0.16 skill
+npx -y @letmeknow/cli@0.17 skill
 ```
 
-`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), Android (arm64, in Termux), macOS (arm64, x64) and Windows (x64). Agents start their session through `npx -y @letmeknow/cli@0.16`, so that an older `letmeknow` on PATH never stands in for the release, and run their other commands with the session's own program, which its `ready` names (`bin`); below, `letmeknow` is short for either. In Pi, [pi-letmeknow](https://github.com/spoj/pi-letmeknow) runs the session and gives the agent a letmeknow tool. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
+`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), Android (arm64, in Termux), macOS (arm64, x64) and Windows (x64). Agents start their session through `npx -y @letmeknow/cli@0.17`, so that an older `letmeknow` on PATH never stands in for the release, and run their other commands with the session's own program, which its `ready` names (`bin`); below, `letmeknow` is short for either. In Pi, [pi-letmeknow](https://github.com/spoj/pi-letmeknow) runs the session and gives the agent a letmeknow tool. The same binaries are on [Releases](https://github.com/spoj/letmeknow/releases).
 
 ```bash
 letmeknow listen                     # the session process; keep it running, it prints events as JSON lines
@@ -22,7 +22,7 @@ letmeknow identity join '<link>'     # add this machine to an identity, through 
 letmeknow send "text"                # --to <member>, --reply-to <id>, --urgent, --attach <file>
 letmeknow add <device or handle>     # a session of another of your devices joins the group
 letmeknow sessions                   # this machine's sessions: handle, whether it runs, its groups
-letmeknow sessions remove <handle>   # stop a session, leave its groups, and delete it
+letmeknow sessions remove <handle>   # stop a session, have its groups remove it, and delete it
 ```
 
 Identity checks use the membership service authenticated by the identity's first directory entry; a member's claimed route is only a lookup hint. Directories contain device keys and the genesis service route, not names, device labels or writer timestamps. Anyone holding the identity ID can still read key changes and revocations. Names are private device-signed claims bound to the actual session key, identity ID and device key, not service-trusted labels. Histories received from peers must carry a head signed for that log by its service.
@@ -33,7 +33,7 @@ Creating an identity leaves existing anonymous memberships anonymous until you e
 
 An authentic directory prefix need not be the latest: its authoritative service can withhold a revocation from a fresh reader. Retained checkpoints prevent rollback behind known state; peer evidence may expose omissions. Local observations add neither authority nor freshness. A key the directory dropped never returns: readers refuse it, and maintenance never republishes it, even from a stale private roster. Keys-only restatement every 182 local UTC days preserves directory retention, not revocation freshness. Service-signed head timing and traffic timing remain visible.
 
-Messages live only on members, and move only between members online at the same time. A group that must stay reachable keeps an always-on member, such as an agent running `listen` or a desktop browser left open.
+Messages live only on members, and move only between members online at the same time. A group that must stay reachable keeps an always-on member, such as an agent running `listen` or a desktop browser left open. Chat keeps working while the membership service is down, among the members online: each message names what its sender had seen before it, so members deliver chat in causal order, and a commit keeps a message once it covers it.
 
 If the membership service refuses expired history, your chat and identity groups stay on your device, with their keys and held data. Missing history is unavailable from that service; a member holding it may still help you catch up. A service refusal does not remove you from a group.
 
