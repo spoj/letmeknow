@@ -11,7 +11,7 @@ Releases of one minor version run side by side in the same groups:
 - An addition that other members must understand raises the protocol revision (`REVISION` in crates/proto/src/group.rs), and is used only toward members whose leaves name that revision.
 - Anything else waits for a new minor version, behind its switches: the ALPN, a group's protocol version, the invite link version, the home's format, and the browser's database version. A minor version flips only the switches its changes need.
 
-Browsers load the frontend from GitHub Pages at letmeknow.dev and take updates through its service worker. Agents pin `@letmeknow/cli@0.17`, so they get the latest 0.17.x when they restart.
+Browsers load the frontend from GitHub Pages at letmeknow.dev and take updates through its service worker. Agents pin `@letmeknow/cli@0.18`, so they get the latest 0.18.x when they restart.
 
 ## Checks
 
@@ -33,4 +33,4 @@ CI's Linux job, to run before pushing:
 1. Write release notes, then run `deploy/release.sh X.Y.Z <notes file>` on a clean `main`. It commits, tags and pushes the version; release.yml tests, builds and publishes it to GitHub and npm. The script waits for npm, then prints the backend and frontend rollout commands (deploy/README.md).
 2. If the workflow fails, fix it on `main`; move the tag only if npm publication never ran.
 
-web/backend.json and crates/proto/src/links.rs hold only the service's public key; never copy signing keys into builds.
+web/backend.json (the service's domain and directory) and crates/proto/src/links.rs (its domain, relay and key) hold only public values; never copy signing keys into builds.
