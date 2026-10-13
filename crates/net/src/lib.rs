@@ -39,6 +39,10 @@ use crate::{
 
 /// How long to wait for a peer's `have`.
 const ANSWER_WAIT: Duration = Duration::from_secs(5);
+/// How long a dial at the hint's relays may take before it is dropped for a dial at all relays.
+const HINT_WAIT: Duration = Duration::from_secs(2);
+/// How long the dial at all relays may take.
+const FALLBACK_WAIT: Duration = Duration::from_secs(5);
 
 /// What this crate needs from the group logic to serve files and gate frames. Calls are quick and local.
 pub trait Groups: Send + Sync + 'static {
@@ -154,9 +158,10 @@ impl Net {
         self.inner.endpoint.id()
     }
 
-    /// Connects to a member by the key and relay in its leaf, unless already connected.
-    pub async fn dial(&self, key: EndpointId, relay: RelayUrl) -> Result<()> {
-        self.inner.connection(key, relay).await?;
+    /// Connects to a member, unless already connected: at the `hint` relays, or if that takes over 2 s, at those and the
+    /// `fallback` relays, giving up 5 s later. Each attempt also dials the same-machine addresses.
+    pub async fn dial(&self, key: EndpointId, hint: Vec<RelayUrl>, fallback: Vec<RelayUrl>) -> Result<()> {
+        self.inner.connection(key, hint, fallback).await?;
         Ok(())
     }
 
@@ -193,8 +198,8 @@ impl Net {
     }
 
     /// Asks a member to admit this session, on an `admission` stream of its own.
-    pub async fn join(&self, peer: EndpointId, relay: RelayUrl, join: Join) -> Result<Answer<Admitted>> {
-        let conn = self.inner.connection(peer, relay).await?;
+    pub async fn join(&self, peer: EndpointId, hint: Vec<RelayUrl>, fallback: Vec<RelayUrl>, join: Join) -> Result<Answer<Admitted>> {
+        let conn = self.inner.connection(peer, hint, fallback).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
         frame::write(&mut send, &Open { stream: Stream::Admission }).await?;
         frame::write(&mut send, &join).await?;
@@ -277,17 +282,19 @@ impl Net {
 }
 
 impl Inner {
-    async fn connection(self: &Arc<Self>, key: EndpointId, relay: RelayUrl) -> Result<Connection> {
+    async fn connection(self: &Arc<Self>, key: EndpointId, hint: Vec<RelayUrl>, fallback: Vec<RelayUrl>) -> Result<Connection> {
         if let Some(conn) = self.live(&key) {
             return Ok(conn);
         }
-        #[allow(unused_mut)]
-        let mut addr = EndpointAddr::new(key).with_relay_url(relay);
-        #[cfg(not(target_family = "wasm"))]
-        if let Some(home) = &self.config.home {
-            addr = addresses::read(home, &key).into_iter().fold(addr, EndpointAddr::with_ip_addr);
-        }
-        let conn = self.endpoint.connect(addr, ALPN).await?;
+        let hinted = if hint.is_empty() {
+            None
+        } else {
+            timeout(HINT_WAIT, self.endpoint.connect(self.addr(key, hint.clone()), ALPN)).await.ok().and_then(Result::ok)
+        };
+        let conn = match hinted {
+            Some(conn) => conn,
+            None => timeout(FALLBACK_WAIT, self.endpoint.connect(self.addr(key, hint.into_iter().chain(fallback)), ALPN)).await??,
+        };
         match self.register(&conn, true) {
             Some((input, rx)) => {
                 spawn(self.clone().serve(conn.clone(), true, input, rx));
@@ -295,6 +302,16 @@ impl Inner {
             }
             None => self.live(&key).context("the connection closed"),
         }
+    }
+
+    fn addr(&self, key: EndpointId, relays: impl IntoIterator<Item = RelayUrl>) -> EndpointAddr {
+        #[allow(unused_mut)]
+        let mut addr = relays.into_iter().fold(EndpointAddr::new(key), EndpointAddr::with_relay_url);
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(home) = &self.config.home {
+            addr = addresses::read(home, &key).into_iter().fold(addr, EndpointAddr::with_ip_addr);
+        }
+        addr
     }
 
     fn live(&self, key: &EndpointId) -> Option<Connection> {

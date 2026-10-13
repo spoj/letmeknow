@@ -201,7 +201,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Dials a member, at the relay its leaf names, and tells `Peers` how it went.
+    /// Dials a member, at the relay its leaf names and then this session's, and tells `Peers` how it went.
     fn dial(self: &Arc<Self>, peer: EndpointId) {
         let relay = {
             let mut st = self.lock();
@@ -216,7 +216,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let Some(relay) = relay else { return };
         let inner = self.clone();
         spawn(async move {
-            let dialed = inner.net().dial(peer, relay).await;
+            let dialed = inner.net().dial(peer, vec![relay], vec![inner.relay.clone()]).await;
             if let Err(error) = &dialed {
                 tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
             }
