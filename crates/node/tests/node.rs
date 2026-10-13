@@ -2668,6 +2668,44 @@ async fn a_summary_without_relay_keeps_the_hint() {
     assert_eq!(alice.node.hint(&bob_iroh), Some(url));
 }
 
+/// A summary names a relay only if it is an https one: a member's other relay is taken from no summary.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_summary_relay_must_be_https() {
+    let relay = relay().await;
+    let dir = folder("relays-https");
+    let (alice_db, bob_db) = (dir.join("alice.db"), dir.join("bob.db"));
+    let alice = stored(&relay, "Alice", &alice_db).await;
+    let bob = stored(&relay, "Bob", &bob_db).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    let (bob_iroh, url) = (bob.node.address().0, relay.url.to_string());
+    eventually("Alice holds Bob's relay", || alice.node.hint(&bob_iroh) == Some(url.clone())).await;
+    let joined = alice.node.heard(&gid.0).unwrap().iter().find(|heard| heard.member.name == "Bob").unwrap().joined;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+
+    let (iroh, mls) = member_of(&bob_db);
+    let shown = seqs(&Bytes(mls.key().to_vec()), joined, &[1]);
+    let summary = Summary {
+        group: gid.clone(),
+        member: Bytes(mls.key().to_vec()),
+        joined,
+        version: lmk_node::now() + 3_600_000,
+        time: lmk_node::now(),
+        epoch: alice.node.epoch(&gid.0).unwrap(),
+        relay: Some("http://127.0.0.1:1".into()),
+        held: Vec::new(),
+        shown: vec![shown.clone()],
+        lost: Vec::new(),
+    };
+    let body = serde_json::to_vec(&summary).unwrap();
+    let sig = mls.sign(&[SUMMARY, &body].concat());
+    let mut bob_hand = hand(&relay, iroh, &alice.node).await;
+    bob_hand.send(&Frame::Summaries { group: gid.clone(), items: vec![Signed { body: Bytes(body), sig: Bytes(sig) }] }).await;
+    eventually("Alice takes the summary", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.shown == [shown.clone()])).await;
+    assert_eq!(alice.node.hint(&bob_iroh), Some(url));
+}
+
 /// Hints are saved with the session: a member restarted with its co-members away still holds what they said.
 #[tokio::test(flavor = "multi_thread")]
 async fn hints_survive_a_restart() {

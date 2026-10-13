@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use iroh::EndpointId;
+use iroh::{EndpointId, RelayUrl};
 use lmk_core::provider::Provider;
 use lmk_membership::Contradiction;
 use lmk_net::Groups;
@@ -258,6 +258,7 @@ impl<P: Provider> State<P> {
                 continue;
             }
             if let Some(relay) = &summary.relay
+                && relay.parse::<RelayUrl>().is_ok_and(|url| url.scheme() == "https")
                 && let Some(leaf) = self.group(gid)?.mls.members().into_iter().find(|m| m.key == summary.member.0).and_then(|m| m.leaf)
                 && self.hints.get(&leaf.key).is_none_or(|hint| hint.time <= summary.time)
             {
