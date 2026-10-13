@@ -130,7 +130,7 @@ impl Admit for Inviter {
     fn join(&self, _: EndpointId, join: Join) -> BoxFuture<Answer<Admitted>> {
         Box::pin(async move {
             if join.secret.0 == SECRET {
-                Answer::Ok(Admitted { welcome: Bytes(b"invited".to_vec()), position: 1, doc: None })
+                Answer::Ok(Admitted { commit: Bytes(b"invited".to_vec()), doc: None })
             } else {
                 Answer::Refused { refused: "unknown secret".into() }
             }

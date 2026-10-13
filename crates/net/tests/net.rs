@@ -8,14 +8,15 @@ use lmk_net::{Disk, Event};
 use n0_future::StreamExt;
 use lmk_proto::{
     Answer, Bytes, frame,
-    peer::{Frame, Join},
+    peer::{Frame, Join, Seqs},
     ranges::Ranges,
 };
 
 const G: &[u8] = b"group";
 
 fn want(n: u64) -> Frame {
-    Frame::Want { group: Bytes(G.to_vec()), positions: Ranges::range(n, n) }
+    let wants = vec![Seqs { key: Bytes(vec![1]), joined: 0, seqs: Ranges::range(n, n) }];
+    Frame::Want { group: Bytes(G.to_vec()), epoch: 0, wants, ids: Vec::new() }
 }
 
 /// Each side of a new connection is told of it, then of the frames on its `peer` stream in order; frames of either
@@ -28,8 +29,8 @@ async fn frames_go_both_ways_in_order() {
     let mut a = node(&relay, keys[0].clone(), Fake::new(), Options::default()).await;
     let mut b = node(&relay, keys[1].clone(), Fake::new(), Options { relay_only: true, ..Options::default() }).await;
     a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    assert_eq!(a.until(|e| matches!(e, Event::Connected(_))).await, Event::Connected(members[1]));
-    assert_eq!(b.until(|e| matches!(e, Event::Connected(_))).await, Event::Connected(members[0]));
+    assert_eq!(a.until(|e| matches!(e, Event::Connected(..))).await, Event::Connected(members[1], true));
+    assert_eq!(b.until(|e| matches!(e, Event::Connected(..))).await, Event::Connected(members[0], false));
     for n in 1..=3 {
         assert!(a.net.frame(members[1], want(n)));
     }
@@ -170,7 +171,7 @@ async fn disk_acknowledgements_wait_for_persistence() {
     let a = node(&relay, keys[0].clone(), Fake::new().with(G, group()), Options::default()).await;
     let mut b = node(&relay, keys[1].clone(), Fake::new().with(G, group()), Options { disk: Some(disk.clone()), ..Options::default() }).await;
     a.net.dial(members[1], relay.url.clone()).await.unwrap();
-    b.until(|e| matches!(e, Event::Connected(_))).await;
+    b.until(|e| matches!(e, Event::Connected(..))).await;
 
     let net = b.net.clone();
     let added = tokio::spawn(async move { net.add_file(std::io::Cursor::new(b"not acknowledged".to_vec())).await });
@@ -271,7 +272,7 @@ async fn requests_to_be_admitted_are_answered_each_on_its_stream() {
     let ask = |join| joiner.net.join(keys[0].public(), relay.url.clone(), join);
     joiner.net.dial(keys[0].public(), relay.url.clone()).await.unwrap();
     let (invited, refused) = tokio::join!(ask(join(SECRET)), ask(join([0; 16])));
-    assert!(matches!(invited.unwrap(), Answer::Ok(admitted) if admitted.welcome.0 == b"invited"));
+    assert!(matches!(invited.unwrap(), Answer::Ok(admitted) if admitted.commit.0 == b"invited"));
     assert_eq!(refused.unwrap(), Answer::Refused { refused: "unknown secret".into() });
     member.net.shutdown().await.unwrap();
     joiner.net.shutdown().await.unwrap();

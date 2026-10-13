@@ -71,8 +71,8 @@ pub trait Admit: Send + Sync + 'static {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A `peer` stream with the peer started, replacing any other.
-    Connected(EndpointId),
+    /// A `peer` stream with the peer started, replacing any other; true when this side dialed it.
+    Connected(EndpointId, bool),
     Disconnected(EndpointId),
     /// A frame on the peer's stream, but files' `want_files` and `have`, which this crate answers.
     Frame(EndpointId, Frame),
@@ -162,6 +162,13 @@ impl Net {
 
     pub fn connected(&self) -> Vec<EndpointId> {
         self.inner.links.lock().unwrap().keys().copied().collect()
+    }
+
+    /// Closes the link to the peer, if there is one.
+    pub fn close(&self, peer: EndpointId) {
+        if let Some(conn) = self.inner.live(&peer) {
+            conn.close(0u32.into(), b"idle");
+        }
     }
 
     /// Sends a frame to a peer, if it is connected.
@@ -340,7 +347,7 @@ impl Inner {
         if dialed {
             match open_peer(&conn).await {
                 Ok((send, recv)) => {
-                    spawn(peer::run(self.clone(), conn.clone(), send, recv, input.clone(), rx.take().unwrap()));
+                    spawn(peer::run(self.clone(), conn.clone(), send, recv, input.clone(), rx.take().unwrap(), dialed));
                 }
                 Err(e) => tracing::debug!("no peer stream to {}: {e:#}", peer.fmt_short()),
             }
@@ -350,7 +357,7 @@ impl Inner {
             match open.stream {
                 Stream::Peer => {
                     if let Some(rx) = rx.take() {
-                        spawn(peer::run(self.clone(), conn.clone(), send, recv, input.clone(), rx));
+                        spawn(peer::run(self.clone(), conn.clone(), send, recv, input.clone(), rx, dialed));
                     }
                 }
                 Stream::Admission => {

@@ -43,9 +43,10 @@ pub(crate) async fn run(
     mut recv: RecvStream,
     input: mpsc::UnboundedSender<Input>,
     mut rx: mpsc::UnboundedReceiver<Input>,
+    dialed: bool,
 ) {
     let peer = conn.remote_id();
-    inner.events.send(Event::Connected(peer)).ok();
+    inner.events.send(Event::Connected(peer, dialed)).ok();
     spawn(async move {
         while let Ok(frame) = frame::read_known(&mut recv).await {
             if input.send(Input::Frame(frame)).is_err() {

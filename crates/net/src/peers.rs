@@ -1,53 +1,63 @@
-//! The peer protocol without I/O, across a member's connections: when `hello` goes, the summaries peers sent on
-//! their current connection, the entries they lack, repair by pull, and the wait before a commit that deletes an
-//! epoch's keys. The node feeds it what it knows, polls it at least every quarter second, and sends what it returns.
-//! Times are milliseconds.
+//! The peer protocol without I/O, across a member's connections: which peers to dial and close, which summaries they
+//! are sent, repair by pull, and the wait before a commit that deletes an epoch's keys. The node feeds it state and
+//! frames, polls it, and sends what it returns. Times are milliseconds.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    mem,
+};
 
 use lmk_proto::{
     Bytes,
     head::Head,
-    peer::{Frame, Item, Summary},
+    peer::{At, Frame, Seqs, Signed, Summary, Version},
     ranges::Ranges,
 };
-use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// A peer's iroh key.
 pub type Key = [u8; 32];
+/// A membership: its leaf signature key and the epoch it joined in.
+pub type Membership = (Bytes, u64);
+/// Positions by membership.
+type Set = BTreeMap<Membership, Ranges>;
 
-/// How long changes gather before their `hello`.
 pub const DEBOUNCE: u64 = 1_000;
-/// How often every summary goes to every peer.
-pub const PERIOD: u64 = 5 * 60_000;
-/// How long after its entry is read a position is not asked for, as its push is likely on the way.
-pub const HOLD_OFF: u64 = 2_000;
-/// How long after the last frame from a holder its request is given up.
+pub const PERIOD: u64 = 300_000;
 pub const TIMEOUT: u64 = 10_000;
-/// The ciphertext an answer to `want` carries, about.
 pub const ANSWER: usize = 1 << 20;
-/// The wait before a commit: never ends sooner after coming online, and ends at the latest after this long without
-/// progress.
-pub const ONLINE: u64 = 3_000;
-pub const QUIET: u64 = 10_000;
+pub const K: usize = 6;
+pub const MESH: usize = 7;
+pub const REDIAL: u64 = 10_000;
+pub const BACKOFF: u64 = 30_000;
+pub const MAX_BACKOFF: u64 = 600_000;
+pub const PROBE: u64 = 60_000;
+pub const RECENT: u64 = 7_200_000;
+pub const IDLE: u64 = 300_000;
+pub const STRANGER: u64 = 30_000;
+pub const MAX_CONNECTIONS: usize = 128;
+/// From when a wait starts, or the member came online, whichever is later, until it gives up.
+pub const WAIT: u64 = 120_000;
+pub const LIVE_IDS: usize = 4_096;
+pub const LIVE_AGE: u64 = 120_000;
+pub const DIALS: usize = 4;
 
-/// This member's state of a group.
+/// This member's state of a group, handed in on every change.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Own {
-    /// The group's current log, by its reference, and its newest signed head held.
+    /// This member's own membership.
+    pub me: Membership,
+    pub epoch: u64,
+    /// The current epoch's log, and its newest signed head held.
     pub log: [u8; 32],
     pub head: Option<Head>,
-    /// The group position its current log's head ends at.
-    pub position: u64,
-    /// Within H, as in its summary.
-    pub held: Ranges,
-    pub read: Ranges,
-    /// The counted positions since its start, within H, that it lacks.
-    pub lacking: Ranges,
-    /// The heads of the public logs of the group's members' identities.
+    /// As in 0.16: the public logs' heads, and the earlier logs' still held.
     pub public: Vec<Head>,
-    /// The heads of the group's earlier logs still held, for members that have not moved on from them.
     pub earlier: Vec<Head>,
+    /// The other current members, with their iroh keys.
+    pub members: Vec<(Membership, Key)>,
+    /// Seqs the node wants now.
+    pub wanted: Vec<Seqs>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,268 +65,410 @@ pub enum Out {
     Frame(Key, Frame),
     /// Send the peer the entries of `log` after `after`, up to this member's head.
     Entries { peer: Key, log: Bytes, after: u64 },
+    Dial(Key),
+    Close(Key),
 }
 
-/// A peer's latest summary of a group and when it was heard: the node saves it, overwriting the last, whatever the
-/// gate, and deletes it when it applies the peer's Remove. Saved ones serve display and Away only.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A verified summary and when it came.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Heard {
-    pub peer: Bytes,
+    pub signed: Signed,
     pub summary: Summary,
     pub at: u64,
 }
 
-/// Before a commit that deletes an epoch's keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     Wait,
     Apply,
-    /// Apply, and record these positions as known losses.
-    Lose(Ranges),
+    /// Apply, and record these seqs as known losses.
+    Lose(Vec<Seqs>),
 }
 
 pub struct Peers {
-    /// When the member came online: its first connection after none. Until then, and while it has none, its wait
-    /// before a commit ends only after `QUIET`, as no dial has landed yet.
+    me: Key,
+    rng: u64,
+    /// When the member last went from no connections to one.
     online: u64,
-    /// When every summary last went to every peer.
+    /// When the last periodic `hello` went.
     full: u64,
-    /// Since when some group's summary has changed unsent.
+    /// When a change to a `hello` arose, unsent.
     changed: Option<u64>,
+    redial: u64,
+    probe: u64,
     groups: BTreeMap<Bytes, Group>,
     conns: BTreeMap<Key, Conn>,
+    backoff: BTreeMap<Key, Backoff>,
+    /// Peers with a `Dial` in flight.
+    dialing: BTreeSet<Key>,
+    /// Live payload ids seen, oldest first.
+    live: VecDeque<([u8; 32], u64)>,
 }
 
 struct Group {
     own: Own,
-    /// When the member came to hold it: it joined, or started.
-    since: u64,
-    fetching: Ranges,
-    dirty: bool,
-    /// The last new summary, connection or ciphertext.
-    progress: u64,
-    /// Positions read recently, and when.
-    read: Vec<(Ranges, u64)>,
-    /// The positions the member waits for before a commit, asked without the hold-off.
-    urgent: Ranges,
+    /// The kept summaries of the current memberships, own included.
+    heard: BTreeMap<Membership, Heard>,
+    /// Per holder and membership, the seqs it covered without sending, struck for the epoch.
+    struck: BTreeMap<(Key, Membership), Ranges>,
     request: Option<Request>,
-    /// Per holder, the positions not to ask it again until its next summary.
-    struck: BTreeMap<Key, Ranges>,
+    /// The seqs of a wait in progress, asked at once.
+    waiting: Set,
 }
 
 struct Request {
     holder: Key,
+    asked: Set,
     at: u64,
 }
 
 struct Conn {
-    last: u64,
-    /// A request to it timed out, and it has sent nothing since.
-    stalled: bool,
+    dialed: bool,
     served: BTreeSet<Bytes>,
-    heard: BTreeMap<Bytes, Summary>,
-    /// Per log, by reference, the longest the peer showed or was sent.
-    theirs: BTreeMap<[u8; 32], u64>,
-    /// Every served group's summary goes at the next poll, as after connecting.
-    full: bool,
-    /// Groups whose summary goes at the next poll, as the gate opened, or the peer's first summary of it came.
+    /// When it last served a group, or connected.
+    served_at: u64,
+    /// Its last directed traffic.
+    active: u64,
+    /// Its last frame.
+    heard_at: u64,
+    /// Whether its `hello` is due at the next poll.
+    hello: bool,
+    /// Groups whose `versions` are due at the next poll.
     opened: BTreeSet<Bytes>,
+    /// Per group, the memberships whose summaries go at the next poll.
+    pending: BTreeMap<Bytes, BTreeSet<Membership>>,
+    /// Per group and membership, the newest version the peer holds or was sent.
+    known: BTreeMap<Bytes, BTreeMap<Membership, u64>>,
+    /// Per log, the longest the peer showed or was sent.
+    theirs: BTreeMap<[u8; 32], u64>,
+}
+
+#[derive(Default)]
+struct Backoff {
+    failures: u32,
+    until: u64,
 }
 
 impl Peers {
-    /// For a member that came online `now`.
-    pub fn new(now: u64) -> Self {
-        Self { online: 0, full: now, changed: None, groups: BTreeMap::new(), conns: BTreeMap::new() }
+    /// For a member, with iroh key `me`, that came online `now`.
+    pub fn new(now: u64, seed: u64, me: Key) -> Self {
+        Self {
+            me,
+            rng: seed,
+            online: now,
+            full: now,
+            changed: None,
+            redial: now,
+            probe: now + PROBE,
+            groups: BTreeMap::new(),
+            conns: BTreeMap::new(),
+            backoff: BTreeMap::new(),
+            dialing: BTreeSet::new(),
+            live: VecDeque::new(),
+        }
     }
 
     /// This member's state of a group, new or changed.
-    pub fn group(&mut self, group: Bytes, own: Own, now: u64) {
-        let Some(g) = self.groups.get_mut(&group) else {
-            let g = Group {
-                own,
-                since: now,
-                fetching: Ranges::default(),
-                dirty: true,
-                progress: now,
-                read: Vec::new(),
-                urgent: Ranges::default(),
-                request: None,
-                struck: BTreeMap::new(),
-            };
-            self.groups.insert(group, g);
-            self.changed.get_or_insert(now);
-            return;
+    pub fn group(&mut self, id: Bytes, own: Own, now: u64) {
+        let changed = match self.groups.get_mut(&id) {
+            Some(g) => {
+                if own.epoch > g.own.epoch {
+                    g.struck.clear();
+                }
+                g.heard.retain(|m, _| *m == own.me || own.members.iter().any(|(n, _)| n == m));
+                let changed = (g.own.epoch, g.own.log, &g.own.head, &g.own.public) != (own.epoch, own.log, &own.head, &own.public);
+                g.own = own;
+                changed
+            }
+            None => {
+                let group = Group { own, heard: BTreeMap::new(), struck: BTreeMap::new(), request: None, waiting: Set::new() };
+                self.groups.insert(id, group);
+                true
+            }
         };
-        if own.position > g.own.position {
-            g.read.push((Ranges::range(g.own.position + 1, own.position), now));
-        }
-        if !g.own.lacking.intersection(&own.held).is_empty() {
-            g.progress = now;
-        }
-        let o = &g.own;
-        if (o.log, &o.head, &o.held, &o.read, &o.public) != (own.log, &own.head, &own.held, &own.read, &own.public) {
-            g.dirty = true;
+        if changed {
             self.changed.get_or_insert(now);
         }
-        g.own = own;
     }
 
-    /// The peer's Remove applied: its summary is of a membership that ended, and it took none of ours to a later one.
-    pub fn removed(&mut self, group: &Bytes, peer: &[u8]) {
-        if let Some(c) = self.conns.get_mut(peer) {
-            c.heard.remove(group);
-        }
-    }
-
-    pub fn forget(&mut self, group: &Bytes) {
-        self.groups.remove(group);
+    pub fn forget(&mut self, id: &Bytes) {
+        self.groups.remove(id);
         for c in self.conns.values_mut() {
-            c.heard.remove(group);
+            c.served.remove(id);
+            c.opened.remove(id);
+            c.pending.remove(id);
+            c.known.remove(id);
         }
     }
 
-    /// A connection to the peer opened, replacing any other, with the groups the gate admits it to.
-    pub fn connect(&mut self, peer: Key, served: BTreeSet<Bytes>, now: u64) {
+    /// A connection to the peer, replacing any other, with the groups the gate admits it to.
+    pub fn connect(&mut self, peer: Key, served: BTreeSet<Bytes>, dialed: bool, now: u64) {
+        self.disconnect(&peer);
         if self.conns.is_empty() {
             self.online = now;
         }
-        self.disconnect(&peer);
+        self.backoff.remove(&peer);
         let conn = Conn {
-            last: now,
-            stalled: false,
+            dialed,
+            served_at: now,
+            active: now,
+            heard_at: now,
+            hello: true,
+            opened: served.clone(),
             served,
-            heard: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            known: BTreeMap::new(),
             theirs: BTreeMap::new(),
-            full: true,
-            opened: BTreeSet::new(),
         };
         self.conns.insert(peer, conn);
-        for g in self.groups.values_mut() {
-            g.progress = now;
-        }
     }
 
     pub fn disconnect(&mut self, peer: &Key) {
         self.conns.remove(peer);
         for g in self.groups.values_mut() {
             g.request.take_if(|r| r.holder == *peer);
-            g.struck.remove(peer);
         }
     }
 
-    /// The groups the gate admits the peer to, as they change.
+    /// The groups the gate admits the peer to now.
     pub fn served(&mut self, peer: &Key, served: BTreeSet<Bytes>, now: u64) {
-        let c = self.conns.get_mut(peer).expect("a connected peer");
+        let Some(c) = self.conns.get_mut(peer) else { return };
+        let newly: Vec<Bytes> = served.difference(&c.served).cloned().collect();
+        if !newly.is_empty() {
+            c.hello = true;
+            c.opened.extend(newly);
+        }
+        if !served.is_empty() {
+            c.served_at = now;
+        }
+        c.served = served;
         for (id, g) in &mut self.groups {
-            if served.contains(id) && !c.served.contains(id) {
-                c.opened.insert(id.clone());
-                if c.heard.contains_key(id) {
-                    g.progress = now;
-                }
-            }
-            if !served.contains(id) {
+            if !c.served.contains(id) {
                 g.request.take_if(|r| r.holder == *peer);
             }
         }
-        c.served = served;
     }
 
-    /// A frame from the peer, which the node handles too. Returns the summaries to save.
-    pub fn frame(&mut self, peer: &Key, frame: &Frame, now: u64) -> Vec<Heard> {
-        let c = self.conns.get_mut(peer).expect("a connected peer");
-        c.last = now;
-        c.stalled = false;
-        let mut heard = Vec::new();
+    /// A dial `Out::Dial` asked for has ended.
+    pub fn dialed(&mut self, peer: &Key, ok: bool, now: u64) {
+        self.dialing.remove(peer);
+        if !ok {
+            let b = self.backoff.entry(*peer).or_default();
+            b.failures += 1;
+            b.until = now + (BACKOFF << (b.failures - 1).min(5)).min(MAX_BACKOFF);
+        }
+    }
+
+    /// Directed traffic on the connection: a want, an answer, files, admission, state.
+    pub fn used(&mut self, peer: &Key, now: u64) {
+        if let Some(c) = self.conns.get_mut(peer) {
+            c.active = now;
+        }
+    }
+
+    /// A frame from a connected peer, after the node's own checks. `Summaries` go to `summary`.
+    pub fn frame(&mut self, peer: &Key, frame: &Frame, now: u64) -> Vec<Out> {
+        let Some(c) = self.conns.get_mut(peer) else { return Vec::new() };
+        c.heard_at = now;
         match frame {
             Frame::Hello { groups, heads } => {
-                for head in heads {
-                    let longest = c.theirs.entry(head.log_ref).or_default();
-                    *longest = (*longest).max(head.length);
+                let logs = heads.iter().map(|h| (h.log_ref, h.length)).chain(groups.iter().map(|at| (at.log, at.head.as_ref().map_or(0, |h| h.length))));
+                for (log, length) in logs {
+                    let theirs = c.theirs.entry(log).or_default();
+                    *theirs = (*theirs).max(length);
                 }
-                for summary in groups {
-                    let Some(g) = self.groups.get_mut(&summary.group) else { continue };
-                    let longest = c.theirs.entry(summary.log).or_default();
-                    *longest = (*longest).max(summary.head.as_ref().map_or(0, |head| head.length));
-                    g.struck.remove(peer);
-                    if c.served.contains(&summary.group) && c.heard.get(&summary.group) != Some(summary) {
-                        g.progress = now;
+                Vec::new()
+            }
+            Frame::Versions { group, versions } => {
+                let Some(g) = self.groups.get(group) else { return Vec::new() };
+                if !c.served.contains(group) {
+                    return Vec::new();
+                }
+                let known = c.known.entry(group.clone()).or_default();
+                for v in versions {
+                    let k = known.entry((v.key.clone(), v.joined)).or_default();
+                    *k = (*k).max(v.version);
+                }
+                let mut items = Vec::new();
+                for (m, h) in &g.heard {
+                    let k = known.entry(m.clone()).or_default();
+                    if *k < h.summary.version {
+                        *k = h.summary.version;
+                        items.push(h.signed.clone());
                     }
-                    // The peer may have taken none of ours, as one that joined, or joined again, since we sent it.
-                    if c.served.contains(&summary.group) && !c.heard.contains_key(&summary.group) {
-                        c.opened.insert(summary.group.clone());
-                    }
-                    c.heard.insert(summary.group.clone(), summary.clone());
-                    heard.push(Heard { peer: Bytes::from(*peer), summary: summary.clone(), at: now });
+                }
+                if items.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Out::Frame(*peer, Frame::Summaries { group: group.clone(), items })]
                 }
             }
-            Frame::Messages { group, answers: Some(answers), .. } => {
-                if let Some(g) = self.groups.get_mut(group) {
-                    let struck = g.struck.entry(*peer).or_default();
-                    *struck = struck.union(answers);
-                    g.request.take_if(|r| r.holder == *peer);
+            Frame::Held { group, answers: Some(answers), .. } => {
+                c.active = now;
+                if let Some(g) = self.groups.get_mut(group)
+                    && g.request.as_ref().is_some_and(|r| r.holder == *peer)
+                {
+                    for s in answers {
+                        let struck = g.struck.entry((*peer, membership(s))).or_default();
+                        *struck = struck.union(&s.seqs);
+                    }
+                    g.request = None;
                 }
+                Vec::new()
             }
-            _ => {}
+            Frame::Want { .. } => {
+                c.active = now;
+                Vec::new()
+            }
+            _ => Vec::new(),
         }
-        heard
     }
 
-    /// Whether to apply a commit that would delete the keys of an epoch whose counted positions in `lacking` this
-    /// member lacks. While it waits, those positions are asked without the hold-off. The summaries of `undecided` peers,
-    /// whom the gate may admit once it can check them, hold the wait too.
-    pub fn wait(&mut self, group: &Bytes, lacking: &Ranges, undecided: &BTreeSet<Key>, now: u64) -> Decision {
-        let g = self.groups.get_mut(group).expect("a group of ours");
-        let counted = |(k, c): &(&Key, &Conn)| c.served.contains(group) || undecided.contains(*k);
-        let peers: Vec<&Summary> = self.conns.iter().filter(counted).filter_map(|(_, c)| c.heard.get(group)).collect();
-        let online = if self.conns.is_empty() { 0 } else { now - self.online.max(g.since) };
-        let decision = wait(lacking, &peers, online, now - g.progress);
-        g.urgent = if decision == Decision::Wait { lacking.clone() } else { Ranges::default() };
+    /// A verified summary, from a peer or, with `from: None`, this member's own. Returns whether it was kept.
+    pub fn summary(&mut self, group: &Bytes, heard: Heard, from: Option<Key>) -> bool {
+        let Some(g) = self.groups.get_mut(group) else { return false };
+        let m = (heard.summary.member.clone(), heard.summary.joined);
+        let version = heard.summary.version;
+        let current = m == g.own.me || g.own.members.iter().any(|(n, _)| *n == m);
+        if !current || g.heard.get(&m).is_some_and(|h| h.summary.version >= version) {
+            return false;
+        }
+        g.heard.insert(m.clone(), heard);
+        for (k, c) in &mut self.conns {
+            if !c.served.contains(group) {
+                continue;
+            }
+            let known = c.known.entry(group.clone()).or_default().entry(m.clone()).or_default();
+            if *known >= version {
+                continue;
+            }
+            *known = version;
+            if Some(*k) != from {
+                c.pending.entry(group.clone()).or_default().insert(m.clone());
+            }
+        }
+        true
+    }
+
+    /// The kept summaries of the group, own included.
+    pub fn heard(&self, group: &Bytes) -> impl Iterator<Item = &Heard> {
+        self.groups.get(group).into_iter().flat_map(|g| g.heard.values())
+    }
+
+    /// The connected peers the group is served to.
+    pub fn neighbours(&self, group: &Bytes) -> Vec<Key> {
+        self.conns.iter().filter(|(_, c)| c.served.contains(group)).map(|(k, _)| *k).collect()
+    }
+
+    pub fn full_mesh(&self, group: &Bytes) -> bool {
+        self.groups[group].own.members.len() < MESH
+    }
+
+    /// Dedups a live payload: `None` if seen lately, else the neighbours to forward it to.
+    pub fn live(&mut self, group: &Bytes, id: [u8; 32], from: Option<Key>, hops: u8, now: u64) -> Option<Vec<Key>> {
+        while self.live.len() >= LIVE_IDS || self.live.front().is_some_and(|(_, at)| now - at >= LIVE_AGE) {
+            self.live.pop_front();
+        }
+        if self.live.iter().any(|(seen, _)| *seen == id) {
+            return None;
+        }
+        self.live.push_back((id, now));
+        let neighbours = self.neighbours(group);
+        Some(match from {
+            None => neighbours,
+            Some(from) if hops > 0 && !self.full_mesh(group) => neighbours.into_iter().filter(|k| *k != from).collect(),
+            Some(_) => Vec::new(),
+        })
+    }
+
+    /// Whether to apply a commit that deletes the keys of an epoch, given the seqs of that epoch the member lacks
+    /// (kept ones of the epoch the commit ends). `read` is when the node read the commit.
+    pub fn wait(&mut self, group: &Bytes, lacking: &[Seqs], read: u64, now: u64) -> Decision {
+        let lack = to_set(lacking);
+        let untried = !lack.is_empty() && now < read.max(self.online) + WAIT && {
+            let g = &self.groups[group];
+            holds(g).iter().any(|(k, held)| self.untried(group, k, now) && !offer(&lack, held, &g.struck, k).is_empty())
+        };
+        let decision = if lack.is_empty() {
+            Decision::Apply
+        } else if untried {
+            Decision::Wait
+        } else {
+            Decision::Lose(lacking.to_vec())
+        };
+        self.groups.get_mut(group).expect("a group of ours").waiting = if decision == Decision::Wait { lack } else { Set::new() };
         decision
     }
 
-    /// This member's summary of a group.
-    pub fn summary(&self, group: &Bytes) -> Summary {
-        summary(group, &self.groups[group])
-    }
-
-    /// The positions of a group this member lacks and is fetching now.
-    pub fn fetching(&self, group: &Bytes) -> Ranges {
-        fetching(group, &self.groups[group], &self.conns)
-    }
-
-    /// What is due: entries peers lack, then `hello`s, then requests.
+    /// What is due, in order: request timeouts, entries and `hello`s, `versions` and summaries, repair, dials, closes.
     pub fn poll(&mut self, now: u64) -> Vec<Out> {
-        for g in self.groups.values_mut() {
-            if let Some(r) = &g.request {
-                let c = self.conns.get_mut(&r.holder).expect("requests go to connected peers");
-                if now - c.last.max(r.at) >= TIMEOUT {
-                    c.stalled = true;
-                    g.request = None;
-                }
-            }
-        }
-        for (id, g) in &mut self.groups {
-            g.read.retain(|&(_, at)| now - at < HOLD_OFF);
-            let fetching = fetching(id, g, &self.conns);
-            if fetching != g.fetching {
-                g.fetching = fetching;
-                g.dirty = true;
-                self.changed.get_or_insert(now);
-            }
-        }
+        self.timeouts(now);
         let mut out = self.hellos(now);
-        for (id, g) in &mut self.groups {
-            if g.request.is_none()
-                && let Some((holder, positions)) = choose(id, g, &self.conns)
-            {
-                g.request = Some(Request { holder, at: now });
-                out.push(Out::Frame(holder, Frame::Want { group: id.clone(), positions }));
-            }
-        }
+        out.extend(self.sync());
+        out.extend(self.repair(now));
+        out.extend(self.dials(now));
+        out.extend(self.closes(now));
         out
     }
 
-    /// The entries each peer lacks of the logs of the groups served to it, and the `hello`s due.
+    fn random(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+
+    fn backing(&self, peer: &Key, now: u64) -> bool {
+        self.backoff.get(peer).is_some_and(|b| now < b.until)
+    }
+
+    /// Whether a holder may still be asked: connected and served, or not connected and not backing off or dialing.
+    fn untried(&self, group: &Bytes, peer: &Key, now: u64) -> bool {
+        match self.conns.get(peer) {
+            Some(c) => c.served.contains(group),
+            None => self.dialing.contains(peer) || !self.backing(peer, now),
+        }
+    }
+
+    fn recent(&self, g: &Group, member: &Membership, peer: &Key, now: u64) -> bool {
+        self.conns.contains_key(peer) || g.heard.get(member).is_some_and(|h| now < h.summary.time.min(h.at) + RECENT)
+    }
+
+    /// The members the group targets: all members in a full mesh, else the best `K` by rank, recent ones first.
+    fn targets(&self, group: &Bytes, now: u64) -> Vec<Key> {
+        let g = &self.groups[group];
+        let mut ranked: Vec<(bool, [u8; 32], Key)> = g
+            .own
+            .members
+            .iter()
+            .filter(|(_, k)| !self.backing(k, now))
+            .map(|(m, k)| (!self.recent(g, m, k, now), rank(group, &self.me, k), *k))
+            .collect();
+        ranked.sort();
+        ranked.iter().take(K).map(|(_, _, k)| *k).collect()
+    }
+
+    fn targeted(&self, now: u64) -> BTreeSet<Key> {
+        self.groups.keys().flat_map(|id| self.targets(id, now)).collect()
+    }
+
+    /// Dials in flight to the group's members.
+    fn flight(&self, group: &Bytes) -> usize {
+        self.groups[group].own.members.iter().filter(|(_, k)| self.dialing.contains(k)).count()
+    }
+
+    fn timeouts(&mut self, now: u64) {
+        for g in self.groups.values_mut() {
+            if let Some(r) = g.request.take_if(|r| now - self.conns[&r.holder].heard_at.max(r.at) >= TIMEOUT) {
+                for (m, asked) in r.asked {
+                    let struck = g.struck.entry((r.holder, m)).or_default();
+                    *struck = struck.union(&asked);
+                }
+            }
+        }
+    }
+
+    /// `entries` to peers that lack them, and `hello`s.
     fn hellos(&mut self, now: u64) -> Vec<Out> {
         let periodic = now - self.full >= PERIOD;
         if periodic {
@@ -336,105 +488,230 @@ impl Peers {
                     }
                 }
             }
-            let send: Vec<&(&Bytes, &Group)> = served.iter().filter(|(id, g)| periodic || c.full || c.opened.contains(*id) || due && g.dirty).collect();
-            if !send.is_empty() {
-                let mut heads: Vec<Head> = send.iter().flat_map(|(_, g)| g.own.public.iter().cloned()).collect();
-                heads.sort_by_key(|head| head.log_ref);
-                heads.dedup_by(|a, b| a.log_ref == b.log_ref);
-                let groups = send.iter().map(|(id, g)| summary(id, g)).collect();
-                out.push(Out::Frame(*key, Frame::Hello { groups, heads }));
+            if c.hello || due {
+                c.hello = false;
+                if !served.is_empty() {
+                    let mut heads: Vec<Head> = served.iter().flat_map(|(_, g)| g.own.public.iter().cloned()).collect();
+                    heads.sort_by_key(|h| h.log_ref);
+                    heads.dedup_by(|a, b| a.log_ref == b.log_ref);
+                    let groups = served.iter().map(|(id, g)| At { group: (*id).clone(), epoch: g.own.epoch, log: g.own.log, head: g.own.head.clone() }).collect();
+                    out.push(Out::Frame(*key, Frame::Hello { groups, heads }));
+                }
             }
-            c.full = false;
-            c.opened.clear();
         }
         if due {
             self.changed = None;
-            for g in self.groups.values_mut() {
-                g.dirty = false;
+        }
+        out
+    }
+
+    /// `versions` of the groups opened to peers, and the summaries pending for them.
+    fn sync(&mut self) -> Vec<Out> {
+        let mut out = Vec::new();
+        for (key, c) in &mut self.conns {
+            for id in mem::take(&mut c.opened) {
+                if !c.served.contains(&id) {
+                    continue;
+                }
+                let Some(g) = self.groups.get(&id) else { continue };
+                let versions: Vec<Version> = g.heard.iter().map(|(m, h)| Version { key: m.0.clone(), joined: m.1, version: h.summary.version }).collect();
+                out.push(Out::Frame(*key, Frame::Versions { group: id, versions }));
             }
+            for (id, members) in mem::take(&mut c.pending) {
+                if !c.served.contains(&id) {
+                    continue;
+                }
+                let Some(g) = self.groups.get(&id) else { continue };
+                let items: Vec<Signed> = members.iter().filter_map(|m| g.heard.get(m)).map(|h| h.signed.clone()).collect();
+                if !items.is_empty() {
+                    out.push(Out::Frame(*key, Frame::Summaries { group: id, items }));
+                }
+            }
+        }
+        out
+    }
+
+    fn repair(&mut self, now: u64) -> Vec<Out> {
+        let mut out = Vec::new();
+        for id in self.groups.keys().cloned().collect::<Vec<_>>() {
+            let g = &self.groups[&id];
+            let epoch = g.own.epoch;
+            let holders = holds(g);
+            let waiting: Vec<Key> = holders
+                .iter()
+                .filter(|(k, held)| !self.conns.contains_key(k) && !self.dialing.contains(k) && !self.backing(k, now) && !offer(&g.waiting, held, &g.struck, k).is_empty())
+                .map(|(k, _)| *k)
+                .collect();
+            let mut wanted = to_set(&g.own.wanted);
+            for (m, r) in &g.waiting {
+                let all = wanted.entry(m.clone()).or_default();
+                *all = all.union(r);
+            }
+            let offers: Vec<(Key, Set)> = holders.iter().map(|(k, held)| (*k, offer(&wanted, held, &g.struck, k))).filter(|(_, o)| !o.is_empty()).collect();
+            let idle = g.request.is_none();
+            let request = offers
+                .iter()
+                .filter(|(k, _)| self.conns.get(k).is_some_and(|c| c.served.contains(&id)))
+                .min_by_key(|(k, o)| (lowest(o), *k))
+                .map(|(k, o)| (*k, o.clone()));
+            let request = if idle { request } else { None };
+            let dial = if idle && request.is_none() && self.flight(&id) == 0 {
+                offers.iter().filter(|(k, _)| !self.conns.contains_key(k) && !self.dialing.contains(k) && !self.backing(k, now)).min_by_key(|(k, o)| (lowest(o), *k)).map(|(k, _)| *k)
+            } else {
+                None
+            };
+            for k in waiting.into_iter().chain(dial) {
+                if self.dialing.insert(k) {
+                    out.push(Out::Dial(k));
+                }
+            }
+            if let Some((holder, asked)) = request {
+                let asked: Set = asked.into_iter().map(|(m, r)| (m, r.iter().take(512).collect::<Ranges>())).collect();
+                let wants = to_seqs(&asked);
+                self.conns.get_mut(&holder).expect("a connected holder").active = now;
+                self.groups.get_mut(&id).expect("a group of ours").request = Some(Request { holder, asked, at: now });
+                out.push(Out::Frame(holder, Frame::Want { group: id, epoch, wants, ids: Vec::new() }));
+            }
+        }
+        out
+    }
+
+    fn dials(&mut self, now: u64) -> Vec<Out> {
+        let mut out = Vec::new();
+        if now >= self.redial {
+            self.redial = now + REDIAL;
+            for id in self.groups.keys().cloned().collect::<Vec<_>>() {
+                for k in self.targets(&id, now) {
+                    if self.flight(&id) >= DIALS {
+                        break;
+                    }
+                    if !self.conns.contains_key(&k) && self.dialing.insert(k) {
+                        out.push(Out::Dial(k));
+                    }
+                }
+            }
+        }
+        if now >= self.probe {
+            self.probe = now + PROBE;
+            let seen: BTreeSet<Key> = self
+                .groups
+                .values()
+                .flat_map(|g| g.own.members.iter().filter(|(m, k)| self.recent(g, m, k, now) && !self.conns.contains_key(k) && !self.dialing.contains(k) && !self.backing(k, now)).map(|(_, k)| *k))
+                .collect();
+            let seen: Vec<Key> = seen.into_iter().collect();
+            if !seen.is_empty() {
+                let k = seen[self.random() as usize % seen.len()];
+                self.dialing.insert(k);
+                out.push(Out::Dial(k));
+            }
+        }
+        out
+    }
+
+    fn closes(&mut self, now: u64) -> Vec<Out> {
+        let targeted = self.targeted(now);
+        let mut close: Vec<Key> = self
+            .conns
+            .iter()
+            .filter(|(k, c)| if c.served.is_empty() { now - c.served_at >= STRANGER } else { c.dialed && !targeted.contains(*k) && now - c.active >= IDLE })
+            .map(|(k, _)| *k)
+            .collect();
+        while self.conns.len() - close.len() > MAX_CONNECTIONS {
+            let Some(k) = self.conns.iter().filter(|(k, _)| !targeted.contains(*k) && !close.contains(*k)).min_by_key(|(_, c)| c.active).map(|(k, _)| *k) else {
+                break;
+            };
+            close.push(k);
+        }
+        let mut out = Vec::new();
+        for k in close {
+            self.disconnect(&k);
+            out.push(Out::Close(k));
         }
         out
     }
 }
 
-fn summary(id: &Bytes, g: &Group) -> Summary {
-    Summary {
-        group: id.clone(),
-        log: g.own.log,
-        head: g.own.head.clone(),
-        held: g.own.held.clone(),
-        read: g.own.read.clone(),
-        fetching: g.fetching.clone(),
+fn rank(group: &Bytes, a: &Key, b: &Key) -> [u8; 32] {
+    let (low, high) = if a <= b { (a, b) } else { (b, a) };
+    Sha256::new().chain_update(b"letmeknow neighbours v1\0").chain_update(&group.0).chain_update(low).chain_update(high).finalize().into()
+}
+
+fn membership(seq: &Seqs) -> Membership {
+    (seq.key.clone(), seq.joined)
+}
+
+fn to_set(seqs: &[Seqs]) -> Set {
+    let mut set = Set::new();
+    for s in seqs {
+        let positions = set.entry(membership(s)).or_default();
+        *positions = positions.union(&s.seqs);
     }
+    set
 }
 
-/// The current-connection summaries of the peers the gate admits to the group.
-fn holders<'a>(id: &'a Bytes, conns: &'a BTreeMap<Key, Conn>) -> impl Iterator<Item = (&'a Key, &'a Conn, &'a Summary)> {
-    conns.iter().filter(|(_, c)| c.served.contains(id)).filter_map(|(k, c)| Some((k, c, c.heard.get(id)?)))
+fn to_seqs(set: &Set) -> Vec<Seqs> {
+    set.iter().map(|((key, joined), seqs)| Seqs { key: key.clone(), joined: *joined, seqs: seqs.clone() }).collect()
 }
 
-/// What the member lacks that a holder it may ask holds.
-fn fetching(id: &Bytes, g: &Group, conns: &BTreeMap<Key, Conn>) -> Ranges {
-    let empty = Ranges::default();
-    holders(id, conns).fold(Ranges::default(), |acc, (k, _, s)| acc.union(&g.own.lacking.intersection(&s.held).difference(g.struck.get(k).unwrap_or(&empty))))
+/// Each member with a kept summary, and what that summary says it holds.
+fn holds(g: &Group) -> Vec<(Key, Set)> {
+    g.own.members.iter().filter_map(|(m, k)| Some((*k, to_set(&g.heard.get(m)?.summary.held)))).collect()
 }
 
-/// The holder holding the first askable position, the lowest key among several, and what it may be asked.
-fn choose(id: &Bytes, g: &Group, conns: &BTreeMap<Key, Conn>) -> Option<(Key, Ranges)> {
-    let held_off = g.read.iter().fold(Ranges::default(), |acc, (read, _)| acc.union(read)).difference(&g.urgent);
-    let askable = g.own.lacking.difference(&held_off);
-    let empty = Ranges::default();
-    holders(id, conns)
-        .filter(|(_, c, _)| !c.stalled)
-        .filter_map(|(k, _, s)| {
-            let positions = askable.intersection(&s.held).difference(g.struck.get(k).unwrap_or(&empty));
-            Some((positions.first()?, *k, positions))
-        })
-        .min_by_key(|&(first, k, _)| (first, k))
-        .map(|(_, k, positions)| (k, positions))
-}
-
-/// The wait before a commit that deletes an epoch's keys, given the epoch's counted positions the member lacks, the
-/// current-connection summaries of the connected peers the gate admits, and the time since it came online (0 while it
-/// has no connection) and since its last progress.
-pub fn wait(lacking: &Ranges, peers: &[&Summary], online: u64, quiet: u64) -> Decision {
-    if lacking.is_empty() {
-        return Decision::Apply;
-    }
-    let pending = peers.iter().any(|s| !lacking.intersection(&s.held.union(&s.fetching)).is_empty());
-    if quiet < QUIET && (pending || online < ONLINE) { Decision::Wait } else { Decision::Lose(lacking.clone()) }
-}
-
-/// The answer to a `want`: the asked ciphertexts this member holds, in position order, until about `ANSWER` bytes.
-/// `held` is its summary's; a want the gate does not take gets an empty `held`, so its asker moves on.
-pub fn answer(group: Bytes, asked: &Ranges, held: &Ranges, mut ciphertext: impl FnMut(u64) -> Option<Vec<u8>>) -> Frame {
-    let (mut items, mut size) = (Vec::new(), 0);
-    for position in asked.intersection(held).iter() {
-        if size >= ANSWER {
-            return Frame::Messages { group, items, answers: Some(asked.through(position - 1)) };
-        }
-        if let Some(ciphertext) = ciphertext(position) {
-            size += ciphertext.len();
-            items.push(Item { position, ciphertext: Bytes(ciphertext) });
+/// The positions of `want` that a holder holds and is not struck for.
+fn offer(want: &Set, held: &Set, struck: &BTreeMap<(Key, Membership), Ranges>, peer: &Key) -> Set {
+    let mut offer = Set::new();
+    for (m, wanted) in want {
+        let Some(held) = held.get(m) else { continue };
+        let struck = struck.get(&(*peer, m.clone())).cloned().unwrap_or_default();
+        let positions = wanted.intersection(held).difference(&struck);
+        if !positions.is_empty() {
+            offer.insert(m.clone(), positions);
         }
     }
-    Frame::Messages { group, items, answers: Some(asked.clone()) }
+    offer
 }
 
-/// Whether a member acts on a frame of a group from a peer. What checks itself is taken from anyone: summaries are
-/// kept whatever the gate (and used only while it admits the peer), entries are checked against their head, and of
-/// `messages` a peer the gate does not admit gives only ciphertexts matching counted entries. Until the member has
-/// applied its log to the head, it takes no `state` or live payloads.
+fn lowest(set: &Set) -> Option<(Membership, u64)> {
+    set.iter().find_map(|(m, seqs)| Some((m.clone(), seqs.first()?)))
+}
+
+/// The `Held` answer to a `want`: the asked ciphertexts this member holds, in order, until about `ANSWER` bytes, and
+/// the asked seqs covered.
+pub fn answer(group: Bytes, asked: &[Seqs], held: &[Seqs], mut ciphertext: impl FnMut(&Bytes, u64, u64) -> Option<Vec<u8>>) -> Frame {
+    let asked = to_set(asked);
+    let held = to_set(held);
+    let mut covered = asked.clone();
+    let mut items = Vec::new();
+    let mut size = 0;
+    'asked: for (m, r) in &asked {
+        let Some(h) = held.get(m) else { continue };
+        for s in r.intersection(h).iter() {
+            if size >= ANSWER {
+                covered.retain(|n, _| n <= m);
+                covered.insert(m.clone(), r.through(s - 1));
+                break 'asked;
+            }
+            if let Some(c) = ciphertext(&m.0, m.1, s) {
+                size += c.len();
+                items.push(Bytes(c));
+            }
+        }
+    }
+    Frame::Held { group, items, answers: Some(to_seqs(&covered)) }
+}
+
+/// Whether a member acts on a frame from a peer: `hello` and `entries` from anyone, the rest only from admitted peers,
+/// and `state` and live payloads only at the head.
 pub fn takes(frame: &Frame, admitted: bool, at_head: bool) -> bool {
     match frame {
-        Frame::Hello { .. } | Frame::Entries { .. } | Frame::Messages { .. } => true,
+        Frame::Hello { .. } | Frame::Entries { .. } => true,
         Frame::State { .. } | Frame::Live { .. } => admitted && at_head,
-        Frame::Want { .. } | Frame::WantFiles { .. } | Frame::Have { .. } => admitted,
+        _ => admitted,
     }
 }
 
-/// Whether a member sends a frame of a group to a peer: only to one the gate admits, and `state` and live payloads
-/// only once it has applied its log to the head.
+/// Whether a member sends a frame to a peer: only to admitted ones, and `state` and live payloads only at the head.
 pub fn sends(frame: &Frame, admitted: bool, at_head: bool) -> bool {
     match frame {
         Frame::State { .. } | Frame::Live { .. } => admitted && at_head,
