@@ -3023,6 +3023,7 @@ dependencies = [
  "lmk-membership",
  "lmk-proto",
  "n0-future",
+ "rand 0.9.5",
  "rcgen",
  "rustls",
  "serde_json",

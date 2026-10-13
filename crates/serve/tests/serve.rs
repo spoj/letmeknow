@@ -12,12 +12,15 @@ use tokio::{
     net::TcpStream,
 };
 
+/// A port free for TCP and UDP, below the ephemeral range: a port `bind(0)` returned could be taken by another test's relay
+/// or endpoint before the service binds it.
 fn free_port() -> u16 {
-    let tcp = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = tcp.local_addr().unwrap().port();
-    std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
-        .map(|_| port)
-        .unwrap_or_else(|_| free_port())
+    loop {
+        let port = rand::random_range(1024..32768);
+        if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() && std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 async fn https_get(port: u16, cert: &CertificateDer<'static>, path: &str, headers: &str) -> String {
