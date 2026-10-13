@@ -132,6 +132,12 @@ jobs:
           }
           for dir in dist/npm-*; do
             platform=${dir#dist/npm-}
+            # Trusted publishing cannot make a package: a platform new to npm waits for its first version, published by hand.
+            if npm view "@letmeknow/$platform" name 2>&1 | grep -q E404; then
+              echo "::warning::@letmeknow/$platform is not on npm: publish its first version by hand and trust this workflow, then release again"
+              rm -r "$dir"
+              continue
+            fi
             os=${platform%-*} cpu=${platform#*-}
             chmod +x "$dir"/bin/*
             cp LICENSE "$dir/"
