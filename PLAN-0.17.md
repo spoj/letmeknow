@@ -103,7 +103,7 @@ Equivocation: the chain down from the cut's id decides which body is kept; a mem
 `(membership, seq)` marks it not kept, warns, and asks for the kept one by id.
 
 **Keep-alive.** A member that holds messages unkept for 10 minutes commits an update at its slot (a hash of its key
-within the next 10 minutes) unless a commit comes first; so active groups get about one commit per 10 minutes, and
+within the next 10 minutes), if its cut would keep any, unless a commit comes first; so active groups get about one commit per 10 minutes, and
 authors can stop soon after they send.
 
 **Applying.** Before applying the commit ending E+1, which deletes E's keys, a member must hold every message the
@@ -152,7 +152,7 @@ admits, but `hello` and `entries`, which check themselves; every frame is checke
 
 - `Hello { groups: [{group, epoch, log, head}], heads }`: on connecting, on change (1 s debounce), and every 5 minutes.
   Commits and public-log entries travel as now: `Entries { log, entries, head }` to a peer whose `hello` shows less.
-- `Versions { group, versions: [[index, joined, version]] }` on connecting, then `Summaries { group, items }` with only
+- `Versions { group, versions: [[key, joined, version]] }` on connecting, then `Summaries { group, items }` with only
   what the other lacks; new summaries go to neighbours that have not shown them.
 - `Held { group, items }`: ciphertexts, pushed and forwarded once each after opening (nothing forwarded in a full mesh),
   or answering `Want`.
@@ -161,8 +161,8 @@ admits, but `hello` and `entries`, which check themselves; every frame is checke
 - `Live { group, hops, item }`, `WantFiles`, `Have`, `State` as now.
 
 **Summaries.** Each member signs its own per group with its leaf key: `"letmeknow summary v1\0" ‖ body`, body the JSON
-`{group, member, joined, version, time, epoch, held, shown, lost}`, the last three `[[index, joined, seqs]]` over the
-current members by leaf index in that epoch. `held` lists seqs whose sealing it holds openable at its epoch, or sealed
+`{group, member, joined, version, time, epoch, held, shown, lost}`, the last three `[[key, joined, seqs]]`, listing
+only memberships with any (most members of a large group never post). `held` lists seqs whose sealing it holds openable at its epoch, or sealed
 in the epoch whose cut kept them; holders keep every sealing they open. `version` is `max(saved + 1, time)`, saved
 before it is sent; a member re-signs at most every `max(1 s, members / 4 s)` while it changes, and at least hourly. A
 receiver keeps the highest valid version per current membership, drops removed ones', keeps up to 32 it cannot verify
