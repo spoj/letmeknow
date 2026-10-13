@@ -7,6 +7,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 TMP = tempfile.mkdtemp(prefix="lmk-compat-")
 ENV = {**os.environ, "NO_PROXY": "localhost,127.0.0.1"}
 ENV.pop("LETMEKNOW_SESSION", None)
+# Each binary's membership setting: 0.17 names a service by its key and relay, this build by its domain.
+SERVICE = {}
 major, minor = re.search(r'^version = "(\d+)\.(\d+)\.\d+"', (ROOT / "Cargo.toml").read_text(), re.M).groups()
 PREVIOUS = f"{major}.{int(minor) - 1}"
 
@@ -48,6 +50,7 @@ def free_port():
 
 
 def serve(bin):
+    """Starts the service with `bin`; returns its process, domain and key."""
     cert, key = os.path.join(TMP, "cert.pem"), os.path.join(TMP, "key.pem")
     subprocess.run(["cargo", "run", "-q", "-p", "letmeknow", "--example", "self_signed", "--", cert, key], cwd=ROOT, check=True)
     https = free_port()
@@ -55,13 +58,18 @@ def serve(bin):
             "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key]
     subprocess.run(args + ["--initialize"], env=ENV, check=True, stdout=subprocess.DEVNULL)
     proc = subprocess.Popen(args, env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
-    membership = proc.stdout.readline().strip().removeprefix("membership: ")
-    ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_RELAY=f"https://localhost:{https}", LETMEKNOW_MEMBERSHIP=membership)
-    return proc
+    domain = proc.stdout.readline().strip().removeprefix("membership: ")
+    key = proc.stdout.readline().strip().removeprefix("key: ")
+    ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_RELAY=f"https://localhost:{https}")
+    return proc, domain, key
 
 
 def home(name):
     return os.path.join(TMP, name)
+
+
+def environ(bin, session):
+    return {**ENV, "LETMEKNOW_MEMBERSHIP": SERVICE[bin], "LETMEKNOW_HOME": home(session)}
 
 
 class Listener:
@@ -69,7 +77,7 @@ class Listener:
 
     def __init__(self, bin, session):
         self.session, self.lines = session, queue.Queue()
-        env = {**ENV, "LETMEKNOW_HOME": home(session)}
+        env = environ(bin, session)
         self.log = open(os.path.join(TMP, f"{session}.log"), "a")
         self.proc = subprocess.Popen([bin, "--session", session, "listen", "--hold", "0"], env=env, stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8")
         threading.Thread(target=self.read, daemon=True).start()
@@ -91,7 +99,7 @@ class Listener:
 
 
 def run(bin, session, *args):
-    env = {**ENV, "LETMEKNOW_HOME": home(session)}
+    env = environ(bin, session)
     result = subprocess.run([bin, "--session", session, *args], env=env, capture_output=True, text=True, encoding="utf-8", timeout=120)
     if result.returncode:
         sys.exit(f"{session} {args}: {result.stderr}")
@@ -100,7 +108,7 @@ def run(bin, session, *args):
 
 def refused(bin, session, *args):
     """The message of a refusal: an error exit, not a crash."""
-    env = {**ENV, "LETMEKNOW_HOME": home(session)}
+    env = environ(bin, session)
     result = subprocess.run([bin, "--session", session, *args], env=env, capture_output=True, text=True, encoding="utf-8", timeout=60)
     if not result.returncode or "panicked" in result.stderr:
         sys.exit(f"{session} {args}: expected a refusal, got {result.returncode}: {result.stderr}")
@@ -118,7 +126,8 @@ def main():
         sys.exit(0)
     subprocess.run(["cargo", "build", "-q", "-p", "letmeknow", "-p", "lmk-kinds"], cwd=ROOT, check=True)
     new = os.path.join(ROOT, os.environ.get("CARGO_TARGET_DIR", "target"), "debug", "letmeknow")
-    server = serve(new)
+    server, domain, key = serve(new)
+    SERVICE.update({old: f"{key}@https://{domain}", new: domain})
     listeners = []
     try:
         alice, bob = Listener(old, "alice"), Listener(old, "bob")

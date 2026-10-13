@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Native sessions and a separately served HTTPS frontend use the real local membership/iroh relay.
 --no-browser skips the frontend. LMK_E2E_BIN tests an already-built native artifact."""
-import functools, http.server, json, os, queue, shutil, socket, ssl, subprocess, sys, tempfile, threading, time
+import functools, http.server, json, os, queue, shutil, socket, ssl, subprocess, sys, tempfile, threading, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("LMK_E2E_BIN") or os.path.join(ROOT, os.environ.get("CARGO_TARGET_DIR", "target"), "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
@@ -110,7 +110,7 @@ def until(produce, accept, timeout=20):
 
 
 def serve():
-    """A local `letmeknow serve` with a self-signed certificate; returns it and its membership address."""
+    """A local `letmeknow serve` with a self-signed certificate; returns it. Sessions name its domain."""
     cert, key = os.path.join(TMP, "cert.pem"), os.path.join(TMP, "key.pem")
     subprocess.run(["cargo", "run", "-q", "-p", "letmeknow", "--example", "self_signed", "--", cert, key], cwd=ROOT, check=True)
     https = free_port()
@@ -118,8 +118,9 @@ def serve():
             "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key]
     subprocess.run(args + ["--initialize"], env=ENV, check=True, stdout=subprocess.DEVNULL)
     proc = subprocess.Popen(args, env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
-    membership = proc.stdout.readline().strip().removeprefix("membership: ")
-    ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_RELAY=f"https://localhost:{https}", LETMEKNOW_MEMBERSHIP=membership)
+    domain = proc.stdout.readline().strip().removeprefix("membership: ")
+    proc.stdout.readline()  # key: its public key, which the directory names
+    ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_RELAY=f"https://localhost:{https}", LETMEKNOW_MEMBERSHIP=domain)
     return proc
 
 
@@ -132,7 +133,8 @@ def main():
     passed = False
     try:
         if BROWSER:
-            config = write("frontend.json", json.dumps({"membershipKey": ENV["LETMEKNOW_MEMBERSHIP"].split("@")[0], "relay": ENV["LETMEKNOW_RELAY"]}))
+            directory = urllib.request.urlopen(f"https://{ENV['LETMEKNOW_MEMBERSHIP']}/.well-known/letmeknow.json", context=ssl.create_default_context(cafile=ENV["LETMEKNOW_CA"]))
+            config = write("frontend.json", json.dumps({"domain": ENV["LETMEKNOW_MEMBERSHIP"], "directory": json.load(directory)}))
             dist = os.path.join(TMP, "frontend")
             subprocess.run([shutil.which("npm"), "run", "build"], cwd=WEB,
                            env={**ENV, "LMK_FRONTEND_CONFIG": config, "LMK_FRONTEND_OUT": dist, "LMK_TEST_WITNESS": "1"}, check=True)
@@ -156,7 +158,7 @@ def main():
 
         # An invite, and chat.
         invite = run("alice", "invite", "--name", "Plans")
-        check(invite["link"].startswith("https://letmeknow.dev/i#6.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
+        check(invite["link"].startswith("https://letmeknow.dev/i#7.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
         group = invite["group"]
         check("serve" in run("alice", "groups")[0]["membership"], "its log is on the local letmeknow serve")
         joined = run("bob", "join", invite["link"])
@@ -216,7 +218,7 @@ def main():
 
         # A device link: bob's tablet joins his identity.
         link = run("bob", "identity", "invite")["link"]
-        check("#6.d." in link, "identity invite gives a device link")
+        check("#7.d." in link, "identity invite gives a device link")
         tablet = Listener("tablet")
         listeners.append(tablet)
         check("device" in run("tablet", "identity", "join", link), "the tablet joins bob's identity")
