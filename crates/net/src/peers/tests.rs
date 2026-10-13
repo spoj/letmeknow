@@ -455,7 +455,23 @@ fn wait_loses_once_every_holder_is_struck() {
     assert_eq!(p.wait(&id(), &lacking, 0, 0), Decision::Wait);
     p.poll(0);
     p.frame(&key(1), &Frame::Held { group: id(), items: vec![], answers: Some(lacking.clone()) }, 100);
-    assert_eq!(p.wait(&id(), &lacking, 0, 100), Decision::Lose(lacking.clone()));
+    assert_eq!(p.wait(&id(), &lacking, 0, HEAR), Decision::Lose(lacking.clone()));
+}
+
+/// A wait holds `HEAR` after the member came online though no summary shows a holder yet: a member back from offline
+/// hears the summaries that show them within it.
+#[test]
+fn a_wait_holds_for_summaries_after_coming_online() {
+    let mut p = peers();
+    p.group(id(), own(1, &[1]), 0);
+    let lacking = vec![seqs(1, &[(5, 5)])];
+    p.connect(key(1), gs(), false, 1_000);
+    assert_eq!(p.wait(&id(), &lacking, 0, 1_000), Decision::Wait);
+    p.summary(&id(), heard(1, 1, 1_500, lacking.clone()), Some(key(1)));
+    assert_eq!(p.wait(&id(), &lacking, 0, 1_000 + HEAR), Decision::Wait, "a holder is untried");
+    p.disconnect(&key(1));
+    p.dialed(&key(1), false, 1_000 + HEAR);
+    assert_eq!(p.wait(&id(), &lacking, 0, 1_000 + HEAR), Decision::Lose(lacking.clone()));
 }
 
 /// A wait gives up two minutes after the commit was read, even with an untried holder.
@@ -478,7 +494,7 @@ fn a_holder_past_its_backoff_is_dialed_when_the_wait_starts() {
     let lacking = vec![seqs(1, &[(5, 5)])];
     p.summary(&id(), heard(1, 1, 0, lacking.clone()), Some(key(1)));
     p.dialed(&key(1), false, 0);
-    assert_eq!(p.wait(&id(), &lacking, 1_000, 1_000), Decision::Lose(lacking.clone()), "backing off");
+    assert_eq!(p.wait(&id(), &lacking, 0, HEAR), Decision::Lose(lacking.clone()), "backing off");
     assert_eq!(p.wait(&id(), &lacking, 31_000, 31_000), Decision::Wait);
     assert_eq!(dials(&p.poll(31_000)), vec![key(1)]);
 }

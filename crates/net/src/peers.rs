@@ -38,6 +38,9 @@ pub const STRANGER: u64 = 30_000;
 pub const MAX_CONNECTIONS: usize = 128;
 /// From when a wait starts, or the member came online, whichever is later, until it gives up.
 pub const WAIT: u64 = 120_000;
+/// From then, how long a wait holds though no summary shows a holder: a member back online hears the others' summaries
+/// within it.
+pub const HEAR: u64 = 15_000;
 pub const LIVE_IDS: usize = 4_096;
 pub const LIVE_AGE: u64 = 120_000;
 pub const DIALS: usize = 4;
@@ -385,7 +388,8 @@ impl Peers {
     /// (kept ones of the epoch the commit ends). `read` is when the node read the commit.
     pub fn wait(&mut self, group: &Bytes, lacking: &[Seqs], read: u64, now: u64) -> Decision {
         let lack = to_set(lacking);
-        let untried = !lack.is_empty() && now < read.max(self.online) + WAIT && self.holder(group, lacking, now);
+        let since = read.max(self.online);
+        let untried = !lack.is_empty() && now < since + WAIT && (now < since + HEAR || self.holder(group, lacking, now));
         let decision = if lack.is_empty() {
             Decision::Apply
         } else if untried {

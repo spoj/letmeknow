@@ -113,7 +113,8 @@ authors can stop soon after they send.
 
 **Applying.** Before applying the commit ending E+1, which deletes E's keys, a member must hold every message the
 commit ending E kept above its baseline. It waits while a holder (by summaries) is untried: connected, or with a dial in
-flight; it dials holders past their backoff; an empty answer or a failed dial strikes a holder for the epoch; only a
+flight; and for 15 s after it read the commit or came online even with none, as a member back online hears the others'
+summaries by then; it dials holders past their backoff; an empty answer or a failed dial strikes a holder for the epoch; only a
 lacking message arriving is progress; the wait ends 2 minutes online after the commit was read at the latest. Then it
 applies, and what it lacks of them is lost to it, by `(author, seq)`. After applying, it drops pending messages of
 removed memberships past their final cuts and takes no more of them, reseals its own (Sending), and opens the unopened
