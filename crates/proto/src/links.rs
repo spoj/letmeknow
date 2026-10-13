@@ -41,7 +41,6 @@ impl Invite {
         match fields.next() {
             Some("7") => {}
             Some("6") => bail!("this invite link is from letmeknow 0.17, whose groups this version cannot join: ask for an invite to a group made with letmeknow 0.18"),
-            Some("5") => bail!("this invite link is from letmeknow 0.16, whose groups this version cannot join: ask for an invite to a group made with letmeknow 0.17"),
             _ => bail!("this invite link is from another version of letmeknow"),
         }
         let device = match fields.next() {
@@ -100,7 +99,7 @@ mod tests {
         assert!(Invite::parse("https://letmeknow.dev/i#7.g.AgICAgICAgICAgICAgICAg.AA").is_err(), "a link names a member");
         let link = Invite { device: false, secret: [2; 16], domain: "relay.example".into(), members }.link();
         assert!(Invite::parse(&link.replacen("#7.", "#6.", 1)).unwrap_err().to_string().contains("letmeknow 0.17"));
-        assert!(Invite::parse(&link.replacen("#7.", "#5.", 1)).unwrap_err().to_string().contains("letmeknow 0.16"));
+        assert!(Invite::parse(&link.replacen("#7.", "#5.", 1)).unwrap_err().to_string().contains("another version"));
         assert!(Invite::parse(&link.replacen("#7.", "#8.", 1)).unwrap_err().to_string().contains("another version"));
     }
 
