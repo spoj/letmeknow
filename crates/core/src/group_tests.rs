@@ -1215,6 +1215,25 @@ fn a_removed_key_cannot_be_added_back_in_the_same_commit() {
     assert!(w.m[0].g().posted().is_none());
 }
 
+/// A joiner refuses a group with a member whose credential names another key than its leaf's: that member could claim
+/// the other key's messages.
+#[test]
+fn a_joiner_refuses_a_member_whose_credential_names_another_key() {
+    let mut w = World::new(&["M", "B"]);
+    w.m[0].session.credential.key = Bytes(w.m[1].session.key().to_vec());
+    let package = w.key_package(1);
+    let m = &mut w.m[0];
+    m.group = Some(Group::create(&m.provider, &m.session, &settings("Plan")).unwrap());
+    // Built as `Group::commit` builds it but past `rules`, which refuses M's own leaf, as a forger's client would not.
+    let g = m.group.as_mut().unwrap();
+    g.mls.set_aad(cut_aad(&g.state.cut));
+    let bundle = g.mls.commit_builder().force_self_update(true).propose_adds(vec![key_package_in(&m.provider, &package).unwrap()]);
+    let bundle = bundle.load_psks(m.provider.storage()).unwrap().build(m.provider.rand(), m.provider.crypto(), &m.session.signer, |_| true).unwrap();
+    let (commit, welcome, _) = bundle.stage_commit(&m.provider).unwrap().into_messages();
+    let entry = entry_of(&m.session.signer, commit.to_bytes().unwrap(), welcome.map(|welcome| welcome.to_bytes().unwrap()));
+    assert!(join_error(&w.m[1], &entry, &package).contains("a member whose credential names another key"));
+}
+
 /// A live payload opens for the members of its epoch, from a current member, verified and unaltered; the members of
 /// another epoch, and a member removed since, do not open it.
 #[test]
@@ -1224,11 +1243,10 @@ fn live_payloads_open_only_in_their_epoch() {
     let edit = serde_json::json!({ "type": "edit", "text": "hi" });
     let wire = live(&w.m[0], &edit);
     assert_eq!(open_live(&w.m[1], &wire).unwrap(), (w.m[0].session.key().to_vec(), edit.clone()));
-    let replay = live(&w.m[0], &edit);
-    assert_ne!(replay, wire);
+    let again = live(&w.m[0], &edit);
     let b = &w.m[1];
     let id = |wire: &[u8]| b.group.as_ref().unwrap().open_live(&b.provider, wire).unwrap().2;
-    assert_eq!(id(&replay), id(&wire), "sealed anew, the same signed body keeps its id");
+    assert_ne!(id(&again), id(&wire), "the same payload sent again is another payload");
     let mut tampered = wire.clone();
     let last = tampered.len() - 1;
     tampered[last] ^= 1;

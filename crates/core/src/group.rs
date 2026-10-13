@@ -427,6 +427,8 @@ impl Group {
             service_key(&settings)?;
             ensure!(staged.group_context().group_id().as_slice().len() == 16, "group ID is not 16 bytes");
             let mls = staged.into_group(provider)?;
+            let named = |m: &openmls::group::Member| credential_of(&m.credential).is_some_and(|c| c.key.0 == m.signature_key);
+            ensure!(mls.members().all(|m| named(&m)), "a member whose credential names another key than its leaf's");
             let epoch = mls.epoch().as_u64();
             ensure!(commit.group_id() == mls.group_id() && commit.epoch().as_u64() + 1 == epoch, "a commit entry of another group or epoch");
             ensure!(
@@ -814,12 +816,13 @@ impl Group {
     }
 
     /// Seals a live payload under the current epoch's live key, signed by this session: `epoch ‖ nonce ‖ ciphertext` of
-    /// `body ‖ sig`, the body `{"author", "payload"}`, and its id, as `open_live` gives it. It uses none of the MLS
+    /// `body ‖ sig`, the body `{"author", "nonce", "payload"}`, and its id, as `open_live` gives it. It uses none of the MLS
     /// ratchet.
     pub fn seal_live<P: Provider>(&self, provider: &P, session: &Session, payload: &Value) -> Result<(Vec<u8>, [u8; 32])> {
         let epoch = self.epoch();
         let context = self.live_context(epoch);
-        let body = serde_json::to_vec(&Live { author: Bytes(session.key().to_vec()), payload: payload.clone() })?;
+        let nonce = Bytes(crate::random::<16>().to_vec());
+        let body = serde_json::to_vec(&Live { author: Bytes(session.key().to_vec()), nonce, payload: payload.clone() })?;
         let sig = session.sign(&[&context, &body[..]].concat());
         let id = held::id(&sig);
         let plaintext = [body, sig].concat();
@@ -845,7 +848,8 @@ impl Group {
         ensure!(plaintext.len() > 64, "a live payload without its signature");
         let (body, sig) = plaintext.split_at(plaintext.len() - 64);
         let live: Live = serde_json::from_slice(body)?;
-        let member = self.members().into_iter().find(|m| m.key == live.author.0).context("a live payload from no current member")?;
+        let index = self.mls.members().find(|m| m.signature_key == live.author.0).context("a live payload from no current member")?.index;
+        let member = Member::of(&self.mls, index).context("a live payload from no current member")?;
         ensure!(crate::device::verify(&live.author.0, &context, body, sig), "a live payload its author did not sign");
         ensure!(live.payload["type"].is_string(), "a payload without a type");
         Ok((member, live.payload, held::id(sig)))
@@ -856,6 +860,8 @@ impl Group {
 #[derive(Serialize, Deserialize)]
 struct Live {
     author: Bytes,
+    /// Random: a payload sent again is another payload, which dedup lets through; a replay keeps its id.
+    nonce: Bytes,
     payload: Value,
 }
 
