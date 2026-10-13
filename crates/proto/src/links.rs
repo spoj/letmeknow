@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 pub const INVITE_PREFIX: &str = "https://letmeknow.dev/i#";
+/// letmeknow.dev's domain: where its service publishes its directory.
+pub const DOMAIN: &str = "relay.letmeknow.dev";
 /// letmeknow.dev's relay, which links leave out.
 pub const RELAY: &str = "https://relay.letmeknow.dev";
 /// letmeknow.dev's membership service: its iroh key, hex. It is reached through `RELAY`.

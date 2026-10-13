@@ -1,6 +1,7 @@
 //! The wire formats, shared by every crate.
 
 pub mod clock;
+pub mod directory;
 pub mod entry;
 pub mod frame;
 pub mod group;
