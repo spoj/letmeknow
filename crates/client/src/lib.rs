@@ -21,9 +21,9 @@ use lmk_core::provider::Provider;
 use lmk_node::identity::{ADD_VALID, Add, Identity, Pending, Presence, SessionGroup};
 use lmk_node::{Event, Heard, INVITE_VALID, Member, Message, Node};
 use lmk_proto::Bytes;
-use lmk_proto::ranges::Ranges;
 use lmk_proto::group::{Attachment, CHAT, Certificate, ChatMessage, IDENTITY, How, IdentityRef, PROTOCOL, Service, Settings, UPDATE};
 use lmk_proto::links::{FileLink, Invite};
+use lmk_proto::peer::Seqs;
 use n0_future::time::{Duration, Instant, timeout};
 use n0_future::{Either, FutureExt};
 use serde::{Deserialize, Serialize};
@@ -47,14 +47,6 @@ pub(crate) fn b64(bytes: &[u8]) -> String {
 
 pub fn message_id(hex_id: &str) -> Result<[u8; 32]> {
     hex::decode(hex_id).ok().and_then(|id| id.try_into().ok()).with_context(|| format!("{hex_id} is not a message id"))
-}
-
-/// What `send` answers: the message's id, and its entry's position once it counts, or that the send is pending.
-fn sent_answer(sent: &lmk_node::Sent) -> Value {
-    match sent.position {
-        Some(position) => json!({ "id": hex::encode(&sent.id.0), "position": position }),
-        None => json!({ "id": hex::encode(&sent.id.0), "pending": true }),
-    }
 }
 
 /// Adds an object's fields to another.
@@ -149,6 +141,21 @@ pub trait Plugins: Send + Sync {
     fn stop(&self, _kind: &str) {}
 }
 
+/// Seqs of one author's membership that a message needed and this client gave up on.
+#[derive(Debug, Serialize)]
+pub struct Missing {
+    pub from: Described,
+    pub seqs: Vec<u64>,
+}
+
+/// Seqs of one author's membership lost, with the ids this client knows of them, in hex.
+#[derive(Debug, Serialize)]
+pub struct LostMessages {
+    pub from: Described,
+    pub seqs: Vec<u64>,
+    pub ids: Vec<String>,
+}
+
 /// What the client tells its shell. Message ids and file hashes are hex.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -158,26 +165,35 @@ pub enum ClientEvent {
     /// This client's commit removed members whose devices were taken off their identities; `added`, the members they
     /// added or let in by their invites, stay until removed by hand.
     Revoked { group: Bytes, removed: Vec<Described>, added: Vec<Described> },
-    /// This client was removed from a group.
-    Removed { group: Bytes, by: Option<Described> },
+    /// This client was removed from a group; `not_kept`: its messages no cut kept, by id.
+    Removed { group: Bytes, by: Option<Described>, not_kept: Vec<String> },
     /// The client let go of a group, removed or leaving: the shell drops what it keeps of it.
     Gone { group: Bytes },
     Settings { group: Bytes, settings: Settings, by: Described },
-    /// A chat message, in a group that carries chat, in position order: `missing`, the counted positions before it that
-    /// were passed over unopened. One that opens after later ones were shown comes when it opens, naming those passed
-    /// before it that no message named yet.
-    Message { group: Bytes, id: String, position: u64, missing: Vec<u64>, from: Described, payload: Value },
-    /// Counted positions a member can no longer open: this client's own, or another member's of this client's messages.
-    Lost { group: Bytes, member: Described, positions: Vec<u64>, ids: Vec<String> },
-    /// A send that `send` answered as pending, as `answered`, counts now, at `position` in the group's log, by its
-    /// final id, `id`.
-    Sent { group: Bytes, id: String, answered: String, position: u64 },
+    /// A chat message, in a group that carries chat, in delivery order. `missing`: what it needed and this client gave
+    /// up on; `late`: messages that needed those were delivered without them; `reply_outside`: `reply_to` is not in its
+    /// causal past.
+    Message {
+        group: Bytes,
+        id: String,
+        from: Described,
+        seq: u64,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        missing: Vec<Missing>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        late: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        reply_outside: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+        payload: Value,
+    },
+    /// Held messages lost, as `member` tells: this client's own, or as another member's summary tells, each seq once.
+    Lost { group: Bytes, member: Described, messages: Vec<LostMessages> },
     /// A sync of the group's held messages with a member ended.
     Synced { group: Bytes },
     /// A member's summary of the group came: who holds and read what may have changed (`Client::receipts`).
     Heard { group: Bytes },
-    /// Another member's summary holds the `leave` that `leave` answered as pending.
-    LeaveHeld { group: Bytes },
     /// A file is held whole.
     File { hash: String },
     /// An event of a kind's plugin: by the delivery policy, waking with `wake`; with `key`, it replaces a held one with
@@ -201,10 +217,8 @@ impl ClientEvent {
             | ClientEvent::Settings { group, .. }
             | ClientEvent::Message { group, .. }
             | ClientEvent::Lost { group, .. }
-            | ClientEvent::Sent { group, .. }
             | ClientEvent::Synced { group }
             | ClientEvent::Heard { group }
-            | ClientEvent::LeaveHeld { group }
             | ClientEvent::Plugin { group, .. } => Some(group),
             ClientEvent::Warning { group, .. } => group.as_ref(),
             ClientEvent::File { .. } | ClientEvent::Identity { .. } | ClientEvent::Added { .. } => None,
@@ -245,8 +259,6 @@ struct State {
     files: Vec<([u8; 32], oneshot::Sender<()>)>,
     /// What plugins show of their groups in `groups`.
     infos: HashMap<Bytes, Value>,
-    /// The groups whose `leave` was answered pending, until another member's summary holds it.
-    leaving: HashSet<Bytes>,
     /// What a group's kind is told before it opens, as a joiner's state may come: its latest state and synced of each
     /// member.
     held: HashMap<Bytes, Vec<Value>>,
@@ -262,29 +274,42 @@ impl State {
     }
 }
 
-/// What another member holds and read of a group.
+/// What another member holds and shows of a group, as its latest summary says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Receipt {
     pub member: Member,
-    pub held: Ranges,
-    pub read: Ranges,
+    pub held: Vec<Seqs>,
+    pub shown: Vec<Seqs>,
 }
 
-/// What each member but `me` holds and read: as its latest summary shows, unless it is away, and as the read ranges of
-/// its chat messages show; what it read it holds.
-pub fn receipts(members: &[Member], me: &Bytes, heard: &[Heard], away: &[Member], messages: &[Message]) -> Vec<Receipt> {
+impl Receipt {
+    /// Whether the member holds the message: its own it does.
+    pub fn holds(&self, message: &Message) -> bool {
+        self.member.key == message.sender.key || covers(&self.held, message)
+    }
+
+    /// Whether the member showed the message: its own it did.
+    pub fn showed(&self, message: &Message) -> bool {
+        self.member.key == message.sender.key || covers(&self.shown, message)
+    }
+}
+
+fn covers(seqs: &[Seqs], message: &Message) -> bool {
+    seqs.iter().any(|s| s.key == message.sender.key && s.joined == message.joined && s.seqs.contains(message.seq))
+}
+
+/// What each member but `me` holds and shows, as its latest summary says; an away member holds nothing.
+pub fn receipts(members: &[Member], me: &Bytes, heard: &[Heard], away: &[Member]) -> Vec<Receipt> {
     let others = members.iter().filter(|member| member.key != *me);
     others
         .map(|member| {
             let summary = heard.iter().find(|heard| heard.member.key == member.key);
-            let chats = messages.iter().filter(|message| message.sender.key == member.key);
-            let said = chats.filter_map(|message| serde_json::from_value::<ChatMessage>(message.payload.clone()).ok());
-            let read = said.fold(summary.map(|heard| heard.read.clone()).unwrap_or_default(), |read, chat| read.union(&chat.read));
             let held = match summary {
-                Some(heard) if !away.contains(member) => heard.held.union(&read),
-                _ => read.clone(),
+                Some(heard) if !away.contains(member) => heard.held.clone(),
+                _ => Vec::new(),
             };
-            Receipt { member: member.clone(), held, read }
+            let shown = summary.map(|heard| heard.shown.clone()).unwrap_or_default();
+            Receipt { member: member.clone(), held, shown }
         })
         .collect()
 }
@@ -565,10 +590,10 @@ impl<P: Provider + Send + 'static> Client<P> {
             Ok(pending) => pending,
             Err(error) => return self.warn(None, format!("reading the adds for this device: {error:#}")),
         };
-        for Pending { position, by, add } in pending {
-            let taken = self.added(&add.link, &add.group, &by).await.and_then(|_| devices.take(position));
-            if let Err(error) = taken {
-                self.warn(None, format!("joining a group your device {by} added this one to: {error:#}"));
+        for Pending { id, by, add } in pending {
+            match self.added(&add.link, &add.group, &by).await {
+                Ok(_) => devices.take(&id),
+                Err(error) => self.warn(None, format!("joining a group your device {by} added this one to: {error:#}")),
             }
         }
     }
@@ -631,16 +656,11 @@ impl<P: Provider + Send + 'static> Client<P> {
     }
 
     async fn leave(&self, gid: &Bytes) -> Result<Value> {
-        let Some(sent) = self.inner.node.leave(&gid.0).await? else {
+        if self.inner.node.leave(&gid.0).await?.is_none() {
             self.drop_group(gid).await?;
             return Ok(json!({ "group": b64(&gid.0), "left": true }));
-        };
-        let mut answer = json!({ "group": b64(&gid.0), "left": true, "status": "another member commits the removal" });
-        if sent.position.is_none() || !self.leave_held(gid)? {
-            self.state().leaving.insert(gid.clone());
-            answer["pending"] = json!(true);
         }
-        Ok(answer)
+        Ok(json!({ "group": b64(&gid.0), "left": true, "pending": true, "status": "a member removes this session once a cut keeps its leave" }))
     }
 
     /// Ends a group for everyone: removes the other members, and leaves it.
@@ -651,27 +671,11 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok(answer)
     }
 
-    /// Whether another member's summary holds a `leave` of this client's in the group, or the session is out of the
-    /// group already: removed, as its `leave` asked.
-    fn leave_held(&self, gid: &Bytes) -> Result<bool> {
-        let node = &self.inner.node;
-        let held = || -> Result<bool> {
-            let (only_here, me) = (node.only_here(&gid.0)?, node.key());
-            let mut leaves = node.messages(&gid.0)?.into_iter().filter(|m| m.sender.key == me && m.payload["type"] == "leave");
-            Ok(leaves.any(|leave| !only_here.contains(leave.position)))
-        };
-        match held() {
-            Err(_) if !node.groups().contains(gid) => Ok(true),
-            held => held,
-        }
-    }
-
     /// Lets go of a group the node has left: tells its kind's plugin, and the shell.
     async fn drop_group(&self, gid: &Bytes) -> Result<()> {
         let kind = {
             let mut st = self.state();
             st.infos.remove(gid);
-            st.leaving.remove(gid);
             st.held.remove(gid);
             st.kind_of.remove(gid)
         };
@@ -714,15 +718,8 @@ impl<P: Provider + Send + 'static> Client<P> {
             let describer = self.describer(&gid)?;
             let online: Vec<Described> = node.online(&gid.0)?.iter().map(|m| describer.describe(m)).collect();
             let away: Vec<Described> = node.away(&gid.0)?.iter().map(|m| describer.describe(m)).collect();
-            let positions = node.only_here(&gid.0)?;
-            let messages: HashMap<u64, Message> = node.messages(&gid.0)?.into_iter().map(|m| (m.position, m)).collect();
-            let mut only_here: Vec<Value> = positions
-                .iter()
-                .map(|position| match messages.get(&position) {
-                    Some(m) => json!({ "what": m.payload["type"], "id": hex::encode(&m.id.0), "position": position }),
-                    None => json!({ "position": position }),
-                })
-                .collect();
+            let mut only_here: Vec<Value> =
+                node.only_here(&gid.0)?.iter().map(|(id, payload)| json!({ "what": payload["type"], "id": hex::encode(&id.0) })).collect();
             only_here.extend(node.pending_files(&gid.0)?.iter().map(|hash| json!({ "what": "file", "id": hex::encode(hash) })));
             only_here_count += only_here.len();
             let mut identity_warnings = Vec::new();
@@ -747,8 +744,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
         let mut status = json!({ "groups": groups });
         if only_here_count > 0 {
-            status["warning"] =
-                json!(format!("{only_here_count} sends are held only by this session; keep it running until another member holds them"));
+            status["warning"] = json!(format!("{only_here_count} sends are not kept by any commit yet; keep this session running until they are"));
         }
         Ok(status)
     }
@@ -797,7 +793,7 @@ impl<P: Provider + Send + 'static> Client<P> {
 
     // Messages.
 
-    /// Sends a chat message, with the positions this client read; returns its id and the answer to `send`.
+    /// Sends a chat message, a reply to `reply_to` if given; returns its id and the answer to `send`.
     pub async fn send(&self, gid: &Bytes, chat: Chat) -> Result<(Bytes, Value)> {
         let node = &self.inner.node;
         let mut addressed: Vec<Member> = Vec::new();
@@ -809,7 +805,7 @@ impl<P: Provider + Send + 'static> Client<P> {
             }
         }
         if let Some(id) = &chat.reply_to {
-            ensure!(node.message(id)?.is_some(), "unknown message {}", hex::encode(id));
+            ensure!(node.message(&gid.0, id)?.is_some(), "unknown message {}", hex::encode(id));
         }
         let attachment = match chat.attachment {
             Some(File { name, media_type, data }) => {
@@ -821,17 +817,14 @@ impl<P: Provider + Send + 'static> Client<P> {
         };
         let payload = ChatMessage {
             content: chat.text,
-            read: node.read(&gid.0)?,
             to: addressed.iter().map(|m| Bytes(Sha256::digest(&m.key.0)[..8].to_vec())).collect(),
-            reply_to: chat.reply_to.map(|id| Bytes(id.to_vec())),
             urgent: chat.urgent,
             attachment: attachment.as_ref().map(|(_, a)| a.clone()),
             sent_at: Some(lmk_proto::clock::corrected()),
         };
-        let sent = node.send(&gid.0, &serde_json::to_value(payload)?).await?;
-        let id = sent.id.clone();
+        let id = node.send(&gid.0, &serde_json::to_value(payload)?, chat.reply_to.as_ref().map(|id| &id[..])).await?;
         let describer = self.describer(gid)?;
-        let mut answer = sent_answer(&sent);
+        let mut answer = json!({ "id": hex::encode(&id.0) });
         if !addressed.is_empty() {
             answer["to"] = json!(addressed.iter().map(|m| fp(&m.key.0)).collect::<Vec<_>>());
         }
@@ -846,20 +839,16 @@ impl<P: Provider + Send + 'static> Client<P> {
         Ok((id, answer))
     }
 
-    /// Marks positions of a group read, as this client showed or printed them.
-    pub fn mark_read(&self, gid: &Bytes, positions: &Ranges) -> Result<()> {
-        let node = &self.inner.node;
-        if positions.difference(&node.read(&gid.0)?).is_empty() {
-            return Ok(());
-        }
-        node.mark_read(&gid.0, positions)
+    /// Marks held messages of a group shown, as this client showed or printed them.
+    pub fn mark_shown(&self, gid: &Bytes, ids: &[Bytes]) -> Result<()> {
+        self.inner.node.mark_shown(&gid.0, ids)
     }
 
-    /// What each other member of a group holds and read (see `receipts`).
+    /// What each other member of a group holds and shows (see `receipts`).
     pub fn receipts(&self, gid: &Bytes) -> Result<Vec<Receipt>> {
         let node = &self.inner.node;
-        let (members, heard, away, messages) = (node.members(&gid.0)?, node.heard(&gid.0)?, node.away(&gid.0)?, node.messages(&gid.0)?);
-        Ok(receipts(&members, &node.key(), &heard, &away, &messages))
+        let (members, heard, away) = (node.members(&gid.0)?, node.heard(&gid.0)?, node.away(&gid.0)?);
+        Ok(receipts(&members, &node.key(), &heard, &away))
     }
 
     /// The members `to` addresses: a fingerprint, or a name they answer to, as long as they speak for one identity.
@@ -922,8 +911,8 @@ impl<P: Provider + Send + 'static> Client<P> {
                     });
                     return self.emit(changed);
                 }
-                if let Event::Logged { group } = &event
-                    && devices.identity_of(&group.0).is_some()
+                if let Event::Message(message) = &event
+                    && devices.identity_of(&message.group.0).is_some()
                 {
                     // A join waits on events, as a doc's state.
                     let client = self.clone();
@@ -972,11 +961,12 @@ impl<P: Provider + Send + 'static> Client<P> {
                 let (removed, added) = (removed.iter().map(|m| describer.describe(m)).collect(), added.iter().map(|m| describer.describe(m)).collect());
                 self.emit(ClientEvent::Revoked { group, removed, added });
             }
-            Event::Public { .. } | Event::Duties { .. } | Event::Logged { .. } => {}
-            Event::Removed { group, by, .. } => {
+            Event::Public { .. } | Event::Duties { .. } => {}
+            Event::Removed { group, by, not_kept, .. } => {
                 let by = by.map(|by| self.describe(&group, &by)).transpose()?;
+                let not_kept = not_kept.iter().map(|id| hex::encode(&id.0)).collect();
                 self.drop_group(&group).await?;
-                self.emit(ClientEvent::Removed { group, by });
+                self.emit(ClientEvent::Removed { group, by, not_kept });
             }
             Event::Settings { group, settings, by } => {
                 let by = self.describe(&group, &by)?;
@@ -987,9 +977,13 @@ impl<P: Provider + Send + 'static> Client<P> {
                 if let Some(link) = message.payload["attachment"]["link"].as_str() {
                     node.hold(&message.group.0, &[link.to_owned()])?;
                 }
-                let from = self.describe(&message.group, &message.sender)?;
-                let (id, position, missing) = (hex::encode(&message.id.0), message.position, message.missing);
-                self.emit(ClientEvent::Message { group: message.group, id, position, missing, from, payload: message.payload });
+                let describer = self.describer(&message.group)?;
+                let from = describer.describe(&message.sender);
+                let missing: Vec<Missing> = message.missing.iter().map(|seqs| Missing { from: describer.describe_key(&seqs.key), seqs: seqs.seqs.iter().collect() }).collect();
+                let id = hex::encode(&message.id.0);
+                let reply_to = message.reply_to.as_ref().map(|id| hex::encode(&id.0));
+                let (seq, late, reply_outside) = (message.seq, message.late, message.reply_outside);
+                self.emit(ClientEvent::Message { group: message.group, id, from, seq, missing, late, reply_outside, reply_to, payload: message.payload });
             }
             // No other kind holds messages.
             Event::Message(_) => {}
@@ -998,22 +992,17 @@ impl<P: Provider + Send + 'static> Client<P> {
                 self.tell_plugin(&group, item)?;
             }
             Event::Lost(lost) => {
-                let member = self.describe(&lost.group, &lost.member)?;
-                let ids = lost.ids.iter().map(|id| hex::encode(&id.0)).collect();
-                self.emit(ClientEvent::Lost { group: lost.group, member, positions: lost.positions, ids });
+                let describer = self.describer(&lost.group)?;
+                let member = describer.describe(&lost.member);
+                let messages = lost.messages.iter().map(|of| LostMessages { from: describer.describe(&of.from), seqs: of.seqs.clone(), ids: of.ids.iter().map(|id| hex::encode(&id.0)).collect() });
+                self.emit(ClientEvent::Lost { group: lost.group, member, messages: messages.collect() });
             }
             Event::Synced { group, member } => {
                 let item = json!({ "type": "synced", "member": self.describe(&group, &member)? });
                 self.tell_plugin(&group, item)?;
                 self.emit(ClientEvent::Synced { group });
             }
-            Event::Heard { group } => {
-                if self.state().leaving.contains(&group) && self.leave_held(&group)? {
-                    self.state().leaving.remove(&group);
-                    self.emit(ClientEvent::LeaveHeld { group: group.clone() });
-                }
-                self.emit(ClientEvent::Heard { group });
-            }
+            Event::Heard { group } => self.emit(ClientEvent::Heard { group }),
             Event::State { group, from, data } => {
                 let item = json!({ "type": "state", "from": self.describe(&group, &from)?, "data": Bytes(data) });
                 self.tell_plugin(&group, item)?;
@@ -1024,9 +1013,6 @@ impl<P: Provider + Send + 'static> Client<P> {
                     let id = self.state().wait_for(&kind, Waiter::Snapshot(reply));
                     self.inner.plugins.send(&kind, &json!({ "type": "snapshot", "id": id, "group": b64(&group.0) }))?;
                 }
-            }
-            Event::Sent { group, id, answered, position } => {
-                self.emit(ClientEvent::Sent { group, id: hex::encode(&id.0), answered: hex::encode(&answered.0), position })
             }
             Event::File(hash) => {
                 let arrived: Vec<oneshot::Sender<()>> = {
@@ -1463,6 +1449,7 @@ impl<P: Provider + Send + 'static> Client<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lmk_proto::ranges::Ranges;
 
     fn member(key: u8) -> Member {
         Member {
@@ -1476,37 +1463,37 @@ mod tests {
         }
     }
 
-    fn chat(sender: u8, position: u64, read: Ranges) -> Message {
-        let payload = serde_json::to_value(ChatMessage { content: String::new(), read, to: Vec::new(), reply_to: None, urgent: false, attachment: None, sent_at: None });
+    fn message(sender: u8, seq: u64) -> Message {
         Message {
-            id: Bytes(vec![sender, position as u8]),
+            id: Bytes(vec![sender, seq as u8]),
             group: Bytes::default(),
-            epoch: 0,
-            position,
+            index: seq,
             at: 0,
             sender: member(sender),
-            payload: payload.unwrap(),
+            joined: 0,
+            seq,
+            reply_to: None,
+            payload: json!({ "type": "message", "content": "" }),
             missing: Vec::new(),
+            late: false,
+            reply_outside: false,
         }
     }
 
+    fn seqs(key: u8, seqs: Ranges) -> Seqs {
+        Seqs { key: Bytes(vec![key]), joined: 0, seqs }
+    }
+
     #[test]
-    fn a_member_holds_what_its_summary_shows_but_away_and_read_what_its_messages_say_too() {
+    fn a_receipt_holds_and_shows_what_its_summary_says_and_an_away_member_holds_nothing() {
         let members = [member(1), member(2), member(3), member(4)];
         let heard = [
-            Heard { member: member(2), held: Ranges::range(1, 10), read: Ranges::range(1, 4), at: 0 },
-            Heard { member: member(3), held: Ranges::range(1, 10), read: Ranges::range(1, 2), at: 0 },
+            Heard { member: member(2), joined: 0, held: vec![seqs(1, Ranges::range(1, 10))], shown: vec![seqs(1, Ranges::range(1, 4))], at: 0 },
+            Heard { member: member(3), joined: 0, held: vec![seqs(1, Ranges::range(1, 10))], shown: vec![seqs(1, Ranges::range(1, 2))], at: 0 },
         ];
-        let messages = [chat(2, 11, Ranges::range(1, 6)), chat(4, 12, Ranges::range(1, 3))];
-        let got = receipts(&members, &Bytes(vec![1]), &heard, &[member(3)], &messages);
-        let got: Vec<(u8, Ranges, Ranges)> = got.into_iter().map(|r| (r.member.key.0[0], r.held, r.read)).collect();
-        assert_eq!(
-            got,
-            [
-                (2, Ranges::range(1, 10), Ranges::range(1, 6)),
-                (3, Ranges::range(1, 2), Ranges::range(1, 2)),
-                (4, Ranges::range(1, 3), Ranges::range(1, 3)),
-            ]
-        );
+        let got = receipts(&members, &Bytes(vec![1]), &heard, &[member(3)]);
+        let got: Vec<(u8, bool, bool)> = got.iter().map(|r| (r.member.key.0[0], r.holds(&message(1, 3)), r.showed(&message(1, 3)))).collect();
+        assert_eq!(got, [(2, true, true), (3, false, false), (4, false, false)]);
+        assert!(receipts(&members, &Bytes(vec![1]), &heard, &[])[1].holds(&message(3, 7)), "its own messages it holds");
     }
 }

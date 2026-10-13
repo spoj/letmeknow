@@ -4,10 +4,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lmk_client::{Access, Client, ClientEvent, Config, Plugins, Request, Standing};
+use lmk_client::{Access, Chat, Client, ClientEvent, Config, Plugins, Receipt, Request, Standing};
 use lmk_core::device::Device;
 use lmk_core::provider::MemoryProvider;
-use lmk_node::{Event, Node};
+use lmk_node::{Event, Message, Node};
 use lmk_node::identity::Identity;
 use lmk_proto::group::{CHAT, IDENTITY};
 use lmk_testing::{Relay, relay};
@@ -246,7 +246,7 @@ async fn a_group_left_while_its_kind_starts_is_never_told_of() {
     let mut bob = Member::start(&relay, "Bob").await;
     let (invite, gate, joined) = joining(&alice, &bob).await;
     tokio::time::timeout(WAIT, bob.stated.notified()).await.expect("bob is in the group");
-    bob.request(json!({ "cmd": "leave", "group": invite["group"] })).await;
+    bob.request(json!({ "cmd": "leave", "group": invite["group"], "end": true })).await;
     bob.until(|e| matches!(e, ClientEvent::Gone { .. })).await;
     gate.notify_one();
     let error = joined.await.unwrap().unwrap_err().to_string();
@@ -406,4 +406,88 @@ async fn a_device_leaves_its_identity_with_other_devices_left_and_as_its_only_de
     assert_eq!(laptop.client.me().unwrap()["identity"], json!(null));
     assert!(laptop.client.node().groups().is_empty(), "its identity group is gone");
     assert!(alice.client.node().read_public(&bob).await.unwrap().closed(), "no session speaks for Bob any more");
+}
+
+fn is_message(event: &ClientEvent) -> bool {
+    matches!(event, ClientEvent::Message { .. })
+}
+
+/// Sends `text` in a chat, a reply to `reply_to` if given; returns the message as its sender holds it.
+async fn say(member: &Member, gid: &lmk_proto::Bytes, text: &str, reply_to: Option<&lmk_proto::Bytes>) -> Message {
+    let reply_to: Option<[u8; 32]> = reply_to.map(|id| id.0.clone().try_into().unwrap());
+    let chat = Chat { text: text.into(), to: Vec::new(), reply_to, urgent: false, attachment: None };
+    let (id, _) = member.client.send(gid, chat).await.unwrap();
+    member.client.node().message(&gid.0, &id.0).unwrap().unwrap()
+}
+
+/// Waits until a member's receipts of the group say what `wanted` asks, as its summaries come.
+async fn receipts_say(member: &mut Member, gid: &lmk_proto::Bytes, wanted: impl Fn(&Receipt) -> bool) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            member.until(|e| matches!(e, ClientEvent::Heard { .. })).await;
+            if member.client.receipts(gid).unwrap().iter().any(&wanted) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the receipts said so")
+}
+
+/// Alice's chat, which Bob joins once Alice has seen him join.
+async fn chat_with_bob(alice: &mut Member, bob: &Member) -> lmk_proto::Bytes {
+    let invite = alice.request(json!({ "cmd": "invite" })).await;
+    bob.request(json!({ "cmd": "join", "target": invite["link"] })).await;
+    alice.until(|e| matches!(e, ClientEvent::Joined { .. })).await;
+    serde_json::from_value(invite["group"].clone()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_message_comes_with_its_seq_and_a_reply_names_the_message_it_answers() {
+    let relay = relay().await;
+    let mut alice = Member::start(&relay, "Alice").await;
+    let mut bob = Member::start(&relay, "Bob").await;
+    let gid = chat_with_bob(&mut alice, &bob).await;
+    // Bob's seqs count from his membership, so his first two messages are 1 and 2; Alice's invite is her seq 1.
+    let first = say(&bob, &gid, "one", None).await;
+    let second = say(&bob, &gid, "two", None).await;
+    let ClientEvent::Message { id, seq: 1, .. } = alice.until(is_message).await else { panic!("the first message is seq 1") };
+    assert_eq!(id, hex::encode(&first.id.0));
+    let ClientEvent::Message { id, seq: 2, .. } = alice.until(is_message).await else { panic!("the second message is seq 2") };
+    assert_eq!(id, hex::encode(&second.id.0));
+    // A reply's causal past holds the message it answers once Alice showed it, so it is not outside.
+    alice.client.mark_shown(&gid, &[first.id.clone(), second.id.clone()]).unwrap();
+    let reply = say(&alice, &gid, "three", Some(&second.id)).await;
+    let ClientEvent::Message { id, reply_to, reply_outside, .. } = bob.until(is_message).await else { panic!("the reply came") };
+    assert_eq!((id, reply_to, reply_outside), (hex::encode(&reply.id.0), Some(hex::encode(&second.id.0)), false));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_members_receipts_show_a_message_held_and_then_shown_as_its_summaries_say() {
+    let relay = relay().await;
+    let mut alice = Member::start(&relay, "Alice").await;
+    let mut bob = Member::start(&relay, "Bob").await;
+    let gid = chat_with_bob(&mut alice, &bob).await;
+    let message = say(&alice, &gid, "hello", None).await;
+    bob.until(is_message).await;
+    receipts_say(&mut alice, &gid, |receipt| receipt.holds(&message) && !receipt.showed(&message)).await;
+    bob.client.node().mark_shown(&gid.0, std::slice::from_ref(&message.id)).unwrap();
+    receipts_say(&mut alice, &gid, |receipt| receipt.showed(&message)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sent_message_is_only_here_until_a_commit_keeps_it() {
+    let relay = relay().await;
+    let mut alice = Member::start(&relay, "Alice").await;
+    let mut bob = Member::start(&relay, "Bob").await;
+    let gid = chat_with_bob(&mut alice, &bob).await;
+    let message = say(&alice, &gid, "hello", None).await;
+    bob.until(is_message).await;
+    // Bob holds it, so the commit that a settings change makes keeps it. Alice's invite is listed until a commit keeps it too.
+    receipts_say(&mut alice, &gid, |receipt| receipt.holds(&message) && !receipt.showed(&message)).await;
+    let status = alice.request(json!({ "cmd": "status" })).await;
+    assert!(status["groups"][0]["only_here"].as_array().unwrap().contains(&json!({ "what": "message", "id": hex::encode(&message.id.0) })));
+    assert!(status["warning"].is_string());
+    alice.request(json!({ "cmd": "name", "name": "Plan" })).await;
+    polled(&alice, json!({ "cmd": "status" }), |status| status["groups"][0]["only_here"] == json!([]) && status["warning"].is_null()).await;
 }
