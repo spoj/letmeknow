@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-use iroh::EndpointId;
+use iroh::{EndpointId, RelayUrl};
 use lmk_core::group::{Group, Session};
 use lmk_core::provider::Provider;
 use lmk_net::peers::Peers;
@@ -81,6 +81,7 @@ impl<P: Provider> State<P> {
             groups.insert(gid.0, G::new(mls, rec));
         }
         let bindings = get(&provider, b"node/identity-bindings")?.unwrap_or_default();
+        let hints = get(&provider, b"node/hints")?.unwrap_or_default();
         let peers = Peers::new(now(), u64::from_be_bytes(lmk_core::random()), *iroh_key(&provider)?.public().as_bytes());
         let mut state = State {
             bindings,
@@ -99,6 +100,8 @@ impl<P: Provider> State<P> {
             peers,
             served: BTreeMap::new(),
             gate: true,
+            home: None,
+            hints,
             time: now(),
         };
         for gid in state.groups.keys().cloned().collect::<Vec<_>>() {
@@ -201,22 +204,18 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Dials a member, at the relay its leaf names and then this session's, and tells `Peers` how it went.
+    /// Dials a member, at the relay it last said it was on or else its leaf names, and then this session's, and tells
+    /// `Peers` how it went.
     fn dial(self: &Arc<Self>, peer: EndpointId) {
         let relay = {
-            let mut st = self.lock();
-            let leaves = st.groups.values().flat_map(|g| g.mls.members()).filter_map(|m| m.leaf);
-            let relay = leaves.into_iter().find(|leaf| endpoint_id(&leaf.key.0) == Some(peer)).and_then(|leaf| leaf.relay.parse().ok());
-            if relay.is_none() {
-                let now = st.tick();
-                st.peers.dialed(peer.as_bytes(), false, now);
-            }
-            relay
+            let st = self.lock();
+            let leaf = st.groups.values().flat_map(|g| g.mls.members()).filter_map(|m| m.leaf).find(|leaf| endpoint_id(&leaf.key.0) == Some(peer)).map(|leaf| leaf.relay);
+            st.hints.get(&Bytes(peer.as_bytes().to_vec())).map(|hint| hint.relay.clone()).or(leaf)
         };
-        let Some(relay) = relay else { return };
+        let hint: Vec<RelayUrl> = relay.and_then(|relay| relay.parse().ok()).into_iter().collect();
         let inner = self.clone();
         spawn(async move {
-            let dialed = inner.net().dial(peer, vec![relay], vec![inner.relay.clone()]).await;
+            let dialed = inner.net().dial(peer, hint, vec![inner.relay.clone()]).await;
             if let Err(error) = &dialed {
                 tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
             }

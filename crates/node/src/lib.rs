@@ -453,6 +453,10 @@ pub(crate) struct State<P> {
     served: BTreeMap<EndpointId, BTreeSet<Bytes>>,
     /// The rosters or the public logs changed since `served` was worked out.
     gate: bool,
+    /// This endpoint's home relay, as net last reported it.
+    home: Option<String>,
+    /// Where each member last said it was, by iroh key.
+    hints: BTreeMap<Bytes, peering::Hint>,
     /// The latest time a step saw, in milliseconds: `Peers` takes no time from before.
     time: u64,
 }
