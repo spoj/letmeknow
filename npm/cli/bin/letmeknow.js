@@ -3,8 +3,7 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
-// Termux's node says android; the static Linux binaries run there.
-const target = `${process.platform === "android" ? "linux" : process.platform}-${process.arch}`;
+const target = `${process.platform}-${process.arch}`;
 let binary;
 try {
   binary = require.resolve(`@letmeknow/${target}/bin/letmeknow${process.platform === "win32" ? ".exe" : ""}`);
