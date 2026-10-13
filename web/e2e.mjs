@@ -428,7 +428,8 @@ try {
   const annIdentity = ann.run("identity", "list").identity;
   const initialBindings = await bindings(laptop);
   check(initialBindings.some(([id, name]) => id === annIdentity && name === "Ann"), "the browser durably observes an installed authorized name");
-  await laptop.locator(".people:visible").click();
+  await laptop.locator(".group-list button", { hasText: "Plans" }).click();
+  await laptop.locator(".title", { hasText: "Plans" }).locator(".people").click();
   await laptop.locator("dialog").getByLabel("Name", { exact: true }).fill("keep this draft");
   ann.run("identity", "rename", "Ann Lee");
   await laptop.locator("dialog .identity-warning", { hasText: "Changed identity-name claim" }).waitFor({ timeout: 30_000 });
@@ -610,7 +611,7 @@ try {
   await laptop.reload();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.getByText("hello from the terminal", { exact: true }).waitFor();
-  check((await laptop.locator(".group-list button").count()) === 3, "a reloaded browser keeps its groups and their messages");
+  check((await laptop.locator(".group-list button").count()) === 4, "a reloaded browser keeps its groups and their messages");
   ann.run("send", `--group=${invite.group}`, "after the reload");
   await laptop.getByText("after the reload").waitFor();
   await laptop.getByPlaceholder("Message").fill("still here");
