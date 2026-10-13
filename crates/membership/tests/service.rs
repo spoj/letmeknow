@@ -1,6 +1,9 @@
-use std::{net::Ipv4Addr, sync::Mutex, time::Duration};
+use std::{net::Ipv4Addr, sync::{Arc, Mutex}, time::Duration};
 
 use anyhow::Result;
+use lmk_membership::client::Resolve;
+use lmk_proto::directory::Directory;
+use n0_future::boxed::BoxFuture;
 use iroh::{Endpoint, RelayMode, SecretKey, endpoint::{Connection, RecvStream, SendStream, presets}, protocol::{AcceptError, ProtocolHandler, Router}};
 use lmk_membership::{Frontier, InvalidProof, Refused, client::ServeClient, service::{CONNECTION_STREAMS, Policy, Service}, store::Store};
 use lmk_proto::{Bytes, frame::{self, ALPN, Open, Stream}, head::{self, Head}, membership::{self, Latest, Page, Reply, Request, Subscribed}};
@@ -23,7 +26,7 @@ impl TestService {
         let server = endpoint(Some(secret)).await;
         let service = Router::builder(server).accept(ALPN, Service::new(store, policy)).spawn();
         let endpoint = endpoint(None).await;
-        let client = ServeClient::new(endpoint.clone(), &key, "", &service.endpoint().bound_sockets().iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap();
+        let client = direct(endpoint.clone(), &key, &service);
         Self { _dir: dir, service, client, endpoint, key }
     }
 
@@ -34,6 +37,18 @@ impl TestService {
         self.endpoint.close().await;
         self.service.shutdown().await.unwrap();
     }
+}
+
+/// A client that reaches the service at its bound sockets, through no relay.
+fn direct(endpoint: Endpoint, key: &[u8], service: &Router) -> ServeClient {
+    let addrs = service.endpoint().bound_sockets().iter().map(ToString::to_string).collect();
+    let directory = Directory { key: key.try_into().unwrap(), addrs, relay: "https://relay.example".into(), relays: vec!["https://relay.example".into()] };
+    let resolve: Resolve = Arc::new(move |_: String| -> BoxFuture<Result<Directory>> {
+        let directory = directory.clone();
+        Box::pin(async move { Ok(directory) })
+    });
+    let service = lmk_proto::group::Service::Serve { key: Bytes(key.to_vec()), domain: "service.example".into(), rest: Default::default() };
+    ServeClient::for_service(endpoint, resolve, &service).unwrap()
 }
 
 async fn endpoint(secret: Option<SecretKey>) -> Endpoint {
@@ -127,7 +142,7 @@ async fn rate_and_stream_limits_preserve_other_connections() {
         for _ in 0..CONNECTION_STREAMS { subscriptions.push(net.client.subscribe(vec![(c, anchor.clone())]).await.unwrap()); }
         assert!(net.client.head(&c).await.is_err(), "a stream over the limit must be reset, not queued indefinitely");
         let other_endpoint = endpoint(None).await;
-        let other = ServeClient::new(other_endpoint.clone(), &net.key, "", &net.service.endpoint().bound_sockets().iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap();
+        let other = direct(other_endpoint.clone(), &net.key, &net.service);
         assert_eq!(other.head(&c).await.unwrap().length, 1);
         for subscription in subscriptions { subscription.cancel().await; }
         other_endpoint.close().await;
@@ -231,7 +246,7 @@ async fn cancellation_owns_idle_and_gap_read_streams() {
             let probe = Probe { key, capability: c, tamper: false, gap, entered: Mutex::new(Some(entered)), read_stopped: Mutex::new(Some(read_stopped)), subscription_stopped: Mutex::new(Some(subscription_stopped)) };
             let router = Router::builder(endpoint(Some(secret)).await).accept(ALPN, probe).spawn();
             let endpoint = endpoint(None).await;
-            let client = ServeClient::new(endpoint.clone(), &s, "", &router.endpoint().bound_sockets().iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap();
+            let client = direct(endpoint.clone(), &s, &router);
             let subscription = client.subscribe(vec![(c, Frontier::empty(s, head::reference(&s, &c)))]).await.unwrap();
             if gap {
                 read_entered.await.unwrap();
@@ -256,7 +271,7 @@ async fn tampered_gap_page_never_delivers_a_prefix_or_contradiction() {
         let probe = Probe { key, capability: c, tamper: true, gap: true, entered: Mutex::new(None), read_stopped: Mutex::new(None), subscription_stopped: Mutex::new(Some(stopped)) };
         let router = Router::builder(endpoint(Some(secret)).await).accept(ALPN, probe).spawn();
         let endpoint = endpoint(None).await;
-        let client = ServeClient::new(endpoint.clone(), &s, "", &router.endpoint().bound_sockets().iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap();
+        let client = direct(endpoint.clone(), &s, &router);
         let empty = Frontier::empty(s, head::reference(&s, &c));
         let mut sub = client.subscribe(vec![(c, empty.clone())]).await.unwrap();
         let first = sub.next().await.unwrap().unwrap_err();
@@ -287,7 +302,7 @@ async fn transport_errors_cannot_echo_private_close_reasons() {
     timeout(Duration::from_secs(15), async {
         let router = Router::builder(endpoint(None).await).accept(ALPN, PrivateClose).spawn();
         let endpoint = endpoint(None).await;
-        let client = ServeClient::new(endpoint.clone(), router.endpoint().id().as_bytes(), "", &router.endpoint().bound_sockets().iter().map(ToString::to_string).collect::<Vec<_>>()).unwrap();
+        let client = direct(endpoint.clone(), router.endpoint().id().as_bytes(), &router);
         let error = client.append(&[7; 32], &[b"opaque".to_vec()], false).await.unwrap_err();
         assert_eq!(format!("{error:#}"), "membership transport interrupted");
         endpoint.close().await;

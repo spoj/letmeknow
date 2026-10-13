@@ -178,6 +178,19 @@ impl ServeClient {
 }
 
 #[cfg(test)]
+#[tokio::test]
+async fn a_directory_must_name_the_service_key() {
+    let served = Directory { key: [1; 32], addrs: vec![], relay: "https://relay.example".into(), relays: vec!["https://relay.example".into()] };
+    let resolve: Resolve = Arc::new(move |_: String| -> BoxFuture<anyhow::Result<Directory>> {
+        let served = served.clone();
+        Box::pin(async move { Ok(served) })
+    });
+    let service = |key: [u8; 32]| Service::Serve { key: Bytes(key.to_vec()), domain: "relay.example".into(), rest: Default::default() };
+    assert!(directory(&resolve, &service([1; 32])).await.is_ok());
+    assert!(directory(&resolve, &service([2; 32])).await.unwrap_err().to_string().contains("another key"));
+}
+
+#[cfg(test)]
 #[test]
 fn unrepresentable_signed_time_cannot_overflow_the_shared_clock() {
     let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
