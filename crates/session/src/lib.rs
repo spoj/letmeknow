@@ -11,7 +11,11 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
 use lmk_node::Node;
+use lmk_membership::client::Resolve;
+use lmk_proto::directory::Directory;
 use lmk_proto::group::Service;
+use lmk_proto::links::DOMAIN;
+use n0_future::boxed::BoxFuture;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,8 +43,8 @@ pub async fn serve(serve: cli::Serve) -> Result<()> {
         config.certificate = lmk_serve::Certificate::Files { chain, key };
     }
     let service = if serve.initialize { config.initialize()? } else { config.service()? };
-    if let Service::Serve { key, relay, .. } = service {
-        println!("membership: {}@{relay}", hex::encode(&key.0));
+    if let Service::Serve { key, domain, .. } = service {
+        println!("membership: {domain}\nkey: {}", hex::encode(&key.0));
     }
     if serve.initialize { return Ok(()); }
     lmk_serve::serve(config).await
@@ -199,11 +203,22 @@ pub async fn remove(config: session::Config, home: &Path, network: Network) -> R
     Ok(json!({ "removed": handle, "left": groups.as_array().unwrap().iter().map(|g| &g["group"]).collect::<Vec<_>>() }))
 }
 
+/// Answers letmeknow.dev's built-in directory, and no other, until the directories are fetched.
+fn builtin() -> Resolve {
+    Arc::new(|domain: String| -> BoxFuture<Result<Directory>> {
+        Box::pin(async move {
+            ensure!(domain == DOMAIN, "no directory for {domain}");
+            Ok(Directory::builtin())
+        })
+    })
+}
+
 fn node_config(network: &Network, home: &Path, handle: &str, device: Option<Device>, files: PathBuf, kinds: Vec<String>) -> lmk_node::Config {
     lmk_node::Config {
         handle: handle.into(),
         device,
-        relay: network.relay.clone(),
+        relays: vec![network.relay.clone()],
+        resolve: builtin(),
         ca: network.ca.clone(),
         home: Some(home.to_path_buf()),
         files: Some(files),

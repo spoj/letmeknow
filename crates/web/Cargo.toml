@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 # Only the browser build has anything in it.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 lmk-client.workspace = true
+lmk-membership.workspace = true
 lmk-node.workspace = true
 lmk-kinds.workspace = true
 lmk-proto.workspace = true

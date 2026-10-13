@@ -19,8 +19,11 @@ use lmk_node::identity::{Identity, Presence};
 use lmk_node::lmk_core::provider::RustCrypto;
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
+use lmk_membership::client::Resolve;
 use lmk_node::{COLLECT, Disk, Node, now};
 use lmk_proto::Bytes;
+use lmk_proto::directory::Directory;
+use lmk_proto::links::DOMAIN;
 use lmk_proto::group::{CHAT, ChatMessage, IDENTITY, PROTOCOL, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::boxed::BoxFuture;
@@ -280,6 +283,16 @@ fn unb64(text: &str) -> Result<Vec<u8>> {
     Ok(serde_json::from_value::<Bytes>(json!(text))?.0)
 }
 
+/// Answers letmeknow.dev's built-in directory, and no other, until the directories are fetched.
+fn builtin() -> Resolve {
+    Arc::new(|domain: String| -> BoxFuture<Result<Directory>> {
+        Box::pin(async move {
+            anyhow::ensure!(domain == DOMAIN, "no directory for {domain}");
+            Ok(Directory::builtin())
+        })
+    })
+}
+
 #[derive(Deserialize)]
 struct Config {
     /// This device's name: used only when the browser has no session yet.
@@ -390,7 +403,8 @@ impl App {
         let node_config = lmk_node::Config {
             handle: String::new(),
             device: Some(device.clone()),
-            relay: config.relay.parse()?,
+            relays: vec![config.relay.parse()?],
+            resolve: builtin(),
             ca: Default::default(),
             home: None,
             files: None,
