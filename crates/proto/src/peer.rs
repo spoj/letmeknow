@@ -5,23 +5,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Bytes, head::Head, membership::fixed32, ranges::Ranges};
 
+/// What a summary's signature covers, before its body.
+pub const SUMMARY: &[u8] = b"letmeknow summary v1\0";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Frame {
-    /// The sender's summaries of groups, and the heads of the public logs their members follow.
-    Hello { groups: Vec<Summary>, heads: Vec<Head> },
+    /// Where the sender is in each group it shares with the receiver, and the heads of the public logs their members
+    /// follow.
+    Hello { groups: Vec<At>, heads: Vec<Head> },
     /// Entries of a log the other lacks, by its reference, ending at `head`.
     Entries { log: Bytes, entries: Vec<Bytes>, head: Head },
-    /// Ciphertexts of counted positions: pushed at send, or the answer to `want`, whose positions up to where the
-    /// sender stopped are `answers`.
-    Messages {
+    /// Members' signed summaries of the group: the sender's own, and those it passes on.
+    Summaries { group: Bytes, items: Vec<Signed> },
+    /// Held messages' ciphertexts: pushed, or the answer to `want`, which covered `answers`.
+    Held {
         group: Bytes,
-        items: Vec<Item>,
+        items: Vec<Bytes>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        answers: Option<Ranges>,
+        answers: Option<Vec<Seqs>>,
     },
-    /// Message positions asked of one holder.
-    Want { group: Bytes, positions: Ranges },
+    /// Held messages asked of one holder, sealed so that a member in `epoch` can open them.
+    Want { group: Bytes, epoch: u64, wants: Vec<Seqs> },
+    /// A live payload, sealed under its epoch's live key, passed on while `hops` lasts.
+    Live { group: Bytes, hops: u8, item: Bytes },
     /// BLAKE3 hashes of files.
     WantFiles { group: Bytes, files: Vec<Bytes> },
     Have { group: Bytes, files: Vec<Bytes> },
@@ -31,29 +38,62 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         link: Option<String>,
     },
-    /// Live payloads' MLS ciphertexts.
-    Live { group: Bytes, items: Vec<Bytes> },
 }
 
-/// A member's state of a group. Ranges count positions with no message (commits, skipped entries) as covered.
+/// Where a member is in a group: its epoch, and that epoch's log, by its reference, with its newest signed head held.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct At {
+    pub group: Bytes,
+    pub epoch: u64,
+    #[serde(with = "fixed32")]
+    pub log: [u8; 32],
+    pub head: Option<Head>,
+}
+
+/// A membership's seqs, carried as `[key, joined, seqs]`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "(Bytes, u64, Ranges)", into = "(Bytes, u64, Ranges)")]
+pub struct Seqs {
+    pub key: Bytes,
+    pub joined: u64,
+    pub seqs: Ranges,
+}
+
+impl From<(Bytes, u64, Ranges)> for Seqs {
+    fn from((key, joined, seqs): (Bytes, u64, Ranges)) -> Self {
+        Seqs { key, joined, seqs }
+    }
+}
+
+impl From<Seqs> for (Bytes, u64, Ranges) {
+    fn from(s: Seqs) -> Self {
+        (s.key, s.joined, s.seqs)
+    }
+}
+
+/// A member's state of a group, as it signs it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
     pub group: Bytes,
-    /// The group's current log, by its reference: each commit moves a group to the log of its new epoch.
-    #[serde(with = "fixed32")]
-    pub log: [u8; 32],
-    /// That log's newest signed head the sender holds; none while it holds none of it.
-    pub head: Option<Head>,
-    /// Within H: the positions it holds, has read (chat), and is fetching.
-    pub held: Ranges,
-    pub read: Ranges,
-    pub fetching: Ranges,
+    /// Its membership: its leaf signature key, and the epoch it joined in.
+    pub member: Bytes,
+    pub joined: u64,
+    /// Grows with each summary the membership signs.
+    pub version: u64,
+    /// When it signed it, by its clock, in milliseconds.
+    pub time: u64,
+    pub epoch: u64,
+    /// Per membership, the seqs it holds, its client has shown, and it lost.
+    pub held: Vec<Seqs>,
+    pub shown: Vec<Seqs>,
+    pub lost: Vec<Seqs>,
 }
 
+/// A signed summary: `body` a `Summary`'s JSON, `sig` its member's signature over `SUMMARY ‖ body`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Item {
-    pub position: u64,
-    pub ciphertext: Bytes,
+pub struct Signed {
+    pub body: Bytes,
+    pub sig: Bytes,
 }
 
 /// A joiner's request, the one frame it writes on an `admission` stream: an invite's secret, and its KeyPackage. The
@@ -66,10 +106,8 @@ pub struct Join {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Admitted {
-    /// The Welcome of the commit entry that added the joiner.
-    pub welcome: Bytes,
-    /// The Add's position in the group: the joiner reads on from there, in the log of the epoch the Welcome brings.
-    pub position: u64,
+    /// The commit entry that added the joiner, its Welcome inside: its cut is where the joiner starts.
+    pub commit: Bytes,
     /// A file link to the state of the group's kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
@@ -81,12 +119,13 @@ mod tests {
 
     #[test]
     fn shapes() {
-        let want = Frame::Want { group: Bytes(vec![1]), positions: Ranges::from(vec![(1, 10), (13, 50)]) };
-        assert_eq!(serde_json::to_string(&want).unwrap(), r#"{"want":{"group":"AQ","positions":[[1,10],[13,50]]}}"#);
-        let push = Frame::Messages { group: Bytes(vec![1]), items: vec![Item { position: 3, ciphertext: Bytes(vec![2]) }], answers: None };
-        let text = serde_json::to_string(&push).unwrap();
-        assert_eq!(text, r#"{"messages":{"group":"AQ","items":[{"position":3,"ciphertext":"Ag"}]}}"#);
-        assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), push);
+        let wants = vec![Seqs { key: Bytes(vec![2]), joined: 3, seqs: Ranges::from(vec![(1, 10), (13, 50)]) }];
+        let want = Frame::Want { group: Bytes(vec![1]), epoch: 4, wants };
+        let text = serde_json::to_string(&want).unwrap();
+        assert_eq!(text, r#"{"want":{"group":"AQ","epoch":4,"wants":[["Ag",3,[[1,10],[13,50]]]]}}"#);
+        assert_eq!(serde_json::from_str::<Frame>(&text).unwrap(), want);
+        let push = Frame::Held { group: Bytes(vec![1]), items: vec![Bytes(vec![2])], answers: None };
+        assert_eq!(serde_json::to_string(&push).unwrap(), r#"{"held":{"group":"AQ","items":["Ag"]}}"#);
         let files: Frame = serde_json::from_str(r#"{"want_files":{"group":"AQ","files":[]}}"#).unwrap();
         assert!(matches!(files, Frame::WantFiles { .. }));
         assert!(serde_json::from_str::<Frame>(r#"{"doc":{"group":"AQ"}}"#).is_err(), "a kind has no frames");

@@ -4,9 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::Bytes;
-use crate::ranges::Ranges;
 
-pub const PROTOCOL: u32 = 5;
+pub const PROTOCOL: u32 = 6;
 /// This release's protocol revision, which grows with each compatible addition; a leaf without one is revision 0.
 pub const REVISION: u32 = 0;
 /// The private-use extension types: settings in the group context, and leaf data.
@@ -117,12 +116,10 @@ pub enum Control {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to: Option<Bytes>,
     },
-    /// Counted positions of the group's log the sender can no longer open.
-    Lost { positions: Vec<u64> },
 }
 
 impl Control {
-    pub const TYPES: [&str; 3] = ["leave", "invite", "lost"];
+    pub const TYPES: [&str; 2] = ["leave", "invite"];
 }
 
 /// A payload's `type`.
@@ -135,13 +132,9 @@ pub fn type_of(payload: &serde_json::Value) -> &str {
 #[serde(tag = "type", rename = "message")]
 pub struct ChatMessage {
     pub content: String,
-    /// The positions of the group's log the sender had read when it sent this.
-    pub read: Ranges,
     /// Fingerprints; empty addresses the group.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub to: Vec<Bytes>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<Bytes>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub urgent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,16 +171,8 @@ mod tests {
     fn payload_shapes() {
         let leave = serde_json::to_string(&Control::Leave).unwrap();
         assert_eq!(leave, r#"{"type":"leave"}"#);
-        let message = ChatMessage {
-            content: "hi".into(),
-            read: Ranges::range(1, 3),
-            to: vec![],
-            reply_to: None,
-            urgent: false,
-            attachment: None,
-            sent_at: Some(5),
-        };
-        assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","read":[[1,3]],"sent_at":5}"#);
+        let message = ChatMessage { content: "hi".into(), to: vec![], urgent: false, attachment: None, sent_at: Some(5) };
+        assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","sent_at":5}"#);
         let service = Service::Serve { key: Bytes(vec![1]), relay: "https://r".into(), addrs: vec![], rest: Default::default() };
         assert_eq!(serde_json::to_string(&service).unwrap(), r#"{"serve":{"key":"AQ","relay":"https://r","addrs":[]}}"#);
     }
