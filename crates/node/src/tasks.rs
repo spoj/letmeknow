@@ -15,13 +15,15 @@ use lmk_proto::group::{Leaf, REVISION};
 use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
 use n0_future::task::spawn;
-use n0_future::time::sleep;
+use n0_future::time::{Duration, sleep};
 use tokio::sync::mpsc;
 
 use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, device_key_key, duties, endpoint_id, get, hex, iroh_key, logs, now, rec_key};
 
 /// How long a fetch keeps looking for a member that holds the file.
 const FETCH_TRIES: u32 = 12;
+/// How often identities whose public logs could not be read are read again, as their directories may answer by then.
+const READ_RETRY: Duration = Duration::from_secs(30);
 
 impl<P: Provider + Send + 'static> Node<P> {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
@@ -158,6 +160,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         drop(st);
         self.spawn(self.clone().resume());
+        self.spawn(self.clone().reread_identities());
         self.spawn(self.clone().polling());
     }
 
@@ -226,9 +229,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
             for g in st.groups.values() {
                 let members = g.mls.members();
                 let Some(member) = members.iter().find(|m| m.leaf.as_ref().and_then(|leaf| endpoint_id(&leaf.key.0)) == Some(peer)) else { continue };
-                groups.push(g.mls.settings().membership);
+                let service = g.mls.settings().membership;
+                if !groups.contains(&service) {
+                    groups.push(service);
+                }
                 if let Some(identity) = member.credential.as_ref().and_then(|credential| credential.identity())
                     && let Some(log) = st.public.get(&identity.id.0)
+                    && !identities.contains(&log.membership)
                 {
                     identities.push(log.membership.clone());
                 }
@@ -247,6 +254,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
         }
         relays
+    }
+
+    async fn reread_identities(self: Arc<Self>) {
+        loop {
+            sleep(READ_RETRY).await;
+            self.refresh_all().await;
+        }
     }
 
     /// Fetches, in the background, the files linked anew that are within this session's limit.
@@ -326,7 +340,7 @@ mod tests {
             let fail = Arc::new(AtomicBool::new(false));
             let failing = fail.clone();
             let config = Config {
-                handle: "Alice".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
+                handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], resolve: lmk_testing::resolve(), ca: relay.ca(),
                 home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
                 durable: Some(Arc::new(move || {
                     let fail = failing.load(Ordering::SeqCst);
@@ -399,7 +413,7 @@ mod tests {
             release: Arc::new(tokio::sync::Notify::new()),
         });
         let config = Config {
-            handle: "Writer".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
+            handle: "Writer".into(), device: None, relays: vec![relay.url.clone()], resolve: lmk_testing::resolve(), ca: relay.ca(),
             home: None, files: None, disk: Some(disk.clone()), file_limit: 0, kinds: vec![], durable: None,
         };
         let (writer, _) = Node::start(MemoryProvider::default(), config).await.unwrap();
@@ -410,7 +424,7 @@ mod tests {
             let fail = Arc::new(AtomicBool::new(false));
             let failing = fail.clone();
             let config = Config {
-                handle: "Reader".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
+                handle: "Reader".into(), device: None, relays: vec![relay.url.clone()], resolve: lmk_testing::resolve(), ca: relay.ca(),
                 home: None, files: None, disk: Some(disk.clone()), file_limit: 0, kinds: vec!["test".into()],
                 durable: Some(Arc::new(move || {
                     let fail = failing.load(Ordering::SeqCst);
@@ -470,7 +484,7 @@ mod tests {
     async fn failed_durability_closes_peer_outbox_and_withholds_client_effects() {
         let relay = lmk_testing::relay().await;
         let config = Config {
-            handle: "Alice".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
+            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], resolve: lmk_testing::resolve(), ca: relay.ca(),
             home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
             durable: Some(Arc::new(|| Box::pin(async { anyhow::bail!("injected persistence failure") }))),
         };
@@ -494,7 +508,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let saved = release.clone();
         let config = Config {
-            handle: "Alice".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
+            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], resolve: lmk_testing::resolve(), ca: relay.ca(),
             home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
             durable: Some(Arc::new(move || {
                 saving.notify_one();
