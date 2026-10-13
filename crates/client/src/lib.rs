@@ -62,9 +62,9 @@ pub fn letmeknow_dev() -> Service {
     Service::Serve { key: Bytes(key), domain: lmk_proto::links::DOMAIN.into(), rest: Default::default() }
 }
 
-/// A membership service from its address: `letmeknow.dev`, for now. Services named by domain come with the directories.
+/// A membership service from its address: its domain, which only letmeknow.dev's is for now.
 pub fn service(address: &str) -> Result<Service> {
-    ensure!(address == "letmeknow.dev", "a membership service is letmeknow.dev");
+    ensure!(address == lmk_proto::links::DOMAIN, "a membership service is named by its domain, such as {}: --membership <domain>, not {address}", lmk_proto::links::DOMAIN);
     Ok(letmeknow_dev())
 }
 
