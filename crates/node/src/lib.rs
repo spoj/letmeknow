@@ -1,7 +1,8 @@
-//! One member's session over lmk-core, lmk-net and lmk-membership: its groups and their logs, its held messages and
-//! files, the invites it shares and the joiners it admits, and its members' identities: their public logs, against which
-//! their credentials' certificates are checked. A group's kind sees its content through the channels here (held
-//! messages in log order, live ones, files, and a state link for joiners), and nothing of the rest; the core reads only
+//! One member's session over lmk-core, lmk-net and lmk-membership: its groups and their logs of commits, its held
+//! messages and files, the invites it shares and the joiners it admits, and its members' identities: their public logs,
+//! against which their credentials' certificates are checked. Held messages travel between members and are delivered
+//! in causal order; commits keep them, by their cuts. A group's kind sees its content through the channels here (held
+//! messages as delivered, live ones, files, and a state link for joiners), and nothing of the rest; the core reads only
 //! its own payloads (`Control`). The identity kind (`devices`) is built on those channels. It stores everything through
 //! the core's `Provider`, so the same code runs natively (SQLite) and in the browser (memory the web client persists),
 //! one transaction per step (`Step`): nothing a step produces leaves the node before its transaction commits.
@@ -11,6 +12,7 @@ mod api;
 pub mod identity;
 mod duties;
 mod groups;
+mod held;
 mod kind;
 mod logs;
 mod peering;
@@ -18,7 +20,7 @@ mod reading;
 mod sending;
 mod tasks;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
@@ -31,12 +33,11 @@ use lmk_core::device::{Device, signer};
 use lmk_core::group::{self as core, Group, Session};
 use lmk_core::public::{PublicLog, Verdict};
 use lmk_core::provider::Provider;
-use lmk_net::peers::{self, Peers};
+use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::group::{Certificate, Credential, How, IdentityRef, Settings};
 use lmk_proto::links::FileLink;
-use lmk_proto::peer::Frame;
-use lmk_proto::ranges::Ranges;
+use lmk_proto::peer::{Frame, Seqs, Signed};
 use lmk_proto::Bytes;
 use n0_future::boxed::BoxFuture;
 use n0_future::task::{JoinHandle, spawn};
@@ -47,6 +48,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
+use held::Author;
+
 pub use lmk_core;
 pub use lmk_net::Disk;
 pub use peering::Heard;
@@ -56,11 +59,7 @@ pub use lmk_proto::clock::now;
 pub const INVITE_VALID: u64 = 10 * 60 * 1000;
 /// How often files no group holds any longer are deleted.
 pub const COLLECT: Duration = Duration::from_secs(60 * 60);
-/// Why a send's outcome never came.
-const UNFINISHED: &str = "the send ended unfinished, as this session stopped or left the group";
 const PERSISTENCE_FAILED: &str = "local persistence failed";
-/// How long `send` waits for its entry to count before it answers that the send is pending.
-const SEND_WAIT: Duration = Duration::from_secs(5);
 /// How long some waits for other members last: for those online to hold a file or an invite, for added members'
 /// certificates.
 const MEMBER_WAIT: Duration = Duration::from_secs(5);
@@ -68,9 +67,6 @@ const MEMBER_WAIT: Duration = Duration::from_secs(5);
 const REREAD: Duration = Duration::from_secs(5 * 60);
 /// How long a member admitting a joiner waits for the state of the group's kind.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
-/// How long a session whose kind is behind waits before it asks the members online for the kind's state again, in
-/// milliseconds.
-const STATE_ASK: u64 = 60 * 1000;
 
 pub struct Config {
     /// The name its credential gives it in groups but identity groups, fixed when it is created: a session process's
@@ -134,65 +130,49 @@ pub struct Observation {
     pub other_ids: Vec<Bytes>,
 }
 
-/// A held message of the group, opened: a payload of its kind, or one of the core's.
+/// A held message of the group as this session delivered it: a payload of its kind, or one of the core's.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     pub id: Bytes,
     pub group: Bytes,
-    pub epoch: u64,
-    /// Its entry's position in the group's log.
-    pub position: u64,
-    /// When it reached this session, in milliseconds since the Unix epoch.
+    /// Its place in this session's delivery order of the group.
+    pub index: u64,
+    /// When it was delivered here, in milliseconds since the Unix epoch.
     pub at: u64,
     pub sender: Member,
+    /// Its author's membership began in epoch `joined`; it is that membership's `seq`th held message.
+    pub joined: u64,
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<Bytes>,
     pub payload: Value,
-    /// The counted positions before it that were passed over unopened, as it is handed on in position order.
+    /// The seqs its requirements reached that this session gave up on, each named once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub missing: Vec<u64>,
+    pub missing: Vec<Seqs>,
+    /// Messages that needed it were delivered without it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub late: bool,
+    /// Its `reply_to` is not in its causal past, as far as this session knows that past whole.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reply_outside: bool,
 }
 
-/// Counted positions a member can no longer open: as it announced them, or this session's own as it learns them.
+/// Held messages a member can no longer have, as this session found its own or a member's summary told them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lost {
     pub group: Bytes,
-    /// Where it is told in log order: the announcement's position, or this session's own lost position.
-    pub position: u64,
     pub member: Member,
-    pub positions: Vec<u64>,
-    /// The ids of the lost messages, those this session knows.
-    pub ids: Vec<Bytes>,
+    pub messages: Vec<LostOf>,
 }
 
-/// What the kind takes in log order: its held messages, and the losses.
+/// Seqs of one author's membership lost, with the ids this session knows: only of its own messages, told by others.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum Item {
-    Entry(Entry),
-    Lost(Lost),
-}
-
-impl Item {
-    pub fn position(&self) -> u64 {
-        match self {
-            Item::Entry(entry) => entry.position,
-            Item::Lost(lost) => lost.position,
-        }
-    }
-}
-
-/// A held message of the kind, at its position in the group's log.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Entry {
-    pub position: u64,
-    pub id: Bytes,
+pub struct LostOf {
     pub from: Member,
-    pub payload: Value,
-}
-
-/// A held send: its message's id, and its entry's position once that counts; none while the send is pending.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Sent {
-    pub id: Bytes,
-    pub position: Option<u64>,
+    pub joined: u64,
+    pub seqs: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<Bytes>,
 }
 
 /// The directory moved on from the one a writer intent was derived from.
@@ -200,18 +180,13 @@ pub struct Sent {
 #[error("the directory advanced; derive the writer intent again")]
 pub struct Advanced;
 
-/// Why a held send failed: the membership service certainly did not take it.
+/// Why `send` refused a held message: nothing of it was kept.
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
-    /// Nothing reached the service.
-    #[error("unavailable: the group's membership service could not be reached")]
-    Unavailable,
-    #[error("rate: the group's membership service refused more appends for now")]
+    #[error("rate: more held messages than members take for now; wait a little")]
     Rate,
     #[error("size: {0}")]
     Size(String),
-    #[error("the group's membership service refused: {0}")]
-    Refused(String),
 }
 
 #[derive(Debug)]
@@ -236,21 +211,21 @@ pub enum Event {
     },
     /// This session was removed, by `by` as it applied the commit, or else with no `by`: by a commit applied before it
     /// stopped, left the only member of a group it asked to leave, or away past its log's retention. The group, of kind
-    /// `kind`, is gone from it.
+    /// `kind`, is gone from it, with its messages no cut kept: `not_kept`, by id.
     Removed {
         group: Bytes,
         kind: String,
         by: Option<Member>,
+        not_kept: Vec<Bytes>,
     },
     Settings {
         group: Bytes,
         settings: Settings,
         by: Member,
     },
-    /// A held payload of the group's kind, opened, in position order; never one of this session's own. One opened after
-    /// later ones were handed on comes when it opens.
+    /// A held payload of the group's kind, delivered, in causal order; never one of this session's own.
     Message(Message),
-    /// Losses that concern this session's user: its own, as it announced them, and other members' of its messages.
+    /// Losses: this session's own, and those members' summaries tell, each seq once.
     Lost(Lost),
     /// A live payload of the group's kind: not held.
     Live {
@@ -258,8 +233,8 @@ pub enum Event {
         sender: Member,
         payload: Value,
     },
-    /// A connected member's `hello` shows the same head of the group's log as this session's: a time to compare the
-    /// kind's state.
+    /// A neighbour's `hello` shows the same head of the group's log as this session's: a time to compare the kind's
+    /// state.
     Synced {
         group: Bytes,
         member: Member,
@@ -274,22 +249,10 @@ pub enum Event {
         from: Member,
         data: Vec<u8>,
     },
-    /// Held messages were kept for the kind, in log order (see `Node::entries`).
-    Logged {
-        group: Bytes,
-    },
     /// A member is being admitted, or asks for it: the state of the group's kind to hand it, if any.
     Snapshot {
         group: Bytes,
         reply: oneshot::Sender<Option<Vec<u8>>>,
-    },
-    /// A send that `send` answered as pending, as `answered`, counts now: `id`, its final id, differs from `answered` when
-    /// a commit came first and it was sealed again.
-    Sent {
-        group: Bytes,
-        id: Bytes,
-        answered: Bytes,
-        position: u64,
     },
     /// A file is held whole.
     File([u8; 32]),
@@ -319,9 +282,7 @@ impl Event {
             | Event::Heard { group }
             | Event::Duties { group }
             | Event::State { group, .. }
-            | Event::Logged { group }
-            | Event::Snapshot { group, .. }
-            | Event::Sent { group, .. } => Some(group),
+            | Event::Snapshot { group, .. } => Some(group),
             Event::Message(message) => Some(&message.group),
             Event::Lost(lost) => Some(&lost.group),
             Event::Warning { group, .. } => group.as_ref(),
@@ -333,20 +294,14 @@ impl Event {
 /// A group's own record, beside its MLS state and its log.
 #[derive(Default, Serialize, Deserialize)]
 struct Rec {
-    /// The last position of its logs read and judged.
+    /// The last position of its logs read and judged, counted from where this session started.
     position: u64,
     /// Its current log, by reference: its epoch's, which every commit moves on from; and the position the log starts
-    /// after, the commit's that moved the group to the epoch, or its start.
+    /// after.
     log: Bytes,
     base: u64,
-    /// The position this session started after: the Add that brought it in, or 0 for the group's creator.
-    start: u64,
-    /// Positions up to here were read longer than H ago, and what this session kept of them is gone.
-    expired: u64,
-    /// Counted positions not opened yet, nor lost: their epoch, and when their entry was read.
-    unopened: BTreeMap<u64, (u64, u64)>,
-    /// This session's held sends whose entries have not counted yet, oldest first.
-    sends: Vec<Bytes>,
+    /// The epoch this session's own last commit moved the group to.
+    committed: u64,
     /// The files this session added that no other member held yet.
     pending: Vec<[u8; 32]>,
     /// File links, with when they were linked: those the kind holds (its files added, and those its held messages
@@ -354,33 +309,36 @@ struct Rec {
     files: Vec<(String, u64)>,
     /// The files the kind links now, held while it does.
     links: Vec<String>,
-    /// What the kind took of the group's held messages, once it follows them.
-    kind: Option<kind::Kind>,
     /// The invites shared with the group, kept for H after they expire.
     invites: Vec<Rule>,
-    /// The current members added since this session's start: each one's key, and its start, the position of its Add.
-    starts: Vec<(Bytes, u64)>,
-    /// Counted `leave`s: each sender's key, and the epoch it was sealed in; kept until moot.
-    leaves: Vec<(Bytes, u64)>,
-    /// This session asked to leave: it asks the others to remove it until one does.
+    /// The `leave`s opened: each one's membership, and its seq.
+    leaves: Vec<(Bytes, u64, u64)>,
+    /// This session asked to leave: it is in the group until a member removes it.
     leaving: bool,
     /// When this session's leaf was last updated, in milliseconds.
     updated: u64,
     /// Local UTC day of this device's last directory publication, for retention only.
     publication_day: u64,
-    /// Counted `lost`s, by position: the sender's key, and the positions it lost.
-    losses: BTreeMap<u64, (Bytes, Vec<u64>)>,
-    /// The last position handed on as events in position order, and the counted ones passed over unopened since the
-    /// last message handed on.
-    shown: u64,
-    missing: Vec<u64>,
-    /// Of the positions kept (after `expired`): the counted ones; those of this session's sends; those lacking their
-    /// ciphertext, which this session can still open; this session's known losses; and those its client marked read.
-    messages: Ranges,
-    own: Ranges,
-    lacking: Ranges,
-    lost: Ranges,
-    read: Ranges,
+    /// The memberships this session knows of in the group: the current ones, and those ended within H.
+    authors: Vec<Author>,
+    /// The last delivery index given, and the first one whose message is still kept.
+    index: u64,
+    first: u64,
+    /// What the last commit applied kept above this session's baselines, held before the next one applies.
+    keep: Vec<Seqs>,
+    /// This session's summary: its last version, and when it was signed.
+    version: u64,
+    signed: u64,
+    /// The memberships whose summaries are saved.
+    heard: Vec<(Bytes, u64)>,
+    /// The seqs members' summaries told lost, each told once: the reporter's membership, and the author's seqs.
+    told: Vec<(Bytes, u64, Seqs)>,
+    /// The epochs whose ending commits are saved, with when they applied.
+    commits: Vec<(u64, u64)>,
+    /// The epoch this session's messages past its cut were last sealed again in.
+    resealed: u64,
+    /// Since when this session has held a message no cut keeps.
+    unkept: Option<u64>,
 }
 
 /// An invite, as its inviter shared it with the group.
@@ -415,28 +373,52 @@ fn days(days: u32) -> u64 {
 pub(crate) struct G {
     mls: Group,
     rec: Rec,
-    /// Ciphertexts that came before their entries were read, of the current epoch or the next, and the peers that sent
-    /// them.
+    /// Ciphertexts of the next epoch, and the peers that sent them.
     early: Vec<(EndpointId, Vec<u8>)>,
-    /// When this session last asked a member for the kind's state, or was handed one, in milliseconds.
-    asked: u64,
-    /// Reading waits before a commit that deletes the keys of an epoch whose messages this session lacks.
+    /// Ciphertexts taken but not opened yet, past the window or the bucket: by claim, with their epoch.
+    unopened: BTreeMap<(Bytes, u64, u64), (u64, Vec<u8>)>,
+    /// The flood buckets of the group's memberships, and this session's own.
+    buckets: BTreeMap<(Bytes, u64), held::Bucket>,
+    sending: held::Bucket,
+    /// The hashes of ciphertexts taken lately.
+    seen: VecDeque<[u8; 32]>,
+    /// Seqs that came to be known lately, and when: not asked for until `HOLD_OFF` passed.
+    fresh: Vec<(Bytes, u64, lmk_proto::ranges::Ranges, u64)>,
+    /// The position of the commit reading waits at, and when it was read.
+    reading: Option<(u64, u64)>,
+    /// Reading waits before a commit that deletes the keys of an epoch whose kept messages this session lacks.
     waiting: bool,
-    /// Each peer's latest summary of the group, by its iroh key, as saved.
-    heard: BTreeMap<Bytes, peers::Heard>,
     /// The public logs this session follows of the identities the group's members speak as.
     public: Vec<Vec<u8>>,
+    /// Summaries of memberships this session does not know yet, as a joiner's before its Add applies here.
+    unverified: Vec<(EndpointId, Signed)>,
+    /// This session's summary changed since it was signed.
+    changed: bool,
 }
 
 impl G {
-    fn new(mls: Group, rec: Rec, heard: BTreeMap<Bytes, peers::Heard>) -> Self {
-        G { mls, rec, early: Vec::new(), asked: 0, waiting: false, heard, public: Vec::new() }
+    fn new(mls: Group, rec: Rec) -> Self {
+        G {
+            mls,
+            rec,
+            early: Vec::new(),
+            unopened: BTreeMap::new(),
+            buckets: BTreeMap::new(),
+            sending: held::Bucket::default(),
+            seen: VecDeque::new(),
+            fresh: Vec::new(),
+            reading: None,
+            waiting: false,
+            public: Vec::new(),
+            unverified: Vec::new(),
+            changed: true,
+        }
     }
 
-    /// Whether the member with key `key` asked to leave: a `leave` of its counts, sealed since its Add.
-    fn left(&self, key: &[u8]) -> bool {
-        let added = self.mls.added().iter().rev().find(|added| added.member.key.0 == key).map_or(0, |added| added.epoch);
-        self.rec.leaves.iter().any(|(by, epoch)| by.0 == key && *epoch >= added)
+    /// The seq of the `leave` of the current membership of the member with key `key`, if it asked to leave.
+    fn left(&self, key: &[u8]) -> Option<u64> {
+        let joined = self.mls.joined(key)?;
+        self.rec.leaves.iter().find(|(by, at, _)| by.0 == key && *at == joined).map(|(_, _, seq)| *seq)
     }
 }
 
@@ -463,8 +445,6 @@ pub(crate) struct State<P> {
     unlisted: HashSet<(Vec<u8>, Vec<u8>)>,
     /// In each identity group, this node's own key there, the device's key on that identity: its seed, and the member.
     device_keys: BTreeMap<Vec<u8>, ([u8; 32], Session)>,
-    /// `send`s waiting for their entries to count, by the id they started with.
-    waiters: HashMap<Vec<u8>, Vec<oneshot::Sender<sending::Outcome>>>,
     peers: Peers,
     /// The peers connected now, and the groups the gate admits each to.
     served: BTreeMap<EndpointId, BTreeSet<Bytes>>,
@@ -479,8 +459,8 @@ pub(crate) enum Out {
     Frame { peer: EndpointId, frame: Frame },
     /// Ask the peer for the files the group links that this session lacks.
     WantFiles { peer: EndpointId, group: Vec<u8> },
-    /// A send's outcome, for those waiting on it.
-    Outcome { waiters: Vec<oneshot::Sender<sending::Outcome>>, outcome: sending::Outcome },
+    Dial(EndpointId),
+    Close(EndpointId),
 }
 
 /// One step: the state, locked, with a transaction open on its storage; committed when the step ends, and only then
@@ -534,6 +514,7 @@ pub(crate) enum Work {
         removed: Vec<core::Member>,
         settings: bool,
         gone: bool,
+        not_kept: Vec<Bytes>,
     },
     /// A group's new log to follow at its service, instead of its old one.
     Follow { log: Vec<u8>, old: Vec<u8> },
@@ -545,8 +526,6 @@ pub(crate) enum Work {
         group: Vec<u8>,
         link: FileLink,
     },
-    /// Held sends of a group to append.
-    Send(Vec<u8>),
 }
 
 /// A log, and the lengths and hashes of two heads of it that contradict each other.
@@ -568,12 +547,10 @@ pub(crate) struct Inner<P> {
     durable: Option<Durable>,
     persistence_error: Mutex<Option<String>>,
     committing: tokio::sync::Mutex<()>,
-    /// Woken whenever a group's log is read further, for sends waiting to reach its head.
+    /// Woken whenever a group's log is read further, for commits waiting to reach its head.
     advanced: tokio::sync::Notify,
     /// Woken whenever a peer's summary is heard.
     heard: tokio::sync::Notify,
-    /// The groups whose held sends are being appended.
-    sending: Mutex<HashSet<Vec<u8>>>,
     /// The groups whose duties run, each with whether another pass is due once it ends.
     passing: Mutex<HashMap<Vec<u8>, bool>>,
     /// The groups with a timer for their next update.
@@ -606,9 +583,6 @@ fn rec_key(gid: &[u8]) -> Vec<u8> {
     [b"node/group/".as_slice(), gid].concat()
 }
 
-fn message_key(id: &[u8]) -> Vec<u8> {
-    [b"node/message/".as_slice(), id].concat()
-}
 
 fn device_key_key(gid: &[u8]) -> Vec<u8> {
     [b"node/device-key/".as_slice(), gid].concat()
@@ -807,24 +781,21 @@ impl<P: Provider> State<P> {
         credential.key.0 == member.key && log.is_some_and(|log| log.verify(credential) == Verdict::Authorized)
     }
 
-    /// The connected peers in a leaf of the group the gate cannot check yet: their identities' public logs are unread.
-    fn undecided(&self, gid: &[u8]) -> BTreeSet<[u8; 32]> {
-        let unread = |member: core::Member| member.credential?.identity().is_some_and(|identity| !self.public.contains_key(&identity.id.0)).then_some(());
-        self.served.keys().filter(|peer| self.in_leaf(gid, peer).and_then(unread).is_some()).map(|peer| *peer.as_bytes()).collect()
-    }
-
     /// The identities a group's members speak as.
     fn identities(&self, gid: &[u8]) -> Vec<IdentityRef> {
         let Some(g) = self.groups.get(gid) else { return Vec::new() };
         g.mls.members().into_iter().filter_map(|m| Some(m.credential?.certificate?.identity)).collect()
     }
 
-    /// A new group's records, its MLS state, and the log of its epoch, read after `rec.position`.
+    /// A new group's records, its MLS state, and the log of its epoch. Its memberships start at their cuts: this
+    /// session holds nothing of what came before.
     fn add_group(&mut self, mls: Group, mut rec: Rec) -> Result<Vec<u8>> {
         let gid = mls.id().to_vec();
         let base = rec.position;
-        (rec.updated, rec.shown) = (now(), base);
-        self.groups.insert(gid.clone(), G::new(mls, rec, BTreeMap::new()));
+        rec.updated = now();
+        rec.resealed = mls.epoch();
+        rec.authors = mls.cut().iter().map(|r| Author::new(r.key.clone(), r.joined, r.seq)).collect();
+        self.groups.insert(gid.clone(), G::new(mls, rec));
         self.next_log(&gid, base)?;
         self.save_groups()?;
         self.observe_identities()?;
@@ -891,7 +862,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let mut failed = self.persistence_error.lock().unwrap();
         if let Err(error) = saved {
             failed.get_or_insert_with(|| format!("{PERSISTENCE_FAILED}: {error:#}; output stopped until restart"));
-            self.state.lock().unwrap().waiters.clear();
         }
         match &*failed {
             Some(error) => Err(anyhow::anyhow!(error.clone())),

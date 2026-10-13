@@ -1,151 +1,28 @@
-//! Reading a group's logs strictly in order, each epoch's from the commit that moved the group to it, its entries after
-//! that epoch's first commit passed over: each position's epoch and verdict is recorded in the step that applies it.
-//! A message entry counts once per id per epoch; its ciphertext, which may come before or after it, is carried for H
-//! and opened in position order within its epoch. Before a commit that deletes an epoch's keys while this session lacks
-//! some of its messages, it waits as `Peers::wait` decides, fetching them from the members that hold them.
-
-use std::collections::HashSet;
+//! Reading a group's logs of commits strictly in order, each epoch's from the commit that moved the group to it, its
+//! entries after that epoch's first valid commit passed over. A commit deletes the keys of the epoch before the current
+//! one, whose messages the last commit kept: before it applies, this session waits for those it lacks as
+//! `Peers::wait` decides, and what it still lacks then is lost to it. Applying a commit moves the cuts: what they kept,
+//! and the memberships that ended and began.
 
 use anyhow::{Context, Result};
-use iroh::EndpointId;
 use lmk_core::group::{self as core, Verdict};
 use lmk_core::provider::Provider;
-use lmk_net::peers::{Decision, HOLD_OFF};
+use lmk_net::peers::Decision;
 use lmk_proto::Bytes;
 use lmk_proto::entry::Entry;
-use lmk_proto::group::{Control, type_of};
+use lmk_proto::peer::Seqs;
 use lmk_proto::ranges::Ranges;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use crate::{Event, Inner, Message, State, Work, days, get, message_key, now, put};
+use crate::held::Author;
+use crate::{Event, Inner, Lost, LostOf, State, Work};
 
-/// The bytes of ciphertexts a group keeps from one peer that came before their entries were read.
-const EARLY: usize = 4 << 20;
-
-/// A position of a group's log, as this session judged it.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Pos {
-    /// The epoch current when it was read.
-    pub epoch: u64,
-    /// When it was read, in milliseconds.
-    pub at: u64,
-    pub judged: Judged,
-    /// A counted position this session can no longer open.
-    pub lost: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Judged {
-    /// A commit applied, this session's own or not.
-    Commit { own: bool },
-    Skipped,
-    /// A message entry that counts: its message's id.
-    Counted { id: Bytes },
-}
-
-pub(crate) fn pos_key(gid: &[u8], position: u64) -> Vec<u8> {
-    [b"node/pos/".as_slice(), gid, b"/", &position.to_be_bytes()].concat()
-}
-
-/// The position at which an id first counted.
-fn id_key(gid: &[u8], id: &[u8]) -> Vec<u8> {
-    [b"node/id/".as_slice(), gid, b"/", id].concat()
-}
-
-/// The Welcome of the commit at a position, for a joiner it added whose answer was lost.
-pub(crate) fn welcome_key(gid: &[u8], position: u64) -> Vec<u8> {
-    [b"node/welcome/".as_slice(), gid, b"/", &position.to_be_bytes()].concat()
-}
-
-pub(crate) fn ciphertext_key(gid: &[u8], position: u64) -> Vec<u8> {
-    [b"node/ciphertext/".as_slice(), gid, b"/", &position.to_be_bytes()].concat()
-}
-
-impl<P: Provider> State<P> {
-    pub(crate) fn pos(&self, gid: &[u8], position: u64) -> Result<Option<Pos>> {
-        get(&self.provider, &pos_key(gid, position))
-    }
-
-    /// The position at which a message's id first counted, while it is held.
-    pub(crate) fn position_of(&self, gid: &[u8], id: &[u8]) -> Result<Option<u64>> {
-        get(&self.provider, &id_key(gid, id))
-    }
-
-    pub(crate) fn held(&self, gid: &[u8], position: u64) -> Result<bool> {
-        Ok(self.provider.get(&ciphertext_key(gid, position))?.is_some())
-    }
-
-    /// The group's held messages this session opened and holds, in log order.
-    pub(crate) fn messages(&self, gid: &[u8]) -> Result<Vec<Message>> {
-        let rec = &self.group(gid)?.rec;
-        let mut messages = Vec::new();
-        for position in rec.expired + 1..=rec.position {
-            if let Some(Pos { judged: Judged::Counted { id }, .. }) = self.pos(gid, position)?
-                && let Some(message) = get::<Message>(&self.provider, &message_key(&id.0))?.filter(|m| m.position == position)
-            {
-                messages.push(message);
-            }
-        }
-        Ok(messages)
-    }
-
-    /// Drops what this session kept of the positions read longer than H ago, and the invites and file links as old.
-    pub(crate) fn expire(&mut self, gid: &[u8]) -> Result<()> {
-        let g = self.group_mut(gid)?;
-        let before = now().saturating_sub(days(g.mls.settings().carry));
-        g.rec.files.retain(|(_, at)| *at >= before);
-        g.rec.invites.retain(|rule| rule.expires >= before);
-        let (mut position, last) = (g.rec.expired, g.rec.position);
-        while position < last && self.pos(gid, position + 1)?.is_none_or(|pos| pos.at < before) {
-            position += 1;
-        }
-        self.drop_earlier(gid, before)?;
-        self.expire_to(gid, position)
-    }
-
-    /// Drops what this session kept of positions up to `to`.
-    pub(crate) fn expire_to(&mut self, gid: &[u8], to: u64) -> Result<()> {
-        let rec = &self.group(gid)?.rec;
-        let (from, to) = (rec.expired + 1, to.min(rec.position));
-        for position in from..=to {
-            if let Some(Pos { judged: Judged::Counted { id }, .. }) = self.pos(gid, position)? {
-                if self.position_of(gid, &id.0)? == Some(position) {
-                    self.provider.delete(&id_key(gid, &id.0))?;
-                }
-                if get::<Message>(&self.provider, &message_key(&id.0))?.is_some_and(|m| m.position == position) {
-                    self.provider.delete(&message_key(&id.0))?;
-                }
-                self.provider.delete(&ciphertext_key(gid, position))?;
-            }
-            self.provider.delete(&welcome_key(gid, position))?;
-            self.provider.delete(&pos_key(gid, position))?;
-        }
-        let rec = &mut self.group_mut(gid)?.rec;
-        rec.expired = rec.expired.max(to);
-        rec.unopened.retain(|position, _| *position > to);
-        let gone = Ranges::range(0, rec.expired);
-        for kept in [&mut rec.messages, &mut rec.own, &mut rec.lacking, &mut rec.lost, &mut rec.read] {
-            *kept = kept.difference(&gone);
-        }
-        rec.losses.retain(|position, _| *position > to);
-        self.save(gid)
-    }
-
-    /// The counted positions of the epoch before the current one, whose keys the next commit deletes, that this
-    /// session lacks.
-    fn lacking(&self, gid: &[u8]) -> Result<Ranges> {
-        let g = self.group(gid)?;
-        let prior = g.mls.epoch().checked_sub(1);
-        let unopened = g.rec.unopened.iter().filter(|(_, (epoch, _))| Some(*epoch) == prior).map(|(position, _)| *position);
-        Ok(unopened.collect::<Ranges>().intersection(&g.rec.lacking))
-    }
+/// The commit entry that ended an epoch, kept for H for a joiner it added whose answer was lost.
+pub(crate) fn commit_key(gid: &[u8], epoch: u64) -> Vec<u8> {
+    [b"node/commit/".as_slice(), gid, b"/", &epoch.to_be_bytes()].concat()
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Reads the stored entries of a group's log this session has not judged yet, in order, then opens what it can and
-    /// hands its kind what is next in order.
+    /// Reads the stored entries of a group's log this session has not judged yet, in order.
     pub(crate) fn advance(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
         while let Some(g) = st.groups.get(gid)
             && g.mls.active()
@@ -159,8 +36,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         if st.groups.contains_key(gid) {
             st.save(gid)?;
-            self.open_ready(st, gid)?;
-            self.kind_advance(st, gid)?;
             if st.at_head(gid) {
                 self.work.send(Work::Duties(gid.to_vec())).ok();
             }
@@ -171,300 +46,188 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Judges and applies the entry at the next position; false if it waits, or the group is gone from this session.
     fn judge(&self, st: &mut State<P>, gid: &[u8], position: u64, entry: &[u8]) -> Result<bool> {
-        let now = now();
         let g = st.groups.get_mut(gid).unwrap();
-        let epoch = g.mls.epoch();
-        let judged = match g.mls.judge(&st.provider, entry)? {
-            Verdict::Message { id } => {
-                let counted = match st.position_of(gid, &id)? {
-                    Some(earlier) => st.pos(gid, earlier)?.is_some_and(|pos| pos.epoch == epoch),
-                    None => false,
-                };
-                if counted {
-                    Judged::Skipped
-                } else {
-                    self.count(st, gid, position, epoch, id, now)?;
-                    Judged::Counted { id: Bytes(id.to_vec()) }
-                }
-            }
-            Verdict::Skipped { .. } => Judged::Skipped,
+        match g.mls.judge(&st.provider, entry)? {
+            Verdict::Skipped { .. } => {}
             Verdict::Copied => {
                 let text = "a copy of this session's state committed in the group, so this session stops using it: join it again, or revoke this device if it may be stolen";
                 self.warn(Some(gid), text.into());
                 self.work.send(Work::Gone(gid.to_vec())).ok();
                 return Ok(false);
             }
-            Verdict::Commit { removes } => return self.apply(st, gid, position, entry, removes, now),
-        };
-        put(&st.provider, &pos_key(gid, position), &Pos { epoch, at: now, judged, lost: false })?;
+            Verdict::Commit { removes } => return self.apply(st, gid, position, entry, removes),
+        }
         st.group_mut(gid)?.rec.position = position;
         Ok(true)
     }
 
-    /// Applies the commit at `position`, unless it waits (`cleared`); false if it waits, or removed this session.
-    fn apply(&self, st: &mut State<P>, gid: &[u8], position: u64, entry: &[u8], removes: bool, now: u64) -> Result<bool> {
-        if !self.cleared(st, gid, position)? {
-            return Ok(false);
-        }
-        self.before_commit(st, gid, removes)?;
-        let g = st.groups.get_mut(gid).unwrap();
-        let epoch = g.mls.epoch();
-        let Entry::Commit { welcome, .. } = Entry::parse(&g.mls.open_entry(&st.provider, entry)?)? else { anyhow::bail!("not a commit") };
-        let applied = g.mls.apply(&st.provider, entry)?;
-        let current = g.mls.epoch();
-        g.early.retain(|(_, early)| core::header(early).is_ok_and(|(epoch, _)| epoch >= current));
-        let members = g.mls.members();
-        g.rec.leaves.retain(|(key, _)| members.iter().any(|m| m.key == key.0));
-        g.rec.starts.retain(|(key, _)| members.iter().any(|m| m.key == key.0) && !applied.added.iter().any(|m| m.key == key.0));
-        g.rec.starts.extend(applied.added.iter().map(|m| (Bytes(m.key.clone()), position)));
-        let by = members.into_iter().find(|m| m.index == applied.by);
-        let own = applied.own;
-        let gone = applied.gone;
-        if own {
-            g.rec.updated = now;
-        }
-        st.observe_identities()?;
-        if !gone {
-            st.events.push(Event::Heard { group: Bytes(gid.to_vec()) });
-        }
-        st.scrub = true;
-        st.gate = true;
-        for leaf in applied.removed.iter().filter_map(|m| m.leaf.as_ref()) {
-            st.unhear(gid, &leaf.key.0)?;
-        }
-        let core::Applied { added, how, removed, settings, .. } = applied;
-        self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, removed, settings, gone }).ok();
-        let pos = Pos { epoch, at: now, judged: Judged::Commit { own }, lost: false };
-        put(&st.provider, &pos_key(gid, position), &pos)?;
-        if let Some(welcome) = welcome {
-            st.provider.put(&welcome_key(gid, position), &welcome)?;
-        }
-        st.group_mut(gid)?.rec.position = position;
-        if !gone {
-            let old = st.group(gid)?.rec.log.0.clone();
-            let log = st.next_log(gid, position)?;
-            self.work.send(Work::Follow { log, old }).ok();
-        }
-        Ok(!gone)
-    }
-
-    /// A message entry counts: its ciphertext is this session's own send, one that came early, or yet to come.
-    fn count(&self, st: &mut State<P>, gid: &[u8], position: u64, epoch: u64, id: [u8; 32], now: u64) -> Result<()> {
-        put(&st.provider, &id_key(gid, &id), &position)?;
-        let rec = &mut st.group_mut(gid)?.rec;
-        rec.unopened.insert(position, (epoch, now));
-        rec.messages.insert(position);
-        if let Some((handle, send)) = st.own_send(gid, &id)? {
-            return self.counted(st, gid, position, handle, send);
-        }
-        let g = st.group_mut(gid)?;
-        let early = g.early.iter().position(|(_, ciphertext)| <[u8; 32]>::from(Sha256::digest(ciphertext)) == id);
-        match early.filter(|early| core::header(&g.early[*early].1).is_ok_and(|(sealed, _)| sealed == epoch)) {
-            Some(early) => {
-                let (_, ciphertext) = g.early.remove(early);
-                st.provider.put(&ciphertext_key(gid, position), &ciphertext)?;
-            }
-            None => g.rec.lacking.insert(position),
-        }
-        Ok(())
-    }
-
-    /// Takes held ciphertexts from a peer, each if it fills a counted position: one whose epoch, in its clear header, is
-    /// the position's. One that comes before its entry, from a peer the gate admits, is kept a while if it is for the
-    /// current epoch or the next, within `EARLY` per peer. Then reads on, if reading waited for them, or opens them.
-    pub(crate) fn take_all(&self, st: &mut State<P>, gid: &[u8], peer: EndpointId, ciphertexts: &[&[u8]], admitted: bool) -> Result<()> {
-        let mut filled = false;
-        for ciphertext in ciphertexts {
-            filled |= self.take(st, gid, peer, ciphertext, admitted)?;
-        }
-        if !filled {
-            return Ok(());
-        }
-        if st.group(gid)?.waiting {
-            return self.advance(st, gid);
-        }
-        self.open_ready(st, gid)?;
-        self.kind_advance(st, gid)
-    }
-
-    /// Takes one held ciphertext; whether it filled a counted position.
-    fn take(&self, st: &mut State<P>, gid: &[u8], peer: EndpointId, ciphertext: &[u8], admitted: bool) -> Result<bool> {
-        let g = st.group(gid)?;
-        let Ok((epoch, false)) = core::header(ciphertext) else { return Ok(false) };
-        if ciphertext.len() > core::MAX_MESSAGE {
-            return Ok(false);
-        }
-        let current = g.mls.epoch();
-        let id: [u8; 32] = Sha256::digest(ciphertext).into();
-        match st.position_of(gid, &id)? {
-            Some(position) => {
-                if st.pos(gid, position)?.is_some_and(|pos| pos.epoch == epoch) && g.rec.lacking.contains(position) {
-                    st.provider.put(&ciphertext_key(gid, position), ciphertext)?;
-                    st.group_mut(gid)?.rec.lacking.remove(position);
-                    return Ok(true);
-                }
-            }
-            None if admitted && (epoch == current || epoch == current + 1) => {
-                let g = st.group_mut(gid)?;
-                let size: usize = g.early.iter().filter(|(from, _)| *from == peer).map(|(_, early)| early.len()).sum();
-                if size + ciphertext.len() <= EARLY && !g.early.iter().any(|(_, early)| early == ciphertext) {
-                    g.early.push((peer, ciphertext.to_vec()));
-                }
-            }
-            None => {}
-        }
-        Ok(false)
-    }
-
-    /// A live payload, which the gate let in once this session applied its log to its head as last read: taken only
-    /// from a sender in its current epoch, by leaf index and key.
-    pub(crate) fn live(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8]) -> Result<()> {
-        let g = st.groups.get_mut(gid).context("this session is not in that group")?;
-        if !core::header(ciphertext).is_ok_and(|(_, live)| live) {
-            return Ok(());
-        }
-        let opened = match g.mls.open(&st.provider, ciphertext) {
-            Ok(opened) if opened.live && opened.current == Some(opened.index) => opened,
-            Ok(_) => return Ok(()),
-            Err(error) => {
-                tracing::debug!("a live message did not open: {error:#}");
-                return Ok(());
-            }
-        };
-        let sender = g.mls.members().into_iter().find(|m| Some(m.index) == opened.current).context("a current member")?;
-        let sender = st.member(gid, &sender).context("the sender has no letmeknow credential")?;
-        st.events.push(Event::Live { group: Bytes(gid.to_vec()), sender, payload: opened.payload });
-        Ok(())
-    }
-
-    /// Opens the held counted positions in position order within each epoch; one missing holds up the later ones of its
-    /// epoch while `holds_up`, then they open past it, and it opens still if it comes while its epoch's keys are kept.
-    pub(crate) fn open_ready(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
-        let mut blocked = HashSet::new();
-        for (position, (epoch, at)) in st.group(gid)?.rec.unopened.clone() {
-            if blocked.contains(&epoch) {
-                continue;
-            }
-            if st.held(gid, position)? {
-                self.open(st, gid, position, epoch)?;
-            } else if self.holds_up(st, gid, position, at) {
-                blocked.insert(epoch);
-            }
-        }
-        st.save(gid)
-    }
-
-    /// Whether a counted position missing here, whose entry was read at `at`, holds up the later ones of its epoch: while
-    /// it is being fetched, or while its push is likely on the way (its entry was read under `HOLD_OFF` ago).
-    pub(crate) fn holds_up(&self, st: &State<P>, gid: &[u8], position: u64, at: u64) -> bool {
-        st.peers.fetching(&Bytes(gid.to_vec())).contains(position) || now() < at + HOLD_OFF
-    }
-    /// Before a commit applies, which deletes the prior epoch's keys: opens what this session holds of that epoch,
-    /// and of the current one too if the commit removes it; what it lacks of them is lost to it.
-    fn before_commit(&self, st: &mut State<P>, gid: &[u8], removes: bool) -> Result<()> {
-        let current = st.group(gid)?.mls.epoch();
-        let ending = |epoch: u64| epoch + 1 == current || removes && epoch == current;
-        for (position, (epoch, _)) in st.group(gid)?.rec.unopened.clone() {
-            if !ending(epoch) {
-                continue;
-            }
-            if st.held(gid, position)? {
-                self.open(st, gid, position, epoch)?;
-            } else {
-                self.lose(st, gid, position)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Opens a counted position's ciphertext and hands its plaintext on, or records it lost.
-    fn open(&self, st: &mut State<P>, gid: &[u8], position: u64, epoch: u64) -> Result<()> {
-        let ciphertext = st.provider.get(&ciphertext_key(gid, position))?.context("a held ciphertext is missing")?;
-        let g = st.groups.get_mut(gid).context("this session is not in that group")?;
-        let opened = match g.mls.open(&st.provider, &ciphertext) {
-            Ok(opened) => opened,
-            Err(error) => {
-                tracing::debug!("a message did not open: {error:#}");
-                return self.lose(st, gid, position);
-            }
-        };
-        g.rec.unopened.remove(&position);
-        let members = g.mls.members();
-        let sender = members.into_iter().find(|m| m.key == opened.sender.key.0).unwrap_or(core::Member {
-            index: opened.index,
-            key: opened.sender.key.0.clone(),
-            credential: Some(opened.sender.clone()),
-            leaf: None,
-        });
-        let sender = st.member(gid, &sender).context("the sender has no letmeknow credential")?;
-        let message = Message { id: Bytes(opened.id.to_vec()), group: Bytes(gid.to_vec()), epoch, position, at: now(), sender, payload: opened.payload, missing: Vec::new() };
-        self.deliver(st, gid, message, false)
-    }
-
-    fn lose(&self, st: &mut State<P>, gid: &[u8], position: u64) -> Result<()> {
-        let rec = &mut st.group_mut(gid)?.rec;
-        rec.unopened.remove(&position);
-        rec.lacking.remove(position);
-        rec.lost.insert(position);
-        self.work.send(Work::Duties(gid.to_vec())).ok();
-        let mut pos = st.pos(gid, position)?.context("a counted position has its record")?;
-        pos.lost = true;
-        put(&st.provider, &pos_key(gid, position), &pos)
-    }
-
-    /// Hands a held message's plaintext to its consumer, in this step: the core takes its own payloads as records; the
-    /// kind's go out as events in position order (`show`), but this session's own, and to the kind in log order
-    /// (`kind_advance`). One that opens after later ones were shown goes out now, naming those passed before it that
-    /// no message named yet.
-    pub(crate) fn deliver(&self, st: &mut State<P>, gid: &[u8], message: Message, own: bool) -> Result<()> {
-        put(&st.provider, &message_key(&message.id.0), &message)?;
-        if !Control::TYPES.contains(&type_of(&message.payload)) {
-            let rec = &mut st.group_mut(gid)?.rec;
-            if !own && message.position <= rec.shown {
-                // It goes out as the next message handed on, naming the positions passed before it not named yet.
-                let position = message.position;
-                rec.missing.retain(|missing| *missing != position);
-                let (before, after) = std::mem::take(&mut rec.missing).into_iter().partition(|missing| *missing < position);
-                rec.missing = after;
-                let mut message = message;
-                message.missing = before;
-                st.events.push(Event::Message(message));
-            }
-            return Ok(());
-        }
-        match serde_json::from_value(message.payload)? {
-            Control::Leave => {
-                st.group_mut(gid)?.rec.leaves.push((message.sender.key, message.epoch));
-                st.save(gid)?;
-                self.work.send(Work::Duties(gid.to_vec())).ok();
-            }
-            Control::Lost { positions } => self.announced(st, gid, message.position, message.sender, positions)?,
-            Control::Invite { hash, expires, to } => {
-                let rec = &mut st.group_mut(gid)?.rec;
-                if !rec.invites.iter().any(|rule| rule.hash == hash) {
-                    rec.invites.push(crate::Rule { hash, expires, to, by: message.sender.key });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether the commit at `position` may apply now. It deletes the keys of the epoch before the current one: while
-    /// this session lacks counted positions of that epoch, it waits as `Peers::wait` decides, fetching them meanwhile;
-    /// what it lacks once it applies the commit is lost (`before_commit`).
+    /// Whether the commit at `position` may apply now: while this session lacks messages the last commit kept, which
+    /// it deletes the keys of, it waits as `Peers::wait` decides, asking for them meanwhile.
     fn cleared(&self, st: &mut State<P>, gid: &[u8], position: u64) -> Result<bool> {
-        let lacking = st.lacking(gid)?;
-        // The gate and this session's state as the step so far left them: a member a commit added may hold what this one
-        // lacks, and a ciphertext taken is progress.
-        st.gate();
-        st.refresh(gid);
         let now = st.tick();
-        let undecided = st.undecided(gid);
-        let waiting = st.peers.wait(&Bytes(gid.to_vec()), &lacking, &undecided, now) == Decision::Wait;
+        let g = st.group_mut(gid)?;
+        let read = match g.reading {
+            Some((at, read)) if at == position => read,
+            _ => {
+                g.reading = Some((position, now));
+                now
+            }
+        };
+        g.waiting = true;
+        let prior = g.mls.epoch().saturating_sub(1);
+        self.open_all(st, gid, prior)?;
+        st.refresh(gid);
+        let lacking = st.group(gid)?.lacking();
+        let waiting = st.peers.wait(&Bytes(gid.to_vec()), &lacking, read, now) == Decision::Wait;
         if waiting {
-            tracing::debug!("waiting at position {position} for {:?}", lacking.ranges());
+            tracing::debug!("waiting at position {position} for {} memberships' kept messages", lacking.len());
         }
         st.group_mut(gid)?.waiting = waiting;
         Ok(!waiting)
+    }
+
+    /// Applies the commit at `position`, unless it waits (`cleared`); false if it waits, or removed this session.
+    fn apply(&self, st: &mut State<P>, gid: &[u8], position: u64, entry: &[u8], removes: bool) -> Result<bool> {
+        if !self.cleared(st, gid, position)? {
+            return Ok(false);
+        }
+        let now = st.tick();
+        let ending = st.group(gid)?.mls.epoch();
+        if removes {
+            self.open_all(st, gid, ending)?;
+        }
+        self.lose(st, gid)?;
+        let g = st.groups.get_mut(gid).unwrap();
+        let inner = g.mls.open_entry(&st.provider, entry)?;
+        let welcome = Entry::parse(&inner)?.welcome;
+        let applied = g.mls.apply(&st.provider, entry)?;
+        let current = g.mls.epoch();
+        g.reading = None;
+        g.changed = true;
+        let members = g.mls.members();
+        let by = members.iter().find(|m| m.index == applied.by).cloned();
+        if applied.own {
+            (g.rec.updated, g.rec.committed) = (now, current);
+        }
+        if welcome.is_some() {
+            st.provider.put(&commit_key(gid, ending), &inner)?;
+            st.group_mut(gid)?.rec.commits.push((ending, now));
+        }
+        let not_kept = self.cuts(st, gid, &applied, ending)?;
+        st.observe_identities()?;
+        st.scrub = true;
+        st.gate = true;
+        let gone = applied.gone;
+        if !gone {
+            st.events.push(Event::Heard { group: Bytes(gid.to_vec()) });
+        }
+        let core::Applied { added, how, removed, settings, .. } = applied;
+        for member in &removed {
+            st.unhear(gid, &member.key)?;
+        }
+        self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, removed, settings, gone, not_kept }).ok();
+        st.group_mut(gid)?.rec.position = position;
+        if gone {
+            return Ok(false);
+        }
+        let old = st.group(gid)?.rec.log.0.clone();
+        let log = st.next_log(gid, position)?;
+        self.work.send(Work::Follow { log, old }).ok();
+        let g = st.group_mut(gid)?;
+        let (early, later): (Vec<_>, Vec<_>) = std::mem::take(&mut g.early).into_iter().partition(|(_, ciphertext)| core::claim(ciphertext).is_ok_and(|(_, epoch)| epoch == current));
+        g.early = later;
+        for (peer, ciphertext) in early {
+            self.take(st, gid, Some(peer), vec![ciphertext])?;
+        }
+        Ok(true)
+    }
+
+    /// What this session lacks of what the last commit kept is lost to it, as the next commit applies.
+    fn lose(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
+        let lacking = st.group(gid)?.lacking();
+        if lacking.is_empty() {
+            return Ok(());
+        }
+        let g = st.group_mut(gid)?;
+        for Seqs { key, joined, seqs } in &lacking {
+            let author = g.author_mut(&key.0, *joined).context("an author")?;
+            author.lost = author.lost.union(seqs);
+        }
+        g.changed = true;
+        let messages = lacking.iter().map(|lost| LostOf { from: st.member_by_key(gid, &lost.key.0), joined: lost.joined, seqs: lost.seqs.iter().collect(), ids: Vec::new() });
+        let member = st.member_by_key(gid, st.me(gid));
+        st.events.push(Event::Lost(Lost { group: Bytes(gid.to_vec()), member, messages: messages.collect() }));
+        Ok(())
+    }
+
+    /// Moves the memberships as an applied commit says: each cut, what it kept above this session's baselines to hold
+    /// before the next commit, the kept sealings frozen, the memberships that ended (their messages past their final
+    /// cuts dropped) and began. Returns, if it removed this session, the ids of its messages no cut kept.
+    fn cuts(&self, st: &mut State<P>, gid: &[u8], applied: &core::Applied, ending: u64) -> Result<Vec<Bytes>> {
+        let me = st.me(gid).to_vec();
+        let now = st.tick();
+        let g = st.group_mut(gid)?;
+        let own = g.mls.joined(&me).or_else(|| applied.cut.iter().find(|r| r.key.0 == me).map(|r| r.joined));
+        let mut keep = Vec::new();
+        let mut kept_own = Ranges::default();
+        for r in &applied.cut {
+            if g.author(&r.key.0, r.joined).is_none() {
+                g.rec.authors.push(Author::new(r.key.clone(), r.joined, 0));
+            }
+            let author = g.author_mut(&r.key.0, r.joined).unwrap();
+            let kept = Ranges::range(author.cut.max(author.baseline) + 1, r.seq);
+            if r.key.0 == me && Some(r.joined) == own {
+                kept_own = kept.clone();
+            }
+            (author.cut, author.known) = (r.seq, author.known.max(r.seq));
+            for (seq, sealed) in author.sealed.range(..=r.seq) {
+                if *sealed != ending {
+                    author.servable.remove(*seq);
+                }
+            }
+            author.sealed.retain(|seq, _| *seq > r.seq);
+            keep.extend(author.seqs(&kept));
+        }
+        g.rec.keep = keep;
+        let state = g.mls.cut().to_vec();
+        for r in &state {
+            if g.author(&r.key.0, r.joined).is_none() {
+                g.rec.authors.push(Author::new(r.key.clone(), r.joined, 0));
+            }
+        }
+        let mut dropped = Vec::new();
+        for author in g.rec.authors.iter_mut().filter(|a| !a.ended && !state.iter().any(|r| r.key == a.key && r.joined == a.joined)) {
+            author.ended = true;
+            let past = author.held.difference(&author.delivered).difference(&Ranges::range(1, author.cut));
+            for seq in past.iter() {
+                dropped.push((author.key.clone(), author.joined, seq));
+            }
+            author.held = author.held.difference(&past);
+            author.servable = author.servable.difference(&past);
+            author.sealed.clear();
+        }
+        g.rec.unkept = g.rec.authors.iter().any(|a| !a.ended && !a.sealed.is_empty()).then_some(now);
+        let gone = applied.gone;
+        let mine = g.author(&me, own.unwrap_or_default()).cloned();
+        for (key, joined, seq) in dropped {
+            if let Some(record) = st.record_at(gid, &key.0, joined, seq)? {
+                st.unstore(gid, &record)?;
+            }
+        }
+        let mut not_kept = Vec::new();
+        if let (Some(mine), Some(joined)) = (mine, own) {
+            for seq in kept_own.iter() {
+                if let Some(mut record) = st.record_at(gid, &me, joined, seq)? {
+                    record.plaintext = None;
+                    st.store(gid, &record)?;
+                }
+            }
+            if gone {
+                for seq in mine.cut + 1..=mine.last() {
+                    not_kept.extend(st.id_at(gid, &me, joined, seq)?);
+                }
+            }
+        }
+        Ok(not_kept)
     }
 }

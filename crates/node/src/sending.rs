@@ -1,264 +1,115 @@
-//! The send path: the node owns a held send until its entry counts. It saves the plaintext and the ciphertext in the
-//! step that seals it, appends the entry, batched with the group's other sends, again with the same bytes after a lost
-//! answer, seals it again after a commit, and finishes it after a restart.
+//! Sending held messages: a send is sealed, saved and delivered to this session in one step, and pushed to the
+//! neighbours; nothing of it involves the membership service. The author keeps its plaintext until a cut keeps it, and
+//! seals it again in each epoch until then, once it is at the head of its log.
 
-use std::sync::Arc;
-
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use lmk_core::group::{FRAMING, MAX_MESSAGE};
 use lmk_core::provider::Provider;
-use lmk_membership::{Refused, Unreached};
 use lmk_proto::Bytes;
-use n0_future::time::{Duration, sleep};
-use serde::{Deserialize, Serialize};
+use lmk_proto::held::{self, Header};
+use lmk_proto::peer::Frame;
 use serde_json::Value;
-use tokio::sync::oneshot;
 
-use lmk_proto::peer::{Frame, Item};
-
-use crate::reading::ciphertext_key;
-use crate::{Event, Inner, Message, Out, SendError, State, get, now, put};
-
-/// How long a send waits before it appends again after an answer that did not come.
-const RETRY: Duration = Duration::from_secs(5);
-
-/// A held send, until its entry counts.
-#[derive(Serialize, Deserialize)]
-pub(crate) struct Held {
-    payload: Value,
-    /// The epoch it is sealed in, its id there, its ciphertext and its log entry; sealed again after a commit.
-    epoch: u64,
-    id: Bytes,
-    ciphertext: Bytes,
-    entry: Bytes,
-    /// Its entry may have reached the service.
-    appended: bool,
-    /// `send` answered that it is pending: `Event::Sent` tells once it counts.
-    pending: bool,
-}
-
-/// A send, by the id it started with.
-pub(crate) fn send_key(handle: &[u8]) -> Vec<u8> {
-    [b"node/send/".as_slice(), handle].concat()
-}
-
-/// A send's position and final id once its entry counts, or why it failed.
-pub(crate) type Outcome = Result<(u64, Bytes), Arc<SendError>>;
-pub(crate) type Counted = oneshot::Receiver<Outcome>;
+use crate::held::Record;
+use crate::{Inner, SendError, State};
 
 impl<P: Provider> State<P> {
-    /// This session's send whose current ciphertext has this id, with the id it started with.
-    pub(crate) fn own_send(&self, gid: &[u8], id: &[u8]) -> Result<Option<(Bytes, Held)>> {
-        for handle in &self.group(gid)?.rec.sends {
-            let send: Held = get(&self.provider, &send_key(&handle.0))?.context("a send without its record")?;
-            if send.id.0 == id {
-                return Ok(Some((handle.clone(), send)));
-            }
-        }
-        Ok(None)
-    }
-
-    /// This session's held sends whose entries have not counted yet: the ids they started with, and their payloads.
-    pub(crate) fn sending(&self, gid: &[u8]) -> Result<Vec<(Bytes, Value)>> {
-        let mut sends = Vec::new();
-        for handle in &self.group(gid)?.rec.sends {
-            let send: Held = get(&self.provider, &send_key(&handle.0))?.context("a send without its record")?;
-            sends.push((handle.clone(), send.payload));
-        }
-        Ok(sends)
-    }
-
-    /// Seals a send's payload in the current epoch.
-    fn seal(&mut self, gid: &[u8], send: &mut Held) -> Result<()> {
-        let st = &mut *self;
-        let g = st.groups.get_mut(gid).context("this session is not in that group")?;
-        let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
-        let (id, ciphertext) = g.mls.seal(&st.provider, session, &send.payload, false)?;
-        send.entry = Bytes(g.mls.entry(&st.provider, &id)?);
-        (send.epoch, send.id, send.ciphertext, send.appended) = (g.mls.epoch(), Bytes(id.to_vec()), Bytes(ciphertext), false);
-        Ok(())
-    }
-}
-
-impl<P: Provider + Send + 'static> crate::Node<P> {
-    /// This session's held sends whose entries have not counted yet, oldest first: the ids `send` answered, and their
-    /// payloads.
-    pub fn sending(&self, gid: &[u8]) -> Result<Vec<(Bytes, Value)>> {
-        self.inner.lock().sending(gid)
+    /// The memberships of a group whose summaries say they hold a held message of this session's, at seq `seq`.
+    pub(crate) fn holders_of(&self, gid: &[u8], seq: u64) -> Result<Vec<Bytes>> {
+        let g = self.group(gid)?;
+        let me = self.me(gid);
+        let joined = g.mls.joined(me).context("a member of its group")?;
+        let holds = |heard: &&lmk_net::peers::Heard| heard.summary.held.iter().any(|held| held.key.0 == me && held.joined == joined && held.seqs.contains(seq));
+        Ok(self.peers.heard(&Bytes(gid.to_vec())).filter(|heard| heard.summary.member.0 != me).filter(holds).map(|heard| heard.summary.member.clone()).collect())
     }
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Starts a held send: seals it, and saves it, in one step. Answers the id it starts with, and its outcome.
-    pub(crate) fn held_send(&self, gid: &[u8], payload: &Value) -> Result<(Bytes, Counted)> {
-        self.start_send(&mut self.lock(), gid, payload)
-    }
-
-    /// Starts a held send in a step.
-    pub(crate) fn start_send(&self, st: &mut State<P>, gid: &[u8], payload: &Value) -> Result<(Bytes, Counted)> {
-        let size = serde_json::to_vec(payload)?.len() + FRAMING;
+    /// Sends a held payload in a step: seals it in the current epoch with this session's next seq, after the messages
+    /// it seals again first, and with the deps its client showed; delivers it to this session and pushes it. Answers
+    /// its id.
+    pub(crate) fn send(&self, st: &mut State<P>, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
+        self.reseal(st, gid)?;
+        let now = st.tick();
+        let me = st.me(gid).to_vec();
+        let g = st.group(gid)?;
+        let joined = g.mls.joined(&me).context("a member of its group")?;
+        let seq = g.current(&me).context("its own membership")?.last() + 1;
+        if let Some(reply_to) = reply_to {
+            ensure!(st.record(gid, reply_to)?.is_some_and(|record| record.delivered.is_some()), "reply_to names no message delivered here");
+        }
+        let prev = match seq {
+            1 => None,
+            _ => Some(st.id_at(gid, &me, joined, seq - 1)?.context("this session's previous message")?),
+        };
+        let control = lmk_proto::group::Control::TYPES.contains(&lmk_proto::group::type_of(payload));
+        let deps = if control || st.group(gid)?.mls.settings().kind == lmk_proto::group::IDENTITY { Vec::new() } else { st.deps(gid)? };
+        let header = Header {
+            group: Bytes(gid.to_vec()),
+            author: Bytes(me.clone()),
+            joined,
+            seq,
+            prev,
+            deps,
+            reply_to: reply_to.map(|id| Bytes(id.to_vec())),
+            payload: payload.clone(),
+        };
+        let plaintext = header.encode();
+        let size = plaintext.len() + FRAMING;
         if size > MAX_MESSAGE {
             return Err(SendError::Size(format!("the message is {size} bytes, over the 1 MiB members take")).into());
         }
-        let mut send = Held {
-            payload: payload.clone(),
-            epoch: 0,
-            id: Bytes::default(),
-            ciphertext: Bytes::default(),
-            entry: Bytes::default(),
-            appended: false,
-            pending: false,
-        };
-        st.seal(gid, &mut send)?;
-        let handle = send.id.clone();
-        put(&st.provider, &send_key(&handle.0), &send)?;
-        st.group_mut(gid)?.rec.sends.push(handle.clone());
+        let g = st.groups.get_mut(gid).unwrap();
+        if !g.sending.take(plaintext.len(), 1.0, now) {
+            return Err(SendError::Rate.into());
+        }
+        let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
+        let ciphertext = g.mls.seal(&st.provider, session, &plaintext)?;
+        let epoch = g.mls.epoch();
+        let author = g.author_mut(&me, joined).unwrap();
+        author.held.insert(seq);
+        author.known = author.known.max(seq);
+        author.servable.insert(seq);
+        author.sealed.insert(seq, epoch);
+        g.rec.unkept.get_or_insert(now);
+        g.changed = true;
+        let id = Bytes(held::id(&plaintext).to_vec());
+        let record = Record { id: id.clone(), header, plaintext: Some(Bytes(plaintext)), sealing: Some((epoch, Bytes(ciphertext.clone()))), opened: now, delivered: None };
+        st.store(gid, &record)?;
+        self.control(st, gid, &record.header)?;
+        self.deliver(st, gid, record)?;
+        st.broadcast(gid, Frame::Held { group: Bytes(gid.to_vec()), items: vec![Bytes(ciphertext)], answers: None });
         st.save(gid)?;
-        let (counted, outcome) = oneshot::channel();
-        st.waiters.entry(handle.0.clone()).or_default().push(counted);
-        self.work.send(crate::Work::Send(gid.to_vec())).ok();
-        Ok((handle, outcome))
+        Ok(id)
     }
 
-    /// `send` answers that a send is pending: once it counts, `Event::Sent` tells. False if it is no longer held, as
-    /// it counted or failed just now: its outcome is on its way.
-    pub(crate) fn pending(&self, handle: &Bytes) -> Result<bool> {
-        let st = self.lock();
-        let Some(mut send) = get::<Held>(&st.provider, &send_key(&handle.0))? else { return Ok(false) };
-        send.pending = true;
-        put(&st.provider, &send_key(&handle.0), &send)?;
-        Ok(true)
-    }
-
-    /// A send's entry counts at `position`: its ciphertext goes to the members online, and its plaintext is that
-    /// position's, as this session never opens its own messages.
-    pub(crate) fn counted(&self, st: &mut State<P>, gid: &[u8], position: u64, handle: Bytes, send: Held) -> Result<()> {
-        st.provider.put(&ciphertext_key(gid, position), &send.ciphertext.0)?;
-        st.provider.delete(&send_key(&handle.0))?;
-        let g = st.group_mut(gid)?;
-        g.rec.unopened.remove(&position);
-        g.rec.own.insert(position);
-        g.rec.sends.retain(|sent| *sent != handle);
-        let me = g.mls.members().into_iter().find(|m| m.index == g.mls.own_index()).context("a member of its group")?;
-        let sender = st.member(gid, &me).context("this session has a letmeknow credential")?;
-        let message = Message { id: send.id.clone(), group: Bytes(gid.to_vec()), epoch: send.epoch, position, at: now(), sender, payload: send.payload, missing: Vec::new() };
-        self.deliver(st, gid, message, true)?;
-        let item = Item { position, ciphertext: send.ciphertext };
-        st.broadcast(gid, Frame::Messages { group: Bytes(gid.to_vec()), items: vec![item], answers: None });
-        let waiters = st.waiters.remove(&handle.0).unwrap_or_default();
-        if send.pending {
-            st.events.push(Event::Sent { group: Bytes(gid.to_vec()), id: send.id.clone(), answered: handle, position });
+    /// Seals this session's messages past its cut again in the current epoch, in seq order, and pushes them: once per
+    /// epoch, at the head of its log, once the log has been read.
+    pub(crate) fn reseal(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
+        let g = st.group(gid)?;
+        let epoch = g.mls.epoch();
+        let read = st.logs.get(&g.rec.log.0).is_some_and(|log| log.at > 0);
+        if g.rec.resealed >= epoch || !read || !st.at_head(gid) {
+            return Ok(());
         }
-        st.out.push(Out::Outcome { waiters, outcome: Ok((position, send.id)) });
-        Ok(())
-    }
-
-    /// Appends the group's held sends, batched, until each counts or fails.
-    pub(crate) async fn sends(&self, gid: &[u8]) {
-        loop {
-            let batch = loop {
-                let advanced = self.advanced.notified();
-                match self.batch(gid) {
-                    Ok(Some(batch)) => break batch,
-                    Ok(None) => advanced.await,
-                    Err(error) => return self.warn(Some(gid), format!("sending: {error:#}")),
-                }
-            };
-            let Some((service, capability, sends)) = batch else { return };
-            if let Err(error) = self.durable().await {
-                return self.warn(Some(gid), format!("{error:#}"));
-            }
-            let appended = async {
-                let entries: Vec<Vec<u8>> = sends.iter().map(|(_, entry)| entry.clone()).collect();
-                self.clients.client(&service)?.append(&capability, &entries, false).await
-            };
-            match appended.await {
-                Ok(_) => {
-                    if let Err(error) = self.read_group(gid).await {
-                        tracing::debug!("reading the group's log after an append: {error:#}");
-                    }
-                }
-                Err(error) if error.is::<Refused>() => {
-                    let reason = error.downcast::<Refused>().expect("refused").0;
-                    let error = Arc::new(match reason.as_str() {
-                        "rate" => SendError::Rate,
-                        "size" => SendError::Size("over the size the group's membership service takes".into()),
-                        _ => SendError::Refused(reason),
-                    });
-                    self.fail(gid, sends.iter().map(|(handle, _)| handle), error);
-                }
-                Err(error) => {
-                    tracing::debug!("appending held sends: {error:#}");
-                    let unreached = error.is::<Unreached>();
-                    let never: Vec<Bytes> = self.appended(gid, &sends, unreached);
-                    self.fail(gid, never.iter(), Arc::new(SendError::Unavailable));
-                    sleep(RETRY).await;
-                }
-            }
+        let me = st.me(gid).to_vec();
+        let Some(mine) = g.current(&me).cloned() else { return Ok(()) };
+        let mut items = Vec::new();
+        for seq in mine.cut + 1..=mine.last() {
+            let mut record = st.record_at(gid, &me, mine.joined, seq)?.context("this session's message past its cut")?;
+            let plaintext = record.plaintext.clone().context("this session's plaintext past its cut")?;
+            let g = st.groups.get_mut(gid).unwrap();
+            let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
+            let ciphertext = g.mls.seal(&st.provider, session, &plaintext.0)?;
+            g.author_mut(&me, mine.joined).unwrap().sealed.insert(seq, epoch);
+            record.sealing = Some((epoch, Bytes(ciphertext.clone())));
+            st.store(gid, &record)?;
+            items.push(Bytes(ciphertext));
         }
-    }
-
-    /// The group's sends to append to its current log, by its capability, each sealed in the current epoch, once this
-    /// session has read the log to its head as last read: none while it has not; an empty batch once there are no more.
-    #[allow(clippy::type_complexity)]
-    fn batch(&self, gid: &[u8]) -> Result<Option<Option<(lmk_proto::group::Service, [u8; 32], Vec<(Bytes, Vec<u8>)>)>>> {
-        let mut st = self.lock();
-        let Ok(g) = st.group(gid) else { return Ok(Some(None)) };
-        if !st.at_head(gid) {
-            return Ok(None);
+        st.group_mut(gid)?.rec.resealed = epoch;
+        if !items.is_empty() {
+            st.broadcast(gid, Frame::Held { group: Bytes(gid.to_vec()), items, answers: None });
         }
-        if g.rec.sends.is_empty() {
-            return Ok(Some(None));
-        }
-        let (epoch, service, capability, handles) = (g.mls.epoch(), g.mls.settings().membership, g.mls.capability(&st.provider)?, g.rec.sends.clone());
-        let mut sends = Vec::new();
-        for handle in handles {
-            let mut send: Held = get(&st.provider, &send_key(&handle.0))?.context("a send without its record")?;
-            if send.epoch != epoch {
-                st.seal(gid, &mut send)?;
-                put(&st.provider, &send_key(&handle.0), &send)?;
-            }
-            sends.push((handle, send.entry.0));
-        }
-        Ok(Some(Some((service, capability, sends))))
-    }
-
-    /// Records that these sends' entries may have reached the service, unless it certainly was not reached; returns
-    /// those that never may have, and that `send` has not answered as pending: those go on.
-    fn appended(&self, gid: &[u8], sends: &[(Bytes, Vec<u8>)], unreached: bool) -> Vec<Bytes> {
-        let st = self.lock();
-        let mut never = Vec::new();
-        for (handle, _) in sends {
-            let Ok(Some(mut send)) = get::<Held>(&st.provider, &send_key(&handle.0)) else { continue };
-            if unreached && !send.appended {
-                if !send.pending {
-                    never.push(handle.clone());
-                }
-            } else if !send.appended {
-                send.appended = true;
-                if let Err(error) = put(&st.provider, &send_key(&handle.0), &send) {
-                    self.warn(Some(gid), format!("{error:#}"));
-                }
-            }
-        }
-        never
-    }
-
-    /// Drops sends the service certainly did not take, and tells why.
-    fn fail<'a>(&self, gid: &[u8], handles: impl Iterator<Item = &'a Bytes>, error: Arc<SendError>) {
-        let mut st = self.lock();
-        for handle in handles {
-            let Ok(Some(send)) = get::<Held>(&st.provider, &send_key(&handle.0)) else { continue };
-            st.provider.delete(&send_key(&handle.0)).ok();
-            if let Ok(g) = st.group_mut(gid) {
-                g.rec.sends.retain(|sent| sent != handle);
-            }
-            st.save(gid).ok();
-            let waiters = st.waiters.remove(&handle.0).unwrap_or_default();
-            st.out.push(Out::Outcome { waiters, outcome: Err(error.clone()) });
-            if send.pending {
-                self.warn(Some(gid), format!("a pending send ({}) failed: {error}", crate::hex(&handle.0)));
-            }
-        }
+        st.save(gid)
     }
 }

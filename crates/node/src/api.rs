@@ -16,7 +16,8 @@ use n0_future::time::{Duration, sleep, timeout};
 use serde_json::{Value, json};
 
 use crate::groups::renaming;
-use crate::{G, MEMBER_WAIT, Member, Message, Node, Rec, SEND_WAIT, Sent, State, UNFINISHED, Work, device_key_key, endpoint_id, get, message_key, now, put, sending};
+use crate::held::delivered_key;
+use crate::{G, MEMBER_WAIT, Member, Message, Node, Rec, State, Work, device_key_key, get, now, put};
 
 impl<P: Provider + Send + 'static> Node<P> {
     /// Stops the peers and every task, and closes the provider.
@@ -29,9 +30,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         }
         self.inner.net().shutdown().await?;
         // Not a step (`lock`), which commits when it ends: after the close.
-        let mut state = self.inner.state.lock().unwrap();
-        state.waiters.clear();
-        state.provider.close()
+        self.inner.state.lock().unwrap().provider.close()
     }
 
     /// This session's key: its MLS signature key.
@@ -156,76 +155,45 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.lock().groups.get(gid).is_some_and(|g| g.rec.leaving)
     }
 
-    /// Marks the group as one this session leaves, and asks the others to remove it; or forgets a group it is alone
-    /// in. Until a member removes it, its duties ask again (`duties`). None once this session is out of the group: it
-    /// was alone in it, or was removed before its `leave` counted.
-    pub async fn leave(&self, gid: &[u8]) -> Result<Option<Sent>> {
-        let (id, counted) = {
+    /// Marks the group as one this session leaves, and sends its `leave`: the others remove it once a cut keeps the
+    /// `leave`, and it is in the group until then. Forgets a group it is alone in. Returns the `leave`'s id; none once
+    /// this session is out of the group.
+    pub async fn leave(&self, gid: &[u8]) -> Result<Option<Bytes>> {
+        let id = {
             let mut st = self.inner.lock();
             st.group_mut(gid)?.rec.leaving = true;
             st.save(gid)?;
-            if st.group(gid)?.mls.members().len() > 1 {
-                self.inner.start_send(&mut st, gid, &json!({ "type": "leave" }))?
-            } else {
+            let g = st.group(gid)?;
+            let me = st.me(gid).to_vec();
+            if g.mls.members().len() == 1 {
                 self.inner.forget(&mut st, gid)?;
-                return Ok(None);
+                None
+            } else if let Some(seq) = g.left(&me) {
+                st.id_at(gid, &me, g.mls.joined(&me).context("a member of its group")?, seq)?
+            } else {
+                Some(self.inner.send(&mut st, gid, &json!({ "type": "leave" }), None)?)
             }
         };
-        match self.answered(id, counted).await {
-            Err(_) if !self.inner.lock().groups.contains_key(gid) => Ok(None),
-            sent => sent.map(Some),
-        }
-    }
-
-    /// Sends a held payload: the node seals it, appends its entry to the group's log, and pushes it to the members
-    /// online once the entry counts. Answers its position once it counts; or after a few seconds without the service's
-    /// answer, that it is pending: the node finishes the send, after a restart too, and tells `Event::Sent`. Fails only
-    /// when the service certainly did not take it (`SendError`), or local persistence fails.
-    pub async fn send(&self, gid: &[u8], payload: &Value) -> Result<Sent> {
-        let (id, counted) = self.inner.held_send(gid, payload)?;
-        self.answered(id, counted).await
-    }
-
-    /// What `send` answers: a send's position once it counts, or that it is pending after a few seconds.
-    async fn answered(&self, id: Bytes, mut counted: sending::Counted) -> Result<Sent> {
         self.inner.durable().await?;
-        let outcome = match timeout(SEND_WAIT, &mut counted).await {
-            Ok(outcome) => outcome,
-            Err(_) if self.inner.pending(&id)? => {
-                self.inner.durable().await?;
-                return Ok(Sent { id, position: None });
-            }
-            Err(_) => counted.await,
-        };
-        let (position, id) = outcome.context(UNFINISHED)?.map_err(|error| anyhow::anyhow!(error))?;
-        Ok(Sent { id, position: Some(position) })
+        Ok(id)
     }
 
-    /// Sends a held payload and waits as long as it takes for its entry to count; answers its position.
-    pub async fn send_counted(&self, gid: &[u8], payload: &Value) -> Result<u64> {
-        let (_, counted) = self.inner.held_send(gid, payload)?;
+    /// Sends a held payload, a reply to the delivered message `reply_to` if given: the node seals it, keeps it, delivers
+    /// it to this session and pushes it to the members online, and seals it again in each epoch until a cut keeps it.
+    /// Answers its id once that is durable. Fails with `SendError` when this session sends faster than members take, or
+    /// the message is too large.
+    pub async fn send(&self, gid: &[u8], payload: &Value, reply_to: Option<&[u8]>) -> Result<Bytes> {
+        let id = self.inner.send(&mut self.inner.lock(), gid, payload, reply_to)?;
         self.inner.durable().await?;
-        Ok(counted.await.context(UNFINISHED)?.map_err(|error| anyhow::anyhow!(error))?.0)
+        Ok(id)
     }
 
     /// Seals a live payload, not held, and sends it to the members online, or to the one with fingerprint `to`; none
     /// while this session has not applied the group's log to its head.
     pub fn send_live(&self, gid: &[u8], payload: &Value, to: Option<&str>) -> Result<()> {
         let mut st = self.inner.lock();
-        let st = &mut *st;
         let peer = to.map(|fp| st.by_fp(gid, fp)).transpose()?;
-        if !st.at_head(gid) {
-            return Ok(());
-        }
-        let g = st.groups.get_mut(gid).context("this session is not in that group")?;
-        let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
-        let ciphertext = g.mls.seal(&st.provider, session, payload, true)?.1;
-        let frame = Frame::Live { group: Bytes(gid.to_vec()), items: vec![Bytes(ciphertext)] };
-        match peer {
-            Some(peer) => st.emit(gid, peer, frame),
-            None => st.broadcast(gid, frame),
-        }
-        Ok(())
+        self.inner.send_live(&mut st, gid, payload, peer)
     }
 
     /// Holds files for the group's H from now, as those a held message links, unless it holds them already; fetches
@@ -268,30 +236,42 @@ impl<P: Provider + Send + 'static> Node<P> {
         lmk_net::Groups::files(&*self.inner, gid)
     }
 
-    /// Whether this session lost a held message: its entry counted, and it can no longer open it.
-    pub fn lost(&self, gid: &[u8], id: &[u8]) -> bool {
-        let st = self.inner.lock();
-        st.position_of(gid, id).ok().flatten().and_then(|position| st.pos(gid, position).ok().flatten()).is_some_and(|pos| pos.lost)
+    /// A held message of the group this session delivered.
+    pub fn message(&self, gid: &[u8], id: &[u8]) -> Result<Option<Message>> {
+        self.inner.lock().message(gid, id)
     }
 
-    /// A held message, opened.
-    pub fn message(&self, id: &[u8]) -> Result<Option<Message>> {
-        get(&self.inner.lock().provider, &message_key(id))
-    }
-
-    /// The group's held messages this session opened and holds, in log order.
+    /// The group's held messages this session delivered and holds, in delivery order.
     pub fn messages(&self, gid: &[u8]) -> Result<Vec<Message>> {
         self.inner.lock().messages(gid)
     }
 
+    /// The latest `n` chat messages in a delivered message's causal past that this session delivered, in delivery order.
+    pub fn ancestors(&self, gid: &[u8], id: &[u8], n: usize) -> Result<Vec<Message>> {
+        let st = self.inner.lock();
+        let record = st.record(gid, id)?.context("no such message here")?;
+        let index = record.delivered.as_ref().context("a message not delivered here")?.index;
+        let mut found = Vec::new();
+        for at in (st.group(gid)?.rec.first.max(1)..index).rev() {
+            if found.len() == n {
+                break;
+            }
+            let Some(earlier) = get::<Bytes>(&st.provider, &delivered_key(gid, at))?.and_then(|id| st.record(gid, &id.0).transpose()).transpose()? else { continue };
+            let h = &earlier.header;
+            if h.payload["type"] == "message" && record.after(&h.author, h.joined, h.seq) {
+                found.extend(earlier.message(gid));
+            }
+        }
+        found.reverse();
+        Ok(found)
+    }
+
     /// Replaces a held message's payload, as when its text is forgotten; it is still served to members as ciphertext.
-    pub fn redact(&self, id: &[u8], payload: Value) -> Result<()> {
+    pub fn redact(&self, gid: &[u8], id: &[u8], payload: Value) -> Result<()> {
         let mut st = self.inner.lock();
-        let Some(mut message) = get::<Message>(&st.provider, &message_key(id))? else {
-            return Ok(());
-        };
-        message.payload = payload;
-        put(&st.provider, &message_key(id), &message)?;
+        let Some(mut record) = st.record(gid, id)? else { return Ok(()) };
+        record.header.payload = payload;
+        st.store(gid, &record)?;
         st.scrub = true;
         Ok(())
     }
@@ -467,13 +447,6 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Reads a group's logs from their service through the current one's end, applying what they hold.
     pub async fn read_group(&self, gid: &[u8]) -> Result<()> {
         self.inner.read_group(gid).await
-    }
-
-    /// Asks a member online, by its iroh key, for the state of the group's kind.
-    pub fn ask_state(&self, gid: &[u8], peer: &[u8]) -> Result<()> {
-        let peer = endpoint_id(peer).context("an iroh key")?;
-        self.inner.lock().emit(gid, peer, Frame::State { group: Bytes(gid.to_vec()), link: None });
-        Ok(())
     }
 
     /// The device's name, where this is a device's node.

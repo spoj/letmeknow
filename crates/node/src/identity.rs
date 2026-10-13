@@ -18,7 +18,7 @@ use lmk_proto::public::certified;
 use n0_future::task::spawn;
 use serde::{Deserialize, Serialize};
 
-use crate::{Event, Item, Node, now};
+use crate::{Event, Node, now};
 
 #[cfg(test)]
 #[path = "identity_tests.rs"]
@@ -67,10 +67,10 @@ pub struct SessionGroup {
     pub members: Vec<String>,
 }
 
-/// An add for this device, which its identity group keeps until it is taken: its position there, and the name of the
+/// An add for this device, which its identity group keeps until it is taken: its message's id, and the name of the
 /// device that sent it.
 pub struct Pending {
-    pub position: u64,
+    pub id: Bytes,
     pub by: String,
     pub add: Add,
 }
@@ -94,8 +94,8 @@ struct Shared {
     presence: Mutex<Presence>,
     /// What the other devices last told of theirs: by device key.
     heard: Mutex<HashMap<Bytes, Presence>>,
-    /// The positions of the adds taken, until the log is let go of past them.
-    taken: Mutex<BTreeSet<u64>>,
+    /// The ids of the adds taken.
+    taken: Mutex<BTreeSet<Bytes>>,
 }
 
 impl<P> Clone for Identity<P> {
@@ -149,9 +149,7 @@ impl<P: Provider + Send + 'static> Identity<P> {
         ensure!(self.group().is_none(), "this device is on an identity already: leave it first");
         let settings =
             Settings { protocol: PROTOCOL, kind: IDENTITY.into(), name: name.into(), carry: 7, update: UPDATE, membership, public: None, rest: Default::default() };
-        let identity = self.node.create_identity(settings).await?;
-        self.node.follow_log(&self.group().context(NO_IDENTITY)?.0, Some(0))?;
-        Ok(identity)
+        self.node.create_identity(settings).await
     }
 
     /// A device link: whoever opens it becomes a device of the identity.
@@ -167,50 +165,31 @@ impl<P: Provider + Send + 'static> Identity<P> {
         ensure!(self.group().is_none(), "this device is on an identity already: leave it first");
         let (gid, _) = self.node.join(link, None).await?;
         ensure!(self.node.settings(&gid.0)?.kind == IDENTITY, "the link led to a group, not an identity");
-        self.node.follow_log(&gid.0, Some(0))
+        Ok(())
     }
 
     /// Hands an add to the device it names: a held message in the identity group.
     pub async fn deliver(&self, add: &Add) -> Result<()> {
         let gid = self.group().context(NO_IDENTITY)?;
-        self.node.send(&gid.0, &serde_json::to_value(add)?).await?;
+        self.node.send(&gid.0, &serde_json::to_value(add)?, None).await?;
         Ok(())
     }
 
-    /// The adds for this device that the identity group keeps, in log order, but those taken or expired; lets go of the
-    /// log up to the first of them.
+    /// The adds for this device that the identity group delivered, in delivery order, but those taken or expired.
     pub fn adds(&self) -> Result<Vec<Pending>> {
         let Some(gid) = self.group() else { return Ok(Vec::new()) };
         let me = self.node.key_in(&gid.0);
-        let (mut pending, mut passed) = (Vec::new(), None);
-        {
-            let taken = self.shared.taken.lock().unwrap();
-            for item in self.node.entries(&gid.0, 0)? {
-                let position = item.position();
-                let add = match item {
-                    Item::Entry(entry) => serde_json::from_value::<Add>(entry.payload)
-                        .ok()
-                        .filter(|add| add.device == me && now() < add.expires && !taken.contains(&position))
-                        .map(|add| Pending { position, by: entry.from.name, add }),
-                    Item::Lost(_) => None,
-                };
-                match add {
-                    Some(add) => pending.push(add),
-                    None if pending.is_empty() => passed = Some(position),
-                    None => {}
-                }
-            }
-        }
-        if let Some(passed) = passed {
-            self.node.follow_log(&gid.0, Some(passed))?;
-        }
-        Ok(pending)
+        let taken = self.shared.taken.lock().unwrap();
+        let adds = self.node.messages(&gid.0)?.into_iter().filter_map(|message| {
+            let add = serde_json::from_value::<Add>(message.payload).ok()?;
+            (add.device == me && now() < add.expires && !taken.contains(&message.id)).then_some(Pending { id: message.id, by: message.sender.name, add })
+        });
+        Ok(adds.collect())
     }
 
     /// Lets go of an add that was taken.
-    pub fn take(&self, position: u64) -> Result<()> {
-        self.shared.taken.lock().unwrap().insert(position);
-        self.adds().map(drop)
+    pub fn take(&self, id: &Bytes) {
+        self.shared.taken.lock().unwrap().insert(id.clone());
     }
 
     /// Sets which of this device's sessions run and their groups, as the session acting for it found them; the identity's
@@ -347,7 +326,7 @@ impl<P: Provider + Send + 'static> Identity<P> {
         Some(IdentityRef { id: settings.public?, membership: settings.membership })
     }
 
-    /// Takes the events of identity groups, but for their members joining and leaving, adds kept (`Logged`) and
+    /// Takes the events of identity groups, but for their members joining and leaving, adds delivered (`Message`) and
     /// warnings; returns every other event. Its duties run as the group's do, and as the identity's public log moves. A
     /// device that comes online hears which sessions this one runs.
     pub fn on(&self, event: Event) -> Option<Event> {
@@ -375,7 +354,7 @@ impl<P: Provider + Send + 'static> Identity<P> {
                     self.shared.heard.lock().unwrap().insert(sender.key, presence);
                 }
             }
-            Event::Joined { .. } | Event::Left { .. } | Event::Settings { .. } | Event::Heard { .. } | Event::Logged { .. } | Event::Warning { .. } => return Some(event),
+            Event::Joined { .. } | Event::Left { .. } | Event::Settings { .. } | Event::Heard { .. } | Event::Message(_) | Event::Warning { .. } => return Some(event),
             _ => {}
         }
         None

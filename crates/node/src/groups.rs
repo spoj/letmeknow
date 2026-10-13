@@ -10,35 +10,36 @@ use lmk_membership::Refused;
 use lmk_proto::Bytes;
 use lmk_proto::group::{IDENTITY, How};
 
-use crate::{Event, G, Inner, Member, State, device_key_key, kind, peering, reading, rec_key, sending};
+use crate::{Event, G, Inner, Member, State, device_key_key, reading, rec_key};
 
 const COMMIT_TRIES: u32 = 5;
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Commits a change built on the group's current epoch, posts its entry to the epoch's log, and reads the log until
-    /// it is known whether it won its epoch; if another commit won, builds it again. Returns the Welcome, if it adds, and
-    /// the position; none once the change has no effect (`None`), and it commits nothing. An entry posted before, which
-    /// the log may or may not have taken, as when the service's answer was lost, is posted again first: only the
-    /// service's refusal drops it.
-    pub(crate) async fn commit(&self, gid: &[u8], change: impl Fn(&State<P>, &G) -> Result<Option<Change>>) -> Result<Option<(Option<Vec<u8>>, u64)>> {
+    /// Commits a change built on the group's current epoch, with the cut this session can make, posts its entry to the
+    /// epoch's log, and reads the log until it is known whether it won its epoch; if another commit won, builds it
+    /// again. Returns the epoch it ended; none once the change has no effect (`None`), and it commits nothing. An entry
+    /// posted before, which the log may or may not have taken, as when the service's answer was lost, is posted again
+    /// first: only the service's refusal drops it.
+    pub(crate) async fn commit(&self, gid: &[u8], change: impl Fn(&State<P>, &G) -> Result<Option<Change>>) -> Result<Option<u64>> {
         let _committing = self.committing.lock().await;
-        let mut built: Option<(Vec<u8>, Option<Vec<u8>>)> = None;
+        let mut built = None;
         for _ in 0..COMMIT_TRIES {
             self.caught_up(gid).await?;
-            let (entry, service, capability, before) = {
+            let (entry, service, capability, epoch) = {
                 let mut st = self.lock();
                 let st = &mut *st;
                 let g = st.group(gid)?;
-                let (service, capability, before) = (g.mls.settings().membership, g.mls.capability(&st.provider)?, g.rec.position);
+                let (service, capability, epoch) = (g.mls.settings().membership, g.mls.capability(&st.provider)?, g.mls.epoch());
                 match g.mls.posted() {
-                    Some(posted) => (posted.to_vec(), service, capability, before),
+                    Some(posted) => (posted.to_vec(), service, capability, epoch),
                     None => {
-                        let Some(change) = change(st, g)? else { return Ok(None) };
+                        let Some(mut change) = change(st, g)? else { return Ok(None) };
+                        change.cut = st.cut_for(gid)?;
                         let g = st.groups.get_mut(gid).unwrap();
                         let session = st.device_keys.get(gid).map_or(&st.session, |(_, session)| session);
                         let commit = g.mls.commit(&st.provider, session, change)?;
-                        built = Some((commit.entry.clone(), commit.welcome));
-                        (commit.entry, service, capability, before)
+                        built = Some(commit.entry.clone());
+                        (commit.entry, service, capability, epoch)
                     }
                 }
             };
@@ -55,12 +56,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             self.caught_up(gid).await?;
             // The one commit of this session's that can apply is the one it posted.
-            let Some((_, welcome)) = built.as_ref().filter(|(ours, _)| *ours == entry) else { continue };
-            let st = self.lock();
-            for position in before + 1..=st.group(gid)?.rec.position {
-                if st.pos(gid, position)?.is_some_and(|pos| pos.judged == reading::Judged::Commit { own: true }) {
-                    return Ok(Some((welcome.clone(), position)));
-                }
+            if built.as_ref() == Some(&entry) && self.lock().group(gid)?.rec.committed == epoch + 1 {
+                return Ok(Some(epoch));
             }
         }
         bail!("the group kept changing over {COMMIT_TRIES} tries; try again")
@@ -101,20 +98,24 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Leaves a group behind: its state and records go.
     pub(crate) fn forget(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
-        st.expire_to(gid, u64::MAX)?;
         for log in st.group_logs(gid) {
             self.unfollow(&log);
             st.drop_log(&log)?;
         }
+        let rec = &st.group(gid)?.rec;
+        let (authors, commits) = (rec.authors.clone(), rec.commits.clone());
+        for author in authors {
+            for seq in author.held.iter() {
+                if let Some(record) = st.record_at(gid, &author.key.0, author.joined, seq)? {
+                    st.unstore(gid, &record)?;
+                }
+            }
+        }
+        for (epoch, _) in commits {
+            st.provider.delete(&reading::commit_key(gid, epoch))?;
+        }
+        st.forget_heard(gid)?;
         let g = st.groups.remove(gid).context("this session is not in that group")?;
-        for id in &g.rec.sends {
-            st.provider.delete(&sending::send_key(&id.0))?;
-            st.waiters.remove(&id.0);
-        }
-        for position in g.rec.kind.iter().flat_map(|kind| &kind.kept) {
-            st.provider.delete(&kind::kept_key(gid, *position))?;
-        }
-        peering::forget_heard(&st.provider, gid, g.heard.keys())?;
         st.peers.forget(&Bytes(gid.to_vec()));
         st.gate = true;
         st.provider.delete(&rec_key(gid))?;
@@ -137,18 +138,21 @@ impl<P: Provider + Send + 'static> Inner<P> {
         removed: Vec<core::Member>,
         settings: bool,
         gone: bool,
+        not_kept: Vec<Bytes>,
     ) {
         if !added.is_empty() {
             self.refresh_all().await;
-            self.dial_all();
         }
         let group = Bytes(gid.to_vec());
         let mut st = self.lock();
         let by = by.and_then(|by| st.member(gid, &by));
         if gone {
             drop(st);
-            self.gone(gid, by);
+            self.gone(gid, by, not_kept);
             return;
+        }
+        if st.groups.contains_key(gid) {
+            st.reverify(gid).ok();
         }
         let Some(by) = by else { return };
         let how = how.unwrap_or(How::Invite);
@@ -169,11 +173,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Forgets a removed group and reports removal once that step is durable.
-    pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>) {
+    pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>, not_kept: Vec<Bytes>) {
         let mut st = self.lock();
         let Some(kind) = st.groups.get(gid).map(|g| g.mls.settings().kind) else { return };
         match self.forget(&mut st, gid) {
-            Ok(()) => st.events.push(Event::Removed { group: Bytes(gid.to_vec()), kind, by }),
+            Ok(()) => st.events.push(Event::Removed { group: Bytes(gid.to_vec()), kind, by, not_kept }),
             Err(error) => self.warn(Some(gid), format!("{error:#}")),
         }
     }

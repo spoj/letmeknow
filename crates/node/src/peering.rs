@@ -1,8 +1,8 @@
 //! The node's side of the peer protocol (`lmk_net::peers`): it hands `Peers` this session's state of each group and the
-//! frames peers send, takes those frames by the gate, answers `want` from the ciphertexts it carries, saves each peer's
-//! latest summary of each group, and sends what `Peers` produces once the step commits.
+//! frames peers send, takes those frames by the gate, signs this session's summaries and checks members', answers
+//! `want` from the sealings it holds, passes live payloads on, and sends what `Peers` produces once the step commits.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -11,64 +11,56 @@ use lmk_core::provider::Provider;
 use lmk_membership::Contradiction;
 use lmk_net::Groups;
 use lmk_net::peers::{self, Own};
-use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
 use lmk_proto::head::Head;
-use lmk_proto::peer::{Frame, Summary};
-use lmk_proto::ranges::Ranges;
+use lmk_proto::links::FileLink;
+use lmk_proto::peer::{At, Frame, SUMMARY, Seqs, Signed, Summary};
 use n0_future::StreamExt;
 use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep};
+use serde::{Deserialize, Serialize};
 
 use crate::logs::Of;
-use crate::reading::ciphertext_key;
-use crate::{Event, Inner, Member, Node, Out, State, days, endpoint_id, get, now, put};
+use crate::{Event, Inner, Lost, LostOf, Member, Node, Out, State, days, get, now, put};
 
 /// How often `Peers` is polled.
 const POLL: Duration = Duration::from_millis(250);
-/// How often members not connected are dialed, in milliseconds.
-const REDIAL: u64 = 10_000;
+/// How long a live payload goes on, in hops.
+const HOPS: u8 = 6;
+/// A member signs its summary at least this often.
+const RESIGN: u64 = 60 * 60 * 1000;
+/// How many summaries of memberships not known yet a group keeps.
+const UNVERIFIED: usize = 32;
 
-/// A member's latest summary of a group, as saved: what it held and read within H, and when it was heard.
+/// A member's latest summary of a group: what it holds, what its client showed, and when it was signed, at most when
+/// it came.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Heard {
     pub member: Member,
-    pub held: Ranges,
-    pub read: Ranges,
+    pub joined: u64,
+    pub held: Vec<Seqs>,
+    pub shown: Vec<Seqs>,
     pub at: u64,
 }
 
-fn heard_key(gid: &[u8], peer: &[u8]) -> Vec<u8> {
-    [b"node/heard/".as_slice(), gid, b"/", peer].concat()
+/// A summary as saved.
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    signed: Signed,
+    at: u64,
 }
 
-/// The peers whose summaries of a group are saved.
-fn heard_index(gid: &[u8]) -> Vec<u8> {
-    [b"node/heard/".as_slice(), gid].concat()
-}
-
-pub(crate) fn load_heard(provider: &impl Provider, gid: &[u8]) -> Result<BTreeMap<Bytes, peers::Heard>> {
-    let peers: Vec<Bytes> = get(provider, &heard_index(gid))?.unwrap_or_default();
-    let heard = |peer: Bytes| Ok((peer.clone(), get(provider, &heard_key(gid, &peer.0))?.context("a summary without its record")?));
-    peers.into_iter().map(heard).collect()
-}
-
-pub(crate) fn forget_heard<'a>(provider: &impl Provider, gid: &[u8], peers: impl Iterator<Item = &'a Bytes>) -> Result<()> {
-    for peer in peers {
-        provider.delete(&heard_key(gid, &peer.0))?;
-    }
-    provider.delete(&heard_index(gid))
-}
-
-fn endpoint(key: peers::Key) -> EndpointId {
-    EndpointId::from_bytes(&key).expect("peers are connected by their iroh keys")
+fn heard_key(gid: &[u8], key: &[u8], joined: u64) -> Vec<u8> {
+    [b"node/heard/".as_slice(), gid, b"/", key, b"/", &joined.to_be_bytes()].concat()
 }
 
 /// The group a frame other than `hello` and `entries` is of.
 fn group_of(frame: &Frame) -> Option<&Bytes> {
     match frame {
         Frame::Hello { .. } | Frame::Entries { .. } => None,
-        Frame::Messages { group, .. }
+        Frame::Versions { group, .. }
+        | Frame::Summaries { group, .. }
+        | Frame::Held { group, .. }
         | Frame::Want { group, .. }
         | Frame::WantFiles { group, .. }
         | Frame::Have { group, .. }
@@ -89,28 +81,35 @@ impl<P: Provider> State<P> {
         self.groups.get(gid).is_some_and(|g| self.held_to(gid).is_ok_and(|held| g.rec.position >= held))
     }
 
-    /// This session's state of a group, as its summary shows it.
-    fn own(&self, gid: &[u8]) -> Own {
-        let g = &self.groups[gid];
-        let kept = Ranges::range(g.rec.expired + 1, g.rec.position);
+    /// This session's state of a group, as `Peers` takes it.
+    fn own(&mut self, gid: &[u8], now: u64) -> Own {
         let mut logs = self.group_logs(gid);
         let log = logs.pop().unwrap();
         let heads = |logs: &[Vec<u8>]| logs.iter().filter_map(|log| self.logs.get(log)?.head.clone()).collect();
+        let (head, earlier) = (self.logs[&log].head.clone(), heads(&logs));
+        let me = self.me(gid).to_vec();
+        let g = self.groups.get_mut(gid).unwrap();
+        let public = g.public.iter().filter_map(|log| self.logs.get(log)?.head.clone()).collect();
+        let members = g.mls.members().into_iter().filter(|m| m.key != me).filter_map(|m| {
+            let iroh = m.leaf.as_ref()?.key.0.as_slice().try_into().ok()?;
+            Some(((Bytes(m.key.clone()), g.mls.joined(&m.key)?), iroh))
+        });
         Own {
+            me: (Bytes(me.clone()), g.mls.joined(&me).unwrap_or_default()),
+            epoch: g.mls.epoch(),
             log: log.as_slice().try_into().unwrap(),
-            head: self.logs[&log].head.clone(),
-            position: g.rec.base + self.logs[&log].length(),
-            held: kept.difference(&g.rec.lacking).difference(&g.rec.lost),
-            read: g.rec.read.union(&kept.difference(&g.rec.messages)),
-            lacking: g.rec.lacking.clone(),
-            public: heads(&g.public),
-            earlier: heads(&logs),
+            head,
+            public,
+            earlier,
+            members: members.collect(),
+            wanted: g.wanted(now),
         }
     }
 
     /// Hands `Peers` this session's state of a group.
     pub(crate) fn refresh(&mut self, gid: &[u8]) {
-        let (own, now) = (self.own(gid), self.tick());
+        let now = self.tick();
+        let own = self.own(gid, now);
         self.peers.group(Bytes(gid.to_vec()), own, now);
     }
 
@@ -168,73 +167,199 @@ impl<P: Provider> State<P> {
     /// since another queued the frame.
     pub(crate) fn admissible(&mut self, peer: &EndpointId, frame: Frame) -> Option<Frame> {
         if let Frame::Hello { groups, heads } = frame {
-            let groups = groups.into_iter().filter(|summary| self.admitted(&summary.group.0, peer)).collect();
+            let groups = groups.into_iter().filter(|at| self.admitted(&at.group.0, peer)).collect();
             return Some(Frame::Hello { groups, heads });
         }
         let group = match &frame {
-            Frame::Hello { .. } => None,
             // Every `want` is answered, with nothing if the gate refuses it.
-            Frame::Messages { items, .. } if items.is_empty() => None,
+            Frame::Held { items, answers: Some(_), .. } if items.is_empty() => None,
             Frame::Entries { log, .. } => match self.logs.get(&log.0).map(|log| &log.of) {
                 Some(Of::Group(group)) => Some(group),
                 _ => None,
             },
-            Frame::Messages { group, .. }
-            | Frame::Want { group, .. }
-            | Frame::WantFiles { group, .. }
-            | Frame::Have { group, .. }
-            | Frame::State { group, .. }
-            | Frame::Live { group, .. } => Some(group),
+            frame => group_of(frame),
         };
         let Some(gid) = group.map(|group| group.0.clone()) else { return Some(frame) };
         peers::sends(&frame, self.admitted(&gid, peer), self.at_head(&gid)).then_some(frame)
     }
 
-    /// Sends a frame of a group to every connected peer the gate lets it go to.
+    /// Sends a frame of a group to every neighbour the gate lets it go to.
     pub(crate) fn broadcast(&mut self, gid: &[u8], frame: Frame) {
-        let peers: Vec<EndpointId> = self.served.keys().copied().collect();
-        for peer in peers {
-            self.emit(gid, peer, frame.clone());
+        for peer in self.peers.neighbours(&Bytes(gid.to_vec())) {
+            if let Ok(peer) = EndpointId::from_bytes(&peer) {
+                self.emit(gid, peer, frame.clone());
+            }
         }
     }
 
-    /// Saves a peer's summary of a group, over the last, while the peer is in a leaf of its current epoch.
-    fn hear(&mut self, heard: peers::Heard) -> Result<()> {
-        let gid = heard.summary.group.0.clone();
-        if endpoint_id(&heard.peer.0).and_then(|peer| self.in_leaf(&gid, &peer)).is_none() {
+    /// This session's summary of a group, signed and handed to `Peers`, when it changed and its last is old enough, or
+    /// hourly.
+    fn sign(&mut self, gid: &[u8], now: u64) -> Result<()> {
+        let g = self.group(gid)?;
+        let gap = (g.mls.members().len() as u64 * 250).max(1000);
+        if !g.mls.active() || !(g.changed && now >= g.rec.signed + gap || now >= g.rec.signed + RESIGN) {
             return Ok(());
         }
-        let g = self.groups.get_mut(&gid).context("this session is not in that group")?;
-        let new = g.heard.insert(heard.peer.clone(), heard.clone()).is_none();
-        put(&self.provider, &heard_key(&gid, &heard.peer.0), &heard)?;
-        if new {
-            put(&self.provider, &heard_index(&gid), &g.heard.keys().collect::<Vec<_>>())?;
+        let me = self.me(gid).to_vec();
+        let list = |of: fn(&crate::Author) -> &lmk_proto::ranges::Ranges| g.rec.authors.iter().filter_map(|a| a.seqs(of(a))).collect();
+        let summary = Summary {
+            group: Bytes(gid.to_vec()),
+            member: Bytes(me.clone()),
+            joined: g.mls.joined(&me).context("a member of its group")?,
+            version: (g.rec.version + 1).max(now),
+            time: now,
+            epoch: g.mls.epoch(),
+            held: list(|a| &a.servable),
+            shown: list(|a| &a.shown),
+            lost: list(|a| &a.lost),
+        };
+        let body = serde_json::to_vec(&summary)?;
+        let sig = self.session_of(gid).sign(&[SUMMARY, &body].concat());
+        let g = self.group_mut(gid)?;
+        (g.rec.version, g.rec.signed, g.changed) = (summary.version, now, false);
+        self.save(gid)?;
+        let heard = peers::Heard { signed: Signed { body: Bytes(body), sig: Bytes(sig) }, summary, at: now };
+        self.peers.summary(&Bytes(gid.to_vec()), heard, None);
+        Ok(())
+    }
+
+    /// Takes members' summaries a peer passed on: each checked against its membership, kept if newer, saved, and its
+    /// losses told once. One of a membership this session does not know yet is kept a while.
+    fn summaries(&mut self, gid: &[u8], peer: EndpointId, items: Vec<Signed>) -> Result<()> {
+        let now = self.tick();
+        let group = Bytes(gid.to_vec());
+        for signed in items {
+            let Ok(summary) = serde_json::from_slice::<Summary>(&signed.body.0) else { continue };
+            if summary.group != group || summary.member.0 == self.me(gid) {
+                continue;
+            }
+            let g = self.groups.get_mut(gid).unwrap();
+            if g.mls.joined(&summary.member.0) != Some(summary.joined) {
+                if g.unverified.len() < UNVERIFIED {
+                    g.unverified.push((peer, signed));
+                }
+                continue;
+            }
+            if !lmk_core::device::verify(&summary.member.0, SUMMARY, &signed.body.0, &signed.sig.0) {
+                continue;
+            }
+            let heard = peers::Heard { signed: signed.clone(), summary: summary.clone(), at: now };
+            if !self.peers.summary(&group, heard, Some(*peer.as_bytes())) {
+                continue;
+            }
+            put(&self.provider, &heard_key(gid, &summary.member.0, summary.joined), &Saved { signed, at: now })?;
+            let g = self.groups.get_mut(gid).unwrap();
+            let membership = (summary.member.clone(), summary.joined);
+            if !g.rec.heard.contains(&membership) {
+                g.rec.heard.push(membership);
+            }
+            for held in &summary.held {
+                if let Some(&(_, last)) = held.seqs.ranges().last() {
+                    g.learn(&held.key.0, held.joined, last, now);
+                }
+            }
+            self.told(gid, &summary)?;
+            self.events.push(Event::Heard { group: group.clone() });
+        }
+        self.save(gid)
+    }
+
+    /// The losses a member's summary tells that it did not tell before: each seq once.
+    fn told(&mut self, gid: &[u8], summary: &Summary) -> Result<()> {
+        let me = self.me(gid).to_vec();
+        let g = self.group_mut(gid)?;
+        let mut messages = Vec::new();
+        for lost in &summary.lost {
+            let told = g.rec.told.iter().filter(|(k, j, s)| *k == summary.member && *j == summary.joined && s.key == lost.key && s.joined == lost.joined);
+            let before = told.fold(lmk_proto::ranges::Ranges::default(), |all, (_, _, s)| all.union(&s.seqs));
+            let new = lost.seqs.difference(&before);
+            if new.is_empty() {
+                continue;
+            }
+            g.rec.told.push((summary.member.clone(), summary.joined, Seqs { key: lost.key.clone(), joined: lost.joined, seqs: new.clone() }));
+            messages.push((lost.key.clone(), lost.joined, new));
+        }
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut lost = Vec::new();
+        for (key, joined, seqs) in messages {
+            let mut ids = Vec::new();
+            if key.0 == me {
+                for seq in seqs.iter() {
+                    ids.extend(self.id_at(gid, &key.0, joined, seq)?);
+                }
+            }
+            lost.push(LostOf { from: self.member_by_key(gid, &key.0), joined, seqs: seqs.iter().collect(), ids });
+        }
+        let member = self.member_by_key(gid, &summary.member.0);
+        self.events.push(Event::Lost(Lost { group: Bytes(gid.to_vec()), member, messages: lost }));
+        Ok(())
+    }
+
+    /// Takes again the summaries kept until a commit made their memberships known.
+    pub(crate) fn reverify(&mut self, gid: &[u8]) -> Result<()> {
+        let unverified = std::mem::take(&mut self.group_mut(gid)?.unverified);
+        for (peer, signed) in unverified {
+            self.summaries(gid, peer, vec![signed])?;
         }
         Ok(())
     }
 
-    /// Deletes a peer's summary of a group, as its Remove applies.
-    pub(crate) fn unhear(&mut self, gid: &[u8], peer: &[u8]) -> Result<()> {
-        self.peers.removed(&Bytes(gid.to_vec()), peer);
-        let g = self.groups.get_mut(gid).context("this session is not in that group")?;
-        if g.heard.remove(&Bytes(peer.to_vec())).is_none() {
-            return Ok(());
+    /// Hands `Peers` a group's saved summaries, as the node starts.
+    pub(crate) fn load_heard(&mut self, gid: &[u8]) -> Result<()> {
+        let group = Bytes(gid.to_vec());
+        for (key, joined) in self.group(gid)?.rec.heard.clone() {
+            let Some(saved) = get::<Saved>(&self.provider, &heard_key(gid, &key.0, joined))? else { continue };
+            let summary = serde_json::from_slice(&saved.signed.body.0)?;
+            self.peers.summary(&group, peers::Heard { signed: saved.signed, summary, at: saved.at }, None);
         }
-        self.provider.delete(&heard_key(gid, peer))?;
-        put(&self.provider, &heard_index(gid), &g.heard.keys().collect::<Vec<_>>())
+        Ok(())
+    }
+
+    /// Deletes a member's summary of a group, as its Remove applies.
+    pub(crate) fn unhear(&mut self, gid: &[u8], key: &[u8]) -> Result<()> {
+        let g = self.group_mut(gid)?;
+        let gone: Vec<(Bytes, u64)> = g.rec.heard.iter().filter(|(k, _)| k.0 == key).cloned().collect();
+        g.rec.heard.retain(|(k, _)| k.0 != key);
+        for (key, joined) in gone {
+            self.provider.delete(&heard_key(gid, &key.0, joined))?;
+        }
+        Ok(())
+    }
+
+    /// Deletes every saved summary of a group.
+    pub(crate) fn forget_heard(&mut self, gid: &[u8]) -> Result<()> {
+        for (key, joined) in self.group(gid)?.rec.heard.clone() {
+            self.provider.delete(&heard_key(gid, &key.0, joined))?;
+        }
+        Ok(())
+    }
+
+    /// The answer to a member's `want`: the sealings it can open, in its epoch or the one before, and not before it
+    /// joined. One the gate does not admit gets nothing, so its asker moves on.
+    fn answer(&mut self, gid: &[u8], peer: EndpointId, epoch: u64, wants: &[Seqs]) -> Result<Frame> {
+        let group = Bytes(gid.to_vec());
+        let admitted = self.admitted(gid, &peer);
+        let g = self.group(gid)?;
+        let joined = self.in_leaf(gid, &peer).and_then(|m| g.mls.joined(&m.key)).unwrap_or(u64::MAX);
+        let held: Vec<Seqs> = if admitted { g.rec.authors.iter().filter_map(|a| a.seqs(&a.servable)).collect() } else { Vec::new() };
+        let sealing = |key: &Bytes, joined_: u64, seq: u64| {
+            let record = self.record_at(gid, &key.0, joined_, seq).ok()??;
+            let (sealed, ciphertext) = record.sealing?;
+            (sealed + 1 >= epoch && sealed <= epoch && sealed >= joined).then_some(ciphertext.0)
+        };
+        Ok(peers::answer(group, wants, &held, sealing))
     }
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Polls `Peers` every `POLL`, and dials the members not connected every `REDIAL`.
+    /// Polls every `POLL`: signs summaries, seals this session's messages again in a new epoch, reads on in groups
+    /// that wait before a commit, opens what waited unopened, gives up what holds dependents too long, and sends what
+    /// `Peers` has due.
     pub(crate) async fn polling(self: Arc<Self>) {
-        let mut dialed = 0;
         loop {
             sleep(POLL).await;
-            if now() >= dialed + REDIAL {
-                dialed = now();
-                self.dial_all();
-            }
             let mut st = self.lock();
             if let Err(error) = self.poll(&mut st) {
                 self.warn(None, format!("{error:#}"));
@@ -242,33 +367,46 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Sends what `Peers` has due; reads on in groups that wait before a commit, opens what no longer waits on a missing
-    /// position, and asks for the kind's state where the kind has none.
     fn poll(&self, st: &mut State<P>) -> Result<()> {
         let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
         let now = st.tick();
-        for out in st.peers.poll(now) {
-            match out {
-                peers::Out::Frame(key, frame) => st.out.push(Out::Frame { peer: endpoint(key), frame }),
-                peers::Out::Entries { peer, log, after } => {
-                    if let Some(head) = st.log(&log.0)?.head.clone().filter(|head| head.length > after) {
-                        let entries = st.entries(&log.0, after);
-                        st.out.push(Out::Frame { peer: endpoint(peer), frame: Frame::Entries { log, entries, head } });
-                    }
-                }
-            }
-        }
         for gid in &gids {
             let Some(g) = st.groups.get(gid) else { continue };
-            if g.waiting {
+            if !g.mls.active() {
+                continue;
+            }
+            let (waiting, unopened) = (g.waiting, !g.unopened.is_empty());
+            st.sign(gid, now)?;
+            self.reseal(st, gid)?;
+            if waiting {
                 self.advance(st, gid)?;
-            } else if !g.rec.unopened.is_empty() {
-                self.open_ready(st, gid)?;
-                self.kind_advance(st, gid)?;
             }
-            if st.groups.get(gid).and_then(|g| g.rec.kind.as_ref()).is_some_and(|kind| kind.behind) {
-                self.ask_state(st, gid);
+            if unopened && st.groups.contains_key(gid) {
+                self.take(st, gid, None, Vec::new())?;
             }
+            if st.groups.contains_key(gid) {
+                self.give_up(st, gid)?;
+            }
+        }
+        st.tell_peers();
+        for out in st.peers.poll(now) {
+            self.out(st, out)?;
+        }
+        Ok(())
+    }
+
+    fn out(&self, st: &mut State<P>, out: peers::Out) -> Result<()> {
+        let endpoint = |key: [u8; 32]| EndpointId::from_bytes(&key).expect("peers are connected by their iroh keys");
+        match out {
+            peers::Out::Frame(key, frame) => st.out.push(Out::Frame { peer: endpoint(key), frame }),
+            peers::Out::Entries { peer, log, after } => {
+                if let Some(head) = st.log(&log.0)?.head.clone().filter(|head| head.length > after) {
+                    let entries = st.entries(&log.0, after);
+                    st.out.push(Out::Frame { peer: endpoint(peer), frame: Frame::Entries { log, entries, head } });
+                }
+            }
+            peers::Out::Dial(key) => st.out.push(Out::Dial(endpoint(key))),
+            peers::Out::Close(key) => st.out.push(Out::Close(endpoint(key))),
         }
         Ok(())
     }
@@ -278,10 +416,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let mut st = self.lock();
         let now = st.tick();
         match event {
-            lmk_net::Event::Connected(peer) => {
+            lmk_net::Event::Connected(peer, dialed) => {
                 let served = st.served_to(&peer);
                 st.served.insert(peer, served.clone());
-                st.peers.connect(*peer.as_bytes(), served, now);
+                st.peers.connect(*peer.as_bytes(), served, dialed, now);
             }
             lmk_net::Event::Disconnected(peer) => {
                 st.served.remove(&peer);
@@ -300,61 +438,62 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let (key, now) = (*peer.as_bytes(), st.tick());
         if let Frame::Hello { groups, heads } = frame {
             let heads: Vec<Head> = heads.into_iter().filter(|head| self.vouched(st, head, &peer)).collect();
-            // A summary of a log this session does not hold, of an epoch it has not reached or has dropped, is taken unchecked.
-            let shown = |s: &Summary| {
-                s.head.as_ref().is_none_or(|head| head.log_ref == s.log && (!st.logs.contains_key(s.log.as_slice()) || self.vouched(st, head, &peer)))
-            };
-            let groups: Vec<Summary> = groups.into_iter().filter(|s| st.groups.contains_key(&s.group.0) && shown(s)).collect();
-            for heard in st.peers.frame(&key, &Frame::Hello { groups: groups.clone(), heads }, now) {
-                let group = heard.summary.group.clone();
-                st.hear(heard)?;
-                st.events.push(Event::Heard { group });
-                self.heard.notify_waiters();
+            // An `at` of a log this session does not hold, of an epoch it has not reached or has dropped, is taken unchecked.
+            let shown = |at: &At| at.head.as_ref().is_none_or(|head| head.log_ref == at.log && (!st.logs.contains_key(at.log.as_slice()) || self.vouched(st, head, &peer)));
+            let groups: Vec<At> = groups.into_iter().filter(|at| st.groups.contains_key(&at.group.0) && shown(at)).collect();
+            for out in st.peers.frame(&key, &Frame::Hello { groups: groups.clone(), heads }, now) {
+                self.out(st, out)?;
             }
             let shows = |head: &Option<Head>| head.as_ref().map(|head| (head.length, head.hash));
-            for summary in groups {
-                let gid = summary.group.0;
+            for at in groups {
+                let gid = at.group.0;
                 let log = &st.group(&gid)?.rec.log.0;
-                if summary.log.as_slice() == log && shows(&summary.head) == shows(&st.log(log)?.head) && st.admitted(&gid, &peer) {
+                if at.log.as_slice() == log && shows(&at.head) == shows(&st.log(log)?.head) && st.admitted(&gid, &peer) {
                     self.synced(st, &gid, peer)?;
                 }
             }
             return Ok(());
         }
-        st.peers.frame(&key, &frame, now);
-        match frame {
-            Frame::Entries { log, entries, head } => {
-                if log.0 == head.log_ref && self.vouched(st, &head, &peer) {
-                    self.take_entries(st, &log.0, head.length.saturating_sub(entries.len() as u64), entries, head)?;
-                }
+        if let Frame::Entries { log, entries, head } = frame {
+            if log.0 == head.log_ref && self.vouched(st, &head, &peer) {
+                self.take_entries(st, &log.0, head.length.saturating_sub(entries.len() as u64), entries, head)?;
             }
-            Frame::Want { group, positions } if st.groups.contains_key(&group.0) => {
-                let held = if st.admitted(&group.0, &peer) { st.own(&group.0).held } else { Ranges::default() };
-                let provider = &st.provider;
-                let answer = peers::answer(group.clone(), &positions, &held, |position| provider.get(&ciphertext_key(&group.0, position)).ok().flatten());
+            return Ok(());
+        }
+        let Some(gid) = group_of(&frame).filter(|gid| st.groups.contains_key(&gid.0)).map(|gid| gid.0.clone()) else { return Ok(()) };
+        let admitted = st.admitted(&gid, &peer);
+        if !peers::takes(&frame, admitted, st.at_head(&gid)) {
+            if let Frame::Want { group, .. } = frame {
+                st.out.push(Out::Frame { peer, frame: Frame::Held { group, items: Vec::new(), answers: Some(Vec::new()) } });
+            }
+            return Ok(());
+        }
+        for out in st.peers.frame(&key, &frame, now) {
+            self.out(st, out)?;
+        }
+        match frame {
+            Frame::Summaries { items, .. } => st.summaries(&gid, peer, items)?,
+            Frame::Held { items, .. } => self.take(st, &gid, Some(peer), items.into_iter().map(|item| item.0).collect())?,
+            Frame::Want { epoch, wants, .. } => {
+                st.peers.used(&key, now);
+                let answer = st.answer(&gid, peer, epoch, &wants)?;
                 st.out.push(Out::Frame { peer, frame: answer });
             }
-            frame => {
-                let Some(gid) = group_of(&frame).filter(|gid| st.groups.contains_key(&gid.0)).map(|gid| gid.0.clone()) else { return Ok(()) };
-                let admitted = st.admitted(&gid, &peer);
-                if !peers::takes(&frame, admitted, st.at_head(&gid)) {
-                    return Ok(());
+            Frame::Live { group, hops, item } => {
+                let g = st.group(&gid)?;
+                let Ok((sender, payload, id)) = g.mls.open_live(&st.provider, &item.0) else { return Ok(()) };
+                let Some(forward) = st.peers.live(&group, id, Some(key), hops, now) else { return Ok(()) };
+                for to in forward {
+                    st.out.push(Out::Frame { peer: EndpointId::from_bytes(&to)?, frame: Frame::Live { group: group.clone(), hops: hops - 1, item: item.clone() } });
                 }
-                match frame {
-                    Frame::Messages { items, .. } => {
-                        let ciphertexts: Vec<&[u8]> = items.iter().map(|item| item.ciphertext.0.as_slice()).collect();
-                        self.take_all(st, &gid, peer, &ciphertexts, admitted)?;
-                    }
-                    Frame::Live { items, .. } => {
-                        for item in items {
-                            self.live(st, &gid, &item.0)?;
-                        }
-                    }
-                    Frame::State { link: Some(link), .. } => self.state_from(&gid, link, peer),
-                    Frame::State { link: None, .. } => self.hand_snapshot(&gid, peer),
-                    _ => {}
-                }
+                let sender = st.member(&gid, &sender).context("the sender has no letmeknow credential")?;
+                st.events.push(Event::Live { group, sender, payload });
             }
+            Frame::State { link: Some(link), .. } => {
+                st.peers.used(&key, now);
+                self.state_from(&gid, link, peer);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -377,7 +516,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// A connected member's `hello` shows this session's head of the group's log.
+    /// A neighbour's `hello` shows this session's head of the group's log.
     fn synced(self: &Arc<Self>, st: &mut State<P>, gid: &[u8], peer: EndpointId) -> Result<()> {
         let member = st.by_iroh(gid, &peer);
         st.events.push(Event::Synced { group: Bytes(gid.to_vec()), member });
@@ -398,56 +537,89 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         Ok(())
     }
+
+    /// Seals a live payload and sends it to the neighbours, or to one member alone.
+    pub(crate) fn send_live(&self, st: &mut State<P>, gid: &[u8], payload: &serde_json::Value, to: Option<EndpointId>) -> Result<()> {
+        if !st.at_head(gid) {
+            return Ok(());
+        }
+        let now = st.tick();
+        let g = st.group(gid)?;
+        let (item, id) = g.mls.seal_live(&st.provider, st.session_of(gid), payload)?;
+        let group = Bytes(gid.to_vec());
+        match to {
+            Some(peer) => st.emit(gid, peer, Frame::Live { group, hops: 0, item: Bytes(item) }),
+            None => {
+                for peer in st.peers.live(&group, id, None, HOPS, now).unwrap_or_default() {
+                    st.emit(gid, EndpointId::from_bytes(&peer)?, Frame::Live { group: group.clone(), hops: HOPS, item: Bytes(item.clone()) });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<P: Provider + Send + 'static> Node<P> {
-    /// The other current members' latest summaries of the group, as saved, whatever the gate.
+    /// The other current members' latest summaries of the group, whatever the gate.
     pub fn heard(&self, gid: &[u8]) -> Result<Vec<Heard>> {
         let st = self.inner.lock();
-        let heard = st.group(gid)?.heard.values().filter_map(|heard| {
-            let member = st.in_leaf(gid, &endpoint_id(&heard.peer.0)?)?;
-            let member = st.member(gid, &member)?;
-            Some(Heard { member, held: heard.summary.held.clone(), read: heard.summary.read.clone(), at: heard.at })
+        let g = st.group(gid)?;
+        let me = st.me(gid);
+        let group = Bytes(gid.to_vec());
+        let heard = st.peers.heard(&group).filter(|heard| heard.summary.member.0 != me && g.mls.joined(&heard.summary.member.0) == Some(heard.summary.joined));
+        let heard = heard.map(|heard| Heard {
+            member: st.member_by_key(gid, &heard.summary.member.0),
+            joined: heard.summary.joined,
+            held: heard.summary.held.clone(),
+            shown: heard.summary.shown.clone(),
+            at: heard.summary.time.min(heard.at),
         });
         Ok(heard.collect())
     }
 
-    /// The other members not online that no summary was heard from for H: away, and their summaries no longer count as
-    /// holding.
+    /// The other members not connected that no summary was heard from for H: away.
     pub fn away(&self, gid: &[u8]) -> Result<Vec<Member>> {
         let (heard, since, me, online) = (self.heard(gid)?, self.carried_since(gid)?, self.key_in(gid), self.online(gid)?);
         let away = |m: &Member| m.key != me && !online.iter().any(|o| o.key == m.key) && !heard.iter().any(|h| h.member.key == m.key && h.at >= since);
         Ok(self.members(gid)?.into_iter().filter(away).collect())
     }
 
-    /// This session's own counted positions within H that no other member's summary shows held, but an away one's;
-    /// less those up to every other member's start, which none of them can hold. A member there before this session
-    /// started before all of its positions.
-    pub fn only_here(&self, gid: &[u8]) -> Result<Ranges> {
-        let since = self.carried_since(gid)?;
+    /// This session's held messages no cut keeps yet: they need this session until one does. Their ids and payloads.
+    pub fn only_here(&self, gid: &[u8]) -> Result<Vec<(Bytes, serde_json::Value)>> {
         let st = self.inner.lock();
         let g = st.group(gid)?;
-        let start = |m: &lmk_core::group::Member| g.rec.starts.iter().find(|(key, _)| key.0 == m.key).map_or(0, |(_, start)| *start);
-        let first = g.mls.members().iter().filter(|m| m.key != st.me(gid)).map(start).min();
-        let before = first.map_or_else(Ranges::default, |first| Ranges::range(0, first));
-        let summaries = g.heard.values().filter(|h| h.at >= since && endpoint_id(&h.peer.0).is_some_and(|peer| st.in_leaf(gid, &peer).is_some()));
-        let held = summaries.fold(Ranges::default(), |held, h| held.union(&h.summary.held));
-        Ok(g.rec.own.difference(&held).difference(&before))
+        let me = st.me(gid);
+        let Some(mine) = g.current(me) else { return Ok(Vec::new()) };
+        let mut unkept = Vec::new();
+        for seq in mine.cut + 1..=mine.last() {
+            if let Some(record) = st.record_at(gid, me, mine.joined, seq)? {
+                unkept.push((record.id, record.header.payload));
+            }
+        }
+        Ok(unkept)
     }
 
-    /// The positions of the group this session read, as its summaries carry them.
-    pub fn read(&self, gid: &[u8]) -> Result<Ranges> {
-        let st = self.inner.lock();
-        st.group(gid)?;
-        Ok(st.own(gid).read)
-    }
-
-    /// Marks positions of the group read, as its client showed or printed them: its summaries carry them.
-    pub fn mark_read(&self, gid: &[u8], positions: &Ranges) -> Result<()> {
+    /// Marks held messages of the group shown, as its client printed or displayed them: its summaries carry them, and
+    /// its next messages depend on them.
+    pub fn mark_shown(&self, gid: &[u8], ids: &[Bytes]) -> Result<()> {
         let mut st = self.inner.lock();
-        let rec = &mut st.group_mut(gid)?.rec;
-        rec.read = rec.read.union(positions).difference(&Ranges::range(0, rec.expired));
+        for id in ids {
+            let Some(record) = st.record(gid, &id.0)? else { continue };
+            let g = st.group_mut(gid)?;
+            if let Some(author) = g.author_mut(&record.header.author.0, record.header.joined) {
+                author.shown.insert(record.header.seq);
+                g.changed = true;
+            }
+        }
         st.save(gid)
+    }
+
+    /// Whether this session's client showed a held message.
+    pub fn shown(&self, gid: &[u8], id: &[u8]) -> Result<bool> {
+        let st = self.inner.lock();
+        let Some(record) = st.record(gid, id)? else { return Ok(false) };
+        let g = st.group(gid)?;
+        Ok(g.author(&record.header.author.0, record.header.joined).is_some_and(|a| a.shown.contains(record.header.seq)))
     }
 
     /// H ago.

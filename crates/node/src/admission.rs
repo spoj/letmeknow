@@ -1,6 +1,6 @@
 //! Admission, both sides: a joiner asks the members an invite link names, keeping its KeyPackage until one admits it; a
-//! member answers by the invite's rule, checked again as the Add is built, or with the logged Welcome to a joiner it
-//! added before whose answer was lost.
+//! member answers by the invite's rule, checked again as the Add is built, with the commit entry that added the joiner,
+//! or with the one it kept to a joiner it added before whose answer was lost.
 
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::logs::NOT_FOLLOWED;
-use crate::reading::{Judged, welcome_key};
+use crate::reading::commit_key;
 use crate::{Event, G, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, SNAPSHOT_WAIT, State, device_key_key, endpoint_id, get, now, put};
 
 /// How many members besides the inviter a link names, of those online that hold the invite's message.
@@ -59,27 +59,25 @@ impl<P: Provider + Send + 'static> Node<P> {
             st.group(gid)?.mls.settings().kind == IDENTITY
         };
         let rule = serde_json::to_value(Control::Invite { hash, expires, to })?;
-        let position = self.send(gid, &rule).await?.position;
+        let id = self.send(gid, &rule, None).await?;
+        let seq = self.inner.lock().record(gid, &id.0)?.context("the invite's message")?.header.seq;
         // The members online whose summaries hold the invite's message admit by it too: a member asked before its push
         // arrived would refuse the joiner.
         let online = self.online(gid)?;
         let holding = || -> Result<Vec<Member>> {
-            let heard = self.heard(gid)?;
-            let holds = |m: &Member| position.is_some_and(|p| heard.iter().any(|h| h.member.key == m.key && h.held.contains(p)));
-            Ok(online.iter().filter(|m| holds(m)).cloned().collect())
+            let holders = self.inner.lock().holders_of(gid, seq)?;
+            Ok(online.iter().filter(|m| holders.contains(&m.key)).cloned().collect())
         };
-        if position.is_some() {
-            let all = async {
-                loop {
-                    let heard = self.inner.heard.notified();
-                    if holding()?.len() == online.len() {
-                        return anyhow::Ok(());
-                    }
-                    heard.await;
+        let all = async {
+            loop {
+                let heard = self.inner.heard.notified();
+                if holding()?.len() == online.len() {
+                    return anyhow::Ok(());
                 }
-            };
-            timeout(MEMBER_WAIT, all).await.unwrap_or(Ok(()))?;
-        }
+                heard.await;
+            }
+        };
+        timeout(MEMBER_WAIT, all).await.unwrap_or(Ok(()))?;
         let holders = holding()?;
         let st = self.inner.lock();
         let mut members = vec![address(*self.inner.net().id().as_bytes(), self.inner.relay.as_str())];
@@ -102,7 +100,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             .collect::<Result<Vec<_>>>()?;
         let (secret, devices) = (Bytes(link.secret.to_vec()), link.device);
         // The KeyPackage, its private keys and its device key are kept until this session joins or every member it asks
-        // refuses it: a member that added it asks again answers with the Welcome its log holds.
+        // refuses it: a member that added it asked again answers with the commit entry it kept.
         let joining = [b"node/joining/".as_slice(), &Sha256::digest(&secret.0)].concat();
         let (join, device_key) = {
             let mut st = self.inner.lock();
@@ -161,7 +159,7 @@ impl<P: Provider + Send + 'static> Node<P> {
                 let answer = timeout(deadline.saturating_duration_since(Instant::now()), self.inner.net().join(peer, relay.clone(), join.clone())).await;
                 match answer {
                     // The connection may have been replaced by one the member dialed meanwhile; asking again is safe, as a
-                    // member that added this session answers with the Welcome its log holds. The ask may have added it.
+                    // member that added this session answers with the commit entry it kept. The ask may have added it.
                     Ok(Err(error)) if Instant::now() + Duration::from_secs(1) < deadline => {
                         tracing::debug!("asking {} to admit this session: {error:#}", peer.fmt_short());
                         refused_by_all = false;
@@ -202,34 +200,29 @@ impl<P: Provider + Send + 'static> Node<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Joins a group from the Welcome a member at `by` sent for this session's KeyPackage: an identity group with the
-    /// device key `device_key`, and only then, as a link's kind is not authenticated.
+    /// Joins a group from the commit entry, with its Welcome, a member at `by` sent for this session's KeyPackage: an
+    /// identity group with the device key `device_key`, and only then, as a link's kind is not authenticated.
     async fn welcomed(self: &Arc<Self>, admitted: Admitted, key_package: &[u8], by: EndpointId, device_key: Option<[u8; 32]>) -> Result<Bytes> {
         let (gid, log) = {
             let mut st = self.lock();
             let st = &mut *st;
-            let mls = Group::join(&st.provider, &admitted.welcome.0, &key_package_reference(&st.provider, key_package)?)?;
+            let mls = Group::join(&st.provider, &admitted.commit.0, &key_package_reference(&st.provider, key_package)?)?;
             ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
             if (mls.settings().kind == IDENTITY) != device_key.is_some() {
                 mls.delete(&st.provider)?;
                 bail!("the link was altered: it admits to a group of another kind than it says");
             }
-            let rec = Rec { position: admitted.position, start: admitted.position, expired: admitted.position, ..Rec::default() };
-            let gid = st.add_group(mls, rec)?;
+            let gid = st.add_group(mls, Rec::default())?;
             if let Some(seed) = device_key {
                 put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
                 let session = st.keyed(seed)?;
                 st.device_keys.insert(gid.clone(), (seed, session));
-            }
-            if admitted.doc.is_some() {
-                st.groups.get_mut(&gid).unwrap().asked = now();
             }
             let log = st.group(&gid)?.rec.log.0.clone();
             (gid, log)
         };
         // The members' public logs first, which the gate needs to take their summaries, before the log's commits apply.
         self.refresh_all().await;
-        self.dial_all();
         self.follow(&log);
         if let Err(error) = self.read_group(&gid).await {
             self.warn(Some(&gid), format!("reading the group's log: {error:#}"));
@@ -258,7 +251,7 @@ const MEMBER_ALREADY: &str = "this session is a member already";
 fn admits(g: &G, joiner: &Credential, rule: &Rule) -> Result<()> {
     let members = g.mls.members();
     ensure!(now() < rule.expires && !g.mls.used(&rule.hash.0), UNKNOWN);
-    ensure!(members.iter().any(|m| m.key == rule.by.0) && !g.left(&rule.by.0), INVITER_LEFT);
+    ensure!(members.iter().any(|m| m.key == rule.by.0) && g.left(&rule.by.0).is_none(), INVITER_LEFT);
     ensure!(members.iter().all(|member| member.key != joiner.key.0), MEMBER_ALREADY);
     Ok(())
 }
@@ -273,9 +266,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let (gid, rule) = found.context(UNKNOWN)?;
         // A joiner the log shows added, whose answer was lost, asks again with the same KeyPackage.
         self.caught_up(&gid).await?;
-        let logged = self.lock().logged_welcome(&gid, &key_package.0)?;
-        if let Some((welcome, position)) = logged {
-            return self.admitted(&gid, welcome, position).await;
+        let logged = self.lock().logged_commit(&gid, &key_package.0)?;
+        if let Some(commit) = logged {
+            return self.admitted(&gid, commit).await;
         }
         admits(self.lock().group(&gid)?, &joiner, &rule)?;
         // Its identity's public log, read afresh, must list the device that certified it.
@@ -290,9 +283,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         match self.admit(&gid, key_package.0.clone(), &joiner, rule).await {
             // Another ask with this KeyPackage, as the joiner's again after one failed in transit, may have added it meanwhile.
             Err(error) => {
-                let logged = self.lock().logged_welcome(&gid, &key_package.0)?;
+                let logged = self.lock().logged_commit(&gid, &key_package.0)?;
                 match logged {
-                    Some((welcome, position)) => self.admitted(&gid, welcome, position).await,
+                    Some(commit) => self.admitted(&gid, commit).await,
                     None => Err(error),
                 }
             }
@@ -300,8 +293,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Commits the Add, naming the invite the joiner came in by, and answers with the Welcome and the state of the group's
-    /// kind, as a file. Each build of the commit checks the joiner's rule again. A joiner whose session does not support
+    /// Commits the Add, naming the invite the joiner came in by, and answers with its commit entry and the state of the
+    /// group's kind, as a file. Each build of the commit checks the joiner's rule again. A joiner whose session does not support
     /// the group's kind is refused.
     async fn admit(self: &Arc<Self>, gid: &[u8], key_package: Vec<u8>, joiner: &Credential, rule: Rule) -> Result<Admitted> {
         {
@@ -311,18 +304,19 @@ impl<P: Provider + Send + 'static> Inner<P> {
             ensure!(leaf.kinds.contains(&kind), "its session does not support {kind} groups");
         }
         let add = Change { add: vec![key_package], how: Some(How::Invite), invite: Some(rule.hash.clone()), ..Change::default() };
-        let (welcome, position) = self
+        let epoch = self
             .commit(gid, |_, g| {
                 admits(g, joiner, &rule)?;
                 Ok(Some(add.clone()))
             })
             .await?
             .context("an Add has effect")?;
-        self.admitted(gid, welcome.context("an add makes a Welcome")?, position).await
+        let commit = self.lock().provider.get(&commit_key(gid, epoch))?.context("an Add's commit entry is kept")?;
+        self.admitted(gid, commit).await
     }
 
-    /// The answer to a joiner added at `position`: the Welcome, and the state of the group's kind, as a file.
-    async fn admitted(self: &Arc<Self>, gid: &[u8], welcome: Vec<u8>, position: u64) -> Result<Admitted> {
+    /// The answer to a joiner: the commit entry that added it, and the state of the group's kind, as a file.
+    async fn admitted(self: &Arc<Self>, gid: &[u8], commit: Vec<u8>) -> Result<Admitted> {
         let state = {
             let st = self.lock();
             let g = st.group(gid)?;
@@ -349,27 +343,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
             None => None,
         };
         self.durable().await?;
-        Ok(Admitted { welcome: Bytes(welcome), position, doc })
+        Ok(Admitted { commit: Bytes(commit), doc })
     }
 }
 
 impl<P: Provider> State<P> {
-    /// The Welcome and position of the commit that added the joiner with this KeyPackage, if its leaf has not updated
-    /// since.
-    fn logged_welcome(&self, gid: &[u8], key_package: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
+    /// The commit entry that added the joiner with this KeyPackage, kept, if its leaf has not updated since.
+    fn logged_commit(&self, gid: &[u8], key_package: &[u8]) -> Result<Option<Vec<u8>>> {
         let g = self.group(gid)?;
         if !g.mls.unchanged(&self.provider, key_package)? {
             return Ok(None);
         }
         let reference = key_package_reference(&self.provider, key_package)?;
         let Some(added) = g.mls.added().iter().rev().find(|added| added.key_package_ref == reference) else { return Ok(None) };
-        for position in (g.rec.expired + 1..=g.rec.position).rev() {
-            let Some(pos) = self.pos(gid, position)? else { continue };
-            if matches!(pos.judged, Judged::Commit { .. }) && pos.epoch + 1 == added.epoch {
-                return Ok(self.provider.get(&welcome_key(gid, position))?.map(|welcome| (welcome, position)));
-            }
-        }
-        Ok(None)
+        self.provider.get(&commit_key(gid, added.epoch - 1))
     }
 }
 

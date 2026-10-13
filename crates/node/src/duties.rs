@@ -1,20 +1,18 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
 //! advance, at start, and every `TIMER`. It drops what the group kept past H; commits at most once, with every Remove
-//! due (members whose counted `leave` was sealed in their current membership, and members whose devices their
-//! identities dropped) and this session's update if due (each T, at an offset of its own); asks the others to remove
-//! this session while it leaves; announces this session's known losses; and in an identity group, has the identity kind
-//! run its own (`Event::Duties`).
+//! due (members whose `leave` the cut it builds keeps, and members whose devices their identities dropped) and this
+//! session's update if due (each T, at an offset of its own, or once it held messages no cut kept for `KEEP_ALIVE`, at
+//! an offset of its own within it); and in an identity group, has the identity kind run its own (`Event::Duties`).
 
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use lmk_core::group::{self as core, Change};
+use lmk_core::group::{self as core, Change, MAX_CUT_STEP};
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
-use lmk_proto::group::{Control, IDENTITY, type_of};
+use lmk_proto::group::IDENTITY;
+use lmk_proto::held::Ref;
 use n0_future::time::{Duration, sleep};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use std::collections::BTreeMap;
@@ -23,10 +21,14 @@ use lmk_core::public::{PublicLog, Verdict};
 use lmk_proto::group::Credential;
 
 use crate::groups::renaming;
-use crate::{Event, G, Inner, State, Work, now};
+use crate::held::delivered_key;
+use crate::reading::commit_key;
+use crate::{Event, G, Inner, State, Work, days, get, now};
 
 /// How often every group's duties run, besides as its log moves.
 pub(crate) const TIMER: Duration = Duration::from_secs(10 * 60);
+/// How long a member holds messages no cut keeps before it commits to keep them.
+const KEEP_ALIVE: u64 = 10 * 60 * 1000;
 
 /// When the leaf of the member with key `key`, last updated at `updated`, is next due an update, in milliseconds: at its
 /// first slot after `updated`, its slots every `update` seconds at an offset by a hash of its key, so that members
@@ -37,20 +39,92 @@ pub(crate) fn next_update(updated: u64, update: u32, key: &[u8]) -> u64 {
     (updated + t - offset) / t * t + offset
 }
 
+/// When a member holding messages no cut keeps since `since` commits to keep them: at its slot within `KEEP_ALIVE`
+/// after.
+fn keep_alive(since: u64, key: &[u8]) -> u64 {
+    since + KEEP_ALIVE + u64::from_be_bytes(Sha256::digest(key)[..8].try_into().unwrap()) % KEEP_ALIVE
+}
+
+impl<P: Provider> State<P> {
+    /// The cut a commit this session builds now carries: per member of the epoch, from the cut state on, each seq it
+    /// holds sealed in the current epoch whose `prev` chains to the last; its own only as far as another member's
+    /// summary shows held.
+    pub(crate) fn cut_for(&self, gid: &[u8]) -> Result<Vec<Ref>> {
+        let g = self.group(gid)?;
+        let (epoch, me) = (g.mls.epoch(), self.me(gid));
+        let mut cut = Vec::new();
+        for r in g.mls.cut() {
+            let (mut seq, mut id) = (r.seq, r.id.clone());
+            while seq < r.seq + MAX_CUT_STEP {
+                let Some(record) = self.record_at(gid, &r.key.0, r.joined, seq + 1)? else { break };
+                let sealed = record.sealing.as_ref().is_some_and(|(sealed, _)| *sealed == epoch);
+                let chained = record.header.prev.as_ref() == (seq > 0).then_some(&id);
+                if !sealed || !chained || (r.key.0 == me && self.holders_of(gid, seq + 1)?.is_empty()) {
+                    break;
+                }
+                (seq, id) = (seq + 1, record.id);
+            }
+            cut.push(Ref { key: r.key.clone(), joined: r.joined, seq, id });
+        }
+        Ok(cut)
+    }
+
+    /// Drops what the group kept past H: delivered messages (but this session's own that no cut kept), commit entries,
+    /// invites, file links, earlier logs, and memberships that ended with nothing left here.
+    fn expire(&mut self, gid: &[u8]) -> Result<()> {
+        let before = now().saturating_sub(days(self.group(gid)?.mls.settings().carry));
+        self.drop_earlier(gid, before)?;
+        let g = self.group_mut(gid)?;
+        g.rec.files.retain(|(_, at)| *at >= before);
+        g.rec.invites.retain(|rule| rule.expires >= before);
+        let (old, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut g.rec.commits).into_iter().partition(|(_, at)| *at < before);
+        g.rec.commits = kept;
+        for (epoch, _) in old {
+            self.provider.delete(&commit_key(gid, epoch))?;
+        }
+        let rec = &self.group(gid)?.rec;
+        let (mut first, last) = (rec.first.max(1), rec.index);
+        while first <= last {
+            if let Some(id) = get::<Bytes>(&self.provider, &delivered_key(gid, first))?
+                && let Some(record) = self.record(gid, &id.0)?
+            {
+                if record.delivered.as_ref().is_some_and(|d| d.at >= before) || record.plaintext.is_some() {
+                    break;
+                }
+                let h = &record.header;
+                if let Some(author) = self.group_mut(gid)?.author_mut(&h.author.0, h.joined) {
+                    author.servable.remove(h.seq);
+                }
+                self.unstore(gid, &record)?;
+                self.scrub = true;
+            }
+            first += 1;
+        }
+        let rec = &mut self.group_mut(gid)?.rec;
+        rec.first = first;
+        rec.authors.retain(|a| !a.ended || !a.servable.is_empty() || a.held != a.delivered);
+        self.save(gid)
+    }
+}
+
 /// What a pass commits on the group as it stands, if anything: the Removes due and this session's update; with the
 /// members removed whose devices were dropped.
-fn due<P: Provider>(st: &State<P>, g: &G) -> Option<(Change, Vec<core::Member>)> {
-    let me = st.me(g.mls.id());
+fn due<P: Provider>(st: &State<P>, g: &G) -> Result<Option<(Change, Vec<core::Member>)>> {
+    let gid = g.mls.id();
+    let me = st.me(gid);
+    let cut = st.cut_for(gid)?;
     let members = g.mls.members();
     let others = members.iter().filter(|m| m.key != me);
     let dropped = |m: &&core::Member| m.credential.as_ref().is_some_and(|c| dropped(&st.public, c));
     let dropped: Vec<core::Member> = others.clone().filter(dropped).cloned().collect();
-    let remove: Vec<u32> = others.filter(|m| g.left(&m.key) || dropped.iter().any(|d| d.index == m.index)).map(|m| m.index).collect();
-    let own = members.iter().find(|m| m.index == g.mls.own_index())?;
+    let kept = |m: &core::Member| g.left(&m.key).is_some_and(|seq| cut.iter().any(|r| r.key.0 == m.key && r.seq >= seq));
+    let remove: Vec<u32> = others.filter(|m| kept(m) || dropped.iter().any(|d| d.index == m.index)).map(|m| m.index).collect();
+    let Some(own) = members.iter().find(|m| m.index == g.mls.own_index()) else { return Ok(None) };
     let name = renaming(&g.mls, st.device.as_deref());
     let leaf = &st.session.leaf;
-    let update = own.leaf.as_ref() != Some(leaf) || name.is_some() || now() >= next_update(g.rec.updated, g.mls.settings().update, me);
-    (update || !remove.is_empty()).then(|| (Change { remove, leaf: Some(leaf.clone()), name, ..Change::default() }, dropped))
+    let keeps = g.rec.unkept.is_some_and(|since| now() >= keep_alive(since, me)) && cut != g.mls.cut();
+    let update = own.leaf.as_ref() != Some(leaf) || name.is_some() || keeps || now() >= next_update(g.rec.updated, g.mls.settings().update, me);
+    Ok((update || !remove.is_empty()).then(|| (Change { remove, leaf: Some(leaf.clone()), name, cut, ..Change::default() }, dropped)))
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
@@ -90,19 +164,17 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             if g.rec.leaving && g.mls.members().len() == 1 {
                 drop(st);
-                self.gone(gid, None);
+                self.gone(gid, None, Vec::new());
                 return Ok(());
             }
-            let expired = g.rec.expired;
             st.expire(gid)?;
-            st.scrub |= st.group(gid)?.rec.expired != expired;
-            self.leaving(&mut st, gid)?;
-            self.announce(&mut st, gid)?;
             if st.group(gid)?.mls.settings().kind == IDENTITY {
                 st.events.push(Event::Duties { group: Bytes(gid.to_vec()) });
             }
             let g = st.group(gid)?;
-            (due(&st, g).is_some(), next_update(g.rec.updated, g.mls.settings().update, st.me(gid)))
+            let next = next_update(g.rec.updated, g.mls.settings().update, st.me(gid));
+            let next = g.rec.unkept.map_or(next, |since| next.min(keep_alive(since, st.me(gid))));
+            (due(&st, g)?.is_some(), next)
         };
         self.time(gid, next);
         if !commit {
@@ -111,7 +183,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let removing = Mutex::new(Vec::new());
         let committed = self
             .commit(gid, |st, g| {
-                let Some((change, dropped)) = due(st, g) else { return Ok(None) };
+                let Some((change, dropped)) = due(st, g)? else { return Ok(None) };
                 *removing.lock().unwrap() = dropped;
                 Ok(Some(change))
             })
@@ -119,35 +191,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let removed = removing.into_inner().unwrap();
         if committed.is_some() && !removed.is_empty() {
             self.revoked(gid, &removed)?;
-        }
-        Ok(())
-    }
-
-    /// While this session leaves a group, it asks the others to remove it, unless a `leave` of its own counts in the
-    /// current or prior epoch, or is being sent.
-    fn leaving(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
-        let g = st.group(gid)?;
-        let (me, epoch) = (st.me(gid), g.mls.epoch());
-        let counts = g.rec.leaves.iter().any(|(key, sealed)| key.0 == me && sealed + 1 >= epoch);
-        if g.rec.leaving && !counts && !st.sending(gid)?.iter().any(|(_, payload)| type_of(payload) == "leave") {
-            self.start_send(st, gid, &json!({ "type": "leave" }))?;
-        }
-        Ok(())
-    }
-
-    /// Announces this session's known losses that no counted `lost` of its own, nor one being sent, names.
-    fn announce(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
-        let g = st.group(gid)?;
-        let me = st.me(gid);
-        let mut told: BTreeSet<u64> = g.rec.losses.values().filter(|(key, _)| key.0 == me).flat_map(|(_, lost)| lost.clone()).collect();
-        for (_, payload) in st.sending(gid)? {
-            if let Ok(Control::Lost { positions }) = serde_json::from_value(payload) {
-                told.extend(positions);
-            }
-        }
-        let positions: Vec<u64> = g.rec.lost.iter().filter(|position| !told.contains(position)).collect();
-        if !positions.is_empty() {
-            self.start_send(st, gid, &serde_json::to_value(Control::Lost { positions })?)?;
         }
         Ok(())
     }

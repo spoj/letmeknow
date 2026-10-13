@@ -2,7 +2,7 @@
 //! group logic hands on runs one item at a time (`drive`), the duties run at start and every while (`resume`), and
 //! files are fetched.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -18,7 +18,7 @@ use n0_future::task::spawn;
 use n0_future::time::sleep;
 use tokio::sync::mpsc;
 
-use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, device_key_key, duties, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
+use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, device_key_key, duties, endpoint_id, get, hex, iroh_key, logs, now, rec_key};
 
 /// How long a fetch keeps looking for a member that holds the file.
 const FETCH_TRIES: u32 = 12;
@@ -51,7 +51,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             committing: tokio::sync::Mutex::new(()),
             advanced: tokio::sync::Notify::new(),
             heard: tokio::sync::Notify::new(),
-            sending: Mutex::default(),
             passing: Mutex::default(),
             timers: Mutex::default(),
             tasks: Mutex::default(),
@@ -80,10 +79,10 @@ impl<P: Provider> State<P> {
         for gid in get::<Vec<Bytes>>(&provider, b"node/groups")?.unwrap_or_default() {
             let mls = Group::load(&provider, &gid.0)?;
             let rec: Rec = get(&provider, &rec_key(&gid.0))?.context("a group without its record")?;
-            let heard = peering::load_heard(&provider, &gid.0)?;
-            groups.insert(gid.0, G::new(mls, rec, heard));
+            groups.insert(gid.0, G::new(mls, rec));
         }
         let bindings = get(&provider, b"node/identity-bindings")?.unwrap_or_default();
+        let peers = Peers::new(now(), u64::from_be_bytes(lmk_core::random()), *iroh_key(&provider)?.public().as_bytes());
         let mut state = State {
             bindings,
             notified: BTreeSet::new(),
@@ -98,8 +97,7 @@ impl<P: Provider> State<P> {
             public: BTreeMap::new(),
             unlisted: HashSet::new(),
             device_keys: BTreeMap::new(),
-            waiters: HashMap::new(),
-            peers: Peers::new(now()),
+            peers,
             served: BTreeMap::new(),
             gate: true,
             time: now(),
@@ -111,14 +109,15 @@ impl<P: Provider> State<P> {
                 state.device_keys.insert(gid.clone(), (seed, session));
             }
             state.refresh(&gid);
+            state.load_heard(&gid)?;
         }
         Ok(state)
     }
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Starts the tasks, follows the logs, and picks up where the session stopped: its public logs replayed, its groups
-    /// it was removed from told, its pending sends appended.
+    /// Starts the tasks, follows the logs, and picks up where the session stopped: its public logs replayed, and its
+    /// groups it was removed from told.
     fn run(
         self: &Arc<Self>,
         mut net_events: mpsc::UnboundedReceiver<lmk_net::Event>,
@@ -150,13 +149,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 self.warn(None, format!("the public log {}: {error:#}", hex(&id.0)));
             }
         }
-        // A session removed by a commit it applied before it stopped is told so now; its sends go on. A group its log's
-        // reading dropped meanwhile is gone already.
+        // A session removed by a commit it applied before it stopped is told so now. A group its log's reading dropped
+        // meanwhile is gone already.
         for (gid, g) in &st.groups {
             if !g.mls.active() {
                 self.work.send(Work::Gone(gid.clone())).ok();
-            } else if !g.rec.sends.is_empty() {
-                self.work.send(Work::Send(gid.clone())).ok();
             }
         }
         drop(st);
@@ -175,11 +172,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 self.events.send(event).ok();
             }
             for out in out {
-                match (out, self.net.get()) {
-                    (Out::Outcome { waiters, outcome }, _) => waiters.into_iter().for_each(|waiter| drop(waiter.send(outcome.clone()))),
-                    (Out::Frame { peer, frame }, Some(net)) => drop(net.frame(peer, frame)),
-                    (Out::WantFiles { peer, group }, Some(net)) => net.want_files(peer, &group),
-                    _ => {}
+                let Some(net) = self.net.get() else { continue };
+                match out {
+                    Out::Frame { peer, frame } => drop(net.frame(peer, frame)),
+                    Out::WantFiles { peer, group } => net.want_files(peer, &group),
+                    Out::Dial(peer) => self.dial(peer),
+                    Out::Close(peer) => net.close(peer),
                 }
             }
         }
@@ -204,28 +202,24 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Dials every member of every group that is not connected.
-    pub(crate) fn dial_all(self: &Arc<Self>) {
-        let connected = self.net().connected();
-        let me = self.net().id();
-        let leaves: BTreeSet<(EndpointId, String)> = {
+    /// Dials a member, at the relay its leaf names, and tells `Peers` how it went.
+    fn dial(self: &Arc<Self>, peer: EndpointId) {
+        let relay = {
             let st = self.lock();
-            st.groups
-                .values()
-                .flat_map(|g| g.mls.members())
-                .filter_map(|m| Some((endpoint_id(&m.leaf.as_ref()?.key.0)?, m.leaf?.relay)))
-                .filter(|(peer, _)| *peer != me && !connected.contains(peer))
-                .collect()
+            let leaves = st.groups.values().flat_map(|g| g.mls.members()).filter_map(|m| m.leaf);
+            leaves.into_iter().find(|leaf| endpoint_id(&leaf.key.0) == Some(peer)).and_then(|leaf| leaf.relay.parse().ok())
         };
-        for (peer, relay) in leaves {
-            let Ok(relay) = relay.parse() else { continue };
-            let net = self.net().clone();
-            spawn(async move {
-                if let Err(error) = net.dial(peer, relay).await {
-                    tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
-                }
-            });
-        }
+        let Some(relay) = relay else { return };
+        let inner = self.clone();
+        spawn(async move {
+            let dialed = inner.net().dial(peer, relay).await;
+            if let Err(error) = &dialed {
+                tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
+            }
+            let mut st = inner.lock();
+            let now = st.tick();
+            st.peers.dialed(peer.as_bytes(), dialed.is_ok(), now);
+        });
     }
 
     /// Fetches, in the background, the files linked anew that are within this session's limit.
@@ -252,13 +246,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
     async fn drive(self: Arc<Self>, mut work: mpsc::UnboundedReceiver<Work>) {
         while let Some(item) = work.recv().await {
             match item {
-                Work::Applied { group, by, added, how, removed, settings, gone } => self.applied(&group, by, added, how, removed, settings, gone).await,
+                Work::Applied { group, by, added, how, removed, settings, gone, not_kept } => self.applied(&group, by, added, how, removed, settings, gone, not_kept).await,
                 Work::Follow { log, old } => {
                     self.unfollow(&old);
                     self.follow(&log);
                 }
                 Work::Duties(gid) => self.duties(&gid),
-                Work::Gone(group) => self.gone(&group, None),
+                Work::Gone(group) => self.gone(&group, None, Vec::new()),
                 Work::Fetch { group, link } => {
                     if self.net().has(link.hash).await.unwrap_or(false) {
                         self.lock().events.push(Event::File(link.hash));
@@ -270,15 +264,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                             tracing::debug!("fetching {}: {error:#}", link.link());
                         }
                     });
-                }
-                Work::Send(gid) => {
-                    if self.sending.lock().unwrap().insert(gid.clone()) {
-                        let inner = self.clone();
-                        self.spawn(async move {
-                            inner.sends(&gid).await;
-                            inner.sending.lock().unwrap().remove(&gid);
-                        });
-                    }
                 }
             }
         }
@@ -305,7 +290,6 @@ mod tests {
     use super::*;
     use lmk_core::provider::MemoryProvider;
     use lmk_proto::peer::Frame;
-    use tokio::sync::oneshot;
 
     #[tokio::test]
     async fn cached_file_work_requires_durability() {
@@ -464,20 +448,12 @@ mod tests {
             durable: Some(Arc::new(|| Box::pin(async { anyhow::bail!("injected persistence failure") }))),
         };
         let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-        let (waiter, outcome) = oneshot::channel();
-        let (pending, unfinished) = oneshot::channel();
-        node.inner.state.lock().unwrap().waiters.insert(vec![2], vec![pending]);
         let peer = node.net().id();
-        let out = vec![
-            Out::Frame { peer, frame: Frame::Hello { groups: vec![], heads: vec![] } },
-            Out::WantFiles { peer, group: vec![1] },
-            Out::Outcome { waiters: vec![waiter], outcome: Ok((1, Bytes(vec![1]))) },
-        ];
+        let out = vec![Out::Frame { peer, frame: Frame::Hello { groups: vec![], heads: vec![] } }, Out::WantFiles { peer, group: vec![1] }];
         assert!(node.inner.outbox.send((out, vec![Event::Heard { group: Bytes(vec![1]) }])).is_ok());
         let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await.unwrap().unwrap();
         assert!(matches!(event, Event::Warning { text, .. } if text.contains("injected persistence failure")));
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(10), outcome).await.unwrap().is_err(), "a failed barrier must not release even a successful outcome");
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(10), unfinished).await.unwrap().is_err(), "pending sends stop waiting without losing their stored records");
+        assert!(events.try_recv().is_err(), "a failed barrier releases none of the batch's events");
         assert!(node.inner.outbox.is_closed(), "no later peer batch can bypass the failure");
         assert!(node.inner.durable().await.is_err(), "failure stays latched until restart");
         tokio::time::timeout(std::time::Duration::from_secs(10), node.shutdown()).await.unwrap().unwrap();
@@ -500,23 +476,15 @@ mod tests {
             })),
         };
         let (node, mut events) = Node::start(MemoryProvider::default(), config).await.unwrap();
-        let (waiter, mut outcome) = oneshot::channel();
-        let out = vec![Out::Outcome { waiters: vec![waiter], outcome: Ok((1, Bytes(vec![1]))) }];
-        assert!(node.inner.outbox.send((out, vec![Event::Heard { group: Bytes(vec![1]) }])).is_ok());
+        assert!(node.inner.outbox.send((vec![], vec![Event::Heard { group: Bytes(vec![1]) }])).is_ok());
         tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await.unwrap();
-        assert!(matches!(outcome.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
         assert!(events.try_recv().is_err());
         release.notify_one();
-        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(10), outcome).await.unwrap().unwrap().unwrap().0, 1);
         assert!(matches!(events.recv().await, Some(Event::Heard { .. })));
 
-        let (waiter, outcome) = oneshot::channel();
-        assert!(node.inner.outbox.send((vec![Out::Outcome { waiters: vec![waiter], outcome: Ok((1, Bytes(vec![1]))) }], vec![])).is_ok());
-        let (pending, unfinished) = oneshot::channel();
-        node.inner.state.lock().unwrap().waiters.insert(vec![2], vec![pending]);
+        assert!(node.inner.outbox.send((vec![], vec![Event::Heard { group: Bytes(vec![2]) }])).is_ok());
         tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), node.shutdown()).await.unwrap().unwrap();
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(10), outcome).await.unwrap().is_err());
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(10), unfinished).await.unwrap().is_err());
+        assert!(!matches!(events.try_recv(), Ok(Event::Heard { .. })), "shutdown cancels the barrier in flight");
     }
 }
