@@ -28,9 +28,9 @@ export async function has(): Promise<boolean> {
   return (await done((await database()).transaction("records").objectStore("records").count())) > 0;
 }
 
-/** Whether this browser keeps letmeknow 0.16's session, in its own database, which this version leaves as it is. */
+/** Whether this browser keeps letmeknow 0.17's session, in its own database, which this version leaves as it is. */
 export async function older(): Promise<boolean> {
-  return (await indexedDB.databases()).some(({ name }) => name === "lmk5");
+  return (await indexedDB.databases()).some(({ name }) => name === "lmk6");
 }
 
 /** The session's records, and the hashes of the files it keeps. */

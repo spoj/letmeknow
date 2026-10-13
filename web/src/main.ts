@@ -142,12 +142,12 @@ async function boot() {
   if (invite && had) offer(kind);
 }
 
-/** letmeknow 0.16's chats stay in its own database, which this version leaves as it is: said once. */
+/** letmeknow 0.17's chats stay in its own database, which this version leaves as it is: said once. */
 async function keptByOlder() {
-  if (localStorage.getItem("lmk 0.16 kept") || !(await store.older())) return;
-  localStorage.setItem("lmk 0.16 kept", "1");
+  if (localStorage.getItem("lmk 0.17 kept") || !(await store.older())) return;
+  localStorage.setItem("lmk 0.17 kept", "1");
   const ok = h("button", { className: "primary" }, "OK");
-  const notice = h("div", { className: "banner", role: "status" }, h("span", {}, "Chats from letmeknow 0.16 stay with 0.16 in this browser. This version keeps its own and does not open them."), ok);
+  const notice = h("div", { className: "banner", role: "status" }, h("span", {}, "Chats from letmeknow 0.17 stay with 0.17 in this browser. This version keeps its own and does not open them."), ok);
   ok.onclick = () => notice.remove();
   document.body.append(notice);
 }
