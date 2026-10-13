@@ -1655,7 +1655,16 @@ async fn a_peer_not_admitted_changes_nothing() {
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     bob.node.shutdown().await.unwrap();
     eventually("Bob is gone", || alice.node.online(&gid.0).unwrap().is_empty()).await;
-    let before = dump(&alice_db);
+    // Alice signs her summary a moment after what she holds changes: her state is taken once it stays still.
+    let mut before = dump(&alice_db);
+    loop {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let now = dump(&alice_db);
+        if now == before {
+            break;
+        }
+        before = now;
+    }
 
     let mut mallory = hand(&relay, iroh::SecretKey::from_bytes(&lmk_core::random()), &alice.node).await;
     let real = sealed(&alice_db, &gid, &sent).1;

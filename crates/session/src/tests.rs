@@ -531,8 +531,11 @@ fn status_lists_sends_held_only_here_and_members_away() {
         let (alice, mut bob, _) = pair(&world, HOUR).await;
         let robert = format!("Robert · {}", bob.device);
         let hello = alice.cmd(&["send", "hello"]).await.unwrap();
-        // Bob holds it, so Alice's next commit keeps it.
-        held(&alice, &hello, &robert).await;
+        // Bob was shown it, so his summary that says so shows that he holds it and the invite before it: Alice's next
+        // commit keeps both.
+        bob.told(&["message"]).await;
+        let read = until(|| async { alice.cmd(&["read", hello["id"].as_str().unwrap()]).await.unwrap() }, |read| read[0]["read_by"] == json!([robert])).await;
+        assert_eq!(read[0]["read_by"], json!([robert]), "{read}");
         alice.cmd(&["name", "Kept"]).await.unwrap();
         let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
         assert!(status["groups"][0]["only_here"].is_null(), "{status}");
