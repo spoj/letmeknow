@@ -77,7 +77,7 @@ impl<P: Provider> Member<P> {
         read
     }
 
-    /// The next held message this member sends: its header signed and sealed in the current epoch.
+    /// The next held message this member sends, sealed in the current epoch.
     pub fn send(&mut self, text: &str) -> Vec<u8> {
         let group = self.group.as_ref().unwrap();
         let header = Header {
@@ -90,12 +90,12 @@ impl<P: Provider> Member<P> {
             reply_to: None,
             payload: message(text),
         };
-        let plaintext = header.sign(|bytes| self.session.sign(bytes));
+        let plaintext = header.encode();
         self.sent.push(held::id(&plaintext));
         self.seal(&plaintext)
     }
 
-    /// A signed held plaintext, sealed in the current epoch.
+    /// A held plaintext, sealed in the current epoch.
     pub fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
         self.group.as_mut().unwrap().seal(&self.provider, &self.session, plaintext).unwrap()
     }
@@ -242,7 +242,7 @@ fn live(m: &Member, payload: &serde_json::Value) -> Vec<u8> {
 
 /// The sender's key and the payload of a live payload `m` opens, if it opens.
 fn open_live(m: &Member, wire: &[u8]) -> Result<(Vec<u8>, serde_json::Value)> {
-    let (sender, payload) = m.group.as_ref().unwrap().open_live(&m.provider, wire)?;
+    let (sender, payload, _) = m.group.as_ref().unwrap().open_live(&m.provider, wire)?;
     Ok((sender.key, payload))
 }
 
@@ -887,12 +887,17 @@ fn credentials_are_checked_not_enforced() {
 
 /// A removed member's messages sealed before its removal still open, while the keys of their epoch are kept.
 #[test]
-fn removed_members_messages_still_open() {
+fn a_removed_members_messages_open_up_to_its_final_cut() {
     let mut w = World::new(&["A", "B", "C"]);
     w.found(0, &[1, 2]);
     let early = w.m[2].send("before my removal");
-    let c = w.m[1].index_of("C");
-    let cut = w.m[1].cut();
+    let past = w.m[2].send("past my final cut");
+    let id = w.m[1].open(&early).unwrap().id;
+    let (c, key) = (w.m[1].index_of("C"), w.m[2].session.key().to_vec());
+    let mut cut = w.m[1].cut();
+    let last = at(&mut cut, &key);
+    last.seq = 1;
+    last.id = Bytes(id.to_vec());
     let commit = w.m[1].commit(Change { cut, remove: vec![c], ..Change::default() });
     w.post(commit.entry);
     let read = w.read(&[0, 1, 2]);
@@ -902,6 +907,7 @@ fn removed_members_messages_still_open() {
     w.agree(&[0, 1]);
     let opened = w.m[0].open(&early).unwrap();
     assert_eq!((opened.sender.name.as_str(), text(&opened)), ("C", "before my removal"));
+    assert!(w.m[0].open(&past).unwrap_err().to_string().contains("final cut"));
 }
 
 #[test]
@@ -991,11 +997,18 @@ fn state_survives_a_restart() {
 fn a_payload_that_could_seal_over_the_limit_is_refused() {
     let mut w = World::new(&["A", "B"]);
     w.found(0, &[1]);
+    let key = w.m[0].session.key().to_vec();
+    let (id, joined) = (w.m[0].g().id().to_vec(), w.m[0].g().joined(&key).unwrap());
+    let sized = |len: usize| {
+        let base = Header { payload: message(""), ..header(&w.m[0], &id, joined) }.encode().len();
+        Header { payload: message(&"x".repeat(len - base)), ..header(&w.m[0], &id, joined) }.encode()
+    };
+    let (over, most) = (sized(MAX_MESSAGE - FRAMING + 1), sized(MAX_MESSAGE - FRAMING));
     let a = &mut w.m[0];
     let group = a.group.as_mut().unwrap();
-    let error = group.seal(&a.provider, &a.session, &vec![0; MAX_MESSAGE - FRAMING + 1]).unwrap_err();
+    let error = group.seal(&a.provider, &a.session, &over).unwrap_err();
     assert_eq!(error.to_string(), format!("the message is {} bytes, over the 1 MiB members take", MAX_MESSAGE + 1));
-    let sealed = group.seal(&a.provider, &a.session, &vec![0; MAX_MESSAGE - FRAMING]).unwrap();
+    let sealed = group.seal(&a.provider, &a.session, &most).unwrap();
     assert!(sealed.len() <= MAX_MESSAGE);
 }
 
@@ -1024,28 +1037,40 @@ fn held_messages_keep_their_id_across_epochs() {
     assert_eq!(w.m[2].open(&again).unwrap().id, first.id);
 }
 
-/// What a held message's header is checked against once MLS opens it: its MLS sender's signature key, its group, and its
-/// author's current membership.
+/// What a held message's header is checked against once MLS opens it: its MLS sender's signature key, its claim, its
+/// group, and its author's membership.
 #[test]
 fn held_headers_are_checked() {
     let mut w = World::new(&["A", "B", "C"]);
     w.found(0, &[1, 2]);
     let id = w.m[0].group.as_ref().unwrap().id().to_vec();
     let joined = w.m[0].group.as_ref().unwrap().joined(w.m[0].session.key()).unwrap();
-    // A's signed header, sealed by B: the MLS sender is not the author.
-    let signed = header(&w.m[0], &id, joined).sign(|bytes| w.m[0].session.sign(bytes));
-    let sealed = w.m[1].seal(&signed);
+    // A's header, sealed by B: the MLS sender is not the author.
+    let plaintext = header(&w.m[0], &id, joined).encode();
+    let sealed = w.m[1].seal(&plaintext);
     assert!(w.m[2].open(&sealed).unwrap_err().to_string().contains("did not author"));
+    // Claiming another seq than its header's.
+    let claim = Claim { seq: 2, ..header(&w.m[0], &id, joined).claim() };
+    let epoch = w.m[1].g().epoch();
+    let a = &mut w.m[0];
+    let g = a.group.as_mut().unwrap();
+    g.mls.set_aad(serde_json::to_vec(&claim).unwrap());
+    let sealed = g.mls.create_message(&a.provider, &a.session.signer, &plaintext).unwrap().to_bytes().unwrap();
+    assert_eq!(crate::group::claim(&sealed).unwrap(), (claim, epoch), "the claim reads in the clear");
+    assert!(w.m[1].open(&sealed).unwrap_err().to_string().contains("claimed otherwise"));
     // Another group's.
-    let other = header(&w.m[0], &[9; 16], joined).sign(|bytes| w.m[0].session.sign(bytes));
+    let other = header(&w.m[0], &[9; 16], joined).encode();
     let sealed = w.m[0].seal(&other);
     assert!(w.m[1].open(&sealed).unwrap_err().to_string().contains("of another group"));
     // A membership of A's other than its current one.
-    let stale = header(&w.m[0], &id, joined + 1).sign(|bytes| w.m[0].session.sign(bytes));
+    let stale = header(&w.m[0], &id, joined + 1).encode();
     let sealed = w.m[0].seal(&stale);
     assert!(w.m[1].open(&sealed).unwrap_err().to_string().contains("another membership"));
     let hi = w.m[0].send("hi");
     assert_eq!(text(&w.m[1].open(&hi).unwrap()), "hi");
+    let b = &mut w.m[1];
+    let again = b.group.as_mut().unwrap().open(&b.provider, &hi).unwrap_err();
+    assert!(again.is::<Unheld>(), "opened before: {again}");
 }
 
 /// Cuts advance, a removed member leaves them, an added one starts at seq 0 of the new epoch, and every cut `rules`
@@ -1156,8 +1181,11 @@ fn a_joiner_starts_at_the_commits_cut() {
 
     let Entry { commit: bytes, welcome, .. } = Entry::parse(&inner).unwrap();
     let before = w.m[2].provider.records();
-    let forged = entry_of(&stranger(), bytes.clone(), welcome);
-    assert!(join_error(&w.m[2], &forged, &kp_c).contains("no member signed"));
+    let forged = entry_of(&stranger(), bytes.clone(), welcome.clone());
+    assert!(join_error(&w.m[2], &forged, &kp_c).contains("did not sign"));
+    assert_eq!(w.m[2].provider.records(), before);
+    let by_another_member = entry_of(&w.m[1].session.signer, bytes.clone(), welcome);
+    assert!(join_error(&w.m[2], &by_another_member, &kp_c).contains("did not sign"), "only the committer vouches for its cut");
     assert_eq!(w.m[2].provider.records(), before);
     let kp_d = w.key_package(3);
     let mut other = w.m[0].copy();
@@ -1194,6 +1222,11 @@ fn live_payloads_open_only_in_their_epoch() {
     let edit = serde_json::json!({ "type": "edit", "text": "hi" });
     let wire = live(&w.m[0], &edit);
     assert_eq!(open_live(&w.m[1], &wire).unwrap(), (w.m[0].session.key().to_vec(), edit.clone()));
+    let replay = live(&w.m[0], &edit);
+    assert_ne!(replay, wire);
+    let b = &w.m[1];
+    let id = |wire: &[u8]| b.group.as_ref().unwrap().open_live(&b.provider, wire).unwrap().2;
+    assert_eq!(id(&replay), id(&wire), "sealed anew, the same signed body keeps its id");
     let mut tampered = wire.clone();
     let last = tampered.len() - 1;
     tampered[last] ^= 1;

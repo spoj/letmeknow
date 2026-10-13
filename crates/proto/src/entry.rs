@@ -12,10 +12,13 @@ pub struct Entry {
     pub sig: Vec<u8>,
 }
 
+/// What a commit entry's signature covers, before its commit and Welcome.
+const COMMIT_SIGNED: &[u8] = b"letmeknow commit v1\0";
+
 /// What a commit entry's signature covers.
 pub fn signed(commit: &[u8], welcome: Option<&[u8]>) -> Vec<u8> {
     let welcome = welcome.unwrap_or_default();
-    [b"letmeknow commit".as_slice(), &(commit.len() as u32).to_be_bytes(), commit, welcome].concat()
+    [COMMIT_SIGNED, &(commit.len() as u32).to_be_bytes(), commit, welcome].concat()
 }
 
 impl Entry {

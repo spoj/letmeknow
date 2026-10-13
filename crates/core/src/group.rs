@@ -1,6 +1,6 @@
 //! Sessions and groups on OpenMLS: epoch-sealed commit entries judged strictly in order, each carrying the cut of the
-//! epoch it ends; held messages as application messages whose plaintext is a header their author signed; and live
-//! payloads sealed under a key exported from the epoch.
+//! epoch it ends; held messages as application messages whose plaintext is their header, claiming in the clear whose
+//! they are; and live payloads sealed under a key exported from the epoch.
 
 use anyhow::{Context, Result, bail, ensure};
 use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, KeyInit, Payload}};
@@ -8,7 +8,7 @@ use lmk_proto::Bytes;
 use lmk_proto::clock::now;
 use lmk_proto::entry::{Entry, signed};
 use lmk_proto::group::{Certificate, Credential, How, IDENTITY, LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
-use lmk_proto::held::{self, Header, Ref};
+use lmk_proto::held::{self, Claim, Header, Ref};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -23,6 +23,8 @@ pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_
 pub const MAX_MESSAGE: usize = 1 << 20;
 /// More than an application message's ciphertext adds to its plaintext.
 pub const FRAMING: usize = 1024;
+/// How far one cut may move a membership's.
+pub const MAX_CUT_STEP: u64 = 100_000;
 const ADDRESS_LABEL: &str = "letmeknow epoch log address v1";
 const SEALING_LABEL: &str = "letmeknow epoch log sealing v1";
 const ENVELOPE_DOMAIN: &[u8] = b"letmeknow epoch envelope v1\0";
@@ -81,10 +83,12 @@ pub fn credential_of(credential: &openmls::prelude::Credential) -> Option<Creden
     serde_json::from_slice(basic.identity()).ok()
 }
 
-/// The epoch a held message's ciphertext was sealed in, as its clear header shows it.
-pub fn sealed_in(bytes: &[u8]) -> Result<u64> {
+/// Whose a held message's ciphertext claims to be, and the epoch it was sealed in, as its clear framing shows them:
+/// `open` checks the claim.
+pub fn claim(bytes: &[u8]) -> Result<(Claim, u64)> {
     let MlsMessageBodyIn::PrivateMessage(message) = parse::<MlsMessageIn>(bytes)?.extract() else { bail!("not a private message") };
-    Ok(message.epoch().as_u64())
+    ensure!(message.content_type() == ContentType::Application, "not an application message");
+    Ok((serde_json::from_slice(message.aad()).context("a held message's claim")?, message.epoch().as_u64()))
 }
 
 fn parse<T: tls_codec::DeserializeBytes>(bytes: &[u8]) -> Result<T> {
@@ -143,7 +147,7 @@ impl Session {
         self.signer.public()
     }
 
-    /// Its signature over `bytes`, which begin with what they are for, as `held::HELD` does.
+    /// Its signature over `bytes`, which begin with what they are for, as `peer::SUMMARY` does.
     pub fn sign(&self, bytes: &[u8]) -> Vec<u8> {
         self.signer.sign(bytes).expect("an Ed25519 key signs")
     }
@@ -233,8 +237,8 @@ struct Aad {
     cut: Vec<Ref>,
 }
 
-/// A message sealed under an epoch whose keys this session does not hold: one it never was in, or one past its key
-/// window.
+/// A message this session holds no key for: sealed in an epoch it never was in or whose keys it deleted, too far behind
+/// the newest of its sender's it opened, or opened before.
 #[derive(Debug)]
 pub struct Unheld;
 
@@ -356,6 +360,8 @@ struct State {
     added: Vec<Added>,
     /// The cut state: per current member, by key, how far its held messages are kept, as the commits applied say.
     cut: Vec<Ref>,
+    /// The cut of the commit that ended the previous epoch: its members, the removed ones at their final cuts.
+    ended: Vec<Ref>,
 }
 
 pub struct Group {
@@ -392,10 +398,10 @@ impl Group {
         Ok(group)
     }
 
-    /// Joins by the Welcome in the commit entry that added this session, whose committer's signature it checks against
-    /// the tree it joins, and whose cut is where it starts: the cut state of the members it found, and every other at
-    /// seq 0 of the new epoch. OpenMLS consumes a package during `build_from_welcome`, before `into_group`, so an error
-    /// here rolls back this call's writes, the package's consumption included.
+    /// Joins by the Welcome in the commit entry that added this session, whose signature it checks against the Welcome's
+    /// sender, its committer, and whose cut, which it cannot judge, is where it starts: the cut state of the members it
+    /// names, and every other at seq 0 of the new epoch. OpenMLS consumes a package during `build_from_welcome`, before
+    /// `into_group`, so an error here rolls back this call's writes, the package's consumption included.
     pub fn join<P: Provider>(provider: &P, entry: &[u8], expected_package: &[u8; 32]) -> Result<Self> {
         let Entry { commit, welcome, sig } = Entry::parse(entry)?;
         let signed = signed(&commit, welcome.as_deref());
@@ -403,6 +409,7 @@ impl Group {
             bail!("not a Welcome")
         };
         let MlsMessageBodyIn::PrivateMessage(commit) = parse::<MlsMessageIn>(&commit)?.extract() else { bail!("not a commit") };
+        ensure!(commit.content_type() == ContentType::Commit, "not a commit");
         let aad: Aad = serde_json::from_slice(commit.aad()).context("a commit's authenticated data")?;
         provider.savepoint()?;
         let result = (|| {
@@ -410,6 +417,7 @@ impl Group {
             let package = builder.processed_welcome().own_key_package().context("Welcome did not use a saved KeyPackage")?;
             ensure!(package.hash_ref(provider.crypto())?.as_slice() == expected_package, "Welcome used another KeyPackage");
             let staged = builder.skip_lifetime_validation().build()?;
+            let committer = staged.welcome_sender()?.signature_key().as_slice().to_vec();
             let settings = settings_of(staged.group_context().extensions())?;
             ensure!(
                 settings.protocol == PROTOCOL,
@@ -421,8 +429,10 @@ impl Group {
             let mls = staged.into_group(provider)?;
             let epoch = mls.epoch().as_u64();
             ensure!(commit.group_id() == mls.group_id() && commit.epoch().as_u64() + 1 == epoch, "a commit entry of another group or epoch");
-            let committer = mls.members().any(|m| provider.crypto().verify_signature(SignatureScheme::ED25519, &signed, &m.signature_key, &sig).is_ok());
-            ensure!(committer, "a commit entry no member signed");
+            ensure!(
+                provider.crypto().verify_signature(SignatureScheme::ED25519, &signed, &committer, &sig).is_ok(),
+                "a commit entry its Welcome's sender did not sign"
+            );
             ensure!(aad.cut.windows(2).all(|pair| pair[0].key < pair[1].key) && aad.cut.iter().all(well_formed), "a malformed cut");
             let cut = mls.members().map(|m| {
                 let found = aad.cut.iter().find(|r| r.key.0 == m.signature_key).cloned();
@@ -430,7 +440,7 @@ impl Group {
             });
             let mut cut: Vec<Ref> = cut.collect();
             cut.sort();
-            let group = Group { state: State { cut, ..State::default() }, mls };
+            let group = Group { state: State { cut, ended: aad.cut, ..State::default() }, mls };
             group.save(provider)?;
             Ok(group)
         })();
@@ -551,7 +561,7 @@ impl Group {
         Ok([&[1], nonce.as_slice(), &ciphertext].concat())
     }
 
-    /// Opens only the current epoch's outer envelope, returning the encoded Entry. `judge` checks its inner signature/MAC.
+    /// Opens only the current epoch's outer envelope, returning the encoded Entry. `judge` checks its inner signature.
     pub fn open_entry<P: Provider>(&self, provider: &P, wire: &[u8]) -> Result<Vec<u8>> {
         let bucket = wire.len();
         ensure!((1024..=1 << 20).contains(&bucket) && bucket.is_power_of_two(), "invalid envelope bucket");
@@ -724,7 +734,7 @@ impl Group {
         let message = parse::<MlsMessageIn>(commit)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Commit, "not a commit");
         let processed = self.mls.process_message(provider, message)?;
-        let aad = serde_json::from_slice::<Aad>(processed.aad()).unwrap_or_default();
+        let aad: Aad = serde_json::from_slice(processed.aad()).context("a commit's authenticated data")?;
         let Sender::Member(by) = *processed.sender() else { bail!("not from a member") };
         let key = self.mls.member_at(by).context("from no member")?.signature_key;
         let signed = provider.crypto().verify_signature(SignatureScheme::ED25519, &signed(commit, welcome), &key, sig).is_ok();
@@ -744,52 +754,57 @@ impl Group {
     fn merged<P: Provider>(&mut self, provider: &P, mut applied: Applied) -> Result<Applied> {
         let members = self.members();
         for member in &mut applied.added {
-            member.index = members.iter().find(|m| m.key == member.key).map_or(0, |m| m.index);
+            member.index = members.iter().find(|m| m.key == member.key).expect("an added member is in the tree").index;
         }
         let epoch = self.epoch();
         let mut cut: Vec<Ref> = applied.cut.iter().filter(|r| members.iter().any(|m| m.key == r.key.0)).cloned().collect();
         cut.extend(applied.added.iter().map(|m| Ref { key: Bytes(m.key.clone()), joined: epoch, seq: 0, id: Bytes::default() }));
         cut.sort();
         self.state.cut = cut;
+        self.state.ended = applied.cut.clone();
         self.save(provider)?;
         Ok(applied)
     }
 
-    /// Seals a held message's plaintext (`held::Header::sign`) as an application message of the current epoch. One whose
-    /// ciphertext could be over `MAX_MESSAGE` fails before it uses any of the sender's keys.
+    /// Seals a held message's plaintext, its header's JSON, as an application message of the current epoch, claiming
+    /// its membership and seq. One whose ciphertext could be over `MAX_MESSAGE` fails before it uses any of the sender's
+    /// keys.
     pub fn seal<P: Provider>(&mut self, provider: &P, session: &Session, plaintext: &[u8]) -> Result<Vec<u8>> {
         let size = plaintext.len() + FRAMING;
         ensure!(size <= MAX_MESSAGE, "the message is {size} bytes, over the 1 MiB members take");
-        self.mls.set_aad(Vec::new());
+        self.mls.set_aad(serde_json::to_vec(&Header::open(plaintext)?.claim())?);
         Ok(self.mls.create_message(provider, &session.signer, plaintext)?.to_bytes()?)
     }
 
-    /// Decrypts a member's held message and checks its header: of this group, its author the sender, signed by it, and
-    /// of the author's current membership if it is still a member. One under an epoch whose keys this session does not
-    /// hold fails with `Unheld`. What openmls does with one it rejects leaves no trace: it advances the claimed sender's
-    /// keys before it checks the signature.
+    /// Decrypts a member's held message and checks its header: of this group, its author the sender, as it claimed, of
+    /// the membership its author had in the epoch it was sealed in, and within its final cut if that membership ended.
+    /// What openmls does with one it rejects leaves no trace: it advances the claimed sender's keys before it checks the
+    /// signature.
     pub fn open<P: Provider>(&mut self, provider: &P, bytes: &[u8]) -> Result<Opened> {
         let message = parse::<MlsMessageIn>(bytes)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Application, "not an application message");
-        let unheld = message.epoch() < self.mls.epoch();
         let processed = self.guarded(provider, |result| matches!(result, Ok(Ok(_))), |g| Ok(g.mls.process_message(provider, message)))?;
         let processed = match processed {
             Err(ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(MessageDecryptionError::SecretTreeError(
-                SecretTreeError::TooDistantInThePast,
-            )))) if unheld => return Err(Unheld.into()),
+                SecretTreeError::TooDistantInThePast | SecretTreeError::SecretReuseError,
+            )))) => return Err(Unheld.into()),
             processed => processed?,
         };
         let epoch = processed.epoch().as_u64();
+        let claim: Claim = serde_json::from_slice(processed.aad()).context("a held message's claim")?;
         let sender = credential_of(processed.credential()).context("the sender has no letmeknow credential")?;
         let ProcessedMessageContent::ApplicationMessage(message) = processed.into_content() else {
             bail!("not an application message")
         };
         let plaintext = message.into_bytes();
-        let header = Header::open(&plaintext, |key, signed, sig| crate::device::verify(key, &[], signed, sig))?;
+        let header = Header::open(&plaintext)?;
         ensure!(header.group.0 == self.id(), "a held message of another group");
-        ensure!(header.author == sender.key, "a held message its sender did not author");
-        let joined = self.joined(&header.author.0);
-        ensure!(joined.is_none_or(|joined| joined == header.joined), "a held message of another membership of its author");
+        ensure!(header.author == sender.key && header.claim() == claim, "a held message its sender did not author, or claimed otherwise");
+        let cuts = if epoch == self.epoch() { &self.state.cut } else { &self.state.ended };
+        let membership = cuts.iter().find(|r| r.key == header.author).context("a held message of no membership")?;
+        ensure!(membership.joined == header.joined, "a held message of another membership of its author");
+        let ended = self.joined(&header.author.0) != Some(header.joined);
+        ensure!(!ended || header.seq <= membership.seq, "a held message past its membership's final cut");
         Ok(Opened { id: held::id(&plaintext), epoch, sender, header, plaintext })
     }
 
@@ -814,9 +829,9 @@ impl Group {
         Ok([&epoch.to_be_bytes()[..], &nonce, &ciphertext].concat())
     }
 
-    /// Opens a live payload sealed in the current epoch by a current member, its signature checked: the member, and the
-    /// payload.
-    pub fn open_live<P: Provider>(&self, provider: &P, wire: &[u8]) -> Result<(Member, Value)> {
+    /// Opens a live payload sealed in the current epoch by a current member, its signature checked: the member, the
+    /// payload, and its id, the hash of the signature, which a replay sealed anew keeps.
+    pub fn open_live<P: Provider>(&self, provider: &P, wire: &[u8]) -> Result<(Member, Value, [u8; 32])> {
         ensure!(wire.len() > 8 + 24 + 64 + 16, "a live payload too short");
         let epoch = u64::from_be_bytes(wire[..8].try_into().unwrap());
         ensure!(epoch == self.epoch(), "a live payload of another epoch");
@@ -831,7 +846,7 @@ impl Group {
         let member = self.members().into_iter().find(|m| m.key == live.author.0).context("a live payload from no current member")?;
         ensure!(crate::device::verify(&live.author.0, &context, body, sig), "a live payload its author did not sign");
         ensure!(live.payload["type"].is_string(), "a payload without a type");
-        Ok((member, live.payload))
+        Ok((member, live.payload, held::id(sig)))
     }
 }
 
@@ -915,7 +930,7 @@ fn well_formed(r: &Ref) -> bool {
 /// make; added members whose credentials name their own keys, and none it removes; settings that parse, at this
 /// protocol, with the kind and the public log unchanged; only name or signed same-identity/device claim updates to the
 /// committer's credential; and a cut that names every member of the cut state `cut`, by key, in order, at its
-/// membership, never below it.
+/// membership, never below it nor more than `MAX_CUT_STEP` past it.
 fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, cut: &[Ref]) -> Result<()> {
     let removed: Vec<Vec<u8>> = staged.remove_proposals().filter_map(|r| group.member_at(r.remove_proposal().removed())).map(|m| m.signature_key).collect();
     for proposal in staged.queued_proposals() {
@@ -935,6 +950,7 @@ fn rules(group: &MlsGroup, staged: &StagedCommit, by: LeafNodeIndex, aad: &Aad, 
     for (new, old) in aad.cut.iter().zip(cut) {
         ensure!(well_formed(new), "a cut whose id does not fit its seq");
         ensure!(new.seq > old.seq || (new.seq == old.seq && new.id == old.id), "a cut below the last");
+        ensure!(new.seq - old.seq <= MAX_CUT_STEP, "a cut too far past the last");
     }
     let old = settings_of(group.extensions())?;
     let new = settings_of(staged.group_context().extensions())?;
