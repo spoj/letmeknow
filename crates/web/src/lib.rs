@@ -8,7 +8,7 @@
 //! strings; message ids and fingerprints are hex, other bytes base64url.
 #![cfg(target_arch = "wasm32")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -293,6 +293,9 @@ fn unb64(text: &str) -> Result<Vec<u8>> {
 /// A directory younger than this is answered as it is.
 const DIRECTORY_AGE: u64 = 10 * 60 * 1000;
 
+/// A domain whose fetch failed is not fetched again for this long.
+const DIRECTORY_RETRY: u64 = 60 * 1000;
+
 /// A directory the browser fetched, and when.
 #[derive(Serialize, Deserialize)]
 struct Fetched {
@@ -310,11 +313,13 @@ struct Backend {
 /// The directories the node asks for, answered from the page's storage and fetch, each lookup in a task of its own.
 fn resolver(idb: Idb, backend: Backend) -> Resolve {
     let (asks, mut asked) = mpsc::unbounded_channel::<(String, oneshot::Sender<Result<Directory>>)>();
+    let failed: Arc<Mutex<HashMap<String, u64>>> = Arc::default();
     spawn_local(async move {
         while let Some((domain, reply)) = asked.recv().await {
             let (idb, backend): (Idb, Backend) = (idb.clone().unchecked_into(), backend.clone());
+            let failed = failed.clone();
             spawn_local(async move {
-                reply.send(directory(&idb, &backend, &domain).await).ok();
+                reply.send(directory(&idb, &backend, &failed, &domain).await).ok();
             });
         }
     });
@@ -326,18 +331,29 @@ fn resolver(idb: Idb, backend: Backend) -> Resolve {
 }
 
 /// A domain's directory: one kept less than `DIRECTORY_AGE` ago, else the one fetched now, which is kept. When the
-/// fetch fails, the kept one, else the backend's if the domain is the default.
-async fn directory(idb: &Idb, backend: &Backend, domain: &str) -> Result<Directory> {
+/// fetch fails, the kept one, else the backend's if the domain is the default. A failed fetch is not repeated for
+/// `DIRECTORY_RETRY`.
+async fn directory(idb: &Idb, backend: &Backend, failed: &Mutex<HashMap<String, u64>>, domain: &str) -> Result<Directory> {
     let kept = JsFuture::from(idb.load_directory(domain)).await.map_err(|e| anyhow!("loading a directory: {e:?}"))?;
     let kept: Option<Fetched> = kept.as_string().map(|text| serde_json::from_str(&text)).transpose()?;
     if let Some(kept) = kept.as_ref().filter(|kept| now() < kept.at + DIRECTORY_AGE) {
         return Ok(kept.directory.clone());
     }
-    let fetched = async {
-        let body = JsFuture::from(idb.fetch_directory(&Directory::url(domain))).await.map_err(|e| anyhow!("fetching {domain}: {e:?}"))?;
-        Directory::parse(&Uint8Array::new(&body).to_vec())
-    }
-    .await;
+    let retry_at = failed.lock().unwrap().get(domain).copied();
+    let fetched = match retry_at {
+        Some(at) if now() < at + DIRECTORY_RETRY => Err(anyhow!("the fetch of {domain} failed less than a minute ago")),
+        _ => {
+            let fetched = async {
+                let body = JsFuture::from(idb.fetch_directory(&Directory::url(domain))).await.map_err(|e| anyhow!("fetching {domain}: {e:?}"))?;
+                Directory::parse(&Uint8Array::new(&body).to_vec())
+            }
+            .await;
+            if fetched.is_err() {
+                failed.lock().unwrap().insert(domain.to_owned(), now());
+            }
+            fetched
+        }
+    };
     match fetched {
         Ok(directory) => {
             let text = serde_json::to_string(&Fetched { at: now(), directory: directory.clone() })?;
