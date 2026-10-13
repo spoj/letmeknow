@@ -68,12 +68,12 @@ extern "C" {
     /// Resolves to a kept file's ciphertext.
     #[wasm_bindgen(method, js_name = loadFile)]
     fn load_file(this: &Idb, hash: &str) -> Promise;
-    /// Resolves to the directory text kept for a domain, if any; and keeps one.
+    /// The directory text kept for a domain, if any: a domain's directories are kept and fetched by the page.
     #[wasm_bindgen(method, js_name = loadDirectory)]
     fn load_directory(this: &Idb, domain: &str) -> Promise;
     #[wasm_bindgen(method, js_name = saveDirectory)]
     fn save_directory(this: &Idb, domain: &str, text: &str) -> Promise;
-    /// Resolves to the body of the directory published at a URL, read as the page's fetch reads it.
+    /// The body of the directory published at a URL, as the page fetches it.
     #[wasm_bindgen(method, js_name = fetchDirectory)]
     fn fetch_directory(this: &Idb, url: &str) -> Promise;
 }
