@@ -48,8 +48,8 @@ pub struct Config {
     pub dir: PathBuf,
     pub hold: Duration,
     pub keep_log: bool,
-    /// For groups and identities this session creates.
-    pub membership: Service,
+    /// The domain of the membership service for groups and identities this session creates.
+    pub membership: String,
     /// Where it looks for kinds' plugins, in order.
     pub plugins: Vec<PathBuf>,
     /// Where it looks for a newer release.
@@ -160,6 +160,7 @@ fn save(dir: &Path, link: &FileLink, name: Option<&str>, bytes: &[u8]) -> Result
 }
 
 impl Session {
+    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         config: Config,
         db: Connection,
@@ -168,10 +169,11 @@ impl Session {
         network: Network,
         inbound: mpsc::UnboundedSender<Inbound>,
         held: std::fs::File,
+        membership: Service,
     ) -> Result<Self> {
         let (plugins, lines) = Plugins::new(crate::kinds::discover(&config.plugins), config.dir.join("kinds"));
         let device = Device::load(&home.join("device.json"))?;
-        let client_config = lmk_client::Config { device, membership: config.membership.clone() };
+        let client_config = lmk_client::Config { device, membership };
         let access = Access::Elsewhere(Arc::new(Published(home.to_path_buf())));
         let plugins = Arc::new(plugins);
         let (client, told) = Client::new(node, client_config, access, plugins.clone(), lines);
@@ -813,6 +815,7 @@ pub async fn run(
     // TERMUX_EXEC__PROC_SELF_EXE.
     let bin = std::env::var_os("TERMUX_EXEC__PROC_SELF_EXE").map_or_else(std::env::current_exe, |exe| Ok(exe.into()))?;
     let mut ready = json!({ "type": "ready", "session": session.config.handle, "name": me["device"]["name"], "fp": me["fp"], "bin": bin });
+    ready["membership"] = json!(session.config.membership);
     if let Some(identity) = me["identity"]["name"].as_str() {
         ready["identity"] = json!(identity);
     }
