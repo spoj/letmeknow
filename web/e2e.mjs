@@ -234,7 +234,7 @@ try {
   ann.run("identity", "create", "Ann");
   desk.run("identity", "create", "Matthew");
 
-  // Another version's database is left as it is, and 0.16's chats are said to stay with 0.16; this version's, incomplete,
+  // Another version's database is left as it is, and 0.17's chats are said to stay with 0.17; this version's, incomplete,
   // is refused visibly, never reset.
   for (const [name, version] of [["lmk", 4], ["lmk5", 1], ["lmk6", 1], ["lmk7", 1]]) {
     const legacy = await open("legacy", { viewport: { width: 1280, height: 800 } }, true);
@@ -254,12 +254,12 @@ try {
     await legacy.goto(SITE);
     if (name === "lmk7") await legacy.getByRole("alert").filter({ hasText: "stored session is incomplete" }).waitFor();
     else await legacy.getByLabel("Your name").waitFor();
-    if (name === "lmk5") {
-      await legacy.getByText("Chats from letmeknow 0.16 stay with 0.16").waitFor();
+    if (name === "lmk6") {
+      await legacy.getByText("Chats from letmeknow 0.17 stay with 0.17").waitFor();
       await legacy.getByRole("button", { name: "OK" }).click();
       await legacy.goto(`${SITE}/i#6.g.${"A".repeat(22)}`);
       await legacy.getByText("This invite was made by letmeknow 0.17").waitFor();
-      check(await legacy.locator(".banner").count() === 0, "letmeknow 0.16's notice is said once");
+      check(await legacy.locator(".banner").count() === 0, "letmeknow 0.17's notice is said once");
     }
     const old = await legacy.evaluate(name => new Promise((resolve, reject) => {
       const request = indexedDB.open(name);
