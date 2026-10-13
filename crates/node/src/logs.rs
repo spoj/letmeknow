@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, ensure};
 use lmk_core::provider::Provider;
 use lmk_core::public::{PublicLog, Verdict};
-use lmk_membership::client::ServeClient;
+use lmk_membership::client::{Resolve, ServeClient};
 use lmk_membership::{Contradiction, Frontier, VerifiedPage};
 use lmk_proto::Bytes;
 use lmk_proto::group::{IdentityRef, Service};
@@ -26,12 +26,13 @@ pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 /// One membership client per service, sharing the session's endpoint.
 pub(crate) struct Clients {
     endpoint: iroh::Endpoint,
+    resolve: Resolve,
     clients: Mutex<HashMap<String, ServeClient>>,
 }
 
 impl Clients {
-    pub fn new(endpoint: iroh::Endpoint) -> Self {
-        Clients { endpoint, clients: Mutex::default() }
+    pub fn new(endpoint: iroh::Endpoint, resolve: Resolve) -> Self {
+        Clients { endpoint, resolve, clients: Mutex::default() }
     }
 
     pub fn client(&self, service: &Service) -> Result<ServeClient> {
@@ -40,7 +41,7 @@ impl Clients {
         if let Some(client) = clients.get(&name) {
             return Ok(client.clone());
         }
-        let client = ServeClient::for_service(self.endpoint.clone(), service)?;
+        let client = ServeClient::for_service(self.endpoint.clone(), self.resolve.clone(), service)?;
         clients.insert(name, client.clone());
         Ok(client)
     }
@@ -402,7 +403,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             None => {
                 let public_id = identity.id.0.as_slice().try_into()?;
                 // Unauthenticated lookups must not seed the shared clients or the persisted route.
-                let hint = ServeClient::for_service(self.clients.endpoint.clone(), &identity.membership)?;
+                let hint = ServeClient::for_service(self.clients.endpoint.clone(), self.clients.resolve.clone(), &identity.membership)?;
                 let key = authority(&identity.membership)?;
                 let first = hint.read(&address, &Frontier::empty(key, head::reference(&key, &address))).await?;
                 let service = PublicLog::replay(public_id, first.page().entries.iter().map(|entry| entry.0.as_slice()))?.membership;

@@ -10,8 +10,8 @@ use lmk_core::group::{Change, Group, key_package_credential, key_package_leaf, k
 use lmk_core::public::Verdict;
 use lmk_core::provider::Provider;
 use lmk_net::Admit;
-use lmk_proto::group::{CHAT, Certificate, Control, Credential, IDENTITY, How};
-use lmk_proto::links::{Address, Invite, RELAY};
+use lmk_proto::group::{CHAT, Certificate, Control, Credential, IDENTITY, How, Service};
+use lmk_proto::links::Invite;
 use lmk_proto::peer::{Admitted, Join};
 use lmk_proto::{Answer, Bytes};
 use n0_future::boxed::BoxFuture;
@@ -80,24 +80,18 @@ impl<P: Provider + Send + 'static> Node<P> {
         timeout(MEMBER_WAIT, all).await.unwrap_or(Ok(()))?;
         let holders = holding()?;
         let st = self.inner.lock();
-        let mut members = vec![address(*self.inner.net().id().as_bytes(), self.inner.relay.as_str())];
-        for member in holders.iter().take(LINK_MEMBERS) {
-            let Some(leaf) = endpoint_id(&member.iroh.0).and_then(|peer| st.in_leaf(gid, &peer)?.leaf) else { continue };
-            members.push(address(*endpoint_id(&leaf.key.0).context("an iroh key")?.as_bytes(), &leaf.relay));
-        }
-        Ok(Invite { device, secret, members })
+        let Service::Serve { domain, .. } = st.group(gid)?.mls.settings().membership else { bail!("unsupported membership service") };
+        let mut members = vec![*self.inner.net().id().as_bytes()];
+        members.extend(holders.iter().take(LINK_MEMBERS).filter_map(|member| endpoint_id(&member.iroh.0)).map(|peer| *peer.as_bytes()));
+        Ok(Invite { device, secret, domain, members })
     }
 
     /// Joins through an invite link, speaking as `identity`: asks the members it names in turn, as each is reached. A
     /// device link joins with a new device key. Returns the group, and the iroh key of the member that admitted this
     /// session.
     pub async fn join(&self, link: &Invite, identity: Option<Certificate>) -> Result<(Bytes, [u8; 32])> {
-        let ours: RelayUrl = RELAY.parse()?;
-        let members = link
-            .members
-            .iter()
-            .map(|member| Ok((EndpointId::from_bytes(&member.key)?, member.relay.as_ref().map_or(Ok(ours.clone()), |relay| relay.parse())?)))
-            .collect::<Result<Vec<_>>>()?;
+        let relay: RelayUrl = (self.inner.resolve)(link.domain.clone()).await?.relay.parse()?;
+        let members = link.members.iter().map(|member| Ok(EndpointId::from_bytes(member)?)).collect::<Result<Vec<_>>>()?;
         let (secret, devices) = (Bytes(link.secret.to_vec()), link.device);
         // The KeyPackage, its private keys and its device key are kept until this session joins or every member it asks
         // refuses it: a member that added it asked again answers with the commit entry it kept.
@@ -126,14 +120,14 @@ impl<P: Provider + Send + 'static> Node<P> {
         let mut dials: FuturesUnordered<_> = members
             .into_iter()
             .enumerate()
-            .map(|(i, (peer, relay))| {
+            .map(|(i, peer)| {
                 let net = self.inner.net().clone();
-                let own = self.inner.relay.clone();
+                let (relay, own) = (relay.clone(), self.inner.relays.clone());
                 spawn(async move {
                     // A dial that fails at once, as one from a node that has just started can, is tried again until the wait
                     // is up.
                     let dialed = timeout(DIAL_WAIT, async {
-                        while let Err(error) = net.dial(peer, vec![relay.clone()], vec![own.clone()]).await {
+                        while let Err(error) = net.dial(peer, vec![relay.clone()], own.clone()).await {
                             tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
                             sleep(Duration::from_secs(1)).await;
                         }
@@ -142,14 +136,14 @@ impl<P: Provider + Send + 'static> Node<P> {
                     if i > 0 {
                         sleep_until(inviter_first).await;
                     }
-                    (peer, relay, dialed)
+                    (peer, dialed)
                 })
             })
             .collect();
         let mut refusal = anyhow::anyhow!("no member the invite names is online");
         let mut refused_by_all = true;
         while let Some(dialed) = dials.next().await {
-            let (peer, relay, dialed) = dialed?;
+            let (peer, dialed) = dialed?;
             if dialed.is_err() {
                 tracing::debug!("{} is not online", peer.fmt_short());
                 refused_by_all = false;
@@ -157,7 +151,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
             let deadline = Instant::now() + JOIN_WAIT;
             let answer = loop {
-                let answer = timeout(deadline.saturating_duration_since(Instant::now()), self.inner.net().join(peer, vec![relay.clone()], vec![self.inner.relay.clone()], join.clone())).await;
+                let answer = timeout(deadline.saturating_duration_since(Instant::now()), self.inner.net().join(peer, vec![relay.clone()], self.inner.relays.clone(), join.clone())).await;
                 match answer {
                     // The connection may have been replaced by one the member dialed meanwhile; asking again is safe, as a
                     // member that added this session answers with the commit entry it kept. The ask may have added it.
@@ -233,12 +227,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         Ok(Bytes(gid))
     }
-}
-
-/// A member to dial, as an invite link names it.
-fn address(key: [u8; 32], relay: &str) -> Address {
-    let ours = RELAY.parse::<RelayUrl>().ok();
-    Address { key, relay: (relay.parse::<RelayUrl>().ok() != ours).then(|| relay.to_string()) }
 }
 
 /// The answer to a secret no rule admits by: whether it is unknown, used or expired is not told.

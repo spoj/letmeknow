@@ -42,9 +42,9 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.net()
     }
 
-    /// This session's iroh key and relay.
-    pub fn address(&self) -> ([u8; 32], RelayUrl) {
-        (*self.inner.net().id().as_bytes(), self.inner.relay.clone())
+    /// This session's iroh key and relays.
+    pub fn address(&self) -> ([u8; 32], Vec<RelayUrl>) {
+        (*self.inner.net().id().as_bytes(), self.inner.relays.clone())
     }
 
     pub fn groups(&self) -> Vec<Bytes> {

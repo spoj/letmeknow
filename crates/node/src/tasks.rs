@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-use iroh::EndpointId;
+use iroh::{EndpointId, RelayUrl};
 use lmk_core::group::{Group, Session};
 use lmk_core::provider::Provider;
 use lmk_net::peers::Peers;
@@ -27,9 +27,9 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
     pub async fn start(provider: P, mut config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let ca = std::mem::take(&mut config.ca);
-        let endpoint = lmk_net::builder([config.relay.clone()]).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
-        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone(), revision: REVISION };
-        let clients = logs::Clients::new(endpoint.clone());
+        let endpoint = lmk_net::builder(config.relays.clone()).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
+        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), kinds: config.kinds.clone(), revision: REVISION };
+        let clients = logs::Clients::new(endpoint.clone(), config.resolve.clone());
         let state = State::open(provider, &config, leaf)?;
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
@@ -39,7 +39,8 @@ impl<P: Provider + Send + 'static> Node<P> {
             net: OnceLock::new(),
             clients,
             follows: Mutex::default(),
-            relay: config.relay.clone(),
+            relays: config.relays.clone(),
+            resolve: config.resolve.clone(),
             file_limit: config.file_limit,
             kinds: config.kinds,
             events,
@@ -201,22 +202,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Dials a member, at the relay its leaf names and then this session's, and tells `Peers` how it went.
+    /// Dials a member, and tells `Peers` how it went.
     fn dial(self: &Arc<Self>, peer: EndpointId) {
-        let relay = {
-            let mut st = self.lock();
-            let leaves = st.groups.values().flat_map(|g| g.mls.members()).filter_map(|m| m.leaf);
-            let relay = leaves.into_iter().find(|leaf| endpoint_id(&leaf.key.0) == Some(peer)).and_then(|leaf| leaf.relay.parse().ok());
-            if relay.is_none() {
-                let now = st.tick();
-                st.peers.dialed(peer.as_bytes(), false, now);
-            }
-            relay
-        };
-        let Some(relay) = relay else { return };
         let inner = self.clone();
         spawn(async move {
-            let dialed = inner.net().dial(peer, vec![relay], vec![inner.relay.clone()]).await;
+            let fallback = inner.fallback(peer).await;
+            let dialed = inner.net().dial(peer, vec![], fallback).await;
             if let Err(error) = &dialed {
                 tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
             }
@@ -224,6 +215,38 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let now = st.tick();
             st.peers.dialed(peer.as_bytes(), dialed.is_ok(), now);
         });
+    }
+
+    /// The relays a member may be reached at: this session's own, the relay of the service of each group the member is
+    /// in, and the relays of the identity it speaks as. A service whose directory does not resolve adds none.
+    async fn fallback(&self, peer: EndpointId) -> Vec<RelayUrl> {
+        let (groups, identities) = {
+            let st = self.lock();
+            let (mut groups, mut identities) = (Vec::new(), Vec::new());
+            for g in st.groups.values() {
+                let members = g.mls.members();
+                let Some(member) = members.iter().find(|m| m.leaf.as_ref().and_then(|leaf| endpoint_id(&leaf.key.0)) == Some(peer)) else { continue };
+                groups.push(g.mls.settings().membership);
+                if let Some(identity) = member.credential.as_ref().and_then(|credential| credential.identity())
+                    && let Some(log) = st.public.get(&identity.id.0)
+                {
+                    identities.push(log.membership.clone());
+                }
+            }
+            (groups, identities)
+        };
+        let mut relays = self.relays.clone();
+        for service in groups {
+            if let Ok(directory) = lmk_membership::client::directory(&self.resolve, &service).await {
+                relays.extend(directory.relay.parse());
+            }
+        }
+        for service in identities {
+            if let Ok(directory) = lmk_membership::client::directory(&self.resolve, &service).await {
+                relays.extend(directory.relays.iter().filter_map(|relay| relay.parse().ok()));
+            }
+        }
+        relays
     }
 
     /// Fetches, in the background, the files linked anew that are within this session's limit.
