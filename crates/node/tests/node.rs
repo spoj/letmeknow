@@ -301,6 +301,24 @@ async fn a_member_is_reached_through_its_groups_service_when_its_own_relay_is_do
     assert_eq!(got.id, sent);
 }
 
+/// A join reaches an inviter whose home relay is not its group's service's, through the service's relay alone, where
+/// the inviter is reached as a backup.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_reaches_an_inviter_on_another_relay_than_the_services() {
+    let (service, own) = (relay().await, relay().await);
+    let mut carol = session(&service, "Carol").await;
+    let gid = carol.node.create(settings(CHAT, &service), None).unwrap();
+    // Bob's home is his first relay, which is not the service's.
+    let (node, events) = Node::start(MemoryProvider::default(), Config { relays: vec![own.url.clone(), service.url.clone()], ca: CaTlsConfig::custom_roots([own.cert.clone(), service.cert.clone()]), ..config(&service, "Bob", None, &[CHAT, KIND]) }).await.unwrap();
+    let mut bob = Session { node, events };
+    bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    carol.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let link = bob.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    let dan = session(&service, "Dan").await;
+    dan.node.join(&link, None).await.unwrap();
+    bob.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+}
+
 /// An identity whose directory is down when a member joins is unverified until the directory answers, and is then read
 /// again, without a restart.
 #[tokio::test(flavor = "multi_thread")]
