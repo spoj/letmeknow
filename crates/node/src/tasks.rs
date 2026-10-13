@@ -218,8 +218,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Dials a member, at the relay it last said it was on, then its fallback, and tells `Peers` how it went.
     fn dial(self: &Arc<Self>, peer: EndpointId) {
-        let hint: Vec<RelayUrl> =
-            self.lock().hints.get(&Bytes(peer.as_bytes().to_vec())).and_then(|hint| hint.relay.parse().ok()).into_iter().collect();
+        let hint: Vec<RelayUrl> = self.lock().hint_of(&peer).into_iter().collect();
         let inner = self.clone();
         spawn(async move {
             let fallback = inner.fallback(peer).await;

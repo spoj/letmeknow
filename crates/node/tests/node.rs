@@ -323,6 +323,20 @@ async fn an_identity_whose_directory_is_down_at_join_is_read_again() {
     .await;
 }
 
+/// A link whose domain does not resolve still admits its joiner: the members it names are dialed at their own relays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_survives_an_unresolved_link_domain() {
+    let relay = relay().await;
+    let mut alice = session(&relay, "Alice").await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    let Service::Serve { domain, .. } = relay.service.clone() else { unreachable!() };
+    lmk_testing::withdraw(&domain);
+    let bob = session(&relay, "Bob").await;
+    bob.node.join(&link, None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+}
+
 /// A joiner whose Welcome failed to persist retries after a restart with the Add already logged, not another.
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_welcome_is_retried_after_restart() {

@@ -120,6 +120,11 @@ impl<P: Provider> State<P> {
         }
     }
 
+    /// The relay a member last said it was on, which a dial to it tries first.
+    pub(crate) fn hint_of(&self, peer: &EndpointId) -> Option<RelayUrl> {
+        self.hints.get(&Bytes(peer.as_bytes().to_vec())).and_then(|hint| hint.relay.parse().ok())
+    }
+
     /// Hands `Peers` this session's state of a group.
     pub(crate) fn refresh(&mut self, gid: &[u8]) {
         let now = self.tick();
