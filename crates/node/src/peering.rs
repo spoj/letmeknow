@@ -27,6 +27,8 @@ use crate::{Event, Inner, Lost, LostOf, Member, Node, Out, State, days, get, now
 const POLL: Duration = Duration::from_millis(250);
 /// How long a live payload goes on, in hops.
 const HOPS: u8 = 6;
+/// A membership's live payloads are allowed ten times what its held messages are.
+const LIVE_SCALE: f64 = 10.0;
 /// A member signs its summary at least this often.
 const RESIGN: u64 = 60 * 60 * 1000;
 /// How many summaries of memberships not known yet a group keeps.
@@ -235,7 +237,7 @@ impl<P: Provider> State<P> {
             }
             let g = self.groups.get_mut(gid).unwrap();
             if g.mls.joined(&summary.member.0) != Some(summary.joined) {
-                if g.unverified.len() < UNVERIFIED {
+                if summary.joined > g.mls.epoch() && g.unverified.len() < UNVERIFIED {
                     g.unverified.push((peer, signed));
                 }
                 continue;
@@ -270,14 +272,25 @@ impl<P: Provider> State<P> {
         let g = self.group_mut(gid)?;
         let mut messages = Vec::new();
         for lost in &summary.lost {
-            let told = g.rec.told.iter().filter(|(k, j, s)| *k == summary.member && *j == summary.joined && s.key == lost.key && s.joined == lost.joined);
-            let before = told.fold(lmk_proto::ranges::Ranges::default(), |all, (_, _, s)| all.union(&s.seqs));
-            let new = lost.seqs.difference(&before);
-            if new.is_empty() {
-                continue;
+            // Only seqs this session knows were sent: a summary's claim alone names none.
+            let Some(last) = g.author(&lost.key.0, lost.joined).map(|a| a.last().max(a.cut)) else { continue };
+            let seqs = lost.seqs.intersection(&lmk_proto::ranges::Ranges::range(1, last));
+            let of = |(k, j, s): &&mut (Bytes, u64, Seqs)| *k == summary.member && *j == summary.joined && s.key == lost.key && s.joined == lost.joined;
+            let new = match g.rec.told.iter_mut().find(of) {
+                Some((_, _, told)) => {
+                    let new = seqs.difference(&told.seqs);
+                    told.seqs = told.seqs.union(&new);
+                    new
+                }
+                None if !seqs.is_empty() => {
+                    g.rec.told.push((summary.member.clone(), summary.joined, Seqs { key: lost.key.clone(), joined: lost.joined, seqs: seqs.clone() }));
+                    seqs
+                }
+                None => continue,
+            };
+            if !new.is_empty() {
+                messages.push((lost.key.clone(), lost.joined, new));
             }
-            g.rec.told.push((summary.member.clone(), summary.joined, Seqs { key: lost.key.clone(), joined: lost.joined, seqs: new.clone() }));
-            messages.push((lost.key.clone(), lost.joined, new));
         }
         if messages.is_empty() {
             return Ok(());
@@ -322,6 +335,7 @@ impl<P: Provider> State<P> {
         let g = self.group_mut(gid)?;
         let gone: Vec<(Bytes, u64)> = g.rec.heard.iter().filter(|(k, _)| k.0 == key).cloned().collect();
         g.rec.heard.retain(|(k, _)| k.0 != key);
+        g.rec.told.retain(|(k, _, _)| k.0 != key);
         for (key, joined) in gone {
             self.provider.delete(&heard_key(gid, &key.0, joined))?;
         }
@@ -371,26 +385,34 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let gids: Vec<Vec<u8>> = st.groups.keys().cloned().collect();
         let now = st.tick();
         for gid in &gids {
-            let Some(g) = st.groups.get(gid) else { continue };
-            if !g.mls.active() {
-                continue;
-            }
-            let (waiting, unopened) = (g.waiting, !g.unopened.is_empty());
-            st.sign(gid, now)?;
-            self.reseal(st, gid)?;
-            if waiting {
-                self.advance(st, gid)?;
-            }
-            if unopened && st.groups.contains_key(gid) {
-                self.take(st, gid, None, Vec::new())?;
-            }
-            if st.groups.contains_key(gid) {
-                self.give_up(st, gid)?;
+            // One group's failure stops neither the others nor the peers' poll.
+            if let Err(error) = self.poll_group(st, gid, now) {
+                tracing::warn!("polling a group: {error:#}");
             }
         }
         st.tell_peers();
         for out in st.peers.poll(now) {
             self.out(st, out)?;
+        }
+        Ok(())
+    }
+
+    fn poll_group(&self, st: &mut State<P>, gid: &[u8], now: u64) -> Result<()> {
+        let Some(g) = st.groups.get(gid) else { return Ok(()) };
+        if !g.mls.active() {
+            return Ok(());
+        }
+        let (waiting, unopened) = (g.waiting, !g.unopened.is_empty());
+        st.sign(gid, now)?;
+        self.reseal(st, gid)?;
+        if waiting {
+            self.advance(st, gid)?;
+        }
+        if unopened && st.groups.contains_key(gid) {
+            self.take(st, gid, None, Vec::new())?;
+        }
+        if st.groups.contains_key(gid) {
+            self.give_up(st, gid)?;
         }
         Ok(())
     }
@@ -460,11 +482,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             return Ok(());
         }
-        let Some(gid) = group_of(&frame).filter(|gid| st.groups.contains_key(&gid.0)).map(|gid| gid.0.clone()) else { return Ok(()) };
-        let admitted = st.admitted(&gid, &peer);
-        if !peers::takes(&frame, admitted, st.at_head(&gid)) {
-            if let Frame::Want { group, .. } = frame {
-                st.out.push(Out::Frame { peer, frame: Frame::Held { group, items: Vec::new(), answers: Some(Vec::new()) } });
+        let Some(gid) = group_of(&frame).map(|gid| gid.0.clone()) else { return Ok(()) };
+        let held = st.groups.contains_key(&gid);
+        if !held || !peers::takes(&frame, st.admitted(&gid, &peer), st.at_head(&gid)) {
+            // A `want` refused, or of a group this session does not hold, is answered with nothing, so its asker moves on.
+            if let Frame::Want { group, wants, .. } = frame {
+                st.out.push(Out::Frame { peer, frame: Frame::Held { group, items: Vec::new(), answers: Some(wants) } });
             }
             return Ok(());
         }
@@ -482,9 +505,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Frame::Live { group, hops, item } => {
                 let g = st.group(&gid)?;
                 let Ok((sender, payload, id)) = g.mls.open_live(&st.provider, &item.0) else { return Ok(()) };
+                let membership = (Bytes(sender.key.clone()), g.mls.joined(&sender.key).context("a live payload's sender has no membership")?);
                 let Some(forward) = st.peers.live(&group, id, Some(key), hops, now) else { return Ok(()) };
+                if !st.group_mut(&gid)?.live.entry(membership).or_default().take(item.0.len(), LIVE_SCALE, now) {
+                    return Ok(());
+                }
                 for to in forward {
-                    st.out.push(Out::Frame { peer: EndpointId::from_bytes(&to)?, frame: Frame::Live { group: group.clone(), hops: hops - 1, item: item.clone() } });
+                    let frame = Frame::Live { group: group.clone(), hops: hops.min(HOPS) - 1, item: item.clone() };
+                    st.out.push(Out::Frame { peer: EndpointId::from_bytes(&to)?, frame });
                 }
                 let sender = st.member(&gid, &sender).context("the sender has no letmeknow credential")?;
                 st.events.push(Event::Live { group, sender, payload });

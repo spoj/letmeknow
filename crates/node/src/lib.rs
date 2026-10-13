@@ -380,6 +380,8 @@ pub(crate) struct G {
     /// The flood buckets of the group's memberships, and this session's own.
     buckets: BTreeMap<(Bytes, u64), held::Bucket>,
     sending: held::Bucket,
+    /// The flood buckets of the memberships' live payloads.
+    live: BTreeMap<(Bytes, u64), held::Bucket>,
     /// The hashes of ciphertexts taken lately.
     seen: VecDeque<[u8; 32]>,
     /// Seqs that came to be known lately, and when: not asked for until `HOLD_OFF` passed.
@@ -405,6 +407,7 @@ impl G {
             unopened: BTreeMap::new(),
             buckets: BTreeMap::new(),
             sending: held::Bucket::default(),
+            live: BTreeMap::new(),
             seen: VecDeque::new(),
             fresh: Vec::new(),
             reading: None,

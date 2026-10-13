@@ -385,10 +385,7 @@ impl Peers {
     /// (kept ones of the epoch the commit ends). `read` is when the node read the commit.
     pub fn wait(&mut self, group: &Bytes, lacking: &[Seqs], read: u64, now: u64) -> Decision {
         let lack = to_set(lacking);
-        let untried = !lack.is_empty() && now < read.max(self.online) + WAIT && {
-            let g = &self.groups[group];
-            holds(g).iter().any(|(k, held)| self.untried(group, k, now) && !offer(&lack, held, &g.struck, k).is_empty())
-        };
+        let untried = !lack.is_empty() && now < read.max(self.online) + WAIT && self.holder(group, lacking, now);
         let decision = if lack.is_empty() {
             Decision::Apply
         } else if untried {
@@ -398,6 +395,13 @@ impl Peers {
         };
         self.groups.get_mut(group).expect("a group of ours").waiting = if decision == Decision::Wait { lack } else { Set::new() };
         decision
+    }
+
+    /// Whether a holder of any of `lacking`, by its summary, may still be asked: connected and not struck, or not
+    /// connected and past its backoff.
+    pub fn holder(&self, group: &Bytes, lacking: &[Seqs], now: u64) -> bool {
+        let (lack, g) = (to_set(lacking), &self.groups[group]);
+        holds(g).iter().any(|(k, held)| self.untried(group, k, now) && !offer(&lack, held, &g.struck, k).is_empty())
     }
 
     /// What is due, in order: request timeouts, entries and `hello`s, `versions` and summaries, repair, dials, closes.

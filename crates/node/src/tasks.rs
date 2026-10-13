@@ -205,9 +205,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Dials a member, at the relay its leaf names, and tells `Peers` how it went.
     fn dial(self: &Arc<Self>, peer: EndpointId) {
         let relay = {
-            let st = self.lock();
+            let mut st = self.lock();
             let leaves = st.groups.values().flat_map(|g| g.mls.members()).filter_map(|m| m.leaf);
-            leaves.into_iter().find(|leaf| endpoint_id(&leaf.key.0) == Some(peer)).and_then(|leaf| leaf.relay.parse().ok())
+            let relay = leaves.into_iter().find(|leaf| endpoint_id(&leaf.key.0) == Some(peer)).and_then(|leaf| leaf.relay.parse().ok());
+            if relay.is_none() {
+                let now = st.tick();
+                st.peers.dialed(peer.as_bytes(), false, now);
+            }
+            relay
         };
         let Some(relay) = relay else { return };
         let inner = self.clone();
