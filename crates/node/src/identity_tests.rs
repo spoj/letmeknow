@@ -290,8 +290,7 @@ async fn an_authorized_unobserved_historical_sender_does_not_change_the_ledger()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn known_public_revocation_does_not_bind_an_authenticated_private_prefix() {
-    // Characterization of the remaining design blocker, NOT an accepted freshness guarantee.
+async fn known_public_revocation_is_not_undone_by_a_stale_roster() {
     let r = Race::new(true).await;
     let log = r.a.log(&r.gid.0).unwrap();
     let prefix = r.authority.read(&log.0);
@@ -300,11 +299,13 @@ async fn known_public_revocation_does_not_bind_an_authenticated_private_prefix()
     r.c_identity.remove(&r.b_identity.key().unwrap().0).await.unwrap();
     let revoked = r.a.read_public(&r.identity).await.unwrap();
     assert_eq!(revoked.verify(&credential), Verdict::Dropped, "A already knows the public revocation");
+    let directory = r.authority.log(&lmk_proto::public::address(&r.identity.id.0));
+    let length = r.authority.store.head(&directory).unwrap().length;
     *r.authority.stale.lock().unwrap() = Some((r.a.net().id(), log.0.as_slice().try_into().unwrap(), prefix));
     r.a_identity.duties(&r.gid.0).await.unwrap();
+    assert_eq!(r.authority.store.head(&directory).unwrap().length, length, "A appends nothing");
     let (observer, _) = device(&r.relay, "Observer").await;
-    assert_eq!(observer.read_public(&r.identity).await.unwrap().verify(&credential), Verdict::Authorized,
-        "remaining blocker: an unchanged public predecessor does not prove private freshness; maintenance reauthorizes B");
+    assert_eq!(observer.read_public(&r.identity).await.unwrap().verify(&credential), Verdict::Dropped);
     observer.shutdown().await.unwrap();
     r.close().await;
 }

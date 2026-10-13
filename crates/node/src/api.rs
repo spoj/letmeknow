@@ -369,6 +369,11 @@ impl<P: Provider + Send + 'static> Node<P> {
         let identity = IdentityRef { id: settings.public.context("a group without a public log")?, membership: settings.membership };
         let latest = self.inner.read_public(&identity).await?;
         ensure!(latest == *predecessor, crate::Advanced);
+        let listed = writers.len();
+        writers.retain(|writer| !latest.is_dropped(writer));
+        if writers.len() < listed {
+            self.inner.warn(Some(gid), "a device the directory dropped is left out of this directory update".into());
+        }
         let entry = {
             let st = self.inner.lock();
             let (seed, session) = st.device_keys.get(gid).context("not an identity group of this node")?;
