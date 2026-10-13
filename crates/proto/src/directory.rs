@@ -3,7 +3,7 @@
 use anyhow::{Result, ensure};
 use http::uri::Authority;
 use serde::{Deserialize, Deserializer, Serialize};
-use url::Url;
+use url::{Host, Url};
 
 use crate::links::{DOMAIN, MEMBERSHIP_KEY, RELAY};
 
@@ -69,9 +69,9 @@ pub fn check_domain(domain: &str) -> Result<()> {
             && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     };
     let labels: Vec<&str> = host.split('.').collect();
-    let ip_literal = labels.last().is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()));
+    let domain_host = matches!(Host::parse(host), Ok(Host::Domain(_)));
     let port_ok = port.is_none_or(|port| port.parse::<u16>().is_ok_and(|n| n.to_string() == port && n != 0 && n != 443));
-    ensure!(host.len() <= 253 && labels.iter().all(label) && !ip_literal && port_ok, "a domain is a canonical host or host:port, not {domain}");
+    ensure!(host.len() <= 253 && labels.iter().all(label) && domain_host && port_ok, "a domain is a canonical host or host:port, not {domain}");
     Ok(())
 }
 
@@ -161,7 +161,7 @@ mod tests {
             "", ":8443", "localhost:", "localhost:443", "localhost:0443", "localhost:+8443", "localhost:0", "localhost:65536",
             "Relay.example", "relay.example.", "a..b", "-a.example", "a-.example", "a_b.example", "127.0.0.1", "127.0.0.1:8443",
             "[::1]:8443", "u@h.example", "h.example/x", "h.example?x", "h.example#x", "h.example:8443/x", "h .example",
-            "h.example:8443:1",
+            "h.example:8443:1", "0x7f000001", "0x7f000001:8443", "a.0x7f", "a.0x", "1.2.3",
         ] {
             assert!(check_domain(domain).is_err(), "{domain}");
         }
