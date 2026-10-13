@@ -6,9 +6,10 @@ use anyhow::{Result, ensure};
 use iroh::{endpoint::{Connection, RecvStream, SendStream}, protocol::{AcceptError, ProtocolHandler}};
 use lmk_proto::{clock::now, frame::{self, Open, Stream}, head::{self, Head}, membership::{self, Latest, Refusal, Reply, Request, Subscribed}};
 use n0_future::task::AbortOnDropHandle;
+use serde::de::DeserializeOwned;
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{OwnedSemaphorePermit, Semaphore, mpsc}, time::{Instant, timeout}};
 
-use crate::{Refused, store::{DAY_MS, Stats, Store}};
+use crate::{Refused, store::{DAY_MS, DISK_BYTES, Stats, Store}};
 
 const MAX_CONNECTIONS: usize = 2048;
 const MAX_STREAMS: usize = 1024;
@@ -18,18 +19,25 @@ pub const CONNECTION_STREAMS: usize = 64;
 const DB_WORK: usize = 4;
 pub const MAX_SUBSCRIBERS: usize = 4096;
 const LAG: usize = 8;
-/// How long a request waits for a slot of `DB_WORK` before it is refused as busy. Work that started runs to its end:
-/// a refusal tells the client the work was not done.
+/// Bytes in flight over the whole service and over each connection, in KiB permits.
+const MEMORY: usize = 256 << 20;
+const CONNECTION_MEMORY: usize = 16 << 20;
+const KIB: usize = 1 << 10;
+/// Bound of a reply that is not a page: an append's, a head's or a refusal.
+const SMALL_REPLY: usize = 4 << 10;
+/// How long a request waits for a slot of `DB_WORK` or for memory before it is refused as busy. Work that started runs
+/// to its end: a refusal tells the client the work was not done.
 const DB_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub appends_per_minute: u32,
     pub retention_days: u64,
+    pub disk: u64,
 }
 
 impl Default for Policy {
-    fn default() -> Self { Self { appends_per_minute: 600, retention_days: 365 } }
+    fn default() -> Self { Self { appends_per_minute: 600, retention_days: 365, disk: DISK_BYTES } }
 }
 
 #[derive(Clone)]
@@ -42,6 +50,7 @@ struct Inner {
     connections: Semaphore,
     streams: Arc<Semaphore>,
     work: Arc<Semaphore>,
+    memory: Arc<Semaphore>,
     expiry: Mutex<Option<AbortOnDropHandle<()>>>,
 }
 
@@ -69,15 +78,44 @@ impl Drop for Registration {
     fn drop(&mut self) { self.inner.subscribers.lock().unwrap().records.remove(&self.id); }
 }
 
+/// Permits for bytes in flight, from the connection's budget and the service's. Taking `bytes` takes twice as many,
+/// as a body is held as bytes and as its decoded value.
+struct Hold { connection: OwnedSemaphorePermit, service: OwnedSemaphorePermit }
+
+impl Hold {
+    async fn take(connection: &Arc<Semaphore>, service: &Arc<Semaphore>, bytes: usize) -> Result<Self> {
+        let kib = (2 * bytes).div_ceil(KIB);
+        let (connection, service) = timeout(DB_WAIT, async {
+            tokio::join!(connection.clone().acquire_many_owned(kib as u32), service.clone().acquire_many_owned(kib as u32))
+        }).await.map_err(|_| Refused("busy".into()))?;
+        Ok(Self { connection: connection?, service: service? })
+    }
+
+    /// Keeps permits for `bytes` of what was taken; the rest are released.
+    fn shrink(&mut self, bytes: usize) {
+        let kib = (2 * bytes).div_ceil(KIB);
+        self.connection = self.connection.split(kib).unwrap();
+        self.service = self.service.split(kib).unwrap();
+    }
+}
+
+async fn receive<T: DeserializeOwned>(recv: &mut RecvStream, connection: &Arc<Semaphore>, service: &Arc<Semaphore>) -> Result<(T, Hold)> {
+    let len = membership::read_len(recv).await?;
+    let hold = Hold::take(connection, service, len).await?;
+    Ok((membership::read_body(recv, len).await?, hold))
+}
+
 impl std::fmt::Debug for Service {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Service") }
 }
 
 impl Service {
-    pub fn new(store: Store, policy: Policy) -> Self {
+    pub fn new(mut store: Store, policy: Policy) -> Self {
+        store.disk = policy.disk;
         let service = Self(Arc::new(Inner {
             store, policy, subscribers: Mutex::default(), connections: Semaphore::new(MAX_CONNECTIONS),
-            streams: Arc::new(Semaphore::new(MAX_STREAMS)), work: Arc::new(Semaphore::new(DB_WORK)), expiry: Mutex::default(),
+            streams: Arc::new(Semaphore::new(MAX_STREAMS)), work: Arc::new(Semaphore::new(DB_WORK)),
+            memory: Arc::new(Semaphore::new(MEMORY / KIB)), expiry: Mutex::default(),
         }));
         let weak = Arc::downgrade(&service.0);
         let expiry = n0_future::task::spawn(async move {
@@ -104,24 +142,28 @@ impl Service {
 
     pub async fn stats(&self) -> Result<Stats> { self.work(|inner| inner.store.stats()).await }
 
-    async fn stream(&self, mut send: SendStream, mut recv: RecvStream, appends: &Mutex<Window>, work_slot: OwnedSemaphorePermit) -> Result<()> {
-        let request = timeout(Duration::from_secs(15), async {
-            let open: Open = membership::read_frame(&mut recv).await?;
-            ensure!(open.stream == Stream::Membership, "unexpected stream");
-            membership::read_frame::<Request, _>(&mut recv).await
-        }).await?;
-        let request = match request {
-            Ok(request) => request,
-            Err(_) => {
-                reply::<()>(&mut send, Err(Refused("policy".into()).into())).await?;
+    async fn stream(&self, mut send: SendStream, mut recv: RecvStream, appends: &Mutex<Window>, connection: &Arc<Semaphore>, work_slot: OwnedSemaphorePermit) -> Result<()> {
+        match self.exchange(&mut send, &mut recv, appends, connection, work_slot).await {
+            Err(error) if error.is::<Refused>() => {
+                reply::<()>(&mut send, Err(error), Hold::take(connection, &self.0.memory, 0).await?).await?;
                 send.shutdown().await?;
-                return Ok(());
+                Ok(())
             }
-        };
+            result => result,
+        }
+    }
+
+    async fn exchange(&self, send: &mut SendStream, recv: &mut RecvStream, appends: &Mutex<Window>, connection: &Arc<Semaphore>, work_slot: OwnedSemaphorePermit) -> Result<()> {
+        let (request, request_hold) = timeout(Duration::from_secs(15), async {
+            let (open, _) = receive::<Open>(recv, connection, &self.0.memory).await?;
+            ensure!(open.stream == Stream::Membership, Refused("policy".into()));
+            receive::<Request>(recv, connection, &self.0.memory).await
+        }).await?.map_err(|error| if error.is::<Refused>() { error } else { Refused("policy".into()).into() })?;
         let service = self.0.store.key().verifying_key().to_bytes();
         match request {
             Request::Append { capability, entries, public } => {
                 let d = head::reference(&service, &capability);
+                let reply_hold = Hold::take(connection, &self.0.memory, SMALL_REPLY).await?;
                 let answer = if !appends.lock().unwrap().take(self.0.policy.appends_per_minute) {
                     Err(Refused("rate".into()).into())
                 } else {
@@ -132,40 +174,51 @@ impl Service {
                         Ok(appended)
                     }).await
                 };
-                reply(&mut send, answer).await?;
+                reply(send, answer, reply_hold).await?;
             }
             Request::Read { capability, after } => {
                 let d = head::reference(&service, &capability);
-                reply(&mut send, self.work(move |inner| inner.store.read(&d, after)).await).await?;
+                let mut reply_hold = Hold::take(connection, &self.0.memory, membership::MAX_BODY).await?;
+                let answer = self.work(move |inner| inner.store.read(&d, after)).await;
+                reply_hold.shrink(answer.as_ref().map_or(SMALL_REPLY, |page| membership::encoded_page_bytes(&page.entries)));
+                reply(send, answer, reply_hold).await?;
             }
             Request::Head { capability } => {
                 let d = head::reference(&service, &capability);
-                reply(&mut send, self.work(move |inner| Ok(Latest { head: inner.store.head(&d)? })).await).await?;
+                let reply_hold = Hold::take(connection, &self.0.memory, SMALL_REPLY).await?;
+                reply(send, self.work(move |inner| Ok(Latest { head: inner.store.head(&d)? })).await, reply_hold).await?;
             }
             Request::Subscribe { capabilities } => {
                 drop(work_slot);
+                drop(request_hold);
                 let refs = capabilities.iter().map(|c| head::reference(&service, c)).collect();
-                return self.subscribe(send, recv, refs).await;
+                return self.subscribe(send, recv, refs, connection).await;
             }
         }
         send.shutdown().await?;
         Ok(())
     }
 
-    async fn subscribe(&self, mut send: SendStream, mut recv: RecvStream, refs: Vec<[u8; 32]>) -> Result<()> {
+    async fn subscribe(&self, send: &mut SendStream, recv: &mut RecvStream, refs: Vec<[u8; 32]>, connection: &Arc<Semaphore>) -> Result<()> {
         let (sender, mut notices) = mpsc::channel(LAG);
         let id = self.0.subscribers.lock().unwrap().add(refs.clone(), sender);
         let id = match id {
             Ok(id) => id,
-            Err(error) => { reply::<Subscribed>(&mut send, Err(error)).await?; return Ok(()); }
+            Err(error) => {
+                reply::<Subscribed>(send, Err(error), Hold::take(connection, &self.0.memory, SMALL_REPLY).await?).await?;
+                return Ok(());
+            }
         };
         let _registration = Registration { inner: self.0.clone(), id };
         let forward = async {
-            reply(&mut send, Ok(Subscribed {})).await?;
+            reply(send, Ok(Subscribed {}), Hold::take(connection, &self.0.memory, SMALL_REPLY).await?).await?;
             for d in refs {
-                reply(&mut send, self.work(move |inner| Ok(Latest { head: inner.store.head(&d)? })).await).await?;
+                let reply_hold = Hold::take(connection, &self.0.memory, SMALL_REPLY).await?;
+                reply(send, self.work(move |inner| Ok(Latest { head: inner.store.head(&d)? })).await, reply_hold).await?;
             }
-            while let Some(head) = notices.recv().await { reply(&mut send, Ok(Latest { head })).await?; }
+            while let Some(head) = notices.recv().await {
+                reply(send, Ok(Latest { head }), Hold::take(connection, &self.0.memory, SMALL_REPLY).await?).await?;
+            }
             anyhow::bail!("membership subscription lagged")
         };
         tokio::select! {
@@ -175,7 +228,7 @@ impl Service {
     }
 }
 
-async fn reply<T: serde::Serialize>(send: &mut SendStream, result: Result<T>) -> Result<()> {
+async fn reply<T: serde::Serialize>(send: &mut SendStream, result: Result<T>, _hold: Hold) -> Result<()> {
     let answer = match result {
         Ok(value) => Reply::Ok(value),
         Err(error) => {
@@ -206,6 +259,7 @@ impl ProtocolHandler for Service {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let Ok(_connection) = self.0.connections.try_acquire() else { conn.close(1u32.into(), b"busy"); return Ok(()); };
         let appends = Arc::new(Mutex::new(Window { start: Instant::now(), count: 0 }));
+        let memory = Arc::new(Semaphore::new(CONNECTION_MEMORY / KIB));
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -214,9 +268,9 @@ impl ProtocolHandler for Service {
                     while tasks.try_join_next().is_some() {}
                     if tasks.len() >= CONNECTION_STREAMS { continue; }
                     let Ok(global) = self.0.streams.clone().try_acquire_owned() else { continue };
-                    let (service, appends) = (self.clone(), appends.clone());
+                    let (service, appends, memory) = (self.clone(), appends.clone(), memory.clone());
                     tasks.spawn(async move {
-                        if service.stream(send, recv, &appends, global).await.is_err() { tracing::debug!("membership stream ended"); }
+                        if service.stream(send, recv, &appends, &memory, global).await.is_err() { tracing::debug!("membership stream ended"); }
                     });
                 }
                 _ = tasks.join_next(), if !tasks.is_empty() => {}

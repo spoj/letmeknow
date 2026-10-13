@@ -62,7 +62,7 @@ letmeknow serve --initialize --domain relay.example.com --state /var/lib/letmekn
 letmeknow serve --domain relay.example.com --state /var/lib/letmeknow
 ```
 
-Each prints its public membership address, `<key>@https://relay.example.com`. `/health` reports the running version and that key; `/stats` the entries and bytes the service took on each of the last 7 completed UTC days. Sessions use it with `listen --membership <address> --relay https://relay.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). For browsers, build the app with its key, or point letmeknow.dev at it: see [deploy/README.md](deploy/README.md).
+Each prints its public membership address, `<key>@https://relay.example.com`. `--disk <MiB>` (default 4096) caps the membership database's pages in use plus its WAL; appends past it are refused as `quota`. `/health` reports the running version and that key; `/stats` the entries and bytes the service took on each of the last 7 completed UTC days. Sessions use it with `listen --membership <address> --relay https://relay.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). For browsers, build the app with its key, or point letmeknow.dev at it: see [deploy/README.md](deploy/README.md).
 
 ## Working on letmeknow
 

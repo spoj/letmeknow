@@ -15,11 +15,6 @@ pub const APPEND_BYTES: usize = 2 << 20;
 pub const PAGE_ROWS: usize = 1024;
 pub const SUBSCRIBE_LOGS: usize = 32;
 pub const PAGE_OVERHEAD: usize = 512;
-pub const MAX_LOGS: u64 = 100_000;
-pub const MAX_LOG_LENGTH: u64 = 1_000_000;
-pub const MAX_LOG_BYTES: u64 = 256 << 20;
-pub const MAX_ROWS: u64 = 2_000_000;
-pub const MAX_STORED_BYTES: u64 = 4 << 30;
 
 pub(crate) fn decode_bytes<'de, D: Deserializer<'de>, const MAX: usize>(d: D) -> Result<Vec<u8>, D::Error> {
     struct Encoded<const MAX: usize>;
@@ -113,9 +108,11 @@ pub fn valid_append(entries: &[Bytes]) -> bool {
         && entries.iter().map(|e| e.0.len()).sum::<usize>() <= APPEND_BYTES
 }
 
+pub fn encoded_page_bytes(entries: &[Bytes]) -> usize { PAGE_OVERHEAD + entries.iter().map(encoded_entry_bytes).sum::<usize>() }
+
 pub fn valid_page(entries: &[Bytes]) -> bool {
     entries.len() <= PAGE_ROWS && entries.iter().all(|e| !e.0.is_empty() && e.0.len() <= MAX_ENTRY)
-        && PAGE_OVERHEAD + entries.iter().map(encoded_entry_bytes).sum::<usize>() <= MAX_BODY
+        && encoded_page_bytes(entries) <= MAX_BODY
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,8 +182,18 @@ impl Refusal {
 }
 
 pub async fn read_frame<T: serde::de::DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R) -> anyhow::Result<T> {
+    let len = read_len(r).await?;
+    read_body(r, len).await
+}
+
+/// The caller reserves memory for the body before `read_body` allocates it.
+pub async fn read_len<R: AsyncRead + Unpin>(r: &mut R) -> anyhow::Result<usize> {
     let len = r.read_u32().await? as usize;
     anyhow::ensure!(len <= MAX_BODY, "membership frame limit");
+    Ok(len)
+}
+
+pub async fn read_body<T: serde::de::DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R, len: usize) -> anyhow::Result<T> {
     let mut body = vec![0; len];
     r.read_exact(&mut body).await?;
     serde_json::from_slice(&body).map_err(|_| anyhow::anyhow!("invalid membership frame"))

@@ -1,7 +1,7 @@
 use std::{net::Ipv4Addr, sync::Mutex, time::Duration};
 
 use anyhow::Result;
-use iroh::{Endpoint, RelayMode, SecretKey, endpoint::{Connection, presets}, protocol::{AcceptError, ProtocolHandler, Router}};
+use iroh::{Endpoint, RelayMode, SecretKey, endpoint::{Connection, RecvStream, SendStream, presets}, protocol::{AcceptError, ProtocolHandler, Router}};
 use lmk_membership::{Frontier, InvalidProof, Refused, client::ServeClient, service::{CONNECTION_STREAMS, Policy, Service}, store::Store};
 use lmk_proto::{Bytes, frame::{self, ALPN, Open, Stream}, head::{self, Head}, membership::{self, Latest, Page, Reply, Request, Subscribed}};
 use tokio::{io::AsyncWriteExt, sync::oneshot, time::timeout};
@@ -304,6 +304,80 @@ async fn oversized_frame_is_rejected_before_reading_body() {
         frame::write(&mut send, &Open { stream: Stream::Membership }).await.unwrap();
         send.write_all(&((membership::MAX_BODY + 1) as u32).to_be_bytes()).await.unwrap();
         assert!(matches!(membership::read_frame::<Reply<()>, _>(&mut recv).await.unwrap(), Reply::Refused(membership::Refusal::Policy)));
+        net.close().await;
+    }).await.unwrap();
+}
+
+/// A stream that announces a body of the largest size: it holds twice that in memory until its body arrives.
+async fn announce(connection: &Connection) -> (SendStream, RecvStream) {
+    let (mut send, recv) = connection.open_bi().await.unwrap();
+    frame::write(&mut send, &Open { stream: Stream::Membership }).await.unwrap();
+    send.write_all(&(membership::MAX_BODY as u32).to_be_bytes()).await.unwrap();
+    (send, recv)
+}
+
+/// Sends the body of an announced stream, which is not JSON: the service refuses it and frees its memory.
+async fn release((mut send, mut recv): (SendStream, RecvStream)) {
+    send.write_all(&vec![b'x'; membership::MAX_BODY]).await.unwrap();
+    assert!(matches!(membership::read_frame::<Reply<()>, _>(&mut recv).await.unwrap(), Reply::Refused(membership::Refusal::Policy)));
+}
+
+async fn head_on(connection: &Connection, c: &[u8; 32]) -> Reply<Latest> {
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    frame::write(&mut send, &Open { stream: Stream::Membership }).await.unwrap();
+    frame::write(&mut send, &Request::Head { capability: *c }).await.unwrap();
+    membership::read_frame(&mut recv).await.unwrap()
+}
+
+/// Asks for heads until the announced bodies hold all the memory a head needs.
+async fn until_busy(connection: &Connection, c: &[u8; 32]) {
+    loop {
+        match head_on(connection, c).await {
+            Reply::Ok(_) => {}
+            reply => return assert!(matches!(reply, Reply::Refused(membership::Refusal::Busy))),
+        }
+    }
+}
+
+#[tokio::test]
+async fn connection_memory_budget_refuses_busy_then_recovers_when_released() {
+    timeout(Duration::from_secs(30), async {
+        let net = TestService::new(Policy::default()).await;
+        let c = [7; 32];
+        let connection = net.endpoint.connect(net.service.endpoint().addr(), ALPN).await.unwrap();
+        let first = announce(&connection).await;
+        let second = announce(&connection).await;
+        until_busy(&connection, &c).await;
+        assert_eq!(net.client.head(&c).await.unwrap().length, 0, "another connection has its own budget");
+        release(first).await;
+        release(second).await;
+        assert!(matches!(head_on(&connection, &c).await, Reply::Ok(_)));
+        net.close().await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn service_memory_budget_is_shared_by_connections() {
+    timeout(Duration::from_secs(60), async {
+        let net = TestService::new(Policy::default()).await;
+        let c = [7; 32];
+        let mut endpoints = Vec::new();
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            let endpoint = endpoint(None).await;
+            let connection = endpoint.connect(net.service.endpoint().addr(), ALPN).await.unwrap();
+            held.push(announce(&connection).await);
+            held.push(announce(&connection).await);
+            endpoints.push((endpoint, connection));
+        }
+        let late = endpoint(None).await;
+        let connection = late.connect(net.service.endpoint().addr(), ALPN).await.unwrap();
+        until_busy(&connection, &c).await;
+        release(held.swap_remove(0)).await;
+        assert!(matches!(head_on(&connection, &c).await, Reply::Ok(_)));
+        drop(held);
+        for (endpoint, _) in endpoints { endpoint.close().await; }
+        late.close().await;
         net.close().await;
     }).await.unwrap();
 }

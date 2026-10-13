@@ -96,6 +96,9 @@ pub struct Serve {
     /// Logs, keys and certificates
     #[arg(long)]
     pub state: PathBuf,
+    /// MiB the membership database may use: its pages in use and its WAL. Appends past it are refused as quota
+    #[arg(long, default_value_t = 4096)]
+    pub disk: u64,
     /// A certificate (PEM) to use instead of Let's Encrypt, with --key
     #[arg(long, requires = "key")]
     pub cert: Option<PathBuf>,

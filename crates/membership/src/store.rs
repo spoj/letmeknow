@@ -1,6 +1,6 @@
 //! Disposable authority and its durable, reference-only SQLite store.
 
-use std::{fs::{self, OpenOptions}, io::Write, path::Path, sync::Mutex};
+use std::{fs::{self, OpenOptions}, io::Write, path::{Path, PathBuf}, sync::Mutex};
 
 use anyhow::{Result, ensure};
 use ed25519_dalek::SigningKey;
@@ -8,12 +8,12 @@ use lmk_proto::{Bytes, clock::now, head::{self, Head}, membership::{self, Append
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::Refused;
-use membership::{MAX_LOGS, MAX_LOG_LENGTH, MAX_LOG_BYTES, MAX_ROWS, MAX_STORED_BYTES};
 const EXPIRE_ROWS: usize = 1024;
 const EXPIRE_BYTES: u64 = 4 << 20;
 pub const DAY_MS: u64 = 86_400_000;
 const STATS_DAYS: u64 = 7;
 const FORMAT: u32 = 3;
+pub const DISK_BYTES: u64 = 4 << 30;
 const PRIVATE_EXPIRY: &str = "SELECT reference,position,length(entry) FROM records WHERE expiry_day<? ORDER BY expiry_day LIMIT ?";
 const PUBLIC_EXPIRY: &str = "SELECT reference FROM anchors WHERE public=1 AND rows>0 AND day<? ORDER BY day LIMIT 1";
 const PUBLIC_RECORDS: &str = "SELECT reference,position,length(entry) FROM records WHERE reference=? ORDER BY position LIMIT ?";
@@ -29,6 +29,17 @@ pub struct Stats { pub days: Vec<DayTotals> }
 pub struct Store {
     db: Mutex<Connection>,
     key: SigningKey,
+    wal: PathBuf,
+    pub(crate) disk: u64,
+}
+
+/// The database's pages in use plus its WAL file, which keeps its high-water size until a truncating checkpoint.
+fn used(db: &Connection, wal: &Path) -> Result<u64> {
+    let (pages, free, size): (u64, u64, u64) = db.query_row(
+        "SELECT (SELECT page_count FROM pragma_page_count), (SELECT freelist_count FROM pragma_freelist_count), (SELECT page_size FROM pragma_page_size)",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    Ok((pages - free) * size + fs::metadata(wal)?.len())
 }
 
 #[cfg(unix)]
@@ -87,7 +98,7 @@ impl Store {
         ready.write_all(key.verifying_key().as_bytes())?;
         ready.sync_all()?;
         sync_dir(state)?;
-        Ok(Self { db: Mutex::new(db), key })
+        Ok(Self { db: Mutex::new(db), key, wal: state.join("membership.db-wal"), disk: DISK_BYTES })
     }
 
     pub fn open(state: &Path) -> Result<Self> {
@@ -106,7 +117,7 @@ impl Store {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "fullfsync", true)?;
-        Ok(Self { db: Mutex::new(db), key })
+        Ok(Self { db: Mutex::new(db), key, wal: state.join("membership.db-wal"), disk: DISK_BYTES })
     }
 
     pub fn key(&self) -> &SigningKey { &self.key }
@@ -121,14 +132,12 @@ impl Store {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = tx.query_row(
-            "SELECT length,hash,public,bytes FROM anchors WHERE reference=?", [log_ref],
-            |r| Ok((r.get::<_, u64>(0)?, r.get::<_, [u8; 32]>(1)?, r.get::<_, bool>(2)?, r.get::<_, u64>(3)?)),
+            "SELECT length,hash,public FROM anchors WHERE reference=?", [log_ref],
+            |r| Ok((r.get::<_, u64>(0)?, r.get::<_, [u8; 32]>(1)?, r.get::<_, bool>(2)?)),
         ).optional()?;
-        let (length, mut hash, public, retained) = existing.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), log_ref), public, 0));
-        let end = length.checked_add(entries.len() as u64).ok_or_else(|| Refused("quota".into()))?;
-        let (logs, rows, stored): (u64, u64, u64) = tx.query_row("SELECT logs,rows,bytes FROM metadata WHERE id=1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        ensure!(end <= MAX_LOG_LENGTH && retained + bytes <= MAX_LOG_BYTES && rows + entries.len() as u64 <= MAX_ROWS
-            && stored + bytes <= MAX_STORED_BYTES && (existing.is_some() || logs < MAX_LOGS), Refused("quota".into()));
+        let (length, mut hash, public) = existing.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), log_ref), public));
+        ensure!(used(&tx, &self.wal)? + bytes <= self.disk, Refused("quota".into()));
+        let end = length + entries.len() as u64;
         let day = now() / DAY_MS;
         for (index, entry) in entries.iter().enumerate() {
             hash = head::next(&hash, &entry.0);
@@ -139,7 +148,6 @@ impl Store {
              SET length=?2, hash=?3, day=?5, rows=rows+?6, bytes=bytes+?7",
             params![log_ref, end, hash, public, day, entries.len() as u64, bytes],
         )?;
-        tx.execute("UPDATE metadata SET logs=logs+?,rows=rows+?,bytes=bytes+? WHERE id=1", params![u64::from(existing.is_none()), entries.len() as u64, bytes])?;
         tx.execute("INSERT INTO totals VALUES(?1,?2,?3) ON CONFLICT(day) DO UPDATE SET entries=entries+?2,bytes=bytes+?3",
             params![day, entries.len() as u64, bytes])?;
         tx.commit()?;
@@ -213,7 +221,6 @@ impl Store {
             tx.execute("DELETE FROM records WHERE reference=? AND position=?", params![reference, position])?;
             tx.execute("UPDATE anchors SET rows=rows-1,bytes=bytes-? WHERE reference=?", params![size, reference])?;
         }
-        tx.execute("UPDATE metadata SET rows=rows-?,bytes=bytes-? WHERE id=1", params![expired.len() as u64, bytes])?;
         tx.commit()?;
         Ok(expired.len())
     }
@@ -250,8 +257,6 @@ mod tests {
         assert!(store.append(&d, &[Bytes(b"uncommitted".to_vec())], false).is_err());
         assert_eq!(store.head(&d).unwrap().length, 0);
         assert!(store.read(&d, 0).unwrap().entries.is_empty());
-        let counters: (u64, u64, u64) = store.db.lock().unwrap().query_row("SELECT logs,rows,bytes FROM metadata", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
-        assert_eq!(counters, (0, 0, 0));
         assert_eq!(store.db.lock().unwrap().query_row("SELECT count(*) FROM totals", [], |r| r.get::<_, u64>(0)).unwrap(), 0);
         store.db.lock().unwrap().execute_batch("DROP TRIGGER abort_append").unwrap();
         let appended = store.append(&d, &[Bytes(b"committed".to_vec())], false).unwrap();
@@ -322,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn row_byte_lifetime_and_anchor_limits_are_transactional() {
+    fn append_size_limits_are_transactional() {
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
         let d = [7; 32];
@@ -330,18 +335,23 @@ mod tests {
         assert!(store.append(&d, &[Bytes(vec![1; membership::MAX_ENTRY+1])], false).is_err());
         assert!(store.append(&d, &vec![Bytes(vec![1; membership::MAX_ENTRY]); 3], false).is_err());
         store.append(&d, &[Bytes(vec![1])], false).unwrap();
-        for sql in [format!("UPDATE metadata SET logs={MAX_LOGS}"), format!("UPDATE metadata SET rows={MAX_ROWS}"), format!("UPDATE metadata SET bytes={MAX_STORED_BYTES}")] {
-            store.db.lock().unwrap().execute_batch(&sql).unwrap();
-            let reference = if sql.contains("logs=") { [8; 32] } else { d };
-            assert_eq!(store.append(&reference, &[Bytes(vec![2])], false).unwrap_err().downcast::<Refused>().unwrap().0, "quota");
-            store.db.lock().unwrap().execute_batch("UPDATE metadata SET logs=1, rows=1, bytes=1").unwrap();
-        }
-        for sql in [format!("UPDATE anchors SET length={MAX_LOG_LENGTH}"), format!("UPDATE anchors SET bytes={MAX_LOG_BYTES}")] {
-            store.db.lock().unwrap().execute_batch(&sql).unwrap();
-            assert_eq!(store.append(&d, &[Bytes(vec![2])], false).unwrap_err().downcast::<Refused>().unwrap().0, "quota");
-            store.db.lock().unwrap().execute_batch("UPDATE anchors SET length=1,bytes=1").unwrap();
-        }
         assert_eq!(store.head(&d).unwrap().length, 1);
+        drop(store);
+    }
+
+    #[test]
+    fn disk_budget_counts_pages_in_use_and_wal_before_insert() {
+        let (_dir, path) = state();
+        let mut store = Store::initialize(&path).unwrap();
+        let d = [7; 32];
+        store.append(&d, &[Bytes(vec![1])], false).unwrap();
+        let before = used(&store.db.lock().unwrap(), &store.wal).unwrap();
+        store.disk = before + 99;
+        assert_eq!(store.append(&d, &[Bytes(vec![2; 100])], false).unwrap_err().downcast::<Refused>().unwrap().0, "quota");
+        assert_eq!(store.head(&d).unwrap().length, 1);
+        store.disk = before + 100;
+        store.append(&d, &[Bytes(vec![2; 100])], false).unwrap();
+        assert_eq!(store.head(&d).unwrap().length, 2);
         drop(store);
     }
 
