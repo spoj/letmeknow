@@ -480,12 +480,13 @@ impl App {
         check_domain(&config.membership)?;
         let resolve = resolver(idb.clone().unchecked_into(), config.backend.clone());
         let own = resolve(config.membership.clone()).await?;
-        let relays = if config.relays.is_empty() { own.relays } else { config.relays };
-        let relays = relays.iter().map(|relay| relay.parse()).collect::<Result<Vec<_>, _>>()?;
+        let relays = own.relays.iter().map(|relay| relay.parse()).collect::<Result<Vec<_>, _>>()?;
+        let chosen = config.relays.iter().map(|relay| relay.parse()).collect::<Result<Vec<_>, _>>()?;
         let node_config = lmk_node::Config {
             handle: String::new(),
             device: Some(device.clone()),
             relays,
+            chosen,
             resolve,
             ca: Default::default(),
             home: None,

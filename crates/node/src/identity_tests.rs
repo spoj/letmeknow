@@ -90,7 +90,7 @@ impl iroh::protocol::ProtocolHandler for Authority {
 async fn device(relay: &Relay, name: &str) -> (Node<MemoryProvider>, Identity<MemoryProvider>) {
     let device = Device::new(name);
     let config = Config {
-        handle: name.into(), device: Some(device.clone()), relays: vec![relay.url.clone()], resolve: lmk_testing::resolve(), ca: relay.ca(),
+        handle: name.into(), device: Some(device.clone()), relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
         home: None, files: None, disk: None, file_limit: 0, kinds: vec![CHAT.into(), IDENTITY.into()], durable: None,
     };
     let (node, _events) = Node::start(MemoryProvider::default(), config).await.unwrap();

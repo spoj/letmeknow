@@ -58,7 +58,9 @@ pub async fn serve(serve: cli::Serve) -> Result<()> {
 /// The relays and certificate authorities a session process reaches its peers through, and the directories it resolves.
 #[derive(Clone)]
 pub struct Network {
-    /// The relays the session is reached through: `--relay`'s, or else its own directory's, which `listen` fills in.
+    /// The relays the session lives on instead of its directory's: `--relay`'s.
+    pub chosen: Vec<iroh::RelayUrl>,
+    /// The relays of its own directory, which `listen` fills in.
     pub relays: Vec<iroh::RelayUrl>,
     pub ca: iroh::tls::CaTlsConfig,
     pub resolve: Resolve,
@@ -66,8 +68,8 @@ pub struct Network {
 }
 
 impl Network {
-    /// The network of the session at `home`: reaching `relays`, or else its directory's, and trusting `ca`.
-    pub fn new(home: &Path, relays: &[String], ca: iroh::tls::CaTlsConfig) -> Result<Self> {
+    /// The network of the session at `home`: living on `chosen` relays, and trusting `ca`.
+    pub fn new(home: &Path, chosen: &[String], ca: iroh::tls::CaTlsConfig) -> Result<Self> {
         let tls = ca.client_config(Arc::new(rustls::crypto::ring::default_provider()))?;
         let mut builder = reqwest::Client::builder()
             .tls_backend_preconfigured(tls)
@@ -79,7 +81,8 @@ impl Network {
         }
         let http = builder.build()?;
         Ok(Network {
-            relays: relays.iter().map(|relay| relay.parse()).collect::<Result<_, _>>()?,
+            chosen: chosen.iter().map(|relay| relay.parse()).collect::<Result<_, _>>()?,
+            relays: Vec::new(),
             ca,
             resolve: cached(home.join("directories"), fetch(http.clone())),
             http,
@@ -223,7 +226,7 @@ pub async fn listen(
     std::fs::write(&format, "7\n")?;
     let directory = own_directory(home, &network, &config.membership).await?;
     let membership = Service::Serve { key: Bytes(directory.key.to_vec()), domain: config.membership.clone(), rest: Default::default() };
-    let relays = if network.relays.is_empty() { directory.relays.iter().map(|relay| relay.parse()).collect::<Result<_, _>>()? } else { network.relays.clone() };
+    let relays = directory.relays.iter().map(|relay| relay.parse()).collect::<Result<_, _>>()?;
     let network = Network { relays, ..network };
     // One process runs a session, even when two start at once.
     let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(config.dir.join("session.lock"))?;
@@ -333,6 +336,7 @@ fn node_config(network: &Network, home: &Path, handle: &str, device: Option<Devi
         handle: handle.into(),
         device,
         relays: network.relays.clone(),
+        chosen: network.chosen.clone(),
         resolve: network.resolve.clone(),
         ca: network.ca.clone(),
         home: Some(home.to_path_buf()),

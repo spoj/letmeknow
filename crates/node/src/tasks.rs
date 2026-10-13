@@ -29,7 +29,8 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
     pub async fn start(provider: P, mut config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let ca = std::mem::take(&mut config.ca);
-        let endpoint = lmk_net::builder(config.relays.clone()).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
+        let home = if config.chosen.is_empty() { config.relays.clone() } else { config.chosen.clone() };
+        let endpoint = lmk_net::builder(home).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
         let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), kinds: config.kinds.clone(), revision: REVISION };
         let clients = logs::Clients::new(endpoint.clone(), config.resolve.clone());
         let state = State::open(provider, &config, leaf)?;
@@ -42,6 +43,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             clients,
             follows: Mutex::default(),
             relays: config.relays.clone(),
+            chosen: config.chosen.clone(),
             resolve: config.resolve.clone(),
             file_limit: config.file_limit,
             kinds: config.kinds,
@@ -218,7 +220,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Dials a member, at the relay it last said it was on, then its fallback, and tells `Peers` how it went.
     fn dial(self: &Arc<Self>, peer: EndpointId) {
-        let hint: Vec<RelayUrl> = self.lock().hint_of(&peer).into_iter().collect();
+        let hint: Vec<RelayUrl> = self.lock().hint_of(&peer).into_iter().chain(self.chosen.clone()).collect();
         let inner = self.clone();
         spawn(async move {
             let dialed = inner.net().dial(peer, hint, Box::pin(inner.clone().fallback(peer))).await;
@@ -349,7 +351,7 @@ mod tests {
             let fail = Arc::new(AtomicBool::new(false));
             let failing = fail.clone();
             let config = Config {
-                handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], resolve: lmk_testing::resolve(), ca: relay.ca(),
+                handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
                 home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
                 durable: Some(Arc::new(move || {
                     let fail = failing.load(Ordering::SeqCst);
@@ -422,7 +424,7 @@ mod tests {
             release: Arc::new(tokio::sync::Notify::new()),
         });
         let config = Config {
-            handle: "Writer".into(), device: None, relays: vec![relay.url.clone()], resolve: lmk_testing::resolve(), ca: relay.ca(),
+            handle: "Writer".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
             home: None, files: None, disk: Some(disk.clone()), file_limit: 0, kinds: vec![], durable: None,
         };
         let (writer, _) = Node::start(MemoryProvider::default(), config).await.unwrap();
@@ -433,7 +435,7 @@ mod tests {
             let fail = Arc::new(AtomicBool::new(false));
             let failing = fail.clone();
             let config = Config {
-                handle: "Reader".into(), device: None, relays: vec![relay.url.clone()], resolve: lmk_testing::resolve(), ca: relay.ca(),
+                handle: "Reader".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
                 home: None, files: None, disk: Some(disk.clone()), file_limit: 0, kinds: vec!["test".into()],
                 durable: Some(Arc::new(move || {
                     let fail = failing.load(Ordering::SeqCst);
@@ -493,7 +495,7 @@ mod tests {
     async fn failed_durability_closes_peer_outbox_and_withholds_client_effects() {
         let relay = lmk_testing::relay().await;
         let config = Config {
-            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], resolve: lmk_testing::resolve(), ca: relay.ca(),
+            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
             home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
             durable: Some(Arc::new(|| Box::pin(async { anyhow::bail!("injected persistence failure") }))),
         };
@@ -517,7 +519,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let saved = release.clone();
         let config = Config {
-            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], resolve: lmk_testing::resolve(), ca: relay.ca(),
+            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
             home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
             durable: Some(Arc::new(move || {
                 saving.notify_one();

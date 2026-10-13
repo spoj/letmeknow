@@ -66,6 +66,7 @@ fn config(relay: &Relay, name: &str, device: Option<Device>, kinds: &[&str]) -> 
         handle: name.into(),
         device,
         relays: vec![relay.url.clone()],
+        chosen: vec![],
         resolve: lmk_testing::resolve(),
         ca: relay.ca(),
         home: None,
@@ -2613,6 +2614,23 @@ async fn members_learn_each_others_relays() {
     let (alice_key, bob_key, url) = (alice.node.address().0, bob.node.address().0, relay.url.to_string());
     eventually("Alice holds Bob's relay", || alice.node.hint(&bob_key) == Some(url.clone())).await;
     eventually("Bob holds Alice's relay", || bob.node.hint(&alice_key) == Some(url.clone())).await;
+}
+
+/// Chosen relays are where a session lives, whatever its directory names: its members hold them as its relays.
+#[tokio::test(flavor = "multi_thread")]
+async fn chosen_relays_replace_the_directorys() {
+    let relay = relay().await;
+    let dead = "https://127.0.0.1:1".parse().unwrap();
+    let (node, events) = Node::start(MemoryProvider::default(), Config { relays: vec![dead], chosen: vec![relay.url.clone()], ..config(&relay, "Alice", None, &[CHAT, KIND]) })
+        .await
+        .unwrap();
+    let alice = Session { node, events };
+    let bob = session(&relay, "Bob").await;
+    assert_eq!(alice.node.address().1, vec![relay.url.clone()]);
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    let (alice_key, url) = (alice.node.address().0, relay.url.to_string());
+    eventually("Bob holds Alice's chosen relay", || bob.node.hint(&alice_key) == Some(url.clone())).await;
 }
 
 /// A member whose home relay moves tells its online co-member, which holds the new relay within seconds.

@@ -98,7 +98,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
         };
         // Each member is dialed at the relay it last said it was on, and at the link's service.
-        let hint = |peer: EndpointId| -> Vec<RelayUrl> { self.inner.lock().hint_of(&peer).into_iter().chain(service.clone()).collect() };
+        let hint = |peer: EndpointId| -> Vec<RelayUrl> { self.inner.lock().hint_of(&peer).into_iter().chain(service.clone()).chain(self.inner.chosen.clone()).collect() };
         let members = link.members.iter().map(|member| Ok(EndpointId::from_bytes(member)?)).collect::<Result<Vec<_>>>()?;
         let (secret, devices) = (Bytes(link.secret.to_vec()), link.device);
         // The KeyPackage, its private keys and its device key are kept until this session joins or every member it asks

@@ -76,8 +76,11 @@ pub struct Config {
     /// The device, where this is a device's node or a browser's one session: its name is its credential's in its
     /// identity groups, each of which this node joins with a key of its own, the device's key on that identity.
     pub device: Option<Device>,
-    /// The relays this session is reached through: its directory's, or those chosen.
+    /// The relays of this session's directory: the relays it lives on unless `chosen` names others, and the fallback of
+    /// every dial.
     pub relays: Vec<RelayUrl>,
+    /// The relays this session lives on instead of its directory's; every dial hints them.
+    pub chosen: Vec<RelayUrl>,
     /// Resolves a domain to its directory, as the shell holds it.
     pub resolve: Resolve,
     pub ca: CaTlsConfig,
@@ -548,6 +551,7 @@ pub(crate) struct Inner<P> {
     /// The tasks that follow logs at their services, by log id.
     follows: Mutex<HashMap<Vec<u8>, JoinHandle<()>>>,
     relays: Vec<RelayUrl>,
+    chosen: Vec<RelayUrl>,
     resolve: Resolve,
     file_limit: u64,
     kinds: Vec<String>,

@@ -82,6 +82,7 @@ impl Member {
             handle: String::new(),
             device: Some(device.clone()),
             relays: vec![relay.url.clone()],
+            chosen: vec![],
             resolve: lmk_testing::resolve(),
             ca: relay.ca(),
             home: None,
