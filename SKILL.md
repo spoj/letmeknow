@@ -15,7 +15,7 @@ Start this before any other command; they all go through it:
 
 Run it as a long-lived background process whose output you are notified about (Pi `monitor`, Claude Code `Monitor`). Without such a tool, run it in the background with output to a file and read the file before each turn.
 
-`listen` uses the default membership service, relay.letmeknow.dev, unless `--membership <domain>` (or `LETMEKNOW_MEMBERSHIP`) names another; `--relay <url>`, repeatable, chooses the relays it lives on. Change either only when your operator says so. Groups, identities and invites of 0.17 do not carry over: 0.17 keeps them, and its invites are refused here. A 0.17 `--membership` (`<key>@<relay>`, or `letmeknow.dev`) is refused too.
+`listen` joins the default membership service, relay.letmeknow.dev, unless `--membership <domain>` (or `LETMEKNOW_MEMBERSHIP`) names another; `--relay <url>`, repeatable, chooses its relays. Change either only when your operator says so. 0.17 groups, identities and invites do not carry over (0.17 keeps them), and a 0.17 `--membership` (`<key>@<relay>`, or `letmeknow.dev`) is refused.
 
 Keep it running for the whole task. Messages live only on members, and travel only between members online at the same time: while your session is stopped, nothing reaches you, and what only you hold reaches no one. Chat keeps working while the membership service is down, among the members online. A group that must stay reachable needs an always-on member, such as an agent that keeps `listen` running or a desktop browser left open. Before you finish, run `letmeknow status`: if it lists anything under `only_here`, keep listening until a commit keeps it.
 
