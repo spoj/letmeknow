@@ -13,6 +13,7 @@ use lmk_membership::store::Store;
 use lmk_testing::{Relay, relay};
 use lmk_node::identity::Identity;
 use lmk_node::{Config, Event, INVITE_VALID, Node};
+use lmk_proto::directory::Directory;
 use lmk_proto::group::{CHAT, Certificate, ChatMessage, IDENTITY, IdentityRef, PROTOCOL, Service, Settings};
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
@@ -46,6 +47,13 @@ async fn node(relay: &Relay, name: &str, kinds: &[&str]) -> Session {
     Session { node, events }
 }
 
+/// A session that trusts the certificates of several relays, for peers and services on any of them.
+async fn session_trusting(relays: [&Relay; 2], name: &str) -> Session {
+    let ca = CaTlsConfig::custom_roots([relays[0].cert.clone(), relays[1].cert.clone()]);
+    let (node, events) = Node::start(MemoryProvider::default(), Config { ca, ..config(relays[0], name, None, &[CHAT, KIND]) }).await.unwrap();
+    Session { node, events }
+}
+
 /// A device's own node, whose key is the device key, as a browser's is: a device and a session at once.
 async fn device(relay: &Relay, name: &str) -> (Session, Identity<MemoryProvider>) {
     let device = Device::new(name);
@@ -57,7 +65,8 @@ fn config(relay: &Relay, name: &str, device: Option<Device>, kinds: &[&str]) -> 
     Config {
         handle: name.into(),
         device,
-        relay: relay.url.clone(),
+        relays: vec![relay.url.clone()],
+        resolve: lmk_testing::resolve(),
         ca: relay.ca(),
         home: None,
         files: None,
@@ -137,7 +146,7 @@ async fn identity<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, m
 async fn publish<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, identity: &IdentityRef, entry: Vec<u8>) {
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
     let log = lmk_proto::public::address(&identity.id.0);
-    lmk_membership::client::ServeClient::for_service(endpoint, &identity.membership).unwrap().append(&log, &[entry], true).await.unwrap();
+    lmk_membership::client::ServeClient::for_service(endpoint, lmk_testing::resolve(), &identity.membership).unwrap().append(&log, &[entry], true).await.unwrap();
     node.read_public(identity).await.unwrap();
 }
 
@@ -160,8 +169,8 @@ async fn an_identity_mirror_is_only_a_hint_to_its_authoritative_service() {
     let dir = folder("identity-mirror");
     let (mirror, mirror_service) = signing_service(&relay, &dir).await;
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    let authority = ServeClient::for_service(endpoint.clone(), &relay.service).unwrap();
-    let mirror_client = ServeClient::for_service(endpoint, &mirror).unwrap();
+    let authority = ServeClient::for_service(endpoint.clone(), lmk_testing::resolve(), &relay.service).unwrap();
+    let mirror_client = ServeClient::for_service(endpoint, lmk_testing::resolve(), &mirror).unwrap();
     let (laptop, tablet) = (lmk_core::random(), lmk_core::random());
     let (id, first) = lmk_core::public::create(&laptop, relay.service.clone());
     let address = lmk_proto::public::address(&id);
@@ -185,7 +194,7 @@ async fn an_identity_mirror_is_only_a_hint_to_its_authoritative_service() {
     let latest = reader.node.read_public(&claim).await.unwrap();
     assert_eq!(latest.membership, relay.service);
     assert_eq!(latest.verify(&credential(&tablet)), Verdict::Dropped);
-    assert_eq!(latest.verify(&credential(&laptop)), Verdict::Authorized, "a claimant's route is not its authority");
+    assert_eq!(latest.verify(&credential(&laptop)), Verdict::Authorized, "a claimant's service is not its authority");
     assert!(reader.node.members(&gid.0).unwrap()[0].identity.as_ref().unwrap().observed.is_none());
     assert!(binding_record(&db).is_none(), "a genuine stale hint must not pin an installed revoked claim");
 
@@ -196,21 +205,21 @@ async fn an_identity_mirror_is_only_a_hint_to_its_authoritative_service() {
     drop(reader);
     mirror_service.shutdown().await.unwrap();
     let reader = stored(&relay, "Reader", &db).await;
-    assert_eq!(reader.node.read_public(&claim).await.unwrap().writers, [lmk_core::device::public(&laptop).into()], "the persisted route is the authority, not the mirror");
+    assert_eq!(reader.node.read_public(&claim).await.unwrap().writers, [lmk_core::device::public(&laptop).into()], "the persisted service is the authority, not the mirror");
     reader.node.shutdown().await.unwrap();
 }
 
-/// A first lookup of an identity that fails persists no route to it; the genuine genesis, once served, does.
+/// A first lookup of an identity that fails persists no service for it; the genuine genesis, once served, does.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_failed_first_identity_lookup_does_not_persist_a_route() {
+async fn a_failed_first_identity_lookup_does_not_persist_a_service() {
     use lmk_membership::client::ServeClient;
 
     let relay = relay().await;
-    let dir = folder("identity-failed-route");
+    let dir = folder("identity-failed-service");
     let (mirror, _mirror_service) = signing_service(&relay, &dir).await;
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    let authority = ServeClient::for_service(endpoint.clone(), &relay.service).unwrap();
-    let mirror_client = ServeClient::for_service(endpoint, &mirror).unwrap();
+    let authority = ServeClient::for_service(endpoint.clone(), lmk_testing::resolve(), &relay.service).unwrap();
+    let mirror_client = ServeClient::for_service(endpoint, lmk_testing::resolve(), &mirror).unwrap();
     let laptop = lmk_core::random();
     let (id, first) = lmk_core::public::create(&laptop, relay.service.clone());
     let address = lmk_proto::public::address(&id);
@@ -243,6 +252,75 @@ async fn a_failed_first_identity_lookup_does_not_persist_a_route() {
     assert_eq!(public.membership, relay.service);
     assert_eq!(public.writers, [lmk_core::device::public(&laptop).into()]);
     reader.node.shutdown().await.unwrap();
+}
+
+/// A group's service and a member's identity's service are two services, each found by its own domain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_whose_identity_is_on_another_service_speaks_in_a_group() {
+    let (group_relay, identity_relay) = (relay().await, relay().await);
+    let alice = session_trusting([&group_relay, &identity_relay], "Alice").await;
+    let mut bob = session_trusting([&group_relay, &identity_relay], "Bob").await;
+    let (claim, laptop) = identity(&identity_relay, &bob.node, identity_relay.service.clone()).await;
+    let gid = bob.node.create(settings(CHAT, &group_relay), Some(certificate(&claim, &laptop, &bob.node.key(), "Bob", "laptop"))).unwrap();
+    alice.node.join(&bob.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    bob.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    eventually("Alice verifies Bob's identity, on the other service", || {
+        alice.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob.node.key() && m.identity.as_ref().is_some_and(|c| c.name == "Bob" && c.error.is_none()))
+    })
+    .await;
+    let sent = alice.node.send(&gid.0, &message("across services"), None).await.unwrap();
+    let got = bob.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    })
+    .await;
+    assert_eq!(got.id, sent);
+}
+
+/// A member whose own relay is down is reached through the relay of its group's service, which its node holds too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_is_reached_through_its_groups_service_when_its_own_relay_is_down() {
+    let (service, own) = (relay().await, relay().await);
+    let mut carol = session(&service, "Carol").await;
+    let gid = carol.node.create(settings(CHAT, &service), None).unwrap();
+    // Bob's own relay is down, and Alice lives on another: Bob is reached through the relay of its group's service.
+    let alice = session_trusting([&own, &service], "Alice").await;
+    alice.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    let dead: iroh::RelayUrl = "https://127.0.0.1:1".parse().unwrap();
+    let (node, events) = Node::start(MemoryProvider::default(), Config { relays: vec![dead, service.url.clone()], ..config(&service, "Bob", None, &[CHAT, KIND]) }).await.unwrap();
+    let mut bob = Session { node, events };
+    bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    carol.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    carol.node.shutdown().await.unwrap();
+    let sent = alice.node.send(&gid.0, &message("through the service"), None).await.unwrap();
+    let got = bob.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    })
+    .await;
+    assert_eq!(got.id, sent);
+}
+
+/// An identity whose directory is down when a member joins is unverified until the directory answers, and is then read
+/// again, without a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identity_whose_directory_is_down_at_join_is_read_again() {
+    let (group_relay, identity_relay) = (relay().await, relay().await);
+    let alice = session_trusting([&group_relay, &identity_relay], "Alice").await;
+    let bob = session_trusting([&group_relay, &identity_relay], "Bob").await;
+    let (claim, laptop) = identity(&identity_relay, &bob.node, identity_relay.service.clone()).await;
+    let gid = bob.node.create(settings(CHAT, &group_relay), Some(certificate(&claim, &laptop, &bob.node.key(), "Bob", "laptop"))).unwrap();
+    let Service::Serve { key, domain, .. } = identity_relay.service.clone() else { unreachable!() };
+    lmk_testing::withdraw(&domain);
+    alice.node.join(&bob.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    let unread = |node: &Node<MemoryProvider>| node.members(&gid.0).unwrap().iter().any(|m| m.key == bob.node.key() && m.identity.as_ref().is_some_and(|c| c.error.is_some()));
+    eventually("Alice cannot verify Bob's identity yet", || unread(&alice.node)).await;
+    let directory = Directory { key: key.0.try_into().unwrap(), addrs: vec![], relay: identity_relay.url.to_string(), relays: vec![identity_relay.url.to_string()] };
+    lmk_testing::publish(&domain, directory);
+    eventually("Alice verifies Bob's identity once its directory answers", || {
+        alice.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob.node.key() && m.identity.as_ref().is_some_and(|c| c.name == "Bob" && c.error.is_none()))
+    })
+    .await;
 }
 
 /// A joiner whose Welcome failed to persist retries after a restart with the Add already logged, not another.
@@ -402,16 +480,16 @@ async fn any_member_admits_an_invite_once() {
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     // A member named first that cannot be reached holds up nothing while another can.
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let dead = lmk_proto::links::Address { key: *iroh::SecretKey::from_bytes(&lmk_core::random()).public().as_bytes(), relay: Some(relay.url.to_string()) };
+    let dead = *iroh::SecretKey::from_bytes(&lmk_core::random()).public().as_bytes();
     let started = std::time::Instant::now();
-    bob.node.join(&Invite { members: vec![dead, link.members[0].clone()], ..link }, None).await.unwrap();
+    bob.node.join(&Invite { members: vec![dead, link.members[0]], ..link }, None).await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
 
     // Two joiners race with one secret, each asking another member: one gets in, and the other is refused.
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
     assert_eq!(link.members.len(), 2, "the link names the inviter and the member that took the invite");
-    let only = |n: usize| Invite { members: vec![link.members[n].clone()], ..link.clone() };
+    let only = |n: usize| Invite { members: vec![link.members[n]], ..link.clone() };
     let (carol, dave) = (session(&relay, "Carol").await, session(&relay, "Dave").await);
     let (to_alice, to_bob) = (only(0), only(1));
     let (by_alice, by_bob) = tokio::join!(carol.node.join(&to_alice, None), dave.node.join(&to_bob, None));
@@ -435,7 +513,7 @@ async fn any_member_admits_an_invite_once() {
     let expired = json!({ "type": "invite", "hash": Bytes(Sha256::digest(secret).to_vec()), "expires": lmk_node::now() - 1 });
     bob.node.send(&gid.0, &expired, None).await.unwrap();
     eventually("Alice holds the expired invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["type"] == "invite")).await;
-    let expired = Invite { secret, members: vec![link.members[0].clone()], ..link.clone() };
+    let expired = Invite { secret, members: vec![link.members[0]], ..link.clone() };
     assert!(format!("{:#}", erin.node.join(&expired, None).await.unwrap_err()).contains("unknown, used or expired"));
 
     // With the inviter offline, another member it named admits the joiner.
@@ -443,7 +521,7 @@ async fn any_member_admits_an_invite_once() {
     drop(alice);
     let (joined, by) = erin.node.join(&link, None).await.unwrap();
     assert_eq!(joined, gid);
-    assert!(link.members[1..].iter().any(|m| m.key == by), "another member admits");
+    assert!(link.members[1..].contains(&by), "another member admits");
     let how = bob.until(|e| match e {
         Event::Joined { member, how, .. } if member.name == "Erin" => Some(how),
         _ => None,
@@ -454,18 +532,18 @@ async fn any_member_admits_an_invite_once() {
 /// A member reached first that never answers keeps the joiner from no other member it dials meanwhile.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_member_reached_first_holds_up_no_other() {
-    use lmk_proto::links::{Address, Invite};
+    use lmk_proto::links::Invite;
     let relay = relay().await;
     let alice = session(&relay, "Alice").await;
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
     let key = iroh::SecretKey::from_bytes(&lmk_core::random());
-    let silent = Address { key: *key.public().as_bytes(), relay: Some(relay.url.to_string()) };
+    let silent = *key.public().as_bytes();
     let _silent = hand(&relay, key.clone(), &bob.node).await;
     eventually("the silent member is connected", || bob.node.net().connected().contains(&key.public())).await;
-    let (joined, by) = bob.node.join(&Invite { members: vec![silent, link.members[0].clone()], ..link.clone() }, None).await.unwrap();
-    assert_eq!((joined, by), (gid, link.members[0].key));
+    let (joined, by) = bob.node.join(&Invite { members: vec![silent, link.members[0]], ..link.clone() }, None).await.unwrap();
+    assert_eq!((joined, by), (gid, link.members[0]));
     alice.node.shutdown().await.unwrap();
 }
 
@@ -489,8 +567,8 @@ async fn an_invite_dies_when_its_inviter_leaves() {
     carol.node.leave(&gid.0).await.unwrap();
     eventually("Bob and Carol are out", || alice.node.members(&gid.0).unwrap().len() == 1).await;
     let dave = session(&relay, "Dave").await;
-    let at_alice = lmk_proto::links::Address { key: alice.node.address().0, relay: Some(relay.url.to_string()) };
-    let ask_alice = |link: &Invite| Invite { members: vec![at_alice.clone()], ..link.clone() };
+    let at_alice = alice.node.address().0;
+    let ask_alice = |link: &Invite| Invite { members: vec![at_alice], ..link.clone() };
     for link in [&by_bob, &by_carol] {
         let refused = dave.node.join(&ask_alice(link), None).await.unwrap_err();
         assert!(format!("{refused:#}").contains("its inviter left the group"), "{refused:#}");
@@ -653,7 +731,7 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
     let reader = session(&relay, "Reader").await;
     assert_eq!(reader.node.read_public(&identity).await.unwrap().writers, published.writers);
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    let directory = lmk_membership::client::ServeClient::for_service(endpoint, &identity.membership).unwrap();
+    let directory = lmk_membership::client::ServeClient::for_service(endpoint, lmk_testing::resolve(), &identity.membership).unwrap();
     let address = lmk_proto::public::address(&identity.id.0);
     let before = directory.head(&address).await.unwrap();
     assert_eq!(before.length, 2, "genesis and the successful publication");
@@ -707,7 +785,7 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
     bob.node.join(&link, None).await.unwrap();
-    let alice_only = vec![link.members[0].clone()];
+    let alice_only = vec![link.members[0]];
     let alice_iroh = alice.node.members(&gid.0).unwrap().into_iter().find(|m| m.name == "Alice").unwrap().iroh;
     // On a slow machine an invite may expire before Alice reads the public log: then once more, valid twice as long.
     let mut valid = 3000;
@@ -724,7 +802,7 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
         let rule = json!({ "type": "invite", "hash": hash, "expires": expires, "to": carol.id });
         bob.node.send(&gid.0, &rule, None).await.unwrap();
         eventually("Alice holds the invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["hash"] == rule["hash"])).await;
-        let link = Invite { device: false, secret, members: alice_only.clone() };
+        let link = Invite { device: false, secret, domain: link.domain.clone(), members: alice_only.clone() };
         let mut joining = tokio::spawn(async move { joiner.node.join(&link, Some(certificate)).await.map(|(gid, _)| gid) });
         // Alice reads the public log once the rule admits Carol.
         let alice_reads = async { while reaching.recv().await.unwrap() != alice_iroh {} };
@@ -934,7 +1012,7 @@ async fn a_dropped_devices_sessions_are_removed_once_and_reported() {
     publish(&relay, &alice.node, &carol, log.next(&laptop, both)).await;
     let groups = [(); 2].map(|_| alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &relay) }, None).unwrap());
     let (tablet, desk, dave, eve) = (session(&relay, "tablet").await, session(&relay, "desk").await, session(&relay, "Dave").await, session(&relay, "Eve").await);
-    let alice_only = vec![alice.node.invite(&groups[0].0, None, INVITE_VALID).await.unwrap().members[0].clone()];
+    let alice_only = vec![alice.node.invite(&groups[0].0, None, INVITE_VALID).await.unwrap().members[0]];
     for gid in &groups {
         for (joiner, device) in [(&tablet, &tablet_key), (&desk, &laptop)] {
             // Alice admits each: a link that named the tablet too could have the tablet add the desk.
@@ -1058,7 +1136,7 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
     let cut = group.cut().to_vec();
     let commit = group.commit(&provider, &mls, Change { leaf: Some(old), cut, ..Change::default() }).unwrap();
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    lmk_membership::client::ServeClient::for_service(endpoint, &relay.service).unwrap().append(&capability, &[commit.entry], false).await.unwrap();
+    lmk_membership::client::ServeClient::for_service(endpoint, lmk_testing::resolve(), &relay.service).unwrap().append(&capability, &[commit.entry], false).await.unwrap();
     drop(provider);
     revision(0).await.expect("Alice sees Bob's leaf of revision 0");
 
@@ -1528,8 +1606,8 @@ struct Hand {
 
 async fn hand<P: Provider + Send + 'static>(relay: &Relay, key: iroh::SecretKey, to: &Node<P>) -> Hand {
     let endpoint = lmk_net::builder([relay.url.clone()]).secret_key(key).ca_tls_config(CaTlsConfig::custom_roots([relay.cert.clone()])).bind().await.unwrap();
-    let (id, relay) = to.address();
-    let addr = iroh::EndpointAddr::new(iroh::EndpointId::from_bytes(&id).unwrap()).with_relay_url(relay);
+    let (id, relays) = to.address();
+    let addr = relays.into_iter().fold(iroh::EndpointAddr::new(iroh::EndpointId::from_bytes(&id).unwrap()), iroh::EndpointAddr::with_relay_url);
     let conn = endpoint.connect(addr, ALPN).await.unwrap();
     let (mut send, recv) = conn.open_bi().await.unwrap();
     frame::write(&mut send, &frame::Open { stream: frame::Stream::Peer }).await.unwrap();
@@ -1813,7 +1891,7 @@ async fn a_link_altered_to_another_kind_admits_to_nothing() {
     let mallory = node(&relay, "Mallory", &[CHAT, IDENTITY]).await;
     let link = Invite::parse(&laptop_devices.invite().await.unwrap()).unwrap();
     // Nor does a device-link attempt left waiting make the same secret, read as a group link, join with a device key.
-    let dead = lmk_proto::links::Address { key: *iroh::SecretKey::from_bytes(&lmk_core::random()).public().as_bytes(), relay: Some(relay.url.to_string()) };
+    let dead = *iroh::SecretKey::from_bytes(&lmk_core::random()).public().as_bytes();
     mallory.node.join(&Invite { members: vec![dead], ..link.clone() }, None).await.unwrap_err();
     let refused = mallory.node.join(&Invite { device: false, ..link }, None).await.unwrap_err();
     assert!(format!("{refused:#}").contains("altered"), "{refused:#}");
@@ -2470,3 +2548,4 @@ async fn a_member_back_takes_more_than_a_thousand_messages_of_one_sender() {
     assert_eq!(taken, ids);
     bob.node.shutdown().await.unwrap();
 }
+

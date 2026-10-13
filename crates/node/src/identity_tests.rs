@@ -3,6 +3,7 @@ use crate::Config;
 use lmk_core::provider::MemoryProvider;
 use lmk_core::public::{PublicLog, Verdict};
 use lmk_membership::store::Store;
+use lmk_proto::directory::Directory;
 use lmk_proto::frame::{self, ALPN, Open};
 use lmk_proto::group::{CHAT, Credential};
 use lmk_proto::head::reference;
@@ -89,7 +90,7 @@ impl iroh::protocol::ProtocolHandler for Authority {
 async fn device(relay: &Relay, name: &str) -> (Node<MemoryProvider>, Identity<MemoryProvider>) {
     let device = Device::new(name);
     let config = Config {
-        handle: name.into(), device: Some(device.clone()), relay: relay.url.clone(), ca: relay.ca(),
+        handle: name.into(), device: Some(device.clone()), relays: vec![relay.url.clone()], resolve: lmk_testing::resolve(), ca: relay.ca(),
         home: None, files: None, disk: None, file_limit: 0, kinds: vec![CHAT.into(), IDENTITY.into()], durable: None,
     };
     let (node, _events) = Node::start(MemoryProvider::default(), config).await.unwrap();
@@ -118,7 +119,10 @@ impl Race {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::initialize(&dir.path().join("state")).unwrap();
         let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&store.key().to_bytes())).await;
-        let membership = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: relay.url.to_string(), addrs: vec![], rest: Default::default() };
+        let Service::Serve { domain, .. } = &relay.service else { unreachable!() };
+        let domain = format!("race.{domain}");
+        lmk_testing::publish(&domain, Directory { key: *endpoint.id().as_bytes(), addrs: vec![], relay: relay.url.to_string(), relays: vec![relay.url.to_string()] });
+        let membership = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), domain, rest: Default::default() };
         let authority = Arc::new(Authority { store, gate: Mutex::default(), stale: Mutex::default() });
         let router = iroh::protocol::Router::builder(endpoint).accept(ALPN, authority.clone()).spawn();
         let (a, a_identity) = device(&relay, "A").await;
@@ -273,7 +277,7 @@ async fn an_authorized_unobserved_historical_sender_does_not_change_the_ledger()
     let before = observer.inner.lock().provider.get(b"node/identity-bindings").unwrap();
     assert!(before.is_some(), "the observer's original binding is already durable");
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    let client = lmk_membership::client::ServeClient::for_service(endpoint, &relay.service).unwrap();
+    let client = lmk_membership::client::ServeClient::for_service(endpoint, lmk_testing::resolve(), &relay.service).unwrap();
     client.append(&lmk_proto::public::address(&id), &[first], true).await.unwrap();
     observer.read_public(&identity).await.unwrap();
     for _ in 0..3 {

@@ -1111,7 +1111,7 @@ fn a_session_goes_on_while_a_join_waits() {
         let (alice, mut bob, group) = pair(&world, HOUR).await;
         let link = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap().to_owned();
         let mut invite = lmk_proto::links::Invite::parse(&link).unwrap();
-        invite.members[0].key = *iroh::SecretKey::generate().public().as_bytes();
+        invite.members[0] = *iroh::SecretKey::generate().public().as_bytes();
         let (home, handle) = (bob.home.clone(), bob.handle.clone());
         let join = lmk_client::Request::Join { target: invite.link(), args: Vec::new(), cwd: String::new() };
         let joining = tokio::task::spawn_local(async move { crate::cli::call(&home, &handle, Request::Client(join)).await });

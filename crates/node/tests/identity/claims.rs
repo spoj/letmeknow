@@ -18,7 +18,7 @@ async fn every_public_body_is_keys_only_through_rename_restatement_removal_and_c
     let identity = devices.create("identity-canary-1734567890123", relay.service.clone()).await.unwrap();
     let gid = devices_group(&laptop.node);
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    let reader = ServeClient::for_service(endpoint, &identity.membership).unwrap();
+    let reader = ServeClient::for_service(endpoint, lmk_testing::resolve(), &identity.membership).unwrap();
     let address = lmk_proto::public::address(&identity.id.0);
     let initial = reader.head(&address).await.unwrap();
     devices.rename("renamed-identity-canary").await.unwrap();
@@ -115,7 +115,7 @@ async fn installed_bindings_survive_refresh_collision_restart_and_group_deletion
     assert_eq!(member.device_name, "pocket");
     assert_eq!(member.identity.unwrap().observed.unwrap().names, ["Ann", "Ann Lee"]);
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    let directory = ServeClient::for_service(endpoint, &identity.membership).unwrap();
+    let directory = ServeClient::for_service(endpoint, lmk_testing::resolve(), &identity.membership).unwrap();
     assert_eq!(directory.head(&lmk_proto::public::address(&identity.id.0)).await.unwrap().length, 1, "refresh is private, not directory growth");
     let phone = certificate(&identity, &device, &peer.node.key(), "Ann Lee", "another label");
     peer.node.recertify(&gid.0, phone).await.unwrap();
@@ -218,7 +218,7 @@ async fn a_late_directory_response_cannot_observe_a_roster_that_was_left() {
     let (id, first) = lmk_core::public::create(&seed, membership.clone());
     let identity = IdentityRef { id: id.into(), membership: membership.clone() };
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    ServeClient::for_service(endpoint, &membership).unwrap().append(&lmk_proto::public::address(&id), &[first], true).await.unwrap();
+    ServeClient::for_service(endpoint, lmk_testing::resolve(), &membership).unwrap().append(&lmk_proto::public::address(&id), &[first], true).await.unwrap();
     gate.set(false);
     let db = dir.join("observer.db");
     let observer = stored(&relay, "observer", &db).await;
