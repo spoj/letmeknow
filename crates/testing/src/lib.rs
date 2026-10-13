@@ -48,6 +48,7 @@ pub fn resolve() -> Resolve {
 pub struct Relay {
     pub url: RelayUrl,
     pub cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
     /// A membership service in memory, for the groups and identities a test makes, at the domain its relay's port names.
     pub service: Service,
     _server: Server,
@@ -77,11 +78,20 @@ pub async fn relay() -> Relay {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert = CertificateDer::from(certified.cert.der().to_vec());
     let key = PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
+    serve(cert, key).await
+}
+
+/// Another relay, with the certificate of `first`, so that whoever trusts one trusts both.
+pub async fn relay_beside(first: &Relay) -> Relay {
+    serve(first.cert.clone(), first.key.clone_key()).await
+}
+
+async fn serve(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> Relay {
     let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
-        .with_single_cert(vec![cert.clone()], key)
+        .with_single_cert(vec![cert.clone()], key.clone_key())
         .unwrap();
     let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
     relay.tls = Some(TlsConfig::new((Ipv6Addr::UNSPECIFIED, 0), CertConfig::Manual { server_config: tls.clone() }));
@@ -94,7 +104,7 @@ pub async fn relay() -> Relay {
     let url = format!("https://localhost:{}", server.https_addr().unwrap().port()).parse().unwrap();
     let state = tempfile::tempdir().unwrap();
     let (service, router) = membership(&url, &cert, &domain(&url), &state.path().join("membership"), |service| service).await;
-    Relay { url, cert, service, _server: server, _router: router, _state: state }
+    Relay { url, cert, key, service, _server: server, _router: router, _state: state }
 }
 
 async fn endpoint(url: &RelayUrl, cert: &CertificateDer<'static>, secret: SecretKey) -> Endpoint {

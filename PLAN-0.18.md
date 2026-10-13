@@ -26,7 +26,7 @@ by its domain; how to reach a domain comes from the domain itself.
   commits to its domain; a claimant's reference only seeds the first read, and the genesis's service is the one held and
   followed, exactly as 0.17 does with routes (logs.rs:394-430; the mirror tests in crates/node/tests/node.rs:153-249).
 - **Domains** are canonical `host` or `host:port`: lowercase LDH labels, no trailing dot, no default port, no userinfo,
-  path, query or fragment; IP literals only in `--membership` (tests). Anything else is refused where it is parsed.
+  path, query, fragment or IP literal (tests use `localhost:<port>`). Anything else is refused where it is parsed.
 - **Directories.** A service publishes `https://<domain>/.well-known/letmeknow.json`:
   `{"key": "<hex>", "addrs": ["relay.letmeknow.dev:7843"], "relay": "https://relay.letmeknow.dev", "relays": ["https://relay.letmeknow.dev"]}`
   - `relay`: where the service lives (`serve`'s own relay). Members reach the service there, and are reachable there.
@@ -36,9 +36,10 @@ by its domain; how to reach a domain comes from the domain itself.
     `credentials: "omit"`. Natively it honours `LETMEKNOW_CA` and iroh's proxy rule (HTTP_PROXY > http_proxy >
     HTTPS_PROXY > https_proxy; NO_PROXY ignored; iroh endpoint.rs:706-716). A directory naming another key than the
     `Service` it was fetched for is refused.
-  - The shells fetch: the session natively, the web app in the browser. They cache directories with their state,
-    refresh them daily and when a dial or read to that service fails (at most once per 10 min per domain), and hand the
-    node a resolver, domain → `Directory`. Node tests inject a map.
+  - The shells fetch: the session natively, the web app in the browser. They hand the node a resolver,
+    `pub type Resolve = Arc<dyn Fn(String) -> BoxFuture<Result<Directory>> + Send + Sync>` (as `Durable`), which the
+    node calls at each connection to a service. A shell answers a cached directory younger than 10 minutes as is;
+    otherwise it fetches, stores and answers, falling back to the cached copy, else the error. Node tests inject a map.
   - letmeknow.dev's directory is built in (`DOMAIN` = `relay.letmeknow.dev`, crates/proto/src/links.rs; web/backend.json),
     used while no fetch has succeeded.
 - **The own service** is `--membership <domain>`. At first start the session takes the key the directory names (the
@@ -96,8 +97,9 @@ The node hands net, per peer, a hint and a fallback. Net dials:
   `--relay <url>`, repeatable (`LETMEKNOW_RELAY`, comma-separated). `listen` prints `membership: <domain>`.
 - **`serve`:** `--relays <url>…`. It prints `membership: <domain>` and `key: <hex>`, and serves its directory with
   `Access-Control-Allow-Origin: *`.
-- **Browser:** backend.json holds letmeknow.dev's domain and directory; localStorage `lmk membership` (a domain) and
-  `lmk relay` (chosen relays, comma-separated).
+- **Browser:** web/backend.json is `{"domain": "relay.letmeknow.dev", "directory": {key, addrs, relay, relays}}`,
+  letmeknow.dev's; deploy/check-backend.py checks the live directory equals it. localStorage `lmk membership` (a
+  domain) and `lmk relay` (chosen relays, comma-separated).
 
 ## Steps
 
@@ -116,14 +118,15 @@ script changes in the step that changes what it reads.
   is on S2; a directory naming another key refused; a claimant's hint cannot displace the genesis's service; a member
   reached through its service's relay when its own relay is down; an identity's directory down at join recovers.
 - **D2. Session:** fetching, caching, refreshing; the pinned own key; `--membership <domain>`, `--relay` repeatable;
-  the refused 0.17 settings; home format 7; `serve` and `listen` printing; test/e2e.py, test/compat.py, test/deploy.py,
-  deploy/deploy.sh, deploy/check-backend.py (checks the directory). Tests: the default falls back to the built-in copy;
-  an unreachable own domain fails `listen`; a key change is refused; the refusals.
-- **F. Web:** the resolver by `fetch`, cached; backend.json; localStorage; `lmk7`; the older-invite text; web/backend.mjs,
-  build.mjs, build-test.mjs, artifact-test.mjs, e2e.mjs. e2e: a browser and an agent on different relays of one
-  directory; a browser joining through a link naming another domain (CORS).
-- **G. Docs and version:** README.md, SKILL.md, deploy/README.md, crates/membership/examples/probe.rs; Cargo.toml 0.18.0
-  and the pins.
+  the refused 0.17 settings; home format 7; `serve` and `listen` printing; test/e2e.py (the Python driver),
+  test/compat.py, test/deploy.py, deploy/deploy.sh, deploy/check-backend.py. Tests: the default falls back to the
+  built-in copy; an unreachable own domain fails `listen`; a key change is refused; the refusals.
+- **F. Web:** the resolver by `fetch` (`credentials: "omit"`, `redirect: "error"`), cached; backend.json; localStorage;
+  `lmk7`; web/src/main.ts (the older-invite text and its pin); web/backend.mjs, build.mjs, build-test.mjs,
+  artifact-test.mjs, e2e.mjs. e2e: a browser and an agent on different relays of one directory; a browser joining
+  through a link naming another domain (CORS).
+- **G. Docs and version:** README.md, SKILL.md, AGENTS.md, deploy/README.md, web/src/index.html's pin; Cargo.toml
+  0.18.0, so test/pins.py passes with F's main.ts.
 - **H. Checks, review, release:** the CI checks in AGENTS.md; a review; release notes (nothing carries over; browsers lose
   0.17 groups when the service worker updates; agents move with `@letmeknow/cli@0.18`; `--membership` takes a domain);
   `deploy/release.sh 0.18.0`; backend, then frontend; pi-letmeknow's `MINOR`.

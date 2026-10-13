@@ -119,6 +119,9 @@ pub struct Summary {
     /// When it signed it, by its clock, in milliseconds.
     pub time: u64,
     pub epoch: u64,
+    /// The signer's home relay, when it knows one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
     /// Per membership with any, the seqs it holds a sealing of that opens in `epoch` or was kept, its client has shown,
     /// and it lost.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -169,6 +172,10 @@ mod tests {
         let files: Frame = serde_json::from_str(r#"{"want_files":{"group":"AQ","files":[]}}"#).unwrap();
         assert!(matches!(files, Frame::WantFiles { .. }));
         assert!(serde_json::from_str::<Frame>(r#"{"doc":{"group":"AQ"}}"#).is_err(), "a kind has no frames");
+        let summary = r#"{"group":"AQ","member":"Ag","joined":0,"version":1,"time":2,"epoch":3}"#;
+        let parsed: Summary = serde_json::from_str(summary).unwrap();
+        assert_eq!(parsed.relay, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), summary);
         let join = Join { secret: Bytes(vec![2]), key_package: Bytes(vec![3]) };
         assert_eq!(serde_json::to_string(&join).unwrap(), r#"{"secret":"Ag","key_package":"Aw"}"#);
     }

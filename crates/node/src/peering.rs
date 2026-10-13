@@ -52,6 +52,13 @@ struct Saved {
     at: u64,
 }
 
+/// Where a member said it was: its home relay, and when the summary that said so was signed.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Hint {
+    pub relay: String,
+    time: u64,
+}
+
 fn heard_key(gid: &[u8], key: &[u8], joined: u64) -> Vec<u8> {
     [b"node/heard/".as_slice(), gid, b"/", key, b"/", &joined.to_be_bytes()].concat()
 }
@@ -211,6 +218,7 @@ impl<P: Provider> State<P> {
             version: (g.rec.version + 1).max(now),
             time: now,
             epoch: g.mls.epoch(),
+            relay: self.home.clone(),
             held: list(|a| &a.servable),
             shown: list(|a| &a.shown),
             lost: list(|a| &a.lost),
@@ -248,6 +256,13 @@ impl<P: Provider> State<P> {
             let heard = peers::Heard { signed: signed.clone(), summary: summary.clone(), at: now };
             if !self.peers.summary(&group, heard, Some(*peer.as_bytes())) {
                 continue;
+            }
+            if let Some(relay) = &summary.relay
+                && let Some(leaf) = self.group(gid)?.mls.members().into_iter().find(|m| m.key == summary.member.0).and_then(|m| m.leaf)
+                && self.hints.get(&leaf.key).is_none_or(|hint| hint.time <= summary.time)
+            {
+                self.hints.insert(leaf.key, Hint { relay: relay.clone(), time: summary.time });
+                put(&self.provider, b"node/hints", &self.hints)?;
             }
             put(&self.provider, &heard_key(gid, &summary.member.0, summary.joined), &Saved { signed, at: now })?;
             let g = self.groups.get_mut(gid).unwrap();
@@ -453,6 +468,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     self.warn(None, format!("a frame from {}: {error:#}", peer.fmt_short()));
                 }
             }
+            lmk_net::Event::Home(relay) => {
+                st.home = Some(relay.to_string());
+                for g in st.groups.values_mut() {
+                    g.changed = true;
+                }
+            }
             _ => {}
         }
     }
@@ -589,6 +610,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
 }
 
 impl<P: Provider + Send + 'static> Node<P> {
+    /// The relay a member last said it was on, which a dial to it tries first.
+    pub fn hint(&self, key: &[u8]) -> Option<String> {
+        self.inner.lock().hints.get(&Bytes(key.to_vec())).map(|hint| hint.relay.clone())
+    }
+
     /// The other current members' latest summaries of the group, whatever the gate.
     pub fn heard(&self, gid: &[u8]) -> Result<Vec<Heard>> {
         let st = self.inner.lock();

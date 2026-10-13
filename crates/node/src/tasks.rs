@@ -84,6 +84,7 @@ impl<P: Provider> State<P> {
             groups.insert(gid.0, G::new(mls, rec));
         }
         let bindings = get(&provider, b"node/identity-bindings")?.unwrap_or_default();
+        let hints = get(&provider, b"node/hints")?.unwrap_or_default();
         let peers = Peers::new(now(), u64::from_be_bytes(lmk_core::random()), *iroh_key(&provider)?.public().as_bytes());
         let mut state = State {
             bindings,
@@ -102,6 +103,8 @@ impl<P: Provider> State<P> {
             peers,
             served: BTreeMap::new(),
             gate: true,
+            home: None,
+            hints,
             time: now(),
         };
         for gid in state.groups.keys().cloned().collect::<Vec<_>>() {
@@ -205,12 +208,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Dials a member, and tells `Peers` how it went.
+    /// Dials a member, at the relay it last said it was on, then its fallback, and tells `Peers` how it went.
     fn dial(self: &Arc<Self>, peer: EndpointId) {
+        let hint: Vec<RelayUrl> =
+            self.lock().hints.get(&Bytes(peer.as_bytes().to_vec())).and_then(|hint| hint.relay.parse().ok()).into_iter().collect();
         let inner = self.clone();
         spawn(async move {
             let fallback = inner.fallback(peer).await;
-            let dialed = inner.net().dial(peer, vec![], fallback).await;
+            let dialed = inner.net().dial(peer, hint, fallback).await;
             if let Err(error) = &dialed {
                 tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
             }
