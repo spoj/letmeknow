@@ -58,10 +58,15 @@ async fn world(test: &str) -> World {
     World { _relay: relay, network, root, plugins: vec![built()], domain, key }
 }
 
+/// A port free for TCP and UDP, below the ephemeral range: a port `bind(0)` returned could be taken by another test's relay
+/// or endpoint before the service binds it.
 fn free_port() -> u16 {
-    let tcp = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = tcp.local_addr().unwrap().port();
-    std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).map(|_| port).unwrap_or_else(|_| free_port())
+    loop {
+        let port = rand::random_range(1024..32768);
+        if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() && std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 /// A membership service run by `serve` in `state`, at a localhost domain of its own with a certificate of its own: its
@@ -77,13 +82,16 @@ async fn service(state: &Path) -> (String, String, CertificateDer<'static>) {
     std::fs::write(state.join("key.pem"), certified.signing_key.serialize_pem()).unwrap();
     config.certificate = Certificate::Files { chain: state.join("cert.pem"), key: state.join("key.pem") };
     let (domain, https) = (config.domain(), config.https_port);
-    tokio::spawn(lmk_serve::serve(config));
-    for _ in 0..50 {
-        if std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, https)).is_ok() {
-            break;
+    let mut serving = tokio::spawn(lmk_serve::serve(config));
+    let listening = async {
+        while std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, https)).is_err() {
+            if serving.is_finished() {
+                (&mut serving).await.unwrap().unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    };
+    tokio::time::timeout(WAIT, listening).await.expect("the service listens");
     (domain, hex::encode(key.0), certified.cert.der().clone())
 }
 
