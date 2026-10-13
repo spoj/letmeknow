@@ -36,7 +36,9 @@ one relay (#78). 0.18 keeps only keys in data and gets routes from outside:
   and `from_pkarr_signed_packet`, re-exported as `iroh::endpoint_info`).
   - Contents: the node's home relay, a timestamp, and a signature by the node's iroh key.
   - About 190 bytes, at most 1,072 as a relay payload.
-  - Sessions put no IP addresses in their records. The service, a public host, includes its direct addresses.
+  - Sessions put no IP addresses in their records. The service, a public host, includes its direct addresses and keeps
+    its relay. A member's connection to the service then keeps a path through that relay, which the fallback rests
+    on (Dialing).
   - Anyone holding the key can check a record, so any path may carry it.
 - **Newest wins.** A record replaces one with an older timestamp. A node signs with `max(now, its last record's
   timestamp + 1)`, so a clock that went back cannot make its new record lose. Sessions do not reject records dated in
@@ -254,8 +256,15 @@ changes from "holds no keys" to "holds no group keys".
    their pin changes. Groups don't cross minor versions.
 6. **#77** (redial after a tab moves) may interact with this, but is not a goal.
 
-## Open questions
+## Decided
 
-1. **A second default relay on another host** (one more VPS), so failover protects default users? Or relay lists
-   stay a self-hosting feature.
-2. **Resolver access** is proposed open, with the rate limits above.
+- **Resolver access** is open, with the rate limits above.
+
+## Later
+
+- **A second default relay on another host.** Until there is one, letmeknow.dev's relay is every default session's
+  home relay as well as the fallback.
+  - **Making it the fallback only** takes another default relay, with letmeknow.dev's left out of `RELAYS`.
+  - **Why it must be left out:** iroh 1.3 picks a home relay by latency alone and has no order of preference.
+  - **Why that's enough:** the fallback needs no home there, since members reach it through their connections to the
+    service.
