@@ -2073,8 +2073,7 @@ async fn a_commit_keeps_what_a_member_holds_and_reseals_the_rest() {
             _ => None,
         }).await);
     }
-    taken.sort();
-    assert_eq!(taken, [m1, m2]);
+    assert_eq!(taken, [m1, m2], "in causal order");
     alice.node.shutdown().await.unwrap();
     carol.node.shutdown().await.unwrap();
 }
