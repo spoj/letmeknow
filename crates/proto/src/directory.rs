@@ -9,14 +9,17 @@ use crate::links::{DOMAIN, MEMBERSHIP_KEY, RELAY};
 
 /// The largest body `parse` reads.
 const MAX_BYTES: usize = 64 << 10;
-const MAX_LIST: usize = 16;
+const MAX_RELAYS: usize = 16;
+const MAX_ADDRS: usize = 4;
 
-/// The service's iroh key, the `host:port` addresses its membership is dialed at, and the relays its members live on.
+/// The service's iroh key, the `host:port` addresses its membership is dialed at, the relay the service lives on, and
+/// the relays its deployment's sessions live on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Directory {
     #[serde(with = "hex_key")]
     pub key: [u8; 32],
     pub addrs: Vec<String>,
+    pub relay: String,
     pub relays: Vec<String>,
 }
 
@@ -30,11 +33,11 @@ impl Directory {
 
     /// Refuses what a client would not dial: relays that are not `https` URLs, and addresses without a port.
     pub fn check(&self) -> Result<()> {
-        ensure!((1..=MAX_LIST).contains(&self.relays.len()), "a directory names 1 to 16 relays");
-        for relay in &self.relays {
+        ensure!((1..=MAX_RELAYS).contains(&self.relays.len()), "a directory names 1 to 16 relays");
+        for relay in self.relays.iter().chain([&self.relay]) {
             ensure!(Url::parse(relay).is_ok_and(|url| url.scheme() == "https"), "a relay is an https URL, not {relay}");
         }
-        ensure!(self.addrs.len() <= MAX_LIST, "a directory names at most 16 addresses");
+        ensure!(self.addrs.len() <= MAX_ADDRS, "a directory names at most 4 addresses");
         for addr in &self.addrs {
             ensure!(addr.parse::<Authority>()?.port_u16().is_some(), "an address is host:port, not {addr}");
         }
@@ -51,6 +54,7 @@ impl Directory {
         Directory {
             key: hex::decode(MEMBERSHIP_KEY).expect("MEMBERSHIP_KEY is hex").try_into().expect("MEMBERSHIP_KEY is 32 bytes"),
             addrs: vec![format!("{DOMAIN}:7843")],
+            relay: RELAY.into(),
             relays: vec![RELAY.into()],
         }
     }
@@ -70,11 +74,13 @@ mod hex_key {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn body(key: &str, addrs: &str, relays: &str) -> String {
-        format!(r#"{{"key":"{key}","addrs":{addrs},"relays":{relays}}}"#)
+    /// `relay` is a raw JSON value, a quoted string.
+    fn body(key: &str, addrs: &str, relay: &str, relays: &str) -> String {
+        format!(r#"{{"key":"{key}","addrs":{addrs},"relay":{relay},"relays":{relays}}}"#)
     }
 
     #[test]
@@ -82,36 +88,46 @@ mod tests {
         let builtin = Directory::builtin();
         assert_eq!(Directory::parse(&serde_json::to_vec(&builtin).unwrap()).unwrap(), builtin);
         assert_eq!(builtin.addrs, ["relay.letmeknow.dev:7843"]);
+        assert_eq!(builtin.relay, RELAY);
         assert_eq!(builtin.relays, [RELAY]);
     }
 
     #[test]
     fn parses_what_serve_publishes() {
         let key = "ab".repeat(32);
-        let parsed = Directory::parse(body(&key, r#"["h.example:7843"]"#, r#"["https://h.example","https://r.example:8443"]"#).as_bytes()).unwrap();
+        let parsed = Directory::parse(
+            body(&key, r#"["h.example:7843"]"#, r#""https://h.example""#, r#"["https://h.example","https://r.example:8443"]"#).as_bytes(),
+        )
+        .unwrap();
         assert_eq!(parsed.key, [0xab; 32]);
         assert_eq!(parsed.addrs, ["h.example:7843"]);
+        assert_eq!(parsed.relay, "https://h.example");
         assert_eq!(parsed.relays, ["https://h.example", "https://r.example:8443"]);
-        assert!(Directory::parse(body(&key, "[]", r#"["https://h.example"]"#).as_bytes()).is_ok(), "no addresses is allowed");
+        assert!(Directory::parse(body(&key, "[]", r#""https://h.example""#, r#"["https://h.example"]"#).as_bytes()).is_ok(), "no addresses is allowed");
     }
 
     #[test]
     fn refuses_what_clients_cannot_use() {
         let key = "ab".repeat(32);
         let refused = |text: String| Directory::parse(text.as_bytes()).unwrap_err().to_string();
-        assert!(refused(body(&"ab".repeat(31), "[]", r#"["https://h"]"#)).contains("32 bytes of hex"));
-        assert!(refused(body(&"zz".repeat(32), "[]", r#"["https://h"]"#)).contains("32 bytes of hex"));
-        assert!(refused(body(&key, "[]", "[]")).contains("1 to 16 relays"));
-        assert!(refused(body(&key, "[]", &format!("[{}]", vec![r#""https://h""#; 17].join(",")))).contains("1 to 16 relays"));
-        assert!(refused(body(&key, "[]", r#"["http://h"]"#)).contains("https URL"));
-        assert!(refused(body(&key, "[]", r#"["h.example"]"#)).contains("https URL"));
-        assert!(refused(body(&key, "[]", r#"["https://"]"#)).contains("https URL"));
-        assert!(refused(body(&key, &format!("[{}]", vec![r#""h:1""#; 17].join(",")), r#"["https://h"]"#)).contains("16 addresses"));
-        assert!(refused(body(&key, r#"["h.example"]"#, r#"["https://h"]"#)).contains("host:port"));
-        assert!(refused(body(&key, r#"["h.example:"]"#, r#"["https://h"]"#)).contains("host:port"));
-        assert!(refused(body(&key, r#"["h.example:99999"]"#, r#"["https://h"]"#)).contains("host:port"));
-        assert!(refused(body(&key, r#"["h/x:1"]"#, r#"["https://h"]"#)).contains("invalid"));
-        let padded = format!(r#"{{"key":"{key}","addrs":[],"relays":["https://h"],"pad":"{}"}}"#, "x".repeat(MAX_BYTES));
+        let ok = r#""https://h""#;
+        assert!(refused(body(&"ab".repeat(31), "[]", ok, r#"["https://h"]"#)).contains("32 bytes of hex"));
+        assert!(refused(body(&"zz".repeat(32), "[]", ok, r#"["https://h"]"#)).contains("32 bytes of hex"));
+        assert!(refused(body(&key, "[]", ok, "[]")).contains("1 to 16 relays"));
+        assert!(refused(body(&key, "[]", ok, &format!("[{}]", vec![r#""https://h""#; 17].join(",")))).contains("1 to 16 relays"));
+        assert!(refused(body(&key, "[]", ok, r#"["http://h"]"#)).contains("https URL"));
+        assert!(refused(body(&key, "[]", ok, r#"["h.example"]"#)).contains("https URL"));
+        assert!(refused(body(&key, "[]", ok, r#"["https://"]"#)).contains("https URL"));
+        assert!(refused(body(&key, "[]", r#""http://h""#, r#"["https://h"]"#)).contains("https URL"));
+        assert!(refused(body(&key, "[]", r#""h.example""#, r#"["https://h"]"#)).contains("https URL"));
+        assert!(refused(body(&key, "[]", "\"\"", r#"["https://h"]"#)).contains("https URL"));
+        assert!(refused(format!(r#"{{"key":"{key}","addrs":[],"relays":["https://h"]}}"#)).contains("relay"));
+        assert!(refused(body(&key, &format!("[{}]", vec![r#""h:1""#; 5].join(",")), ok, r#"["https://h"]"#)).contains("4 addresses"));
+        assert!(refused(body(&key, r#"["h.example"]"#, ok, r#"["https://h"]"#)).contains("host:port"));
+        assert!(refused(body(&key, r#"["h.example:"]"#, ok, r#"["https://h"]"#)).contains("host:port"));
+        assert!(refused(body(&key, r#"["h.example:99999"]"#, ok, r#"["https://h"]"#)).contains("host:port"));
+        assert!(refused(body(&key, r#"["h/x:1"]"#, ok, r#"["https://h"]"#)).contains("invalid"));
+        let padded = format!(r#"{{"key":"{key}","addrs":[],"relay":"https://h","relays":["https://h"],"pad":"{}"}}"#, "x".repeat(MAX_BYTES));
         assert!(refused(padded).contains("64 KB"));
     }
 
