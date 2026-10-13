@@ -340,15 +340,15 @@ impl<P: Provider> State<P> {
 
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Takes held ciphertexts a peer sent, or that came early: opens what is in order, keeps a while what is not,
-    /// passes on what it opened, and delivers what is ready.
-    pub(crate) fn take(&self, st: &mut State<P>, gid: &[u8], from: Option<EndpointId>, ciphertexts: Vec<Vec<u8>>) -> Result<()> {
+    /// passes on what it opened unless they answered this session's `want`, and delivers what is ready.
+    pub(crate) fn take(&self, st: &mut State<P>, gid: &[u8], from: Option<EndpointId>, ciphertexts: Vec<Vec<u8>>, forward: bool) -> Result<()> {
         let mut opened = Vec::new();
         for ciphertext in ciphertexts {
             opened.extend(self.take_one(st, gid, from, ciphertext)?);
         }
         self.open_unopened(st, gid, &mut opened)?;
         let group = Bytes(gid.to_vec());
-        if !opened.is_empty() && !st.peers.full_mesh(&group) {
+        if forward && !opened.is_empty() && !st.peers.full_mesh(&group) {
             for peer in st.peers.neighbours(&group) {
                 let peer = EndpointId::from_bytes(&peer)?;
                 if Some(peer) != from {

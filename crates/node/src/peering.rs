@@ -409,7 +409,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.advance(st, gid)?;
         }
         if unopened && st.groups.contains_key(gid) {
-            self.take(st, gid, None, Vec::new())?;
+            self.take(st, gid, None, Vec::new(), true)?;
         }
         if st.groups.contains_key(gid) {
             self.give_up(st, gid)?;
@@ -496,7 +496,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         match frame {
             Frame::Summaries { items, .. } => st.summaries(&gid, peer, items)?,
-            Frame::Held { items, .. } => self.take(st, &gid, Some(peer), items.into_iter().map(|item| item.0).collect())?,
+            Frame::Held { items, answers, .. } => self.take(st, &gid, Some(peer), items.into_iter().map(|item| item.0).collect(), answers.is_none())?,
             Frame::Want { epoch, wants, .. } => {
                 st.peers.used(&key, now);
                 let answer = st.answer(&gid, peer, epoch, &wants)?;

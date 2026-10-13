@@ -137,7 +137,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let (early, later): (Vec<_>, Vec<_>) = std::mem::take(&mut g.early).into_iter().partition(|(_, ciphertext)| core::claim(ciphertext).is_ok_and(|(_, epoch)| epoch == current));
         g.early = later;
         for (peer, ciphertext) in early {
-            self.take(st, gid, Some(peer), vec![ciphertext])?;
+            self.take(st, gid, Some(peer), vec![ciphertext], true)?;
         }
         Ok(true)
     }
