@@ -251,13 +251,13 @@ impl<P: Provider + Send + 'static> Inner<P> {
     async fn drive(self: Arc<Self>, mut work: mpsc::UnboundedReceiver<Work>) {
         while let Some(item) = work.recv().await {
             match item {
-                Work::Applied { group, by, added, how, removed, settings, gone, not_kept } => self.applied(&group, by, added, how, removed, settings, gone, not_kept).await,
+                Work::Applied { group, by, added, how, removed, settings, gone } => self.applied(&group, by, added, how, removed, settings, gone).await,
                 Work::Follow { log, old } => {
                     self.unfollow(&old);
                     self.follow(&log);
                 }
                 Work::Duties(gid) => self.duties(&gid),
-                Work::Gone(group) => self.gone(&group, None, Vec::new()),
+                Work::Gone(group) => self.gone(&group, None),
                 Work::Fetch { group, link } => {
                     if self.net().has(link.hash).await.unwrap_or(false) {
                         self.lock().events.push(Event::File(link.hash));

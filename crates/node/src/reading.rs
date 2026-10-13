@@ -113,7 +113,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             st.provider.put(&commit_key(gid, ending), &inner)?;
             st.group_mut(gid)?.rec.commits.push((ending, now));
         }
-        let not_kept = self.cuts(st, gid, &applied, ending)?;
+        self.cuts(st, gid, &applied, ending)?;
         st.observe_identities()?;
         st.scrub = true;
         st.gate = true;
@@ -125,7 +125,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for member in &removed {
             st.unhear(gid, &member.key)?;
         }
-        self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, removed, settings, gone, not_kept }).ok();
+        self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, removed, settings, gone }).ok();
         st.group_mut(gid)?.rec.position = position;
         if gone {
             return Ok(false);
@@ -162,8 +162,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Moves the memberships as an applied commit says: each cut, what it kept above this session's baselines to hold
     /// before the next commit, the kept sealings frozen, the memberships that ended (their messages past their final
-    /// cuts dropped) and began. Returns, if it removed this session, the ids of its messages no cut kept.
-    fn cuts(&self, st: &mut State<P>, gid: &[u8], applied: &core::Applied, ending: u64) -> Result<Vec<Bytes>> {
+    /// cuts dropped, their leaves forgotten) and began.
+    fn cuts(&self, st: &mut State<P>, gid: &[u8], applied: &core::Applied, ending: u64) -> Result<()> {
         let me = st.me(gid).to_vec();
         let now = st.tick();
         let g = st.group_mut(gid)?;
@@ -206,28 +206,21 @@ impl<P: Provider + Send + 'static> Inner<P> {
             author.servable = author.servable.difference(&past);
             author.sealed.clear();
         }
+        g.rec.leaves.retain(|(key, joined, _)| state.iter().any(|r| r.key == *key && r.joined == *joined));
         g.rec.unkept = g.rec.authors.iter().any(|a| !a.ended && !a.sealed.is_empty()).then_some(now);
-        let gone = applied.gone;
-        let mine = g.author(&me, own.unwrap_or_default()).cloned();
         for (key, joined, seq) in dropped {
             if let Some(record) = st.record_at(gid, &key.0, joined, seq)? {
                 st.unstore(gid, &record)?;
             }
         }
-        let mut not_kept = Vec::new();
-        if let (Some(mine), Some(joined)) = (mine, own) {
+        if let Some(joined) = own {
             for seq in kept_own.iter() {
                 if let Some(mut record) = st.record_at(gid, &me, joined, seq)? {
                     record.plaintext = None;
                     st.store(gid, &record)?;
                 }
             }
-            if gone {
-                for seq in mine.cut + 1..=mine.last() {
-                    not_kept.extend(st.id_at(gid, &me, joined, seq)?);
-                }
-            }
         }
-        Ok(not_kept)
+        Ok(())
     }
 }

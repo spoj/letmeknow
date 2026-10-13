@@ -29,6 +29,8 @@ use crate::{Event, G, Inner, State, Work, days, get, now};
 pub(crate) const TIMER: Duration = Duration::from_secs(10 * 60);
 /// How long a member holds messages no cut keeps before it commits to keep them.
 const KEEP_ALIVE: u64 = 10 * 60 * 1000;
+/// How soon a pass runs again after a commit waited for what the last cut kept.
+const BLOCKED: u64 = 10_000;
 
 /// When the leaf of the member with key `key`, last updated at `updated`, is next due an update, in milliseconds: at its
 /// first slot after `updated`, its slots every `update` seconds at an offset by a hash of its key, so that members
@@ -102,7 +104,8 @@ impl<P: Provider> State<P> {
         }
         let rec = &mut self.group_mut(gid)?.rec;
         rec.first = first;
-        rec.authors.retain(|a| !a.ended || !a.servable.is_empty() || a.held != a.delivered);
+        let keep = rec.keep.clone();
+        rec.authors.retain(|a| !a.ended || !a.servable.is_empty() || a.held != a.delivered || keep.iter().any(|k| k.key == a.key && k.joined == a.joined));
         self.save(gid)
     }
 }
@@ -164,17 +167,22 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             if g.rec.leaving && g.mls.members().len() == 1 {
                 drop(st);
-                self.gone(gid, None, Vec::new());
+                self.gone(gid, None);
                 return Ok(());
             }
             st.expire(gid)?;
             if st.group(gid)?.mls.settings().kind == IDENTITY {
                 st.events.push(Event::Duties { group: Bytes(gid.to_vec()) });
             }
+            let tick = st.tick();
             let g = st.group(gid)?;
             let next = next_update(g.rec.updated, g.mls.settings().update, st.me(gid));
             let next = g.rec.unkept.map_or(next, |since| next.min(keep_alive(since, st.me(gid))));
-            (due(&st, g)?.is_some(), next)
+            // A commit waits while a holder of what the last cut kept, which this session lacks, may still be asked.
+            let lacking = g.lacking();
+            let blocked = !lacking.is_empty() && st.peers.holder(&Bytes(gid.to_vec()), &lacking, tick);
+            let next = if blocked { next.min(now() + BLOCKED) } else { next };
+            (due(&st, g)?.is_some() && !blocked, next)
         };
         self.time(gid, next);
         if !commit {

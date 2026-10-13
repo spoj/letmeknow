@@ -10,7 +10,8 @@ use lmk_membership::Refused;
 use lmk_proto::Bytes;
 use lmk_proto::group::{IDENTITY, How};
 
-use crate::{Event, G, Inner, Member, State, device_key_key, reading, rec_key};
+use crate::held::delivered_key;
+use crate::{Event, G, Inner, Member, State, device_key_key, get, reading, rec_key};
 
 const COMMIT_TRIES: u32 = 5;
 
@@ -46,6 +47,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.durable().await?;
             match self.clients.client(&service)?.append(&capability, std::slice::from_ref(&entry), false).await {
                 Ok(_) => {}
+                // A refusal that may pass keeps the entry posted, as an earlier attempt may have landed.
+                Err(error) if error.downcast_ref::<Refused>().is_some_and(|refused| matches!(refused.0.as_str(), "busy" | "rate" | "quota")) => return Err(error),
                 Err(error) if error.is::<Refused>() => {
                     let mut st = self.lock();
                     let st = &mut *st;
@@ -103,7 +106,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
             st.drop_log(&log)?;
         }
         let rec = &st.group(gid)?.rec;
-        let (authors, commits) = (rec.authors.clone(), rec.commits.clone());
+        let (authors, commits, delivered) = (rec.authors.clone(), rec.commits.clone(), rec.first.max(1)..=rec.index);
+        for index in delivered {
+            if let Some(id) = get::<Bytes>(&st.provider, &delivered_key(gid, index))?
+                && let Some(record) = st.record(gid, &id.0)?
+            {
+                st.unstore(gid, &record)?;
+            }
+        }
         for author in authors {
             for seq in author.held.iter() {
                 if let Some(record) = st.record_at(gid, &author.key.0, author.joined, seq)? {
@@ -138,7 +148,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         removed: Vec<core::Member>,
         settings: bool,
         gone: bool,
-        not_kept: Vec<Bytes>,
     ) {
         if !added.is_empty() {
             self.refresh_all().await;
@@ -148,7 +157,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let by = by.and_then(|by| st.member(gid, &by));
         if gone {
             drop(st);
-            self.gone(gid, by, not_kept);
+            self.gone(gid, by);
             return;
         }
         if st.groups.contains_key(gid) {
@@ -172,10 +181,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Forgets a removed group and reports removal once that step is durable.
-    pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>, not_kept: Vec<Bytes>) {
+    /// Forgets a removed group and reports removal once that step is durable, with this session's messages that no cut
+    /// kept, which its records still show.
+    pub(crate) fn gone(&self, gid: &[u8], by: Option<Member>) {
         let mut st = self.lock();
         let Some(kind) = st.groups.get(gid).map(|g| g.mls.settings().kind) else { return };
+        let not_kept = match st.not_kept(gid) {
+            Ok(not_kept) => not_kept,
+            Err(error) => return self.warn(Some(gid), format!("{error:#}")),
+        };
         match self.forget(&mut st, gid) {
             Ok(()) => st.events.push(Event::Removed { group: Bytes(gid.to_vec()), kind, by, not_kept }),
             Err(error) => self.warn(Some(gid), format!("{error:#}")),

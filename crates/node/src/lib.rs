@@ -517,7 +517,6 @@ pub(crate) enum Work {
         removed: Vec<core::Member>,
         settings: bool,
         gone: bool,
-        not_kept: Vec<Bytes>,
     },
     /// A group's new log to follow at its service, instead of its old one.
     Follow { log: Vec<u8>, old: Vec<u8> },

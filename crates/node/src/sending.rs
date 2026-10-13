@@ -22,6 +22,17 @@ impl<P: Provider> State<P> {
         let holds = |heard: &&lmk_net::peers::Heard| heard.summary.held.iter().any(|held| held.key.0 == me && held.joined == joined && held.seqs.contains(seq));
         Ok(self.peers.heard(&Bytes(gid.to_vec())).filter(|heard| heard.summary.member.0 != me).filter(holds).map(|heard| heard.summary.member.clone()).collect())
     }
+
+    /// This session's messages of its latest membership of the group that no cut kept, by id.
+    pub(crate) fn not_kept(&self, gid: &[u8]) -> Result<Vec<Bytes>> {
+        let me = self.me(gid);
+        let Some(mine) = self.group(gid)?.rec.authors.iter().filter(|a| a.key.0 == me).max_by_key(|a| a.joined) else { return Ok(Vec::new()) };
+        let mut ids = Vec::new();
+        for seq in mine.cut + 1..=mine.last() {
+            ids.extend(self.id_at(gid, me, mine.joined, seq)?);
+        }
+        Ok(ids)
+    }
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
