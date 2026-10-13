@@ -17,7 +17,7 @@ use lmk_proto::ranges::Ranges;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Event, G, Inner, Member, Message, Rule, State, Work, get, put};
+use crate::{Event, G, Inner, Lost, LostOf, Member, Message, Rule, State, Work, get, put};
 
 /// How far past a membership's lowest wanted seq ciphertexts are opened as they come: openmls opens none more than
 /// 1,000 behind the newest it opened of a sender.
@@ -92,6 +92,12 @@ impl Author {
         self.held.ranges().last().map_or(self.baseline, |&(_, last)| last)
     }
 
+    /// Its last seq this session knows was sent from its own messages or a cut: what another's dep alone cannot
+    /// raise.
+    fn evidence(&self) -> u64 {
+        self.last().max(self.cut)
+    }
+
     pub(crate) fn seqs(&self, seqs: &Ranges) -> Option<Seqs> {
         (!seqs.is_empty()).then(|| Seqs { key: self.key.clone(), joined: self.joined, seqs: seqs.clone() })
     }
@@ -110,6 +116,9 @@ pub(crate) struct Record {
     pub sealing: Option<(u64, Bytes)>,
     /// When it was opened here, or sent.
     pub opened: u64,
+    /// Waited `GIVE_UP` on a dep past what this session knows was sent: that dep is met once all known sent is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub released: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered: Option<Delivered>,
 }
@@ -379,7 +388,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let lowest = author.lowest();
         let membership = (claim.key.clone(), claim.joined);
         let waiting = g.waiting;
-        let taken = claim.seq < lowest + WINDOW && (waiting || g.buckets.entry(membership).or_default().take(ciphertext.len(), 2.0, now));
+        let taken = claim.seq < lowest + WINDOW && (waiting || newer || g.buckets.entry(membership).or_default().take(ciphertext.len(), 2.0, now));
         if !taken {
             let size: usize = g.unopened.iter().filter(|((k, j, _), _)| *k == claim.key && *j == claim.joined).map(|(_, (_, c))| c.len()).sum();
             if size + ciphertext.len() <= UNOPENED {
@@ -430,6 +439,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Ok(opened) => opened,
             Err(error) => {
                 tracing::debug!("a held message did not open: {error:#}");
+                if error.is::<core::Unheld>() {
+                    self.unheld(st, gid, &ciphertext)?;
+                }
                 return Ok(None);
             }
         };
@@ -475,10 +487,27 @@ impl<P: Provider + Send + 'static> Inner<P> {
             g.rec.unkept.get_or_insert(now);
         }
         g.changed = true;
-        let record = Record { id: Bytes(id.to_vec()), header: h, plaintext: None, sealing: Some((opened.epoch, Bytes(ciphertext.clone()))), opened: now, delivered: None };
+        let record = Record { id: Bytes(id.to_vec()), header: h, plaintext: None, sealing: Some((opened.epoch, Bytes(ciphertext.clone()))), opened: now, released: false, delivered: None };
         st.store(gid, &record)?;
         self.control(st, gid, &record.header)?;
         Ok(Some(ciphertext))
+    }
+
+    /// A ciphertext of a kept seq that is too old to open: no sealing of it can come that opens, so it is lost.
+    fn unheld(&self, st: &mut State<P>, gid: &[u8], ciphertext: &[u8]) -> Result<()> {
+        let (claim, _) = core::claim(ciphertext)?;
+        let g = st.group_mut(gid)?;
+        let Some(author) = g.author_mut(&claim.key.0, claim.joined) else { return Ok(()) };
+        if claim.seq > author.cut || author.held.contains(claim.seq) || author.lost.contains(claim.seq) {
+            return Ok(());
+        }
+        author.lost.insert(claim.seq);
+        g.changed = true;
+        let from = st.member_by_key(gid, &claim.key.0);
+        let messages = vec![LostOf { from, joined: claim.joined, seqs: vec![claim.seq], ids: Vec::new() }];
+        let member = st.member_by_key(gid, st.me(gid));
+        st.events.push(Event::Lost(Lost { group: Bytes(gid.to_vec()), member, messages }));
+        Ok(())
     }
 
     /// Acts on one of the core's payloads as it opens, or as this session sends it.
@@ -486,8 +515,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if !Control::TYPES.contains(&type_of(&h.payload)) {
             return Ok(());
         }
+        let Ok(control) = serde_json::from_value(h.payload.clone()) else { return Ok(()) };
         let rec = &mut st.group_mut(gid)?.rec;
-        match serde_json::from_value(h.payload.clone())? {
+        match control {
             Control::Leave => {
                 rec.leaves.push((h.author.clone(), h.joined, h.seq));
                 self.work.send(Work::Duties(gid.to_vec())).ok();
@@ -512,7 +542,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     continue;
                 }
                 let record = st.record_at(gid, &author.key.0, author.joined, seq)?.context("a held message without its record")?;
-                let met = |dep: &lmk_proto::held::Ref| g.author(&dep.key.0, dep.joined).is_none_or(|a| a.through(dep.seq));
+                let reach = |dep: &lmk_proto::held::Ref, a: &Author| if record.released { dep.seq.min(a.evidence()) } else { dep.seq };
+                let met = |dep: &lmk_proto::held::Ref| g.author(&dep.key.0, dep.joined).is_none_or(|a| a.through(reach(dep, a)));
                 if record.header.deps.iter().all(met) {
                     ready = Some(record);
                     break;
@@ -558,9 +589,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
         };
         let sender = st.member_by_key(gid, &h.author.0);
         let me = st.me(gid).to_vec();
+        let shown = !Control::TYPES.contains(&type_of(&h.payload)) && h.author.0 != me;
         let g = st.group_mut(gid)?;
         let mut missing = Vec::new();
-        for (key, joined, seq) in &requirements {
+        for (key, joined, seq) in requirements.iter().filter(|_| shown) {
             if let Some(author) = g.author_mut(&key.0, *joined) {
                 let given_up = author.given_up.through(*seq).difference(&author.reported);
                 author.reported = author.reported.union(&given_up);
@@ -576,30 +608,25 @@ impl<P: Provider + Send + 'static> Inner<P> {
         record.delivered = Some(Delivered { index, at: now, sender, past, whole, missing, late, reply_outside });
         put(&st.provider, &delivered_key(gid, index), &record.id)?;
         st.store(gid, &record)?;
-        let shown = !Control::TYPES.contains(&type_of(&h.payload)) && h.author.0 != me;
         if shown && let Some(message) = record.message(gid) {
             st.events.push(Event::Message(message));
         }
         Ok(())
     }
 
-    /// Gives up, at the log's head, on what the held messages next in line require and this session does not hold:
-    /// after `HOLD_OFF` while no connected member's summary shows it held, else after `GIVE_UP`. Then delivers.
+    /// Gives up, at the log's head, on what the held messages next in line require and this session does not hold,
+    /// of what it knows was sent: after `HOLD_OFF` once no holder, by summaries, may still be asked, else after
+    /// `GIVE_UP`, then held ones too, as two pending messages may require each other. A dep past what it knows was sent
+    /// is met after `GIVE_UP` once all it knows was sent is. Then delivers.
     pub(crate) fn give_up(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
         if !st.at_head(gid) {
             return Ok(());
         }
         let now = st.tick();
         let group = Bytes(gid.to_vec());
-        let neighbours: Vec<Bytes> = st.peers.neighbours(&group).iter().filter_map(|peer| st.in_leaf(gid, &EndpointId::from_bytes(peer).ok()?)).map(|m| Bytes(m.key)).collect();
-        let held_by_neighbour = |key: &Bytes, joined: u64, seqs: &Ranges| {
-            st.peers.heard(&group).any(|heard| {
-                neighbours.contains(&heard.summary.member)
-                    && heard.summary.held.iter().any(|held| held.key == *key && held.joined == joined && !held.seqs.intersection(seqs).is_empty())
-            })
-        };
         let g = st.group(gid)?;
         let mut giving = Vec::new();
+        let mut releasing = Vec::new();
         for author in &g.rec.authors {
             let Some(seq) = author.held.difference(&author.delivered).first() else { continue };
             let Some(record) = st.record_at(gid, &author.key.0, author.joined, seq)? else { continue };
@@ -611,15 +638,27 @@ impl<P: Provider + Send + 'static> Inner<P> {
             requirements.push((author.key.clone(), author.joined, seq - 1));
             for (key, joined, seq) in requirements {
                 let Some(required) = g.author(&key.0, joined) else { continue };
+                if seq > required.evidence() && waited >= GIVE_UP && !record.released && !releasing.contains(&record.id) {
+                    releasing.push(record.id.clone());
+                }
                 let unopened: Ranges = g.unopened.keys().filter(|(k, j, _)| *k == key && *j == joined).map(|(_, _, s)| *s).collect();
-                let lacking = Ranges::range(1, seq).difference(&required.resolved()).difference(&required.held).difference(&unopened);
-                if !lacking.is_empty() && (waited >= GIVE_UP || !held_by_neighbour(&key, joined, &lacking)) {
+                let mut lacking = Ranges::range(1, seq.min(required.evidence())).difference(&required.resolved()).difference(&unopened);
+                if waited < GIVE_UP {
+                    lacking = lacking.difference(&required.held);
+                }
+                let untried = || required.seqs(&lacking).is_some_and(|lacking| st.peers.holder(&group, &[lacking], now));
+                if !lacking.is_empty() && (waited >= GIVE_UP || !untried()) {
                     giving.push((key, joined, lacking));
                 }
             }
         }
-        if giving.is_empty() {
+        if giving.is_empty() && releasing.is_empty() {
             return Ok(());
+        }
+        for id in releasing {
+            let mut record = st.record(gid, &id.0)?.context("a held message without its record")?;
+            record.released = true;
+            st.store(gid, &record)?;
         }
         let g = st.group_mut(gid)?;
         for (key, joined, lacking) in giving {
@@ -629,6 +668,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.deliver_ready(st, gid)
     }
 }
+
 
 fn remember(seen: &mut std::collections::VecDeque<[u8; 32]>, hash: [u8; 32]) {
     if seen.len() >= SEEN {
