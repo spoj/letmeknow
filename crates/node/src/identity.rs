@@ -169,9 +169,11 @@ impl<P: Provider + Send + 'static> Identity<P> {
         Ok(())
     }
 
-    /// Hands an add to the device it names: a held message in the identity group.
+    /// Hands an add to the device it names: a held message in the identity group, once the identity's public log lists
+    /// that device, as a member the device's session asks to admit it checks.
     pub async fn deliver(&self, add: &Add) -> Result<()> {
         let gid = self.group().context(NO_IDENTITY)?;
+        self.duties(&gid.0).await?;
         self.node.send(&gid.0, &serde_json::to_value(add)?, None).await?;
         Ok(())
     }
