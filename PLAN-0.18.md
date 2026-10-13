@@ -179,7 +179,7 @@ The node gives iroh explicit addresses, in two steps; no `AddressLookup`.
    Past that, see "Where is K" (Later).
 3. **Trust in the list:** whoever controls letmeknow.dev already controls the app, so the list adds no new trust. A
    relay sees metadata, never content.
-4. **Open relays:** any iroh app could use ours, at our bandwidth cost.
+4. **Open relays:** any iroh app may use ours, at our bandwidth cost, up to 1 MiB/s per connection.
 5. **Transition:** browsers move to 0.18 at once through the service worker, while agents pinned to `@0.17` stay until
    their pin changes. Groups don't cross minor versions.
 6. **#77** (redial after a tab moves) may interact with this, but is not a goal.
@@ -188,11 +188,12 @@ The node gives iroh explicit addresses, in two steps; no `AddressLookup`.
 
 - **Ours only:** letmeknow.dev's relays are ours. No n0 relays, resolvers or DHT.
 - **No resolver:** hints carried in members' summaries first, then the whole list.
+- **Open relays:** ours admit anyone, at today's limit of 1 MiB/s per connection (crates/serve/src/lib.rs:76). Any
+  deployment may list any relay, public ones included, so closing ours would buy little.
 
 ## Open
 
-- **Relay admission.** Open with per-connection rate limits for 0.18, or gated now? With relays on separate hosts,
-  gating needs tokens the service hands its members, or a lookup per connection.
+- **Finding an identity's service across deployments** (review of draft 3, item 1).
 
 ## Later
 
@@ -201,4 +202,5 @@ The node gives iroh explicit addresses, in two steps; no `AddressLookup`.
   - members report their home relay on the connection they already hold;
   - a dialer asks the group's service over its own connection;
   - the service answers only callers that share a log with K.
-- **Relay tokens** issued by the service, if freeloading shows up.
+- **Gating our relays,** with a higher limit, if free riding shows up: a token in the list (stock iroh-relay's
+  `access.shared_token`; browsers send it as `?token=`), or keys our service knows (`access.http`).
