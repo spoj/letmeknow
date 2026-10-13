@@ -68,7 +68,7 @@ pub enum Done {
     /// The handles of the device's sessions that run.
     Found(Vec<String>),
     /// How handing a session the add with this id went.
-    Handed(Bytes, Result<Value>),
+    Handed(Bytes, u64, Result<Value>),
 }
 
 /// The device's node, as another session process runs it: its state as published in `LETMEKNOW_HOME`, and its command
@@ -340,8 +340,14 @@ impl Session {
             let printed = item.as_object_mut().and_then(|item| item.remove("printed"));
             print(short::line(&self.compact(item.clone())))?;
             if item["type"] == "message" {
-                let gid: Bytes = serde_json::from_value(item["group"].clone())?;
-                self.show(&gid, &message_id(item["id"].as_str().context("a message has an id")?)?)?;
+                let shown = || -> Result<()> {
+                    let gid: Bytes = serde_json::from_value(item["group"].clone())?;
+                    self.show(&gid, &message_id(item["id"].as_str().context("a message has an id")?)?)
+                };
+                // Only a line that cannot be written stops the session.
+                if let Err(error) = shown() {
+                    self.warn(format!("marking a message shown: {error:#}"));
+                }
             }
             if let Some(printed) = printed {
                 let (kind, key) = (printed["kind"].as_str().unwrap_or_default(), printed["key"].as_str().unwrap_or_default());
@@ -440,9 +446,9 @@ impl Session {
                     self.warn(format!("handing this device's sessions their adds: {error:#}"));
                 }
             }
-            Done::Handed(id, handed) => {
+            Done::Handed(id, expires, handed) => {
                 let Access::Here(devices) = self.client.access() else { return };
-                if let Err(error) = handed.map(|_| devices.take(&id)) {
+                if let Err(error) = handed.and_then(|_| devices.take(&id, expires)) {
                     self.warn(format!("handing a session of this device an add: {error:#}"));
                 }
             }
@@ -472,7 +478,7 @@ impl Session {
             let home = self.home.clone();
             self.running.spawn_local(async move {
                 let request = Request::Added { link: add.link, group: add.group, device: by };
-                Done::Handed(id, crate::cli::call(&home, &session, request).await)
+                Done::Handed(id, add.expires, crate::cli::call(&home, &session, request).await)
             });
         }
         Ok(())

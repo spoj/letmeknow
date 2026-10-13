@@ -555,8 +555,8 @@ pub(crate) struct Inner<P> {
     heard: tokio::sync::Notify,
     /// The groups whose duties run, each with whether another pass is due once it ends.
     passing: Mutex<HashMap<Vec<u8>, bool>>,
-    /// The groups with a timer for their next update.
-    timers: Mutex<HashSet<Vec<u8>>>,
+    /// When each group's next timed pass of its duties is due.
+    timers: Mutex<HashMap<Vec<u8>, u64>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// The contradictions reported, each once.
     contradictions: Mutex<HashSet<Contradicted>>,

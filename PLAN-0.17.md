@@ -198,7 +198,7 @@ on the database's pages in use plus its WAL (`serve --disk`), refused as `quota`
   in delivery order. `read <id> --ancestors N`: the latest N chat messages in its causal past that this member
   delivered, by delivery index. A restart reprints what was delivered after the last shown message.
 - `lost`: `{member, messages: [{from, seqs, ids}]}`, from summaries, once per seq.
-- `status.only_here`: own messages not kept yet (`{what, id, seq}`); `leave` is pending until the Remove applies
+- `status.only_here`: own messages not kept yet (`{what, id}`); `leave` is pending until the Remove applies
   (`removed`), and `leave_held` goes; `sessions remove` waits for that; `removed` lists `not_kept` own messages.
 - `online`: members connected to this session (in groups over 7, its neighbours); `away` as above.
 - `ChatMessage.read` and `reply_to` leave the payload: deps carry causality, `reply_to` the header.

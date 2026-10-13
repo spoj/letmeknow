@@ -174,14 +174,15 @@ pub async fn remove(config: session::Config, home: &Path, network: Network) -> R
         for group in groups.as_array().context("groups are a list")? {
             let leave = lmk_client::Request::Leave { group: group["group"].as_str().map(str::to_owned), end: false };
             if cli::call(home, &handle, cli::Request::Client(leave)).await?["pending"] == true {
-                waiting.push(group["group"].clone());
+                waiting.push((group["group"].clone(), group["name"].clone()));
             }
         }
         let held = async {
             while !waiting.is_empty() {
                 let line: Value = serde_json::from_str(&printed.recv().await.context("the session stopped")?)?;
+                // A line names a group by its name where no other group of the session's has it, else by its id.
                 if line["type"] == "removed" {
-                    waiting.retain(|group| *group != line["group"]);
+                    waiting.retain(|(id, name)| *id != line["group"] && *name != line["group"]);
                 }
             }
             anyhow::Ok(())

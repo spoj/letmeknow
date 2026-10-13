@@ -756,7 +756,7 @@ class View {
         { className: "buttons leave" },
         confirmed(`Leave ${kind}`, "Leave for good?", async () => {
           const left = await request({ cmd: "leave", group: gid });
-          if (left.pending) toast("Asked the others to remove you; keep this page open until one of them has your request.");
+          if (left.pending) toast("Asked the others to remove you; keep this page open until one of them does.");
           else if (left.status) toast("Asked the others to remove you; one of them removes you.");
           render();
           dialog.close();
@@ -932,10 +932,13 @@ class ChatView extends View {
       }
       case "lost": {
         const count = item.messages.flatMap(m => m.seqs).length;
-        return h("li", { className: "event warn" }, `You could not read ${count === 1 ? "a message" : `${count} messages`}: no member online held them in time`, at);
+        const text = item.member.you
+          ? `You could not read ${count === 1 ? "a message" : `${count} messages`}: no member online held them in time`
+          : `${item.member.name} could not read ${count === 1 ? "a message" : `${count} messages`} of yours`;
+        return h("li", { className: "event warn" }, text, at);
       }
       case "leave":
-        return h("li", { className: "event" }, who(item.from), " asked to leave", item.only_here && h("small", { className: "ticks", title: "Only on this device: keep this page open until another member has it" }, " ✓"), at);
+        return h("li", { className: "event" }, who(item.from), " asked to leave", item.only_here && h("small", { className: "ticks", title: "No commit keeps it yet: keep this page open until a member removes you" }, " ✓"), at);
       case "joined":
       case "left": {
         const self = item.by.fp === item.member.fp;

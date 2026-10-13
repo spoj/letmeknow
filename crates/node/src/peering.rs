@@ -271,8 +271,8 @@ impl<P: Provider> State<P> {
         let me = self.me(gid).to_vec();
         let g = self.group_mut(gid)?;
         let mut messages = Vec::new();
-        for lost in &summary.lost {
-            // Only seqs this session knows were sent: a summary's claim alone names none.
+        // Losses are told to their author alone, and only of seqs it knows it sent.
+        for lost in summary.lost.iter().filter(|lost| lost.key.0 == me) {
             let Some(last) = g.author(&lost.key.0, lost.joined).map(|a| a.last().max(a.cut)) else { continue };
             let seqs = lost.seqs.intersection(&lmk_proto::ranges::Ranges::range(1, last));
             let of = |(k, j, s): &&mut (Bytes, u64, Seqs)| *k == summary.member && *j == summary.joined && s.key == lost.key && s.joined == lost.joined;

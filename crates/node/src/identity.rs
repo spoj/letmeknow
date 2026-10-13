@@ -5,7 +5,7 @@
 //! Its held messages are adds, invites into groups for one device's sessions, which that device keeps until it takes
 //! them or they expire; its live ones tell which sessions each device runs, and the groups they are in.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
@@ -94,9 +94,10 @@ struct Shared {
     presence: Mutex<Presence>,
     /// What the other devices last told of theirs: by device key.
     heard: Mutex<HashMap<Bytes, Presence>>,
-    /// The ids of the adds taken.
-    taken: Mutex<BTreeSet<Bytes>>,
 }
+
+/// The ids of the adds taken, with when each expires.
+const TAKEN: &[u8] = b"node/identity-taken";
 
 impl<P> Clone for Identity<P> {
     fn clone(&self) -> Self {
@@ -179,17 +180,22 @@ impl<P: Provider + Send + 'static> Identity<P> {
     pub fn adds(&self) -> Result<Vec<Pending>> {
         let Some(gid) = self.group() else { return Ok(Vec::new()) };
         let me = self.node.key_in(&gid.0);
-        let taken = self.shared.taken.lock().unwrap();
+        let taken: Vec<(Bytes, u64)> = crate::get(&self.node.inner.lock().provider, TAKEN)?.unwrap_or_default();
+        let taken = |id: &Bytes| taken.iter().any(|(taken, _)| taken == id);
         let adds = self.node.messages(&gid.0)?.into_iter().filter_map(|message| {
             let add = serde_json::from_value::<Add>(message.payload).ok()?;
-            (add.device == me && now() < add.expires && !taken.contains(&message.id)).then_some(Pending { id: message.id, by: message.sender.name, add })
+            (add.device == me && now() < add.expires && !taken(&message.id)).then_some(Pending { id: message.id, by: message.sender.name, add })
         });
         Ok(adds.collect())
     }
 
-    /// Lets go of an add that was taken.
-    pub fn take(&self, id: &Bytes) {
-        self.shared.taken.lock().unwrap().insert(id.clone());
+    /// Lets go of an add that was taken, for good: the ids taken are kept until their adds expire.
+    pub fn take(&self, id: &Bytes, expires: u64) -> Result<()> {
+        let st = self.node.inner.lock();
+        let mut taken: Vec<(Bytes, u64)> = crate::get(&st.provider, TAKEN)?.unwrap_or_default();
+        taken.retain(|(_, expires)| now() < *expires);
+        taken.push((id.clone(), expires));
+        crate::put(&st.provider, TAKEN, &taken)
     }
 
     /// Sets which of this device's sessions run and their groups, as the session acting for it found them; the identity's

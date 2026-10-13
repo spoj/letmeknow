@@ -786,7 +786,9 @@ try {
   await laptop.evaluate(() => { window.peerMutation = { text: "arrived during ciphertext recovery" }; });
   const recoveryMessage = ann.run("send", `--group=${fileChat.group}`, "arrived during ciphertext recovery");
   await laptop.waitForFunction(() => window.peerMutation.record && window.peerMutation.phase === "held");
-  check(await laptop.evaluate(id => window.peerMutation.record.id === id, Buffer.from(recoveryMessage.id, "hex").toString("base64url")), "the named peer message mutated the node provider while the ciphertext retry was held");
+  // `send` answers an id's beginning.
+  const mutated = async () => Buffer.from(await laptop.evaluate(() => window.peerMutation.record.id), "base64url").toString("hex");
+  check((await mutated()).startsWith(recoveryMessage.id), "the named peer message mutated the node provider while the ciphertext retry was held");
   const heldItems = outcome(call(laptop, "items", fileChat.group, false));
   await laptop.evaluate(() => { window.storageFault.release = "commit"; });
   check((await retryingFiles).error?.includes("changed during the recovery save"), "a ciphertext retry also refuses reload when records changed during its transaction");
@@ -873,7 +875,7 @@ try {
   await laptop.evaluate(() => { window.peerMutation = { text: "arrived during the recovery transaction" }; });
   const recoveryPeerMessage = ann.run("send", `--group=${invite.group}`, "arrived during the recovery transaction");
   await laptop.waitForFunction(() => window.peerMutation.record && window.peerMutation.phase === "held");
-  check(await laptop.evaluate(id => window.peerMutation.record.id === id, Buffer.from(recoveryPeerMessage.id, "hex").toString("base64url")), "the named peer message mutated the node provider while the records retry was held");
+  check((await mutated()).startsWith(recoveryPeerMessage.id), "the named peer message mutated the node provider while the records retry was held");
   const during = outcome(call(laptop, "items", invite.group, false));
   await laptop.evaluate(() => { window.storageFault.release = "commit"; });
   const dirtyRetry = await retrying;

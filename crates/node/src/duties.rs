@@ -203,16 +203,28 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(())
     }
 
-    /// Runs the group's duties again at `at`, when this session's update is due, if that is sooner than `TIMER`.
+    /// Runs the group's duties again at `at`, if that is sooner than `TIMER` and than the run already timed.
     fn time(self: &Arc<Self>, gid: &[u8], at: u64) {
         let wait = at.saturating_sub(now());
-        if wait == 0 || wait >= TIMER.as_millis() as u64 || !self.timers.lock().unwrap().insert(gid.to_vec()) {
+        if wait == 0 || wait >= TIMER.as_millis() as u64 {
             return;
+        }
+        {
+            let mut timers = self.timers.lock().unwrap();
+            if timers.get(gid).is_some_and(|due| *due <= at) {
+                return;
+            }
+            timers.insert(gid.to_vec(), at);
         }
         let (inner, gid) = (self.clone(), gid.to_vec());
         self.spawn(async move {
             sleep(Duration::from_millis(wait)).await;
-            inner.timers.lock().unwrap().remove(&gid);
+            {
+                let mut timers = inner.timers.lock().unwrap();
+                if timers.get(&gid) == Some(&at) {
+                    timers.remove(&gid);
+                }
+            }
             inner.work.send(Work::Duties(gid)).ok();
         });
     }

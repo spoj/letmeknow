@@ -591,9 +591,9 @@ impl<P: Provider + Send + 'static> Client<P> {
             Err(error) => return self.warn(None, format!("reading the adds for this device: {error:#}")),
         };
         for Pending { id, by, add } in pending {
-            match self.added(&add.link, &add.group, &by).await {
-                Ok(_) => devices.take(&id),
-                Err(error) => self.warn(None, format!("joining a group your device {by} added this one to: {error:#}")),
+            let taken = self.added(&add.link, &add.group, &by).await.and_then(|_| devices.take(&id, add.expires));
+            if let Err(error) = taken {
+                self.warn(None, format!("joining a group your device {by} added this one to: {error:#}"));
             }
         }
     }
