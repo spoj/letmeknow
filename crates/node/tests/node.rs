@@ -1527,8 +1527,7 @@ struct Hand {
 }
 
 async fn hand<P: Provider + Send + 'static>(relay: &Relay, key: iroh::SecretKey, to: &Node<P>) -> Hand {
-    let relays = iroh::RelayMap::from(iroh::RelayConfig::new(relay.url.clone(), Some(Default::default())));
-    let endpoint = lmk_net::builder(relays).secret_key(key).ca_tls_config(CaTlsConfig::custom_roots([relay.cert.clone()])).bind().await.unwrap();
+    let endpoint = lmk_net::builder([relay.url.clone()]).secret_key(key).ca_tls_config(CaTlsConfig::custom_roots([relay.cert.clone()])).bind().await.unwrap();
     let (id, relay) = to.address();
     let addr = iroh::EndpointAddr::new(iroh::EndpointId::from_bytes(&id).unwrap()).with_relay_url(relay);
     let conn = endpoint.connect(addr, ALPN).await.unwrap();

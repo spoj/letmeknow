@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl,
+    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl,
     endpoint::{Builder, Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -92,10 +92,10 @@ pub struct Config {
     pub collect: Duration,
 }
 
-/// An endpoint with our relays and no address lookup; relay connections honour the proxy
+/// An endpoint with these relays and no address lookup; relay connections honour the proxy
 /// environment variables.
-pub fn builder(relays: RelayMap) -> Builder {
-    Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(relays)).proxy_from_env()
+pub fn builder(relays: impl IntoIterator<Item = RelayUrl>) -> Builder {
+    Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(relays.into_iter().collect())).proxy_from_env()
 }
 
 #[derive(Clone)]

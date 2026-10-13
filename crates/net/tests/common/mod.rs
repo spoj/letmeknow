@@ -12,11 +12,8 @@ use std::{
 };
 
 use anyhow::Result;
-use iroh::{EndpointId, RelayMap, RelayUrl, SecretKey, tls::CaTlsConfig};
-use iroh_relay::{
-    RelayQuicConfig,
-    server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig},
-};
+use iroh::{EndpointId, RelayUrl, SecretKey, tls::CaTlsConfig};
+use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, Server, ServerConfig, TlsConfig};
 use lmk_net::{Admit, Config, Disk, Event, Groups, Net};
 use lmk_proto::{
     Answer, Bytes,
@@ -32,32 +29,38 @@ pub const WAIT: Duration = Duration::from_secs(30);
 pub struct Relay {
     pub server: Server,
     pub url: RelayUrl,
-    pub map: RelayMap,
     pub cert: CertificateDer<'static>,
 }
 
 pub async fn relay() -> Relay {
+    relays(1).await.remove(0)
+}
+
+/// Relays that share one certificate, so one CA trusts them all.
+pub async fn relays(n: usize) -> Vec<Relay> {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert = CertificateDer::from(certified.cert.der().to_vec());
     let key = PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
-    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.clone()], key)
-        .unwrap();
-    let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
-    relay.tls = Some(TlsConfig::new((Ipv6Addr::UNSPECIFIED, 0), CertConfig::Manual { server_config: tls.clone() }));
-    let mut quic = QuicConfig::new((Ipv6Addr::UNSPECIFIED, 0));
-    quic.server_config = Some(tls);
-    let mut config = ServerConfig::default();
-    config.relay = Some(relay);
-    config.quic = Some(quic);
-    let server = Server::spawn(config).await.unwrap();
-    let url: RelayUrl = format!("https://localhost:{}", server.https_addr().unwrap().port()).parse().unwrap();
-    let quic = RelayQuicConfig::new(server.quic_addr().unwrap().port());
-    let map = RelayMap::from(iroh::RelayConfig::new(url.clone(), Some(quic)));
-    Relay { server, url, map, cert }
+    let mut relays = Vec::new();
+    for _ in 0..n {
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key.clone_key())
+            .unwrap();
+        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
+        relay.tls = Some(TlsConfig::new((Ipv6Addr::UNSPECIFIED, 0), CertConfig::Manual { server_config: tls.clone() }));
+        let mut quic = QuicConfig::new((Ipv6Addr::UNSPECIFIED, 0));
+        quic.server_config = Some(tls);
+        let mut config = ServerConfig::default();
+        config.relay = Some(relay);
+        config.quic = Some(quic);
+        let server = Server::spawn(config).await.unwrap();
+        let url: RelayUrl = format!("https://localhost:{}", server.https_addr().unwrap().port()).parse().unwrap();
+        relays.push(Relay { server, url, cert: cert.clone() });
+    }
+    relays
 }
 
 pub struct Node {
@@ -81,7 +84,7 @@ impl Default for Options {
 }
 
 pub async fn node(relay: &Relay, key: SecretKey, fake: Arc<Fake>, options: Options) -> Node {
-    let mut builder = lmk_net::builder(relay.map.clone()).secret_key(key).ca_tls_config(CaTlsConfig::custom_roots([relay.cert.clone()]));
+    let mut builder = lmk_net::builder([relay.url.clone()]).secret_key(key).ca_tls_config(CaTlsConfig::custom_roots([relay.cert.clone()]));
     if options.relay_only {
         builder = builder.clear_ip_transports();
     }

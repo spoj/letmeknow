@@ -51,7 +51,7 @@ async fn an_unknown_frame_is_skipped() {
     let relay = relay().await;
     let keys = keys(2);
     let mut a = node(&relay, keys[0].clone(), Fake::new(), Options::default()).await;
-    let peer = lmk_net::builder(relay.map.clone()).secret_key(keys[1].clone()).ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone()]));
+    let peer = lmk_net::builder([relay.url.clone()]).secret_key(keys[1].clone()).ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone()]));
     let peer = peer.bind().await.unwrap();
     let conn = peer.connect(iroh::EndpointAddr::new(keys[0].public()).with_relay_url(relay.url.clone()), frame::ALPN).await.unwrap();
     let (mut send, _recv) = conn.open_bi().await.unwrap();
@@ -187,7 +187,7 @@ async fn disk_acknowledgements_wait_for_persistence() {
     for fake in [&a.fake, &b.fake] {
         fake.groups.lock().unwrap().get_mut(G).unwrap().files.push(link.clone());
     }
-    let raw = lmk_net::builder(relay.map.clone()).secret_key(keys[2].clone())
+    let raw = lmk_net::builder([relay.url.clone()]).secret_key(keys[2].clone())
         .ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone()])).bind().await.unwrap();
     for commit in [false, true] {
         let (net, fetching) = (b.net.clone(), link.clone());

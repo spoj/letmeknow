@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-use iroh::{EndpointId, RelayMap};
+use iroh::EndpointId;
 use lmk_core::group::{Group, Session};
 use lmk_core::provider::Provider;
 use lmk_net::peers::Peers;
@@ -26,9 +26,8 @@ const FETCH_TRIES: u32 = 12;
 impl<P: Provider + Send + 'static> Node<P> {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
     pub async fn start(provider: P, mut config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
-        let relays = RelayMap::from(iroh::RelayConfig::new(config.relay.clone(), Some(Default::default())));
         let ca = std::mem::take(&mut config.ca);
-        let endpoint = lmk_net::builder(relays).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
+        let endpoint = lmk_net::builder([config.relay.clone()]).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
         let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone(), revision: REVISION };
         let clients = logs::Clients::new(endpoint.clone());
         let state = State::open(provider, &config, leaf)?;
