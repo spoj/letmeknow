@@ -331,7 +331,7 @@ try {
 
   // Members: Ann's identity is only her own claim to the laptop.
   await laptop.locator(".people:visible").click();
-  const annRow = laptop.locator("dialog .people-list li", { hasText: "Ann" });
+  const annRow = laptop.locator("dialog .people-list li", { hasText: /Ann · / });
   check((await annRow.textContent()).includes("Locally observed here; not independently verified"), "members distinguish local observation from human verification");
   await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
 
@@ -629,8 +629,8 @@ try {
   check((await laptop.locator(".group-list button").count()) === 4, "a reloaded browser keeps its groups and their messages");
   ann.run("send", `--group=${invite.group}`, "after the reload");
   await laptop.getByText("after the reload").waitFor();
-  await laptop.getByPlaceholder("Message").fill("still here");
-  await laptop.getByPlaceholder("Message").press("Enter");
+  await laptop.locator("textarea:visible").fill("still here");
+  await laptop.locator("textarea:visible").press("Enter");
   await ann.printed(e => e.type === "message" && e.content === "still here");
   check(true, "and still exchanges messages");
   await laptop.locator(".group-list button", { hasText: "Notes" }).click();
