@@ -8,7 +8,7 @@ use url::Url;
 use crate::links::{DOMAIN, MEMBERSHIP_KEY, RELAY};
 
 /// The largest body `parse` reads.
-const MAX_BYTES: usize = 64 << 10;
+pub const MAX_BYTES: usize = 64 << 10;
 const MAX_RELAYS: usize = 16;
 const MAX_ADDRS: usize = 4;
 
