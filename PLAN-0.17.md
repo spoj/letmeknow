@@ -1,256 +1,235 @@
 # 0.17: causal chat over gossip
 
-Spec draft 3 of #80, the implementation contract until 0.17 ships; then it goes, as PLAN-0.16.md went. It settles
-draft 2's open items (numbered as there, under "Settled"), keeps its decisions, and answers the draft-1 review where it
-still applies. Existing chats, docs and identities do not carry over.
+Spec draft 4 of #80, the implementation contract until 0.17 ships; then it goes, as PLAN-0.16.md went. Draft 3 settled
+#80's open items; an adversarial review of it (five lenses: cuts, MLS, delivery, overlay, client) led to this draft. It
+keeps #80's decisions, but: held headers are not signed (MLS authenticates their author), cuts are keyed by member key,
+and summaries never decide what is safe to drop. Existing chats, docs and identities do not carry over.
 
 ## Model
 
 Every member keeps, per group:
 
 - **memberships**: a member's MLS signature key and `joined`, the epoch its Add moved into (0 for the creator). A key
-  admitted again is a new membership, with a new sequence.
-- **cut state**: per current membership, `(seq, id)`: how far its held messages are kept by the group. It changes only
-  when a commit applies, and every member derives it alike from the commits it applied.
+  admitted again is a new membership, with a new sequence. A commit may not add a key it removes.
+- **cut state**: per current membership, `(seq, id)`: how far its held messages are kept. It changes only when a commit
+  applies; every member derives it alike. A removed membership's final cut is kept while its epochs' keys are.
 - **held messages**: by id, and by `(membership, seq)`.
-- **delivery state**: per membership, the seqs delivered, given up (missing past the wait, lost, or not kept), and the
-  seqs its client marked shown.
+- **delivery state**: per membership, the seqs delivered, given up, lost, and shown by the client; kept for the
+  membership's lifetime.
 
-A held message is in one of these states for a member: *pending* (opened, waiting on requirements), *delivered* (handed
-to the client and kind; the client may then show it), *kept* (at or below its author's cut: every member holds it, or
-knows it lost it), *not kept* (its author's membership ended with a cut below it). Delivered and kept are independent: a
-member may deliver a message no cut ever keeps.
+States of a held message for a member: *unopened* (a ciphertext it holds), *pending* (opened, waiting on
+requirements), *delivered*, and, by the cuts, *kept* (at or below its author's cut) or *not kept* (past the final cut of
+an ended membership). Delivered and kept are independent.
 
-**Guarantees.** Every held message of a membership that stays is eventually kept, once its author is online in an epoch
-and some committer holds it. All members agree on the kept set of each epoch. A member that held the keys of every
-epoch since it joined delivers every kept message, or reports it lost by `(author, seq)`. A removed or departed
-member's messages after its final cut may reach only some members; members that delivered them keep them, and
-messages that depend on them are delivered without them. Control effects (`leave`, invites, identity adds) act on
-delivery, as now, independent of later cuts: a leave or an invite from a member later removed is judged against the
-membership current when it acts, as `admits` does now.
+**Guarantees.** All members agree on each epoch's kept `(membership, seq, id)`. Every message of a membership that stays
+is kept once its author is online at the head of the log and some member holds it: the author reseals it in each epoch
+until a cut keeps it, and a member that holds unkept messages commits within minutes (Cuts). A member that held the
+keys of every epoch since it joined delivers every kept message, or reports it lost by `(author, seq)`. An ended
+membership's messages past its final cut may reach only some members. Control payloads (`leave`, `invite`, identity
+adds) act when opened, as 0.16's acted when counted, judged against the membership current then. Only being kept makes
+a message safe without its author: `only_here`, leave completion and `sessions remove` key on it, never on summaries.
 
 ## Held messages
 
-The plaintext of the MLS application message is `body ‖ sig`: `body` is the header's JSON, `sig` (the last 64 bytes)
-the author's Ed25519 signature, by its leaf's signature key, over `"letmeknow held v1\0" ‖ body`.
+The MLS application message's plaintext is its header's JSON; its id is `SHA-256(plaintext)`, the same in every epoch
+its author seals it in, as the author keeps and reseals the exact bytes. The body names the group, so ids are
+group-scoped. Its MLS authenticated data, clear on the wire and authenticated once opened, is `[key, joined, seq]`.
 
 ```json
 {"group": "<16-byte group id>", "author": "<key>", "joined": 3, "seq": 7, "prev": "<id of seq 6>",
  "deps": [["<key>", 2, 41, "<id>"]], "reply_to": "<id>", "payload": {"type": "message", "content": "…"}}
 ```
 
-- `id = SHA-256(plaintext)`: the same in every epoch the author seals it in, as the author keeps and reseals the exact
-  bytes. The body names the group, so ids are group-scoped; storage keys them by `(group, id)`.
-- `prev` is absent for seq 1. `deps` holds at most one entry per membership, none the author's own; `reply_to` and
-  `deps` are absent when empty.
-- A receiver checks, after MLS opens it: `group` is the group; `author` is the MLS sender's signature key; `joined` is
-  the sender's current membership's (from the cut state; a membership the receiver never saw is taken as claimed, as
-  it predates the receiver); the signature; `seq ≥ 1` and `prev` present iff `seq > 1`; `deps` well formed; `payload`
-  has a `type`. A message failing any check is dropped. `prev` is checked against the held `seq - 1`, and a dep's id
-  against the held message it names: a mismatch, or two bodies under one `(membership, seq)`, is equivocation: the
-  member keeps the first and warns once per membership.
-- The node assigns `seq` and `prev`; the client supplies `deps` (the shown frontier, below) and `reply_to`.
+- `prev` is absent at seq 1. `deps` holds at most one entry per membership, none the author's own; control payloads and
+  identity adds have none. `reply_to` and `deps` are absent when empty.
+- A receiver checks, after MLS opens it: the group; the author is the MLS sender; `joined` is the author's membership in
+  the epoch it was sealed in (core keeps the cut states of the current and previous epochs); the authenticated data
+  matches; `seq ≥ 1` and `prev` present iff `seq > 1`; `payload` has a `type`. A message failing a check is dropped.
+- Tuples (`deps`, cuts, `Seqs`) ignore trailing elements, so a later 0.17.x can extend them; the checks here and the
+  cut's validity are frozen for 0.17.x.
 
-**Delivery.** A message's requirements are its `prev` and its deps. A requirement is satisfied once it is delivered, at
-or below the member's baseline for its membership (below), or given up. A message is delivered once all its
-requirements are satisfied, and gets the group's next local index (delivery order, which local cursors use). An
-unsatisfied requirement holds up its dependents while it may still come: for at least `HOLD_OFF` (2 s) after a
-dependent was opened, and while some member's summary shows it held and that holder has not been struck for it, up to
-`GIVE_UP` (30 s). Then it is given up, and the next message delivered that needed it, directly or through its
-author's earlier seqs, names in `missing` every seq of that membership up to the requirement not delivered or reported
-yet. A given-up message that arrives later is delivered when its own requirements are satisfied, marked `late`. A dep
-on a membership the member never knew is satisfied: that membership ended before the member joined.
+**Opening.** Openmls refuses a generation more than 1,000 behind the newest it opened (999 still open). A member opens a
+membership's ciphertext only while its seq is within 500 of that membership's lowest wanted seq; others wait unopened,
+up to 4 MiB per membership, beyond which they are not taken and come again by repair. It saves the plaintext in the
+same step as the ratchet advance, and never evicts an opened message. A ciphertext it opened is never opened again (the
+message record lists its sealings' hashes). One that fails as too distant is, if kept, lost to it.
 
-**Shown frontier.** The client marks messages shown as it prints or displays them (`mark_shown(ids)`). `deps` is the
-frontier of the shown set: for each membership, its highest shown seq, less those in another such message's causal
-past. The node keeps each delivered message's causal past as a vector (membership → seq), the pointwise maximum of its
-requirements' vectors and itself. `reply_to` must name a message in the shown past: the sending client refuses
-otherwise, and a receiver that holds the replied-to message and finds it outside the message's vector marks the
-message `reply_outside: true`. Messages the node delivered but the client has not shown are concurrent with what the
-client sends.
+**Delivery.** A message's requirements are its `prev` and deps. A requirement `(N, t)` is satisfied once every seq of
+`N` up to `t` is resolved: at or below the member's baseline for `N`, delivered, given up, lost, or past `N`'s final
+cut. A message is delivered once its requirements are; it then gets the group's next local index (delivery order). Only
+at the head of its log (not while catching up commit by commit) does a member give up: an unsatisfied requirement whose
+seqs it does not hold holds up dependents for `HOLD_OFF` (2 s) after they opened, and while a holder is untried, up to
+`GIVE_UP` (30 s). Giving up releases dependents only: the seqs stay wanted. The next message delivered whose
+requirements reach them names them in `missing`, per membership; one delivered later is `late`. A requirement held
+back by the local flood bucket is never given up. A dep on a membership the member never knew is satisfied: it ended
+before the member joined.
 
-**Opening.** A member opens a held ciphertext when it arrives, if it holds its epoch's keys; one of the next epoch waits
-in `early` (4 MiB per peer, as now). Live messages no longer use the MLS ratchet, so a sender's generations count only
-its held messages and reseals. Authors seal in seq order, pushes go out in that order and repair asks each membership's
-seqs in ascending order, so the out-of-order distance stays at the messages in flight, far below openmls's 1,000; a
-member catching up asks in ascending order, far below 100,000 ahead. A message a member cannot open because the ratchet
-moved more than 1,000 past it is, if kept, lost to that member (known by `(author, seq)`); if not kept, its author
-reseals it later. Item 4 below has the tests.
+**Shown frontier.** The client marks what it shows (prints, displays, or replies to). `deps` is the frontier of the
+shown set: per membership its highest shown seq, less those in another's causal past, found by walking deps (cached),
+and less memberships that ended over H ago. `reply_to` must name a delivered message; a receiver whose walk of the
+message's past completes without finding it marks the message `reply_outside`. Once shown, a record keeps no payload
+text (as 0.16's redaction); the plaintext of a reseal of a shown message is dropped after its id is checked.
 
-**The outbox.** `send` signs the header, seals it in the current epoch, and saves the plaintext, its seq and prev, the
-ciphertext and its epoch in one step, then answers `{id}` once that step is durable, and pushes it. The author keeps
-the plaintext until its cut reaches the seq; after each commit it applies, it reseals every message past its cut in the
-new epoch, in seq order, and pushes those. Nothing of `send` involves the service.
+**Sending.** `send` signs nothing: it builds the header (the node assigns `seq` and `prev`, the client gives `deps` by
+showing and `reply_to`), seals it in the current epoch, saves plaintext, seq, prev and sealing in one step, delivers it
+to itself (own messages are never opened), answers `{id}` once that step is durable, and pushes it. Errors: `size`, and
+`rate` past the sender's bucket (100 messages and 4 MiB, refilled at 1 per second and 64 KiB per second). Nothing of
+`send` involves the service. The author keeps the plaintext until its cut reaches the seq. In the step that applies a
+commit and leaves it at the head of its log, before any new seal, it reseals every own message past its cut, in seq
+order, and pushes them. When a commit removes it, `removed` names its messages past its final cut as `not_kept`.
 
-**Flood control** is local: per `(group, membership)` a token bucket (100, refilled at 1 per second) for pushes and
-repair. A message over it is not taken now (no MLS work, no storage); its author's summary still shows it, so it is
-pulled when tokens return. The wait before a commit ignores the bucket for what the ending cut names. Nothing over the
-bucket is ever counted lost.
+**Flood control** is local. Receivers allow each membership twice the sender's bucket, charged when opening, and a
+membership over it waits unopened (then not taken), so honest senders are never throttled. Live payloads have a bucket
+of their own per membership (100, refilled at 10 per second). The wait before a commit ignores buckets.
 
 ## Cuts
 
-A commit's authenticated data (inside the sealed, padded commit envelope, as now) is JSON
-`{"how", "invite", "cut": [[index, joined, seq, id], …]}`: one entry per member of the epoch the commit ends, in leaf
-index order, `id` empty for seq 0. It is cumulative: the cut state after the commit is its entries, less the members it
-removes, plus the members it adds at `(joined = new epoch, seq 0)`.
+A commit's authenticated data (inside the sealed, padded commit envelope, as now) is JSON `{"how", "invite", "cut"}`,
+`cut` being `[[key, joined, seq, id], …]`: one entry per member of the epoch the commit ends, sorted by key, `id` empty
+at seq 0. It is cumulative: after the commit the cut state is its entries less the members it removes, plus those it
+adds at `(joined = new epoch, 0)`; a removed member's entry is its final cut.
 
-**Meaning.** The committer of the commit ending epoch E asserts it holds, each sealed in E, every message of each
-membership from that membership's previous cut seq to the cut's, and that the cut's id is the message at that seq.
-Messages at or below a membership's cut are kept; the commit ending E keeps those between the previous cut and its own.
-Since the committer seals and holds only sealings of E, members that lack a kept message can fetch an E sealing while
-they still hold E's keys, until the next commit.
+**Validity**, checked in `rules` from the group state alone: exactly the members of the cut state, by key, in order, at
+their `joined`; each `seq` at least the state's and at most 100,000 more, with the same `id` when equal; `id` 32 bytes
+iff `seq > 0`. An invalid cut makes the commit invalid.
 
-**Validity**, checked in `rules` from the group state alone, never from what a reader holds: exactly one entry per
-member of the ending epoch, by index; `joined` as in the cut state; `seq` not below the cut state's, and the same `id`
-when equal; `id` 32 bytes iff `seq > 0`. An invalid cut makes the commit invalid, like any rule. The encoding costs
-about 70 bytes per member beside the Welcome's ~1 KiB per added tree member, within the 1 MiB entry for the group sizes
-supported (below).
+**Meaning and building.** The committer of the commit ending E asserts it holds, each sealed in E, every message of each
+membership from its previous cut seq to the cut's, chained by `prev` down from the cut's `id`. It builds the cut so: per
+membership, extend while it holds the next seq sealed in E with a chaining `prev`; its own entry too, and only as far as
+another member's summary shows held, so every kept message has two holders. A member builds a commit only once it holds,
+or has lost, everything the previous cut kept, which makes it another holder of those. The pending commit keeps its
+authenticated data, so a retry posts the same cut; a commit that loses its epoch is built again on the next.
+Equivocation: the chain down from the cut's id decides which body is kept; a member holding another body under that
+`(membership, seq)` marks it not kept, warns, and asks for the kept one by id.
 
-**Building.** The node computes the cut as it builds the commit: for each membership, from its cut state seq, while it
-holds the next seq sealed in E with a `prev` that chains, take it. Its own seq is its last, as it reseals its outbox in
-each epoch. The pending commit keeps its authenticated data, so posting it again after a crash or a lost answer posts
-the same cut; a commit that loses its epoch is built again on the next one, with a new cut. Messages that arrive after
-the build are past the cut and resealed after it.
+**Keep-alive.** A member that holds messages unkept for 10 minutes commits an update at its slot (a hash of its key
+within the next 10 minutes) unless a commit comes first; so active groups get about one commit per 10 minutes, and
+authors can stop soon after they send.
 
 **Applying.** Before applying the commit ending E+1, which deletes E's keys, a member must hold every message the
-commit ending E kept. It waits for them as now (`Peers::wait`), asking any member whose summary shows them held, and
-dialing a holder that is not a neighbour; then it applies, and whatever it still lacks of them is lost to it, by
-`(author, seq)`, and given up. After applying, a member drops the pending messages of memberships the commit removed
-that lie past their final cuts (not kept), gives up requirements on them, reseals its own outbox, and opens its early
-ciphertexts of the new epoch. A member catches up commit by commit: holders keep, for H, each kept message's sealing in
-the epoch whose cut kept it, and each unkept message's latest sealing.
+commit ending E kept above its baseline. It waits while a holder (by summaries) is untried: connected, or with a dial in
+flight; it dials holders past their backoff; an empty answer or a failed dial strikes a holder for the epoch; only a
+lacking message arriving is progress; the wait ends 2 minutes online after the commit was read at the latest. Then it
+applies, and what it lacks of them is lost to it, by `(author, seq)`. After applying, it drops pending messages of
+removed memberships past their final cuts and takes no more of them, reseals its own (Sending), and opens the unopened
+ciphertexts of the new epoch. Catching up goes commit by commit.
 
 **Joining.** An admitter answers `Admitted { commit, doc }`: `commit` is the encoded commit entry (commit, Welcome and
-signature) that added the joiner. The joiner joins by the Welcome inside it, checks the entry's signature against a
-member of the tree it joined, and reads the cut from the commit's authenticated data: its baseline. Requirements at or
-below the baseline are satisfied, as they came before the joiner. Messages sealed before the Add but kept only after it
-reach the joiner too: a joiner gets every message kept after its baseline. A member asked again for a lost answer
-answers with the commit entry it kept for H, by the epoch the Add moved into.
+signature) that added the joiner. The joiner joins by the Welcome inside it, checks the entry's signature against the
+Welcome's sender (the GroupInfo signer, which is the committer), and that the commit is a commit of the group's previous
+epoch; it trusts the committer's cut, which it cannot judge: its baseline. Tree members named in the cut take their
+entries, the others `(new epoch, 0)`. Messages sealed before the Add but kept only after it reach the joiner too. A
+member asked again for a lost answer answers with the commit entry it kept for H.
 
 ## Live messages
 
-Doc and table edits, typing, presence: the wire form is `epoch ‖ nonce ‖ XChaCha20-Poly1305(key, nonce, aad, plaintext)`
-with `key = MLS-Exporter("letmeknow live", group ‖ epoch, 32)`, `aad = "letmeknow live v1\0" ‖ group ‖ epoch`, and
-plaintext `body ‖ sig`: body the JSON `{"author", "payload"}`, sig the author's over `"letmeknow live v1\0" ‖ group ‖
-epoch ‖ body`. A member takes one sealed in its current epoch from a current member, verified. Its id is the hash of the
-wire bytes. `Live { group, hops, item }` goes once to each neighbour but the one it came from, with `hops` (at most 6)
-less one; a member keeps the ids it saw in the last 2 minutes, at most 4,096, and forwards nothing it saw. A live
-message to one member goes to it alone, with no hops. Live messages in flight across a commit are dropped.
+Doc and table edits, typing, presence: `epoch ‖ nonce ‖ XChaCha20-Poly1305(key, nonce, aad, body ‖ sig)` with
+`key = MLS-Exporter("letmeknow live", aad, 32)`, `aad = "letmeknow live v1\0" ‖ group ‖ epoch`, body the JSON
+`{"author", "payload"}`, sig the author's over `aad ‖ body`. A member takes one sealed in its current epoch from a
+current member, verified; its id is `SHA-256(sig)`, checked after opening. `Live { group, hops, item }` goes to each
+neighbour but its source, once verified, with `hops` (at most 6) less one; ids are kept FIFO, 2 minutes and at most
+4,096. In a full mesh nothing is forwarded. A live payload to one member goes to it alone. Live payloads in flight
+across a commit are dropped.
 
-Docs and tables keep syncing by state. `Synced` fires for a neighbour whose `hello` shows the same current log reference
-(the same epoch secret): on connecting, after each commit, and with every periodic `hello` (5 minutes), so neighbours
-compare state hashes on a schedule and a repair reaches others through the next comparison, with no further edits.
+Docs and tables sync by state. `Synced` fires for a neighbour whose `hello` shows the same current log reference (the
+same epoch secret): on connecting, after each commit, and with each periodic `hello` (5 minutes), so neighbours compare
+state hashes on a schedule and a repair reaches others through the next comparison.
 
 ## Peers
 
-**Neighbours.** Per group, a member's targets are every other member when the group has at most K + 1 = 7, else the K = 6
-members ranked best by `SHA-256("letmeknow neighbours v1\0" ‖ MLS-Exporter("letmeknow neighbours", "", 32) ‖ min(a, b) ‖
-max(a, b))` over iroh keys, among those not backing off. The rank is symmetric, so pairs tend to choose each other, and
-changes with each epoch's secret, which no key can be ground against. A member dials targets it is not connected to every
-10 s; a failed dial backs off from 30 s, doubling to 10 minutes. Every minute it also dials one random member it is
-not connected to, so an overlay split during an outage heals without a commit. One connection serves every group a pair
-shares. A member accepts at most 128 connections; a dialer closes a connection none of its groups targets, after 5
-idle minutes. Directed connections, outside the targets: admission, repair from a holder that is not a neighbour, a
-file only one member holds, a joiner's state.
+**Overlay.** A neighbour is any connected member the gate admits. Per group, a member's targets are every other member
+when the group has at most 7, else the 6 ranked best by `SHA-256("letmeknow neighbours v1\0" ‖ group ‖ min(a, b) ‖ max(a,
+b))` over iroh keys, among members connected or whose summary `time` is under 2 hours old and not backing off. The rank
+is symmetric and stable: a commit changes only the added and removed members' edges. A member dials targets every 10 s;
+a failed dial backs off from 30 s, doubling to 10 minutes, cleared when the peer connects to it. Once a minute per
+session it dials one random recently seen member it is not connected to, so a split heals without a commit. One
+connection serves every group a pair shares. A connection a group targets is always accepted; others are capped at 128,
+evicting the longest-idle one nothing targets; a non-member's closes after its admission exchange, or 30 s. A dialer
+closes a connection idle 5 minutes: no target of it, and no request, answer, admission or file transfer.
 
-**Frames** (`letmeknow/3`, as 0.16 and 0.17 share no groups):
+**Frames** (`letmeknow/3`, as 0.16 and 0.17 share no groups). A frame of a group is taken only from a peer the gate
+admits, but `hello` and `entries`, which check themselves; every frame is checked against the membership as written.
 
 - `Hello { groups: [{group, epoch, log, head}], heads }`: on connecting, on change (1 s debounce), and every 5 minutes.
   Commits and public-log entries travel as now: `Entries { log, entries, head }` to a peer whose `hello` shows less.
-- `Summaries { group, items: [signed summary] }`.
-- `Held { group, items: [ciphertext] }`: a push, forwarded once to each other neighbour (dedup by ciphertext hash), or
-  an answer to `Want`.
-- `Want { group, epoch, wants: [[key, joined, seqs]] }`: the asker's epoch, so the holder answers with the sealings it
-  can open (that epoch's, or the one before); it answers with what it has, ~1 MiB at most, and an empty answer strikes it
-  for those seqs until its next summary.
+- `Versions { group, versions: [[index, joined, version]] }` on connecting, then `Summaries { group, items }` with only
+  what the other lacks; new summaries go to neighbours that have not shown them.
+- `Held { group, items }`: ciphertexts, pushed and forwarded once each after opening (nothing forwarded in a full mesh),
+  or answering `Want`.
+- `Want { group, epoch, wants: [[key, joined, seqs]], ids }`: the holder answers with sealings openable in the asker's
+  epoch or the one before and not before the asker's `joined`, about 1 MiB at most, and `answers`, what it covered.
 - `Live { group, hops, item }`, `WantFiles`, `Have`, `State` as now.
 
-Every frame of a group is checked against the group's membership as it is written, as now.
+**Summaries.** Each member signs its own per group with its leaf key: `"letmeknow summary v1\0" ‖ body`, body the JSON
+`{group, member, joined, version, time, epoch, held, shown, lost}`, the last three `[[index, joined, seqs]]` over the
+current members by leaf index in that epoch. `held` lists seqs whose sealing it holds openable at its epoch, or sealed
+in the epoch whose cut kept them; holders keep every sealing they open. `version` is `max(saved + 1, time)`, saved
+before it is sent; a member re-signs at most every `max(1 s, members / 4 s)` while it changes, and at least hourly. A
+receiver keeps the highest valid version per current membership, drops removed ones', keeps up to 32 it cannot verify
+yet (a joiner's before its Add) until the next commit, and takes `time` as at most when it received it. Summaries serve
+receipts (`held_by`, `read_by` = shown), repair, the wait before a commit, `lost` (told to the author once per seq,
+persisted), and `away` (no summary within H, not connected). `Control::Lost` goes.
 
-**Summaries.** Each member signs its own per group: `"letmeknow summary v1\0" ‖ body`, body the JSON
-`{group, member, joined, version, time, epoch, held, shown, lost}`, each of the last three `[[key, joined, seqs]]`.
-`version` grows with each new summary and is saved; `time` is the member's clock. A member re-signs at most once a
-second while it changes, and at least hourly. A receiver keeps the highest version of each current membership's
-summary that verifies, drops those of removed memberships, and passes on new ones to neighbours that have not shown
-them (each connection remembers the versions it carried); on connecting, peers send each other all they hold for their
-shared groups. Receipts (`held_by`, `read_by` = shown), `only_here`, `leave_held`, losses (the `lost` event to the
-author) and `away` (no summary with a `time` within H, and not connected) come from them; `online` is the members
-connected now. `Control::Lost` goes: losses travel in summaries.
-
-**Repair.** A member wants, per membership, the seqs it knows exist (deps, prev gaps, cuts, summaries) that it neither
-holds nor gave up, and asks the best holder for them in ascending order: a connected neighbour whose summary shows them,
-else any member whose summary shows them, dialed directly. One request per group at a time, as now, with the same
-timeout and strikes.
+**Repair.** A member wants each membership's seqs it knows of (deps, prev gaps, cuts, summaries) that it neither holds
+nor lost, given up or not, and asks one holder per group at a time, in ascending seq order: a connected neighbour whose
+summary shows them, else any such member, dialed directly; with the timeout and strikes of 0.16, strikes lasting for
+the epoch.
 
 ## The membership service
 
 Epoch logs hold only commit entries (with each add's Welcome and the cut). `Entry::Message`, its MAC, the node's
 message pages and batches, and sends' appends go. The request API stays, so one service serves 0.16 and 0.17 during the
-move. Limits (from #78): one budget of bytes in flight per connection and overall that covers decoding requests and
-building replies; a disk budget on the database's pages in use plus its WAL, refused as `quota`; `MAX_LOGS`,
-`MAX_ROWS`, `MAX_STORED_BYTES`, `MAX_LOG_LENGTH` and `MAX_LOG_BYTES` go. Store format 3 stays.
+move. Limits (from #78): a byte budget per connection and overall covering request decoding and replies; a disk budget
+on the database's pages in use plus its WAL (`serve --disk`), refused as `quota`; `MAX_LOGS`, `MAX_ROWS`,
+`MAX_STORED_BYTES`, `MAX_LOG_LENGTH` and `MAX_LOG_BYTES` go. Store format 3 stays.
 
 ## Client, CLI, browser
 
-- `send` answers `{id}`; `pos`, `pending` and the `sent` event go.
-- `message` events show `id`, `from`, `seq`, `sent_at`, and `missing: [{from, seqs}]`; a late one `late: true`. Events
-  come in delivery order.
-- `lost`: `{member, messages: [{from, seqs, ids}]}`, from summaries; told to authors as now.
-- `read <id> --ancestors N`: the N most recent shown messages in its causal past.
-- `status.only_here`: `{what, id, seq}` of own messages no other member's summary holds; `leave` is pending until
-  another member's summary holds the `leave`.
-- `ChatMessage.read` goes (deps carry causality); receipts come from summaries.
-- Local cursors replace positions: the identity kind follows delivery indices and takes adds by id; the session
-  reprints unshown messages in delivery order after a restart; the browser stores records by id in delivery order.
-- SKILL.md and README.md describe causal order, `missing`, `late`, `lost`, and that chat works while the service is
-  down.
+- `send` answers `{id}`; `pos`, `pending`, `unavailable` and the `sent` event go; `rate` and `size` stay.
+- `message` events show `id`, `from`, `seq`, `sent_at`, `missing: [{from, seqs}]`, `late`, `reply_outside`; they come
+  in delivery order. `read <id> --ancestors N`: the latest N chat messages in its causal past that this member
+  delivered, by delivery index. A restart reprints what was delivered after the last shown message.
+- `lost`: `{member, messages: [{from, seqs, ids}]}`, from summaries, once per seq.
+- `status.only_here`: own messages not kept yet (`{what, id, seq}`); `leave` is pending until the Remove applies
+  (`removed`), and `leave_held` goes; `sessions remove` waits for that; `removed` lists `not_kept` own messages.
+- `online`: members connected to this session (in groups over 7, its neighbours); `away` as above.
+- `ChatMessage.read` and `reply_to` leave the payload: deps carry causality, `reply_to` the header.
+- Positions go everywhere: the kind cursor (`follow_log`, `entries`, `Logged`) goes; the identity kind scans delivered
+  adds and persists the ids taken; the browser keeps its timeline by delivery time, late ones where they were delivered.
+- The browser, finding an `lmk5` database, says once that 0.16's chats stay with 0.16; a `5.` link is explained as made
+  by letmeknow 0.16, whose maker must restart with `@letmeknow/cli@0.17`.
+- SKILL.md and README.md describe causal order, `missing`, `late`, `lost`, `not_kept`, keeping, and that chat works
+  while the service is down.
 
-## Switches
+## Switches and rollout
 
 Group `PROTOCOL` 6; invite links `6.`; home `letmeknow-v6` (format 6); browser database, Web Lock and channel `lmk6`;
-ALPN stays `letmeknow/3`. Pins move to `@letmeknow/cli@0.17` by hand. Rollout: the service first (its API is
-unchanged), then npm, then Pages. Links of 0.16 are refused as another version's. A browser profile with `lmk5` and
-`lmk6` tabs runs both apart, as their names differ.
+ALPN stays `letmeknow/3`; commit entries are signed over `"letmeknow commit v1\0"`. The release goes npm, then the
+service (its API is unchanged), then pi-letmeknow's pin, then Pages. Pins move to `@letmeknow/cli@0.17`.
 
-## Settled
+## Budgets and size
 
-1. **Shown, then not kept**: the states and guarantees above (Model). No event retracts a delivered message.
-2. **The cut**: cumulative, one entry per member, JSON in the sealed commit's authenticated data, ~70 bytes per member;
-   competing commits: only the winner's counts, the loser is rebuilt; crash and retry post the same pending entry.
-3. **When no commit comes**: requirements are given up after `HOLD_OFF`, or while holders are known up to `GIVE_UP`;
-   late arrivals are delivered `late`. Nothing is lost without a commit.
-4. **Ratchet bounds**: live messages leave the ratchet; held messages open on arrival, in ascending order under repair.
-   Real-openmls tests: a gap of up to 1,000 later held messages opens late; one more makes it unopenable, and if kept it
-   is reported lost; a member catching up 5,000 messages of one epoch in ascending order opens them all.
-5. **Overlay**: symmetric epoch-keyed ranking, K = 6, full mesh to 7, 10 s redial with backoff, a random probe a minute,
-   128 connections, idle close by the dialer. Admission and repair dial outside the targets.
-6. **Summaries**: signed per membership, versioned, highest kept, forwarded once per connection, re-signed at most once
-   a second and at least hourly. Supported group size: 200 members (summaries are O(members × authors) per member).
-7. **Live**: at most 6 hops; ids kept 2 minutes, at most 4,096; author checked against the current epoch; dropped across
-   commits.
-8. **Budgets**: pending (opened, undelivered) messages 64 MiB per group, beyond which the oldest pending wait for repair
-   again; early ciphertexts 4 MiB per peer; answers ~1 MiB; frames 16 MiB; dials 4 at once per group.
-9. **Client inventory**: as listed above; every position use goes (kind cursors, adds, receipts, `only_here`,
-   `leave_held`, the browser timeline).
-10. **Rollout**: as under Switches.
-11. **ALPN**: stays `letmeknow/3`.
-12. **Sealing again by holders**: no. Only an author seals its messages: holders delete text once shown (decision 8), and
-    a holder's sealing would need a membership check of the original author per epoch. A message a member lost stays
-    lost; an author's unkept message waits for its author.
+Supported group size: 100 members, with the peer core's tests asserting bytes per message and per hour there. Per
+membership: 4 MiB unopened; per group: early (next-epoch) ciphertexts 4 MiB per peer; answers ~1 MiB; frames 16 MiB;
+4 dials at once per group; live ids 4,096.
 
 ## Tests
 
-Real openmls and storage, as examples: causal delivery with holes and late arrivals; the shown frontier, `reply_to`
-checks; more than 8 concurrent heads; a cut, and resealing past it; competing commits with different cuts; a removal
-after a member delivered the removed member's last message; joining and rejoining with the same key; catch-up over many
-epochs; the ratchet bounds of item 4; equivocation; a sole holder that is not a neighbour; a split overlay healing
-without commits; doc repair through a neighbour with no further edits; chat while the service is unreachable; #76's
-reproducer. The peer core stays I/O-free, with randomized schedules of loss, reordering and reconnection.
+Real openmls and storage, as examples: causal delivery with holes, `missing` and `late`; the shown frontier and
+`reply_outside`; more than 8 concurrent heads; a cut, and resealing past it; competing commits; a removal after a member
+delivered the removed member's last message, and a removed member sealing on in its last epoch; joining and rejoining
+with the same key; a forged baseline refused; catch-up over many epochs with a dependency kept one epoch later; the
+ratchet bounds (999 and 1,000 later messages; catch-up then a push; bucket overflow then a late push); equivocation
+with a cut through either body; a sole holder that is not a neighbour; a split overlay healing without commits;
+keep-alive making a message kept; doc repair through a neighbour with no further edits; chat while the service is
+unreachable; `lost` told once across a restart; a send after being removed offline; the 0.16 and 0.17 CLIs on one
+service; the frontend over an `lmk5` database with a `5.` link; #76's reproducer. The peer core stays I/O-free, with
+randomized schedules of loss, reordering and reconnection.
 
 ## Work, in order
 
-1. Proto and core: headers, ids, cuts in commits, the joiner's baseline, live sealing; message entries go.
-2. Net: the I/O-free peer core (neighbours, summaries, repair, flooding); the service's limits; #76.
-3. Node: delivery, the outbox, cuts and catch-up, admission, summaries.
+1. Proto and core: headers, AAD claims, cuts, the joiner's baseline, live sealing.
+2. Net: the I/O-free peer core; the service's limits; #76.
+3. Node: opening, delivery, the outbox, cuts, keep-alive and catch-up, admission, summaries.
 4. Client, CLI, browser and kinds.
 5. Release tooling (#69, #71, #64), docs and switches; then the release.
