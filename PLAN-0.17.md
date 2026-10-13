@@ -59,9 +59,12 @@ message record lists its sealings' hashes). One that fails as too distant is, if
 cut. A message is delivered once its requirements are; it then gets the group's next local index (delivery order). Only
 at the head of its log (not while catching up commit by commit) does a member give up: an unsatisfied requirement whose
 seqs it does not hold holds up dependents for `HOLD_OFF` (2 s) after they opened, and while a holder is untried, up to
-`GIVE_UP` (30 s). Giving up releases dependents only: the seqs stay wanted. The next message delivered whose
-requirements reach them names them in `missing`, per membership; one delivered later is `late`. A requirement held
-back by the local flood bucket is never given up. A dep on a membership the member never knew is satisfied: it ended
+`GIVE_UP` (30 s); after `GIVE_UP`, seqs it holds but has not delivered are given up too, as two pending messages may
+require each other. It gives up only seqs it knows were sent (its author's own messages it holds, or a cut): a dep
+past those is met, after `GIVE_UP`, once all it knows was sent is, so no dep can name a range that poisons later
+messages. Giving up releases dependents only: the seqs stay wanted. The next message shown whose requirements reach
+them names them in `missing`, per membership; one delivered later is `late`. A requirement held back by the local
+flood bucket is never given up. A dep on a membership the member never knew is satisfied: it ended
 before the member joined.
 
 **Shown frontier.** The client marks what it shows (prints, displays, or replies to). `deps` is the frontier of the
@@ -80,7 +83,8 @@ order, and pushes them. When a commit removes it, `removed` names its messages p
 
 **Flood control** is local. Receivers allow each membership twice the sender's bucket, charged when opening, and a
 membership over it waits unopened (then not taken), so honest senders are never throttled. Live payloads have a bucket
-of their own per membership (100, refilled at 10 per second). The wait before a commit ignores buckets.
+of their own per membership, ten times the held one (1,000 and 40 MiB, refilled at 10 per second and 640 KiB per
+second), charged after dedup, and are forwarded at most `HOPS` (6) hops. The wait before a commit ignores buckets.
 
 ## Cuts
 
@@ -99,8 +103,9 @@ membership, extend while it holds the next seq sealed in E with a chaining `prev
 another member's summary shows held, so every kept message has two holders. A member builds a commit only once it holds,
 or has lost, everything the previous cut kept, which makes it another holder of those. The pending commit keeps its
 authenticated data, so a retry posts the same cut; a commit that loses its epoch is built again on the next.
-Equivocation: the chain down from the cut's id decides which body is kept; a member holding another body under that
-`(membership, seq)` marks it not kept, warns, and asks for the kept one by id.
+Equivocation: a member keeps the first body it holds under a `(membership, seq)` and warns of another. Deciding by the
+chain down from the cut's id (marking another body not kept, asking for the kept one by id) is left for after 0.17.0:
+until then, members an author equivocated to may keep different bodies under one kept seq.
 
 **Keep-alive.** A member that holds messages unkept for 10 minutes commits an update at its slot (a hash of its key
 within the next 10 minutes), if its cut would keep any, unless a commit comes first; so active groups get about one commit per 10 minutes, and
@@ -172,7 +177,9 @@ persisted), and `away` (no summary within H, not connected). `Control::Lost` goe
 
 **Repair.** A member wants each membership's seqs it knows of (deps, prev gaps, cuts, summaries) that it neither holds
 nor lost, given up or not, and asks one holder per group at a time, in ascending seq order: a connected neighbour whose
-summary shows them, else any such member, dialed directly; with the timeout and strikes of 0.16, strikes lasting for
+summary shows them, else any such member, dialed directly. A request times out 10 s after it was made; an answer
+short of its size (about 1 MiB) strikes its holder for all that was asked, a full one for what it covered; a want
+refused, or of a group the holder no longer has, is answered empty. Strikes last for
 the epoch.
 
 ## The membership service
