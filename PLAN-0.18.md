@@ -54,13 +54,19 @@ one relay (#78). 0.18 keeps only keys in data and gets routes from outside:
   at start. A key that becomes relevant to none of the session's groups is dropped.
 - **Resolver** (a phone book). iroh's pkarr relay protocol at `<service host>/pkarr/<z32 key>`: `PUT` stores a
   record, `GET` returns the newest. In memory only.
-- **Phone books a session uses.** Its own (`--resolver`), plus the one on the host of each of its groups' services.
-  `serve` runs both on one host, so a service's phone book sits at its relay's `/pkarr`, known from the service's
-  record.
-  - The session publishes its record to all of them, and looks a key up in its own and in those of the services of
-    the groups it shares with that key.
+- **Phone books a session uses.** `serve` runs a relay and a phone book on one host, so a relay's phone book sits at
+  `<relay>/pkarr`.
+  - **It publishes its record to:**
+    - its own phone book (`--resolver`);
+    - the phone book on the host of each of its groups' services, known from the service's record;
+    - the phone book of every relay it connects through, before it connects (relay admission, below).
+  - **It looks a key up in** its own phone book and in those of the services of the groups it shares with that key.
   - So a group whose members use different phone books still reconnects after all of them were offline: they meet in
     the phone book of the group's service, which the group relies on already.
+- **Relay admission.** Our relay admits a key only while our phone book holds a fresh record of it. Every session
+  that uses the relay has published there first, so this stops other apps from using our relay as a free one. It
+  doesn't stop someone determined, since anyone can publish a record. iroh retries a refused relay connection, so a
+  connection that races the session's `PUT` costs one retry.
 - **Relays: chosen, or the defaults.** A session's relays are where it lives. Its home relay is one of them, and its
   record names that one. iroh picks the home relay among them by latency and moves off one that stops answering, in
   about a minute (validated: about 50 s).
@@ -100,6 +106,9 @@ anything.
 
 ## Own record
 
+Before the endpoint binds, the session `PUT`s a first record naming its configured relays to their phone books, so
+that its home relay admits it.
+
 crates/net implements iroh's `AddressLookup`. iroh calls `publish` whenever the endpoint's addresses change: on IP-only
 changes too, and before any home relay is known (validated: `[]`, `[]`, then `[relay]`). The session ignores data with
 no relay or with an unchanged one. Otherwise it:
@@ -120,6 +129,8 @@ changes from "holds no keys" to "holds no group keys".
     a path works.
 - **After a failed dial.** The node `GET`s the key from the phone books that may have it: its own, and those of the
   services of the groups it shares with that key. If a record is newer, it caches it and dials again.
+- **Publishing where it goes.** Before `resolve` yields a relay, it makes sure the session's record is fresh in that
+  relay's phone book, so the relay admits the session.
 - **Fallback.** When dialing a co-member, the node adds the relay in the record of the group's service.
   - **Why it works:** a member following its group's log holds a connection to the service, and iroh keeps the path
     through the service's relay as a backup. It pings it every 5 s, under the 60 s cutoff for an idle non-home
@@ -189,6 +200,8 @@ changes from "holds no keys" to "holds no group keys".
   taken, so a flood of fresh keys cannot push out live records. A record not republished within an hour expires.
 - **CORS:** `Access-Control-Allow-Origin: *` on both, and `OPTIONS` allows `PUT`, which a browser preflights.
 - **Access:** open to anyone holding a key (see Risks). `/stats` gains the record count.
+- **The relay's admission** (iroh-relay's `AccessControl::on_connect`, today `AllowAll`): it admits a key holding a
+  fresh record in this host's phone book, and the service's own key.
 
 ## Work, in order
 
@@ -260,7 +273,10 @@ changes from "holds no keys" to "holds no group keys".
   - `/pkarr` `PUT` and `GET`;
   - older, future-dated and forged records refused;
   - a flood of new keys leaves held records served;
-  - CORS preflight.
+  - CORS preflight;
+  - the relay refuses a key without a fresh record and admits it once one is `PUT`.
+- **Admission across hosts:** a session dials a peer living on another host's relay, and is admitted there after it
+  publishes; a browser publishes before its first relay connection.
 - **compat.py:** the released 0.17 against the new `serve`: create, join, follow.
 - **e2e:** a browser `PUT`s through the real `serve`; a browser and an agent on different relays.
 
@@ -289,6 +305,8 @@ changes from "holds no keys" to "holds no group keys".
 - **Resolver access** is open, with the rate limits above.
 - **Ours only:** the built-in relays and resolver are ours. No n0 public relays and no n0 resolver.
 - **Each group's service host is also its phone book**, as well as each session's own.
+- **Our relay admits only keys with a fresh record in our phone book.** Sessions therefore publish to the phone book
+  of each relay they use.
 
 ## Later
 
