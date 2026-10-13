@@ -1,5 +1,5 @@
 // The browser's session: lmk-node in WebAssembly (crates/web), its records and files kept in IndexedDB. One tab at a
-// time runs it, holding the Web Lock "lmk6"; the other tabs call it over the BroadcastChannel "lmk6", and hear
+// time runs it, holding the Web Lock "lmk7"; the other tabs call it over the BroadcastChannel "lmk7", and hear
 // its events there. When that tab closes, a waiting tab takes the lock and runs the session from IndexedDB. Its
 // default backend is compiled into the trusted frontend. Explicit localStorage choices override it; the backend
 // never supplies configuration or code.
@@ -72,7 +72,7 @@ export const listen = (listener: (event: Event) => void) => listeners.add(listen
 export const unlisten = (listener: (event: Event) => void) => listeners.delete(listener);
 const dispatch = (event: Event) => listeners.forEach(listener => listener(event));
 
-const channel = new BroadcastChannel("lmk6");
+const channel = new BroadcastChannel("lmk7");
 const tab = crypto.randomUUID();
 let calls = 0;
 /** This tab's calls not answered yet: sent again whenever a tab starts running the session. */
@@ -140,9 +140,14 @@ let running: Promise<void> | undefined;
 function run(device = ""): Promise<void> {
   running ??= (async () => {
     const { records, kept } = await store.load();
-    const membership = localStorage.getItem("lmk membership") ?? DEFAULT_MEMBERSHIP;
-    const relay = localStorage.getItem("lmk relay") ?? membership.slice(membership.indexOf("@") + 1);
-    const config = { device, relay, membership };
+    let membership = localStorage.getItem("lmk membership") ?? BACKEND.domain;
+    if (membership.includes("@") || membership === "letmeknow.dev") {
+      localStorage.removeItem("lmk relay");
+      dispatch({ type: "warning", text: `lmk membership ${membership} is letmeknow 0.17's: a membership is a domain now, as --membership <domain> is. This browser uses ${BACKEND.domain}.` });
+      membership = BACKEND.domain;
+    }
+    const relays = localStorage.getItem("lmk relay")?.split(",") ?? [];
+    const config = { device, membership, relays, backend: BACKEND };
     local = await start(records, kept, JSON.stringify(config), store, (json: string) => {
       const event = JSON.parse(json) as Event;
       if (event.type === "storage_failed") storageFailure = event;
@@ -165,7 +170,7 @@ function run(device = ""): Promise<void> {
 export async function prepare(): Promise<boolean> {
   const had = await store.has();
   await init({ module_or_path: wasm });
-  navigator.locks.request("lmk6", async () => {
+  navigator.locks.request("lmk7", async () => {
     leading = true;
     if (await store.has()) await run();
     await new Promise(() => {});
