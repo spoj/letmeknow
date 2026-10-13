@@ -31,7 +31,7 @@ async fn frames_go_both_ways_in_order() {
     let members: Vec<_> = keys.iter().map(|k| k.public()).collect();
     let mut a = node(&relay, keys[0].clone(), Fake::new(), Options::default()).await;
     let mut b = node(&relay, keys[1].clone(), Fake::new(), Options { relay_only: true, ..Options::default() }).await;
-    a.net.dial(members[1], vec![relay.url.clone()], vec![]).await.unwrap();
+    a.net.dial(members[1], vec![relay.url.clone()], Box::pin(std::future::ready(vec![]))).await.unwrap();
     assert_eq!(a.until(|e| matches!(e, Event::Connected(..))).await, Event::Connected(members[1], true));
     assert_eq!(b.until(|e| matches!(e, Event::Connected(..))).await, Event::Connected(members[0], false));
     for n in 1..=3 {
@@ -84,13 +84,13 @@ async fn file_from_two_holders_one_cut_off() {
     let link = a.net.add_file(std::io::Cursor::new(plain.clone())).await.unwrap();
     assert_eq!(link.size, plain.len() as u64);
     // B fetches it from A first.
-    b.net.dial(members[0], vec![relay.url.clone()], vec![]).await.unwrap();
+    b.net.dial(members[0], vec![relay.url.clone()], Box::pin(std::future::ready(vec![]))).await.unwrap();
     for fake in [&fake_a, &fake_b, &fake_c] {
         fake.groups.lock().unwrap().get_mut(G).unwrap().files.push(link.clone());
     }
     b.net.fetch(G, &link).await.unwrap();
 
-    c.net.dial(members[1], vec![relay.url.clone()], vec![]).await.unwrap();
+    c.net.dial(members[1], vec![relay.url.clone()], Box::pin(std::future::ready(vec![]))).await.unwrap();
     assert_eq!(c.net.held(link.hash).await.unwrap(), 0, "16 MiB is over C's limit, so C waits to be asked");
     // B, the one holder C knows, stops counting C as a member partway through the transfer: after about 3 MiB, at
     // 16 KiB a check. C then finds A, and the same fetch takes the rest from it.
@@ -98,7 +98,7 @@ async fn file_from_two_holders_one_cut_off() {
     let resume = async {
         eventually("B cut C off mid-transfer", || *fake_b.cut.lock().unwrap() == Some((members[2], 0))).await;
         assert!(c.net.held(link.hash).await.unwrap() > 0);
-        c.net.dial(members[0], vec![relay.url.clone()], vec![]).await.unwrap();
+        c.net.dial(members[0], vec![relay.url.clone()], Box::pin(std::future::ready(vec![]))).await.unwrap();
         c.net.fetch(G, &link).await.unwrap();
     };
     let (fetched, ()) = tokio::join!(c.net.fetch(G, &link), resume);
@@ -122,7 +122,7 @@ async fn small_files_are_fetched_when_wanted() {
     a.fake.groups.lock().unwrap().get_mut(G).unwrap().files.push(link.clone());
     let mut b = node(&relay, keys[1].clone(), Fake::new().with(G, group()), Options::default()).await;
     b.fake.groups.lock().unwrap().get_mut(G).unwrap().files.push(link.clone());
-    b.net.dial(members[0], vec![relay.url.clone()], vec![]).await.unwrap();
+    b.net.dial(members[0], vec![relay.url.clone()], Box::pin(std::future::ready(vec![]))).await.unwrap();
     b.net.want_files(members[0], G);
     b.until(|e| *e == Event::Fetched(link.hash)).await;
     let mut out = Vec::new();
@@ -173,7 +173,7 @@ async fn disk_acknowledgements_wait_for_persistence() {
     let disk = Arc::new(GatedDisk { files: Arc::default(), writes });
     let a = node(&relay, keys[0].clone(), Fake::new().with(G, group()), Options::default()).await;
     let mut b = node(&relay, keys[1].clone(), Fake::new().with(G, group()), Options { disk: Some(disk.clone()), ..Options::default() }).await;
-    a.net.dial(members[1], vec![relay.url.clone()], vec![]).await.unwrap();
+    a.net.dial(members[1], vec![relay.url.clone()], Box::pin(std::future::ready(vec![]))).await.unwrap();
     b.until(|e| matches!(e, Event::Connected(..))).await;
 
     let net = b.net.clone();
@@ -246,12 +246,12 @@ async fn a_disk_holds_and_serves_only_what_it_keeps() {
         fake.groups.lock().unwrap().get_mut(G).unwrap().files.extend([kept.clone(), fetched.clone(), own.clone()]);
     }
     assert!(a.net.has(kept.hash).await.unwrap());
-    a.net.dial(members[2], vec![relay.url.clone()], vec![]).await.unwrap();
+    a.net.dial(members[2], vec![relay.url.clone()], Box::pin(std::future::ready(vec![]))).await.unwrap();
     a.net.fetch(G, &fetched).await.unwrap();
     let mut out = Vec::new();
     a.net.read_file(&fetched, &mut out).await.unwrap();
     assert_eq!(out, b"fetched");
-    b.net.dial(members[0], vec![relay.url.clone()], vec![]).await.unwrap();
+    b.net.dial(members[0], vec![relay.url.clone()], Box::pin(std::future::ready(vec![]))).await.unwrap();
     assert_eq!(b.net.holders(G, kept.hash).collect::<Vec<_>>().await, vec![members[0]], "A loads a kept file to serve it");
     b.net.fetch(G, &kept).await.unwrap();
     out.clear();
@@ -272,8 +272,8 @@ async fn requests_to_be_admitted_are_answered_each_on_its_stream() {
     let member = node(&relay, keys[0].clone(), Fake::new(), Options::default()).await;
     let joiner = node(&relay, keys[1].clone(), Fake::new(), Options { relay_only: true, ..Options::default() }).await;
     let join = |secret: [u8; 16]| Join { secret: Bytes::from(secret), key_package: Bytes(b"kp".to_vec()) };
-    let ask = |join| joiner.net.join(keys[0].public(), vec![relay.url.clone()], vec![], join);
-    joiner.net.dial(keys[0].public(), vec![relay.url.clone()], vec![]).await.unwrap();
+    let ask = |join| joiner.net.join(keys[0].public(), vec![relay.url.clone()], Box::pin(std::future::ready(vec![])), join);
+    joiner.net.dial(keys[0].public(), vec![relay.url.clone()], Box::pin(std::future::ready(vec![]))).await.unwrap();
     let (invited, refused) = tokio::join!(ask(join(SECRET)), ask(join([0; 16])));
     assert!(matches!(invited.unwrap(), Answer::Ok(admitted) if admitted.commit.0 == b"invited"));
     assert_eq!(refused.unwrap(), Answer::Refused { refused: "unknown secret".into() });
@@ -295,7 +295,7 @@ async fn sessions_of_one_device_find_each_other() {
     eventually("A publishes its addresses", || addresses().is_some_and(|a| a["addrs"].as_array().is_some_and(|addrs| !addrs.is_empty()))).await;
     // A relay that is not there: only the published addresses lead to A.
     let nowhere: RelayUrl = "https://localhost:1".parse().unwrap();
-    b.net.dial(keys[0].public(), vec![nowhere], vec![]).await.unwrap();
+    b.net.dial(keys[0].public(), vec![nowhere], Box::pin(std::future::ready(vec![]))).await.unwrap();
     assert_eq!(b.net.connected(), [keys[0].public()]);
     a.net.shutdown().await.unwrap();
     assert!(!published.exists());
@@ -339,13 +339,29 @@ async fn stale_hint_reaches_peer_through_fallback() {
     let mut a = node(&rs[0], keys[0].clone(), Fake::new(), Options::default()).await;
     let mut b = node(&rs[2], keys[1].clone(), Fake::new(), Options::default()).await;
     let started = Instant::now();
-    a.net.dial(keys[1].public(), vec![rs[1].url.clone()], vec![rs[1].url.clone(), rs[2].url.clone()]).await.unwrap();
+    a.net.dial(keys[1].public(), vec![rs[1].url.clone()], Box::pin(std::future::ready(vec![rs[1].url.clone(), rs[2].url.clone()]))).await.unwrap();
     let took = started.elapsed();
     assert!(took >= Duration::from_secs(2) && took < Duration::from_secs(4), "connected after {took:?}");
     assert_eq!(a.net.connected(), [keys[1].public()]);
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(links(&mut a.events), [Event::Connected(keys[1].public(), true)]);
     assert_eq!(links(&mut b.events), [Event::Connected(keys[0].public(), false)]);
+}
+
+/// A fallback that takes long does not hold back a dial the hint reaches: the hint is dialed at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_fallback_does_not_hold_back_the_hint() {
+    let rs = relays(1).await;
+    let keys = keys(2);
+    let a = node(&rs[0], keys[0].clone(), Fake::new(), Options::default()).await;
+    let _b = node(&rs[0], keys[1].clone(), Fake::new(), Options::default()).await;
+    let started = Instant::now();
+    let slow = async {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        vec![]
+    };
+    a.net.dial(keys[1].public(), vec![rs[0].url.clone()], Box::pin(slow)).await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2), "connected after {:?}", started.elapsed());
 }
 
 /// The connection events queued so far.
@@ -360,7 +376,7 @@ async fn dial_to_absent_key_gives_up() {
     let keys = keys(3);
     let a = node(&rs[0], keys[0].clone(), Fake::new(), Options::default()).await;
     let started = Instant::now();
-    let dialed = a.net.dial(keys[2].public(), vec![rs[1].url.clone()], vec![rs[0].url.clone(), rs[1].url.clone()]).await;
+    let dialed = a.net.dial(keys[2].public(), vec![rs[1].url.clone()], Box::pin(std::future::ready(vec![rs[0].url.clone(), rs[1].url.clone()]))).await;
     let took = started.elapsed();
     assert!(dialed.is_err());
     assert!(took >= Duration::from_secs(6) && took < Duration::from_secs(8), "gave up after {took:?}");

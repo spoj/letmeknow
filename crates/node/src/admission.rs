@@ -135,7 +135,7 @@ impl<P: Provider + Send + 'static> Node<P> {
                     // A dial that fails at once, as one from a node that has just started can, is tried again until the wait
                     // is up.
                     let dialed = timeout(DIAL_WAIT, async {
-                        while let Err(error) = net.dial(peer, hint.clone(), own.clone()).await {
+                        while let Err(error) = net.dial(peer, hint.clone(), Box::pin(std::future::ready(own.clone()))).await {
                             tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
                             sleep(Duration::from_secs(1)).await;
                         }
@@ -159,7 +159,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
             let deadline = Instant::now() + JOIN_WAIT;
             let answer = loop {
-                let answer = timeout(deadline.saturating_duration_since(Instant::now()), self.inner.net().join(peer, hint(peer), self.inner.relays.clone(), join.clone())).await;
+                let answer = timeout(deadline.saturating_duration_since(Instant::now()), self.inner.net().join(peer, hint(peer), Box::pin(std::future::ready(self.inner.relays.clone())), join.clone())).await;
                 match answer {
                     // The connection may have been replaced by one the member dialed meanwhile; asking again is safe, as a
                     // member that added this session answers with the commit entry it kept. The ask may have added it.

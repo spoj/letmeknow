@@ -14,7 +14,7 @@ use lmk_net::Net;
 use lmk_proto::group::{Leaf, REVISION};
 use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
-use n0_future::task::spawn;
+use n0_future::{join_all, task::spawn};
 use n0_future::time::{Duration, sleep};
 use tokio::sync::mpsc;
 
@@ -221,8 +221,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let hint: Vec<RelayUrl> = self.lock().hint_of(&peer).into_iter().collect();
         let inner = self.clone();
         spawn(async move {
-            let fallback = inner.fallback(peer).await;
-            let dialed = inner.net().dial(peer, hint, fallback).await;
+            let dialed = inner.net().dial(peer, hint, Box::pin(inner.clone().fallback(peer))).await;
             if let Err(error) = &dialed {
                 tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
             }
@@ -233,8 +232,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// The relays a member may be reached at: this session's own, the relay of the service of each group the member is
-    /// in, and the relays of the identity it speaks as. A service whose directory does not resolve adds none.
-    async fn fallback(&self, peer: EndpointId) -> Vec<RelayUrl> {
+    /// in, and the relays of the identity it speaks as. The directories resolve together; one that does not adds none.
+    async fn fallback(self: Arc<Self>, peer: EndpointId) -> Vec<RelayUrl> {
         let (groups, identities) = {
             let st = self.lock();
             let (mut groups, mut identities) = (Vec::new(), Vec::new());
@@ -254,17 +253,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
             (groups, identities)
         };
+        let resolve = &self.resolve;
+        let services = groups.iter().map(|service| (service, false)).chain(identities.iter().map(|service| (service, true)));
+        let found = join_all(services.map(|(service, identity)| async move {
+            let found = lmk_membership::client::directory(resolve, service).await;
+            found.map(|found| if identity { found.relays } else { vec![found.relay] }).unwrap_or_default()
+        }))
+        .await;
         let mut relays = self.relays.clone();
-        for service in groups {
-            if let Ok(directory) = lmk_membership::client::directory(&self.resolve, &service).await {
-                relays.extend(directory.relay.parse());
-            }
-        }
-        for service in identities {
-            if let Ok(directory) = lmk_membership::client::directory(&self.resolve, &service).await {
-                relays.extend(directory.relays.iter().filter_map(|relay| relay.parse().ok()));
-            }
-        }
+        relays.extend(found.iter().flatten().filter_map(|relay| relay.parse().ok()));
         relays
     }
 
