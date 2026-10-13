@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use iroh::tls::CaTlsConfig;
 use lmk_core::device::Device;
+use lmk_core::group::Session as Mls;
 use lmk_core::provider::{MemoryProvider, Provider, SqliteProvider};
 use lmk_membership::service::Service as Membership;
 use lmk_membership::store::Store;
@@ -16,8 +17,7 @@ use lmk_proto::group::{CHAT, Certificate, ChatMessage, IDENTITY, IdentityRef, PR
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
 use lmk_proto::head::Head;
-use lmk_proto::peer::{Frame, Item, Summary};
-use lmk_proto::ranges::Ranges;
+use lmk_proto::peer::{Frame, Seqs};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -120,7 +120,7 @@ fn settings(kind: &str, relay: &Relay) -> Settings {
 }
 
 fn message(text: &str) -> Value {
-    serde_json::to_value(ChatMessage { content: text.into(), read: Default::default(), to: vec![], reply_to: None, urgent: false, attachment: None, sent_at: None }).unwrap()
+    serde_json::to_value(ChatMessage { content: text.into(), to: vec![], urgent: false, attachment: None, sent_at: None }).unwrap()
 }
 
 /// A new identity, its public log on `membership`, whose first writer is a device called laptop, read by `node`: the
@@ -148,6 +148,8 @@ fn certificate(identity: &IdentityRef, device: &[u8; 32], session: &Bytes, name:
     Certificate { identity: identity.clone(), device: key.into(), name: name.into(), device_name: device_name.into(), sig: Bytes(sig) }
 }
 
+/// A mirror of an identity's public log is only a hint: a reader takes the log from the service the identity names, and a
+/// stale copy installs no claim.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_identity_mirror_is_only_a_hint_to_its_authoritative_service() {
     use lmk_core::public::{PublicLog, Verdict};
@@ -198,6 +200,7 @@ async fn an_identity_mirror_is_only_a_hint_to_its_authoritative_service() {
     reader.node.shutdown().await.unwrap();
 }
 
+/// A first lookup of an identity that fails persists no route to it; the genuine genesis, once served, does.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_first_identity_lookup_does_not_persist_a_route() {
     use lmk_membership::client::ServeClient;
@@ -242,6 +245,7 @@ async fn a_failed_first_identity_lookup_does_not_persist_a_route() {
     reader.node.shutdown().await.unwrap();
 }
 
+/// A joiner whose Welcome failed to persist retries after a restart with the Add already logged, not another.
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_welcome_is_retried_after_restart() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -297,6 +301,7 @@ async fn failed_welcome_is_retried_after_restart() {
     bob.node.shutdown().await.unwrap();
 }
 
+/// A removal is reported only once durable: while persistence fails, the removed member sees no `Removed`.
 #[tokio::test(flavor = "multi_thread")]
 async fn removal_events_require_durability() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -320,7 +325,7 @@ async fn removal_events_require_durability() {
         bob.node.join(&link, None).await.unwrap();
         if failed {
             fail.store(true, Ordering::SeqCst);
-            let error = bob.node.send(&gid.0, &message("not durable")).await.unwrap_err();
+            let error = bob.node.send(&gid.0, &message("not durable"), None).await.unwrap_err();
             assert!(format!("{error:#}").contains("injected persistence failure"), "{error:#}");
             fail.store(false, Ordering::SeqCst);
         }
@@ -332,7 +337,7 @@ async fn removal_events_require_durability() {
             }
         } else {
             bob.until(|event| match event {
-                Event::Removed { group, kind, by } => {
+                Event::Removed { group, kind, by, .. } => {
                     assert_eq!(group, gid);
                     assert_eq!(kind, CHAT);
                     assert_eq!(by.unwrap().name, "Alice");
@@ -346,6 +351,8 @@ async fn removal_events_require_durability() {
     }
 }
 
+/// A chat of two: a message arrives with its sender, a settings change reaches the other member, and a removal ends its
+/// group for the removed member.
 #[tokio::test(flavor = "multi_thread")]
 async fn chat_and_removal() {
     let relay = relay().await;
@@ -362,14 +369,14 @@ async fn chat_and_removal() {
     assert_eq!(member.name, "Bob");
     assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
 
-    let sent = bob.node.send(&gid.0, &message("hello")).await.unwrap();
+    let sent = bob.node.send(&gid.0, &message("hello"), None).await.unwrap();
     let got = alice.until(|e| match e {
         Event::Message(message) => Some(message),
         _ => None,
     }).await;
-    assert_eq!((got.id, got.position, got.sender.name.as_str()), (sent.id, sent.position.unwrap(), "Bob"));
+    assert_eq!((got.id, got.seq, got.sender.name.as_str()), (sent, 1, "Bob"));
     let big = message(&"x".repeat(1 << 20));
-    let refused = bob.node.send(&gid.0, &big).await.unwrap_err();
+    let refused = bob.node.send(&gid.0, &big, None).await.unwrap_err();
     assert!(matches!(refused.downcast_ref(), Some(lmk_node::SendError::Size(_))), "{refused:#}");
 
     alice.node.change_settings(&gid.0, |s| Settings { name: "Release".into(), ..s }).await.unwrap();
@@ -426,7 +433,7 @@ async fn any_member_admits_an_invite_once() {
     // An expired one too.
     let secret = [7u8; 16];
     let expired = json!({ "type": "invite", "hash": Bytes(Sha256::digest(secret).to_vec()), "expires": lmk_node::now() - 1 });
-    bob.node.send(&gid.0, &expired).await.unwrap();
+    bob.node.send(&gid.0, &expired, None).await.unwrap();
     eventually("Alice holds the expired invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["type"] == "invite")).await;
     let expired = Invite { secret, members: vec![link.members[0].clone()], ..link.clone() };
     assert!(format!("{:#}", erin.node.join(&expired, None).await.unwrap_err()).contains("unknown, used or expired"));
@@ -494,6 +501,7 @@ async fn an_invite_dies_when_its_inviter_leaves() {
     alice.node.shutdown().await.unwrap();
 }
 
+/// A joiner gets the kind's state from its admitter; the kind's held and live payloads and its linked files reach it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() {
     let relay = relay().await;
@@ -523,19 +531,19 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
 
     // Held and live payloads; a live payload to one member.
     let push = json!({ "type": "push", "n": 1 });
-    let sent = alice.node.send(&gid.0, &push).await.unwrap();
+    let sent = alice.node.send(&gid.0, &push, None).await.unwrap();
     let held = bob.until(|e| match e {
         Event::Message(message) => Some(message),
         _ => None,
     }).await;
-    assert_eq!((held.id, held.payload), (sent.id, push));
+    assert_eq!((held.id, held.payload), (sent, push));
     alice.node.send_live(&gid.0, &json!({ "type": "edit", "n": 2 }), Some(&lmk_node::fp(&bob.node.key().0))).unwrap();
     let live = bob.until(|e| match e {
         Event::Live { payload, sender, .. } => Some((payload, sender.name)),
         _ => None,
     }).await;
     assert_eq!(live, (json!({ "type": "edit", "n": 2 }), "Alice".to_owned()));
-    assert!(bob.node.messages(&gid.0).unwrap().iter().all(|m| m.payload["type"] == "push"), "a live payload is not held");
+    assert!(bob.node.messages(&gid.0).unwrap().iter().all(|m| m.payload["type"] != "edit"), "a live payload is not held");
 
     // A file the kind links now is fetched and held; one it hands as state reaches the member it names.
     let file = alice.node.add_file(&gid.0, b"linked".to_vec()).await.unwrap();
@@ -616,6 +624,7 @@ impl iroh::protocol::ProtocolHandler for Gated {
     }
 }
 
+/// A publication that fails with its persistence appends nothing to the directory, and a retry resumes once it works.
 #[tokio::test(flavor = "multi_thread")]
 async fn publication_resuming_after_persistence_failure_does_not_append() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -671,7 +680,7 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
         }
     }).await.unwrap();
     fail.store(true, Ordering::SeqCst);
-    let error = node.send(&gid.0, &message("not durable")).await.unwrap_err();
+    let error = node.send(&gid.0, &message("not durable"), None).await.unwrap_err();
     assert!(format!("{error:#}").contains("injected persistence failure"), "{error:#}");
     fail.store(false, Ordering::SeqCst);
     gate.set(true);
@@ -713,7 +722,7 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
         let secret: [u8; 16] = lmk_core::random();
         let hash = Bytes(Sha256::digest(secret).to_vec());
         let rule = json!({ "type": "invite", "hash": hash, "expires": expires, "to": carol.id });
-        bob.node.send(&gid.0, &rule).await.unwrap();
+        bob.node.send(&gid.0, &rule, None).await.unwrap();
         eventually("Alice holds the invite", || alice.node.messages(&gid.0).unwrap().iter().any(|m| m.payload["hash"] == rule["hash"])).await;
         let link = Invite { device: false, secret, members: alice_only.clone() };
         let mut joining = tokio::spawn(async move { joiner.node.join(&link, Some(certificate)).await.map(|(gid, _)| gid) });
@@ -750,14 +759,12 @@ async fn a_contradiction_is_reported_once() {
     let dir = folder("contradiction");
     let (membership, _service) = signing_service(&relay, &dir).await;
     let mut alice = session(&relay, "Alice").await;
-    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
-    let rename = |name: &'static str| move |s: Settings| Settings { name: name.into(), ..s };
-    alice.node.change_settings(&gid.0, rename("Release")).await.unwrap();
-    alice.node.send_counted(&gid.0, &message("in the epoch's log")).await.unwrap();
+    let (identity, _laptop) = identity(&relay, &alice.node, membership).await;
+    alice.node.read_public(&identity).await.unwrap();
     let db = rusqlite::Connection::open(dir.join("membership/membership.db")).unwrap();
-    assert_eq!(db.execute("UPDATE anchors SET hash = zeroblob(32) WHERE reference = ?", [&alice.node.log(&gid.0).unwrap().0]).unwrap(), 1);
-    for name in ["Again", "And again"] {
-        assert!(alice.node.change_settings(&gid.0, rename(name)).await.is_err());
+    assert!(db.execute("UPDATE anchors SET hash = zeroblob(32)", []).unwrap() > 0);
+    for _ in 0..2 {
+        assert!(alice.node.read_public(&identity).await.is_err());
     }
     let mut warnings = 0;
     while let Ok(event) = alice.events.try_recv() {
@@ -766,27 +773,7 @@ async fn a_contradiction_is_reported_once() {
     assert_eq!(warnings, 1);
 }
 
-/// The kind's held messages taken after position `after`.
-fn entries<P: Provider + Send + 'static>(node: &Node<P>, gid: &Bytes, after: u64) -> Vec<lmk_node::Entry> {
-    let items = node.entries(&gid.0, after).unwrap().into_iter();
-    items.filter_map(|item| match item {
-        lmk_node::Item::Entry(entry) => Some(entry),
-        lmk_node::Item::Lost(_) => None,
-    }).collect()
-}
-
 impl Session {
-    /// Waits for the kind's held messages after position `after`; returns them.
-    async fn logged(&mut self, gid: &Bytes, after: u64) -> Vec<lmk_node::Entry> {
-        loop {
-            let entries = entries(&self.node, gid, after);
-            if !entries.is_empty() {
-                return entries;
-            }
-            self.until(|e| matches!(e, Event::Logged { .. }).then_some(())).await;
-        }
-    }
-
     /// Answers the next request for the kind's state.
     async fn snapshot(&mut self, state: Option<&[u8]>) {
         let reply = self.until(|e| match e {
@@ -797,107 +784,6 @@ impl Session {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_kind_takes_held_messages_in_log_order_and_a_member_without_state_asks_for_one() {
-    let relay = relay().await;
-    let dir = folder("log");
-    let (membership, _service) = signing_service(&relay, &dir).await;
-    let mut alice = session(&relay, "Alice").await;
-    let bob = session(&relay, "Bob").await;
-    let gid = alice.node.create(Settings { membership, ..settings(KIND, &relay) }, None).unwrap();
-    alice.node.follow_log(&gid.0, Some(0)).unwrap();
-    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let joining = tokio::spawn(async move { bob.node.join(&link, None).await.map(|_| bob) });
-    alice.snapshot(Some(b"empty")).await;
-    let mut bob = joining.await.unwrap().unwrap();
-    bob.until(|e| matches!(e, Event::State { .. }).then_some(())).await;
-    bob.node.follow_log(&gid.0, Some(0)).unwrap();
-
-    // A held send answers its entry's position, and every member takes the messages in one order.
-    let one = alice.node.send(&gid.0, &json!({ "type": "push", "n": 1 })).await.unwrap();
-    let p = one.position.unwrap();
-    let first = bob.logged(&gid, 0).await;
-    assert_eq!((first[0].position, first[0].from.name.as_str(), &first[0].payload), (p, "Alice", &json!({ "type": "push", "n": 1 })));
-    assert_eq!(first[0].id, one.id);
-    let (two, three) = (json!({ "type": "push", "n": 2 }), json!({ "type": "push", "n": 3 }));
-    let (a, b) = tokio::join!(alice.node.send_counted(&gid.0, &two), bob.node.send_counted(&gid.0, &three));
-    let mut positions = [a.unwrap(), b.unwrap()];
-    positions.sort();
-    assert_eq!(positions, [p + 1, p + 2]);
-    let order = |entries: Vec<lmk_node::Entry>| entries.iter().map(|e| (e.position, e.payload["n"].as_u64().unwrap())).collect::<Vec<_>>();
-    let seen = order(alice.logged(&gid, p + 1).await);
-    let seen = if seen.len() == 2 { seen } else { order(entries(&alice.node, &gid, p)) };
-    assert_eq!(seen.len(), 2);
-    assert_eq!(order(bob.logged(&gid, p + 1).await), seen[1..]);
-    bob.node.follow_log(&gid.0, Some(p + 1)).unwrap();
-    assert_eq!(bob.node.entries(&gid.0, 0).unwrap().len(), 1, "messages the kind read past go");
-
-    // Carol joins with no state, admitted by whichever member she reaches first: she asks every member online for the
-    // kind's state, gets none from Bob, and Alice's, and follows from her start.
-    let carol = session(&relay, "Carol").await;
-    let link = bob.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let joining = tokio::spawn(async move { carol.node.join(&link, None).await.map(|_| carol) });
-    tokio::select! {
-        _ = alice.snapshot(None) => {}
-        _ = bob.snapshot(None) => {}
-    }
-    let mut carol = joining.await.unwrap().unwrap();
-    let mut synced = std::collections::BTreeSet::new();
-    carol.until(|e| match e {
-        Event::Synced { member, .. } => (synced.insert(member.name) && synced.len() == 2).then_some(()),
-        _ => None,
-    }).await;
-    carol.node.follow_log(&gid.0, None).unwrap();
-    tokio::join!(alice.snapshot(Some(b"through 3")), bob.snapshot(None));
-    let data = carol.until(|e| match e {
-        Event::State { data, .. } => Some(data),
-        _ => None,
-    }).await;
-    assert_eq!(data, b"through 3");
-    carol.node.follow_log(&gid.0, Some(p + 2)).unwrap();
-    let four = carol.node.send_counted(&gid.0, &json!({ "type": "push", "n": 4 })).await.unwrap();
-    let after = alice.logged(&gid, p + 2).await;
-    assert_eq!((after[0].position, after[0].from.name.as_str()), (four, "Carol"));
-    assert_eq!(carol.logged(&gid, 0).await[0].from.name, "Carol");
-}
-
-/// A member whose kind has no state asks the members online for one as they connect, as after a restart.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_member_without_state_asks_for_one_once_members_are_online() {
-    use lmk_core::provider::SqliteProvider;
-    let relay = relay().await;
-    let dir = folder("state-ask");
-    let (membership, _service) = signing_service(&relay, &dir).await;
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut alice = session(&relay, "Alice").await;
-    let gid = alice.node.create(Settings { membership, ..settings(KIND, &relay) }, None).unwrap();
-    alice.node.follow_log(&gid.0, Some(0)).unwrap();
-    let start = || {
-        let (relay, db) = (&relay, dir.join("carol.db"));
-        async move {
-            let (node, events) = Node::start(SqliteProvider::open(&db).unwrap(), config(relay, "Carol", None, &[CHAT, KIND])).await.unwrap();
-            Session { node, events }
-        }
-    };
-    let carol = start().await;
-    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let joining = tokio::spawn(async move { carol.node.join(&link, None).await.map(|_| carol) });
-    alice.snapshot(None).await;
-    let carol = joining.await.unwrap().unwrap();
-    carol.node.follow_log(&gid.0, None).unwrap();
-    alice.snapshot(None).await;
-    carol.node.shutdown().await.unwrap();
-    drop(carol);
-
-    let mut carol = start().await;
-    alice.snapshot(Some(b"state")).await;
-    let data = carol.until(|e| match e {
-        Event::State { data, .. } => Some(data),
-        _ => None,
-    }).await;
-    assert_eq!(data, b"state");
-    alice.node.shutdown().await.unwrap();
-}
 
 impl<P: Provider + Send + 'static> Session<P> {
     /// Waits until a member's identity checks out, or not.
@@ -961,6 +847,8 @@ fn devices_group<P: Provider + Send + 'static>(node: &Node<P>) -> Bytes {
     node.groups().into_iter().find(|gid| node.settings(&gid.0).unwrap().kind == IDENTITY).unwrap()
 }
 
+/// Devices share an identity's list; each certifies its session, and a device dropped from the list takes its session out
+/// of chats.
 #[tokio::test(flavor = "multi_thread")]
 async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions() {
     let relay = relay().await;
@@ -999,7 +887,7 @@ async fn devices_share_an_identity_list_their_devices_and_certify_their_sessions
     lists(&laptop.node, &bob, &[laptop_devices.key().unwrap()]).await;
     alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "tablet").then_some(())).await;
     alice.checked(&chat, "laptop", true).await;
-    let id = alice.node.send(&chat.0, &message("after the tablet left")).await.unwrap().id;
+    let id = alice.node.send(&chat.0, &message("after the tablet left"), None).await.unwrap();
     let got = laptop.until(|e| match e {
         Event::Message(message) if message.id == id => Some(message.id),
         _ => None,
@@ -1167,7 +1055,8 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
     let old = lmk_proto::group::Leaf { revision: 0, ..mls.leaf.clone() };
     let mut group = Group::load(&provider, &gid.0).unwrap();
     let capability = group.capability(&provider).unwrap();
-    let commit = group.commit(&provider, &mls, Change { leaf: Some(old), ..Change::default() }).unwrap();
+    let cut = group.cut().to_vec();
+    let commit = group.commit(&provider, &mls, Change { leaf: Some(old), cut, ..Change::default() }).unwrap();
     let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
     lmk_membership::client::ServeClient::for_service(endpoint, &relay.service).unwrap().append(&capability, &[commit.entry], false).await.unwrap();
     drop(provider);
@@ -1179,6 +1068,7 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
     alice.node.shutdown().await.unwrap();
 }
 
+/// A device keeps its identity across restarts, from its database.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_keeps_its_identity_across_restarts() {
     use lmk_core::provider::SqliteProvider;
@@ -1201,51 +1091,6 @@ async fn a_device_keeps_its_identity_across_restarts() {
     node.shutdown().await.unwrap();
 }
 
-/// A member catching up from a holder gets a sender's messages about as they were sent, so more than the 1000 that MLS
-/// opens out of order all arrive.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_member_catching_up_takes_more_than_a_thousand_messages_of_one_sender() {
-    use lmk_core::provider::SqliteProvider;
-    const MESSAGES: usize = 1100;
-    let relay = relay().await;
-    let dir = folder("thousand");
-    std::fs::create_dir_all(&dir).unwrap();
-    let carol_config = || config(&relay, "Carol", None, &[CHAT]);
-    let carol_db = dir.join("carol.db");
-    let mut alice = session(&relay, "Alice").await;
-    let mut bob = session(&relay, "Bob").await;
-    let (carol, _events) = Node::start(SqliteProvider::open(&carol_db).unwrap(), carol_config()).await.unwrap();
-    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
-    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    bob.node.join(&link, None).await.unwrap();
-    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    carol.join(&link, None).await.unwrap();
-    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    bob.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    carol.shutdown().await.unwrap();
-    drop(carol);
-    for n in 0..MESSAGES {
-        alice.node.send(&gid.0, &message(&n.to_string())).await.unwrap();
-    }
-    for _ in 0..MESSAGES {
-        bob.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
-    }
-    alice.node.shutdown().await.unwrap();
-    drop(alice);
-    let (carol, mut events) = Node::start(SqliteProvider::open(&carol_db).unwrap(), carol_config()).await.unwrap();
-    let mut taken = 0;
-    let all = async {
-        while taken < MESSAGES {
-            if let Event::Message(_) = events.recv().await.unwrap() {
-                taken += 1;
-            }
-        }
-    };
-    tokio::time::timeout(3 * WAIT, all).await.expect("Carol took every message");
-    carol.shutdown().await.unwrap();
-}
-
 /// Waits until `done` holds, polling.
 async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     tokio::time::timeout(WAIT, async {
@@ -1257,8 +1102,8 @@ async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     .unwrap_or_else(|_| panic!("{what}"));
 }
 
-/// A `leave` sent while the group's log is unreachable is pending: the leaver appends it once the log is reachable,
-/// after a restart with `restart_leaver`, and the other member then removes it.
+/// A `leave` sent while the membership service is unreachable reaches the other member, which removes the leaver once the
+/// service is back: the leaver is restarted meanwhile with `restart_leaver`.
 async fn held_leave(test: &str, restart_leaver: bool) {
     use lmk_core::provider::SqliteProvider;
     let relay = relay().await;
@@ -1279,22 +1124,15 @@ async fn held_leave(test: &str, restart_leaver: bool) {
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
 
     gate.set(false);
-    let mut bob = bob;
-    let sent = bob.node.leave(&gid.0).await.unwrap().unwrap();
-    assert_eq!(sent.position, None, "the leave is pending");
+    bob.node.leave(&gid.0).await.unwrap().unwrap();
     if restart_leaver {
         bob.node.shutdown().await.unwrap();
         drop(bob);
         gate.set(true);
-        bob = start("Bob").await;
+        let _bob = start("Bob").await;
     } else {
         gate.set(true);
     }
-    let answered = bob.until(|e| match e {
-        Event::Sent { answered, .. } => Some(answered),
-        _ => None,
-    }).await;
-    assert_eq!(answered, sent.id, "Sent names the send as `leave` answered it");
     alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "Bob").then_some(())).await;
     assert_eq!(alice.node.members(&gid.0).unwrap().len(), 1);
     alice.node.shutdown().await.unwrap();
@@ -1329,28 +1167,37 @@ async fn an_old_leave_does_not_remove_a_member_added_again() {
     bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     // Only Carol holds the leave: were Bob online, Alice's wait could end at her connection to him before Carol's lands.
     bob.node.shutdown().await.unwrap();
-    let alice = start().await;
+    let mut alice = start().await;
     let leaves = || alice.node.messages(&gid.0).unwrap().iter().filter(|m| m.payload["type"] == "leave").count();
-    eventually("Alice holds Bob's old leave", || leaves() == 1).await;
+    // Alice applies the removal before it reaches Carol, which holds the leave: it is told the leave lost, or holds it.
+    let mut lost = false;
+    eventually("Alice settles the old leave", || {
+        while let Ok(event) = alice.events.try_recv() {
+            lost |= matches!(event, Event::Lost(_));
+        }
+        lost || leaves() == 1
+    })
+    .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(alice.node.members(&gid.0).unwrap().len(), 3, "Bob is still in");
     assert_eq!(carol.node.members(&gid.0).unwrap().len(), 3, "Bob is still in");
     alice.node.shutdown().await.unwrap();
 }
 
+/// A `leave` sent while the membership service is unreachable is finished by the other member, the leaver restarted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pending_leave_is_finished_after_a_restart() {
     held_leave("leave-restart", true).await;
 }
 
+/// A `leave` sent while the membership service is unreachable is finished by the other member once the service is back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pending_leave_is_finished_once_the_log_is_reachable() {
     held_leave("leave-reachable", false).await;
 }
 
 /// Each commit moves a group to its new epoch's log, at a reference only the epoch's members can derive: a joiner reads
-/// from the log its Add moved the group to, a removed member is left behind on the last one it could name, and positions
-/// go on across the moves.
+/// from the log its Add moved the group to, and a removed member is left behind on the last one it could name.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_commit_moves_the_group_to_its_new_epochs_log() {
     let relay = relay().await;
@@ -1359,7 +1206,7 @@ async fn each_commit_moves_the_group_to_its_new_epochs_log() {
     let mut carol = session(&relay, "Carol").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let mut logs = vec![alice.node.log(&gid.0).unwrap()];
-    let before = alice.node.send_counted(&gid.0, &message("before anyone")).await.unwrap();
+    alice.node.send(&gid.0, &message("before anyone"), None).await.unwrap();
     for joiner in [&bob, &carol] {
         joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
@@ -1371,47 +1218,15 @@ async fn each_commit_moves_the_group_to_its_new_epochs_log() {
     alice.node.remove(&gid.0, &carol.node.key_in(&gid.0).0).await.unwrap();
     carol.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     assert!(!logs.contains(&alice.node.log(&gid.0).unwrap()), "the Remove moved the group to a log Carol cannot name");
-    let after = alice.node.send_counted(&gid.0, &message("after Carol")).await.unwrap();
-    assert!(after >= before + 4, "two Adds and a Remove came between: {before}, then {after}");
+    let after = alice.node.send(&gid.0, &message("after Carol"), None).await.unwrap();
     let got = bob.until(|e| match e {
-        Event::Message(m) if m.payload == message("after Carol") => Some(m.position),
+        Event::Message(m) if m.payload == message("after Carol") => Some(m.id),
         _ => None,
     }).await;
     assert_eq!(got, after);
     for session in [&alice, &bob, &carol] {
         session.node.shutdown().await.unwrap();
     }
-}
-
-/// A pending send sealed again after a commit is reported sent by the id its members know it by.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_pending_send_sealed_again_is_reported_by_its_final_id() {
-    let relay = relay().await;
-    let dir = folder("sealed-again");
-    let (gate, _reaching) = Gate::new();
-    let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
-    let (mut alice, mut bob) = (session(&relay, "Alice").await, session(&relay, "Bob").await);
-    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
-    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
-    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-
-    // Only Bob is kept from the log: his send is pending while Alice renames the group.
-    gate.spared.lock().unwrap().push(alice.node.address().0);
-    gate.set(false);
-    let sent = bob.node.send(&gid.0, &message("before the rename")).await.unwrap();
-    assert_eq!(sent.position, None, "the send is pending");
-    alice.node.change_settings(&gid.0, |s| Settings { name: "Release".into(), ..s }).await.unwrap();
-    gate.set(true);
-    let (id, answered) = bob.until(|e| match e {
-        Event::Sent { id, answered, .. } => Some((id, answered)),
-        _ => None,
-    }).await;
-    assert!(answered == sent.id && id != sent.id, "sealed again after the rename");
-    let got = alice.until(|e| match e {
-        Event::Message(message) => Some(message.id),
-        _ => None,
-    }).await;
-    assert_eq!(got, id);
 }
 
 /// Two members that leave at once: one's removal of the other wins, and the one left alone forgets the group.
@@ -1505,38 +1320,26 @@ async fn expired_service_history_preserves_chat_and_identity_groups() {
             gid
         };
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-        let held = bob.node.send(&gid.0, &message("held before refusal")).await.unwrap();
+        let held = bob.node.send(&gid.0, &message("held before refusal"), None).await.unwrap();
         let file = bob.node.add_file(&gid.0, b"held file".to_vec()).await.unwrap();
         let members = bob.node.members(&gid.0).unwrap();
         let epoch = bob.node.epoch(&gid.0).unwrap();
         let key = bob.node.key_in(&gid.0);
         let identity = bob_devices.identity();
+        let log_ref: [u8; 32] = bob.node.log(&gid.0).unwrap().0.try_into().unwrap();
         let signature = (kind == IDENTITY).then(|| bob.node.sign(&gid.0, b"still my key").unwrap());
         bob.node.shutdown().await.unwrap();
         drop((bob, bob_devices));
-        let bob_db = dir.join("Bob.db");
-        let before = holdings(&bob_db, &gid, &[held.position.unwrap()]);
-        let (log_ref, length) = (before.1.log, before.1.head.as_ref().map_or(0, |head| head.length));
-        let log_key = [b"node/log/".as_slice(), &log_ref].concat();
-        let provider = SqliteProvider::open(&bob_db).unwrap();
-        let log = provider.get(&log_key).unwrap().unwrap();
-        let entries: Vec<_> = (1..=length).map(|position| {
-            let key = [b"node/entry/".as_slice(), &log_ref, b"/", &position.to_be_bytes()].concat();
-            let entry = provider.get(&key).unwrap().unwrap();
-            (key, entry)
-        }).collect();
-        assert!(!entries.is_empty());
-        drop(provider);
 
         for name in ["Sooner", "Later"] {
             alice.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
         }
-        let missed = alice.node.send(&gid.0, &message("recover from the peer")).await.unwrap();
+        let missed = alice.node.send(&gid.0, &message("recover from the peer"), None).await.unwrap();
         alice.node.shutdown().await.unwrap();
         drop((alice, alice_devices));
         let store = Store::open(&dir.join("membership")).unwrap();
         assert!(store.expire(lmk_node::now() / lmk_membership::store::DAY_MS + 1).unwrap() > 0);
-        assert!(store.read(&log_ref, length).unwrap_err().is::<lmk_membership::Refused>());
+        assert!(store.read(&log_ref, 0).unwrap_err().is::<lmk_membership::Refused>());
 
         let (mut bob, bob_devices) = start("Bob").await;
         let error = bob.node.read_group(&gid.0).await.unwrap_err();
@@ -1554,23 +1357,13 @@ async fn expired_service_history_preserves_chat_and_identity_groups() {
         assert_eq!(bob.node.epoch(&gid.0).unwrap(), epoch);
         assert_eq!(bob.node.key_in(&gid.0), key);
         assert_eq!(bob_devices.identity(), identity);
-        assert_eq!(bob.node.message(&held.id.0).unwrap().unwrap().payload, message("held before refusal"));
+        assert_eq!(bob.node.message(&gid.0, &held.0).unwrap().unwrap().payload, message("held before refusal"));
         assert_eq!(bob.node.file(&file).await.unwrap().unwrap(), b"held file");
         if let Some(signature) = &signature {
             assert_eq!(&bob.node.sign(&gid.0, b"still my key").unwrap(), signature);
         }
         bob.node.shutdown().await.unwrap();
         drop((bob, bob_devices));
-        let after = holdings(&bob_db, &gid, &[held.position.unwrap()]);
-        assert_eq!(after.0.public(), before.0.public());
-        assert_eq!(after.1, before.1);
-        assert_eq!(after.3, before.3);
-        let provider = SqliteProvider::open(&bob_db).unwrap();
-        assert_eq!(provider.get(&log_key).unwrap().unwrap(), log);
-        for (key, entry) in entries {
-            assert_eq!(provider.get(&key).unwrap().unwrap(), entry);
-        }
-        drop(provider);
 
         // Neither member can reach the service: only Alice's retained entries and ciphertext can fill Bob's gap.
         gate.set(false);
@@ -1582,8 +1375,8 @@ async fn expired_service_history_preserves_chat_and_identity_groups() {
             assert!(!matches!(&e, Event::Removed { group, .. } if group == &gid));
             matches!(e, Event::Settings { group, settings, .. } if group == gid && settings.name == "Later").then_some(())
         }).await;
-        eventually("Bob decrypts the message beyond the expired history", || bob.node.message(&missed.id.0).unwrap().is_some()).await;
-        assert_eq!(bob.node.message(&missed.id.0).unwrap().unwrap().payload, message("recover from the peer"));
+        eventually("Bob takes the message beyond the expired history", || bob.node.message(&gid.0, &missed.0).unwrap().is_some()).await;
+        assert_eq!(bob.node.message(&gid.0, &missed.0).unwrap().unwrap().payload, message("recover from the peer"));
         assert_eq!(bob.node.key_in(&gid.0), key);
         assert_eq!(bob.node.members(&gid.0).unwrap(), members);
         assert!(bob.node.epoch(&gid.0).unwrap() > epoch);
@@ -1602,8 +1395,9 @@ async fn stored(relay: &Relay, name: &str, db: &Path) -> Session<SqliteProvider>
     Session { node, events }
 }
 
-/// A member that applies the commit deleting an epoch's keys while no member online holds a message of it loses that
-/// message, and announces it: every member gets the announcement, and the sender is told its message was lost.
+/// A commit keeps the messages its committer holds, and a member that comes back with none of them loses those no
+/// online member holds: the commit after the one that kept them cannot wait for them, and tells the member `Lost` with
+/// their author's seqs.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_announced_loss_reaches_every_member() {
     let relay = relay().await;
@@ -1619,42 +1413,27 @@ async fn an_announced_loss_reaches_every_member() {
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
     eventually("Carol has both Adds", || carol.node.members(&gid.0).unwrap().len() == 3).await;
-    for session in [&alice, &carol] {
-        session.node.shutdown().await.unwrap();
-    }
-    drop((alice, carol));
+    carol.node.shutdown().await.unwrap();
+    drop(carol);
 
-    // Only Bob holds his message; Alice, back while he is away, commits twice, and so loses it.
-    let sent = bob.node.send(&gid.0, &message("only Bob holds this")).await.unwrap();
-    let position = sent.position.unwrap();
-    bob.node.shutdown().await.unwrap();
-    drop(bob);
-    let mut alice = stored(&relay, "Alice", &db("alice")).await;
+    // Alice holds Bob's message and keeps it in a commit; then Alice and Bob stop, and Carol, back, has no holder.
+    let sent = bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     for name in ["One", "Two"] {
         alice.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
     }
-    let lost = alice.until(|e| match e {
-        Event::Lost(lost) => Some(lost),
-        _ => None,
-    }).await;
-    assert_eq!((lost.member.name.as_str(), lost.positions.clone(), lost.ids.clone()), ("Alice", vec![position], vec![sent.id.clone()]));
-    let announced = lost.position;
+    bob.node.shutdown().await.unwrap();
+    alice.node.shutdown().await.unwrap();
 
-    // Bob hears that Alice lost his message; Carol, who gets it from Bob, holds the announcement too.
-    let mut bob = stored(&relay, "Bob", &db("bob")).await;
-    let told = bob.until(|e| match e {
+    let mut carol = stored(&relay, "Carol", &db("carol")).await;
+    let lost = carol.until(|e| match e {
         Event::Lost(lost) => Some(lost),
         _ => None,
     }).await;
-    assert_eq!((told.member.name.as_str(), told.positions, told.ids, told.position), ("Alice", vec![position], vec![sent.id.clone()], announced));
-    let carol = stored(&relay, "Carol", &db("carol")).await;
-    let alices = |node: &Node<SqliteProvider>| node.losses(&gid.0).unwrap().iter().any(|l| l.member.name == "Alice" && l.positions == [position]);
-    eventually("Carol holds Alice's announcement", || alices(&carol.node)).await;
-    assert!(alices(&bob.node) && alices(&alice.node));
-    assert!(carol.node.message(&sent.id.0).unwrap().is_some(), "Carol got the message from Bob");
-    for session in [&alice, &bob, &carol] {
-        session.node.shutdown().await.unwrap();
-    }
+    assert_eq!(lost.member.name, "Carol");
+    assert_eq!((lost.messages[0].from.name.as_str(), lost.messages[0].seqs.clone()), ("Bob", vec![1]));
+    assert!(carol.node.message(&gid.0, &sent.0).unwrap().is_none(), "Carol never took the message");
+    carol.node.shutdown().await.unwrap();
 }
 
 /// The members a public log entry drops are removed by one commit.
@@ -1691,8 +1470,8 @@ async fn a_pass_removes_every_member_due_in_one_commit() {
     assert_eq!((alice.node.epoch(&gid.0).unwrap(), alice.node.members(&gid.0).unwrap().len()), (epoch + 1, 1));
 }
 
-/// Members update their leaves every T. One that leaves asks again once its `leave` is older than the prior epoch,
-/// and is removed once a member that can is back.
+/// Members update their leaves every T. A leaver that updates while the others are away reseals its `leave` in each
+/// epoch it moves to, and is removed once a member that holds it is back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leaver_asks_again_while_it_updates_every_t() {
     let relay = relay().await;
@@ -1708,9 +1487,7 @@ async fn a_leaver_asks_again_while_it_updates_every_t() {
 
     let epoch = bob.node.epoch(&gid.0).unwrap();
     bob.node.leave(&gid.0).await.unwrap().unwrap();
-    let leaves = || bob.node.messages(&gid.0).unwrap().iter().filter(|m| m.payload["type"] == "leave").count();
-    eventually("Bob asks again", || leaves() >= 2).await;
-    assert!(bob.node.epoch(&gid.0).unwrap() >= epoch + 2, "Bob updated his leaf meanwhile");
+    eventually("Bob updates its leaf", || bob.node.epoch(&gid.0).unwrap() >= epoch + 2).await;
 
     let alice = stored(&relay, "Alice", &alice_db).await;
     bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
@@ -1718,18 +1495,22 @@ async fn a_leaver_asks_again_while_it_updates_every_t() {
     alice.node.shutdown().await.unwrap();
 }
 
-/// A stopped session's iroh key; its summary of a group, holding nothing, and the position its log ends at; and its
-/// ciphertexts at `positions`.
-fn holdings(db: &Path, gid: &Bytes, positions: &[u64]) -> (iroh::SecretKey, Summary, u64, Vec<Bytes>) {
+/// A stopped stored member's record of a message of `gid`, as its database keeps it.
+fn record(db: &Path, gid: &Bytes, id: &Bytes) -> Value {
     let provider = SqliteProvider::open(db).unwrap();
-    let key = lmk_node::iroh_key(&provider).unwrap();
-    let rec: Value = serde_json::from_slice(&provider.get(&[b"node/group/".as_slice(), &gid.0].concat()).unwrap().unwrap()).unwrap();
-    let log: Bytes = serde_json::from_value(rec["log"].clone()).unwrap();
-    let head = held_head(&provider, &log);
-    let position = rec["base"].as_u64().unwrap() + head.as_ref().map_or(0, |head| head.length);
-    let summary = Summary { group: gid.clone(), log: log.0.try_into().unwrap(), head, held: Ranges::default(), read: Ranges::default(), fetching: Ranges::default() };
-    let ciphertext = |p: &u64| Bytes(provider.get(&[b"node/ciphertext/".as_slice(), &gid.0, b"/", &p.to_be_bytes()].concat()).unwrap().unwrap());
-    (key, summary, position, positions.iter().map(ciphertext).collect())
+    let key = [b"node/message/".as_slice(), &gid.0, b"/", &id.0].concat();
+    serde_json::from_slice(&provider.get(&key).unwrap().unwrap()).unwrap()
+}
+
+/// The sealing a stopped stored member holds of a message of `gid`: its epoch, and its ciphertext.
+fn sealed(db: &Path, gid: &Bytes, id: &Bytes) -> (u64, Bytes) {
+    serde_json::from_value(record(db, gid, id)["sealing"].clone()).unwrap()
+}
+
+/// A stopped stored member's iroh key, and its MLS session, which a hand stands in for it with.
+fn member_of(db: &Path) -> (iroh::SecretKey, Mls) {
+    let provider = SqliteProvider::open(db).unwrap();
+    (lmk_node::iroh_key(&provider).unwrap(), Mls::load(&provider).unwrap())
 }
 
 /// The newest head of a log a session holds.
@@ -1774,154 +1555,29 @@ impl Hand {
         .expect("the frame came")
     }
 
-    /// The positions the node asks for next.
-    async fn wanted(&mut self) -> Ranges {
+    /// Asks the node for nothing, and waits for its answer, which carries what it gave: it has handled every frame sent
+    /// before.
+    async fn settle(&mut self, gid: &Bytes) -> Vec<Bytes> {
+        self.send(&Frame::Want { group: gid.clone(), epoch: 0, wants: Vec::new(), ids: Vec::new() }).await;
         self.until(|f| match f {
-            Frame::Want { positions, .. } => Some(positions),
-            _ => None,
-        })
-        .await
-    }
-
-    /// Asks the node for a position and waits for its answer: it has handled every frame sent before. Returns what it
-    /// gave.
-    async fn settle(&mut self, gid: &Bytes) -> Vec<Item> {
-        self.send(&Frame::Want { group: gid.clone(), positions: Ranges::range(1, 1) }).await;
-        self.until(|f| match f {
-            Frame::Messages { items, answers: Some(_), .. } => Some(items),
+            Frame::Held { items, answers: Some(_), .. } => Some(items),
             _ => None,
         })
         .await
     }
 }
 
-/// A `hello` showing a group as `shown` does, with `held` held.
-fn summary(shown: &Summary, held: Ranges) -> Frame {
-    let summary = Summary { held: held.clone(), read: held, ..shown.clone() };
-    Frame::Hello { groups: vec![summary], heads: vec![] }
+/// The seqs of one membership, as a `Seqs`.
+fn seqs(key: &Bytes, joined: u64, seqs: &[u64]) -> Seqs {
+    Seqs { key: key.clone(), joined, seqs: seqs.iter().copied().collect() }
 }
 
-fn one(position: u64) -> Ranges {
-    Ranges::range(position, position)
-}
-
-/// The answer to a `want` of `asked`, carrying a ciphertext at a position, or none.
-fn answer(gid: &Bytes, asked: u64, item: Option<(u64, &Bytes)>) -> Frame {
-    let items = item.map(|(position, ciphertext)| Item { position, ciphertext: ciphertext.clone() }).into_iter().collect();
-    Frame::Messages { group: gid.clone(), items, answers: Some(one(asked)) }
-}
-
-/// Each peer's latest summary of a group is saved over the last, survives a restart, shows what it held and read, and
-/// goes when its Remove applies; `synced` fires on a `hello` at this session's head; `only_here` and Away follow.
+/// A member that reaches only one holder of a message a commit kept waits for it before applying the next commit, which
+/// deletes the keys it needs, and takes the message from that holder. Quinn holds Sam's message, which Sam's first
+/// rename keeps; Rita, online, hears Quinn hold it, and so waits for it from Quinn alone while Sam's second rename
+/// waits. Sam stops after that.
 #[tokio::test(flavor = "multi_thread")]
-async fn summaries_are_kept_shown_and_dropped_with_their_member() {
-    let relay = relay().await;
-    let dir = folder("summaries");
-    std::fs::create_dir_all(&dir).unwrap();
-    let alice_db = dir.join("alice.db");
-    let mut alice = stored(&relay, "Alice", &alice_db).await;
-    let bob = session(&relay, "Bob").await;
-    let carol = session(&relay, "Carol").await;
-    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
-    let first = alice.node.send_counted(&gid.0, &message("before anyone")).await.unwrap();
-    for joiner in [&bob, &carol] {
-        joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
-        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    }
-    assert!(!alice.node.only_here(&gid.0).unwrap().contains(first), "before every other member's start, whether or not heard yet");
-    let p = alice.node.send_counted(&gid.0, &message("hello")).await.unwrap();
-    eventually("both hold Alice's message", || !alice.node.only_here(&gid.0).unwrap().contains(p)).await;
-    bob.node.mark_read(&gid.0, &one(p)).unwrap();
-    eventually("Bob's summary shows it read", || {
-        alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.name == "Bob" && h.held.contains(p) && h.read.contains(p))
-    })
-    .await;
-    alice.until(|e| matches!(e, Event::Synced { member, .. } if member.name == "Bob").then_some(())).await;
-    assert!(alice.node.away(&gid.0).unwrap().is_empty());
-
-    alice.node.shutdown().await.unwrap();
-    drop(alice);
-    let alice = stored(&relay, "Alice", &alice_db).await;
-    let mut names: Vec<String> = alice.node.heard(&gid.0).unwrap().into_iter().map(|h| h.member.name).collect();
-    names.sort();
-    assert_eq!(names, ["Bob", "Carol"], "saved across the restart");
-    alice.node.remove(&gid.0, &carol.node.key().0).await.unwrap();
-    assert!(alice.node.heard(&gid.0).unwrap().iter().all(|h| h.member.name != "Carol"), "gone with its member");
-    bob.node.shutdown().await.unwrap();
-    let q = alice.node.send_counted(&gid.0, &message("alone")).await.unwrap();
-    let only_here = alice.node.only_here(&gid.0).unwrap();
-    assert!(only_here.contains(q) && !only_here.contains(p) && !only_here.contains(first), "Bob's saved summary holds the first, not the second");
-    alice.node.shutdown().await.unwrap();
-}
-
-/// A missing position holds up the later ones of its epoch while it is being fetched; once no summary shows it, they open
-/// past it; it opens still if it comes while its epoch's keys are kept; and one still missing as a commit deletes them is
-/// lost.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_gap_holds_up_its_epoch_while_fetched_then_is_passed_and_opens_late_or_is_lost() {
-    let relay = relay().await;
-    let dir = folder("gap");
-    std::fs::create_dir_all(&dir).unwrap();
-    let (sam_db, bob_db) = (dir.join("sam.db"), dir.join("bob.db"));
-    let sam = stored(&relay, "Sam", &sam_db).await;
-    let bob = stored(&relay, "Bob", &bob_db).await;
-    let gid = sam.node.create(settings(CHAT, &relay), None).unwrap();
-    bob.node.join(&sam.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
-    eventually("Bob is in", || sam.node.members(&gid.0).unwrap().len() == 2).await;
-    bob.node.shutdown().await.unwrap();
-    drop(bob);
-    let mut sent = Vec::new();
-    for text in ["one", "two", "three"] {
-        sent.push(sam.node.send(&gid.0, &message(text)).await.unwrap());
-    }
-    sam.node.shutdown().await.unwrap();
-    drop(sam);
-    let p: Vec<u64> = sent.iter().map(|s| s.position.unwrap()).collect();
-    let (key, shown, position, ciphertexts) = holdings(&sam_db, &gid, &p);
-
-    // Bob comes back. Sam, by hand, holds the first two: Bob asks for them, and gets the second only.
-    let mut bob = stored(&relay, "Bob", &bob_db).await;
-    // Bob knows the log's head before Sam's summary, so he asks for both at once.
-    bob.node.read_group(&gid.0).await.unwrap();
-    let mut sam = hand(&relay, key, &bob.node).await;
-    let held = Ranges::range(1, position).difference(&one(p[2]));
-    sam.send(&summary(&shown, held.clone())).await;
-    assert_eq!(sam.wanted().await, Ranges::range(p[0], p[1]));
-    sam.send(&answer(&gid, p[1], Some((p[1], &ciphertexts[1])))).await;
-    // The first is being fetched still: the second waits for it.
-    assert_eq!(sam.wanted().await, one(p[0]));
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(bob.node.messages(&gid.0).unwrap().is_empty(), "the second waits while the first is fetched");
-    // Sam has not got the first after all: no summary shows it, and the second opens past it.
-    sam.send(&answer(&gid, p[0], None)).await;
-    let got = bob.until(|e| match e {
-        Event::Message(message) => Some(message),
-        _ => None,
-    }).await;
-    assert_eq!(got.id, sent[1].id);
-    // Sam's next summary shows it again: it opens late.
-    sam.send(&summary(&shown, held)).await;
-    assert_eq!(sam.wanted().await, one(p[0]));
-    sam.send(&answer(&gid, p[0], Some((p[0], &ciphertexts[0])))).await;
-    let got = bob.until(|e| match e {
-        Event::Message(message) => Some(message),
-        _ => None,
-    }).await;
-    assert_eq!((got.id, got.position), (sent[0].id.clone(), p[0]));
-
-    // No member holds the third: once its epoch's keys go, two commits on, it is lost.
-    for name in ["Later", "Later still"] {
-        bob.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
-    }
-    assert!(bob.node.lost(&gid.0, &sent[2].id.0));
-    assert!(!bob.node.lost(&gid.0, &sent[0].id.0));
-    bob.node.shutdown().await.unwrap();
-}
-
-/// The line S–Q–R (G3): R, which reaches only Q, waits before the commit that deletes the keys of a message it lacks
-/// while Q fetches the message from S, then gets it from Q. Behind its log's head, Q takes no `state`.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_member_waits_while_the_member_between_it_and_the_holder_fetches() {
+async fn a_member_waits_for_the_kept_message_its_only_holder_gives() {
     let relay = relay().await;
     let dir = folder("line");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1929,53 +1585,37 @@ async fn a_member_waits_while_the_member_between_it_and_the_holder_fetches() {
     let sam = stored(&relay, "Sam", &dbs[0]).await;
     let gid = sam.node.create(settings(CHAT, &relay), None).unwrap();
     let links = [sam.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), sam.node.invite(&gid.0, None, INVITE_VALID).await.unwrap()];
-    for ((name, db), link) in [("Quinn", &dbs[1]), ("Rita", &dbs[2])].into_iter().zip(links) {
-        let joiner = stored(&relay, name, db).await;
-        joiner.node.join(&link, None).await.unwrap();
-        eventually("the joiner has its Add", || joiner.node.members(&gid.0).unwrap().iter().any(|m| m.name == name)).await;
-        joiner.node.shutdown().await.unwrap();
-    }
-    let sent = sam.node.send(&gid.0, &message("p")).await.unwrap();
-    let epoch = sam.node.epoch(&gid.0).unwrap();
-    for name in ["One", "Two"] {
-        sam.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
-    }
-    sam.node.shutdown().await.unwrap();
-    drop(sam);
-    let p = sent.position.unwrap();
-    let (key, shown, position, ciphertexts) = holdings(&dbs[0], &gid, &[p]);
+    let mut quinn = stored(&relay, "Quinn", &dbs[1]).await;
+    quinn.node.join(&links[0], None).await.unwrap();
+    let rita = stored(&relay, "Rita", &dbs[2]).await;
+    rita.node.join(&links[1], None).await.unwrap();
+    rita.node.shutdown().await.unwrap();
+    drop(rita);
 
-    // Q comes back, reads to the second rename, which deletes p's keys, and fetches p from S.
-    let quinn = stored(&relay, "Quinn", &dbs[1]).await;
-    let mut sam = hand(&relay, key, &quinn.node).await;
-    sam.send(&summary(&shown, Ranges::range(1, position))).await;
-    assert_eq!(sam.wanted().await, one(p));
-    let file = lmk_proto::links::FileLink { hash: [7; 32], size: 1, key: [0; 32] };
-    sam.send(&Frame::State { group: gid.clone(), link: Some(file.link()) }).await;
-    sam.settle(&gid).await;
-    assert!(!quinn.node.linked(&gid.0).contains(&file), "no state while behind");
-
-    // R comes back too, reaching only Q, whose summary shows p fetching: R waits past the 3 seconds after it came online
-    // (its first connection), and within the 10 without progress. S keeps Q's request alive.
-    let mut rita = stored(&relay, "Rita", &dbs[2]).await;
-    eventually("R reaches Q", || rita.node.online(&gid.0).unwrap().iter().any(|m| m.name == "Quinn")).await;
-    let online = std::time::Instant::now();
-    eventually("R reached the second rename", || rita.node.epoch(&gid.0).unwrap() == epoch + 1).await;
-    while online.elapsed() < Duration::from_secs(4) {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        sam.send(&summary(&shown, Ranges::range(1, position))).await;
-    }
-    assert_eq!(rita.node.epoch(&gid.0).unwrap(), epoch + 1, "R waits past the 3 seconds after it came online");
-    sam.send(&answer(&gid, p, Some((p, &ciphertexts[0])))).await;
-    let got = rita.until(|e| match e {
+    // Quinn is online for the message and holds it; Sam's first rename keeps it, as Quinn's summary shows it held.
+    let sent = sam.node.send(&gid.0, &message("p"), None).await.unwrap();
+    let got = quinn.until(|e| match e {
         Event::Message(message) => Some(message),
         _ => None,
     }).await;
-    assert_eq!((got.id, got.position), (sent.id.clone(), p));
-    eventually("R applied the second rename", || rita.node.epoch(&gid.0).unwrap() >= epoch + 2).await;
-    assert!(!rita.node.lost(&gid.0, &sent.id.0));
-    sam.send(&Frame::State { group: gid.clone(), link: Some(file.link()) }).await;
-    eventually("at its head, Q takes a state", || quinn.node.linked(&gid.0).contains(&file)).await;
+    assert_eq!(got.id, sent);
+    let sam_key = sam.node.key();
+    let held = |node: &Node<SqliteProvider>| node.heard(&gid.0).unwrap().iter().any(|h| h.held.iter().any(|s| s.key == sam_key && s.seqs.contains(got.seq)));
+    eventually("Sam hears that Quinn holds it", || held(&sam.node)).await;
+    sam.node.change_settings(&gid.0, |s| Settings { name: "One".into(), ..s }).await.unwrap();
+
+    // Rita comes back online and hears that Quinn holds the message before Sam's second rename needs it.
+    let mut rita = stored(&relay, "Rita", &dbs[2]).await;
+    eventually("Rita hears that Quinn holds it", || held(&rita.node)).await;
+    sam.node.change_settings(&gid.0, |s| Settings { name: "Two".into(), ..s }).await.unwrap();
+    let epoch = sam.node.epoch(&gid.0).unwrap();
+    let got_by_rita = rita.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    }).await;
+    assert_eq!(got_by_rita.id, sent);
+    eventually("Rita applied the second rename", || rita.node.epoch(&gid.0).unwrap() == epoch).await;
+    sam.node.shutdown().await.unwrap();
     quinn.node.shutdown().await.unwrap();
     rita.node.shutdown().await.unwrap();
 }
@@ -2011,32 +1651,26 @@ async fn a_peer_not_admitted_changes_nothing() {
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
-    let sent = bob.node.send(&gid.0, &message("real")).await.unwrap();
+    let sent = bob.node.send(&gid.0, &message("real"), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
     bob.node.shutdown().await.unwrap();
     eventually("Bob is gone", || alice.node.online(&gid.0).unwrap().is_empty()).await;
     let before = dump(&alice_db);
 
     let mut mallory = hand(&relay, iroh::SecretKey::from_bytes(&lmk_core::random()), &alice.node).await;
-    let p = sent.position.unwrap();
-    let real = Bytes(rusqlite::Connection::open(&alice_db).unwrap().query_row(
-        "SELECT value FROM lmk WHERE key = ?",
-        [[b"node/ciphertext/".as_slice(), &gid.0, b"/", &p.to_be_bytes()].concat()],
-        |row| row.get(0),
-    ).unwrap());
+    let real = sealed(&alice_db, &gid, &sent).1;
     let forged = |n: u8| {
         let mut forged = real.clone();
         *forged.0.last_mut().unwrap() ^= n;
         forged
     };
-    let items = vec![Item { position: p, ciphertext: forged(1) }, Item { position: p + 1, ciphertext: forged(2) }];
-    mallory.send(&Frame::Messages { group: gid.clone(), items, answers: None }).await;
+    mallory.send(&Frame::Held { group: gid.clone(), items: vec![forged(1), forged(2)], answers: None }).await;
     let log = alice.node.log(&gid.0).unwrap();
-    let head = Head { log_ref: log.0.as_slice().try_into().unwrap(), length: p + 1, hash: [9; 32], time: lmk_node::now(), sig: Bytes(vec![0; 64]) };
+    let head = Head { log_ref: log.0.as_slice().try_into().unwrap(), length: 2, hash: [9; 32], time: lmk_node::now(), sig: Bytes(vec![0; 64]) };
     mallory.send(&Frame::Entries { log, entries: vec![Bytes(b"junk".to_vec())], head }).await;
     let file = lmk_proto::links::FileLink { hash: [7; 32], size: 1, key: [0; 32] };
     mallory.send(&Frame::State { group: gid.clone(), link: Some(file.link()) }).await;
-    mallory.send(&Frame::Live { group: gid.clone(), items: vec![forged(3)] }).await;
+    mallory.send(&Frame::Live { group: gid.clone(), hops: 0, item: forged(3) }).await;
     assert!(mallory.settle(&gid).await.is_empty(), "a want the gate does not take gets nothing");
     assert_eq!(dump(&alice_db), before);
     assert!(!alice.node.linked(&gid.0).contains(&file));
@@ -2046,6 +1680,7 @@ async fn a_peer_not_admitted_changes_nothing() {
     alice.node.shutdown().await.unwrap();
 }
 
+/// A peer's entries under a genuine head for another log or service change nothing; under the right head, they are taken.
 #[tokio::test(flavor = "multi_thread")]
 async fn peer_entries_are_bound_to_the_destination_log_and_service() {
     let relay = relay().await;
@@ -2227,4 +1862,604 @@ async fn a_member_online_is_not_away_and_a_file_spreads_on_its_first_holder() {
     let carol = alice.node.members(&gid.0).unwrap().into_iter().find(|m| m.name == "Carol").unwrap();
     assert_eq!(carol.added.unwrap().0, bob.node.key());
     alice.node.shutdown().await.unwrap();
+}
+
+/// The deps a stored member keeps for a message of `gid`.
+fn deps_of(db: &Path, gid: &Bytes, id: &Bytes) -> Vec<lmk_proto::held::Ref> {
+    let header = &record(db, gid, id)["header"];
+    serde_json::from_value(header.get("deps").cloned().unwrap_or(json!([]))).unwrap()
+}
+
+/// Three members chat in causal order. Each sender's messages come with seqs 1, 2, 3, in order. A reply's deps are the
+/// messages its sender marked shown: Bob's replies depend on Alice's first message, which it showed, and not on her
+/// second, which it received but did not show.
+#[tokio::test(flavor = "multi_thread")]
+async fn three_members_chat_in_causal_order() {
+    let relay = relay().await;
+    let dir = folder("chat");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = stored(&relay, "Alice", &db("alice")).await;
+    let bob = stored(&relay, "Bob", &db("bob")).await;
+    let carol = stored(&relay, "Carol", &db("carol")).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("everyone has three members", || [&alice, &bob, &carol].iter().all(|s| s.node.members(&gid.0).unwrap().len() == 3)).await;
+    let mut bob = bob;
+    let mut carol = carol;
+
+    let a1 = alice.node.send(&gid.0, &message("a1"), None).await.unwrap();
+    let first = bob.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    }).await;
+    assert_eq!((first.id.clone(), first.sender.name.as_str()), (a1.clone(), "Alice"));
+    bob.node.mark_shown(&gid.0, std::slice::from_ref(&a1)).unwrap();
+    assert!(bob.node.shown(&gid.0, &a1.0).unwrap());
+    let b1 = bob.node.send(&gid.0, &message("b1 replies to a1"), None).await.unwrap();
+    let a2 = alice.node.send(&gid.0, &message("a2"), None).await.unwrap();
+    let a3 = alice.node.send(&gid.0, &message("a3"), None).await.unwrap();
+    let b2 = bob.node.send(&gid.0, &message("b2 is sent after a2 arrived, unshown"), None).await.unwrap();
+    assert!(!bob.node.shown(&gid.0, &a2.0).unwrap());
+
+    // Carol takes all five, each of Alice's in its seq order, and Bob's replies after the message they depend on.
+    let mut taken = Vec::new();
+    while taken.len() < 5 {
+        taken.push(carol.until(|e| match e {
+            Event::Message(message) => Some(message),
+            _ => None,
+        }).await);
+    }
+    let index = |id: &Bytes| taken.iter().find(|m| m.id == *id).unwrap().index;
+    let seq = |id: &Bytes| taken.iter().find(|m| m.id == *id).unwrap().seq;
+    assert_eq!([seq(&a1), seq(&a2), seq(&a3)], [3, 4, 5], "the two invites took seqs 1 and 2");
+    assert!(index(&a1) < index(&b1) && index(&a2) < index(&a3), "causal order: {taken:?}");
+    assert!(taken.iter().all(|m| m.index >= 1 && m.missing.is_empty() && !m.late));
+
+    // Heard, Alice sees what Bob holds and showed.
+    let alice_key = alice.node.key();
+    eventually("Alice hears that Bob showed a1", || {
+        alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.name == "Bob" && h.shown.iter().any(|s| s.key == alice_key && s.seqs.contains(first.seq)))
+    })
+    .await;
+    bob.node.shutdown().await.unwrap();
+    assert_eq!(deps_of(&db("bob"), &gid, &b1), [lmk_proto::held::Ref { key: alice.node.key(), joined: 0, seq: 3, id: a1.clone() }]);
+    assert_eq!(deps_of(&db("bob"), &gid, &b2), deps_of(&db("bob"), &gid, &b1), "b2 depends on a1 still: a2 was not shown");
+    carol.node.shutdown().await.unwrap();
+    alice.node.shutdown().await.unwrap();
+}
+
+/// A message whose dep is withheld waits for it, then is delivered with the dep named in `missing`, and the withheld
+/// message comes `late` once its holder is back. Sam's first message is held by Bob alone, and Sam's reply depends on
+/// it; Sam is then a hand that pushes the reply to Carol, and answers nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_whose_dep_is_withheld_is_delivered_with_missing_and_the_dep_comes_late() {
+    let relay = relay().await;
+    let dir = folder("withheld");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut bob = stored(&relay, "Bob", &db("bob")).await;
+    let sam = stored(&relay, "Sam", &db("sam")).await;
+    let carol = stored(&relay, "Carol", &db("carol")).await;
+    let gid = bob.node.create(settings(CHAT, &relay), None).unwrap();
+    for joiner in [&sam, &carol] {
+        joiner.node.join(&bob.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        bob.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("everyone has three members", || [&bob, &sam, &carol].iter().all(|s| s.node.members(&gid.0).unwrap().len() == 3)).await;
+    carol.node.shutdown().await.unwrap();
+    drop(carol);
+
+    // Bob's m1 reaches Sam, who shows it and replies. Bob's rename keeps m1, since Sam's summary shows it held: Carol
+    // then knows m1 was sent. Then Bob and Sam stop.
+    let bob_key = bob.node.key();
+    let m1 = bob.node.send(&gid.0, &message("m1"), None).await.unwrap();
+    let mut sam = sam;
+    let m1_seq = sam.until(|e| match e {
+        Event::Message(message) => Some(message.seq),
+        _ => None,
+    }).await;
+    sam.node.mark_shown(&gid.0, std::slice::from_ref(&m1)).unwrap();
+    eventually("Bob hears that Sam holds m1", || bob.node.heard(&gid.0).unwrap().iter().any(|h| h.member.name == "Sam" && h.held.iter().any(|s| s.key == bob_key && s.seqs.contains(m1_seq)))).await;
+    bob.node.change_settings(&gid.0, |s| Settings { name: "Kept".into(), ..s }).await.unwrap();
+    let m2 = sam.node.send(&gid.0, &message("m2 replies to m1"), None).await.unwrap();
+    bob.node.shutdown().await.unwrap();
+    sam.node.shutdown().await.unwrap();
+
+    // Carol comes back and takes m2 from Sam's hand, which never answers a `want`: m1 is withheld, so Carol waits for
+    // it, gives it up after the hold-off, and delivers m2 with m1 in `missing`.
+    let mut carol = stored(&relay, "Carol", &db("carol")).await;
+    let (sam_key, _) = member_of(&db("sam"));
+    let mut hand = hand(&relay, sam_key, &carol.node).await;
+    let started = std::time::Instant::now();
+    hand.send(&Frame::Held { group: gid.clone(), items: vec![sealed(&db("sam"), &gid, &m2).1], answers: None }).await;
+    let reply = carol.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    }).await;
+    assert_eq!(reply.id, m2);
+    assert!(started.elapsed() >= Duration::from_secs(2), "m2 waited for m1: {:?}", started.elapsed());
+    assert_eq!((reply.missing.clone(), reply.late), (vec![seqs(&bob_key, 0, &[m1_seq])], false));
+
+    // Bob is back: Carol takes m1 from him, late, after m2.
+    let bob = stored(&relay, "Bob", &db("bob")).await;
+    let late = carol.until(|e| match e {
+        Event::Message(message) => Some(message),
+        _ => None,
+    }).await;
+    assert_eq!((late.id, late.seq, late.late, late.index > reply.index), (m1, m1_seq, true, true));
+    bob.node.shutdown().await.unwrap();
+    carol.node.shutdown().await.unwrap();
+}
+
+/// A sender alone online sends while the membership service is unreachable: its sends answer and deliver to it, and a
+/// member that comes online later takes both messages, in order, from the sender.
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_works_while_the_service_is_down() {
+    let relay = relay().await;
+    let dir = folder("service-down");
+    let (membership, service) = signing_service(&relay, &dir).await;
+    let mut alice = stored(&relay, "Alice", &dir.join("alice.db")).await;
+    let bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+
+    service.shutdown().await.unwrap();
+    let one = alice.node.send(&gid.0, &message("one"), None).await.unwrap();
+    let two = alice.node.send(&gid.0, &message("two"), None).await.unwrap();
+    let mut bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
+    for (id, seq) in [(one, 2), (two, 3)] {
+        let got = bob.until(|e| match e {
+            Event::Message(message) => Some(message),
+            _ => None,
+        }).await;
+        assert_eq!((got.id, got.seq, got.sender.name.as_str()), (id, seq, "Alice"));
+    }
+    bob.node.shutdown().await.unwrap();
+    alice.node.shutdown().await.unwrap();
+}
+
+/// A commit keeps what another member holds: `only_here` empties for the message Bob held when Alice removed Dave. The
+/// message no one held then is sealed again by Alice in the new epoch, and reaches Carol, who was offline across the
+/// commit, after the commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_keeps_what_a_member_holds_and_reseals_the_rest() {
+    let relay = relay().await;
+    let dir = folder("keeps");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = stored(&relay, "Alice", &db("alice")).await;
+    let bob = stored(&relay, "Bob", &db("bob")).await;
+    let carol = stored(&relay, "Carol", &db("carol")).await;
+    let dave = stored(&relay, "Dave", &db("dave")).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    for joiner in [&bob, &carol, &dave] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("Alice has four members", || alice.node.members(&gid.0).unwrap().len() == 4).await;
+    carol.node.shutdown().await.unwrap();
+    drop(carol);
+    let (bob_key, dave_key) = (bob.node.key(), dave.node.key());
+
+    let alice_key = alice.node.key();
+    let m1 = alice.node.send(&gid.0, &message("one"), None).await.unwrap();
+    let mut bob = bob;
+    let seq = bob.until(|e| match e {
+        Event::Message(message) => Some(message.seq),
+        _ => None,
+    }).await;
+    eventually("Alice hears that Bob holds her messages up to one", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && (1..=seq).all(|q| h.held.iter().any(|s| s.key == alice_key && s.seqs.contains(q))))).await;
+    bob.node.shutdown().await.unwrap();
+    dave.node.shutdown().await.unwrap();
+    let m2 = alice.node.send(&gid.0, &message("two"), None).await.unwrap();
+    let held = |node: &Node<SqliteProvider>| node.only_here(&gid.0).unwrap().into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    assert_eq!(held(&alice.node), [m1.clone(), m2.clone()], "neither is kept yet");
+
+    assert!(alice.node.remove(&gid.0, &dave_key.0).await.unwrap());
+    assert_eq!(held(&alice.node), std::slice::from_ref(&m2), "the commit kept one, which Bob held");
+
+    let mut carol = stored(&relay, "Carol", &db("carol")).await;
+    let mut taken = Vec::new();
+    while taken.len() < 2 {
+        taken.push(carol.until(|e| match e {
+            Event::Message(message) => Some(message.id),
+            _ => None,
+        }).await);
+    }
+    taken.sort();
+    assert_eq!(taken, [m1, m2]);
+    alice.node.shutdown().await.unwrap();
+    carol.node.shutdown().await.unwrap();
+}
+
+/// A removed member's sends while it is offline are told to it as not kept: `Removed` names the ids of its messages no
+/// cut kept, and it keeps none of them once it comes back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_member_is_told_which_of_its_messages_no_cut_kept() {
+    let relay = relay().await;
+    let dir = folder("not-kept");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let alice = stored(&relay, "Alice", &db("alice")).await;
+    let dave = stored(&relay, "Dave", &db("dave")).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    dave.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    eventually("Alice has Dave's Add", || alice.node.members(&gid.0).unwrap().len() == 2).await;
+    let dave_key = dave.node.key();
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+
+    // Alice is away, so Dave's messages are held by Dave alone; then Dave stops too.
+    let one = dave.node.send(&gid.0, &message("one"), None).await.unwrap();
+    let two = dave.node.send(&gid.0, &message("two"), None).await.unwrap();
+    dave.node.shutdown().await.unwrap();
+    drop(dave);
+
+    let alice = stored(&relay, "Alice", &db("alice")).await;
+    assert!(alice.node.remove(&gid.0, &dave_key.0).await.unwrap());
+    alice.node.shutdown().await.unwrap();
+    let mut dave = stored(&relay, "Dave", &db("dave")).await;
+    let (not_kept, by) = dave.until(|e| match e {
+        Event::Removed { not_kept, by, .. } => Some((not_kept, by)),
+        _ => None,
+    }).await;
+    assert_eq!(not_kept, [one, two]);
+    assert_eq!(by.map(|m| m.name), Some("Alice".to_owned()));
+    dave.node.shutdown().await.unwrap();
+}
+
+/// A member that delivered a removed member's last kept message still has it after the removal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_holder_keeps_the_removed_members_last_kept_message() {
+    let relay = relay().await;
+    let dir = folder("holder");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = stored(&relay, "Alice", &db("alice")).await;
+    let bob = stored(&relay, "Bob", &db("bob")).await;
+    let dave = stored(&relay, "Dave", &db("dave")).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    for joiner in [&bob, &dave] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("Alice has three members", || alice.node.members(&gid.0).unwrap().len() == 3).await;
+    let (bob_key, dave_key) = (bob.node.key(), dave.node.key());
+    let mut bob = bob;
+    let last = dave.node.send(&gid.0, &message("Dave's last"), None).await.unwrap();
+    bob.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
+    alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
+    eventually("Alice hears that Bob holds it", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && h.held.iter().any(|s| s.key == dave_key && s.seqs.contains(1)))).await;
+    dave.node.shutdown().await.unwrap();
+
+    assert!(alice.node.remove(&gid.0, &dave_key.0).await.unwrap());
+    assert!(alice.node.message(&gid.0, &last.0).unwrap().is_some(), "Alice kept it");
+    bob.until(|e| matches!(e, Event::Left { member, .. } if member.name == "Dave").then_some(())).await;
+    assert!(bob.node.message(&gid.0, &last.0).unwrap().is_some(), "Bob keeps it");
+    bob.node.shutdown().await.unwrap();
+    alice.node.shutdown().await.unwrap();
+}
+
+/// A joiner starts at the cut of the commit that added it: a message its sender sent before the Add, which no cut kept,
+/// the sender seals again after the Add, and the joiner takes it, then takes what is sent after it joined.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joiner_takes_what_was_unkept_at_its_add_and_what_follows() {
+    let relay = relay().await;
+    let mut alice = session(&relay, "Alice").await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    let before = alice.node.send(&gid.0, &message("before Bob"), None).await.unwrap();
+    let mut bob = session(&relay, "Bob").await;
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let after = alice.node.send(&gid.0, &message("after Bob"), None).await.unwrap();
+    // Alice's invite took seq 2: before is seq 1, after seq 3. Bob may take after first, given up on before, which then comes late.
+    let mut taken = Vec::new();
+    while taken.len() < 2 {
+        taken.push(bob.until(|e| match e {
+            Event::Message(message) => Some((message.id, message.seq)),
+            _ => None,
+        }).await);
+    }
+    taken.sort_by_key(|(_, seq)| *seq);
+    assert_eq!(taken, [(before, 1), (after, 3)]);
+    alice.node.shutdown().await.unwrap();
+    bob.node.shutdown().await.unwrap();
+}
+
+/// Carol misses two commits that keep Alice's two messages, which Bob holds; it comes back to them: the messages it
+/// took, and those it was told lost, by seq. Each is one or the other, once.
+async fn missed_commits(test: &str) -> (Vec<u64>, Vec<u64>) {
+    let relay = relay().await;
+    let dir = folder(test);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = stored(&relay, "Alice", &db("alice")).await;
+    let mut bob = stored(&relay, "Bob", &db("bob")).await;
+    let carol = stored(&relay, "Carol", &db("carol")).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("Alice has three members", || alice.node.members(&gid.0).unwrap().len() == 3).await;
+    carol.node.shutdown().await.unwrap();
+    drop(carol);
+    let alice_key = alice.node.key();
+
+    // The two invites took seqs 1 and 2; Alice's messages are 3 and 4, each held by Bob before the rename that keeps it.
+    let mut sent = Vec::new();
+    for text in ["a1", "a2"] {
+        alice.node.send(&gid.0, &message(text), None).await.unwrap();
+        let seq = bob.until(|e| match e {
+            Event::Message(message) => Some(message.seq),
+            _ => None,
+        }).await;
+        sent.push(seq);
+        eventually("Alice hears that Bob holds her messages up to it", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.name == "Bob" && (1..=seq).all(|q| h.held.iter().any(|s| s.key == alice_key && s.seqs.contains(q))))).await;
+        alice.node.change_settings(&gid.0, |s| Settings { name: text.into(), ..s }).await.unwrap();
+    }
+    alice.node.change_settings(&gid.0, |s| Settings { name: "last".into(), ..s }).await.unwrap();
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    assert_eq!(sent, [3, 4]);
+
+    let mut carol = stored(&relay, "Carol", &db("carol")).await;
+    let (mut delivered, mut lost) = (Vec::new(), Vec::new());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match carol.events.recv().await {
+                Some(Event::Message(message)) => delivered.push(message.seq),
+                Some(Event::Lost(lost_now)) => lost.extend(lost_now.messages.iter().flat_map(|of| of.seqs.clone())),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_err();
+    eventually("Carol applied every commit", || carol.node.epoch(&gid.0).unwrap() == epoch).await;
+    for session in [&alice, &bob, &carol] {
+        session.node.shutdown().await.unwrap();
+    }
+    (delivered, lost)
+}
+
+/// A member offline across several commits accounts for each message they kept once: it takes it, or is told it lost,
+/// and never both or twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_back_after_several_commits_takes_or_is_told_each_kept_message_once() {
+    let (delivered, lost) = missed_commits("several").await;
+    let mut accounted: Vec<u64> = delivered.into_iter().chain(lost).collect();
+    accounted.sort();
+    assert_eq!(accounted, [3, 4]);
+}
+
+/// A member offline across several commits takes each message they kept, once, when it comes back: the wait before
+/// each commit holds until it heard the summaries that show who holds them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_back_after_several_commits_takes_each_kept_message() {
+    let (delivered, lost) = missed_commits("several-taken").await;
+    assert_eq!((delivered, lost), (vec![3, 4], Vec::<u64>::new()));
+}
+
+/// A removed member that has not read the commit removing it still sends: what it sends past its final cut reaches no
+/// member that read the removal. Alice and Bob read the commit; Dave, behind the gate, cannot.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_members_send_past_its_final_cut_reaches_no_one() {
+    let relay = relay().await;
+    let dir = folder("sealed-on");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (gate, _reaching) = Gate::new();
+    let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
+    let mut alice = session(&relay, "Alice").await;
+    let mut bob = session(&relay, "Bob").await;
+    let dave = session(&relay, "Dave").await;
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
+    for joiner in [&bob, &dave] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("Alice has three members", || alice.node.members(&gid.0).unwrap().len() == 3).await;
+    gate.spared.lock().unwrap().extend([alice.node.address().0, bob.node.address().0]);
+    gate.set(false);
+
+    // Closing the gate can race the removal's request on the old connection: Alice asks again once it reconnects.
+    let removed = loop {
+        match alice.node.remove(&gid.0, &dave.node.key().0).await {
+            Ok(removed) => break removed,
+            Err(error) => assert!(format!("{error:#}").contains("membership transport interrupted"), "{error:#}"),
+        }
+    };
+    assert!(removed);
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    eventually("Bob applies the removal", || bob.node.epoch(&gid.0).unwrap() == epoch).await;
+    let sealed_on = dave.node.send(&gid.0, &message("sealed on after the removal"), None).await.unwrap();
+    let quiet = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            alice.until(|e| matches!(e, Event::Message(m) if m.id == sealed_on).then_some(())),
+            bob.until(|e| matches!(e, Event::Message(m) if m.id == sealed_on).then_some(())),
+        )
+    })
+    .await;
+    assert!(quiet.is_err(), "neither member delivers it");
+    assert!(alice.node.message(&gid.0, &sealed_on.0).unwrap().is_none());
+    assert!(bob.node.message(&gid.0, &sealed_on.0).unwrap().is_none());
+    for session in [&alice, &bob] {
+        session.node.shutdown().await.unwrap();
+    }
+    dave.node.shutdown().await.unwrap();
+}
+
+/// A member's summary tells what another holds and showed, and survives a restart. A loss a member reports is told to
+/// the author once, and not again after it restarts.
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_seqs_are_told_once_across_restarts() {
+    let relay = relay().await;
+    let dir = folder("told");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = stored(&relay, "Alice", &db("alice")).await;
+    let bob = stored(&relay, "Bob", &db("bob")).await;
+    let carol = stored(&relay, "Carol", &db("carol")).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("Alice has three members", || alice.node.members(&gid.0).unwrap().len() == 3).await;
+    carol.node.shutdown().await.unwrap();
+    drop(carol);
+    let bob_key = bob.node.key();
+    let sent = bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
+    eventually("Alice hears that Bob holds it", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && h.held.iter().any(|s| s.key == bob_key && s.seqs.contains(1)))).await;
+    for name in ["One", "Two"] {
+        alice.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
+    }
+    bob.node.shutdown().await.unwrap();
+    alice.node.shutdown().await.unwrap();
+
+    // Carol, back with no holder online, loses Bob's message and says so in its summary.
+    let mut carol = stored(&relay, "Carol", &db("carol")).await;
+    let lost = carol.until(|e| match e {
+        Event::Lost(lost) => Some(lost),
+        _ => None,
+    }).await;
+    assert_eq!((lost.messages[0].from.key.clone(), lost.messages[0].seqs.clone()), (bob_key.clone(), vec![1]));
+
+    // Bob comes back and hears Carol's summary: he is told once, as its author. Carol's summary survives his restart.
+    let mut bob = stored(&relay, "Bob", &db("bob")).await;
+    let told = bob.until(|e| match e {
+        Event::Lost(lost) => Some(lost),
+        _ => None,
+    }).await;
+    let of = &told.messages[0];
+    assert_eq!((told.member.name.as_str(), &of.from.key, of.seqs.clone(), of.ids.clone()), ("Carol", &bob_key, vec![1], vec![sent.clone()]));
+    bob.node.shutdown().await.unwrap();
+    let mut bob = stored(&relay, "Bob", &db("bob")).await;
+    assert!(bob.node.heard(&gid.0).unwrap().iter().any(|h| h.member.name == "Carol"), "Carol's summary survives the restart");
+    let again = tokio::time::timeout(Duration::from_secs(3), bob.until(|e| matches!(e, Event::Lost(_)).then_some(()))).await;
+    assert!(again.is_err(), "told once");
+    assert!(carol.node.message(&gid.0, &sent.0).unwrap().is_none());
+    for session in [&bob, &carol] {
+        session.node.shutdown().await.unwrap();
+    }
+}
+
+/// Live payloads reach each member online once. One sent before a commit moved the group on is not delivered after it,
+/// to a member that comes back: it takes what is sent after, once it is connected.
+#[tokio::test(flavor = "multi_thread")]
+async fn live_payloads_reach_each_member_once_and_not_across_a_commit() {
+    let relay = relay().await;
+    let dir = folder("live");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut alice = session(&relay, "Alice").await;
+    let mut bob = session(&relay, "Bob").await;
+    let carol = stored(&relay, "Carol", &dir.join("carol.db")).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    carol.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    eventually("Alice has three members", || alice.node.members(&gid.0).unwrap().len() == 3).await;
+    let live = |n: u64| json!({ "type": "edit", "n": n });
+    alice.node.send_live(&gid.0, &live(1), None).unwrap();
+    let first = bob.until(|e| match e {
+        Event::Live { payload, .. } => Some(payload),
+        _ => None,
+    }).await;
+    assert_eq!(first, live(1));
+    carol.node.shutdown().await.unwrap();
+    alice.node.send_live(&gid.0, &live(2), None).unwrap();
+    bob.until(|e| matches!(e, Event::Live { payload, .. } if payload == live(2)).then_some(())).await;
+    alice.node.change_settings(&gid.0, |s| Settings { name: "Release".into(), ..s }).await.unwrap();
+
+    let mut carol = stored(&relay, "Carol", &dir.join("carol.db")).await;
+    eventually("Alice is online to Carol", || alice.node.online(&gid.0).unwrap().iter().any(|m| m.name == "Carol")).await;
+    alice.node.send_live(&gid.0, &live(3), None).unwrap();
+    let got = carol.until(|e| match e {
+        Event::Live { payload, .. } => Some(payload),
+        _ => None,
+    }).await;
+    assert_eq!(got, live(3), "what came before the commit is not resent");
+    assert_eq!(bob.until(|e| match e {
+        Event::Live { payload, .. } => Some(payload),
+        _ => None,
+    }).await, live(3));
+    let extra = tokio::time::timeout(Duration::from_secs(2), bob.until(|e| matches!(e, Event::Live { .. }).then_some(()))).await;
+    assert!(extra.is_err(), "Bob takes each payload once");
+    alice.node.shutdown().await.unwrap();
+    bob.node.shutdown().await.unwrap();
+    carol.node.shutdown().await.unwrap();
+}
+
+/// One sender with more than a thousand messages in an epoch, while a member is offline: the member, back, takes all of
+/// them, in order. Alice's messages are sealed here from her stored state, as her node would seal them, since her own
+/// sends are limited to a hundred and then one a second; a receiver's flood bucket, twice that, admits about two a
+/// second after its first 200, so this takes some minutes.
+#[ignore = "about eight minutes: a receiver's flood bucket admits 2 messages a second after its first 200"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_back_takes_more_than_a_thousand_messages_of_one_sender() {
+    const MESSAGES: u64 = 1100;
+    let relay = relay().await;
+    let dir = folder("thousand");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = stored(&relay, "Alice", &db("alice")).await;
+    let bob = stored(&relay, "Bob", &db("bob")).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+
+    // Alice's invite for Bob is her seq 1, so her messages run from 2.
+    let provider = SqliteProvider::open(&db("alice")).unwrap();
+    let (iroh, session) = member_of(&db("alice"));
+    let author = Bytes(session.key().to_vec());
+    let invite = provider.get(&[b"node/seq/".as_slice(), &gid.0, b"/", &author.0, b"/", &0u64.to_be_bytes(), &1u64.to_be_bytes()].concat()).unwrap().unwrap();
+    let mut prev: Bytes = serde_json::from_slice(&invite).unwrap();
+    let mut group = lmk_core::group::Group::load(&provider, &gid.0).unwrap();
+    let invite_plaintext: Bytes = serde_json::from_value(record(&db("alice"), &gid, &prev)["plaintext"].clone()).unwrap();
+    let mut ciphertexts = vec![Bytes(group.seal(&provider, &session, &invite_plaintext.0).unwrap())];
+    let mut ids = Vec::new();
+    for seq in 2..=MESSAGES + 1 {
+        let header = lmk_proto::held::Header {
+            group: gid.clone(),
+            author: author.clone(),
+            joined: 0,
+            seq,
+            prev: Some(prev.clone()),
+            deps: Vec::new(),
+            reply_to: None,
+            payload: message(&seq.to_string()),
+        };
+        let plaintext = header.encode();
+        ciphertexts.push(Bytes(group.seal(&provider, &session, &plaintext).unwrap()));
+        prev = Bytes(lmk_proto::held::id(&plaintext).to_vec());
+        ids.push(prev.clone());
+    }
+    drop(group);
+    drop(provider);
+
+    // Bob, back, takes them from Alice's hand, the invite first: all of them, once each, in seq order.
+    let mut bob = stored(&relay, "Bob", &db("bob")).await;
+    let mut hand = hand(&relay, iroh, &bob.node).await;
+    hand.send(&Frame::Held { group: gid.clone(), items: ciphertexts, answers: None }).await;
+    let mut taken = Vec::new();
+    while taken.len() < MESSAGES as usize {
+        taken.push(bob.until(|e| match e {
+            Event::Message(message) => Some(message.id),
+            _ => None,
+        }).await);
+    }
+    assert_eq!(taken, ids);
+    bob.node.shutdown().await.unwrap();
 }
