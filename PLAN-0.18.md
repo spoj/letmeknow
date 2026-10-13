@@ -39,23 +39,24 @@ by its domain; how to reach a domain comes from the domain itself.
   - The shells fetch: the session natively, the web app in the browser. They hand the node a resolver,
     `pub type Resolve = Arc<dyn Fn(String) -> BoxFuture<Result<Directory>> + Send + Sync>` (as `Durable`), which the
     node calls at each connection to a service. A shell answers a cached directory younger than 10 minutes as is;
-    otherwise it fetches, stores and answers, falling back to the cached copy, else the error. Node tests inject a map.
+    otherwise it fetches, stores and answers, falling back to the cached copy, else the error. A failed fetch is
+    remembered for a minute, so a domain is fetched at most once a minute whoever asks. Node tests inject a map.
   - letmeknow.dev's directory is built in (`DOMAIN` = `relay.letmeknow.dev`, crates/proto/src/links.rs; web/backend.json),
     used while no fetch has succeeded.
 - **The own service** is `--membership <domain>`. At first start the session takes the key the directory names (the
   default domain must name `MEMBERSHIP_KEY`) and pins it in the home; a later directory with another key fails `listen`,
   naming both keys. Only the own domain failing (no cache, no fetch) fails `listen`; any other failing domain affects
   only its groups or identities, which retry.
-- **A session lives on its own directory's `relays`;** iroh picks the nearest as home and moves off a dead one in about a
-  minute, and a refreshed directory updates them live (`Endpoint::insert_relay`/`remove_relay`). **Chosen relays**
-  (`--relay`, repeatable) replace them.
+- **A session lives on its own directory's `relays`,** as fetched at start; iroh picks the nearest as home and moves off
+  a dead one in about a minute. **Chosen relays** (`--relay`, repeatable) replace them (`Config.chosen`), and are
+  dialed in the hint step too.
 - **Relay hints:** a member's summary gains `relay`, its current home relay.
   - Summaries are signed by the member, passed on unchanged, newest wins, saved, kept within the group, swapped on
     connections that share a group (crates/net/src/peers.rs:208-224).
   - A change of home relay (net reports it) marks every group changed, so the summary is re-signed within
     max(1 s, 250 ms × members) (crates/node/src/peering.rs:199-203).
   - A summary without `relay` keeps the hint saved before. Across groups the newest by `time` wins. Hints survive
-    restarts. Any `https` relay is taken, as 0.17 took any leaf relay.
+    restarts. Only an `https` relay is taken; any other value leaves the hint as it was.
 - **Reachability:** a member following a group's log dials the service at its `addrs` plus its `relay`, and keeps a
   backup path through that relay (validated), so it is reachable there.
 
@@ -154,6 +155,7 @@ C and D1 run in parallel after A and B; D2, F and G in parallel after D1; main i
 ## Later
 
 - **A second relay on another host,** so failover protects default users.
+- **Relays updated live** when a directory changes (`Endpoint::insert_relay`/`remove_relay`); until then, at restart.
 - **"Where is K"**, asked of the group's service over the connection members hold, if relay lists grow past about 10.
 - **Gating our relays** with a higher limit, if free riding shows up: a token in the directory (stock iroh-relay's
   `access.shared_token`; browsers send `?token=`), or keys the service knows (`access.http`).
