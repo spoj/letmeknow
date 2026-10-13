@@ -584,7 +584,8 @@ fn a_message_no_commit_kept_is_not_lost() {
         alice.stop().await;
         let mut bob = world.start("bob", HOUR).await;
         let _alice = world.start("alice", HOUR).await;
-        assert_eq!(bob.expect("message").await["content"], "while you were out");
+        // Unless it comes while Bob catches up, the message, which does not wake him, waits for his next command.
+        assert_eq!(bob.told(&["message"]).await["content"], "while you were out");
         assert!(bob.printed().await.iter().all(|e| e["type"] != "lost"));
     });
 }
