@@ -276,6 +276,7 @@ changes from "holds no keys" to "holds no group keys".
 ## Decided
 
 - **Resolver access** is open, with the rate limits above.
+- **Ours only:** the built-in relays and resolver are ours. No n0 public relays and no n0 resolver.
 
 ## Later
 
