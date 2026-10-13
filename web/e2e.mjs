@@ -288,8 +288,8 @@ try {
   await refused.getByLabel("Device name").fill("refused");
   await refused.getByRole("button", { name: "Continue" }).click();
   await refused.getByRole("button", { name: "New chat" }).waitFor();
-  await until(() => refused.evaluate(() => window.toasts.splice(0)), toasts => toasts.some(t => t.includes("is letmeknow 0.17's")));
-  check(await refused.evaluate(() => localStorage.getItem("lmk relay") === null), "a browser refuses letmeknow 0.17's membership, clears its relay and says so");
+  const said = await until(() => refused.evaluate(() => window.toasts.splice(0)), toasts => toasts.some(t => t.includes("is letmeknow 0.17's")));
+  check(said.some(t => t.includes("is letmeknow 0.17's")) && await refused.evaluate(() => localStorage.getItem("lmk relay") === null), "a browser refuses letmeknow 0.17's membership, clears its relay and says so");
   await refused.context().close();
   delete pages.refused;
 
