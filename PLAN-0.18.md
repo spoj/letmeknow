@@ -52,8 +52,15 @@ one relay (#78). 0.18 keeps only keys in data and gets routes from outside:
   that K is relevant to.
 - **Route cache.** A session keeps the newest record of each tracked key. The cache is saved in the home and loaded
   at start. A key that becomes relevant to none of the session's groups is dropped.
-- **Resolver.** iroh's pkarr relay protocol at `<service host>/pkarr/<z32 key>`: `PUT` stores a record, `GET`
-  returns the newest. In memory only.
+- **Resolver** (a phone book). iroh's pkarr relay protocol at `<service host>/pkarr/<z32 key>`: `PUT` stores a
+  record, `GET` returns the newest. In memory only.
+- **Phone books a session uses.** Its own (`--resolver`), plus the one on the host of each of its groups' services.
+  `serve` runs both on one host, so a service's phone book sits at its relay's `/pkarr`, known from the service's
+  record.
+  - The session publishes its record to all of them, and looks a key up in its own and in those of the services of
+    the groups it shares with that key.
+  - So a group whose members use different phone books still reconnects after all of them were offline: they meet in
+    the phone book of the group's service, which the group relies on already.
 - **Relays: chosen, or the defaults.** A session's relays are where it lives. Its home relay is one of them, and its
   record names that one. iroh picks the home relay among them by latency and moves off one that stops answering, in
   about a minute (validated: about 50 s).
@@ -98,9 +105,9 @@ changes too, and before any home relay is known (validated: `[]`, `[]`, then `[r
 no relay or with an unchanged one. Otherwise it:
 - signs a new record with the endpoint's key (`Endpoint::secret_key()`);
 - caches it and pushes it;
-- `PUT`s it to its resolver.
+- `PUT`s it to every phone book it uses.
 
-It re-`PUT`s every 5 minutes (iroh's `DEFAULT_REPUBLISH_INTERVAL`), so the resolver's copy stays fresh. net's doc
+It re-`PUT`s every 5 minutes (iroh's `DEFAULT_REPUBLISH_INTERVAL`), so their copies stay fresh. net's doc
 changes from "holds no keys" to "holds no group keys".
 
 `serve` puts its own record, with its direct addresses, straight into its store and re-signs it on the same timer.
@@ -111,8 +118,8 @@ changes from "holds no keys" to "holds no group keys".
   - iroh asks `resolve` on every dial without a selected path, and merges what it yields with the app's addresses.
   - `resolve` yields the cached record; on a cache miss, the resolver's. It has no timers, since it cannot see whether
     a path works.
-- **After a failed dial.** The node `GET`s the key from the resolver. If that record is newer, it caches it and
-  dials again.
+- **After a failed dial.** The node `GET`s the key from the phone books that may have it: its own, and those of the
+  services of the groups it shares with that key. If a record is newer, it caches it and dials again.
 - **Fallback.** When dialing a co-member, the node adds the relay in the record of the group's service.
   - **Why it works:** a member following its group's log holds a connection to the service, and iroh keeps the path
     through the service's relay as a backup. It pings it every 5 s, under the 60 s cutoff for an idle non-home
@@ -158,8 +165,9 @@ changes from "holds no keys" to "holds no group keys".
   - `--membership letmeknow.dev | <key, hex>` (`listen` only).
   - `--relay <url>`, repeatable (`LETMEKNOW_RELAY`, comma-separated): the chosen relays. Without it, the built-in
     `RELAYS`.
-  - `--resolver <url>` (`LETMEKNOW_RESOLVER`). Its default is the first chosen relay's `/pkarr`, since a service host
-    runs both; with no chosen relays, the built-in `RESOLVER`.
+  - `--resolver <url>` (`LETMEKNOW_RESOLVER`): the session's own phone book. Its default is the first chosen
+    relay's `/pkarr`, since a service host runs both; with no chosen relays, the built-in `RESOLVER`. The phone books
+    of its groups' services come on top, unconfigured.
 - **The resolver client:**
   - It honours `LETMEKNOW_CA`, through its rustls config.
   - It uses the relays' proxy rule: iroh's `proxy_from_env` takes `HTTP_PROXY` first and ignores `NO_PROXY`, while
@@ -238,6 +246,8 @@ changes from "holds no keys" to "holds no group keys".
   - **Relay change, service down:** a member restarts on another relay while the service is down. Its co-members
     reach it through `routes`, well within `BACKOFF`.
   - **Both moved:** two members both restart on new relays, with the service up. They meet through the resolver.
+  - **Two phone books:** a group on a self-hosted service has a member on letmeknow.dev's defaults. Both go offline
+    and come back on new relays, and they meet through the phone book of the group's service.
   - **Saved cache:** a session restarts and reaches a peer that moved, from its saved cache, with the resolver down.
   - **Joiner:** with a resolver that lacks the service's record, a joiner reads the log within a bound, through
     `Admitted.routes`.
@@ -260,7 +270,8 @@ changes from "holds no keys" to "holds no group keys".
    - Anyone with a key learns its relay and whether it is online. Today anyone with a key and its relay can probe
      that by dialing, and an old invite link lets its holder do so for good (as in 0.17).
    - The resolver also sees lookups: who looks up whom, from which IP, though only on cache misses and failed dials.
-   - A session that chooses its relays uses their host's resolver by default, so its lookups stay with that host.
+   - A session that chooses its relays uses their host's phone book by default. It also uses the phone book of each
+     group's service, so joining a group on another host announces it there too.
    - Restricting the resolver to co-members would need our own protocol.
 2. **IP addresses** stay out of sessions' records and of gossip. iroh's hole punching shares them with connected peers
    only, as now.
@@ -277,6 +288,7 @@ changes from "holds no keys" to "holds no group keys".
 
 - **Resolver access** is open, with the rate limits above.
 - **Ours only:** the built-in relays and resolver are ours. No n0 public relays and no n0 resolver.
+- **Each group's service host is also its phone book**, as well as each session's own.
 
 ## Later
 
