@@ -1,7 +1,7 @@
 # 0.18: routes leave the data
 
 Draft 3, for review. It replaces draft 2's route records, resolver and route gossip with a fixed relay list per
-deployment, relay hints in `hello`, and trying every relay of the list when a hint fails. Once settled it is the
+deployment, relay hints in members' summaries, and trying every relay of the list when a hint fails. Once settled it is the
 implementation contract, as PLAN-0.17.md was, and goes when 0.18 ships. Existing chats, docs and identities do not
 carry over (#56).
 
@@ -47,13 +47,14 @@ from peers, first-hand.
   nearest as home and moves off one that stops answering, in about a minute (validated: about 50 s).
   - **Chosen relays** (`--relay`): the session lives only on those, for a small footprint, and dials through them
     first (Dialing).
-- **Relay hints.** `hello` gains `relay`: the sender's current home relay.
-  - It is sent with `hello` as now: on connect, about 1 s after a change (now also a change of home relay), and every
-    5 minutes.
-  - It is first-hand and never passed on, so it needs no signature: iroh's connection authenticates the sender.
-  - The receiver saves it per key, and ignores a relay on no list it knows, so nobody can steer others to a relay of
-    their own.
-  - Both sides send one, so after any connection each knows the other's relay.
+- **Relay hints.** A member's summary gains `relay`: its current home relay.
+  - Summaries already do what a spreading hint needs: the member signs them, co-members pass them on unchanged, the
+    newest version wins, they are saved, and they stay within the group.
+  - A change of home relay marks the summary changed, so it is re-signed within seconds and spreads.
+  - Peers swap summaries on connect, so after any connection each side knows the other's relay. A member's relay
+    also reaches co-members it never connected to.
+  - A dialer takes the relay from the peer's newest summary in any group they share. It ignores a relay on no list
+    it knows, which keeps chosen-relay sessions off relays they never agreed to.
 - **Lists per service.** A session remembers, per service key, the URL of the list naming that service: its own
   deployment's, or one an invite link gave it. A group's members live on the relays of its service's list, so a
   member may be tried there. A session in groups of two deployments lives on its own deployment's relays, and is
@@ -89,7 +90,7 @@ The node gives iroh explicit addresses, in two steps; no `AddressLookup`.
   - An optional field names the group's service's list URL, written when it isn't letmeknow.dev's.
   - A `6` link is refused as 0.17 refuses a `5` one (links.rs:48): "this invite link is from letmeknow 0.17, whose
     groups this version cannot join: ask for an invite to a group made with letmeknow 0.18".
-- **`hello`:** gains `relay`.
+- **Summary:** gains `relay`.
 - **Home format:** 6 → 7. A format-6 home is answered with the 0.17 command, as 0.17 answers format 5
   (crates/session/src/lib.rs:79-95).
 - **Browser:** the database, Web Lock and BroadcastChannel `lmk6` → `lmk7` (web/src/store.ts:7,
@@ -126,12 +127,13 @@ The node gives iroh explicit addresses, in two steps; no `AddressLookup`.
    - the same from a browser, counting its WebSockets.
 1. **Release:** the tree carries 0.18 and its pins. Write the release notes' migration line now: nothing carries
    over, and browsers lose their 0.17 groups when the service worker updates (#56).
-2. **Proto:** `Leaf`, `Service`, invite link 7, `hello.relay`; `PROTOCOL`, home format, browser names.
+2. **Proto:** `Leaf`, `Service`, invite link 7, `Summary.relay`; `PROTOCOL`, home format, browser names.
 3. **Serve:** `/relays.json`; the printed address. letmeknow.dev's list goes on Pages, and deploy/check-backend.py
    checks it.
 4. **Net:** the relay list from the deployment's file; two-step dialing; `ServeClient` by key at the service's
    addresses.
-5. **Node:** the saved hints; `hello.relay` sent and taken; lists per service; link hints.
+5. **Node:** the relay in the own summary, re-signed on a change of home relay; hints from summaries; lists per
+   service; link hints.
 6. **Client, session, web:**
    - flags, env, outputs, backend.json, localStorage;
    - the scripts that read the 0.17 forms: test/compat.py, test/e2e.py, test/deploy.py, deploy/deploy.sh,
@@ -152,7 +154,8 @@ The node gives iroh explicit addresses, in two steps; no `AddressLookup`.
   - `Leaf` and `Service` carry no routes.
 - **Hints:**
   - both sides learn each other's relay on connect;
-  - a home-relay change while connected reaches the peer within seconds;
+  - a member's relay reaches a co-member it never connected to, in a group over 7;
+  - a home-relay change reaches online co-members within seconds;
   - a hint naming a relay on no known list is ignored;
   - hints survive a restart.
 - **Dialing:**
@@ -184,7 +187,7 @@ The node gives iroh explicit addresses, in two steps; no `AddressLookup`.
 ## Decided
 
 - **Ours only:** letmeknow.dev's relays are ours. No n0 relays, resolvers or DHT.
-- **No resolver:** peers' first-hand hints first, then the whole list.
+- **No resolver:** hints carried in members' summaries first, then the whole list.
 
 ## Open
 
