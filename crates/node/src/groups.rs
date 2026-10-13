@@ -126,6 +126,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         st.forget_heard(gid)?;
         let g = st.groups.remove(gid).context("this session is not in that group")?;
+        st.unhint(g.mls.members().iter().filter_map(|member| member.leaf.as_ref().map(|leaf| leaf.key.clone())).collect())?;
         st.peers.forget(&Bytes(gid.to_vec()));
         st.gate = true;
         st.provider.delete(&rec_key(gid))?;

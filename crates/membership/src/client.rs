@@ -12,14 +12,14 @@ use n0_future::{boxed::BoxFuture, task::AbortOnDropHandle};
 use serde::de::DeserializeOwned;
 use tokio::{io::AsyncWriteExt, sync::{Mutex, Semaphore, mpsc}};
 
-use crate::{Contradiction, Forged, Frontier, InvalidProof, Refused, Subscription, Unreached, VerifiedPage, WrongLog};
+use crate::{Contradiction, Forged, Frontier, InvalidProof, Refused, Subscription, Unreached, VerifiedPage, WrongDirectory, WrongLog};
 
 const MAX_IN_FLIGHT: usize = 4;
 
 // Transport errors can include a peer's arbitrary application-close reason.
 fn safe_error(error: anyhow::Error) -> anyhow::Error {
     if error.is::<Refused>() || error.is::<Unreached>() || error.is::<Forged>() || error.is::<WrongLog>()
-        || error.is::<InvalidProof>() || error.is::<Contradiction>() { error }
+        || error.is::<InvalidProof>() || error.is::<Contradiction>() || error.is::<WrongDirectory>() { error }
     else { anyhow::anyhow!("membership transport interrupted") }
 }
 
@@ -36,7 +36,9 @@ pub type Resolve = Arc<dyn Fn(String) -> BoxFuture<Result<Directory>> + Send + S
 pub async fn directory(resolve: &Resolve, service: &Service) -> Result<Directory> {
     let Service::Serve { key, domain, .. } = service else { bail!("unsupported membership service") };
     let directory = resolve(domain.clone()).await?;
-    ensure!(directory.key.as_slice() == key.0.as_slice(), "the directory of {domain} names another key than the service");
+    if directory.key.as_slice() != key.0.as_slice() {
+        return Err(WrongDirectory(domain.clone()).into());
+    }
     Ok(directory)
 }
 
@@ -187,7 +189,7 @@ async fn a_directory_must_name_the_service_key() {
     });
     let service = |key: [u8; 32]| Service::Serve { key: Bytes(key.to_vec()), domain: "relay.example".into(), rest: Default::default() };
     assert!(directory(&resolve, &service([1; 32])).await.is_ok());
-    assert!(directory(&resolve, &service([2; 32])).await.unwrap_err().to_string().contains("another key"));
+    assert!(directory(&resolve, &service([2; 32])).await.unwrap_err().is::<WrongDirectory>());
 }
 
 #[cfg(test)]

@@ -90,7 +90,15 @@ impl<P: Provider + Send + 'static> Node<P> {
     /// device link joins with a new device key. Returns the group, and the iroh key of the member that admitted this
     /// session.
     pub async fn join(&self, link: &Invite, identity: Option<Certificate>) -> Result<(Bytes, [u8; 32])> {
-        let relay: RelayUrl = (self.inner.resolve)(link.domain.clone()).await?.relay.parse()?;
+        let service: Vec<RelayUrl> = match (self.inner.resolve)(link.domain.clone()).await {
+            Ok(directory) => vec![directory.relay.parse()?],
+            Err(error) => {
+                self.inner.warn(None, format!("joining without the directory of {}: {error:#}", link.domain));
+                Vec::new()
+            }
+        };
+        // Each member is dialed at the relay it last said it was on, and at the link's service.
+        let hint = |peer: EndpointId| -> Vec<RelayUrl> { self.inner.lock().hint_of(&peer).into_iter().chain(service.clone()).collect() };
         let members = link.members.iter().map(|member| Ok(EndpointId::from_bytes(member)?)).collect::<Result<Vec<_>>>()?;
         let (secret, devices) = (Bytes(link.secret.to_vec()), link.device);
         // The KeyPackage, its private keys and its device key are kept until this session joins or every member it asks
@@ -122,12 +130,12 @@ impl<P: Provider + Send + 'static> Node<P> {
             .enumerate()
             .map(|(i, peer)| {
                 let net = self.inner.net().clone();
-                let (relay, own) = (relay.clone(), self.inner.relays.clone());
+                let (hint, own) = (hint(peer), self.inner.relays.clone());
                 spawn(async move {
                     // A dial that fails at once, as one from a node that has just started can, is tried again until the wait
                     // is up.
                     let dialed = timeout(DIAL_WAIT, async {
-                        while let Err(error) = net.dial(peer, vec![relay.clone()], own.clone()).await {
+                        while let Err(error) = net.dial(peer, hint.clone(), Box::pin(std::future::ready(own.clone()))).await {
                             tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
                             sleep(Duration::from_secs(1)).await;
                         }
@@ -151,7 +159,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             }
             let deadline = Instant::now() + JOIN_WAIT;
             let answer = loop {
-                let answer = timeout(deadline.saturating_duration_since(Instant::now()), self.inner.net().join(peer, vec![relay.clone()], self.inner.relays.clone(), join.clone())).await;
+                let answer = timeout(deadline.saturating_duration_since(Instant::now()), self.inner.net().join(peer, hint(peer), Box::pin(std::future::ready(self.inner.relays.clone())), join.clone())).await;
                 match answer {
                     // The connection may have been replaced by one the member dialed meanwhile; asking again is safe, as a
                     // member that added this session answers with the commit entry it kept. The ask may have added it.

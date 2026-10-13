@@ -125,6 +125,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         for member in &removed {
             st.unhear(gid, &member.key)?;
         }
+        st.unhint(removed.iter().filter_map(|member| member.leaf.as_ref().map(|leaf| leaf.key.clone())).collect())?;
         self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, removed, settings, gone }).ok();
         st.group_mut(gid)?.rec.position = position;
         if gone {
