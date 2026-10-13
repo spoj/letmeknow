@@ -42,6 +42,22 @@ fn the_binary_logs_what_rust_log_asks_without_colour_in_a_pipe() {
     }
 }
 
+/// Termux may run the binary through Android's linker, which /proc/self/exe then names; `ready` names the binary.
+#[test]
+fn the_binary_names_itself_as_termux_names_it() {
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_letmeknow"));
+    command.arg("--home").arg(dir.path().join("home")).args(["listen", "--relay", "http://127.0.0.1:1"]).env_remove("LETMEKNOW_SESSION");
+    command.env("TERMUX_EXEC__PROC_SELF_EXE", "/data/data/com.termux/files/home/letmeknow");
+    let mut child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let mut ready = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(ready.contains(r#""bin":"/data/data/com.termux/files/home/letmeknow""#), "{ready}");
+}
+
 /// A home that 0.15 made is refused, and left as it is.
 #[test]
 fn the_binary_leaves_an_earlier_home_as_it_is() {

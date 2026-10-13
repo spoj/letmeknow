@@ -813,7 +813,9 @@ pub async fn run(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let me = session.client.me()?;
-    let bin = std::env::current_exe()?;
+    // Termux may run a program through Android's linker, which /proc/self/exe then names; it names the program in
+    // TERMUX_EXEC__PROC_SELF_EXE.
+    let bin = std::env::var_os("TERMUX_EXEC__PROC_SELF_EXE").map_or_else(std::env::current_exe, |exe| Ok(exe.into()))?;
     let mut ready = json!({ "type": "ready", "session": session.config.handle, "name": me["device"]["name"], "fp": me["fp"], "bin": bin });
     if let Some(identity) = me["identity"]["name"].as_str() {
         ready["identity"] = json!(identity);

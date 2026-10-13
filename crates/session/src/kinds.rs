@@ -37,7 +37,10 @@ pub fn discover(dirs: &[PathBuf]) -> BTreeMap<String, PathBuf> {
 
 /// The directories a session looks in for plugins: its executable's, then PATH's.
 pub fn dirs() -> Vec<PathBuf> {
-    let own = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    // Termux may run a program through Android's linker, which /proc/self/exe then names; it names the program in
+    // TERMUX_EXEC__PROC_SELF_EXE.
+    let exe = std::env::var_os("TERMUX_EXEC__PROC_SELF_EXE").map(PathBuf::from).or_else(|| std::env::current_exe().ok());
+    let own = exe.and_then(|exe| exe.parent().map(Path::to_path_buf));
     let path = std::env::var_os("PATH").map(|path| std::env::split_paths(&path).collect::<Vec<_>>()).unwrap_or_default();
     own.into_iter().chain(path).collect()
 }
