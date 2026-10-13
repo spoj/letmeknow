@@ -18,7 +18,7 @@ use n0_future::task::spawn;
 use n0_future::time::{Duration, sleep};
 use tokio::sync::mpsc;
 
-use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, device_key_key, duties, endpoint_id, get, hex, iroh_key, logs, now, rec_key};
+use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, device_key_key, duties, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
 
 /// How long a fetch keeps looking for a member that holds the file.
 const FETCH_TRIES: u32 = 12;
@@ -85,7 +85,14 @@ impl<P: Provider> State<P> {
             groups.insert(gid.0, G::new(mls, rec));
         }
         let bindings = get(&provider, b"node/identity-bindings")?.unwrap_or_default();
-        let hints = get(&provider, b"node/hints")?.unwrap_or_default();
+        let mut hints = BTreeMap::new();
+        for g in groups.values() {
+            for leaf in g.mls.members().iter().filter_map(|member| member.leaf.as_ref()) {
+                if let Some(hint) = get::<peering::Hint>(&provider, &peering::hint_key(&leaf.key.0))? {
+                    hints.insert(leaf.key.clone(), hint);
+                }
+            }
+        }
         let peers = Peers::new(now(), u64::from_be_bytes(lmk_core::random()), *iroh_key(&provider)?.public().as_bytes());
         let mut state = State {
             bindings,
