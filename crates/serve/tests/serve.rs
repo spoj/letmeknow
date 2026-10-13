@@ -113,6 +113,7 @@ async fn serves_relay_and_membership_without_frontend() {
     let directory = Directory::parse(directory.split_once("\r\n\r\n").unwrap().1.as_bytes()).unwrap();
     assert_eq!(directory.key.to_vec(), key.0);
     assert_eq!(directory.addrs, [format!("localhost:{membership}")]);
+    assert_eq!(directory.relay, relay);
     assert_eq!(directory.relays, [relay.as_str()]);
     let portal = http_get(
         http,
@@ -177,12 +178,13 @@ async fn directory_names_the_relays_given() {
     let state = dir.path().join("state");
     let (mut config, cert) = configure(&state);
     config.relays = vec!["https://relay.example:8443".into(), "https://relay2.example".into()];
-    let https = config.https_port;
+    let (https, relay) = (config.https_port, config.relay_url());
     let server = tokio::spawn(serve(config));
     wait_for_https(https).await;
 
     let response = https_get(https, &cert, "/.well-known/letmeknow.json", "").await;
     let directory = Directory::parse(response.split_once("\r\n\r\n").unwrap().1.as_bytes()).unwrap();
+    assert_eq!(directory.relay, relay);
     assert_eq!(directory.relays, ["https://relay.example:8443", "https://relay2.example"]);
     server.abort();
 }

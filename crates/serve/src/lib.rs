@@ -190,6 +190,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
     let directory = Directory {
         key: *store.key().verifying_key().as_bytes(),
         addrs: vec![format!("{}:{}", config.domain, config.membership_port)],
+        relay: config.relay_url(),
         relays: if config.relays.is_empty() { vec![config.relay_url()] } else { config.relays.clone() },
     };
     directory.check()?;
