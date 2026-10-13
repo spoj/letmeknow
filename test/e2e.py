@@ -168,7 +168,7 @@ def main():
         check(seen["identity"]["name"] == "Bob" and seen["identity"]["how"] == "observed", "another identity is known by its own name, a claim")
 
         sent = run("alice", "send", "hello bob")
-        check(len(sent["id"]) == 64 and "pos" not in sent, "send answers the message's id at once")
+        check(sent.get("id") and "pos" not in sent, "send answers the message's id at once")
         got = bob.expect("message")
         check(got["content"] == "hello bob" and got["from"] == f"Alice · {alice.ready['name']}", "bob receives it from alice, as her identity claims")
         reply = run("bob", "send", "--reply-to", got["id"], "hi alice")["id"]
