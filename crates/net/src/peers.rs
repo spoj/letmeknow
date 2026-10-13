@@ -29,7 +29,7 @@ pub const ANSWER: usize = 1 << 20;
 pub const K: usize = 6;
 pub const MESH: usize = 7;
 pub const REDIAL: u64 = 10_000;
-pub const BACKOFF: u64 = 30_000;
+pub const BACKOFF: u64 = 10_000;
 pub const MAX_BACKOFF: u64 = 600_000;
 pub const PROBE: u64 = 60_000;
 pub const RECENT: u64 = 7_200_000;
@@ -259,7 +259,7 @@ impl Peers {
         if !ok {
             let b = self.backoff.entry(*peer).or_default();
             b.failures += 1;
-            b.until = now + (BACKOFF << (b.failures - 1).min(5)).min(MAX_BACKOFF);
+            b.until = now + (BACKOFF << (b.failures - 1).min(6)).min(MAX_BACKOFF);
         }
     }
 

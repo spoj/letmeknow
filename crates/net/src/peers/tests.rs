@@ -119,22 +119,21 @@ fn the_pair_rank_is_symmetric() {
     assert_ne!(rank(&id(), &key(3), &key(9)), rank(&id(), &key(3), &key(8)));
 }
 
-/// A failed dial backs the peer off 30 s, then 60 s after the next failure; a connection clears the backoff.
+/// A failed dial backs the peer off 10 s, then 20 s after the next failure; a connection clears the backoff.
 #[test]
 fn a_failed_dial_backs_off_and_a_connection_clears_it() {
     let mut p = peers();
     p.group(id(), own(1, &[1]), 0);
     assert_eq!(dials(&p.poll(0)), vec![key(1)]);
     p.dialed(&key(1), false, 0);
-    assert!(dials(&p.poll(REDIAL)).is_empty());
-    assert_eq!(dials(&p.poll(BACKOFF)), vec![key(1)]);
-    p.dialed(&key(1), false, BACKOFF);
-    assert!(dials(&p.poll(80_000)).is_empty());
-    assert_eq!(dials(&p.poll(90_000)), vec![key(1)]);
-    p.dialed(&key(1), false, 90_000);
-    p.connect(key(1), gs(), false, 95_000);
+    assert_eq!(dials(&p.poll(10_000)), vec![key(1)]);
+    p.dialed(&key(1), false, 10_000);
+    assert!(dials(&p.poll(20_000)).is_empty());
+    assert_eq!(dials(&p.poll(30_000)), vec![key(1)]);
+    p.dialed(&key(1), false, 30_000);
+    p.connect(key(1), gs(), false, 35_000);
     p.disconnect(&key(1));
-    assert_eq!(dials(&p.poll(100_000)), vec![key(1)], "a connection cleared the backoff");
+    assert_eq!(dials(&p.poll(40_000)), vec![key(1)], "a connection cleared the backoff");
 }
 
 /// A member seen recently is a target ahead of a better-ranked member that is not.
@@ -509,7 +508,7 @@ fn a_holder_past_its_backoff_is_dialed_when_the_wait_starts() {
     p.group(id(), own(1, &[1]), 0);
     let lacking = vec![seqs(1, &[(5, 5)])];
     p.summary(&id(), heard(1, 1, 0, lacking.clone()), Some(key(1)));
-    p.dialed(&key(1), false, 0);
+    p.dialed(&key(1), false, HEAR - 1);
     assert_eq!(p.wait(&id(), &lacking, 0, HEAR), Decision::Lose(lacking.clone()), "backing off");
     assert_eq!(p.wait(&id(), &lacking, 31_000, 31_000), Decision::Wait);
     assert_eq!(dials(&p.poll(31_000)), vec![key(1)]);
