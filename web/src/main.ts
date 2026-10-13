@@ -890,11 +890,12 @@ class ChatView extends View {
         const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent", item.failed && "unsent"];
         const lostBy = item.lost_by?.length && h("p", { className: "tag" }, item.lost_by.map(p => p.name).join(", "), " could not read this; send it again if it matters");
         const readBy = item.read_by?.length ? ` · read by ${item.read_by.map(p => p.name).join(", ")}` : "";
+        const unkept = item.only_here ? "; no commit keeps it yet: keep this page open" : "";
         const ticks =
           item.only_here !== undefined &&
-          (item.only_here
-            ? h("small", { className: "ticks", title: "Only on this device: keep this page open until another member has it" }, "✓")
-            : h("small", { className: "ticks", title: `Held by ${item.held_by!.map(p => p.name).join(", ")}` }, "✓✓", readBy));
+          (item.held_by?.length
+            ? h("small", { className: "ticks", title: `Held by ${item.held_by.map(p => p.name).join(", ")}${unkept}` }, "✓✓", readBy)
+            : h("small", { className: "ticks", title: "Only on this device: keep this page open until another member has it" }, "✓"));
         return h(
           "li",
           { className: classes.filter(Boolean).join(" "), tabIndex: -1 },

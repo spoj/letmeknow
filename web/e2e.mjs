@@ -634,7 +634,7 @@ try {
   await laptop.locator(".devices li", { hasText: "this browser" }).waitFor();
   await laptop.getByRole("button", { name: "Add a device" }).click();
   const link = await laptop.locator("dialog .copy code").first().textContent();
-  check(link.includes("#5.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
+  check(link.includes("#6.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
   const tablet = native("tablet");
   await tablet.printed(e => e.type === "ready");
   const joining = tablet.start("identity", "join", link);
@@ -900,18 +900,19 @@ try {
   await ann.printed(e => e.type === "message" && e.content === "after recovery handoff", 60_000);
   check(true, "the surviving tab still sends to the real peer after the recovery handoff");
 
-  // With Ann gone, what the laptop sends to her chat still counts on the group's log, held only by the laptop.
+  // With Ann gone, what the laptop sends to her chat is held only by the laptop.
   await ann.stop();
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
   await laptop.locator("textarea:visible").fill("anyone there?");
   await laptop.locator("textarea:visible").press("Enter");
   const lone = laptop.locator(".messages li", { hasText: "anyone there?" });
   await lone.waitFor();
-  check(true, "a message sent with no other member online is listed once the group's log takes it");
+  check(true, "a message sent with no other member online is listed at once");
   await lone.locator(".ticks", { hasText: /^✓$/ }).waitFor();
   check(true, "with a single tick, as no other member holds it");
 
-  // Two renames move the chat two epochs on, and the laptop closes: Ann, back, cannot read the message, and says so.
+  // Two renames move the chat two epochs on, and the laptop closes, asking first, as no commit keeps the message. Open
+  // again, it sealed it anew in each epoch, so Ann, back, receives it.
   for (const name of ["Plans 2", "Plans 3"]) {
     await laptop.getByRole("button", { name: "Settings" }).click();
     await laptop.locator("dialog").getByLabel("Name").fill(name);
@@ -923,22 +924,19 @@ try {
   const asked = new Promise(resolve => laptop.once("dialog", dialog => (resolve(dialog.type()), dialog.accept())));
   const closed = laptop.waitForEvent("close");
   await laptop.close({ runBeforeUnload: true });
-  check((await asked) === "beforeunload", "closing the page while a message is held only there asks first");
+  check((await asked) === "beforeunload", "closing the page while no commit keeps a message asks first");
   await closed;
   delete pages["second tab"];
-  const annBack = native("ann");
-  await annBack.printed(e => e.type === "lost" && e.member === "you", 60_000);
   laptop = watch("laptop", await context.newPage());
   laptop.on("dialog", dialog => dialog.accept());
   await laptop.goto(SITE);
   await laptop.locator(".group-list button", { hasText: "Plans" }).click();
-  const lost = laptop.locator(".messages li", { hasText: "anyone there?" });
-  await lost.locator(".tag", { hasText: "could not read this" }).waitFor({ timeout: 60_000 });
-  check((await lost.locator(".tag").textContent()).startsWith("Ann"), "the laptop shows who lost its message");
-  const carlBack = native("carl");
-  await lost.locator(".ticks", { hasText: "✓✓" }).waitFor({ timeout: 60_000 });
-  check(true, "and two ticks once Carl, back, holds it");
-  await carlBack.stop();
+  const annBack = native("ann");
+  await annBack.printed(e => e.type === "message" && e.content === "anyone there?", 60_000);
+  check(true, "Ann, back two epochs on, receives what the laptop sent while she was away");
+  await laptop.locator(".messages li", { hasText: "anyone there?" }).locator(".ticks", { hasText: "✓✓" }).waitFor({ timeout: 60_000 });
+  check(true, "and the laptop shows two ticks once she holds it");
+  await annBack.stop();
 
   // Selection now awaits its durable description snapshot before switching the visible view.
   await laptop.locator(".group-list button", { hasText: "Notes" }).click();
