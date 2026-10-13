@@ -6,9 +6,9 @@ use crate::provider::MemoryProvider;
 use lmk_proto::group::{CHAT, ChatMessage, REVISION, Service};
 use sha2::{Digest, Sha256};
 
-/// A membership service at `relay`, for logs no test reaches.
-pub(crate) fn service(relay: &str) -> Service {
-    Service::Serve { key: ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes().into(), relay: relay.into(), addrs: vec![], rest: Default::default() }
+/// A membership service at `domain`, for logs no test reaches.
+pub(crate) fn service(domain: &str) -> Service {
+    Service::Serve { key: ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes().into(), domain: domain.into(), rest: Default::default() }
 }
 
 pub(crate) fn settings(name: &str) -> Settings {
@@ -18,14 +18,14 @@ pub(crate) fn settings(name: &str) -> Settings {
         name: name.into(),
         carry: 7,
         update: lmk_proto::group::UPDATE,
-        membership: service("https://lmk.example"),
+        membership: service("lmk.example"),
         public: None,
         rest: Default::default(),
     }
 }
 
 pub(crate) fn leaf(name: &str) -> Leaf {
-    Leaf { key: Bytes(name.as_bytes().to_vec()), relay: "https://relay.example/".into(), kinds: vec![CHAT.into()], revision: REVISION }
+    Leaf { key: Bytes(name.as_bytes().to_vec()), kinds: vec![CHAT.into()], revision: REVISION }
 }
 
 /// An entry as a member read it: its verdict, and for a commit what applying it did.
@@ -628,7 +628,7 @@ fn settings_in_the_welcome() {
     let mut changed = w.m[0].g().settings();
     changed.name = "Plan v2".into();
     changed.carry = 30;
-    changed.membership = service("https://elsewhere.example");
+    changed.membership = service("elsewhere.example");
     let cut = w.m[0].cut();
     let commit = w.m[0].commit(Change { cut, settings: Some(changed.clone()), ..Change::default() });
     w.post(commit.entry);
@@ -655,7 +655,7 @@ fn leaf_data() {
     w.found(0, &[1, 2]);
     let leaves: Vec<_> = w.m[0].g().members().into_iter().map(|m| m.leaf.unwrap()).collect();
     assert_eq!(leaves, [leaf("A"), leaf("B"), leaf("C")]);
-    let moved = Leaf { relay: "https://relay2.example/".into(), ..leaf("B") };
+    let moved = Leaf { kinds: vec![CHAT.into(), "doc".into()], ..leaf("B") };
     let cut = w.m[1].cut();
     let commit = w.m[1].commit(Change { cut, leaf: Some(moved.clone()), ..Change::default() });
     w.post(commit.entry);
@@ -726,7 +726,7 @@ fn rules_bind_everyone() {
     }
 
     // An update that changes the committer's credential beyond its name: C claims an identity.
-    let identity = lmk_proto::group::IdentityRef { id: Bytes(vec![1; 32]), membership: service("https://lmk.example") };
+    let identity = lmk_proto::group::IdentityRef { id: Bytes(vec![1; 32]), membership: service("lmk.example") };
     w.m[2].session.credential.certificate = Some(lmk_proto::group::Certificate { identity, device: Bytes(vec![2; 32]), name: "Ann".into(), device_name: "laptop".into(), sig: Bytes(vec![3; 64]) }.into());
     let cut = w.m[2].cut();
     let c = &mut w.m[2];
@@ -777,7 +777,7 @@ fn private_certificates_refresh_but_cannot_rebind_a_membership() {
     let id = crate::random();
     let key: [u8; 32] = w.m[0].session.key().try_into().unwrap();
     let of = |id: [u8; 32], seed: &[u8; 32], key: [u8; 32], name: &str, label: &str| Certificate {
-        identity: IdentityRef { id: id.into(), membership: service("https://lmk.example") },
+        identity: IdentityRef { id: id.into(), membership: service("lmk.example") },
         device: public(seed).into(), name: name.into(), device_name: label.into(),
         sig: Bytes(sign(seed, &certified(&key, &id, &public(seed), name, label))),
     };
@@ -868,9 +868,9 @@ fn credentials_are_checked_not_enforced() {
     use lmk_proto::public::certified;
     let mut w = World::new(&["A", "M"]);
     let laptop = crate::random();
-    let (id, first) = create(&laptop, service("https://lmk.example"));
+    let (id, first) = create(&laptop, service("lmk.example"));
     let log = PublicLog::replay(&id, [first.as_slice()]).unwrap();
-    let identity = IdentityRef { id: id.into(), membership: service("https://lmk.example") };
+    let identity = IdentityRef { id: id.into(), membership: service("lmk.example") };
     // A speaks as Alice, certified by her laptop; M claims her identity with A's certificate.
     let sig = Bytes(sign(&laptop, &certified(w.m[0].session.key().try_into().unwrap(), &id, &public(&laptop), "Alice", "laptop")));
     let certificate = Certificate { identity, device: public(&laptop).into(), name: "Alice".into(), device_name: "laptop".into(), sig };
