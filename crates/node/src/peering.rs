@@ -391,6 +391,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             }
         }
         st.tell_peers();
+        let now = st.tick();
         for out in st.peers.poll(now) {
             self.out(st, out)?;
         }
