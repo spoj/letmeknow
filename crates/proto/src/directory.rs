@@ -2,7 +2,7 @@
 
 use anyhow::{Result, ensure};
 use http::uri::Authority;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
 use crate::links::{DOMAIN, MEMBERSHIP_KEY, RELAY};
@@ -58,6 +58,28 @@ impl Directory {
             relays: vec![RELAY.into()],
         }
     }
+}
+
+/// Checks a service's domain as it is written: `host` or `host:port`, lowercase LDH labels, no trailing dot, no IP
+/// literal, and no port 443 (the default) or other non-canonical port.
+pub fn check_domain(domain: &str) -> Result<()> {
+    let (host, port) = domain.split_once(':').map_or((domain, None), |(host, port)| (host, Some(port)));
+    let label = |label: &&str| {
+        !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-')
+            && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    let labels: Vec<&str> = host.split('.').collect();
+    let ip_literal = labels.last().is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()));
+    let port_ok = port.is_none_or(|port| port.parse::<u16>().is_ok_and(|n| n.to_string() == port && n != 0 && n != 443));
+    ensure!(host.len() <= 253 && labels.iter().all(label) && !ip_literal && port_ok, "a domain is a canonical host or host:port, not {domain}");
+    Ok(())
+}
+
+/// A service's domain, checked as it is read.
+pub fn deserialize_domain<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let domain = String::deserialize(d)?;
+    check_domain(&domain).map_err(serde::de::Error::custom)?;
+    Ok(domain)
 }
 
 mod hex_key {
@@ -128,6 +150,22 @@ mod tests {
         assert!(refused(body(&key, r#"["h/x:1"]"#, ok, r#"["https://h"]"#)).contains("invalid"));
         let padded = format!(r#"{{"key":"{key}","addrs":[],"relay":"https://h","relays":["https://h"],"pad":"{}"}}"#, "x".repeat(MAX_BYTES));
         assert!(refused(padded).contains("64 KB"));
+    }
+
+    #[test]
+    fn domains_are_canonical_hosts() {
+        for domain in ["relay.letmeknow.dev", "localhost:8443", "localhost", "a-b.example:7843", "h.example:1"] {
+            assert!(check_domain(domain).is_ok(), "{domain}");
+        }
+        for domain in [
+            "", ":8443", "localhost:", "localhost:443", "localhost:0443", "localhost:+8443", "localhost:0", "localhost:65536",
+            "Relay.example", "relay.example.", "a..b", "-a.example", "a-.example", "a_b.example", "127.0.0.1", "127.0.0.1:8443",
+            "[::1]:8443", "u@h.example", "h.example/x", "h.example?x", "h.example#x", "h.example:8443/x", "h .example",
+            "h.example:8443:1",
+        ] {
+            assert!(check_domain(domain).is_err(), "{domain}");
+        }
+        assert!(check_domain(&format!("{}.example", "a".repeat(64))).is_err(), "a label is at most 63 bytes");
     }
 
     #[test]

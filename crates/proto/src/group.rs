@@ -3,9 +3,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::Bytes;
+use crate::{Bytes, directory};
 
-pub const PROTOCOL: u32 = 6;
+pub const PROTOCOL: u32 = 7;
 /// This release's protocol revision, which grows with each compatible addition; a leaf without one is revision 0.
 pub const REVISION: u32 = 0;
 /// The private-use extension types: settings in the group context, and leaf data.
@@ -19,14 +19,14 @@ pub const IDENTITY: &str = "identity";
 /// T's default: daily.
 pub const UPDATE: u32 = 24 * 60 * 60;
 
-/// Where a log lives.
+/// Where a log lives: the membership service whose key is `key`, which its domain's directory names.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Service {
     Serve {
         key: Bytes,
-        relay: String,
-        addrs: Vec<String>,
+        #[serde(deserialize_with = "directory::deserialize_domain")]
+        domain: String,
         #[serde(flatten)]
         rest: Map<String, Value>,
     },
@@ -60,7 +60,6 @@ pub struct Settings {
 pub struct Leaf {
     /// The session's iroh key.
     pub key: Bytes,
-    pub relay: String,
     /// The kinds the session supports.
     pub kinds: Vec<String>,
     /// The session's protocol revision.
@@ -173,8 +172,8 @@ mod tests {
         assert_eq!(leave, r#"{"type":"leave"}"#);
         let message = ChatMessage { content: "hi".into(), to: vec![], urgent: false, attachment: None, sent_at: Some(5) };
         assert_eq!(serde_json::to_string(&message).unwrap(), r#"{"type":"message","content":"hi","sent_at":5}"#);
-        let service = Service::Serve { key: Bytes(vec![1]), relay: "https://r".into(), addrs: vec![], rest: Default::default() };
-        assert_eq!(serde_json::to_string(&service).unwrap(), r#"{"serve":{"key":"AQ","relay":"https://r","addrs":[]}}"#);
+        let service = Service::Serve { key: Bytes(vec![1]), domain: "localhost:8443".into(), rest: Default::default() };
+        assert_eq!(serde_json::to_string(&service).unwrap(), r#"{"serve":{"key":"AQ","domain":"localhost:8443"}}"#);
     }
 
     #[test]
@@ -183,15 +182,17 @@ mod tests {
         let service: Service = serde_json::from_str(r#"{"s3":{"bucket":"b"}}"#).unwrap();
         assert!(matches!(service, Service::Newer(_)));
         assert_eq!(serde_json::to_string(&service).unwrap(), r#"{"s3":{"bucket":"b"}}"#);
+        let uncanonical: Service = serde_json::from_str(r#"{"serve":{"key":"AQ","domain":"Relay.example"}}"#).unwrap();
+        assert!(matches!(uncanonical, Service::Newer(_)), "a domain that is not canonical is not a service this version knows");
     }
 
     #[test]
     fn records_keep_fields_this_version_does_not_know() {
-        let text = r#"{"protocol":4,"kind":"chat","name":"Plan","carry":7,"update":86400,"membership":{"serve":{"key":"Ag","relay":"r","addrs":[],"ticket":"t"}},"color":"red"}"#;
+        let text = r#"{"protocol":4,"kind":"chat","name":"Plan","carry":7,"update":86400,"membership":{"serve":{"key":"Ag","domain":"h.example","ticket":"t"}},"color":"red"}"#;
         let settings: Settings = serde_json::from_str(text).unwrap();
         let renamed = Settings { name: "Release".into(), ..settings };
         assert_eq!(serde_json::to_string(&renamed).unwrap(), text.replace("Plan", "Release"));
-        let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ","relay":"r","kinds":["chat"]}"#).unwrap();
+        let leaf: Leaf = serde_json::from_str(r#"{"key":"AQ","kinds":["chat"]}"#).unwrap();
         assert_eq!(leaf.revision, 0);
     }
 }
