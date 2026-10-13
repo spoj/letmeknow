@@ -424,6 +424,21 @@ try {
   await laptop.getByText("across domains").waitFor();
   check(true, "and exchanges messages with it");
 
+  // A link naming a domain whose directory is down: its fetch is tried, and not again within a minute.
+  const encoded = domain => Buffer.from(domain).toString("base64url");
+  const down = crossing.link.replace(`.${encoded(LETMEKNOW_OTHER)}.`, `.${encoded("localhost:1")}.`);
+  const fetchesDown = () => requests.filter(([url]) => url.startsWith("https://localhost:1/")).length;
+  await laptop.getByRole("button", { name: "Join", exact: true }).first().click();
+  await laptop.locator("dialog").getByLabel("Invite link").fill(down);
+  await laptop.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
+  await until(() => laptop.evaluate(() => window.toasts.splice(0)), toasts => toasts.some(t => t.includes("localhost:1")));
+  const tried = fetchesDown();
+  await laptop.locator("dialog").getByLabel("Invite link").fill(down);
+  await laptop.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
+  const again = await until(() => laptop.evaluate(() => window.toasts.splice(0)), toasts => toasts.some(t => t.includes("failed less than a minute ago")));
+  check(tried >= 1 && fetchesDown() === tried && again.length, "a directory whose fetch failed is not fetched again within a minute");
+  await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
+
   // Existing private leaves, not a public directory overlay, drive the open People dialog.
   const annIdentity = ann.run("identity", "list").identity;
   const initialBindings = await bindings(laptop);
