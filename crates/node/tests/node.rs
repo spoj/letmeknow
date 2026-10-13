@@ -10,14 +10,14 @@ use lmk_core::group::Session as Mls;
 use lmk_core::provider::{MemoryProvider, Provider, SqliteProvider};
 use lmk_membership::service::Service as Membership;
 use lmk_membership::store::Store;
-use lmk_testing::{Relay, relay};
+use lmk_testing::{Relay, relay, relay_beside};
 use lmk_node::identity::Identity;
 use lmk_node::{Config, Event, INVITE_VALID, Node};
 use lmk_proto::group::{CHAT, Certificate, ChatMessage, IDENTITY, IdentityRef, PROTOCOL, Service, Settings};
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
 use lmk_proto::head::Head;
-use lmk_proto::peer::{Frame, Seqs};
+use lmk_proto::peer::{Frame, SUMMARY, Seqs, Signed, Summary};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -2469,4 +2469,124 @@ async fn a_member_back_takes_more_than_a_thousand_messages_of_one_sender() {
     }
     assert_eq!(taken, ids);
     bob.node.shutdown().await.unwrap();
+}
+
+/// Members learn each other's home relays as they connect.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_learn_each_others_relays() {
+    let relay = relay().await;
+    let dir = folder("relays-learn");
+    let alice = stored(&relay, "Alice", &dir.join("alice.db")).await;
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    let (alice_key, bob_key, url) = (alice.node.address().0, bob.node.address().0, relay.url.to_string());
+    eventually("Alice holds Bob's relay", || alice.node.hint(&bob_key) == Some(url.clone())).await;
+    eventually("Bob holds Alice's relay", || bob.node.hint(&alice_key) == Some(url.clone())).await;
+}
+
+/// A member whose home relay moves tells its online co-member, which holds the new relay within seconds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_home_relay_change_reaches_an_online_co_member() {
+    let relay = relay().await;
+    let moved = relay_beside(&relay).await;
+    let dir = folder("relays-move");
+    let alice_db = dir.join("alice.db");
+    let alice = stored(&relay, "Alice", &alice_db).await;
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    let alice_key = alice.node.address().0;
+    eventually("Bob holds Alice's relay", || bob.node.hint(&alice_key) == Some(relay.url.to_string())).await;
+
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+    let _alice = stored(&moved, "Alice", &alice_db).await;
+    eventually("Bob holds Alice's new relay", || bob.node.hint(&alice_key) == Some(moved.url.to_string())).await;
+}
+
+/// In a group over seven, where members do not all connect, a member's new home relay reaches every co-member, though
+/// most of them never connect to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_home_relay_reaches_every_member_of_a_group_over_seven() {
+    let relay = relay().await;
+    let moved = relay_beside(&relay).await;
+    let dir = folder("relays-seven");
+    let bob_db = dir.join("bob.db");
+    let mut sessions = vec![session(&relay, "Alice").await];
+    let gid = sessions[0].node.create(settings(CHAT, &relay), None).unwrap();
+    let bob = stored(&relay, "Bob", &bob_db).await;
+    bob.node.join(&sessions[0].node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    for name in ["Carol", "Dave", "Erin", "Frank", "Grace", "Heidi"] {
+        let joiner = session(&relay, name).await;
+        joiner.node.join(&sessions[0].node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        sessions.push(joiner);
+    }
+    eventually("Alice has eight members", || sessions[0].node.members(&gid.0).unwrap().len() == 8).await;
+
+    let bob_key = bob.node.address().0;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+    let _bob = stored(&moved, "Bob", &bob_db).await;
+    eventually("every member holds Bob's new relay", || sessions.iter().all(|s| s.node.hint(&bob_key) == Some(moved.url.to_string()))).await;
+}
+
+/// A summary without a relay leaves the hint saved before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_summary_without_relay_keeps_the_hint() {
+    let relay = relay().await;
+    let dir = folder("relays-keep");
+    let (alice_db, bob_db) = (dir.join("alice.db"), dir.join("bob.db"));
+    let alice = stored(&relay, "Alice", &alice_db).await;
+    let bob = stored(&relay, "Bob", &bob_db).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    let (bob_iroh, url) = (bob.node.address().0, relay.url.to_string());
+    eventually("Alice holds Bob's relay", || alice.node.hint(&bob_iroh) == Some(url.clone())).await;
+    let joined = alice.node.heard(&gid.0).unwrap().iter().find(|heard| heard.member.name == "Bob").unwrap().joined;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+
+    // Bob's stopped session, standing in for itself, signs a newer summary that names no relay.
+    let (iroh, mls) = member_of(&bob_db);
+    let shown = seqs(&Bytes(mls.key().to_vec()), joined, &[1]);
+    let summary = Summary {
+        group: gid.clone(),
+        member: Bytes(mls.key().to_vec()),
+        joined,
+        version: lmk_node::now() + 3_600_000,
+        time: lmk_node::now(),
+        epoch: alice.node.epoch(&gid.0).unwrap(),
+        relay: None,
+        held: Vec::new(),
+        shown: vec![shown.clone()],
+        lost: Vec::new(),
+    };
+    let body = serde_json::to_vec(&summary).unwrap();
+    let sig = mls.sign(&[SUMMARY, &body].concat());
+    let mut bob_hand = hand(&relay, iroh, &alice.node).await;
+    bob_hand.send(&Frame::Summaries { group: gid.clone(), items: vec![Signed { body: Bytes(body), sig: Bytes(sig) }] }).await;
+    eventually("Alice takes the summary", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.shown == [shown.clone()])).await;
+    assert_eq!(alice.node.hint(&bob_iroh), Some(url));
+}
+
+/// Hints are saved with the session: a member restarted with its co-members away still holds what they said.
+#[tokio::test(flavor = "multi_thread")]
+async fn hints_survive_a_restart() {
+    let relay = relay().await;
+    let dir = folder("relays-restart");
+    let alice_db = dir.join("alice.db");
+    let alice = stored(&relay, "Alice", &alice_db).await;
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    let (bob_iroh, url) = (bob.node.address().0, relay.url.to_string());
+    eventually("Alice holds Bob's relay", || alice.node.hint(&bob_iroh) == Some(url.clone())).await;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+
+    let alice = stored(&relay, "Alice", &alice_db).await;
+    assert_eq!(alice.node.hint(&bob_iroh), Some(url));
 }
