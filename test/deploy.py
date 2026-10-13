@@ -171,7 +171,7 @@ def git(*args, cwd):
 
 
 def release(tmp, before, version, mock_dir):
-    tmp = tmp / version
+    tmp = tmp / f"{before}-{version}"
     tmp.mkdir()
     origin, work = tmp / "origin.git", tmp / "work"
     git("init", "-q", "--bare", "-b", "main", str(origin), cwd=tmp)
@@ -181,7 +181,7 @@ def release(tmp, before, version, mock_dir):
     (work / "deploy/release-run.py").write_text("")
     (work / "Cargo.toml").write_text(f'[workspace.package]\nversion = "{before}"\n')
     for name in PIN_FILES:
-        (work / name).write_text("@letmeknow/cli@0.16\n")
+        (work / name).write_text(f"@letmeknow/cli@{before.rsplit('.', 1)[0]}\n")
     git("init", "-q", "-b", "main", cwd=work)
     git("config", "user.name", "test", cwd=work)
     git("config", "user.email", "test@example.com", cwd=work)
@@ -196,12 +196,13 @@ def release(tmp, before, version, mock_dir):
     assert result.returncode == 0, (version, result.stdout, result.stderr)
     minor = version.rsplit(".", 1)[0]
     patch = version.endswith(".0")
+    pinned = minor if patch else before.rsplit(".", 1)[0]
     pins = {name: git("show", f"main:{name}", cwd=origin) for name in PIN_FILES}
     assert f'version = "{version}"' in git("show", "main:Cargo.toml", cwd=origin), version
-    assert pins == {name: f"@letmeknow/cli@{minor if patch else '0.16'}\n" for name in PIN_FILES}, pins
+    assert pins == {name: f"@letmeknow/cli@{pinned}\n" for name in PIN_FILES}, pins
     assert ("MINOR = \"" + minor + "\"" in result.stdout) == patch, result.stdout
     assert f"v{version}" in git("tag", cwd=origin).split(), version
-    print(f"ok - release {version}: pins {'move to ' + minor if patch else 'stay at 0.16'}")
+    print(f"ok - release {version} from {before}: pins at {pinned}")
 
 
 with tempfile.TemporaryDirectory(prefix="lmk-release-test-") as directory:
@@ -214,3 +215,4 @@ with tempfile.TemporaryDirectory(prefix="lmk-release-test-") as directory:
         path.chmod(0o755)
     release(tmp, "0.16.1", "0.17.0", mock_dir)
     release(tmp, "0.16.1", "0.16.2", mock_dir)
+    release(tmp, "0.17.0", "0.17.0", mock_dir)

@@ -2,7 +2,7 @@
 
 The code and its comments are the documentation. SKILL.md, compiled into the binary as `letmeknow skill`, is what agents using letmeknow read, and README.md what people read first: keep both true in the same change as the code.
 
-`main` is the next release, patch or minor; choose the version at release time. Commit subjects read `Area: what changed`.
+`main` is the next release. Once it needs a new minor version, the tree carries that version and its pins; otherwise choose the version at release time. Commit subjects read `Area: what changed`.
 
 ## Compatibility
 
@@ -11,7 +11,7 @@ Releases of one minor version run side by side in the same groups:
 - An addition that other members must understand raises the protocol revision (`REVISION` in crates/proto/src/group.rs), and is used only toward members whose leaves name that revision.
 - Anything else waits for a new minor version, behind its switches: the ALPN, a group's protocol version, the invite link version, the home's format, and the browser's database version. A minor version flips only the switches its changes need.
 
-Browsers load the frontend from GitHub Pages at letmeknow.dev and take updates through its service worker. Agents pin `@letmeknow/cli@0.16`, so they get the latest 0.16.x when they restart.
+Browsers load the frontend from GitHub Pages at letmeknow.dev and take updates through its service worker. Agents pin `@letmeknow/cli@0.17`, so they get the latest 0.17.x when they restart.
 
 ## Checks
 

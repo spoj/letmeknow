@@ -15,7 +15,7 @@ if [ "${version##*.}" = 0 ]; then
   sed -i "s#@letmeknow/cli@[0-9]*\.[0-9]*#@letmeknow/cli@$minor#g" README.md SKILL.md web/src/index.html AGENTS.md
 fi
 cargo update -w --offline
-git commit -qam "$version"
+git commit -q --allow-empty -am "$version"
 sha=$(git rev-parse HEAD)
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 git push -q origin main
