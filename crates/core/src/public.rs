@@ -21,6 +21,7 @@ pub struct PublicLog {
     pub id: [u8; 32],
     pub membership: Service,
     pub writers: Vec<Bytes>,
+    /// Every key the log ever dropped: none returns.
     dropped: Vec<Bytes>,
     latest: [u8; 32],
 }
@@ -106,11 +107,11 @@ impl PublicLog {
     pub fn apply(&mut self, sealed: &[u8]) -> bool {
         let Ok(entry) = open(&self.id, sealed) else { return false };
         let Some(body) = signed_body(&entry, &self.writers) else { return false };
-        if body.prev.as_ref().map(|prev| prev.0.as_slice()) != Some(self.latest.as_slice()) || body.membership.is_some() {
+        let linked = body.prev.as_ref().map(|prev| prev.0.as_slice()) == Some(self.latest.as_slice());
+        if !linked || body.membership.is_some() || body.writers.iter().any(|writer| self.dropped.contains(writer)) {
             return false;
         }
         self.dropped.extend(self.writers.iter().filter(|held| !body.writers.contains(held)).cloned());
-        self.dropped.retain(|dropped| !body.writers.contains(dropped));
         self.writers = body.writers;
         self.latest = Sha256::digest(&entry.body.0).into();
         true
@@ -118,6 +119,10 @@ impl PublicLog {
 
     pub fn closed(&self) -> bool {
         self.writers.is_empty()
+    }
+
+    pub fn is_dropped(&self, key: &Bytes) -> bool {
+        self.dropped.contains(key)
     }
 
     pub fn next(&self, seed: &[u8; 32], mut writers: Vec<Bytes>) -> Vec<u8> {
@@ -134,7 +139,7 @@ impl PublicLog {
         }
         if self.writers.contains(&certificate.device) {
             Verdict::Authorized
-        } else if self.closed() || self.dropped.contains(&certificate.device) {
+        } else if self.closed() || self.is_dropped(&certificate.device) {
             Verdict::Dropped
         } else {
             Verdict::Unverified
@@ -179,8 +184,8 @@ mod tests {
         }
         assert!(log.apply(&log.next(&b, keys[1..].to_vec())));
         assert!(!log.apply(&log.next(&a, keys.clone())), "dropped writer");
-        assert!(log.apply(&log.next(&b, keys.clone())), "explicit reauthorization");
-        assert!(log.apply(&log.next(&a, vec![])));
+        assert!(!log.apply(&log.next(&b, keys.clone())), "a dropped writer never returns");
+        assert!(log.apply(&log.next(&b, vec![])));
         assert!(log.closed());
         assert!(!log.apply(&log.next(&b, keys)));
     }
@@ -244,8 +249,9 @@ mod tests {
         let other = crate::random();
         assert!(log.apply(&log.next(&seed, vec![public(&other).into()])));
         assert_eq!(log.verify(&of("Ann", "laptop")), Verdict::Dropped);
-        assert!(log.apply(&log.next(&other, vec![device.into()])));
-        assert_eq!(log.verify(&of("Ann", "laptop")), Verdict::Authorized);
+        assert!(!log.apply(&log.next(&other, vec![device.into()])), "a dropped device never returns");
+        assert_eq!(log.verify(&of("Ann", "laptop")), Verdict::Dropped);
+        assert!(log.apply(&log.next(&other, vec![public(&crate::random()).into()])), "a fresh key is the way back");
     }
 
     #[test]
