@@ -8,7 +8,8 @@ BIN = os.environ.get("LMK_E2E_BIN") or os.path.join(ROOT, os.environ.get("CARGO_
 WEB = os.path.join(ROOT, "web")
 BROWSER = "--no-browser" not in sys.argv
 TMP = tempfile.mkdtemp(prefix="lmk-e2e-")
-ENV = {**os.environ, "NO_PROXY": "localhost,127.0.0.1"}
+# No session asks the real registry whether a newer release is out.
+ENV = {**os.environ, "NO_PROXY": "localhost,127.0.0.1", "LETMEKNOW_REGISTRY": "http://127.0.0.1:1"}
 ENV.pop("LETMEKNOW_SESSION", None)
 
 
@@ -155,7 +156,7 @@ def main():
 
         # An invite, and chat.
         invite = run("alice", "invite", "--name", "Plans")
-        check(invite["link"].startswith("https://letmeknow.dev/i#5.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
+        check(invite["link"].startswith("https://letmeknow.dev/i#6.g.") and invite["kind"] == "chat", "invite gives a link to a new chat")
         group = invite["group"]
         check("serve" in run("alice", "groups")[0]["membership"], "its log is on the local letmeknow serve")
         joined = run("bob", "join", invite["link"])
@@ -167,14 +168,14 @@ def main():
         check(seen["identity"]["name"] == "Bob" and seen["identity"]["how"] == "observed", "another identity is known by its own name, a claim")
 
         sent = run("alice", "send", "hello bob")
-        check(isinstance(sent.get("pos"), int), "send answers the message's position in the group's log")
+        check(len(sent["id"]) == 64 and "pos" not in sent, "send answers the message's id at once")
         got = bob.expect("message")
         check(got["content"] == "hello bob" and got["from"] == f"Alice · {alice.ready['name']}", "bob receives it from alice, as her identity claims")
         reply = run("bob", "send", "--reply-to", got["id"], "hi alice")["id"]
         answer = alice.expect("message")
         check(answer["reply_to"] == got["id"] and "direct" not in answer, "a reply names what it answers")
         history = run("alice", "read", reply, "--ancestors", "1")
-        check([m["id"] for m in history] == [sent["id"], reply], "read follows what the sender had read")
+        check([m["id"] for m in history] == [sent["id"], reply], "read shows a message after the latest in its causal past")
 
         # An attachment.
         token = write("token.txt", "s3cret")
@@ -215,7 +216,7 @@ def main():
 
         # A device link: bob's tablet joins his identity.
         link = run("bob", "identity", "invite")["link"]
-        check("#5.d." in link, "identity invite gives a device link")
+        check("#6.d." in link, "identity invite gives a device link")
         tablet = Listener("tablet")
         listeners.append(tablet)
         check("device" in run("tablet", "identity", "join", link), "the tablet joins bob's identity")
@@ -251,11 +252,11 @@ def main():
         check(alice.expect("joined", lambda e: e["member"] == erin.ready["fp"])["by"] != f"Bob · {bob.ready['name']} (bob)", "admitted by another member")
         run("alice", "name", f"--group={group}", "Release")
         missed = run("alice", "send", f"--group={group}", "while you were away")
-        check(isinstance(missed.get("pos"), int), "the group's log takes what bob misses")
+        check("id" in missed, "alice sends while bob is away")
         bob = Listener("bob")
         listeners.append(bob)
         got = bob.expect("message", lambda e: e["content"] == "while you were away", timeout=60)
-        check(got["group"] == "Release" and got["pos"] == missed["pos"], "a restarted session catches up on what it missed, at its position")
+        check(got["group"] == "Release" and got["id"] == missed["id"], "a restarted session catches up on what it missed")
         renamed = until(lambda: run("bob", "groups"), lambda gs: any(g.get("name") == "Release" for g in gs))
         check(any(g.get("name") == "Release" for g in renamed), "and on the commits it missed")
 

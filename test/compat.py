@@ -134,12 +134,12 @@ def main():
         carol = Listener(new, "carol")
         listeners.append(carol)
         message = refused(new, "carol", "join", unused)
-        check("another version of letmeknow" in message, f"this build refuses {PREVIOUS}'s invite link, with its reason")
+        check(f"letmeknow {PREVIOUS}" in message, f"this build refuses {PREVIOUS}'s invite link, with its reason")
         for listener in listeners:
             listener.stop()
         listeners.clear()
         message = refused(new, "alice", "listen", "--hold", "0")
-        check("earlier letmeknow" in message, f"this build refuses {PREVIOUS}'s home, with its reason")
+        check(f"letmeknow {PREVIOUS}" in message, f"this build refuses {PREVIOUS}'s home, with its reason")
     finally:
         for listener in listeners:
             listener.stop()

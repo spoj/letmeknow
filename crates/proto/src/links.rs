@@ -43,7 +43,11 @@ impl Invite {
     pub fn parse(link: &str) -> Result<Self> {
         let fragment = link.split_once('#').context("an invite link has a part after #")?.1;
         let mut fields = fragment.split('.');
-        ensure!(fields.next() == Some("6"), "this invite link is from another version of letmeknow");
+        match fields.next() {
+            Some("6") => {}
+            Some("5") => bail!("this invite link is from letmeknow 0.16, whose groups this version cannot join: ask for an invite to a group made with letmeknow 0.17"),
+            _ => bail!("this invite link is from another version of letmeknow"),
+        }
         let device = match fields.next() {
             Some("d") => true,
             Some("g") => false,
@@ -104,8 +108,9 @@ mod tests {
         }
         assert!(Invite::parse("https://letmeknow.dev/i#6.g.AA.AA").is_err());
         assert!(Invite::parse("https://letmeknow.dev/i#6.g.AgICAgICAgICAgICAgICAg").is_err(), "a link names a member");
-        let older = Invite { device: false, secret: [2; 16], members }.link().replacen("#6.", "#5.", 1);
-        assert!(Invite::parse(&older).unwrap_err().to_string().contains("another version"));
+        let link = Invite { device: false, secret: [2; 16], members }.link();
+        assert!(Invite::parse(&link.replacen("#6.", "#5.", 1)).unwrap_err().to_string().contains("letmeknow 0.16"));
+        assert!(Invite::parse(&link.replacen("#6.", "#7.", 1)).unwrap_err().to_string().contains("another version"));
     }
 
     #[test]
