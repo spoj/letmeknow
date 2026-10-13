@@ -365,3 +365,10 @@ async fn dial_to_absent_key_gives_up() {
     assert!(dialed.is_err());
     assert!(took >= Duration::from_secs(6) && took < Duration::from_secs(8), "gave up after {took:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn home_relay_is_reported() {
+    let relay = relay().await;
+    let mut a = node(&relay, keys(1)[0].clone(), Fake::new(), Options::default()).await;
+    assert_eq!(a.until(|event| matches!(event, Event::Home(_))).await, Event::Home(relay.url.clone()));
+}

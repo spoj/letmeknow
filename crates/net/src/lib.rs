@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl,
+    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, Watcher,
     endpoint::{Builder, Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -82,6 +82,8 @@ pub enum Event {
     Frame(EndpointId, Frame),
     /// A file is now held whole.
     Fetched([u8; 32]),
+    /// The endpoint's home relay is now this one.
+    Home(RelayUrl),
 }
 
 pub struct Config {
@@ -138,6 +140,19 @@ impl Net {
         #[cfg(not(target_family = "wasm"))]
         let publishing = config.home.as_ref().map(|home| addresses::publish(&endpoint, home)).transpose()?;
         let (events, rx) = mpsc::unbounded_channel();
+        let mut homes = endpoint.watch_addr().stream();
+        let reporting = events.clone();
+        spawn(async move {
+            let mut last = None;
+            while let Some(addr) = homes.next().await {
+                if let Some(home) = addr.relay_urls().next()
+                    && last.as_ref() != Some(home)
+                {
+                    last = Some(home.clone());
+                    reporting.send(Event::Home(home.clone())).ok();
+                }
+            }
+        });
         let inner = Arc::new(Inner {
             endpoint: endpoint.clone(),
             config,
