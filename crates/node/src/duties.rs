@@ -70,8 +70,10 @@ impl<P: Provider> State<P> {
     fn fetch_blocked(&mut self, gid: &[u8], now: u64) -> Result<bool> {
         let live = self.fetchable(gid)?;
         let g = self.group_mut(gid)?;
-        g.fetch = waiting(g.fetch.take(), &live, now);
-        Ok(g.fetch.is_some())
+        if g.fetch.is_none() && !live.is_empty() {
+            g.fetch = Some((live.clone(), now));
+        }
+        Ok(g.fetch.as_ref().is_some_and(|(fixed, since)| waits(fixed, *since, &live, now)))
     }
 
     /// Drops what the group kept past H: delivered messages (but this session's own that no cut kept), commit entries,
@@ -250,12 +252,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 }
 
-/// The fetch an update waits on, while the seqs connected members list that it lacks: the seqs it fixed when it first
-/// waited, which later ones do not join, for at most `HEAR`.
-fn waiting(fixed: Option<(Vec<Seqs>, u64)>, live: &[Seqs], now: u64) -> Option<(Vec<Seqs>, u64)> {
-    let (fixed, since) = fixed.unwrap_or_else(|| (live.to_vec(), now));
-    let lacking = live.iter().any(|want| fixed.iter().any(|f| f.key == want.key && f.joined == want.joined && !f.seqs.intersection(&want.seqs).is_empty()));
-    (lacking && now < since + HEAR).then_some((fixed, since))
+/// Whether an update waits on its fetch: while `live`, the seqs connected members list that it lacks, still holds any of
+/// `fixed`, those it listed when it first waited in this epoch `since`, for at most `HEAR`.
+fn waits(fixed: &[Seqs], since: u64, live: &[Seqs], now: u64) -> bool {
+    now < since + HEAR && live.iter().any(|want| fixed.iter().any(|f| f.key == want.key && f.joined == want.joined && !f.seqs.intersection(&want.seqs).is_empty()))
 }
 
 /// Whether a member's device was dropped from its identity's list, as the public logs held show it.
@@ -275,12 +275,10 @@ mod tests {
 
     #[test]
     fn an_update_waits_for_what_was_listed_when_it_first_waited_for_at_most_hear() {
-        let first = waiting(None, &[seqs(b"a", 0, &[3, 4])], 1_000).unwrap();
-        assert_eq!(first, (vec![seqs(b"a", 0, &[3, 4])], 1_000));
-        assert_eq!(waiting(Some(first.clone()), &[seqs(b"a", 0, &[4]), seqs(b"b", 0, &[9])], 5_000), Some((vec![seqs(b"a", 0, &[3, 4])], 1_000)), "seq 3 still lacking, and b's seq 9 not joined");
-        assert_eq!(waiting(Some(first.clone()), &[seqs(b"b", 0, &[9])], 5_000), None, "nothing fixed is still lacking");
-        assert_eq!(waiting(Some(first), &[seqs(b"a", 0, &[3])], 1_000 + HEAR), None, "HEAR is up");
-        assert_eq!(waiting(None, &[], 1_000), None);
+        let fixed = [seqs(b"a", 0, &[3, 4])];
+        assert!(waits(&fixed, 1_000, &[seqs(b"a", 0, &[4]), seqs(b"b", 0, &[9])], 5_000), "seq 4 still lacking");
+        assert!(!waits(&fixed, 1_000, &[seqs(b"b", 0, &[9])], 5_000), "nothing fixed is still lacking");
+        assert!(!waits(&fixed, 1_000, &[seqs(b"a", 0, &[3])], 1_000 + HEAR), "HEAR is up");
     }
 
     #[test]

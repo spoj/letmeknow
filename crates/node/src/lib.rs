@@ -400,7 +400,7 @@ pub(crate) struct G {
     reading: Option<(u64, u64)>,
     /// Reading waits before a commit that deletes the keys of an epoch whose kept messages this session lacks.
     waiting: bool,
-    /// The seqs an update waits to fetch before it commits, and when it first waited.
+    /// The seqs an update waits to fetch before it commits, and when it first waited, in this epoch.
     fetch: Option<(Vec<Seqs>, u64)>,
     /// The public logs this session follows of the identities the group's members speak as.
     public: Vec<Vec<u8>>,

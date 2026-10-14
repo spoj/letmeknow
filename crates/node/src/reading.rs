@@ -111,7 +111,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         let inner = g.mls.open_entry(&st.provider, entry)?;
         let mut applied = g.mls.apply(&st.provider, entry)?;
         let current = g.mls.epoch();
-        g.reading = None;
+        (g.reading, g.fetch) = (None, None);
         g.changed = true;
         let members = g.mls.members();
         let by = members.iter().find(|m| m.index == applied.by).cloned();
