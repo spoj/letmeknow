@@ -144,6 +144,17 @@ async fn public_logs_take_small_entries_and_few_new_and_stored_appends() {
 }
 
 #[tokio::test]
+async fn a_public_log_keeps_its_caps_whatever_flag_an_append_sends() {
+    let http = Http::new(Policy { public_appends_per_day: 2, ..Policy::default() });
+    assert!(http.append("192.0.2.1", 1, &one(b"x"), true).await.is_none());
+    assert!(matches!(http.append("192.0.2.1", 1, &one(&[1; (16 << 10) + 1]), false).await, Some(Refusal::Policy)));
+    assert!(matches!(http.append("192.0.2.1", 1, &one(b"x"), false).await, Some(Refusal::Policy)));
+    assert!(matches!(http.append("192.0.2.1", 1, &[b"y".to_vec(), b"z".to_vec()], true).await, Some(Refusal::Rate)));
+    assert!(http.append("192.0.2.1", 1, &one(b"y"), true).await.is_none());
+    assert!(matches!(http.append("192.0.2.1", 1, &one(b"z"), true).await, Some(Refusal::Rate)));
+}
+
+#[tokio::test]
 async fn reads_and_heads_share_a_request_budget_and_a_byte_budget() {
     let http = Http::new(Policy { reads_per_minute: 2, ..Policy::default() });
     let read = serde_json::to_vec(&Read { capability: [1; 32], after: 0 }).unwrap();

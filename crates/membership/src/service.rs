@@ -50,7 +50,7 @@ pub struct Policy {
     pub read_bytes_per_minute: u64,
     pub new_logs_per_day: u64,
     pub new_public_logs_per_day: u64,
-    /// Stored appends a day to each public log, from any address.
+    /// Stored entries a day to each public log, from any address.
     pub public_appends_per_day: u64,
     /// New logs a day from all addresses.
     pub new_logs_per_day_in_all: u64,
@@ -290,11 +290,12 @@ impl Service {
         ensure!(!public || entries.iter().all(|e| e.0.len() <= PUBLIC_ENTRY), Refused("size".into()));
         let reference = head::reference(&self.0.store.key().verifying_key().to_bytes(), &capability);
         let bytes: u64 = entries.iter().map(|e| e.0.len() as u64).sum();
+        let count = entries.len() as u64;
         let _slot = self.slot().await?;
         let may_start = {
             let mut budgets = self.0.budgets.lock().unwrap();
             ensure!(budgets.appends.take(at, sources, 1) && budgets.append_bytes.take(at, sources, bytes)
-                && (!public || budgets.public_appends.fits(at, &[(reference, 1)], 1)), Refused("rate".into()));
+                && (!public || budgets.public_appends.fits(at, &[(reference, 1)], count)), Refused("rate".into()));
             budgets.new_logs.fits(at, sources, 1) && budgets.new_logs_in_all.fits(at, &IN_ALL, 1)
                 && (!public || budgets.new_public_logs.fits(at, sources, 1))
         };
@@ -303,7 +304,7 @@ impl Service {
             inner.store.append(&reference, &entries, public)
         }).await?;
         let mut budgets = self.0.budgets.lock().unwrap();
-        if public { budgets.public_appends.charge(at, &[(reference, 1)], 1); }
+        if public { budgets.public_appends.charge(at, &[(reference, 1)], count); }
         if appended.position == 1 {
             budgets.new_logs.charge(at, sources, 1);
             budgets.new_logs_in_all.charge(at, &IN_ALL, 1);

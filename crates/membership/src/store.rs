@@ -135,7 +135,8 @@ impl Store {
             "SELECT length,hash,public FROM anchors WHERE reference=?", [log_ref],
             |r| Ok((r.get::<_, u64>(0)?, r.get::<_, [u8; 32]>(1)?, r.get::<_, bool>(2)?)),
         ).optional()?;
-        let (length, mut hash, public) = existing.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), log_ref), public));
+        let (length, mut hash, stored) = existing.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), log_ref), public));
+        ensure!(stored == public, Refused("policy".into()));
         ensure!(used(&tx, &self.wal)? + bytes <= self.disk, Refused("quota".into()));
         if public {
             let public_bytes: u64 = tx.query_row("SELECT public_bytes FROM metadata", [], |r| r.get(0))?;
@@ -300,7 +301,7 @@ mod tests {
         let day = now() / DAY_MS;
         store.db.lock().unwrap().execute("UPDATE records SET expiry_day=? WHERE reference=?", params![day-2, d]).unwrap();
         store.db.lock().unwrap().execute("UPDATE anchors SET day=? WHERE reference=?", params![day-2, public]).unwrap();
-        store.append(&public, &[Bytes(vec![2])], false).unwrap();
+        store.append(&public, &[Bytes(vec![2])], true).unwrap();
         assert_eq!(store.expire(day).unwrap(), 1);
         assert_eq!(store.read(&public, 0).unwrap().entries.len(), 2);
         assert_eq!(store.read(&d, 0).unwrap_err().downcast::<Refused>().unwrap().0, "expired");
