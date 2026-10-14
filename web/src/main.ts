@@ -100,7 +100,7 @@ let groups: Group[] = [];
 let page: "group" | "devices" = "group";
 let selected: string | undefined;
 let entered: Promise<void> | undefined;
-/** How many of this browser's messages and files no cut keeps yet: closing the page while any is loses them. */
+/** How many of this browser's messages and files no other member holds yet: closing the page while any is loses them. */
 let onlyHere = 0;
 let storageFailed = false;
 addEventListener("beforeunload", event => (onlyHere || storageFailed) && event.preventDefault());
@@ -890,7 +890,7 @@ class ChatView extends View {
         const classes = ["message", item.from.you && "mine", follows && "follows", item.to?.includes(me.fp) && "direct", item.urgent && "urgent", item.failed && "unsent"];
         const lostBy = item.lost_by?.length && h("p", { className: "tag" }, item.lost_by.map(p => p.name).join(", "), " could not read this; send it again if it matters");
         const readBy = item.read_by?.length ? ` · read by ${item.read_by.map(p => p.name).join(", ")}` : "";
-        const unkept = item.only_here ? "; no commit keeps it yet: keep this page open" : "";
+        const unkept = item.only_here ? "; no other member holds it yet: keep this page open" : "";
         const ticks =
           item.only_here !== undefined &&
           (item.held_by?.length
@@ -938,7 +938,7 @@ class ChatView extends View {
         return h("li", { className: "event warn" }, text, at);
       }
       case "leave":
-        return h("li", { className: "event" }, who(item.from), " asked to leave", item.only_here && h("small", { className: "ticks", title: "No commit keeps it yet: keep this page open until a member removes you" }, " ✓"), at);
+        return h("li", { className: "event" }, who(item.from), " asked to leave", item.only_here && h("small", { className: "ticks", title: "No other member holds it yet: keep this page open until a member removes you" }, " ✓"), at);
       case "joined":
       case "left": {
         const self = item.by.fp === item.member.fp;

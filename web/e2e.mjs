@@ -960,7 +960,7 @@ try {
   await lone.locator(".ticks", { hasText: /^✓$/ }).waitFor();
   check(true, "with a single tick, as no other member holds it");
 
-  // Two renames move the chat two epochs on, and the laptop closes, asking first, as no commit keeps the message. Open
+  // Two renames move the chat two epochs on, and the laptop closes, asking first, as no other member holds the message. Open
   // again, it sealed it anew in each epoch, so Ann, back, receives it.
   for (const name of ["Plans 2", "Plans 3"]) {
     await laptop.getByRole("button", { name: "Settings" }).click();
@@ -973,7 +973,7 @@ try {
   const asked = new Promise(resolve => laptop.once("dialog", dialog => (resolve(dialog.type()), dialog.accept())));
   const closed = laptop.waitForEvent("close");
   await laptop.close({ runBeforeUnload: true });
-  check((await asked) === "beforeunload", "closing the page while no commit keeps a message asks first");
+  check((await asked) === "beforeunload", "closing the page while no other member holds a message asks first");
   await closed;
   delete pages["second tab"];
   laptop = watch("laptop", await context.newPage());

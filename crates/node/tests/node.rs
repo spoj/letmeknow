@@ -2494,7 +2494,7 @@ async fn a_commit_keeps_what_a_member_holds_and_reseals_the_rest() {
     dave.node.shutdown().await.unwrap();
     let m2 = alice.node.send(&gid.0, &message("two"), None).await.unwrap();
     let held = |node: &Node<SqliteProvider>| node.only_here(&gid.0).unwrap().into_iter().map(|(id, _)| id).collect::<Vec<_>>();
-    assert_eq!(held(&alice.node), [m1.clone(), m2.clone()], "neither is kept yet");
+    assert_eq!(held(&alice.node), [m1.clone(), m2.clone()], "neither is held by another member yet");
 
     assert!(alice.node.remove(&gid.0, &dave_key.0).await.unwrap());
     assert_eq!(held(&alice.node), std::slice::from_ref(&m2), "the commit kept one, which Bob held");

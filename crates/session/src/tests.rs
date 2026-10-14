@@ -597,7 +597,7 @@ fn status_lists_sends_held_only_here_and_members_away() {
         held(&alice, &sent, &robert).await;
         alice.cmd(&["name", "Again"]).await.unwrap();
         let status = until(|| async { alice.cmd(&["status"]).await.unwrap() }, |status| status["groups"][0]["only_here"].is_null()).await;
-        assert!(status["groups"][0]["only_here"].is_null(), "Bob holds it, and a commit kept it");
+        assert!(status["groups"][0]["only_here"].is_null(), "Bob holds it");
         assert!(status.get("warning").is_none());
         bob.stop().await;
         SHIFT.store(8 * 24 * 3600 * 1000, std::sync::atomic::Ordering::Relaxed);
@@ -621,10 +621,10 @@ fn a_leave_is_pending_until_another_member_removes_the_session() {
     });
 }
 
-/// A message no commit kept is not told lost: Bob is away while Alice sends and commits twice, and gets the message once
-/// Alice is back, as she still holds it.
+/// A message no other member holds is not told lost: Bob is away while Alice sends and commits twice, and gets the
+/// message once Alice is back, as she still holds it.
 #[test]
-fn a_message_no_commit_kept_is_not_lost() {
+fn a_message_no_other_member_holds_is_not_lost() {
     local(async {
         let world = world("unkept").await;
         let (mut alice, mut bob, _) = pair(&world, HOUR).await;

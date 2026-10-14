@@ -743,7 +743,7 @@ impl App {
 
     /// A group's timeline: the messages it stored, the changes and losses this session saw, in delivery time. Its own
     /// messages say which other members hold them (`held_by`), show them (`read_by`) or lost them (`lost_by`), and whether
-    /// no cut keeps them yet (`only_here`). `shown`: the page shows them, so they are marked shown.
+    /// no other member holds them yet (`only_here`). `shown`: the page shows them, so they are marked shown.
     fn items(&self, gid: &Bytes, shown: bool) -> Result<Value> {
         let node = self.client.node();
         let describer = self.client.describer(gid)?;
@@ -815,7 +815,7 @@ impl App {
         Ok(Value::Array(items))
     }
 
-    /// How many of this browser's messages no cut keeps yet, and files it holds only here, in its groups but identity
+    /// How many of this browser's messages no other member holds yet, and files it holds only here, in its groups but identity
     /// groups.
     fn only_here(&self) -> Result<u32> {
         let node = self.client.node();
@@ -867,7 +867,7 @@ impl Lmk {
         Ok(snapshot)
     }
 
-    /// How many of this browser's messages and files no cut keeps yet: closing it while any is loses them.
+    /// How many of this browser's messages and files no other member holds yet: closing it while any is loses them.
     pub fn only_here(&self) -> R<u32> {
         self.app.only_here().map_err(js)
     }

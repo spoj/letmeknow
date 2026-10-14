@@ -740,7 +740,7 @@ impl<P: Provider + Send + 'static> Client<P> {
         }
         let mut status = json!({ "groups": groups });
         if only_here_count > 0 {
-            status["warning"] = json!(format!("{only_here_count} sends are not kept by any commit yet; keep this session running until they are"));
+            status["warning"] = json!(format!("{only_here_count} sends are held by no other member yet; keep this session running until they are"));
         }
         Ok(status)
     }

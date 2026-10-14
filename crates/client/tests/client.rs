@@ -485,7 +485,7 @@ async fn a_sent_message_is_only_here_until_a_commit_keeps_it() {
     let gid = chat_with_bob(&mut alice, &bob).await;
     let message = say(&alice, &gid, "hello", None).await;
     bob.until(is_message).await;
-    // Bob holds it, so the commit that a settings change makes keeps it. Alice's invite is listed until a commit keeps it too.
+    // Bob holds it, so the commit that the rename makes keeps it.
     receipts_say(&mut alice, &gid, |receipt| receipt.holds(&message) && !receipt.showed(&message)).await;
     let status = alice.request(json!({ "cmd": "status" })).await;
     assert!(status["groups"][0]["only_here"].as_array().unwrap().contains(&json!({ "what": "message", "id": hex::encode(&message.id.0) })));

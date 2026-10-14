@@ -34,7 +34,7 @@ export type Item =
       late?: boolean;
       /** A send that failed, kept with its text until sent again or dropped. */
       failed?: { error: string; retry: () => void; drop: () => void };
-      /** Of this browser's own: no cut keeps it yet. */
+      /** Of this browser's own: no other member holds it yet. */
       only_here?: boolean;
       /** Of this browser's own: the other members that hold it, and those that read it. */
       held_by?: Person[];

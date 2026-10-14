@@ -679,7 +679,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         Ok(self.members(gid)?.into_iter().filter(away).collect())
     }
 
-    /// This session's held messages no cut keeps yet: they need this session until one does. Their ids and payloads.
+    /// This session's held messages no other member holds yet: they need this session until one does. Their ids and payloads.
     pub fn only_here(&self, gid: &[u8]) -> Result<Vec<(Bytes, serde_json::Value)>> {
         let st = self.inner.lock();
         let g = st.group(gid)?;
