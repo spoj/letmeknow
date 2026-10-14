@@ -102,9 +102,12 @@ pub struct Serve {
     /// Logs, keys and certificates
     #[arg(long)]
     pub state: PathBuf,
-    /// MiB the membership database may use: its pages in use and its WAL. Appends past it are refused as quota
+    /// MiB the membership database may use: its pages in use and its WAL. Appends past it are refused as quota; public logs take a tenth
     #[arg(long, default_value_t = 4096)]
     pub disk: u64,
+    /// An origin besides letmeknow.dev's whose pages may append to the membership service; repeat for several
+    #[arg(long)]
+    pub origin: Vec<String>,
     /// A certificate (PEM) to use instead of Let's Encrypt, with --key
     #[arg(long, requires = "key")]
     pub cert: Option<PathBuf>,
