@@ -2,6 +2,7 @@
 //! member answers by the invite's rule, checked again as the Add is built, with the commit entry that added the joiner,
 //! or with the one it kept to a joiner it added before whose answer was lost.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -156,7 +157,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         // Members that gave no answer wait until the members reached meanwhile are asked, then are asked again, while
         // JOIN_LIMIT has not passed.
         let until = Instant::now() + JOIN_LIMIT;
-        let mut silent = Vec::new();
+        let mut silent = VecDeque::new();
         loop {
             let peer = match dials.next().await {
                 Some(dialed) => {
@@ -168,7 +169,7 @@ impl<P: Provider + Send + 'static> Node<P> {
                     }
                     peer
                 }
-                None => match silent.pop() {
+                None => match silent.pop_front() {
                     Some(peer) if Instant::now() < until => peer,
                     _ => break,
                 },
@@ -194,12 +195,12 @@ impl<P: Provider + Send + 'static> Node<P> {
                     refused_by_all = false;
                     tracing::debug!("asking {} to admit this session: {error:#}", peer.fmt_short());
                     sleep(Duration::from_secs(1)).await;
-                    silent.push(peer);
+                    silent.push_back(peer);
                 }
                 Err(_) => {
                     refused_by_all = false;
                     tracing::debug!("{} did not answer", peer.fmt_short());
-                    silent.push(peer);
+                    silent.push_back(peer);
                 }
             }
         }

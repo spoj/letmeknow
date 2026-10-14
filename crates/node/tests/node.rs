@@ -2154,6 +2154,51 @@ async fn a_joiner_asks_again_once_the_committers_answer_is_late() {
     assert_eq!(bob.node.members(&gid.0).unwrap().len(), 2);
 }
 
+/// A joiner's committer is busy past its wait, and a second member it names gives no answer: the joiner asks the committer
+/// again once the second member's wait is up, and the committer answers with the Add it kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joiner_asks_its_committer_again_past_a_silent_member() {
+    use lmk_proto::links::Invite;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let relay = relay().await;
+    let slow = Arc::new(AtomicBool::new(false));
+    let busy = slow.clone();
+    let mut config = config(&relay, "Alice", None, &[CHAT, KIND]);
+    config.durable = Some(Arc::new(move || {
+        let busy = busy.clone();
+        Box::pin(async move {
+            while busy.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(())
+        })
+    }));
+    let (node, events) = Node::start(MemoryProvider::default(), config).await.unwrap();
+    let mut alice = Session { node, events };
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
+    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    let key = iroh::SecretKey::from_bytes(&lmk_core::random());
+    let silent = *key.public().as_bytes();
+    let _silent = hand(&relay, key.clone(), &bob.node).await;
+    eventually("the silent member is connected", || bob.node.net().connected().contains(&key.public())).await;
+    let link = Invite { members: vec![link.members[0], silent], ..link };
+    let (node, first) = (bob.node.clone(), link.clone());
+    let joining = tokio::spawn(async move { node.join(&first, None).await });
+    let _reply = alice.until(|e| match e {
+        Event::Snapshot { reply, .. } => Some(reply),
+        _ => None,
+    }).await;
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    slow.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    slow.store(false, Ordering::SeqCst);
+    alice.snapshot(Some(b"state")).await;
+    let (joined, _) = tokio::time::timeout(Duration::from_secs(120), joining).await.unwrap().unwrap().unwrap();
+    assert_eq!(joined, gid);
+    assert_eq!(alice.node.epoch(&gid.0).unwrap(), epoch, "no second Add");
+}
+
 /// Two asks with one KeyPackage at once, as a joiner's again after one failed in transit: the member adds it once and
 /// answers both with its Welcome, refusing neither.
 #[tokio::test(flavor = "multi_thread")]
