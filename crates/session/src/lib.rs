@@ -217,24 +217,24 @@ pub async fn listen(
     let format = home.join("format");
     let found = std::fs::read_to_string(&format).ok().map(|found| found.trim().to_owned());
     match found.as_deref() {
-        Some("7") => {}
+        Some("8") => {}
         None if !home.join("device.json").exists() => {}
-        Some("6") => bail!(
-            "{home} holds state that letmeknow 0.17 wrote (format 6), which this one cannot read: to keep using it, run `npx -y @letmeknow/cli@0.17 --home {home} listen`, or use another --home for this one",
+        Some("7") => bail!(
+            "{home} holds state that letmeknow 0.18 wrote (format 7), which this one cannot read: to keep using it, run `npx -y @letmeknow/cli@0.18 --home {home} listen`, or use another --home for this one",
             home = home.display()
         ),
         Some("5") => bail!(
             "{home} holds state that letmeknow 0.16 wrote (format 5), which this one cannot read: to keep using it, run `npx -y @letmeknow/cli@0.16 --home {home} listen`, or use another --home for this one",
             home = home.display()
         ),
-        Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 7) => bail!(
+        Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 8) => bail!(
             "{home} holds state that a newer letmeknow wrote (format {newer}), which this one cannot read: run the newest release, `npx -y @letmeknow/cli@latest --home {home} listen`, or use another --home for this one",
             home = home.display()
         ),
         _ => bail!("{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home", home.display()),
     }
     cli::private_dir(&config.dir)?;
-    std::fs::write(&format, "7\n")?;
+    std::fs::write(&format, "8\n")?;
     let directory = own_directory(home, &network, &config.membership).await?;
     let membership = Service::Serve { key: Bytes(directory.key.to_vec()), domain: config.membership.clone(), rest: Default::default() };
     let relays = directory.relays.iter().map(|relay| relay.parse()).collect::<Result<_, _>>()?;

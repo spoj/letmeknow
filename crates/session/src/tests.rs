@@ -1249,8 +1249,8 @@ fn a_home_of_another_format_is_refused_and_names_its_release() {
         let world = world("format").await;
         for (format, names, run) in [
             ("5", "letmeknow 0.16", "@letmeknow/cli@0.16"),
-            ("6", "letmeknow 0.17", "@letmeknow/cli@0.17"),
-            ("8", "a newer letmeknow", "@letmeknow/cli@latest"),
+            ("7", "letmeknow 0.18", "@letmeknow/cli@0.18"),
+            ("9", "a newer letmeknow", "@letmeknow/cli@latest"),
         ] {
             let home = world.root.path().join(format!("format-{format}"));
             std::fs::create_dir_all(&home).unwrap();
