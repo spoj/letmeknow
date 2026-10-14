@@ -349,8 +349,6 @@ struct Rec {
     answered: Vec<([u8; 32], u64)>,
     /// The epoch this session's messages past its cut were last sealed again in.
     resealed: u64,
-    /// Since when this session has held a message no cut keeps.
-    unkept: Option<u64>,
 }
 
 /// An invite, as its inviter shared it with the group.

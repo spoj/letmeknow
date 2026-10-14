@@ -484,7 +484,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         author.servable.insert(h.seq);
         if h.seq > author.cut {
             author.sealed.insert(h.seq, opened.epoch);
-            g.rec.unkept.get_or_insert(now);
         }
         g.changed = true;
         let record = Record { id: Bytes(id.to_vec()), header: h, plaintext: None, sealing: Some((opened.epoch, Bytes(ciphertext.clone()))), opened: now, released: false, delivered: None };

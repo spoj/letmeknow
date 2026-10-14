@@ -174,7 +174,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// cuts dropped, their leaves forgotten) and began.
     fn cuts(&self, st: &mut State<P>, gid: &[u8], applied: &core::Applied, ending: u64) -> Result<()> {
         let me = st.me(gid).to_vec();
-        let now = st.tick();
         let g = st.group_mut(gid)?;
         let own = g.mls.joined(&me).or_else(|| applied.cut.iter().find(|r| r.key.0 == me).map(|r| r.joined));
         let mut keep = Vec::new();
@@ -216,7 +215,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
             author.sealed.clear();
         }
         g.rec.leaves.retain(|(key, joined, _)| state.iter().any(|r| r.key == *key && r.joined == *joined));
-        g.rec.unkept = g.rec.authors.iter().any(|a| !a.ended && !a.sealed.is_empty()).then_some(now);
         for (key, joined, seq) in dropped {
             if let Some(record) = st.record_at(gid, &key.0, joined, seq)? {
                 st.unstore(gid, &record)?;

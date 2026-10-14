@@ -1,8 +1,8 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
 //! advance, at start, and every `TIMER`. It drops what the group kept past H; commits at most once, with every Remove
 //! due (members whose `leave` the cut it builds keeps, and members whose devices their identities dropped) and this
-//! session's update if due (each T, at an offset of its own, or once it held messages no cut kept for `KEEP_ALIVE`, at
-//! an offset of its own within it); and in an identity group, has the identity kind run its own (`Event::Duties`).
+//! session's update if due (each T, at an offset of its own); and in an identity group, has the identity kind run its
+//! own (`Event::Duties`).
 
 use std::sync::{Arc, Mutex};
 
@@ -27,8 +27,6 @@ use crate::{Event, G, Inner, State, Work, days, get, now};
 
 /// How often every group's duties run, besides as its log moves.
 pub(crate) const TIMER: Duration = Duration::from_secs(10 * 60);
-/// How long a member holds messages no cut keeps before it commits to keep them.
-const KEEP_ALIVE: u64 = 10 * 60 * 1000;
 /// How soon a pass runs again after a commit waited for what the last cut kept.
 const BLOCKED: u64 = 10_000;
 
@@ -39,12 +37,6 @@ pub(crate) fn next_update(updated: u64, update: u32, key: &[u8]) -> u64 {
     let t = update.max(1) as u64 * 1000;
     let offset = u64::from_be_bytes(Sha256::digest(key)[..8].try_into().unwrap()) % t;
     (updated + t - offset) / t * t + offset
-}
-
-/// When a member holding messages no cut keeps since `since` commits to keep them: at its slot within `KEEP_ALIVE`
-/// after.
-fn keep_alive(since: u64, key: &[u8]) -> u64 {
-    since + KEEP_ALIVE + u64::from_be_bytes(Sha256::digest(key)[..8].try_into().unwrap()) % KEEP_ALIVE
 }
 
 impl<P: Provider> State<P> {
@@ -126,8 +118,7 @@ fn due<P: Provider>(st: &State<P>, g: &G) -> Result<Option<(Change, Vec<core::Me
     let Some(own) = members.iter().find(|m| m.index == g.mls.own_index()) else { return Ok(None) };
     let name = renaming(&g.mls, st.device.as_deref());
     let leaf = &st.session.leaf;
-    let keeps = g.rec.unkept.is_some_and(|since| now() >= keep_alive(since, me)) && cut != g.mls.cut();
-    let update = own.leaf.as_ref() != Some(leaf) || name.is_some() || keeps || now() >= next_update(g.rec.updated, g.mls.settings().update, me);
+    let update = own.leaf.as_ref() != Some(leaf) || name.is_some() || now() >= next_update(g.rec.updated, g.mls.settings().update, me);
     Ok((update || !remove.is_empty()).then(|| (Change { remove, leaf: Some(leaf.clone()), name, cut, ..Change::default() }, dropped)))
 }
 
@@ -178,7 +169,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let tick = st.tick();
             let g = st.group(gid)?;
             let next = next_update(g.rec.updated, g.mls.settings().update, st.me(gid));
-            let next = g.rec.unkept.map_or(next, |since| next.min(keep_alive(since, st.me(gid))));
             // A commit waits while a holder of what the last cut kept, which this session lacks, may still be asked.
             let lacking = g.lacking();
             let blocked = !lacking.is_empty() && st.peers.holder(&Bytes(gid.to_vec()), &lacking, tick);

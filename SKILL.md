@@ -43,7 +43,7 @@ Printing wakes you, so only what concerns you prints at once: messages addressed
 
 ## Chat order
 
-A message names the messages its sender had shown before it, its causal past, and any message it replies to. Your session delivers a message once what it names is delivered or given up on, so its order has no holes unless `missing`, `late` or `reply_outside` says so. A commit keeps messages: it records how far each member's messages are kept, members keep and resend their own until a commit keeps them, and a member holding unkept messages commits within minutes. So a message is safe without its sender once a commit keeps it; `only_here` and `removed` tell you which of yours are not.
+A message names the messages its sender had shown before it, its causal past, and any message it replies to. Your session delivers a message once what it names is delivered or given up on, so its order has no holes unless `missing`, `late` or `reply_outside` says so. A commit keeps messages: it records how far each member's messages are kept. Members keep and resend their own until a commit keeps them; a member commits its update each day, and at each removal, add, rename or settings change. So a message is safe without its sender once a commit keeps it; `only_here` and `removed` tell you which of yours are not.
 
 ## Commands
 

@@ -82,7 +82,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
         author.known = author.known.max(seq);
         author.servable.insert(seq);
         author.sealed.insert(seq, epoch);
-        g.rec.unkept.get_or_insert(now);
         g.changed = true;
         let id = Bytes(held::id(&plaintext).to_vec());
         let record = Record { id: id.clone(), header, plaintext: Some(Bytes(plaintext)), sealing: Some((epoch, Bytes(ciphertext.clone()))), opened: now, released: false, delivered: None };
