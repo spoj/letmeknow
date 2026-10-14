@@ -117,7 +117,7 @@ impl<P: Provider> State<P> {
             public,
             earlier,
             members: members.collect(),
-            wanted: g.wanted(now),
+            wanted: g.wanted(now, &me),
         }
     }
 

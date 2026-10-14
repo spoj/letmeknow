@@ -235,8 +235,9 @@ impl<P: Provider> State<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Follows a log at its service while it is current: what is new as the service tells of it, and all of it every
-    /// 5 minutes and whenever the subscription restarts, until this session drops the log or its group moves on.
+    /// Follows a log at its service while it is current: all of it to start with, then what is new as the service tells
+    /// of it, and all of it every 5 minutes and whenever the subscription restarts, until this session drops the log or
+    /// its group moves on.
     pub(crate) fn follow(self: &Arc<Self>, log: &[u8]) {
         let (inner, id) = (self.clone(), log.to_vec());
         let task = spawn(async move {
@@ -250,6 +251,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 };
                 let Ok((capability, service, frontier)) = source else { return };
                 let followed = async {
+                    inner.read(&id).await?;
                     let mut subscription = inner.clients.client(&service)?.subscribe(vec![(capability, frontier)]).await?;
                     loop {
                         match timeout(REREAD, subscription.next()).await {

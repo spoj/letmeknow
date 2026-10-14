@@ -5,6 +5,7 @@
 use anyhow::{Context, Result, ensure};
 use lmk_core::group::{FRAMING, MAX_MESSAGE};
 use lmk_core::provider::Provider;
+use lmk_net::peers::ANSWER;
 use lmk_proto::Bytes;
 use lmk_proto::held::{self, Header};
 use lmk_proto::peer::{Frame, Summary};
@@ -105,8 +106,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         Ok(id)
     }
 
-    /// Seals this session's messages past its cut again in the current epoch, in seq order, and pushes them: once per
-    /// epoch, at the head of its log, once the log has been read.
+    /// Seals this session's messages past its cut again in the current epoch, in seq order, and pushes them in frames:
+    /// once per epoch, at the head of its log, once the log has been read.
     pub(crate) fn reseal(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
         let g = st.group(gid)?;
         let epoch = g.mls.epoch();
@@ -128,10 +129,44 @@ impl<P: Provider + Send + 'static> Inner<P> {
             st.store(gid, &record)?;
             items.push(Bytes(ciphertext));
         }
-        st.group_mut(gid)?.rec.resealed = epoch;
-        if !items.is_empty() {
+        let g = st.group_mut(gid)?;
+        g.rec.resealed = epoch;
+        g.changed |= !items.is_empty();
+        for items in frames(items) {
             st.broadcast(gid, Frame::Held { group: Bytes(gid.to_vec()), items, answers: None });
         }
         st.save(gid)
+    }
+}
+
+/// Splits ciphertexts into frames of at most `ANSWER` bytes, as answers are; one that is larger goes alone.
+fn frames(items: Vec<Bytes>) -> Vec<Vec<Bytes>> {
+    let mut frames: Vec<Vec<Bytes>> = Vec::new();
+    let mut size = 0;
+    for item in items {
+        size += item.0.len();
+        match frames.last_mut() {
+            Some(frame) if size <= ANSWER => frame.push(item),
+            _ => {
+                size = item.0.len();
+                frames.push(vec![item]);
+            }
+        }
+    }
+    frames
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reseals_are_pushed_in_frames_of_at_most_answer_bytes() {
+        let item = |len: usize| Bytes(vec![0; len]);
+        let sizes = |frames: Vec<Vec<Bytes>>| frames.iter().map(|frame| frame.iter().map(|item| item.0.len()).collect::<Vec<_>>()).collect::<Vec<_>>();
+        let half = ANSWER / 2;
+        assert_eq!(sizes(frames(vec![item(half), item(half), item(1)])), vec![vec![half, half], vec![1]]);
+        assert_eq!(sizes(frames(vec![item(10), item(ANSWER + 5), item(10)])), vec![vec![10], vec![ANSWER + 5], vec![10]]);
+        assert!(frames(Vec::new()).is_empty());
     }
 }

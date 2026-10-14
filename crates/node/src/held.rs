@@ -234,11 +234,16 @@ impl G {
 
     /// What this session wants of each membership now: known, neither held nor lost nor waiting unopened here, and not
     /// learned of within `HOLD_OFF`.
-    pub(crate) fn wanted(&mut self, now: u64) -> Vec<Seqs> {
+    pub(crate) fn wanted(&mut self, now: u64, me: &[u8]) -> Vec<Seqs> {
         self.fresh.retain(|(_, _, _, at)| now < at + HOLD_OFF);
+        let epoch = self.mls.epoch();
         let mut wanted = Vec::new();
         for author in &self.rec.authors {
             let mut seqs = author.wanted();
+            if author.key.0 != me {
+                // A sealing of an ended epoch is wanted again: a commit keeps only what is sealed in its own.
+                seqs = seqs.union(&author.sealed.iter().filter(|(_, sealed)| **sealed < epoch).map(|(seq, _)| *seq).collect());
+            }
             for (key, joined, fresh, _) in &self.fresh {
                 if *key == author.key && *joined == author.joined {
                     seqs = seqs.difference(fresh);
@@ -456,6 +461,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
                 author.sealed.insert(h.seq, opened.epoch);
                 author.servable.insert(h.seq);
+                st.group_mut(gid)?.changed = true;
                 record.sealing = Some((opened.epoch, Bytes(ciphertext.clone())));
                 st.store(gid, &record)?;
                 return Ok(Some(ciphertext));

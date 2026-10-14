@@ -2512,6 +2512,36 @@ async fn a_commit_keeps_what_an_online_member_holds() {
     carol.node.shutdown().await.unwrap();
 }
 
+/// A message Bob holds sealed in an epoch that Alice's commit ended, which Bob missed, is only here until Bob holds it
+/// sealed in the new epoch: Alice reseals it once she reads the new log, and Bob asks her for the new sealing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_held_in_an_ended_epoch_is_only_here_until_its_holder_takes_the_new_sealing() {
+    let relay = relay().await;
+    let dir = folder("ended-epoch");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("bob.db");
+    let alice = session(&relay, "Alice").await;
+    let mut bob = stored(&relay, "Bob", &db).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    eventually("Alice has Bob", || alice.node.members(&gid.0).unwrap().len() == 2).await;
+    let m = alice.node.send(&gid.0, &message("held"), None).await.unwrap();
+    bob.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
+    eventually("Alice hears that Bob holds it", || alice.node.only_here(&gid.0).unwrap().is_empty()).await;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+
+    alice.node.change_settings(&gid.0, |s| Settings { name: "Moved".into(), ..s }).await.unwrap();
+    let here: Vec<Bytes> = alice.node.only_here(&gid.0).unwrap().into_iter().map(|(id, _)| id).collect();
+    assert!(here.contains(&m), "the commit kept nothing: Bob was away");
+
+    let bob = stored(&relay, "Bob", &db).await;
+    eventually("Bob holds it sealed in the new epoch", || alice.node.only_here(&gid.0).unwrap().is_empty()).await;
+    assert_eq!(bob.node.epoch(&gid.0).unwrap(), alice.node.epoch(&gid.0).unwrap());
+    alice.node.shutdown().await.unwrap();
+    bob.node.shutdown().await.unwrap();
+}
+
 /// A message an online member holds is kept by the next commit: Bob holds Alice's message, and the next commit that Alice
 /// makes keeps it, so it is no longer only here once Bob goes away.
 #[tokio::test(flavor = "multi_thread")]
