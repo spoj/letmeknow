@@ -34,7 +34,7 @@ pub struct Head {
     pub sig: Bytes,
 }
 
-fn signature<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Bytes, D::Error> {
+pub(crate) fn signature<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Bytes, D::Error> {
     let bytes = crate::membership::decode_bytes::<D, 64>(d)?;
     if bytes.len() != 64 {
         return Err(serde::de::Error::custom("signature length"));

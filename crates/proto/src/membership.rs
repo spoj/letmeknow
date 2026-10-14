@@ -4,9 +4,10 @@ use std::{fmt, marker::PhantomData};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::{Error, SeqAccess, Visitor}};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::{Bytes, head::Head};
+use crate::{Bytes, head::{self, Head}};
 
 pub const MAX_BODY: usize = 4 << 20;
 pub const MAX_ENTRY: usize = 1 << 20;
@@ -14,6 +15,7 @@ pub const APPEND_ROWS: usize = 64;
 pub const APPEND_BYTES: usize = 2 << 20;
 pub const PAGE_ROWS: usize = 1024;
 pub const SUBSCRIBE_LOGS: usize = 32;
+pub const HEAD_LOGS: usize = 256;
 pub const PAGE_OVERHEAD: usize = 512;
 
 pub(crate) fn decode_bytes<'de, D: Deserializer<'de>, const MAX: usize>(d: D) -> Result<Vec<u8>, D::Error> {
@@ -100,6 +102,14 @@ mod capabilities {
     }
 }
 
+fn known_logs<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Known>, D::Error> {
+    bounded::<D, Known, HEAD_LOGS>(d)
+}
+
+fn moved_heads<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Head>, D::Error> {
+    bounded::<D, Head, HEAD_LOGS>(d)
+}
+
 pub fn encoded_entry_bytes(entry: &Bytes) -> usize { (entry.0.len() * 4).div_ceil(3) + 3 }
 
 pub fn valid_append(entries: &[Bytes]) -> bool {
@@ -157,6 +167,56 @@ impl fmt::Debug for Page {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Latest { pub head: Head }
 
+/// The bodies of the HTTPS routes; each route takes one.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Append {
+    #[serde(with = "fixed32")]
+    pub capability: [u8; 32],
+    #[serde(deserialize_with = "append_entries")]
+    pub entries: Vec<Bytes>,
+    pub public: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Read {
+    #[serde(with = "fixed32")]
+    pub capability: [u8; 32],
+    pub after: u64,
+}
+
+/// A log, and the length its requester holds.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Known(#[serde(with = "fixed32")] pub [u8; 32], pub u64);
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Heads {
+    #[serde(deserialize_with = "known_logs")]
+    pub logs: Vec<Known>,
+}
+
+/// The heads of the logs a `Heads` request named whose length differs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Moved {
+    #[serde(deserialize_with = "moved_heads")]
+    pub heads: Vec<Head>,
+}
+
+/// What the HTTPS routes answer: the value, or a refusal the service signs over `refusal_message`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Answer<T> {
+    Ok(T),
+    Refused {
+        refusal: Refusal,
+        #[serde(deserialize_with = "head::signature")]
+        sig: Bytes,
+    },
+}
+
+pub fn refusal_message(refusal: Refusal, request: &[u8]) -> Vec<u8> {
+    [b"letmeknow refusal v1\0".as_slice(), refusal.code().as_bytes(), &Sha256::digest(request)].concat()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Subscribed {}
 
@@ -178,6 +238,10 @@ impl Refusal {
             Self::Policy => "policy", Self::Size => "size", Self::Rate => "rate",
             Self::Busy => "busy", Self::Quota => "quota", Self::Expired => "expired",
         }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        [Self::Policy, Self::Size, Self::Rate, Self::Busy, Self::Quota, Self::Expired].into_iter().find(|r| r.code() == code)
     }
 }
 
@@ -225,6 +289,24 @@ mod tests {
         let bytes = crate::frame::encode(&serde_json::json!({"refused": "private arbitrary refusal"}));
         let error = read_frame::<Reply<()>, _>(&mut bytes.as_slice()).await.unwrap_err();
         assert_eq!(format!("{error:#}"), "invalid membership frame");
+    }
+
+    #[test]
+    fn heads_are_bounded_and_refusals_carry_a_64_byte_signature() {
+        let log = format!(r#"["{}",1]"#, URL_SAFE_NO_PAD.encode([7; 32]));
+        let logs = |n: usize| format!(r#"{{"logs":[{}]}}"#, vec![log.as_str(); n].join(","));
+        assert!(serde_json::from_str::<Heads>(&logs(HEAD_LOGS)).is_ok());
+        assert!(serde_json::from_str::<Heads>(&logs(HEAD_LOGS + 1)).is_err());
+        let sig = URL_SAFE_NO_PAD.encode([9; 64]);
+        let refused = format!(r#"{{"refused":{{"refusal":"rate","sig":"{sig}"}}}}"#);
+        assert!(matches!(serde_json::from_str::<Answer<()>>(&refused).unwrap(), Answer::Refused { refusal: Refusal::Rate, .. }));
+        let short = URL_SAFE_NO_PAD.encode([9; 63]);
+        assert!(serde_json::from_str::<Answer<()>>(&refused.replace(&sig, &short)).is_err());
+        assert_eq!(Refusal::from_code("quota").map(Refusal::code), Some("quota"));
+        assert!(Refusal::from_code("nope").is_none());
+        assert!(refusal_message(Refusal::Rate, b"a").starts_with(b"letmeknow refusal v1\0rate"));
+        assert_ne!(refusal_message(Refusal::Rate, b"a"), refusal_message(Refusal::Busy, b"a"));
+        assert_ne!(refusal_message(Refusal::Rate, b"a"), refusal_message(Refusal::Rate, b"b"));
     }
 
     #[test]
