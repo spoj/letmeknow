@@ -79,7 +79,7 @@ impl Store {
         db.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id=1), format INTEGER NOT NULL,
-                 authority BLOB NOT NULL CHECK(length(authority)=32), logs INTEGER NOT NULL, rows INTEGER NOT NULL, bytes INTEGER NOT NULL);
+                 authority BLOB NOT NULL CHECK(length(authority)=32), public_bytes INTEGER NOT NULL);
              CREATE TABLE totals (day INTEGER PRIMARY KEY, entries INTEGER NOT NULL, bytes INTEGER NOT NULL);
              CREATE TABLE anchors (reference BLOB PRIMARY KEY CHECK(length(reference)=32), length INTEGER NOT NULL,
                  hash BLOB NOT NULL CHECK(length(hash)=32), public INTEGER NOT NULL, day INTEGER NOT NULL,
@@ -91,7 +91,7 @@ impl Store {
              CREATE VIEW logs AS SELECT reference,length,hash FROM anchors;
              CREATE VIEW entries AS SELECT reference,position FROM records;",
         )?;
-        db.execute("INSERT INTO metadata VALUES(1,?,?,0,0,0)", params![FORMAT, key.verifying_key().as_bytes()])?;
+        db.execute("INSERT INTO metadata VALUES(1,?,?,0)", params![FORMAT, key.verifying_key().as_bytes()])?;
         db.execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE);")?;
         sync_dir(state)?;
         let mut ready = options.open(state.join("membership.ready"))?;
@@ -137,6 +137,11 @@ impl Store {
         ).optional()?;
         let (length, mut hash, public) = existing.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), log_ref), public));
         ensure!(used(&tx, &self.wal)? + bytes <= self.disk, Refused("quota".into()));
+        if public {
+            let public_bytes: u64 = tx.query_row("SELECT public_bytes FROM metadata", [], |r| r.get(0))?;
+            ensure!(public_bytes + bytes <= self.disk / 10, Refused("quota".into()));
+            tx.execute("UPDATE metadata SET public_bytes=public_bytes+?", [bytes])?;
+        }
         let end = length + entries.len() as u64;
         let day = now() / DAY_MS;
         for (index, entry) in entries.iter().enumerate() {
@@ -183,6 +188,21 @@ impl Store {
         Ok(self.sign(log_ref, length, hash))
     }
 
+    pub fn length(&self, log_ref: &[u8; 32]) -> Result<u64> {
+        let length: Option<u64> = self.db.lock().unwrap().query_row("SELECT length FROM anchors WHERE reference=?", [log_ref], |r| r.get(0)).optional()?;
+        Ok(length.unwrap_or(0))
+    }
+
+    /// The heads of the logs whose length differs from the one given.
+    pub fn moved(&self, logs: &[([u8; 32], u64)]) -> Result<Vec<Head>> {
+        let mut moved = Vec::new();
+        for (log_ref, length) in logs {
+            let head = self.head(log_ref)?;
+            if head.length != *length { moved.push(head); }
+        }
+        Ok(moved)
+    }
+
     pub fn stats(&self) -> Result<Stats> {
         let db = self.db.lock().unwrap();
         let today = now() / DAY_MS;
@@ -220,6 +240,7 @@ impl Store {
         for (reference, position, size) in &expired {
             tx.execute("DELETE FROM records WHERE reference=? AND position=?", params![reference, position])?;
             tx.execute("UPDATE anchors SET rows=rows-1,bytes=bytes-? WHERE reference=?", params![size, reference])?;
+            tx.execute("UPDATE metadata SET public_bytes=public_bytes-?1 WHERE EXISTS(SELECT 1 FROM anchors WHERE reference=?2 AND public=1)", params![size, reference])?;
         }
         tx.commit()?;
         Ok(expired.len())
@@ -352,6 +373,32 @@ mod tests {
         store.disk = before + 100;
         store.append(&d, &[Bytes(vec![2; 100])], false).unwrap();
         assert_eq!(store.head(&d).unwrap().length, 2);
+        drop(store);
+    }
+
+    #[test]
+    fn public_logs_share_a_tenth_of_the_disk_until_they_expire() {
+        let (_dir, path) = state();
+        let mut store = Store::initialize(&path).unwrap();
+        store.disk = 10 << 20;
+        store.append(&[7; 32], &[Bytes(vec![1; membership::MAX_ENTRY])], true).unwrap();
+        assert_eq!(store.append(&[8; 32], &[Bytes(vec![2])], true).unwrap_err().downcast::<Refused>().unwrap().0, "quota");
+        store.append(&[8; 32], &[Bytes(vec![2])], false).unwrap();
+        assert_eq!(store.expire(now() / DAY_MS + 1).unwrap(), 2);
+        store.append(&[9; 32], &[Bytes(vec![2])], true).unwrap();
+        drop(store);
+    }
+
+    #[test]
+    fn heads_name_only_the_logs_whose_length_differs() {
+        let (_dir, path) = state();
+        let store = Store::initialize(&path).unwrap();
+        let (a, b) = ([1; 32], [2; 32]);
+        store.append(&a, &[Bytes(vec![1])], false).unwrap();
+        assert_eq!((store.length(&a).unwrap(), store.length(&b).unwrap()), (1, 0));
+        let moved = store.moved(&[(a, 0), (a, 1), (b, 0)]).unwrap();
+        assert_eq!(moved.len(), 1);
+        assert_eq!((moved[0].log_ref, moved[0].length), (a, 1));
         drop(store);
     }
 
