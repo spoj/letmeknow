@@ -1384,3 +1384,29 @@ async fn a_directory_is_cached_and_the_built_in_one_answers_for_letmeknow_dev() 
     assert_eq!(resolve(lmk_proto::links::DOMAIN.into()).await.unwrap(), Directory::builtin());
     assert!(resolve("localhost:9443".into()).await.is_err());
 }
+
+/// Lookups that arrive during a fetch do not start another: the first answers its failure, the others answer that they
+/// started too recently.
+#[tokio::test]
+async fn lookups_during_a_fetch_do_not_start_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicU32::new(0));
+    let fetch: lmk_membership::client::Resolve = {
+        let calls = calls.clone();
+        Arc::new(move |domain: String| -> BoxFuture<anyhow::Result<Directory>> {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                anyhow::bail!("{domain} is down")
+            })
+        })
+    };
+    let resolve = crate::cached(dir.path().join("directories"), fetch);
+    let (a, b, c) = tokio::join!(resolve("localhost:8443".into()), resolve("localhost:8443".into()), resolve("localhost:8443".into()));
+    assert!(a.unwrap_err().to_string().contains("is down"));
+    for answer in [b, c] {
+        assert!(answer.unwrap_err().to_string().contains("started less than a minute ago"));
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}

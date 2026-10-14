@@ -435,7 +435,7 @@ try {
   const tried = fetchesDown();
   await laptop.locator("dialog").getByLabel("Invite link").fill(down);
   await laptop.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
-  const again = await until(() => laptop.evaluate(() => window.toasts.splice(0)), toasts => toasts.some(t => t.includes("failed less than a minute ago")));
+  const again = await until(() => laptop.evaluate(() => window.toasts.splice(0)), toasts => toasts.some(t => t.includes("started less than a minute ago")));
   check(tried >= 1 && fetchesDown() === tried && again.length, "a directory whose fetch failed is not fetched again within a minute");
   await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
 

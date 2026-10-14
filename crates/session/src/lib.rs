@@ -30,7 +30,7 @@ const LOOKUP: Duration = Duration::from_secs(2);
 /// How long a fetched directory answers without another fetch, and how long a fetch of one may take.
 const FRESH: Duration = Duration::from_secs(10 * 60);
 const FETCH: Duration = Duration::from_secs(5);
-/// How long a domain whose fetch failed is not fetched again.
+/// How long a domain whose last fetch failed, or is still under way, is not fetched again.
 const RETRY: Duration = Duration::from_secs(60);
 
 /// The skill text for agents.
@@ -130,7 +130,8 @@ fn fetch(http: reqwest::Client) -> Resolve {
 
 /// Answers a domain's directory from its copy in `dir` while that is younger than `FRESH`. Otherwise fetches it with
 /// `fetch`, stores it and answers it; where the fetch fails, answers the copy, else letmeknow.dev's built-in directory,
-/// else the failure. A failed fetch is not repeated for `RETRY`.
+/// else the failure. A fetch is not repeated for `RETRY` after one that failed or started, so lookups during a fetch
+/// do not start another.
 fn cached(dir: PathBuf, fetch: Resolve) -> Resolve {
     let failed: Arc<Mutex<BTreeMap<String, Instant>>> = Default::default();
     Arc::new(move |domain: String| -> BoxFuture<Result<Directory>> {
@@ -140,12 +141,22 @@ fn cached(dir: PathBuf, fetch: Resolve) -> Resolve {
             if age(&file).is_some_and(|age| age < FRESH) && let Some(directory) = stored(&file) {
                 return Ok(directory);
             }
-            let failed_at = failed.lock().unwrap().get(&domain).copied();
-            let fetched = match failed_at {
-                Some(at) if at.elapsed() < RETRY => Err(anyhow!("the fetch of {domain} failed less than a minute ago")),
-                _ => fetch(domain.clone()).await.inspect_err(|_| {
-                    failed.lock().unwrap().insert(domain.clone(), Instant::now());
-                }),
+            let recent = {
+                let mut failed = failed.lock().unwrap();
+                let recent = failed.get(&domain).is_some_and(|at| at.elapsed() < RETRY);
+                if !recent {
+                    failed.insert(domain.clone(), Instant::now());
+                }
+                recent
+            };
+            let fetched = if recent {
+                Err(anyhow!("a fetch of {domain} started less than a minute ago and has not succeeded"))
+            } else {
+                let fetched = fetch(domain.clone()).await;
+                if fetched.is_ok() {
+                    failed.lock().unwrap().remove(&domain);
+                }
+                fetched
             };
             match fetched {
                 Ok(directory) => {
