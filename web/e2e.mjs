@@ -279,7 +279,7 @@ try {
     delete pages.legacy;
   }
 
-  // letmeknow 0.17's membership is refused: the browser keeps to its default domain, says so, and clears the relay.
+  // letmeknow 0.17's membership is refused: the browser keeps to its default domain, says so, and clears both settings.
   const refused = await open("refused", { viewport: { width: 1280, height: 800 } }, true);
   await refused.goto(SITE);
   await refused.evaluate(([membership, relay]) => { localStorage.setItem("lmk membership", membership); localStorage.setItem("lmk relay", relay); }, [`${"11".repeat(32)}@https://old-relay.invalid`, "https://old-relay.invalid"]);
@@ -289,7 +289,7 @@ try {
   await refused.getByRole("button", { name: "Continue" }).click();
   await refused.getByRole("button", { name: "New chat" }).waitFor();
   const said = await until(() => refused.evaluate(() => window.toasts.splice(0)), toasts => toasts.some(t => t.includes("is letmeknow 0.17's")));
-  check(said.some(t => t.includes("is letmeknow 0.17's")) && await refused.evaluate(() => localStorage.getItem("lmk relay") === null), "a browser refuses letmeknow 0.17's membership, clears its relay and says so");
+  check(said.some(t => t.includes("is letmeknow 0.17's")) && await refused.evaluate(() => localStorage.getItem("lmk membership") === null && localStorage.getItem("lmk relay") === null), "a browser refuses letmeknow 0.17's membership, clears it and its relay, and says so");
   await refused.context().close();
   delete pages.refused;
 

@@ -142,6 +142,7 @@ function run(device = ""): Promise<void> {
     const { records, kept } = await store.load();
     let membership = localStorage.getItem("lmk membership") ?? BACKEND.domain;
     if (membership.includes("@") || membership === "letmeknow.dev") {
+      localStorage.removeItem("lmk membership");
       localStorage.removeItem("lmk relay");
       dispatch({ type: "warning", text: `lmk membership ${membership} is letmeknow 0.17's: a membership is a domain now, as --membership <domain> is. This browser uses ${BACKEND.domain}.` });
       membership = BACKEND.domain;
