@@ -30,10 +30,10 @@ iroh = { version = "=1.3.0", default-features = false }
 iroh-blobs = { version = "=0.103.1", default-features = false }
 iroh-relay = { version = "=1.3.0", default-features = false }
 notify = "8.2"
-openmls = "=0.9.1"
+openmls = { version = "=0.9.1", features = ["draft-ietf-mls-pq-ciphersuites"] }
 openmls_basic_credential = "=0.6.0"
 openmls_memory_storage = "=0.6.0"
-openmls_rust_crypto = "=0.6.0"
+openmls_rust_crypto = { version = "=0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
 openmls_sqlite_storage = "=0.3.0"
 openmls_traits = "=0.6.0"
 rand = "0.9"

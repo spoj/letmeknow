@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::provider::Provider;
 
-pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519;
 /// The largest message ciphertext taken, and sent.
 pub const MAX_MESSAGE: usize = 1 << 20;
 /// More than an application message's ciphertext adds to its plaintext.

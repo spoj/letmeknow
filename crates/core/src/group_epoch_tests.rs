@@ -226,7 +226,7 @@ fn staged_oversize_and_malformed_builds_restore_everything() {
     let probe = a.commit(Change { cut, name: Some("x".into()), ..Change::default() });
     let minimum = a.group.as_ref().unwrap().open_entry(&a.provider, &probe.entry).unwrap().len();
     a.cancel();
-    for (length, bucket) in [(979, 1024), (980, 2048)] {
+    for (length, bucket) in [(8147, 8192), (8148, 16384)] {
         let cut = a.cut();
         let commit = a.commit(Change { cut, name: Some("x".repeat(1 + length - minimum)), ..Change::default() });
         assert_eq!(a.group.as_ref().unwrap().open_entry(&a.provider, &commit.entry).unwrap().len(), length);
