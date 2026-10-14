@@ -311,7 +311,7 @@ async fn stalled_handshakes_and_headers_are_dropped() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn membership_bodies_in_flight_are_bounded() {
+async fn one_address_at_once_does_not_refuse_another() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let (config, cert) = configure(&state);
@@ -320,7 +320,7 @@ async fn membership_bodies_in_flight_are_bounded() {
     wait_for_https(https).await;
 
     let mut stalled = Vec::new();
-    for _ in 0..32 {
+    for _ in 0..8 {
         let mut tls = tls_connect("127.0.0.1", https, &cert).await;
         tls.write_all(format!("POST {APPEND} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n").as_bytes()).await.unwrap();
         stalled.push(tls);
@@ -328,5 +328,7 @@ async fn membership_bodies_in_flight_are_bounded() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, &append_json(1, b"x"))).await;
     assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    let response = https_raw("::1", https, &cert, &post(APPEND, None, &append_json(2, b"x"))).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     server.abort();
 }

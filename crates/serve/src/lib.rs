@@ -49,8 +49,8 @@ const APP: &str = "https://letmeknow.dev";
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const HEADERS: Duration = Duration::from_secs(10);
 const BODY: Duration = Duration::from_secs(15);
-/// Membership bodies at once: each is held twice, as bytes and as its value, so these fill the iroh protocol's 256 MiB.
-const BODIES: usize = 32;
+/// Membership bodies at once, over every address: above what one /48 may have at once, so no single address fills them.
+const BODIES: usize = 256;
 
 pub enum Certificate {
     /// From Let's Encrypt, by TLS-ALPN-01 on the HTTPS port; cached in the state directory.
@@ -343,11 +343,13 @@ async fn answer_membership(route: Route, service: Service, peer: IpAddr, origins
             .header(header::ACCESS_CONTROL_MAX_AGE, "600")
             .body(body("")),
         Method::POST => {
-            let Ok(_body) = bodies.try_acquire_owned() else { return respond(StatusCode::SERVICE_UNAVAILABLE).body(body("")) };
+            let (Some(admission), Ok(_body)) = (service.admit(peer), bodies.try_acquire_owned()) else {
+                return respond(StatusCode::SERVICE_UNAVAILABLE).body(body(""));
+            };
             let Ok(Ok(collected)) = timeout(BODY, Limited::new(req.into_body(), MAX_BODY).collect()).await else {
                 return respond(StatusCode::BAD_REQUEST).body(body(""));
             };
-            match service.post(route, peer, &collected.to_bytes()).await {
+            match service.post(route, &admission, &collected.to_bytes()).await {
                 Ok(answer) => allow(respond(StatusCode::OK))
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::CACHE_CONTROL, "no-store")

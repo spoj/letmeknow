@@ -118,11 +118,11 @@ identities stay behind (#56). The plan goes when 0.19 ships.
 - **Limits**, per client address: IPv4 as itself, also when mapped into IPv6 (the listener is dual-stack,
   serve/lib.rs:236-245); IPv6 by its /64, within a /48 budget 16 times as large.
   - Appends: 600 a minute and 256 MiB a day; new logs: 2,000 a day. Reads and heads: 600 requests and 64 MiB a
-    minute. At most 8 membership requests at once.
+    minute. At most 8 membership requests at once from each address (a /48 at 16 times as many).
   - In all, at most 250,000 new logs a day, twice the target's.
   - A TLS handshake timeout, and hyper's header timeout, which needs its timer (off now, serve/lib.rs:227): it also
     ends idle connections, and stops at an upgrade, so the relay's WebSockets (serve/lib.rs:308) keep their own limits.
-  - Public logs: entries of at most 16 KiB; at most 10 new public logs a day per address, and 10 stored appends a day
+  - Public logs: entries of at most 16 KiB; at most 10 new public logs a day per address, and 10 stored entries a day
     per log; at most a tenth of `--disk`.
   - Bodies, database work and memory as now. Per-address state lives in memory only; nothing about requests is
     written to disk.

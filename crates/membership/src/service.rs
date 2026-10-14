@@ -54,6 +54,7 @@ pub struct Policy {
     pub public_appends_per_day: u64,
     /// New logs a day from all addresses.
     pub new_logs_per_day_in_all: u64,
+    /// Per source: an IPv4 address, a /64, and a /48 at `WIDE` times as many.
     pub requests_at_once: usize,
 }
 
@@ -89,7 +90,7 @@ struct Inner {
     store: Store,
     policy: Policy,
     budgets: Mutex<Budgets>,
-    at_once: Arc<Semaphore>,
+    in_flight: Mutex<HashMap<Source, u64>>,
     subscribers: Mutex<Subscribers>,
     connections: Semaphore,
     streams: Arc<Semaphore>,
@@ -204,6 +205,20 @@ impl Drop for Registration {
     fn drop(&mut self) { self.inner.subscribers.lock().unwrap().records.remove(&self.id); }
 }
 
+/// A request counted in flight from its sources until it is dropped.
+pub struct Admission { sources: Vec<(Source, u64)>, service: Arc<Inner> }
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        let mut in_flight = self.service.in_flight.lock().unwrap();
+        for (source, _) in &self.sources {
+            let count = in_flight.get_mut(source).unwrap();
+            *count -= 1;
+            if *count == 0 { in_flight.remove(source); }
+        }
+    }
+}
+
 /// Permits for bytes in flight, from the connection's budget and the service's. Taking `bytes` takes twice as many,
 /// as a body is held as bytes and as its decoded value.
 struct Hold { connection: OwnedSemaphorePermit, service: OwnedSemaphorePermit }
@@ -239,7 +254,7 @@ impl Service {
     pub fn new(mut store: Store, policy: Policy) -> Self {
         store.disk = policy.disk;
         let service = Self(Arc::new(Inner {
-            store, budgets: Mutex::new(Budgets::new(&policy)), at_once: Arc::new(Semaphore::new(policy.requests_at_once)), policy,
+            store, budgets: Mutex::new(Budgets::new(&policy)), in_flight: Mutex::default(), policy,
             subscribers: Mutex::default(), connections: Semaphore::new(MAX_CONNECTIONS),
             streams: Arc::new(Semaphore::new(MAX_STREAMS)), work: Arc::new(Semaphore::new(DB_WORK)),
             memory: Arc::new(Semaphore::new(MEMORY / KIB)), expiry: Mutex::default(),
@@ -269,18 +284,28 @@ impl Service {
 
     pub async fn stats(&self) -> Result<Stats> { self.work(|inner| inner.store.stats()).await }
 
+    /// Counts a request from `from` in flight, unless one of its sources already has its requests at once.
+    pub fn admit(&self, from: IpAddr) -> Option<Admission> {
+        let sources = sources(from);
+        let at_once = self.0.policy.requests_at_once as u64;
+        let mut in_flight = self.0.in_flight.lock().unwrap();
+        if sources.iter().any(|(source, scale)| in_flight.get(source).copied().unwrap_or(0) >= at_once * scale) { return None; }
+        for (source, _) in &sources { *in_flight.entry(*source).or_default() += 1; }
+        Some(Admission { sources, service: self.0.clone() })
+    }
+
     /// Answers one request on the HTTPS routes: the body is the route's, and the answer is an `Answer` as JSON. An error
     /// is the service's own failure, which is no answer.
-    pub async fn post(&self, route: Route, from: IpAddr, body: &[u8]) -> Result<Vec<u8>> {
-        let sources = sources(from);
+    pub async fn post(&self, route: Route, admission: &Admission, body: &[u8]) -> Result<Vec<u8>> {
+        let sources = &admission.sources;
         let at = now();
         let answer = match route {
-            Route::Append => self.answer(body, self.append(&sources, at, body).await),
-            Route::Read => self.answer(body, self.read(&sources, at, body).await),
-            Route::Heads => self.answer(body, self.heads(&sources, at, body).await),
+            Route::Append => self.answer(body, self.append(sources, at, body).await),
+            Route::Read => self.answer(body, self.read(sources, at, body).await),
+            Route::Heads => self.answer(body, self.heads(sources, at, body).await),
         }?;
         if !matches!(route, Route::Append) {
-            self.0.budgets.lock().unwrap().read_bytes.charge(at, &sources, answer.len() as u64);
+            self.0.budgets.lock().unwrap().read_bytes.charge(at, sources, answer.len() as u64);
         }
         Ok(answer)
     }
@@ -291,7 +316,6 @@ impl Service {
         let reference = head::reference(&self.0.store.key().verifying_key().to_bytes(), &capability);
         let bytes: u64 = entries.iter().map(|e| e.0.len() as u64).sum();
         let count = entries.len() as u64;
-        let _slot = self.slot().await?;
         let may_start = {
             let mut budgets = self.0.budgets.lock().unwrap();
             ensure!(budgets.appends.take(at, sources, 1) && budgets.append_bytes.take(at, sources, bytes)
@@ -316,7 +340,6 @@ impl Service {
     async fn read(&self, sources: &[(Source, u64)], at: u64, body: &[u8]) -> Result<Page> {
         let Read { capability, after } = decode(body)?;
         let reference = head::reference(&self.0.store.key().verifying_key().to_bytes(), &capability);
-        let _slot = self.slot().await?;
         {
             let mut budgets = self.0.budgets.lock().unwrap();
             ensure!(budgets.reads.take(at, sources, 1) && budgets.read_bytes.fits(at, sources, 0), Refused("rate".into()));
@@ -328,17 +351,12 @@ impl Service {
         let Heads { logs } = decode(body)?;
         let service = self.0.store.key().verifying_key().to_bytes();
         let logs: Vec<([u8; 32], u64)> = logs.iter().map(|Known(capability, length)| (head::reference(&service, capability), *length)).collect();
-        let _slot = self.slot().await?;
         {
             let mut budgets = self.0.budgets.lock().unwrap();
             ensure!(budgets.reads.take(at, sources, 1) && budgets.read_bytes.fits(at, sources, 0), Refused("rate".into()));
         }
         let heads = self.work(move |inner| inner.store.moved(&logs)).await?;
         Ok(Moved { heads })
-    }
-
-    async fn slot(&self) -> Result<OwnedSemaphorePermit> {
-        Ok(timeout(DB_WAIT, self.0.at_once.clone().acquire_owned()).await.map_err(|_| Refused("busy".into()))??)
     }
 
     fn answer<T: Serialize>(&self, body: &[u8], result: Result<T>) -> Result<Vec<u8>> {
@@ -524,18 +542,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requests_at_once_are_bounded_and_refused_busy() {
+    async fn requests_at_once_are_counted_per_source() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = Policy { requests_at_once: 1, ..Policy::default() };
-        let service = Service::new(Store::initialize(&dir.path().join("state")).unwrap(), policy);
+        let service = Service::new(Store::initialize(&dir.path().join("state")).unwrap(), Policy { requests_at_once: 1, ..Policy::default() });
         service.0.expiry.lock().unwrap().take();
-        let body = serde_json::to_vec(&Read { capability: [1; 32], after: 0 }).unwrap();
-        let held = service.slot().await.unwrap();
-        let answer = service.post(Route::Read, "192.0.2.1".parse().unwrap(), &body).await.unwrap();
-        assert!(matches!(serde_json::from_slice::<Answer<Page>>(&answer).unwrap(), Answer::Refused { refusal: Refusal::Busy, .. }));
+        let one: IpAddr = "192.0.2.1".parse().unwrap();
+        let held = service.admit(one).unwrap();
+        assert!(service.admit(one).is_none());
+        assert!(service.admit("192.0.2.2".parse().unwrap()).is_some());
         drop(held);
-        let answer = service.post(Route::Read, "192.0.2.1".parse().unwrap(), &body).await.unwrap();
-        assert!(matches!(serde_json::from_slice::<Answer<Page>>(&answer).unwrap(), Answer::Ok(_)));
+        assert!(service.admit(one).is_some());
+        let net64 = |i: u32| -> IpAddr { format!("2001:db8:0:{i:x}::1").parse().unwrap() };
+        let wide: Vec<_> = (0..WIDE as u32).map(|i| service.admit(net64(i)).unwrap()).collect();
+        assert!(service.admit(net64(WIDE as u32)).is_none());
+        assert!(service.admit("2001:db9::1".parse().unwrap()).is_some());
+        drop(wide);
     }
 
     #[tokio::test]
