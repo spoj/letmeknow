@@ -170,7 +170,7 @@ elif name == "gh" and sys.argv[1:3] == ["run", "list"]:
 elif name == "npm":
     print(sys.argv[2].rsplit("@", 1)[1])
 """
-PIN_FILES = ["README.md", "SKILL.md", "web/src/index.html", "AGENTS.md"]
+PIN_FILES = ["README.md", "SKILL.md", "web/src/index.html", "web/src/main.ts", "AGENTS.md"]
 
 
 def git(*args, cwd):
