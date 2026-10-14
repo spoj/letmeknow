@@ -14,12 +14,13 @@ Its domain, directory and public key are in web/backend.json; crates/proto/src/l
 
 ## A new minor
 
-Its groups and homes are new, so agents and browsers move to it in this order:
+Nothing carries over: it gets a new service, and the previous minor's sessions stop working once the old one goes. In this order:
 
-1. npm: `release.sh` publishes `@letmeknow/cli@X.Y.0`, which the pins and `npx` start.
-2. The service: the backend command above. Its membership API is unchanged and it keeps its data, so the previous minor's sessions keep working through it (`test/compat.py` checks this in CI).
-3. pi-letmeknow: set its `MINOR`, so Pi agents start sessions of the new minor.
-4. Pages, last: browsers take the new app through their service worker, and it must find the service already running the new version.
+1. Before the release: make the new service's state into /var/lib/letmeknow.new ("A new service", below), and commit its key in web/backend.json and crates/proto/src/links.rs.
+2. npm: `release.sh` publishes `@letmeknow/cli@X.Y.0`, which the pins and `npx` start.
+3. The service: stop it, delete /var/lib/letmeknow, move /var/lib/letmeknow.new there, and run the backend command above.
+4. pi-letmeknow: set its `MINOR`, so Pi agents start sessions of the new minor.
+5. Pages, last: browsers take the new app through their service worker, and it must find the service already running the new version.
 
 ## A new service
 
