@@ -7,7 +7,7 @@ use std::time::Duration;
 use iroh::tls::CaTlsConfig;
 use n0_future::boxed::BoxFuture;
 use lmk_core::device::Device;
-use lmk_core::group::Session as Mls;
+use lmk_core::group::{Group, Session as Mls, open_link, seal_link};
 use lmk_core::provider::{MemoryProvider, Provider, SqliteProvider};
 use lmk_membership::service::Service as Membership;
 use lmk_membership::store::Store;
@@ -19,6 +19,7 @@ use lmk_proto::group::{CHAT, Certificate, ChatMessage, IDENTITY, IdentityRef, PR
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
 use lmk_proto::head::Head;
+use lmk_proto::links::FileLink;
 use lmk_proto::peer::{Frame, SUMMARY, Seqs, Signed, Summary};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -674,6 +675,101 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
         _ => None,
     }).await;
     assert_eq!(data, b"newer");
+}
+
+/// A state handed from a later epoch than this session's is dropped. Once this session reaches that epoch, it asks the
+/// member for the state again, and takes the link the member seals in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_state_from_a_later_epoch_is_asked_again_once_reached() {
+    let relay = relay().await;
+    let dir = folder("state-epoch");
+    let (gate, _reaching) = Gate::new();
+    let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = stored(&relay, "Alice", &db("alice")).await;
+    let bob = stored(&relay, "Bob", &db("bob")).await;
+    let gid = alice.node.create(Settings { membership, ..settings(KIND, &relay) }, None).unwrap();
+    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    let joining = {
+        let node = bob.node.clone();
+        tokio::spawn(async move { node.join(&link, None).await })
+    };
+    alice.until(|e| match e {
+        Event::Snapshot { reply, .. } => Some(reply),
+        _ => None,
+    }).await.send(Some(b"the state".to_vec())).unwrap();
+    joining.await.unwrap().unwrap();
+    let mut bob = bob;
+
+    // Bob cannot read the service while Alice commits, so it stays in the epoch it has.
+    gate.spared.lock().unwrap().push(alice.node.address().0);
+    gate.set(false);
+    alice.node.change_settings(&gid.0, |settings| Settings { name: "Renamed".into(), ..settings }).await.unwrap();
+    let ahead = alice.node.epoch(&gid.0).unwrap();
+    alice.node.shutdown().await.unwrap();
+    let (alice_key, _) = member_of(&db("alice"));
+    let mut hand = hand(&relay, alice_key, &bob.node).await;
+    hand.send(&Frame::State { group: gid.clone(), epoch: ahead, link: Some(Bytes(vec![0; 64])) }).await;
+    hand.settle(&gid).await;
+
+    gate.set(true);
+    let asked = hand.until(|frame| match frame {
+        Frame::State { group, epoch, link: None } => Some((group, epoch)),
+        _ => None,
+    }).await;
+    assert_eq!(asked, (gid.clone(), ahead), "bob asks alice again, in the epoch it reached");
+
+    // Alice's state key of that epoch seals a link to a file Bob holds: Bob opens it and takes the state.
+    let file = bob.node.add_file(&gid.0, b"the state".to_vec()).await.unwrap();
+    let key = Group::load(&SqliteProvider::open(&db("alice")).unwrap(), &gid.0).unwrap().state_secret(&SqliteProvider::open(&db("alice")).unwrap()).unwrap();
+    hand.send(&Frame::State { group: gid.clone(), epoch: ahead, link: Some(Bytes(seal_link(&key, &file.link()).unwrap())) }).await;
+    let (data, from) = bob.until(|e| match e {
+        Event::State { data, from, .. } => Some((data, from)),
+        _ => None,
+    }).await;
+    assert_eq!((data.as_slice(), from.name.as_str()), (&b"the state"[..], "Alice"));
+    bob.node.shutdown().await.unwrap();
+}
+
+/// A member's request for the state is answered with a link sealed in the answering member's epoch, to the file it holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_for_the_state_is_answered_with_a_link_sealed_in_its_epoch() {
+    let relay = relay().await;
+    let dir = folder("state-answer");
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = stored(&relay, "Alice", &db("alice")).await;
+    let bob = stored(&relay, "Bob", &db("bob")).await;
+    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
+    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    let joining = {
+        let node = bob.node.clone();
+        tokio::spawn(async move { node.join(&link, None).await })
+    };
+    alice.until(|e| match e {
+        Event::Snapshot { reply, .. } => Some(reply),
+        _ => None,
+    }).await.send(Some(b"the state".to_vec())).unwrap();
+    joining.await.unwrap().unwrap();
+    bob.node.shutdown().await.unwrap();
+
+    let (bob_key, _) = member_of(&db("bob"));
+    let mut hand = hand(&relay, bob_key, &alice.node).await;
+    hand.send(&Frame::State { group: gid.clone(), epoch: 0, link: None }).await;
+    let reply = alice.until(|e| match e {
+        Event::Snapshot { reply, .. } => Some(reply),
+        _ => None,
+    }).await;
+    reply.send(Some(b"the state".to_vec())).unwrap();
+    let (epoch, sealed) = hand.until(|frame| match frame {
+        Frame::State { epoch, link: Some(link), .. } => Some((epoch, link)),
+        _ => None,
+    }).await;
+    let provider = SqliteProvider::open(&db("bob")).unwrap();
+    assert_eq!(epoch, alice.node.epoch(&gid.0).unwrap());
+    let key = Group::load(&provider, &gid.0).unwrap().state_secret(&provider).unwrap();
+    let link = FileLink::parse(&open_link(&key, &sealed.0).unwrap()).unwrap();
+    assert_eq!(alice.node.file(&link).await.unwrap(), Some(b"the state".to_vec()));
+    alice.node.shutdown().await.unwrap();
 }
 
 /// A joiner's state link is sealed under the state key of the epoch its Add moved into, so it opens although another
@@ -1575,7 +1671,7 @@ async fn expired_service_history_preserves_chat_and_identity_groups() {
 
 /// A session on SQLite at `db`, which survives a restart.
 async fn stored(relay: &Relay, name: &str, db: &Path) -> Session<SqliteProvider> {
-    let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), config(relay, name, None, &[CHAT])).await.unwrap();
+    let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), config(relay, name, None, &[CHAT, KIND])).await.unwrap();
     Session { node, events }
 }
 
@@ -1861,7 +1957,8 @@ async fn a_peer_not_admitted_changes_nothing() {
     let head = Head { log_ref: log.0.as_slice().try_into().unwrap(), length: 2, hash: [9; 32], time: lmk_node::now(), sig: Bytes(vec![0; 64]) };
     mallory.send(&Frame::Entries { log, entries: vec![Bytes(b"junk".to_vec())], head }).await;
     let file = lmk_proto::links::FileLink { hash: [7; 32], size: 1, key: [0; 32] };
-    mallory.send(&Frame::State { group: gid.clone(), link: Some(file.link()) }).await;
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    mallory.send(&Frame::State { group: gid.clone(), epoch, link: Some(Bytes(file.link().into_bytes())) }).await;
     mallory.send(&Frame::Live { group: gid.clone(), hops: 0, item: forged(3) }).await;
     assert!(mallory.settle(&gid).await.is_empty(), "a want the gate does not take gets nothing");
     assert_eq!(dump(&alice_db), before);

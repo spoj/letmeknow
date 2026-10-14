@@ -5,12 +5,13 @@
 //! and the memberships that ended and began.
 
 use anyhow::{Context, Result};
+use iroh::EndpointId;
 use lmk_core::group::{self as core, Verdict};
 use lmk_core::provider::Provider;
 use lmk_net::peers::Decision;
 use lmk_proto::Bytes;
 use lmk_proto::entry::Entry;
-use lmk_proto::peer::Seqs;
+use lmk_proto::peer::{Frame, Seqs};
 use lmk_proto::ranges::Ranges;
 
 use crate::held::Author;
@@ -43,6 +44,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if st.groups.contains_key(gid) {
             st.save(gid)?;
             if st.at_head(gid) {
+                if let Some((peer, epoch)) = st.group(gid)?.rec.wanted && epoch == st.group(gid)?.mls.epoch() {
+                    st.group_mut(gid)?.rec.wanted = None;
+                    let frame = Frame::State { group: Bytes(gid.to_vec()), epoch, link: None };
+                    st.emit(gid, EndpointId::from_bytes(&peer)?, frame);
+                }
                 self.work.send(Work::Duties(gid.to_vec())).ok();
             }
         }

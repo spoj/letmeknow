@@ -43,11 +43,13 @@ pub enum Frame {
     /// BLAKE3 hashes of files.
     WantFiles { group: Bytes, files: Vec<Bytes> },
     Have { group: Bytes, files: Vec<Bytes> },
-    /// A file link to the state of the group's kind; without one, a request for one.
+    /// The state of the group's kind, as a link sealed under the state key of `epoch`, the sender's; without a link, a
+    /// request for one, which a member answers in its own epoch.
     State {
         group: Bytes,
+        epoch: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        link: Option<String>,
+        link: Option<Bytes>,
     },
 }
 

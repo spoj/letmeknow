@@ -9,7 +9,6 @@ use lmk_core::provider::Provider;
 use lmk_net::Net;
 use lmk_proto::group::{Certificate, IdentityRef, Settings};
 use lmk_proto::links::FileLink;
-use lmk_proto::peer::Frame;
 use lmk_proto::Bytes;
 use n0_future::{FutureExt, MergeUnbounded, StreamExt};
 use n0_future::time::{Duration, sleep, timeout};
@@ -228,7 +227,9 @@ impl<P: Provider + Send + 'static> Node<P> {
     pub async fn hand_state(&self, gid: &[u8], to: &str, data: Vec<u8>) -> Result<()> {
         let peer = self.inner.lock().by_fp(gid, to)?;
         let link = self.inner.state_file(gid, data).await?;
-        self.inner.lock().emit(gid, peer, Frame::State { group: Bytes(gid.to_vec()), link: Some(link) });
+        let mut st = self.inner.lock();
+        let frame = st.state_frame(gid, &link)?;
+        st.emit(gid, peer, frame);
         Ok(())
     }
 

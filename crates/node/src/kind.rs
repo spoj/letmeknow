@@ -5,16 +5,44 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::EndpointId;
+use lmk_core::group::seal_link;
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
 use lmk_proto::group::CHAT;
 use lmk_proto::links::FileLink;
+use lmk_proto::peer::Frame;
 use n0_future::time::timeout;
 use tokio::sync::oneshot;
 
-use crate::{Event, Inner, SNAPSHOT_WAIT};
+use crate::{Event, Inner, SNAPSHOT_WAIT, State};
+
+impl<P: Provider> State<P> {
+    /// The frame that hands a member a link to the group's state, sealed in the group's current epoch, which it names.
+    pub(crate) fn state_frame(&self, gid: &[u8], link: &str) -> Result<Frame> {
+        let g = self.group(gid)?;
+        let sealed = seal_link(&g.mls.state_secret(&self.provider)?, link)?;
+        Ok(Frame::State { group: Bytes(gid.to_vec()), epoch: g.mls.epoch(), link: Some(Bytes(sealed)) })
+    }
+}
 
 impl<P: Provider + Send + 'static> Inner<P> {
+    /// Answers a member's request for the state with a fresh link, in this session's epoch as it is then.
+    pub(crate) fn answer_state(self: &Arc<Self>, gid: &[u8], peer: EndpointId) {
+        let (inner, gid) = (self.clone(), gid.to_vec());
+        self.spawn(async move {
+            let answered = async {
+                let Some(link) = inner.state_link(&gid).await else { return anyhow::Ok(()) };
+                let mut st = inner.lock();
+                let frame = st.state_frame(&gid, &link)?;
+                st.emit(&gid, peer, frame);
+                anyhow::Ok(())
+            };
+            if let Err(error) = answered.await {
+                inner.warn(Some(&gid), format!("answering a request for the group's state: {error:#}"));
+            }
+        });
+    }
+
     /// Takes a state `by` handed this session, once it is fetched, and tells the group's kind.
     pub(crate) fn state_from(self: &Arc<Self>, gid: &[u8], link: String, by: EndpointId) {
         let (inner, gid) = (self.clone(), gid.to_vec());

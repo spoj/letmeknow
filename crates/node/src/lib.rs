@@ -342,6 +342,9 @@ struct Rec {
     told: Vec<(Bytes, u64, Seqs)>,
     /// The epochs whose ending commits are saved, with when they applied.
     commits: Vec<(u64, u64)>,
+    /// The member that handed a state of an epoch this session had not reached, and that epoch: once this session
+    /// reaches it, it asks that member for the state again.
+    wanted: Option<([u8; 32], u64)>,
     /// The epoch this session's messages past its cut were last sealed again in.
     resealed: u64,
     /// Since when this session has held a message no cut keeps.
