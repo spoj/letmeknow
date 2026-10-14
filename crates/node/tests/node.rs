@@ -1774,6 +1774,59 @@ async fn an_announced_loss_reaches_every_member() {
     carol.node.shutdown().await.unwrap();
 }
 
+static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The system's clock, moved on by `SHIFT`.
+fn shifted() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A member catching up does not wait for what a commit made more than H ago kept: Carol, back 8 days later with no
+/// holder of Bob's kept message online, is told it lost at once rather than after `HEAR`. Every thread of the runtime,
+/// the service's included, reads the shifted clock.
+#[test]
+fn catching_up_waits_for_nothing_a_commit_older_than_h_kept() {
+    let runtime = tokio::runtime::Builder::new_multi_thread().on_thread_start(|| lmk_proto::clock::set(shifted)).enable_all().build().unwrap();
+    runtime.block_on(catching_up());
+}
+
+async fn catching_up() {
+    let relay = relay().await;
+    let dir = folder("lost-old");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let mut alice = stored(&relay, "Alice", &db("alice")).await;
+    let bob = stored(&relay, "Bob", &db("bob")).await;
+    let carol = stored(&relay, "Carol", &db("carol")).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    for joiner in [&bob, &carol] {
+        joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    }
+    eventually("Carol has both Adds", || carol.node.members(&gid.0).unwrap().len() == 3).await;
+    carol.node.shutdown().await.unwrap();
+    drop(carol);
+
+    bob.node.send(&gid.0, &message("only Alice and Bob hold this"), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
+    for name in ["One", "Two"] {
+        alice.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
+    }
+    bob.node.shutdown().await.unwrap();
+    alice.node.shutdown().await.unwrap();
+
+    SHIFT.store(8 * 24 * 3600 * 1000, std::sync::atomic::Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    let mut carol = stored(&relay, "Carol", &db("carol")).await;
+    let lost = carol.until(|e| match e {
+        Event::Lost(lost) => Some(lost),
+        _ => None,
+    }).await;
+    assert!(started.elapsed() < Duration::from_millis(lmk_net::peers::HEAR), "took {:?}", started.elapsed());
+    assert_eq!((lost.messages[0].from.name.as_str(), lost.messages[0].seqs.clone()), ("Bob", vec![1]));
+    carol.node.shutdown().await.unwrap();
+}
+
 /// The members a public log entry drops are removed by one commit.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pass_removes_every_member_due_in_one_commit() {

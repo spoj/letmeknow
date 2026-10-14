@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, KeyInit, Payload}};
 use lmk_proto::Bytes;
-use lmk_proto::clock::now;
+use lmk_proto::clock::{corrected, now};
 use lmk_proto::entry::{Entry, signed, welcome_signed};
 use lmk_proto::group::{Certificate, Credential, How, IDENTITY, LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
 use lmk_proto::held::{self, Claim, Header, Ref};
@@ -226,8 +226,8 @@ pub struct Change {
     pub cut: Vec<Ref>,
 }
 
-/// A commit's authenticated data, inside its sealed entry: how the members it adds came in, and the cut of the epoch it
-/// ends.
+/// A commit's authenticated data, inside its sealed entry: how the members it adds came in, the cut of the epoch it
+/// ends, and when it was made, by the committer's corrected clock.
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Aad {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,6 +236,8 @@ struct Aad {
     invite: Option<Bytes>,
     #[serde(default)]
     cut: Vec<Ref>,
+    #[serde(default)]
+    time: u64,
 }
 
 /// A message this session holds no key for: sealed in an epoch it never was in or whose keys it deleted, too far behind
@@ -298,6 +300,8 @@ pub enum Verdict {
     Commit {
         /// It removes this session.
         removes: bool,
+        /// When its committer made it, by its corrected clock.
+        time: u64,
     },
     /// A commit from this session's own leaf, signed with its key, that this session did not make: its state was copied.
     Copied,
@@ -631,7 +635,7 @@ impl Group {
             // One staged but never saved, so never posted.
             g.mls.clear_pending_commit(provider.storage())?;
             let adds = change.add.iter().map(|bytes| key_package_in(provider, bytes)).collect::<Result<Vec<_>>>()?;
-            let aad = Aad { how: change.how, invite: change.invite, cut: change.cut };
+            let aad = Aad { how: change.how, invite: change.invite, cut: change.cut, time: corrected() };
             g.mls.set_aad(serde_json::to_vec(&aad)?);
             let mut parameters = LeafNodeParameters::builder();
             if let Some(leaf) = &change.leaf {
@@ -718,7 +722,7 @@ impl Group {
                 self.save(provider)?;
                 return Ok(Verdict::Skipped { reason: error.to_string(), lost: true });
             }
-            return Ok(Verdict::Commit { removes: false });
+            return Ok(Verdict::Commit { removes: false, time: self.state.aad.time });
         }
         match Entry::parse(&entry) {
             Err(error) => Ok(skipped(error)),
@@ -726,7 +730,7 @@ impl Group {
                 let staged = self.guarded(provider, |_| false, |g| g.stage(provider, &commit, &sig));
                 Ok(match staged {
                     Ok(Staged::Copied) => Verdict::Copied,
-                    Ok(Staged::Commit(staged, ..)) => Verdict::Commit { removes: staged.self_removed() },
+                    Ok(Staged::Commit(staged, _, aad)) => Verdict::Commit { removes: staged.self_removed(), time: aad.time },
                     Err(error) => skipped(error),
                 })
             }

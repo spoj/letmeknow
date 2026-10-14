@@ -247,7 +247,7 @@ fn staged_oversize_and_malformed_builds_restore_everything() {
     assert_eq!(largest.entry.len(), 1 << 20);
     group.cancel(&a.provider).unwrap();
     group.mls.set_aad(b"transient AAD before a failed build".to_vec());
-    group.state.aad = Aad { how: Some(How::Other("future".into())), invite: Some([3; 32].into()), cut: group.cut().to_vec() };
+    group.state.aad = Aad { how: Some(How::Other("future".into())), invite: Some([3; 32].into()), cut: group.cut().to_vec(), time: 1 };
     group.save(&a.provider).unwrap();
     let before = a.provider.records();
     let before_state = serde_json::to_vec(&group.state).unwrap();
@@ -321,7 +321,7 @@ fn accepted_package_refs_survive_pending_serde_and_reenveloping() {
     let a = &mut w.m[0];
     let epoch = a.g().epoch();
     let records = a.provider.records();
-    assert_eq!(a.group.as_mut().unwrap().judge(&a.provider, &rewrapped).unwrap(), Verdict::Commit { removes: false });
+    assert!(matches!(a.group.as_mut().unwrap().judge(&a.provider, &rewrapped).unwrap(), Verdict::Commit { removes: false, .. }));
     assert_eq!(a.provider.records(), records);
     let pos = w.post(rewrapped);
     let read = w.read(&[0, 1]);
