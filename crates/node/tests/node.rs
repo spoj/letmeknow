@@ -906,9 +906,14 @@ impl Gate {
         let mut conns = self.conns.lock().unwrap();
         self.open.send_replace(open);
         if !open {
-            for conn in conns.drain(..) {
-                conn.close(0u32.into(), b"closed");
-            }
+            let spared = self.spared.lock().unwrap();
+            conns.retain(|conn| {
+                let kept = spared.contains(conn.remote_id().as_bytes());
+                if !kept {
+                    conn.close(0u32.into(), b"closed");
+                }
+                kept
+            });
         }
     }
 }
