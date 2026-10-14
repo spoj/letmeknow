@@ -2,21 +2,22 @@
 
 use std::{
     future::Future,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU32,
     path::PathBuf,
     pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
-use http::{Request, Response, StatusCode, header};
-use http_body_util::Full;
+use http::{Method, Request, Response, StatusCode, header};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
     body::{Bytes, Incoming},
     service::{Service as HyperService, service_fn},
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use iroh::{
     Endpoint, RelayConfig, RelayMap, RelayMode, SecretKey, endpoint::presets, protocol::Router, tls::CaTlsConfig,
 };
@@ -29,15 +30,21 @@ use iroh_relay::{
     },
 };
 use lmk_membership::{
-    service::{Policy, Service},
+    service::{Policy, Route, Service},
     store::Store,
 };
-use lmk_proto::{directory::{self, Directory}, frame::ALPN, group};
+use lmk_proto::{directory::{self, Directory}, frame::ALPN, group, membership::MAX_BODY};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use socket2::{Domain, Socket, Type};
-use tokio::{net::TcpListener, sync::Notify};
+use tokio::{net::TcpListener, sync::Notify, time::timeout};
 use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
 use tokio_stream::StreamExt;
+
+/// The app's origin: its pages may append to the membership service, as may those `--origin` adds.
+const APP: &str = "https://letmeknow.dev";
+const HANDSHAKE: Duration = Duration::from_secs(10);
+const HEADERS: Duration = Duration::from_secs(10);
+const BODY: Duration = Duration::from_secs(15);
 
 pub enum Certificate {
     /// From Let's Encrypt, by TLS-ALPN-01 on the HTTPS port; cached in the state directory.
@@ -63,6 +70,8 @@ pub struct ServeConfig {
     /// Bytes a second that the relay reads from each connection.
     pub relay_rate_limit: NonZeroU32,
     pub policy: Policy,
+    /// Origins besides the app's whose pages may append to the membership service.
+    pub origins: Vec<String>,
 }
 
 impl ServeConfig {
@@ -78,6 +87,7 @@ impl ServeConfig {
             certificate: Certificate::Acme { contact: None },
             relay_rate_limit: NonZeroU32::new(1 << 20).unwrap(),
             policy: Policy::default(),
+            origins: vec![],
         }
     }
 
@@ -205,26 +215,33 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
     let _router = Router::builder(endpoint).accept(ALPN, membership.clone()).spawn();
 
     let tls = Arc::new(tls);
+    let origins = Arc::new(std::iter::once(APP.to_owned()).chain(config.origins.iter().cloned()).collect::<Vec<_>>());
     loop {
-        let (tcp, _) = https.accept().await?;
-        let (tls, relay, health, directory, membership) =
-            (tls.clone(), relay.clone(), health.clone(), directory.clone(), membership.clone());
+        let (tcp, peer) = https.accept().await?;
+        let (tls, relay, health, directory, membership, origins) =
+            (tls.clone(), relay.clone(), health.clone(), directory.clone(), membership.clone(), origins.clone());
         tokio::spawn(async move {
-            let stream = match &*tls {
-                Tls::Files(acceptor) => acceptor.accept(tcp).await.ok(),
-                Tls::Acme(acceptor, server_config) => match acceptor.accept(tcp).await {
-                    Ok(Some(start)) => start.into_stream(server_config.clone()).await.ok(),
-                    _ => None,
-                },
-            };
+            let stream = timeout(HANDSHAKE, async move {
+                match &*tls {
+                    Tls::Files(acceptor) => acceptor.accept(tcp).await.ok(),
+                    Tls::Acme(acceptor, server_config) => match acceptor.accept(tcp).await {
+                        Ok(Some(start)) => start.into_stream(server_config.clone()).await.ok(),
+                        _ => None,
+                    },
+                }
+            }).await.ok().flatten();
             let Some(stream) = stream else { return };
             let site = Site {
                 relay: RelayServiceWithNotify::new(relay, Arc::new(Notify::new())),
                 health,
                 directory,
                 membership,
+                peer: peer.ip(),
+                origins,
             };
             let _ = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADERS)
                 .serve_connection(TokioIo::new(MaybeTlsStream::Tls(stream)), site)
                 .with_upgrades()
                 .await;
@@ -294,6 +311,42 @@ struct Site {
     /// The directory at `/.well-known/letmeknow.json`.
     directory: Bytes,
     membership: Service,
+    /// The address membership budgets count the request against.
+    peer: IpAddr,
+    origins: Arc<Vec<String>>,
+}
+
+/// Membership requests. Only the app's origins, and those `--origin` adds, may send them: another page could otherwise
+/// make its visitors append.
+async fn answer_membership(route: Route, service: Service, peer: IpAddr, origins: Arc<Vec<String>>, req: Request<Incoming>) -> http::Result<Response<BytesBody>> {
+    let origin = req.headers().get(header::ORIGIN).cloned();
+    if !origin.as_ref().is_none_or(|o| o.to_str().is_ok_and(|o| origins.iter().any(|allowed| allowed == o))) {
+        return respond(StatusCode::FORBIDDEN).body(body(""));
+    }
+    let allow = |res: http::response::Builder| match &origin {
+        Some(o) => res.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, o),
+        None => res,
+    };
+    match *req.method() {
+        Method::OPTIONS => allow(respond(StatusCode::NO_CONTENT))
+            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "POST")
+            .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type")
+            .header(header::ACCESS_CONTROL_MAX_AGE, "600")
+            .body(body("")),
+        Method::POST => {
+            let Ok(Ok(collected)) = timeout(BODY, Limited::new(req.into_body(), MAX_BODY).collect()).await else {
+                return respond(StatusCode::BAD_REQUEST).body(body(""));
+            };
+            match service.post(route, peer, &collected.to_bytes()).await {
+                Ok(answer) => allow(respond(StatusCode::OK))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CACHE_CONTROL, "no-store")
+                    .body(body(answer)),
+                Err(_) => respond(StatusCode::INTERNAL_SERVER_ERROR).body(body("")),
+            }
+        }
+        _ => respond(StatusCode::METHOD_NOT_ALLOWED).header(header::ALLOW, "POST, OPTIONS").body(body("")),
+    }
 }
 
 type Answer = Pin<Box<dyn Future<Output = Result<Response<BytesBody>, HyperError>> + Send>>;
@@ -304,6 +357,10 @@ impl HyperService<Request<Incoming>> for Site {
     type Future = Answer;
 
     fn call(&self, req: Request<Incoming>) -> Answer {
+        if let Some(route) = Route::parse(req.uri().path()) {
+            let (service, peer, origins) = (self.membership.clone(), self.peer, self.origins.clone());
+            return Box::pin(async move { answer_membership(route, service, peer, origins, req).await.map_err(Into::into) });
+        }
         match req.uri().path() {
             "/relay" => return Box::pin(self.relay.call(req)),
             "/ping" => {

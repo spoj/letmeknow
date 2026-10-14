@@ -1,15 +1,18 @@
 use std::{net::Ipv4Addr, path::Path, sync::Arc, time::Duration};
 
+use ed25519_dalek::{Signature, VerifyingKey};
 use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, endpoint::presets, tls::CaTlsConfig};
 use iroh_relay::RelayQuicConfig;
 use lmk_membership::client::{Resolve, ServeClient};
-use lmk_proto::directory::Directory;
+use lmk_proto::{Bytes, directory::Directory, membership::{Answer, Append, Appended, Page, Read, Refusal, refusal_message}};
 use n0_future::boxed::BoxFuture;
 use lmk_serve::{Certificate, ServeConfig, serve};
 use rustls::pki_types::{CertificateDer, ServerName};
+use serde::de::DeserializeOwned;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    time::timeout,
 };
 
 /// A port free for TCP and UDP, below the ephemeral range: a port `bind(0)` returned could be taken by another test's relay
@@ -23,7 +26,7 @@ fn free_port() -> u16 {
     }
 }
 
-async fn https_get(port: u16, cert: &CertificateDer<'static>, path: &str, headers: &str) -> String {
+async fn tls_connect(host: &str, port: u16, cert: &CertificateDer<'static>) -> tokio_rustls::client::TlsStream<TcpStream> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.clone()).unwrap();
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -31,18 +34,22 @@ async fn https_get(port: u16, cert: &CertificateDer<'static>, path: &str, header
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await.unwrap();
+    let tcp = TcpStream::connect((host, port)).await.unwrap();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let mut tls = connector
-        .connect(ServerName::try_from("localhost").unwrap(), tcp)
-        .await
-        .unwrap();
-    tls.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{headers}\r\n").as_bytes())
-        .await
-        .unwrap();
+    connector.connect(ServerName::try_from("localhost").unwrap(), tcp).await.unwrap()
+}
+
+async fn https_raw(host: &str, port: u16, cert: &CertificateDer<'static>, request: &[u8]) -> String {
+    let mut tls = tls_connect(host, port, cert).await;
+    tls.write_all(request).await.unwrap();
     let mut response = Vec::new();
     let _ = tls.read_to_end(&mut response).await;
     String::from_utf8(response).unwrap()
+}
+
+async fn https_get(port: u16, cert: &CertificateDer<'static>, path: &str, headers: &str) -> String {
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{headers}\r\n");
+    https_raw("127.0.0.1", port, cert, request.as_bytes()).await
 }
 
 async fn http_get(port: u16, request: &str) -> String {
@@ -198,5 +205,107 @@ async fn directory_names_the_relays_given() {
     let directory = Directory::parse(response.split_once("\r\n\r\n").unwrap().1.as_bytes()).unwrap();
     assert_eq!(directory.relay, relay);
     assert_eq!(directory.relays, ["https://relay.example:8443", "https://relay2.example"]);
+    server.abort();
+}
+
+const APP: &str = "https://letmeknow.dev";
+const APPEND: &str = "/membership/1/append";
+
+fn append_json(capability: u8, entry: &[u8]) -> Vec<u8> {
+    serde_json::to_vec(&Append { capability: [capability; 32], entries: vec![Bytes(entry.to_vec())], public: false }).unwrap()
+}
+
+fn post(path: &str, origin: Option<&str>, body: &[u8]) -> Vec<u8> {
+    let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
+    let head = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\n{origin}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    [head.as_bytes(), body].concat()
+}
+
+fn answer<T: DeserializeOwned>(response: &str) -> Answer<T> {
+    serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_takes_appends_from_the_app_and_listed_origins_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (mut config, cert) = configure(&state);
+    config.origins = vec!["http://localhost:5173".into()];
+    let (https, service) = (config.https_port, config.service().unwrap());
+    let server = tokio::spawn(serve(config));
+    wait_for_https(https).await;
+    let lmk_proto::group::Service::Serve { key, .. } = &service else { unreachable!() };
+    let key = VerifyingKey::from_bytes(key.0.as_slice().try_into().unwrap()).unwrap();
+
+    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, Some(APP), &append_json(7, b"one"))).await;
+    assert!(response.starts_with("HTTP/1.1 200") && response.to_lowercase().contains(&format!("access-control-allow-origin: {APP}")), "{response}");
+    let Answer::Ok(appended) = answer::<Appended>(&response) else { panic!("{response}") };
+    assert!(appended.head.verify(&key));
+
+    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, Some("https://evil.example"), &append_json(8, b"x"))).await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    let read = serde_json::to_vec(&Read { capability: [8; 32], after: 0 }).unwrap();
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/1/read", None, &read)).await;
+    let Answer::Ok(page) = answer::<Page>(&response) else { panic!("{response}") };
+    assert!(page.entries.is_empty(), "a page of another origin appended");
+
+    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, &append_json(9, b"y"))).await;
+    assert!(response.starts_with("HTTP/1.1 200") && !response.to_lowercase().contains("access-control-allow-origin"), "{response}");
+    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, Some("http://localhost:5173"), &append_json(10, b"z"))).await;
+    assert!(response.starts_with("HTTP/1.1 200") && response.to_lowercase().contains("access-control-allow-origin: http://localhost:5173"), "{response}");
+
+    let preflight = |origin: &str| format!("OPTIONS {APPEND} HTTP/1.1\r\nHost: localhost\r\nOrigin: {origin}\r\nAccess-Control-Request-Method: POST\r\nConnection: close\r\n\r\n");
+    let response = https_raw("127.0.0.1", https, &cert, preflight(APP).as_bytes()).await;
+    let lower = response.to_lowercase();
+    assert!(response.starts_with("HTTP/1.1 204") && lower.contains(&format!("access-control-allow-origin: {APP}")) && lower.contains("access-control-max-age: 600"), "{response}");
+    let response = https_raw("127.0.0.1", https, &cert, preflight("https://evil.example").as_bytes()).await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+
+    let response = https_raw("127.0.0.1", https, &cert, b"GET /membership/1/read HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
+    assert!(response.starts_with("HTTP/1.1 405"), "{response}");
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/append", Some(APP), &append_json(7, b"x"))).await;
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+
+    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, b"not json")).await;
+    let Answer::<()>::Refused { refusal, sig } = answer(&response) else { panic!("{response}") };
+    assert!(matches!(refusal, Refusal::Policy));
+    assert!(Signature::from_slice(&sig.0).is_ok_and(|sig| key.verify_strict(&refusal_message(Refusal::Policy, b"not json"), &sig).is_ok()));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_counts_a_mapped_address_as_its_ipv4_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (mut config, cert) = configure(&state);
+    config.policy.appends_per_minute = 1;
+    let https = config.https_port;
+    let server = tokio::spawn(serve(config));
+    wait_for_https(https).await;
+
+    let first = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, &append_json(1, b"a"))).await;
+    assert!(matches!(answer::<Appended>(&first), Answer::Ok(_)), "{first}");
+    let mapped = https_raw("::ffff:127.0.0.1", https, &cert, &post(APPEND, None, &append_json(1, b"b"))).await;
+    assert!(matches!(answer::<Appended>(&mapped), Answer::Refused { refusal: Refusal::Rate, .. }), "{mapped}");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stalled_handshakes_and_headers_are_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (config, cert) = configure(&state);
+    let https = config.https_port;
+    let server = tokio::spawn(serve(config));
+    wait_for_https(https).await;
+
+    let mut silent = TcpStream::connect((Ipv4Addr::LOCALHOST, https)).await.unwrap();
+    let mut rest = Vec::new();
+    assert!(timeout(Duration::from_secs(14), silent.read_to_end(&mut rest)).await.is_ok(), "a silent handshake was kept open");
+
+    let mut tls = tls_connect("127.0.0.1", https, &cert).await;
+    tls.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n").await.unwrap();
+    let mut rest = Vec::new();
+    assert!(timeout(Duration::from_secs(14), tls.read_to_end(&mut rest)).await.is_ok(), "stalled headers were kept open");
     server.abort();
 }

@@ -3038,6 +3038,7 @@ name = "lmk-serve"
 version = "0.19.0"
 dependencies = [
  "anyhow",
+ "ed25519-dalek 3.0.0",
  "hex",
  "http",
  "http-body-util",
@@ -3051,6 +3052,7 @@ dependencies = [
  "rand 0.9.5",
  "rcgen",
  "rustls",
+ "serde",
  "serde_json",
  "socket2",
  "tempfile",
