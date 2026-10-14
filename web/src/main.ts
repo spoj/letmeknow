@@ -40,7 +40,7 @@ const FILE_LIMIT = 25 << 20;
 const INVITE_PREFIX = "https://letmeknow.dev/i";
 /** letmeknow 0.17's invite links, which this version cannot read. */
 const madeByOlder = (link: string) => /#6\./.test(link);
-const OLDER_INVITE = "This invite was made by letmeknow 0.17. Its maker must restart with `npx -y @letmeknow/cli@0.18`, then make a new link.";
+const OLDER_INVITE = "This invite is from letmeknow 0.17, whose groups this version cannot join: ask for an invite to a group made with letmeknow 0.18 (`npx -y @letmeknow/cli@0.18`).";
 
 const root = document.getElementById("app")!;
 const agentsHelp = document.getElementById("agents")!;

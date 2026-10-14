@@ -258,7 +258,7 @@ try {
       await legacy.getByText("Chats from letmeknow 0.17 stay with 0.17").waitFor();
       await legacy.getByRole("button", { name: "OK" }).click();
       await legacy.goto(`${SITE}/i#6.g.${"A".repeat(22)}`);
-      await legacy.getByText("This invite was made by letmeknow 0.17").waitFor();
+      await legacy.getByText("This invite is from letmeknow 0.17").waitFor();
       check(await legacy.locator(".banner").count() === 0, "letmeknow 0.17's notice is said once");
     }
     const old = await legacy.evaluate(name => new Promise((resolve, reject) => {
