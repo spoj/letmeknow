@@ -41,8 +41,6 @@ use crate::{
 const ANSWER_WAIT: Duration = Duration::from_secs(5);
 /// How long a dial at the hint's relays may take before it is dropped for a dial at all relays.
 const HINT_WAIT: Duration = Duration::from_secs(2);
-/// How long the dial at all relays may take.
-const FALLBACK_WAIT: Duration = Duration::from_secs(5);
 
 /// What this crate needs from the group logic to serve files and gate frames. Calls are quick and local.
 pub trait Groups: Send + Sync + 'static {
@@ -314,11 +312,8 @@ impl Inner {
                 conn
             }
             None => {
-                timeout(FALLBACK_WAIT, async {
-                    let relays = fallback.await?;
-                    anyhow::Ok(self.endpoint.connect(self.addr(key, hint.into_iter().chain(relays)), ALPN).await?)
-                })
-                .await??
+                let relays = fallback.await?;
+                self.endpoint.connect(self.addr(key, hint.into_iter().chain(relays)), ALPN).await?
             }
         };
         match self.register(&conn, true) {

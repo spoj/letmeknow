@@ -369,7 +369,8 @@ fn links(events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) -> Vec<Event>
     std::iter::from_fn(|| events.try_recv().ok()).filter(|event| matches!(event, Event::Connected(..) | Event::Disconnected(_))).collect()
 }
 
-/// A dial to a key nobody holds gives up about 7 s after it starts: 2 s at the hint, then 5 s at all relays.
+/// A dial to a key nobody holds gives up when iroh's handshake does, about 32 s after it starts: 2 s at the hint, then
+/// 30 s at all relays, as long as a peer that is starting up may take to come online.
 #[tokio::test(flavor = "multi_thread")]
 async fn dial_to_absent_key_gives_up() {
     let rs = relays(2).await;
@@ -379,7 +380,7 @@ async fn dial_to_absent_key_gives_up() {
     let dialed = a.net.dial(keys[2].public(), vec![rs[1].url.clone()], Box::pin(std::future::ready(vec![rs[0].url.clone(), rs[1].url.clone()]))).await;
     let took = started.elapsed();
     assert!(dialed.is_err());
-    assert!(took >= Duration::from_secs(6) && took < Duration::from_secs(8), "gave up after {took:?}");
+    assert!(took >= Duration::from_secs(30) && took < Duration::from_secs(40), "gave up after {took:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
