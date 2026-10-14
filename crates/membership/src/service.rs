@@ -156,9 +156,7 @@ impl<K: Key> Quota<K> {
         self.roll(at);
         for (key, _) in keys {
             if !self.tracks(key) { continue; }
-            if !self.spent.contains_key(key) {
-                if let Some(net) = key.net48() { *self.nets.entry(net).or_default() += 1; }
-            }
+            if let Some(net) = key.net48().filter(|_| !self.spent.contains_key(key)) { *self.nets.entry(net).or_default() += 1; }
             *self.spent.entry(key.clone()).or_default() += amount;
         }
     }
