@@ -27,9 +27,13 @@ use crate::{G, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, State, device_key_ke
 
 /// How many members besides the inviter a link names, of those online that hold the invite's message.
 const LINK_MEMBERS: usize = 3;
-/// How long a joiner waits to reach each member it asks, all at once, and then for each one's answer.
+/// How long a joiner waits to reach each member it names.
 const DIAL_WAIT: Duration = Duration::from_secs(30);
+/// How long a joiner waits for each member's answer.
 const JOIN_WAIT: Duration = Duration::from_secs(30);
+/// How long a joiner asks the members it names: one that gave no answer is asked again until this has passed. A member
+/// busy past `JOIN_WAIT` still answers with the Add it kept.
+const JOIN_LIMIT: Duration = Duration::from_secs(300);
 /// How long the inviter, whom a link names first, has to be reached before the other members it names are asked: so the
 /// inviter admits whom it invited when it is online.
 const INVITER_FIRST: Duration = Duration::from_secs(3);
@@ -149,27 +153,27 @@ impl<P: Provider + Send + 'static> Node<P> {
             .collect();
         let mut refusal = anyhow::anyhow!("no member the invite names is online");
         let mut refused_by_all = true;
-        while let Some(dialed) = dials.next().await {
-            let (peer, dialed) = dialed?;
-            if dialed.is_err() {
-                tracing::debug!("{} is not online", peer.fmt_short());
-                refused_by_all = false;
-                continue;
-            }
-            let deadline = Instant::now() + JOIN_WAIT;
-            let answer = loop {
-                let answer = timeout(deadline.saturating_duration_since(Instant::now()), self.inner.net().join(peer, hint(peer), Box::pin(std::future::ready(self.inner.relays.clone())), join.clone())).await;
-                match answer {
-                    // The connection may have been replaced by one the member dialed meanwhile; asking again is safe, as a
-                    // member that added this session answers with the commit entry it kept. The ask may have added it.
-                    Ok(Err(error)) if Instant::now() + Duration::from_secs(1) < deadline => {
-                        tracing::debug!("asking {} to admit this session: {error:#}", peer.fmt_short());
+        // Members that gave no answer wait until the members reached meanwhile are asked, then are asked again, while
+        // JOIN_LIMIT has not passed.
+        let until = Instant::now() + JOIN_LIMIT;
+        let mut silent = Vec::new();
+        loop {
+            let peer = match dials.next().await {
+                Some(dialed) => {
+                    let (peer, dialed) = dialed?;
+                    if dialed.is_err() {
+                        tracing::debug!("{} is not online", peer.fmt_short());
                         refused_by_all = false;
-                        sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
-                    answer => break answer,
+                    peer
                 }
+                None => match silent.pop() {
+                    Some(peer) if Instant::now() < until => peer,
+                    _ => break,
+                },
             };
+            let answer = timeout(JOIN_WAIT, self.inner.net().join(peer, hint(peer), Box::pin(std::future::ready(self.inner.relays.clone())), join.clone())).await;
             match answer {
                 Ok(Ok(Answer::Ok(admitted))) => {
                     let gid = self.inner.welcomed(admitted, &join.key_package.0, peer, device_key).await?;
@@ -184,13 +188,18 @@ impl<P: Provider + Send + 'static> Node<P> {
                     }
                     refusal = anyhow::anyhow!("refused: {refused}");
                 }
+                // The connection may have been replaced by one the member dialed meanwhile; asking again is safe, as a
+                // member that added this session answers with the Add it kept. The ask may have added it.
                 Ok(Err(error)) => {
                     refused_by_all = false;
                     tracing::debug!("asking {} to admit this session: {error:#}", peer.fmt_short());
+                    sleep(Duration::from_secs(1)).await;
+                    silent.push(peer);
                 }
                 Err(_) => {
                     refused_by_all = false;
                     tracing::debug!("{} did not answer", peer.fmt_short());
+                    silent.push(peer);
                 }
             }
         }
@@ -202,13 +211,13 @@ impl<P: Provider + Send + 'static> Node<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Joins a group from the commit entry, with its Welcome, a member at `by` sent for this session's KeyPackage: an
-    /// identity group with the device key `device_key`, and only then, as a link's kind is not authenticated.
+    /// Joins a group from the Add's answer, a member at `by` sent for this session's KeyPackage: an identity group with the
+    /// device key `device_key`, and only then, as a link's kind is not authenticated.
     async fn welcomed(self: &Arc<Self>, admitted: Admitted, key_package: &[u8], by: EndpointId, device_key: Option<[u8; 32]>) -> Result<Bytes> {
         let (gid, log, doc) = {
             let mut st = self.lock();
             let st = &mut *st;
-            let mls = Group::join(&st.provider, &admitted.commit.0, &key_package_reference(&st.provider, key_package)?)?;
+            let mls = Group::join(&st.provider, &admitted.commit.0, &admitted.welcome.0, &admitted.sig.0, &key_package_reference(&st.provider, key_package)?)?;
             ensure!(!st.groups.contains_key(mls.id()), "this session is in that group already");
             if (mls.settings().kind == IDENTITY) != device_key.is_some() {
                 mls.delete(&st.provider)?;
@@ -324,20 +333,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.admitted(gid, epoch).await
     }
 
-    /// The answer to a joiner an Add moved into `epoch`: the commit entry that added it, and the state of the group's
-    /// kind, sealed under the epoch's state key. The joiner is added, by an entry in the log: refusing it now would strand
-    /// it, and it asks members for the state later.
+    /// The answer to a joiner an Add moved into `epoch`: the Add's kept answer, and the state of the group's kind, sealed
+    /// under the epoch's state key. The joiner is added, by an entry in the log: refusing it now would strand it, and it
+    /// asks members for the state later.
     async fn admitted(self: &Arc<Self>, gid: &[u8], epoch: u64) -> Result<Admitted> {
-        let (commit, key) = {
+        let (mut admitted, key) = {
             let st = self.lock();
             (
-                st.provider.get(&commit_key(gid, epoch))?.context("an Add's commit entry is kept")?,
+                get::<Admitted>(&st.provider, &commit_key(gid, epoch))?.context("an Add's answer is kept")?,
                 st.provider.get(&admitted_key(gid, epoch))?.context("an Add's state key is kept")?,
             )
         };
-        let doc = self.state_link(gid).await.map(|link| seal_link(&key, &link)).transpose()?.map(Bytes);
+        admitted.doc = self.state_link(gid).await.map(|link| seal_link(&key, &link)).transpose()?.map(Bytes);
         self.durable().await?;
-        Ok(Admitted { commit: Bytes(commit), doc })
+        Ok(admitted)
     }
 }
 

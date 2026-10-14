@@ -1,32 +1,35 @@
-//! A group log's entries: each a commit with its Welcome and its committer's signature.
+//! A group log's entries: each a commit with its committer's signature.
 
 use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
 
 const COMMIT: u8 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub commit: Vec<u8>,
-    pub welcome: Option<Vec<u8>>,
-    /// The committer's signature, with its leaf key, over `signed(commit, welcome)`.
+    /// The committer's signature, with its leaf key, over `signed(commit)`.
     pub sig: Vec<u8>,
 }
 
-/// What a commit entry's signature covers, before its commit and Welcome.
-const COMMIT_SIGNED: &[u8] = b"letmeknow commit v1\0";
-
 /// What a commit entry's signature covers.
-pub fn signed(commit: &[u8], welcome: Option<&[u8]>) -> Vec<u8> {
-    let welcome = welcome.unwrap_or_default();
-    [COMMIT_SIGNED, &(commit.len() as u32).to_be_bytes(), commit, welcome].concat()
+const COMMIT_SIGNED: &[u8] = b"letmeknow commit v2\0";
+
+pub fn signed(commit: &[u8]) -> Vec<u8> {
+    [COMMIT_SIGNED, commit].concat()
+}
+
+/// What a Welcome's signature covers: the entry of the commit it came with, and the Welcome.
+const WELCOME_SIGNED: &[u8] = b"letmeknow welcome v1\0";
+
+pub fn welcome_signed(entry: &[u8], welcome: &[u8]) -> Vec<u8> {
+    [WELCOME_SIGNED, Sha256::digest(entry).as_slice(), welcome].concat()
 }
 
 impl Entry {
-    /// `1 ‖ u32 length ‖ commit ‖ u32 length ‖ Welcome ‖ signature`.
+    /// `1 ‖ u32 length ‖ commit ‖ signature`.
     pub fn encode(&self) -> Vec<u8> {
-        let welcome = self.welcome.as_deref().unwrap_or_default();
-        let lengths = [(self.commit.len() as u32).to_be_bytes(), (welcome.len() as u32).to_be_bytes()];
-        [&[COMMIT], &lengths[0][..], &self.commit, &lengths[1][..], welcome, &self.sig].concat()
+        [&[COMMIT][..], &(self.commit.len() as u32).to_be_bytes(), &self.commit, &self.sig].concat()
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -40,11 +43,9 @@ impl Entry {
         };
         let length = u32::from_be_bytes(take(4)?.try_into()?) as usize;
         let commit = take(length)?.to_vec();
-        let length = u32::from_be_bytes(take(4)?.try_into()?) as usize;
-        let welcome = Some(take(length)?.to_vec()).filter(|welcome| !welcome.is_empty());
         let sig = take(64)?.to_vec();
         ensure!(rest.is_empty(), "an entry with bytes left over");
-        Ok(Entry { commit, welcome, sig })
+        Ok(Entry { commit, sig })
     }
 }
 
@@ -53,13 +54,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entries_round_trip() {
-        let commit = Entry { commit: vec![1, 2, 3], welcome: Some(vec![4]), sig: vec![5; 64] };
-        assert_eq!(Entry::parse(&commit.encode()).unwrap(), commit);
-        let bare = Entry { commit: vec![1], welcome: None, sig: vec![5; 64] };
-        assert_eq!(Entry::parse(&bare.encode()).unwrap(), bare);
+    fn entries_round_trip_without_a_welcome() {
+        let entry = Entry { commit: vec![1, 2, 3], sig: vec![5; 64] };
+        assert_eq!(entry.encode(), [&[1, 0, 0, 0, 3, 1, 2, 3][..], &[5u8; 64][..]].concat(), "an entry is its commit and signature");
+        assert_eq!(Entry::parse(&entry.encode()).unwrap(), entry);
         assert!(Entry::parse(&[2; 65]).is_err(), "0.16's message entries are no entry");
-        assert!(Entry::parse(&commit.encode()[..20]).is_err());
-        assert!(Entry::parse(&[commit.encode(), vec![0]].concat()).is_err());
+        assert!(Entry::parse(&entry.encode()[..20]).is_err());
+        assert!(Entry::parse(&[entry.encode(), vec![0]].concat()).is_err());
     }
 }

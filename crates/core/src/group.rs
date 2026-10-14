@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, KeyInit, Payload}};
 use lmk_proto::Bytes;
 use lmk_proto::clock::now;
-use lmk_proto::entry::{Entry, signed};
+use lmk_proto::entry::{Entry, signed, welcome_signed};
 use lmk_proto::group::{Certificate, Credential, How, IDENTITY, LEAF_EXTENSION, Leaf, PROTOCOL, SETTINGS_EXTENSION, Service, Settings};
 use lmk_proto::held::{self, Claim, Header, Ref};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
@@ -251,10 +251,18 @@ impl std::fmt::Display for Unheld {
 
 impl std::error::Error for Unheld {}
 
-/// A commit's sealed wire entry, with the Welcome also available separately for admission.
+/// A commit's sealed wire entry, and for an Add the Welcome that admits its joiner.
 pub struct Commit {
     pub entry: Vec<u8>,
-    pub welcome: Option<Vec<u8>>,
+    pub admission: Option<Admission>,
+}
+
+/// An Add's Welcome, and the committer's signature over it and the commit entry (`welcome_signed`). Only the committer
+/// keeps it, to answer the joiner.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Admission {
+    pub welcome: Vec<u8>,
+    pub sig: Vec<u8>,
 }
 
 /// A member as its leaf shows it.
@@ -321,6 +329,8 @@ pub struct Applied {
     /// For a commit this session made: the state key of the epoch it moved into, which its Add's answer seals a state
     /// link under.
     pub link_key: Option<Vec<u8>>,
+    /// For a commit this session made that adds a member: its Welcome.
+    pub admission: Option<Admission>,
 }
 
 /// A member's held message, decrypted and verified.
@@ -354,6 +364,7 @@ struct Posted {
     wire: Bytes,
     // OpenMLS drops the original KeyPackage serialization when saving a pending commit.
     add_refs: Vec<[u8; 32]>,
+    admission: Option<Admission>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -402,19 +413,18 @@ impl Group {
         Ok(group)
     }
 
-    /// Joins by the Welcome in the commit entry that added this session, whose signature it checks against the Welcome's
-    /// sender, its committer, and whose cut, which it cannot judge, is where it starts: the cut state of the members it
-    /// names, and every other at seq 0 of the new epoch. OpenMLS consumes a package during `build_from_welcome`, before
-    /// `into_group`, so an error here rolls back this call's writes, the package's consumption included.
-    pub fn join<P: Provider>(provider: &P, entry: &[u8], expected_package: &[u8; 32]) -> Result<Self> {
-        let Entry { commit, welcome, sig } = Entry::parse(entry)?;
-        let signed = signed(&commit, welcome.as_deref());
-        let MlsMessageBodyIn::Welcome(welcome) = parse::<MlsMessageIn>(&welcome.context("a commit entry without a Welcome")?)?.extract() else {
+    /// Joins by the Welcome that admitted this session to the commit entry it came with, whose signatures it checks against
+    /// the Welcome's sender, its committer, and whose cut, which it cannot judge, is where it starts: the cut state of the
+    /// members it names, and every other at seq 0 of the new epoch. OpenMLS consumes a package during `build_from_welcome`,
+    /// before `into_group`, so an error here rolls back this call's writes, the package's consumption included.
+    pub fn join<P: Provider>(provider: &P, entry: &[u8], welcome_bytes: &[u8], welcome_sig: &[u8], expected_package: &[u8; 32]) -> Result<Self> {
+        let Entry { commit, sig } = Entry::parse(entry)?;
+        let MlsMessageBodyIn::Welcome(welcome) = parse::<MlsMessageIn>(welcome_bytes)?.extract() else {
             bail!("not a Welcome")
         };
-        let MlsMessageBodyIn::PrivateMessage(commit) = parse::<MlsMessageIn>(&commit)?.extract() else { bail!("not a commit") };
-        ensure!(commit.content_type() == ContentType::Commit, "not a commit");
-        let aad: Aad = serde_json::from_slice(commit.aad()).context("a commit's authenticated data")?;
+        let MlsMessageBodyIn::PrivateMessage(message) = parse::<MlsMessageIn>(&commit)?.extract() else { bail!("not a commit") };
+        ensure!(message.content_type() == ContentType::Commit, "not a commit");
+        let aad: Aad = serde_json::from_slice(message.aad()).context("a commit's authenticated data")?;
         provider.savepoint()?;
         let result = (|| {
             let builder = StagedWelcome::build_from_welcome(provider, &join_config(), welcome)?;
@@ -434,10 +444,14 @@ impl Group {
             let named = |m: &openmls::group::Member| credential_of(&m.credential).is_some_and(|c| c.key.0 == m.signature_key);
             ensure!(mls.members().all(|m| named(&m)), "a member whose credential names another key than its leaf's");
             let epoch = mls.epoch().as_u64();
-            ensure!(commit.group_id() == mls.group_id() && commit.epoch().as_u64() + 1 == epoch, "a commit entry of another group or epoch");
+            ensure!(message.group_id() == mls.group_id() && message.epoch().as_u64() + 1 == epoch, "a commit entry of another group or epoch");
             ensure!(
-                provider.crypto().verify_signature(SignatureScheme::ED25519, &signed, &committer, &sig).is_ok(),
+                provider.crypto().verify_signature(SignatureScheme::ED25519, &signed(&commit), &committer, &sig).is_ok(),
                 "a commit entry its Welcome's sender did not sign"
+            );
+            ensure!(
+                provider.crypto().verify_signature(SignatureScheme::ED25519, &welcome_signed(entry, welcome_bytes), &committer, welcome_sig).is_ok(),
+                "a Welcome its sender did not sign"
             );
             ensure!(aad.cut.windows(2).all(|pair| pair[0].key < pair[1].key) && aad.cut.iter().all(well_formed), "a malformed cut");
             let cut = mls.members().map(|m| {
@@ -658,17 +672,23 @@ impl Group {
             rules(&g.mls, g.mls.pending_commit().unwrap(), g.mls.own_leaf_index(), &aad, &g.state.cut)?;
             let (commit, welcome, _) = bundle.into_messages();
             let commit = commit.to_bytes()?;
-            let welcome = welcome.map(|welcome| welcome.to_bytes()).transpose()?;
-            let sig = session.sign(&signed(&commit, welcome.as_deref()));
-            let entry = Entry { commit, welcome: welcome.clone(), sig }.encode();
+            let sig = session.sign(&signed(&commit));
+            let entry = Entry { commit, sig }.encode();
+            let admission = welcome
+                .map(|welcome| -> Result<Admission> {
+                    let welcome = welcome.to_bytes()?;
+                    let sig = session.sign(&welcome_signed(&entry, &welcome));
+                    Ok(Admission { welcome, sig })
+                })
+                .transpose()?;
             let wire = g.seal_entry(provider, &entry)?;
             let add_refs = g.mls.pending_commit().unwrap().add_proposals()
                 .map(|add| Ok(add.add_proposal().key_package().hash_ref(provider.crypto())?.as_slice().try_into()?))
                 .collect::<Result<_>>()?;
-            g.state.posted = Some(Posted { inner: Bytes(entry), wire: Bytes(wire.clone()), add_refs });
+            g.state.posted = Some(Posted { inner: Bytes(entry), wire: Bytes(wire.clone()), add_refs, admission: admission.clone() });
             g.state.aad = aad;
             g.save(provider)?;
-            Ok(Commit { entry: wire, welcome })
+            Ok(Commit { entry: wire, admission })
         })
     }
 
@@ -702,8 +722,8 @@ impl Group {
         }
         match Entry::parse(&entry) {
             Err(error) => Ok(skipped(error)),
-            Ok(Entry { commit, welcome, sig }) => {
-                let staged = self.guarded(provider, |_| false, |g| g.stage(provider, &commit, welcome.as_deref(), &sig));
+            Ok(Entry { commit, sig }) => {
+                let staged = self.guarded(provider, |_| false, |g| g.stage(provider, &commit, &sig));
                 Ok(match staged {
                     Ok(Staged::Copied) => Verdict::Copied,
                     Ok(Staged::Commit(staged, ..)) => Verdict::Commit { removes: staged.self_removed() },
@@ -723,12 +743,12 @@ impl Group {
                 let aad = g.state.aad.clone();
                 let mut applied = observe(provider, &g.mls, &mut g.state, staged, by, aad, true)?;
                 applied.link_key = Some(staged.export_secret(provider.crypto(), STATE_LABEL, &state_context(g.id(), staged.epoch().as_u64()), 32)?);
-                g.state.posted = None;
+                applied.admission = g.state.posted.take().and_then(|posted| posted.admission);
                 g.mls.merge_pending_commit(provider)?;
                 return g.merged(provider, applied);
             }
-            let Entry { commit, welcome, sig } = Entry::parse(&entry)?;
-            let Staged::Commit(staged, by, aad) = g.stage(provider, &commit, welcome.as_deref(), &sig)? else { bail!("not a commit to apply") };
+            let Entry { commit, sig } = Entry::parse(&entry)?;
+            let Staged::Commit(staged, by, aad) = g.stage(provider, &commit, &sig)? else { bail!("not a commit to apply") };
             let applied = observe(provider, &g.mls, &mut g.state, &staged, by, aad, false)?;
             g.state.posted = None;
             g.mls.clear_pending_commit(provider.storage())?;
@@ -737,14 +757,14 @@ impl Group {
         })
     }
 
-    fn stage<P: Provider>(&mut self, provider: &P, commit: &[u8], welcome: Option<&[u8]>, sig: &[u8]) -> Result<Staged> {
+    fn stage<P: Provider>(&mut self, provider: &P, commit: &[u8], sig: &[u8]) -> Result<Staged> {
         let message = parse::<MlsMessageIn>(commit)?.try_into_protocol_message()?;
         ensure!(message.content_type() == ContentType::Commit, "not a commit");
         let processed = self.mls.process_message(provider, message)?;
         let aad: Aad = serde_json::from_slice(processed.aad()).context("a commit's authenticated data")?;
         let Sender::Member(by) = *processed.sender() else { bail!("not from a member") };
         let key = self.mls.member_at(by).context("from no member")?.signature_key;
-        let signed = provider.crypto().verify_signature(SignatureScheme::ED25519, &signed(commit, welcome), &key, sig).is_ok();
+        let signed = provider.crypto().verify_signature(SignatureScheme::ED25519, &signed(commit), &key, sig).is_ok();
         let staged = match processed.into_content() {
             ProcessedMessageContent::OwnPrivateMessage if signed => return Ok(Staged::Copied),
             ProcessedMessageContent::OwnPrivateMessage => bail!("from this session's leaf, not signed by its key"),
@@ -952,6 +972,7 @@ fn observe<P: Provider>(
         gone: staged.self_removed(),
         cut: aad.cut,
         link_key: None,
+        admission: None,
     })
 }
 

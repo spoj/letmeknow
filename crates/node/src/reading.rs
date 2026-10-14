@@ -9,14 +9,13 @@ use lmk_core::group::{self as core, Verdict};
 use lmk_core::provider::Provider;
 use lmk_net::peers::Decision;
 use lmk_proto::Bytes;
-use lmk_proto::entry::Entry;
-use lmk_proto::peer::Seqs;
+use lmk_proto::peer::{Admitted, Seqs};
 use lmk_proto::ranges::Ranges;
 
 use crate::held::Author;
-use crate::{Event, Inner, Lost, LostOf, State, Work};
+use crate::{Event, Inner, Lost, LostOf, State, Work, put};
 
-/// The commit entry that ended an epoch, kept for H for a joiner it added whose answer was lost.
+/// The answer to the Add that ended an epoch, which its committer keeps for H for a joiner whose answer was lost.
 pub(crate) fn commit_key(gid: &[u8], epoch: u64) -> Vec<u8> {
     [b"node/commit/".as_slice(), gid, b"/", &epoch.to_be_bytes()].concat()
 }
@@ -106,8 +105,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.lose(st, gid)?;
         let g = st.groups.get_mut(gid).unwrap();
         let inner = g.mls.open_entry(&st.provider, entry)?;
-        let welcome = Entry::parse(&inner)?.welcome;
-        let applied = g.mls.apply(&st.provider, entry)?;
+        let mut applied = g.mls.apply(&st.provider, entry)?;
         let current = g.mls.epoch();
         g.reading = None;
         g.changed = true;
@@ -116,8 +114,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if applied.own {
             (g.rec.updated, g.rec.committed) = (now, current);
         }
-        if welcome.is_some() {
-            st.provider.put(&commit_key(gid, ending), &inner)?;
+        if let Some(core::Admission { welcome, sig }) = applied.admission.take() {
+            put(&st.provider, &commit_key(gid, ending), &Admitted { commit: Bytes(inner), welcome: Bytes(welcome), sig: Bytes(sig), doc: None })?;
             if let Some(key) = &applied.link_key {
                 st.provider.put(&admitted_key(gid, ending), key)?;
             }

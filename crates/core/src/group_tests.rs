@@ -119,10 +119,11 @@ impl<P: Provider> Member<P> {
         group.members().iter().find(|m| m.credential.as_ref().unwrap().name == name).unwrap().index
     }
 
-    /// Joins by the inner entry of the commit that added this member, which its committer posted at `pos`.
-    pub fn join(&mut self, entry: &[u8], pos: usize, package: &[u8]) {
+    /// Joins by the inner entry of the commit that added this member, and the Welcome of its Add, which its committer
+    /// posted at `pos`.
+    pub fn join(&mut self, entry: &[u8], admission: &Admission, pos: usize, package: &[u8]) {
         let reference = key_package_reference(&self.provider, package).unwrap();
-        self.group = Some(Group::join(&self.provider, entry, &reference).unwrap());
+        self.group = Some(Group::join(&self.provider, entry, &admission.welcome, &admission.sig, &reference).unwrap());
         self.pos = pos;
     }
 }
@@ -147,9 +148,9 @@ fn text(opened: &Opened) -> &str {
 }
 
 /// A commit's entry, signed by `signer`.
-fn entry_of(signer: &SignatureKeyPair, commit: Vec<u8>, welcome: Option<Vec<u8>>) -> Vec<u8> {
-    let sig = signer.sign(&signed(&commit, welcome.as_deref())).unwrap();
-    Entry { commit, welcome, sig }.encode()
+fn entry_of(signer: &SignatureKeyPair, commit: Vec<u8>) -> Vec<u8> {
+    let sig = signer.sign(&signed(&commit)).unwrap();
+    Entry { commit, sig }.encode()
 }
 
 /// A signature key no member holds.
@@ -183,9 +184,9 @@ fn unruled(m: &mut Member, cut: Vec<Ref>, settings: Option<Settings>, leaf: Opti
         .unwrap()
         .stage_commit(&m.provider)
         .unwrap();
-    let entry = entry_of(&m.session.signer, bundle.into_messages().0.to_bytes().unwrap(), None);
+    let entry = entry_of(&m.session.signer, bundle.into_messages().0.to_bytes().unwrap());
     let wire = group.seal_entry(&m.provider, &entry).unwrap();
-    group.state.posted = Some(Posted { inner: Bytes(entry), wire: Bytes(wire.clone()), add_refs: vec![] });
+    group.state.posted = Some(Posted { inner: Bytes(entry), wire: Bytes(wire.clone()), add_refs: vec![], admission: None });
     group.state.aad = aad;
     wire
 }
@@ -196,10 +197,10 @@ fn refused(m: &mut Member, change: Change) -> String {
     group.commit(&m.provider, &m.session, change).err().expect("refused").to_string()
 }
 
-/// The refusal `Group::join` gives an entry for `package`, which must be refused.
-fn join_error(m: &Member, entry: &[u8], package: &[u8]) -> String {
+/// The refusal `Group::join` gives an entry and its Welcome for `package`, which must be refused.
+fn join_error(m: &Member, entry: &[u8], admission: &Admission, package: &[u8]) -> String {
     let reference = key_package_reference(&m.provider, package).unwrap();
-    Group::join(&m.provider, entry, &reference).err().expect("refused").to_string()
+    Group::join(&m.provider, entry, &admission.welcome, &admission.sig, &reference).err().expect("refused").to_string()
 }
 
 /// The entry of `cut` for the member with `key`.
@@ -280,10 +281,11 @@ impl World {
         let cut = self.m[creator].cut();
         let commit = self.m[creator].commit(Change { cut, add: adds.clone(), how: Some(How::Invite), ..Change::default() });
         let inner = self.m[creator].open_inner(&commit.entry);
+        let admission = commit.admission.clone().unwrap();
         let pos = self.post(commit.entry);
         self.read(&[creator]);
         for (&i, package) in others.iter().zip(adds) {
-            self.m[i].join(&inner, pos, &package);
+            self.m[i].join(&inner, &admission, pos, &package);
         }
     }
 
@@ -332,11 +334,12 @@ fn commit_race() {
     let cut = w.m[1].cut();
     let b2 = w.m[1].commit(Change { cut, add: vec![kp_d.clone()], how: Some(How::Invite), ..Change::default() });
     let inner = w.m[1].open_inner(&b2.entry);
+    let admission = b2.admission.clone().unwrap();
     let pos = w.post(b2.entry);
     let read = w.read(&[0, 1, 2]);
     let Applied { added, by, .. } = applied(&read[0][0]);
     assert_eq!((added[0].credential.as_ref().unwrap().name.as_str(), *by), ("D", w.m[1].g().own_index()));
-    w.m[3].join(&inner, pos, &kp_d);
+    w.m[3].join(&inner, &admission, pos, &kp_d);
     w.agree(&[0, 1, 2, 3]);
     let added = w.m[0].g().added().last().unwrap().clone();
     assert_eq!((added.member.name.as_str(), added.by.name.as_str(), added.epoch), ("D", "B", e + 2));
@@ -361,7 +364,7 @@ fn junk_is_skipped() {
     w.post(b"\xde\xad\xbe\xef".to_vec());
     w.post(w.log[p_old - 1].clone());
     let app = w.m[3].send("hello");
-    w.post_inner(Entry { commit: app, welcome: None, sig: vec![0; 64] }.encode());
+    w.post_inner(Entry { commit: app, sig: vec![0; 64] }.encode());
     let x = &mut w.m[4];
     x.group = Some(Group::create(&x.provider, &x.session, &settings("other")).unwrap());
     let cut = w.m[4].cut();
@@ -398,7 +401,7 @@ fn junk_is_skipped() {
     w.agree(&[0, 1, 3]);
 }
 
-/// A commit entry counts only with its committer's signature over the commit and its Welcome.
+/// A commit entry counts only with its committer's signature over the commit, and a log entry holds no Welcome.
 #[test]
 fn a_commit_entry_needs_its_committers_signature() {
     let mut w = World::new(&["A", "B", "C", "D"]);
@@ -407,10 +410,9 @@ fn a_commit_entry_needs_its_committers_signature() {
     let cut = w.m[1].cut();
     let commit = w.m[1].commit(Change { cut, add: vec![kp], how: Some(How::Invite), ..Change::default() });
     let inner = w.m[0].open_inner(&commit.entry);
-    let Entry { commit: bytes, welcome, sig } = Entry::parse(&inner).unwrap();
-    // Signed by a stranger, or carrying another Welcome than the committer signed.
-    w.post_inner(entry_of(&stranger(), bytes.clone(), welcome));
-    w.post_inner(Entry { commit: bytes, welcome: Some(b"another welcome".to_vec()), sig }.encode());
+    let Entry { commit: bytes, .. } = Entry::parse(&inner).unwrap();
+    assert_eq!(inner.len(), 1 + 4 + bytes.len() + 64, "an entry is its commit and signature");
+    w.post_inner(entry_of(&stranger(), bytes));
     let read = w.read(&[0, 2]);
     assert!(read.iter().flatten().all(|read| matches!(&read.0, Verdict::Skipped { reason, .. } if reason.contains("did not sign"))));
     w.post(commit.entry);
@@ -478,9 +480,10 @@ fn a_forged_message_leaves_no_trace<P: Provider>(providers: impl Fn(&str) -> P) 
     let cut = a.cut();
     let commit = a.commit(Change { cut, add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
     let inner = a.open_inner(&commit.entry);
+    let admission = commit.admission.clone().unwrap();
     let log = vec![commit.entry];
     a.read(&log);
-    b.join(&inner, 1, &kp);
+    b.join(&inner, &admission, 1, &kp);
     let real = |b: &mut Member, text: &str| b.send(text);
     let first = real(&mut b, "first");
     let forger = b.copy();
@@ -531,9 +534,10 @@ fn a_step_commits_or_rolls_back_with_openmls() {
     let cut = a.cut();
     let commit = a.commit(Change { cut, add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
     let inner = a.open_inner(&commit.entry);
+    let admission = commit.admission.clone().unwrap();
     let log = vec![commit.entry];
     a.read(&log);
-    b.join(&inner, 1, &kp);
+    b.join(&inner, &admission, 1, &kp);
     let id = a.g().id().to_vec();
     let one = b.send("one");
     let two = b.send("two");
@@ -577,8 +581,8 @@ fn commits_from_ones_own_leaf_are_told_apart() {
     // Junk: the copy's commit, signed by another key. Then the copy's commit as it signs it.
     let junk = copy.commit(Change { cut: copy.cut(), ..Change::default() });
     let inner = copy.open_inner(&junk.entry);
-    let Entry { commit, welcome, .. } = Entry::parse(&inner).unwrap();
-    w.post_inner(entry_of(&stranger(), commit, welcome));
+    let Entry { commit, .. } = Entry::parse(&inner).unwrap();
+    w.post_inner(entry_of(&stranger(), commit));
     copy.cancel();
     let copied = copy.commit(Change { cut: copy.cut(), ..Change::default() });
     w.post(copied.entry);
@@ -642,9 +646,10 @@ fn settings_in_the_welcome() {
     let cut = w.m[2].cut();
     let commit = w.m[2].commit(Change { cut, add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
     let inner = w.m[2].open_inner(&commit.entry);
+    let admission = commit.admission.clone().unwrap();
     let pos = w.post(commit.entry);
     w.read(&[0, 1, 2]);
-    w.m[3].join(&inner, pos, &kp);
+    w.m[3].join(&inner, &admission, pos, &kp);
     assert_eq!(w.m[3].g().settings(), changed);
     w.agree(&[0, 1, 2, 3]);
 }
@@ -756,10 +761,10 @@ fn rules_bind_everyone() {
     group.mls.store_pending_proposal(c.provider.storage(), *queued).unwrap();
     group.mls.set_aad(cut_aad(&cut));
     let (commit, _, _) = group.mls.commit_to_pending_proposals(&c.provider, &c.session.signer).unwrap();
-    let entry = entry_of(&c.session.signer, commit.to_bytes().unwrap(), None);
+    let entry = entry_of(&c.session.signer, commit.to_bytes().unwrap());
     let wire = group.seal_entry(&c.provider, &entry).unwrap();
-    group.state.posted = Some(Posted { inner: Bytes(entry), wire: Bytes(wire.clone()), add_refs: vec![] });
-    w.post_inner(entry_of(&w.m[1].session.signer, proposal, None));
+    group.state.posted = Some(Posted { inner: Bytes(entry), wire: Bytes(wire.clone()), add_refs: vec![], admission: None });
+    w.post_inner(entry_of(&w.m[1].session.signer, proposal));
     w.post(wire);
     let read = w.read(&[0, 1, 2]);
     assert!(read.iter().all(|reader| reader.iter().all(|a| !is_commit(a))));
@@ -819,9 +824,10 @@ fn private_certificates_refresh_but_cannot_rebind_a_membership() {
     let cut = w.m[1].cut();
     let add = w.m[1].commit(Change { cut, add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
     let inner = w.m[1].open_inner(&add.entry);
+    let admission = add.admission.clone().unwrap();
     let pos = w.post(add.entry);
     w.read(&[0, 1]);
-    w.m[2].join(&inner, pos, &kp);
+    w.m[2].join(&inner, &admission, pos, &kp);
     for reader in &mut w.m {
         let a = reader.g().members().into_iter().find(|m| m.key == key).unwrap().credential.unwrap();
         assert_eq!(a.name, "A");
@@ -939,9 +945,11 @@ fn another_protocol_is_refused_at_join() {
         .stage_commit(&a.provider)
         .unwrap();
     let (commit, welcome, _) = bundle.into_messages();
-    let entry = entry_of(&a.session.signer, commit.to_bytes().unwrap(), Some(welcome.unwrap().to_bytes().unwrap()));
+    let entry = entry_of(&a.session.signer, commit.to_bytes().unwrap());
+    let welcome = welcome.unwrap().to_bytes().unwrap();
+    let sig = a.session.signer.sign(&welcome_signed(&entry, &welcome)).unwrap();
     group.mls.merge_pending_commit(&a.provider).unwrap();
-    let error = Group::join(&w.m[1].provider, &entry, &reference).err().unwrap();
+    let error = Group::join(&w.m[1].provider, &entry, &welcome, &sig, &reference).err().unwrap();
     assert!(error.to_string().contains(&format!("protocol {}", PROTOCOL + 1)), "{error}");
 }
 
@@ -959,17 +967,19 @@ fn state_survives_a_restart() {
     let cut = a.cut();
     let commit = a.commit(Change { cut, add: vec![kp.clone()], how: Some(How::Invite), ..Change::default() });
     let inner = a.open_inner(&commit.entry);
+    let admission = commit.admission.clone().unwrap();
     log.push(commit.entry);
     a.read(&log);
     let id = a.g().id().to_vec();
     let mut b = Member { pos: 1, ..b };
-    b.join(&inner, 1, &kp);
+    b.join(&inner, &admission, 1, &kp);
     // B adds C, then restarts before reading a separately re-enveloped copy of its pending inner Entry.
     let mut c = Member::new(MemoryProvider::default(), "C");
     let c_package = c.session.key_package(&c.provider).unwrap();
     let c_ref = key_package_reference(&c.provider, &c_package).unwrap();
     let cut = b.cut();
     let pending = b.commit(Change { cut, add: vec![c_package.clone()], how: Some(How::Invite), ..Change::default() });
+    let pending_admission = pending.admission.clone().unwrap();
     let inner = a.open_inner(&pending.entry);
     let rewrapped = a.seal_inner(&inner);
     assert_ne!(rewrapped, pending.entry);
@@ -986,7 +996,7 @@ fn state_survives_a_restart() {
     assert_eq!(a.g().epoch_authenticator(), b.g().epoch_authenticator());
     assert_eq!(a.g().added().last().unwrap().key_package_ref, c_ref);
     assert_eq!(b.g().added().last().unwrap().key_package_ref, c_ref);
-    c.join(&inner, log.len(), &c_package);
+    c.join(&inner, &pending_admission, log.len(), &c_package);
     assert_eq!(a.g().epoch_authenticator(), c.g().epoch_authenticator());
     let hi = b.send("after a restart");
     assert_eq!(text(&a.open(&hi).unwrap()), "after a restart");
@@ -1175,29 +1185,32 @@ fn a_joiner_starts_at_the_commits_cut() {
     let kp_c = w.key_package(2);
     let commit = w.m[0].commit(Change { cut: cut.clone(), add: vec![kp_c.clone()], how: Some(How::Invite), ..Change::default() });
     let inner = w.m[0].open_inner(&commit.entry);
+    let admission = commit.admission.clone().unwrap();
     let pos = w.post(commit.entry);
     w.read(&[0, 1]);
     let mut expected = cut;
     expected.push(Ref { key: Bytes(c), joined: next, seq: 0, id: Bytes::default() });
     expected.sort();
 
-    let Entry { commit: bytes, welcome, .. } = Entry::parse(&inner).unwrap();
+    let Entry { commit: bytes, .. } = Entry::parse(&inner).unwrap();
     let before = w.m[2].provider.records();
-    let forged = entry_of(&stranger(), bytes.clone(), welcome.clone());
-    assert!(join_error(&w.m[2], &forged, &kp_c).contains("did not sign"));
+    let forged = entry_of(&stranger(), bytes.clone());
+    assert!(join_error(&w.m[2], &forged, &admission, &kp_c).contains("did not sign"));
     assert_eq!(w.m[2].provider.records(), before);
-    let by_another_member = entry_of(&w.m[1].session.signer, bytes.clone(), welcome);
-    assert!(join_error(&w.m[2], &by_another_member, &kp_c).contains("did not sign"), "only the committer vouches for its cut");
+    let by_another_member = entry_of(&w.m[1].session.signer, bytes.clone());
+    assert!(join_error(&w.m[2], &by_another_member, &admission, &kp_c).contains("did not sign"), "only the committer vouches for its cut");
+    assert_eq!(w.m[2].provider.records(), before);
+    let welcome = Admission { sig: stranger().sign(&welcome_signed(&inner, &admission.welcome)).unwrap(), ..admission.clone() };
+    assert!(join_error(&w.m[2], &inner, &welcome, &kp_c).contains("a Welcome its sender did not sign"));
     assert_eq!(w.m[2].provider.records(), before);
     let kp_d = w.key_package(3);
     let mut other = w.m[0].copy();
     let cut = other.cut();
     let theirs = other.commit(Change { cut, add: vec![kp_d], how: Some(How::Invite), ..Change::default() });
-    let mixed = entry_of(&w.m[0].session.signer, bytes, theirs.welcome);
-    join_error(&w.m[2], &mixed, &kp_c);
+    join_error(&w.m[2], &inner, &theirs.admission.unwrap(), &kp_c);
     assert_eq!(w.m[2].provider.records(), before);
 
-    w.m[2].join(&inner, pos, &kp_c);
+    w.m[2].join(&inner, &admission, pos, &kp_c);
     assert_eq!(w.m[2].cut(), expected);
     w.agree(&[0, 1, 2]);
 }
@@ -1230,8 +1243,10 @@ fn a_joiner_refuses_a_member_whose_credential_names_another_key() {
     let bundle = g.mls.commit_builder().force_self_update(true).propose_adds(vec![key_package_in(&m.provider, &package).unwrap()]);
     let bundle = bundle.load_psks(m.provider.storage()).unwrap().build(m.provider.rand(), m.provider.crypto(), &m.session.signer, |_| true).unwrap();
     let (commit, welcome, _) = bundle.stage_commit(&m.provider).unwrap().into_messages();
-    let entry = entry_of(&m.session.signer, commit.to_bytes().unwrap(), welcome.map(|welcome| welcome.to_bytes().unwrap()));
-    assert!(join_error(&w.m[1], &entry, &package).contains("a member whose credential names another key"));
+    let entry = entry_of(&m.session.signer, commit.to_bytes().unwrap());
+    let welcome = welcome.unwrap().to_bytes().unwrap();
+    let admission = Admission { sig: m.session.signer.sign(&welcome_signed(&entry, &welcome)).unwrap(), welcome };
+    assert!(join_error(&w.m[1], &entry, &admission, &package).contains("a member whose credential names another key"));
 }
 
 /// A live payload opens for the members of its epoch, from a current member, verified and unaltered; the members of
@@ -1312,12 +1327,15 @@ fn the_committer_keeps_the_state_key_of_the_epoch_its_add_moved_into() {
     let cut = w.m[0].cut();
     let commit = w.m[0].commit(Change { cut, add: vec![package.clone()], how: Some(How::Invite), ..Change::default() });
     let inner = w.m[0].open_inner(&commit.entry);
+    let admission = commit.admission.clone().unwrap();
     let pos = w.post(commit.entry);
     let read = w.read(&[0, 1]);
     let own = applied(&read[0][0]).link_key.clone().expect("the committer keeps its key");
     assert_eq!(own, w.m[0].group.as_ref().unwrap().state_secret(&w.m[0].provider).unwrap());
     assert_eq!(applied(&read[1][0]).link_key, None, "another member keeps none");
-    w.m[2].join(&inner, pos, &package);
+    assert!(applied(&read[0][0]).admission.is_some(), "the committer keeps the Welcome");
+    assert!(applied(&read[1][0]).admission.is_none(), "another member keeps none");
+    w.m[2].join(&inner, &admission, pos, &package);
     assert_eq!(w.m[2].group.as_ref().unwrap().state_secret(&w.m[2].provider).unwrap(), own, "the joiner derives the same key");
 }
 

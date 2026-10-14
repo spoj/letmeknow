@@ -151,8 +151,11 @@ pub struct Join {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Admitted {
-    /// The commit entry that added the joiner, its Welcome inside: its cut is where the joiner starts.
+    /// The log entry that added the joiner: its cut is where the joiner starts.
     pub commit: Bytes,
+    /// The Welcome to the joiner, and the committer's signature over it and the entry (`welcome_signed`).
+    pub welcome: Bytes,
+    pub sig: Bytes,
     /// A state link to the group's kind, sealed under the state key of the epoch the Add moved into.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<Bytes>,

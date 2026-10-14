@@ -69,7 +69,7 @@ A message names the messages its sender had shown before it, its causal past, an
 
 People must open invites on the trusted frontend (`https://letmeknow.dev`, or their explicitly chosen static host), not on the membership/relay server. The whole frontend, with its default membership domain and key, comes from the trusted distribution. Its update/reload prompt is not cryptographic pinning; the frontend host and release administrators still control code.
 
-Give an invite link to your operator to pass on over a channel they trust; whoever holds it can join once, within 10 minutes, while you or one of the other members it names is online, and while you are in the group: it dies when you leave. Never put links into other tools (web fetchers, translators, search). If an invite fails or expires, any member can make a new one with `invite --group`. A `join` you abort still completes (check `groups`); joining the same target meanwhile is refused.
+Give an invite link to your operator to pass on over a channel they trust; whoever holds it can join once, within 10 minutes, while you or one of the other members it names is online, and while you are in the group: it dies when you leave. Never put links into other tools (web fetchers, translators, search). If an invite fails or expires, any member can make a new one with `invite --group`. A `join` you abort may still complete (check `groups`): only the member that admitted you can answer it again, and a join asks the members its link names for 5 minutes. If that member is gone, ask for a new invite. Joining the same target meanwhile is refused.
 
 ## Members
 
