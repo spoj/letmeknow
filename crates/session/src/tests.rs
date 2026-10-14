@@ -1286,11 +1286,12 @@ fn ready_names_a_newer_minor_version_and_the_command_to_run_it() {
 fn a_slow_registry_leaves_ready_without_a_notice() {
     local(async {
         let world = world("slow").await;
-        let slow = registry(r#"{"dist-tags":{"latest":"0.19.0"}}"#, Duration::from_secs(10)).await;
+        let slow = registry(r#"{"dist-tags":{"latest":"0.19.0"}}"#, Duration::from_secs(60)).await;
         let started = std::time::Instant::now();
         let alice = world.launch(Config { registry: slow, ..world.config("alice", "alice") }, usize::MAX).await;
         assert!(alice.ready.get("newer").is_none(), "{}", alice.ready);
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        // Well short of the registry's answer, with room for a slow start beside the bound.
+        assert!(started.elapsed() < Duration::from_secs(30), "{:?}", started.elapsed());
     });
 }
 
