@@ -1,8 +1,8 @@
 // The browser's session: lmk-node in WebAssembly (crates/web), its records and files kept in IndexedDB. One tab at a
 // time runs it, holding the Web Lock "lmk7"; the other tabs call it over the BroadcastChannel "lmk7", and hear
 // its events there. When that tab closes, a waiting tab takes the lock and runs the session from IndexedDB. Its
-// default backend is compiled into the trusted frontend. Explicit localStorage choices override it; the backend
-// never supplies configuration or code.
+// default membership is compiled into the trusted frontend (backend.json): its directory is fetched, and must name the
+// compiled key. Explicit localStorage choices override the domain; the backend never supplies code.
 import init, { type Lmk, invite_kind, start } from "../pkg/lmk_web.js";
 import wasm from "../pkg/lmk_web_bg.wasm";
 import * as store from "./store";
