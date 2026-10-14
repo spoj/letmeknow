@@ -35,6 +35,8 @@ const PUBLIC_ENTRY: usize = 16 << 10;
 /// A /48's budget, in /64s.
 const WIDE: u64 = 16;
 const IN_ALL: [((), u64); 1] = [((), 1)];
+/// Keys a quota tracks at once: a source past them is refused, so a flood of addresses cannot grow memory.
+const KEYS: usize = 1 << 20;
 
 #[derive(Clone, Debug)]
 pub struct Policy {
@@ -128,7 +130,11 @@ impl<K: Clone + Eq + Hash> Quota<K> {
 
     fn fits(&mut self, at: u64, keys: &[(K, u64)], amount: u64) -> bool {
         self.roll(at);
-        keys.iter().all(|(key, scale)| self.spent.get(key).copied().unwrap_or(0) + amount <= self.limit * scale)
+        keys.iter().all(|(key, scale)| {
+            let spent = self.spent.get(key).copied();
+            let room = spent.is_some() || self.spent.len() < KEYS;
+            room && spent.unwrap_or(0) + amount <= self.limit * scale
+        })
     }
 
     fn charge(&mut self, at: u64, keys: &[(K, u64)], amount: u64) {
@@ -288,7 +294,7 @@ impl Service {
         let may_start = {
             let mut budgets = self.0.budgets.lock().unwrap();
             ensure!(budgets.appends.take(at, sources, 1) && budgets.append_bytes.take(at, sources, bytes)
-                && (!public || budgets.public_appends.take(at, &[(reference, 1)], 1)), Refused("rate".into()));
+                && (!public || budgets.public_appends.fits(at, &[(reference, 1)], 1)), Refused("rate".into()));
             budgets.new_logs.fits(at, sources, 1) && budgets.new_logs_in_all.fits(at, &IN_ALL, 1)
                 && (!public || budgets.new_public_logs.fits(at, sources, 1))
         };
@@ -296,8 +302,9 @@ impl Service {
             ensure!(may_start || inner.store.length(&reference)? > 0, Refused("rate".into()));
             inner.store.append(&reference, &entries, public)
         }).await?;
+        let mut budgets = self.0.budgets.lock().unwrap();
+        if public { budgets.public_appends.charge(at, &[(reference, 1)], 1); }
         if appended.position == 1 {
-            let mut budgets = self.0.budgets.lock().unwrap();
             budgets.new_logs.charge(at, sources, 1);
             budgets.new_logs_in_all.charge(at, &IN_ALL, 1);
             if public { budgets.new_public_logs.charge(at, sources, 1); }
@@ -504,6 +511,15 @@ mod tests {
         subscribers.notify(&head);
         assert!(subscribers.records.is_empty());
         assert!(receivers.iter().all(|r| r.len() == LAG));
+    }
+
+    #[test]
+    fn a_quota_refuses_new_keys_past_its_capacity() {
+        let mut quota = Quota::new(MINUTE, 2);
+        for key in 0..KEYS as u64 { quota.charge(0, &[(key, 1)], 1); }
+        assert!(quota.fits(0, &[(0, 1)], 1));
+        assert!(!quota.fits(0, &[(KEYS as u64, 1)], 1));
+        assert!(quota.fits(MINUTE, &[(KEYS as u64, 1)], 1));
     }
 
     #[tokio::test]
