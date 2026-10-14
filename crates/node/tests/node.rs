@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::tls::CaTlsConfig;
+use n0_future::boxed::BoxFuture;
 use lmk_core::device::Device;
 use lmk_core::group::Session as Mls;
 use lmk_core::provider::{MemoryProvider, Provider, SqliteProvider};
@@ -349,9 +350,12 @@ async fn a_join_survives_an_unresolved_link_domain() {
     let mut alice = session(&relay, "Alice").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
-    let Service::Serve { domain, .. } = relay.service.clone() else { unreachable!() };
-    lmk_testing::withdraw(&domain);
-    let bob = session(&relay, "Bob").await;
+    // Only Bob's node fails to resolve the link's domain: Alice's commits still need the service's directory.
+    let unresolved: lmk_membership::client::Resolve = Arc::new(|domain: String| -> BoxFuture<anyhow::Result<Directory>> {
+        Box::pin(async move { anyhow::bail!("no directory for {domain}") })
+    });
+    let (node, events) = Node::start(MemoryProvider::default(), Config { resolve: unresolved, ..config(&relay, "Bob", None, &[CHAT, KIND]) }).await.unwrap();
+    let bob = Session { node, events };
     bob.node.join(&link, None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
 }
