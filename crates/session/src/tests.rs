@@ -59,11 +59,12 @@ async fn world(test: &str) -> World {
 }
 
 /// A port free for TCP and UDP, below the ephemeral range: a port `bind(0)` returned could be taken by another test's relay
-/// or endpoint before the service binds it.
+/// or endpoint before the service binds it. No two tests of this process get the same one, though both could find it free.
 fn free_port() -> u16 {
+    static TAKEN: std::sync::Mutex<BTreeSet<u16>> = std::sync::Mutex::new(BTreeSet::new());
     loop {
         let port = rand::random_range(1024..32768);
-        if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() && std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+        if TAKEN.lock().unwrap().insert(port) && std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() && std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
             return port;
         }
     }
