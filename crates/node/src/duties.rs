@@ -1,8 +1,9 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
 //! advance, at start, and every `TIMER`. It drops what the group kept past H; commits at most once, with every Remove
 //! due (members whose `leave` the cut it builds keeps, and members whose devices their identities dropped) and this
-//! session's update if due (each T, at an offset of its own), which first fetches for at most `HEAR` what connected
-//! members hold past the cut; and in an identity group, has the identity kind run its own (`Event::Duties`).
+//! session's update if due (each T, at an offset of its own), which first fetches for at most `HEAR` what the last commit
+//! kept and connected members hold past the cut; and in an identity group, has the identity kind run its own
+//! (`Event::Duties`).
 
 use std::sync::{Arc, Mutex};
 

@@ -37,13 +37,13 @@ impl<P: Provider> State<P> {
         Ok(self.online_summaries(gid)?.into_iter().filter(holds).map(|summary| summary.member.clone()).collect())
     }
 
-    /// The seqs past the cut of each other membership that connected members show sealed in this epoch, and this
-    /// session lacks: what an update fetches before it commits.
+    /// What this session lacks of what the last commit kept, and of the seqs past the cut of each other membership that
+    /// connected members show sealed in this epoch: what an update fetches before it commits.
     pub(crate) fn fetchable(&self, gid: &[u8]) -> Result<Vec<Seqs>> {
         let g = self.group(gid)?;
         let me = self.me(gid);
         let online = self.online_summaries(gid)?;
-        let mut fetch = Vec::new();
+        let mut fetch = g.lacking();
         for cut in g.mls.cut().iter().filter(|cut| cut.key.0 != me) {
             let Some(author) = g.author(&cut.key.0, cut.joined) else { continue };
             let listed = online.iter().flat_map(|summary| &summary.sealed).filter(|sealed| sealed.key == cut.key && sealed.joined == cut.joined).fold(Ranges::default(), |all, sealed| all.union(&sealed.seqs));
