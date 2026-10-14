@@ -104,6 +104,7 @@ impl<P: Provider> State<P> {
         let (head, earlier) = (self.logs[&log].head.clone(), heads(&logs));
         let me = self.me(gid).to_vec();
         let g = self.groups.get_mut(gid).unwrap();
+        let (wanted, stale) = g.wanted(now, &me);
         let public = g.public.iter().filter_map(|log| self.logs.get(log)?.head.clone()).collect();
         let members = g.mls.members().into_iter().filter(|m| m.key != me).filter_map(|m| {
             let iroh = m.leaf.as_ref()?.key.0.as_slice().try_into().ok()?;
@@ -117,7 +118,8 @@ impl<P: Provider> State<P> {
             public,
             earlier,
             members: members.collect(),
-            wanted: g.wanted(now, &me),
+            wanted,
+            stale,
         }
     }
 

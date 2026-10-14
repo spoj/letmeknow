@@ -31,6 +31,7 @@ fn own(epoch: u64, members: &[u8]) -> Own {
         earlier: vec![],
         members: members.iter().map(|&n| (member(n), key(n))).collect(),
         wanted: vec![],
+        stale: vec![],
     }
 }
 
@@ -299,6 +300,24 @@ fn both_hold() -> Peers {
         p.summary(&id(), heard(n, 1, 0, ask()), Some(key(n)));
     }
     p
+}
+
+/// A seq held only sealed in an ended epoch is asked of holders whose summary of this epoch lists it sealed, and of none
+/// else, though every holder lists it held.
+#[test]
+fn a_seq_held_in_an_ended_epoch_is_asked_only_of_a_holder_that_shows_it_sealed_now() {
+    let mut p = peers();
+    let mut o = own(2, &[1, 2]);
+    o.stale = ask();
+    p.group(id(), o, 0);
+    for n in [1, 2] {
+        p.connect(key(n), gs(), false, 0);
+    }
+    p.summary(&id(), heard(1, 1, 0, ask()), Some(key(1)));
+    let mut sealed_now = heard(2, 1, 0, ask());
+    (sealed_now.summary.epoch, sealed_now.summary.sealed) = (2, ask());
+    p.summary(&id(), sealed_now, Some(key(2)));
+    assert_eq!(wants(&p.poll(0)), vec![(key(2), ask())]);
 }
 
 /// Repair asks the holder of the lowest wanted seq, and keeps one request outstanding at a time.
@@ -697,7 +716,7 @@ fn twelve_members_converge_through_loss_and_reconnection() {
     let mut sim = Sim { now: 0, chaos: true, rng: Rng(0x9e37_79b9_7f4a_7c15), peers: Vec::new(), versions: vec![0; N], links: BTreeSet::new(), queue: BTreeMap::new(), sent: 0 };
     for i in 0..N {
         let members = (0..N).filter(|&j| j != i).map(|j| ((Bytes(vec![j as u8]), 0), key(j as u8))).collect();
-        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, public: vec![], earlier: vec![], members, wanted: vec![] };
+        let own = Own { me: (Bytes(vec![i as u8]), 0), epoch: 1, log: [1; 32], head: None, public: vec![], earlier: vec![], members, wanted: vec![], stale: vec![] };
         sim.peers.push(Peers::new(0, i as u64 + 1, key(i as u8)));
         sim.peers[i].group(id(), own, 0);
     }

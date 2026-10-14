@@ -61,6 +61,9 @@ pub struct Own {
     pub members: Vec<(Membership, Key)>,
     /// Seqs the node wants now.
     pub wanted: Vec<Seqs>,
+    /// Seqs the node holds sealed in an ended epoch, which it wants sealed again: offered only to holders whose summary
+    /// of this epoch lists them sealed.
+    pub stale: Vec<Seqs>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -406,7 +409,7 @@ impl Peers {
     /// connected and past its backoff.
     pub fn holder(&self, group: &Bytes, lacking: &[Seqs], now: u64) -> bool {
         let (lack, g) = (to_set(lacking), &self.groups[group]);
-        holds(g).iter().any(|(k, held)| self.untried(group, k, now) && !offer(&lack, held, &g.struck, k).is_empty())
+        holds(g).iter().any(|(k, held, _)| self.untried(group, k, now) && !offer(&lack, held, &g.struck, k).is_empty())
     }
 
     /// What is due, in order: request timeouts, entries and `hello`s, `versions` and summaries, repair, dials, closes.
@@ -550,17 +553,14 @@ impl Peers {
             let holders = holds(g);
             let mut waiting: Vec<(Option<(Membership, u64)>, Key)> = holders
                 .iter()
-                .filter(|(k, _)| !self.conns.contains_key(k) && !self.dialing.contains(k) && !self.backing(k, now))
-                .map(|(k, held)| (lowest(&offer(&g.waiting, held, &g.struck, k)), *k))
+                .filter(|(k, _, _)| !self.conns.contains_key(k) && !self.dialing.contains(k) && !self.backing(k, now))
+                .map(|(k, held, _)| (lowest(&offer(&g.waiting, held, &g.struck, k)), *k))
                 .filter(|(lowest, _)| lowest.is_some())
                 .collect();
             waiting.sort();
-            let mut wanted = to_set(&g.own.wanted);
-            for (m, r) in &g.waiting {
-                let all = wanted.entry(m.clone()).or_default();
-                *all = all.union(r);
-            }
-            let offers: Vec<(Key, Set)> = holders.iter().map(|(k, held)| (*k, offer(&wanted, held, &g.struck, k))).filter(|(_, o)| !o.is_empty()).collect();
+            let wanted = union(to_set(&g.own.wanted), &g.waiting);
+            let stale = to_set(&g.own.stale);
+            let offers: Vec<(Key, Set)> = holders.iter().map(|(k, held, sealed)| (*k, union(offer(&wanted, held, &g.struck, k), &offer(&stale, sealed, &g.struck, k)))).filter(|(_, o)| !o.is_empty()).collect();
             let idle = g.request.is_none();
             let request = offers
                 .iter()
@@ -669,9 +669,21 @@ fn to_seqs(set: &Set) -> Vec<Seqs> {
     set.iter().map(|((key, joined), seqs)| Seqs { key: key.clone(), joined: *joined, seqs: seqs.clone() }).collect()
 }
 
-/// Each member with a kept summary, and what that summary says it holds.
-fn holds(g: &Group) -> Vec<(Key, Set)> {
-    g.own.members.iter().filter_map(|(m, k)| Some((*k, to_set(&g.heard.get(m)?.summary.held)))).collect()
+/// Each member with a kept summary, what that summary says it holds, and what it shows sealed in this epoch.
+fn holds(g: &Group) -> Vec<(Key, Set, Set)> {
+    g.own.members.iter().filter_map(|(m, k)| {
+        let summary = &g.heard.get(m)?.summary;
+        let sealed = if summary.epoch == g.own.epoch { to_set(&summary.sealed) } else { Set::new() };
+        Some((*k, to_set(&summary.held), sealed))
+    }).collect()
+}
+
+fn union(mut a: Set, b: &Set) -> Set {
+    for (m, seqs) in b {
+        let all = a.entry(m.clone()).or_default();
+        *all = all.union(seqs);
+    }
+    a
 }
 
 /// The positions of `want` that a holder holds and is not struck for.

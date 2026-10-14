@@ -232,28 +232,25 @@ impl G {
         }
     }
 
-    /// What this session wants of each membership now: known, neither held nor lost nor waiting unopened here, and not
-    /// learned of within `HOLD_OFF`.
-    pub(crate) fn wanted(&mut self, now: u64, me: &[u8]) -> Vec<Seqs> {
+    /// What this session wants of each membership now, and, second, the seqs it holds sealed in an ended epoch, which it
+    /// wants sealed again: known, neither held nor lost nor waiting unopened here, and not learned of within `HOLD_OFF`.
+    /// A commit keeps only what is sealed in its own epoch, so a holder must show the second sealed in this one.
+    pub(crate) fn wanted(&mut self, now: u64, me: &[u8]) -> (Vec<Seqs>, Vec<Seqs>) {
         self.fresh.retain(|(_, _, _, at)| now < at + HOLD_OFF);
         let epoch = self.mls.epoch();
-        let mut wanted = Vec::new();
+        let (mut wanted, mut stale) = (Vec::new(), Vec::new());
         for author in &self.rec.authors {
-            let mut seqs = author.wanted();
-            if author.key.0 != me {
-                // A sealing of an ended epoch is wanted again: a commit keeps only what is sealed in its own.
-                seqs = seqs.union(&author.sealed.iter().filter(|(_, sealed)| **sealed < epoch).map(|(seq, _)| *seq).collect());
-            }
-            for (key, joined, fresh, _) in &self.fresh {
-                if *key == author.key && *joined == author.joined {
-                    seqs = seqs.difference(fresh);
-                }
-            }
-            let unopened = self.unopened.keys().filter(|(k, j, _)| *k == author.key && *j == author.joined).map(|(_, _, s)| *s);
-            seqs = seqs.difference(&unopened.collect());
-            wanted.extend(author.seqs(&seqs));
+            let ended: Ranges = match author.key.0 == me {
+                true => Ranges::default(),
+                false => author.sealed.iter().filter(|(_, sealed)| **sealed < epoch).map(|(seq, _)| *seq).collect(),
+            };
+            let learned = self.fresh.iter().filter(|(key, joined, _, _)| *key == author.key && *joined == author.joined).fold(Ranges::default(), |all, (_, _, seqs, _)| all.union(seqs));
+            let unopened: Ranges = self.unopened.keys().filter(|(k, j, _)| *k == author.key && *j == author.joined).map(|(_, _, s)| *s).collect();
+            let pending = |seqs: Ranges| seqs.difference(&learned).difference(&unopened);
+            wanted.extend(author.seqs(&pending(author.wanted())));
+            stale.extend(author.seqs(&pending(ended)));
         }
-        wanted
+        (wanted, stale)
     }
 
     /// What the last commit kept above this session's baselines that it neither holds nor lost.
