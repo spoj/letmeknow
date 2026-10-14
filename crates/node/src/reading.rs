@@ -21,6 +21,12 @@ pub(crate) fn commit_key(gid: &[u8], epoch: u64) -> Vec<u8> {
     [b"node/commit/".as_slice(), gid, b"/", &epoch.to_be_bytes()].concat()
 }
 
+/// The state key of the epoch an Add moved into, kept by its committer with the commit entry, for the answer to a joiner
+/// whose answer was lost.
+pub(crate) fn admitted_key(gid: &[u8], epoch: u64) -> Vec<u8> {
+    [b"node/admitted/".as_slice(), gid, b"/", &epoch.to_be_bytes()].concat()
+}
+
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Reads the stored entries of a group's log this session has not judged yet, in order.
     pub(crate) fn advance(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
@@ -111,6 +117,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         if welcome.is_some() {
             st.provider.put(&commit_key(gid, ending), &inner)?;
+            if let Some(key) = &applied.link_key {
+                st.provider.put(&admitted_key(gid, ending), key)?;
+            }
             st.group_mut(gid)?.rec.commits.push((ending, now));
         }
         self.cuts(st, gid, &applied, ending)?;

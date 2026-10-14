@@ -151,9 +151,9 @@ pub struct Join {
 pub struct Admitted {
     /// The commit entry that added the joiner, its Welcome inside: its cut is where the joiner starts.
     pub commit: Bytes,
-    /// A file link to the state of the group's kind.
+    /// A state link to the group's kind, sealed under the state key of the epoch the Add moved into.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub doc: Option<String>,
+    pub doc: Option<Bytes>,
 }
 
 #[cfg(test)]

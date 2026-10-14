@@ -676,6 +676,55 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
     assert_eq!(data, b"newer");
 }
 
+/// A joiner's state link is sealed under the state key of the epoch its Add moved into, so it opens although another
+/// commit landed before the answer was sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joiner_opens_its_state_after_another_commit_landed_before_the_answer() {
+    let relay = relay().await;
+    let mut alice = session(&relay, "Alice").await;
+    let carol = session(&relay, "Carol").await;
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
+    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    let joining = {
+        let node = carol.node.clone();
+        tokio::spawn(async move { node.join(&link, None).await })
+    };
+    alice.until(|e| match e {
+        Event::Snapshot { reply, .. } => Some(reply),
+        _ => None,
+    }).await.send(Some(b"the state".to_vec())).unwrap();
+    joining.await.unwrap().unwrap();
+
+    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    let joining = {
+        let node = bob.node.clone();
+        tokio::spawn(async move { node.join(&link, None).await.map(|_| bob) })
+    };
+    let reply = alice.until(|e| match e {
+        Event::Snapshot { reply, .. } => Some(reply),
+        _ => None,
+    }).await;
+    carol.node.change_settings(&gid.0, |settings| Settings { name: "Renamed".into(), ..settings }).await.unwrap();
+    let ahead = carol.node.epoch(&gid.0).unwrap();
+    tokio::time::timeout(WAIT, async {
+        while alice.node.epoch(&gid.0).unwrap() != ahead {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("alice applies the commit that landed");
+    reply.send(Some(b"the state".to_vec())).unwrap();
+
+    let mut bob = joining.await.unwrap().unwrap();
+    let data = bob.until(|e| match e {
+        Event::State { data, .. } => Some(data),
+        _ => None,
+    }).await;
+    assert_eq!(data, b"the state");
+    alice.node.shutdown().await.unwrap();
+}
+
 /// A membership service like `letmeknow serve`'s, which signs its heads.
 async fn signing_service(relay: &Relay, dir: &Path) -> (Service, iroh::protocol::Router) {
     served(relay, dir, |service| service).await

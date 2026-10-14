@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, RelayUrl};
-use lmk_core::group::{Change, Group, key_package_credential, key_package_leaf, key_package_reference};
+use lmk_core::group::{Change, Group, key_package_credential, key_package_leaf, key_package_reference, open_link, seal_link};
 use lmk_core::public::Verdict;
 use lmk_core::provider::Provider;
 use lmk_net::Admit;
-use lmk_proto::group::{CHAT, Certificate, Control, Credential, IDENTITY, How, Service};
+use lmk_proto::group::{Certificate, Control, Credential, IDENTITY, How, Service};
 use lmk_proto::links::Invite;
 use lmk_proto::peer::{Admitted, Join};
 use lmk_proto::{Answer, Bytes};
@@ -20,11 +20,10 @@ use n0_future::{FuturesUnordered, StreamExt};
 use n0_future::time::{Duration, Instant, sleep, sleep_until, timeout};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::oneshot;
 
 use crate::logs::NOT_FOLLOWED;
-use crate::reading::commit_key;
-use crate::{Event, G, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, SNAPSHOT_WAIT, State, device_key_key, endpoint_id, get, now, put};
+use crate::reading::{admitted_key, commit_key};
+use crate::{G, Inner, MEMBER_WAIT, Member, Node, Rec, Rule, State, device_key_key, endpoint_id, get, now, put};
 
 /// How many members besides the inviter a link names, of those online that hold the invite's message.
 const LINK_MEMBERS: usize = 3;
@@ -206,7 +205,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Joins a group from the commit entry, with its Welcome, a member at `by` sent for this session's KeyPackage: an
     /// identity group with the device key `device_key`, and only then, as a link's kind is not authenticated.
     async fn welcomed(self: &Arc<Self>, admitted: Admitted, key_package: &[u8], by: EndpointId, device_key: Option<[u8; 32]>) -> Result<Bytes> {
-        let (gid, log) = {
+        let (gid, log, doc) = {
             let mut st = self.lock();
             let st = &mut *st;
             let mls = Group::join(&st.provider, &admitted.commit.0, &key_package_reference(&st.provider, key_package)?)?;
@@ -215,6 +214,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 mls.delete(&st.provider)?;
                 bail!("the link was altered: it admits to a group of another kind than it says");
             }
+            // Opened now: the state key is the one of the epoch the Welcome starts in, which a later commit moves past.
+            let doc = match admitted.doc.map(|sealed| open_link(&mls.state_secret(&st.provider)?, &sealed.0)).transpose() {
+                Ok(doc) => doc,
+                Err(error) => {
+                    mls.delete(&st.provider)?;
+                    return Err(error);
+                }
+            };
             let gid = st.add_group(mls, Rec::default())?;
             if let Some(seed) = device_key {
                 put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
@@ -222,7 +229,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 st.device_keys.insert(gid.clone(), (seed, session));
             }
             let log = st.group(&gid)?.rec.log.0.clone();
-            (gid, log)
+            (gid, log, doc)
         };
         // The members' public logs first, which the gate needs to take their summaries, before the log's commits apply.
         self.refresh_all().await;
@@ -230,7 +237,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if let Err(error) = self.read_group(&gid).await {
             self.warn(Some(&gid), format!("reading the group's log: {error:#}"));
         }
-        if let Some(link) = admitted.doc {
+        if let Some(link) = doc {
             self.state_from(&gid, link, by);
         }
         Ok(Bytes(gid))
@@ -264,8 +271,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         // A joiner the log shows added, whose answer was lost, asks again with the same KeyPackage.
         self.caught_up(&gid).await?;
         let logged = self.lock().logged_commit(&gid, &key_package.0)?;
-        if let Some(commit) = logged {
-            return self.admitted(&gid, commit).await;
+        if let Some(epoch) = logged {
+            return self.admitted(&gid, epoch).await;
         }
         admits(self.lock().group(&gid)?, &joiner, &rule)?;
         // Its identity's public log, read afresh, must list the device that certified it.
@@ -282,7 +289,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Err(error) => {
                 let logged = self.lock().logged_commit(&gid, &key_package.0)?;
                 match logged {
-                    Some(commit) => self.admitted(&gid, commit).await,
+                    Some(epoch) => self.admitted(&gid, epoch).await,
                     None => Err(error),
                 }
             }
@@ -308,52 +315,38 @@ impl<P: Provider + Send + 'static> Inner<P> {
             })
             .await?
             .context("an Add has effect")?;
-        let commit = self.lock().provider.get(&commit_key(gid, epoch))?.context("an Add's commit entry is kept")?;
-        self.admitted(gid, commit).await
+        self.admitted(gid, epoch).await
     }
 
-    /// The answer to a joiner: the commit entry that added it, and the state of the group's kind, as a file.
-    async fn admitted(self: &Arc<Self>, gid: &[u8], commit: Vec<u8>) -> Result<Admitted> {
-        let state = {
+    /// The answer to a joiner an Add moved into `epoch`: the commit entry that added it, and the state of the group's
+    /// kind, sealed under the epoch's state key. The joiner is added, by an entry in the log: refusing it now would strand
+    /// it, and it asks members for the state later.
+    async fn admitted(self: &Arc<Self>, gid: &[u8], epoch: u64) -> Result<Admitted> {
+        let (commit, key) = {
             let st = self.lock();
-            let g = st.group(gid)?;
-            (g.mls.settings().kind != CHAT).then(|| {
-                let (reply, state) = oneshot::channel();
-                self.events.send(Event::Snapshot { group: Bytes(gid.to_vec()), reply }).ok();
-                state
-            })
+            (
+                st.provider.get(&commit_key(gid, epoch))?.context("an Add's commit entry is kept")?,
+                st.provider.get(&admitted_key(gid, epoch))?.context("an Add's state key is kept")?,
+            )
         };
-        let state = match state {
-            Some(asked) => timeout(SNAPSHOT_WAIT, asked).await.ok().and_then(Result::ok).flatten(),
-            None => None,
-        };
-        // The joiner is added, by an entry in the log: refusing it now would strand it, and it asks members for the state
-        // later.
-        let doc = match state {
-            Some(state) => match self.state_file(gid, state).await {
-                Ok(link) => Some(link),
-                Err(error) => {
-                    self.warn(Some(gid), format!("admitting a member without the group's state: {error:#}"));
-                    None
-                }
-            },
-            None => None,
-        };
+        let doc = self.state_link(gid).await.map(|link| seal_link(&key, &link)).transpose()?.map(Bytes);
         self.durable().await?;
         Ok(Admitted { commit: Bytes(commit), doc })
     }
 }
 
 impl<P: Provider> State<P> {
-    /// The commit entry that added the joiner with this KeyPackage, kept, if its leaf has not updated since.
-    fn logged_commit(&self, gid: &[u8], key_package: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// The epoch the Add of the joiner with this KeyPackage moved from, if its leaf has not updated since and this session
+    /// made that Add, which keeps its answer.
+    fn logged_commit(&self, gid: &[u8], key_package: &[u8]) -> Result<Option<u64>> {
         let g = self.group(gid)?;
         if !g.mls.unchanged(&self.provider, key_package)? {
             return Ok(None);
         }
         let reference = key_package_reference(&self.provider, key_package)?;
         let Some(added) = g.mls.added().iter().rev().find(|added| added.key_package_ref == reference) else { return Ok(None) };
-        self.provider.get(&commit_key(gid, added.epoch - 1))
+        let epoch = added.epoch - 1;
+        Ok(self.provider.get(&admitted_key(gid, epoch))?.is_some().then_some(epoch))
     }
 }
 

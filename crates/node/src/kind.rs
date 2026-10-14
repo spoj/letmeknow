@@ -7,9 +7,12 @@ use anyhow::Result;
 use iroh::EndpointId;
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
+use lmk_proto::group::CHAT;
 use lmk_proto::links::FileLink;
+use n0_future::time::timeout;
+use tokio::sync::oneshot;
 
-use crate::{Event, Inner};
+use crate::{Event, Inner, SNAPSHOT_WAIT};
 
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Takes a state `by` handed this session, once it is fetched, and tells the group's kind.
@@ -35,6 +38,23 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 inner.warn(Some(&gid), format!("the group's state did not arrive: {error:#}"));
             }
         });
+    }
+
+    /// A file link to the group's kind's state as its snapshot is now: none for a chat, or when the kind gives none.
+    pub(crate) async fn state_link(self: &Arc<Self>, gid: &[u8]) -> Option<String> {
+        if self.lock().group(gid).ok()?.mls.settings().kind == CHAT {
+            return None;
+        }
+        let (reply, asked) = oneshot::channel();
+        self.events.send(Event::Snapshot { group: Bytes(gid.to_vec()), reply }).ok();
+        let state = timeout(SNAPSHOT_WAIT, asked).await.ok().and_then(Result::ok).flatten()?;
+        match self.state_file(gid, state).await {
+            Ok(link) => Some(link),
+            Err(error) => {
+                self.warn(Some(gid), format!("the group's state could not be handed: {error:#}"));
+                None
+            }
+        }
     }
 
     /// Seals a state of the group's kind as a file to hand a member; holds it.
