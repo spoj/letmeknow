@@ -1,12 +1,13 @@
 //! Bounded membership work. Only capabilities cross the service request boundary.
 
-use std::{collections::BTreeMap, sync::{Arc, Mutex}, time::Duration};
+use std::{collections::{BTreeMap, HashMap}, hash::Hash, net::{IpAddr, Ipv4Addr}, sync::{Arc, Mutex}, time::Duration};
 
 use anyhow::{Result, ensure};
+use ed25519_dalek::Signer;
 use iroh::{endpoint::{Connection, RecvStream, SendStream}, protocol::{AcceptError, ProtocolHandler}};
-use lmk_proto::{clock::now, frame::{self, Open, Stream}, head::{self, Head}, membership::{self, Latest, Refusal, Reply, Request, Subscribed}};
+use lmk_proto::{Bytes, clock::now, frame::{self, Open, Stream}, head::{self, Head}, membership::{self, Answer, Append, Appended, Heads, Known, Latest, Moved, Page, Read, Refusal, Reply, Request, Subscribed, refusal_message}};
 use n0_future::task::AbortOnDropHandle;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{OwnedSemaphorePermit, Semaphore, mpsc}, time::{Instant, timeout}};
 
 use crate::{Refused, store::{DAY_MS, DISK_BYTES, Stats, Store}};
@@ -28,16 +29,55 @@ const SMALL_REPLY: usize = 4 << 10;
 /// How long a request waits for a slot of `DB_WORK` or for memory before it is refused as busy. Work that started runs
 /// to its end: a refusal tells the client the work was not done.
 const DB_WAIT: Duration = Duration::from_secs(2);
+const MINUTE: u64 = 60_000;
+/// The largest entry a public log takes.
+const PUBLIC_ENTRY: usize = 16 << 10;
+/// A /48's budget, in /64s.
+const WIDE: u64 = 16;
+const IN_ALL: [((), u64); 1] = [((), 1)];
 
 #[derive(Clone, Debug)]
 pub struct Policy {
+    /// Per connection on the iroh protocol; per address over HTTPS.
     pub appends_per_minute: u32,
     pub retention_days: u64,
     pub disk: u64,
+    /// Over HTTPS, per address from here down.
+    pub append_bytes_per_day: u64,
+    pub reads_per_minute: u32,
+    pub read_bytes_per_minute: u64,
+    pub new_logs_per_day: u64,
+    pub new_public_logs_per_day: u64,
+    /// Stored appends a day to each public log, from any address.
+    pub public_appends_per_day: u64,
+    /// New logs a day from all addresses.
+    pub new_logs_per_day_in_all: u64,
+    pub requests_at_once: usize,
 }
 
 impl Default for Policy {
-    fn default() -> Self { Self { appends_per_minute: 600, retention_days: 365, disk: DISK_BYTES } }
+    fn default() -> Self {
+        Self {
+            appends_per_minute: 600, retention_days: 365, disk: DISK_BYTES,
+            append_bytes_per_day: 256 << 20, reads_per_minute: 600, read_bytes_per_minute: 64 << 20,
+            new_logs_per_day: 2_000, new_public_logs_per_day: 10, public_appends_per_day: 10,
+            new_logs_per_day_in_all: 250_000, requests_at_once: 8,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Route { Append, Read, Heads }
+
+impl Route {
+    pub fn parse(path: &str) -> Option<Self> {
+        match path {
+            "/membership/1/append" => Some(Self::Append),
+            "/membership/1/read" => Some(Self::Read),
+            "/membership/1/heads" => Some(Self::Heads),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -46,6 +86,8 @@ pub struct Service(Arc<Inner>);
 struct Inner {
     store: Store,
     policy: Policy,
+    budgets: Mutex<Budgets>,
+    at_once: Arc<Semaphore>,
     subscribers: Mutex<Subscribers>,
     connections: Semaphore,
     streams: Arc<Semaphore>,
@@ -70,6 +112,84 @@ impl Subscribers {
 
     fn notify(&mut self, head: &Head) {
         self.records.retain(|_, (refs, sender)| !refs.contains(&head.log_ref) || sender.try_send(head.clone()).is_ok());
+    }
+}
+
+/// What each key spent in the current window of `period` milliseconds, against `limit` times its scale.
+struct Quota<K> {
+    period: u64,
+    limit: u64,
+    window: u64,
+    spent: HashMap<K, u64>,
+}
+
+impl<K: Clone + Eq + Hash> Quota<K> {
+    fn new(period: u64, limit: u64) -> Self { Self { period, limit, window: 0, spent: HashMap::new() } }
+
+    fn fits(&mut self, at: u64, keys: &[(K, u64)], amount: u64) -> bool {
+        self.roll(at);
+        keys.iter().all(|(key, scale)| self.spent.get(key).copied().unwrap_or(0) + amount <= self.limit * scale)
+    }
+
+    fn charge(&mut self, at: u64, keys: &[(K, u64)], amount: u64) {
+        self.roll(at);
+        for (key, _) in keys { *self.spent.entry(key.clone()).or_default() += amount; }
+    }
+
+    fn take(&mut self, at: u64, keys: &[(K, u64)], amount: u64) -> bool {
+        let fits = self.fits(at, keys, amount);
+        if fits { self.charge(at, keys, amount); }
+        fits
+    }
+
+    fn roll(&mut self, at: u64) {
+        if at / self.period != self.window {
+            self.window = at / self.period;
+            self.spent.clear();
+        }
+    }
+}
+
+/// What an address's budgets are drawn from: an IPv4 address, mapped or not; an IPv6 address's /64, and its /48.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Source { V4(Ipv4Addr), Net64(u64), Net48(u64) }
+
+fn sources(from: IpAddr) -> Vec<(Source, u64)> {
+    match from {
+        IpAddr::V4(v4) => vec![(Source::V4(v4), 1)],
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => vec![(Source::V4(v4), 1)],
+            None => {
+                let bits = u128::from(v6);
+                vec![(Source::Net64((bits >> 64) as u64), 1), (Source::Net48((bits >> 80) as u64), WIDE)]
+            }
+        },
+    }
+}
+
+struct Budgets {
+    appends: Quota<Source>,
+    append_bytes: Quota<Source>,
+    reads: Quota<Source>,
+    read_bytes: Quota<Source>,
+    new_logs: Quota<Source>,
+    new_public_logs: Quota<Source>,
+    public_appends: Quota<[u8; 32]>,
+    new_logs_in_all: Quota<()>,
+}
+
+impl Budgets {
+    fn new(policy: &Policy) -> Self {
+        Self {
+            appends: Quota::new(MINUTE, policy.appends_per_minute.into()),
+            append_bytes: Quota::new(DAY_MS, policy.append_bytes_per_day),
+            reads: Quota::new(MINUTE, policy.reads_per_minute.into()),
+            read_bytes: Quota::new(MINUTE, policy.read_bytes_per_minute),
+            new_logs: Quota::new(DAY_MS, policy.new_logs_per_day),
+            new_public_logs: Quota::new(DAY_MS, policy.new_public_logs_per_day),
+            public_appends: Quota::new(DAY_MS, policy.public_appends_per_day),
+            new_logs_in_all: Quota::new(DAY_MS, policy.new_logs_per_day_in_all),
+        }
     }
 }
 
@@ -113,7 +233,8 @@ impl Service {
     pub fn new(mut store: Store, policy: Policy) -> Self {
         store.disk = policy.disk;
         let service = Self(Arc::new(Inner {
-            store, policy, subscribers: Mutex::default(), connections: Semaphore::new(MAX_CONNECTIONS),
+            store, budgets: Mutex::new(Budgets::new(&policy)), at_once: Arc::new(Semaphore::new(policy.requests_at_once)), policy,
+            subscribers: Mutex::default(), connections: Semaphore::new(MAX_CONNECTIONS),
             streams: Arc::new(Semaphore::new(MAX_STREAMS)), work: Arc::new(Semaphore::new(DB_WORK)),
             memory: Arc::new(Semaphore::new(MEMORY / KIB)), expiry: Mutex::default(),
         }));
@@ -141,6 +262,89 @@ impl Service {
     }
 
     pub async fn stats(&self) -> Result<Stats> { self.work(|inner| inner.store.stats()).await }
+
+    /// Answers one request on the HTTPS routes: the body is the route's, and the answer is an `Answer` as JSON. An error
+    /// is the service's own failure, which is no answer.
+    pub async fn post(&self, route: Route, from: IpAddr, body: &[u8]) -> Result<Vec<u8>> {
+        let sources = sources(from);
+        let at = now();
+        let answer = match route {
+            Route::Append => self.answer(body, self.append(&sources, at, body).await),
+            Route::Read => self.answer(body, self.read(&sources, at, body).await),
+            Route::Heads => self.answer(body, self.heads(&sources, at, body).await),
+        }?;
+        if !matches!(route, Route::Append) {
+            self.0.budgets.lock().unwrap().read_bytes.charge(at, &sources, answer.len() as u64);
+        }
+        Ok(answer)
+    }
+
+    async fn append(&self, sources: &[(Source, u64)], at: u64, body: &[u8]) -> Result<Appended> {
+        let Append { capability, entries, public } = decode(body)?;
+        ensure!(!public || entries.iter().all(|e| e.0.len() <= PUBLIC_ENTRY), Refused("size".into()));
+        let reference = head::reference(&self.0.store.key().verifying_key().to_bytes(), &capability);
+        let bytes: u64 = entries.iter().map(|e| e.0.len() as u64).sum();
+        let _slot = self.slot().await?;
+        let may_start = {
+            let mut budgets = self.0.budgets.lock().unwrap();
+            ensure!(budgets.appends.take(at, sources, 1) && budgets.append_bytes.take(at, sources, bytes)
+                && (!public || budgets.public_appends.take(at, &[(reference, 1)], 1)), Refused("rate".into()));
+            budgets.new_logs.fits(at, sources, 1) && budgets.new_logs_in_all.fits(at, &IN_ALL, 1)
+                && (!public || budgets.new_public_logs.fits(at, sources, 1))
+        };
+        let appended = self.work(move |inner| {
+            ensure!(may_start || inner.store.length(&reference)? > 0, Refused("rate".into()));
+            inner.store.append(&reference, &entries, public)
+        }).await?;
+        if appended.position == 1 {
+            let mut budgets = self.0.budgets.lock().unwrap();
+            budgets.new_logs.charge(at, sources, 1);
+            budgets.new_logs_in_all.charge(at, &IN_ALL, 1);
+            if public { budgets.new_public_logs.charge(at, sources, 1); }
+        }
+        Ok(appended)
+    }
+
+    async fn read(&self, sources: &[(Source, u64)], at: u64, body: &[u8]) -> Result<Page> {
+        let Read { capability, after } = decode(body)?;
+        let reference = head::reference(&self.0.store.key().verifying_key().to_bytes(), &capability);
+        let _slot = self.slot().await?;
+        {
+            let mut budgets = self.0.budgets.lock().unwrap();
+            ensure!(budgets.reads.take(at, sources, 1) && budgets.read_bytes.fits(at, sources, 0), Refused("rate".into()));
+        }
+        self.work(move |inner| inner.store.read(&reference, after)).await
+    }
+
+    async fn heads(&self, sources: &[(Source, u64)], at: u64, body: &[u8]) -> Result<Moved> {
+        let Heads { logs } = decode(body)?;
+        let service = self.0.store.key().verifying_key().to_bytes();
+        let logs: Vec<([u8; 32], u64)> = logs.iter().map(|Known(capability, length)| (head::reference(&service, capability), *length)).collect();
+        let _slot = self.slot().await?;
+        {
+            let mut budgets = self.0.budgets.lock().unwrap();
+            ensure!(budgets.reads.take(at, sources, 1) && budgets.read_bytes.fits(at, sources, 0), Refused("rate".into()));
+        }
+        let heads = self.work(move |inner| inner.store.moved(&logs)).await?;
+        Ok(Moved { heads })
+    }
+
+    async fn slot(&self) -> Result<OwnedSemaphorePermit> {
+        Ok(timeout(DB_WAIT, self.0.at_once.clone().acquire_owned()).await.map_err(|_| Refused("busy".into()))??)
+    }
+
+    fn answer<T: Serialize>(&self, body: &[u8], result: Result<T>) -> Result<Vec<u8>> {
+        let answer = match result {
+            Ok(value) => Answer::Ok(value),
+            Err(error) => {
+                let Some(Refused(code)) = error.downcast_ref::<Refused>() else { return Err(error) };
+                let Some(refusal) = Refusal::from_code(code) else { return Err(error) };
+                let sig = self.0.store.key().sign(&refusal_message(refusal, body));
+                Answer::Refused { refusal, sig: Bytes(sig.to_bytes().to_vec()) }
+            }
+        };
+        Ok(serde_json::to_vec(&answer)?)
+    }
 
     async fn stream(&self, mut send: SendStream, mut recv: RecvStream, appends: &Mutex<Window>, connection: &Arc<Semaphore>, work_slot: OwnedSemaphorePermit) -> Result<()> {
         match self.exchange(&mut send, &mut recv, appends, connection, work_slot).await {
@@ -228,17 +432,17 @@ impl Service {
     }
 }
 
+fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
+    serde_json::from_slice(body).map_err(|_| Refused("policy".into()).into())
+}
+
 async fn reply<T: serde::Serialize>(send: &mut SendStream, result: Result<T>, _hold: Hold) -> Result<()> {
     let answer = match result {
         Ok(value) => Reply::Ok(value),
         Err(error) => {
             let Some(Refused(code)) = error.downcast_ref::<Refused>() else { return Err(error) };
-            let code = match code.as_str() {
-                "policy" => Refusal::Policy, "size" => Refusal::Size, "rate" => Refusal::Rate,
-                "busy" => Refusal::Busy, "quota" => Refusal::Quota, "expired" => Refusal::Expired,
-                _ => return Err(error),
-            };
-            Reply::Refused(code)
+            let Some(reason) = Refusal::from_code(code) else { return Err(error) };
+            Reply::Refused(reason)
         }
     };
     timeout(Duration::from_secs(30), frame::write(send, &answer)).await??;
@@ -300,6 +504,21 @@ mod tests {
         subscribers.notify(&head);
         assert!(subscribers.records.is_empty());
         assert!(receivers.iter().all(|r| r.len() == LAG));
+    }
+
+    #[tokio::test]
+    async fn requests_at_once_are_bounded_and_refused_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Policy { requests_at_once: 1, ..Policy::default() };
+        let service = Service::new(Store::initialize(&dir.path().join("state")).unwrap(), policy);
+        service.0.expiry.lock().unwrap().take();
+        let body = serde_json::to_vec(&Read { capability: [1; 32], after: 0 }).unwrap();
+        let held = service.slot().await.unwrap();
+        let answer = service.post(Route::Read, "192.0.2.1".parse().unwrap(), &body).await.unwrap();
+        assert!(matches!(serde_json::from_slice::<Answer<Page>>(&answer).unwrap(), Answer::Refused { refusal: Refusal::Busy, .. }));
+        drop(held);
+        let answer = service.post(Route::Read, "192.0.2.1".parse().unwrap(), &body).await.unwrap();
+        assert!(matches!(serde_json::from_slice::<Answer<Page>>(&answer).unwrap(), Answer::Ok(_)));
     }
 
     #[tokio::test]
