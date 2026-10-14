@@ -379,6 +379,19 @@ fn the_commit_wait_dials_four_holders_at_a_time() {
     assert_eq!(dials(&p.poll(0)), vec![key(5), key(6), key(4), key(3)]);
 }
 
+/// A summary sent to a peer is not assumed held: a peer whose versions do not show it is sent it again.
+#[test]
+fn a_summary_a_peer_lacks_is_sent_again() {
+    let mut p = peers();
+    p.group(id(), own(1, &[1, 2]), 0);
+    p.connect(key(1), gs(), false, 0);
+    p.poll(0);
+    assert!(p.summary(&id(), heard(100, 2, 0, vec![]), None));
+    assert_eq!(summaries_to(&p.poll(1)), vec![key(1)]);
+    let answered = p.frame(&key(1), &Frame::Versions { group: id(), versions: vec![] }, 2);
+    assert_eq!(summaries_to(&answered), vec![key(1)]);
+}
+
 /// A peer that stops being served a group, and is served it again, is sent the group's summaries anew: what it held
 /// before is not assumed.
 #[test]

@@ -287,11 +287,9 @@ impl Peers {
                 if !c.served.contains(group) {
                     return Vec::new();
                 }
+                // What the peer lists is what it holds: a summary sent it that it does not list was dropped, and is sent again.
                 let known = c.known.entry(group.clone()).or_default();
-                for v in versions {
-                    let k = known.entry((v.key.clone(), v.joined)).or_default();
-                    *k = (*k).max(v.version);
-                }
+                *known = versions.iter().map(|v| ((v.key.clone(), v.joined), v.version)).collect();
                 let mut items = Vec::new();
                 for (m, h) in &g.heard {
                     let k = known.entry(m.clone()).or_default();
