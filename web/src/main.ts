@@ -38,9 +38,9 @@ const KINDS = { chat: "chat", doc: "document", table: "table" };
 /** Files up to this size every member fetches; larger ones only on request. */
 const FILE_LIMIT = 25 << 20;
 const INVITE_PREFIX = "https://letmeknow.dev/i";
-/** letmeknow 0.17's invite links, which this version cannot read. */
-const madeByOlder = (link: string) => /#6\./.test(link);
-const OLDER_INVITE = "This invite is from letmeknow 0.17, whose groups this version cannot join: ask for an invite to a group made with letmeknow 0.18 (`npx -y @letmeknow/cli@0.18`).";
+/** letmeknow 0.18's invite links, which this version cannot read. */
+const madeByOlder = (link: string) => /#7\./.test(link);
+const OLDER_INVITE = "This invite is from letmeknow 0.18, whose groups this version cannot join: ask for an invite to a group made with letmeknow 0.19 (`npx -y @letmeknow/cli@0.19`).";
 
 const root = document.getElementById("app")!;
 const agentsHelp = document.getElementById("agents")!;
@@ -142,12 +142,12 @@ async function boot() {
   if (invite && had) offer(kind);
 }
 
-/** letmeknow 0.17's chats stay in its own database, which this version leaves as it is: said once. */
+/** letmeknow 0.18's chats stay in its own database, which this version leaves as it is: said once. */
 async function keptByOlder() {
-  if (localStorage.getItem("lmk 0.17 kept") || !(await store.older())) return;
-  localStorage.setItem("lmk 0.17 kept", "1");
+  if (localStorage.getItem("lmk 0.18 kept") || !(await store.older())) return;
+  localStorage.setItem("lmk 0.18 kept", "1");
   const ok = h("button", { className: "primary" }, "OK");
-  const notice = h("div", { className: "banner", role: "status" }, h("span", {}, "Chats from letmeknow 0.17 stay with 0.17 in this browser. This version keeps its own and does not open them."), ok);
+  const notice = h("div", { className: "banner", role: "status" }, h("span", {}, "Chats from letmeknow 0.18 stay with 0.18 in this browser. This version keeps its own and does not open them."), ok);
   ok.onclick = () => notice.remove();
   document.body.append(notice);
 }

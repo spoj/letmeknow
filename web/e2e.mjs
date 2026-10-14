@@ -110,7 +110,7 @@ const kept = page =>
   page.evaluate(
     () =>
       new Promise((resolve, reject) => {
-        const db = indexedDB.open("lmk7");
+        const db = indexedDB.open("lmk8");
         db.onsuccess = () => {
           const request = db.result.transaction("files").objectStore("files").getAllKeys();
           request.onsuccess = () => (db.result.close(), resolve(request.result));
@@ -120,7 +120,7 @@ const kept = page =>
   );
 const text = page => page.locator(".cm-content").evaluate(content => content.cmTile.view.state.doc.toString());
 const call = (page, method, ...args) => page.evaluate(([method, args]) => new Promise((resolve, reject) => {
-  const channel = new BroadcastChannel("lmk7");
+  const channel = new BroadcastChannel("lmk8");
   const id = crypto.randomUUID();
   // As long as a join may take: reaching a member, then its answer.
   const timer = setTimeout(() => { channel.close(); reject(new Error(`no answer to ${method}`)); }, 90_000);
@@ -193,7 +193,7 @@ async function recover(page) {
 }
 
 const record = (page, store, key) => page.evaluate(([store, key]) => new Promise((resolve, reject) => {
-  const request = indexedDB.open("lmk7");
+  const request = indexedDB.open("lmk8");
   request.onsuccess = () => {
     const db = request.result;
     const value = db.transaction(store).objectStore(store).get(typeof key === "string" ? key : new Uint8Array(key));
@@ -234,9 +234,9 @@ try {
   ann.run("identity", "create", "Ann");
   desk.run("identity", "create", "Matthew");
 
-  // Another version's database is left as it is, and 0.17's chats are said to stay with 0.17; this version's, incomplete,
+  // Another version's database is left as it is, and 0.18's chats are said to stay with 0.18; this version's, incomplete,
   // is refused visibly, never reset.
-  for (const [name, version] of [["lmk", 4], ["lmk5", 1], ["lmk6", 1], ["lmk7", 1]]) {
+  for (const [name, version] of [["lmk", 4], ["lmk5", 1], ["lmk6", 1], ["lmk7", 1], ["lmk8", 1]]) {
     const legacy = await open("legacy", { viewport: { width: 1280, height: 800 } }, true);
     const errors = [];
     legacy.on("pageerror", error => errors.push(error.message));
@@ -252,14 +252,14 @@ try {
       request.onerror = () => reject(request.error);
     }), [name, version]);
     await legacy.goto(SITE);
-    if (name === "lmk7") await legacy.getByRole("alert").filter({ hasText: "stored session is incomplete" }).waitFor();
+    if (name === "lmk8") await legacy.getByRole("alert").filter({ hasText: "stored session is incomplete" }).waitFor();
     else await legacy.getByLabel("Your name").waitFor();
-    if (name === "lmk6") {
-      await legacy.getByText("Chats from letmeknow 0.17 stay with 0.17").waitFor();
+    if (name === "lmk7") {
+      await legacy.getByText("Chats from letmeknow 0.18 stay with 0.18").waitFor();
       await legacy.getByRole("button", { name: "OK" }).click();
-      await legacy.goto(`${SITE}/i#6.g.${"A".repeat(22)}`);
-      await legacy.getByText("This invite is from letmeknow 0.17").waitFor();
-      check(await legacy.locator(".banner").count() === 0, "letmeknow 0.17's notice is said once");
+      await legacy.goto(`${SITE}/i#7.g.${"A".repeat(22)}`);
+      await legacy.getByText("This invite is from letmeknow 0.18").waitFor();
+      check(await legacy.locator(".banner").count() === 0, "letmeknow 0.18's notice is said once");
     }
     const old = await legacy.evaluate(name => new Promise((resolve, reject) => {
       const request = indexedDB.open(name);
@@ -589,7 +589,7 @@ try {
   const recorded = await laptop.evaluate(
     gid =>
       new Promise((resolve, reject) => {
-        const open = indexedDB.open("lmk7");
+        const open = indexedDB.open("lmk8");
         open.onsuccess = () => {
           const records = open.result.transaction("records").objectStore("records");
           const count = records.count(new TextEncoder().encode(`lmk/kind/doc/${gid}`));
@@ -603,7 +603,7 @@ try {
   const stored = await laptop.evaluate(
     ([gid, id]) =>
       new Promise((resolve, reject) => {
-        const open = indexedDB.open("lmk7");
+        const open = indexedDB.open("lmk8");
         open.onsuccess = () => {
           const records = open.result.transaction("records").objectStore("records");
           const bytes = id.match(/../g).map(byte => parseInt(byte, 16));
@@ -681,7 +681,7 @@ try {
   await laptop.locator(".devices li", { hasText: "this browser" }).waitFor();
   await laptop.getByRole("button", { name: "Add a device" }).click();
   const link = await laptop.locator("dialog .copy code").first().textContent();
-  check(link.includes("#7.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
+  check(link.includes("#8.d.") && (await laptop.locator("dialog .qr path").getAttribute("d")).length > 100, "the browser makes a device link, with a QR code");
   const tablet = native("tablet");
   await tablet.printed(e => e.type === "ready");
   const joining = tablet.start("identity", "join", link);
@@ -936,7 +936,7 @@ try {
     check(JSON.parse(await call(tab, "me")).fp === beforeFailure, "follower-initiated explicit retry reloads every tab with the same session and all pending messages");
   }
   check(new TextDecoder().decode(new Uint8Array(await record(laptop, "records", failedKey))).includes(target.text), "the failed batch itself, not just later writes, reached IndexedDB");
-  check(await laptop.evaluate(async () => (await navigator.locks.query()).held.filter(lock => lock.name === "lmk7").length === 1), "after recovery exactly one tab owns the session");
+  check(await laptop.evaluate(async () => (await navigator.locks.query()).held.filter(lock => lock.name === "lmk8").length === 1), "after recovery exactly one tab owns the session");
   await follower.close();
   await late.close();
   delete pages["recovery follower"];

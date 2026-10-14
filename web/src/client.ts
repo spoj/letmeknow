@@ -1,5 +1,5 @@
 // The browser's session: lmk-node in WebAssembly (crates/web), its records and files kept in IndexedDB. One tab at a
-// time runs it, holding the Web Lock "lmk7"; the other tabs call it over the BroadcastChannel "lmk7", and hear
+// time runs it, holding the Web Lock "lmk8"; the other tabs call it over the BroadcastChannel "lmk8", and hear
 // its events there. When that tab closes, a waiting tab takes the lock and runs the session from IndexedDB. Its
 // default membership is compiled into the trusted frontend (backend.json): its directory is fetched, and must name the
 // compiled key. Explicit localStorage choices override the domain; the backend never supplies code.
@@ -72,7 +72,7 @@ export const listen = (listener: (event: Event) => void) => listeners.add(listen
 export const unlisten = (listener: (event: Event) => void) => listeners.delete(listener);
 const dispatch = (event: Event) => listeners.forEach(listener => listener(event));
 
-const channel = new BroadcastChannel("lmk7");
+const channel = new BroadcastChannel("lmk8");
 const tab = crypto.randomUUID();
 let calls = 0;
 /** This tab's calls not answered yet: sent again whenever a tab starts running the session. */
@@ -171,7 +171,7 @@ function run(device = ""): Promise<void> {
 export async function prepare(): Promise<boolean> {
   const had = await store.has();
   await init({ module_or_path: wasm });
-  navigator.locks.request("lmk7", async () => {
+  navigator.locks.request("lmk8", async () => {
     leading = true;
     if (await store.has()) await run();
     await new Promise(() => {});
