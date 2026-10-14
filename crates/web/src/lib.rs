@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use js_sys::{Array, Function, Promise, Uint8Array};
 use lmk_client::{Access, Chat, Client, ClientEvent, File, Request, fp, message_id};
 use lmk_node::identity::{Identity, Presence};
@@ -478,9 +478,18 @@ impl App {
                 saved.await?
             })
         });
+        config.backend.directory.check()?;
+        check_domain(&config.backend.domain)?;
         check_domain(&config.membership)?;
         let resolve = resolver(idb.clone().unchecked_into(), config.backend.clone());
         let own = resolve(config.membership.clone()).await?;
+        ensure!(
+            config.membership != config.backend.domain || own.key == config.backend.directory.key,
+            "{} names key {}, but this app is built for key {}",
+            config.membership,
+            hex::encode(own.key),
+            hex::encode(config.backend.directory.key)
+        );
         let relays = own.relays.iter().map(|relay| relay.parse()).collect::<Result<Vec<_>, _>>()?;
         let chosen = config.relays.iter().map(|relay| relay.parse()).collect::<Result<Vec<_>, _>>()?;
         let node_config = lmk_node::Config {
