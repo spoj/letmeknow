@@ -59,17 +59,13 @@ fn merge(into: &mut Value, from: Value) {
 /// letmeknow.dev's membership service.
 pub fn letmeknow_dev() -> Service {
     let key = hex::decode(lmk_proto::links::MEMBERSHIP_KEY).unwrap();
-    Service::Serve { key: Bytes(key), relay: lmk_proto::links::RELAY.into(), addrs: Vec::new(), rest: Default::default() }
+    Service::Serve { key: Bytes(key), domain: lmk_proto::links::DOMAIN.into(), rest: Default::default() }
 }
 
-/// A membership service from its address: `letmeknow.dev`, or `<iroh key, hex>@<relay URL>`.
+/// A membership service from its address: its domain, which only letmeknow.dev's is for now.
 pub fn service(address: &str) -> Result<Service> {
-    if address == "letmeknow.dev" {
-        return Ok(letmeknow_dev());
-    }
-    let (key, relay) = address.split_once("@https://").context("a membership service is letmeknow.dev, or <key>@<relay URL>")?;
-    let key = Bytes(hex::decode(key).context("a service key is hex")?);
-    Ok(Service::Serve { key, relay: format!("https://{relay}"), addrs: Vec::new(), rest: Default::default() })
+    ensure!(address == lmk_proto::links::DOMAIN, "a membership service is named by its domain, such as {}: --membership <domain>, not {address}", lmk_proto::links::DOMAIN);
+    Ok(letmeknow_dev())
 }
 
 pub struct Config {

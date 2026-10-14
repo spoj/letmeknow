@@ -11,8 +11,8 @@ fn offline_initialization_emits_only_the_durable_public_configuration() {
     assert!(!path.exists());
     let public = config.initialize().unwrap();
     assert_eq!(config.service().unwrap(), public);
-    let Service::Serve { key, relay, .. } = public else { panic!("expected serve") };
-    assert_eq!(relay, "https://relay.example");
+    let Service::Serve { key, domain, .. } = public else { panic!("expected serve") };
+    assert_eq!(domain, "relay.example");
     let store = Store::open(&path).unwrap();
     assert_eq!(key.0, store.key().verifying_key().as_bytes());
     assert!(config.initialize().is_err());

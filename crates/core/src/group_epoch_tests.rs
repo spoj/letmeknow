@@ -496,9 +496,9 @@ fn unsupported_authorities_fail_without_partial_state() {
     let invalid = (0..=255).map(|byte| [byte; 32]).find(|bytes| ed25519_dalek::VerifyingKey::from_bytes(bytes).is_err()).unwrap();
     let authorities = [
         Service::Newer(serde_json::json!({"future": {"key": "unknown"}})),
-        Service::Serve { key: Bytes(vec![1; 31]), relay: "r".into(), addrs: vec![], rest: Default::default() },
-        Service::Serve { key: invalid.into(), relay: "r".into(), addrs: vec![], rest: Default::default() },
-        Service::Serve { key: [0; 32].into(), relay: "r".into(), addrs: vec![], rest: Default::default() },
+        Service::Serve { key: Bytes(vec![1; 31]), domain: "r.example".into(), rest: Default::default() },
+        Service::Serve { key: invalid.into(), domain: "r.example".into(), rest: Default::default() },
+        Service::Serve { key: [0; 32].into(), domain: "r.example".into(), rest: Default::default() },
     ];
     for membership in authorities {
         let changed = Settings { membership, ..w.m[0].g().settings() };
@@ -567,7 +567,7 @@ fn private_service_changes_bind_both_authorities_and_keep_future_settings() {
     let new_service = ed25519_dalek::SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes();
     let mut changed = w.m[0].g().settings();
     changed.membership = Service::Serve {
-        key: new_service.into(), relay: "https://new.example".into(), addrs: vec!["new route".into()],
+        key: new_service.into(), domain: "new.example".into(),
         rest: [("future-service-setting".into(), serde_json::json!(7))].into_iter().collect(),
     };
     changed.rest.insert("future-group-setting".into(), serde_json::json!({"x": true}));
@@ -637,8 +637,8 @@ fn identity_authority_cannot_change_but_its_route_can() {
     assert!(group.apply(&b.provider, &sealed).is_err());
     assert_eq!(b.provider.records(), before);
     let mut routed = group.settings();
-    let Service::Serve { relay, .. } = &mut routed.membership else { panic!() };
-    *relay = "https://new-route.example".into();
+    let Service::Serve { domain, .. } = &mut routed.membership else { panic!() };
+    *domain = "new-route.example".into();
     let cut = w.m[0].cut();
     let commit = w.m[0].commit(Change { cut, settings: Some(routed.clone()), ..Change::default() });
     w.post(commit.entry);

@@ -41,8 +41,6 @@ use crate::{
 const ANSWER_WAIT: Duration = Duration::from_secs(5);
 /// How long a dial at the hint's relays may take before it is dropped for a dial at all relays.
 const HINT_WAIT: Duration = Duration::from_secs(2);
-/// How long the dial at all relays may take.
-const FALLBACK_WAIT: Duration = Duration::from_secs(5);
 
 /// What this crate needs from the group logic to serve files and gate frames. Calls are quick and local.
 pub trait Groups: Send + Sync + 'static {
@@ -142,7 +140,7 @@ impl Net {
         let (events, rx) = mpsc::unbounded_channel();
         let mut homes = endpoint.watch_addr().stream();
         let reporting = events.clone();
-        spawn(async move {
+        spawn(endpoint.closed().run_until(async move {
             let mut last = None;
             while let Some(addr) = homes.next().await {
                 if let Some(home) = addr.relay_urls().next()
@@ -152,7 +150,7 @@ impl Net {
                     reporting.send(Event::Home(home.clone())).ok();
                 }
             }
-        });
+        }));
         let inner = Arc::new(Inner {
             endpoint: endpoint.clone(),
             config,
@@ -174,8 +172,9 @@ impl Net {
     }
 
     /// Connects to a member, unless already connected: at the `hint` relays, or if that takes over 2 s, at those and the
-    /// `fallback` relays, giving up 5 s later. Each attempt also dials the same-machine addresses.
-    pub async fn dial(&self, key: EndpointId, hint: Vec<RelayUrl>, fallback: Vec<RelayUrl>) -> Result<()> {
+    /// `fallback` relays, giving up 5 s later. The fallback is resolved from the start, and awaited once the 2 s are up.
+    /// Each attempt also dials the same-machine addresses.
+    pub async fn dial(&self, key: EndpointId, hint: Vec<RelayUrl>, fallback: BoxFuture<Vec<RelayUrl>>) -> Result<()> {
         self.inner.connection(key, hint, fallback).await?;
         Ok(())
     }
@@ -213,7 +212,7 @@ impl Net {
     }
 
     /// Asks a member to admit this session, on an `admission` stream of its own.
-    pub async fn join(&self, peer: EndpointId, hint: Vec<RelayUrl>, fallback: Vec<RelayUrl>, join: Join) -> Result<Answer<Admitted>> {
+    pub async fn join(&self, peer: EndpointId, hint: Vec<RelayUrl>, fallback: BoxFuture<Vec<RelayUrl>>, join: Join) -> Result<Answer<Admitted>> {
         let conn = self.inner.connection(peer, hint, fallback).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
         frame::write(&mut send, &Open { stream: Stream::Admission }).await?;
@@ -297,18 +296,25 @@ impl Net {
 }
 
 impl Inner {
-    async fn connection(self: &Arc<Self>, key: EndpointId, hint: Vec<RelayUrl>, fallback: Vec<RelayUrl>) -> Result<Connection> {
+    async fn connection(self: &Arc<Self>, key: EndpointId, hint: Vec<RelayUrl>, fallback: BoxFuture<Vec<RelayUrl>>) -> Result<Connection> {
         if let Some(conn) = self.live(&key) {
             return Ok(conn);
         }
+        let fallback = spawn(fallback);
         let hinted = if hint.is_empty() {
             None
         } else {
             timeout(HINT_WAIT, self.endpoint.connect(self.addr(key, hint.clone()), ALPN)).await.ok().and_then(Result::ok)
         };
         let conn = match hinted {
-            Some(conn) => conn,
-            None => timeout(FALLBACK_WAIT, self.endpoint.connect(self.addr(key, hint.into_iter().chain(fallback)), ALPN)).await??,
+            Some(conn) => {
+                fallback.abort();
+                conn
+            }
+            None => {
+                let relays = fallback.await?;
+                self.endpoint.connect(self.addr(key, hint.into_iter().chain(relays)), ALPN).await?
+            }
         };
         match self.register(&conn, true) {
             Some((input, rx)) => {

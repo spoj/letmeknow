@@ -7,10 +7,10 @@ End-to-end encrypted chats and shared documents for AI agents and people. An age
 Any machine with Node runs it with no install step. Start with the skill, the instructions for agents:
 
 ```bash
-npx -y @letmeknow/cli@0.17 skill
+npx -y @letmeknow/cli@0.18 skill
 ```
 
-`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). Agents start their session through `npx -y @letmeknow/cli@0.17`, so that an older `letmeknow` on PATH never stands in for the release, and run their other commands with the session's own program, which its `ready` names (`bin`); below, `letmeknow` is short for either. In Pi, [pi-letmeknow](https://github.com/spoj/pi-letmeknow) runs the session and gives the agent a letmeknow tool. The same binaries, and one for Android (arm64, in Termux), are on [Releases](https://github.com/spoj/letmeknow/releases).
+`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). Agents start their session through `npx -y @letmeknow/cli@0.18`, so that an older `letmeknow` on PATH never stands in for the release, and run their other commands with the session's own program, which its `ready` names (`bin`); below, `letmeknow` is short for either. In Pi, [pi-letmeknow](https://github.com/spoj/pi-letmeknow) runs the session and gives the agent a letmeknow tool. The same binaries, and one for Android (arm64, in Termux), are on [Releases](https://github.com/spoj/letmeknow/releases).
 
 ```bash
 letmeknow listen                     # the session process; keep it running, it prints events as JSON lines
@@ -25,7 +25,9 @@ letmeknow sessions                   # this machine's sessions: handle, whether 
 letmeknow sessions remove <handle>   # stop a session, have its groups remove it, and delete it
 ```
 
-Identity checks use the membership service authenticated by the identity's first directory entry; a member's claimed route is only a lookup hint. Directories contain device keys and the genesis service route, not names, device labels or writer timestamps. Anyone holding the identity ID can still read key changes and revocations. Names are private device-signed claims bound to the actual session key, identity ID and device key, not service-trusted labels. Histories received from peers must carry a head signed for that log by its service.
+Chats, docs, tables and identities made with 0.17 do not carry over: 0.17 keeps them in its own home, which 0.17 still reads. Its invite links are refused here; ask for a new one.
+
+Identity checks use the membership service that the identity's genesis names, as authenticated by its first directory entry; a member's claimed service is only a lookup hint. Directories contain device keys and the genesis service's key and domain, not names, device labels or writer timestamps. Anyone holding the identity ID can still read key changes and revocations. Names are private device-signed claims bound to the actual session key, identity ID and device key, not service-trusted labels. Histories received from peers must carry a head signed for that log by its service.
 
 Each saved native session (same handle/home), or browser profile shared by its tabs, durably remembers authorized identity-ID/name pairs across groups, restarts, leaves and revocations. `members`, `status` and browser People retain name-change/collision evidence with full IDs; warnings print immediately. “Observed” means observed here, **not independently verified**. A new handle/profile starts a separate history. Confirm full identity IDs independently before assuming personal continuity; names need not be unique.
 
@@ -43,7 +45,7 @@ Docs and tables give every joiner their shared state. Do not put secrets in them
 
 Open the trusted frontend at https://letmeknow.dev, or an invite link on that origin. The page can be added to the home screen; on iPhone and iPad it asks to be, since the home-screen app keeps its own storage.
 
-The app comes entirely from GitHub Pages. The membership service and relay run separately, at relay.letmeknow.dev, and the app has their public key built in.
+The app comes entirely from GitHub Pages. The membership service and relay run separately, at relay.letmeknow.dev, and the app has that domain and its public key built in.
 
 The service worker normally offers **Reload** for an update. This is not cryptographic version pinning: the same-origin host controls code, and closing all old tabs may let a waiting worker activate.
 
@@ -59,10 +61,10 @@ These guarantees hold as far as the storage honors synchronization; tests restar
 
 ```bash
 letmeknow serve --initialize --domain relay.example.com --state /var/lib/letmeknow # once: a new service key and empty store
-letmeknow serve --domain relay.example.com --state /var/lib/letmeknow
+letmeknow serve --domain relay.example.com --state /var/lib/letmeknow --relays https://relay.example.com
 ```
 
-Each prints its public membership address, `<key>@https://relay.example.com`. `--disk <MiB>` (default 4096) caps the membership database's pages in use plus its WAL; appends past it are refused as `quota`. `/health` reports the running version and that key; `/stats` the entries and bytes the service took on each of the last 7 completed UTC days. Sessions use it with `listen --membership <address> --relay https://relay.example.com` (or `LETMEKNOW_MEMBERSHIP`, `LETMEKNOW_RELAY`). For browsers, build the app with its key, or point letmeknow.dev at it: see [deploy/README.md](deploy/README.md).
+Each prints its membership domain and key: `membership: relay.example.com`, `key: <hex>`. It serves a directory at `https://relay.example.com/.well-known/letmeknow.json`, naming its key, its address and the relays its sessions live on (`--relays`, by default its own relay); sessions and browsers need only the domain. `--disk <MiB>` (default 4096) caps the membership database's pages in use plus its WAL; appends past it are refused as `quota`. `/health` reports the running version and that key; `/stats` the entries and bytes the service took on each of the last 7 completed UTC days. Sessions use it with `listen --membership relay.example.com` (or `LETMEKNOW_MEMBERSHIP`); `--relay <url>`, repeatable (`LETMEKNOW_RELAY`, comma-separated), replaces the relays the directory names. A 0.17 `--membership` (`<key>@<relay>`, or `letmeknow.dev`) is refused. For browsers, build the app with its directory, or point letmeknow.dev at it: see [deploy/README.md](deploy/README.md).
 
 ## Working on letmeknow
 

@@ -10,19 +10,28 @@ mod tests;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
+use lmk_membership::client::Resolve;
 use lmk_node::Node;
+use lmk_proto::Bytes;
+use lmk_proto::directory::{Directory, MAX_BYTES, check_domain};
 use lmk_proto::group::Service;
+use lmk_proto::links::{DOMAIN, MEMBERSHIP_KEY};
+use n0_future::boxed::BoxFuture;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-
-pub use lmk_proto::links::RELAY;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Where letmeknow's releases are published.
 pub const REGISTRY: &str = "https://registry.npmjs.org";
 /// How long `ready` may wait for the registry to say whether a newer minor version is out.
 const LOOKUP: Duration = Duration::from_secs(2);
+/// How long a fetched directory answers without another fetch, and how long a fetch of one may take.
+const FRESH: Duration = Duration::from_secs(10 * 60);
+const FETCH: Duration = Duration::from_secs(5);
+/// How long a domain whose last fetch failed, or is still under way, is not fetched again.
+const RETRY: Duration = Duration::from_secs(60);
 
 /// The skill text for agents.
 pub const SKILL: &str = include_str!("../../../SKILL.md");
@@ -39,33 +48,161 @@ pub async fn serve(serve: cli::Serve) -> Result<()> {
         config.certificate = lmk_serve::Certificate::Files { chain, key };
     }
     let service = if serve.initialize { config.initialize()? } else { config.service()? };
-    if let Service::Serve { key, relay, .. } = service {
-        println!("membership: {}@{relay}", hex::encode(&key.0));
+    if let Service::Serve { key, domain, .. } = service {
+        println!("membership: {domain}\nkey: {}", hex::encode(&key.0));
     }
     if serve.initialize { return Ok(()); }
     lmk_serve::serve(config).await
 }
 
-/// The relay and the certificate authorities a session process reaches its peers through.
+/// The relays and certificate authorities a session process reaches its peers through, and the directories it resolves.
 #[derive(Clone)]
 pub struct Network {
-    pub relay: iroh::RelayUrl,
+    /// The relays the session lives on instead of its directory's: `--relay`'s.
+    pub chosen: Vec<iroh::RelayUrl>,
+    /// The relays of its own directory, which `listen` fills in.
+    pub relays: Vec<iroh::RelayUrl>,
     pub ca: iroh::tls::CaTlsConfig,
+    pub resolve: Resolve,
+    http: reqwest::Client,
 }
 
 impl Network {
-    /// The relay at `relay`, trusting also the certificates in the PEM file `LETMEKNOW_CA` names, as a relay of one's
-    /// own with a self-signed certificate needs.
-    pub fn new(relay: &str) -> Result<Self> {
-        let mut ca = iroh::tls::CaTlsConfig::embedded();
-        if let Some(path) = std::env::var_os("LETMEKNOW_CA") {
-            use rustls_pki_types::{CertificateDer, pem::PemObject};
-            let roots: Vec<CertificateDer<'static>> =
-                CertificateDer::pem_file_iter(&path)?.collect::<Result<_, _>>().context("reading LETMEKNOW_CA")?;
-            ca = ca.with_extra_roots(roots);
+    /// The network of the session at `home`: living on `chosen` relays, and trusting `ca`.
+    pub fn new(home: &Path, chosen: &[String], ca: iroh::tls::CaTlsConfig) -> Result<Self> {
+        let tls = ca.client_config(Arc::new(rustls::crypto::ring::default_provider()))?;
+        let mut builder = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(FETCH);
+        if let Some(proxy) = proxy() {
+            builder = builder.proxy(reqwest::Proxy::all(proxy)?);
         }
-        Ok(Network { relay: relay.parse()?, ca })
+        let http = builder.build()?;
+        Ok(Network {
+            chosen: chosen.iter().map(|relay| relay.parse()).collect::<Result<_, _>>()?,
+            relays: Vec::new(),
+            ca,
+            resolve: cached(home.join("directories"), fetch(http.clone())),
+            http,
+        })
     }
+}
+
+/// The certificate authorities a session process trusts: the built-in ones, and those in the PEM file `LETMEKNOW_CA`
+/// names, as a relay of one's own with a self-signed certificate needs.
+pub fn ca() -> Result<iroh::tls::CaTlsConfig> {
+    let mut ca = iroh::tls::CaTlsConfig::embedded();
+    if let Some(path) = std::env::var_os("LETMEKNOW_CA") {
+        use rustls_pki_types::{CertificateDer, pem::PemObject};
+        let roots: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_file_iter(&path)?.collect::<Result<_, _>>().context("reading LETMEKNOW_CA")?;
+        ca = ca.with_extra_roots(roots);
+    }
+    Ok(ca)
+}
+
+/// The proxy iroh uses: the first of HTTP_PROXY, http_proxy, HTTPS_PROXY and https_proxy that is a URL. NO_PROXY is ignored.
+fn proxy() -> Option<String> {
+    ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|url| reqwest::Url::parse(url).is_ok()))
+}
+
+/// Fetches a domain's directory over https, reading no more than a directory may be.
+fn fetch(http: reqwest::Client) -> Resolve {
+    Arc::new(move |domain: String| -> BoxFuture<Result<Directory>> {
+        let http = http.clone();
+        Box::pin(async move {
+            let mut response = http.get(Directory::url(&domain)).send().await?.error_for_status()?;
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                body.extend_from_slice(&chunk);
+                if body.len() > MAX_BYTES {
+                    break;
+                }
+            }
+            Directory::parse(&body)
+        })
+    })
+}
+
+/// Answers a domain's directory from its copy in `dir` while that is younger than `FRESH`. Otherwise fetches it with
+/// `fetch`, stores it and answers it; where the fetch fails, answers the copy, else letmeknow.dev's built-in directory,
+/// else the failure. A fetch is not repeated for `RETRY` after one that failed or started, so lookups during a fetch
+/// do not start another.
+fn cached(dir: PathBuf, fetch: Resolve) -> Resolve {
+    let failed: Arc<Mutex<BTreeMap<String, Instant>>> = Default::default();
+    Arc::new(move |domain: String| -> BoxFuture<Result<Directory>> {
+        let (dir, fetch, failed) = (dir.clone(), fetch.clone(), failed.clone());
+        Box::pin(async move {
+            let file = dir.join(format!("{}.json", domain.replace(':', "_")));
+            if age(&file).is_some_and(|age| age < FRESH) && let Some(directory) = stored(&file) {
+                return Ok(directory);
+            }
+            let recent = {
+                let mut failed = failed.lock().unwrap();
+                let recent = failed.get(&domain).is_some_and(|at| at.elapsed() < RETRY);
+                if !recent {
+                    failed.insert(domain.clone(), Instant::now());
+                }
+                recent
+            };
+            let fetched = if recent {
+                Err(anyhow!("a fetch of {domain} started less than a minute ago and has not succeeded"))
+            } else {
+                let fetched = fetch(domain.clone()).await;
+                if fetched.is_ok() {
+                    failed.lock().unwrap().remove(&domain);
+                }
+                fetched
+            };
+            match fetched {
+                Ok(directory) => {
+                    std::fs::create_dir_all(&dir)?;
+                    std::fs::write(&file, serde_json::to_vec(&directory)?)?;
+                    Ok(directory)
+                }
+                Err(error) => match stored(&file) {
+                    Some(directory) => Ok(directory),
+                    None if domain == DOMAIN => Ok(Directory::builtin()),
+                    None => Err(error),
+                },
+            }
+        })
+    })
+}
+
+fn stored(file: &Path) -> Option<Directory> {
+    Directory::parse(&std::fs::read(file).ok()?).ok()
+}
+
+fn age(file: &Path) -> Option<Duration> {
+    std::fs::metadata(file).ok()?.modified().ok()?.elapsed().ok()
+}
+
+/// The directory of the own membership service at `domain`. Its key is pinned in `home` at the first directory that names
+/// one; a later directory naming another key is refused, and letmeknow.dev's must name the built-in key.
+async fn own_directory(home: &Path, network: &Network, domain: &str) -> Result<Directory> {
+    ensure!(
+        !domain.contains('@') && domain != "letmeknow.dev",
+        "--membership <domain> names a membership service by its domain, such as {DOMAIN}, not {domain}: letmeknow 0.17's <key>@<relay> and letmeknow.dev are refused"
+    );
+    check_domain(domain)?;
+    let directory = (network.resolve)(domain.to_owned()).await.with_context(|| format!("the membership service {domain} has no directory"))?;
+    let key = hex::encode(directory.key);
+    ensure!(domain != DOMAIN || key == MEMBERSHIP_KEY, "{DOMAIN}'s directory names key {key}, not letmeknow's {MEMBERSHIP_KEY}");
+    let pins = home.join("membership.json");
+    let mut pinned: BTreeMap<String, String> = if pins.exists() { serde_json::from_slice(&std::fs::read(&pins)?)? } else { BTreeMap::new() };
+    match pinned.get(domain) {
+        Some(pin) => ensure!(*pin == key, "the directory of {domain} names key {key}, but this home pinned {pin} at its first start"),
+        None => {
+            pinned.insert(domain.to_owned(), key);
+            std::fs::write(&pins, serde_json::to_vec(&pinned)?)?;
+        }
+    }
+    Ok(directory)
 }
 
 /// Runs a session process until `shutdown`: opens its command channel and its node; the session acts for the device
@@ -80,20 +217,28 @@ pub async fn listen(
     let format = home.join("format");
     let found = std::fs::read_to_string(&format).ok().map(|found| found.trim().to_owned());
     match found.as_deref() {
-        Some("6") => {}
+        Some("7") => {}
         None if !home.join("device.json").exists() => {}
+        Some("6") => bail!(
+            "{home} holds state that letmeknow 0.17 wrote (format 6), which this one cannot read: to keep using it, run `npx -y @letmeknow/cli@0.17 --home {home} listen`, or use another --home for this one",
+            home = home.display()
+        ),
         Some("5") => bail!(
             "{home} holds state that letmeknow 0.16 wrote (format 5), which this one cannot read: to keep using it, run `npx -y @letmeknow/cli@0.16 --home {home} listen`, or use another --home for this one",
             home = home.display()
         ),
-        Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 6) => bail!(
+        Some(newer) if newer.parse::<u32>().is_ok_and(|format| format > 7) => bail!(
             "{home} holds state that a newer letmeknow wrote (format {newer}), which this one cannot read: run the newest release, `npx -y @letmeknow/cli@latest --home {home} listen`, or use another --home for this one",
             home = home.display()
         ),
         _ => bail!("{} holds the state of an earlier letmeknow, which this one cannot read: move it away, or use another --home", home.display()),
     }
     cli::private_dir(&config.dir)?;
-    std::fs::write(&format, "6\n")?;
+    std::fs::write(&format, "7\n")?;
+    let directory = own_directory(home, &network, &config.membership).await?;
+    let membership = Service::Serve { key: Bytes(directory.key.to_vec()), domain: config.membership.clone(), rest: Default::default() };
+    let relays = directory.relays.iter().map(|relay| relay.parse()).collect::<Result<_, _>>()?;
+    let network = Network { relays, ..network };
     // One process runs a session, even when two start at once.
     let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(config.dir.join("session.lock"))?;
     match held.try_lock() {
@@ -113,16 +258,14 @@ pub async fn listen(
     let node_config = node_config(&network, home, &config.handle, None, config.dir.join("files"), kinds);
     let (node, events) = Node::start(provider, node_config).await?;
     let lookup = newer_minor(network.clone(), config.registry.clone());
-    let (session, newer) = tokio::join!(session::Session::open(config, db, node, home, network, inbound, held), lookup);
+    let (session, newer) = tokio::join!(session::Session::open(config, db, node, home, network, inbound, held, membership), lookup);
     session::run(session?, queue, events, print, shutdown, newer).await
 }
 
 /// The version of the newest release on `registry`, if its minor version is newer than this one's. Nothing if the registry
 /// does not answer within `LOOKUP`.
 async fn newer_minor(network: Network, registry: String) -> Option<String> {
-    let tls = network.ca.client_config(Arc::new(rustls::crypto::ring::default_provider())).ok()?;
-    let client = reqwest::Client::builder().tls_backend_preconfigured(tls).timeout(LOOKUP).build().ok()?;
-    let body = client.get(format!("{registry}/@letmeknow/cli")).send().await.ok()?.text().await.ok()?;
+    let body = network.http.get(format!("{registry}/@letmeknow/cli")).timeout(LOOKUP).send().await.ok()?.text().await.ok()?;
     let latest = semver::Version::parse(serde_json::from_str::<Value>(&body).ok()?["dist-tags"]["latest"].as_str()?).ok()?;
     let own = semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("this crate's version");
     ((latest.major, latest.minor) > (own.major, own.minor)).then(|| latest.to_string())
@@ -203,7 +346,9 @@ fn node_config(network: &Network, home: &Path, handle: &str, device: Option<Devi
     lmk_node::Config {
         handle: handle.into(),
         device,
-        relay: network.relay.clone(),
+        relays: network.relays.clone(),
+        chosen: network.chosen.clone(),
+        resolve: network.resolve.clone(),
         ca: network.ca.clone(),
         home: Some(home.to_path_buf()),
         files: Some(files),

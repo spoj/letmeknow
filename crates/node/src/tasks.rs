@@ -14,22 +14,25 @@ use lmk_net::Net;
 use lmk_proto::group::{Leaf, REVISION};
 use lmk_proto::links::FileLink;
 use lmk_proto::Bytes;
-use n0_future::task::spawn;
-use n0_future::time::sleep;
+use n0_future::{join_all, task::spawn};
+use n0_future::time::{Duration, sleep};
 use tokio::sync::mpsc;
 
-use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, device_key_key, duties, endpoint_id, get, hex, iroh_key, logs, now, rec_key};
+use crate::{COLLECT, Config, Event, G, Inner, MEMBER_WAIT, Node, Out, Rec, State, Work, admission, device_key_key, duties, endpoint_id, get, hex, iroh_key, logs, now, peering, rec_key};
 
 /// How long a fetch keeps looking for a member that holds the file.
 const FETCH_TRIES: u32 = 12;
+/// How often identities whose public logs could not be read are read again, as their directories may answer by then.
+const READ_RETRY: Duration = Duration::from_secs(30);
 
 impl<P: Provider + Send + 'static> Node<P> {
     /// Opens the session in `provider`, creating it on first use, and starts its peers.
     pub async fn start(provider: P, mut config: Config) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let ca = std::mem::take(&mut config.ca);
-        let endpoint = lmk_net::builder([config.relay.clone()]).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
-        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), relay: config.relay.to_string(), kinds: config.kinds.clone(), revision: REVISION };
-        let clients = logs::Clients::new(endpoint.clone());
+        let home = if config.chosen.is_empty() { config.relays.clone() } else { config.chosen.clone() };
+        let endpoint = lmk_net::builder(home).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
+        let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), kinds: config.kinds.clone(), revision: REVISION };
+        let clients = logs::Clients::new(endpoint.clone(), config.resolve.clone());
         let state = State::open(provider, &config, leaf)?;
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
@@ -39,7 +42,9 @@ impl<P: Provider + Send + 'static> Node<P> {
             net: OnceLock::new(),
             clients,
             follows: Mutex::default(),
-            relay: config.relay.clone(),
+            relays: config.relays.clone(),
+            chosen: config.chosen.clone(),
+            resolve: config.resolve.clone(),
             file_limit: config.file_limit,
             kinds: config.kinds,
             events,
@@ -54,6 +59,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             timers: Mutex::default(),
             tasks: Mutex::default(),
             contradictions: Mutex::default(),
+            misdirected: Mutex::default(),
         });
         let net_config = lmk_net::Config { home: config.home, files: config.files, disk: config.disk, file_limit: config.file_limit, collect: COLLECT };
         let (net, net_events) = Net::spawn(endpoint, net_config, inner.clone(), Arc::new(admission::Admitter(inner.clone()))).await?;
@@ -81,7 +87,14 @@ impl<P: Provider> State<P> {
             groups.insert(gid.0, G::new(mls, rec));
         }
         let bindings = get(&provider, b"node/identity-bindings")?.unwrap_or_default();
-        let hints = get(&provider, b"node/hints")?.unwrap_or_default();
+        let mut hints = BTreeMap::new();
+        for g in groups.values() {
+            for leaf in g.mls.members().iter().filter_map(|member| member.leaf.as_ref()) {
+                if let Some(hint) = get::<peering::Hint>(&provider, &peering::hint_key(&leaf.key.0))? {
+                    hints.insert(leaf.key.clone(), hint);
+                }
+            }
+        }
         let peers = Peers::new(now(), u64::from_be_bytes(lmk_core::random()), *iroh_key(&provider)?.public().as_bytes());
         let mut state = State {
             bindings,
@@ -160,6 +173,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
         drop(st);
         self.spawn(self.clone().resume());
+        self.spawn(self.clone().reread_identities());
         self.spawn(self.clone().polling());
     }
 
@@ -204,18 +218,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
         }
     }
 
-    /// Dials a member, at the relay it last said it was on or else its leaf names, and then this session's, and tells
-    /// `Peers` how it went.
+    /// Dials a member, at the relay it last said it was on, then its fallback, and tells `Peers` how it went.
     fn dial(self: &Arc<Self>, peer: EndpointId) {
-        let relay = {
-            let st = self.lock();
-            let leaf = st.groups.values().flat_map(|g| g.mls.members()).filter_map(|m| m.leaf).find(|leaf| endpoint_id(&leaf.key.0) == Some(peer)).map(|leaf| leaf.relay);
-            st.hints.get(&Bytes(peer.as_bytes().to_vec())).map(|hint| hint.relay.clone()).or(leaf)
-        };
-        let hint: Vec<RelayUrl> = relay.and_then(|relay| relay.parse().ok()).into_iter().collect();
+        let hint: Vec<RelayUrl> = self.lock().hint_of(&peer).into_iter().chain(self.chosen.clone()).collect();
         let inner = self.clone();
         spawn(async move {
-            let dialed = inner.net().dial(peer, hint, vec![inner.relay.clone()]).await;
+            let dialed = inner.net().dial(peer, hint, Box::pin(inner.clone().fallback(peer))).await;
             if let Err(error) = &dialed {
                 tracing::debug!("dialing {}: {error:#}", peer.fmt_short());
             }
@@ -223,6 +231,47 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let now = st.tick();
             st.peers.dialed(peer.as_bytes(), dialed.is_ok(), now);
         });
+    }
+
+    /// The relays a member may be reached at: this session's own, the relay of the service of each group the member is
+    /// in, and the relays of the identity it speaks as. The directories resolve together; one that does not adds none.
+    async fn fallback(self: Arc<Self>, peer: EndpointId) -> Vec<RelayUrl> {
+        let (groups, identities) = {
+            let st = self.lock();
+            let (mut groups, mut identities) = (Vec::new(), Vec::new());
+            for g in st.groups.values() {
+                let members = g.mls.members();
+                let Some(member) = members.iter().find(|m| m.leaf.as_ref().and_then(|leaf| endpoint_id(&leaf.key.0)) == Some(peer)) else { continue };
+                let service = g.mls.settings().membership;
+                if !groups.contains(&service) {
+                    groups.push(service);
+                }
+                if let Some(identity) = member.credential.as_ref().and_then(|credential| credential.identity())
+                    && let Some(log) = st.public.get(&identity.id.0)
+                    && !identities.contains(&log.membership)
+                {
+                    identities.push(log.membership.clone());
+                }
+            }
+            (groups, identities)
+        };
+        let resolve = &self.resolve;
+        let services = groups.iter().map(|service| (service, false)).chain(identities.iter().map(|service| (service, true)));
+        let found = join_all(services.map(|(service, identity)| async move {
+            let found = lmk_membership::client::directory(resolve, service).await;
+            found.map(|found| if identity { found.relays } else { vec![found.relay] }).unwrap_or_default()
+        }))
+        .await;
+        let mut relays = self.relays.clone();
+        relays.extend(found.iter().flatten().filter_map(|relay| relay.parse().ok()));
+        relays
+    }
+
+    async fn reread_identities(self: Arc<Self>) {
+        loop {
+            sleep(READ_RETRY).await;
+            self.refresh_all().await;
+        }
     }
 
     /// Fetches, in the background, the files linked anew that are within this session's limit.
@@ -302,7 +351,7 @@ mod tests {
             let fail = Arc::new(AtomicBool::new(false));
             let failing = fail.clone();
             let config = Config {
-                handle: "Alice".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
+                handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
                 home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
                 durable: Some(Arc::new(move || {
                     let fail = failing.load(Ordering::SeqCst);
@@ -375,7 +424,7 @@ mod tests {
             release: Arc::new(tokio::sync::Notify::new()),
         });
         let config = Config {
-            handle: "Writer".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
+            handle: "Writer".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
             home: None, files: None, disk: Some(disk.clone()), file_limit: 0, kinds: vec![], durable: None,
         };
         let (writer, _) = Node::start(MemoryProvider::default(), config).await.unwrap();
@@ -386,7 +435,7 @@ mod tests {
             let fail = Arc::new(AtomicBool::new(false));
             let failing = fail.clone();
             let config = Config {
-                handle: "Reader".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
+                handle: "Reader".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
                 home: None, files: None, disk: Some(disk.clone()), file_limit: 0, kinds: vec!["test".into()],
                 durable: Some(Arc::new(move || {
                     let fail = failing.load(Ordering::SeqCst);
@@ -446,7 +495,7 @@ mod tests {
     async fn failed_durability_closes_peer_outbox_and_withholds_client_effects() {
         let relay = lmk_testing::relay().await;
         let config = Config {
-            handle: "Alice".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
+            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
             home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
             durable: Some(Arc::new(|| Box::pin(async { anyhow::bail!("injected persistence failure") }))),
         };
@@ -470,7 +519,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let saved = release.clone();
         let config = Config {
-            handle: "Alice".into(), device: None, relay: relay.url.clone(), ca: relay.ca(),
+            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
             home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
             durable: Some(Arc::new(move || {
                 saving.notify_one();

@@ -8,20 +8,22 @@
 //! strings; message ids and fingerprints are hex, other bytes base64url.
 #![cfg(target_arch = "wasm32")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use js_sys::{Array, Function, Promise, Uint8Array};
-use lmk_client::{Access, Chat, Client, ClientEvent, File, Request, fp, message_id, service};
+use lmk_client::{Access, Chat, Client, ClientEvent, File, Request, fp, message_id};
 use lmk_node::identity::{Identity, Presence};
 use lmk_node::lmk_core::provider::RustCrypto;
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
+use lmk_membership::client::Resolve;
 use lmk_node::{COLLECT, Disk, Node, now};
 use lmk_proto::Bytes;
-use lmk_proto::group::{CHAT, ChatMessage, IDENTITY, PROTOCOL, Settings};
+use lmk_proto::directory::{Directory, check_domain};
+use lmk_proto::group::{CHAT, ChatMessage, IDENTITY, PROTOCOL, Service, Settings};
 use lmk_proto::links::{FileLink, Invite};
 use n0_future::boxed::BoxFuture;
 use n0_future::time::{Duration, sleep};
@@ -66,6 +68,14 @@ extern "C" {
     /// Resolves to a kept file's ciphertext.
     #[wasm_bindgen(method, js_name = loadFile)]
     fn load_file(this: &Idb, hash: &str) -> Promise;
+    /// The directory text kept for a domain, if any: a domain's directories are kept and fetched by the page.
+    #[wasm_bindgen(method, js_name = loadDirectory)]
+    fn load_directory(this: &Idb, domain: &str) -> Promise;
+    #[wasm_bindgen(method, js_name = saveDirectory)]
+    fn save_directory(this: &Idb, domain: &str, text: &str) -> Promise;
+    /// The body of the directory published at a URL, as the page fetches it.
+    #[wasm_bindgen(method, js_name = fetchDirectory)]
+    fn fetch_directory(this: &Idb, url: &str) -> Promise;
 }
 
 /// The files kept in IndexedDB, which the session loads and saves through the page.
@@ -280,12 +290,93 @@ fn unb64(text: &str) -> Result<Vec<u8>> {
     Ok(serde_json::from_value::<Bytes>(json!(text))?.0)
 }
 
+/// A directory younger than this is answered as it is.
+const DIRECTORY_AGE: u64 = 10 * 60 * 1000;
+
+/// A domain whose last fetch failed, or is still under way, is not fetched again for this long.
+const DIRECTORY_RETRY: u64 = 60 * 1000;
+
+/// A directory the browser fetched, and when.
+#[derive(Serialize, Deserialize)]
+struct Fetched {
+    at: u64,
+    directory: Directory,
+}
+
+/// The default membership's domain and directory, from backend.json.
+#[derive(Clone, Deserialize)]
+struct Backend {
+    domain: String,
+    directory: Directory,
+}
+
+/// The directories the node asks for, answered from the page's storage and fetch, each lookup in a task of its own.
+fn resolver(idb: Idb, backend: Backend) -> Resolve {
+    let (asks, mut asked) = mpsc::unbounded_channel::<(String, oneshot::Sender<Result<Directory>>)>();
+    let failed: Arc<Mutex<HashMap<String, u64>>> = Arc::default();
+    spawn_local(async move {
+        while let Some((domain, reply)) = asked.recv().await {
+            let (idb, backend): (Idb, Backend) = (idb.clone().unchecked_into(), backend.clone());
+            let failed = failed.clone();
+            spawn_local(async move {
+                reply.send(directory(&idb, &backend, &failed, &domain).await).ok();
+            });
+        }
+    });
+    Arc::new(move |domain: String| -> BoxFuture<Result<Directory>> {
+        let (reply, answer) = oneshot::channel();
+        asks.send((domain, reply)).ok();
+        Box::pin(async move { answer.await? })
+    })
+}
+
+/// A domain's directory: one kept less than `DIRECTORY_AGE` ago, else the one fetched now, which is kept. When the
+/// fetch fails, the kept one, else the backend's if the domain is the default. A fetch is not repeated for
+/// `DIRECTORY_RETRY` after one that failed or started, so lookups during a fetch do not start another.
+async fn directory(idb: &Idb, backend: &Backend, failed: &Mutex<HashMap<String, u64>>, domain: &str) -> Result<Directory> {
+    let kept = JsFuture::from(idb.load_directory(domain)).await.map_err(|e| anyhow!("loading a directory: {e:?}"))?;
+    let kept: Option<Fetched> = kept.as_string().map(|text| serde_json::from_str(&text)).transpose()?;
+    if let Some(kept) = kept.as_ref().filter(|kept| now() < kept.at + DIRECTORY_AGE) {
+        return Ok(kept.directory.clone());
+    }
+    let retry_at = failed.lock().unwrap().get(domain).copied();
+    let fetched = match retry_at {
+        Some(at) if now() < at + DIRECTORY_RETRY => Err(anyhow!("a fetch of {domain} started less than a minute ago and has not succeeded")),
+        _ => {
+            failed.lock().unwrap().insert(domain.to_owned(), now());
+            let fetched = async {
+                let body = JsFuture::from(idb.fetch_directory(&Directory::url(domain))).await.map_err(|e| anyhow!("fetching {domain}: {e:?}"))?;
+                Directory::parse(&Uint8Array::new(&body).to_vec())
+            }
+            .await;
+            if fetched.is_ok() {
+                failed.lock().unwrap().remove(domain);
+            }
+            fetched
+        }
+    };
+    match fetched {
+        Ok(directory) => {
+            let text = serde_json::to_string(&Fetched { at: now(), directory: directory.clone() })?;
+            JsFuture::from(idb.save_directory(domain, &text)).await.map_err(|e| anyhow!("saving a directory: {e:?}"))?;
+            Ok(directory)
+        }
+        Err(error) => match kept {
+            Some(kept) => Ok(kept.directory),
+            None if domain == backend.domain => Ok(backend.directory.clone()),
+            None => Err(error),
+        },
+    }
+}
+
 #[derive(Deserialize)]
 struct Config {
     /// This device's name: used only when the browser has no session yet.
     device: String,
-    relay: String,
+    /// The membership's domain, and the relays chosen for it: none, for its directory's.
     membership: String,
+    relays: Vec<String>,
+    backend: Backend,
 }
 
 struct App {
@@ -387,10 +478,26 @@ impl App {
                 saved.await?
             })
         });
+        config.backend.directory.check()?;
+        check_domain(&config.backend.domain)?;
+        check_domain(&config.membership)?;
+        let resolve = resolver(idb.clone().unchecked_into(), config.backend.clone());
+        let own = resolve(config.membership.clone()).await?;
+        ensure!(
+            config.membership != config.backend.domain || own.key == config.backend.directory.key,
+            "{} names key {}, but this app is built for key {}",
+            config.membership,
+            hex::encode(own.key),
+            hex::encode(config.backend.directory.key)
+        );
+        let relays = own.relays.iter().map(|relay| relay.parse()).collect::<Result<Vec<_>, _>>()?;
+        let chosen = config.relays.iter().map(|relay| relay.parse()).collect::<Result<Vec<_>, _>>()?;
         let node_config = lmk_node::Config {
             handle: String::new(),
             device: Some(device.clone()),
-            relay: config.relay.parse()?,
+            relays,
+            chosen,
+            resolve,
             ca: Default::default(),
             home: None,
             files: None,
@@ -402,7 +509,7 @@ impl App {
         let (node, mut events) = Node::start(store.clone(), node_config).await?;
         let saved = store.clone();
         let devices = Identity::new(node.clone(), device.clone(), Arc::new(move |device: &Device| put(&saved, b"web/device", device)));
-        let membership = service(&config.membership)?;
+        let membership = Service::Serve { key: Bytes(own.key.to_vec()), domain: config.membership, rest: Default::default() };
         let (lines, written) = mpsc::unbounded_channel();
         let plugins = InPage {
             docs: Mutex::new(lmk_kinds::Page::new(lmk_kinds::Kind::Doc, PageStore(store.clone()))),

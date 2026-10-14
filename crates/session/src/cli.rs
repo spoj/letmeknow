@@ -41,12 +41,12 @@ pub enum Command {
         /// Keep the text of messages once delivered, for audit; by default only ids, senders and references are kept
         #[arg(long)]
         keep_log: bool,
-        /// The membership service for groups and identities this session creates: letmeknow.dev, or <key, hex>@<relay URL>
-        #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = "letmeknow.dev")]
+        /// The domain of the membership service for groups and identities this session creates
+        #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = lmk_proto::links::DOMAIN)]
         membership: String,
-        /// The relay this session is reached through
-        #[arg(long, env = "LETMEKNOW_RELAY", default_value = crate::RELAY)]
-        relay: String,
+        /// A relay this session is reached through, instead of its directory's; repeat for several
+        #[arg(long, env = "LETMEKNOW_RELAY", value_delimiter = ',')]
+        relay: Vec<String>,
     },
     /// This machine's sessions: each one's handle, whether it runs, and its groups
     Sessions {
@@ -69,9 +69,12 @@ pub enum SessionsOp {
     /// Stop a session if it runs, leave its groups, and delete it, once the other members have removed it from each group
     Remove {
         handle: String,
-        /// The relay the session is reached through
-        #[arg(long, env = "LETMEKNOW_RELAY", default_value = crate::RELAY)]
-        relay: String,
+        /// The domain of the session's membership service
+        #[arg(long, env = "LETMEKNOW_MEMBERSHIP", default_value = lmk_proto::links::DOMAIN)]
+        membership: String,
+        /// A relay the session is reached through, instead of its directory's; repeat for several
+        #[arg(long, env = "LETMEKNOW_RELAY", value_delimiter = ',')]
+        relay: Vec<String>,
     },
 }
 
@@ -222,7 +225,7 @@ fn hyphens(command: clap::Command) -> clap::Command {
 pub fn home_dir(home: Option<PathBuf>) -> Result<PathBuf> {
     match home {
         Some(home) => Ok(home),
-        None => Ok(dirs::data_local_dir().context("no local data directory")?.join("letmeknow-v6")),
+        None => Ok(dirs::data_local_dir().context("no local data directory")?.join("letmeknow-v7")),
     }
 }
 
@@ -452,6 +455,13 @@ mod tests {
         assert_eq!((to, text.as_str(), urgent), (vec!["-Ia".to_owned()], "- an item", true));
         assert!(matches!(parse(["letmeknow", "read", "-Ia"]).unwrap().command, Command::Request(Request::Read { id, .. }) if id == "-Ia"));
         assert_eq!(parse(["letmeknow", "send", "--help"]).err().unwrap().kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn relays_repeat_and_the_membership_is_a_domain() {
+        let cli = parse(["letmeknow", "listen", "--relay", "https://a.example", "--relay", "https://b.example"]).unwrap();
+        let Command::Listen { membership, relay, .. } = cli.command else { panic!("not listen") };
+        assert_eq!((membership.as_str(), relay), ("relay.letmeknow.dev", vec!["https://a.example".to_owned(), "https://b.example".into()]));
     }
 
     #[test]

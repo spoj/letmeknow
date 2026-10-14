@@ -153,7 +153,7 @@ mod tests {
     use lmk_proto::group::{Certificate, IdentityRef};
 
     fn service() -> Service {
-        crate::group::tests::service("https://lmk.example")
+        crate::group::tests::service("lmk.example")
     }
 
     fn replay(id: &[u8; 32], log: &[Vec<u8>]) -> PublicLog {
@@ -194,7 +194,7 @@ mod tests {
     fn genesis_is_bound_to_its_bytes_service_writer_and_v2_domain() {
         let seed = crate::random();
         let (id, first) = create(&seed, service());
-        let (elsewhere, _) = create(&seed, crate::group::tests::service("https://elsewhere.example"));
+        let (elsewhere, _) = create(&seed, crate::group::tests::service("elsewhere.example"));
         assert!(PublicLog::replay(&elsewhere, [first.as_slice()]).is_err());
         let mut entry = open(&id, &first).unwrap();
         entry.sig = Bytes(sign(&seed, &[b"letmeknow public log v1\0", entry.body.0.as_slice()].concat()));
@@ -243,7 +243,7 @@ mod tests {
                 assert_eq!(log.verify(&bad), Verdict::Unverified);
             }
             let mut hint = good.clone();
-            hint.certificate.as_mut().unwrap().identity.membership = crate::group::tests::service("https://hint.example");
+            hint.certificate.as_mut().unwrap().identity.membership = crate::group::tests::service("hint.example");
             assert_eq!(log.verify(&hint), Verdict::Authorized, "route hint is not signed authority");
         }
         let other = crate::random();

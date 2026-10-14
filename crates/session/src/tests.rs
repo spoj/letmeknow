@@ -3,12 +3,18 @@
 //! channels.
 
 use anyhow::Result;
-use lmk_proto::group::Service;
+use lmk_proto::directory::Directory;
+use lmk_serve::{Certificate, ServeConfig};
 use lmk_testing::{Relay, relay};
+use n0_future::boxed::BoxFuture;
+use rustls_pki_types::CertificateDer;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cli::{Command, Request, session_dir};
@@ -22,10 +28,14 @@ const HOUR: Duration = Duration::from_secs(3600);
 const WAIT: Duration = Duration::from_secs(60);
 
 struct World {
-    relay: Relay,
+    /// Keeps the relay running.
+    _relay: Relay,
     network: crate::Network,
     root: tempfile::TempDir,
     plugins: Vec<PathBuf>,
+    /// The membership service its own `serve` runs at: its domain, and its key in hex.
+    domain: String,
+    key: String,
 }
 
 /// Where cargo builds the workspace's binaries, the kinds' plugins among them: beside this test's own directory.
@@ -42,8 +52,48 @@ async fn world(test: &str) -> World {
     let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_test_writer().try_init();
     let relay = relay().await;
     let root = tempfile::Builder::new().prefix(&format!("lmk-session-{test}-")).tempdir().unwrap();
-    let network = crate::Network { relay: relay.url.clone(), ca: relay.ca() };
-    World { relay, network, root, plugins: vec![built()] }
+    let (domain, key, cert) = service(&root.path().join("service")).await;
+    let ca = iroh::tls::CaTlsConfig::custom_roots([relay.cert.clone(), cert]);
+    let network = crate::Network::new(root.path(), &[relay.url.to_string()], ca).unwrap();
+    World { _relay: relay, network, root, plugins: vec![built()], domain, key }
+}
+
+/// A port free for TCP and UDP, below the ephemeral range: a port `bind(0)` returned could be taken by another test's relay
+/// or endpoint before the service binds it. No two tests of this process get the same one, though both could find it free.
+fn free_port() -> u16 {
+    static TAKEN: std::sync::Mutex<BTreeSet<u16>> = std::sync::Mutex::new(BTreeSet::new());
+    loop {
+        let port = rand::random_range(1024..32768);
+        if TAKEN.lock().unwrap().insert(port) && std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() && std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
+}
+
+/// A membership service run by `serve` in `state`, at a localhost domain of its own with a certificate of its own: its
+/// domain, its key in hex, and its certificate.
+async fn service(state: &Path) -> (String, String, CertificateDer<'static>) {
+    let mut config = ServeConfig::new("localhost", state);
+    (config.https_port, config.qad_port, config.membership_port) = (free_port(), free_port(), free_port());
+    config.http_port = Some(free_port());
+    config.policy.appends_per_minute = u32::MAX;
+    let lmk_proto::group::Service::Serve { key, .. } = config.initialize().unwrap() else { unreachable!() };
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    std::fs::write(state.join("cert.pem"), certified.cert.pem()).unwrap();
+    std::fs::write(state.join("key.pem"), certified.signing_key.serialize_pem()).unwrap();
+    config.certificate = Certificate::Files { chain: state.join("cert.pem"), key: state.join("key.pem") };
+    let (domain, https) = (config.domain(), config.https_port);
+    let mut serving = tokio::spawn(lmk_serve::serve(config));
+    let listening = async {
+        while std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, https)).is_err() {
+            if serving.is_finished() {
+                (&mut serving).await.unwrap().unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(WAIT, listening).await.expect("the service listens");
+    (domain, hex::encode(key.0), certified.cert.der().clone())
 }
 
 struct Agent {
@@ -59,10 +109,6 @@ struct Agent {
 }
 
 impl World {
-    fn membership(&self) -> Service {
-        self.relay.service.clone()
-    }
-
     /// A session process in its own home: its own device.
     async fn start(&self, handle: &str, hold: Duration) -> Agent {
         self.start_in(handle, handle, hold).await
@@ -80,7 +126,7 @@ impl World {
             dir: session_dir(&self.root.path().join(device), handle).unwrap(),
             hold: HOUR,
             keep_log: false,
-            membership: self.membership(),
+            membership: self.domain.clone(),
             plugins: self.plugins.clone(),
             registry: "http://127.0.0.1:1".into(),
         }
@@ -109,7 +155,7 @@ impl World {
         });
         let mut agent = Agent { handle, home, fp: String::new(), device: String::new(), events, stop: Some(stop), done: Some(done), ready: Value::Null };
         let ready = agent.expect("ready").await;
-        assert!(keys(&ready).is_superset(&keys(&json!({ "type": 0, "session": 0, "name": 0, "fp": 0, "bin": 0 }))), "{ready}");
+        assert!(keys(&ready).is_superset(&keys(&json!({ "type": 0, "session": 0, "name": 0, "fp": 0, "bin": 0, "membership": 0 }))), "{ready}");
         agent.fp = ready["fp"].as_str().unwrap().into();
         agent.device = ready["name"].as_str().unwrap().into();
         agent.ready = ready;
@@ -207,7 +253,7 @@ async fn pair(world: &World, hold: Duration) -> (Agent, Agent, String) {
     let invite = alice.cmd(&["invite"]).await.unwrap();
     assert_eq!(keys(&invite), keys(&json!({ "link": 0, "group": 0, "kind": 0, "expires_in": 0 })));
     let link = invite["link"].as_str().unwrap();
-    assert!(link.starts_with("https://letmeknow.dev/i#6.g."));
+    assert!(link.starts_with("https://letmeknow.dev/i#7.g."));
     let joined = bob.cmd(&["join", link]).await.unwrap();
     assert_eq!(joined["group"], invite["group"]);
     assert_eq!(joined["members"].as_array().unwrap().len(), 2);
@@ -690,7 +736,7 @@ fn a_device_is_on_one_identity_which_lists_and_loses_devices() {
         assert_eq!(listed["devices"][0]["you"], true);
         assert_eq!(listed["name"], "Alice Smith");
         let invite = alice.cmd(&["identity", "invite"]).await.unwrap();
-        assert!(invite["link"].as_str().unwrap().contains("#6.d."));
+        assert!(invite["link"].as_str().unwrap().contains("#7.d."));
         let phone = world.start("phone", HOUR).await;
         let refused = phone.cmd(&["join", invite["link"].as_str().unwrap()]).await.unwrap_err().to_string();
         assert!(refused.contains("letmeknow identity join <link>"), "{refused}");
@@ -1111,7 +1157,7 @@ fn a_session_goes_on_while_a_join_waits() {
         let (alice, mut bob, group) = pair(&world, HOUR).await;
         let link = alice.cmd(&["invite", &format!("--group={group}")]).await.unwrap()["link"].as_str().unwrap().to_owned();
         let mut invite = lmk_proto::links::Invite::parse(&link).unwrap();
-        invite.members[0].key = *iroh::SecretKey::generate().public().as_bytes();
+        invite.members[0] = *iroh::SecretKey::generate().public().as_bytes();
         let (home, handle) = (bob.home.clone(), bob.handle.clone());
         let join = lmk_client::Request::Join { target: invite.link(), args: Vec::new(), cwd: String::new() };
         let joining = tokio::task::spawn_local(async move { crate::cli::call(&home, &handle, Request::Client(join)).await });
@@ -1201,7 +1247,11 @@ fn a_leave_then_a_removal_finishes_on_the_removal() {
 fn a_home_of_another_format_is_refused_and_names_its_release() {
     local(async {
         let world = world("format").await;
-        for (format, names, run) in [("5", "letmeknow 0.16", "@letmeknow/cli@0.16"), ("7", "a newer letmeknow", "@letmeknow/cli@latest")] {
+        for (format, names, run) in [
+            ("5", "letmeknow 0.16", "@letmeknow/cli@0.16"),
+            ("6", "letmeknow 0.17", "@letmeknow/cli@0.17"),
+            ("8", "a newer letmeknow", "@letmeknow/cli@latest"),
+        ] {
             let home = world.root.path().join(format!("format-{format}"));
             std::fs::create_dir_all(&home).unwrap();
             std::fs::write(home.join("format"), format!("{format}\n")).unwrap();
@@ -1219,11 +1269,11 @@ fn a_home_of_another_format_is_refused_and_names_its_release() {
 fn ready_names_a_newer_minor_version_and_the_command_to_run_it() {
     local(async {
         let world = world("newer").await;
-        let newer = registry(r#"{"dist-tags":{"latest":"0.18.2"}}"#, Duration::ZERO).await;
+        let newer = registry(r#"{"dist-tags":{"latest":"0.19.0"}}"#, Duration::ZERO).await;
         let alice = world.launch(Config { registry: newer, ..world.config("alice", "alice") }, usize::MAX).await;
         let home = world.root.path().join("alice");
-        assert_eq!(alice.ready["newer"], "0.18.2");
-        assert_eq!(alice.ready["update"], format!("LETMEKNOW_HOME={} npx -y @letmeknow/cli@0.18 --session alice listen", home.display()));
+        assert_eq!(alice.ready["newer"], "0.19.0");
+        assert_eq!(alice.ready["update"], format!("LETMEKNOW_HOME={} npx -y @letmeknow/cli@0.19 --session alice listen", home.display()));
         let same = registry(r#"{"dist-tags":{"latest":"0.17.4"}}"#, Duration::ZERO).await;
         let bob = world.launch(Config { registry: same, ..world.config("bob", "bob") }, usize::MAX).await;
         assert!(bob.ready.get("newer").is_none(), "{}", bob.ready);
@@ -1236,7 +1286,7 @@ fn ready_names_a_newer_minor_version_and_the_command_to_run_it() {
 fn a_slow_registry_leaves_ready_without_a_notice() {
     local(async {
         let world = world("slow").await;
-        let slow = registry(r#"{"dist-tags":{"latest":"0.18.2"}}"#, Duration::from_secs(10)).await;
+        let slow = registry(r#"{"dist-tags":{"latest":"0.19.0"}}"#, Duration::from_secs(10)).await;
         let started = std::time::Instant::now();
         let alice = world.launch(Config { registry: slow, ..world.config("alice", "alice") }, usize::MAX).await;
         assert!(alice.ready.get("newer").is_none(), "{}", alice.ready);
@@ -1267,4 +1317,97 @@ async fn registry(body: &'static str, delay: Duration) -> String {
         }
     });
     address
+}
+
+/// A session refuses a membership service that is not a domain, names one its home has pinned another key for, or has
+/// no directory, and the refusals name what they concern.
+#[test]
+fn a_membership_domain_is_checked_pinned_and_fetched() {
+    local(async {
+        let world = world("membership").await;
+        let network = world.network.clone();
+        let listen = |config: Config, home: PathBuf| {
+            let network = network.clone();
+            async move { crate::listen(config, &home, network, |_| Ok(()), std::future::pending()).await.unwrap_err().to_string() }
+        };
+        for address in ["letmeknow.dev", "a1b2@https://relay.example.com"] {
+            let config = Config { membership: address.into(), ..world.config("alice", "alice") };
+            let error = listen(config, world.root.path().join("alice")).await;
+            assert!(error.contains("--membership <domain>"), "{error}");
+        }
+        let unreachable = free_port();
+        let config = Config { membership: format!("localhost:{unreachable}"), ..world.config("bob", "bob") };
+        let error = listen(config, world.root.path().join("bob")).await;
+        assert!(error.contains(&format!("localhost:{unreachable}")), "{error}");
+
+        let home = world.root.path().join("carol");
+        std::fs::create_dir_all(&home).unwrap();
+        let other = hex::encode([7u8; 32]);
+        std::fs::write(home.join("membership.json"), json!({ &world.domain: other }).to_string()).unwrap();
+        let config = world.config("carol", "carol");
+        let error = listen(config, home.clone()).await;
+        assert!(error.contains(&other) && error.contains(&world.key), "{error}");
+    });
+}
+
+/// A session's directory is fetched, and a copy of it answers while it is fresh, and where a fetch fails.
+#[tokio::test]
+async fn a_directory_is_cached_and_the_built_in_one_answers_for_letmeknow_dev() {
+    let dir = tempfile::tempdir().unwrap();
+    let served = Directory { key: [1; 32], addrs: vec![], relay: "https://relay.example".into(), relays: vec!["https://relay.example".into()] };
+    let calls = Arc::new(AtomicU32::new(0));
+    let fetch: lmk_membership::client::Resolve = {
+        let (served, calls) = (served.clone(), calls.clone());
+        Arc::new(move |domain: String| -> BoxFuture<anyhow::Result<Directory>> {
+            let (served, calls) = (served.clone(), calls.clone());
+            Box::pin(async move {
+                if calls.fetch_add(1, Ordering::Relaxed) == 0 { Ok(served) } else { anyhow::bail!("{domain} is down") }
+            })
+        })
+    };
+    let cache = dir.path().join("directories");
+    let resolve = crate::cached(cache.clone(), fetch);
+    assert_eq!(resolve("localhost:8443".into()).await.unwrap(), served);
+    assert_eq!(resolve("localhost:8443".into()).await.unwrap(), served);
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "a fresh copy answers without a fetch");
+    let file = std::fs::File::options().write(true).open(cache.join("localhost_8443.json")).unwrap();
+    file.set_modified(SystemTime::now() - Duration::from_secs(3600)).unwrap();
+    assert_eq!(resolve("localhost:8443".into()).await.unwrap(), served, "a failed fetch answers the copy");
+    assert!(resolve("localhost:9443".into()).await.unwrap_err().to_string().contains("is down"));
+    let fetches = calls.load(Ordering::Relaxed);
+    assert!(resolve("localhost:9443".into()).await.is_err());
+    assert_eq!(calls.load(Ordering::Relaxed), fetches, "a failed fetch is not repeated for a minute");
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    let down: lmk_membership::client::Resolve = Arc::new(|domain: String| -> BoxFuture<anyhow::Result<Directory>> {
+        Box::pin(async move { anyhow::bail!("{domain} is down") })
+    });
+    let resolve = crate::cached(dir.path().join("empty"), down);
+    assert_eq!(resolve(lmk_proto::links::DOMAIN.into()).await.unwrap(), Directory::builtin());
+    assert!(resolve("localhost:9443".into()).await.is_err());
+}
+
+/// Lookups that arrive during a fetch do not start another: the first answers its failure, the others answer that they
+/// started too recently.
+#[tokio::test]
+async fn lookups_during_a_fetch_do_not_start_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicU32::new(0));
+    let fetch: lmk_membership::client::Resolve = {
+        let calls = calls.clone();
+        Arc::new(move |domain: String| -> BoxFuture<anyhow::Result<Directory>> {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                anyhow::bail!("{domain} is down")
+            })
+        })
+    };
+    let resolve = crate::cached(dir.path().join("directories"), fetch);
+    let (a, b, c) = tokio::join!(resolve("localhost:8443".into()), resolve("localhost:8443".into()), resolve("localhost:8443".into()));
+    assert!(a.unwrap_err().to_string().contains("is down"));
+    for answer in [b, c] {
+        assert!(answer.unwrap_err().to_string().contains("started less than a minute ago"));
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
 }

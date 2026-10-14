@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use iroh::EndpointId;
+use iroh::{EndpointId, RelayUrl};
 use lmk_core::provider::Provider;
 use lmk_membership::Contradiction;
 use lmk_net::Groups;
@@ -52,11 +52,16 @@ struct Saved {
     at: u64,
 }
 
-/// Where a member said it was: its home relay, and when the summary that said so was signed.
+/// Where a member said it was: its home relay, and when the summary that said so was signed. Saved when the relay
+/// changes, with that summary's time; the newest time is held in memory.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Hint {
     pub relay: String,
     time: u64,
+}
+
+pub(crate) fn hint_key(key: &[u8]) -> Vec<u8> {
+    [b"node/hint/".as_slice(), key].concat()
 }
 
 fn heard_key(gid: &[u8], key: &[u8], joined: u64) -> Vec<u8> {
@@ -113,6 +118,11 @@ impl<P: Provider> State<P> {
             members: members.collect(),
             wanted: g.wanted(now),
         }
+    }
+
+    /// The relay a member last said it was on, which a dial to it tries first.
+    pub(crate) fn hint_of(&self, peer: &EndpointId) -> Option<RelayUrl> {
+        self.hints.get(&Bytes(peer.as_bytes().to_vec())).and_then(|hint| hint.relay.parse().ok())
     }
 
     /// Hands `Peers` this session's state of a group.
@@ -258,11 +268,16 @@ impl<P: Provider> State<P> {
                 continue;
             }
             if let Some(relay) = &summary.relay
+                && relay.parse::<RelayUrl>().is_ok_and(|url| url.scheme() == "https")
                 && let Some(leaf) = self.group(gid)?.mls.members().into_iter().find(|m| m.key == summary.member.0).and_then(|m| m.leaf)
                 && self.hints.get(&leaf.key).is_none_or(|hint| hint.time <= summary.time)
             {
-                self.hints.insert(leaf.key, Hint { relay: relay.clone(), time: summary.time });
-                put(&self.provider, b"node/hints", &self.hints)?;
+                let moved = self.hints.get(&leaf.key).is_none_or(|hint| hint.relay != *relay);
+                let hint = Hint { relay: relay.clone(), time: summary.time };
+                if moved {
+                    put(&self.provider, &hint_key(&leaf.key.0), &hint)?;
+                }
+                self.hints.insert(leaf.key, hint);
             }
             put(&self.provider, &heard_key(gid, &summary.member.0, summary.joined), &Saved { signed, at: now })?;
             let g = self.groups.get_mut(gid).unwrap();
@@ -341,6 +356,17 @@ impl<P: Provider> State<P> {
             let Some(saved) = get::<Saved>(&self.provider, &heard_key(gid, &key.0, joined))? else { continue };
             let summary = serde_json::from_slice(&saved.signed.body.0)?;
             self.peers.summary(&group, peers::Heard { signed: saved.signed, summary, at: saved.at }, None);
+        }
+        Ok(())
+    }
+
+    /// Drops the hints of members, by iroh key, that no group of this session has any longer.
+    pub(crate) fn unhint(&mut self, keys: Vec<Bytes>) -> Result<()> {
+        for key in keys {
+            let held = self.groups.values().any(|g| g.mls.members().iter().any(|m| m.leaf.as_ref().is_some_and(|leaf| leaf.key == key)));
+            if !held && self.hints.remove(&key).is_some() {
+                self.provider.delete(&hint_key(&key.0))?;
+            }
         }
         Ok(())
     }

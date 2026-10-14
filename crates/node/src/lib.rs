@@ -33,6 +33,7 @@ use lmk_core::device::{Device, signer};
 use lmk_core::group::{self as core, Group, Session};
 use lmk_core::public::{PublicLog, Verdict};
 use lmk_core::provider::Provider;
+use lmk_membership::client::Resolve;
 use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::group::{Certificate, Credential, How, IdentityRef, Settings};
@@ -75,7 +76,13 @@ pub struct Config {
     /// The device, where this is a device's node or a browser's one session: its name is its credential's in its
     /// identity groups, each of which this node joins with a key of its own, the device's key on that identity.
     pub device: Option<Device>,
-    pub relay: RelayUrl,
+    /// The relays of this session's directory: the relays it lives on unless `chosen` names others, and the fallback of
+    /// every dial.
+    pub relays: Vec<RelayUrl>,
+    /// The relays this session lives on instead of its directory's; every dial hints them.
+    pub chosen: Vec<RelayUrl>,
+    /// Resolves a domain to its directory, as the shell holds it.
+    pub resolve: Resolve,
     pub ca: CaTlsConfig,
     /// `LETMEKNOW_HOME`, where sessions of one device publish their addresses.
     pub home: Option<PathBuf>,
@@ -543,7 +550,9 @@ pub(crate) struct Inner<P> {
     clients: logs::Clients,
     /// The tasks that follow logs at their services, by log id.
     follows: Mutex<HashMap<Vec<u8>, JoinHandle<()>>>,
-    relay: RelayUrl,
+    relays: Vec<RelayUrl>,
+    chosen: Vec<RelayUrl>,
+    resolve: Resolve,
     file_limit: u64,
     kinds: Vec<String>,
     events: mpsc::UnboundedSender<Event>,
@@ -564,6 +573,8 @@ pub(crate) struct Inner<P> {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// The contradictions reported, each once.
     contradictions: Mutex<HashSet<Contradicted>>,
+    /// The domains whose directories named another key than their service, each reported once.
+    misdirected: Mutex<HashSet<String>>,
 }
 
 /// One member's session. Clones share it.

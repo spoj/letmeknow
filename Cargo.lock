@@ -2564,7 +2564,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "letmeknow"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2576,10 +2576,12 @@ dependencies = [
  "lmk-client",
  "lmk-core",
  "lmk-kinds",
+ "lmk-membership",
  "lmk-node",
  "lmk-proto",
  "lmk-serve",
  "lmk-testing",
+ "n0-future",
  "qrcode",
  "rand 0.9.5",
  "rcgen",
@@ -2864,7 +2866,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "lmk-client"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2883,7 +2885,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-core"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "chacha20poly1305 0.11.0",
@@ -2906,7 +2908,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-kinds"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "csv",
@@ -2920,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-membership"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek 3.0.0",
@@ -2941,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-net"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "bao-tree",
@@ -2966,7 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-node"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek 3.0.0",
@@ -2989,7 +2991,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-proto"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3008,7 +3010,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-serve"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -3020,6 +3022,8 @@ dependencies = [
  "iroh-relay",
  "lmk-membership",
  "lmk-proto",
+ "n0-future",
+ "rand 0.9.5",
  "rcgen",
  "rustls",
  "serde_json",
@@ -3034,13 +3038,15 @@ dependencies = [
 
 [[package]]
 name = "lmk-testing"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
+ "anyhow",
  "ed25519-dalek 3.0.0",
  "iroh",
  "iroh-relay",
  "lmk-membership",
  "lmk-proto",
+ "n0-future",
  "rcgen",
  "rustls",
  "tempfile",
@@ -3048,7 +3054,7 @@ dependencies = [
 
 [[package]]
 name = "lmk-web"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -3056,6 +3062,7 @@ dependencies = [
  "js-sys",
  "lmk-client",
  "lmk-kinds",
+ "lmk-membership",
  "lmk-node",
  "lmk-proto",
  "n0-future",

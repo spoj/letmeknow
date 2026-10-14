@@ -1,6 +1,7 @@
 use letmeknow::cli::{Cli, Command, Request, SessionsOp, call, home_dir, new_handle, running_session, session_dir};
 use letmeknow::kinds;
 use letmeknow::session::Config;
+use letmeknow::Network;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let home = home_dir(cli.home)?;
     match cli.command {
         Command::Listen { hold, keep_log, membership, relay } => {
+            let network = Network::new(&home, &relay, letmeknow::ca()?)?;
             let handle = match cli.session {
                 Some(session) => session,
                 None => new_handle(&home)?,
@@ -39,7 +41,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 handle,
                 hold: Duration::from_secs(hold),
                 keep_log,
-                membership: lmk_client::service(&membership)?,
+                membership,
                 plugins: kinds::dirs(),
                 registry: registry(),
             };
@@ -48,24 +50,25 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 writeln!(std::io::stdout(), "{line}")
             };
             // Work in flight runs on the loop's thread: the client starts a plugin, and takes in its lines, a step at a time.
-            let listen = letmeknow::listen(config, &home, letmeknow::Network::new(&relay)?, print, letmeknow::shutdown());
+            let listen = letmeknow::listen(config, &home, network, print, letmeknow::shutdown());
             tokio::task::LocalSet::new().run_until(listen).await
         }
         Command::Sessions { op: None } => {
             println!("{}", letmeknow::sessions(&home).await?);
             Ok(())
         }
-        Command::Sessions { op: Some(SessionsOp::Remove { handle, relay }) } => {
+        Command::Sessions { op: Some(SessionsOp::Remove { handle, membership, relay }) } => {
+            let network = Network::new(&home, &relay, letmeknow::ca()?)?;
             let config = Config {
                 dir: session_dir(&home, &handle)?,
                 handle,
                 hold: Duration::from_secs(3600),
                 keep_log: false,
-                membership: lmk_client::service("letmeknow.dev")?,
+                membership,
                 plugins: kinds::dirs(),
                 registry: registry(),
             };
-            let remove = letmeknow::remove(config, &home, letmeknow::Network::new(&relay)?);
+            let remove = letmeknow::remove(config, &home, network);
             println!("{}", tokio::task::LocalSet::new().run_until(remove).await?);
             Ok(())
         }

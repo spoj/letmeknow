@@ -3,6 +3,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
+use crate::directory;
+
 pub const INVITE_PREFIX: &str = "https://letmeknow.dev/i#";
 /// letmeknow.dev's domain: where its service publishes its directory.
 pub const DOMAIN: &str = "relay.letmeknow.dev";
@@ -11,33 +13,24 @@ pub const RELAY: &str = "https://relay.letmeknow.dev";
 /// letmeknow.dev's membership service: its iroh key, hex. It is reached through `RELAY`.
 pub const MEMBERSHIP_KEY: &str = "7fdc5178ea2da4c7c282d34dd183e6fb109e8afdcb61ffd3f1a9a7c715e50518";
 
-/// `https://letmeknow.dev/i#6.<g|d>.<secret>.<member>[.<member>...]`, where each member is its iroh key, then `~` and
-/// its relay when that is not letmeknow.dev's; every field after the kind in unpadded base64url.
+/// `https://letmeknow.dev/i#7.<g|d>.<secret>.<domain>.<member>[.<member>...]`, every field after the kind in unpadded
+/// base64url: the domain is the group's service's, and each member is its iroh key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invite {
     pub device: bool,
     pub secret: [u8; 16],
+    pub domain: String,
     /// The members a joiner asks, in turn.
-    pub members: Vec<Address>,
-}
-
-/// A member to dial: its iroh key, and its relay when it is not letmeknow.dev's.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Address {
-    pub key: [u8; 32],
-    pub relay: Option<String>,
+    pub members: Vec<[u8; 32]>,
 }
 
 impl Invite {
     pub fn link(&self) -> String {
-        let mut link = format!("{INVITE_PREFIX}6.{}.{}", if self.device { "d" } else { "g" }, URL_SAFE_NO_PAD.encode(self.secret));
+        let kind = if self.device { "d" } else { "g" };
+        let mut link = format!("{INVITE_PREFIX}7.{kind}.{}.{}", URL_SAFE_NO_PAD.encode(self.secret), URL_SAFE_NO_PAD.encode(&self.domain));
         for member in &self.members {
             link.push('.');
-            link.push_str(&URL_SAFE_NO_PAD.encode(member.key));
-            if let Some(relay) = &member.relay {
-                link.push('~');
-                link.push_str(&URL_SAFE_NO_PAD.encode(relay));
-            }
+            link.push_str(&URL_SAFE_NO_PAD.encode(member));
         }
         link
     }
@@ -46,8 +39,8 @@ impl Invite {
         let fragment = link.split_once('#').context("an invite link has a part after #")?.1;
         let mut fields = fragment.split('.');
         match fields.next() {
-            Some("6") => {}
-            Some("5") => bail!("this invite link is from letmeknow 0.16, whose groups this version cannot join: ask for an invite to a group made with letmeknow 0.17"),
+            Some("7") => {}
+            Some("6") => bail!("this invite link is from letmeknow 0.17, whose groups this version cannot join: ask for an invite to a group made with letmeknow 0.18"),
             _ => bail!("this invite link is from another version of letmeknow"),
         }
         let device = match fields.next() {
@@ -55,20 +48,14 @@ impl Invite {
             Some("g") => false,
             _ => bail!("unknown invite kind"),
         };
-        let secret =
-            URL_SAFE_NO_PAD.decode(fields.next().context("no secret")?)?.try_into().ok().context("a secret is 16 bytes")?;
+        let secret = URL_SAFE_NO_PAD.decode(fields.next().context("no secret")?)?.try_into().ok().context("a secret is 16 bytes")?;
+        let domain = String::from_utf8(URL_SAFE_NO_PAD.decode(fields.next().context("no domain")?)?)?;
+        directory::check_domain(&domain)?;
         let members = fields
-            .map(|member| {
-                let (key, relay) = match member.split_once('~') {
-                    Some((key, relay)) => (key, Some(String::from_utf8(URL_SAFE_NO_PAD.decode(relay)?)?)),
-                    None => (member, None),
-                };
-                let key = URL_SAFE_NO_PAD.decode(key)?.try_into().ok().context("a key is 32 bytes")?;
-                Ok(Address { key, relay })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .map(|member| URL_SAFE_NO_PAD.decode(member)?.try_into().ok().context("a key is 32 bytes"))
+            .collect::<Result<Vec<[u8; 32]>>>()?;
         ensure!(!members.is_empty(), "an invite link names a member");
-        Ok(Invite { device, secret, members })
+        Ok(Invite { device, secret, domain, members })
     }
 }
 
@@ -103,16 +90,26 @@ mod tests {
 
     #[test]
     fn invite_round_trip() {
-        let members = vec![Address { key: [1; 32], relay: None }, Address { key: [3; 32], relay: Some("https://relay.example/".into()) }];
+        let members = vec![[1; 32], [3; 32]];
         for device in [false, true] {
-            let invite = Invite { device, secret: [2; 16], members: members.clone() };
+            let invite = Invite { device, secret: [2; 16], domain: "relay.example:8443".into(), members: members.clone() };
             assert_eq!(Invite::parse(&invite.link()).unwrap(), invite);
         }
-        assert!(Invite::parse("https://letmeknow.dev/i#6.g.AA.AA").is_err());
-        assert!(Invite::parse("https://letmeknow.dev/i#6.g.AgICAgICAgICAgICAgICAg").is_err(), "a link names a member");
-        let link = Invite { device: false, secret: [2; 16], members }.link();
-        assert!(Invite::parse(&link.replacen("#6.", "#5.", 1)).unwrap_err().to_string().contains("letmeknow 0.16"));
-        assert!(Invite::parse(&link.replacen("#6.", "#7.", 1)).unwrap_err().to_string().contains("another version"));
+        assert!(Invite::parse("https://letmeknow.dev/i#7.g.AA.AA").is_err());
+        assert!(Invite::parse("https://letmeknow.dev/i#7.g.AgICAgICAgICAgICAgICAg.AA").is_err(), "a link names a member");
+        let link = Invite { device: false, secret: [2; 16], domain: "relay.example".into(), members }.link();
+        assert!(Invite::parse(&link.replacen("#7.", "#6.", 1)).unwrap_err().to_string().contains("letmeknow 0.17"));
+        assert!(Invite::parse(&link.replacen("#7.", "#5.", 1)).unwrap_err().to_string().contains("another version"));
+        assert!(Invite::parse(&link.replacen("#7.", "#8.", 1)).unwrap_err().to_string().contains("another version"));
+    }
+
+    #[test]
+    fn invite_refuses_a_domain_that_is_not_canonical() {
+        let link = |domain: &str| format!("https://letmeknow.dev/i#7.g.{}.{}.{}", URL_SAFE_NO_PAD.encode([2; 16]), URL_SAFE_NO_PAD.encode(domain), URL_SAFE_NO_PAD.encode([1; 32]));
+        assert!(Invite::parse(&link("relay.example")).is_ok());
+        for domain in ["Relay.example", "relay.example:443", "relay.example.", "u@relay.example", "127.0.0.1:8443", "relay.example/x"] {
+            assert!(Invite::parse(&link(domain)).is_err(), "{domain}");
+        }
     }
 
     #[test]

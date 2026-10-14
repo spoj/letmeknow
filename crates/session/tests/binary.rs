@@ -1,7 +1,18 @@
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn letmeknow(home: &std::path::Path, args: &[&str]) -> std::process::Output {
+use lmk_proto::directory::Directory;
+
+fn letmeknow(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_letmeknow")).arg("--home").arg(home).args(args).env_remove("LETMEKNOW_SESSION").output().unwrap()
+}
+
+/// A home in `dir` whose membership directory is its built-in copy, stored as fresh: `listen` fetches nothing.
+fn seeded_home(dir: &Path) -> PathBuf {
+    let home = dir.join("home");
+    std::fs::create_dir_all(home.join("directories")).unwrap();
+    std::fs::write(home.join("directories/relay.letmeknow.dev.json"), serde_json::to_vec(&Directory::builtin()).unwrap()).unwrap();
+    home
 }
 
 #[test]
@@ -25,7 +36,7 @@ fn the_binary_logs_what_rust_log_asks_without_colour_in_a_pipe() {
     use std::io::BufRead;
     for (rust_log, quiet) in [(None, true), (Some("debug"), false)] {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
+        let home = seeded_home(dir.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_letmeknow"));
         command.arg("--home").arg(&home).args(["listen", "--relay", "http://127.0.0.1:1"]).env_remove("LETMEKNOW_SESSION").env_remove("RUST_LOG");
         command.env("LETMEKNOW_REGISTRY", "http://127.0.0.1:1");
@@ -49,7 +60,7 @@ fn the_binary_names_itself_as_termux_names_it() {
     use std::io::BufRead;
     let dir = tempfile::tempdir().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_letmeknow"));
-    command.arg("--home").arg(dir.path().join("home")).args(["listen", "--relay", "http://127.0.0.1:1"]).env_remove("LETMEKNOW_SESSION");
+    command.arg("--home").arg(seeded_home(dir.path())).args(["listen", "--relay", "http://127.0.0.1:1"]).env_remove("LETMEKNOW_SESSION");
     command.env("TERMUX_EXEC__PROC_SELF_EXE", "/data/data/com.termux/files/home/letmeknow");
     command.env("LETMEKNOW_REGISTRY", "http://127.0.0.1:1");
     let mut child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();

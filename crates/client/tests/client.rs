@@ -81,7 +81,9 @@ impl Member {
         let config = lmk_node::Config {
             handle: String::new(),
             device: Some(device.clone()),
-            relay: relay.url.clone(),
+            relays: vec![relay.url.clone()],
+            chosen: vec![],
+            resolve: lmk_testing::resolve(),
             ca: relay.ca(),
             home: None,
             files: None,

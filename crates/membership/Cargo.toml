@@ -20,7 +20,7 @@ tracing = "0.1"
 # The browser has only the client of `letmeknow serve`.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusqlite = { workspace = true, features = ["bundled"] }
-tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "net"] }
 
 [dev-dependencies]
 iroh-relay.workspace = true
