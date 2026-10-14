@@ -1,8 +1,8 @@
 //! A group's duties, each derived from committed records and idempotent: a pass runs at the log's head after each
 //! advance, at start, and every `TIMER`. It drops what the group kept past H; commits at most once, with every Remove
 //! due (members whose `leave` the cut it builds keeps, and members whose devices their identities dropped) and this
-//! session's update if due (each T, at an offset of its own); and in an identity group, has the identity kind run its
-//! own (`Event::Duties`).
+//! session's update if due (each T, at an offset of its own), which first fetches for at most `HEAR` what connected
+//! members hold past the cut; and in an identity group, has the identity kind run its own (`Event::Duties`).
 
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +18,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 use lmk_core::public::{PublicLog, Verdict};
+use lmk_net::peers::HEAR;
 use lmk_proto::group::Credential;
+use lmk_proto::peer::Seqs;
 
 use crate::groups::renaming;
 use crate::held::delivered_key;
@@ -61,6 +63,14 @@ impl<P: Provider> State<P> {
             cut.push(Ref { key: r.key.clone(), joined: r.joined, seq, id });
         }
         Ok(cut)
+    }
+
+    /// Whether an update that would commit waits for what `fetchable` lists.
+    fn fetch_blocked(&mut self, gid: &[u8], now: u64) -> Result<bool> {
+        let live = self.fetchable(gid)?;
+        let g = self.group_mut(gid)?;
+        g.fetch = waiting(g.fetch.take(), &live, now);
+        Ok(g.fetch.is_some())
     }
 
     /// Drops what the group kept past H: delivered messages (but this session's own that no cut kept), commit entries,
@@ -169,11 +179,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let tick = st.tick();
             let g = st.group(gid)?;
             let next = next_update(g.rec.updated, g.mls.settings().update, st.me(gid));
-            // A commit waits while a holder of what the last cut kept, which this session lacks, may still be asked.
-            let lacking = g.lacking();
-            let blocked = !lacking.is_empty() && st.peers.holder(&Bytes(gid.to_vec()), &lacking, tick);
+            let pending = due(&st, g)?;
+            // A pass that removes commits at once.
+            let removing = pending.as_ref().is_some_and(|(change, _)| !change.remove.is_empty());
+            let blocked = pending.is_some() && !removing && st.fetch_blocked(gid, tick)?;
             let next = if blocked { next.min(now() + BLOCKED) } else { next };
-            (due(&st, g)?.is_some() && !blocked, next)
+            (pending.is_some() && !blocked, next)
         };
         self.time(gid, next);
         if !commit {
@@ -238,6 +249,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 }
 
+/// The fetch an update waits on, while the seqs connected members list that it lacks: the seqs it fixed when it first
+/// waited, which later ones do not join, for at most `HEAR`.
+fn waiting(fixed: Option<(Vec<Seqs>, u64)>, live: &[Seqs], now: u64) -> Option<(Vec<Seqs>, u64)> {
+    let (fixed, since) = fixed.unwrap_or_else(|| (live.to_vec(), now));
+    let lacking = live.iter().any(|want| fixed.iter().any(|f| f.key == want.key && f.joined == want.joined && !f.seqs.intersection(&want.seqs).is_empty()));
+    (lacking && now < since + HEAR).then_some((fixed, since))
+}
+
 /// Whether a member's device was dropped from its identity's list, as the public logs held show it.
 fn dropped(public: &BTreeMap<Vec<u8>, PublicLog>, credential: &Credential) -> bool {
     let log = credential.identity().and_then(|identity| public.get(&identity.id.0));
@@ -247,6 +266,21 @@ fn dropped(public: &BTreeMap<Vec<u8>, PublicLog>, credential: &Credential) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lmk_proto::ranges::Ranges;
+
+    fn seqs(key: &[u8], joined: u64, seqs: &[u64]) -> Seqs {
+        Seqs { key: Bytes(key.to_vec()), joined, seqs: seqs.iter().copied().collect::<Ranges>() }
+    }
+
+    #[test]
+    fn an_update_waits_for_what_was_listed_when_it_first_waited_for_at_most_hear() {
+        let first = waiting(None, &[seqs(b"a", 0, &[3, 4])], 1_000).unwrap();
+        assert_eq!(first, (vec![seqs(b"a", 0, &[3, 4])], 1_000));
+        assert_eq!(waiting(Some(first.clone()), &[seqs(b"a", 0, &[4]), seqs(b"b", 0, &[9])], 5_000), Some((vec![seqs(b"a", 0, &[3, 4])], 1_000)), "seq 3 still lacking, and b's seq 9 not joined");
+        assert_eq!(waiting(Some(first.clone()), &[seqs(b"b", 0, &[9])], 5_000), None, "nothing fixed is still lacking");
+        assert_eq!(waiting(Some(first), &[seqs(b"a", 0, &[3])], 1_000 + HEAR), None, "HEAR is up");
+        assert_eq!(waiting(None, &[], 1_000), None);
+    }
 
     #[test]
     fn each_member_updates_every_t_at_an_offset_of_its_own() {

@@ -362,7 +362,11 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
             }
         }
-        self.deliver_ready(st, gid)
+        self.deliver_ready(st, gid)?;
+        if st.group(gid)?.fetch.is_some() {
+            self.work.send(Work::Duties(gid.to_vec())).ok();
+        }
+        Ok(())
     }
 
     /// Takes one ciphertext; the ciphertext, if it opened.
