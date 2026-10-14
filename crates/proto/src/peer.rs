@@ -44,7 +44,7 @@ pub enum Frame {
     WantFiles { group: Bytes, files: Vec<Bytes> },
     Have { group: Bytes, files: Vec<Bytes> },
     /// The state of the group's kind, as a link sealed under the state key of `epoch`, the sender's; without a link, a
-    /// request for one, which a member answers in its own epoch.
+    /// request for one made in the requester's `epoch`, which a member answers only in that epoch.
     State {
         group: Bytes,
         epoch: u64,

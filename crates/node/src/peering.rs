@@ -569,10 +569,15 @@ impl<P: Provider + Send + 'static> Inner<P> {
             Frame::State { epoch, link, .. } => {
                 st.peers.used(&key, now);
                 match link {
-                    None => self.answer_state(&gid, peer),
+                    None => {
+                        if st.may_answer(&gid, peer, epoch)? {
+                            self.answer_state(&gid, peer);
+                        }
+                    }
                     Some(sealed) if st.group(&gid)?.mls.epoch() == epoch => {
                         let g = st.group(&gid)?;
                         let Ok(link) = open_link(&g.mls.state_secret(&st.provider)?, &sealed.0) else { return Ok(()) };
+                        st.group_mut(&gid)?.rec.wanted = None;
                         self.state_from(&gid, link, peer);
                     }
                     Some(_) => st.group_mut(&gid)?.rec.wanted = Some((*peer.as_bytes(), epoch)),

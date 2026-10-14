@@ -23,6 +23,29 @@ impl<P: Provider> State<P> {
         let sealed = seal_link(&g.mls.state_secret(&self.provider)?, link)?;
         Ok(Frame::State { group: Bytes(gid.to_vec()), epoch: g.mls.epoch(), link: Some(Bytes(sealed)) })
     }
+
+    /// Asks the member wanted for the state, once this session is at or past the epoch it wants it of.
+    pub(crate) fn ask_state(&mut self, gid: &[u8]) -> Result<()> {
+        let current = self.group(gid)?.mls.epoch();
+        if let Some((peer, epoch)) = self.group(gid)?.rec.wanted && epoch <= current {
+            let frame = Frame::State { group: Bytes(gid.to_vec()), epoch: current, link: None };
+            self.emit(gid, EndpointId::from_bytes(&peer)?, frame);
+        }
+        Ok(())
+    }
+
+    /// Whether a request for the state, made in `epoch`, is answered: only in this session's epoch, and once per member
+    /// in each epoch, as each answer takes a snapshot and a file.
+    pub(crate) fn may_answer(&mut self, gid: &[u8], peer: EndpointId, epoch: u64) -> Result<bool> {
+        let g = self.group_mut(gid)?;
+        let current = g.mls.epoch();
+        g.rec.answered.retain(|(_, at)| *at == current);
+        if epoch != current || g.rec.answered.iter().any(|(member, _)| member == peer.as_bytes()) {
+            return Ok(false);
+        }
+        g.rec.answered.push((*peer.as_bytes(), current));
+        Ok(true)
+    }
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {

@@ -677,10 +677,10 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
     assert_eq!(data, b"newer");
 }
 
-/// A state handed from a later epoch than this session's is dropped. Once this session reaches that epoch, it asks the
-/// member for the state again, and takes the link the member seals in it.
+/// A state handed from a later epoch than this session's is dropped. Once this session is past that epoch, it asks the
+/// member for the state again, and takes the link the member seals in the epoch it asks in.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_state_from_a_later_epoch_is_asked_again_once_reached() {
+async fn a_state_from_a_later_epoch_is_asked_again_once_passed() {
     let relay = relay().await;
     let dir = folder("state-epoch");
     let (gate, _reaching) = Gate::new();
@@ -706,6 +706,8 @@ async fn a_state_from_a_later_epoch_is_asked_again_once_reached() {
     gate.set(false);
     alice.node.change_settings(&gid.0, |settings| Settings { name: "Renamed".into(), ..settings }).await.unwrap();
     let ahead = alice.node.epoch(&gid.0).unwrap();
+    alice.node.change_settings(&gid.0, |settings| Settings { name: "Renamed again".into(), ..settings }).await.unwrap();
+    let passed = alice.node.epoch(&gid.0).unwrap();
     alice.node.shutdown().await.unwrap();
     let (alice_key, _) = member_of(&db("alice"));
     let mut hand = hand(&relay, alice_key, &bob.node).await;
@@ -714,15 +716,16 @@ async fn a_state_from_a_later_epoch_is_asked_again_once_reached() {
 
     gate.set(true);
     let asked = hand.until(|frame| match frame {
-        Frame::State { group, epoch, link: None } => Some((group, epoch)),
+        Frame::State { group, epoch, link: None } if epoch == passed => Some(group),
         _ => None,
     }).await;
-    assert_eq!(asked, (gid.clone(), ahead), "bob asks alice again, in the epoch it reached");
+    assert_eq!(asked, gid, "bob asks alice again, in the epoch it is in");
 
     // Alice's state key of that epoch seals a link to a file Bob holds: Bob opens it and takes the state.
     let file = bob.node.add_file(&gid.0, b"the state".to_vec()).await.unwrap();
     let key = Group::load(&SqliteProvider::open(&db("alice")).unwrap(), &gid.0).unwrap().state_secret(&SqliteProvider::open(&db("alice")).unwrap()).unwrap();
-    hand.send(&Frame::State { group: gid.clone(), epoch: ahead, link: Some(Bytes(seal_link(&key, &file.link()).unwrap())) }).await;
+    let sealed = seal_link(&key, &file.link()).unwrap();
+    hand.send(&Frame::State { group: gid.clone(), epoch: passed, link: Some(Bytes(sealed)) }).await;
     let (data, from) = bob.until(|e| match e {
         Event::State { data, from, .. } => Some((data, from)),
         _ => None,
@@ -754,21 +757,41 @@ async fn a_request_for_the_state_is_answered_with_a_link_sealed_in_its_epoch() {
 
     let (bob_key, _) = member_of(&db("bob"));
     let mut hand = hand(&relay, bob_key, &alice.node).await;
-    hand.send(&Frame::State { group: gid.clone(), epoch: 0, link: None }).await;
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    hand.send(&Frame::State { group: gid.clone(), epoch, link: None }).await;
     let reply = alice.until(|e| match e {
         Event::Snapshot { reply, .. } => Some(reply),
         _ => None,
     }).await;
     reply.send(Some(b"the state".to_vec())).unwrap();
-    let (epoch, sealed) = hand.until(|frame| match frame {
+    let (sent, sealed) = hand.until(|frame| match frame {
         Frame::State { epoch, link: Some(link), .. } => Some((epoch, link)),
         _ => None,
     }).await;
     let provider = SqliteProvider::open(&db("bob")).unwrap();
-    assert_eq!(epoch, alice.node.epoch(&gid.0).unwrap());
+    assert_eq!(sent, epoch);
     let key = Group::load(&provider, &gid.0).unwrap().state_secret(&provider).unwrap();
     let link = FileLink::parse(&open_link(&key, &sealed.0).unwrap()).unwrap();
     assert_eq!(alice.node.file(&link).await.unwrap(), Some(b"the state".to_vec()));
+
+    // Nothing more is answered in that epoch, nor a request made in another.
+    hand.send(&Frame::State { group: gid.clone(), epoch, link: None }).await;
+    hand.send(&Frame::State { group: gid.clone(), epoch: epoch - 1, link: None }).await;
+    hand.settle(&gid).await;
+    assert!(!std::iter::from_fn(|| alice.events.try_recv().ok()).any(|event| matches!(event, Event::Snapshot { .. })));
+    alice.node.change_settings(&gid.0, |settings| Settings { name: "Renamed".into(), ..settings }).await.unwrap();
+    let next = alice.node.epoch(&gid.0).unwrap();
+    hand.send(&Frame::State { group: gid.clone(), epoch: next, link: None }).await;
+    let reply = alice.until(|e| match e {
+        Event::Snapshot { reply, .. } => Some(reply),
+        _ => None,
+    }).await;
+    reply.send(Some(b"the state".to_vec())).unwrap();
+    let sent = hand.until(|frame| match frame {
+        Frame::State { epoch, link: Some(_), .. } => Some(epoch),
+        _ => None,
+    }).await;
+    assert_eq!(sent, next, "once in a new epoch, a member is answered again");
     alice.node.shutdown().await.unwrap();
 }
 
