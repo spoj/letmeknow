@@ -2616,6 +2616,82 @@ async fn a_message_an_online_member_holds_is_kept_by_the_next_commit() {
     alice.node.shutdown().await.unwrap();
 }
 
+/// A pass that removes, and an Add, do not wait for holders: while Bob, connected, lists messages Alice lacks and never
+/// gives them, Alice's updates wait, but she removes the device Carol's identity dropped, and admits Dave, at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removing_pass_and_an_add_do_not_wait_for_holders() {
+    let relay = relay().await;
+    let dir = folder("no-wait");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (membership, _service) = signing_service(&relay, &dir).await;
+    let bob_db = dir.join("bob.db");
+    let alice = session(&relay, "Alice").await;
+    let (carol, laptop) = identity(&relay, &alice.node, membership.clone()).await;
+    let tablet_key: [u8; 32] = lmk_core::random();
+    let log = alice.node.read_public(&carol).await.unwrap();
+    let both = vec![lmk_core::device::public(&laptop).into(), lmk_core::device::public(&tablet_key).into()];
+    publish(&relay, &alice.node, &carol, log.next(&laptop, both)).await;
+    let gid = alice.node.create(Settings { update: 2, membership, ..settings(CHAT, &relay) }, None).unwrap();
+    let bob = stored(&relay, "Bob", &bob_db).await;
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    let tablet = session(&relay, "tablet").await;
+    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    tablet.node.join(&link, Some(certificate(&carol, &tablet_key, &tablet.node.key(), "Carol", "tablet"))).await.unwrap();
+    eventually("Alice hears Bob", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.member.name == "Bob")).await;
+    let joined = alice.node.heard(&gid.0).unwrap().iter().find(|heard| heard.member.name == "Bob").unwrap().joined;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+    tablet.node.shutdown().await.unwrap();
+
+    // Bob's stopped session, standing in for itself, lists seqs of its own that it never sent, sealed in Alice's epoch.
+    let (iroh, mls) = member_of(&bob_db);
+    let mut bob_hand = hand(&relay, iroh, &alice.node).await;
+    let mut version = lmk_node::now() + 3_600_000;
+    // Lists them in Alice's epoch until her updates, due every 2 s, wait on them; answers when it listed.
+    let mut block = async || {
+        for _ in 0..3 {
+            let epoch = alice.node.epoch(&gid.0).unwrap();
+            let listed = seqs(&Bytes(mls.key().to_vec()), joined, &[1, 2, 3]);
+            version += 1;
+            let summary = Summary {
+                group: gid.clone(),
+                member: Bytes(mls.key().to_vec()),
+                joined,
+                version,
+                time: lmk_node::now(),
+                epoch,
+                relay: None,
+                held: vec![listed.clone()],
+                sealed: vec![listed],
+                shown: Vec::new(),
+                lost: Vec::new(),
+            };
+            let body = serde_json::to_vec(&summary).unwrap();
+            let sig = mls.sign(&[SUMMARY, &body].concat());
+            bob_hand.send(&Frame::Summaries { group: gid.clone(), items: vec![Signed { body: Bytes(body), sig: Bytes(sig) }] }).await;
+            let listed_at = std::time::Instant::now();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if alice.node.epoch(&gid.0).unwrap() == epoch {
+                return listed_at;
+            }
+        }
+        panic!("Alice's updates never waited");
+    };
+
+    let listed_at = block().await;
+    let log = alice.node.read_public(&carol).await.unwrap();
+    publish(&relay, &alice.node, &carol, log.next(&laptop, vec![lmk_core::device::public(&laptop).into()])).await;
+    eventually("Alice removes the tablet", || alice.node.members(&gid.0).unwrap().len() == 2).await;
+    assert!(listed_at.elapsed() < Duration::from_millis(lmk_net::peers::HEAR), "the removal waited");
+
+    let listed_at = block().await;
+    let dave = session(&relay, "Dave").await;
+    dave.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    assert!(listed_at.elapsed() < Duration::from_millis(lmk_net::peers::HEAR), "the Add waited");
+    alice.node.shutdown().await.unwrap();
+    dave.node.shutdown().await.unwrap();
+}
+
 /// A chat commits only for its members' updates and changes: messages both members hold, and sends of either, move no
 /// epoch.
 #[tokio::test(flavor = "multi_thread")]
