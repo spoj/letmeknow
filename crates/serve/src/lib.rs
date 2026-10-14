@@ -36,7 +36,11 @@ use lmk_membership::{
 use lmk_proto::{directory::{self, Directory}, frame::ALPN, group, membership::MAX_BODY};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use socket2::{Domain, Socket, Type};
-use tokio::{net::TcpListener, sync::Notify, time::timeout};
+use tokio::{
+    net::TcpListener,
+    sync::{Notify, Semaphore},
+    time::timeout,
+};
 use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
 use tokio_stream::StreamExt;
 
@@ -45,6 +49,8 @@ const APP: &str = "https://letmeknow.dev";
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const HEADERS: Duration = Duration::from_secs(10);
 const BODY: Duration = Duration::from_secs(15);
+/// Membership bodies at once: each is held twice, as bytes and as its value, so these fill the iroh protocol's 256 MiB.
+const BODIES: usize = 32;
 
 pub enum Certificate {
     /// From Let's Encrypt, by TLS-ALPN-01 on the HTTPS port; cached in the state directory.
@@ -216,10 +222,11 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
 
     let tls = Arc::new(tls);
     let origins = Arc::new(std::iter::once(APP.to_owned()).chain(config.origins.iter().cloned()).collect::<Vec<_>>());
+    let bodies = Arc::new(Semaphore::new(BODIES));
     loop {
         let (tcp, peer) = https.accept().await?;
-        let (tls, relay, health, directory, membership, origins) =
-            (tls.clone(), relay.clone(), health.clone(), directory.clone(), membership.clone(), origins.clone());
+        let (tls, relay, health, directory, membership, origins, bodies) =
+            (tls.clone(), relay.clone(), health.clone(), directory.clone(), membership.clone(), origins.clone(), bodies.clone());
         tokio::spawn(async move {
             let stream = timeout(HANDSHAKE, async move {
                 match &*tls {
@@ -238,6 +245,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
                 membership,
                 peer: peer.ip(),
                 origins,
+                bodies,
             };
             let _ = hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())
@@ -314,11 +322,12 @@ struct Site {
     /// The address membership budgets count the request against.
     peer: IpAddr,
     origins: Arc<Vec<String>>,
+    bodies: Arc<Semaphore>,
 }
 
 /// Membership requests. Only the app's origins, and those `--origin` adds, may send them: another page could otherwise
 /// make its visitors append.
-async fn answer_membership(route: Route, service: Service, peer: IpAddr, origins: Arc<Vec<String>>, req: Request<Incoming>) -> http::Result<Response<BytesBody>> {
+async fn answer_membership(route: Route, service: Service, peer: IpAddr, origins: Arc<Vec<String>>, bodies: Arc<Semaphore>, req: Request<Incoming>) -> http::Result<Response<BytesBody>> {
     let origin = req.headers().get(header::ORIGIN).cloned();
     if !origin.as_ref().is_none_or(|o| o.to_str().is_ok_and(|o| origins.iter().any(|allowed| allowed == o))) {
         return respond(StatusCode::FORBIDDEN).body(body(""));
@@ -334,6 +343,7 @@ async fn answer_membership(route: Route, service: Service, peer: IpAddr, origins
             .header(header::ACCESS_CONTROL_MAX_AGE, "600")
             .body(body("")),
         Method::POST => {
+            let Ok(_body) = bodies.try_acquire_owned() else { return respond(StatusCode::SERVICE_UNAVAILABLE).body(body("")) };
             let Ok(Ok(collected)) = timeout(BODY, Limited::new(req.into_body(), MAX_BODY).collect()).await else {
                 return respond(StatusCode::BAD_REQUEST).body(body(""));
             };
@@ -358,8 +368,8 @@ impl HyperService<Request<Incoming>> for Site {
 
     fn call(&self, req: Request<Incoming>) -> Answer {
         if let Some(route) = Route::parse(req.uri().path()) {
-            let (service, peer, origins) = (self.membership.clone(), self.peer, self.origins.clone());
-            return Box::pin(async move { answer_membership(route, service, peer, origins, req).await.map_err(Into::into) });
+            let (service, peer, origins, bodies) = (self.membership.clone(), self.peer, self.origins.clone(), self.bodies.clone());
+            return Box::pin(async move { answer_membership(route, service, peer, origins, bodies, req).await.map_err(Into::into) });
         }
         match req.uri().path() {
             "/relay" => return Box::pin(self.relay.call(req)),
