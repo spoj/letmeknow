@@ -293,7 +293,7 @@ fn unb64(text: &str) -> Result<Vec<u8>> {
 /// A directory younger than this is answered as it is.
 const DIRECTORY_AGE: u64 = 10 * 60 * 1000;
 
-/// A domain whose fetch failed is not fetched again for this long.
+/// A domain whose last fetch failed, or is still under way, is not fetched again for this long.
 const DIRECTORY_RETRY: u64 = 60 * 1000;
 
 /// A directory the browser fetched, and when.
@@ -331,8 +331,8 @@ fn resolver(idb: Idb, backend: Backend) -> Resolve {
 }
 
 /// A domain's directory: one kept less than `DIRECTORY_AGE` ago, else the one fetched now, which is kept. When the
-/// fetch fails, the kept one, else the backend's if the domain is the default. A failed fetch is not repeated for
-/// `DIRECTORY_RETRY`.
+/// fetch fails, the kept one, else the backend's if the domain is the default. A fetch is not repeated for
+/// `DIRECTORY_RETRY` after one that failed or started, so lookups during a fetch do not start another.
 async fn directory(idb: &Idb, backend: &Backend, failed: &Mutex<HashMap<String, u64>>, domain: &str) -> Result<Directory> {
     let kept = JsFuture::from(idb.load_directory(domain)).await.map_err(|e| anyhow!("loading a directory: {e:?}"))?;
     let kept: Option<Fetched> = kept.as_string().map(|text| serde_json::from_str(&text)).transpose()?;
@@ -341,15 +341,16 @@ async fn directory(idb: &Idb, backend: &Backend, failed: &Mutex<HashMap<String, 
     }
     let retry_at = failed.lock().unwrap().get(domain).copied();
     let fetched = match retry_at {
-        Some(at) if now() < at + DIRECTORY_RETRY => Err(anyhow!("the fetch of {domain} failed less than a minute ago")),
+        Some(at) if now() < at + DIRECTORY_RETRY => Err(anyhow!("a fetch of {domain} started less than a minute ago and has not succeeded")),
         _ => {
+            failed.lock().unwrap().insert(domain.to_owned(), now());
             let fetched = async {
                 let body = JsFuture::from(idb.fetch_directory(&Directory::url(domain))).await.map_err(|e| anyhow!("fetching {domain}: {e:?}"))?;
                 Directory::parse(&Uint8Array::new(&body).to_vec())
             }
             .await;
-            if fetched.is_err() {
-                failed.lock().unwrap().insert(domain.to_owned(), now());
+            if fetched.is_ok() {
+                failed.lock().unwrap().remove(domain);
             }
             fetched
         }
