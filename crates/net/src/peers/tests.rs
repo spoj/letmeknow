@@ -566,13 +566,15 @@ fn an_answer_stops_near_a_mebibyte_and_covers_what_it_reached() {
     assert_eq!(answers, Some(asked));
 }
 
-/// `hello` and `entries` are taken from anyone; the rest from admitted peers, and `state` and live only at the head.
+/// `hello` and `entries` are taken from anyone; the rest from admitted peers, and live payloads only at the head.
 #[test]
 fn the_gate() {
     let hello = Frame::Hello { groups: vec![], heads: vec![] };
     assert!(takes(&hello, false, false) && !sends(&hello, false, false));
     let want = Frame::Want { group: id(), epoch: 1, wants: vec![], ids: vec![] };
     assert!(!takes(&want, false, true) && takes(&want, true, false));
+    let state = Frame::State { group: id(), epoch: 1, link: None };
+    assert!(!takes(&state, false, true) && takes(&state, true, false) && sends(&state, true, false));
     let live = Frame::Live { group: id(), hops: 1, item: Bytes(vec![]) };
     assert!(!takes(&live, true, false) && takes(&live, true, true));
     assert!(!sends(&live, true, false) && sends(&live, true, true));

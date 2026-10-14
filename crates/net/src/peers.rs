@@ -718,19 +718,19 @@ pub fn answer(group: Bytes, asked: &[Seqs], held: &[Seqs], mut ciphertext: impl 
 }
 
 /// Whether a member acts on a frame from a peer: `hello` and `entries` from anyone, the rest only from admitted peers,
-/// and `state` and live payloads only at the head.
+/// and live payloads only at the head.
 pub fn takes(frame: &Frame, admitted: bool, at_head: bool) -> bool {
     match frame {
         Frame::Hello { .. } | Frame::Entries { .. } => true,
-        Frame::State { .. } | Frame::Live { .. } => admitted && at_head,
+        Frame::Live { .. } => admitted && at_head,
         _ => admitted,
     }
 }
 
-/// Whether a member sends a frame to a peer: only to admitted ones, and `state` and live payloads only at the head.
+/// Whether a member sends a frame to a peer: only to admitted ones, and live payloads only at the head.
 pub fn sends(frame: &Frame, admitted: bool, at_head: bool) -> bool {
     match frame {
-        Frame::State { .. } | Frame::Live { .. } => admitted && at_head,
+        Frame::Live { .. } => admitted && at_head,
         _ => admitted,
     }
 }
