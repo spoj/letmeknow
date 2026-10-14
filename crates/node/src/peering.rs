@@ -221,16 +221,19 @@ impl<P: Provider> State<P> {
             return Ok(());
         }
         let me = self.me(gid).to_vec();
+        let epoch = g.mls.epoch();
         let list = |of: fn(&crate::Author) -> &lmk_proto::ranges::Ranges| g.rec.authors.iter().filter_map(|a| a.seqs(of(a))).collect();
+        let sealed = g.rec.authors.iter().filter_map(|a| a.seqs(&a.sealed.iter().filter(|(_, sealed)| **sealed == epoch).map(|(seq, _)| *seq).collect())).collect();
         let summary = Summary {
             group: Bytes(gid.to_vec()),
             member: Bytes(me.clone()),
             joined: g.mls.joined(&me).context("a member of its group")?,
             version: (g.rec.version + 1).max(now),
             time: now,
-            epoch: g.mls.epoch(),
+            epoch,
             relay: self.home.clone(),
             held: list(|a| &a.servable),
+            sealed,
             shown: list(|a| &a.shown),
             lost: list(|a| &a.lost),
         };
@@ -687,7 +690,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let Some(mine) = g.current(me) else { return Ok(Vec::new()) };
         let mut unkept = Vec::new();
         for seq in mine.cut + 1..=mine.last() {
-            if let Some(record) = st.record_at(gid, me, mine.joined, seq)? {
+            if let Some(record) = st.record_at(gid, me, mine.joined, seq)? && st.holders_of(gid, seq)?.is_empty() {
                 unkept.push((record.id, record.header.payload));
             }
         }

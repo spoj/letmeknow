@@ -40,7 +40,7 @@ fn peers() -> Peers {
 
 /// Member `n`'s summary of version `version`, signed and heard at `time`, holding `held`.
 fn heard(n: u8, version: u64, time: u64, held: Vec<Seqs>) -> Heard {
-    let summary = Summary { group: id(), member: Bytes(vec![n]), joined: 0, version, time, epoch: 1, relay: None, held, shown: vec![], lost: vec![] };
+    let summary = Summary { group: id(), member: Bytes(vec![n]), joined: 0, version, time, epoch: 1, relay: None, held, sealed: vec![], shown: vec![], lost: vec![] };
     Heard { signed: Signed { body: Bytes(vec![]), sig: Bytes(vec![]) }, summary, at: time }
 }
 
@@ -680,7 +680,7 @@ impl Sim {
 
     fn publish(&mut self, i: usize) {
         self.versions[i] += 1;
-        let summary = Summary { group: id(), member: Bytes(vec![i as u8]), joined: 0, version: self.versions[i], time: self.now, epoch: 1, relay: None, held: vec![], shown: vec![], lost: vec![] };
+        let summary = Summary { group: id(), member: Bytes(vec![i as u8]), joined: 0, version: self.versions[i], time: self.now, epoch: 1, relay: None, held: vec![], sealed: vec![], shown: vec![], lost: vec![] };
         let body = serde_json::to_vec(&summary).unwrap();
         let heard = Heard { signed: Signed { body: Bytes(body), sig: Bytes(vec![]) }, summary, at: self.now };
         self.peers[i].summary(&id(), heard, None);

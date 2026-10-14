@@ -478,18 +478,15 @@ async fn a_members_receipts_show_a_message_held_and_then_shown_as_its_summaries_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_sent_message_is_only_here_until_a_commit_keeps_it() {
+async fn a_sent_message_is_only_here_until_another_member_holds_it() {
     let relay = relay().await;
     let mut alice = Member::start(&relay, "Alice").await;
     let mut bob = Member::start(&relay, "Bob").await;
     let gid = chat_with_bob(&mut alice, &bob).await;
     let message = say(&alice, &gid, "hello", None).await;
-    bob.until(is_message).await;
-    // Bob holds it, so the commit that the rename makes keeps it.
-    receipts_say(&mut alice, &gid, |receipt| receipt.holds(&message) && !receipt.showed(&message)).await;
     let status = alice.request(json!({ "cmd": "status" })).await;
     assert!(status["groups"][0]["only_here"].as_array().unwrap().contains(&json!({ "what": "message", "id": hex::encode(&message.id.0) })));
     assert!(status["warning"].is_string());
-    alice.request(json!({ "cmd": "name", "name": "Plan" })).await;
+    bob.until(is_message).await;
     polled(&alice, json!({ "cmd": "status" }), |status| status["groups"][0]["only_here"] == json!([]) && status["warning"].is_null()).await;
 }

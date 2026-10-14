@@ -7,20 +7,32 @@ use lmk_core::group::{FRAMING, MAX_MESSAGE};
 use lmk_core::provider::Provider;
 use lmk_proto::Bytes;
 use lmk_proto::held::{self, Header};
-use lmk_proto::peer::Frame;
+use lmk_proto::peer::{Frame, Summary};
 use serde_json::Value;
 
 use crate::held::Record;
 use crate::{Inner, SendError, State};
 
 impl<P: Provider> State<P> {
-    /// The memberships of a group whose summaries say they hold a held message of this session's, at seq `seq`.
-    pub(crate) fn holders_of(&self, gid: &[u8], seq: u64) -> Result<Vec<Bytes>> {
+    /// The summaries of the group's epoch that members connected now sent, other than this session's own.
+    fn online_summaries(&self, gid: &[u8]) -> Result<Vec<&Summary>> {
         let g = self.group(gid)?;
+        let (me, epoch) = (self.me(gid), g.mls.epoch());
+        let connected = self.peers.neighbours(&Bytes(gid.to_vec()));
+        let members = g.mls.members();
+        let reached = |member: &Bytes| members.iter().find(|m| m.key == member.0).and_then(|m| m.leaf.as_ref()).is_some_and(|leaf| connected.iter().any(|key| key.as_slice() == leaf.key.0.as_slice()));
+        let group = Bytes(gid.to_vec());
+        let summaries = self.peers.heard(&group).map(|heard| &heard.summary);
+        Ok(summaries.filter(|summary| summary.member.0 != me && summary.epoch == epoch && reached(&summary.member)).collect())
+    }
+
+    /// The memberships whose summaries show that they hold this session's message `seq` sealed in this epoch, from
+    /// members connected now: a commit may keep the message on their word.
+    pub(crate) fn holders_of(&self, gid: &[u8], seq: u64) -> Result<Vec<Bytes>> {
         let me = self.me(gid);
-        let joined = g.mls.joined(me).context("a member of its group")?;
-        let holds = |heard: &&lmk_net::peers::Heard| heard.summary.held.iter().any(|held| held.key.0 == me && held.joined == joined && held.seqs.contains(seq));
-        Ok(self.peers.heard(&Bytes(gid.to_vec())).filter(|heard| heard.summary.member.0 != me).filter(holds).map(|heard| heard.summary.member.clone()).collect())
+        let joined = self.group(gid)?.mls.joined(me).context("a member of its group")?;
+        let holds = |summary: &&Summary| summary.sealed.iter().any(|sealed| sealed.key.0 == me && sealed.joined == joined && sealed.seqs.contains(seq));
+        Ok(self.online_summaries(gid)?.into_iter().filter(holds).map(|summary| summary.member.clone()).collect())
     }
 
     /// This session's messages of its latest membership of the group that no cut kept, by id.

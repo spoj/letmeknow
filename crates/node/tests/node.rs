@@ -2459,11 +2459,10 @@ async fn chat_works_while_the_service_is_down() {
     alice.node.shutdown().await.unwrap();
 }
 
-/// A commit keeps what another member holds: `only_here` empties for the message Bob held when Alice removed Dave. The
-/// message no one held then is sealed again by Alice in the new epoch, and reaches Carol, who was offline across the
-/// commit, after the commit.
+/// A commit keeps what an online member holds: Bob holds Alice's two messages while Alice removes Dave, so `only_here`
+/// empties and the commit keeps both, which reach Carol after Bob is gone, in causal order.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_commit_keeps_what_a_member_holds_and_reseals_the_rest() {
+async fn a_commit_keeps_what_an_online_member_holds() {
     let relay = relay().await;
     let dir = folder("keeps");
     std::fs::create_dir_all(&dir).unwrap();
@@ -2490,15 +2489,16 @@ async fn a_commit_keeps_what_a_member_holds_and_reseals_the_rest() {
         _ => None,
     }).await;
     eventually("Alice hears that Bob holds her messages up to one", || alice.node.heard(&gid.0).unwrap().iter().any(|h| h.member.key == bob_key && (1..=seq).all(|q| h.held.iter().any(|s| s.key == alice_key && s.seqs.contains(q))))).await;
-    bob.node.shutdown().await.unwrap();
     dave.node.shutdown().await.unwrap();
     let m2 = alice.node.send(&gid.0, &message("two"), None).await.unwrap();
+    bob.until(|e| matches!(e, Event::Message(message) if message.id == m2).then_some(())).await;
     let held = |node: &Node<SqliteProvider>| node.only_here(&gid.0).unwrap().into_iter().map(|(id, _)| id).collect::<Vec<_>>();
-    assert_eq!(held(&alice.node), [m1.clone(), m2.clone()], "neither is held by another member yet");
+    eventually("Alice hears that Bob holds both", || held(&alice.node).is_empty()).await;
 
     assert!(alice.node.remove(&gid.0, &dave_key.0).await.unwrap());
-    assert_eq!(held(&alice.node), std::slice::from_ref(&m2), "the commit kept one, which Bob held");
+    assert!(held(&alice.node).is_empty(), "the commit kept both, which Bob held");
 
+    bob.node.shutdown().await.unwrap();
     let mut carol = stored(&relay, "Carol", &db("carol")).await;
     let mut taken = Vec::new();
     while taken.len() < 2 {
@@ -2510,6 +2510,27 @@ async fn a_commit_keeps_what_a_member_holds_and_reseals_the_rest() {
     assert_eq!(taken, [m1, m2], "in causal order");
     alice.node.shutdown().await.unwrap();
     carol.node.shutdown().await.unwrap();
+}
+
+/// A message an online member holds is kept by the next commit: Bob holds Alice's message, and the next commit that Alice
+/// makes keeps it, so it is no longer only here once Bob goes away.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_an_online_member_holds_is_kept_by_the_next_commit() {
+    let relay = relay().await;
+    let alice = session(&relay, "Alice").await;
+    let mut bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(Settings { update: 2, ..settings(CHAT, &relay) }, None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    eventually("Alice has Bob", || alice.node.members(&gid.0).unwrap().len() == 2).await;
+    alice.node.send(&gid.0, &message("kept"), None).await.unwrap();
+    bob.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
+    eventually("Alice hears that Bob holds it", || alice.node.only_here(&gid.0).unwrap().is_empty()).await;
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    eventually("Alice commits its update", || alice.node.epoch(&gid.0).unwrap() > epoch).await;
+    bob.node.shutdown().await.unwrap();
+    eventually("Alice sees Bob go", || alice.node.online(&gid.0).unwrap().is_empty()).await;
+    assert!(alice.node.only_here(&gid.0).unwrap().is_empty(), "the commit kept it");
+    alice.node.shutdown().await.unwrap();
 }
 
 /// A chat commits only for its members' updates and changes: messages both members hold, and sends of either, move no
@@ -3021,6 +3042,7 @@ async fn a_summary_without_relay_keeps_the_hint() {
         epoch: alice.node.epoch(&gid.0).unwrap(),
         relay: None,
         held: Vec::new(),
+        sealed: Vec::new(),
         shown: vec![shown.clone()],
         lost: Vec::new(),
     };
@@ -3059,6 +3081,7 @@ async fn a_summary_relay_must_be_https() {
         epoch: alice.node.epoch(&gid.0).unwrap(),
         relay: Some("http://127.0.0.1:1".into()),
         held: Vec::new(),
+        sealed: Vec::new(),
         shown: vec![shown.clone()],
         lost: Vec::new(),
     };
@@ -3100,6 +3123,7 @@ async fn a_hint_is_saved_when_the_relay_changes() {
         epoch: alice.node.epoch(&gid.0).unwrap(),
         relay: Some(url.clone()),
         held: Vec::new(),
+        sealed: Vec::new(),
         shown: vec![shown.clone()],
         lost: Vec::new(),
     };

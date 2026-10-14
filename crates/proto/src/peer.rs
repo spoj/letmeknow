@@ -124,12 +124,16 @@ pub struct Summary {
     /// The signer's home relay, when it knows one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<String>,
-    /// Per membership with any, the seqs it holds a sealing of that opens in `epoch` or was kept, its client has shown,
-    /// and it lost.
+    /// Per membership with any, the seqs it holds a sealing of, to serve.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held: Vec<Seqs>,
+    /// Per membership with any, the unkept seqs it holds sealed in `epoch`: a commit of that epoch keeps them on its word.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sealed: Vec<Seqs>,
+    /// Per membership with any, the seqs its client has shown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shown: Vec<Seqs>,
+    /// Per membership with any, the seqs it lost.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lost: Vec<Seqs>,
 }
