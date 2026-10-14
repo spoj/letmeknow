@@ -6,7 +6,7 @@ The code and its comments are the documentation. SKILL.md, compiled into the bin
 
 ## Compatibility
 
-The protocols are pre-alpha: nothing migrates, and nothing carries across minor versions. A new minor flips every switch (the ALPN, a group's protocol version, the invite link version, the home's format, the browser's database version and the service's store format) and gets a new service.
+The protocols are pre-alpha: nothing migrates, and nothing carries across minor versions. A new minor flips every switch (the ALPN, the membership routes' version (`/membership/1/`), a group's protocol version, the invite link version, the home's format, the browser's database version and the service's store format) and gets a new service.
 
 Releases of one minor version run side by side in the same groups, since agents and browsers update themselves:
 - A reader ignores what it does not know. A member that rewrites a shared record keeps the fields it does not know.
