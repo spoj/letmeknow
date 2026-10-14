@@ -37,6 +37,8 @@ const WIDE: u64 = 16;
 const IN_ALL: [((), u64); 1] = [((), 1)];
 /// Keys a quota tracks at once: a source past them is refused, so a flood of addresses cannot grow memory.
 const KEYS: usize = 1 << 20;
+/// /64s a /48 tracks in one window of a quota: past them, its /64s are charged to the /48 alone.
+const NETS: u64 = 16;
 
 #[derive(Clone, Debug)]
 pub struct Policy {
@@ -124,23 +126,41 @@ struct Quota<K> {
     limit: u64,
     window: u64,
     spent: HashMap<K, u64>,
+    /// The /64s each /48 tracks in `spent`.
+    nets: HashMap<u64, u64>,
 }
 
-impl<K: Clone + Eq + Hash> Quota<K> {
-    fn new(period: u64, limit: u64) -> Self { Self { period, limit, window: 0, spent: HashMap::new() } }
+trait Key: Clone + Eq + Hash {
+    fn net48(&self) -> Option<u64> { None }
+}
+
+impl Key for [u8; 32] {}
+impl Key for () {}
+
+impl<K: Key> Quota<K> {
+    fn new(period: u64, limit: u64) -> Self { Self { period, limit, window: 0, spent: HashMap::new(), nets: HashMap::new() } }
+
+    fn tracks(&self, key: &K) -> bool {
+        self.spent.contains_key(key) || key.net48().is_none_or(|net| self.nets.get(&net).copied().unwrap_or(0) < NETS)
+    }
 
     fn fits(&mut self, at: u64, keys: &[(K, u64)], amount: u64) -> bool {
         self.roll(at);
-        keys.iter().all(|(key, scale)| {
-            let spent = self.spent.get(key).copied();
-            let room = spent.is_some() || self.spent.len() < KEYS;
-            room && spent.unwrap_or(0) + amount <= self.limit * scale
+        let full = self.spent.len() >= KEYS;
+        keys.iter().filter(|(key, _)| self.tracks(key)).all(|(key, scale)| {
+            (!full || self.spent.contains_key(key)) && self.spent.get(key).copied().unwrap_or(0) + amount <= self.limit * scale
         })
     }
 
     fn charge(&mut self, at: u64, keys: &[(K, u64)], amount: u64) {
         self.roll(at);
-        for (key, _) in keys { *self.spent.entry(key.clone()).or_default() += amount; }
+        for (key, _) in keys {
+            if !self.tracks(key) { continue; }
+            if !self.spent.contains_key(key) {
+                if let Some(net) = key.net48() { *self.nets.entry(net).or_default() += 1; }
+            }
+            *self.spent.entry(key.clone()).or_default() += amount;
+        }
     }
 
     fn take(&mut self, at: u64, keys: &[(K, u64)], amount: u64) -> bool {
@@ -153,6 +173,7 @@ impl<K: Clone + Eq + Hash> Quota<K> {
         if at / self.period != self.window {
             self.window = at / self.period;
             self.spent.clear();
+            self.nets.clear();
         }
     }
 }
@@ -160,6 +181,12 @@ impl<K: Clone + Eq + Hash> Quota<K> {
 /// What an address's budgets are drawn from: an IPv4 address, mapped or not; an IPv6 address's /64, and its /48.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Source { V4(Ipv4Addr), Net64(u64), Net48(u64) }
+
+impl Key for Source {
+    fn net48(&self) -> Option<u64> {
+        match self { Source::Net64(net) => Some(net >> 16), _ => None }
+    }
+}
 
 fn sources(from: IpAddr) -> Vec<(Source, u64)> {
     match from {
@@ -535,10 +562,20 @@ mod tests {
     #[test]
     fn a_quota_refuses_new_keys_past_its_capacity() {
         let mut quota = Quota::new(MINUTE, 2);
-        for key in 0..KEYS as u64 { quota.charge(0, &[(key, 1)], 1); }
-        assert!(quota.fits(0, &[(0, 1)], 1));
-        assert!(!quota.fits(0, &[(KEYS as u64, 1)], 1));
-        assert!(quota.fits(MINUTE, &[(KEYS as u64, 1)], 1));
+        let v4 = |key: usize| Source::V4(Ipv4Addr::from(key as u32));
+        for key in 0..KEYS { quota.charge(0, &[(v4(key), 1)], 1); }
+        assert!(quota.fits(0, &[(v4(0), 1)], 1));
+        assert!(!quota.fits(0, &[(v4(KEYS), 1)], 1));
+        assert!(quota.fits(MINUTE, &[(v4(KEYS), 1)], 1));
+    }
+
+    #[test]
+    fn a_net48_tracks_only_some_of_its_nets() {
+        let mut quota = Quota::new(MINUTE, 2);
+        let net64 = |i: u32| sources(format!("2001:db8:0:{i:x}::1").parse().unwrap());
+        for i in 0..1_000 { quota.charge(0, &net64(i), 1); }
+        assert_eq!(quota.spent.len(), 1 + NETS as usize);
+        assert!(quota.fits(0, &sources("192.0.2.1".parse().unwrap()), 1));
     }
 
     #[tokio::test]

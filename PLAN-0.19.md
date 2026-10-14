@@ -116,7 +116,8 @@ identities stay behind (#56). The plan goes when 0.19 ships.
   differs, and the signed expiries of those gone.
 - Capabilities stay in bodies, never in URLs.
 - **Limits**, per client address: IPv4 as itself, also when mapped into IPv6 (the listener is dual-stack,
-  serve/lib.rs:236-245); IPv6 by its /64, within a /48 budget 16 times as large.
+  serve/lib.rs:236-245); IPv6 by its /64, within a /48 budget 16 times as large;
+    a /48 tracks 16 of its /64s in each window, and its others share its budget.
   - Appends: 600 a minute and 256 MiB a day; new logs: 2,000 a day. Reads and heads: 600 requests and 64 MiB a
     minute. At most 8 membership requests at once from each address (a /48 at 16 times as many).
   - In all, at most 250,000 new logs a day, twice the target's.
