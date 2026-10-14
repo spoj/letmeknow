@@ -1962,6 +1962,26 @@ fn seqs(key: &Bytes, joined: u64, seqs: &[u64]) -> Seqs {
     Seqs { key: key.clone(), joined, seqs: seqs.iter().copied().collect() }
 }
 
+/// Hands `hand` a summary of `mls`'s membership, signed as its member, which holds and seals `listed` in `epoch`.
+async fn list(hand: &mut Hand, mls: &Mls, gid: &Bytes, joined: u64, epoch: u64, version: u64, listed: Vec<Seqs>) {
+    let summary = Summary {
+        group: gid.clone(),
+        member: Bytes(mls.key().to_vec()),
+        joined,
+        version,
+        time: lmk_node::now(),
+        epoch,
+        relay: None,
+        held: listed.clone(),
+        sealed: listed,
+        shown: Vec::new(),
+        lost: Vec::new(),
+    };
+    let body = serde_json::to_vec(&summary).unwrap();
+    let sig = mls.sign(&[SUMMARY, &body].concat());
+    hand.send(&Frame::Summaries { group: gid.clone(), items: vec![Signed { body: Bytes(body), sig: Bytes(sig) }] }).await;
+}
+
 /// A member that reaches only one holder of a message a commit kept waits for it before applying the next commit, which
 /// deletes the keys it needs, and takes the message from that holder. Quinn holds Sam's message, which Sam's first
 /// rename keeps; Rita, online, hears Quinn hold it, and so waits for it from Quinn alone while Sam's second rename
@@ -2565,8 +2585,10 @@ async fn a_commit_keeps_what_an_online_member_holds() {
     carol.node.shutdown().await.unwrap();
 }
 
-/// A message Bob holds sealed in an epoch that Alice's commit ended, which Bob missed, is only here until Bob holds it
-/// sealed in the new epoch: Alice reseals it once she reads the new log, and Bob asks her for the new sealing.
+/// A message Bob holds sealed in an epoch that Alice's commit ended is only here until Bob holds it sealed in the new
+/// epoch. Bob is away across the commit, and then connected as a stand-in that takes no reseal: it lists the message
+/// held sealed in the ended epoch, which does not count, and then sealed in the new one, which Alice's reseal would have
+/// given it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_message_held_in_an_ended_epoch_is_only_here_until_its_holder_takes_the_new_sealing() {
     let relay = relay().await;
@@ -2579,20 +2601,29 @@ async fn a_message_held_in_an_ended_epoch_is_only_here_until_its_holder_takes_th
     bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     eventually("Alice has Bob", || alice.node.members(&gid.0).unwrap().len() == 2).await;
     let m = alice.node.send(&gid.0, &message("held"), None).await.unwrap();
-    bob.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
+    let seq = bob.until(|e| match e {
+        Event::Message(message) => Some(message.seq),
+        _ => None,
+    }).await;
     eventually("Alice hears that Bob holds it", || alice.node.only_here(&gid.0).unwrap().is_empty()).await;
+    let (bob_key, alice_key) = (bob.node.key(), alice.node.key());
+    let bob_joined = alice.node.heard(&gid.0).unwrap().iter().find(|h| h.member.key == bob_key).unwrap().joined;
+    let alice_joined = alice.node.heard(&gid.0).unwrap().iter().find(|h| h.member.key == bob_key).unwrap().held.iter().find(|s| s.key == alice_key).unwrap().joined;
     bob.node.shutdown().await.unwrap();
     drop(bob);
 
     alice.node.change_settings(&gid.0, |s| Settings { name: "Moved".into(), ..s }).await.unwrap();
-    let here: Vec<Bytes> = alice.node.only_here(&gid.0).unwrap().into_iter().map(|(id, _)| id).collect();
-    assert!(here.contains(&m), "the commit kept nothing: Bob was away");
+    assert!(alice.node.only_here(&gid.0).unwrap().iter().any(|(id, _)| *id == m), "the commit kept nothing: Bob was away");
 
-    let bob = stored(&relay, "Bob", &db).await;
-    eventually("Bob holds it sealed in the new epoch", || alice.node.only_here(&gid.0).unwrap().is_empty()).await;
-    assert_eq!(bob.node.epoch(&gid.0).unwrap(), alice.node.epoch(&gid.0).unwrap());
+    let (iroh, mls) = member_of(&db);
+    let mut bob_hand = hand(&relay, iroh, &alice.node).await;
+    eventually("Bob is back, and still holds the message sealed in the ended epoch", || alice.node.online(&gid.0).unwrap().iter().any(|m| m.key == bob_key)).await;
+    assert!(alice.node.only_here(&gid.0).unwrap().iter().any(|(id, _)| *id == m), "a summary of an ended epoch does not count");
+
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    list(&mut bob_hand, &mls, &gid, bob_joined, epoch, lmk_node::now() + 3_600_000, vec![seqs(&alice_key, alice_joined, &(1..=seq).collect::<Vec<_>>())]).await;
+    eventually("Alice hears that Bob holds it sealed in the new epoch", || alice.node.only_here(&gid.0).unwrap().is_empty()).await;
     alice.node.shutdown().await.unwrap();
-    bob.node.shutdown().await.unwrap();
 }
 
 /// A message an online member holds is kept by the next commit: Bob holds Alice's message, and the next commit that Alice
@@ -2613,6 +2644,39 @@ async fn a_message_an_online_member_holds_is_kept_by_the_next_commit() {
     bob.node.shutdown().await.unwrap();
     eventually("Alice sees Bob go", || alice.node.online(&gid.0).unwrap().is_empty()).await;
     assert!(alice.node.only_here(&gid.0).unwrap().is_empty(), "the commit kept it");
+    alice.node.shutdown().await.unwrap();
+}
+
+/// An update waiting for what connected members list commits once HEAR is up, not later: Bob's stand-in lists seqs that
+/// Alice never got, and nothing sends them.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_waits_for_what_connected_members_list_for_at_most_hear() {
+    let relay = relay().await;
+    let dir = folder("fetch-hear");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bob_db = dir.join("bob.db");
+    let alice = session(&relay, "Alice").await;
+    let bob = stored(&relay, "Bob", &bob_db).await;
+    let gid = alice.node.create(Settings { update: 2, ..settings(CHAT, &relay) }, None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    eventually("Alice hears Bob", || alice.node.heard(&gid.0).unwrap().iter().any(|heard| heard.member.name == "Bob")).await;
+    let joined = alice.node.heard(&gid.0).unwrap().iter().find(|heard| heard.member.name == "Bob").unwrap().joined;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+
+    let (iroh, mls) = member_of(&bob_db);
+    let mut bob_hand = hand(&relay, iroh, &alice.node).await;
+    let epoch = alice.node.epoch(&gid.0).unwrap();
+    let listed_at = std::time::Instant::now();
+    list(&mut bob_hand, &mls, &gid, joined, epoch, lmk_node::now() + 3_600_000, vec![seqs(&Bytes(mls.key().to_vec()), joined, &[1, 2, 3])]).await;
+    tokio::time::timeout(Duration::from_millis(lmk_net::peers::HEAR + 5_000), async {
+        while alice.node.epoch(&gid.0).unwrap() == epoch {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("Alice's update waited past HEAR");
+    assert!(listed_at.elapsed() >= Duration::from_millis(lmk_net::peers::HEAR), "Alice's update did not wait for what was listed");
     alice.node.shutdown().await.unwrap();
 }
 
@@ -2651,24 +2715,8 @@ async fn a_removing_pass_and_an_add_do_not_wait_for_holders() {
     let mut block = async || {
         for _ in 0..3 {
             let epoch = alice.node.epoch(&gid.0).unwrap();
-            let listed = seqs(&Bytes(mls.key().to_vec()), joined, &[1, 2, 3]);
             version += 1;
-            let summary = Summary {
-                group: gid.clone(),
-                member: Bytes(mls.key().to_vec()),
-                joined,
-                version,
-                time: lmk_node::now(),
-                epoch,
-                relay: None,
-                held: vec![listed.clone()],
-                sealed: vec![listed],
-                shown: Vec::new(),
-                lost: Vec::new(),
-            };
-            let body = serde_json::to_vec(&summary).unwrap();
-            let sig = mls.sign(&[SUMMARY, &body].concat());
-            bob_hand.send(&Frame::Summaries { group: gid.clone(), items: vec![Signed { body: Bytes(body), sig: Bytes(sig) }] }).await;
+            list(&mut bob_hand, &mls, &gid, joined, epoch, version, vec![seqs(&Bytes(mls.key().to_vec()), joined, &[1, 2, 3])]).await;
             let listed_at = std::time::Instant::now();
             tokio::time::sleep(Duration::from_secs(5)).await;
             if alice.node.epoch(&gid.0).unwrap() == epoch {

@@ -30,7 +30,7 @@ use crate::{Event, G, Inner, State, Work, days, get, now};
 
 /// How often every group's duties run, besides as its log moves.
 pub(crate) const TIMER: Duration = Duration::from_secs(10 * 60);
-/// How soon a pass runs again after a commit waited for what the last cut kept.
+/// How soon a pass runs again while an update waits for its fetch.
 const BLOCKED: u64 = 10_000;
 
 /// When the leaf of the member with key `key`, last updated at `updated`, is next due an update, in milliseconds: at its
@@ -66,14 +66,14 @@ impl<P: Provider> State<P> {
         Ok(cut)
     }
 
-    /// Whether an update that would commit waits for what `fetchable` lists.
-    fn fetch_blocked(&mut self, gid: &[u8], now: u64) -> Result<bool> {
+    /// When the fetch an update waits on ends, while it waits for what `fetchable` lists.
+    fn fetch_wait(&mut self, gid: &[u8], now: u64) -> Result<Option<u64>> {
         let live = self.fetchable(gid)?;
         let g = self.group_mut(gid)?;
         if g.fetch.is_none() && !live.is_empty() {
             g.fetch = Some((live.clone(), now));
         }
-        Ok(g.fetch.as_ref().is_some_and(|(fixed, since)| waits(fixed, *since, &live, now)))
+        Ok(g.fetch.as_ref().filter(|(fixed, since)| waits(fixed, *since, &live, now)).map(|(_, since)| since + HEAR))
     }
 
     /// Drops what the group kept past H: delivered messages (but this session's own that no cut kept), commit entries,
@@ -185,9 +185,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
             let pending = due(&st, g)?;
             // A pass that removes commits at once.
             let removing = pending.as_ref().is_some_and(|(change, _)| !change.remove.is_empty());
-            let blocked = pending.is_some() && !removing && st.fetch_blocked(gid, tick)?;
-            let next = if blocked { next.min(now() + BLOCKED) } else { next };
-            (pending.is_some() && !blocked, next)
+            let fetch = if pending.is_some() && !removing { st.fetch_wait(gid, tick)? } else { None };
+            let next = match fetch {
+                Some(until) => (now() + BLOCKED).min(until),
+                None => next,
+            };
+            (pending.is_some() && fetch.is_none(), next)
         };
         self.time(gid, next);
         if !commit {
