@@ -88,7 +88,7 @@ identities stay behind (#56). The plan goes when 0.19 ships.
   when the pass first waits, for at most `HEAR`, 15 s. A pass that removes does not wait. Other commits keep only what
   their committer holds.
 - **Catching up,** a member does not wait for what a commit older than H kept (`cleared`, reading.rs:66-86): no member
-  carries it any more.
+  carries it any more. A commit's authenticated data carries when it was made, by its committer's corrected clock.
 - **`only_here`** lists this session's messages that no other member's summary lists as held in its epoch, beside the
   files no other member holds yet, as now. It answers in seconds, for agents and for the browser's leave prompt
   (web/src/main.ts:106) alike. Where the status warning (crates/client/src/lib.rs:743), the browser's texts
@@ -199,7 +199,7 @@ identities stay behind (#56). The plan goes when 0.19 ships.
 
 - **ALPN:** `letmeknow/3` → `letmeknow/4` (crates/proto/src/frame.rs:6).
 - **Group protocol:** `PROTOCOL` 7 → 8 (crates/proto/src/group.rs:8): the suite, the entry, `Admitted`, sealed state
-  links, summaries' current holdings.
+  links, summaries' current holdings, commits' times.
 - **Invite link:** 7 → 8 (crates/proto/src/links.rs:16, 30, 42-43, 98-103, 108). A 7 link: "this invite link is from
   letmeknow 0.18, whose groups this version cannot join: ask for an invite to a group made with letmeknow 0.19".
 - **Home format:** 7 → 8, `letmeknow-v8` (cli.rs:228, crates/session/src/lib.rs:217-236, tests.rs:1252); a format-7
