@@ -66,7 +66,8 @@ The node hands net, per peer, a hint and a fallback. Net dials:
 
 1. **The hint:** the peer's hinted relay, the chosen relays, and the same-machine addresses (`addresses/`).
 2. **The fallback:** after 2 s without a connection, or at once with no hint, net drops the first attempt and dials with
-   the hint plus the fallback; it gives up 5 s later. The fallback for a peer: the `relay` of each shared group's
+   the hint plus the fallback, until iroh's handshake gives up (30 s): a peer that is starting up, such as a browser
+   reloading, is reached without its dialers building redial backoff. The fallback for a peer: the `relay` of each shared group's
    service, the `relays` of the peer's identity's service, and the session's own `relays`.
 
 - **The membership service:** dialed at its directory's `addrs` plus its `relay`.
@@ -137,8 +138,8 @@ C and D1 run in parallel after A and B; D2, F and G in parallel after D1; main i
 ## Risks
 
 1. **One host by default:** letmeknow.dev's only relay and its service share relay.letmeknow.dev (Later).
-2. **Fallback dials** to an offline member cost about 1 KB per relay per second for 5 s, per redial (backoff 10 s to
-   600 s), over at most the three sets above.
+2. **Fallback dials** to an offline member cost about 18 KB per relay over iroh's 30 s handshake, per redial (backoff
+   10 s to 600 s), over at most the three sets above.
 3. **Trust:** whoever controls a domain can make its service unreachable, never impersonate it (keys are verified). A
    member naming an arbitrary domain or relay makes co-members fetch https from it, as 0.17's leaf relays did.
 4. **Open relays:** any iroh app may use ours, up to 1 MiB/s per connection.
