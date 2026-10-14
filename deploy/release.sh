@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 sed -i "0,/^version = \".*\"/s//version = \"$version\"/" Cargo.toml
 minor=${version%.*}
 if [ "${version##*.}" = 0 ]; then
-  sed -i "s#@letmeknow/cli@[0-9]*\.[0-9]*#@letmeknow/cli@$minor#g" README.md SKILL.md web/src/index.html AGENTS.md
+  sed -i "s#@letmeknow/cli@[0-9]*\.[0-9]*#@letmeknow/cli@$minor#g" README.md SKILL.md web/src/index.html web/src/main.ts AGENTS.md
 fi
 cargo update -w --offline
 git commit -q --allow-empty -am "$version"

@@ -7,10 +7,10 @@ End-to-end encrypted chats and shared documents for AI agents and people. An age
 Any machine with Node runs it with no install step. Start with the skill, the instructions for agents:
 
 ```bash
-npx -y @letmeknow/cli@0.18 skill
+npx -y @letmeknow/cli@0.19 skill
 ```
 
-`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). Agents start their session through `npx -y @letmeknow/cli@0.18`, so that an older `letmeknow` on PATH never stands in for the release, and run their other commands with the session's own program, which its `ready` names (`bin`); below, `letmeknow` is short for either. In Pi, [pi-letmeknow](https://github.com/spoj/pi-letmeknow) runs the session and gives the agent a letmeknow tool. The same binaries, and one for Android (arm64, in Termux), are on [Releases](https://github.com/spoj/letmeknow/releases).
+`@letmeknow/cli` provides the `letmeknow` command, with a prebuilt binary for Linux (x64, arm64), macOS (arm64, x64) and Windows (x64). Agents start their session through `npx -y @letmeknow/cli@0.19`, so that an older `letmeknow` on PATH never stands in for the release, and run their other commands with the session's own program, which its `ready` names (`bin`); below, `letmeknow` is short for either. In Pi, [pi-letmeknow](https://github.com/spoj/pi-letmeknow) runs the session and gives the agent a letmeknow tool. The same binaries, and one for Android (arm64, in Termux), are on [Releases](https://github.com/spoj/letmeknow/releases).
 
 ```bash
 letmeknow listen                     # the session process; keep it running, it prints events as JSON lines
@@ -25,7 +25,7 @@ letmeknow sessions                   # this machine's sessions: handle, whether 
 letmeknow sessions remove <handle>   # stop a session, have its groups remove it, and delete it
 ```
 
-Chats, docs, tables and identities made with 0.17 do not carry over: 0.17 keeps them in its own home, which 0.17 still reads. Its invite links are refused here; ask for a new one.
+Chats, docs, tables and identities made with 0.18 do not carry over: they end with 0.18's membership service, and 0.18 keeps them in its own home, which 0.18 still reads. Its invite links are refused here; ask for a new one.
 
 Identity checks use the membership service that the identity's genesis names, as authenticated by its first directory entry; a member's claimed service is only a lookup hint. Directories contain device keys and the genesis service's key and domain, not names, device labels or writer timestamps. Anyone holding the identity ID can still read key changes and revocations. Names are private device-signed claims bound to the actual session key, identity ID and device key, not service-trusted labels. Histories received from peers must carry a head signed for that log by its service.
 

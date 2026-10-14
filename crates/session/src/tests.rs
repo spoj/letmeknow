@@ -1269,12 +1269,12 @@ fn a_home_of_another_format_is_refused_and_names_its_release() {
 fn ready_names_a_newer_minor_version_and_the_command_to_run_it() {
     local(async {
         let world = world("newer").await;
-        let newer = registry(r#"{"dist-tags":{"latest":"0.19.0"}}"#, Duration::ZERO).await;
+        let newer = registry(r#"{"dist-tags":{"latest":"0.20.0"}}"#, Duration::ZERO).await;
         let alice = world.launch(Config { registry: newer, ..world.config("alice", "alice") }, usize::MAX).await;
         let home = world.root.path().join("alice");
-        assert_eq!(alice.ready["newer"], "0.19.0");
-        assert_eq!(alice.ready["update"], format!("LETMEKNOW_HOME={} npx -y @letmeknow/cli@0.19 --session alice listen", home.display()));
-        let same = registry(r#"{"dist-tags":{"latest":"0.17.4"}}"#, Duration::ZERO).await;
+        assert_eq!(alice.ready["newer"], "0.20.0");
+        assert_eq!(alice.ready["update"], format!("LETMEKNOW_HOME={} npx -y @letmeknow/cli@0.20 --session alice listen", home.display()));
+        let same = registry(r#"{"dist-tags":{"latest":"0.19.4"}}"#, Duration::ZERO).await;
         let bob = world.launch(Config { registry: same, ..world.config("bob", "bob") }, usize::MAX).await;
         assert!(bob.ready.get("newer").is_none(), "{}", bob.ready);
     });
@@ -1286,7 +1286,7 @@ fn ready_names_a_newer_minor_version_and_the_command_to_run_it() {
 fn a_slow_registry_leaves_ready_without_a_notice() {
     local(async {
         let world = world("slow").await;
-        let slow = registry(r#"{"dist-tags":{"latest":"0.19.0"}}"#, Duration::from_secs(60)).await;
+        let slow = registry(r#"{"dist-tags":{"latest":"0.20.0"}}"#, Duration::from_secs(60)).await;
         let started = std::time::Instant::now();
         let alice = world.launch(Config { registry: slow, ..world.config("alice", "alice") }, usize::MAX).await;
         assert!(alice.ready.get("newer").is_none(), "{}", alice.ready);
