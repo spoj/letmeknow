@@ -795,6 +795,36 @@ async fn a_request_for_the_state_is_answered_with_a_link_sealed_in_its_epoch() {
     alice.node.shutdown().await.unwrap();
 }
 
+/// A joiner whose Admitted carries no state asks its committer for it once joined, and takes the state it answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joiner_without_state_asks_for_it_once_joined() {
+    let relay = relay().await;
+    let mut alice = session(&relay, "Alice").await;
+    let bob = session(&relay, "Bob").await;
+    let gid = alice.node.create(settings(KIND, &relay), None).unwrap();
+    let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
+    let joining = {
+        let node = bob.node.clone();
+        tokio::spawn(async move { node.join(&link, None).await.map(|_| bob) })
+    };
+    alice.until(|e| match e {
+        Event::Snapshot { reply, .. } => Some(reply),
+        _ => None,
+    }).await.send(None).unwrap();
+    let mut bob = joining.await.unwrap().unwrap();
+    alice.until(|e| match e {
+        Event::Snapshot { reply, .. } => Some(reply),
+        _ => None,
+    }).await.send(Some(b"the state".to_vec())).unwrap();
+    let (data, from) = bob.until(|e| match e {
+        Event::State { data, from, .. } => Some((data, from)),
+        _ => None,
+    }).await;
+    assert_eq!((data.as_slice(), from.name.as_str()), (&b"the state"[..], "Alice"));
+    alice.node.shutdown().await.unwrap();
+    bob.node.shutdown().await.unwrap();
+}
+
 /// A joiner's state link is sealed under the state key of the epoch its Add moved into, so it opens although another
 /// commit landed before the answer was sent.
 #[tokio::test(flavor = "multi_thread")]

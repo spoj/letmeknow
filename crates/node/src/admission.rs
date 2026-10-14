@@ -215,14 +215,19 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 bail!("the link was altered: it admits to a group of another kind than it says");
             }
             // Opened now: the state key is the one of the epoch the Welcome starts in, which a later commit moves past.
-            let doc = match admitted.doc.map(|sealed| open_link(&mls.state_secret(&st.provider)?, &sealed.0)).transpose() {
-                Ok(doc) => doc,
-                Err(error) => {
-                    mls.delete(&st.provider)?;
-                    return Err(error);
-                }
+            // A state that does not open is asked for from `by` once the log is read, as a missing one is.
+            let doc = match admitted.doc {
+                Some(sealed) => match mls.state_secret(&st.provider) {
+                    Ok(key) => open_link(&key, &sealed.0).ok(),
+                    Err(error) => {
+                        mls.delete(&st.provider)?;
+                        return Err(error);
+                    }
+                },
+                None => None,
             };
-            let gid = st.add_group(mls, Rec::default())?;
+            let wanted = doc.is_none().then(|| (*by.as_bytes(), mls.epoch()));
+            let gid = st.add_group(mls, Rec { wanted, ..Rec::default() })?;
             if let Some(seed) = device_key {
                 put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
                 let session = st.keyed(seed)?;
@@ -237,8 +242,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if let Err(error) = self.read_group(&gid).await {
             self.warn(Some(&gid), format!("reading the group's log: {error:#}"));
         }
-        if let Some(link) = doc {
-            self.state_from(&gid, link, by);
+        match doc {
+            Some(link) => self.state_from(&gid, link, by),
+            None => self.lock().ask_state(&gid)?,
         }
         Ok(Bytes(gid))
     }
