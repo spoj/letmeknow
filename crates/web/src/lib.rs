@@ -19,12 +19,13 @@ use lmk_node::identity::{Identity, Presence};
 use lmk_node::lmk_core::provider::RustCrypto;
 use lmk_node::lmk_core::device::Device;
 use lmk_node::lmk_core::provider::{MemoryProvider, Provider};
-use lmk_membership::client::Resolve;
+use lmk_membership::client::{Post, Resolve, answered};
 use lmk_node::{COLLECT, Disk, Node, now};
 use lmk_proto::Bytes;
 use lmk_proto::directory::{Directory, check_domain};
 use lmk_proto::group::{CHAT, ChatMessage, IDENTITY, PROTOCOL, Service, Settings};
 use lmk_proto::links::{FileLink, Invite};
+use lmk_proto::membership::MAX_BODY;
 use n0_future::boxed::BoxFuture;
 use n0_future::time::{Duration, sleep};
 use openmls_memory_storage::MemoryStorage;
@@ -76,6 +77,9 @@ extern "C" {
     /// The body of the directory published at a URL, as the page fetches it.
     #[wasm_bindgen(method, js_name = fetchDirectory)]
     fn fetch_directory(this: &Idb, url: &str) -> Promise;
+    /// The status and body of a POST to a membership route, as the page makes it.
+    #[wasm_bindgen(method, js_name = postMembership)]
+    fn post_membership(this: &Idb, url: &str, body: &[u8], limit: u32) -> Promise;
 }
 
 /// The files kept in IndexedDB, which the session loads and saves through the page.
@@ -330,6 +334,33 @@ fn resolver(idb: Idb, backend: Backend) -> Resolve {
     })
 }
 
+/// Posts to membership services' routes, answered by the page's fetch, on the channel the directories use.
+fn poster(idb: Idb) -> Post {
+    let (asks, mut asked) = mpsc::unbounded_channel::<(String, &'static str, Vec<u8>, oneshot::Sender<Result<Vec<u8>>>)>();
+    spawn_local(async move {
+        while let Some((domain, route, body, reply)) = asked.recv().await {
+            let idb: Idb = idb.clone().unchecked_into();
+            spawn_local(async move {
+                reply.send(post(&idb, &domain, route, &body).await).ok();
+            });
+        }
+    });
+    Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| -> BoxFuture<Result<Vec<u8>>> {
+        let (reply, answer) = oneshot::channel();
+        asks.send((domain, route, body, reply)).ok();
+        Box::pin(async move { answer.await? })
+    })
+}
+
+async fn post(idb: &Idb, domain: &str, route: &str, body: &[u8]) -> Result<Vec<u8>> {
+    let reply = JsFuture::from(idb.post_membership(&format!("https://{domain}{route}"), body, MAX_BODY as u32))
+        .await
+        .map_err(|e| anyhow!("posting to {domain}: {e:?}"))?;
+    let reply = Array::from(&reply);
+    let status = reply.get(0).as_f64().context("a status")? as u16;
+    answered(domain, status, Uint8Array::new(&reply.get(1)).to_vec())
+}
+
 /// A domain's directory: one kept less than `DIRECTORY_AGE` ago, else the one fetched now, which is kept. When the
 /// fetch fails, the kept one, else the backend's if the domain is the default. A fetch is not repeated for
 /// `DIRECTORY_RETRY` after one that failed or started, so lookups during a fetch do not start another.
@@ -498,6 +529,7 @@ impl App {
             relays,
             chosen,
             resolve,
+            post: poster(idb.clone().unchecked_into()),
             ca: Default::default(),
             home: None,
             files: None,

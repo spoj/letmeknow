@@ -32,7 +32,7 @@ impl<P: Provider + Send + 'static> Node<P> {
         let home = if config.chosen.is_empty() { config.relays.clone() } else { config.chosen.clone() };
         let endpoint = lmk_net::builder(home).secret_key(iroh_key(&provider)?).ca_tls_config(ca).bind().await?;
         let leaf = Leaf { key: Bytes(endpoint.id().as_bytes().to_vec()), kinds: config.kinds.clone(), revision: REVISION };
-        let clients = logs::Clients::new(endpoint.clone(), config.resolve.clone());
+        let clients = logs::Clients::new(config.post.clone());
         let state = State::open(provider, &config, leaf)?;
         let (events, events_rx) = mpsc::unbounded_channel();
         let (work, work_rx) = mpsc::unbounded_channel();
@@ -41,7 +41,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             state: Mutex::new(state),
             net: OnceLock::new(),
             clients,
-            follows: Mutex::default(),
             relays: config.relays.clone(),
             chosen: config.chosen.clone(),
             resolve: config.resolve.clone(),
@@ -59,7 +58,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             timers: Mutex::default(),
             tasks: Mutex::default(),
             contradictions: Mutex::default(),
-            misdirected: Mutex::default(),
+            warned: Mutex::default(),
         });
         let net_config = lmk_net::Config { home: config.home, files: config.files, disk: config.disk, file_limit: config.file_limit, collect: COLLECT };
         let (net, net_events) = Net::spawn(endpoint, net_config, inner.clone(), Arc::new(admission::Admitter(inner.clone()))).await?;
@@ -131,7 +130,7 @@ impl<P: Provider> State<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Starts the tasks, follows the logs, and picks up where the session stopped: its public logs replayed, and its
+    /// Starts the tasks, polls the logs, and picks up where the session stopped: its public logs replayed, and its
     /// groups it was removed from told.
     fn run(
         self: &Arc<Self>,
@@ -150,11 +149,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
         });
         self.spawn(self.clone().drive(work));
         self.spawn(self.clone().send_out(outbox));
+        self.spawn(self.clone().ask_heads_forever());
         let mut st = self.lock();
-        let followed: Vec<Vec<u8>> = st.logs.keys().filter(|log| st.capability(log).is_ok()).cloned().collect();
-        for log in &followed {
-            self.follow(log);
-        }
         let public: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
             logs::Of::Public(id) => Some(id.clone()),
             _ => None,
@@ -299,9 +295,14 @@ impl<P: Provider + Send + 'static> Inner<P> {
         while let Some(item) = work.recv().await {
             match item {
                 Work::Applied { group, by, added, how, removed, settings, gone } => self.applied(&group, by, added, how, removed, settings, gone).await,
-                Work::Follow { log, old } => {
-                    self.unfollow(&old);
-                    self.follow(&log);
+                Work::Read(log) => {
+                    let node = self.clone();
+                    self.spawn(async move {
+                        eprintln!("DBG read new log {}", hex(&log));
+                        if let Err(error) = node.read(&log).await {
+                            tracing::debug!("reading log {}: {error:#}", hex(&log));
+                        }
+                    });
                 }
                 Work::Duties(gid) => self.duties(&gid),
                 Work::Gone(group) => self.gone(&group, None),
@@ -351,7 +352,7 @@ mod tests {
             let fail = Arc::new(AtomicBool::new(false));
             let failing = fail.clone();
             let config = Config {
-                handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
+                handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post: relay.post(), ca: relay.ca(),
                 home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
                 durable: Some(Arc::new(move || {
                     let fail = failing.load(Ordering::SeqCst);
@@ -424,7 +425,7 @@ mod tests {
             release: Arc::new(tokio::sync::Notify::new()),
         });
         let config = Config {
-            handle: "Writer".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
+            handle: "Writer".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post: relay.post(), ca: relay.ca(),
             home: None, files: None, disk: Some(disk.clone()), file_limit: 0, kinds: vec![], durable: None,
         };
         let (writer, _) = Node::start(MemoryProvider::default(), config).await.unwrap();
@@ -435,7 +436,7 @@ mod tests {
             let fail = Arc::new(AtomicBool::new(false));
             let failing = fail.clone();
             let config = Config {
-                handle: "Reader".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
+                handle: "Reader".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post: relay.post(), ca: relay.ca(),
                 home: None, files: None, disk: Some(disk.clone()), file_limit: 0, kinds: vec!["test".into()],
                 durable: Some(Arc::new(move || {
                     let fail = failing.load(Ordering::SeqCst);
@@ -495,7 +496,7 @@ mod tests {
     async fn failed_durability_closes_peer_outbox_and_withholds_client_effects() {
         let relay = lmk_testing::relay().await;
         let config = Config {
-            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
+            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post: relay.post(), ca: relay.ca(),
             home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
             durable: Some(Arc::new(|| Box::pin(async { anyhow::bail!("injected persistence failure") }))),
         };
@@ -519,7 +520,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let saved = release.clone();
         let config = Config {
-            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
+            handle: "Alice".into(), device: None, relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post: relay.post(), ca: relay.ca(),
             home: None, files: None, disk: None, file_limit: 0, kinds: vec![],
             durable: Some(Arc::new(move || {
                 saving.notify_one();

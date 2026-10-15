@@ -2957,7 +2957,9 @@ dependencies = [
  "lmk-proto",
  "n0-future",
  "rcgen",
+ "reqwest",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -3051,6 +3053,7 @@ dependencies = [
  "n0-future",
  "rand 0.9.5",
  "rcgen",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
@@ -3069,14 +3072,20 @@ version = "0.19.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek 3.0.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "iroh",
  "iroh-relay",
  "lmk-membership",
  "lmk-proto",
  "n0-future",
  "rcgen",
+ "reqwest",
  "rustls",
  "tempfile",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

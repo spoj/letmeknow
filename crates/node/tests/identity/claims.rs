@@ -17,21 +17,20 @@ async fn every_public_body_is_keys_only_through_rename_restatement_removal_and_c
     let (laptop, devices) = stored_device(&relay, "device-canary-1734567890123", &db).await;
     let identity = devices.create("identity-canary-1734567890123", relay.service.clone()).await.unwrap();
     let gid = devices_group(&laptop.node);
-    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    let reader = ServeClient::for_service(endpoint, lmk_testing::resolve(), &identity.membership).unwrap();
+    let reader = ServeClient::for_service(relay.post(), &identity.membership).unwrap();
     let address = lmk_proto::public::address(&identity.id.0);
-    let initial = reader.head(&address).await.unwrap();
+    let initial = lmk_testing::head(&reader, &address).await;
     devices.rename("renamed-identity-canary").await.unwrap();
     devices.rename_device("renamed-device-canary").await.unwrap();
     devices.duties(&gid.0).await.unwrap();
-    assert_eq!(reader.head(&address).await.unwrap().length, initial.length, "rename must not publish descriptions or clocks");
+    assert_eq!(lmk_testing::head(&reader, &address).await.length, initial.length, "rename must not publish descriptions or clocks");
     let key = devices.key().unwrap();
     laptop.node.shutdown().await.unwrap();
     drop((laptop, devices));
 
     let (laptop, devices) = stored_device(&relay, "renamed-device-canary", &db).await;
     devices.duties(&gid.0).await.unwrap();
-    assert_eq!(reader.head(&address).await.unwrap().length, initial.length, "restart preserves the publication day");
+    assert_eq!(lmk_testing::head(&reader, &address).await.length, initial.length, "restart preserves the publication day");
     laptop.node.shutdown().await.unwrap();
     drop((laptop, devices));
     let mut provider = SqliteProvider::open(&db).unwrap();
@@ -42,13 +41,13 @@ async fn every_public_body_is_keys_only_through_rename_restatement_removal_and_c
     provider.close().unwrap();
     let (laptop, devices) = stored_device(&relay, "renamed-device-canary", &db).await;
     devices.duties(&gid.0).await.unwrap();
-    let restated = reader.head(&address).await.unwrap().length;
+    let restated = lmk_testing::head(&reader, &address).await.length;
     assert_eq!(restated, initial.length + 1, "182 local days restates the same keys");
     for _ in 0..3 {
         laptop.node.read_public(&identity).await.unwrap();
         devices.duties(&gid.0).await.unwrap();
     }
-    assert_eq!(reader.head(&address).await.unwrap().length, restated);
+    assert_eq!(lmk_testing::head(&reader, &address).await.length, restated);
 
     let (mut phone, phone_devices) = device(&relay, "other-device-canary").await;
     routed(&mut phone, phone_devices.clone());
@@ -114,9 +113,8 @@ async fn installed_bindings_survive_refresh_collision_restart_and_group_deletion
     let member = observer.checked(&gid, "peer", true).await;
     assert_eq!(member.device_name, "pocket");
     assert_eq!(member.identity.unwrap().observed.unwrap().names, ["Ann", "Ann Lee"]);
-    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    let directory = ServeClient::for_service(endpoint, lmk_testing::resolve(), &identity.membership).unwrap();
-    assert_eq!(directory.head(&lmk_proto::public::address(&identity.id.0)).await.unwrap().length, 1, "refresh is private, not directory growth");
+    let directory = ServeClient::for_service(relay.post(), &identity.membership).unwrap();
+    assert_eq!(lmk_testing::head(&directory, &lmk_proto::public::address(&identity.id.0)).await.length, 1, "refresh is private, not directory growth");
     let phone = certificate(&identity, &device, &peer.node.key(), "Ann Lee", "another label");
     peer.node.recertify(&gid.0, phone).await.unwrap();
     eventually("device label refresh", || observer.node.members(&gid.0).unwrap().iter().any(|m| m.device_name == "another label")).await;
@@ -212,22 +210,21 @@ async fn a_late_directory_response_cannot_observe_a_roster_that_was_left() {
     let relay = relay().await;
     let dir = folder("late-observation");
     std::fs::create_dir_all(&dir).unwrap();
-    let (gate, mut reaching) = Gate::new();
-    let (membership, service) = served(&relay, &dir.join("service"), |service| Gated { service, gate: gate.clone() }).await;
+    let (membership, _service) = served(&relay, &dir.join("service")).await;
+    let (gate, mut reaching) = Gate::new(Some(&membership));
     let seed = lmk_core::random();
     let (id, first) = lmk_core::public::create(&seed, membership.clone());
     let identity = IdentityRef { id: id.into(), membership: membership.clone() };
-    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    ServeClient::for_service(endpoint, lmk_testing::resolve(), &membership).unwrap().append(&lmk_proto::public::address(&id), &[first], true).await.unwrap();
+    ServeClient::for_service(relay.post(), &membership).unwrap().append(&lmk_proto::public::address(&id), &[first], true).await.unwrap();
     gate.set(false);
     let db = dir.join("observer.db");
-    let observer = stored(&relay, "observer", &db).await;
+    let observer = stored_with(&relay, "observer", &db, gate.post("observer", relay.post())).await;
     let gid = observer.node.create(settings(CHAT, &relay), Some(certificate(&identity, &seed, &observer.node.key(), "Too late", "phone"))).unwrap();
     let reader = observer.node.clone();
     let lookup = tokio::spawn(async move { reader.read_public(&identity).await });
     tokio::time::timeout(WAIT, async {
         loop {
-            if reaching.recv().await.unwrap().0 == observer.node.net().id().as_bytes() { break; }
+            if reaching.recv().await.unwrap() == "observer" { break; }
         }
     }).await.unwrap();
     assert!(binding_record(&db).is_none());
@@ -236,7 +233,6 @@ async fn a_late_directory_response_cannot_observe_a_roster_that_was_left() {
     tokio::time::timeout(WAIT, lookup).await.unwrap().unwrap().unwrap();
     assert!(binding_record(&db).is_none(), "an authenticated response authorizes no departed/historical roster");
     observer.node.shutdown().await.unwrap();
-    service.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

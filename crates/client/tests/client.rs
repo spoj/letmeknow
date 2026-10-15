@@ -84,6 +84,7 @@ impl Member {
             relays: vec![relay.url.clone()],
             chosen: vec![],
             resolve: lmk_testing::resolve(),
+            post: relay.post(),
             ca: relay.ca(),
             home: None,
             files: None,

@@ -24,9 +24,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         for task in self.inner.tasks.lock().unwrap().drain(..) {
             task.abort();
         }
-        for (_, follow) in self.inner.follows.lock().unwrap().drain() {
-            follow.abort();
-        }
         self.inner.net().shutdown().await?;
         // Not a step (`lock`), which commits when it ends: after the close.
         self.inner.state.lock().unwrap().provider.close()
@@ -88,9 +85,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             let st = &mut *st;
             st.speak(identity);
             let mls = Group::create(&st.provider, &st.session, &settings)?;
-            let gid = st.add_group(mls, Rec::default())?;
-            self.inner.follow(&st.group(&gid)?.rec.log.0);
-            gid
+            st.add_group(mls, Rec::default())?
         };
         Ok(Bytes(gid))
     }
@@ -108,7 +103,6 @@ impl<P: Provider + Send + 'static> Node<P> {
             settings.public = Some(Bytes(id.to_vec()));
             let mls = Group::create(&st.provider, &session, &settings)?;
             let gid = st.add_group(mls, Rec { publication_day: now() / crate::days(1), ..Rec::default() })?;
-            self.inner.follow(&st.group(&gid)?.rec.log.0);
             put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
             st.device_keys.insert(gid.clone(), (seed, session));
             (gid, IdentityRef { id: Bytes(id.to_vec()), membership: settings.membership }, first)
@@ -355,6 +349,12 @@ impl<P: Provider + Send + 'static> Node<P> {
             st.save(gid).ok();
         }
         holders
+    }
+
+    /// Asks the services for the heads of the logs this session follows, and reads those that moved, as the session does
+    /// every 2 minutes.
+    pub async fn sync(&self) {
+        self.inner.ask_heads().await;
     }
 
     /// An identity's public log, read from its service now.

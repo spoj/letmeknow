@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use iroh::tls::CaTlsConfig;
 use n0_future::boxed::BoxFuture;
+use n0_future::task::AbortOnDropHandle;
 use lmk_core::device::Device;
 use lmk_core::group::{Group, Session as Mls, open_link, seal_link};
 use lmk_core::provider::{MemoryProvider, Provider, SqliteProvider};
-use lmk_membership::service::Service as Membership;
+use lmk_membership::client::{Post, ServeClient};
 use lmk_membership::store::Store;
 use lmk_testing::{Relay, relay, relay_beside};
 use lmk_node::identity::Identity;
@@ -49,6 +50,12 @@ async fn node(relay: &Relay, name: &str, kinds: &[&str]) -> Session {
     Session { node, events }
 }
 
+/// A session that posts to membership services through `post`.
+async fn session_with(relay: &Relay, name: &str, post: Post) -> Session {
+    let (node, events) = Node::start(MemoryProvider::default(), Config { post, ..config(relay, name, None, &[CHAT, KIND]) }).await.unwrap();
+    Session { node, events }
+}
+
 /// A session that trusts the certificates of several relays, for peers and services on any of them.
 async fn session_trusting(relays: [&Relay; 2], name: &str) -> Session {
     let ca = CaTlsConfig::custom_roots([relays[0].cert.clone(), relays[1].cert.clone()]);
@@ -70,6 +77,7 @@ fn config(relay: &Relay, name: &str, device: Option<Device>, kinds: &[&str]) -> 
         relays: vec![relay.url.clone()],
         chosen: vec![],
         resolve: lmk_testing::resolve(),
+        post: relay.post(),
         ca: relay.ca(),
         home: None,
         files: None,
@@ -147,9 +155,8 @@ async fn identity<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, m
 
 /// Appends a sealed entry to an identity's public log, as a device of it would, and has `node` read the log.
 async fn publish<P: Provider + Send + 'static>(relay: &Relay, node: &Node<P>, identity: &IdentityRef, entry: Vec<u8>) {
-    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
     let log = lmk_proto::public::address(&identity.id.0);
-    lmk_membership::client::ServeClient::for_service(endpoint, lmk_testing::resolve(), &identity.membership).unwrap().append(&log, &[entry], true).await.unwrap();
+    ServeClient::for_service(relay.post(), &identity.membership).unwrap().append(&log, &[entry], true).await.unwrap();
     node.read_public(identity).await.unwrap();
 }
 
@@ -171,9 +178,8 @@ async fn an_identity_mirror_is_only_a_hint_to_its_authoritative_service() {
     let relay = relay().await;
     let dir = folder("identity-mirror");
     let (mirror, mirror_service) = signing_service(&relay, &dir).await;
-    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    let authority = ServeClient::for_service(endpoint.clone(), lmk_testing::resolve(), &relay.service).unwrap();
-    let mirror_client = ServeClient::for_service(endpoint, lmk_testing::resolve(), &mirror).unwrap();
+    let authority = ServeClient::for_service(relay.post(), &relay.service).unwrap();
+    let mirror_client = ServeClient::for_service(relay.post(), &mirror).unwrap();
     let (laptop, tablet) = (lmk_core::random(), lmk_core::random());
     let (id, first) = lmk_core::public::create(&laptop, relay.service.clone());
     let address = lmk_proto::public::address(&id);
@@ -206,7 +212,7 @@ async fn an_identity_mirror_is_only_a_hint_to_its_authoritative_service() {
     assert_eq!(reader.node.read_public(&claim).await.unwrap().writers, [lmk_core::device::public(&laptop).into()]);
     reader.node.shutdown().await.unwrap();
     drop(reader);
-    mirror_service.shutdown().await.unwrap();
+    drop(mirror_service);
     let reader = stored(&relay, "Reader", &db).await;
     assert_eq!(reader.node.read_public(&claim).await.unwrap().writers, [lmk_core::device::public(&laptop).into()], "the persisted service is the authority, not the mirror");
     reader.node.shutdown().await.unwrap();
@@ -220,9 +226,8 @@ async fn a_failed_first_identity_lookup_does_not_persist_a_service() {
     let relay = relay().await;
     let dir = folder("identity-failed-service");
     let (mirror, _mirror_service) = signing_service(&relay, &dir).await;
-    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    let authority = ServeClient::for_service(endpoint.clone(), lmk_testing::resolve(), &relay.service).unwrap();
-    let mirror_client = ServeClient::for_service(endpoint, lmk_testing::resolve(), &mirror).unwrap();
+    let authority = ServeClient::for_service(relay.post(), &relay.service).unwrap();
+    let mirror_client = ServeClient::for_service(relay.post(), &mirror).unwrap();
     let laptop = lmk_core::random();
     let (id, first) = lmk_core::public::create(&laptop, relay.service.clone());
     let address = lmk_proto::public::address(&id);
@@ -295,6 +300,7 @@ async fn a_member_is_reached_through_its_groups_service_when_its_own_relay_is_do
     bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     carol.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     carol.node.shutdown().await.unwrap();
+    alice.node.sync().await;
     let sent = alice.node.send(&gid.0, &message("through the service"), None).await.unwrap();
     let got = bob.until(|e| match e {
         Event::Message(message) => Some(message),
@@ -327,17 +333,18 @@ async fn a_join_reaches_an_inviter_on_another_relay_than_the_services() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_identity_whose_directory_is_down_at_join_is_read_again() {
     let (group_relay, identity_relay) = (relay().await, relay().await);
-    let alice = session_trusting([&group_relay, &identity_relay], "Alice").await;
+    let (gate, _reaching) = Gate::new(Some(&identity_relay.service));
+    let ca = CaTlsConfig::custom_roots([group_relay.cert.clone(), identity_relay.cert.clone()]);
+    let (node, events) = Node::start(MemoryProvider::default(), Config { ca, post: gate.post("Alice", identity_relay.post()), ..config(&group_relay, "Alice", None, &[CHAT, KIND]) }).await.unwrap();
+    let alice = Session { node, events };
     let bob = session_trusting([&group_relay, &identity_relay], "Bob").await;
     let (claim, laptop) = identity(&identity_relay, &bob.node, identity_relay.service.clone()).await;
     let gid = bob.node.create(settings(CHAT, &group_relay), Some(certificate(&claim, &laptop, &bob.node.key(), "Bob", "laptop"))).unwrap();
-    let Service::Serve { key, domain, .. } = identity_relay.service.clone() else { unreachable!() };
-    lmk_testing::withdraw(&domain);
+    gate.set(false);
     alice.node.join(&bob.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     let unread = |node: &Node<MemoryProvider>| node.members(&gid.0).unwrap().iter().any(|m| m.key == bob.node.key() && m.identity.as_ref().is_some_and(|c| c.error.is_some()));
     eventually("Alice cannot verify Bob's identity yet", || unread(&alice.node)).await;
-    let directory = Directory { key: key.0.try_into().unwrap(), addrs: vec![], relay: identity_relay.url.to_string(), relays: vec![identity_relay.url.to_string()] };
-    lmk_testing::publish(&domain, directory);
+    gate.set(true);
     eventually("Alice verifies Bob's identity once its directory answers", || {
         alice.node.members(&gid.0).unwrap().iter().any(|m| m.key == bob.node.key() && m.identity.as_ref().is_some_and(|c| c.name == "Bob" && c.error.is_none()))
     })
@@ -504,6 +511,7 @@ async fn chat_and_removal() {
 
     let bob_key = bob.node.key();
     alice.node.remove(&gid.0, &bob_key.0).await.unwrap();
+    bob.node.sync().await;
     bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     eventually("Bob forgot the group", || bob.node.groups().is_empty()).await;
 }
@@ -603,6 +611,7 @@ async fn an_invite_dies_when_its_inviter_leaves() {
 
     alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap();
     carol.node.leave(&gid.0).await.unwrap();
+    alice.node.sync().await;
     eventually("Bob and Carol are out", || alice.node.members(&gid.0).unwrap().len() == 1).await;
     let dave = session(&relay, "Dave").await;
     let at_alice = alice.node.address().0;
@@ -683,11 +692,11 @@ async fn a_kind_gets_its_state_to_a_joiner_and_its_payloads_and_files_through() 
 async fn a_state_from_a_later_epoch_is_asked_again_once_passed() {
     let relay = relay().await;
     let dir = folder("state-epoch");
-    let (gate, _reaching) = Gate::new();
-    let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
+    let (membership, _service) = served(&relay, &dir).await;
+    let (gate, _reaching) = Gate::new(Some(&membership));
     let db = |name: &str| dir.join(format!("{name}.db"));
     let mut alice = stored(&relay, "Alice", &db("alice")).await;
-    let bob = stored(&relay, "Bob", &db("bob")).await;
+    let bob = stored_with(&relay, "Bob", &db("bob"), gate.post("Bob", relay.post())).await;
     let gid = alice.node.create(Settings { membership, ..settings(KIND, &relay) }, None).unwrap();
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
     let joining = {
@@ -702,7 +711,6 @@ async fn a_state_from_a_later_epoch_is_asked_again_once_passed() {
     let mut bob = bob;
 
     // Bob cannot read the service while Alice commits, so it stays in the epoch it has.
-    gate.spared.lock().unwrap().push(alice.node.address().0);
     gate.set(false);
     alice.node.change_settings(&gid.0, |settings| Settings { name: "Renamed".into(), ..settings }).await.unwrap();
     let ahead = alice.node.epoch(&gid.0).unwrap();
@@ -715,6 +723,7 @@ async fn a_state_from_a_later_epoch_is_asked_again_once_passed() {
     hand.settle(&gid).await;
 
     gate.set(true);
+    bob.node.sync().await;
     let asked = hand.until(|frame| match frame {
         Frame::State { group, epoch, link: None } if epoch == passed => Some(group),
         _ => None,
@@ -875,70 +884,52 @@ async fn a_joiner_opens_its_state_after_another_commit_landed_before_the_answer(
 }
 
 /// A membership service like `letmeknow serve`'s, which signs its heads.
-async fn signing_service(relay: &Relay, dir: &Path) -> (Service, iroh::protocol::Router) {
-    served(relay, dir, |service| service).await
+async fn signing_service(relay: &Relay, dir: &Path) -> (Service, AbortOnDropHandle<()>) {
+    served(relay, dir).await
 }
 
-/// A signing membership service, its store in `dir`, served through `serve`.
-async fn served<H: iroh::protocol::ProtocolHandler>(relay: &Relay, dir: &Path, serve: impl FnOnce(Membership) -> H) -> (Service, iroh::protocol::Router) {
+/// A signing membership service, its store in `dir`, served over https.
+async fn served(relay: &Relay, dir: &Path) -> (Service, AbortOnDropHandle<()>) {
     std::fs::create_dir_all(dir).unwrap();
-    relay.serve(&dir.join("membership"), serve).await
+    relay.serve(&dir.join("membership")).await
 }
 
-/// A membership service's gate: closing it ends the service's connections, and those opened while it is closed wait
-/// until it opens, each told by `reached` with the key of the endpoint that opened it.
-#[derive(Debug)]
+/// A membership service's gate: while it is shut, the posts a node makes to its domain wait until it opens, and each
+/// node whose post waits is told by `reaching`, by its name.
 struct Gate {
+    /// The domain whose posts wait; all domains' if none.
+    domain: Option<String>,
     open: tokio::sync::watch::Sender<bool>,
-    /// The endpoints let through while it is shut.
-    spared: std::sync::Mutex<Vec<[u8; 32]>>,
-    conns: std::sync::Mutex<Vec<iroh::endpoint::Connection>>,
-    reached: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    reached: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 impl Gate {
-    fn new() -> (Arc<Gate>, UnboundedReceiver<Bytes>) {
+    fn new(service: Option<&Service>) -> (Arc<Gate>, UnboundedReceiver<String>) {
+        let domain = service.map(|service| { let Service::Serve { domain, .. } = service else { unreachable!() }; domain.clone() });
         let (reached, reaching) = tokio::sync::mpsc::unbounded_channel();
-        (Arc::new(Gate { open: tokio::sync::watch::Sender::new(true), spared: Default::default(), conns: Default::default(), reached }), reaching)
+        (Arc::new(Gate { domain, open: tokio::sync::watch::Sender::new(true), reached }), reaching)
     }
 
     fn set(&self, open: bool) {
-        let mut conns = self.conns.lock().unwrap();
         self.open.send_replace(open);
-        if !open {
-            let spared = self.spared.lock().unwrap();
-            conns.retain(|conn| {
-                let kept = spared.contains(conn.remote_id().as_bytes());
-                if !kept {
-                    conn.close(0u32.into(), b"closed");
-                }
-                kept
-            });
-        }
     }
-}
 
-#[derive(Debug)]
-struct Gated {
-    service: Membership,
-    gate: Arc<Gate>,
-}
-
-impl iroh::protocol::ProtocolHandler for Gated {
-    async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
-        if self.gate.spared.lock().unwrap().contains(connection.remote_id().as_bytes()) {
-            return iroh::protocol::ProtocolHandler::accept(&self.service, connection).await;
-        }
-        let mut open = self.gate.open.subscribe();
-        {
-            let mut conns = self.gate.conns.lock().unwrap();
-            conns.push(connection.clone());
-            if !*open.borrow() {
-                self.gate.reached.send(Bytes(connection.remote_id().as_bytes().to_vec())).ok();
-            }
-        }
-        open.wait_for(|open| *open).await.ok();
-        iroh::protocol::ProtocolHandler::accept(&self.service, connection).await
+    /// The posts of the node `who` through the gate: its domain's wait while the gate is shut, and the others pass.
+    fn post(self: &Arc<Self>, who: &str, post: Post) -> Post {
+        let (gate, who) = (self.clone(), who.to_owned());
+        Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+            let (gate, who, post) = (gate.clone(), who.clone(), post.clone());
+            Box::pin(async move {
+                if gate.domain.as_ref().is_none_or(|waits| *waits == domain) {
+                    let mut open = gate.open.subscribe();
+                    if !*open.borrow() {
+                        gate.reached.send(who).ok();
+                    }
+                    open.wait_for(|open| *open).await.ok();
+                }
+                post(domain, route, body).await
+            })
+        })
     }
 }
 
@@ -948,11 +939,12 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let relay = relay().await;
     let dir = folder("publication-durability");
-    let (gate, mut reaching) = Gate::new();
-    let (membership, service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
+    let (membership, service) = served(&relay, &dir).await;
+    let (gate, mut reaching) = Gate::new(Some(&membership));
     let fail = Arc::new(AtomicBool::new(false));
     let failing = fail.clone();
     let mut config = config(&relay, "laptop", Some(Device::new("laptop")), &[CHAT, IDENTITY]);
+    config.post = gate.post("laptop", relay.post());
     config.durable = Some(Arc::new(move || {
         let fail = failing.load(Ordering::SeqCst);
         Box::pin(async move {
@@ -970,10 +962,9 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
     assert_eq!(published.writers.len(), 2);
     let reader = session(&relay, "Reader").await;
     assert_eq!(reader.node.read_public(&identity).await.unwrap().writers, published.writers);
-    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    let directory = lmk_membership::client::ServeClient::for_service(endpoint, lmk_testing::resolve(), &identity.membership).unwrap();
+    let directory = ServeClient::for_service(relay.post(), &identity.membership).unwrap();
     let address = lmk_proto::public::address(&identity.id.0);
-    let before = directory.head(&address).await.unwrap();
+    let before = lmk_testing::head(&directory, &address).await;
     assert_eq!(before.length, 2, "genesis and the successful publication");
 
     let before_writers = vec![node.key_in(&gid.0)];
@@ -991,7 +982,7 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
                     publication.set(node.publish(&gid.0, &published, before_writers.clone()));
                 }
                 reached = reaching.recv() => {
-                    assert_eq!(reached.unwrap().0, node.net().id().as_bytes());
+                    assert_eq!(reached.unwrap(), "laptop");
                     break;
                 }
             }
@@ -1006,11 +997,11 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
     assert!(format!("{error:#}").contains("injected persistence failure"), "{error:#}");
     let after = reader.node.read_public(&identity).await.unwrap();
     assert_eq!(after.writers, published.writers);
-    let after = directory.head(&address).await.unwrap();
+    let after = lmk_testing::head(&directory, &address).await;
     assert_eq!((after.length, after.hash), (before.length, before.hash), "no append reached the directory");
     node.shutdown().await.unwrap();
     reader.node.shutdown().await.unwrap();
-    service.shutdown().await.unwrap();
+    drop(service);
 }
 
 /// The rule a joiner comes by is checked again as the Add is built: an invite that expired while the admitter read the
@@ -1020,18 +1011,17 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
     use lmk_proto::links::Invite;
     let relay = relay().await;
     let dir = folder("rebuild");
-    let alice = session(&relay, "Alice").await;
+    let (gate, mut reaching) = Gate::new(None);
+    let alice = session_with(&relay, "Alice", gate.post("Alice", relay.post())).await;
     let bob = session(&relay, "Bob").await;
     let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
     let link = alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap();
     bob.node.join(&link, None).await.unwrap();
     let alice_only = vec![link.members[0]];
-    let alice_iroh = alice.node.members(&gid.0).unwrap().into_iter().find(|m| m.name == "Alice").unwrap().iroh;
     // On a slow machine an invite may expire before Alice reads the public log: then once more, valid twice as long.
     let mut valid = 3000;
     loop {
-        let (gate, mut reaching) = Gate::new();
-        let (membership, _service) = served(&relay, &dir.join(valid.to_string()), |service| Gated { service, gate: gate.clone() }).await;
+        let (membership, _service) = served(&relay, &dir.join(valid.to_string())).await;
         let joiner = session(&relay, "Carol").await;
         let (carol, device) = identity(&relay, &joiner.node, membership).await;
         let certificate = certificate(&carol, &device, &joiner.node.key(), "Carol", "laptop");
@@ -1045,7 +1035,7 @@ async fn a_rule_is_checked_again_as_the_add_is_built() {
         let link = Invite { device: false, secret, domain: link.domain.clone(), members: alice_only.clone() };
         let mut joining = tokio::spawn(async move { joiner.node.join(&link, Some(certificate)).await.map(|(gid, _)| gid) });
         // Alice reads the public log once the rule admits Carol.
-        let alice_reads = async { while reaching.recv().await.unwrap() != alice_iroh {} };
+        let alice_reads = async { while reaching.recv().await.unwrap() != "Alice" {} };
         let reached = tokio::time::timeout(WAIT, async {
             tokio::select! {
                 _ = alice_reads => true,
@@ -1091,19 +1081,27 @@ async fn a_contradiction_is_reported_once() {
     assert_eq!(warnings, 1);
 }
 
-/// A service whose domain then publishes a directory naming another key is reported once, though the session that
-/// follows its group retries every 2 s.
+/// A session whose service answers with another key, as a domain whose directory names another key does, is told once,
+/// however often it asks.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_directory_naming_another_key_is_reported_once() {
     let relay = relay().await;
     let dir = folder("misdirected");
-    let (membership, router) = signing_service(&relay, &dir).await;
-    let mut alice = session(&relay, "Alice").await;
-    alice.node.create(Settings { membership: membership.clone(), ..settings(CHAT, &relay) }, None).unwrap();
-    let Service::Serve { domain, .. } = membership else { unreachable!() };
-    lmk_testing::publish(&domain, Directory { key: [9; 32], addrs: vec![], relay: relay.url.to_string(), relays: vec![relay.url.to_string()] });
-    router.shutdown().await.unwrap();
-    tokio::time::sleep(Duration::from_secs(7)).await;
+    let (membership, _service) = signing_service(&relay, &dir.join("first")).await;
+    let (other, _other_service) = signing_service(&relay, &dir.join("other")).await;
+    let Service::Serve { domain: elsewhere, .. } = other else { unreachable!() };
+    let switched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (base, flag) = (relay.post(), switched.clone());
+    let post: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+        let domain = if flag.load(std::sync::atomic::Ordering::SeqCst) { elsewhere.clone() } else { domain };
+        base(domain, route, body)
+    });
+    let mut alice = session_with(&relay, "Alice", post).await;
+    let (identity, _laptop) = identity(&relay, &alice.node, membership).await;
+    alice.node.read_public(&identity).await.unwrap();
+    switched.store(true, std::sync::atomic::Ordering::SeqCst);
+    alice.node.sync().await;
+    alice.node.sync().await;
     let mut warnings = 0;
     while let Ok(event) = alice.events.try_recv() {
         warnings += matches!(&event, Event::Warning { group, text } if group.is_none() && text.contains("names another key")) as usize;
@@ -1395,8 +1393,7 @@ async fn a_session_updates_an_older_leaf_as_it_starts() {
     let capability = group.capability(&provider).unwrap();
     let cut = group.cut().to_vec();
     let commit = group.commit(&provider, &mls, Change { leaf: Some(old), cut, ..Change::default() }).unwrap();
-    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    lmk_membership::client::ServeClient::for_service(endpoint, lmk_testing::resolve(), &relay.service).unwrap().append(&capability, &[commit.entry], false).await.unwrap();
+    ServeClient::for_service(relay.post(), &relay.service).unwrap().append(&capability, &[commit.entry], false).await.unwrap();
     drop(provider);
     revision(0).await.expect("Alice sees Bob's leaf of revision 0");
 
@@ -1446,12 +1443,12 @@ async fn held_leave(test: &str, restart_leaver: bool) {
     use lmk_core::provider::SqliteProvider;
     let relay = relay().await;
     let dir = folder(test);
-    let (gate, _reaching) = Gate::new();
-    let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
+    let (membership, _service) = served(&relay, &dir).await;
+    let (gate, _reaching) = Gate::new(Some(&membership));
     let start = |name: &'static str| {
-        let (relay, db) = (&relay, dir.join(format!("{name}.db")));
+        let (relay, db, gate) = (&relay, dir.join(format!("{name}.db")), gate.clone());
         async move {
-            let (node, events) = Node::start(SqliteProvider::open(&db).unwrap(), config(relay, name, None, &[CHAT])).await.unwrap();
+            let (node, events) = Node::start(SqliteProvider::open(&db).unwrap(), Config { post: gate.post(name, relay.post()), ..config(relay, name, None, &[CHAT]) }).await.unwrap();
             Session { node, events }
         }
     };
@@ -1501,6 +1498,7 @@ async fn an_old_leave_does_not_remove_a_member_added_again() {
     drop(alice);
 
     bob.node.leave(&gid.0).await.unwrap();
+    bob.node.sync().await;
     bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     // Only Carol holds the leave: were Bob online, Alice's wait could end at her connection to him before Carol's lands.
@@ -1554,6 +1552,7 @@ async fn each_commit_moves_the_group_to_its_new_epochs_log() {
         logs.push(log);
     }
     alice.node.remove(&gid.0, &carol.node.key_in(&gid.0).0).await.unwrap();
+    carol.node.sync().await;
     carol.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     assert!(!logs.contains(&alice.node.log(&gid.0).unwrap()), "the Remove moved the group to a log Carol cannot name");
     let after = alice.node.send(&gid.0, &message("after Carol"), None).await.unwrap();
@@ -1632,13 +1631,14 @@ async fn expired_service_history_preserves_chat_and_identity_groups() {
     let relay = relay().await;
     for kind in [CHAT, IDENTITY] {
         let dir = folder(&format!("retention-{kind}"));
-        let (gate, _reaching) = Gate::new();
-        let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
+        let (membership, _service) = served(&relay, &dir).await;
+        let (gate, _reaching) = Gate::new(Some(&membership));
         let start = |name: &'static str| {
-            let (relay, dir) = (&relay, &dir);
+            let (relay, dir, gate) = (&relay, &dir, gate.clone());
             async move {
                 let device = Device::new(name);
                 let mut config = config(relay, name, Some(device.clone()), &[CHAT, IDENTITY]);
+                config.post = gate.post(name, relay.post());
                 config.files = Some(dir.join(format!("{name}-files")));
                 let (node, events) = Node::start(SqliteProvider::open(&dir.join(format!("{name}.db"))).unwrap(), config).await.unwrap();
                 let devices = Identity::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
@@ -1729,7 +1729,12 @@ async fn expired_service_history_preserves_chat_and_identity_groups() {
 
 /// A session on SQLite at `db`, which survives a restart.
 async fn stored(relay: &Relay, name: &str, db: &Path) -> Session<SqliteProvider> {
-    let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), config(relay, name, None, &[CHAT, KIND])).await.unwrap();
+    stored_with(relay, name, db, relay.post()).await
+}
+
+/// A session on SQLite at `db` that posts to membership services through `post`.
+async fn stored_with(relay: &Relay, name: &str, db: &Path, post: Post) -> Session<SqliteProvider> {
+    let (node, events) = Node::start(SqliteProvider::open(db).unwrap(), Config { post, ..config(relay, name, None, &[CHAT, KIND]) }).await.unwrap();
     Session { node, events }
 }
 
@@ -1764,6 +1769,7 @@ async fn an_announced_loss_reaches_every_member() {
     alice.node.shutdown().await.unwrap();
 
     let mut carol = stored(&relay, "Carol", &db("carol")).await;
+    carol.node.sync().await;
     let lost = carol.until(|e| match e {
         Event::Lost(lost) => Some(lost),
         _ => None,
@@ -1818,6 +1824,7 @@ async fn catching_up() {
     SHIFT.store(8 * 24 * 3600 * 1000, std::sync::atomic::Ordering::Relaxed);
     let started = std::time::Instant::now();
     let mut carol = stored(&relay, "Carol", &db("carol")).await;
+    carol.node.sync().await;
     let lost = carol.until(|e| match e {
         Event::Lost(lost) => Some(lost),
         _ => None,
@@ -2105,14 +2112,14 @@ async fn a_peer_not_admitted_changes_nothing() {
 async fn peer_entries_are_bound_to_the_destination_log_and_service() {
     let relay = relay().await;
     let dir = folder("wrong-log-head");
-    let (gate_a, _reaching_a) = Gate::new();
-    let (gate_b, _reaching_b) = Gate::new();
-    let (service_a, router_a) = served(&relay, &dir.join("a"), |service| Gated { service, gate: gate_a.clone() }).await;
-    let (service_b, router_b) = served(&relay, &dir.join("b"), |service| Gated { service, gate: gate_b.clone() }).await;
-    let key_a = ed25519_dalek::SigningKey::from_bytes(&router_a.endpoint().secret_key().to_bytes());
-    let key_b = ed25519_dalek::SigningKey::from_bytes(&router_b.endpoint().secret_key().to_bytes());
+    let (service_a, _membership_a) = served(&relay, &dir.join("a")).await;
+    let (service_b, _membership_b) = served(&relay, &dir.join("b")).await;
+    let (gate_a, _reaching_a) = Gate::new(Some(&service_a));
+    let (gate_b, _reaching_b) = Gate::new(Some(&service_b));
+    let key_of = |name: &str| ed25519_dalek::SigningKey::from_bytes(&Store::open(&dir.join(name).join("membership")).unwrap().key().to_bytes());
+    let (key_a, key_b) = (key_of("a"), key_of("b"));
     let db = dir.join("reader.db");
-    let reader = stored(&relay, "Reader", &db).await;
+    let reader = stored_with(&relay, "Reader", &db, gate_b.post("Reader", gate_a.post("Reader", relay.post()))).await;
     let gid = reader.node.create(settings(CHAT, &relay), None).unwrap();
     let (identity_a, _) = identity(&relay, &reader.node, service_a).await;
     let (identity_b, writer_b) = identity(&relay, &reader.node, service_b).await;
@@ -2137,7 +2144,7 @@ async fn peer_entries_are_bound_to_the_destination_log_and_service() {
     let record = provider.get(&record_key).unwrap();
     provider.close().unwrap();
 
-    let mut reader = stored(&relay, "Reader", &db).await;
+    let mut reader = stored_with(&relay, "Reader", &db, gate_b.post("Reader", gate_a.post("Reader", relay.post()))).await;
     let mut peer = hand(&relay, iroh::SecretKey::from_bytes(&lmk_core::random()), &reader.node).await;
     let log = Bytes(log_b.to_vec());
     peer.send(&Frame::Entries { log: log.clone(), entries: vec![entry.clone()], head: wrong_log }).await;
@@ -2517,7 +2524,7 @@ async fn chat_works_while_the_service_is_down() {
     bob.node.shutdown().await.unwrap();
     drop(bob);
 
-    service.shutdown().await.unwrap();
+    drop(service);
     let one = alice.node.send(&gid.0, &message("one"), None).await.unwrap();
     let two = alice.node.send(&gid.0, &message("two"), None).await.unwrap();
     let mut bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
@@ -2934,18 +2941,17 @@ async fn a_removed_members_send_past_its_final_cut_reaches_no_one() {
     let relay = relay().await;
     let dir = folder("sealed-on");
     std::fs::create_dir_all(&dir).unwrap();
-    let (gate, _reaching) = Gate::new();
-    let (membership, _service) = served(&relay, &dir, |service| Gated { service, gate: gate.clone() }).await;
+    let (membership, _service) = served(&relay, &dir).await;
+    let (gate, _reaching) = Gate::new(Some(&membership));
     let mut alice = session(&relay, "Alice").await;
     let mut bob = session(&relay, "Bob").await;
-    let dave = session(&relay, "Dave").await;
+    let dave = session_with(&relay, "Dave", gate.post("Dave", relay.post())).await;
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
     for joiner in [&bob, &dave] {
         joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
     eventually("Alice has three members", || alice.node.members(&gid.0).unwrap().len() == 3).await;
-    gate.spared.lock().unwrap().extend([alice.node.address().0, bob.node.address().0]);
     gate.set(false);
 
     // Closing the gate can race the removal's request on the old connection: Alice asks again once it reconnects.
@@ -3006,6 +3012,7 @@ async fn lost_seqs_are_told_once_across_restarts() {
 
     // Carol, back with no holder online, loses Bob's message and says so in its summary.
     let mut carol = stored(&relay, "Carol", &db("carol")).await;
+    carol.node.sync().await;
     let lost = carol.until(|e| match e {
         Event::Lost(lost) => Some(lost),
         _ => None,
@@ -3374,6 +3381,7 @@ async fn a_removed_session_drops_its_groups_hints() {
     eventually("Alice holds Bob's relay", || alice.node.hint(&bob_iroh).is_some()).await;
     let alice_key = bob.node.members(&gid.0).unwrap().into_iter().find(|m| m.name == "Alice").unwrap().key;
     assert!(bob.node.remove(&gid.0, &alice_key.0).await.unwrap());
+    alice.node.sync().await;
     alice.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     assert_eq!(alice.node.hint(&bob_iroh), None);
     assert!(hint_records(&alice_db).is_empty());

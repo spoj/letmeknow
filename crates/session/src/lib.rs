@@ -10,7 +10,7 @@ mod tests;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use lmk_core::device::Device;
 use lmk_core::provider::SqliteProvider;
-use lmk_membership::client::Resolve;
+use lmk_membership::client::{Post, Resolve, https};
 use lmk_node::Node;
 use lmk_proto::Bytes;
 use lmk_proto::directory::{Directory, MAX_BYTES, check_domain};
@@ -65,6 +65,7 @@ pub struct Network {
     pub relays: Vec<iroh::RelayUrl>,
     pub ca: iroh::tls::CaTlsConfig,
     pub resolve: Resolve,
+    pub post: Post,
     http: reqwest::Client,
 }
 
@@ -86,6 +87,7 @@ impl Network {
             relays: Vec::new(),
             ca,
             resolve: cached(home.join("directories"), fetch(http.clone())),
+            post: https(http.clone()),
             http,
         })
     }
@@ -350,6 +352,7 @@ fn node_config(network: &Network, home: &Path, handle: &str, device: Option<Devi
         relays: network.relays.clone(),
         chosen: network.chosen.clone(),
         resolve: network.resolve.clone(),
+        post: network.post.clone(),
         ca: network.ca.clone(),
         home: Some(home.to_path_buf()),
         files: Some(files),

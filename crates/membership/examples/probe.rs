@@ -1,29 +1,21 @@
-//! Checks a deployed `letmeknow serve` from outside: `probe <service key, hex> <relay URL>` appends to a fresh log
-//! through the relay, reads it back, and checks the heads.
+//! Checks a deployed `letmeknow serve` from outside: `probe <service key, hex> <domain>` appends to a fresh log over
+//! HTTPS, reads it back, and checks the heads.
 
 use std::sync::Arc;
 
 use anyhow::{Result, ensure};
-use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, endpoint::presets};
-use iroh_relay::RelayQuicConfig;
-use lmk_membership::{Frontier, client::{Resolve, ServeClient}};
-use lmk_proto::{Bytes, directory::Directory, group::Service};
-use n0_future::boxed::BoxFuture;
+use lmk_membership::{Frontier, client::{ServeClient, https}};
+use lmk_proto::{Bytes, group::Service};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let (key, relay) = (hex::decode(&args[1])?, &args[2]);
-    let relays = RelayMap::from_iter([RelayConfig::new(relay.parse()?, Some(RelayQuicConfig::default()))]);
-    let endpoint = Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(relays)).bind().await?;
+    let (key, domain) = (hex::decode(&args[1])?, args[2].clone());
+    let tls = iroh::tls::CaTlsConfig::embedded().client_config(Arc::new(rustls::crypto::ring::default_provider()))?;
+    let http = reqwest::Client::builder().tls_backend_preconfigured(tls).no_proxy().build()?;
     let service: [u8; 32] = key.as_slice().try_into()?;
-    let directory = Directory { key: service, addrs: vec![], relay: relay.clone(), relays: vec![relay.clone()] };
-    let resolve: Resolve = Arc::new(move |_: String| -> BoxFuture<Result<Directory>> {
-        let directory = directory.clone();
-        Box::pin(async move { Ok(directory) })
-    });
-    let membership = Service::Serve { key: Bytes(key), domain: "probe.invalid".into(), rest: Default::default() };
-    let client = ServeClient::for_service(endpoint, resolve, &membership)?;
+    let membership = Service::Serve { key: Bytes(key), domain, rest: Default::default() };
+    let client = ServeClient::for_service(https(http), &membership)?;
     let log = lmk_proto::random::random::<32>();
     let anchor = Frontier::empty(service, lmk_proto::head::reference(&service, &log));
     let started = std::time::Instant::now();

@@ -90,6 +90,25 @@ export async function fetchDirectory(url: string): Promise<Uint8Array> {
   return new Uint8Array(await new Blob(chunks).arrayBuffer());
 }
 
+/** A membership route's answer: its status, and its body of at most `limit` bytes. No credentials, no redirects, 30 s. */
+export async function postMembership(url: string, body: Uint8Array, limit: number): Promise<[number, Uint8Array]> {
+  const response = await fetch(url, { method: "POST", body, credentials: "omit", redirect: "error", signal: AbortSignal.timeout(30_000) });
+  const reader = response.body!.getReader();
+  const chunks: Uint8Array<ArrayBuffer>[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.length;
+    if (size > limit) {
+      await reader.cancel();
+      throw new Error(`a reply is at most ${limit} bytes`);
+    }
+    chunks.push(value);
+  }
+  return [response.status, new Uint8Array(await new Blob(chunks).arrayBuffer())];
+}
+
 /** The directory last fetched for a domain, as the session stored it. */
 export async function loadDirectory(domain: string): Promise<string | undefined> {
   return done((await database()).transaction("directories").objectStore("directories").get(domain));

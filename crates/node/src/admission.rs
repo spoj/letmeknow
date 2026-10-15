@@ -215,7 +215,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Joins a group from the Add's answer, a member at `by` sent for this session's KeyPackage: an identity group with the
     /// device key `device_key`, and only then, as a link's kind is not authenticated.
     async fn welcomed(self: &Arc<Self>, admitted: Admitted, key_package: &[u8], by: EndpointId, device_key: Option<[u8; 32]>) -> Result<Bytes> {
-        let (gid, log, doc) = {
+        let (gid, doc) = {
             let mut st = self.lock();
             let st = &mut *st;
             let mls = Group::join(&st.provider, &admitted.commit.0, &admitted.welcome.0, &admitted.sig.0, &key_package_reference(&st.provider, key_package)?)?;
@@ -243,12 +243,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 let session = st.keyed(seed)?;
                 st.device_keys.insert(gid.clone(), (seed, session));
             }
-            let log = st.group(&gid)?.rec.log.0.clone();
-            (gid, log, doc)
+            (gid, doc)
         };
         // The members' public logs first, which the gate needs to take their summaries, before the log's commits apply.
         self.refresh_all().await;
-        self.follow(&log);
         if let Err(error) = self.read_group(&gid).await {
             self.warn(Some(&gid), format!("reading the group's log: {error:#}"));
         }

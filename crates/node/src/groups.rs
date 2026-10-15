@@ -102,7 +102,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
     /// Leaves a group behind: its state and records go.
     pub(crate) fn forget(&self, st: &mut State<P>, gid: &[u8]) -> Result<()> {
         for log in st.group_logs(gid) {
-            self.unfollow(&log);
             st.drop_log(&log)?;
         }
         let rec = &st.group(gid)?.rec;

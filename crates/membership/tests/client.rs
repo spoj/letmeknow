@@ -1,0 +1,170 @@
+use std::{net::IpAddr, sync::{Arc, Mutex}};
+
+use ed25519_dalek::{Signer, SigningKey};
+use lmk_membership::{
+    Forged, Frontier, InvalidProof, Refused, Unsupported, WrongDirectory,
+    client::{Post, ServeClient, answered},
+    service::{Policy, Route, Service},
+    store::Store,
+};
+use lmk_proto::{
+    Bytes,
+    group::Service as Wire,
+    head,
+    membership::{self, Answer, Known, Refusal, refusal_message},
+};
+use n0_future::boxed::BoxFuture;
+
+struct Membership {
+    _dir: tempfile::TempDir,
+    service: Service,
+    key: SigningKey,
+}
+
+impl Membership {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::initialize(&dir.path().join("state")).unwrap();
+        let key = SigningKey::from_bytes(&store.key().to_bytes());
+        Self { _dir: dir, service: Service::new(store, Policy::default()), key }
+    }
+
+    fn wire(&self, domain: &str) -> Wire {
+        Wire::Serve { key: Bytes(self.key.verifying_key().to_bytes().to_vec()), domain: domain.into(), rest: Default::default() }
+    }
+
+    /// A post that the service answers in process, route by route, as its HTTPS listener would.
+    fn post(&self) -> Post {
+        let service = self.service.clone();
+        Arc::new(move |_: String, route: &'static str, body: Vec<u8>| -> BoxFuture<anyhow::Result<Vec<u8>>> {
+            let service = service.clone();
+            Box::pin(async move {
+                let admission = service.admit(IpAddr::from([127, 0, 0, 1])).unwrap();
+                service.post(Route::parse(route).unwrap(), &admission, &body).await
+            })
+        })
+    }
+
+    fn client(&self) -> ServeClient {
+        ServeClient::for_service(self.post(), &self.wire("membership.example")).unwrap()
+    }
+}
+
+fn log(seed: u8) -> [u8; 32] { [seed; 32] }
+
+fn anchor(key: &SigningKey, capability: &[u8; 32]) -> Frontier {
+    let service = key.verifying_key().to_bytes();
+    Frontier::empty(service, head::reference(&service, capability))
+}
+
+#[tokio::test]
+async fn appends_reads_and_heads_check_against_the_service_key() {
+    let membership = Membership::new();
+    let client = membership.client();
+    let capability = log(1);
+    let appended = client.append(&capability, &[b"one".to_vec(), b"two".to_vec()], false).await.unwrap();
+    assert_eq!(appended.position, 1);
+    let page = client.read(&capability, &anchor(&membership.key, &capability)).await.unwrap();
+    assert_eq!(page.page().entries, [Bytes(b"one".to_vec()), Bytes(b"two".to_vec())]);
+    let moved = client.heads(&[Known(capability, 0)]).await.unwrap();
+    assert_eq!((moved.len(), moved[0].length, moved[0].hash), (1, 2, appended.head.hash));
+    assert!(client.heads(&[Known(capability, 2)]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn heads_ask_256_logs_to_a_request_and_leave_unmoved_logs_out() {
+    let membership = Membership::new();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let post = membership.post();
+    let counting: Post = {
+        let requests = requests.clone();
+        Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+            requests.lock().unwrap().push(body.clone());
+            post(domain, route, body)
+        })
+    };
+    let client = ServeClient::for_service(counting, &membership.wire("membership.example")).unwrap();
+    let client_for_appends = membership.client();
+    client_for_appends.append(&log(7), &[b"x".to_vec()], false).await.unwrap();
+    let distinct = |i: u16| { let mut capability = [0; 32]; capability[..2].copy_from_slice(&i.to_be_bytes()); capability };
+    let known: Vec<Known> = (0..600).map(|i| Known(distinct(i), 0)).chain([Known(log(7), 0)]).collect();
+    let moved = client.heads(&known).await.unwrap();
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0].log_ref, head::reference(&membership.key.verifying_key().to_bytes(), &log(7)));
+    assert_eq!(requests.lock().unwrap().len(), 3, "601 logs ask for 256 at a time");
+}
+
+#[tokio::test]
+async fn a_head_signed_by_another_key_is_the_directorys_name() {
+    let served = Membership::new();
+    let other = Membership::new();
+    let wrong = ServeClient::for_service(served.post(), &other.wire("membership.example")).unwrap();
+    let error = wrong.heads(&[Known(log(1), 5)]).await.unwrap_err();
+    assert!(error.is::<WrongDirectory>(), "{error}");
+}
+
+#[tokio::test]
+async fn a_refusal_acts_only_when_the_service_signed_it() {
+    let membership = Membership::new();
+    let request = serde_json::to_vec(&membership::Append { capability: log(1), entries: vec![Bytes(b"x".to_vec())], public: false }).unwrap();
+    let refused = |sig: [u8; 64]| serde_json::to_vec(&Answer::<()>::Refused { refusal: Refusal::Rate, sig: Bytes(sig.to_vec()) }).unwrap();
+    let signed = membership.key.sign(&refusal_message(Refusal::Rate, &request)).to_bytes();
+    let answering = |reply: Vec<u8>| -> Post {
+        Arc::new(move |_: String, _: &'static str, _: Vec<u8>| -> BoxFuture<anyhow::Result<Vec<u8>>> {
+            let reply = reply.clone();
+            Box::pin(async move { Ok(reply) })
+        })
+    };
+    let client = |reply: Vec<u8>| ServeClient::for_service(answering(reply), &membership.wire("membership.example")).unwrap();
+    let error = client(refused(signed)).append(&log(1), &[b"x".to_vec()], false).await.unwrap_err();
+    assert!(error.downcast_ref::<Refused>().is_some_and(|refused| refused.0 == "rate"), "{error}");
+    let error = client(refused([9; 64])).append(&log(1), &[b"x".to_vec()], false).await.unwrap_err();
+    assert!(error.is::<Forged>(), "a refusal another key signed is no refusal: {error}");
+}
+
+#[tokio::test]
+async fn a_404_stops_the_client_with_its_text() {
+    let membership = Membership::new();
+    let asked = Arc::new(Mutex::new(0));
+    let post: Post = {
+        let asked = asked.clone();
+        Arc::new(move |domain: String, _: &'static str, _: Vec<u8>| -> BoxFuture<anyhow::Result<Vec<u8>>> {
+            *asked.lock().unwrap() += 1;
+            let reply = answered(&domain, 404, b"not found".to_vec());
+            Box::pin(async move { reply })
+        })
+    };
+    let client = ServeClient::for_service(post, &membership.wire("membership.example")).unwrap();
+    for _ in 0..2 {
+        let error = client.heads(&[Known(log(1), 0)]).await.unwrap_err();
+        assert!(error.is::<Unsupported>() && error.to_string().contains("runs another minor: not found"), "{error}");
+    }
+    assert_eq!(*asked.lock().unwrap(), 1, "the client asks no more once it stopped");
+}
+
+#[test]
+fn replies_are_bounded_and_only_200_is_an_answer() {
+    assert!(answered("d", 200, vec![0; membership::MAX_BODY]).is_ok());
+    assert!(answered("d", 200, vec![0; membership::MAX_BODY + 1]).is_err());
+    assert!(answered("d", 503, Vec::new()).unwrap_err().to_string().contains("answered 503"));
+}
+
+#[tokio::test]
+async fn a_page_that_does_not_chain_to_the_anchor_is_refused() {
+    let membership = Membership::new();
+    let capability = log(3);
+    membership.client().append(&capability, &[b"one".to_vec()], false).await.unwrap();
+    let post = membership.post();
+    let tampered: Post = Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+        let post = post.clone();
+        Box::pin(async move {
+            let reply = post(domain, route, body).await?;
+            let Answer::Ok(mut page) = serde_json::from_slice::<Answer<membership::Page>>(&reply)? else { return Ok(reply) };
+            page.entries[0] = Bytes(b"forged".to_vec());
+            Ok(serde_json::to_vec(&Answer::Ok(page))?)
+        }) as BoxFuture<anyhow::Result<Vec<u8>>>
+    });
+    let client = ServeClient::for_service(tampered, &membership.wire("membership.example")).unwrap();
+    let error = client.read(&capability, &anchor(&membership.key, &capability)).await.unwrap_err();
+    assert!(error.is::<InvalidProof>() || error.is::<Forged>(), "{error}");
+}

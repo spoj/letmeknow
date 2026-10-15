@@ -1,11 +1,9 @@
 use std::{net::Ipv4Addr, path::Path, sync::Arc, time::Duration};
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use iroh::{Endpoint, RelayConfig, RelayMap, RelayMode, endpoint::presets, tls::CaTlsConfig};
-use iroh_relay::RelayQuicConfig;
-use lmk_membership::client::{Resolve, ServeClient};
+use iroh::tls::CaTlsConfig;
+use lmk_membership::client::ServeClient;
 use lmk_proto::{Bytes, directory::Directory, membership::{Answer, Append, Appended, Page, Read, Refusal, refusal_message}};
-use n0_future::boxed::BoxFuture;
 use lmk_serve::{Certificate, ServeConfig, serve};
 use rustls::pki_types::{CertificateDer, ServerName};
 use serde::de::DeserializeOwned;
@@ -91,23 +89,11 @@ async fn serves_relay_and_membership_without_frontend() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let (config, cert) = configure(&state);
-    let (https, http, qad, membership) = (
-        config.https_port,
-        config.http_port.unwrap(),
-        config.qad_port,
-        config.membership_port,
-    );
+    let (https, http, membership) = (config.https_port, config.http_port.unwrap(), config.membership_port);
     let relay = config.relay_url();
     let service = config.service().unwrap();
     let server = tokio::spawn(serve(config));
     wait_for_https(https).await;
-    let resolved = |directory: Directory| -> Resolve {
-        Arc::new(move |_: String| -> BoxFuture<anyhow::Result<Directory>> {
-            let directory = directory.clone();
-            Box::pin(async move { Ok(directory) })
-        })
-    };
-
     for path in ["/", "/i", "/index.html", "/app.js", "/sw.js", "/membership", "/missing.js"] {
         let response = https_get(https, &cert, path, "").await;
         assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
@@ -129,7 +115,6 @@ async fn serves_relay_and_membership_without_frontend() {
     );
     let directory = Directory::parse(directory.split_once("\r\n\r\n").unwrap().1.as_bytes()).unwrap();
     assert_eq!(directory.key.to_vec(), key.0);
-    let through_relay = directory.clone();
     assert_eq!(directory.addrs, [format!("localhost:{membership}")]);
     assert_eq!(directory.relay, relay);
     assert_eq!(directory.relays, [relay.as_str()]);
@@ -154,39 +139,21 @@ async fn serves_relay_and_membership_without_frontend() {
         "{moved}"
     );
 
-    // Through the relay only.
-    let relay_config = RelayConfig::new(relay.parse().unwrap(), Some(RelayQuicConfig::new(qad)));
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .relay_mode(RelayMode::Custom(RelayMap::from_iter([relay_config])))
-        .ca_tls_config(CaTlsConfig::custom_roots([cert.clone()]))
-        .clear_ip_transports()
-        .bind()
-        .await
-        .unwrap();
-    let client = ServeClient::for_service(endpoint, resolved(through_relay), &service).unwrap();
+    let tls = CaTlsConfig::custom_roots([cert.clone()]).client_config(Arc::new(rustls::crypto::ring::default_provider())).unwrap();
+    let https_post = lmk_membership::client::https(reqwest::Client::builder().tls_backend_preconfigured(tls).no_proxy().build().unwrap());
+    let post: lmk_membership::client::Post = Arc::new(move |_: String, route, body| https_post(format!("localhost:{https}"), route, body));
+    let client = ServeClient::for_service(post, &service).unwrap();
     let appended = tokio::time::timeout(Duration::from_secs(10), client.append(&[7; 32], &[b"commit".to_vec()], false))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(appended.position, 1);
-
-    // Directly, on the membership port.
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .relay_mode(RelayMode::Disabled)
-        .bind()
-        .await
-        .unwrap();
-    let lmk_proto::group::Service::Serve { key, .. } = &service else {
-        unreachable!()
-    };
-    let at_port = Directory { key: key.0.as_slice().try_into().unwrap(), addrs: vec![format!("127.0.0.1:{membership}")], relay: relay.clone(), relays: vec![relay.clone()] };
-    let direct = ServeClient::for_service(endpoint, resolved(at_port), &service).unwrap();
-    let service_key = key.0.as_slice().try_into().unwrap();
-    let log_ref = lmk_proto::head::reference(&service_key, &[7; 32]);
-    let page = direct.read(&[7; 32], &lmk_membership::Frontier::empty(service_key, log_ref)).await.unwrap();
+    let lmk_proto::group::Service::Serve { key, .. } = &service else { unreachable!() };
+    let key: [u8; 32] = key.0.as_slice().try_into().unwrap();
+    let page = client.read(&[7; 32], &lmk_membership::Frontier::empty(key, lmk_proto::head::reference(&key, &[7; 32]))).await.unwrap();
     assert_eq!(page.page().entries[0].0, b"commit");
-    let head = direct.head(&[7; 32]).await.unwrap();
-    assert_eq!((head.length, head.hash), (page.page().head.length, page.page().head.hash));
+    let heads = client.heads(&[lmk_proto::membership::Known([7; 32], 0)]).await.unwrap();
+    assert_eq!((heads[0].length, heads[0].hash), (page.page().head.length, page.page().head.hash));
 
     server.abort();
 }

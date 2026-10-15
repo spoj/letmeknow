@@ -10,29 +10,35 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, ensure};
 use lmk_core::provider::Provider;
 use lmk_core::public::{PublicLog, Verdict};
-use lmk_membership::client::{Resolve, ServeClient};
-use lmk_membership::{Contradiction, Frontier, VerifiedPage, WrongDirectory};
+use lmk_membership::client::{Post, ServeClient};
+use lmk_membership::{Contradiction, Frontier, Unsupported, VerifiedPage, WrongDirectory};
 use lmk_proto::Bytes;
 use lmk_proto::group::{IdentityRef, Service};
 use lmk_proto::head::{self, Head};
-use n0_future::task::spawn;
+use lmk_proto::membership::Known;
+use lmk_proto::clock::now;
 use n0_future::time::{Duration, sleep, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Event, Inner, MEMBER_WAIT, REREAD, State, Work, get, hex, put};
+use crate::{Event, Inner, MEMBER_WAIT, State, Work, get, hex, put};
 
 pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
-/// One membership client per service, sharing the session's endpoint.
+/// How often a session asks its services for the heads of the logs it follows, give or take a quarter.
+const POLL: Duration = Duration::from_secs(2 * 60);
+
+/// The logs asked of one service, each with the length held.
+type Asked = (Service, Vec<(Vec<u8>, Known)>);
+
+/// One membership client per service, sharing the session's post.
 pub(crate) struct Clients {
-    endpoint: iroh::Endpoint,
-    resolve: Resolve,
+    post: Post,
     clients: Mutex<HashMap<String, ServeClient>>,
 }
 
 impl Clients {
-    pub fn new(endpoint: iroh::Endpoint, resolve: Resolve) -> Self {
-        Clients { endpoint, resolve, clients: Mutex::default() }
+    pub fn new(post: Post) -> Self {
+        Clients { post, clients: Mutex::default() }
     }
 
     pub fn client(&self, service: &Service) -> Result<ServeClient> {
@@ -41,7 +47,7 @@ impl Clients {
         if let Some(client) = clients.get(&name) {
             return Ok(client.clone());
         }
-        let client = ServeClient::for_service(self.endpoint.clone(), self.resolve.clone(), service)?;
+        let client = ServeClient::for_service(self.post.clone(), service)?;
         clients.insert(name, client.clone());
         Ok(client)
     }
@@ -116,6 +122,13 @@ impl<P: Provider> State<P> {
 
     pub(crate) fn save_log(&self, id: &[u8]) -> Result<()> {
         put(&self.provider, &log_key(id), self.log(id)?)
+    }
+
+    /// Records that a log was read from its service as of `at`, if this session still follows it.
+    pub(crate) fn read_as_of(&mut self, id: &[u8], at: u64) -> Result<()> {
+        let Some(log) = self.logs.get_mut(id) else { return Ok(()) };
+        log.at = at;
+        self.save_log(id)
     }
 
     fn save_logs(&self) -> Result<()> {
@@ -219,6 +232,21 @@ impl<P: Provider> State<P> {
         self.logs.iter().find_map(|(id, log)| matches!(&log.of, Of::Public(of) if of.0 == identity).then(|| id.clone()))
     }
 
+    /// The logs this session follows at their services: its public logs, and each group's current log.
+    pub(crate) fn followed(&self) -> Vec<(Vec<u8>, Service, Known)> {
+        let mut followed = Vec::new();
+        for (id, log) in &self.logs {
+            let current = match &log.of {
+                Of::Public(_) => true,
+                Of::Group(group) => self.groups.get(&group.0).is_some_and(|g| g.rec.log.0 == *id),
+            };
+            if let (true, Ok(capability)) = (current, self.capability(id)) {
+                followed.push((id.clone(), log.service.clone(), Known(capability, log.length())));
+            }
+        }
+        followed
+    }
+
     /// The groups a log concerns.
     pub(crate) fn groups_of(&self, id: &[u8]) -> Vec<Vec<u8>> {
         match self.logs.get(id).map(|log| &log.of) {
@@ -235,56 +263,59 @@ impl<P: Provider> State<P> {
 }
 
 impl<P: Provider + Send + 'static> Inner<P> {
-    /// Follows a log at its service while it is current: all of it to start with, then what is new as the service tells
-    /// of it, and all of it every 5 minutes and whenever the subscription restarts, until this session drops the log or
-    /// its group moves on.
-    pub(crate) fn follow(self: &Arc<Self>, log: &[u8]) {
-        let (inner, id) = (self.clone(), log.to_vec());
-        let task = spawn(async move {
-            loop {
-                let source = {
-                    let st = inner.lock();
-                    st.capability(&id).and_then(|capability| {
-                        let log = st.log(&id)?;
-                        Ok((capability, log.service.clone(), log.frontier(&id)?))
-                    })
-                };
-                let Ok((capability, service, frontier)) = source else { return };
-                let followed = async {
-                    inner.read(&id).await?;
-                    let mut subscription = inner.clients.client(&service)?.subscribe(vec![(capability, frontier)]).await?;
-                    loop {
-                        match timeout(REREAD, subscription.next()).await {
-                            Ok(Some(page)) => inner.stored(&id, page?)?,
-                            Ok(None) => break,
-                            Err(_) => inner.read(&id).await?,
-                        }
-                    }
-                    anyhow::Ok(())
-                };
-                if let Err(error) = followed.await {
-                    if let Some(contradiction) = error.downcast_ref::<Contradiction>() {
-                        inner.contradicted(&inner.lock(), &id, contradiction, "this session");
-                    }
-                    if let Some(wrong) = error.downcast_ref::<WrongDirectory>()
-                        && inner.misdirected.lock().unwrap().insert(wrong.0.clone())
-                    {
-                        inner.warn(None, error.to_string());
-                    }
-                    tracing::debug!("following log {}: {error:#}", hex(&id));
-                }
-                sleep(Duration::from_secs(2)).await;
+    /// Asks each service for the heads of the logs this session follows, and reads those that moved. A log the answer
+    /// leaves out is unchanged as of the request, which counts as a read of it.
+    pub(crate) async fn ask_heads(self: &Arc<Self>) {
+        let followed = self.lock().followed();
+        let mut services: Vec<Asked> = Vec::new();
+        for (id, service, known) in followed {
+            match services.iter_mut().find(|(s, _)| *s == service) {
+                Some((_, logs)) => logs.push((id, known)),
+                None => services.push((service, vec![(id, known)])),
             }
-        });
-        if let Some(old) = self.follows.lock().unwrap().insert(log.to_vec(), task) {
-            old.abort();
+        }
+        for (service, logs) in services {
+            let sent = now();
+            let known: Vec<Known> = logs.iter().map(|(_, known)| *known).collect();
+            let moved = match self.clients.client(&service) {
+                Ok(client) => client.heads(&known).await,
+                Err(error) => Err(error),
+            };
+            let moved = match moved {
+                Ok(moved) => moved,
+                Err(error) => {
+                    self.report(&error);
+                    continue;
+                }
+            };
+            for (id, _) in logs {
+                if moved.iter().any(|head| head.log_ref[..] == id[..]) {
+                    if let Err(error) = self.read(&id).await {
+                        self.report(&error);
+                    }
+                } else if let Err(error) = self.lock().read_as_of(&id, sent) {
+                    self.report(&error);
+                }
+            }
         }
     }
 
-    pub(crate) fn unfollow(&self, id: &[u8]) {
-        if let Some(task) = self.follows.lock().unwrap().remove(id) {
-            task.abort();
+    /// Asks for the heads every `POLL`, from now on.
+    pub(crate) async fn ask_heads_forever(self: Arc<Self>) {
+        loop {
+            self.ask_heads().await;
+            let jitter = u64::from_be_bytes(lmk_proto::random::random::<8>()) % (POLL.as_millis() as u64 / 4);
+            sleep(POLL - POLL / 8 + Duration::from_millis(jitter)).await;
         }
+    }
+
+    /// Warns once of what the service answered that it is not the group's, or runs another minor. Other failures are
+    /// retried at the next poll.
+    fn report(&self, error: &anyhow::Error) {
+        if (error.is::<WrongDirectory>() || error.is::<Unsupported>()) && self.warned.lock().unwrap().insert(error.to_string()) {
+            self.warn(None, error.to_string());
+        }
+        tracing::debug!("polling the membership service: {error:#}");
     }
 
     /// Reads a log from its service, through its end; a group's only while the group is in its epoch.
@@ -410,7 +441,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             None => {
                 let public_id = identity.id.0.as_slice().try_into()?;
                 // Unauthenticated lookups must not seed the shared clients or the persisted route.
-                let hint = ServeClient::for_service(self.clients.endpoint.clone(), self.clients.resolve.clone(), &identity.membership)?;
+                let hint = ServeClient::for_service(self.clients.post.clone(), &identity.membership)?;
                 let key = authority(&identity.membership)?;
                 let first = hint.read(&address, &Frontier::empty(key, head::reference(&key, &address))).await?;
                 let service = PublicLog::replay(public_id, first.page().entries.iter().map(|entry| entry.0.as_slice()))?.membership;
@@ -432,7 +463,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 if !st.logs.contains_key(&id) {
                     st.add_log(&id, Log::new(Of::Public(identity.id.clone()), service))?;
                     self.take_entries(&mut st, &id, 0, entries, frontier.head().cloned().context("the public log has no head")?)?;
-                    self.follow(&id);
                 }
                 id
             }

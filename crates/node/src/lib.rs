@@ -33,7 +33,7 @@ use lmk_core::device::{Device, signer};
 use lmk_core::group::{self as core, Group, Session};
 use lmk_core::public::{PublicLog, Verdict};
 use lmk_core::provider::Provider;
-use lmk_membership::client::Resolve;
+use lmk_membership::client::{Post, Resolve};
 use lmk_net::peers::Peers;
 use lmk_net::Net;
 use lmk_proto::group::{Certificate, Credential, How, IdentityRef, Settings};
@@ -64,8 +64,6 @@ const PERSISTENCE_FAILED: &str = "local persistence failed";
 /// How long some waits for other members last: for those online to hold a file or an invite, for added members'
 /// certificates.
 const MEMBER_WAIT: Duration = Duration::from_secs(5);
-/// How often a followed log is read again whole.
-const REREAD: Duration = Duration::from_secs(5 * 60);
 /// How long a member admitting a joiner waits for the state of the group's kind.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(10);
 
@@ -83,6 +81,8 @@ pub struct Config {
     pub chosen: Vec<RelayUrl>,
     /// Resolves a domain to its directory, as the shell holds it.
     pub resolve: Resolve,
+    /// Posts to a membership service's routes, as the shell does over https.
+    pub post: Post,
     pub ca: CaTlsConfig,
     /// `LETMEKNOW_HOME`, where sessions of one device publish their addresses.
     pub home: Option<PathBuf>,
@@ -535,8 +535,8 @@ pub(crate) enum Work {
         settings: bool,
         gone: bool,
     },
-    /// A group's new log to follow at its service, instead of its old one.
-    Follow { log: Vec<u8>, old: Vec<u8> },
+    /// A group's new log, read once from its service, so that its peers' entries are taken.
+    Read(Vec<u8>),
     /// A group's duties to run.
     Duties(Vec<u8>),
     /// A group this session is out of, by no one's commit.
@@ -554,11 +554,9 @@ pub(crate) struct Inner<P> {
     state: Mutex<State<P>>,
     net: OnceLock<Net>,
     clients: logs::Clients,
-    /// The tasks that follow logs at their services, by log id.
-    follows: Mutex<HashMap<Vec<u8>, JoinHandle<()>>>,
+    resolve: Resolve,
     relays: Vec<RelayUrl>,
     chosen: Vec<RelayUrl>,
-    resolve: Resolve,
     file_limit: u64,
     kinds: Vec<String>,
     events: mpsc::UnboundedSender<Event>,
@@ -579,8 +577,8 @@ pub(crate) struct Inner<P> {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// The contradictions reported, each once.
     contradictions: Mutex<HashSet<Contradicted>>,
-    /// The domains whose directories named another key than their service, each reported once.
-    misdirected: Mutex<HashSet<String>>,
+    /// The warnings given, each once: a service that signs with another key, or that runs another minor.
+    warned: Mutex<HashSet<String>>,
 }
 
 /// One member's session. Clones share it.

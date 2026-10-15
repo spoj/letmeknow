@@ -2,13 +2,13 @@ use super::*;
 use crate::Config;
 use lmk_core::provider::MemoryProvider;
 use lmk_core::public::{PublicLog, Verdict};
+use lmk_membership::client::{Post, ServeClient};
 use lmk_membership::store::Store;
-use lmk_proto::directory::Directory;
-use lmk_proto::frame::{self, ALPN, Open};
 use lmk_proto::group::{CHAT, Credential};
 use lmk_proto::head::reference;
-use lmk_proto::membership::{Latest, Page, Reply, Request};
+use lmk_proto::membership::{Answer, Page, Read};
 use lmk_testing::{Relay, relay};
+use n0_future::task::AbortOnDropHandle;
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 
@@ -16,17 +16,18 @@ const WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct ReadGate {
-    peer: iroh::EndpointId,
     log: [u8; 32],
     remaining: usize,
     reached: Arc<Notify>,
     release: Arc<Notify>,
 }
 
+/// The membership service's state the test controls: what its node reads of a log wait for, and what it reads of a
+/// log from a page it was given in place of the service's own.
 struct Authority {
     store: Store,
     gate: Mutex<Option<ReadGate>>,
-    stale: Mutex<Option<(iroh::EndpointId, [u8; 32], Page)>>,
+    stale: Mutex<Option<([u8; 32], Page)>>,
 }
 
 impl Authority {
@@ -37,24 +38,20 @@ impl Authority {
     fn read(&self, log: &[u8]) -> Page {
         self.store.read(log.try_into().unwrap(), 0).unwrap()
     }
-}
 
-impl std::fmt::Debug for Authority {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Authority") }
-}
-
-impl iroh::protocol::ProtocolHandler for Authority {
-    async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
-        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-            let _: Open = frame::read(&mut recv).await.unwrap();
-            let request: Request = frame::read(&mut recv).await.unwrap();
-            let answer = match request {
-                Request::Read { capability, after } => {
-                    let log = self.log(&capability);
+    /// The posts of one node through the state: its reads wait at the gate, and answer from the stale page.
+    fn post(self: &Arc<Self>, base: Post) -> Post {
+        let authority = self.clone();
+        Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+            let (authority, base) = (authority.clone(), base.clone());
+            Box::pin(async move {
+                if route == "/membership/1/read" {
+                    let Read { capability, after } = serde_json::from_slice(&body)?;
+                    let log = authority.log(&capability);
                     let gate = {
-                        let mut gate = self.gate.lock().unwrap();
+                        let mut gate = authority.gate.lock().unwrap();
                         match gate.as_mut() {
-                            Some(g) if g.peer == connection.remote_id() && g.log == log => {
+                            Some(g) if g.log == log => {
                                 g.remaining -= 1;
                                 if g.remaining == 0 { gate.take() } else { None }
                             }
@@ -65,32 +62,27 @@ impl iroh::protocol::ProtocolHandler for Authority {
                         gate.reached.notify_one();
                         gate.release.notified().await;
                     }
-                    let stale = self.stale.lock().unwrap().clone();
-                    let page = match stale {
-                        Some((peer, id, page)) if peer == connection.remote_id() && id == log => {
-                            assert!(after <= page.head.length);
-                            Page { after, entries: page.entries.into_iter().skip(after as usize).collect(), head: page.head }
-                        }
-                        _ => self.store.read(&log, after).unwrap(),
-                    };
-                    serde_json::to_value(Reply::Ok(page)).unwrap()
+                    let stale = authority.stale.lock().unwrap().clone();
+                    if let Some((_, page)) = stale.filter(|(id, _)| *id == log) {
+                        assert!(after <= page.head.length);
+                        let page = Page { after, entries: page.entries.into_iter().skip(after as usize).collect(), head: page.head };
+                        return Ok(serde_json::to_vec(&Answer::Ok(page))?);
+                    }
                 }
-                Request::Append { capability, entries, public } => serde_json::to_value(Reply::Ok(self.store.append(&self.log(&capability), &entries, public).unwrap())).unwrap(),
-                Request::Head { capability } => serde_json::to_value(Reply::Ok(Latest { head: self.store.head(&self.log(&capability)).unwrap() })).unwrap(),
-                // No subscription delivery: the test controls when each node reads and applies history.
-                Request::Subscribe { .. } => continue,
-            };
-            frame::write(&mut send, &answer).await.unwrap();
-            send.finish().unwrap();
-        }
-        Ok(())
+                base(domain, route, body).await
+            })
+        })
     }
 }
 
-async fn device(relay: &Relay, name: &str) -> (Node<MemoryProvider>, Identity<MemoryProvider>) {
+impl std::fmt::Debug for Authority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Authority") }
+}
+
+async fn device(relay: &Relay, name: &str, post: Post) -> (Node<MemoryProvider>, Identity<MemoryProvider>) {
     let device = Device::new(name);
     let config = Config {
-        handle: name.into(), device: Some(device.clone()), relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), ca: relay.ca(),
+        handle: name.into(), device: Some(device.clone()), relays: vec![relay.url.clone()], chosen: vec![], resolve: lmk_testing::resolve(), post, ca: relay.ca(),
         home: None, files: None, disk: None, file_limit: 0, kinds: vec![CHAT.into(), IDENTITY.into()], durable: None,
     };
     let (node, _events) = Node::start(MemoryProvider::default(), config).await.unwrap();
@@ -102,7 +94,7 @@ struct Race {
     _dir: tempfile::TempDir,
     relay: Relay,
     authority: Arc<Authority>,
-    router: iroh::protocol::Router,
+    service: AbortOnDropHandle<()>,
     a: Node<MemoryProvider>,
     a_identity: Identity<MemoryProvider>,
     c: Node<MemoryProvider>,
@@ -117,17 +109,12 @@ impl Race {
     async fn new(with_b: bool) -> Self {
         let relay = relay().await;
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::initialize(&dir.path().join("state")).unwrap();
-        let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&store.key().to_bytes())).await;
-        let Service::Serve { domain, .. } = &relay.service else { unreachable!() };
-        let domain = format!("race.{domain}");
-        lmk_testing::publish(&domain, Directory { key: *endpoint.id().as_bytes(), addrs: vec![], relay: relay.url.to_string(), relays: vec![relay.url.to_string()] });
-        let membership = Service::Serve { key: Bytes(endpoint.id().as_bytes().to_vec()), domain, rest: Default::default() };
-        let authority = Arc::new(Authority { store, gate: Mutex::default(), stale: Mutex::default() });
-        let router = iroh::protocol::Router::builder(endpoint).accept(ALPN, authority.clone()).spawn();
-        let (a, a_identity) = device(&relay, "A").await;
-        let (c, c_identity) = device(&relay, "C").await;
-        let (b, b_identity) = device(&relay, "B").await;
+        let state = dir.path().join("state");
+        let (membership, service) = relay.serve(&state).await;
+        let authority = Arc::new(Authority { store: Store::open(&state).unwrap(), gate: Mutex::default(), stale: Mutex::default() });
+        let (a, a_identity) = device(&relay, "A", authority.post(relay.post())).await;
+        let (c, c_identity) = device(&relay, "C", relay.post()).await;
+        let (b, b_identity) = device(&relay, "B", relay.post()).await;
         let identity = a_identity.create("Identity", membership).await.unwrap();
         let gid = a_identity.group().unwrap();
         c_identity.join(&Invite::parse(&a_identity.invite().await.unwrap()).unwrap()).await.unwrap();
@@ -139,22 +126,21 @@ impl Race {
         a.inner.caught_up(&gid.0).await.unwrap();
         a.read_public(&identity).await.unwrap();
         // Keep A's service client, but no peer pump, follow, polling or automatic duties can apply C's later commit.
-        let mut tasks: Vec<_> = a.inner.tasks.lock().unwrap().drain(..).collect();
-        tasks.extend(a.inner.follows.lock().unwrap().drain().map(|(_, task)| task));
+        let tasks: Vec<_> = a.inner.tasks.lock().unwrap().drain(..).collect();
         for task in &tasks { task.abort(); }
         for task in tasks { let _ = task.await; }
-        Self { _dir: dir, relay, authority, router, a, a_identity, c, c_identity, b, b_identity, identity, gid }
+        Self { _dir: dir, relay, authority, service, a, a_identity, c, c_identity, b, b_identity, identity, gid }
     }
 
     fn gate(&self, log: [u8; 32], remaining: usize) -> (Arc<Notify>, Arc<Notify>) {
         let (reached, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
-        *self.authority.gate.lock().unwrap() = Some(ReadGate { peer: self.a.net().id(), log, remaining, reached: reached.clone(), release: release.clone() });
+        *self.authority.gate.lock().unwrap() = Some(ReadGate { log, remaining, reached: reached.clone(), release: release.clone() });
         (reached, release)
     }
 
     async fn close(self) {
         for node in [&self.a, &self.b, &self.c] { node.shutdown().await.unwrap(); }
-        self.router.shutdown().await.unwrap();
+        drop(self.service);
     }
 }
 
@@ -179,7 +165,7 @@ async fn captured_roster_race(remove: bool, leave: bool) {
     };
     let credential = Credential { key: [7; 32].into(), name: "external session".into(), certificate: Some(Box::new(certificate)) };
     let expected = if remove { Verdict::Dropped } else { Verdict::Authorized };
-    let (observer, _) = device(&r.relay, "Observer").await;
+    let (observer, _) = device(&r.relay, "Observer", r.relay.post()).await;
     let published = observer.read_public(&r.identity).await.unwrap();
     assert_eq!(published.verify(&credential), expected);
     let cut = r.authority.store.head(&address).unwrap().length;
@@ -258,8 +244,8 @@ async fn publication_waits_for_application_not_just_a_received_page() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_authorized_unobserved_historical_sender_does_not_change_the_ledger() {
     let relay = relay().await;
-    let (observer, own) = device(&relay, "observer").await;
-    let (peer, _) = device(&relay, "former").await;
+    let (observer, own) = device(&relay, "observer", relay.post()).await;
+    let (peer, _) = device(&relay, "former", relay.post()).await;
     own.create("Observer", relay.service.clone()).await.unwrap();
     let settings = Settings { protocol: PROTOCOL, kind: CHAT.into(), name: "chat".into(), carry: 7, update: UPDATE,
         membership: relay.service.clone(), public: None, rest: Default::default() };
@@ -276,8 +262,7 @@ async fn an_authorized_unobserved_historical_sender_does_not_change_the_ledger()
     observer.remove(&gid.0, &peer.key().0).await.unwrap();
     let before = observer.inner.lock().provider.get(b"node/identity-bindings").unwrap();
     assert!(before.is_some(), "the observer's original binding is already durable");
-    let endpoint = relay.endpoint(iroh::SecretKey::from_bytes(&lmk_core::random())).await;
-    let client = lmk_membership::client::ServeClient::for_service(endpoint, lmk_testing::resolve(), &relay.service).unwrap();
+    let client = ServeClient::for_service(relay.post(), &relay.service).unwrap();
     client.append(&lmk_proto::public::address(&id), &[first], true).await.unwrap();
     observer.read_public(&identity).await.unwrap();
     for _ in 0..3 {
@@ -305,10 +290,10 @@ async fn known_public_revocation_is_not_undone_by_a_stale_roster() {
     assert_eq!(revoked.verify(&credential), Verdict::Dropped, "A already knows the public revocation");
     let directory = r.authority.log(&lmk_proto::public::address(&r.identity.id.0));
     let length = r.authority.store.head(&directory).unwrap().length;
-    *r.authority.stale.lock().unwrap() = Some((r.a.net().id(), log.0.as_slice().try_into().unwrap(), prefix));
+    *r.authority.stale.lock().unwrap() = Some((log.0.as_slice().try_into().unwrap(), prefix));
     r.a_identity.duties(&r.gid.0).await.unwrap();
     assert_eq!(r.authority.store.head(&directory).unwrap().length, length, "A appends nothing");
-    let (observer, _) = device(&r.relay, "Observer").await;
+    let (observer, _) = device(&r.relay, "Observer", r.relay.post()).await;
     assert_eq!(observer.read_public(&r.identity).await.unwrap().verify(&credential), Verdict::Dropped);
     observer.shutdown().await.unwrap();
     r.close().await;
