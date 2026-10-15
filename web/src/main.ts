@@ -572,7 +572,8 @@ async function leaveDialog(link?: string) {
   );
   go.onclick = () =>
     busy(go, link ? "Moving…" : "Leaving…", async () => {
-      await request({ cmd: "identity", op: "leave" });
+      // In the render queue, so no render in flight reads a group that the leave ends.
+      await (rendering = rendering.then(() => request({ cmd: "identity", op: "leave" })));
       me = JSON.parse(await lmk.me());
       dialog.close();
       if (link) await redeem(link);
