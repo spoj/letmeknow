@@ -27,7 +27,7 @@ pub fn answered(domain: &str, status: u16, body: Vec<u8>) -> Result<Vec<u8>> {
             ensure!(body.len() <= membership::MAX_BODY, "the membership service at {domain} sent more than a reply may be");
             Ok(body)
         }
-        404 => Err(Unsupported(domain.into(), String::from_utf8_lossy(&body).into()).into()),
+        404 => Err(Unsupported(domain.into()).into()),
         _ => bail!("the membership service at {domain} answered {status}"),
     }
 }

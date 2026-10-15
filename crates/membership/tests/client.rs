@@ -123,21 +123,21 @@ async fn a_refusal_acts_only_when_the_service_signed_it() {
 }
 
 #[tokio::test]
-async fn a_404_stops_the_client_with_its_text() {
+async fn a_404_stops_the_client_and_echoes_no_text() {
     let membership = Membership::new();
     let asked = Arc::new(Mutex::new(0));
     let post: Post = {
         let asked = asked.clone();
         Arc::new(move |domain: String, _: &'static str, _: Vec<u8>| -> BoxFuture<anyhow::Result<Vec<u8>>> {
             *asked.lock().unwrap() += 1;
-            let reply = answered(&domain, 404, b"not found".to_vec());
+            let reply = answered(&domain, 404, b"<script>sent by the service</script>".to_vec());
             Box::pin(async move { reply })
         })
     };
     let client = ServeClient::for_service(post, &membership.wire("membership.example")).unwrap();
     for _ in 0..2 {
         let error = client.heads(&[Known(log(1), 0)]).await.unwrap_err();
-        assert!(error.is::<Unsupported>() && error.to_string().contains("runs another minor: not found"), "{error}");
+        assert!(error.is::<Unsupported>() && error.to_string() == "the membership service at membership.example runs another minor", "{error}");
     }
     assert_eq!(*asked.lock().unwrap(), 1, "the client asks no more once it stopped");
 }
