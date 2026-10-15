@@ -2,7 +2,7 @@
 
 use std::{
     future::Future,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     num::NonZeroU32,
     path::PathBuf,
     pin::Pin,
@@ -18,11 +18,8 @@ use hyper::{
     service::{Service as HyperService, service_fn},
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
-use iroh::{
-    Endpoint, RelayConfig, RelayMap, RelayMode, SecretKey, endpoint::presets, protocol::Router, tls::CaTlsConfig,
-};
 use iroh_relay::{
-    KeyCache, RelayQuicConfig,
+    KeyCache,
     server::{
         AllowAll, ClientRateLimit, Handlers, Metrics, QuicConfig, RelayService, Server, ServerConfig,
         http_server::{BytesBody, HyperError, RelayServiceWithNotify},
@@ -33,7 +30,7 @@ use lmk_membership::{
     service::{Policy, Route, Service},
     store::Store,
 };
-use lmk_proto::{directory::{self, Directory}, frame::ALPN, group, membership::MAX_BODY};
+use lmk_proto::{directory::{self, Directory}, group, membership::MAX_BODY};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use socket2::{Domain, Socket, Type};
 use tokio::{
@@ -66,8 +63,6 @@ pub struct ServeConfig {
     pub http_port: Option<u16>,
     /// QUIC address discovery. Clients given only the relay's URL assume 7842.
     pub qad_port: u16,
-    /// The membership service's iroh endpoint.
-    pub membership_port: u16,
     /// The relays the directory names, which members live on; empty names this service's own `relay_url()`.
     pub relays: Vec<String>,
     /// Holds the service's key, its database and the ACME cache.
@@ -87,7 +82,6 @@ impl ServeConfig {
             https_port: 443,
             http_port: Some(80),
             qad_port: 7842,
-            membership_port: 7843,
             relays: vec![],
             state: state.into(),
             certificate: Certificate::Acme { contact: None },
@@ -139,8 +133,6 @@ fn rustls_builder() -> rustls::ConfigBuilder<rustls::ServerConfig, rustls::serve
 /// Runs until the HTTPS listener fails.
 pub async fn serve(config: ServeConfig) -> Result<()> {
     let store = Store::open(&config.state)?;
-    let secret = SecretKey::from_bytes(&store.key().to_bytes());
-    let mut roots = Vec::new();
     let (tls, server_config) = match &config.certificate {
         Certificate::Acme { contact } => {
             let mut state = AcmeConfig::new([&config.domain])
@@ -165,7 +157,6 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
                 .collect::<Result<_, _>>()
                 .context("reading the certificate")?;
             let key = PrivateKeyDer::from_pem_file(key).context("reading the key")?;
-            roots = chain.clone();
             let server_config = Arc::new(rustls_builder().with_single_cert(chain, key)?);
             (
                 Tls::Files(tokio_rustls::TlsAcceptor::from(server_config.clone())),
@@ -194,19 +185,8 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         tokio::spawn(redirect(http, config.relay_url()));
     }
 
-    let relay_config = RelayConfig::new(config.relay_url().parse()?, Some(RelayQuicConfig::new(config.qad_port)));
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .secret_key(secret)
-        .relay_mode(RelayMode::Custom(RelayMap::from_iter([relay_config])))
-        .ca_tls_config(CaTlsConfig::embedded().with_extra_roots(roots))
-        .clear_ip_transports()
-        .bind_addr((Ipv4Addr::UNSPECIFIED, config.membership_port))?
-        .bind_addr((Ipv6Addr::UNSPECIFIED, config.membership_port))?
-        .bind()
-        .await?;
     let directory = Directory {
         key: *store.key().verifying_key().as_bytes(),
-        addrs: vec![format!("{}:{}", config.domain, config.membership_port)],
         relay: config.relay_url(),
         relays: if config.relays.is_empty() { vec![config.relay_url()] } else { config.relays.clone() },
     };
@@ -218,7 +198,6 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         hex::encode(store.key().verifying_key().as_bytes())
     ));
     let membership = Service::new(store, config.policy);
-    let _router = Router::builder(endpoint).accept(ALPN, membership.clone()).spawn();
 
     let tls = Arc::new(tls);
     let origins = Arc::new(std::iter::once(APP.to_owned()).chain(config.origins.iter().cloned()).collect::<Vec<_>>());

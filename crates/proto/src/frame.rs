@@ -17,7 +17,6 @@ pub struct Open {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stream {
-    Membership,
     Peer,
     Admission,
 }
@@ -72,8 +71,8 @@ mod tests {
     #[tokio::test]
     async fn read_known_skips_what_does_not_parse() {
         let mut buf = encode(&serde_json::json!({"stream": "newer"}));
-        buf.extend(encode(&Open { stream: Stream::Membership }));
+        buf.extend(encode(&Open { stream: Stream::Admission }));
         let open: Open = read_known(&mut buf.as_slice()).await.unwrap();
-        assert_eq!(open.stream, Stream::Membership);
+        assert_eq!(open.stream, Stream::Admission);
     }
 }

@@ -133,7 +133,7 @@ def serve():
     cert, key = os.path.join(TMP, "cert.pem"), os.path.join(TMP, "key.pem")
     subprocess.run(["cargo", "run", "-q", "-p", "letmeknow", "--example", "self_signed", "--", cert, key], cwd=ROOT, check=True)
     https = free_port()
-    args = [BIN, "serve", "--domain", "localhost", "--https-port", str(https), "--http-port", str(free_port()), "--membership-port", str(free_port()),
+    args = [BIN, "serve", "--domain", "localhost", "--https-port", str(https), "--http-port", str(free_port()),
             "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key]
     subprocess.run(args + ["--initialize"], env=ENV, check=True, stdout=subprocess.DEVNULL)
     proc = subprocess.Popen(args + ["--relays", f"https://localhost:{https}", f"https://127.0.0.1:{https}"], env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)

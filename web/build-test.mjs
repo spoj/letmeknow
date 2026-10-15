@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-const good = { domain: "relay.letmeknow.dev", directory: { key: "11".repeat(32), addrs: [], relay: "https://relay.letmeknow.dev", relays: ["https://relay.letmeknow.dev"] } };
+const good = { domain: "relay.letmeknow.dev", directory: { key: "11".repeat(32), relay: "https://relay.letmeknow.dev", relays: ["https://relay.letmeknow.dev"] } };
 const with_ = (domain, directory) => ({ domain, directory: { ...good.directory, ...directory } });
 for (const [backend, message] of [
   [with_(good.domain, { key: null }), /reviewed fresh authority/],

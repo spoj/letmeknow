@@ -74,7 +74,7 @@ fn free_port() -> u16 {
 /// domain, its key in hex, and its certificate.
 async fn service(state: &Path) -> (String, String, CertificateDer<'static>) {
     let mut config = ServeConfig::new("localhost", state);
-    (config.https_port, config.qad_port, config.membership_port) = (free_port(), free_port(), free_port());
+    (config.https_port, config.qad_port) = (free_port(), free_port());
     config.http_port = Some(free_port());
     config.policy.appends_per_minute = u32::MAX;
     let lmk_proto::group::Service::Serve { key, .. } = config.initialize().unwrap() else { unreachable!() };
@@ -1356,7 +1356,7 @@ fn a_membership_domain_is_checked_pinned_and_fetched() {
 #[tokio::test]
 async fn a_directory_is_cached_and_the_built_in_one_answers_for_letmeknow_dev() {
     let dir = tempfile::tempdir().unwrap();
-    let served = Directory { key: [1; 32], addrs: vec![], relay: "https://relay.example".into(), relays: vec!["https://relay.example".into()] };
+    let served = Directory { key: [1; 32], relay: "https://relay.example".into(), relays: vec!["https://relay.example".into()] };
     let calls = Arc::new(AtomicU32::new(0));
     let fetch: lmk_membership::client::Resolve = {
         let (served, calls) = (served.clone(), calls.clone());

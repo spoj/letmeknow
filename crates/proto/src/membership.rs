@@ -1,11 +1,11 @@
-//! Capability-addressed membership streams. References in replies confer no access.
+//! The bodies of the membership service's HTTPS routes and their answers, which name logs by capability. References in
+//! answers confer no access.
 
 use std::{fmt, marker::PhantomData};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::{Error, SeqAccess, Visitor}};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{Bytes, head::{self, Head}};
 
@@ -14,7 +14,6 @@ pub const MAX_ENTRY: usize = 1 << 20;
 pub const APPEND_ROWS: usize = 64;
 pub const APPEND_BYTES: usize = 2 << 20;
 pub const PAGE_ROWS: usize = 1024;
-pub const SUBSCRIBE_LOGS: usize = 32;
 pub const HEAD_LOGS: usize = 256;
 pub const PAGE_OVERHEAD: usize = 512;
 
@@ -42,9 +41,6 @@ pub(crate) mod fixed32 {
         decode_bytes::<D, 32>(d)?.try_into().map_err(|_| Error::custom("expected 32 bytes"))
     }
 }
-
-#[derive(Serialize, Deserialize)]
-struct Capability(#[serde(with = "fixed32")] [u8; 32]);
 
 struct Entry(Bytes);
 impl<'de> Deserialize<'de> for Entry {
@@ -85,23 +81,6 @@ fn page_entries<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Bytes>, D::Error>
     Ok(entries)
 }
 
-mod capabilities {
-    use super::*;
-    pub fn serialize<S: Serializer>(caps: &[[u8; 32]], s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq;
-        let mut seq = s.serialize_seq(Some(caps.len()))?;
-        for cap in caps { seq.serialize_element(&Capability(*cap))?; }
-        seq.end()
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<[u8; 32]>, D::Error> {
-        let caps: Vec<_> = bounded::<D, Capability, SUBSCRIBE_LOGS>(d)?.into_iter().map(|c| c.0).collect();
-        if caps.is_empty() || caps.iter().enumerate().any(|(i, c)| caps[..i].contains(c)) {
-            return Err(Error::custom("subscription shape"));
-        }
-        Ok(caps)
-    }
-}
-
 fn known_logs<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Known>, D::Error> {
     bounded::<D, Known, HEAD_LOGS>(d)
 }
@@ -125,25 +104,6 @@ pub fn valid_page(entries: &[Bytes]) -> bool {
         && encoded_page_bytes(entries) <= MAX_BODY
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Request {
-    Append {
-        #[serde(with = "fixed32")]
-        capability: [u8; 32],
-        #[serde(deserialize_with = "append_entries")]
-        entries: Vec<Bytes>,
-        public: bool,
-    },
-    Read { #[serde(with = "fixed32")] capability: [u8; 32], after: u64 },
-    Head { #[serde(with = "fixed32")] capability: [u8; 32] },
-    Subscribe { #[serde(with = "capabilities")] capabilities: Vec<[u8; 32]> },
-}
-
-impl fmt::Debug for Request {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("membership request (redacted)") }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Appended {
     pub position: u64,
@@ -163,9 +123,6 @@ impl fmt::Debug for Page {
         f.debug_struct("Page").field("after", &self.after).field("rows", &self.entries.len()).field("head", &self.head).finish()
     }
 }
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Latest { pub head: Head }
 
 /// The bodies of the HTTPS routes; each route takes one.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,7 +158,8 @@ pub struct Moved {
     pub heads: Vec<Head>,
 }
 
-/// What the HTTPS routes answer: the value, or a refusal the service signs over `refusal_message`.
+/// What the HTTPS routes answer: the value, or a refusal the service signs over `refusal_message`. Externally tagged: an
+/// untagged answer buffers arbitrary arrays before their bounded visitors run.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Answer<T> {
@@ -215,17 +173,6 @@ pub enum Answer<T> {
 
 pub fn refusal_message(refusal: Refusal, request: &[u8]) -> Vec<u8> {
     [b"letmeknow refusal v1\0".as_slice(), refusal.code().as_bytes(), &Sha256::digest(request)].concat()
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Subscribed {}
-
-// Externally tagged: an untagged answer buffers arbitrary arrays before their bounded visitors run.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Reply<T> {
-    Ok(T),
-    Refused(Refusal),
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -245,24 +192,6 @@ impl Refusal {
     }
 }
 
-pub async fn read_frame<T: serde::de::DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R) -> anyhow::Result<T> {
-    let len = read_len(r).await?;
-    read_body(r, len).await
-}
-
-/// The caller reserves memory for the body before `read_body` allocates it.
-pub async fn read_len<R: AsyncRead + Unpin>(r: &mut R) -> anyhow::Result<usize> {
-    let len = r.read_u32().await? as usize;
-    anyhow::ensure!(len <= MAX_BODY, "membership frame limit");
-    Ok(len)
-}
-
-pub async fn read_body<T: serde::de::DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R, len: usize) -> anyhow::Result<T> {
-    let mut body = vec![0; len];
-    r.read_exact(&mut body).await?;
-    serde_json::from_slice(&body).map_err(|_| anyhow::anyhow!("invalid membership frame"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,25 +199,12 @@ mod tests {
     #[test]
     fn counts_are_bounded_while_decoding() {
         let entries = |n| format!("[{}]", vec!["\"\""; n].join(","));
-        let text = format!(r#"{{"append":{{"capability":"{}","entries":{},"public":false}}}}"#, URL_SAFE_NO_PAD.encode([7; 32]), entries(100_000));
-        let error = serde_json::from_str::<Request>(&text).unwrap_err();
+        let text = format!(r#"{{"capability":"{}","entries":{},"public":false}}"#, URL_SAFE_NO_PAD.encode([7; 32]), entries(100_000));
+        let Err(error) = serde_json::from_str::<Append>(&text) else { panic!("an oversized append decoded") };
         assert!(error.column() < 512, "must stop before decoding the oversized list");
-        let caps = vec![URL_SAFE_NO_PAD.encode([7; 32]); 100_000];
-        let text = format!(r#"{{"subscribe":{{"capabilities":{}}}}}"#, serde_json::to_string(&caps).unwrap());
-        assert!(serde_json::from_str::<Request>(&text).unwrap_err().column() < 2048);
         let text = format!(r#"{{"ok":{{"after":0,"entries":{}}}}}"#, entries(100_000));
-        assert!(serde_json::from_str::<Reply<Page>>(&text).unwrap_err().column() < 4096,
-            "reply decoding must not buffer the unbounded list before invoking its visitor");
-    }
-
-    #[tokio::test]
-    async fn frame_errors_do_not_echo_requests_or_refusals() {
-        let bytes = crate::frame::encode(&serde_json::json!({"private arbitrary request body": ["credential"]}));
-        let error = read_frame::<Request, _>(&mut bytes.as_slice()).await.unwrap_err();
-        assert_eq!(format!("{error:#}"), "invalid membership frame");
-        let bytes = crate::frame::encode(&serde_json::json!({"refused": "private arbitrary refusal"}));
-        let error = read_frame::<Reply<()>, _>(&mut bytes.as_slice()).await.unwrap_err();
-        assert_eq!(format!("{error:#}"), "invalid membership frame");
+        assert!(serde_json::from_str::<Answer<Page>>(&text).unwrap_err().column() < 4096,
+            "answer decoding must not buffer the unbounded list before invoking its visitor");
     }
 
     #[test]
@@ -310,16 +226,14 @@ mod tests {
     }
 
     #[test]
-    fn maximum_envelope_and_redaction() {
-        let request = Request::Append { capability: [7; 32], entries: vec![Bytes(vec![9; MAX_ENTRY])], public: false };
-        let body = serde_json::to_vec(&request).unwrap();
+    fn the_largest_append_fits_a_body() {
+        let append = Append { capability: [7; 32], entries: vec![Bytes(vec![9; MAX_ENTRY])], public: false };
+        let body = serde_json::to_vec(&append).unwrap();
         assert!(body.len() < MAX_BODY);
-        assert_eq!(serde_json::from_slice::<Request>(&body).unwrap(), request);
-        assert_eq!(format!("{request:?}"), "membership request (redacted)");
+        assert!(serde_json::from_slice::<Append>(&body).unwrap() == append);
         assert!(!valid_append(&vec![Bytes(vec![1]); APPEND_ROWS + 1]));
         assert!(!valid_append(&[Bytes(vec![1; MAX_ENTRY + 1])]));
         assert!(!valid_append(&vec![Bytes(vec![1; MAX_ENTRY]); 3]));
-        assert!(serde_json::from_str::<Request>(r#"{"head":{"log":"AQ"}}"#).is_err());
-        assert!(serde_json::from_str::<Request>(r#"{"head":{"capability":"AQ"}}"#).is_err());
+        assert!(serde_json::from_str::<Read>(r#"{"capability":"AQ","after":0}"#).is_err());
     }
 }

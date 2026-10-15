@@ -66,7 +66,7 @@ fn configure(state: &Path) -> (ServeConfig, CertificateDer<'static>) {
     std::fs::write(state.join("key.pem"), ck.signing_key.serialize_pem()).unwrap();
 
     let mut config = ServeConfig::new("localhost", state);
-    (config.https_port, config.qad_port, config.membership_port) = (free_port(), free_port(), free_port());
+    (config.https_port, config.qad_port) = (free_port(), free_port());
     config.http_port = Some(free_port());
     config.certificate = Certificate::Files {
         chain: state.join("cert.pem"),
@@ -89,7 +89,7 @@ async fn serves_relay_and_membership_without_frontend() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let (config, cert) = configure(&state);
-    let (https, http, membership) = (config.https_port, config.http_port.unwrap(), config.membership_port);
+    let (https, http) = (config.https_port, config.http_port.unwrap());
     let relay = config.relay_url();
     let service = config.service().unwrap();
     let server = tokio::spawn(serve(config));
@@ -115,7 +115,6 @@ async fn serves_relay_and_membership_without_frontend() {
     );
     let directory = Directory::parse(directory.split_once("\r\n\r\n").unwrap().1.as_bytes()).unwrap();
     assert_eq!(directory.key.to_vec(), key.0);
-    assert_eq!(directory.addrs, [format!("localhost:{membership}")]);
     assert_eq!(directory.relay, relay);
     assert_eq!(directory.relays, [relay.as_str()]);
     let portal = http_get(

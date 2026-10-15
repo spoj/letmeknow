@@ -483,7 +483,7 @@ mod tests {
         for _ in 0..3 { store.append(&d, &[Bytes(vec![3; membership::MAX_ENTRY])], false).unwrap(); }
         let page = store.read(&d, 0).unwrap();
         assert_eq!(page.entries.len(), 2);
-        assert!(serde_json::to_vec(&membership::Reply::Ok(&page)).unwrap().len() < membership::MAX_BODY);
+        assert!(serde_json::to_vec(&membership::Answer::Ok(&page)).unwrap().len() < membership::MAX_BODY);
         assert_eq!(store.read(&d, 2).unwrap().entries.len(), 1);
         drop(store);
     }

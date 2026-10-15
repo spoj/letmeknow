@@ -153,7 +153,7 @@ async fn membership(url: &RelayUrl, cert: &CertificateDer<'static>, key: &Privat
         }
     }));
     let domain = format!("localhost:{port}");
-    publish(&domain, Directory { key: public, addrs: vec![], relay: url.to_string(), relays: vec![url.to_string()] });
+    publish(&domain, Directory { key: public, relay: url.to_string(), relays: vec![url.to_string()] });
     (Service::Serve { key: Bytes(public.to_vec()), domain, rest: Default::default() }, task)
 }
 

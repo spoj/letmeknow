@@ -90,9 +90,6 @@ pub struct Serve {
     pub https_port: u16,
     #[arg(long, default_value_t = 80)]
     pub http_port: u16,
-    /// The membership service's UDP port
-    #[arg(long, default_value_t = 7843)]
-    pub membership_port: u16,
     /// The relays its directory names, which members live on; default its own
     #[arg(long, num_args = 1..)]
     pub relays: Vec<String>,

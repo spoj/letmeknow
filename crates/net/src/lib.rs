@@ -401,7 +401,6 @@ impl Inner {
                 Stream::Admission => {
                     spawn(self.clone().admit(peer, send, recv));
                 }
-                Stream::Membership => {}
             }
         }
         self.unregister(&conn);
