@@ -43,6 +43,7 @@ pub async fn serve(serve: cli::Serve) -> Result<()> {
     config.relays = serve.relays;
     config.qad_port = serve.qad_port;
     config.policy.disk = serve.disk << 20;
+    config.policy.retention_days = serve.retention;
     config.origins = serve.origin;
     if let (Some(chain), Some(key)) = (serve.cert, serve.key) {
         config.certificate = lmk_serve::Certificate::Files { chain, key };

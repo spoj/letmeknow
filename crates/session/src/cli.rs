@@ -105,6 +105,9 @@ pub struct Serve {
     /// An origin besides letmeknow.dev's whose pages may append to the membership service; repeat for several
     #[arg(long)]
     pub origin: Vec<String>,
+    /// Days a group's log is kept after its first entry, and a directory's after its last append, at least 7
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(7..))]
+    pub retention: u64,
     /// A certificate (PEM) to use instead of Let's Encrypt, with --key
     #[arg(long, requires = "key")]
     pub cert: Option<PathBuf>,
@@ -462,6 +465,17 @@ mod tests {
         let cli = parse(["letmeknow", "listen", "--relay", "https://a.example", "--relay", "https://b.example"]).unwrap();
         let Command::Listen { membership, relay, .. } = cli.command else { panic!("not listen") };
         assert_eq!((membership.as_str(), relay), ("relay.letmeknow.dev", vec!["https://a.example".to_owned(), "https://b.example".into()]));
+    }
+
+    #[test]
+    fn a_service_keeps_logs_for_a_week_at_least() {
+        let retention = |days: &[&str]| parse([&["letmeknow", "serve", "--domain", "relay.example", "--state", "s"], days].concat()).map(|cli| match cli.command {
+            Command::Serve(serve) => serve.retention,
+            _ => panic!("not serve"),
+        });
+        assert_eq!(retention(&[]).unwrap(), 30);
+        assert_eq!(retention(&["--retention", "7"]).unwrap(), 7);
+        assert!(retention(&["--retention", "6"]).is_err());
     }
 
     #[test]
