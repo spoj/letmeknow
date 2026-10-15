@@ -9,7 +9,7 @@ pub(super) fn binding_record(db: &Path) -> Option<Vec<u8>> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn every_public_body_is_keys_only_through_rename_restatement_removal_and_closure() {
+async fn every_public_body_is_keys_only_through_rename_touch_removal_and_closure() {
     let relay = relay().await;
     let dir = folder("keys-only-bodies");
     std::fs::create_dir_all(&dir).unwrap();
@@ -33,21 +33,12 @@ async fn every_public_body_is_keys_only_through_rename_restatement_removal_and_c
     assert_eq!(lmk_testing::head(&reader, &address).await.length, initial.length, "restart preserves the publication day");
     laptop.node.shutdown().await.unwrap();
     drop((laptop, devices));
-    let mut provider = SqliteProvider::open(&db).unwrap();
-    let rec_key = [b"node/group/".as_slice(), &gid.0].concat();
-    let mut rec: Value = serde_json::from_slice(&provider.get(&rec_key).unwrap().unwrap()).unwrap();
-    rec["publication_day"] = json!(lmk_node::now() / 86_400_000 - 182);
-    provider.put(&rec_key, &serde_json::to_vec(&rec).unwrap()).unwrap();
-    provider.close().unwrap();
     let (laptop, devices) = stored_device(&relay, "renamed-device-canary", &db).await;
-    devices.duties(&gid.0).await.unwrap();
-    let restated = lmk_testing::head(&reader, &address).await.length;
-    assert_eq!(restated, initial.length + 1, "182 local days restates the same keys");
     for _ in 0..3 {
         laptop.node.read_public(&identity).await.unwrap();
         devices.duties(&gid.0).await.unwrap();
     }
-    assert_eq!(lmk_testing::head(&reader, &address).await.length, restated);
+    assert_eq!(lmk_testing::head(&reader, &address).await.length, initial.length, "a touch stores nothing");
 
     let (mut phone, phone_devices) = device(&relay, "other-device-canary").await;
     routed(&mut phone, phone_devices.clone());
@@ -78,7 +69,7 @@ async fn every_public_body_is_keys_only_through_rename_restatement_removal_and_c
             bodies.push(body);
         }
     }
-    assert!(bodies.len() >= 5, "create, maintenance, add, removal, closure were all read");
+    assert!(bodies.len() >= 4, "create, add, removal, closure were all read");
     assert!(bodies.iter().any(|body| body["writers"].as_array().unwrap().contains(&json!(revoked))));
     assert_eq!(bodies.last().unwrap()["writers"], json!([]), "an ID held before removal still opens closure");
     laptop.node.shutdown().await.unwrap();

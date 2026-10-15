@@ -60,10 +60,28 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.caught_up(gid).await?;
             // The one commit of this session's that can apply is the one it posted.
             if built.as_ref() == Some(&entry) && self.lock().group(gid)?.rec.committed == epoch + 1 {
+                let identity = self.lock().group(gid)?.mls.settings().kind == IDENTITY;
+                if identity && let Err(error) = self.touch_directory(gid).await {
+                    self.warn(Some(gid), format!("touching the directory: {error:#}"));
+                }
                 return Ok(Some(epoch));
             }
         }
         bail!("the group kept changing over {COMMIT_TRIES} tries; try again")
+    }
+
+    /// Touches the directory of an identity group, which this device commits in: its last entry again, which its service
+    /// keeps for another retention instead of storing it.
+    async fn touch_directory(&self, gid: &[u8]) -> Result<()> {
+        let (service, address, entry) = {
+            let st = self.lock();
+            let settings = st.group(gid)?.mls.settings();
+            let id = settings.public.context("an identity group without a directory")?;
+            let log = st.public_log(&id.0).context("the directory is not followed")?;
+            let entry = st.entry(&log, st.log(&log)?.length())?.context("the directory's last entry is not held")?;
+            (settings.membership, lmk_proto::public::address(&id.0), entry)
+        };
+        self.clients.client(&service)?.append(&address, &[entry], true).await.map(drop)
     }
 
     /// Reads a group's logs from their service, each epoch's it moves to, through the current one's end.

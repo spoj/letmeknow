@@ -324,8 +324,6 @@ struct Rec {
     leaving: bool,
     /// When this session's leaf was last updated, in milliseconds.
     updated: u64,
-    /// Local UTC day of this device's last directory publication, for retention only.
-    publication_day: u64,
     /// The memberships this session knows of in the group: the current ones, and those ended within H.
     authors: Vec<Author>,
     /// The last delivery index given, and the first one whose message is still kept.

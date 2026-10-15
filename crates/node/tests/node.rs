@@ -1586,10 +1586,14 @@ async fn a_poll_asks_each_service_once_for_every_256_logs() {
         Service::Serve { domain, .. } => domain.clone(),
         _ => unreachable!(),
     };
-    let mut expected = vec![(domain(&relay.service), 256), (domain(&relay.service), 44), (domain(&other), 1)];
-    expected.sort();
+    let once = vec![(domain(&relay.service), 256), (domain(&relay.service), 44), (domain(&other), 1)];
     let mut asked = asked.lock().unwrap().clone();
     asked.sort();
+    // The background poll, every two minutes, may land in this window and ask the same.
+    let polls = asked.len() / once.len();
+    assert!(polls >= 1, "the poll asked no service");
+    let mut expected: Vec<_> = (0..polls).flat_map(|_| once.clone()).collect();
+    expected.sort();
     assert_eq!(asked, expected);
     alice.node.shutdown().await.unwrap();
 }

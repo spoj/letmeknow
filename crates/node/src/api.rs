@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::groups::renaming;
 use crate::held::delivered_key;
-use crate::{G, MEMBER_WAIT, Member, Message, Node, Rec, State, Work, device_key_key, get, now, put};
+use crate::{G, MEMBER_WAIT, Member, Message, Node, Rec, State, Work, device_key_key, get, put};
 
 impl<P: Provider + Send + 'static> Node<P> {
     /// Stops the peers and every task, and closes the provider.
@@ -102,7 +102,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             let (id, first) = public::create(&seed, settings.membership.clone());
             settings.public = Some(Bytes(id.to_vec()));
             let mls = Group::create(&st.provider, &session, &settings)?;
-            let gid = st.add_group(mls, Rec { publication_day: now() / crate::days(1), ..Rec::default() })?;
+            let gid = st.add_group(mls, Rec::default())?;
             put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
             st.device_keys.insert(gid.clone(), (seed, session));
             (gid, IdentityRef { id: Bytes(id.to_vec()), membership: settings.membership }, first)
@@ -362,8 +362,8 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.read_public(identity).await
     }
 
-    /// Publishes an intent derived after reading `predecessor`, never rebasing it onto a later directory.
-    /// Restates unchanged keys every 182 local UTC days for retention, not freshness.
+    /// Publishes an intent derived after reading `predecessor`, never rebasing it onto a later directory. Unchanged
+    /// writers publish nothing: each commit of the identity group touches the directory instead.
     pub async fn publish(&self, gid: &[u8], predecessor: &PublicLog, mut writers: Vec<Bytes>) -> Result<PublicLog> {
         writers.sort();
         writers.dedup();
@@ -380,7 +380,7 @@ impl<P: Provider + Send + 'static> Node<P> {
             let st = self.inner.lock();
             let (seed, session) = st.device_keys.get(gid).context("not an identity group of this node")?;
             ensure!(latest.writers.contains(&Bytes(session.key().to_vec())), "this device is not a directory writer");
-            if latest.writers == writers && now() / crate::days(1) < st.group(gid)?.rec.publication_day + 182 {
+            if latest.writers == writers {
                 return Ok(latest);
             }
             latest.next(seed, writers)
@@ -388,11 +388,6 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.durable().await?;
         let address = lmk_proto::public::address(&identity.id.0);
         self.inner.clients.client(&identity.membership)?.append(&address, &[entry], true).await?;
-        {
-            let mut st = self.inner.lock();
-            st.group_mut(gid)?.rec.publication_day = now() / crate::days(1);
-            st.save(gid)?;
-        }
         self.inner.durable().await?;
         self.inner.read_public(&identity).await
     }
