@@ -175,7 +175,8 @@ async fn public_logs_take_small_entries_and_few_new_and_stored_appends() {
     assert!(matches!(http.append("192.0.2.1", 2, &one(b"x"), true).await, Some(Refusal::Rate)));
     assert!(http.append("192.0.2.1", 2, &one(b"x"), false).await.is_none(), "a private log is not public");
     assert!(http.append("192.0.2.1", 1, &one(b"x"), true).await.is_none());
-    assert!(matches!(http.append("192.0.2.1", 1, &one(b"x"), true).await, Some(Refusal::Rate)));
+    assert!(http.append("192.0.2.1", 1, &one(b"x"), true).await.is_none(), "a touch of the last entry stores nothing, and is not charged");
+    assert!(matches!(http.append("192.0.2.1", 1, &one(b"z"), true).await, Some(Refusal::Rate)));
     assert!(http.append("192.0.2.2", 3, &one(b"x"), true).await.is_none());
 }
 

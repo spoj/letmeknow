@@ -279,10 +279,19 @@ impl Service {
         let reference = head::reference(&self.0.store.key().verifying_key().to_bytes(), &capability);
         let bytes: u64 = entries.iter().map(|e| e.0.len() as u64).sum();
         let count = entries.len() as u64;
+        {
+            let mut budgets = self.0.budgets.lock().unwrap();
+            ensure!(budgets.appends.take(at, sources, 1) && budgets.append_bytes.take(at, sources, bytes), Refused("rate".into()));
+        }
+        if public && count == 1 {
+            let entry = entries[0].0.clone();
+            if let Some(touched) = self.work(move |inner| inner.store.touch(&reference, &entry)).await? {
+                return Ok(touched);
+            }
+        }
         let may_start = {
             let mut budgets = self.0.budgets.lock().unwrap();
-            ensure!(budgets.appends.take(at, sources, 1) && budgets.append_bytes.take(at, sources, bytes)
-                && (!public || budgets.public_appends.fits(at, &[(reference, 1)], count)), Refused("rate".into()));
+            ensure!(!public || budgets.public_appends.fits(at, &[(reference, 1)], count), Refused("rate".into()));
             budgets.new_logs.fits(at, sources, 1) && budgets.new_logs_in_all.fits(at, &IN_ALL, 1)
                 && (!public || budgets.new_public_logs.fits(at, sources, 1))
         };

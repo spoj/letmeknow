@@ -151,12 +151,6 @@ impl Store {
         let live = tip(&tx, log_ref)?;
         let (length, mut hash, stored) = live.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), log_ref), public));
         ensure!(stored == public, Refused("policy".into()));
-        if public && live.is_some() && entries.len() == 1
-            && tx.query_row("SELECT entry FROM records WHERE reference=? AND position=?", params![log_ref, length], |r| r.get::<_, Vec<u8>>(0))? == entries[0].0 {
-            tx.execute("UPDATE anchors SET day=? WHERE reference=?", params![now() / DAY_MS, log_ref])?;
-            tx.commit()?;
-            return Ok((Appended { position: length, head: self.sign(log_ref, length, hash) }, 0));
-        }
         ensure!(used(&tx, &self.wal)? + bytes <= self.disk, Refused("quota".into()));
         if public {
             let public_bytes: u64 = tx.query_row("SELECT public_bytes FROM metadata", [], |r| r.get(0))?;
@@ -178,6 +172,19 @@ impl Store {
             params![day, entries.len() as u64, bytes])?;
         tx.commit()?;
         Ok((Appended { position: length + 1, head: self.sign(log_ref, end, hash) }, entries.len() as u64))
+    }
+
+    /// Touches a public log whose last entry is `entry`, byte for byte: its day moves, and nothing is stored. None, and
+    /// nothing changes, when it is not so.
+    pub fn touch(&self, log_ref: &[u8; 32], entry: &[u8]) -> Result<Option<Appended>> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some((length, hash, true)) = tip(&tx, log_ref)? else { return Ok(None) };
+        let last: Vec<u8> = tx.query_row("SELECT entry FROM records WHERE reference=? AND position=?", params![log_ref, length], |r| r.get(0))?;
+        if last != entry { return Ok(None) }
+        tx.execute("UPDATE anchors SET day=? WHERE reference=?", params![now() / DAY_MS, log_ref])?;
+        tx.commit()?;
+        Ok(Some(Appended { position: length, head: self.sign(log_ref, length, hash) }))
     }
 
     pub fn read(&self, log_ref: &[u8; 32], after: u64) -> Result<Page> {
@@ -363,7 +370,7 @@ mod tests {
         store.append(&directory, &[Bytes(vec![1])], true).unwrap();
         on(110);
         store.append(&group, &[Bytes(vec![2])], false).unwrap();
-        store.append(&directory, &[Bytes(vec![1])], true).unwrap();
+        store.touch(&directory, &[1]).unwrap().unwrap();
         assert!(!store.expire(101).unwrap());
         assert_eq!(store.read(&group, 0).unwrap_err().downcast_ref::<Expired>().unwrap().0, group);
         assert_eq!(store.read(&directory, 0).unwrap().entries, [Bytes(vec![1])]);
@@ -402,16 +409,17 @@ mod tests {
         let (first, stored) = store.append(&directory, &[Bytes(b"entry".to_vec())], true).unwrap();
         assert_eq!((first.position, stored), (1, 1));
         on(12);
-        let (touch, stored) = store.append(&directory, &[Bytes(b"entry".to_vec())], true).unwrap();
-        assert_eq!((touch.position, touch.head.length, touch.head.hash, stored), (1, 1, first.head.hash, 0));
+        let touch = store.touch(&directory, b"entry").unwrap().unwrap();
+        assert_eq!((touch.position, touch.head.length, touch.head.hash), (1, 1, first.head.hash));
+        assert!(store.touch(&directory, b"other").unwrap().is_none());
         assert_eq!(store.db.lock().unwrap().query_row("SELECT count(*) FROM records", [], |r| r.get::<_, u64>(0)).unwrap(), 1);
         store.expire(11).unwrap();
         assert_eq!(store.read(&directory, 0).unwrap().entries, [Bytes(b"entry".to_vec())]);
         let (next, stored) = store.append(&directory, &[Bytes(b"next".to_vec())], true).unwrap();
         assert_eq!((next.position, stored), (2, 1));
+        assert!(store.touch(&directory, b"entry").unwrap().is_none(), "a touch is of the last entry");
         store.append(&group, &[Bytes(b"same".to_vec())], false).unwrap();
-        let (again, stored) = store.append(&group, &[Bytes(b"same".to_vec())], false).unwrap();
-        assert_eq!((again.position, stored), (2, 1));
+        assert!(store.touch(&group, b"same").unwrap().is_none(), "only a public log is touched");
         store.expire(13).unwrap();
         assert!(store.read(&directory, 0).unwrap_err().is::<Expired>());
     }
