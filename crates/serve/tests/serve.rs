@@ -315,19 +315,41 @@ impl std::io::Write for Journal {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
+/// Echoes what a client sends, so that two endpoints connect and exchange bytes through the relay.
+#[derive(Debug)]
+struct Echo;
+
+impl iroh::protocol::ProtocolHandler for Echo {
+    async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
+        let (mut send, mut recv) = conn.accept_bi().await.map_err(iroh::protocol::AcceptError::from_err)?;
+        let data = recv.read_to_end(64).await.map_err(iroh::protocol::AcceptError::from_err)?;
+        send.write_all(&data).await.map_err(iroh::protocol::AcceptError::from_err)?;
+        send.finish().map_err(iroh::protocol::AcceptError::from_err)?;
+        conn.closed().await;
+        Ok(())
+    }
+}
+
+/// The forms a secret's bytes take in a log line: hex, base64url, and Debug's list of numbers.
+fn forms(bytes: &[u8]) -> Vec<String> {
+    use base64::Engine;
+    vec![hex::encode(bytes), base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes), format!("{bytes:?}")]
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_journal_holds_no_addresses_keys_or_capabilities() {
     let journal = Journal::default();
     let writer = journal.clone();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("info,lmk_membership=trace,lmk_serve=trace"))
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info,iroh=off,iroh_relay=warn,lmk_membership=trace,lmk_serve=trace"))
         .with_ansi(false)
         .with_writer(move || writer.clone())
         .init();
+    tracing::info!("the control line");
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let (config, cert) = configure(&state);
-    let https = config.https_port;
+    let (https, relay) = (config.https_port, config.relay_url());
     let service = config.service().unwrap();
     let server = tokio::spawn(serve(config));
     wait_for_https(https).await;
@@ -342,11 +364,56 @@ async fn the_journal_holds_no_addresses_keys_or_capabilities() {
     let response = https_raw("127.0.0.1", https, &cert, &post("/membership/1/heads", Some(APP), &heads)).await;
     let Answer::<Moved>::Ok(moved) = answer(&response) else { panic!("{response}") };
     assert_eq!(moved.heads.len(), 1);
+    let public = serde_json::to_vec(&Append { capability: [9; 32], entries: vec![Bytes(vec![0; 17 << 10])], public: true }).unwrap();
+    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, Some(APP), &public)).await;
+    assert!(matches!(answer::<Appended>(&response), Answer::Refused { .. }), "{response}");
+    let mut failed = TcpStream::connect((Ipv4Addr::LOCALHOST, https)).await.unwrap();
+    failed.write_all(b"not a TLS handshake\r\n\r\n").await.unwrap();
+    let mut ignored = Vec::new();
+    let _ = failed.read_to_end(&mut ignored).await;
+
+    let mut endpoints = Vec::new();
+    for _ in 0..2 {
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(iroh::RelayConfig::new(relay.parse().unwrap(), Some(Default::default())))))
+            .ca_tls_config(iroh::tls::CaTlsConfig::custom_roots([cert.clone()]))
+            .bind().await.unwrap();
+        endpoints.push(endpoint);
+    }
+    let [dialer, listener]: [iroh::Endpoint; 2] = endpoints.try_into().unwrap();
+    let router = iroh::protocol::Router::builder(listener.clone()).accept(b"journal/1", Echo).spawn();
+    timeout(Duration::from_secs(30), listener.online()).await.unwrap();
+    timeout(Duration::from_secs(30), dialer.online()).await.unwrap();
+    let connection = dialer.connect(listener.addr(), b"journal/1").await.unwrap();
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    send.write_all(b"through the relay").await.unwrap();
+    send.finish().unwrap();
+    assert_eq!(recv.read_to_end(64).await.unwrap(), b"through the relay");
+    let stranger = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(iroh::RelayConfig::new(relay.parse().unwrap(), Some(Default::default())))))
+        .bind().await.unwrap();
+    assert!(timeout(Duration::from_secs(5), stranger.online()).await.is_err(), "a client that trusts no certificate does not reach the relay");
+
+    let store = lmk_membership::store::Store::open(&state).unwrap();
+    while store.expire(i64::MAX as u64).unwrap() {}
+    drop(store);
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/1/read", Some(APP), &read)).await;
+    assert!(matches!(answer::<Page>(&response), Answer::Expired { .. }), "{response}");
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/1/heads", Some(APP), &heads)).await;
+    assert!(matches!(answer::<Moved>(&response), Answer::Ok(moved) if moved.expired.len() == 1), "{response}");
+    router.shutdown().await.unwrap();
     server.abort();
+
     let text = String::from_utf8_lossy(&journal.0.lock().unwrap()).into_owned();
-    assert!(text.contains("listening on"), "the control: the service logs its start:\n{text}");
+    assert!(text.contains("the control line"), "the control: the journal holds this process's lines:\n{text}");
     let reference = head::reference(&key, &capability);
-    for secret in [hex::encode(capability), hex::encode(reference), hex::encode(key), "127.0.0.1".into()] {
-        assert!(!text.contains(&secret), "the journal holds {secret}:\n{text}");
+    let mut secrets = vec![("the capability", forms(&capability)), ("the reference", forms(&reference)), ("the key", forms(&key)), ("an address", vec!["127.0.0.1".into()])];
+    for endpoint in [&dialer, &listener, &stranger] {
+        secrets.push(("an endpoint", [forms(endpoint.id().as_bytes()), vec![endpoint.id().to_string(), endpoint.id().fmt_short().to_string()]].concat()));
+    }
+    for (what, forms) in secrets {
+        for form in forms {
+            assert!(!text.contains(&form), "the journal holds {what} as {form}:\n{text}");
+        }
     }
 }
