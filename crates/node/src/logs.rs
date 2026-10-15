@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use lmk_core::provider::Provider;
 use lmk_core::public::{PublicLog, Verdict};
 use lmk_membership::client::{Post, ServeClient};
-use lmk_membership::{Contradiction, Frontier, Unsupported, VerifiedPage, WrongDirectory};
+use lmk_membership::{Contradiction, Expired, Frontier, Unsupported, VerifiedPage, WrongDirectory};
 use lmk_proto::Bytes;
 use lmk_proto::group::{IdentityRef, Service};
 use lmk_proto::head::{self, Head};
@@ -20,13 +20,15 @@ use lmk_proto::clock::now;
 use n0_future::time::{Duration, sleep, timeout};
 use serde::{Deserialize, Serialize};
 
-use crate::{Event, Inner, MEMBER_WAIT, State, Work, get, hex, put};
+use crate::{Epoch, Event, Inner, MEMBER_WAIT, State, Work, get, hex, put};
 
 pub(crate) const NOT_FOLLOWED: &str = "this session does not follow that log";
 
 /// How often, at most, a session asks its services for the heads of the logs it follows: a random time between three
 /// quarters of it and all of it.
 const POLL: Duration = Duration::from_secs(2 * 60);
+/// How often the logs members are behind in are asked of their services: a member whose log its service let go is removed.
+const MEMBERS_POLL: Duration = Duration::from_secs(60 * 60);
 
 /// The logs asked of one service, each with the length held.
 type Asked = (Service, Vec<(Vec<u8>, Known)>);
@@ -98,6 +100,13 @@ impl Log {
             Some(head) => Frontier::from_head(service, id, head.clone()),
             None => Ok(Frontier::empty(service, id)),
         }
+    }
+}
+
+impl Epoch {
+    /// The reference of the epoch's log at its service.
+    fn reference(&self) -> Result<[u8; 32]> {
+        Ok(head::reference(&authority(&self.service)?, &self.capability))
     }
 }
 
@@ -298,6 +307,70 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     self.report(&error);
                 }
             }
+        }
+    }
+
+    /// Asks the services whether the logs that members are behind in were let go, and tells each group whose member's log
+    /// one let go to remove it (`due`).
+    pub(crate) async fn ask_members(self: &Arc<Self>) -> Result<()> {
+        let asked: Vec<(Vec<u8>, Epoch)> = {
+            let st = self.lock();
+            st.groups.iter().flat_map(|(gid, g)| g.rec.epochs.iter().filter(|e| e.epoch < g.mls.epoch()).map(|e| (gid.clone(), e.clone()))).collect()
+        };
+        let gone = self.let_go(asked.iter().map(|(_, epoch)| (epoch.service.clone(), epoch.capability)).collect()).await;
+        let mut found = Vec::new();
+        for (gid, epoch) in asked {
+            if gone.contains(&epoch.reference()?) {
+                found.push((gid, epoch.epoch));
+            }
+        }
+        let mut behind = Vec::new();
+        {
+            let mut st = self.lock();
+            for (gid, g) in st.groups.iter_mut() {
+                g.lapsed = found.iter().filter(|(id, _)| id == gid).map(|(_, epoch)| *epoch).collect();
+                if !g.lapsed.is_empty() {
+                    behind.push(gid.clone());
+                }
+            }
+        }
+        for gid in behind {
+            self.duties(&gid);
+        }
+        Ok(())
+    }
+
+    /// The references among `logs`, each a service and a capability, that their services let go. They are asked for heads
+    /// with no length, so each answers its expiry or its head, and only expiries are taken.
+    async fn let_go(&self, logs: Vec<(Service, [u8; 32])>) -> Vec<[u8; 32]> {
+        let mut services: Vec<(Service, Vec<Known>)> = Vec::new();
+        for (service, capability) in logs {
+            match services.iter_mut().find(|(s, _)| *s == service) {
+                Some((_, known)) => known.push(Known(capability, 0)),
+                None => services.push((service, vec![Known(capability, 0)])),
+            }
+        }
+        let mut gone = Vec::new();
+        for (service, known) in services {
+            let answers = match self.clients.client(&service) {
+                Ok(client) => client.heads(&known).await,
+                Err(error) => Err(error),
+            };
+            match answers {
+                Ok(answers) => gone.extend(answers.into_iter().filter_map(|answer| answer.err().map(|Expired(reference)| reference))),
+                Err(error) => self.report(&error),
+            }
+        }
+        gone
+    }
+
+    /// Asks for the members' logs every `MEMBERS_POLL`, from now on.
+    pub(crate) async fn ask_members_forever(self: Arc<Self>) {
+        loop {
+            if let Err(error) = self.ask_members().await {
+                self.report(&error);
+            }
+            sleep(MEMBERS_POLL).await;
         }
     }
 

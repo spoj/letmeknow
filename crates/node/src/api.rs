@@ -357,6 +357,11 @@ impl<P: Provider + Send + 'static> Node<P> {
         self.inner.ask_heads().await;
     }
 
+    /// Asks the services whether the logs members are behind in were let go, as every hour does.
+    pub async fn sync_members(&self) -> Result<()> {
+        self.inner.ask_members().await
+    }
+
     /// An identity's public log, read from its service now.
     pub async fn read_public(&self, identity: &IdentityRef) -> Result<PublicLog> {
         self.inner.read_public(identity).await

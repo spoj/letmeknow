@@ -127,7 +127,7 @@ fn due<P: Provider>(st: &State<P>, g: &G) -> Result<Option<(Change, Vec<core::Me
     let dropped = |m: &&core::Member| m.credential.as_ref().is_some_and(|c| dropped(&st.public, c));
     let dropped: Vec<core::Member> = others.clone().filter(dropped).cloned().collect();
     let kept = |m: &core::Member| g.left(&m.key).is_some_and(|seq| cut.iter().any(|r| r.key.0 == m.key && r.seq >= seq));
-    let remove: Vec<u32> = others.filter(|m| kept(m) || dropped.iter().any(|d| d.index == m.index)).map(|m| m.index).collect();
+    let remove: Vec<u32> = others.filter(|m| kept(m) || g.left_behind(&m.key) || dropped.iter().any(|d| d.index == m.index)).map(|m| m.index).collect();
     let Some(own) = members.iter().find(|m| m.index == g.mls.own_index()) else { return Ok(None) };
     let name = renaming(&g.mls, st.device.as_deref());
     let leaf = &st.session.leaf;

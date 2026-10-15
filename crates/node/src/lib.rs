@@ -36,7 +36,7 @@ use lmk_core::provider::Provider;
 use lmk_membership::client::{Post, Resolve};
 use lmk_net::peers::Peers;
 use lmk_net::Net;
-use lmk_proto::group::{Certificate, Credential, How, IdentityRef, Settings};
+use lmk_proto::group::{Certificate, Credential, How, IdentityRef, Service, Settings};
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::{Frame, Seqs, Signed};
 use lmk_proto::Bytes;
@@ -347,6 +347,18 @@ struct Rec {
     answered: Vec<([u8; 32], u64)>,
     /// The epoch this session's messages past its cut were last sealed again in.
     resealed: u64,
+    /// The epoch each other member is surely at: its join epoch, its latest commit's, or a summary's in the current epoch.
+    members: Vec<(Bytes, u64)>,
+    /// The epochs behind the current one that members are at, each with its log's capability and service.
+    epochs: Vec<Epoch>,
+}
+
+/// An epoch behind a group's current one, with its log's capability and service: a member still in it reads that log.
+#[derive(Clone, Serialize, Deserialize)]
+struct Epoch {
+    epoch: u64,
+    capability: [u8; 32],
+    service: Service,
 }
 
 /// An invite, as its inviter shared it with the group.
@@ -406,6 +418,8 @@ pub(crate) struct G {
     unverified: Vec<(EndpointId, Signed)>,
     /// This session's summary changed since it was signed.
     changed: bool,
+    /// Epochs behind this session's whose logs their services let go, as the hourly check found.
+    lapsed: Vec<u64>,
 }
 
 impl G {
@@ -426,7 +440,13 @@ impl G {
             public: Vec::new(),
             unverified: Vec::new(),
             changed: true,
+            lapsed: Vec::new(),
         }
+    }
+
+    /// Whether the member with key `key` is in an epoch whose log its service let go.
+    fn left_behind(&self, key: &[u8]) -> bool {
+        self.rec.members.iter().any(|(member, epoch)| member.0 == key && self.lapsed.contains(epoch))
     }
 
     /// The seq of the `leave` of the current membership of the member with key `key`, if it asked to leave.
@@ -813,6 +833,8 @@ impl<P: Provider> State<P> {
         let base = rec.position;
         rec.updated = now();
         rec.resealed = mls.epoch();
+        let own = mls.own_index();
+        rec.members = mls.members().into_iter().filter(|m| m.index != own).map(|m| (Bytes(m.key), mls.epoch())).collect();
         rec.authors = mls.cut().iter().map(|r| Author::new(r.key.clone(), r.joined, r.seq)).collect();
         self.groups.insert(gid.clone(), G::new(mls, rec));
         self.next_log(&gid, base)?;

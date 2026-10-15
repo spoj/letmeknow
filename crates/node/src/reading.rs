@@ -14,7 +14,7 @@ use lmk_proto::peer::{Admitted, Frame, Seqs};
 use lmk_proto::ranges::Ranges;
 
 use crate::held::Author;
-use crate::{Event, Inner, Lost, LostOf, Out, State, Work, days, put};
+use crate::{Epoch, Event, Inner, Lost, LostOf, Out, State, Work, days, put};
 
 /// The answer to the Add that ended an epoch, which its committer keeps for H for a joiner whose answer was lost.
 pub(crate) fn commit_key(gid: &[u8], epoch: u64) -> Vec<u8> {
@@ -109,6 +109,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.lose(st, gid)?;
         let g = st.groups.get_mut(gid).unwrap();
         let inner = g.mls.open_entry(&st.provider, entry)?;
+        let ended = Epoch { epoch: ending, capability: g.mls.capability(&st.provider)?, service: g.mls.settings().membership };
         let mut applied = g.mls.apply(&st.provider, entry)?;
         let current = g.mls.epoch();
         (g.reading, g.fetch) = (None, None);
@@ -126,6 +127,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
             st.group_mut(gid)?.rec.commits.push((ending, now));
         }
         self.cuts(st, gid, &applied, ending)?;
+        st.moved(gid, &applied, ended)?;
         st.observe_identities()?;
         st.scrub = true;
         st.gate = true;
@@ -237,6 +239,35 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+impl<P: Provider> State<P> {
+    /// Records that the member with key `key` is at `epoch`, unless this session knows it is past it.
+    pub(crate) fn at(&mut self, gid: &[u8], key: &[u8], epoch: u64) -> Result<()> {
+        let g = self.group_mut(gid)?;
+        match g.rec.members.iter_mut().find(|(member, _)| member.0 == key) {
+            Some((_, at)) => *at = (*at).max(epoch),
+            None => g.rec.members.push((Bytes(key.to_vec()), epoch)),
+        }
+        Ok(())
+    }
+
+    /// Moves what this session knows of its members' epochs as a commit applied: the epoch it ended keeps its log while a
+    /// member is still in it; the committer and the members it added are in the epoch it began; the removed are forgotten.
+    fn moved(&mut self, gid: &[u8], applied: &core::Applied, ended: Epoch) -> Result<()> {
+        let me = self.me(gid).to_vec();
+        let current = self.group(gid)?.mls.epoch();
+        let members = self.group(gid)?.mls.members();
+        let committer = members.iter().find(|m| m.index == applied.by).map(|m| m.key.clone());
+        for key in committer.into_iter().chain(applied.added.iter().map(|m| m.key.clone())).filter(|key| *key != me) {
+            self.at(gid, &key, current)?;
+        }
+        let g = self.group_mut(gid)?;
+        g.rec.members.retain(|(key, _)| members.iter().any(|m| m.key == key.0));
+        g.rec.epochs.push(ended);
+        g.rec.epochs.retain(|e| g.rec.members.iter().any(|(_, at)| *at == e.epoch));
         Ok(())
     }
 }

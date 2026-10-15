@@ -150,6 +150,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
         self.spawn(self.clone().drive(work));
         self.spawn(self.clone().send_out(outbox));
         self.spawn(self.clone().ask_heads_forever());
+        self.spawn(self.clone().ask_members_forever());
         let mut st = self.lock();
         let public: Vec<Bytes> = st.logs.values().filter_map(|log| match &log.of {
             logs::Of::Public(id) => Some(id.clone()),

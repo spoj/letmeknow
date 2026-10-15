@@ -275,6 +275,10 @@ impl<P: Provider> State<P> {
             if !self.peers.summary(&group, heard, Some(*peer.as_bytes())) {
                 continue;
             }
+            if summary.epoch == self.group(gid)?.mls.epoch() {
+                self.at(gid, &summary.member.0, summary.epoch)?;
+                self.save(gid)?;
+            }
             if let Some(relay) = &summary.relay
                 && relay.parse::<RelayUrl>().is_ok_and(|url| url.scheme() == "https")
                 && let Some(leaf) = self.group(gid)?.mls.members().into_iter().find(|m| m.key == summary.member.0).and_then(|m| m.leaf)

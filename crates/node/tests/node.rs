@@ -1811,6 +1811,47 @@ async fn expired_service_history_preserves_chat_and_identity_groups() {
     }
 }
 
+/// Runs `test` on a runtime whose every thread reads the system's clock as `clock` does: the nodes, relay and service
+/// of one test share the time it moves to, and no other test's threads do.
+fn on_clock(clock: fn() -> u64, test: impl std::future::Future<Output = ()>) {
+    let runtime = tokio::runtime::Builder::new_multi_thread().on_thread_start(move || lmk_proto::clock::set(clock)).enable_all().build().unwrap();
+    runtime.block_on(async {
+        lmk_proto::clock::set(clock);
+        test.await
+    });
+}
+
+const DAY_MS: u64 = 24 * 3600 * 1000;
+
+/// A member whose epoch's log its service let go is removed by the others, which hold the commits it missed: the hourly
+/// check finds the log gone, and their next pass removes the member.
+#[test]
+fn a_member_in_an_epoch_the_service_let_go_is_removed_by_the_others() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let mut alice = session(&relay, "Alice").await;
+        let bob = session(&relay, "Bob").await;
+        let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+        bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        bob.node.shutdown().await.unwrap();
+        alice.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
+        alice.node.sync_members().await.unwrap();
+        assert_eq!(alice.node.members(&gid.0).unwrap().len(), 2, "the log Bob is in is not gone yet");
+
+        SHIFT.store(31 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        alice.node.sync_members().await.unwrap();
+        alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "Bob").then_some(())).await;
+        assert_eq!(alice.node.members(&gid.0).unwrap().len(), 1);
+        alice.node.shutdown().await.unwrap();
+    });
+}
+
 /// A session on SQLite at `db`, which survives a restart.
 async fn stored(relay: &Relay, name: &str, db: &Path) -> Session<SqliteProvider> {
     stored_with(relay, name, db, relay.post()).await
