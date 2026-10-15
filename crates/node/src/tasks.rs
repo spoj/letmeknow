@@ -298,7 +298,6 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 Work::Read(log) => {
                     let node = self.clone();
                     self.spawn(async move {
-                        eprintln!("DBG read new log {}", hex(&log));
                         if let Err(error) = node.read(&log).await {
                             tracing::debug!("reading log {}: {error:#}", hex(&log));
                         }

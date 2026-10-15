@@ -267,7 +267,7 @@ async fn observation_events_wait_for_storage_and_failure_never_releases_them() {
         while observer.events.try_recv().is_ok() {}
         held.store(true, Ordering::SeqCst);
         peer.node.recertify(&gid.0, certificate(&identity, &device, &peer.node.key(), "Ann Lee", "phone")).await.unwrap();
-        eventually("observation staged before output", || binding_record(&db).is_some_and(|r| String::from_utf8(r).unwrap().contains("Ann Lee"))).await;
+        polled(&observer.node, "observation staged before output", || binding_record(&db).is_some_and(|r| String::from_utf8(r).unwrap().contains("Ann Lee"))).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         while let Ok(e) = observer.events.try_recv() {
             assert!(!matches!(e, Event::Warning { text, .. } if text.contains("Ann Lee")), "observation escaped held storage");

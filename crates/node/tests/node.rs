@@ -104,6 +104,24 @@ impl<P: Provider + Send + 'static> Session<P> {
         .await
         .expect("the event came")
     }
+
+    /// As `until`, asking for heads every 200 ms meanwhile, as `polled` does.
+    async fn polling<T>(&mut self, mut wanted: impl FnMut(Event) -> Option<T>) -> T {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                match tokio::time::timeout(Duration::from_millis(200), self.events.recv()).await {
+                    Ok(event) => {
+                        if let Some(found) = wanted(event.unwrap()) {
+                            return found;
+                        }
+                    }
+                    Err(_) => self.node.sync().await,
+                }
+            }
+        })
+        .await
+        .expect("the event came")
+    }
 }
 
 /// A test's folder, deleted when the test ends.
@@ -453,7 +471,7 @@ async fn removal_events_require_durability() {
             fail.store(false, Ordering::SeqCst);
         }
         assert!(alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap());
-        eventually("the MLS removal forgot Bob's group", || bob.node.groups().is_empty()).await;
+        polled(&bob.node, "the MLS removal forgot Bob's group", || bob.node.groups().is_empty()).await;
         if failed {
             while let Ok(event) = bob.events.try_recv() {
                 assert!(!matches!(event, Event::Removed { .. }), "removal escaped the failed barrier");
@@ -1437,6 +1455,19 @@ async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     .unwrap_or_else(|_| panic!("{what}"));
 }
 
+/// Waits until `done` holds, the session asking for heads every 200 ms meanwhile rather than every 2 minutes: for a
+/// commit no peer brings, as to the member it removed.
+async fn polled<P: Provider + Send + 'static>(node: &Node<P>, what: &str, mut done: impl FnMut() -> bool) {
+    tokio::time::timeout(WAIT, async {
+        while !done() {
+            node.sync().await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"));
+}
+
 /// A `leave` sent while the membership service is unreachable reaches the other member, which removes the leaver once the
 /// service is back: the leaver is restarted meanwhile with `restart_leaver`.
 async fn held_leave(test: &str, restart_leaver: bool) {
@@ -1493,13 +1524,12 @@ async fn an_old_leave_does_not_remove_a_member_added_again() {
         joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
-    eventually("Carol has both Adds", || carol.node.members(&gid.0).unwrap().len() == 3).await;
+    eventually("Bob and Carol have both Adds", || [&bob, &carol].iter().all(|s| s.node.members(&gid.0).unwrap().len() == 3)).await;
     alice.node.shutdown().await.unwrap();
     drop(alice);
 
     bob.node.leave(&gid.0).await.unwrap();
-    bob.node.sync().await;
-    bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
+    bob.polling(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     // Only Carol holds the leave: were Bob online, Alice's wait could end at her connection to him before Carol's lands.
     bob.node.shutdown().await.unwrap();
@@ -1755,7 +1785,7 @@ async fn an_announced_loss_reaches_every_member() {
         joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
-    eventually("Carol has both Adds", || carol.node.members(&gid.0).unwrap().len() == 3).await;
+    eventually("Bob and Carol have both Adds", || [&bob, &carol].iter().all(|s| s.node.members(&gid.0).unwrap().len() == 3)).await;
     carol.node.shutdown().await.unwrap();
     drop(carol);
 
@@ -1809,7 +1839,7 @@ async fn catching_up() {
         joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
-    eventually("Carol has both Adds", || carol.node.members(&gid.0).unwrap().len() == 3).await;
+    eventually("Bob and Carol have both Adds", || [&bob, &carol].iter().all(|s| s.node.members(&gid.0).unwrap().len() == 3)).await;
     carol.node.shutdown().await.unwrap();
     drop(carol);
 
@@ -2997,7 +3027,7 @@ async fn lost_seqs_are_told_once_across_restarts() {
         joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     }
-    eventually("Alice has three members", || alice.node.members(&gid.0).unwrap().len() == 3).await;
+    eventually("Bob and Carol have both Adds", || [&bob, &carol].iter().all(|s| s.node.members(&gid.0).unwrap().len() == 3)).await;
     carol.node.shutdown().await.unwrap();
     drop(carol);
     let bob_key = bob.node.key();
@@ -3053,7 +3083,7 @@ async fn live_payloads_reach_each_member_once_and_not_across_a_commit() {
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
     carol.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    eventually("Alice has three members", || alice.node.members(&gid.0).unwrap().len() == 3).await;
+    eventually("Bob and Carol have both Adds", || bob.node.members(&gid.0).unwrap().len() == 3 && carol.node.members(&gid.0).unwrap().len() == 3).await;
     let live = |n: u64| json!({ "type": "edit", "n": n });
     alice.node.send_live(&gid.0, &live(1), None).unwrap();
     let first = bob.until(|e| match e {
@@ -3068,6 +3098,7 @@ async fn live_payloads_reach_each_member_once_and_not_across_a_commit() {
 
     let mut carol = stored(&relay, "Carol", &dir.join("carol.db")).await;
     eventually("Alice is online to Carol", || alice.node.online(&gid.0).unwrap().iter().any(|m| m.name == "Carol")).await;
+    eventually("Bob and Carol have the commit", || [bob.node.settings(&gid.0), carol.node.settings(&gid.0)].iter().all(|s| s.as_ref().unwrap().name == "Release")).await;
     alice.node.send_live(&gid.0, &live(3), None).unwrap();
     let got = carol.until(|e| match e {
         Event::Live { payload, .. } => Some(payload),

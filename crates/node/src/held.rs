@@ -465,6 +465,10 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 st.group_mut(gid)?.changed = true;
                 record.sealing = Some((opened.epoch, Bytes(ciphertext.clone())));
                 st.store(gid, &record)?;
+                // A leaver's resealed messages may let the next cut keep its `leave`.
+                if st.group(gid)?.rec.leaves.iter().any(|(key, joined, _)| *key == h.author && *joined == h.joined) {
+                    self.work.send(Work::Duties(gid.to_vec())).ok();
+                }
                 return Ok(Some(ciphertext));
             }
             Some(_) => {
