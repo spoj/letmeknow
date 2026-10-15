@@ -3156,7 +3156,8 @@ async fn a_removing_pass_and_an_add_do_not_wait_for_holders() {
 }
 
 /// A chat commits only for its members' updates and changes: messages both members hold, and sends of either, move no
-/// epoch.
+/// epoch, even at the passes their sessions run when they start 21 minutes later. Its T is so long that no update falls
+/// due.
 #[test]
 fn a_chat_of_held_messages_commits_only_for_an_update_or_change() {
     static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3165,9 +3166,12 @@ fn a_chat_of_held_messages_commits_only_for_an_update_or_change() {
     }
     on_clock(shifted, async {
         let relay = relay().await;
-        let mut alice = session(&relay, "Alice").await;
-        let mut bob = session(&relay, "Bob").await;
-        let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+        let dir = folder("held-chat");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = |name: &str| dir.join(format!("{name}.db"));
+        let mut alice = stored(&relay, "Alice", &db("alice")).await;
+        let mut bob = stored(&relay, "Bob", &db("bob")).await;
+        let gid = alice.node.create(Settings { update: u32::MAX, ..settings(CHAT, &relay) }, None).unwrap();
         bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
         eventually("Alice has Bob's Add", || alice.node.members(&gid.0).unwrap().len() == 2).await;
         let epoch = alice.node.epoch(&gid.0).unwrap();
@@ -3175,9 +3179,16 @@ fn a_chat_of_held_messages_commits_only_for_an_update_or_change() {
         bob.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
         bob.node.send(&gid.0, &message("two"), None).await.unwrap();
         alice.until(|e| matches!(e, Event::Message(_)).then_some(())).await;
+        alice.node.shutdown().await.unwrap();
+        bob.node.shutdown().await.unwrap();
+        drop((alice, bob));
         SHIFT.store(21 * 60 * 1000, std::sync::atomic::Ordering::Relaxed);
+        let alice = stored(&relay, "Alice", &db("alice")).await;
+        let bob = stored(&relay, "Bob", &db("bob")).await;
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert_eq!((alice.node.epoch(&gid.0).unwrap(), bob.node.epoch(&gid.0).unwrap()), (epoch, epoch));
+        alice.node.shutdown().await.unwrap();
+        bob.node.shutdown().await.unwrap();
     });
 }
 
