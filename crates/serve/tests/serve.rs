@@ -3,7 +3,7 @@ use std::{net::Ipv4Addr, path::Path, sync::Arc, time::Duration};
 use ed25519_dalek::{Signature, VerifyingKey};
 use iroh::tls::CaTlsConfig;
 use lmk_membership::client::ServeClient;
-use lmk_proto::{Bytes, directory::Directory, membership::{Answer, Append, Appended, Page, Read, Refusal, refusal_message}};
+use lmk_proto::{Bytes, directory::Directory, head, membership::{Answer, Append, Appended, Heads, Known, Moved, Page, Read, Refusal, refusal_message}};
 use lmk_serve::{Certificate, ServeConfig, serve};
 use rustls::pki_types::{CertificateDer, ServerName};
 use serde::de::DeserializeOwned;
@@ -152,7 +152,8 @@ async fn serves_relay_and_membership_without_frontend() {
     let page = client.read(&[7; 32], &lmk_membership::Frontier::empty(key, lmk_proto::head::reference(&key, &[7; 32]))).await.unwrap();
     assert_eq!(page.page().entries[0].0, b"commit");
     let heads = client.heads(&[lmk_proto::membership::Known([7; 32], 0)]).await.unwrap();
-    assert_eq!((heads[0].length, heads[0].hash), (page.page().head.length, page.page().head.hash));
+    let head = heads[0].as_ref().unwrap();
+    assert_eq!((head.length, head.hash), (page.page().head.length, page.page().head.hash));
 
     server.abort();
 }
@@ -299,4 +300,53 @@ async fn one_address_at_once_does_not_refuse_another() {
     let response = https_raw("::1", https, &cert, &post(APPEND, None, &append_json(2, b"x"))).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     server.abort();
+}
+
+/// The journal a service keeps, which an operator's unit writes at its level, as the service's own log lines.
+#[derive(Clone, Default)]
+struct Journal(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Journal {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_journal_holds_no_addresses_keys_or_capabilities() {
+    let journal = Journal::default();
+    let writer = journal.clone();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info,lmk_membership=trace,lmk_serve=trace"))
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .init();
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (config, cert) = configure(&state);
+    let https = config.https_port;
+    let service = config.service().unwrap();
+    let server = tokio::spawn(serve(config));
+    wait_for_https(https).await;
+    let lmk_proto::group::Service::Serve { key, .. } = &service else { unreachable!() };
+    let key: [u8; 32] = key.0.as_slice().try_into().unwrap();
+    let capability = [7u8; 32];
+    let append = post(APPEND, Some(APP), &append_json(7, b"one"));
+    assert!(https_raw("127.0.0.1", https, &cert, &append).await.starts_with("HTTP/1.1 200"));
+    let read = serde_json::to_vec(&Read { capability, after: 0 }).unwrap();
+    assert!(https_raw("127.0.0.1", https, &cert, &post("/membership/1/read", Some(APP), &read)).await.starts_with("HTTP/1.1 200"));
+    let heads = serde_json::to_vec(&Heads { logs: vec![Known(capability, 0)] }).unwrap();
+    let response = https_raw("127.0.0.1", https, &cert, &post("/membership/1/heads", Some(APP), &heads)).await;
+    let Answer::<Moved>::Ok(moved) = answer(&response) else { panic!("{response}") };
+    assert_eq!(moved.heads.len(), 1);
+    server.abort();
+    let text = String::from_utf8_lossy(&journal.0.lock().unwrap()).into_owned();
+    assert!(text.contains("listening on"), "the control: the service logs its start:\n{text}");
+    let reference = head::reference(&key, &capability);
+    for secret in [hex::encode(capability), hex::encode(reference), hex::encode(key), "127.0.0.1".into()] {
+        assert!(!text.contains(&secret), "the journal holds {secret}:\n{text}");
+    }
 }

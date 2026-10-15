@@ -89,6 +89,10 @@ fn moved_heads<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Head>, D::Error> {
     bounded::<D, Head, HEAD_LOGS>(d)
 }
 
+fn gone_logs<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Expiry>, D::Error> {
+    bounded::<D, Expiry, HEAD_LOGS>(d)
+}
+
 pub fn encoded_entry_bytes(entry: &Bytes) -> usize { (entry.0.len() * 4).div_ceil(3) + 3 }
 
 pub fn valid_append(entries: &[Bytes]) -> bool {
@@ -151,15 +155,27 @@ pub struct Heads {
     pub logs: Vec<Known>,
 }
 
-/// The heads of the logs a `Heads` request named whose length differs.
+/// The heads of the logs a `Heads` request named whose length differs, and the expiries of those gone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Moved {
     #[serde(deserialize_with = "moved_heads")]
     pub heads: Vec<Head>,
+    #[serde(deserialize_with = "gone_logs")]
+    pub expired: Vec<Expiry>,
 }
 
-/// What the HTTPS routes answer: the value, or a refusal the service signs over `refusal_message`. Externally tagged: an
-/// untagged answer buffers arbitrary arrays before their bounded visitors run.
+/// A log the service let go, signed over `expiry_message`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Expiry {
+    #[serde(with = "fixed32")]
+    pub log_ref: [u8; 32],
+    #[serde(deserialize_with = "head::signature")]
+    pub sig: Bytes,
+}
+
+/// What the HTTPS routes answer: the value, a refusal the service signs over `refusal_message`, or a log's expiry it
+/// signs over `expiry_message`. Externally tagged: an untagged answer buffers arbitrary arrays before their bounded
+/// visitors run.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Answer<T> {
@@ -169,26 +185,33 @@ pub enum Answer<T> {
         #[serde(deserialize_with = "head::signature")]
         sig: Bytes,
     },
+    Expired {
+        #[serde(deserialize_with = "head::signature")]
+        sig: Bytes,
+    },
 }
 
 pub fn refusal_message(refusal: Refusal, request: &[u8]) -> Vec<u8> {
     [b"letmeknow refusal v1\0".as_slice(), refusal.code().as_bytes(), &Sha256::digest(request)].concat()
 }
 
+pub fn expiry_message(log_ref: &[u8; 32]) -> Vec<u8> {
+    [b"letmeknow expired v1\0".as_slice(), log_ref].concat()
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Refusal { Policy, Size, Rate, Busy, Quota, Expired }
+pub enum Refusal { Policy, Size, Rate, Busy, Quota }
 
 impl Refusal {
     pub fn code(self) -> &'static str {
         match self {
-            Self::Policy => "policy", Self::Size => "size", Self::Rate => "rate",
-            Self::Busy => "busy", Self::Quota => "quota", Self::Expired => "expired",
+            Self::Policy => "policy", Self::Size => "size", Self::Rate => "rate", Self::Busy => "busy", Self::Quota => "quota",
         }
     }
 
     pub fn from_code(code: &str) -> Option<Self> {
-        [Self::Policy, Self::Size, Self::Rate, Self::Busy, Self::Quota, Self::Expired].into_iter().find(|r| r.code() == code)
+        [Self::Policy, Self::Size, Self::Rate, Self::Busy, Self::Quota].into_iter().find(|r| r.code() == code)
     }
 }
 
@@ -221,6 +244,9 @@ mod tests {
         assert_eq!(Refusal::from_code("quota").map(Refusal::code), Some("quota"));
         assert!(Refusal::from_code("nope").is_none());
         assert!(refusal_message(Refusal::Rate, b"a").starts_with(b"letmeknow refusal v1\0rate"));
+        assert!(expiry_message(&[7; 32]).starts_with(b"letmeknow expired v1\0"));
+        let expired = format!(r#"{{"expired":{{"sig":"{sig}"}}}}"#);
+        assert!(matches!(serde_json::from_str::<Answer<()>>(&expired).unwrap(), Answer::Expired { .. }));
         assert_ne!(refusal_message(Refusal::Rate, b"a"), refusal_message(Refusal::Busy, b"a"));
         assert_ne!(refusal_message(Refusal::Rate, b"a"), refusal_message(Refusal::Rate, b"b"));
     }

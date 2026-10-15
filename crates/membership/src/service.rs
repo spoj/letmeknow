@@ -4,12 +4,12 @@ use std::{collections::HashMap, hash::Hash, net::{IpAddr, Ipv4Addr}, sync::{Arc,
 
 use anyhow::{Result, ensure};
 use ed25519_dalek::Signer;
-use lmk_proto::{Bytes, clock::now, head, membership::{Answer, Append, Appended, Heads, Known, Moved, Page, Read, Refusal, refusal_message}};
+use lmk_proto::{Bytes, clock::now, head, membership::{Answer, Append, Appended, Expiry, Heads, Known, Moved, Page, Read, Refusal, expiry_message, refusal_message}};
 use n0_future::task::AbortOnDropHandle;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::{sync::Semaphore, time::timeout};
 
-use crate::{Refused, store::{DAY_MS, DISK_BYTES, Stats, Store}};
+use crate::{Expired, Refused, store::{DAY_MS, DISK_BYTES, Stats, Store}};
 
 const DB_WORK: usize = 4;
 /// How long a request waits for a slot of `DB_WORK` before it is refused as busy. Work that started runs to its end: a
@@ -48,7 +48,7 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            appends_per_minute: 600, retention_days: 365, disk: DISK_BYTES,
+            appends_per_minute: 600, retention_days: 30, disk: DISK_BYTES,
             append_bytes_per_day: 256 << 20, reads_per_minute: 600, read_bytes_per_minute: 64 << 20,
             new_logs_per_day: 2_000, new_public_logs_per_day: 10, public_appends_per_day: 10,
             new_logs_per_day_in_all: 250_000, requests_at_once: 8,
@@ -214,15 +214,13 @@ impl Service {
         }));
         let weak = Arc::downgrade(&service.0);
         let expiry = n0_future::task::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(60), Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 let Some(inner) = weak.upgrade() else { return };
-                let before = (now() / DAY_MS).saturating_sub(inner.policy.retention_days);
-                if Service(inner).work(move |inner| inner.store.expire(before)).await.is_err() {
-                    tracing::warn!("membership expiry deferred");
-                }
+                let service = Service(inner);
+                while service.expire().await {}
             }
         });
         *service.0.expiry.lock().unwrap() = Some(AbortOnDropHandle::new(expiry));
@@ -236,6 +234,18 @@ impl Service {
     }
 
     pub async fn stats(&self) -> Result<Stats> { self.work(|inner| inner.store.stats()).await }
+
+    /// One pass of expiry, as `Store::expire` runs it; whether more is left.
+    pub async fn expire(&self) -> bool {
+        let before = (now() / DAY_MS).saturating_sub(self.0.policy.retention_days);
+        match self.work(move |inner| inner.store.expire(before)).await {
+            Ok(more) => more,
+            Err(_) => {
+                tracing::warn!("membership expiry deferred");
+                false
+            }
+        }
+    }
 
     /// Counts a request from `from` in flight, unless one of its sources already has its requests at once.
     pub fn admit(&self, from: IpAddr) -> Option<Admission> {
@@ -276,12 +286,12 @@ impl Service {
             budgets.new_logs.fits(at, sources, 1) && budgets.new_logs_in_all.fits(at, &IN_ALL, 1)
                 && (!public || budgets.new_public_logs.fits(at, sources, 1))
         };
-        let appended = self.work(move |inner| {
+        let (appended, stored) = self.work(move |inner| {
             ensure!(may_start || inner.store.length(&reference)? > 0, Refused("rate".into()));
             inner.store.append(&reference, &entries, public)
         }).await?;
         let mut budgets = self.0.budgets.lock().unwrap();
-        if public { budgets.public_appends.charge(at, &[(reference, 1)], count); }
+        if public { budgets.public_appends.charge(at, &[(reference, 1)], stored); }
         if appended.position == 1 {
             budgets.new_logs.charge(at, sources, 1);
             budgets.new_logs_in_all.charge(at, &IN_ALL, 1);
@@ -308,18 +318,27 @@ impl Service {
             let mut budgets = self.0.budgets.lock().unwrap();
             ensure!(budgets.reads.take(at, sources, 1) && budgets.read_bytes.fits(at, sources, 0), Refused("rate".into()));
         }
-        let heads = self.work(move |inner| inner.store.moved(&logs)).await?;
-        Ok(Moved { heads })
+        let (heads, gone) = self.work(move |inner| inner.store.moved(&logs)).await?;
+        let expired = gone.iter().map(|log_ref| Expiry { log_ref: *log_ref, sig: self.expiry(log_ref) }).collect();
+        Ok(Moved { heads, expired })
+    }
+
+    fn expiry(&self, log_ref: &[u8; 32]) -> Bytes {
+        Bytes(self.0.store.key().sign(&expiry_message(log_ref)).to_bytes().to_vec())
     }
 
     fn answer<T: Serialize>(&self, body: &[u8], result: Result<T>) -> Result<Vec<u8>> {
         let answer = match result {
             Ok(value) => Answer::Ok(value),
             Err(error) => {
-                let Some(Refused(code)) = error.downcast_ref::<Refused>() else { return Err(error) };
-                let Some(refusal) = Refusal::from_code(code) else { return Err(error) };
-                let sig = self.0.store.key().sign(&refusal_message(refusal, body));
-                Answer::Refused { refusal, sig: Bytes(sig.to_bytes().to_vec()) }
+                if let Some(Expired(log_ref)) = error.downcast_ref::<Expired>() {
+                    Answer::Expired { sig: self.expiry(log_ref) }
+                } else {
+                    let Some(Refused(code)) = error.downcast_ref::<Refused>() else { return Err(error) };
+                    let Some(refusal) = Refusal::from_code(code) else { return Err(error) };
+                    let sig = self.0.store.key().sign(&refusal_message(refusal, body));
+                    Answer::Refused { refusal, sig: Bytes(sig.to_bytes().to_vec()) }
+                }
             }
         };
         Ok(serde_json::to_vec(&answer)?)

@@ -6,12 +6,14 @@ use lmk_membership::{
     store::Store,
 };
 use lmk_proto::{
-    Bytes, clock,
-    membership::{Answer, Append, Appended, Heads, Known, Moved, Page, Read, Refusal, refusal_message},
+    Bytes, clock, head,
+    membership::{Answer, Append, Appended, Heads, Known, Moved, Page, Read, Refusal, expiry_message, refusal_message},
 };
 use serde::de::DeserializeOwned;
 
 const T0: u64 = 1_800_000_000_000;
+/// Far enough ahead that every log is older than the retention.
+const FAR: u64 = 10_000_000_000_000;
 
 fn fixed() -> u64 { T0 }
 
@@ -41,11 +43,21 @@ impl Http {
         match self.post::<Appended>(Route::Append, from, &body).await {
             Answer::Ok(_) => None,
             Answer::Refused { refusal, .. } => Some(refusal),
+            Answer::Expired { .. } => panic!("an append to a live log expired"),
         }
     }
 
     fn signed(&self, refusal: Refusal, request: &[u8], sig: &Bytes) -> bool {
         Signature::from_slice(&sig.0).is_ok_and(|sig| self.key.verify_strict(&refusal_message(refusal, request), &sig).is_ok())
+    }
+
+    fn expiry_signed(&self, log_ref: &[u8; 32], sig: &Bytes) -> bool {
+        Signature::from_slice(&sig.0).is_ok_and(|sig| self.key.verify_strict(&expiry_message(log_ref), &sig).is_ok())
+    }
+
+    async fn expire_all(&self) {
+        clock::set(|| FAR);
+        while self.service.expire().await {}
     }
 }
 
@@ -81,6 +93,29 @@ async fn routes_answer_appends_reads_and_heads_with_signed_heads() {
         panic!("heads refused")
     };
     assert!(moved.heads.is_empty());
+}
+
+#[tokio::test]
+async fn expired_logs_answer_signed_expiries_on_every_route() {
+    let http = Http::new(Policy::default());
+    let reference = head::reference(http.key.as_bytes(), &[7; 32]);
+    let Answer::Ok(_) = http.post::<Appended>(Route::Append, "192.0.2.1", &append_body(7, &one(b"one"), false)).await else {
+        panic!("append refused")
+    };
+    http.expire_all().await;
+    let read = serde_json::to_vec(&Read { capability: [7; 32], after: 0 }).unwrap();
+    let Answer::<Page>::Expired { sig } = http.post(Route::Read, "192.0.2.1", &read).await else { panic!("read answered") };
+    assert!(http.expiry_signed(&reference, &sig));
+    let Answer::<Appended>::Expired { sig } = http.post(Route::Append, "192.0.2.1", &append_body(7, &one(b"two"), false)).await else {
+        panic!("append answered")
+    };
+    assert!(http.expiry_signed(&reference, &sig));
+    let heads = serde_json::to_vec(&Heads { logs: vec![Known([7; 32], 0), Known([8; 32], 0)] }).unwrap();
+    let Answer::<Moved>::Ok(moved) = http.post(Route::Heads, "192.0.2.1", &heads).await else { panic!("heads refused") };
+    assert!(moved.heads.is_empty());
+    assert_eq!(moved.expired.len(), 1);
+    assert_eq!(moved.expired[0].log_ref, reference);
+    assert!(http.expiry_signed(&reference, &moved.expired[0].sig));
 }
 
 #[tokio::test]

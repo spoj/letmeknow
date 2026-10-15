@@ -177,7 +177,7 @@ async fn answer(membership: Membership, peer: IpAddr, req: Request<Incoming>) ->
 
 /// The head of a log, which a heads request answers whatever length it names, as no log has `u64::MAX` entries.
 pub async fn head(client: &ServeClient, capability: &[u8; 32]) -> Head {
-    client.heads(&[Known(*capability, u64::MAX)]).await.unwrap().remove(0)
+    client.heads(&[Known(*capability, u64::MAX)]).await.unwrap().remove(0).unwrap()
 }
 
 /// Limits no test's traffic: no test counts its appends.

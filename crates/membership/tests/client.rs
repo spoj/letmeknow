@@ -2,7 +2,7 @@ use std::{net::IpAddr, sync::{Arc, Mutex}};
 
 use ed25519_dalek::{Signer, SigningKey};
 use lmk_membership::{
-    Forged, Frontier, InvalidProof, Refused, Unsupported, WrongDirectory,
+    Expired, Forged, Frontier, InvalidProof, Refused, Unsupported, WrongDirectory,
     client::{Post, ServeClient, answered},
     service::{Policy, Route, Service},
     store::Store,
@@ -11,8 +11,9 @@ use lmk_proto::{
     Bytes,
     group::Service as Wire,
     head,
-    membership::{self, Answer, Known, Refusal, refusal_message},
+    membership::{self, Answer, Expiry, Known, Moved, Page, Refusal, expiry_message, refusal_message},
 };
+use lmk_proto::clock;
 use n0_future::boxed::BoxFuture;
 
 struct Membership {
@@ -50,6 +51,9 @@ impl Membership {
     }
 }
 
+/// Far enough ahead that every log is older than the retention.
+const FAR: u64 = 10_000_000_000_000;
+
 fn log(seed: u8) -> [u8; 32] { [seed; 32] }
 
 fn anchor(key: &SigningKey, capability: &[u8; 32]) -> Frontier {
@@ -67,7 +71,8 @@ async fn appends_reads_and_heads_check_against_the_service_key() {
     let page = client.read(&capability, &anchor(&membership.key, &capability)).await.unwrap();
     assert_eq!(page.page().entries, [Bytes(b"one".to_vec()), Bytes(b"two".to_vec())]);
     let moved = client.heads(&[Known(capability, 0)]).await.unwrap();
-    assert_eq!((moved.len(), moved[0].length, moved[0].hash), (1, 2, appended.head.hash));
+    let head = moved[0].as_ref().unwrap();
+    assert_eq!((moved.len(), head.length, head.hash), (1, 2, appended.head.hash));
     assert!(client.heads(&[Known(capability, 2)]).await.unwrap().is_empty());
 }
 
@@ -90,7 +95,7 @@ async fn heads_ask_256_logs_to_a_request_and_leave_unmoved_logs_out() {
     let known: Vec<Known> = (0..600).map(|i| Known(distinct(i), 0)).chain([Known(log(7), 0)]).collect();
     let moved = client.heads(&known).await.unwrap();
     assert_eq!(moved.len(), 1);
-    assert_eq!(moved[0].log_ref, head::reference(&membership.key.verifying_key().to_bytes(), &log(7)));
+    assert_eq!(moved[0].as_ref().unwrap().log_ref, head::reference(&membership.key.verifying_key().to_bytes(), &log(7)));
     assert_eq!(requests.lock().unwrap().len(), 3, "601 logs ask for 256 at a time");
 }
 
@@ -109,17 +114,56 @@ async fn a_refusal_acts_only_when_the_service_signed_it() {
     let request = serde_json::to_vec(&membership::Append { capability: log(1), entries: vec![Bytes(b"x".to_vec())], public: false }).unwrap();
     let refused = |sig: [u8; 64]| serde_json::to_vec(&Answer::<()>::Refused { refusal: Refusal::Rate, sig: Bytes(sig.to_vec()) }).unwrap();
     let signed = membership.key.sign(&refusal_message(Refusal::Rate, &request)).to_bytes();
-    let answering = |reply: Vec<u8>| -> Post {
-        Arc::new(move |_: String, _: &'static str, _: Vec<u8>| -> BoxFuture<anyhow::Result<Vec<u8>>> {
-            let reply = reply.clone();
-            Box::pin(async move { Ok(reply) })
-        })
-    };
     let client = |reply: Vec<u8>| ServeClient::for_service(answering(reply), &membership.wire("membership.example")).unwrap();
     let error = client(refused(signed)).append(&log(1), &[b"x".to_vec()], false).await.unwrap_err();
     assert!(error.downcast_ref::<Refused>().is_some_and(|refused| refused.0 == "rate"), "{error}");
     let error = client(refused([9; 64])).append(&log(1), &[b"x".to_vec()], false).await.unwrap_err();
     assert!(error.is::<Forged>(), "a refusal another key signed is no refusal: {error}");
+}
+
+/// A post that answers every route with `reply`.
+fn answering(reply: Vec<u8>) -> Post {
+    Arc::new(move |_: String, _: &'static str, _: Vec<u8>| -> BoxFuture<anyhow::Result<Vec<u8>>> {
+        let reply = reply.clone();
+        Box::pin(async move { Ok(reply) })
+    })
+}
+
+#[tokio::test]
+async fn an_expiry_acts_only_when_the_service_signed_it() {
+    let membership = Membership::new();
+    let (capability, other) = (log(1), log(2));
+    membership.client().append(&capability, &[b"one".to_vec()], false).await.unwrap();
+    clock::set(|| FAR);
+    while membership.service.expire().await {}
+    let key = membership.key.verifying_key().to_bytes();
+    let (reference, other_reference) = (head::reference(&key, &capability), head::reference(&key, &other));
+    let anchored = anchor(&membership.key, &capability);
+    let expired = membership.client();
+    let error = expired.read(&capability, &anchored).await.unwrap_err();
+    assert_eq!(error.downcast_ref::<Expired>().map(|e| e.0), Some(reference));
+    assert_eq!(expired.append(&capability, &[b"two".to_vec()], false).await.unwrap_err().downcast_ref::<Expired>().map(|e| e.0), Some(reference));
+    let heads = expired.heads(&[Known(capability, 0)]).await.unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0].as_ref().unwrap_err().0, reference);
+
+    let signed = |message: Vec<u8>| Bytes(membership.key.sign(&message).to_bytes().to_vec());
+    let unsigned = Bytes(vec![9; 64]);
+    let read = |sig: Bytes| serde_json::to_vec(&Answer::<Page>::Expired { sig }).unwrap();
+    let client = |reply: Vec<u8>| ServeClient::for_service(answering(reply), &membership.wire("membership.example")).unwrap();
+    let error = client(read(unsigned.clone())).read(&capability, &anchored).await.unwrap_err();
+    assert!(error.is::<Forged>(), "{error}");
+    let error = client(read(signed(expiry_message(&other_reference)))).read(&capability, &anchored).await.unwrap_err();
+    assert!(error.is::<Forged>(), "an expiry of another log is no expiry of this one: {error}");
+    let heads = |expired: Vec<Expiry>| serde_json::to_vec(&Answer::Ok(Moved { heads: vec![], expired })).unwrap();
+    let listed = |log_ref, sig| Expiry { log_ref, sig };
+    let unsigned_heads = client(heads(vec![listed(reference, unsigned)])).heads(&[Known(capability, 0)]).await.unwrap();
+    assert!(unsigned_heads.is_empty(), "an unsigned expiry is ignored");
+    let other_heads = client(heads(vec![listed(other_reference, signed(expiry_message(&other_reference)))])).heads(&[Known(capability, 0)]).await.unwrap();
+    assert!(other_heads.is_empty(), "an expiry of a log the request did not name is ignored");
+    let signed_heads = client(heads(vec![listed(reference, signed(expiry_message(&reference)))])).heads(&[Known(capability, 0)]).await.unwrap();
+    assert_eq!(signed_heads.len(), 1);
+    assert_eq!(signed_heads[0].as_ref().unwrap_err().0, reference);
 }
 
 #[tokio::test]

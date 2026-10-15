@@ -1,5 +1,6 @@
 //! A client of the membership service's HTTPS routes, with caller-owned trust anchors, never a shared history cache. What
-//! a route answers is checked here: pages and heads against the service's key, and refusals, which act only when signed.
+//! a route answers is checked here: pages and heads against the service's key, and refusals and expiries, which count
+//! only when signed.
 
 use std::sync::{Arc, OnceLock};
 
@@ -7,12 +8,12 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use ed25519_dalek::{Signature, VerifyingKey};
 use lmk_proto::{
     Bytes, clock, directory::Directory, group::Service, head::{self, Head},
-    membership::{self, Answer, Append, Appended, Heads, Known, Moved, Page, Read, refusal_message},
+    membership::{self, Answer, Append, Appended, Expiry, Heads, Known, Moved, Page, Read, expiry_message, refusal_message},
 };
 use n0_future::boxed::BoxFuture;
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{Forged, Frontier, Refused, Unsupported, VerifiedPage, WrongDirectory, WrongLog};
+use crate::{Expired, Forged, Frontier, Refused, Unsupported, VerifiedPage, WrongDirectory, WrongLog};
 
 /// Resolves a domain to the directory its service publishes.
 pub type Resolve = Arc<dyn Fn(String) -> BoxFuture<Result<Directory>> + Send + Sync>;
@@ -81,7 +82,9 @@ impl ServeClient {
         Ok(Self(Arc::new(Inner { post, domain: domain.clone(), key, stopped: OnceLock::new() })))
     }
 
-    async fn request<T: DeserializeOwned>(&self, route: &'static str, body: Vec<u8>) -> Result<T> {
+    /// Posts a body to a route and answers its reply. A refusal or an expiry must be signed, and an expiry is of the one
+    /// log the request is for: `heads` names many logs, and its expiries come in its answer.
+    async fn request<T: DeserializeOwned>(&self, route: &'static str, body: Vec<u8>, log_ref: Option<[u8; 32]>) -> Result<T> {
         if let Some(stopped) = self.0.stopped.get() {
             return Err(stopped.clone().into());
         }
@@ -101,6 +104,12 @@ impl ServeClient {
                 ensure!(self.0.key.verify_strict(&refusal_message(refusal, &body), &sig).is_ok(), Forged);
                 Err(Refused(refusal.code().into()).into())
             }
+            Answer::Expired { sig } => {
+                let Some(log_ref) = log_ref else { bail!("an invalid membership reply") };
+                let sig = Signature::from_slice(&sig.0).map_err(|_| Forged)?;
+                ensure!(self.0.key.verify_strict(&expiry_message(&log_ref), &sig).is_ok(), Forged);
+                Err(Expired(log_ref).into())
+            }
         }
     }
 
@@ -110,7 +119,7 @@ impl ServeClient {
             && entries.iter().map(Vec::len).sum::<usize>() <= membership::APPEND_BYTES, Refused("size".into()));
         let sent = clock::now();
         let body = json(&Append { capability: *capability, entries: entries.iter().cloned().map(Bytes).collect(), public })?;
-        let appended: Appended = self.request("/membership/1/append", body).await?;
+        let appended: Appended = self.request("/membership/1/append", body, Some(head::reference(self.0.key.as_bytes(), capability))).await?;
         Frontier::empty(*self.0.key.as_bytes(), head::reference(self.0.key.as_bytes(), capability)).check(&appended.head, None)?;
         ensure!(appended.position > 0 && appended.position.checked_add(entries.len() as u64 - 1) == Some(appended.head.length), crate::InvalidProof);
         record_time(sent, &appended.head)?;
@@ -120,26 +129,34 @@ impl ServeClient {
     pub async fn read(&self, capability: &[u8; 32], anchor: &Frontier) -> Result<VerifiedPage> {
         ensure!(anchor.service() == self.0.key.as_bytes() && anchor.log_ref() == &head::reference(self.0.key.as_bytes(), capability), WrongLog);
         let sent = clock::now();
-        let page: Page = self.request("/membership/1/read", json(&Read { capability: *capability, after: anchor.length() })?).await?;
+        let body = json(&Read { capability: *capability, after: anchor.length() })?;
+        let page: Page = self.request("/membership/1/read", body, Some(*anchor.log_ref())).await?;
         let page = anchor.verify_page(page)?;
         record_time(sent, &page.page().head)?;
         Ok(page)
     }
 
-    /// The heads of the logs whose length differs from the one given, from one request per `HEAD_LOGS` logs. A log
-    /// missing from the answer is unchanged at the time of the request.
-    pub async fn heads(&self, logs: &[Known]) -> Result<Vec<Head>> {
+    /// The heads of the logs whose length differs from the one given, and the logs gone, from one request per `HEAD_LOGS`
+    /// logs. A log missing from the answer is unchanged at the time of the request. An expiry the service did not sign,
+    /// or of a log the request did not name, is ignored.
+    pub async fn heads(&self, logs: &[Known]) -> Result<Vec<Result<Head, Expired>>> {
         let mut moved = Vec::new();
         for chunk in logs.chunks(membership::HEAD_LOGS) {
             let sent = clock::now();
-            let Moved { heads } = self.request("/membership/1/heads", json(&Heads { logs: chunk.to_vec() })?).await?;
+            let Moved { heads, expired } = self.request("/membership/1/heads", json(&Heads { logs: chunk.to_vec() })?, None).await?;
             for head in heads {
                 if !head.verify(&self.0.key) {
                     return Err(WrongDirectory(self.0.domain.clone()).into());
                 }
                 ensure!(chunk.iter().any(|Known(capability, _)| head::reference(self.0.key.as_bytes(), capability) == head.log_ref), WrongLog);
                 record_time(sent, &head)?;
-                moved.push(head);
+                moved.push(Ok(head));
+            }
+            for Expiry { log_ref, sig } in expired {
+                let signed = Signature::from_slice(&sig.0).is_ok_and(|sig| self.0.key.verify_strict(&expiry_message(&log_ref), &sig).is_ok());
+                if signed && chunk.iter().any(|Known(capability, _)| head::reference(self.0.key.as_bytes(), capability) == log_ref) {
+                    moved.push(Err(Expired(log_ref)));
+                }
             }
         }
         Ok(moved)

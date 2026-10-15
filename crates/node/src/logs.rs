@@ -282,8 +282,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 Ok(client) => client.heads(&known).await,
                 Err(error) => Err(error),
             };
-            let moved = match moved {
-                Ok(moved) => moved,
+            let moved: Vec<Head> = match moved {
+                Ok(moved) => moved.into_iter().filter_map(Result::ok).collect(),
                 Err(error) => {
                     self.report(&error);
                     continue;

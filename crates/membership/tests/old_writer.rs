@@ -16,7 +16,7 @@ fn published_writer_refuses_without_mutation_and_guard_removal_is_a_negative_con
         let state = root.join("state");
         let store = Store::initialize(&state).unwrap();
         let d = head::reference(store.key().verifying_key().as_bytes(), &[7; 32]);
-        let tip = store.append(&d, &[Bytes(vec![42])], false).unwrap().head;
+        let tip = store.append(&d, &[Bytes(vec![42])], false).unwrap().0.head;
         drop(store);
         let db_path = state.join("membership.db");
         if !guard {

@@ -1738,12 +1738,12 @@ async fn expired_service_history_preserves_chat_and_identity_groups() {
         alice.node.shutdown().await.unwrap();
         drop((alice, alice_devices));
         let store = Store::open(&dir.join("membership")).unwrap();
-        assert!(store.expire(lmk_node::now() / lmk_membership::store::DAY_MS + 1).unwrap() > 0);
-        assert!(store.read(&log_ref, 0).unwrap_err().is::<lmk_membership::Refused>());
+        store.expire(lmk_node::now() / lmk_membership::store::DAY_MS + 1).unwrap();
+        assert!(store.read(&log_ref, 0).unwrap_err().is::<lmk_membership::Expired>());
 
         let (mut bob, bob_devices) = start("Bob").await;
         let error = bob.node.read_group(&gid.0).await.unwrap_err();
-        assert_eq!(error.downcast_ref::<lmk_membership::Refused>().unwrap().0, "expired");
+        assert!(error.is::<lmk_membership::Expired>(), "{error:#}");
         // read() used to queue Gone before returning its error. Settings runs through the same FIFO work driver,
         // so seeing this later commit's event proves that deletion is not merely still waiting to run.
         let barrier = bob.node.create(settings(CHAT, &relay), None).unwrap();
