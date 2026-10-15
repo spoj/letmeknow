@@ -176,7 +176,7 @@ def serve(frontend):
     subprocess.run(["cargo", "run", "-q", "-p", "letmeknow", "--example", "self_signed", "--", cert, key], cwd=ROOT, check=True)
     https = free_port()
     args = [BIN, "serve", "--domain", "localhost", "--https-port", str(https), "--http-port", str(free_port()),
-            "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key]
+            "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key, "--public-logs", "1000"]
     subprocess.run(args + ["--initialize"], env=ENV, check=True, stdout=subprocess.DEVNULL)
     proc = subprocess.Popen(args + ["--origin", f"https://localhost:{frontend}", "--relays", f"https://localhost:{https}", f"https://127.0.0.1:{https}"], env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
     domain = proc.stdout.readline().strip().removeprefix("membership: ")

@@ -105,6 +105,9 @@ pub struct Serve {
     /// An origin besides letmeknow.dev's whose pages may append to the membership service; repeat for several
     #[arg(long)]
     pub origin: Vec<String>,
+    /// New public logs (identity directories) a day from one address; the browser test makes more from its one
+    #[arg(long, default_value_t = 10, hide = true)]
+    pub public_logs: u64,
     /// Days a group's log is kept after its first entry, and a directory's after its last append, at least 7
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(7..))]
     pub retention: u64,
