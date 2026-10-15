@@ -434,7 +434,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
 
     /// Uses a claimant's route only to find the genesis-authenticated service; only that service's history is held
     /// and followed.
-    pub(crate) async fn read_public(self: &Arc<Self>, identity: &IdentityRef) -> Result<PublicLog> {
+    pub(crate) async fn read_public(&self, identity: &IdentityRef) -> Result<PublicLog> {
         let address = lmk_proto::public::address(&identity.id.0);
         let followed = self.lock().public_log(&identity.id.0);
         let id = match followed {

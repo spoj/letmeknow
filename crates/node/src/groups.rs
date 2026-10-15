@@ -8,7 +8,7 @@ use lmk_core::group::{self as core, Change, Group};
 use lmk_core::provider::Provider;
 use lmk_membership::Refused;
 use lmk_proto::Bytes;
-use lmk_proto::group::{IDENTITY, How};
+use lmk_proto::group::{IDENTITY, How, IdentityRef};
 
 use crate::held::delivered_key;
 use crate::{Event, G, Inner, Member, State, device_key_key, get, reading, rec_key};
@@ -71,17 +71,21 @@ impl<P: Provider + Send + 'static> Inner<P> {
     }
 
     /// Touches the directory of an identity group, which this device commits in: its last entry again, which its service
-    /// keeps for another retention instead of storing it.
+    /// keeps for another retention instead of storing it. The directory is read first, so that its last entry is held.
     async fn touch_directory(&self, gid: &[u8]) -> Result<()> {
-        let (service, address, entry) = {
+        let identity = {
             let st = self.lock();
             let settings = st.group(gid)?.mls.settings();
-            let id = settings.public.context("an identity group without a directory")?;
-            let log = st.public_log(&id.0).context("the directory is not followed")?;
-            let entry = st.entry(&log, st.log(&log)?.length())?.context("the directory's last entry is not held")?;
-            (settings.membership, lmk_proto::public::address(&id.0), entry)
+            IdentityRef { id: settings.public.context("an identity group without a directory")?, membership: settings.membership }
         };
-        self.clients.client(&service)?.append(&address, &[entry], true).await.map(drop)
+        self.read_public(&identity).await?;
+        let entry = {
+            let st = self.lock();
+            let log = st.public_log(&identity.id.0).context("the directory is not followed")?;
+            st.entry(&log, st.log(&log)?.length())?.context("the directory's last entry is not held")?
+        };
+        let address = lmk_proto::public::address(&identity.id.0);
+        self.clients.client(&identity.membership)?.append(&address, &[entry], true).await.map(drop)
     }
 
     /// Reads a group's logs from their service, each epoch's it moves to, through the current one's end.

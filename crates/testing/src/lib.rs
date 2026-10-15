@@ -60,6 +60,8 @@ pub struct Relay {
     key: PrivateKeyDer<'static>,
     /// A membership service in memory, for the groups and identities a test makes, at the domain its relay's port names.
     pub service: Service,
+    /// The membership service of `service`, to expire its history.
+    pub membership: Membership,
     _server: Server,
     _membership: AbortOnDropHandle<()>,
     _state: tempfile::TempDir,
@@ -85,7 +87,8 @@ impl Relay {
     /// Another membership service, its store at `db`, served over https at a port of its own; it runs while the guard
     /// lives. The service limits nothing.
     pub async fn serve(&self, db: &Path) -> (Service, AbortOnDropHandle<()>) {
-        membership(&self.url, &self.cert, &self.key, db).await
+        let (service, _, task) = membership(&self.url, &self.cert, &self.key, db).await;
+        (service, task)
     }
 }
 
@@ -114,8 +117,8 @@ async fn serve(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> Re
     let server = Server::spawn(config).await.unwrap();
     let url = format!("https://localhost:{}", server.https_addr().unwrap().port()).parse().unwrap();
     let state = tempfile::tempdir().unwrap();
-    let (service, membership) = membership(&url, &cert, &key, &state.path().join("membership")).await;
-    Relay { url, cert, key, service, _server: server, _membership: membership, _state: state }
+    let (service, handle, membership) = membership(&url, &cert, &key, &state.path().join("membership")).await;
+    Relay { url, cert, key, service, membership: handle, _server: server, _membership: membership, _state: state }
 }
 
 fn server_config(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> rustls::ServerConfig {
@@ -134,10 +137,11 @@ async fn endpoint(url: &RelayUrl, cert: &CertificateDer<'static>, secret: Secret
 }
 
 /// Serves a membership service from `db` over https on a port of its own, which is its domain.
-async fn membership(url: &RelayUrl, cert: &CertificateDer<'static>, key: &PrivateKeyDer<'static>, db: &Path) -> (Service, AbortOnDropHandle<()>) {
+async fn membership(url: &RelayUrl, cert: &CertificateDer<'static>, key: &PrivateKeyDer<'static>, db: &Path) -> (Service, Membership, AbortOnDropHandle<()>) {
     let store = Store::initialize(db).unwrap();
     let public = store.key().verifying_key().to_bytes();
     let membership = Membership::new(store, unlimited());
+    let handle = membership.clone();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let acceptor = TlsAcceptor::from(Arc::new(server_config(cert.clone(), key.clone_key())));
@@ -154,7 +158,7 @@ async fn membership(url: &RelayUrl, cert: &CertificateDer<'static>, key: &Privat
     }));
     let domain = format!("localhost:{port}");
     publish(&domain, Directory { key: public, relay: url.to_string(), relays: vec![url.to_string()] });
-    (Service::Serve { key: Bytes(public.to_vec()), domain, rest: Default::default() }, task)
+    (Service::Serve { key: Bytes(public.to_vec()), domain, rest: Default::default() }, handle, task)
 }
 
 /// The membership routes, as `letmeknow serve` answers them: the service's answer as its body, or 404 and 503 alone.

@@ -284,3 +284,46 @@ async fn observation_events_wait_for_storage_and_failure_never_releases_them() {
         peer.node.shutdown().await.unwrap();
     }
 }
+
+static LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The system's clock, moved on by `LATER`.
+fn later() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + LATER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A commit of an identity's group touches its directory, so the directory outlives the retention, and one nobody commits
+/// to does not. Every thread of the runtime reads the moved clock.
+#[test]
+fn a_commit_touches_its_identitys_directory_past_the_retention() {
+    let runtime = tokio::runtime::Builder::new_multi_thread().on_thread_start(|| lmk_proto::clock::set(later)).enable_all().build().unwrap();
+    runtime.block_on(async {
+        lmk_proto::clock::set(later);
+        touched_directory_outlives_retention().await
+    });
+}
+
+async fn touched_directory_outlives_retention() {
+    const DAY: u64 = 24 * 3600 * 1000;
+    let relay = relay().await;
+    let dir = folder("touched-directory");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = |name: &str| dir.join(format!("{name}.db"));
+    let (laptop, laptop_devices) = stored_device(&relay, "laptop-canary", &db("laptop")).await;
+    let touched = laptop_devices.create("touched", relay.service.clone()).await.unwrap();
+    let (other, other_devices) = stored_device(&relay, "other-canary", &db("other")).await;
+    let untouched = other_devices.create("untouched", relay.service.clone()).await.unwrap();
+    other.node.shutdown().await.unwrap();
+    let gid = devices_group(&laptop.node);
+    LATER.store(20 * DAY, std::sync::atomic::Ordering::Relaxed);
+    let epoch = laptop.node.epoch(&gid.0).unwrap();
+    laptop_devices.rename("renamed-canary").await.unwrap();
+    assert!(laptop.node.epoch(&gid.0).unwrap() > epoch, "the rename commits, and so touches the directory");
+    LATER.store(35 * DAY, std::sync::atomic::Ordering::Relaxed);
+    while relay.membership.expire().await {}
+    let reader = ServeClient::for_service(relay.post(), &touched.membership).unwrap();
+    let logs = [touched.id.0, untouched.id.0].map(|id| lmk_proto::membership::Known(lmk_proto::public::address(&id), u64::MAX));
+    let answers = reader.heads(&logs).await.unwrap();
+    assert!(answers[0].is_ok(), "the commit moved the directory's day, so the retention keeps it");
+    assert!(answers[1].is_err(), "the control: a directory whose device is gone, and nobody committed to, expires");
+}
