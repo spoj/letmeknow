@@ -6,7 +6,8 @@
 // across a reload, a second tab works through the first and takes over when it closes; a chat on another domain of the
 // service, and a phone on another relay of its directory; refusals, files kept and deleted, and the service worker's
 // updates. From test/e2e.py: LETMEKNOW_MEMBERSHIP (the default domain), LETMEKNOW_RELAY, LETMEKNOW_OTHER (another domain of
-// that service, whose directory is served cross-origin with CORS) and LETMEKNOW_OTHER_RELAY (another URL of its relay).
+// that service, whose directory is served cross-origin with CORS), LETMEKNOW_MINOR (another domain of that service, whose
+// routes of the next minor it answers 404) and LETMEKNOW_OTHER_RELAY (another URL of its relay).
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,7 +16,7 @@ import { createInterface } from "node:readline";
 import { chromium } from "playwright";
 import * as Y from "yjs";
 
-const { URL: SITE, BIN, LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP, LETMEKNOW_OTHER, LETMEKNOW_OTHER_RELAY, FRONTEND_DIST } = process.env;
+const { URL: SITE, BIN, LETMEKNOW_RELAY, LETMEKNOW_MEMBERSHIP, LETMEKNOW_OTHER, LETMEKNOW_MINOR, LETMEKNOW_UPGRADED, LETMEKNOW_OTHER_RELAY, FRONTEND_DIST } = process.env;
 const tmp = mkdtempSync(join(tmpdir(), "lmk-browser-"));
 const check = (condition, message) => {
   if (!condition) throw new Error(`FAIL: ${message}`);
@@ -437,6 +438,19 @@ try {
   await laptop.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
   const again = await until(() => laptop.evaluate(() => window.toasts.splice(0)), toasts => toasts.some(t => t.includes("started less than a minute ago")));
   check(tried >= 1 && fetchesDown() === tried && again.length, "a directory whose fetch failed is not fetched again within a minute");
+  await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
+
+  // A chat on a domain of the service that then runs another minor: the browser's join reads the 404, and says so.
+  const minorSession = native("minor", LETMEKNOW_MINOR);
+  await minorSession.printed(e => e.type === "ready");
+  minorSession.run("identity", "create", "Minor");
+  const minor = minorSession.run("invite", "--name", "Minor");
+  writeFileSync(LETMEKNOW_UPGRADED, "");
+  await laptop.getByRole("button", { name: "Join", exact: true }).first().click();
+  await laptop.locator("dialog").getByLabel("Invite link").fill(minor.link);
+  await laptop.locator("dialog").getByRole("button", { name: "Join", exact: true }).click();
+  const minorSaid = await until(() => laptop.evaluate(() => window.toasts.splice(0)), toasts => toasts.some(t => t.includes("runs another minor")));
+  check(minorSaid.some(t => t.includes(`${LETMEKNOW_MINOR} runs another minor`)), "a browser reads the 404 of a service that runs another minor, and says so");
   await laptop.locator("dialog").getByRole("button", { name: "Close" }).click();
 
   // Existing private leaves, not a public directory overlay, drive the open People dialog.

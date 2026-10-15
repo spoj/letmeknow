@@ -129,11 +129,14 @@ class Other(Cors):
     def do_POST(self):
         self.forward()
 
+    def route(self):
+        return self.path
+
     def forward(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         passed = ("origin", "access-control-request-method", "access-control-request-headers", "content-type")
         headers = {k: v for k, v in self.headers.items() if k.lower() in passed}
-        request = urllib.request.Request(f"https://{ENV['LETMEKNOW_MEMBERSHIP']}{self.path}", data=body if self.command == "POST" else None, headers=headers, method=self.command)
+        request = urllib.request.Request(f"https://{ENV['LETMEKNOW_MEMBERSHIP']}{self.route()}", data=body if self.command == "POST" else None, headers=headers, method=self.command)
         try:
             response = urllib.request.urlopen(request, context=ssl.create_default_context(cafile=ENV["LETMEKNOW_CA"]))
         except urllib.error.HTTPError as error:
@@ -146,6 +149,14 @@ class Other(Cors):
         self.send_header("Content-Length", str(len(answer)))
         self.end_headers()
         self.wfile.write(answer)
+
+
+class Minor(Other):
+    """Another domain of the service: once its flag file exists, the service has run another minor, so its routes are
+    the next minor's, which it answers 404."""
+
+    def route(self):
+        return self.path.replace("/membership/1/", "/membership/2/") if os.path.exists(ENV["LETMEKNOW_UPGRADED"]) else self.path
 
 
 def tls_server(handler, port=0):
@@ -192,6 +203,8 @@ def main():
             write("other/.well-known/letmeknow.json", directory)
             servers.append(tls_server(functools.partial(Other, directory=other)))
             ENV.update(LETMEKNOW_OTHER=f"localhost:{servers[-1].server_port}")
+            servers.append(tls_server(functools.partial(Minor, directory=other)))
+            ENV.update(LETMEKNOW_MINOR=f"localhost:{servers[-1].server_port}", LETMEKNOW_UPGRADED=os.path.join(TMP, "upgraded"))
             dist = os.path.join(TMP, "frontend")
             subprocess.run([shutil.which("npm"), "run", "build"], cwd=WEB,
                            env={**ENV, "LMK_FRONTEND_CONFIG": config, "LMK_FRONTEND_OUT": dist, "LMK_TEST_WITNESS": "1"}, check=True)
