@@ -972,20 +972,9 @@ async fn publication_resuming_after_persistence_failure_does_not_append() {
     let publication = node.publish(&gid.0, &published, before_writers.clone());
     tokio::pin!(publication);
     tokio::time::timeout(WAIT, async {
-        loop {
-            tokio::select! {
-                biased;
-                result = &mut publication => {
-                    // Closing the gate can race a request on the old connection; establish its replacement.
-                    let error = result.unwrap_err();
-                    assert!(format!("{error:#}").contains("membership transport interrupted"), "{error:#}");
-                    publication.set(node.publish(&gid.0, &published, before_writers.clone()));
-                }
-                reached = reaching.recv() => {
-                    assert_eq!(reached.unwrap(), "laptop");
-                    break;
-                }
-            }
+        tokio::select! {
+            result = &mut publication => panic!("the publication passed the shut gate: {result:?}"),
+            reached = reaching.recv() => assert_eq!(reached.unwrap(), "laptop"),
         }
     }).await.unwrap();
     fail.store(true, Ordering::SeqCst);
