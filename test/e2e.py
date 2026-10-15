@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Native sessions and a separately served HTTPS frontend use the real local membership/iroh relay.
 --no-browser skips the frontend. LMK_E2E_BIN tests an already-built native artifact."""
-import functools, http.server, json, os, queue, shutil, socket, ssl, subprocess, sys, tempfile, threading, time, urllib.request
+import functools, http.server, json, os, queue, shutil, socket, ssl, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("LMK_E2E_BIN") or os.path.join(ROOT, os.environ.get("CARGO_TARGET_DIR", "target"), "debug", "letmeknow" + (".exe" if os.name == "nt" else ""))
@@ -117,9 +117,40 @@ class Cors(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
 
-def tls_server(handler):
+class Other(Cors):
+    """Another domain of the service: its directory, and its membership routes passed on to the service."""
+
+    def end_headers(self):
+        http.server.SimpleHTTPRequestHandler.end_headers(self) if self.command in ("POST", "OPTIONS") else super().end_headers()
+
+    def do_OPTIONS(self):
+        self.forward()
+
+    def do_POST(self):
+        self.forward()
+
+    def forward(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        passed = ("origin", "access-control-request-method", "access-control-request-headers", "content-type")
+        headers = {k: v for k, v in self.headers.items() if k.lower() in passed}
+        request = urllib.request.Request(f"https://{ENV['LETMEKNOW_MEMBERSHIP']}{self.path}", data=body if self.command == "POST" else None, headers=headers, method=self.command)
+        try:
+            response = urllib.request.urlopen(request, context=ssl.create_default_context(cafile=ENV["LETMEKNOW_CA"]))
+        except urllib.error.HTTPError as error:
+            response = error
+        answer = response.read()
+        self.send_response(response.status)
+        for k, v in response.headers.items():
+            if k.lower() not in ("connection", "transfer-encoding", "content-length", "date", "server"):
+                self.send_header(k, v)
+        self.send_header("Content-Length", str(len(answer)))
+        self.end_headers()
+        self.wfile.write(answer)
+
+
+def tls_server(handler, port=0):
     """An HTTPS server on a port of its own, with the test certificate; serves until the process ends."""
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.load_cert_chain(os.path.join(TMP, "cert.pem"), os.path.join(TMP, "key.pem"))
     server.socket = tls.wrap_socket(server.socket, server_side=True)
@@ -127,16 +158,16 @@ def tls_server(handler):
     return server
 
 
-def serve():
+def serve(frontend):
     """A local `letmeknow serve` with a self-signed certificate; returns it. Sessions name its domain. Its directory names
-    two URLs of its relay: the name and 127.0.0.1."""
+    two URLs of its relay: the name and 127.0.0.1. Pages from the frontend's port may append."""
     cert, key = os.path.join(TMP, "cert.pem"), os.path.join(TMP, "key.pem")
     subprocess.run(["cargo", "run", "-q", "-p", "letmeknow", "--example", "self_signed", "--", cert, key], cwd=ROOT, check=True)
     https = free_port()
     args = [BIN, "serve", "--domain", "localhost", "--https-port", str(https), "--http-port", str(free_port()),
             "--qad-port", str(free_port()), "--state", os.path.join(TMP, "serve"), "--cert", cert, "--key", key]
     subprocess.run(args + ["--initialize"], env=ENV, check=True, stdout=subprocess.DEVNULL)
-    proc = subprocess.Popen(args + ["--relays", f"https://localhost:{https}", f"https://127.0.0.1:{https}"], env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
+    proc = subprocess.Popen(args + ["--origin", f"https://localhost:{frontend}", "--relays", f"https://localhost:{https}", f"https://127.0.0.1:{https}"], env=ENV, stdout=subprocess.PIPE, stderr=open(os.path.join(TMP, "serve.log"), "w"), text=True)
     domain = proc.stdout.readline().strip().removeprefix("membership: ")
     proc.stdout.readline()  # key: its public key, which the directory names
     ENV.update(LETMEKNOW_CA=cert, LETMEKNOW_RELAY=f"https://localhost:{https}", LETMEKNOW_OTHER_RELAY=f"https://127.0.0.1:{https}", LETMEKNOW_MEMBERSHIP=domain)
@@ -146,7 +177,8 @@ def serve():
 def main():
     if "LMK_E2E_BIN" not in os.environ:
         subprocess.run(["cargo", "build", "-q", "-p", "letmeknow", "-p", "lmk-kinds"], cwd=ROOT, check=True)
-    server = serve()
+    frontend = free_port()
+    server = serve(frontend)
     servers = []
     listeners = []
     passed = False
@@ -158,7 +190,7 @@ def main():
             other = os.path.join(TMP, "other")
             os.makedirs(os.path.join(other, ".well-known"))
             write("other/.well-known/letmeknow.json", directory)
-            servers.append(tls_server(functools.partial(Cors, directory=other)))
+            servers.append(tls_server(functools.partial(Other, directory=other)))
             ENV.update(LETMEKNOW_OTHER=f"localhost:{servers[-1].server_port}")
             dist = os.path.join(TMP, "frontend")
             subprocess.run([shutil.which("npm"), "run", "build"], cwd=WEB,
@@ -167,7 +199,7 @@ def main():
                            env={**ENV, "LMK_FRONTEND_CONFIG": config}, check=True)
             with open(os.path.join(dist, "blank.html"), "w") as f:
                 f.write("<!doctype html><title>Test setup only</title>")
-            servers.append(tls_server(functools.partial(Cors, directory=dist)))
+            servers.append(tls_server(functools.partial(Cors, directory=dist), frontend))
             ENV.update(URL=f"https://localhost:{servers[-1].server_port}", FRONTEND_DIST=dist)
         alice, bob, carol = (Listener(s) for s in ("alice", "bob", "carol"))
         listeners += [alice, bob, carol]

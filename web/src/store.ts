@@ -91,7 +91,7 @@ export async function fetchDirectory(url: string): Promise<Uint8Array> {
 }
 
 /** A membership route's answer: its status, and its body of at most `limit` bytes. No credentials, no redirects, 30 s. */
-export async function postMembership(url: string, body: Uint8Array, limit: number): Promise<[number, Uint8Array]> {
+export async function postMembership(url: string, body: Uint8Array<ArrayBuffer>, limit: number): Promise<[number, Uint8Array]> {
   const response = await fetch(url, { method: "POST", body, credentials: "omit", redirect: "error", signal: AbortSignal.timeout(30_000) });
   const reader = response.body!.getReader();
   const chunks: Uint8Array<ArrayBuffer>[] = [];
