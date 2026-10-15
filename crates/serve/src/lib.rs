@@ -305,8 +305,9 @@ struct Site {
 }
 
 /// Membership requests. Only the app's origins, and those `--origin` adds, may send them: another page could otherwise
-/// make its visitors append.
-async fn answer_membership(route: Route, service: Service, peer: IpAddr, origins: Arc<Vec<String>>, bodies: Arc<Semaphore>, req: Request<Incoming>) -> http::Result<Response<BytesBody>> {
+/// make its visitors append. A path with no route is a 404 those origins can read, so a page learns the service runs
+/// another minor.
+async fn answer_membership(route: Option<Route>, service: Service, peer: IpAddr, origins: Arc<Vec<String>>, bodies: Arc<Semaphore>, req: Request<Incoming>) -> http::Result<Response<BytesBody>> {
     let origin = req.headers().get(header::ORIGIN).cloned();
     if !origin.as_ref().is_none_or(|o| o.to_str().is_ok_and(|o| origins.iter().any(|allowed| allowed == o))) {
         return respond(StatusCode::FORBIDDEN).body(body(""));
@@ -315,13 +316,14 @@ async fn answer_membership(route: Route, service: Service, peer: IpAddr, origins
         Some(o) => res.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, o),
         None => res,
     };
-    match *req.method() {
-        Method::OPTIONS => allow(respond(StatusCode::NO_CONTENT))
+    match (req.method(), route) {
+        (&Method::OPTIONS, _) => allow(respond(StatusCode::NO_CONTENT))
             .header(header::ACCESS_CONTROL_ALLOW_METHODS, "POST")
             .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type")
             .header(header::ACCESS_CONTROL_MAX_AGE, "600")
             .body(body("")),
-        Method::POST => {
+        (_, None) => allow(respond(StatusCode::NOT_FOUND)).body(body("not found")),
+        (&Method::POST, Some(route)) => {
             let (Some(admission), Ok(_body)) = (service.admit(peer), bodies.try_acquire_owned()) else {
                 return respond(StatusCode::SERVICE_UNAVAILABLE).body(body(""));
             };
@@ -348,7 +350,8 @@ impl HyperService<Request<Incoming>> for Site {
     type Future = Answer;
 
     fn call(&self, req: Request<Incoming>) -> Answer {
-        if let Some(route) = Route::parse(req.uri().path()) {
+        if req.uri().path().starts_with("/membership/") {
+            let route = Route::parse(req.uri().path());
             let (service, peer, origins, bodies) = (self.membership.clone(), self.peer, self.origins.clone(), self.bodies.clone());
             return Box::pin(async move { answer_membership(route, service, peer, origins, bodies, req).await.map_err(Into::into) });
         }

@@ -220,17 +220,19 @@ async fn membership_takes_appends_from_the_app_and_listed_origins_only() {
     let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, Some("http://localhost:5173"), &append_json(10, b"z"))).await;
     assert!(response.starts_with("HTTP/1.1 200") && response.to_lowercase().contains("access-control-allow-origin: http://localhost:5173"), "{response}");
 
-    let preflight = |origin: &str| format!("OPTIONS {APPEND} HTTP/1.1\r\nHost: localhost\r\nOrigin: {origin}\r\nAccess-Control-Request-Method: POST\r\nConnection: close\r\n\r\n");
-    let response = https_raw("127.0.0.1", https, &cert, preflight(APP).as_bytes()).await;
+    let preflight = |path: &str, origin: &str| format!("OPTIONS {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: {origin}\r\nAccess-Control-Request-Method: POST\r\nConnection: close\r\n\r\n");
+    let response = https_raw("127.0.0.1", https, &cert, preflight(APPEND, APP).as_bytes()).await;
     let lower = response.to_lowercase();
     assert!(response.starts_with("HTTP/1.1 204") && lower.contains(&format!("access-control-allow-origin: {APP}")) && lower.contains("access-control-max-age: 600"), "{response}");
-    let response = https_raw("127.0.0.1", https, &cert, preflight("https://evil.example").as_bytes()).await;
+    let response = https_raw("127.0.0.1", https, &cert, preflight(APPEND, "https://evil.example").as_bytes()).await;
     assert!(response.starts_with("HTTP/1.1 403"), "{response}");
 
     let response = https_raw("127.0.0.1", https, &cert, b"GET /membership/1/read HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
     assert!(response.starts_with("HTTP/1.1 405"), "{response}");
+    let response = https_raw("127.0.0.1", https, &cert, preflight("/membership/2/append", APP).as_bytes()).await;
+    assert!(response.starts_with("HTTP/1.1 204") && response.to_lowercase().contains(&format!("access-control-allow-origin: {APP}")), "{response}");
     let response = https_raw("127.0.0.1", https, &cert, &post("/membership/2/append", Some(APP), &append_json(7, b"x"))).await;
-    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    assert!(response.starts_with("HTTP/1.1 404") && response.to_lowercase().contains(&format!("access-control-allow-origin: {APP}")), "{response}");
 
     let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, b"not json")).await;
     let Answer::<()>::Refused { refusal, sig } = answer(&response) else { panic!("{response}") };
