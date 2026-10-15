@@ -4,7 +4,7 @@
 fn published_writer_refuses_without_mutation_and_guard_removal_is_a_negative_control() {
     use std::{fs, process::Command};
     use lmk_membership::store::Store;
-    use lmk_proto::{Bytes, head};
+    use lmk_proto::Bytes;
     use rusqlite::Connection;
 
     let binary = std::env::var_os("LMK_0_15_BIN").expect("LMK_0_15_BIN must name the published binary, not a shared cargo target");
@@ -15,7 +15,7 @@ fn published_writer_refuses_without_mutation_and_guard_removal_is_a_negative_con
         let root = dir.path();
         let state = root.join("state");
         let store = Store::initialize(&state).unwrap();
-        let d = head::reference(store.key().verifying_key().as_bytes(), &[7; 32]);
+        let d = store.log(&[7; 32]);
         let tip = store.append(&d, &[Bytes(vec![42])], false).unwrap().0.head;
         drop(store);
         let db_path = state.join("membership.db");

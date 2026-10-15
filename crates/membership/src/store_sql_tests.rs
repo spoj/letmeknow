@@ -11,9 +11,9 @@ fn locked_sqlite_uses_bounded_index_ranges_not_limit_scans() {
         let db = store.db.lock().unwrap();
         db.execute_batch(&format!("BEGIN;
             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{population})
-            INSERT INTO anchors SELECT CAST(printf('%032d',i) AS BLOB),1,zeroblob(32),i%2,100,100,1 FROM n;
+            INSERT INTO anchors SELECT CAST(printf('%032d',i) AS BLOB),i%2,100,100,1,zeroblob(64) FROM n;
             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{population})
-            INSERT INTO records SELECT CAST(printf('%032d',i) AS BLOB),1,x'01',zeroblob(32) FROM n;
+            INSERT INTO records SELECT CAST(printf('%032d',i) AS BLOB),1,zeroblob(64) FROM n;
             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{population})
             INSERT INTO totals SELECT i,1,1 FROM n;
             COMMIT;")).unwrap();
@@ -21,10 +21,10 @@ fn locked_sqlite_uses_bounded_index_ranges_not_limit_scans() {
         let public = vec![8; 32];
         for matches in [false, true] {
             if matches {
-                db.execute("INSERT INTO anchors VALUES(?,3,zeroblob(32),0,0,0,3)", [&d]).unwrap();
-                db.execute("INSERT INTO anchors VALUES(?,3,zeroblob(32),1,0,0,3)", [&public]).unwrap();
+                db.execute("INSERT INTO anchors VALUES(?,0,0,0,3,zeroblob(64))", [&d]).unwrap();
+                db.execute("INSERT INTO anchors VALUES(?,1,0,0,3,zeroblob(64))", [&public]).unwrap();
                 for p in 1..=3 {
-                    db.execute("INSERT INTO records VALUES(?,?,x'01',zeroblob(32))", params![d, p]).unwrap();
+                    db.execute("INSERT INTO records VALUES(?,?,zeroblob(64))", params![d, p]).unwrap();
                 }
             }
             for (sql, values, index) in [

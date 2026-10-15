@@ -18,11 +18,13 @@ tracing = "0.1"
 
 # The browser has only the client of `letmeknow serve`.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+chacha20poly1305.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "net"] }
 
 [dev-dependencies]
+libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 iroh = { workspace = true, features = ["tls-ring"] }
 tempfile.workspace = true

@@ -158,7 +158,10 @@ identities stay behind (#56). The plan goes when 0.19 ships.
 - **A log that goes leaves only its reference,** which answers reads, appends and `heads` with a signed expiry, so a
   member that fell behind learns it, and no one can start the log again: a deleted public log started again from its
   first entry would bring back its revoked devices. The references are all the service keeps past the retention. The
-  store sets `secure_delete` and truncates its WAL after each expiry pass, so a leaked file holds nothing expired.
+  store seals each entry and each log's state under a key from the log's capability, which it never keeps. SQLite
+  leaves stale copies of moved rows in its pages, which `secure_delete` does not clear, so sealing is what keeps a
+  leaked file free of expired content; `secure_delete` and a WAL truncate after each expiry pass remove the rest. What
+  stays in stale copies of an expired log is its reference, day and sizes.
 - **Directories are touched, not restated.** At each commit of its identity group, a device appends its directory's
   last entry again, byte for byte; the service takes that as a touch: it moves the log's day and stores nothing. The
   182-day restate goes (crates/node/src/api.rs:365-382).

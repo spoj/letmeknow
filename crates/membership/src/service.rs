@@ -4,12 +4,12 @@ use std::{collections::HashMap, hash::Hash, net::{IpAddr, Ipv4Addr}, sync::{Arc,
 
 use anyhow::{Result, ensure};
 use ed25519_dalek::Signer;
-use lmk_proto::{Bytes, clock::now, head, membership::{Answer, Append, Appended, Expiry, Heads, Known, Moved, Page, Read, Refusal, expiry_message, refusal_message}};
+use lmk_proto::{Bytes, clock::now, membership::{Answer, Append, Appended, Expiry, Heads, Known, Moved, Page, Read, Refusal, expiry_message, refusal_message}};
 use n0_future::task::AbortOnDropHandle;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::{sync::Semaphore, time::timeout};
 
-use crate::{Expired, Refused, store::{DAY_MS, DISK_BYTES, Stats, Store}};
+use crate::{Expired, Refused, store::{DAY_MS, DISK_BYTES, Log, Stats, Store}};
 
 const DB_WORK: usize = 4;
 /// How long a request waits for a slot of `DB_WORK` before it is refused as busy. Work that started runs to its end: a
@@ -276,7 +276,7 @@ impl Service {
     async fn append(&self, sources: &[(Source, u64)], at: u64, body: &[u8]) -> Result<Appended> {
         let Append { capability, entries, public } = decode(body)?;
         ensure!(!public || entries.iter().all(|e| e.0.len() <= PUBLIC_ENTRY), Refused("size".into()));
-        let reference = head::reference(&self.0.store.key().verifying_key().to_bytes(), &capability);
+        let log = self.0.store.log(&capability);
         let bytes: u64 = entries.iter().map(|e| e.0.len() as u64).sum();
         let count = entries.len() as u64;
         {
@@ -285,22 +285,22 @@ impl Service {
         }
         if public && count == 1 {
             let entry = entries[0].0.clone();
-            if let Some(touched) = self.work(move |inner| inner.store.touch(&reference, &entry)).await? {
+            if let Some(touched) = self.work({ let log = log.clone(); move |inner| inner.store.touch(&log, &entry) }).await? {
                 return Ok(touched);
             }
         }
         let may_start = {
             let mut budgets = self.0.budgets.lock().unwrap();
-            ensure!(!public || budgets.public_appends.fits(at, &[(reference, 1)], count), Refused("rate".into()));
+            ensure!(!public || budgets.public_appends.fits(at, &[(log.reference, 1)], count), Refused("rate".into()));
             budgets.new_logs.fits(at, sources, 1) && budgets.new_logs_in_all.fits(at, &IN_ALL, 1)
                 && (!public || budgets.new_public_logs.fits(at, sources, 1))
         };
-        let (appended, stored) = self.work(move |inner| {
-            ensure!(may_start || inner.store.length(&reference)? > 0, Refused("rate".into()));
-            inner.store.append(&reference, &entries, public)
-        }).await?;
+        let (appended, stored) = self.work({ let log = log.clone(); move |inner| {
+            ensure!(may_start || inner.store.length(&log)? > 0, Refused("rate".into()));
+            inner.store.append(&log, &entries, public)
+        } }).await?;
         let mut budgets = self.0.budgets.lock().unwrap();
-        if public { budgets.public_appends.charge(at, &[(reference, 1)], stored); }
+        if public { budgets.public_appends.charge(at, &[(log.reference, 1)], stored); }
         if appended.position == 1 {
             budgets.new_logs.charge(at, sources, 1);
             budgets.new_logs_in_all.charge(at, &IN_ALL, 1);
@@ -311,18 +311,17 @@ impl Service {
 
     async fn read(&self, sources: &[(Source, u64)], at: u64, body: &[u8]) -> Result<Page> {
         let Read { capability, after } = decode(body)?;
-        let reference = head::reference(&self.0.store.key().verifying_key().to_bytes(), &capability);
+        let log = self.0.store.log(&capability);
         {
             let mut budgets = self.0.budgets.lock().unwrap();
             ensure!(budgets.reads.take(at, sources, 1) && budgets.read_bytes.fits(at, sources, 0), Refused("rate".into()));
         }
-        self.work(move |inner| inner.store.read(&reference, after)).await
+        self.work(move |inner| inner.store.read(&log, after)).await
     }
 
     async fn heads(&self, sources: &[(Source, u64)], at: u64, body: &[u8]) -> Result<Moved> {
         let Heads { logs } = decode(body)?;
-        let service = self.0.store.key().verifying_key().to_bytes();
-        let logs: Vec<([u8; 32], u64)> = logs.iter().map(|Known(capability, length)| (head::reference(&service, capability), *length)).collect();
+        let logs: Vec<(Log, u64)> = logs.iter().map(|Known(capability, length)| (self.0.store.log(capability), *length)).collect();
         {
             let mut budgets = self.0.budgets.lock().unwrap();
             ensure!(budgets.reads.take(at, sources, 1) && budgets.read_bytes.fits(at, sources, 0), Refused("rate".into()));

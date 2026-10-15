@@ -20,6 +20,7 @@ use lmk_proto::group::{CHAT, Certificate, ChatMessage, IDENTITY, IdentityRef, PR
 use lmk_proto::Bytes;
 use lmk_proto::frame::{self, ALPN};
 use lmk_proto::head::Head;
+use lmk_proto::membership::{Answer, Page};
 use lmk_proto::links::FileLink;
 use lmk_proto::peer::{Frame, SUMMARY, Seqs, Signed, Summary};
 use serde_json::{Value, json};
@@ -1055,11 +1056,26 @@ async fn a_contradiction_is_reported_once() {
     let relay = relay().await;
     let dir = folder("contradiction");
     let (membership, _service) = signing_service(&relay, &dir).await;
-    let mut alice = session(&relay, "Alice").await;
+    // The service's key signs the forged head, as an operator's own fork would be signed.
+    let key = Store::open(&dir.join("membership")).unwrap().key().clone();
+    let forging = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let post: Post = {
+        let (forging, base) = (forging.clone(), relay.post());
+        Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+            let (forging, base, key) = (forging.clone(), base.clone(), key.clone());
+            Box::pin(async move {
+                let answer = base(domain, route, body).await?;
+                if route != "/membership/1/read" || !forging.load(std::sync::atomic::Ordering::Relaxed) { return Ok(answer) }
+                let Answer::<Page>::Ok(mut page) = serde_json::from_slice(&answer)? else { return Ok(answer) };
+                page.head = Head::sign(&key, &page.head.log_ref, page.head.length, [0; 32], page.head.time);
+                Ok(serde_json::to_vec(&Answer::Ok(page))?)
+            })
+        })
+    };
+    let mut alice = session_with(&relay, "Alice", post).await;
     let (identity, _laptop) = identity(&relay, &alice.node, membership).await;
     alice.node.read_public(&identity).await.unwrap();
-    let db = rusqlite::Connection::open(dir.join("membership/membership.db")).unwrap();
-    assert!(db.execute("UPDATE anchors SET hash = zeroblob(32)", []).unwrap() > 0);
+    forging.store(true, std::sync::atomic::Ordering::Relaxed);
     for _ in 0..2 {
         assert!(alice.node.read_public(&identity).await.is_err());
     }
@@ -1743,7 +1759,9 @@ async fn expired_service_history_preserves_chat_and_identity_groups() {
         drop((alice, alice_devices));
         let store = Store::open(&dir.join("membership")).unwrap();
         store.expire(lmk_node::now() / lmk_membership::store::DAY_MS + 1).unwrap();
-        assert!(store.read(&log_ref, 0).unwrap_err().is::<lmk_membership::Expired>());
+        let expired: bool = rusqlite::Connection::open(dir.join("membership").join("membership.db")).unwrap()
+            .query_row("SELECT EXISTS(SELECT 1 FROM expired WHERE reference=?)", [log_ref], |r| r.get(0)).unwrap();
+        assert!(expired);
 
         let (mut bob, bob_devices) = start("Bob").await;
         let error = bob.node.read_group(&gid.0).await.unwrap_err();

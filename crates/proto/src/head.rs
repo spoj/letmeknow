@@ -10,6 +10,11 @@ pub fn reference(service: &[u8; 32], capability: &[u8]) -> [u8; 32] {
     Sha256::new().chain_update(b"letmeknow log reference v1\0").chain_update(service).chain_update(capability).finalize().into()
 }
 
+/// The key a log's entries and state are sealed under at rest: the capability's, which only the log's members hold.
+pub fn sealing(capability: &[u8]) -> [u8; 32] {
+    Sha256::new().chain_update(b"letmeknow log sealing v1\0").chain_update(capability).finalize().into()
+}
+
 pub fn start(service: &[u8; 32], log_ref: &[u8; 32]) -> [u8; 32] {
     Sha256::new().chain_update(b"letmeknow log v2\0").chain_update(service).chain_update(log_ref).finalize().into()
 }

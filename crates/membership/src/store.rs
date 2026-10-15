@@ -2,7 +2,8 @@
 
 use std::{fs::{self, OpenOptions}, io::Write, path::{Path, PathBuf}, sync::Mutex};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
+use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, KeyInit}};
 use ed25519_dalek::SigningKey;
 use lmk_proto::{Bytes, clock::now, head::{self, Head}, membership::{self, Appended, Page}};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -19,8 +20,8 @@ pub const DISK_BYTES: u64 = 4 << 30;
 const GROUP_EXPIRY: &str = "SELECT reference FROM anchors WHERE public=0 AND opened<? LIMIT ?";
 const PUBLIC_EXPIRY: &str = "SELECT reference FROM anchors WHERE public=1 AND day<? LIMIT ?";
 const DOOMED: &str = "SELECT reference FROM doomed LIMIT 1";
-const DOOMED_RECORDS: &str = "SELECT position,length(entry) FROM records WHERE reference=? ORDER BY position LIMIT ?";
-const READ_RECORDS: &str = "SELECT entry,hash FROM records WHERE reference=? AND position>? ORDER BY position LIMIT ?";
+const DOOMED_RECORDS: &str = "SELECT position,length(sealed) FROM records WHERE reference=? ORDER BY position LIMIT ?";
+const READ_RECORDS: &str = "SELECT sealed FROM records WHERE reference=? AND position>? ORDER BY position LIMIT ?";
 const TOTALS: &str = "SELECT day,entries,bytes FROM totals WHERE day>=? AND day<? ORDER BY day";
 
 #[derive(Debug, serde::Serialize, PartialEq, Eq)]
@@ -36,14 +37,45 @@ pub struct Store {
     pub(crate) disk: u64,
 }
 
+/// A log as the store addresses it: its reference, and the key its entries and state are sealed under. The capability
+/// gives both; the store keeps neither.
+#[derive(Clone)]
+pub struct Log { pub reference: [u8; 32], key: [u8; 32] }
+
+/// Seals with a fresh nonce. Records and a log's state are sealed alike, so a stale copy of either is ciphertext: SQLite
+/// leaves moved rows in its pages' free space, which `secure_delete` does not clear.
+fn seal(key: &[u8; 32], plain: &[u8]) -> Vec<u8> {
+    let nonce = lmk_proto::random::random::<24>();
+    let sealed = XChaCha20Poly1305::new(key.into()).encrypt((&nonce).into(), plain).unwrap();
+    [nonce.as_slice(), &sealed].concat()
+}
+
+fn open(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
+    let (nonce, sealed) = sealed.split_at_checked(24).context("a sealed row is shorter than its nonce")?;
+    let nonce: &[u8; 24] = nonce.try_into()?;
+    XChaCha20Poly1305::new(key.into()).decrypt(nonce.into(), sealed).map_err(|_| anyhow!("a sealed row does not open"))
+}
+
+/// A record's entry and the head hash after it.
+fn record(key: &[u8; 32], sealed: &[u8]) -> Result<(Vec<u8>, [u8; 32])> {
+    let plain = open(key, sealed)?;
+    let (entry, hash) = plain.split_at(plain.len() - 32);
+    Ok((entry.to_vec(), hash.try_into()?))
+}
+
 /// A live log's length, hash and kind, or none if no entry was ever appended to it. An expired log is an error.
-fn tip(db: &Connection, log_ref: &[u8; 32]) -> Result<Option<(u64, [u8; 32], bool)>> {
-    let live = db.query_row("SELECT length,hash,public FROM anchors WHERE reference=?", [log_ref], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+fn tip(db: &Connection, log: &Log) -> Result<Option<(u64, [u8; 32], bool)>> {
+    let live: Option<(Vec<u8>, bool)> = db.query_row("SELECT sealed,public FROM anchors WHERE reference=?", [log.reference], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
-    if live.is_none() && db.query_row("SELECT EXISTS(SELECT 1 FROM expired WHERE reference=?)", [log_ref], |r| r.get(0))? {
-        return Err(Expired(*log_ref).into());
-    }
-    Ok(live)
+    let Some((sealed, public)) = live else {
+        if db.query_row("SELECT EXISTS(SELECT 1 FROM expired WHERE reference=?)", [log.reference], |r| r.get(0))? {
+            return Err(Expired(log.reference).into());
+        }
+        return Ok(None);
+    };
+    let state = open(&log.key, &sealed)?;
+    let hash: [u8; 32] = state[8..].try_into()?;
+    Ok(Some((u64::from_be_bytes(state[..8].try_into()?), hash, public)))
 }
 
 /// The database's pages in use plus its WAL file, which keeps its high-water size until a truncating checkpoint.
@@ -95,16 +127,15 @@ impl Store {
              CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id=1), format INTEGER NOT NULL,
                  authority BLOB NOT NULL CHECK(length(authority)=32), public_bytes INTEGER NOT NULL);
              CREATE TABLE totals (day INTEGER PRIMARY KEY, entries INTEGER NOT NULL, bytes INTEGER NOT NULL);
-             CREATE TABLE anchors (reference BLOB PRIMARY KEY CHECK(length(reference)=32), length INTEGER NOT NULL,
-                 hash BLOB NOT NULL CHECK(length(hash)=32), public INTEGER NOT NULL, opened INTEGER NOT NULL,
-                 day INTEGER NOT NULL, bytes INTEGER NOT NULL) WITHOUT ROWID;
+             CREATE TABLE anchors (reference BLOB PRIMARY KEY CHECK(length(reference)=32), public INTEGER NOT NULL,
+                 opened INTEGER NOT NULL, day INTEGER NOT NULL, bytes INTEGER NOT NULL, sealed BLOB NOT NULL) WITHOUT ROWID;
              CREATE INDEX group_expiry ON anchors(opened) WHERE public=0;
              CREATE INDEX public_expiry ON anchors(day) WHERE public=1;
              CREATE TABLE expired (reference BLOB PRIMARY KEY CHECK(length(reference)=32)) WITHOUT ROWID;
              CREATE TABLE doomed (reference BLOB PRIMARY KEY CHECK(length(reference)=32)) WITHOUT ROWID;
-             CREATE TABLE records (reference BLOB NOT NULL, position INTEGER NOT NULL, entry BLOB NOT NULL,
-                 hash BLOB NOT NULL CHECK(length(hash)=32), PRIMARY KEY(reference,position)) WITHOUT ROWID;
-             CREATE VIEW logs AS SELECT reference,length,hash FROM anchors;
+             CREATE TABLE records (reference BLOB NOT NULL, position INTEGER NOT NULL, sealed BLOB NOT NULL,
+                 PRIMARY KEY(reference,position)) WITHOUT ROWID;
+             CREATE VIEW logs AS SELECT reference,public,day FROM anchors;
              CREATE VIEW entries AS SELECT reference,position FROM records;",
         )?;
         db.execute("INSERT INTO metadata VALUES(1,?,?,0)", params![FORMAT, key.verifying_key().as_bytes()])?;
@@ -139,17 +170,21 @@ impl Store {
 
     pub fn key(&self) -> &SigningKey { &self.key }
 
+    pub fn log(&self, capability: &[u8; 32]) -> Log {
+        Log { reference: head::reference(self.key.verifying_key().as_bytes(), capability), key: head::sealing(capability) }
+    }
+
     fn sign(&self, log_ref: &[u8; 32], length: u64, hash: [u8; 32]) -> Head {
         Head::sign(&self.key, log_ref, length, hash, now())
     }
 
-    pub fn append(&self, log_ref: &[u8; 32], entries: &[Bytes], public: bool) -> Result<(Appended, u64)> {
+    pub fn append(&self, log: &Log, entries: &[Bytes], public: bool) -> Result<(Appended, u64)> {
         ensure!(membership::valid_append(entries), Refused("size".into()));
         let bytes = entries.iter().map(|e| e.0.len() as u64).sum::<u64>();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let live = tip(&tx, log_ref)?;
-        let (length, mut hash, stored) = live.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), log_ref), public));
+        let live = tip(&tx, log)?;
+        let (length, mut hash, stored) = live.unwrap_or((0, head::start(self.key.verifying_key().as_bytes(), &log.reference), public));
         ensure!(stored == public, Refused("policy".into()));
         ensure!(used(&tx, &self.wal)? + bytes <= self.disk, Refused("quota".into()));
         if public {
@@ -161,42 +196,44 @@ impl Store {
         let day = now() / DAY_MS;
         for (index, entry) in entries.iter().enumerate() {
             hash = head::next(&hash, &entry.0);
-            tx.execute("INSERT INTO records VALUES(?,?,?,?)", params![log_ref, length + index as u64 + 1, entry.0, hash])?;
+            let sealed = seal(&log.key, &[entry.0.as_slice(), &hash].concat());
+            tx.execute("INSERT INTO records VALUES(?,?,?)", params![log.reference, length + index as u64 + 1, sealed])?;
         }
+        let state = seal(&log.key, &[&end.to_be_bytes()[..], &hash].concat());
         tx.execute(
-            "INSERT INTO anchors VALUES(?1,?2,?3,?4,?5,?5,?6) ON CONFLICT(reference) DO UPDATE
-             SET length=?2, hash=?3, day=?5, bytes=bytes+?6",
-            params![log_ref, end, hash, public, day, bytes],
+            "INSERT INTO anchors VALUES(?1,?2,?3,?3,?4,?5) ON CONFLICT(reference) DO UPDATE
+             SET sealed=?5, day=?3, bytes=bytes+?4",
+            params![log.reference, public, day, bytes, state],
         )?;
         tx.execute("INSERT INTO totals VALUES(?1,?2,?3) ON CONFLICT(day) DO UPDATE SET entries=entries+?2,bytes=bytes+?3",
             params![day, entries.len() as u64, bytes])?;
         tx.commit()?;
-        Ok((Appended { position: length + 1, head: self.sign(log_ref, end, hash) }, entries.len() as u64))
+        Ok((Appended { position: length + 1, head: self.sign(&log.reference, end, hash) }, entries.len() as u64))
     }
 
     /// Touches a public log whose last entry is `entry`, byte for byte: its day moves, and nothing is stored. None, and
     /// nothing changes, when it is not so.
-    pub fn touch(&self, log_ref: &[u8; 32], entry: &[u8]) -> Result<Option<Appended>> {
+    pub fn touch(&self, log: &Log, entry: &[u8]) -> Result<Option<Appended>> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let Some((length, hash, true)) = tip(&tx, log_ref)? else { return Ok(None) };
-        let last: Vec<u8> = tx.query_row("SELECT entry FROM records WHERE reference=? AND position=?", params![log_ref, length], |r| r.get(0))?;
-        if last != entry { return Ok(None) }
-        tx.execute("UPDATE anchors SET day=? WHERE reference=?", params![now() / DAY_MS, log_ref])?;
+        let Some((length, hash, true)) = tip(&tx, log)? else { return Ok(None) };
+        let sealed: Vec<u8> = tx.query_row("SELECT sealed FROM records WHERE reference=? AND position=?", params![log.reference, length], |r| r.get(0))?;
+        if record(&log.key, &sealed)?.0 != entry { return Ok(None) }
+        tx.execute("UPDATE anchors SET day=? WHERE reference=?", params![now() / DAY_MS, log.reference])?;
         tx.commit()?;
-        Ok(Some(Appended { position: length, head: self.sign(log_ref, length, hash) }))
+        Ok(Some(Appended { position: length, head: self.sign(&log.reference, length, hash) }))
     }
 
-    pub fn read(&self, log_ref: &[u8; 32], after: u64) -> Result<Page> {
+    pub fn read(&self, log: &Log, after: u64) -> Result<Page> {
         let db = self.db.lock().unwrap();
-        let (length, mut hash) = self.state(&db, log_ref)?;
+        let (length, mut hash) = self.state(&db, log)?;
         ensure!(after <= length, Refused("policy".into()));
         let mut query = db.prepare_cached(READ_RECORDS)?;
-        let mut rows = query.query(params![log_ref, after, membership::PAGE_ROWS as u64])?;
+        let mut rows = query.query(params![log.reference, after, membership::PAGE_ROWS as u64])?;
         let mut entries = Vec::new();
         let mut encoded = membership::PAGE_OVERHEAD;
         while let Some(row) = rows.next()? {
-            let (entry, next_hash): (Vec<u8>, [u8; 32]) = (row.get(0)?, row.get(1)?);
+            let (entry, next_hash) = record(&log.key, &row.get::<_, Vec<u8>>(0)?)?;
             let entry = Bytes(entry);
             let size = membership::encoded_entry_bytes(&entry);
             if encoded + size > membership::MAX_BODY { break; }
@@ -204,27 +241,27 @@ impl Store {
             encoded += size;
             hash = next_hash;
         }
-        Ok(Page { after, head: self.sign(log_ref, after + entries.len() as u64, hash), entries })
+        Ok(Page { after, head: self.sign(&log.reference, after + entries.len() as u64, hash), entries })
     }
 
-    pub fn head(&self, log_ref: &[u8; 32]) -> Result<Head> {
-        let (length, hash) = self.state(&self.db.lock().unwrap(), log_ref)?;
-        Ok(self.sign(log_ref, length, hash))
+    pub fn head(&self, log: &Log) -> Result<Head> {
+        let (length, hash) = self.state(&self.db.lock().unwrap(), log)?;
+        Ok(self.sign(&log.reference, length, hash))
     }
 
-    pub fn length(&self, log_ref: &[u8; 32]) -> Result<u64> {
-        Ok(tip(&self.db.lock().unwrap(), log_ref)?.map_or(0, |(length, _, _)| length))
+    pub fn length(&self, log: &Log) -> Result<u64> {
+        Ok(tip(&self.db.lock().unwrap(), log)?.map_or(0, |(length, _, _)| length))
     }
 
     /// The heads of the logs whose length differs from the one given, and the references of those that expired.
-    pub fn moved(&self, logs: &[([u8; 32], u64)]) -> Result<(Vec<Head>, Vec<[u8; 32]>)> {
+    pub fn moved(&self, logs: &[(Log, u64)]) -> Result<(Vec<Head>, Vec<[u8; 32]>)> {
         let db = self.db.lock().unwrap();
         let (mut heads, mut expired) = (Vec::new(), Vec::new());
-        for (log_ref, length) in logs {
-            match self.state(&db, log_ref) {
-                Ok((held, hash)) if held != *length => heads.push(self.sign(log_ref, held, hash)),
+        for (log, length) in logs {
+            match self.state(&db, log) {
+                Ok((held, hash)) if held != *length => heads.push(self.sign(&log.reference, held, hash)),
                 Ok(_) => {}
-                Err(error) if error.is::<Expired>() => expired.push(*log_ref),
+                Err(error) if error.is::<Expired>() => expired.push(log.reference),
                 Err(error) => return Err(error),
             }
         }
@@ -232,8 +269,8 @@ impl Store {
     }
 
     /// The length and hash of a log, which a log never appended to has as none.
-    fn state(&self, db: &Connection, log_ref: &[u8; 32]) -> Result<(u64, [u8; 32])> {
-        Ok(tip(db, log_ref)?.map_or((0, head::start(self.key.verifying_key().as_bytes(), log_ref)), |(length, hash, _)| (length, hash)))
+    fn state(&self, db: &Connection, log: &Log) -> Result<(u64, [u8; 32])> {
+        Ok(tip(db, log)?.map_or((0, head::start(self.key.verifying_key().as_bytes(), &log.reference)), |(length, hash, _)| (length, hash)))
     }
 
     pub fn stats(&self) -> Result<Stats> {
@@ -334,7 +371,7 @@ mod tests {
     fn durable_restart_and_transaction_abort() {
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
-        let d = head::reference(store.key().verifying_key().as_bytes(), &[7; 32]);
+        let d = store.log(&[7; 32]);
         {
             let db = store.db.lock().unwrap();
             assert_eq!(db.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "wal");
@@ -364,7 +401,7 @@ mod tests {
     fn a_group_log_goes_by_its_first_entry_and_a_directory_by_its_last_append() {
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
-        let (group, directory) = ([1; 32], [2; 32]);
+        let (group, directory) = (store.log(&[1; 32]), store.log(&[2; 32]));
         on(100);
         store.append(&group, &[Bytes(vec![1])], false).unwrap();
         store.append(&directory, &[Bytes(vec![1])], true).unwrap();
@@ -372,39 +409,39 @@ mod tests {
         store.append(&group, &[Bytes(vec![2])], false).unwrap();
         store.touch(&directory, &[1]).unwrap().unwrap();
         assert!(!store.expire(101).unwrap());
-        assert_eq!(store.read(&group, 0).unwrap_err().downcast_ref::<Expired>().unwrap().0, group);
+        assert_eq!(store.read(&group, 0).unwrap_err().downcast_ref::<Expired>().unwrap().0, group.reference);
         assert_eq!(store.read(&directory, 0).unwrap().entries, [Bytes(vec![1])]);
         store.expire(111).unwrap();
-        assert_eq!(store.read(&directory, 0).unwrap_err().downcast_ref::<Expired>().unwrap().0, directory);
+        assert_eq!(store.read(&directory, 0).unwrap_err().downcast_ref::<Expired>().unwrap().0, directory.reference);
     }
 
     #[test]
     fn an_expired_log_answers_expired_and_never_starts_again() {
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
-        let log = [7; 32];
+        let log = store.log(&[7; 32]);
         on(10);
         store.append(&log, &[Bytes(vec![1])], false).unwrap();
         on(11);
         store.expire(11).unwrap();
         let db = store.db.lock().unwrap();
         assert_eq!(db.query_row("SELECT count(*) FROM anchors", [], |r| r.get::<_, u64>(0)).unwrap(), 0);
-        assert_eq!(db.query_row("SELECT reference FROM expired", [], |r| r.get::<_, [u8; 32]>(0)).unwrap(), log);
+        assert_eq!(db.query_row("SELECT reference FROM expired", [], |r| r.get::<_, [u8; 32]>(0)).unwrap(), log.reference);
         drop(db);
-        assert_eq!(store.read(&log, 0).unwrap_err().downcast_ref::<Expired>().unwrap().0, log);
-        assert_eq!(store.append(&log, &[Bytes(vec![2])], false).unwrap_err().downcast_ref::<Expired>().unwrap().0, log);
-        assert_eq!(store.head(&log).unwrap_err().downcast_ref::<Expired>().unwrap().0, log);
-        assert_eq!(store.length(&log).unwrap_err().downcast_ref::<Expired>().unwrap().0, log);
-        assert_eq!(store.moved(&[(log, 0), ([8; 32], 0)]).unwrap(), (vec![], vec![log]));
-        assert_eq!(store.moved(&[([8; 32], 0)]).unwrap(), (vec![], vec![]));
-        assert_eq!(store.moved(&[([8; 32], 1)]).unwrap().0.len(), 1);
+        assert_eq!(store.read(&log, 0).unwrap_err().downcast_ref::<Expired>().unwrap().0, log.reference);
+        assert_eq!(store.append(&log, &[Bytes(vec![2])], false).unwrap_err().downcast_ref::<Expired>().unwrap().0, log.reference);
+        assert_eq!(store.head(&log).unwrap_err().downcast_ref::<Expired>().unwrap().0, log.reference);
+        assert_eq!(store.length(&log).unwrap_err().downcast_ref::<Expired>().unwrap().0, log.reference);
+        assert_eq!(store.moved(&[(log.clone(), 0), (store.log(&[8; 32]), 0)]).unwrap(), (vec![], vec![log.reference]));
+        assert_eq!(store.moved(&[(store.log(&[8; 32]), 0)]).unwrap(), (vec![], vec![]));
+        assert_eq!(store.moved(&[(store.log(&[8; 32]), 1)]).unwrap().0.len(), 1);
     }
 
     #[test]
     fn a_directory_touch_moves_its_day_and_stores_nothing() {
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
-        let (directory, group) = ([3; 32], [4; 32]);
+        let (directory, group) = (store.log(&[3; 32]), store.log(&[4; 32]));
         on(10);
         let (first, stored) = store.append(&directory, &[Bytes(b"entry".to_vec())], true).unwrap();
         assert_eq!((first.position, stored), (1, 1));
@@ -426,23 +463,34 @@ mod tests {
 
     #[test]
     fn a_leaked_store_holds_no_expired_bytes() {
+        const LOGS: usize = 3_000;
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
-        let (gone, kept) = ([1; 32], [2; 32]);
-        let secret: Vec<u8> = (0..3000u32).map(|i| (i * 7 + 3) as u8).collect();
-        on(10);
-        store.append(&gone, &[Bytes(secret.clone()), Bytes(b"second secret".to_vec())], false).unwrap();
-        let hash = store.head(&gone).unwrap().hash;
+        let capabilities: Vec<[u8; 32]> = (0..LOGS).map(|_| lmk_proto::random::random()).collect();
+        // Appends in scrambled order, so pages split, merge and defragment, leaving stale copies of rows in them.
+        let mut order: Vec<usize> = (0..3 * LOGS).collect();
+        order.sort_by_key(|&x| (x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut markers = vec![Vec::new(); LOGS];
+        let mut head_hash = None;
+        for x in order {
+            let i = x / 3;
+            let mut entry = lmk_proto::random::random::<16>().to_vec();
+            entry.extend(vec![0x5a; 100 + (x * 37) % 900]);
+            markers[i].push(entry[..16].to_vec());
+            on(if i < LOGS / 2 { 10 } else { 11 });
+            let log = store.log(&capabilities[i]);
+            store.append(&log, &[Bytes(entry)], false).unwrap();
+            if i == 0 { head_hash = Some(store.head(&log).unwrap().hash); }
+        }
+        let gone: std::collections::HashSet<&[u8]> = markers[..LOGS / 2].iter().flatten().map(Vec::as_slice).collect();
+        let kept = store.log(&capabilities[LOGS - 1]).reference;
+        assert!(leaked(&path, &kept), "the control: a kept log's reference is in the file");
         on(11);
-        store.append(&kept, &[Bytes(b"kept entry".to_vec())], false).unwrap();
-        // Each needle lies within one run of bytes: the head in the record, the tail in an overflow page.
-        let (head, tail) = (&secret[..256], &secret[1000..1256]);
-        assert!(leaked(&path, head) && leaked(&path, tail), "the control: an unexpired entry is in the file before expiry");
-        store.expire(11).unwrap();
-        assert!(!leaked(&path, head) && !leaked(&path, tail));
-        assert!(!leaked(&path, b"second secret"));
-        assert!(!leaked(&path, &hash));
-        assert!(leaked(&path, b"kept entry"));
+        while store.expire(11).unwrap() {}
+        let files: Vec<Vec<u8>> = ["membership.db", "membership.db-wal"].iter().map(|f| fs::read(path.join(f)).unwrap()).collect();
+        assert!(files.iter().all(|bytes| !bytes.windows(16).any(|window| gone.contains(window))), "an expired entry is in the file");
+        assert!(!leaked(&path, &head_hash.unwrap()), "an expired log's head hash is in the file");
+        assert!(leaked(&path, &kept));
         assert_eq!(fs::metadata(path.join("membership.db-wal")).unwrap().len(), 0);
         drop(store);
     }
@@ -454,22 +502,22 @@ mod tests {
         on(10);
         for log in 0..3u8 {
             for _ in 0..16 {
-                store.append(&[log; 32], &vec![Bytes(vec![log; 100]); membership::APPEND_ROWS], false).unwrap();
+                store.append(&store.log(&[log; 32]), &vec![Bytes(vec![log; 100]); membership::APPEND_ROWS], false).unwrap();
             }
         }
         for log in 3..5u8 {
             for _ in 0..6 {
-                store.append(&[log; 32], &[Bytes(vec![log; membership::MAX_ENTRY]), Bytes(vec![log; membership::MAX_ENTRY])], false).unwrap();
+                store.append(&store.log(&[log; 32]), &[Bytes(vec![log; membership::MAX_ENTRY]), Bytes(vec![log; membership::MAX_ENTRY])], false).unwrap();
             }
         }
         let count = |sql: &str| store.db.lock().unwrap().query_row(sql, [], |r| r.get::<_, u64>(0)).unwrap();
         on(11);
         let mut passes = 0;
         loop {
-            let (rows, bytes) = (count("SELECT count(*) FROM records"), count("SELECT coalesce(sum(length(entry)),0) FROM records"));
+            let (rows, bytes) = (count("SELECT count(*) FROM records"), count("SELECT coalesce(sum(length(sealed)),0) FROM records"));
             let more = store.expire(11).unwrap();
             assert!(rows - count("SELECT count(*) FROM records") <= EXPIRE_ROWS as u64);
-            assert!(bytes - count("SELECT coalesce(sum(length(entry)),0) FROM records") <= EXPIRE_BYTES);
+            assert!(bytes - count("SELECT coalesce(sum(length(sealed)),0) FROM records") <= EXPIRE_BYTES);
             passes += 1;
             if !more { break; }
         }
@@ -485,7 +533,7 @@ mod tests {
         let store = Store::initialize(&path).unwrap();
         let totals = || store.db.lock().unwrap().query_row("SELECT count(*) FROM totals", [], |r| r.get::<_, u64>(0)).unwrap();
         on(10);
-        store.append(&[1; 32], &[Bytes(vec![1])], false).unwrap();
+        store.append(&store.log(&[1; 32]), &[Bytes(vec![1])], false).unwrap();
         on(16);
         store.expire(0).unwrap();
         assert_eq!(totals(), 1);
@@ -505,7 +553,7 @@ mod tests {
         for lost in ["membership.key", "membership.db", "membership.ready"] {
             let (_dir, path) = state();
             let store = Store::initialize(&path).unwrap();
-            store.append(&[7; 32], &[Bytes(vec![1])], false).unwrap();
+            store.append(&store.log(&[7; 32]), &[Bytes(vec![1])], false).unwrap();
             drop(store);
             fs::remove_file(path.join(lost)).unwrap();
             assert!(Store::open(&path).is_err());
@@ -515,7 +563,7 @@ mod tests {
         for fault in ["empty", "authority", "format"] {
             let (_dir, path) = state();
             let store = Store::initialize(&path).unwrap();
-            store.append(&[7; 32], &[Bytes(vec![1])], false).unwrap();
+            store.append(&store.log(&[7; 32]), &[Bytes(vec![1])], false).unwrap();
             drop(store);
             let db_path = path.join("membership.db");
             if fault == "empty" { fs::write(&db_path, []).unwrap(); }
@@ -533,7 +581,7 @@ mod tests {
     fn append_size_limits_are_transactional() {
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
-        let d = [7; 32];
+        let d = store.log(&[7; 32]);
         assert!(store.append(&d, &vec![Bytes(vec![1]); membership::APPEND_ROWS+1], false).is_err());
         assert!(store.append(&d, &[Bytes(vec![1; membership::MAX_ENTRY+1])], false).is_err());
         assert!(store.append(&d, &vec![Bytes(vec![1; membership::MAX_ENTRY]); 3], false).is_err());
@@ -546,7 +594,7 @@ mod tests {
     fn disk_budget_counts_pages_in_use_and_wal_before_insert() {
         let (_dir, path) = state();
         let mut store = Store::initialize(&path).unwrap();
-        let d = [7; 32];
+        let d = store.log(&[7; 32]);
         store.append(&d, &[Bytes(vec![1])], false).unwrap();
         let before = used(&store.db.lock().unwrap(), &store.wal).unwrap();
         store.disk = before + 99;
@@ -563,11 +611,11 @@ mod tests {
         let (_dir, path) = state();
         let mut store = Store::initialize(&path).unwrap();
         store.disk = 10 << 20;
-        store.append(&[7; 32], &[Bytes(vec![1; membership::MAX_ENTRY])], true).unwrap();
-        assert_eq!(store.append(&[8; 32], &[Bytes(vec![2])], true).unwrap_err().downcast::<Refused>().unwrap().0, "quota");
-        store.append(&[8; 32], &[Bytes(vec![2])], false).unwrap();
+        store.append(&store.log(&[7; 32]), &[Bytes(vec![1; membership::MAX_ENTRY])], true).unwrap();
+        assert_eq!(store.append(&store.log(&[8; 32]), &[Bytes(vec![2])], true).unwrap_err().downcast::<Refused>().unwrap().0, "quota");
+        store.append(&store.log(&[8; 32]), &[Bytes(vec![2])], false).unwrap();
         store.expire(now() / DAY_MS + 1).unwrap();
-        store.append(&[9; 32], &[Bytes(vec![2])], true).unwrap();
+        store.append(&store.log(&[9; 32]), &[Bytes(vec![2])], true).unwrap();
         drop(store);
     }
 
@@ -575,13 +623,13 @@ mod tests {
     fn heads_name_only_the_logs_whose_length_differs() {
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
-        let (a, b) = ([1; 32], [2; 32]);
+        let (a, b) = (store.log(&[1; 32]), store.log(&[2; 32]));
         store.append(&a, &[Bytes(vec![1])], false).unwrap();
         assert_eq!((store.length(&a).unwrap(), store.length(&b).unwrap()), (1, 0));
-        let (moved, expired) = store.moved(&[(a, 0), (a, 1), (b, 0)]).unwrap();
+        let (moved, expired) = store.moved(&[(a.clone(), 0), (a.clone(), 1), (b, 0)]).unwrap();
         assert!(expired.is_empty());
         assert_eq!(moved.len(), 1);
-        assert_eq!((moved[0].log_ref, moved[0].length), (a, 1));
+        assert_eq!((moved[0].log_ref, moved[0].length), (a.reference, 1));
         drop(store);
     }
 
@@ -590,17 +638,17 @@ mod tests {
         lmk_proto::clock::set(|| 10 * DAY_MS);
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
-        store.append(&[1; 32], &[Bytes(vec![1; 3]), Bytes(vec![2; 5])], false).unwrap();
-        store.append(&[2; 32], &[Bytes(vec![3; 7])], true).unwrap();
+        store.append(&store.log(&[1; 32]), &[Bytes(vec![1; 3]), Bytes(vec![2; 5])], false).unwrap();
+        store.append(&store.log(&[2; 32]), &[Bytes(vec![3; 7])], true).unwrap();
         assert!(store.stats().unwrap().days.iter().all(|d| d.entries == 0 && d.bytes == 0));
         lmk_proto::clock::set(|| 11 * DAY_MS);
         let expected = store.stats().unwrap();
         assert_eq!(expected.days.len(), 7);
         assert_eq!(expected.days[6], DayTotals { day: 10, entries: 3, bytes: 15 });
-        store.append(&[1; 32], &[Bytes(vec![1; 9])], false).unwrap();
+        store.append(&store.log(&[1; 32]), &[Bytes(vec![1; 9])], false).unwrap();
         store.db.lock().unwrap().execute_batch("CREATE TRIGGER fail_totals BEFORE UPDATE ON totals BEGIN SELECT RAISE(ABORT,'failure'); END;").unwrap();
-        assert!(store.append(&[3; 32], &[Bytes(vec![1; 10])], false).is_err());
-        assert_eq!(store.head(&[3; 32]).unwrap().length, 0);
+        assert!(store.append(&store.log(&[3; 32]), &[Bytes(vec![1; 10])], false).is_err());
+        assert_eq!(store.head(&store.log(&[3; 32])).unwrap().length, 0);
         assert_eq!(store.stats().unwrap(), expected);
         store.expire(12).unwrap();
         drop(store);
@@ -622,10 +670,10 @@ mod tests {
     fn pages_are_bounded() {
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
-        let d = [7; 32];
+        let d = store.log(&[7; 32]);
         for _ in 0..17 { store.append(&d, &vec![Bytes(vec![1]); membership::APPEND_ROWS], false).unwrap(); }
         assert_eq!(store.read(&d, 0).unwrap().entries.len(), membership::PAGE_ROWS);
-        let d = [8; 32];
+        let d = store.log(&[8; 32]);
         for _ in 0..3 { store.append(&d, &[Bytes(vec![3; membership::MAX_ENTRY])], false).unwrap(); }
         let page = store.read(&d, 0).unwrap();
         assert_eq!(page.entries.len(), 2);
@@ -634,40 +682,69 @@ mod tests {
         drop(store);
     }
 
+    /// The target's store, built and read from a cold cache: 3.6M live logs and 44M expired references, which a year of
+    /// commits makes. Every poll asks each membership for its group's log and four directories it follows, each two
+    /// minutes, so a poll's lookups are 100,000 memberships times five over 120 seconds. Run with
+    /// `cargo test --release -- --ignored heads_keep`.
     #[test]
+    #[ignore = "builds the target's store: minutes even in release"]
     fn heads_keep_the_target_rate_from_a_cold_cache() {
-        const LOGS: u64 = 100_000;
+        const LIVE: u64 = 3_600_000;
+        const EXPIRED: u64 = 44_000_000;
+        const BAR: f64 = 100_000.0 * 5.0 / 120.0;
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
-        store.db.lock().unwrap().execute_batch(&format!("BEGIN;
-            WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{LOGS})
-            INSERT INTO anchors SELECT CAST(printf('%032d',i) AS BLOB),1,zeroblob(32),0,0,0,1 FROM n;
-            WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{LOGS})
-            INSERT INTO expired SELECT CAST(printf('%032d',i+{LOGS}) AS BLOB) FROM n;
-            COMMIT;")).unwrap();
+        let capability = |i: u64| -> [u8; 32] { let mut c = [0; 32]; c[24..].copy_from_slice(&i.to_be_bytes()); c };
+        let started = std::time::Instant::now();
+        {
+            let mut db = store.db.lock().unwrap();
+            for batch in (1..=LIVE + EXPIRED).collect::<Vec<_>>().chunks(100_000) {
+                let tx = db.transaction().unwrap();
+                for &i in batch {
+                    let log = store.log(&capability(i));
+                    if i <= LIVE {
+                        let state = seal(&log.key, &[&1u64.to_be_bytes()[..], &[0; 32]].concat());
+                        tx.execute("INSERT INTO anchors VALUES(?1,0,0,0,1,?2)", params![log.reference, state]).unwrap();
+                    } else {
+                        tx.execute("INSERT INTO expired VALUES(?)", [log.reference]).unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+            }
+            db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        println!("built in {:?}", started.elapsed());
         drop(store);
-        // A new connection starts with an empty page cache: every lookup reads its pages again.
+        // A new connection has no pages cached, and the file's pages are dropped from the operating system's cache.
+        drop_cache(&path.join("membership.db"));
         let store = Store::open(&path).unwrap();
-        let reference = |i: u64| -> [u8; 32] { format!("{i:032}").into_bytes().try_into().unwrap() };
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut draw = || {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            seed % (2 * LOGS) + 1
+            1 + seed % (LIVE + EXPIRED)
         };
         let requests = 200;
         let started = std::time::Instant::now();
         let mut answered = 0;
         for _ in 0..requests {
-            let logs: Vec<([u8; 32], u64)> = (0..membership::HEAD_LOGS).map(|_| (reference(draw()), 0)).collect();
+            let logs: Vec<(Log, u64)> = (0..membership::HEAD_LOGS).map(|_| (store.log(&capability(draw())), 0)).collect();
             let (heads, expired) = store.moved(&logs).unwrap();
             answered += heads.len() + expired.len();
         }
         let rate = (requests * membership::HEAD_LOGS) as f64 / started.elapsed().as_secs_f64();
         assert_eq!(answered, requests * membership::HEAD_LOGS);
-        println!("heads: {rate:.0} log lookups a second, cold");
-        assert!(rate >= 2_500.0, "{rate:.0} log lookups a second");
+        println!("heads: {rate:.0} log lookups a second, cold; the bar is {BAR:.0}");
+        assert!(rate >= BAR, "{rate:.0} log lookups a second");
+    }
+
+    #[cfg(unix)]
+    fn drop_cache(path: &Path) {
+        use std::os::unix::io::AsRawFd;
+        let file = fs::File::open(path).unwrap();
+        // SAFETY: the descriptor is open for the call, and the advice only lets the kernel drop clean pages.
+        assert_eq!(unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) }, 0);
     }
 
     #[test]
@@ -675,7 +752,7 @@ mod tests {
         let (_dir, path) = state();
         let store = Store::initialize(&path).unwrap();
         let capability = lmk_proto::random::random::<32>();
-        let d = head::reference(store.key().verifying_key().as_bytes(), &capability);
+        let d = store.log(&capability);
         store.append(&d, &[Bytes(vec![42])], false).unwrap();
         let db = store.db.lock().unwrap();
         assert!(db.execute_batch("CREATE TABLE IF NOT EXISTS logs(id BLOB PRIMARY KEY, length INTEGER NOT NULL, hash BLOB NOT NULL, public INTEGER NOT NULL DEFAULT 0, appended INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;

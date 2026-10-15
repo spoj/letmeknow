@@ -3,9 +3,8 @@ use crate::Config;
 use lmk_core::provider::MemoryProvider;
 use lmk_core::public::{PublicLog, Verdict};
 use lmk_membership::client::{Post, ServeClient};
-use lmk_membership::store::Store;
+use lmk_membership::store::{Log, Store};
 use lmk_proto::group::{CHAT, Credential};
-use lmk_proto::head::reference;
 use lmk_proto::membership::{Answer, Page, Read};
 use lmk_testing::{Relay, relay};
 use n0_future::task::AbortOnDropHandle;
@@ -31,12 +30,12 @@ struct Authority {
 }
 
 impl Authority {
-    fn log(&self, capability: &[u8; 32]) -> [u8; 32] {
-        reference(&self.store.key().verifying_key().to_bytes(), capability)
+    fn log(&self, capability: &[u8; 32]) -> Log {
+        self.store.log(capability)
     }
 
-    fn read(&self, log: &[u8]) -> Page {
-        self.store.read(log.try_into().unwrap(), 0).unwrap()
+    fn read(&self, log: &Log) -> Page {
+        self.store.read(log, 0).unwrap()
     }
 
     /// The posts of one node through the state: its reads wait at the gate, and answer from the stale page.
@@ -47,7 +46,7 @@ impl Authority {
             Box::pin(async move {
                 if route == "/membership/1/read" {
                     let Read { capability, after } = serde_json::from_slice(&body)?;
-                    let log = authority.log(&capability);
+                    let log = authority.log(&capability).reference;
                     let gate = {
                         let mut gate = authority.gate.lock().unwrap();
                         match gate.as_mut() {
@@ -148,7 +147,7 @@ async fn captured_roster_race(remove: bool, leave: bool) {
     let r = Race::new(remove).await;
     let address = r.authority.log(&lmk_proto::public::address(&r.identity.id.0));
     let old_epoch = r.a.epoch(&r.gid.0).unwrap();
-    let (reached, release) = r.gate(address, 2);
+    let (reached, release) = r.gate(address.reference, 2);
     let (a, gid) = (r.a_identity.clone(), r.gid.clone());
     let pending = tokio::spawn(async move {
         if leave { a.leave().await.map(drop) } else { a.duties(&gid.0).await }
@@ -208,7 +207,7 @@ async fn publication_waits_for_application_not_just_a_received_page() {
     r.b_identity.join(&Invite::parse(&r.c_identity.invite().await.unwrap()).unwrap()).await.unwrap();
     r.c_identity.duties(&r.gid.0).await.unwrap();
     let log = r.a.log(&r.gid.0).unwrap();
-    let page = r.authority.read(&log.0);
+    let page = r.authority.read(&r.authority.log(&r.a.inner.lock().capability(&log.0).unwrap()));
     {
         let mut st = r.a.inner.lock();
         let held = st.log(&log.0).unwrap().length();
@@ -227,7 +226,7 @@ async fn publication_waits_for_application_not_just_a_received_page() {
     timeout(WAIT, reached.notified()).await.unwrap();
     release.notify_one();
     // A second public read is reachable only after the accepted-application barrier.
-    let (published, proceed) = r.gate(r.authority.log(&lmk_proto::public::address(&r.identity.id.0)), 1);
+    let (published, proceed) = r.gate(r.authority.log(&lmk_proto::public::address(&r.identity.id.0)).reference, 1);
     assert!(timeout(Duration::from_millis(100), published.notified()).await.is_err(), "receipt alone allowed writer derivation");
     {
         let mut st = r.a.inner.lock();
@@ -282,7 +281,8 @@ async fn an_authorized_unobserved_historical_sender_does_not_change_the_ledger()
 async fn known_public_revocation_is_not_undone_by_a_stale_roster() {
     let r = Race::new(true).await;
     let log = r.a.log(&r.gid.0).unwrap();
-    let prefix = r.authority.read(&log.0);
+    let group = r.authority.log(&r.a.inner.lock().capability(&log.0).unwrap());
+    let prefix = r.authority.read(&group);
     let certificate = r.b_identity.certify(&[7; 32]).unwrap();
     let credential = Credential { key: [7; 32].into(), name: "external session".into(), certificate: Some(Box::new(certificate)) };
     r.c_identity.remove(&r.b_identity.key().unwrap().0).await.unwrap();
@@ -290,7 +290,7 @@ async fn known_public_revocation_is_not_undone_by_a_stale_roster() {
     assert_eq!(revoked.verify(&credential), Verdict::Dropped, "A already knows the public revocation");
     let directory = r.authority.log(&lmk_proto::public::address(&r.identity.id.0));
     let length = r.authority.store.head(&directory).unwrap().length;
-    *r.authority.stale.lock().unwrap() = Some((log.0.as_slice().try_into().unwrap(), prefix));
+    *r.authority.stale.lock().unwrap() = Some((group.reference, prefix));
     r.a_identity.duties(&r.gid.0).await.unwrap();
     assert_eq!(r.authority.store.head(&directory).unwrap().length, length, "A appends nothing");
     let (observer, _) = device(&r.relay, "Observer", r.relay.post()).await;
