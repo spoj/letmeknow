@@ -158,14 +158,14 @@ async fn ipv6_budgets_are_per_slash_64_and_a_slash_48_holds_16_of_them() {
 }
 
 #[tokio::test]
-async fn new_logs_are_budgeted_per_address_and_in_all() {
-    let http = Http::new(Policy { new_logs_per_day: 2, new_logs_per_day_in_all: 3, ..Policy::default() });
+async fn new_logs_are_budgeted_per_address() {
+    let http = Http::new(Policy { new_logs_per_day: 2, ..Policy::default() });
     assert!(http.append("192.0.2.1", 1, &one(b"x"), false).await.is_none());
     assert!(http.append("192.0.2.1", 2, &one(b"x"), false).await.is_none());
     assert!(matches!(http.append("192.0.2.1", 3, &one(b"x"), false).await, Some(Refusal::Rate)));
     assert!(http.append("192.0.2.1", 1, &one(b"y"), false).await.is_none(), "an existing log is not new");
+    assert!(http.append("192.0.2.2", 3, &one(b"x"), false).await.is_none());
     assert!(http.append("192.0.2.2", 4, &one(b"x"), false).await.is_none());
-    assert!(matches!(http.append("192.0.2.2", 5, &one(b"x"), false).await, Some(Refusal::Rate)));
 }
 
 #[tokio::test]
@@ -178,6 +178,16 @@ async fn public_logs_take_small_entries_and_few_new_and_stored_appends() {
     assert!(http.append("192.0.2.1", 1, &one(b"x"), true).await.is_none(), "a touch of the last entry stores nothing, and is not charged");
     assert!(matches!(http.append("192.0.2.1", 1, &one(b"z"), true).await, Some(Refusal::Rate)));
     assert!(http.append("192.0.2.2", 3, &one(b"x"), true).await.is_none());
+}
+
+#[tokio::test]
+async fn a_public_log_counts_its_stored_appends_per_address() {
+    let http = Http::new(Policy::default());
+    for i in 0..10u8 {
+        assert!(http.append("192.0.2.1", 1, &one(&[i]), true).await.is_none());
+    }
+    assert!(matches!(http.append("192.0.2.1", 1, &one(b"x"), true).await, Some(Refusal::Rate)));
+    assert!(http.append("192.0.2.2", 1, &one(b"y"), true).await.is_none());
 }
 
 #[tokio::test]

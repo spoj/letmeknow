@@ -20,7 +20,6 @@ const MINUTE: u64 = 60_000;
 const PUBLIC_ENTRY: usize = 16 << 10;
 /// A /48's budget, in /64s.
 const WIDE: u64 = 16;
-const IN_ALL: [((), u64); 1] = [((), 1)];
 /// Keys a quota tracks at once: a source past them is refused, so a flood of addresses cannot grow memory.
 const KEYS: usize = 1 << 20;
 /// /64s a /48 tracks in one window of a quota: past them, its /64s are charged to the /48 alone.
@@ -37,10 +36,8 @@ pub struct Policy {
     pub read_bytes_per_minute: u64,
     pub new_logs_per_day: u64,
     pub new_public_logs_per_day: u64,
-    /// Stored entries a day to each public log, from any address.
+    /// Stored entries a day to each public log.
     pub public_appends_per_day: u64,
-    /// New logs a day from all addresses.
-    pub new_logs_per_day_in_all: u64,
     /// Per source: an IPv4 address, a /64, and a /48 at `WIDE` times as many.
     pub requests_at_once: usize,
 }
@@ -51,7 +48,7 @@ impl Default for Policy {
             appends_per_minute: 600, retention_days: 30, disk: DISK_BYTES,
             append_bytes_per_day: 256 << 20, reads_per_minute: 600, read_bytes_per_minute: 64 << 20,
             new_logs_per_day: 2_000, new_public_logs_per_day: 10, public_appends_per_day: 10,
-            new_logs_per_day_in_all: 250_000, requests_at_once: 8,
+            requests_at_once: 8,
         }
     }
 }
@@ -96,8 +93,9 @@ trait Key: Clone + Eq + Hash {
     fn net48(&self) -> Option<u64> { None }
 }
 
-impl Key for [u8; 32] {}
-impl Key for () {}
+impl Key for ([u8; 32], Source) {
+    fn net48(&self) -> Option<u64> { self.1.net48() }
+}
 
 impl<K: Key> Quota<K> {
     fn new(period: u64, limit: u64) -> Self { Self { period, limit, window: 0, spent: HashMap::new(), nets: HashMap::new() } }
@@ -168,8 +166,7 @@ struct Budgets {
     read_bytes: Quota<Source>,
     new_logs: Quota<Source>,
     new_public_logs: Quota<Source>,
-    public_appends: Quota<[u8; 32]>,
-    new_logs_in_all: Quota<()>,
+    public_appends: Quota<([u8; 32], Source)>,
 }
 
 impl Budgets {
@@ -182,7 +179,6 @@ impl Budgets {
             new_logs: Quota::new(DAY_MS, policy.new_logs_per_day),
             new_public_logs: Quota::new(DAY_MS, policy.new_public_logs_per_day),
             public_appends: Quota::new(DAY_MS, policy.public_appends_per_day),
-            new_logs_in_all: Quota::new(DAY_MS, policy.new_logs_per_day_in_all),
         }
     }
 }
@@ -289,21 +285,20 @@ impl Service {
                 return Ok(touched);
             }
         }
+        let per_log: Vec<_> = sources.iter().map(|(source, scale)| ((log.reference, *source), *scale)).collect();
         let may_start = {
             let mut budgets = self.0.budgets.lock().unwrap();
-            ensure!(!public || budgets.public_appends.fits(at, &[(log.reference, 1)], count), Refused("rate".into()));
-            budgets.new_logs.fits(at, sources, 1) && budgets.new_logs_in_all.fits(at, &IN_ALL, 1)
-                && (!public || budgets.new_public_logs.fits(at, sources, 1))
+            ensure!(!public || budgets.public_appends.fits(at, &per_log, count), Refused("rate".into()));
+            budgets.new_logs.fits(at, sources, 1) && (!public || budgets.new_public_logs.fits(at, sources, 1))
         };
         let (appended, stored) = self.work({ let log = log.clone(); move |inner| {
             ensure!(may_start || inner.store.length(&log)? > 0, Refused("rate".into()));
             inner.store.append(&log, &entries, public)
         } }).await?;
         let mut budgets = self.0.budgets.lock().unwrap();
-        if public { budgets.public_appends.charge(at, &[(log.reference, 1)], stored); }
+        if public { budgets.public_appends.charge(at, &per_log, stored); }
         if appended.position == 1 {
             budgets.new_logs.charge(at, sources, 1);
-            budgets.new_logs_in_all.charge(at, &IN_ALL, 1);
             if public { budgets.new_public_logs.charge(at, sources, 1); }
         }
         Ok(appended)
