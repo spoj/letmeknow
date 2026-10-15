@@ -165,8 +165,9 @@ identities stay behind (#56). The plan goes when 0.19 ships.
 - **Directories are touched, not restated.** At each commit of its identity group, a device appends its directory's
   last entry again, byte for byte; the service takes that as a touch: it moves the log's day and stores nothing. The
   182-day restate goes (crates/node/src/api.rs:365-382).
-- **What a leak shows:** each entry's day and padded size, whose bucket grows with its group; each live log's length;
-  the references of expired logs; 7 days of totals. Not which logs are one group's, times, addresses or capabilities.
+- **What a leak shows:** each entry's day and padded size, whose bucket grows with its group; the references, days and
+  sizes of expired logs, in stale copies; 7 days of totals. Not which logs are one group's, times, addresses,
+  capabilities, entries, lengths or hashes.
 - **A member that fell behind is out.** When the service answers a signed expiry for the log a session is in, and no
   peer brings its entries within `WAIT`, a commit the session never read is gone. It forgets the group, as on
   removal, and reports `removed`. A quiet group's log is empty, not expired, so a group survives any pause in which no
