@@ -1137,9 +1137,10 @@ fn an_added_session_tells_of_its_join_first() {
         until(|| async { bob.cmd(&["identity", "list"]).await.unwrap() }, runs_desk).await;
         let at = format!("--group={group}");
         let renames = tokio::task::spawn_local(async move {
+            // Within the service's 600 appends a minute from one address.
             for round in 0..1000 {
                 alice.cmd(&["name", &format!("round {round}"), &at]).await.ok();
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         });
         bob.cmd(&["add", "desk", &format!("--group={group}")]).await.unwrap();

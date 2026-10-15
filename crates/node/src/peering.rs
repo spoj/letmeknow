@@ -195,8 +195,10 @@ impl<P: Provider> State<P> {
         let group = match &frame {
             // Every `want` is answered, with nothing if the gate refuses it.
             Frame::Held { items, answers: Some(_), .. } if items.is_empty() => None,
+            // A group's earlier logs go to whom they were queued for: a peer that showed it holds the log, or a member
+            // its last commit removed.
             Frame::Entries { log, .. } => match self.logs.get(&log.0).map(|log| &log.of) {
-                Some(Of::Group(group)) => Some(group),
+                Some(Of::Group(group)) if self.groups.get(&group.0).is_some_and(|g| g.rec.log == *log) => Some(group),
                 _ => None,
             },
             frame => group_of(frame),

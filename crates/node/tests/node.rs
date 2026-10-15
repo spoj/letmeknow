@@ -104,24 +104,6 @@ impl<P: Provider + Send + 'static> Session<P> {
         .await
         .expect("the event came")
     }
-
-    /// As `until`, asking for heads every 200 ms meanwhile, as `polled` does.
-    async fn polling<T>(&mut self, mut wanted: impl FnMut(Event) -> Option<T>) -> T {
-        tokio::time::timeout(WAIT, async {
-            loop {
-                match tokio::time::timeout(Duration::from_millis(200), self.events.recv()).await {
-                    Ok(event) => {
-                        if let Some(found) = wanted(event.unwrap()) {
-                            return found;
-                        }
-                    }
-                    Err(_) => self.node.sync().await,
-                }
-            }
-        })
-        .await
-        .expect("the event came")
-    }
 }
 
 /// A test's folder, deleted when the test ends.
@@ -471,7 +453,7 @@ async fn removal_events_require_durability() {
             fail.store(false, Ordering::SeqCst);
         }
         assert!(alice.node.remove(&gid.0, &bob.node.key().0).await.unwrap());
-        polled(&bob.node, "the MLS removal forgot Bob's group", || bob.node.groups().is_empty()).await;
+        eventually("the MLS removal forgot Bob's group", || bob.node.groups().is_empty()).await;
         if failed {
             while let Ok(event) = bob.events.try_recv() {
                 assert!(!matches!(event, Event::Removed { .. }), "removal escaped the failed barrier");
@@ -1455,19 +1437,6 @@ async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     .unwrap_or_else(|_| panic!("{what}"));
 }
 
-/// Waits until `done` holds, the session asking for heads every 200 ms meanwhile rather than every 2 minutes: for a
-/// commit no peer brings, as to the member it removed.
-async fn polled<P: Provider + Send + 'static>(node: &Node<P>, what: &str, mut done: impl FnMut() -> bool) {
-    tokio::time::timeout(WAIT, async {
-        while !done() {
-            node.sync().await;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{what}"));
-}
-
 /// A `leave` sent while the membership service is unreachable reaches the other member, which removes the leaver once the
 /// service is back: the leaver is restarted meanwhile with `restart_leaver`.
 async fn held_leave(test: &str, restart_leaver: bool) {
@@ -1529,7 +1498,7 @@ async fn an_old_leave_does_not_remove_a_member_added_again() {
     drop(alice);
 
     bob.node.leave(&gid.0).await.unwrap();
-    bob.polling(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
+    bob.until(|e| matches!(e, Event::Removed { .. }).then_some(())).await;
     bob.node.join(&carol.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
     // Only Carol holds the leave: were Bob online, Alice's wait could end at her connection to him before Carol's lands.
     bob.node.shutdown().await.unwrap();
@@ -1560,6 +1529,60 @@ async fn a_pending_leave_is_finished_after_a_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pending_leave_is_finished_once_the_log_is_reachable() {
     held_leave("leave-reachable", false).await;
+}
+
+/// A commit reaches a member that no peer brings it to at the member's poll, which also runs as it starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_reaches_a_member_with_no_peer_online_at_its_poll() {
+    let relay = relay().await;
+    let dir = folder("polled");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut alice = stored(&relay, "Alice", &dir.join("alice.db")).await;
+    let bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
+    let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
+    alice.node.change_settings(&gid.0, |s| Settings { name: "Moved".into(), ..s }).await.unwrap();
+    alice.node.shutdown().await.unwrap();
+
+    let bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
+    eventually("Bob reads the commit", || bob.node.settings(&gid.0).unwrap().name == "Moved").await;
+    bob.node.shutdown().await.unwrap();
+}
+
+/// A poll asks each service once for every 256 logs followed there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_poll_asks_each_service_once_for_every_256_logs() {
+    let relay = relay().await;
+    let dir = folder("heads");
+    let (other, _service) = served(&relay, &dir).await;
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (counting, post) = (asked.clone(), relay.post());
+    let alice = session_with(&relay, "Alice", Arc::new(move |domain: String, route: &'static str, body: Vec<u8>| {
+        if route == "/membership/1/heads" {
+            let heads: lmk_proto::membership::Heads = serde_json::from_slice(&body).unwrap();
+            counting.lock().unwrap().push((domain.clone(), heads.logs.len()));
+        }
+        post(domain, route, body)
+    })).await;
+    for _ in 0..300 {
+        alice.node.create(settings(CHAT, &relay), None).unwrap();
+    }
+    alice.node.create(Settings { membership: other.clone(), ..settings(CHAT, &relay) }, None).unwrap();
+    asked.lock().unwrap().clear();
+    alice.node.sync().await;
+    let domain = |service: &Service| match service {
+        Service::Serve { domain, .. } => domain.clone(),
+        _ => unreachable!(),
+    };
+    let mut expected = vec![(domain(&relay.service), 256), (domain(&relay.service), 44), (domain(&other), 1)];
+    expected.sort();
+    let mut asked = asked.lock().unwrap().clone();
+    asked.sort();
+    assert_eq!(asked, expected);
+    alice.node.shutdown().await.unwrap();
 }
 
 /// Each commit moves a group to its new epoch's log, at a reference only the epoch's members can derive: a joiner reads
@@ -2965,7 +2988,8 @@ async fn a_member_back_after_several_commits_takes_each_kept_message() {
 }
 
 /// A removed member that has not read the commit removing it still sends: what it sends past its final cut reaches no
-/// member that read the removal. Alice and Bob read the commit; Dave, behind the gate, cannot.
+/// member that read the removal. Alice and Bob read the commit; Dave, away as it lands and back behind the gate, cannot:
+/// no peer brings a commit to a member it removed that was not connected.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_members_send_past_its_final_cut_reaches_no_one() {
     let relay = relay().await;
@@ -2975,25 +2999,23 @@ async fn a_removed_members_send_past_its_final_cut_reaches_no_one() {
     let (gate, _reaching) = Gate::new(Some(&membership));
     let mut alice = session(&relay, "Alice").await;
     let mut bob = session(&relay, "Bob").await;
-    let dave = session_with(&relay, "Dave", gate.post("Dave", relay.post())).await;
+    let dave = stored_with(&relay, "Dave", &dir.join("dave.db"), gate.post("Dave", relay.post())).await;
     let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
-    for joiner in [&bob, &dave] {
-        joiner.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
-        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-    }
-    eventually("Alice has three members", || alice.node.members(&gid.0).unwrap().len() == 3).await;
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    dave.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    eventually("Bob has three members", || bob.node.members(&gid.0).unwrap().len() == 3).await;
+    let dave_key = dave.node.key();
+    dave.node.shutdown().await.unwrap();
+    drop(dave);
     gate.set(false);
 
-    // Closing the gate can race the removal's request on the old connection: Alice asks again once it reconnects.
-    let removed = loop {
-        match alice.node.remove(&gid.0, &dave.node.key().0).await {
-            Ok(removed) => break removed,
-            Err(error) => assert!(format!("{error:#}").contains("membership transport interrupted"), "{error:#}"),
-        }
-    };
-    assert!(removed);
+    assert!(alice.node.remove(&gid.0, &dave_key.0).await.unwrap());
     let epoch = alice.node.epoch(&gid.0).unwrap();
     eventually("Bob applies the removal", || bob.node.epoch(&gid.0).unwrap() == epoch).await;
+    let dave = stored_with(&relay, "Dave", &dir.join("dave.db"), gate.post("Dave", relay.post())).await;
+    eventually("Dave reaches Alice", || dave.node.online(&gid.0).unwrap().iter().any(|m| m.name == "Alice")).await;
     let sealed_on = dave.node.send(&gid.0, &message("sealed on after the removal"), None).await.unwrap();
     let quiet = tokio::time::timeout(Duration::from_secs(3), async {
         tokio::join!(

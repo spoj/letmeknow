@@ -267,7 +267,13 @@ async fn observation_events_wait_for_storage_and_failure_never_releases_them() {
         while observer.events.try_recv().is_ok() {}
         held.store(true, Ordering::SeqCst);
         peer.node.recertify(&gid.0, certificate(&identity, &device, &peer.node.key(), "Ann Lee", "phone")).await.unwrap();
-        polled(&observer.node, "observation staged before output", || binding_record(&db).is_some_and(|r| String::from_utf8(r).unwrap().contains("Ann Lee"))).await;
+        // The observer's held storage holds back its hellos too, so no peer brings the commit: it asks for heads.
+        tokio::time::timeout(WAIT, async {
+            while !binding_record(&db).is_some_and(|r| String::from_utf8(r).unwrap().contains("Ann Lee")) {
+                observer.node.sync().await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }).await.expect("observation staged before output");
         tokio::time::sleep(Duration::from_millis(100)).await;
         while let Ok(e) = observer.events.try_recv() {
             assert!(!matches!(e, Event::Warning { text, .. } if text.contains("Ann Lee")), "observation escaped held storage");

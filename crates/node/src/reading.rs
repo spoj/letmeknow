@@ -10,11 +10,11 @@ use lmk_core::provider::Provider;
 use lmk_net::peers::Decision;
 use lmk_proto::Bytes;
 use lmk_proto::clock::corrected;
-use lmk_proto::peer::{Admitted, Seqs};
+use lmk_proto::peer::{Admitted, Frame, Seqs};
 use lmk_proto::ranges::Ranges;
 
 use crate::held::Author;
-use crate::{Event, Inner, Lost, LostOf, State, Work, days, put};
+use crate::{Event, Inner, Lost, LostOf, Out, State, Work, days, put};
 
 /// The answer to the Add that ended an epoch, which its committer keeps for H for a joiner whose answer was lost.
 pub(crate) fn commit_key(gid: &[u8], epoch: u64) -> Vec<u8> {
@@ -138,6 +138,12 @@ impl<P: Provider + Send + 'static> Inner<P> {
             st.unhear(gid, &member.key)?;
         }
         st.unhint(removed.iter().filter_map(|member| member.leaf.as_ref().map(|leaf| leaf.key.clone())).collect())?;
+        // The members it removed that are connected are told at once: no peer brings them later commits.
+        let ended = st.group(gid)?.rec.log.0.clone();
+        let (entries, head) = (st.entries(&ended, 0), st.log(&ended)?.head.clone().context("an applied entry without its head")?);
+        for peer in removed.iter().filter_map(|member| crate::endpoint_id(&member.leaf.as_ref()?.key.0)).filter(|peer| st.served.contains_key(peer)) {
+            st.out.push(Out::Frame { peer, frame: Frame::Entries { log: Bytes(ended.clone()), entries: entries.clone(), head: head.clone() } });
+        }
         self.work.send(Work::Applied { group: gid.to_vec(), by, added, how, removed, settings, gone }).ok();
         st.group_mut(gid)?.rec.position = position;
         if gone {
