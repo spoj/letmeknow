@@ -1820,11 +1820,10 @@ async fn an_expired_directory_ends_its_identity_on_its_devices() {
 
     let (mut bob, bob_devices) = start("Bob").await;
     bob.node.sync().await;
-    let kind = bob.until(|e| match e {
-        Event::Removed { group, kind, .. } if group == gid => Some(kind),
-        _ => None,
-    }).await;
-    assert_eq!(kind, IDENTITY);
+    let removed = bob.until(|e| matches!(&e, Event::Removed { group, kind, .. } if *group == gid && kind == IDENTITY).then_some(e)).await;
+    let Some(Event::Warning { group, text }) = bob_devices.on(removed) else { panic!("the identity's removal is told") };
+    assert_eq!(group, Some(gid.clone()));
+    assert!(text.contains("identity join"), "{text}");
     assert!(!bob.node.groups().contains(&gid));
     assert!(bob_devices.identity().is_none());
     bob.node.shutdown().await.unwrap();
@@ -1934,6 +1933,64 @@ fn a_group_quiet_past_the_retention_survives() {
         bob.until(|e| matches!(e, Event::Message(message) if message.payload["content"] == "after the pause").then_some(())).await;
         alice.node.shutdown().await.unwrap();
         bob.node.shutdown().await.unwrap();
+    });
+}
+
+/// A device that missed its identity's commits past the retention is removed by the identity's other device, and told: its
+/// identity group removes a member that fell behind, and the device, its log let go, leaves that group. The device in use
+/// carries on, its identity's directory kept by its commits.
+#[test]
+fn a_device_missing_its_identitys_commits_past_the_retention_is_removed_and_told() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("device-behind");
+        let start = |name: &'static str| {
+            let (relay, dir) = (&relay, &dir);
+            async move {
+                let device = Device::new(name);
+                let config = config(relay, name, Some(device.clone()), &[CHAT, IDENTITY]);
+                let (node, events) = Node::start(SqliteProvider::open(&dir.join(format!("{name}.db"))).unwrap(), config).await.unwrap();
+                let devices = Identity::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
+                (Session { node, events }, devices)
+            }
+        };
+        let (mut laptop, laptop_devices) = start("laptop").await;
+        laptop_devices.create("Plan", relay.service.clone()).await.unwrap();
+        let link = lmk_proto::links::Invite::parse(&laptop_devices.invite().await.unwrap()).unwrap();
+        let (phone, phone_devices) = start("phone").await;
+        phone_devices.join(&link).await.unwrap();
+        let gid = devices_group(&laptop.node);
+        laptop.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        // The duties read the directory, which the phone follows from then on. The phone is away before the commit that
+        // moves the group on, so that it never reaches the epoch the laptop's later commits are in.
+        phone_devices.duties(&gid.0).await.unwrap();
+        phone.node.shutdown().await.unwrap();
+        drop((phone, phone_devices));
+        laptop_devices.rename("Renamed").await.unwrap();
+
+        SHIFT.store(20 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        laptop_devices.rename("Again").await.unwrap();
+        SHIFT.store(35 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        laptop.node.sync_members().await.unwrap();
+        laptop.until(|e| matches!(e, Event::Left { member, .. } if member.name == "phone").then_some(())).await;
+        assert_eq!(laptop.node.members(&gid.0).unwrap().len(), 1);
+        assert!(laptop_devices.identity().is_some(), "the device in use keeps its identity");
+
+        let (mut phone, phone_devices) = start("phone").await;
+        phone.node.sync().await;
+        SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
+        phone.node.sync().await;
+        let removed = phone.until(|e| matches!(&e, Event::Removed { group, kind, .. } if *group == gid && kind == IDENTITY).then_some(e)).await;
+        let Some(Event::Warning { text, .. }) = phone_devices.on(removed) else { panic!("the removal is told") };
+        assert!(text.contains("identity join"), "{text}");
+        assert!(phone_devices.identity().is_none());
+        phone.node.shutdown().await.unwrap();
+        laptop.node.shutdown().await.unwrap();
     });
 }
 
