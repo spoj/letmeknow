@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn records_keep_fields_this_version_does_not_know() {
-        let text = r#"{"protocol":4,"kind":"chat","name":"Plan","carry":7,"update":86400,"membership":{"serve":{"key":"Ag","domain":"h.example","ticket":"t"}},"color":"red"}"#;
+        let text = r#"{"protocol":4,"kind":"chat","name":"Plan","carry":7,"update":86400,"membership":{"serve":{"key":"Ag","domain":"h.example","future":"t"}},"color":"red"}"#;
         let settings: Settings = serde_json::from_str(text).unwrap();
         let renamed = Settings { name: "Release".into(), ..settings };
         assert_eq!(serde_json::to_string(&renamed).unwrap(), text.replace("Plan", "Release"));
