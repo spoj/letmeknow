@@ -12,8 +12,9 @@ use lmk_core::provider::Provider;
 use lmk_core::public::{PublicLog, Verdict};
 use lmk_membership::client::{Post, ServeClient};
 use lmk_membership::{Contradiction, Expired, Frontier, Unsupported, VerifiedPage, WrongDirectory};
+use lmk_net::peers::WAIT;
 use lmk_proto::Bytes;
-use lmk_proto::group::{IdentityRef, Service};
+use lmk_proto::group::{IDENTITY, IdentityRef, Service};
 use lmk_proto::head::{self, Head};
 use lmk_proto::membership::Known;
 use lmk_proto::clock::now;
@@ -81,11 +82,13 @@ pub(crate) struct Log {
     /// When it was last read from its service, or the time of the newest head a peer's entries ended at, in
     /// milliseconds.
     pub at: u64,
+    /// When the service first answered that it let the log go, and the length held then.
+    pub lapsed: Option<(u64, u64)>,
 }
 
 impl Log {
     pub fn new(of: Of, service: Service) -> Self {
-        Log { of, service, head: None, at: 0 }
+        Log { of, service, head: None, at: 0, lapsed: None }
     }
 
     /// The entries held, positions 1 to this.
@@ -247,7 +250,7 @@ impl<P: Provider> State<P> {
         let mut followed = Vec::new();
         for (id, log) in &self.logs {
             let current = match &log.of {
-                Of::Public(_) => true,
+                Of::Public(_) => log.lapsed.is_none(),
                 Of::Group(group) => self.groups.get(&group.0).is_some_and(|g| g.rec.log.0 == *id),
             };
             if let (true, Ok(capability)) = (current, self.capability(id)) {
@@ -274,7 +277,7 @@ impl<P: Provider> State<P> {
 
 impl<P: Provider + Send + 'static> Inner<P> {
     /// Asks each service for the heads of the logs this session follows, and reads those that moved. A log the answer
-    /// leaves out is unchanged as of the request, which counts as a read of it.
+    /// leaves out is unchanged as of the request, which counts as a read of it; one it lets go is lapsed.
     pub(crate) async fn ask_heads(self: &Arc<Self>) {
         let followed = self.lock().followed();
         let mut services: Vec<Asked> = Vec::new();
@@ -291,15 +294,22 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 Ok(client) => client.heads(&known).await,
                 Err(error) => Err(error),
             };
-            let moved: Vec<Head> = match moved {
-                Ok(moved) => moved.into_iter().filter_map(Result::ok).collect(),
+            let answers = match moved {
+                Ok(answers) => answers,
                 Err(error) => {
                     self.report(&error);
                     continue;
                 }
             };
+            let (moved, lapsed): (Vec<_>, Vec<_>) = answers.into_iter().partition(Result::is_ok);
+            let moved: Vec<Head> = moved.into_iter().flatten().collect();
+            let lapsed: Vec<[u8; 32]> = lapsed.into_iter().filter_map(|answer| answer.err().map(|Expired(reference)| reference)).collect();
             for (id, _) in logs {
-                if moved.iter().any(|head| head.log_ref[..] == id[..]) {
+                if lapsed.iter().any(|reference| reference[..] == id[..]) {
+                    if let Err(error) = self.lapse(&mut self.lock(), &id) {
+                        self.report(&error);
+                    }
+                } else if moved.iter().any(|head| head.log_ref[..] == id[..]) {
                     if let Err(error) = self.read(&id).await {
                         self.report(&error);
                     }
@@ -407,6 +417,9 @@ impl<P: Provider + Send + 'static> Inner<P> {
                     if let Some(contradiction) = error.downcast_ref::<Contradiction>() {
                         self.contradicted(&self.lock(), id, contradiction, "this session");
                     }
+                    if error.is::<Expired>() {
+                        self.lapse(&mut self.lock(), id)?;
+                    }
                     return Err(error);
                 }
             };
@@ -463,6 +476,33 @@ impl<P: Provider + Send + 'static> Inner<P> {
             self.check(st, id)?;
         }
         Ok(())
+    }
+
+    /// The service let a log go, as it answered. A public log's directory is closed from then on, and so is every identity
+    /// group of it, which this session leaves. A group's current log that stays gone for `WAIT`, with no entry of it
+    /// brought meanwhile, is left: the commit that moves the group on is in it, and no member can read it.
+    fn lapse(&self, st: &mut State<P>, id: &[u8]) -> Result<()> {
+        let now = crate::now();
+        let log = st.logs.get_mut(id).context(NOT_FOLLOWED)?;
+        let length = log.length();
+        let since = match log.lapsed {
+            Some((since, held)) if held == length => since,
+            _ => {
+                log.lapsed = Some((now, length));
+                now
+            }
+        };
+        let of = log.of.clone();
+        st.save_log(id)?;
+        match of {
+            Of::Public(identity) => self.replayed(st, &identity.0),
+            Of::Group(group) => {
+                if now >= since + WAIT && st.groups.get(&group.0).is_some_and(|g| g.rec.log.0 == id) {
+                    self.work.send(Work::Gone(group.0)).ok();
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Hands a log's new entries to its log type: a group's, while it is the group's current log.
@@ -552,8 +592,20 @@ impl<P: Provider + Send + 'static> Inner<P> {
         if entries.is_empty() {
             return Ok(());
         }
-        let public = PublicLog::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
+        let mut public = PublicLog::replay(id.try_into()?, entries.iter().map(|entry| entry.0.as_slice()))?;
         ensure!(public.membership == st.log(&log)?.service, "the public log belongs to another membership service");
+        if st.log(&log)?.lapsed.is_some() {
+            public.expire();
+            let own: Vec<Vec<u8>> = st
+                .groups
+                .iter()
+                .filter(|(_, g)| g.mls.settings().kind == IDENTITY && g.mls.settings().public.as_ref().is_some_and(|public| public.0 == id))
+                .map(|(gid, _)| gid.clone())
+                .collect();
+            for gid in own {
+                self.work.send(Work::Gone(gid)).ok();
+            }
+        }
         st.public.insert(id.to_vec(), public);
         st.observe_identities()?;
         st.gate = true;

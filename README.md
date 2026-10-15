@@ -37,7 +37,7 @@ An authentic directory prefix need not be the latest: its authoritative service 
 
 Messages live only on members, and move only between members online at the same time. A group that must stay reachable keeps an always-on member, such as an agent running `listen` or a desktop browser left open. Membership and settings changes reach a member from the members online at once, or else from the membership service within 2 minutes. Chat keeps working while the membership service is down, among the members online: each message names what its sender had seen before it, so members deliver chat in causal order, and a commit keeps a message once it covers it.
 
-If the membership service has let expired history go, your chat and identity groups stay on your device, with their keys and held data. Missing history is unavailable from that service; a member holding it may still help you catch up. A service expiry does not remove you from a group.
+If the membership service has let the log of your group's current epoch go, you stay in the group only while an online member brings you the commits you missed, within 2 minutes; otherwise you leave it, its keys are deleted, and the other members remove you, as they remove anyone who fell behind. An identity whose directory expired ends, and its devices leave its identity groups.
 
 Docs and tables give every joiner their shared state. Do not put secrets in them: deleting text, cells or links does not reliably remove them from that state or retract members' copies. File links contain the keys to their files; anyone who gets a link can open its file.
 

@@ -1706,109 +1706,128 @@ async fn a_change_made_moot_commits_nothing() {
     assert!(format!("{again:#}").contains("not a member"), "removing a non-member fails at once: {again:#}");
 }
 
-/// Expired service history is unavailable, not a removal: both kinds keep their state and can catch up from a peer,
-/// across the two logs the group moved through meanwhile.
+/// A log its service let go is no removal while a peer brings the commits the member missed, within `WAIT`: the member keeps
+/// its state and catches up from the peer, across the two logs the group moved through meanwhile.
 #[tokio::test(flavor = "multi_thread")]
-async fn expired_service_history_preserves_chat_and_identity_groups() {
+async fn a_log_let_go_is_no_removal_while_a_peer_brings_the_commits() {
     let relay = relay().await;
-    for kind in [CHAT, IDENTITY] {
-        let dir = folder(&format!("retention-{kind}"));
-        let (membership, _service) = served(&relay, &dir).await;
-        let (gate, _reaching) = Gate::new(Some(&membership));
-        let start = |name: &'static str| {
-            let (relay, dir, gate) = (&relay, &dir, gate.clone());
-            async move {
-                let device = Device::new(name);
-                let mut config = config(relay, name, Some(device.clone()), &[CHAT, IDENTITY]);
-                config.post = gate.post(name, relay.post());
-                config.files = Some(dir.join(format!("{name}-files")));
-                let (node, events) = Node::start(SqliteProvider::open(&dir.join(format!("{name}.db"))).unwrap(), config).await.unwrap();
-                let devices = Identity::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
-                (Session { node, events }, devices)
-            }
-        };
-        let (mut alice, alice_devices) = start("Alice").await;
-        let (bob, bob_devices) = start("Bob").await;
-        let gid = if kind == IDENTITY {
-            alice_devices.create("Plan", membership.clone()).await.unwrap();
-            let link = lmk_proto::links::Invite::parse(&alice_devices.invite().await.unwrap()).unwrap();
-            bob_devices.join(&link).await.unwrap();
-            devices_group(&bob.node)
-        } else {
-            let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
-            bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
-            gid
-        };
-        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
-        let held = bob.node.send(&gid.0, &message("held before refusal"), None).await.unwrap();
-        let file = bob.node.add_file(&gid.0, b"held file".to_vec()).await.unwrap();
-        let members = bob.node.members(&gid.0).unwrap();
-        let epoch = bob.node.epoch(&gid.0).unwrap();
-        let key = bob.node.key_in(&gid.0);
-        let identity = bob_devices.identity();
-        let log_ref: [u8; 32] = bob.node.log(&gid.0).unwrap().0.try_into().unwrap();
-        let signature = (kind == IDENTITY).then(|| bob.node.sign(&gid.0, b"still my key").unwrap());
-        bob.node.shutdown().await.unwrap();
-        drop((bob, bob_devices));
-
-        for name in ["Sooner", "Later"] {
-            alice.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
+    let dir = folder("let-go-catch-up");
+    let (membership, _service) = served(&relay, &dir).await;
+    let (gate, _reaching) = Gate::new(Some(&membership));
+    let start = |name: &'static str| {
+        let (relay, dir, gate) = (&relay, &dir, gate.clone());
+        async move {
+            let mut config = config(relay, name, None, &[CHAT]);
+            config.post = gate.post(name, relay.post());
+            config.files = Some(dir.join(format!("{name}-files")));
+            let (node, events) = Node::start(SqliteProvider::open(&dir.join(format!("{name}.db"))).unwrap(), config).await.unwrap();
+            Session { node, events }
         }
-        let missed = alice.node.send(&gid.0, &message("recover from the peer"), None).await.unwrap();
-        alice.node.shutdown().await.unwrap();
-        drop((alice, alice_devices));
-        let store = Store::open(&dir.join("membership")).unwrap();
-        store.expire(lmk_node::now() / lmk_membership::store::DAY_MS + 1).unwrap();
-        let expired: bool = rusqlite::Connection::open(dir.join("membership").join("membership.db")).unwrap()
-            .query_row("SELECT EXISTS(SELECT 1 FROM expired WHERE reference=?)", [log_ref], |r| r.get(0)).unwrap();
-        assert!(expired);
+    };
+    let mut alice = start("Alice").await;
+    let bob = start("Bob").await;
+    let gid = alice.node.create(Settings { membership, ..settings(CHAT, &relay) }, None).unwrap();
+    bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    let held = bob.node.send(&gid.0, &message("held before refusal"), None).await.unwrap();
+    let file = bob.node.add_file(&gid.0, b"held file".to_vec()).await.unwrap();
+    let members = bob.node.members(&gid.0).unwrap();
+    let epoch = bob.node.epoch(&gid.0).unwrap();
+    let key = bob.node.key_in(&gid.0);
+    let log_ref: [u8; 32] = bob.node.log(&gid.0).unwrap().0.try_into().unwrap();
+    bob.node.shutdown().await.unwrap();
+    drop(bob);
 
-        let (mut bob, bob_devices) = start("Bob").await;
-        let error = bob.node.read_group(&gid.0).await.unwrap_err();
-        assert!(error.is::<lmk_membership::Expired>(), "{error:#}");
-        // read() used to queue Gone before returning its error. Settings runs through the same FIFO work driver,
-        // so seeing this later commit's event proves that deletion is not merely still waiting to run.
-        let barrier = bob.node.create(settings(CHAT, &relay), None).unwrap();
-        bob.node.change_settings(&barrier.0, |s| Settings { name: "barrier".into(), ..s }).await.unwrap();
-        bob.until(|e| {
-            assert!(!matches!(&e, Event::Removed { group, .. } if group == &gid), "{kind}: refusal removed the group");
-            matches!(e, Event::Settings { group, .. } if group == barrier).then_some(())
-        }).await;
-        assert!(bob.node.groups().contains(&gid));
-        assert_eq!(bob.node.members(&gid.0).unwrap(), members);
-        assert_eq!(bob.node.epoch(&gid.0).unwrap(), epoch);
-        assert_eq!(bob.node.key_in(&gid.0), key);
-        assert_eq!(bob_devices.identity(), identity);
-        assert_eq!(bob.node.message(&gid.0, &held.0).unwrap().unwrap().payload, message("held before refusal"));
-        assert_eq!(bob.node.file(&file).await.unwrap().unwrap(), b"held file");
-        if let Some(signature) = &signature {
-            assert_eq!(&bob.node.sign(&gid.0, b"still my key").unwrap(), signature);
-        }
-        bob.node.shutdown().await.unwrap();
-        drop((bob, bob_devices));
-
-        // Neither member can reach the service: only Alice's retained entries and ciphertext can fill Bob's gap.
-        gate.set(false);
-        let (mut bob, bob_devices) = start("Bob").await;
-        assert_eq!(bob.node.members(&gid.0).unwrap(), members);
-        assert_eq!(bob_devices.identity(), identity);
-        let (alice, _alice_devices) = start("Alice").await;
-        bob.until(|e| {
-            assert!(!matches!(&e, Event::Removed { group, .. } if group == &gid));
-            matches!(e, Event::Settings { group, settings, .. } if group == gid && settings.name == "Later").then_some(())
-        }).await;
-        eventually("Bob takes the message beyond the expired history", || bob.node.message(&gid.0, &missed.0).unwrap().is_some()).await;
-        assert_eq!(bob.node.message(&gid.0, &missed.0).unwrap().unwrap().payload, message("recover from the peer"));
-        assert_eq!(bob.node.key_in(&gid.0), key);
-        assert_eq!(bob.node.members(&gid.0).unwrap(), members);
-        assert!(bob.node.epoch(&gid.0).unwrap() > epoch);
-        if let Some((identity, _)) = identity {
-            assert_eq!(bob_devices.identity(), Some((identity, "Later".into())));
-            assert_eq!(bob.node.sign(&gid.0, b"still my key").unwrap(), signature.unwrap());
-        }
-        bob.node.shutdown().await.unwrap();
-        alice.node.shutdown().await.unwrap();
+    for name in ["Sooner", "Later"] {
+        alice.node.change_settings(&gid.0, |s| Settings { name: name.into(), ..s }).await.unwrap();
     }
+    let missed = alice.node.send(&gid.0, &message("recover from the peer"), None).await.unwrap();
+    alice.node.shutdown().await.unwrap();
+    drop(alice);
+    let store = Store::open(&dir.join("membership")).unwrap();
+    store.expire(lmk_node::now() / lmk_membership::store::DAY_MS + 1).unwrap();
+    let expired: bool = rusqlite::Connection::open(dir.join("membership").join("membership.db")).unwrap()
+        .query_row("SELECT EXISTS(SELECT 1 FROM expired WHERE reference=?)", [log_ref], |r| r.get(0)).unwrap();
+    assert!(expired);
+    let mut bob = start("Bob").await;
+    let error = bob.node.read_group(&gid.0).await.unwrap_err();
+    assert!(error.is::<lmk_membership::Expired>(), "{error:#}");
+    // Settings runs through the same FIFO work driver as a removal would, so seeing this later commit's event shows
+    // that no removal was queued before it.
+    let barrier = bob.node.create(settings(CHAT, &relay), None).unwrap();
+    bob.node.change_settings(&barrier.0, |s| Settings { name: "barrier".into(), ..s }).await.unwrap();
+    bob.until(|e| {
+        assert!(!matches!(&e, Event::Removed { group, .. } if group == &gid), "refusal removed the group");
+        matches!(e, Event::Settings { group, .. } if group == barrier).then_some(())
+    }).await;
+    assert!(bob.node.groups().contains(&gid));
+    assert_eq!(bob.node.members(&gid.0).unwrap(), members);
+    assert_eq!(bob.node.epoch(&gid.0).unwrap(), epoch);
+    assert_eq!(bob.node.key_in(&gid.0), key);
+    assert_eq!(bob.node.message(&gid.0, &held.0).unwrap().unwrap().payload, message("held before refusal"));
+    assert_eq!(bob.node.file(&file).await.unwrap().unwrap(), b"held file");
+    bob.node.shutdown().await.unwrap();
+
+    gate.set(false);
+    let mut bob = start("Bob").await;
+    assert_eq!(bob.node.members(&gid.0).unwrap(), members);
+    let alice = start("Alice").await;
+    bob.until(|e| {
+        assert!(!matches!(&e, Event::Removed { group, .. } if group == &gid));
+        matches!(e, Event::Settings { group, settings, .. } if group == gid && settings.name == "Later").then_some(())
+    }).await;
+    eventually("Bob takes the message beyond the expired history", || bob.node.message(&gid.0, &missed.0).unwrap().is_some()).await;
+    assert_eq!(bob.node.message(&gid.0, &missed.0).unwrap().unwrap().payload, message("recover from the peer"));
+    assert_eq!(bob.node.key_in(&gid.0), key);
+    assert_eq!(bob.node.members(&gid.0).unwrap(), members);
+    assert!(bob.node.epoch(&gid.0).unwrap() > epoch);
+    bob.node.shutdown().await.unwrap();
+    alice.node.shutdown().await.unwrap();
+}
+
+/// An identity whose directory its service let go ends on the devices that followed it: each forgets its identity group,
+/// which reports its removal, and the identity is no more.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_directory_ends_its_identity_on_its_devices() {
+    let relay = relay().await;
+    let dir = folder("expired-directory");
+    let (membership, _service) = served(&relay, &dir).await;
+    let start = |name: &'static str| {
+        let (relay, dir) = (&relay, &dir);
+        async move {
+            let device = Device::new(name);
+            let config = config(relay, name, Some(device.clone()), &[CHAT, IDENTITY]);
+            let (node, events) = Node::start(SqliteProvider::open(&dir.join(format!("{name}.db"))).unwrap(), config).await.unwrap();
+            let devices = Identity::new(node.clone(), device, Arc::new(|_: &Device| Ok(())));
+            (Session { node, events }, devices)
+        }
+    };
+    let (mut alice, alice_devices) = start("Alice").await;
+    let (bob, bob_devices) = start("Bob").await;
+    alice_devices.create("Plan", membership).await.unwrap();
+    let link = lmk_proto::links::Invite::parse(&alice_devices.invite().await.unwrap()).unwrap();
+    bob_devices.join(&link).await.unwrap();
+    let gid = devices_group(&bob.node);
+    alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+    // The duties read the directory, which this device follows from then on.
+    bob_devices.duties(&gid.0).await.unwrap();
+    bob.node.shutdown().await.unwrap();
+    drop((bob, bob_devices));
+    alice.node.shutdown().await.unwrap();
+    drop((alice, alice_devices));
+    let store = Store::open(&dir.join("membership")).unwrap();
+    store.expire(lmk_node::now() / lmk_membership::store::DAY_MS + 1).unwrap();
+
+    let (mut bob, bob_devices) = start("Bob").await;
+    bob.node.sync().await;
+    let kind = bob.until(|e| match e {
+        Event::Removed { group, kind, .. } if group == gid => Some(kind),
+        _ => None,
+    }).await;
+    assert_eq!(kind, IDENTITY);
+    assert!(!bob.node.groups().contains(&gid));
+    assert!(bob_devices.identity().is_none());
+    bob.node.shutdown().await.unwrap();
 }
 
 /// Runs `test` on a runtime whose every thread reads the system's clock as `clock` does: the nodes, relay and service
@@ -1849,6 +1868,72 @@ fn a_member_in_an_epoch_the_service_let_go_is_removed_by_the_others() {
         alice.until(|e| matches!(e, Event::Left { member, .. } if member.name == "Bob").then_some(())).await;
         assert_eq!(alice.node.members(&gid.0).unwrap().len(), 1);
         alice.node.shutdown().await.unwrap();
+    });
+}
+
+/// A member whose service let its log go, and which no peer brings the commits of within `WAIT`, leaves the group, and is
+/// told it did, with nothing kept: the commit that moved the group on is in that log, which no member can read now.
+#[test]
+fn a_member_whose_log_the_service_let_go_leaves_when_no_peer_brings_it_within_wait() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let dir = folder("let-go-leaver");
+        let mut alice = session(&relay, "Alice").await;
+        let bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
+        let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+        bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        bob.node.shutdown().await.unwrap();
+        alice.node.change_settings(&gid.0, |s| Settings { name: "Later".into(), ..s }).await.unwrap();
+        alice.node.shutdown().await.unwrap();
+
+        SHIFT.store(31 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        let mut bob = stored(&relay, "Bob", &dir.join("bob.db")).await;
+        bob.node.sync().await;
+        assert!(bob.node.groups().contains(&gid), "a log let go is left only after WAIT with no entry of it brought");
+        SHIFT.fetch_add(lmk_net::peers::WAIT + 60_000, std::sync::atomic::Ordering::Relaxed);
+        bob.node.sync().await;
+        let (by, not_kept) = bob.until(|e| match e {
+            Event::Removed { group, by, not_kept, .. } if group == gid => Some((by, not_kept)),
+            _ => None,
+        }).await;
+        assert!(by.is_none() && not_kept.is_empty(), "no commit removed it: its own log did");
+        assert!(!bob.node.groups().contains(&gid));
+        bob.node.shutdown().await.unwrap();
+    });
+}
+
+/// A group nobody commits to for longer than the retention is not left: its current log is empty, and empty logs do not
+/// expire.
+#[test]
+fn a_group_quiet_past_the_retention_survives() {
+    static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn shifted() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + SHIFT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    on_clock(shifted, async {
+        let relay = relay().await;
+        let mut alice = session(&relay, "Alice").await;
+        let mut bob = session(&relay, "Bob").await;
+        let gid = alice.node.create(settings(CHAT, &relay), None).unwrap();
+        bob.node.join(&alice.node.invite(&gid.0, None, INVITE_VALID).await.unwrap(), None).await.unwrap();
+        alice.until(|e| matches!(e, Event::Joined { .. }).then_some(())).await;
+        SHIFT.store(60 * DAY_MS, std::sync::atomic::Ordering::Relaxed);
+        while relay.membership.expire().await {}
+        for node in [&alice.node, &bob.node] {
+            node.sync().await;
+            node.sync_members().await.unwrap();
+        }
+        assert_eq!((alice.node.members(&gid.0).unwrap().len(), bob.node.members(&gid.0).unwrap().len()), (2, 2));
+        alice.node.send(&gid.0, &message("after the pause"), None).await.unwrap();
+        bob.until(|e| matches!(e, Event::Message(message) if message.payload["content"] == "after the pause").then_some(())).await;
+        alice.node.shutdown().await.unwrap();
+        bob.node.shutdown().await.unwrap();
     });
 }
 

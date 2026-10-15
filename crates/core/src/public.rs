@@ -121,6 +121,11 @@ impl PublicLog {
         self.writers.is_empty()
     }
 
+    /// The identity's log let go: no key is listed any more, so each of its devices is dropped.
+    pub fn expire(&mut self) {
+        self.writers.clear();
+    }
+
     pub fn is_dropped(&self, key: &Bytes) -> bool {
         self.dropped.contains(key)
     }
