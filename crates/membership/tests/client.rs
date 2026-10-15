@@ -40,8 +40,9 @@ impl Membership {
         Arc::new(move |_: String, route: &'static str, body: Vec<u8>| -> BoxFuture<anyhow::Result<Vec<u8>>> {
             let service = service.clone();
             Box::pin(async move {
-                let admission = service.admit(IpAddr::from([127, 0, 0, 1])).unwrap();
-                service.post(Route::parse(route).unwrap(), &admission, &body).await
+                let route = Route::parse(route).unwrap();
+                let admission = service.admit(IpAddr::from([127, 0, 0, 1]), route, body.len()).unwrap();
+                service.post(route, &admission, &body).await
             })
         })
     }

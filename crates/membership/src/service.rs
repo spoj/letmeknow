@@ -4,7 +4,7 @@ use std::{collections::HashMap, hash::Hash, net::{IpAddr, Ipv4Addr}, sync::{Arc,
 
 use anyhow::{Result, ensure};
 use ed25519_dalek::Signer;
-use lmk_proto::{Bytes, clock::now, membership::{Answer, Append, Appended, Expiry, Heads, Known, Moved, Page, Read, Refusal, expiry_message, refusal_message}};
+use lmk_proto::{Bytes, clock::now, membership::{Answer, Append, Appended, Expiry, HEAD_LOGS, Heads, Known, MAX_BODY, Moved, Page, Read, Refusal, expiry_message, refusal_message}};
 use n0_future::task::AbortOnDropHandle;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::{sync::Semaphore, time::timeout};
@@ -40,6 +40,10 @@ pub struct Policy {
     pub public_appends_per_day: u64,
     /// Per source: an IPv4 address, a /64, and a /48 at `WIDE` times as many.
     pub requests_at_once: usize,
+    /// Bodies and answers in flight, a body counted twice: as bytes and as its decoded value.
+    pub bytes_at_once: u64,
+    /// Over all addresses.
+    pub bytes_at_once_in_all: u64,
 }
 
 impl Default for Policy {
@@ -48,7 +52,7 @@ impl Default for Policy {
             appends_per_minute: 600, retention_days: 30, disk: DISK_BYTES,
             append_bytes_per_day: 256 << 20, reads_per_minute: 600, read_bytes_per_minute: 64 << 20,
             new_logs_per_day: 2_000, new_public_logs_per_day: 10, public_appends_per_day: 10,
-            requests_at_once: 8,
+            requests_at_once: 8, bytes_at_once: 16 << 20, bytes_at_once_in_all: 256 << 20,
         }
     }
 }
@@ -65,6 +69,15 @@ impl Route {
             _ => None,
         }
     }
+
+    /// The most an answer takes: a page, or a few signed heads.
+    fn answer_bytes(self) -> u64 {
+        match self {
+            Self::Read => MAX_BODY as u64,
+            Self::Heads => (HEAD_LOGS << 10) as u64,
+            Self::Append => 4 << 10,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -74,7 +87,7 @@ struct Inner {
     store: Store,
     policy: Policy,
     budgets: Mutex<Budgets>,
-    in_flight: Mutex<HashMap<Source, u64>>,
+    in_flight: Mutex<InFlight>,
     work: Arc<Semaphore>,
     expiry: Mutex<Option<AbortOnDropHandle<()>>>,
 }
@@ -183,16 +196,35 @@ impl Budgets {
     }
 }
 
-/// A request counted in flight from its sources until it is dropped.
-pub struct Admission { sources: Vec<(Source, u64)>, service: Arc<Inner> }
+#[derive(Default)]
+struct InFlight { bytes: u64, sources: HashMap<Source, Held> }
+
+#[derive(Default, Clone, Copy)]
+struct Held { requests: u64, bytes: u64 }
+
+/// A request and its bytes, counted in flight from its sources until it is dropped.
+pub struct Admission { sources: Vec<(Source, u64)>, bytes: u64, service: Arc<Inner> }
+
+impl Admission {
+    /// Keeps `bytes` of those admitted, once only the answer is left.
+    pub fn keep(&mut self, bytes: usize) {
+        let freed = self.bytes - bytes as u64;
+        self.bytes = bytes as u64;
+        let mut in_flight = self.service.in_flight.lock().unwrap();
+        in_flight.bytes -= freed;
+        for (source, _) in &self.sources { in_flight.sources.get_mut(source).unwrap().bytes -= freed; }
+    }
+}
 
 impl Drop for Admission {
     fn drop(&mut self) {
         let mut in_flight = self.service.in_flight.lock().unwrap();
+        in_flight.bytes -= self.bytes;
         for (source, _) in &self.sources {
-            let count = in_flight.get_mut(source).unwrap();
-            *count -= 1;
-            if *count == 0 { in_flight.remove(source); }
+            let held = in_flight.sources.get_mut(source).unwrap();
+            held.requests -= 1;
+            held.bytes -= self.bytes;
+            if held.requests == 0 { in_flight.sources.remove(source); }
         }
     }
 }
@@ -243,14 +275,25 @@ impl Service {
         }
     }
 
-    /// Counts a request from `from` in flight, unless one of its sources already has its requests at once.
-    pub fn admit(&self, from: IpAddr) -> Option<Admission> {
+    /// Counts a request from `from` to `route` in flight, with a body of `body` bytes and its answer, unless that is
+    /// more than the service or one of its sources has room for.
+    pub fn admit(&self, from: IpAddr, route: Route, body: usize) -> Option<Admission> {
         let sources = sources(from);
-        let at_once = self.0.policy.requests_at_once as u64;
+        let bytes = 2 * body as u64 + route.answer_bytes();
+        let policy = &self.0.policy;
         let mut in_flight = self.0.in_flight.lock().unwrap();
-        if sources.iter().any(|(source, scale)| in_flight.get(source).copied().unwrap_or(0) >= at_once * scale) { return None; }
-        for (source, _) in &sources { *in_flight.entry(*source).or_default() += 1; }
-        Some(Admission { sources, service: self.0.clone() })
+        let full = |(source, scale): &(Source, u64)| {
+            let held = in_flight.sources.get(source).copied().unwrap_or_default();
+            held.requests >= policy.requests_at_once as u64 * scale || held.bytes + bytes > policy.bytes_at_once * scale
+        };
+        if in_flight.bytes + bytes > policy.bytes_at_once_in_all || sources.iter().any(full) { return None; }
+        in_flight.bytes += bytes;
+        for (source, _) in &sources {
+            let held = in_flight.sources.entry(*source).or_default();
+            held.requests += 1;
+            held.bytes += bytes;
+        }
+        Some(Admission { sources, bytes, service: self.0.clone() })
     }
 
     /// Answers one request on the HTTPS routes: the body is the route's, and the answer is an `Answer` as JSON. An error
@@ -375,30 +418,57 @@ mod tests {
         assert!(quota.fits(0, &sources("192.0.2.1".parse().unwrap()), 1));
     }
 
+    fn service(policy: Policy) -> (tempfile::TempDir, Service) {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::new(Store::initialize(&dir.path().join("state")).unwrap(), policy);
+        service.0.expiry.lock().unwrap().take();
+        (dir, service)
+    }
+
     #[tokio::test]
     async fn requests_at_once_are_counted_per_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let service = Service::new(Store::initialize(&dir.path().join("state")).unwrap(), Policy { requests_at_once: 1, ..Policy::default() });
-        service.0.expiry.lock().unwrap().take();
-        let one: IpAddr = "192.0.2.1".parse().unwrap();
-        let held = service.admit(one).unwrap();
-        assert!(service.admit(one).is_none());
-        assert!(service.admit("192.0.2.2".parse().unwrap()).is_some());
+        let (_dir, service) = service(Policy { requests_at_once: 1, ..Policy::default() });
+        let admit = |from: &str| service.admit(from.parse().unwrap(), Route::Heads, 0);
+        let held = admit("192.0.2.1").unwrap();
+        assert!(admit("192.0.2.1").is_none());
+        assert!(admit("192.0.2.2").is_some());
         drop(held);
-        assert!(service.admit(one).is_some());
-        let net64 = |i: u32| -> IpAddr { format!("2001:db8:0:{i:x}::1").parse().unwrap() };
-        let wide: Vec<_> = (0..WIDE as u32).map(|i| service.admit(net64(i)).unwrap()).collect();
-        assert!(service.admit(net64(WIDE as u32)).is_none());
-        assert!(service.admit("2001:db9::1".parse().unwrap()).is_some());
+        assert!(admit("192.0.2.1").is_some());
+        let wide: Vec<_> = (0..WIDE).map(|i| admit(&format!("2001:db8:0:{i:x}::1")).unwrap()).collect();
+        assert!(admit(&format!("2001:db8:0:{WIDE:x}::1")).is_none());
+        assert!(admit("2001:db9::1").is_some());
         drop(wide);
     }
 
     #[tokio::test]
+    async fn bytes_in_flight_are_bounded_per_source_until_the_answer_is_dropped() {
+        let (_dir, service) = service(Policy::default());
+        let one: IpAddr = "192.0.2.1".parse().unwrap();
+        let mut held = service.admit(one, Route::Append, MAX_BODY).unwrap();
+        assert!(service.admit(one, Route::Append, MAX_BODY).is_none(), "a body counts twice, with its answer");
+        assert!(service.admit("192.0.2.2".parse().unwrap(), Route::Append, MAX_BODY).is_some());
+        held.keep(100);
+        let mut reads: Vec<_> = (0..3).map(|_| service.admit(one, Route::Read, 0).unwrap()).collect();
+        assert!(service.admit(one, Route::Read, 0).is_none());
+        reads.pop();
+        assert!(service.admit(one, Route::Read, 0).is_some());
+        drop((held, reads));
+    }
+
+    #[tokio::test]
+    async fn bytes_in_flight_are_bounded_in_all() {
+        let (_dir, service) = service(Policy::default());
+        let per = 2 * MAX_BODY as u64 + Route::Append.answer_bytes();
+        let admit = |i: u64| service.admit(IpAddr::from(Ipv4Addr::from(i as u32)), Route::Append, MAX_BODY);
+        let mut held: Vec<_> = (0..Policy::default().bytes_at_once_in_all / per).map(|i| admit(i).unwrap()).collect();
+        assert!(admit(1 << 20).is_none());
+        held.pop();
+        assert!(admit(1 << 20).is_some());
+    }
+
+    #[tokio::test]
     async fn running_db_work_is_not_cut_off() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state");
-        let service = Service::new(Store::initialize(&path).unwrap(), Policy::default());
-        service.0.expiry.lock().unwrap().take();
+        let (_dir, service) = service(Policy::default());
         let (release, wait) = std::sync::mpsc::channel();
         let running = tokio::spawn({
             let service = service.clone();
@@ -412,10 +482,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_work_is_bounded_and_cancellation_does_not_free_running_slots() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state");
-        let service = Service::new(Store::initialize(&path).unwrap(), Policy::default());
-        service.0.expiry.lock().unwrap().take();
+        let (_dir, service) = service(Policy::default());
         let mut jobs = Vec::new();
         let mut releases = Vec::new();
         for _ in 0..DB_WORK {

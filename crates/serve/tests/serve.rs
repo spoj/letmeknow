@@ -25,6 +25,10 @@ fn free_port() -> u16 {
 }
 
 async fn tls_connect(host: &str, port: u16, cert: &CertificateDer<'static>) -> tokio_rustls::client::TlsStream<TcpStream> {
+    tls_over(TcpStream::connect((host, port)).await.unwrap(), cert).await
+}
+
+async fn tls_over(tcp: TcpStream, cert: &CertificateDer<'static>) -> tokio_rustls::client::TlsStream<TcpStream> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.clone()).unwrap();
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -32,7 +36,6 @@ async fn tls_connect(host: &str, port: u16, cert: &CertificateDer<'static>) -> t
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let tcp = TcpStream::connect((host, port)).await.unwrap();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     connector.connect(ServerName::try_from("localhost").unwrap(), tcp).await.unwrap()
 }
@@ -299,6 +302,37 @@ async fn one_address_at_once_does_not_refuse_another() {
     assert!(response.starts_with("HTTP/1.1 503"), "{response}");
     let response = https_raw("::1", https, &cert, &post(APPEND, None, &append_json(2, b"x"))).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_that_does_not_drain_closes_its_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (config, cert) = configure(&state);
+    let https = config.https_port;
+    let server = tokio::spawn(serve(config));
+    wait_for_https(https).await;
+
+    let entries = vec![Bytes(vec![1; 1 << 20]), Bytes(vec![2; 1 << 20])];
+    let append = serde_json::to_vec(&Append { capability: [3; 32], entries, public: false }).unwrap();
+    let response = https_raw("127.0.0.1", https, &cert, &post(APPEND, None, &append)).await;
+    assert!(matches!(answer::<Appended>(&response), Answer::Ok(_)), "{response}");
+    let read = post("/membership/1/read", None, &serde_json::to_vec(&Read { capability: [3; 32], after: 0 }).unwrap());
+    let page = https_raw("127.0.0.1", https, &cert, &read).await.len();
+
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    socket.set_recv_buffer_size(4 << 10).unwrap();
+    socket.connect(&std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, https)).into()).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let tls = tls_over(TcpStream::from_std(socket.into()).unwrap(), &cert).await;
+    let (mut reader, mut writer) = tokio::io::split(tls);
+    let pipelined = String::from_utf8(read).unwrap().replace("Connection: close\r\n", "").repeat(8);
+    writer.write_all(pipelined.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    let mut received = Vec::new();
+    let _ = timeout(Duration::from_secs(20), reader.read_to_end(&mut received)).await.expect("the stalled connection was kept open");
+    assert!(received.len() < 8 * page, "{} of {}", received.len(), 8 * page);
     server.abort();
 }
 

@@ -164,7 +164,7 @@ async fn membership(url: &RelayUrl, cert: &CertificateDer<'static>, key: &Privat
 /// The membership routes, as `letmeknow serve` answers them: the service's answer as its body, or 404 and 503 alone.
 async fn answer(membership: Membership, peer: IpAddr, req: Request<Incoming>) -> Result<Response<Full<Body>>, Infallible> {
     let (status, body) = match Route::parse(req.uri().path()) {
-        Some(route) if req.method() == Method::POST => match membership.admit(peer) {
+        Some(route) if req.method() == Method::POST => match membership.admit(peer, route, MAX_BODY) {
             None => (StatusCode::SERVICE_UNAVAILABLE, Vec::new()),
             Some(admission) => match Limited::new(req.into_body(), MAX_BODY).collect().await {
                 Ok(collected) => match membership.post(route, &admission, &collected.to_bytes()).await {
@@ -190,6 +190,6 @@ fn unlimited() -> Policy {
     Policy {
         appends_per_minute: u32::MAX, append_bytes_per_day: big, reads_per_minute: u32::MAX, read_bytes_per_minute: big,
         new_logs_per_day: big, new_public_logs_per_day: big, public_appends_per_day: big,
-        requests_at_once: 1 << 20, ..Policy::default()
+        requests_at_once: 1 << 20, bytes_at_once: big, bytes_at_once_in_all: big, ..Policy::default()
     }
 }

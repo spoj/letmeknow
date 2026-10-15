@@ -33,7 +33,7 @@ impl Http {
     }
 
     async fn post<T: DeserializeOwned>(&self, route: Route, from: &str, body: &[u8]) -> Answer<T> {
-        let admission = self.service.admit(from.parse().unwrap()).unwrap();
+        let admission = self.service.admit(from.parse().unwrap(), route, body.len()).unwrap();
         let answer = self.service.post(route, &admission, body).await.unwrap();
         serde_json::from_slice(&answer).unwrap()
     }

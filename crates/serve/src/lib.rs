@@ -1,12 +1,14 @@
 //! `letmeknow serve`: the membership service and an embedded iroh relay.
 
 use std::{
+    convert::Infallible,
     future::Future,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     num::NonZeroU32,
     path::PathBuf,
     pin::Pin,
     sync::Arc,
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 
@@ -14,7 +16,7 @@ use anyhow::{Context, Result};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
-    body::{Bytes, Incoming},
+    body::{Body, Bytes, Frame, Incoming, SizeHint},
     service::{Service as HyperService, service_fn},
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -27,7 +29,7 @@ use iroh_relay::{
     },
 };
 use lmk_membership::{
-    service::{Policy, Route, Service},
+    service::{Admission, Policy, Route, Service},
     store::Store,
 };
 use lmk_proto::{directory::{self, Directory}, group, membership::MAX_BODY};
@@ -35,8 +37,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use socket2::{Domain, Socket, Type};
 use tokio::{
     net::TcpListener,
-    sync::{Notify, Semaphore},
-    time::timeout,
+    sync::{Notify, watch},
+    time::{Instant, sleep_until, timeout},
 };
 use tokio_rustls_acme::{AcmeConfig, caches::DirCache};
 use tokio_stream::StreamExt;
@@ -46,8 +48,10 @@ const APP: &str = "https://letmeknow.dev";
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const HEADERS: Duration = Duration::from_secs(10);
 const BODY: Duration = Duration::from_secs(15);
-/// Membership bodies at once, over every address: above what one /48 may have at once, so no single address fills them.
-const BODIES: usize = 256;
+/// How long a membership answer may take to drain before its connection is closed.
+const DRAIN: Duration = Duration::from_secs(30);
+/// Hyper takes an answer's next chunk once it has room to write it.
+const CHUNK: usize = 64 << 10;
 
 pub enum Certificate {
     /// From Let's Encrypt, by TLS-ALPN-01 on the HTTPS port; cached in the state directory.
@@ -201,11 +205,10 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
 
     let tls = Arc::new(tls);
     let origins = Arc::new(std::iter::once(APP.to_owned()).chain(config.origins.iter().cloned()).collect::<Vec<_>>());
-    let bodies = Arc::new(Semaphore::new(BODIES));
     loop {
         let (tcp, peer) = https.accept().await?;
-        let (tls, relay, health, directory, membership, origins, bodies) =
-            (tls.clone(), relay.clone(), health.clone(), directory.clone(), membership.clone(), origins.clone(), bodies.clone());
+        let (tls, relay, health, directory, membership, origins) =
+            (tls.clone(), relay.clone(), health.clone(), directory.clone(), membership.clone(), origins.clone());
         tokio::spawn(async move {
             let stream = timeout(HANDSHAKE, async move {
                 match &*tls {
@@ -217,6 +220,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
                 }
             }).await.ok().flatten();
             let Some(stream) = stream else { return };
+            let (drain, mut draining) = watch::channel(None);
             let site = Site {
                 relay: RelayServiceWithNotify::new(relay, Arc::new(Notify::new())),
                 health,
@@ -224,14 +228,29 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
                 membership,
                 peer: peer.ip(),
                 origins,
-                bodies,
+                drain,
             };
-            let _ = hyper::server::conn::http1::Builder::new()
+            let connection = hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())
                 .header_read_timeout(HEADERS)
                 .serve_connection(TokioIo::new(MaybeTlsStream::Tls(stream)), site)
-                .with_upgrades()
-                .await;
+                .with_upgrades();
+            tokio::pin!(connection);
+            loop {
+                let deadline = *draining.borrow_and_update();
+                let drained = async {
+                    match deadline {
+                        Some(deadline) => sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = &mut connection => return,
+                    _ = drained => return,
+                    _ = draining.changed() => {}
+                }
+            }
         });
     }
 }
@@ -301,13 +320,31 @@ struct Site {
     /// The address membership budgets count the request against.
     peer: IpAddr,
     origins: Arc<Vec<String>>,
-    bodies: Arc<Semaphore>,
+    /// When the last membership answer must have drained, unless another request follows it.
+    drain: watch::Sender<Option<Instant>>,
+}
+
+/// An answer, which holds its admission until it is written or dropped.
+struct Held { answer: Bytes, _admission: Admission }
+
+impl Body for Held {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(mut self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        let chunk = self.answer.len().min(CHUNK);
+        Poll::Ready((chunk > 0).then(|| Ok(Frame::data(self.answer.split_to(chunk)))))
+    }
+
+    fn is_end_stream(&self) -> bool { self.answer.is_empty() }
+
+    fn size_hint(&self) -> SizeHint { SizeHint::with_exact(self.answer.len() as u64) }
 }
 
 /// Membership requests. Only the app's origins, and those `--origin` adds, may send them: another page could otherwise
 /// make its visitors append. A path with no route is a 404 those origins can read, so a page learns the service runs
 /// another minor.
-async fn answer_membership(route: Option<Route>, service: Service, peer: IpAddr, origins: Arc<Vec<String>>, bodies: Arc<Semaphore>, req: Request<Incoming>) -> http::Result<Response<BytesBody>> {
+async fn answer_membership(route: Option<Route>, service: Service, peer: IpAddr, origins: Arc<Vec<String>>, drain: watch::Sender<Option<Instant>>, req: Request<Incoming>) -> http::Result<Response<BytesBody>> {
     let origin = req.headers().get(header::ORIGIN).cloned();
     if !origin.as_ref().is_none_or(|o| o.to_str().is_ok_and(|o| origins.iter().any(|allowed| allowed == o))) {
         return respond(StatusCode::FORBIDDEN).body(body(""));
@@ -324,17 +361,22 @@ async fn answer_membership(route: Option<Route>, service: Service, peer: IpAddr,
             .body(body("")),
         (_, None) => allow(respond(StatusCode::NOT_FOUND)).body(body("not found")),
         (&Method::POST, Some(route)) => {
-            let (Some(admission), Ok(_body)) = (service.admit(peer), bodies.try_acquire_owned()) else {
+            let size = req.body().size_hint().upper().map_or(MAX_BODY, |upper| MAX_BODY.min(upper as usize));
+            let Some(mut admission) = service.admit(peer, route, size) else {
                 return respond(StatusCode::SERVICE_UNAVAILABLE).body(body(""));
             };
             let Ok(Ok(collected)) = timeout(BODY, Limited::new(req.into_body(), MAX_BODY).collect()).await else {
                 return respond(StatusCode::BAD_REQUEST).body(body(""));
             };
             match service.post(route, &admission, &collected.to_bytes()).await {
-                Ok(answer) => allow(respond(StatusCode::OK))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::CACHE_CONTROL, "no-store")
-                    .body(body(answer)),
+                Ok(answer) => {
+                    admission.keep(answer.len());
+                    drain.send_replace(Some(Instant::now() + DRAIN));
+                    allow(respond(StatusCode::OK))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::CACHE_CONTROL, "no-store")
+                        .body(Box::new(Held { answer: answer.into(), _admission: admission }))
+                }
                 Err(_) => respond(StatusCode::INTERNAL_SERVER_ERROR).body(body("")),
             }
         }
@@ -350,10 +392,11 @@ impl HyperService<Request<Incoming>> for Site {
     type Future = Answer;
 
     fn call(&self, req: Request<Incoming>) -> Answer {
+        self.drain.send_replace(None);
         if req.uri().path().starts_with("/membership/") {
             let route = Route::parse(req.uri().path());
-            let (service, peer, origins, bodies) = (self.membership.clone(), self.peer, self.origins.clone(), self.bodies.clone());
-            return Box::pin(async move { answer_membership(route, service, peer, origins, bodies, req).await.map_err(Into::into) });
+            let (service, peer, origins, drain) = (self.membership.clone(), self.peer, self.origins.clone(), self.drain.clone());
+            return Box::pin(async move { answer_membership(route, service, peer, origins, drain, req).await.map_err(Into::into) });
         }
         match req.uri().path() {
             "/relay" => return Box::pin(self.relay.call(req)),
