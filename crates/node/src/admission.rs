@@ -11,7 +11,7 @@ use lmk_core::group::{Change, Group, key_package_credential, key_package_leaf, k
 use lmk_core::public::Verdict;
 use lmk_core::provider::Provider;
 use lmk_net::Admit;
-use lmk_proto::group::{Certificate, Control, Credential, IDENTITY, How, Service};
+use lmk_proto::group::{CHAT, Certificate, Control, Credential, IDENTITY, How, Service};
 use lmk_proto::links::Invite;
 use lmk_proto::peer::{Admitted, Join};
 use lmk_proto::{Answer, Bytes};
@@ -236,7 +236,8 @@ impl<P: Provider + Send + 'static> Inner<P> {
                 },
                 None => None,
             };
-            let wanted = doc.is_none().then(|| (*by.as_bytes(), mls.epoch()));
+            let hands_state = !matches!(mls.settings().kind.as_str(), CHAT | IDENTITY);
+            let wanted = (doc.is_none() && hands_state).then(|| (*by.as_bytes(), mls.epoch()));
             let gid = st.add_group(mls, Rec { wanted, ..Rec::default() })?;
             if let Some(seed) = device_key {
                 put(&st.provider, &device_key_key(&gid), &Bytes(seed.to_vec()))?;
