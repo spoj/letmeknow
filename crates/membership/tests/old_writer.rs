@@ -30,7 +30,7 @@ fn published_writer_refuses_without_mutation_and_guard_removal_is_a_negative_con
         fs::write(root.join("cert.pem"), certificate.cert.pem()).unwrap();
         fs::write(root.join("cert.key"), certificate.signing_key.serialize_pem()).unwrap();
         let output = Command::new("timeout").arg("20s").arg(&binary)
-            .args(["serve", "--domain", "localhost", "--https-port", "0", "--http-port", "0", "--qad-port", "0", "--state"])
+            .args(["serve", "--domain", "localhost", "--https-port", "0", "--http-port", "0", "--membership-port", "0", "--qad-port", "0", "--state"])
             .arg(&state).arg("--cert").arg(root.join("cert.pem")).arg("--key").arg(root.join("cert.key"))
             .env("LETMEKNOW_HOME", root.join("home")).output().unwrap();
         assert!(!output.status.success());
