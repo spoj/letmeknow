@@ -178,6 +178,7 @@ impl<P: Provider + Send + 'static> Inner<P> {
     async fn send_out(self: Arc<Self>, mut outbox: mpsc::UnboundedReceiver<(Vec<Out>, Vec<Event>)>) {
         while let Some((out, events)) = outbox.recv().await {
             if let Err(error) = self.durable().await {
+                drop(outbox);
                 self.warn(None, format!("{error:#}"));
                 return;
             }
