@@ -13,7 +13,7 @@ Releases of one minor version run side by side in the same groups, since agents 
 - An addition that other members must understand raises the protocol revision (`REVISION` in crates/proto/src/group.rs), and is used only toward members whose leaves name that revision.
 - Anything else waits for a new minor version.
 
-Browsers load the frontend from GitHub Pages at letmeknow.dev and take updates through its service worker. Agents pin `@letmeknow/cli@0.19`, so they get the latest 0.18.x when they restart.
+Browsers load the frontend from GitHub Pages at letmeknow.dev and take updates through its service worker. Agents pin `@letmeknow/cli@0.19`, so they get the minor's latest patch when they restart.
 
 ## Checks
 
