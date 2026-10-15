@@ -7,7 +7,7 @@ Its domain, directory and public key are in web/backend.json; crates/proto/src/l
 
 ## A release
 
-`deploy/release.sh X.Y.Z <notes file>` publishes the release, then prints two commands. Both take the release run's artifacts and check them against its tag and commit; neither rebuilds. A new minor (X.Y.0) also moves the `@letmeknow/cli@` pins in README.md, SKILL.md, web/src/index.html and AGENTS.md to it, in the release commit, and prints the pi-letmeknow `MINOR` to set by hand.
+`deploy/release.sh X.Y.Z <notes file>` publishes the release, then prints two commands. Both take the release run's artifacts and check them against its tag and commit; neither rebuilds. A new minor (X.Y.0) also moves the `@letmeknow/cli@` pins in README.md, SKILL.md, web/src/index.html, web/src/main.ts and AGENTS.md to it, in the release commit, and prints the pi-letmeknow `MINOR` to set by hand.
 
 1. Backend: `deploy/deploy.sh root@129.212.227.207 relay.letmeknow.dev spoj/letmeknow <run> vX.Y.Z <sha>` installs the Linux binary and systemd unit, restarts the service, and checks that `/health` reports the version and key, and that the live directory is web/backend.json's. A first start may still be getting its certificate: rerun the check with `deploy/check-backend.py web/backend.json vX.Y.Z`.
 2. Frontend: `gh workflow run pages.yml --repo spoj/letmeknow -f release_run=<run> -f release_tag=vX.Y.Z -f release_sha=<sha>`, then approve its `github-pages` deployment. It deploys only while the backend's `/health` matches the app's configuration.
@@ -32,6 +32,6 @@ It prints the new domain and public key: put the key in web/backend.json's direc
 
 ## Browsers on your own server
 
-For a server of your own (README.md), either build the app for it, with a copy of web/backend.json naming its domain and directory: `LMK_FRONTEND_CONFIG=/absolute/path.json npm run build` in web/ (`LMK_FRONTEND_OUT` sets the output directory), served from any static HTTPS host, `/i/index.html` included. Or, on letmeknow.dev, set localStorage `lmk membership` to the domain, `relay.example.com`, and `lmk relay` to the chosen relays, comma-separated, optionally; then reload: new groups and identities use it.
+For a server of your own (README.md), either build the app for it, with a copy of web/backend.json naming its domain and directory: `LMK_FRONTEND_CONFIG=/absolute/path.json npm run build` in web/ (`LMK_FRONTEND_OUT` sets the output directory), served from any static HTTPS host, `/i/index.html` included, and the service runs with `--origin <that origin>`, or it refuses the app's membership posts (403). Or, on letmeknow.dev, set localStorage `lmk membership` to the domain, `relay.example.com`, and `lmk relay` to the chosen relays, comma-separated, optionally; then reload: new groups and identities use it.
 
 Browsers fetch the directory cross-origin, which the service allows, and reach the relay over WSS. The service worker offers updates, but pins nothing: whoever controls letmeknow.dev's DNS, Pages or releases controls the app.
